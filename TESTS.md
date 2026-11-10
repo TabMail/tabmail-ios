@@ -590,7 +590,7 @@ its card, and does not refuse times of one day when `all_day` is not stated.
 spell out) is read as timed by every ICS reader: `ICSParser` (CalDAV event reads), `ICSBuilder.parseIncoming`
 (invitations in mail), and `CalDAVProvider`'s `icsIsAllDay`, `masterDTStartKind` and `parseICSDateTime`; for the
 invitation reader and `parseICSDateTime` the instant is also checked against one computed independently. The CalDAV
-split helpers (`extractMasterDuration`, `buildNewSeriesInput`) read such a master as timed with its real length.
+split helpers (`extractMasterDuration`, `seriesSplitResources` with an empty patch) read such a master as timed with its real length, and a changed occurrence of such a series keeps a timed end of its length.
 `VALUE=DATE`, in any case, is still a day at each of them. All of them match the
 parameter through `ICSValueType.statesDate`, which compares it whole, never as a substring. In
 `CalendarEditKeepsKindTests`, a CalDAV event stored with `VALUE=DATE-TIME` and moved with a start alone lands as a

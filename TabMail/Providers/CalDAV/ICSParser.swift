@@ -312,7 +312,7 @@ enum ICSParser {
     /// `CalDAVProvider.effectiveEnd` use it; any other reader of a VEVENT's end should too.
     static func impliedEndValue(dtstartParams: String?, dtstartValue: String) -> String? {
         let value = dtstartValue.trimmingCharacters(in: .whitespaces)
-        let isDate = (dtstartParams ?? "").uppercased().split(separator: ";").contains("VALUE=DATE")
+        let isDate = ICSValueType.statesDate(dtstartParams ?? "")
             || (value.count == 8 && !value.contains("T"))
         guard isDate else { return value }
         let fmt = DateFormatter()

@@ -182,7 +182,7 @@ extension CalDAVProvider {
         // RFC 5545 §3.8.4.4: RECURRENCE-ID takes the series DTSTART's value type and zone. A date
         // value must say so, even where the series' own DTSTART leaves it implicit.
         var ridParams = dtstartProperty.params
-        if case .allDay = kind, !ridParams.uppercased().contains("VALUE=DATE") { ridParams += ";VALUE=DATE" }
+        if case .allDay = kind, !ICSValueType.statesDate(ridParams) { ridParams += ";VALUE=DATE" }
         let ridLine = "RECURRENCE-ID\(ridParams):\(ridValue)"
         guard let ridInstant = parseICSDateTime(ridLine) else {
             throw CalendarProviderError.notSupported("The repeating event's time zone can't be read, so one occurrence of it can't be changed.")
@@ -651,7 +651,7 @@ extension CalDAVProvider {
         let value = p.value.trimmingCharacters(in: .whitespaces)
         let fmt = DateFormatter()
         fmt.locale = Locale(identifier: "en_US_POSIX")
-        if p.params.uppercased().contains("VALUE=DATE") || (value.count == 8 && !value.contains("T")) {
+        if ICSValueType.statesDate(p.params) || (value.count == 8 && !value.contains("T")) {
             // `parseICSDateTime` reads a date at midnight UTC; write it back the same way.
             fmt.dateFormat = "yyyyMMdd"
             fmt.timeZone = TimeZone(identifier: "UTC")

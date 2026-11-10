@@ -578,6 +578,32 @@ struct CalDAVCalendarEditKeepsKindTests {
         #expect(end?.hasSuffix(":20990316T153000") == true, "the new series did not keep the length: \(end ?? "<none>")")
     }
 
+    @Test("one occurrence of a timed series whose DTSTART states VALUE=DATE-TIME, given only a new start, keeps a timed end")
+    func explicitDateTimeOccurrenceKeepsTimedEnd() async throws {
+        let store = FakeCalDAVStore(servesETags: true)
+        // 2099-03-02 is a Monday; weekly from there.
+        store.seed(path: "/cal/tm-4.ics", ics: [
+            "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//TabMail//Test//EN", "BEGIN:VEVENT",
+            "UID:tm-4", "DTSTAMP:20990101T000000Z",
+            "DTSTART;VALUE=DATE-TIME;TZID=America/Los_Angeles:20990302T100000",
+            "DTEND;VALUE=DATE-TIME;TZID=America/Los_Angeles:20990302T113000",
+            "RRULE:FREQ=WEEKLY", "SUMMARY:Planning", "END:VEVENT", "END:VCALENDAR",
+        ].joined(separator: "\r\n"))
+        let rows = try await run(store, eventId: "/cal/tm-4.ics", [
+            "edit_scope": .string("this_only"), "recurrence_id": .string("2099-03-16T10:00:00"),
+            "start_iso": .string("2099-03-16T14:00:00"), "timezone": .string("America/Los_Angeles"),
+        ], account: "kind-c-explicit-datetime-occurrence")
+        #expect(rows.isEmpty, "the change was refused: \(rows.first?.failureReason ?? "<none>")")
+        // The changed occurrence is the VEVENT that carries a RECURRENCE-ID.
+        let blocks = (store.storedICS(path: "/cal/tm-4.ics") ?? "").components(separatedBy: "BEGIN:VEVENT")
+        let override = blocks.first { $0.contains("RECURRENCE-ID") }
+        #expect(override != nil, "no changed occurrence was written")
+        let start = line(override, "DTSTART")
+        let end = line(override, "DTEND")
+        #expect(start?.hasSuffix(":20990316T140000") == true, "occurrence start: \(start ?? "<none>")")
+        #expect(end?.hasSuffix(":20990316T153000") == true, "the occurrence did not keep a timed end of its length: \(end ?? "<none>")")
+    }
+
     @Test("splitting an all-day series with a move starts the new series on the given date")
     func allDaySplitStartsOnTheGivenDate() async throws {
         let store = FakeCalDAVStore(servesETags: true)

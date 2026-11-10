@@ -109,18 +109,19 @@ struct ICSValueTypeTests {
             "RRULE:FREQ=WEEKLY", "SUMMARY:Review", "END:VEVENT", "END:VCALENDAR",
         ].joined(separator: "\r\n")
         #expect(CalDAVProvider.extractMasterDuration(from: master) == TimeInterval(90 * 60))
-        let out = try CalDAVProvider.buildNewSeriesInput(
-            masterICS: master, patch: GCalEventInput(),
-            newStartNaiveISO: "2099-03-16T10:00:00",
-            newStartZone: TimeZone(identifier: "America/Los_Angeles")!,
-            newRRule: "RRULE:FREQ=WEEKLY")
-        #expect(out.startDate == nil, "the new series was written all-day: \(out.startDate ?? "")")
-        #expect(out.startTimeZone == "America/Los_Angeles")
-        if let s = out.startDateTime.flatMap(Date.fromISO8601), let e = out.endDateTime.flatMap(Date.fromISO8601) {
-            #expect(e.timeIntervalSince(s) == TimeInterval(90 * 60))
-        } else {
-            Issue.record("no timed start/end: \(String(describing: out.startDateTime)) \(String(describing: out.endDateTime))")
-        }
+        // An empty patch: the new part's start and end are the copy's own, so its end is the one
+        // the copy wrote and no later merge rewrites it.
+        let split = try CalDAVProvider.seriesSplitResources(
+            storedICS: master, slotNaiveISO: "2099-03-16T10:00:00",
+            cappedRRule: "RRULE:FREQ=WEEKLY;UNTIL=20990316T165959Z", newRRule: "RRULE:FREQ=WEEKLY",
+            newUid: "vt-2-split", patch: GCalEventInput(), now: Date())
+        let lines = split.newPart.components(separatedBy: "\r\n")
+        let start = lines.first { $0.hasPrefix("DTSTART") }
+        let end = lines.first { $0.hasPrefix("DTEND") }
+        #expect(start == "DTSTART;VALUE=DATE-TIME;TZID=America/Los_Angeles:20990316T100000",
+                "the new series' start: \(start ?? "<none>")")
+        #expect(end == "DTEND;VALUE=DATE-TIME;TZID=America/Los_Angeles:20990316T113000",
+                "the new series' end is not a timed end of the series' length: \(end ?? "<none>")")
     }
 
     @Test("the CalDAV resource readers still treat VALUE=DATE as a day")
