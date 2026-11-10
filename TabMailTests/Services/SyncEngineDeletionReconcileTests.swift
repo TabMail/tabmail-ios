@@ -576,7 +576,7 @@ struct DeletionReconcileDeletePathTests {
         let deletedIds = try db.write { conn in
             try SyncEngine.deleteConfirmedGhostHeaders(
                 folderId: folder.id, folderPath: folder.path, accountId: "acc1",
-                folderRole: .inbox, uids: [101, 999], // 999 unknown → no-op
+                folderRole: .inbox, ids: ["101", "999"], // 999 unknown → no-op
                 recentlyCompleted: [:], db: conn
             )
         }
@@ -596,7 +596,7 @@ struct DeletionReconcileDeletePathTests {
         let deletedIds = try db.write { conn in
             try SyncEngine.deleteConfirmedGhostHeaders(
                 folderId: folder.id, folderPath: folder.path, accountId: "acc1",
-                folderRole: .inbox, uids: [],
+                folderRole: .inbox, ids: [],
                 recentlyCompleted: [:], db: conn
             )
         }
@@ -624,7 +624,7 @@ struct DeletionReconcileDeletePathTests {
         let deletedIds = try db.write { conn in
             try SyncEngine.deleteConfirmedGhostHeaders(
                 folderId: folder.id, folderPath: folder.path, accountId: "acc1",
-                folderRole: .inbox, uids: [200],
+                folderRole: .inbox, ids: ["200"],
                 recentlyCompleted: [:], db: conn
             )
         }
@@ -653,7 +653,7 @@ struct DeletionReconcileDeletePathTests {
         let deletedIds = try db.write { conn in
             try SyncEngine.deleteConfirmedGhostHeaders(
                 folderId: folder.id, folderPath: folder.path, accountId: "acc1",
-                folderRole: .inbox, uids: [300],
+                folderRole: .inbox, ids: ["300"],
                 recentlyCompleted: [:], db: conn
             )
         }
@@ -674,7 +674,7 @@ struct DeletionReconcileDeletePathTests {
         let deletedIds = try db.write { conn in
             try SyncEngine.deleteConfirmedGhostHeaders(
                 folderId: folder.id, folderPath: folder.path, accountId: "acc1",
-                folderRole: .inbox, uids: [400, 401],
+                folderRole: .inbox, ids: ["400", "401"],
                 recentlyCompleted: ["400": now, "recent-401@example.com": now],
                 db: conn
             )
@@ -701,7 +701,7 @@ struct DeletionReconcileDeletePathTests {
         let deletedIds = try db.write { conn in
             try SyncEngine.deleteConfirmedGhostHeaders(
                 folderId: sent.id, folderPath: sent.path, accountId: "acc1",
-                folderRole: .sent, uids: [500],
+                folderRole: .sent, ids: ["500"],
                 recentlyCompleted: [:], db: conn
             )
         }
@@ -727,7 +727,7 @@ struct DeletionReconcileDeletePathTests {
         let deletedIds = try db.write { conn in
             try SyncEngine.deleteConfirmedGhostHeaders(
                 folderId: folder.id, folderPath: folder.path, accountId: "acc1",
-                folderRole: .inbox, uids: [600],
+                folderRole: .inbox, ids: ["600"],
                 recentlyCompleted: [:], db: conn
             )
         }
