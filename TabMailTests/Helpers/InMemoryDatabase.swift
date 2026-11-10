@@ -34,6 +34,11 @@ enum TestDatabase {
     }
 
     /// Insert a test folder and return it.
+    ///
+    /// Writes only the columns the live schema has, so a migration test can seed a
+    /// folder on a database stopped at an older version (before a later migration
+    /// added a `Folder` column). On a fully migrated database every column exists
+    /// and this is exactly `folder.insert`.
     @discardableResult
     static func insertFolder(
         _ db: DatabaseQueue,
@@ -43,7 +48,15 @@ enum TestDatabase {
         accountId: String = "acc1"
     ) throws -> Folder {
         let folder = Folder(name: name, path: path, role: role, accountId: accountId)
-        try db.write { try folder.insert($0) }
+        try db.write { conn in
+            let existing = Set(try conn.columns(in: Folder.databaseTableName).map(\.name))
+            let pairs = try folder.databaseDictionary.filter { existing.contains($0.key) }.sorted { $0.key < $1.key }
+            let columns = pairs.map { "\"\($0.key)\"" }.joined(separator: ", ")
+            let placeholders = Array(repeating: "?", count: pairs.count).joined(separator: ", ")
+            try conn.execute(
+                sql: "INSERT INTO \"\(Folder.databaseTableName)\" (\(columns)) VALUES (\(placeholders))",
+                arguments: StatementArguments(pairs.map(\.value)))
+        }
         return folder
     }
 

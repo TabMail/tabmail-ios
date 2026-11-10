@@ -1452,3 +1452,34 @@ extension AICacheUpdatedAtEncodingMigrationTests {
     }
 }
 
+
+// MARK: - v98 — folder.catchUpState (ADR-IOS-107)
+
+/// `v98_addFolderCatchUpState` adds the provider's opaque catch-up state. Every
+/// pre-existing folder must read NULL — "no state yet", from which the provider
+/// starts a fresh listing — and keep every other column it had.
+@Suite("Migration v98 — folder.catchUpState")
+struct FolderCatchUpStateMigrationTests {
+    @Test("v98 adds a nullable column and leaves every existing folder without state")
+    func existingFoldersHaveNoState() throws {
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let db = try DatabaseQueue(configuration: configuration)
+        var migrator = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &migrator)
+        try migrator.migrate(db, upTo: "v95_convertNumericAICacheUpdatedAt")
+        try TestDatabase.insertAccount(db, id: "acc1", email: "one@example.com")
+        try TestDatabase.insertFolder(db)
+
+        try migrator.migrate(db, upTo: "v98_addFolderCatchUpState")
+
+        let columns = try db.read { try Row.fetchAll($0, sql: "PRAGMA table_info(folder)") }
+        let column = try #require(columns.first { ($0["name"] as String) == "catchUpState" })
+        #expect((column["notnull"] as Int) == 0)
+        #expect((column["type"] as String).uppercased() == "TEXT")
+        let folders = try db.read { try Folder.fetchAll($0) }
+        #expect(folders.count == 1)
+        guard folders.count == 1 else { return }
+        #expect(folders[0].catchUpState == nil)
+    }
+}

@@ -182,6 +182,15 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// mailbox recreation (message list churn is separately simulated via
         /// `setMessages`).
         var uidValidityByMailbox: [String: Int] = [:]
+        /// CONDSTORE (RFC 7162) model, used only when the fake advertises
+        /// `CONDSTORE`: each mailbox's HIGHESTMODSEQ, and the content fingerprint
+        /// (UIDs plus flags) it was last reported for. STATUS bumps the counter
+        /// whenever the fingerprint moved since the previous report, so ANY
+        /// mutation path — a test seam, STORE, EXPUNGE, MOVE, APPEND — raises it,
+        /// and it never decreases. A client that only ever reads the value through
+        /// STATUS cannot tell this from a server bumping it at mutation time.
+        var highestModSeqByMailbox: [String: Int] = [:]
+        var modSeqFingerprintByMailbox: [String: String] = [:]
         /// Mailboxes whose SELECT/EXAMINE response OMITS the
         /// `* OK [UIDVALIDITY n]` line entirely (T1.2b, `suppressSelectUidValidity`).
         /// RFC 3501 §6.3.1 says a server SHOULD send it, not MUST, and SwiftMail
@@ -1817,8 +1826,10 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// not advertise stays genuinely absent from the reply (CONDSTORE's
     /// `HIGHESTMODSEQ` is the case that matters: SwiftMail only asks for it
     /// when the server advertises CONDSTORE, and inventing it here would let a
-    /// test pass against a server shape that cannot exist). Does NOT change the
-    /// connection's selected mailbox — that is the whole point of STATUS.
+    /// test pass against a server shape that cannot exist). A fake constructed
+    /// with `CONDSTORE` among its capabilities does answer it, from the
+    /// `highestModSeqByMailbox` model. Does NOT change the connection's selected
+    /// mailbox — that is the whole point of STATUS.
     private func handleStatus(tag: String, args: String) -> String {
         guard let openParen = args.firstIndex(of: "(") else {
             return "\(tag) BAD STATUS requires an attribute list\r\n"
@@ -1834,15 +1845,29 @@ final class FakeIMAPServer: @unchecked Sendable {
             .split(separator: " ")
             .map { $0.uppercased() }
 
-        let (count, unseen, uidNext, uidValidity) = withState { state -> (Int, Int, Int, Int) in
+        let condStore = capabilities.contains("CONDSTORE")
+        let (count, unseen, uidNext, uidValidity, highestModSeq) = withState { state -> (Int, Int, Int, Int, Int) in
             let messages = state.messagesByMailbox[mailbox] ?? []
             let flags = state.flagsByMailbox[mailbox] ?? [:]
             let unseen = messages.filter { !(flags[$0.uid]?.contains("\\Seen") ?? false) }.count
+            var highestModSeq = 0
+            if condStore {
+                let fingerprint = messages.map(\.uid).sorted().map { uid in
+                    "\(uid):\((flags[uid] ?? []).sorted().joined(separator: ","))"
+                }.joined(separator: ";")
+                highestModSeq = state.highestModSeqByMailbox[mailbox] ?? 1
+                if let previous = state.modSeqFingerprintByMailbox[mailbox], previous != fingerprint {
+                    highestModSeq += 1
+                }
+                state.highestModSeqByMailbox[mailbox] = highestModSeq
+                state.modSeqFingerprintByMailbox[mailbox] = fingerprint
+            }
             return (
                 messages.count,
                 unseen,
                 (messages.map(\.uid).max() ?? 0) + 1,
-                state.uidValidityByMailbox[mailbox] ?? 1
+                state.uidValidityByMailbox[mailbox] ?? 1,
+                highestModSeq
             )
         }
 
@@ -1854,6 +1879,7 @@ final class FakeIMAPServer: @unchecked Sendable {
             case "UNSEEN": parts.append("UNSEEN \(unseen)")
             case "UIDNEXT": parts.append("UIDNEXT \(uidNext)")
             case "UIDVALIDITY": parts.append("UIDVALIDITY \(uidValidity)")
+            case "HIGHESTMODSEQ" where condStore: parts.append("HIGHESTMODSEQ \(highestModSeq)")
             default: continue // an attribute this fake does not model — never invent one
             }
         }

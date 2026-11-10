@@ -492,6 +492,14 @@ extension SyncEngine {
             }
         }
 
+        // ADR-IOS-107: catch up server-side changes to older mail that no window above
+        // reaches (a read/flag change or a removal on an old message). One provider
+        // call for every syncable folder, applied through the paths above, inside this
+        // pass's lock and bounded by `SyncConfig.catchUpPassBudgetSeconds` plus one
+        // `catchUpRequestTimeoutSeconds`. Generic: a provider without catch-up returns
+        // nothing. Never throws, so it cannot trigger the caller's retry.
+        await runCatchUp(provider: provider, folderIds: syncableFolders.map(\.id))
+
         // Body fetching happens during backfill (startBackfill called after fullSync).
         // Running it inline here would block sync and explode memory for large folders.
         // Unread recount is now handled per-folder inside syncMessages, immediately after header commit.

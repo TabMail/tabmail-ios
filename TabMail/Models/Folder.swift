@@ -227,6 +227,13 @@ struct Folder: Codable, FetchableRecord, PersistableRecord, Identifiable, Hashab
     /// cycle. Nil until the first STATUS on a CONDSTORE server; nil also means "no
     /// CONDSTORE" → callers fall back to the uidNext+count comparison.
     var lastKnownHighestModSeq: Int?
+    /// The provider's OPAQUE catch-up state for this folder (ADR-IOS-107): only the
+    /// provider that wrote it can read it, and the full sync stores it unread. It is
+    /// written in the same transaction as the catch-up results it describes, so a
+    /// crash resumes from the last write. It holds ids and stamps, never message
+    /// content (ADR-004). Nil means "no state yet". The UIDVALIDITY purge clears it
+    /// with the folder's other sync cursors.
+    var catchUpState: String?
 
     init(name: String, path: String, role: FolderRole, accountId: String) {
         self.id = "\(accountId):\(path)"
