@@ -23,6 +23,14 @@ import Synchronization
 ///   that differs from the stored one makes Graph restore deleted occurrences
 ///   and move moved ones back — counted in `seriesResets`. Writing the stored
 ///   recurrence back exactly changed nothing;
+/// - writing a series' `start` or `end` (measured on a work account on
+///   2026-11-10): a PATCH of start and end alone, with no recurrence and the
+///   stored recurrence left as it was, brought a deleted occurrence back and
+///   made a moved one a plain occurrence at the new time — also counted in
+///   `seriesResets`. Counted when the written start or end differs from the
+///   stored one (wall time and zone label), or an `isAllDay` that differs (a
+///   series made all-day or timed, assumed to reset as a moved start does);
+///   writing them back unchanged was not measured;
 /// - a `recurrence` written without `start` moves the series' start and end to
 ///   UTC midnight on the range's `startDate` (measured, see `splitSeries`);
 /// - a recurrence whose range has no `startDate` is refused with a 400
@@ -131,8 +139,12 @@ final class FakeGraphCalendar: Sendable {
                 return .json(raw: #"{"error":{"code":"UnknownError","message":""}}"#, statusCode: 405)
             }
             patchLog.withLock { $0.append((id: parts[0], body: body)) }
-            if let written = patch["recurrence"],
-               Self.canonicalJSON(written) != Self.canonicalJSON(stored["recurrence"]) {
+            let changesRule = patch["recurrence"].map { Self.canonicalJSON($0) != Self.canonicalJSON(stored["recurrence"]) } ?? false
+            let isSeries = stored["recurrence"] != nil && !(stored["recurrence"] is NSNull)
+            let movesTime = isSeries && (["start", "end"].contains { key in
+                patch[key].map { !Self.sameTime($0, stored[key]) } ?? false
+            } || patch["isAllDay"].map { ($0 as? Bool) != (stored["isAllDay"] as? Bool) } ?? false)
+            if changesRule || movesTime {
                 resets.withLock { $0 += 1 }
             }
             Self.apply(patch, to: &stored)
@@ -150,6 +162,14 @@ final class FakeGraphCalendar: Sendable {
             store(created)
             return Self.json(created)
         }
+    }
+
+    /// Whether a written start or end names the stored one: the same wall time to the
+    /// second and the same zone label.
+    private static func sameTime(_ written: Any, _ stored: Any?) -> Bool {
+        guard let written = written as? [String: Any], let stored = stored as? [String: Any] else { return false }
+        func wall(_ value: [String: Any]) -> String { String((value["dateTime"] as? String ?? "").prefix(19)) }
+        return wall(written) == wall(stored) && written["timeZone"] as? String == stored["timeZone"] as? String
     }
 
     private func store(_ event: [String: Any]) {
@@ -655,6 +675,43 @@ enum AllDaySpelling: String, CaseIterable, CustomTestStringConvertible, Sendable
     func spell(_ day: String) -> String { day + rawValue }
 }
 
+/// A series' recurrence as Graph stores it (every field, the unused ones at their
+/// defaults, in a zone other than UTC and with weeks starting on Monday), one of
+/// each range kind.
+enum StoredRule: String, CaseIterable, CustomTestStringConvertible, Sendable {
+    case weeklyNoEnd, relativeMonthlyEndDate, absoluteYearlyNumbered, everyOtherDayNumbered
+
+    var testDescription: String { rawValue }
+
+    func recurrence(start: Date) -> [String: Any] {
+        let startDate = GraphFixture.utcDay(start)
+        let pattern: [String: Any]
+        let range: [String: Any]
+        switch self {
+        case .weeklyNoEnd:
+            pattern = ["type": "weekly", "interval": 1, "month": 0, "dayOfMonth": 0,
+                       "daysOfWeek": [GraphFixture.weekday(start)], "firstDayOfWeek": "monday", "index": "first"]
+            range = ["type": "noEnd", "startDate": startDate, "endDate": "0001-01-01", "numberOfOccurrences": 0]
+        case .relativeMonthlyEndDate:
+            pattern = ["type": "relativeMonthly", "interval": 1, "month": 0, "dayOfMonth": 0,
+                       "daysOfWeek": ["tuesday", "thursday"], "firstDayOfWeek": "monday", "index": "second"]
+            range = ["type": "endDate", "startDate": startDate,
+                     "endDate": GraphFixture.utcDay(start.addingTimeInterval(90 * 86_400)), "numberOfOccurrences": 0]
+        case .absoluteYearlyNumbered:
+            pattern = ["type": "absoluteYearly", "interval": 1, "month": 3, "dayOfMonth": 15,
+                       "daysOfWeek": [String](), "firstDayOfWeek": "monday", "index": "first"]
+            range = ["type": "numbered", "startDate": startDate, "endDate": "0001-01-01", "numberOfOccurrences": 4]
+        case .everyOtherDayNumbered:
+            pattern = ["type": "daily", "interval": 2, "month": 0, "dayOfMonth": 0,
+                       "daysOfWeek": [String](), "firstDayOfWeek": "monday", "index": "first"]
+            range = ["type": "numbered", "startDate": startDate, "endDate": "0001-01-01", "numberOfOccurrences": 6]
+        }
+        var zoned = range
+        zoned["recurrenceTimeZone"] = "Pacific Standard Time"
+        return ["pattern": pattern, "range": zoned]
+    }
+}
+
 /// Every property a user can see on an Outlook event and an edit must not touch
 /// unless it is the one edited.
 private let watchedProperties = [
@@ -856,8 +913,10 @@ struct ExchangeCalendarEditPreservationTests {
     /// restore deleted occurrences and move moved ones back. So an edit of a
     /// whole series that gives no rule and keeps the series' date (a rename, a
     /// time change on the same day, an attendee or availability change) sends
-    /// no `recurrence` at all.
-    @Test("an edit of a whole series that gives no rule writes no recurrence",
+    /// no `recurrence` at all. A time change still resets them: Graph does that
+    /// for any change of a series' start or end (measured, 2026-11-10), which
+    /// the edit's card says (`editResetsChangedOccurrences`).
+    @Test("an edit of a whole series that gives no rule writes no recurrence, and resets only on a time change",
           arguments: UserCalendarEdit.ofAnOnlineMeeting)
     func wholeSeriesKeepsRule(_ edit: UserCalendarEdit) async throws {
         let http = FakeHTTP.Scenario()
@@ -870,7 +929,9 @@ struct ExchangeCalendarEditPreservationTests {
         let sent = graph.patches("ser-1")
         #expect(sent.count == 1, "\(edit.rawValue): \(sent.count) PATCHes")
         #expect(sent.allSatisfy { $0["recurrence"] == nil }, "\(edit.rawValue): the PATCH carried a recurrence")
-        #expect(graph.seriesResets == 0, "\(edit.rawValue): the edit reset the series' exceptions")
+        let movesTime = edit == .moveOneHour || edit == .endLater
+        #expect(graph.seriesResets == (movesTime ? 1 : 0),
+                "\(edit.rawValue): \(graph.seriesResets) resets of the series' exceptions; Graph resets them on a time change only")
     }
 
     /// A whole series moved to start a week later: the range's `startDate` must
@@ -930,6 +991,723 @@ struct ExchangeCalendarEditPreservationTests {
         #expect(((after["start"] as? [String: Any])?["dateTime"] as? String)?.hasPrefix(GraphFixture.naive(newStart)) == true)
     }
 
+    /// #423, measured: a rule written without the series' zone is stored as UTC (a
+    /// series pinned to UTC moves by an hour in local time across a daylight saving
+    /// change), and one naming Sunday moves the series' weeks to start on Sunday.
+    /// "make it every other week": the new rule is written in the series' own zone,
+    /// with its own first day of the week.
+    @Test("a rule change on a series keeps the series' zone and first day of the week")
+    func ruleChangeKeepsZoneAndFirstDay() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = GraphFixture.calendar()
+        graph.install(on: http)
+        let before = try #require(graph.event("ser-1"))
+        let wasRecurrence = try #require(before["recurrence"] as? [String: Any])
+        let wasZone = (wasRecurrence["range"] as? [String: Any])?["recurrenceTimeZone"] as? String
+        let wasFirstDay = (wasRecurrence["pattern"] as? [String: Any])?["firstDayOfWeek"] as? String
+        #expect(wasZone == "Pacific Standard Time" && wasFirstDay == "monday", "the fixture's series is not the measured one")
+        var patch = GCalEventInput()
+        patch.recurrence = ["RRULE:FREQ=WEEKLY;INTERVAL=2"]
+
+        _ = try await makeProvider(http).updateEvent(eventId: "ser-1", event: patch)
+
+        let after = try #require(graph.event("ser-1"))
+        let recurrence = try #require(after["recurrence"] as? [String: Any])
+        let pattern = recurrence["pattern"] as? [String: Any]
+        let range = recurrence["range"] as? [String: Any]
+        #expect(pattern?["interval"] as? Int == 2, "the new rule was not written")
+        #expect(range?["recurrenceTimeZone"] as? String == wasZone,
+                "the series' zone is \(range?["recurrenceTimeZone"] as? String ?? "none"), was \(wasZone ?? "none")")
+        #expect(pattern?["firstDayOfWeek"] as? String == wasFirstDay,
+                "the series' weeks start on \(pattern?["firstDayOfWeek"] as? String ?? "none"), did on \(wasFirstDay ?? "none")")
+        for property in watchedProperties where property != "recurrence" {
+            #expect(canonical(after[property]) == canonical(before[property]), "the rule change changed \(property)")
+        }
+    }
+
+    /// #423, measured: writing a series' stored recurrence back exactly changed
+    /// nothing, but writing it rebuilt from its RRULE restored deleted occurrences
+    /// and moved moved ones back. The assistant re-sends the rule it read with an
+    /// edit, so a whole-series edit whose rule is the series' own resets nothing,
+    /// whatever kind of rule and range the series has.
+    @Test("a whole-series edit that re-sends the series' own rule resets nothing and leaves the series as it was",
+          arguments: StoredRule.allCases, [false, true])
+    func resentRuleResetsNothing(_ rule: StoredRule, _ withRename: Bool) async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        var series = GraphFixture.event(id: "ser-r", online: false, recurring: true)
+        series["recurrence"] = rule.recurrence(start: GraphFixture.start)
+        let graph = FakeGraphCalendar([series])
+        graph.install(on: http)
+        let before = try #require(graph.event("ser-r"))
+        let provider = makeProvider(http)
+        var patch = withRename ? UserCalendarEdit.rename.patch(start: GraphFixture.start) : GCalEventInput()
+        let read = try await provider.getEvent(eventId: "ser-r")
+        patch.recurrence = [try #require(read.recurrence?.first)]
+
+        _ = try await provider.updateEvent(eventId: "ser-r", event: patch)
+
+        let label = "\(rule.rawValue)\(withRename ? " with a rename" : "")"
+        let sent = graph.patches("ser-r")
+        #expect(sent.count == (withRename ? 1 : 0), "\(label): \(sent.count) PATCHes")
+        #expect(sent.allSatisfy { $0["recurrence"] == nil }, "\(label): the PATCH carried a recurrence")
+        #expect(graph.seriesResets == 0, "\(label): the edit reset the series' exceptions")
+        let after = try #require(graph.event("ser-r"))
+        expectOnlyEdited(withRename ? .rename : nil, before: before, after: after, label: label)
+    }
+
+    /// The series' own rule with its days named in another order is the same rule.
+    @Test("a whole-series edit that re-sends the series' own rule with its days in another order resets nothing")
+    func resentRuleInAnotherDayOrder() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        var series = GraphFixture.event(id: "ser-d", online: false, recurring: true)
+        series["recurrence"] = StoredRule.relativeMonthlyEndDate.recurrence(start: GraphFixture.start)
+        let graph = FakeGraphCalendar([series])
+        graph.install(on: http)
+        let before = try #require(graph.event("ser-d"))
+        let provider = makeProvider(http)
+        let read = try #require(try await provider.getEvent(eventId: "ser-d").recurrence?.first)
+        #expect(read.contains("BYDAY=TU,TH"), "the read rule is \(read)")
+        var patch = UserCalendarEdit.rename.patch(start: GraphFixture.start)
+        patch.recurrence = [read.replacingOccurrences(of: "BYDAY=TU,TH", with: "BYDAY=TH,TU")]
+
+        _ = try await provider.updateEvent(eventId: "ser-d", event: patch)
+
+        #expect(graph.patches("ser-d").allSatisfy { $0["recurrence"] == nil }, "the PATCH carried a recurrence")
+        #expect(graph.seriesResets == 0, "the edit reset the series' exceptions")
+        let after = try #require(graph.event("ser-d"))
+        expectOnlyEdited(.rename, before: before, after: after, label: "days in another order")
+    }
+
+    /// The same, with the series moved a week later: the rule is the series' own,
+    /// so the stored recurrence is written with only its range's start date moved.
+    @Test("a whole series moved to another date with its own rule re-sent keeps its recurrence but for the range's start date")
+    func resentRuleWithDateMove() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = GraphFixture.calendar()
+        graph.install(on: http)
+        let before = try #require(graph.event("ser-1"))
+        let provider = makeProvider(http)
+        let newStart = GraphFixture.start.addingTimeInterval(7 * 86_400)
+        var patch = GCalEventInput()
+        patch.startDateTime = GraphFixture.rfc3339(newStart)
+        patch.startTimeZone = "UTC"
+        let read = try await provider.getEvent(eventId: "ser-1")
+        patch.recurrence = [try #require(read.recurrence?.first)]
+
+        _ = try await provider.updateEvent(eventId: "ser-1", event: patch)
+
+        let after = try #require(graph.event("ser-1"))
+        let was = try #require(before["recurrence"] as? [String: Any])
+        let now = try #require(after["recurrence"] as? [String: Any])
+        #expect(canonical(now["pattern"]) == canonical(was["pattern"]), "the move changed the pattern")
+        var range = try #require(now["range"] as? [String: Any])
+        #expect(range["startDate"] as? String == GraphFixture.utcDay(newStart), "the range's start date did not move")
+        range["startDate"] = (was["range"] as? [String: Any])?["startDate"]
+        #expect(canonical(range) == canonical(was["range"]), "the move changed the range beyond its start date")
+    }
+
+    /// A series kept in Tokyo's zone (stored by its Windows name) whose start Graph
+    /// gives in UTC at 20:00, which is 05:00 the next day in Tokyo. "repeat daily
+    /// until …" ends at 21:00 UTC ten days later, 06:00 eleven days later in Tokyo:
+    /// the series' last day in its own zone is the eleventh, which is the date the
+    /// range's end must name, since Graph reads it in that zone.
+    @Test("a rule change dates its end in the series' stored zone, not the start's")
+    func ruleChangeEndsInTheStoredZone() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = GraphFixture.utc
+        let day = cal.startOfDay(for: Date().addingTimeInterval(30 * 86_400))
+        let start = day.addingTimeInterval(20 * 3_600)
+        var series = GraphFixture.event(id: "ser-tk", start: start, online: false, recurring: true)
+        var recurrence = try #require(series["recurrence"] as? [String: Any])
+        var range = try #require(recurrence["range"] as? [String: Any])
+        range["recurrenceTimeZone"] = "Tokyo Standard Time"
+        recurrence["range"] = range
+        series["recurrence"] = recurrence
+        let graph = FakeGraphCalendar([series])
+        graph.install(on: http)
+        let until = day.addingTimeInterval(10 * 86_400 + 21 * 3_600)
+        let untilText = GraphFixture.naive(until).replacingOccurrences(of: "-", with: "").replacingOccurrences(of: ":", with: "") + "Z"
+        var patch = GCalEventInput()
+        patch.recurrence = ["RRULE:FREQ=DAILY;UNTIL=\(untilText)"]
+
+        _ = try await makeProvider(http).updateEvent(eventId: "ser-tk", event: patch)
+
+        let written = (graph.event("ser-tk")?["recurrence"] as? [String: Any])?["range"] as? [String: Any]
+        let tokyoLastDay = GraphFixture.utcDay(day.addingTimeInterval(11 * 86_400))
+        #expect(written?["type"] as? String == "endDate", "the new rule's end was not written")
+        #expect(written?["endDate"] as? String == tokyoLastDay,
+                "the series ends on \(written?["endDate"] as? String ?? "none"), its last day in Tokyo is \(tokyoLastDay)")
+        #expect(written?["recurrenceTimeZone"] as? String == "Tokyo Standard Time")
+        // Graph reads the range's start date in the same zone and requires it to match the
+        // start: 20:00 UTC is the next day in Tokyo.
+        let tokyoFirstDay = GraphFixture.utcDay(day.addingTimeInterval(86_400))
+        #expect(written?["startDate"] as? String == tokyoFirstDay,
+                "the range starts on \(written?["startDate"] as? String ?? "none"), the series' first day in Tokyo is \(tokyoFirstDay)")
+    }
+
+    enum EndOnlyChange: String, CaseIterable, CustomTestStringConvertible {
+        case newCount, untilAdded, countToUntil
+        var testDescription: String { rawValue }
+    }
+
+    /// The series' own pattern with only its end changed ("make it nine times",
+    /// "end it in two months") is a new rule: it is written, with the new end.
+    @Test("a whole-series edit that changes only the series' end writes the new end", arguments: EndOnlyChange.allCases)
+    func endOnlyChangeIsWritten(_ change: EndOnlyChange) async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let stored: StoredRule = change == .untilAdded ? .weeklyNoEnd : .everyOtherDayNumbered
+        var series = GraphFixture.event(id: "ser-e", online: false, recurring: true)
+        series["recurrence"] = stored.recurrence(start: GraphFixture.start)
+        let graph = FakeGraphCalendar([series])
+        graph.install(on: http)
+        let provider = makeProvider(http)
+        let read = try #require(try await provider.getEvent(eventId: "ser-e").recurrence?.first)
+        let endDay = GraphFixture.utcDay(GraphFixture.start.addingTimeInterval(60 * 86_400))
+        let untilPart = "UNTIL=" + endDay.replacingOccurrences(of: "-", with: "")
+        let edited: String
+        switch change {
+        case .newCount:
+            #expect(read.contains("COUNT=6"), "the read rule is \(read)")
+            edited = read.replacingOccurrences(of: "COUNT=6", with: "COUNT=9")
+        case .untilAdded:
+            #expect(!read.contains("UNTIL") && !read.contains("COUNT"), "the read rule is \(read)")
+            edited = read + ";" + untilPart
+        case .countToUntil:
+            #expect(read.contains("COUNT=6"), "the read rule is \(read)")
+            edited = read.replacingOccurrences(of: "COUNT=6", with: untilPart)
+        }
+        var patch = GCalEventInput()
+        patch.recurrence = [edited]
+
+        _ = try await provider.updateEvent(eventId: "ser-e", event: patch)
+
+        #expect(graph.patches("ser-e").contains { $0["recurrence"] != nil }, "\(change): the new end was not written")
+        let after = try #require(graph.event("ser-e"))
+        let recurrence = try #require(after["recurrence"] as? [String: Any])
+        let pattern = recurrence["pattern"] as? [String: Any]
+        let wasPattern = stored.recurrence(start: GraphFixture.start)["pattern"] as? [String: Any]
+        #expect(pattern?["type"] as? String == wasPattern?["type"] as? String
+                && pattern?["interval"] as? Int == wasPattern?["interval"] as? Int
+                && Set(pattern?["daysOfWeek"] as? [String] ?? []) == Set(wasPattern?["daysOfWeek"] as? [String] ?? []),
+                "\(change): the pattern changed")
+        let range = recurrence["range"] as? [String: Any]
+        switch change {
+        case .newCount:
+            #expect(range?["type"] as? String == "numbered" && range?["numberOfOccurrences"] as? Int == 9,
+                    "\(change): the range is \(canonical(range))")
+        case .untilAdded, .countToUntil:
+            #expect(range?["type"] as? String == "endDate" && range?["endDate"] as? String == endDay,
+                    "\(change): the range is \(canonical(range))")
+        }
+    }
+
+    /// A series whose stored zone TabMail does not recognize: a rule edit, whose
+    /// end would be dated in that zone, is refused by the zone's name and nothing
+    /// is written.
+    @Test("a rule edit of a series stored in an unrecognized zone is refused by the zone's name and writes nothing")
+    func ruleEditInUnrecognizedZoneIsRefused() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        var series = GraphFixture.event(id: "ser-cz", online: false, recurring: true)
+        var recurrence = try #require(series["recurrence"] as? [String: Any])
+        var range = try #require(recurrence["range"] as? [String: Any])
+        range["recurrenceTimeZone"] = "Customized Time Zone"
+        recurrence["range"] = range
+        series["recurrence"] = recurrence
+        let graph = FakeGraphCalendar([series])
+        graph.install(on: http)
+        let before = try #require(graph.event("ser-cz"))
+        var patch = UserCalendarEdit.rename.patch(start: GraphFixture.start)
+        patch.recurrence = ["RRULE:FREQ=DAILY;COUNT=5"]
+
+        let provider = makeProvider(http)
+        let read = try await provider.getEvent(eventId: "ser-cz")
+        #expect(provider.editResetsChangedOccurrences(read, edit: patch), "the card does not warn of a reset for the refused rule edit")
+        var reason: String?
+        do {
+            _ = try await provider.updateEvent(eventId: "ser-cz", event: patch)
+        } catch CalendarProviderError.notSupported(let message) {
+            reason = message
+        }
+
+        #expect(reason?.contains("This event uses the time zone \"Customized Time Zone\", which TabMail does not recognize") == true,
+                "the edit was not refused by the zone's name: \(reason ?? "not refused")")
+        #expect(graph.patches("ser-cz").isEmpty, "the refused edit wrote \(graph.patches("ser-cz").count) PATCHes")
+        let after = try #require(graph.event("ser-cz"))
+        expectOnlyEdited(nil, before: before, after: after, label: "refused edit")
+    }
+
+    enum RuleEdit: String, CaseIterable, CustomTestStringConvertible {
+        case resent, renameOnly, newEnd, newInterval, newKind, timeMove, timeMoveWithResentRule
+        case ownTimeResent, ownTimeResentWithRename, sameInstantOtherZone, sameInstantOtherZoneWithRename, endOnly
+        var testDescription: String { rawValue }
+
+        /// Whether the edit resets the series' changed occurrences: a rule change, or a start or
+        /// end at another instant than the series' own (the same instant under another zone label
+        /// is its own, and is not sent).
+        var resets: Bool {
+            ![.resent, .renameOnly, .ownTimeResent, .ownTimeResentWithRename, .sameInstantOtherZone, .sameInstantOtherZoneWithRename]
+                .contains(self)
+        }
+    }
+
+    /// The edit's card says changed occurrences may be reset exactly when the write resets
+    /// them, as Graph does on any change of a series' rule, start or end: both decide from the
+    /// same merge of the edit with the series, the card from the event it read.
+    @Test("the card's answer to whether an edit resets changed occurrences is the write's",
+          arguments: StoredRule.allCases, RuleEdit.allCases)
+    func cardAnswerIsTheWrites(_ rule: StoredRule, _ edit: RuleEdit) async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        var series = GraphFixture.event(id: "ser-c", online: false, recurring: true)
+        series["recurrence"] = rule.recurrence(start: GraphFixture.start)
+        let graph = FakeGraphCalendar([series])
+        graph.install(on: http)
+        let provider = makeProvider(http)
+        let read = try await provider.getEvent(eventId: "ser-c")
+        let stored = try #require(read.recurrence?.first)
+        func without(_ names: [String]) -> String {
+            stored.split(separator: ";").filter { part in !names.contains { part.hasPrefix($0 + "=") } }.joined(separator: ";")
+        }
+        var patch = GCalEventInput()
+        switch edit {
+        case .resent: patch.recurrence = [stored]
+        case .renameOnly: patch.summary = "Planning (renamed)"
+        case .newEnd: patch.recurrence = [without(["COUNT", "UNTIL"]) + ";COUNT=3"]
+        case .newInterval: patch.recurrence = [without(["INTERVAL"]) + ";INTERVAL=3"]
+        case .newKind: patch.recurrence = [stored.hasPrefix("RRULE:FREQ=DAILY") ? "RRULE:FREQ=WEEKLY" : "RRULE:FREQ=DAILY"]
+        case .timeMove, .timeMoveWithResentRule:
+            // An hour later on the same day: no date move, so no recurrence is written.
+            patch.startDateTime = GraphFixture.rfc3339(GraphFixture.start.addingTimeInterval(3_600))
+            patch.startTimeZone = "UTC"
+            if edit == .timeMoveWithResentRule { patch.recurrence = [stored] }
+        case .ownTimeResent, .ownTimeResentWithRename:
+            // The series' start and end as the read gives them.
+            patch.startDateTime = read.start?.dateTime
+            patch.startTimeZone = read.start?.timeZone
+            patch.endDateTime = read.end?.dateTime
+            patch.endTimeZone = read.end?.timeZone
+            if edit == .ownTimeResentWithRename { patch.summary = "Planning (renamed)" }
+        case .sameInstantOtherZone, .sameInstantOtherZoneWithRename:
+            // The series' own start and end, spelled as Tokyo wall times labelled Tokyo.
+            let tokyo: TimeInterval = 9 * 3_600
+            patch.startDateTime = GraphFixture.naive(GraphFixture.start.addingTimeInterval(tokyo)) + "+09:00"
+            patch.startTimeZone = "Asia/Tokyo"
+            patch.endDateTime = GraphFixture.naive(GraphFixture.start.addingTimeInterval(1_800 + tokyo)) + "+09:00"
+            patch.endTimeZone = "Asia/Tokyo"
+            if edit == .sameInstantOtherZoneWithRename { patch.summary = "Planning (renamed)" }
+        case .endOnly:
+            // The series' own start, and an end an hour later.
+            patch.startDateTime = read.start?.dateTime
+            patch.startTimeZone = read.start?.timeZone
+            patch.endDateTime = GraphFixture.rfc3339(GraphFixture.start.addingTimeInterval(1_800 + 3_600))
+            patch.endTimeZone = "UTC"
+        }
+
+        let answer = provider.editResetsChangedOccurrences(read, edit: patch)
+        _ = try await provider.updateEvent(eventId: "ser-c", event: patch)
+
+        let label = "\(rule.rawValue), \(edit.rawValue) (\(patch.recurrence?.first ?? "no rule"))"
+        let reset = graph.seriesResets > 0
+        #expect(answer == reset, "\(label): the card says \(answer ? "a reset" : "no reset"), the write \(reset ? "reset" : "did not reset") the series")
+        #expect(answer == edit.resets, "\(label): the card says \(answer ? "a reset" : "no reset")")
+        // One decision: the card warns exactly when the PATCH carries the series' start and end
+        // (a move, or beside a written rule).
+        let sent = graph.patches("ser-c")
+        let sentTimes = sent.contains { $0["start"] != nil || $0["end"] != nil }
+        #expect(answer == sentTimes, "\(label): the card says \(answer ? "a reset" : "no reset"), the PATCH \(sentTimes ? "carries" : "does not carry") start and end")
+        if [.ownTimeResent, .ownTimeResentWithRename, .sameInstantOtherZone, .sameInstantOtherZoneWithRename].contains(edit) {
+            #expect(sent.allSatisfy { $0["start"] == nil && $0["end"] == nil && $0["recurrence"] == nil },
+                    "\(label): the series' own times sent back were PATCHed: \(sent.map { $0.keys.sorted() })")
+            let renamed = [.ownTimeResentWithRename, .sameInstantOtherZoneWithRename].contains(edit)
+            #expect(sent.count == (renamed ? 1 : 0), "\(label): \(sent.count) PATCHes")
+        }
+    }
+
+    enum ZoneLabel: String, CaseIterable, CustomTestStringConvertible {
+        case ianaForStoredWindows, otherZone, unresolvable
+        var testDescription: String { rawValue }
+
+        /// The label the edit gives the series' own wall times.
+        var label: String {
+            switch self {
+            case .ianaForStoredWindows: "America/Los_Angeles"
+            case .otherZone: "America/New_York"
+            case .unresolvable: "Customized Time Zone"
+            }
+        }
+
+        /// A series' time moves when its wall time or its resolved zone changes; a label that does
+        /// not resolve is a move.
+        var moves: Bool { self != .ianaForStoredWindows }
+    }
+
+    /// A series stored with Graph's Windows zone name, renamed with its own wall times labelled
+    /// by an IANA name (as the tools write them): the same zone, so nothing moves, and the write
+    /// sends no start, end or recurrence. Another zone, or a label that does not resolve, is a
+    /// move (its recurrence may be written too, when the move changes the device's date), and the
+    /// card's answer is the write's.
+    @Test("a series' own wall times under another name for its zone are no move; another or unknown zone is one",
+          arguments: ZoneLabel.allCases)
+    func zoneLabelsCompareByResolvedZone(_ zone: ZoneLabel) async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        var series = GraphFixture.event(id: "ser-w", online: false, recurring: true)
+        series["start"] = ["dateTime": GraphFixture.naive(GraphFixture.start) + ".0000000", "timeZone": "Pacific Standard Time"]
+        series["end"] = ["dateTime": GraphFixture.naive(GraphFixture.start.addingTimeInterval(1_800)) + ".0000000",
+                         "timeZone": "Pacific Standard Time"]
+        let graph = FakeGraphCalendar([series])
+        graph.install(on: http)
+        let provider = makeProvider(http)
+        let read = try await provider.getEvent(eventId: "ser-w")
+        var patch = GCalEventInput()
+        patch.summary = "Planning (renamed)"
+        patch.startDateTime = GraphFixture.naive(GraphFixture.start)
+        patch.startTimeZone = zone.label
+        patch.endDateTime = GraphFixture.naive(GraphFixture.start.addingTimeInterval(1_800))
+        patch.endTimeZone = zone.label
+
+        let answer = provider.editResetsChangedOccurrences(read, edit: patch)
+        _ = try await provider.updateEvent(eventId: "ser-w", event: patch)
+
+        let sent = graph.patches("ser-w")
+        let reset = graph.seriesResets > 0
+        #expect(sent.count == 1, "\(zone): \(sent.count) PATCHes")
+        #expect(answer == zone.moves, "\(zone): the card says \(answer ? "a reset" : "no reset")")
+        #expect(answer == reset, "\(zone): the card says \(answer ? "a reset" : "no reset"), the write \(reset ? "reset" : "did not reset") the series")
+        let sentTimes = sent.contains { $0["start"] != nil || $0["end"] != nil }
+        #expect(sentTimes == zone.moves, "\(zone): the PATCH \(sentTimes ? "sent" : "did not send") start and end: \(sent.map { $0.keys.sorted() })")
+        #expect(answer == sentTimes, "\(zone): the card and the PATCH disagree")
+        #expect(reset == zone.moves, "\(zone): \(graph.seriesResets) resets")
+        if !zone.moves {
+            #expect(sent.allSatisfy { $0["recurrence"] == nil }, "\(zone): the PATCH carried a recurrence")
+        }
+    }
+
+    enum KindChange: String, CaseIterable, CustomTestStringConvertible {
+        case timedToAllDay, allDayToTimed
+        var testDescription: String { rawValue }
+    }
+
+    /// A series at 00:00 UTC made all-day on the same date, or the reverse: the start and end
+    /// write the same wall times and zone, and only `isAllDay` differs. That is a move: the PATCH
+    /// sends the start, the end and the new kind, and the card warns.
+    @Test("a series made all-day on the same date at 00:00 UTC, or the reverse, is sent and warned of",
+          arguments: KindChange.allCases)
+    func allDayChangeIsAMove(_ change: KindChange) async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let day = GraphFixture.utcDay(GraphFixture.start)
+        let next = GraphFixture.utcDay(GraphFixture.start.addingTimeInterval(86_400))
+        var series = GraphFixture.event(id: "ser-k", online: false, recurring: true, allDay: change == .allDayToTimed)
+        series["start"] = ["dateTime": day + "T00:00:00.0000000", "timeZone": "UTC"]
+        series["end"] = ["dateTime": next + "T00:00:00.0000000", "timeZone": "UTC"]
+        let graph = FakeGraphCalendar([series])
+        graph.install(on: http)
+        let provider = makeProvider(http)
+        let read = try await provider.getEvent(eventId: "ser-k")
+        var patch = GCalEventInput()
+        switch change {
+        case .timedToAllDay:
+            patch.startDate = day
+            patch.endDate = next
+        case .allDayToTimed:
+            patch.startDateTime = day + "T00:00:00Z"
+            patch.startTimeZone = "UTC"
+            patch.endDateTime = next + "T00:00:00Z"
+            patch.endTimeZone = "UTC"
+        }
+
+        let answer = provider.editResetsChangedOccurrences(read, edit: patch)
+        _ = try await provider.updateEvent(eventId: "ser-k", event: patch)
+
+        let sent = graph.patches("ser-k")
+        #expect(answer, "\(change): the card does not warn")
+        #expect(graph.seriesResets > 0, "\(change): the fake counted no reset")
+        #expect(sent.contains { $0["start"] != nil && $0["end"] != nil && $0["isAllDay"] as? Bool == (change == .timedToAllDay) },
+                "\(change): the change was not sent: \(sent.map { $0.keys.sorted() })")
+    }
+
+    enum ReadZone: String, CaseIterable, CustomTestStringConvertible {
+        case daylightSavingSeriesReadWithout, seriesWithoutReadWithDaylightSaving
+        var testDescription: String { rawValue }
+
+        /// The zone Graph keeps the series in, by its Windows name.
+        var stored: String { self == .daylightSavingSeriesReadWithout ? "Eastern Standard Time" : "Tokyo Standard Time" }
+        /// The device's zone, which a read asks Graph to give the times in, by both its names.
+        var read: (windows: String, iana: String) {
+            self == .daylightSavingSeriesReadWithout
+                ? ("Tokyo Standard Time", "Asia/Tokyo") : ("Eastern Standard Time", "America/New_York")
+        }
+    }
+
+    /// Reads ask Graph for times in the device's zone, so a series Graph keeps in one zone reads
+    /// back in another, with or without daylight saving on either side. A rename that echoes the
+    /// read times, labelled with the device's zone as the tools write them, restates the series'
+    /// own instants: nothing moves, so the PATCH sends no start, end or recurrence, the card does
+    /// not warn, nothing is reset, and the series keeps the zone Graph keeps it in.
+    @Test("a series renamed with the times it was read with, in the zone it was read in, keeps its time and zone",
+          arguments: ReadZone.allCases)
+    func readTimesEchoedAreNoMove(_ zone: ReadZone) async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let readZone = try #require(TimeZone(identifier: zone.read.iana))
+        let start = GraphFixture.start
+        let end = GraphFixture.start.addingTimeInterval(1_800)
+        var series = GraphFixture.event(id: "ser-t", online: false, recurring: true)
+        // As a read asking for the device's zone gives a series Graph keeps in another.
+        series["start"] = ["dateTime": GraphFixture.wall(start, in: zone.read.iana) + ".0000000", "timeZone": zone.read.windows]
+        series["end"] = ["dateTime": GraphFixture.wall(end, in: zone.read.iana) + ".0000000", "timeZone": zone.read.windows]
+        series["originalStartTimeZone"] = zone.stored
+        series["originalEndTimeZone"] = zone.stored
+        var recurrence = try #require(series["recurrence"] as? [String: Any])
+        var range = try #require(recurrence["range"] as? [String: Any])
+        range["recurrenceTimeZone"] = zone.stored
+        recurrence["range"] = range
+        series["recurrence"] = recurrence
+        let graph = FakeGraphCalendar([series])
+        graph.install(on: http)
+        let before = try #require(graph.event("ser-t"))
+        let provider = makeProvider(http)
+        let read = try await provider.getEvent(eventId: "ser-t")
+        var patch = GCalEventInput()
+        patch.summary = "Planning (renamed)"
+        patch.startDateTime = try #require(read.start?.dateTime.flatMap { Date.fromISO8601($0) }).iso8601String(timeZone: readZone)
+        patch.startTimeZone = zone.read.iana
+        patch.endDateTime = try #require(read.end?.dateTime.flatMap { Date.fromISO8601($0) }).iso8601String(timeZone: readZone)
+        patch.endTimeZone = zone.read.iana
+
+        let answer = provider.editResetsChangedOccurrences(read, edit: patch)
+        _ = try await provider.updateEvent(eventId: "ser-t", event: patch)
+
+        let sent = graph.patches("ser-t")
+        #expect(!answer, "\(zone): the card warns of a reset for the series' own times")
+        #expect(sent.count == 1 && sent.allSatisfy { $0["start"] == nil && $0["end"] == nil && $0["recurrence"] == nil },
+                "\(zone): the rename sent \(sent.map { $0.keys.sorted() })")
+        #expect(graph.seriesResets == 0, "\(zone): \(graph.seriesResets) resets")
+        let after = try #require(graph.event("ser-t"))
+        for key in ["start", "end", "originalStartTimeZone", "originalEndTimeZone", "recurrence"] {
+            #expect(canonical(after[key]) == canonical(before[key]), "\(zone): the rename changed '\(key)': \(canonical(after[key]))")
+        }
+        #expect(after["subject"] as? String == "Planning (renamed)", "\(zone): the rename was not written")
+    }
+
+    /// The card's stand-in for the stored recurrence (the event's RRULE rebuilt in Graph's form)
+    /// means the rule Graph stores: for every stored rule kind, it is `sameRule` with the raw
+    /// recurrence the write compares with, so the card and the write judge an edit's rule against
+    /// the same rule.
+    @Test("the card's rebuilt stored rule is the write's raw stored recurrence", arguments: StoredRule.allCases)
+    func cardBaselineIsTheStoredRule(_ rule: StoredRule) async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        var series = GraphFixture.event(id: "ser-b", online: false, recurring: true)
+        series["recurrence"] = rule.recurrence(start: GraphFixture.start)
+        let graph = FakeGraphCalendar([series])
+        graph.install(on: http)
+        let provider = makeProvider(http)
+        let read = try await provider.getEvent(eventId: "ser-b")
+        let raw = try #require(graph.event("ser-b")?["recurrence"] as? [String: Any])
+
+        let baseline = try #require(provider.storedRuleBaseline(read), "\(rule): the card has no stand-in for the stored rule")
+        #expect(ExchangeCalendarProvider.sameRule(baseline.recurrence, as: raw),
+                "\(rule): the card's rule \(canonical(baseline.recurrence)) is not the stored \(canonical(raw))")
+    }
+
+    enum StartMove: String, CaseIterable, CustomTestStringConvertible {
+        case weeklyToAnotherWeekday, monthlyToAnotherDay, untilEndDayShifts
+        var testDescription: String { rawValue }
+    }
+
+    /// The same, for a rule edit that also moves the series' start: a rule that names no day
+    /// takes it from the new start, and an UNTIL earlier in its day than the new start time ends
+    /// the series a day sooner, so the write's rule decision is taken beside the new start.
+    @Test("the card's answer is the write's for a rule edit that also moves the series' start",
+          arguments: StartMove.allCases)
+    func cardAnswerIsTheWritesWithStartMove(_ move: StartMove) async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let start = GraphFixture.start
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = GraphFixture.utc
+        let endDay = GraphFixture.utcDay(start.addingTimeInterval(20 * 86_400))
+        let endDayCompact = endDay.replacingOccurrences(of: "-", with: "")
+        let pattern: [String: Any]
+        let rule: String
+        let newStart: Date
+        switch move {
+        case .weeklyToAnotherWeekday:
+            pattern = ["type": "weekly", "interval": 1, "month": 0, "dayOfMonth": 0,
+                       "daysOfWeek": [GraphFixture.weekday(start)], "firstDayOfWeek": "monday", "index": "first"]
+            rule = "RRULE:FREQ=WEEKLY;UNTIL=\(endDayCompact)"
+            newStart = start.addingTimeInterval(86_400)
+        case .monthlyToAnotherDay:
+            pattern = ["type": "absoluteMonthly", "interval": 1, "month": 0, "dayOfMonth": cal.component(.day, from: start),
+                       "daysOfWeek": [String](), "firstDayOfWeek": "monday", "index": "first"]
+            rule = "RRULE:FREQ=MONTHLY;UNTIL=\(endDayCompact)"
+            newStart = start.addingTimeInterval(86_400)
+        case .untilEndDayShifts:
+            // The series' last day at an hour after its start time: still the stored end
+            // beside the stored start, the day before beside a start two hours later.
+            pattern = ["type": "daily", "interval": 1, "month": 0, "dayOfMonth": 0,
+                       "daysOfWeek": [String](), "firstDayOfWeek": "monday", "index": "first"]
+            let until = start.addingTimeInterval(20 * 86_400 + 3_600)
+            rule = "RRULE:FREQ=DAILY;UNTIL=" + GraphFixture.naive(until)
+                .replacingOccurrences(of: "-", with: "").replacingOccurrences(of: ":", with: "") + "Z"
+            newStart = start.addingTimeInterval(2 * 3_600)
+        }
+        let storedRange: [String: Any] = ["type": "endDate", "startDate": GraphFixture.utcDay(start), "endDate": endDay,
+                                          "numberOfOccurrences": 0, "recurrenceTimeZone": "UTC"]
+        var series = GraphFixture.event(id: "ser-m", start: start, online: false, recurring: true)
+        series["recurrence"] = ["pattern": pattern, "range": storedRange] as [String: Any]
+        let graph = FakeGraphCalendar([series])
+        graph.install(on: http)
+        let provider = makeProvider(http)
+        let read = try await provider.getEvent(eventId: "ser-m")
+        var patch = GCalEventInput()
+        patch.recurrence = [rule]
+        patch.startDateTime = GraphFixture.rfc3339(newStart)
+        patch.startTimeZone = "UTC"
+
+        let answer = provider.editResetsChangedOccurrences(read, edit: patch)
+        _ = try await provider.updateEvent(eventId: "ser-m", event: patch)
+
+        // A rule written, as opposed to the stored one written back with its range's start
+        // date moved (a date move with the series' own rule).
+        var wasRange = storedRange
+        wasRange.removeValue(forKey: "startDate")
+        let wroteRule = graph.patches("ser-m").contains { sent in
+            guard let written = sent["recurrence"] as? [String: Any] else { return false }
+            var range = written["range"] as? [String: Any] ?? [:]
+            range.removeValue(forKey: "startDate")
+            return canonical(written["pattern"]) != canonical(pattern) || canonical(range) != canonical(wasRange)
+        }
+        #expect(wroteRule, "\(move) (\(rule)): the write judged the rule the stored one beside the new start")
+        let reset = graph.seriesResets > 0
+        #expect(answer == reset, "\(move) (\(rule)): the card says \(answer ? "a reset" : "no reset"), the write \(reset ? "reset" : "did not reset") the series")
+        #expect(answer, "\(move) (\(rule)): the card says no reset")
+    }
+
+    enum UnmappedPattern: String, CaseIterable, CustomTestStringConvertible {
+        case weeklyWithNoDays, relativeMonthlyWithNoIndex
+        var testDescription: String { rawValue }
+    }
+
+    /// A stored pattern that its RRULE does not say exactly (it does not come back the same
+    /// through one): the card cannot tell the rule the edit re-sends is the stored one, so it
+    /// answers "changed", as the write, comparing with the stored pattern, writes the rule.
+    @Test("a series whose pattern its RRULE does not say exactly answers changed, as its write writes the rule",
+          arguments: UnmappedPattern.allCases)
+    func unmappedPatternAnswersChanged(_ kind: UnmappedPattern) async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let pattern: [String: Any]
+        switch kind {
+        case .weeklyWithNoDays:
+            pattern = ["type": "weekly", "interval": 1, "month": 0, "dayOfMonth": 0,
+                       "daysOfWeek": [String](), "firstDayOfWeek": "monday", "index": "first"]
+        case .relativeMonthlyWithNoIndex:
+            pattern = ["type": "relativeMonthly", "interval": 1, "month": 0, "dayOfMonth": 0,
+                       "daysOfWeek": ["tuesday"], "firstDayOfWeek": "monday"]
+        }
+        var series = GraphFixture.event(id: "ser-u", online: false, recurring: true)
+        series["recurrence"] = [
+            "pattern": pattern,
+            "range": ["type": "noEnd", "startDate": GraphFixture.utcDay(GraphFixture.start), "endDate": "0001-01-01",
+                      "numberOfOccurrences": 0, "recurrenceTimeZone": "UTC"],
+        ] as [String: Any]
+        let graph = FakeGraphCalendar([series])
+        graph.install(on: http)
+        let provider = makeProvider(http)
+        let read = try await provider.getEvent(eventId: "ser-u")
+        var patch = GCalEventInput()
+        patch.recurrence = [try #require(read.recurrence?.first)]
+
+        let answer = provider.editResetsChangedOccurrences(read, edit: patch)
+        _ = try await provider.updateEvent(eventId: "ser-u", event: patch)
+
+        let reset = graph.seriesResets > 0
+        #expect(answer, "\(kind): the card says the re-sent rule is the stored one")
+        #expect(answer == reset, "\(kind): the card says \(answer ? "a reset" : "no reset"), the write \(reset ? "reset" : "did not reset") the series")
+    }
+
+    /// A series kept in Tokyo whose start Graph gives at 20:00 UTC, 05:00 the next day in
+    /// Tokyo, on that day's weekday. A weekly rule that names no day, as the assistant may
+    /// write it, recurs on the start's weekday in the series' zone: the series' own rule.
+    @Test("a weekly rule with no day, for a series kept in another zone, is its weekday there and the stored rule")
+    func bareWeeklyIsTheSeriesWeekday() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = GraphFixture.utc
+        let day = cal.startOfDay(for: Date().addingTimeInterval(30 * 86_400))
+        let start = day.addingTimeInterval(20 * 3_600)
+        let tokyoDay = day.addingTimeInterval(86_400)
+        var series = GraphFixture.event(id: "ser-tw", start: start, online: false, recurring: true)
+        series["recurrence"] = [
+            "pattern": ["type": "weekly", "interval": 1, "month": 0, "dayOfMonth": 0,
+                        "daysOfWeek": [GraphFixture.weekday(tokyoDay.addingTimeInterval(12 * 3_600))],
+                        "firstDayOfWeek": "monday", "index": "first"],
+            "range": ["type": "noEnd", "startDate": GraphFixture.utcDay(tokyoDay), "endDate": "0001-01-01",
+                      "numberOfOccurrences": 0, "recurrenceTimeZone": "Tokyo Standard Time"],
+        ] as [String: Any]
+        let graph = FakeGraphCalendar([series])
+        graph.install(on: http)
+        let before = try #require(graph.event("ser-tw"))
+        let provider = makeProvider(http)
+        let read = try await provider.getEvent(eventId: "ser-tw")
+        var patch = GCalEventInput()
+        patch.recurrence = ["RRULE:FREQ=WEEKLY"]
+
+        #expect(!provider.editResetsChangedOccurrences(read, edit: patch), "the card says the series' own weekday resets changed occurrences")
+        _ = try await provider.updateEvent(eventId: "ser-tw", event: patch)
+
+        #expect(graph.patches("ser-tw").allSatisfy { $0["recurrence"] == nil }, "the series' own rule was written")
+        #expect(graph.seriesResets == 0, "the edit reset the series' exceptions")
+        let after = try #require(graph.event("ser-tw"))
+        expectOnlyEdited(nil, before: before, after: after, label: "bare weekly")
+    }
+
+    /// A series whose range names no zone: a rule change labels the range with
+    /// the zone the start is written in, not UTC.
+    @Test("a rule change on a series stored with no zone labels its range with the start's zone",
+          arguments: ["absent", "empty"])
+    func ruleChangeWithNoStoredZone(_ storedZone: String) async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let zone = "America/New_York"
+        var series = GraphFixture.event(id: "ser-nz", online: false, recurring: true)
+        series["start"] = ["dateTime": GraphFixture.wall(GraphFixture.start, in: zone), "timeZone": zone]
+        series["end"] = ["dateTime": GraphFixture.wall(GraphFixture.start.addingTimeInterval(1_800), in: zone), "timeZone": zone]
+        var recurrence = try #require(series["recurrence"] as? [String: Any])
+        var range = try #require(recurrence["range"] as? [String: Any])
+        if storedZone == "empty" {
+            range["recurrenceTimeZone"] = ""
+        } else {
+            range.removeValue(forKey: "recurrenceTimeZone")
+        }
+        recurrence["range"] = range
+        series["recurrence"] = recurrence
+        let graph = FakeGraphCalendar([series])
+        graph.install(on: http)
+        var patch = GCalEventInput()
+        patch.recurrence = ["RRULE:FREQ=DAILY;COUNT=5"]
+
+        _ = try await makeProvider(http).updateEvent(eventId: "ser-nz", event: patch)
+
+        let after = try #require(graph.event("ser-nz"))
+        let start = try #require(after["start"] as? [String: Any])
+        #expect(start["timeZone"] as? String == zone, "the start is written in \(start["timeZone"] as? String ?? "none")")
+        let written = ((after["recurrence"] as? [String: Any])?["range"] as? [String: Any])?["recurrenceTimeZone"] as? String
+        #expect(written == zone, "\(storedZone) stored zone: the range is labelled \(written ?? "none"), the start \(zone)")
+    }
+
     /// The date a series starts on is the device's (`request` asks Graph for starts
     /// in the device's zone), not UTC's. A move within the device's day that
     /// crosses UTC midnight is not a date move.
@@ -949,7 +1727,7 @@ struct ExchangeCalendarEditPreservationTests {
 
         let sent = graph.patches("ser-x")
         #expect(sent.count == 1 && sent.allSatisfy { $0["recurrence"] == nil }, "a move within the device's day wrote a recurrence")
-        #expect(graph.seriesResets == 0)
+        #expect(graph.seriesResets == 1, "a start move did not reset the series' exceptions, as Graph does")
         #expect(((graph.event("ser-x")?["start"] as? [String: Any])?["dateTime"] as? String)?.hasPrefix(GraphFixture.naive(to)) == true)
     }
 
@@ -1031,9 +1809,9 @@ struct ExchangeCalendarEditPreservationTests {
         let seriesDay = GraphFixture.deviceDay(seriesStart)
         #expect((storedDay != seriesDay) == move.movesDate, "the series is stored on \(storedDay), was on \(seriesDay)")
         let wroteRecurrence = graph.patches("ser-z").contains { $0["recurrence"] != nil }
+        #expect(graph.seriesResets == 1, "a start move did not reset the series' exceptions, as Graph does")
         if storedDay == seriesDay {
             #expect(!wroteRecurrence, "a move within the device's day wrote a recurrence")
-            #expect(graph.seriesResets == 0, "a move within the device's day reset the series' exceptions")
         } else {
             #expect(wroteRecurrence, "a move to another day kept the range's old start date")
         }

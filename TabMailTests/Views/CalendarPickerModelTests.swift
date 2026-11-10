@@ -17,6 +17,7 @@ import Foundation
 /// provider answered. A sleep-based "slow" provider would only prove that the
 /// model was fast enough on this machine, today.
 private actor GatedCalendarProvider: CalendarProvider {
+    nonisolated func editResetsChangedOccurrences(_ event: GCalEvent, edit: GCalEventInput) -> Bool { false }
     private let calendars: [GCalCalendar]
     private let failure: Error?
     private var gate: CheckedContinuation<Void, Never>?

@@ -215,6 +215,17 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         // presence, so an `all`-scope edit that happens to carry a stale recurrence_id still
         // shows the master.
         let tz = CalendarToolHelpers.resolveTimeZone(arguments)
+        // A whole-series edit may reset the occurrences the user changed one by one (#423): on
+        // Outlook any change of the series' rule, start or end does. Say so on the card. The
+        // series' calendar decides, as its write does, from the event already read and the same
+        // edit; a rename, or a rule equal to the stored one, which the assistant re-sends with
+        // other edits, gets no line.
+        if resolvedScope == "all", let provider, let series = fetchedEvent, series.recurrence?.isEmpty == false,
+           let edit = try? CalendarToolHelpers.buildGCalEventInput(
+               arguments, isAllDay: CalendarToolHelpers.boolArg(arguments, "all_day") ?? series.isAllDay),
+           provider.editResetsChangedOccurrences(series, edit: edit) {
+            changes.append(CalendarToolHelpers.ruleChangeResetNote)
+        }
         let showsOccurrence = resolvedScope != "all"
         let masterDuration: TimeInterval? = {
             guard let s = fetchedEvent?.startDate, let e = fetchedEvent?.endDate else { return nil }

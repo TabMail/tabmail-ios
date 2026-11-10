@@ -898,6 +898,12 @@ enum CalendarToolHelpers {
         return desc
     }
 
+    /// The confirmation-card line for a whole-series edit that resets the occurrences changed one
+    /// by one (`CalendarProvider.editResetsChangedOccurrences`): Outlook resets a series' deleted
+    /// and moved occurrences when its rule, start or end changes (#423, measured), and other
+    /// calendars may when its rule does.
+    static let ruleChangeResetNote = "Occurrences you changed individually may be reset."
+
     /// Could `buildGCalEventInput(arguments:isAllDay:)` emit an `UNTIL` for these arguments?
     ///
     /// **COULD, not WOULD — deliberately WIDER than the producer.** It mirrors the producer's branch

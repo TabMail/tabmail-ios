@@ -168,6 +168,9 @@ actor DemoCalendarProvider: CalendarProvider {
         return try await getEvent(calendarId: "primary", eventId: eventId)
     }
 
+    /// The demo calendar stores no rule (`updateEvent` writes none), so an edit never changes one.
+    nonisolated func editResetsChangedOccurrences(_ event: GCalEvent, edit: GCalEventInput) -> Bool { false }
+
     func deleteEvent(calendarId: String, eventId: String, sendUpdates: String) async throws {
         guard let db = AppDatabase.shared.withLock({ $0 }) else { return }
         try await db.dbPool.write { conn in

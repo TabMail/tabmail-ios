@@ -40,7 +40,11 @@ attachments, conferences, extended and X-properties, attendee roles and paramete
   - The split reads the series with every copied property selected, then overlays the edit with
     `toGraphEventJSON`, keeping each attendee's stored type.
   - The stored `recurrence.pattern` is written verbatim on both parts, together with the stored
-    range's zone. The cap is the stored range with type `endDate`. The new part's range starts on
+    range's zone. The cap is the stored range with type `endDate`, sent with the stored pattern's
+    `firstDayOfWeek` and the range's `recurrenceTimeZone` (asserted on the cap as sent in
+    `ExchangeSeriesSplitCopyTests.cappedSeriesKeepsItsPattern`: a live cap that sent a range with no
+    zone and `firstDayOfWeek` "sunday" moved a Pacific series to UTC, in the shape the split wrote
+    before #610). The new part's range starts on
     its own date; a numbered range becomes `noEnd`, and `endDate` is kept only for an `endDate`
     range.
   - The create body is built **before** the cap is written, so a series that can't be copied is

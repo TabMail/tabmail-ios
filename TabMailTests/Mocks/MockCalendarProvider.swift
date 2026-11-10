@@ -3,11 +3,23 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import Synchronization
 @testable import TabMail
 
 /// Configurable mock CalendarProvider for testing services that depend on calendar operations.
 /// Records all method calls for assertion. Can be configured to throw errors or return specific results.
 actor MockCalendarProvider: CalendarProvider {
+    // MARK: - Rule comparison
+
+    /// What `editResetsChangedOccurrences` answers, and the edits it was asked about.
+    nonisolated let resetsAnswer = Mutex(false)
+    nonisolated let resetsAsked = Mutex<[GCalEventInput]>([])
+
+    nonisolated func editResetsChangedOccurrences(_ event: GCalEvent, edit: GCalEventInput) -> Bool {
+        resetsAsked.withLock { $0.append(edit) }
+        return resetsAnswer.withLock { $0 }
+    }
+
     // MARK: - Call Recording
 
     var callLog: [String] = []

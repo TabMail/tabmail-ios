@@ -364,6 +364,140 @@ struct CalendarToolResolvedAccountTests {
         }
     }
 
+    // MARK: - The card of a rule edit
+
+    /// A weekly series a week from today at 10:00 UTC, on that day's weekday; a one-off
+    /// event at the same time when `recurring` is false.
+    private static func series(recurring: Bool = true) -> GCalEvent {
+        let start = isoDay(7, hour: 10)
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC") ?? .gmt
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.timeZone = cal.timeZone
+        fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        let weekday = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"][cal.component(.weekday, from: fmt.date(from: start) ?? Date()) - 1]
+        return GCalEvent(
+            id: "evt-bare", summary: "Weekly sync", location: nil, description: nil,
+            start: GCalDateTime(dateTime: start + "Z", date: nil, timeZone: "UTC"),
+            end: GCalDateTime(dateTime: isoDay(7, hour: 11) + "Z", date: nil, timeZone: "UTC"),
+            attendees: nil, organizer: nil, recurrence: recurring ? ["RRULE:FREQ=WEEKLY;BYDAY=\(weekday)"] : nil,
+            transparency: nil, status: "confirmed", htmlLink: nil, created: nil, updated: nil
+        )
+    }
+
+    /// The lines of the card an edit of `series` with `arguments` presents, with the series'
+    /// calendar answering `answer` to whether the edit resets changed occurrences, and the
+    /// edits it was asked about.
+    private func cardLines(
+        series: GCalEvent, arguments: [String: JSONValue], answer: Bool
+    ) async throws -> (lines: [String], asked: [GCalEventInput]) {
+        var lines: [String] = []
+        var asked: [GCalEventInput] = []
+        try await withCalendars(registered: [.a], preferred: .a) { f in
+            await f.mockA.setGetEventResult(series)
+            f.mockA.resetsAnswer.withLock { $0 = answer }
+            let sink = RecordingConfirmSink()
+            let output = try await CalendarEventEditTool(context: ToolContext(db: f.pool, translator: MockChatIdTranslator())).execute(
+                arguments: ["event_id": .string("evt-bare"), "timezone": .string("UTC")].merging(arguments) { $1 },
+                invocation: ToolInvocation(uiSink: sink, sessionKey: "cal-tool-rule-card"))
+            #expect(sink.calendarEvents.count == 1, "setup: the edit card was not shown; tool said: \(output)")
+            lines = sink.calendarEvents.first?.changes ?? []
+            asked = f.mockA.resetsAsked.withLock { $0 }
+        }
+        return (lines, asked)
+    }
+
+    /// Outlook resets a series' deleted and moved occurrences when a whole-series edit
+    /// changes its rule (its end, interval or kind) or moves its start or end (measured), so
+    /// a whole-series edit the series' calendar says resets them says so on the card.
+    enum ResettingEdit: String, CaseIterable, CustomTestStringConvertible {
+        case daily, weeklyWithCount, everyOtherWeek, monthly, yearly, timeOnlyMove
+        var testDescription: String { rawValue }
+
+        /// The rule the edit gives; none for a time-only move.
+        var rule: [String: JSONValue]? {
+            switch self {
+            case .daily: ["freq": .string("DAILY")]
+            case .weeklyWithCount: ["freq": .string("WEEKLY"), "count": .int(9)]
+            case .everyOtherWeek: ["freq": .string("WEEKLY"), "interval": .int(2)]
+            case .monthly: ["freq": .string("MONTHLY")]
+            case .yearly: ["freq": .string("YEARLY")]
+            case .timeOnlyMove: nil
+            }
+        }
+    }
+
+    @Test("A whole-series edit the calendar says resets changed occurrences says so on its card",
+          arguments: ResettingEdit.allCases)
+    func resettingEditCardWarns(_ resetting: ResettingEdit) async throws {
+        // A time-only move puts the series an hour later on the same day.
+        let edit: [String: JSONValue] = if let rule = resetting.rule {
+            ["recurrence": .dictionary(rule)]
+        } else {
+            ["start_iso": .string(Self.isoDay(7, hour: 11)), "end_iso": .string(Self.isoDay(7, hour: 12))]
+        }
+        let card = try await cardLines(series: Self.series(), arguments: edit, answer: true)
+        #expect(card.lines.filter { $0 == CalendarToolHelpers.ruleChangeResetNote }.count == 1, "the card shows \(card.lines)")
+        #expect(card.lines.contains("Occurrences you changed individually may be reset."), "the card shows \(card.lines)")
+        guard card.asked.count == 1 else {
+            Issue.record("the calendar was asked \(card.asked.count) times")
+            return
+        }
+        if edit["recurrence"] != nil {
+            #expect(card.asked[0].recurrence?.first?.hasPrefix("RRULE:FREQ=") == true,
+                    "the calendar was asked about \(String(describing: card.asked[0].recurrence)), not the edit's rule")
+        } else {
+            #expect(card.asked[0].recurrence == nil && card.asked[0].startDateTime != nil && card.asked[0].endDateTime != nil,
+                    "the calendar was not asked about the edit's new times")
+        }
+    }
+
+    enum QuietEdit: String, CaseIterable, CustomTestStringConvertible {
+        case resentRule, renameOnly
+        var testDescription: String { rawValue }
+    }
+
+    /// The assistant re-sends the rule it read with other edits, or only renames the series;
+    /// the calendar says neither resets anything, so the card has no line.
+    @Test("A whole-series edit the calendar says resets nothing shows no reset line", arguments: QuietEdit.allCases)
+    func quietEditCardHasNoWarning(_ edit: QuietEdit) async throws {
+        var arguments: [String: JSONValue] = ["title": .string("Weekly sync (renamed)")]
+        if edit == .resentRule { arguments["recurrence"] = .dictionary(["freq": .string("WEEKLY")]) }
+        let card = try await cardLines(series: Self.series(), arguments: arguments, answer: false)
+        #expect(!card.lines.contains(CalendarToolHelpers.ruleChangeResetNote), "\(edit): the card shows \(card.lines)")
+        #expect(card.lines.contains("title → Weekly sync (renamed)"), "setup: the edit was not on the card: \(card.lines)")
+        if edit == .resentRule {
+            #expect(card.lines.contains { $0.hasPrefix("recurrence → ") }, "setup: the rule was not on the card: \(card.lines)")
+        }
+        #expect(card.asked.count == 1, "\(edit): the calendar was asked \(card.asked.count) times")
+    }
+
+    enum NoLineEdit: String, CaseIterable, CustomTestStringConvertible {
+        case oneOffMadeRecurring, thisAndFollowing
+        var testDescription: String { rawValue }
+    }
+
+    /// No line, and the calendar is not asked, for an event that has no rule (it has no
+    /// occurrences to reset) and for an edit of part of a series (it writes nothing on the
+    /// series).
+    @Test("An edit of an event with no rule, or of part of a series, shows no reset line",
+          arguments: NoLineEdit.allCases)
+    func noLineEditCardHasNoWarning(_ edit: NoLineEdit) async throws {
+        var arguments: [String: JSONValue] = [
+            "title": .string("Weekly sync (renamed)"), "recurrence": .dictionary(["freq": .string("DAILY")]),
+        ]
+        if edit == .thisAndFollowing {
+            arguments["edit_scope"] = .string("this_and_following")
+            arguments["recurrence_id"] = .string(Self.isoDay(14, hour: 10))
+        }
+        let card = try await cardLines(
+            series: Self.series(recurring: edit != .oneOffMadeRecurring), arguments: arguments, answer: true)
+        #expect(!card.lines.contains(CalendarToolHelpers.ruleChangeResetNote), "\(edit): the card shows \(card.lines)")
+        #expect(card.lines.contains("title → Weekly sync (renamed)"), "setup: the edit was not on the card: \(card.lines)")
+        #expect(card.asked.isEmpty, "\(edit): the calendar was asked about \(card.asked.count) edits")
+    }
+
     @Test("A bare event id with no resolvable calendar is refused before any card", arguments: BareIdTool.allCases)
     func bareIdWithNoCalendarIsRefused(_ kind: BareIdTool) async throws {
         try await withCalendars(registered: [], preferred: .a) { f in

@@ -42,6 +42,12 @@ protocol CalendarProvider: Sendable {
     /// declared frame in only one of them would make one argument mean two
     /// different instants depending on `edit_scope`.
     func splitSeries(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, patch: GCalEventInput, sendUpdates: String) async throws -> GCalEvent
+    /// Whether the whole-series edit `edit` (the input the write is given) resets the
+    /// occurrences of `event` changed one by one, as this calendar's write treats them: on
+    /// Outlook and Google, any change of the series' rule, start or end; on CalDAV, a change of
+    /// its rule. Pure: it reads only `event`, the series as already read, and makes no request.
+    /// The edit's confirmation card says so when it does (#423).
+    func editResetsChangedOccurrences(_ event: GCalEvent, edit: GCalEventInput) -> Bool
 }
 
 /// Errors common to calendar providers when an operation isn't supported.
@@ -1190,6 +1196,75 @@ actor GoogleCalendarProvider: CalendarProvider {
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 
+    /// Google resets a series' deleted and moved occurrences when an edit moves its start or end
+    /// (measured on a personal account, 2026-11-10: a master PATCH moving a weekly series from
+    /// 08:00 to 13:00 brought a deleted occurrence back and made a moved one a plain occurrence at
+    /// the new time, with the recurrence unchanged) and, as assumed before, when it changes the
+    /// rule. A Google edit writes the `recurrence` it is given in place of the stored one
+    /// (`mergeExistingEventWithPatch`), so the rule changes unless the two hold the same lines.
+    nonisolated func editResetsChangedOccurrences(_ event: GCalEvent, edit: GCalEventInput) -> Bool {
+        if Self.movesSeriesTime(edit, existing: event, as: Self.googleTimes) { return true }
+        guard let rule = edit.recurrence else { return false }
+        return Self.recurrenceLinesDiffer(event.recurrence ?? [], rule)
+    }
+
+    /// Whether the whole-series edit `patch` moves the series `existing`'s start or end, in the
+    /// terms its calendar writes them: whether `times`, the start and end the write sends for the
+    /// edit merged as the write merges it (`mergeExistingEventWithPatch`), differ from `times` of
+    /// the series' own. An edit that gives no start or end moves nothing. Google passes
+    /// `googleTimes`, each as the date or instant and the zone it names.
+    nonisolated static func movesSeriesTime(
+        _ patch: GCalEventInput, existing: GCalEvent, as times: (GCalEventInput) -> NSDictionary
+    ) -> Bool {
+        guard patch.startDate != nil || patch.startDateTime != nil || patch.endDate != nil || patch.endDateTime != nil
+        else { return false }
+        let moved = times(mergeExistingEventWithPatch(existing: existing, patch: patch))
+        return !moved.isEqual(times(mergeExistingEventWithPatch(existing: existing, patch: GCalEventInput())))
+    }
+
+    /// A Google write's start and end as Google reads them: an all-day date, or a timed one's
+    /// instant (its RFC 3339 string when it does not parse), each with the zone it names. So the
+    /// series' own times spelled otherwise are its own, and the same instant in another zone,
+    /// which Google stores and repeats the series in, is a move.
+    nonisolated static func googleTimes(_ merged: GCalEventInput) -> NSDictionary {
+        func time(_ date: String?, _ dateTime: String?, _ zone: String?) -> [String: Any] {
+            var value: [String: Any] = [:]
+            if let date { value["date"] = date }
+            if let dateTime { value["dateTime"] = Date.fromISO8601(dateTime).map { "\($0.timeIntervalSince1970)" } ?? dateTime }
+            if let zone { value["timeZone"] = zone }
+            return value
+        }
+        return NSDictionary(dictionary: [
+            "start": time(merged.startDate, merged.startDateTime, merged.startTimeZone),
+            "end": time(merged.endDate, merged.endDateTime, merged.endTimeZone),
+        ])
+    }
+
+    /// Whether two `recurrence` arrays differ in meaning, as sets of lines: an RRULE line as
+    /// `canonicalRRULE` reads it, any other line (EXDATE, RDATE) uppercased and trimmed.
+    nonisolated static func recurrenceLinesDiffer(_ stored: [String], _ edited: [String]) -> Bool {
+        func line(_ text: String) -> String {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+            return trimmed.hasPrefix("RRULE:") ? canonicalRRULE(trimmed) : trimmed
+        }
+        return Set(stored.map(line)) != Set(edited.map(line))
+    }
+
+    /// An RRULE line as RFC 5545 means it, for comparing two spellings: its parts by name in
+    /// name order, names and values uppercased, `INTERVAL=1` (the default) left out, and each
+    /// `BY…` list in sorted order.
+    nonisolated static func canonicalRRULE(_ rule: String) -> String {
+        var body = rule.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        if body.hasPrefix("RRULE:") { body.removeFirst("RRULE:".count) }
+        var parts: [String: String] = [:]
+        for part in body.split(separator: ";") {
+            let kv = part.split(separator: "=", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
+            guard kv.count == 2, !(kv[0] == "INTERVAL" && kv[1] == "1") else { continue }
+            parts[kv[0]] = kv[0].hasPrefix("BY") ? kv[1].split(separator: ",").map(String.init).sorted().joined(separator: ",") : kv[1]
+        }
+        return "RRULE:" + parts.keys.sorted().map { "\($0)=\(parts[$0] ?? "")" }.joined(separator: ";")
+    }
+
     /// Build a "full" `GCalEventInput` representing the patched state of an
     /// existing event, by inheriting unchanged fields from `existing` and
     /// applying `patch` overrides. Used to defend against partial-PATCH
@@ -1533,6 +1608,10 @@ struct GCalEvent: Codable, Sendable {
     /// (`conference_url`, as the Thunderbird add-on names it) rather than inside
     /// the description. Outlook's `onlineMeeting.joinUrl` (#511); nil elsewhere.
     var conferenceUrl: String? = nil
+    /// The zone a series' rule is kept in, by the name its calendar stores (Outlook's
+    /// `recurrenceTimeZone`), so a provider can read the rule as it does for a write
+    /// (`CalendarProvider.editResetsChangedOccurrences`). Nil when the calendar names none; in memory only.
+    var recurrenceTimeZoneName: String? = nil
 }
 
 // Convenience initializer that fills in `eventType`/`iCalUID`/`kind`/`visibility`

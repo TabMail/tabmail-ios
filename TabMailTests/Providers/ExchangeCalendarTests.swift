@@ -568,6 +568,42 @@ struct ExchangeCalendarRecurringTests {
         #expect(pattern?["firstDayOfWeek"] as? String == "sunday")
     }
 
+    /// A series in a zone other than the device's that starts near midnight recurs on its
+    /// start's weekday in its own zone, where Graph reads the pattern, not the device's.
+    @Test("toGraphEventJSON: a weekly rule with no day recurs on the start's weekday in the event's zone, not the device's")
+    func weeklyNoByDayInEventZone() throws {
+        let provider = makeProvider()
+        // A zone half a day from the device's, and a start whose date there is not the device's.
+        let east = TimeZone.current.secondsFromGMT() < 0
+        let zoneName = east ? "Pacific/Kiritimati" : "Pacific/Pago_Pago"
+        let zone = try #require(east ? TimeZone(identifier: "Pacific/Kiritimati") : TimeZone(identifier: "Pacific/Pago_Pago"))
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = zone
+        let day = cal.startOfDay(for: Date().addingTimeInterval(30 * 86_400))
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.timeZone = zone
+        fmt.dateFormat = "yyyy-MM-dd"
+        let dayText = fmt.string(from: day)
+        let offset = east ? "+14:00" : "-11:00"
+        let wall = east ? "00:30:00" : "23:30:00"
+        var input = GCalEventInput()
+        input.summary = "Standup"
+        input.startDateTime = "\(dayText)T\(wall)\(offset)"
+        input.startTimeZone = zoneName
+        input.endDateTime = "\(dayText)T\(east ? "01:30:00" : "23:45:00")\(offset)"
+        input.endTimeZone = zoneName
+        input.recurrence = ["RRULE:FREQ=WEEKLY"]
+
+        let recurrence = provider.toGraphEventJSON(input)["recurrence"] as? [String: Any]
+
+        let names = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
+        let weekday = names[cal.component(.weekday, from: day) - 1]
+        let days = (recurrence?["pattern"] as? [String: Any])?["daysOfWeek"] as? [String]
+        #expect(days == [weekday], "the series recurs on \(days ?? []), its start is a \(weekday) in \(zoneName)")
+        #expect((recurrence?["range"] as? [String: Any])?["startDate"] as? String == dayText)
+    }
+
     @Test("parseRRULEToGraphRecurrence: FREQ=MONTHLY maps to absoluteMonthly with dayOfMonth from DTSTART")
     func parseRRULEMonthlyAbsolute() async {
         // "monthly" is NOT a valid Graph pattern type — must be absoluteMonthly
