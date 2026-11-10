@@ -661,9 +661,18 @@ refused.
 
 A stated `all_day` that differs from the stored kind, on CalDAV (`CalDAVCalendarEditKeepsKindTests`): with a
 start and an end, an all-day event becomes timed at those times and a timed one (stored with `DTEND` or with
-`DURATION`) becomes all-day on those dates, with the rest of the event kept. A change that gives only a start,
-and a change on a repeating event on every `edit_scope`, are refused with nothing written and the stored
-event byte-identical.
+`DURATION`) becomes all-day on those dates, with the rest of the event kept, and a zoned event stored with a
+VTIMEZONE whose own rules repeat converts with the VTIMEZONE kept byte for byte. A change that gives only a
+start, a change on a repeating event on every `edit_scope` in both directions (a timed series made all-day,
+an all-day series given times of one day), and a change on an event that repeats only by `RDATE`, are refused
+with nothing written and the stored event byte-identical. `CalDAVOccurrenceOverrideTests` refuses times on an
+all-day occurrence rather than writing their dates.
+
+A stated `all_day` of the other kind that gives no `start_iso` or `end_iso` (`CalendarEditToolAllDayEndTests`):
+the shared rule refuses it, in both directions and on every scope, and refuses nothing when the stated kind is
+the stored one, when the edit gives times, or when the event was not read. Through `calendar_event_edit`, for
+the event as Google's, Outlook's and CalDAV's own `getEvent` read it from their fakes, it is refused before the
+card, reported as not changed, and nothing is queued.
 
 ## ICS value types — `VALUE=DATE-TIME` is timed
 

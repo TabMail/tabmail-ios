@@ -197,8 +197,9 @@ struct CalendarEventEditTool: AgentTool, Sendable {
             ] as [String: Any])
         }
 
-        // An all-day event given a time of day without `all_day`, or an all-day end on or before
-        // its start, is refused here, before the card, now that the stored kind is known: the
+        // An all-day event given a time of day without `all_day`, an all-day end on or before
+        // its start, or a stated `all_day` of the other kind with no start or end, is refused
+        // here, before the card, now that the stored kind is known: the
         // assistant asks the user instead of the user confirming an edit that is then refused.
         // The queue applies the same rule again before the write.
         //

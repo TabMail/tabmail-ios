@@ -905,17 +905,18 @@ actor CalDAVProvider: CalendarProvider {
         let kind = try kindToWrite(in: result, stored: storedKind, patch: patch, mayChangeKind: mayChangeKind)
         let patchedEnd = try formatDTLine(name: "DTEND", patch: patch, isStart: false, kind: kind, zones: zones)
         if kind != storedKind {
-            // The event changes kind: both lines are written in the new kind, and a
-            // DURATION, which is in the old one, goes. `kindToWrite` allowed this
-            // only for an event that does not repeat, so nothing else is tied to
-            // the start.
+            // The event changes kind: both lines are written in the new kind (the
+            // end below), and a DURATION, which is in the old one, goes.
+            // `kindToWrite` allowed this only for an event that does not repeat, so
+            // nothing else is tied to the start. One line of each kind is not a
+            // valid event, so a start or end missing, or not readable in the new
+            // kind, refuses the edit.
             guard let dtstart = try formatDTLine(name: "DTSTART", patch: patch, isStart: true, kind: kind, zones: zones),
-                  let dtend = patchedEnd else {
+                  patchedEnd != nil else {
                 throw CalendarProviderError.notSupported(Self.kindChangeNeedsBothMessage)
             }
             result = removeFromMasterVEvent(in: result, propertyKey: "DURATION")
             result = replaceOrAppendInMasterVEvent(in: result, propertyKey: "DTSTART", newLine: dtstart)
-            result = replaceOrAppendInMasterVEvent(in: result, propertyKey: "DTEND", newLine: dtend)
         } else if let dtstart = try formatDTLine(name: "DTSTART", patch: patch, isStart: true, kind: kind, zones: zones) {
             let oldStart = try masterStartWallTime(in: result)
             result = replaceOrAppendInMasterVEvent(in: result, propertyKey: "DTSTART", newLine: dtstart)
@@ -930,7 +931,7 @@ actor CalDAVProvider: CalendarProvider {
                     moveUntil: patchedRRule == nil, moveEnd: patchedEnd == nil)
             }
         }
-        if kind == storedKind, let dtend = patchedEnd {
+        if let dtend = patchedEnd {
             result = replaceOrAppendInMasterVEvent(in: result, propertyKey: "DTEND", newLine: dtend)
         }
         if let attendees = patch.attendees {
@@ -940,7 +941,7 @@ actor CalDAVProvider: CalendarProvider {
     }
 
     static let kindChangeNeedsBothMessage =
-        "To change this event between all-day and timed, give both its new start and its new end. Nothing was changed."
+        "To change this event between all-day and timed, give both its new start and its new end, each as a date or a date and time. Nothing was changed."
     static let kindChangeOnRepeatingMessage =
         "TabMail can't change a repeating event between all-day and timed on this calendar. Nothing was changed. Change it in your calendar app instead."
 
@@ -953,10 +954,12 @@ actor CalDAVProvider: CalendarProvider {
     ///
     /// The change is made only on a whole event that does not repeat
     /// (`mayChangeKind`, no rule, no extra or excluded dates, no changed
-    /// occurrence), and only when the patch gives both the start and the end:
-    /// one line of each kind is not a valid event. Every other case throws
-    /// before anything is written. A newly timed event is written in UTC, which
-    /// names the same instants and needs no VTIMEZONE.
+    /// occurrence). The merge then writes both the start and the end in the new
+    /// kind, and refuses when the patch does not give both: one line of each
+    /// kind is not a valid event. Every other case throws before anything is
+    /// written. A newly timed event is written in UTC, which names the same
+    /// instants and needs no VTIMEZONE. The series is read as the writer sees
+    /// it (`masterTopLevelLines`), so the two never disagree on what repeats.
     static func kindToWrite(
         in ics: String, stored: MasterDTStartKind, patch: GCalEventInput, mayChangeKind: Bool
     ) throws -> MasterDTStartKind {
@@ -965,16 +968,13 @@ actor CalDAVProvider: CalendarProvider {
         let toTimed = stored == .allDay && givesTime
         let toAllDay = stored != .allDay && givesDate
         guard toTimed || toAllDay else { return stored }
-        let repeats = masterVEventLines(from: ics).contains { line in
-            ["RRULE", "RDATE", "EXDATE"].contains { line.uppercased().hasPrefix($0) }
-        } || icsLines(ics).contains { $0.uppercased().hasPrefix("RECURRENCE-ID") }
+        let repeats = masterTopLevelLines(ics).contains { line in
+            guard let name = icsProperty(line)?.name else { return false }
+            return ["RRULE", "RDATE", "EXDATE"].contains(name)
+        } || icsUnits(ics).contains { icsProperty($0.text)?.name == "RECURRENCE-ID" }
         guard mayChangeKind, !repeats else {
             throw CalendarProviderError.notSupported(kindChangeOnRepeatingMessage)
         }
-        let givesBoth = toTimed
-            ? patch.startDateTime != nil && patch.endDateTime != nil
-            : patch.startDate != nil && patch.endDate != nil
-        guard givesBoth else { throw CalendarProviderError.notSupported(kindChangeNeedsBothMessage) }
         return toTimed ? .utc : .allDay
     }
 

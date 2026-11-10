@@ -58,6 +58,9 @@ private let allDayEndHint = "this is an all-day event, so its end_iso is the day
 /// The refusal the queue gives an all-day event a time of day when the edit leaves `all_day` out.
 private let allDayTimeHint = "this is an all-day event, and the edit gives a time of day without all_day. Ask the user whether it should stay all-day"
 
+/// The refusal the edit tool gives a stated `all_day` of the other kind when the edit gives no start or end.
+private let kindChangeTimesHint = "to change this event between all-day and timed, give its new start_iso and end_iso"
+
 // MARK: - A stateful Google calendar
 
 /// An in-memory Google calendar: `GET` returns the stored event (or a series' instances), `PATCH`
@@ -846,13 +849,15 @@ struct CalDAVCalendarEditKeepsKindTests {
     // A stated all_day that differs from the stored kind: the event changes kind, or the edit is
     // refused with nothing written. It never reports success with the event as it was.
 
-    private static func timedICS(uid: String, day start: String, end: String, recurring: Bool = false) -> String {
+    private static func timedICS(uid: String, day start: String, end: String, recurring: Bool = false,
+                                 extra: [String] = []) -> String {
         var lines = [
             "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//TabMail//Test//EN", "BEGIN:VEVENT",
             "UID:\(uid)", "DTSTAMP:\(compact(day(-14)))T000000Z",
             "DTSTART:\(compact(start))T090000Z", end, "SUMMARY:Planning",
         ]
         if recurring { lines.append("RRULE:FREQ=WEEKLY") }
+        lines += extra
         lines += ["END:VEVENT", "END:VCALENDAR"]
         return lines.joined(separator: "\r\n")
     }
@@ -901,25 +906,77 @@ struct CalDAVCalendarEditKeepsKindTests {
                 "reason: \(rows.first?.failureReason ?? "<none>")")
     }
 
-    @Test("a change of kind on a repeating event is refused with nothing written, on every edit_scope",
-          arguments: ["all", "this_only", "this_and_following"])
-    func kindChangeOnASeriesIsRefused(_ scope: String) async throws {
+    /// A timed weekly series made all-day, or an all-day weekly series made timed at times of one day.
+    @Test("a change of kind on a repeating event is refused with nothing written, on every edit_scope, both ways",
+          arguments: ["all", "this_only", "this_and_following"], [true, false])
+    func kindChangeOnASeriesIsRefused(_ scope: String, _ toAllDay: Bool) async throws {
         let store = FakeCalDAVStore(servesETags: true)
-        let stored = Self.timedICS(uid: "cv-4", day: day(0), end: "DTEND:\(compact(day(0)))T100000Z", recurring: true)
+        let stored = toAllDay
+            ? Self.timedICS(uid: "cv-4", day: day(0), end: "DTEND:\(compact(day(0)))T100000Z", recurring: true)
+            : Self.allDayICS(uid: "cv-4", start: day(0), end: day(1), recurring: true)
         store.seed(path: "/cal/cv-4.ics", ics: stored)
-        var arguments: [String: JSONValue] = [
-            "all_day": .bool(true), "start_iso": .string(day(7)), "end_iso": .string(day(8)),
-            "edit_scope": .string(scope),
-        ]
+        var arguments: [String: JSONValue] = toAllDay
+            ? ["all_day": .bool(true), "start_iso": .string(day(7)), "end_iso": .string(day(8))]
+            : ["all_day": .bool(false), "start_iso": .string("\(day(7))T09:00:00"),
+               "end_iso": .string("\(day(7))T10:00:00")]
+        arguments["edit_scope"] = .string(scope)
+        arguments["timezone"] = .string("UTC")
         if scope != "all" {
-            arguments["recurrence_id"] = .string("\(day(7))T09:00:00")
-            arguments["timezone"] = .string("UTC")
+            arguments["recurrence_id"] = .string(toAllDay ? "\(day(7))T09:00:00" : "\(day(7))T00:00:00")
         }
-        let rows = try await run(store, eventId: "/cal/cv-4.ics", arguments, account: "kind-c-series-\(scope)")
+        let label = "\(scope) \(toAllDay ? "to all-day" : "to timed")"
+        let rows = try await run(store, eventId: "/cal/cv-4.ics", arguments,
+                                 account: "kind-c-series-\(scope)-\(toAllDay)")
+        #expect(store.recordedPuts().isEmpty, "\(label): wrote \(store.recordedPuts().map(\.path))")
+        #expect(store.storedICS(path: "/cal/cv-4.ics") == stored, "\(label): the series changed")
+        #expect(rows.first?.failureReason?.contains(CalDAVProvider.kindChangeOnRepeatingMessage) == true,
+                "\(label): reason: \(rows.first?.failureReason ?? "<none>")")
+    }
+
+    @Test("a change of kind on an event that repeats only by added dates (RDATE) is refused with nothing written")
+    func kindChangeOnAnRDateSeriesIsRefused() async throws {
+        let store = FakeCalDAVStore(servesETags: true)
+        let stored = Self.timedICS(uid: "cv-5", day: day(0), end: "DTEND:\(compact(day(0)))T100000Z",
+                                   extra: ["RDATE:\(compact(day(7)))T090000Z"])
+        store.seed(path: "/cal/cv-5.ics", ics: stored)
+        let rows = try await run(store, eventId: "/cal/cv-5.ics", [
+            "all_day": .bool(true), "start_iso": .string(day(7)), "end_iso": .string(day(8)), "edit_scope": .string("all"),
+        ], account: "kind-c-rdate")
         #expect(store.recordedPuts().isEmpty, "wrote \(store.recordedPuts().map(\.path))")
-        #expect(store.storedICS(path: "/cal/cv-4.ics") == stored)
+        #expect(store.storedICS(path: "/cal/cv-5.ics") == stored, "the event changed")
         #expect(rows.first?.failureReason?.contains(CalDAVProvider.kindChangeOnRepeatingMessage) == true,
                 "reason: \(rows.first?.failureReason ?? "<none>")")
+    }
+
+    @Test("a zoned event that does not repeat, stored with a VTIMEZONE whose rules repeat, becomes all-day")
+    func zonedEventWithAVTimezoneConverts() async throws {
+        let vtimezone = [
+            "BEGIN:VTIMEZONE", "TZID:America/Vancouver",
+            "BEGIN:DAYLIGHT", "TZOFFSETFROM:-0800", "TZOFFSETTO:-0700", "TZNAME:PDT",
+            "DTSTART:19700308T020000", "RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU", "END:DAYLIGHT",
+            "BEGIN:STANDARD", "TZOFFSETFROM:-0700", "TZOFFSETTO:-0800", "TZNAME:PST",
+            "DTSTART:19701101T020000", "RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU", "END:STANDARD",
+            "END:VTIMEZONE",
+        ].joined(separator: "\r\n")
+        let stored = [
+            "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//TabMail//Test//EN", vtimezone, "BEGIN:VEVENT",
+            "UID:cv-6", "DTSTAMP:\(compact(day(-14)))T000000Z",
+            "DTSTART;TZID=America/Vancouver:\(compact(day(0)))T090000",
+            "DTEND;TZID=America/Vancouver:\(compact(day(0)))T100000", "SUMMARY:Planning",
+            "END:VEVENT", "END:VCALENDAR",
+        ].joined(separator: "\r\n")
+        let store = FakeCalDAVStore(servesETags: true)
+        store.seed(path: "/cal/cv-6.ics", ics: stored)
+        let rows = try await run(store, eventId: "/cal/cv-6.ics", [
+            "all_day": .bool(true), "start_iso": .string(day(7)), "end_iso": .string(day(8)), "edit_scope": .string("all"),
+        ], account: "kind-c-vtimezone")
+        let ics = store.storedICS(path: "/cal/cv-6.ics")
+        // The VTIMEZONE has DTSTART lines of its own, so the event's are read after BEGIN:VEVENT.
+        let event = ics?.components(separatedBy: "BEGIN:VEVENT").last
+        #expect(line(event, "DTSTART") == "DTSTART;VALUE=DATE:\(compact(day(7)))", "start: \(line(event, "DTSTART") ?? "<none>")")
+        #expect(line(event, "DTEND") == "DTEND;VALUE=DATE:\(compact(day(8)))", "end: \(line(event, "DTEND") ?? "<none>")")
+        #expect(ics?.contains(vtimezone) == true, "the VTIMEZONE was not kept byte for byte: \(ics ?? "<none>")")
+        #expect(rows.isEmpty, "the conversion did not complete: \(rows.map { $0.failureReason ?? $0.status })")
     }
 }
 
@@ -1416,6 +1473,88 @@ struct CalendarEditToolAllDayEndTests {
         #expect(refusal(["title": .string("Renamed")], allDay) == nil, "an edit giving no times was refused")
         #expect(refusal(times, allDay)?.contains(allDayTimeHint) == true)
         #expect(refusal(["end_iso": .string(day(0))], allDay)?.contains(allDayEndHint) == true, "an end on the stored start was not refused")
+    }
+
+    // A stated all_day of the other kind with no start or end: the patch carries the kind only in its
+    // start and end, so every provider would write the event as it was and report success.
+
+    @Test("the shared rule refuses a stated all_day of the other kind that gives no start or end, and nothing else")
+    func kindChangeWithoutTimesRule() {
+        let allDay = GCalDateTime(dateTime: nil, date: day(0), timeZone: nil)
+        let timed = GCalDateTime(dateTime: "\(day(0))T09:00:00Z", date: nil, timeZone: "UTC")
+        let rid = "\(day(7))T00:00:00"
+        let cases: [(label: String, args: [String: JSONValue], stored: GCalDateTime?, scope: String, refused: Bool)] = [
+            ("true on a timed event", ["all_day": .bool(true)], timed, "all", true),
+            ("false on an all-day event", ["all_day": .bool(false)], allDay, "all", true),
+            ("false on an all-day event with a title", ["all_day": .bool(false), "title": .string("Renamed")], allDay, "all", true),
+            ("true on one occurrence of a timed series", ["all_day": .bool(true), "recurrence_id": .string(rid)], timed, "this_only", true),
+            ("false on a split of an all-day series", ["all_day": .bool(false), "recurrence_id": .string(rid)], allDay, "this_and_following", true),
+            ("a title only, all-day", ["title": .string("Renamed")], allDay, "all", false),
+            ("a title only, timed", ["title": .string("Renamed")], timed, "all", false),
+            ("true on an all-day event", ["all_day": .bool(true), "title": .string("Renamed")], allDay, "all", false),
+            ("false on a timed event", ["all_day": .bool(false), "title": .string("Renamed")], timed, "all", false),
+            ("true, the event not read", ["all_day": .bool(true)], nil, "all", false),
+            ("false, the event not read", ["all_day": .bool(false)], nil, "all", false),
+            ("true with dates on a timed event", ["all_day": .bool(true), "start_iso": .string(day(7)), "end_iso": .string(day(8))], timed, "all", false),
+        ]
+        for c in cases {
+            let reason = CalendarToolHelpers.allDayEditRefusal(
+                c.args, storedStart: c.stored, scope: c.scope, recurrenceId: CalendarToolHelpers.stringArgOpt(c.args, "recurrence_id"))
+            if c.refused {
+                #expect(reason?.contains(kindChangeTimesHint) == true, "\(c.label): \(reason ?? "not refused")")
+                #expect(reason?.contains("ask the user") == true, "\(c.label): \(reason ?? "not refused")")
+            } else {
+                #expect(reason == nil, "\(c.label): refused with \(reason ?? "")")
+            }
+        }
+    }
+
+    /// The event as `provider`'s own `getEvent` reads it from that provider's fake: the shape the
+    /// tool compares the stated kind with.
+    private func providerShape(_ provider: String, allDay: Bool) async throws -> GCalEvent {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        switch provider {
+        case "google":
+            FakeGoogleCalendar([allDay ? FakeGoogleCalendar.allDay(id: "ev-1", start: day(0), end: day(1))
+                                       : FakeGoogleCalendar.timed(id: "ev-1", day: day(0))]).install(on: http)
+            return try await GoogleCalendarProvider(accessToken: { _ in "test-token" }, session: http.session)
+                .getEvent(calendarId: "primary", eventId: "ev-1")
+        case "outlook":
+            FakeGraphCalendar([GraphFixture.event(id: "ev-1", online: false, allDay: allDay)]).install(on: http)
+            return try await ExchangeCalendarProvider(mailbox: "calendar@example.com", accessToken: { _ in "test-token" },
+                                                      session: http.session)
+                .getEvent(calendarId: "primary", eventId: "ev-1")
+        default:
+            let times = allDay
+                ? ["DTSTART;VALUE=DATE:\(compact(day(0)))", "DTEND;VALUE=DATE:\(compact(day(1)))"]
+                : ["DTSTART:\(compact(day(0)))T090000Z", "DTEND:\(compact(day(0)))T100000Z"]
+            let store = FakeCalDAVStore(servesETags: true)
+            store.seed(path: "/cal/ev-1.ics", ics: ([
+                "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//TabMail//Test//EN", "BEGIN:VEVENT",
+                "UID:ev-1", "DTSTAMP:\(compact(day(-14)))T000000Z", "SUMMARY:Offsite",
+            ] + times + ["END:VEVENT", "END:VCALENDAR"]).joined(separator: "\r\n"))
+            http.register(path: "/cal/", method: "GET") { store.handleGET($0) }
+            let home = URL(string: "https://caldav.example.com/cal/")!
+            return try await CalDAVProvider(
+                client: CalDAVClient(username: "user@example.com", password: "pw", session: http.session),
+                calendarHomeURL: home, serverBaseURL: home)
+                .getEvent(calendarId: "/cal/", eventId: "/cal/ev-1.ics")
+        }
+    }
+
+    @Test("all_day alone asking for the other kind is refused before the card and reported as not done, on every provider's event",
+          arguments: ["google", "outlook", "caldav"], [true, false])
+    func kindChangeWithoutTimesIsRefusedBeforeTheCard(_ provider: String, _ storedAllDay: Bool) async throws {
+        let event = try await providerShape(provider, allDay: storedAllDay)
+        #expect((event.start?.date != nil) == storedAllDay,
+                "setup: \(provider) read the stored event as \(event.start?.date != nil ? "all-day" : "timed")")
+        let label = "\(provider), \(storedAllDay ? "all-day made timed" : "timed made all-day")"
+        let r = try await run(["all_day": .bool(!storedAllDay)],
+                              account: "kind-tool-alone-\(provider)-\(storedAllDay)", event: event)
+        #expect(r.out.contains(kindChangeTimesHint) && r.out.contains("NOT changed"), "\(label): got \(r.out)")
+        #expect(r.writes == 0 && r.queued == 0 && r.cards == 0,
+                "\(label): writes \(r.writes) queued \(r.queued) cards \(r.cards)")
     }
 
     @Test("a time of day is any non-zero hour, minute or second; a date, or midnight, is none")
