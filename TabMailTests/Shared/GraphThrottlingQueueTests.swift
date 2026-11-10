@@ -136,10 +136,24 @@ struct GraphThrottlingQueueTests {
         try fixture.pool.read { db in try PendingOperation.fetchAll(db) }
     }
 
+    /// How many times, and how often, `waitForQuietQueue` checks the queue.
+    private static let quietQueueAttempts = 200
+    private static let quietQueueInterval = Duration.milliseconds(10)
+
+    /// Wait, bounded, until no drain owns the queue. A gesture such as `markRead`
+    /// ends by starting a drain of its own; with no provider registered it changes
+    /// nothing, but it still owns the queue until it returns.
+    private func waitForQuietQueue() async -> Bool {
+        for _ in 0..<Self.quietQueueAttempts {
+            if await AccountManager.shared.pendingQueueIsQuiescentForTesting() { return true }
+            try? await Task.sleep(for: Self.quietQueueInterval)
+        }
+        return await AccountManager.shared.pendingQueueIsQuiescentForTesting()
+    }
+
     /// Register the provider and run ONE drain from a quiet queue, timed.
     private func drainOnce(_ fixture: Fixture, provider: any EmailProvider) async throws -> Duration {
-        try #require(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
-                     "an earlier drain still owns the queue")
+        try #require(await waitForQuietQueue(), "an earlier drain still owns the queue")
         await register(provider, fixture)
         let clock = ContinuousClock()
         let start = clock.now
@@ -180,8 +194,10 @@ struct GraphThrottlingQueueTests {
                 Wire.metered(meter, latency: Self.slowAnswer, Wire.throttled(503, retryAfter: refusal.retryAfter))
             }
             let header = try seedHeader(f, graphId: "graph-slow-refusal")
-            // No provider yet, so the gesture is queued and nothing drains it.
+            // No provider yet, so the gesture is queued, and the drain it starts
+            // leaves it there. Read the queue once that drain has returned.
             await AccountManager.shared.markRead([header])
+            try #require(await waitForQuietQueue(), "the gesture's own drain never returned")
             let queued = try queuedOperations(f)
             #expect(queued.count == 1, "the gesture was not queued")
             guard queued.count == 1 else { return }
