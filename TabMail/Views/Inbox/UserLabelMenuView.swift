@@ -366,6 +366,9 @@ final class UserLabelMenuModel {
         do {
             let accountId = messageSnapshot.accountId
             let labelId: String
+            // The name the row is stored under: the typed one, or Gmail's own
+            // spelling when Gmail already has a label by this name.
+            var labelName = name
 
             // Provider gate — an account whose adapter cannot mutate labels
             // remotely must not even get the local `UserLabel` row created below:
@@ -382,13 +385,15 @@ final class UserLabelMenuModel {
                 // Gmail: create label on server synchronously (with timeout)
                 let provider = await AccountManager.shared.providers[accountId]
                 guard let gmail = provider as? GmailProvider else { return false }
-                labelId = try await withThrowingTaskGroup(of: String.self) { group in
+                let label = try await withThrowingTaskGroup(of: (id: String, name: String).self) { group in
                     group.addTask {
                         do {
-                            return try await gmail.createLabel(name: name, visible: true)
-                        } catch let error as NSError where error.code == 409 {
-                            guard let existingId = try await gmail.findLabelIdByName(name) else { throw error }
-                            return existingId
+                            return (try await gmail.createLabel(name: name, visible: true), name)
+                        } catch where httpStatus(of: error) == 409 {
+                            // Gmail already has a label by this name (compared
+                            // without case): apply that one, under its name.
+                            guard let existing = try await gmail.findLabelByName(name) else { throw error }
+                            return existing
                         }
                     }
                     group.addTask {
@@ -399,6 +404,8 @@ final class UserLabelMenuModel {
                     group.cancelAll()
                     return result
                 }
+                labelId = label.id
+                labelName = label.name
             case .imap, .icloud:
                 // IMAP: keyword name (lowercased) IS the ID — no server call needed
                 labelId = name.lowercased()
@@ -442,7 +449,7 @@ final class UserLabelMenuModel {
             // (D10 / `IOS-LABEL-001`).
             let newLabel = UserLabel(
                 accountId: accountId, providerLabelId: labelId,
-                name: name, isSystem: false
+                name: labelName, isSystem: false
             )
 
             // Insert locally
@@ -462,7 +469,14 @@ final class UserLabelMenuModel {
             // `reconcileAppliedIdsFromDatabase`; inserting the BARE provider value
             // here would put a member in the set that nothing else can ever match,
             // so the freshly created label's checkmark would not draw.
-            sortedLabels.insert(newLabel, at: 0)
+            //
+            // A label Gmail already had may already be in the menu: replace that
+            // entry rather than listing the same label twice.
+            if let index = sortedLabels.firstIndex(where: { $0.id == newLabel.id }) {
+                sortedLabels[index] = newLabel
+            } else {
+                sortedLabels.insert(newLabel, at: 0)
+            }
             if admitted { appliedIds.insert(newLabel.id) }
             return true
         } catch {

@@ -419,6 +419,27 @@ nothing more. Through the real caller, `GmailReceivedDateBoundaryTests` pulls ol
 serve still says there may be more, so the next pull loads the message beyond it, the unreadable
 message gets no row, and the stored rows stay.
 
+## On-demand folder sync — a folder the provider reports gone
+
+`FolderSyncGoneStatusTests` drives `AccountManager.syncFolders(_:)` over two folders of one account
+whose provider throws the Gmail and Outlook HTTP error shape (`ProviderError.networkError` around
+`HTTPError.networkError(statusCode:)`). A 404 or 410 skips the folder: no error reaches the caller
+and the next folder is still synced. Any other status (500) still reaches the caller.
+
+## Gmail label create — a name Gmail already has
+
+`UserLabelCreateExistingNameTests` creates a label through `UserLabelMenuModel.createAndApply(name:)`
+against `StatefulGmailActionServer`, which answers 409 "Label name exists or conflicts" when a user
+label with that name (compared without case) exists. A name Gmail already has applies Gmail's
+existing label: the gesture succeeds, Gmail is asked to add that label's id, the stored row and the
+menu entry carry Gmail's spelling of the name, and a label already in the menu, under an older name, is
+listed once under Gmail's name. A 409 for a name the label listing no longer has (deleted elsewhere in
+between) fails the gesture and writes nothing: no label row, no menu entry, no queued label change. A
+create that fails with any other status (a 500) is refused the same way and writes nothing, even
+though Gmail lists a label by that name, so only the 409 leads to the lookup. A
+free name still creates and applies a new label. The 409 is read through `httpStatus(of:)`; a check of the
+bridged `NSError` code on the thrown error never sees the HTTP status.
+
 ## Plan picker — no in-app purchase while a web subscription is live
 
 `WebSubscriptionGateTests` decodes `/whoami` bodies through the real `AccountInfo` parser. A web

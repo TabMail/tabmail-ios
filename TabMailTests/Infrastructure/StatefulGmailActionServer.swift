@@ -96,6 +96,9 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         var messagesByProviderId: [String: Message]
         var userLabels: [String: String]
         let createdLabelId: String?
+        /// Label creates still to refuse with 409 whatever `/labels` lists: a
+        /// conflicting label deleted elsewhere before the client looks it up.
+        var createConflictsRemaining = 0
         var lookupFailuresRemaining = 0
         var lookupFailuresConsumed = 0
         /// Label ids `/messages/{id}/modify` and `/messages` (list) must
@@ -228,6 +231,14 @@ final class StatefulGmailActionServer: @unchecked Sendable {
             accessToken: { _ in "stateful-test-token" },
             session: http.session
         )
+    }
+
+    /// Refuse the next `POST /labels` with 409 "Label name exists or
+    /// conflicts" while `/labels` keeps listing only what it already holds, as
+    /// when the conflicting label is deleted on another device before the
+    /// client looks it up by name.
+    func refuseNextCreateWithConflict() {
+        state.value.withLock { $0.createConflictsRemaining += 1 }
     }
 
     func failNextLookup() {
@@ -472,6 +483,23 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         return (try? JSONSerialization.data(withJSONObject: object)) ?? Data()
     }
 
+    /// Gmail's answer to creating a label whose name is already taken.
+    private static func labelNameConflictBody() -> Data {
+        let message = "Label name exists or conflicts"
+        let object: [String: Any] = [
+            "error": [
+                "errors": [[
+                    "domain": "global",
+                    "reason": "duplicate",
+                    "message": message,
+                ]],
+                "code": 409,
+                "message": message,
+            ],
+        ]
+        return (try? JSONSerialization.data(withJSONObject: object)) ?? Data()
+    }
+
     /// Gmail's real `400` error body for a malformed/never-valid message id
     /// on exact-ID `GET /messages/{id}` — literal wording `"Invalid id value
     /// <id>"` (matched by `GmailProvider.isGmailInvalidIdError`'s
@@ -546,6 +574,23 @@ final class StatefulGmailActionServer: @unchecked Sendable {
             let name = request.body.flatMap {
                 try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
             }?["name"] as? String
+            // Gmail refuses a label whose name an existing label already has
+            // with 409 "Label name exists or conflicts" (the observed response;
+            // the API reference does not list it). Comparing without case is
+            // this fake's assumption, the one `findLabelByName` makes. If Gmail
+            // instead accepts a name that differs only in case, the client
+            // simply creates a new label.
+            let conflicts = state.value.withLock { model -> Bool in
+                if model.createConflictsRemaining > 0 {
+                    model.createConflictsRemaining -= 1
+                    return true
+                }
+                guard let name else { return false }
+                return model.userLabels.values.contains { $0.caseInsensitiveCompare(name) == .orderedSame }
+            }
+            if conflicts {
+                return .bytes(Self.labelNameConflictBody(), contentType: "application/json", statusCode: 409)
+            }
             let created = state.value.withLock { model -> (id: String, name: String)? in
                 guard let id = model.createdLabelId, let name else { return nil }
                 model.userLabels[id] = name

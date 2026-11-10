@@ -694,12 +694,27 @@ extension EmailProvider {
 /// `ProviderError.messageNotFound` because Gmail/Exchange overload it for
 /// parse failures (see `fetchMessagesBatch` doc above).
 func isHttpGoneStatus(_ error: Error) -> Bool {
-    guard case ProviderError.networkError(let underlying) = error else { return false }
-    if case HTTPError.networkError(let statusCode) = underlying {
-        return statusCode == 404 || statusCode == 410
-    }
-    let nsCode = (underlying as NSError).code
-    return nsCode == 404 || nsCode == 410
+    guard let status = httpStatus(of: error) else { return false }
+    return status == 404 || status == 410
+}
+
+/// The HTTP status a provider request failed with: the status inside
+/// `ProviderError.networkError`, from `HTTPError.networkError(statusCode:)`, or
+/// otherwise the underlying error's bridged `NSError` code. That code is the
+/// status only for an `NSError` the provider built with the status as its code
+/// (the draft-delete and trash paths). For any other underlying error it is not
+/// a status: `HTTPError.networkErrorWithBody` bridges to its case index (2),
+/// `HTTPError.invalidURL` to 0, a `URLError` to its negative code. Compare the
+/// result only against the 4xx/5xx statuses you mean. Nil when the error is not
+/// a provider network error.
+///
+/// Prefer this to reading `(error as NSError).code` on the thrown error, which
+/// is never an HTTP status: a Swift error enum bridges to an `NSError` whose
+/// code is its case index, so a check such as `code == 409` never matches.
+func httpStatus(of error: Error) -> Int? {
+    guard case ProviderError.networkError(let underlying) = error else { return nil }
+    if case HTTPError.networkError(let statusCode) = underlying { return statusCode }
+    return (underlying as NSError).code
 }
 
 /// Result of a Gmail history.list call — tells us exactly what changed since last sync
