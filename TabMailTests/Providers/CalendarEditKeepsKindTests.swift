@@ -520,6 +520,28 @@ struct CalDAVCalendarEditKeepsKindTests {
         #expect(rows.isEmpty)
     }
 
+    @Test("a timed event whose DTSTART states VALUE=DATE-TIME, given only a new start, moves as a timed event")
+    func explicitDateTimeStartAloneMovesTimed() async throws {
+        let store = FakeCalDAVStore(servesETags: true)
+        store.seed(path: "/cal/tm-2.ics", ics: [
+            "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//TabMail//Test//EN", "BEGIN:VEVENT",
+            "UID:tm-2", "DTSTAMP:20990101T000000Z",
+            "DTSTART;VALUE=DATE-TIME;TZID=America/Los_Angeles:20990302T100000",
+            "DTEND;VALUE=DATE-TIME;TZID=America/Los_Angeles:20990302T113000",
+            "SUMMARY:Planning", "END:VEVENT", "END:VCALENDAR",
+        ].joined(separator: "\r\n"))
+        let rows = try await run(store, eventId: "/cal/tm-2.ics", [
+            "start_iso": .string("2099-03-02T14:00:00"), "timezone": .string("America/Los_Angeles"),
+        ], account: "kind-c-explicit-datetime")
+        let ics = store.storedICS(path: "/cal/tm-2.ics")
+        let start = line(ics, "DTSTART")
+        let end = line(ics, "DTEND")
+        #expect(start?.hasSuffix(":20990302T140000") == true, "start: \(start ?? "<none>")")
+        #expect(start?.contains("TZID=America/Los_Angeles") == true, "start: \(start ?? "<none>")")
+        #expect(end?.hasSuffix(":20990302T153000") == true, "the event did not keep its length: \(end ?? "<none>")")
+        #expect(rows.isEmpty, "the move was refused: \(rows.first?.failureReason ?? "<none>")")
+    }
+
     @Test("splitting an all-day series with a move starts the new series on the given date")
     func allDaySplitStartsOnTheGivenDate() async throws {
         let store = FakeCalDAVStore(servesETags: true)

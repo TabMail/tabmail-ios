@@ -583,3 +583,13 @@ still saves an all-day event stored with its end on its start. The queue suite c
 `getEvent` calls: an edit that moves nothing and sets no UNTIL makes none, and a failed read on a move writes
 nothing and stays queued. `calendar_event_edit` refuses a stated `all_day: true` with a same-day end before
 its card, and does not refuse times of one day when `all_day` is not stated.
+
+## ICS value types — `VALUE=DATE-TIME` is timed
+
+`ICSValueTypeTests` checks that a `DTSTART` stating `VALUE=DATE-TIME` (the default, which another client may
+spell out) is read as timed by every ICS reader: `ICSParser` (CalDAV event reads), `ICSBuilder.parseIncoming`
+(invitations in mail), and `CalDAVProvider`'s `icsIsAllDay`, `masterDTStartKind` and `parseICSDateTime`, with the
+instant computed independently. `VALUE=DATE`, in any case, is still a day at each of them. All of them match the
+parameter through `ICSValueType.statesDate`, which compares it whole, never as a substring. In
+`CalendarEditKeepsKindTests`, a CalDAV event stored with `VALUE=DATE-TIME` and moved with a start alone lands as a
+timed event and keeps its length.

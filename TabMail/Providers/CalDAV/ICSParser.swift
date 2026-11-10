@@ -126,7 +126,7 @@ enum ICSParser {
         if hasRecurrenceId { return nil }
 
         // Parse dates
-        let isAllDay = dtstartParams?.contains("VALUE=DATE") == true
+        let isAllDay = dtstartParams.map { ICSValueType.statesDate($0) } == true
             || (dtstart.map { $0.count == 8 } ?? false)
 
         let startDate = dtstart.flatMap { parseICSDate($0, params: dtstartParams) }

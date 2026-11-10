@@ -641,14 +641,11 @@ actor CalDAVProvider: CalendarProvider {
     static func icsIsAllDay(_ ics: String) -> Bool {
         for line in Self.masterVEventLines(from: ics) {
             guard line.hasPrefix("DTSTART") else { continue }
-            let upper = line.uppercased()
-            if upper.contains("VALUE=DATE") { return true }
+            guard let colonIdx = line.firstIndex(of: ":") else { return false }
+            if ICSValueType.statesDate(line[..<colonIdx]) { return true }
             // Bare form: "DTSTART:20260520" (8 digits, no T after the colon).
-            if let colonIdx = line.firstIndex(of: ":") {
-                let value = String(line[line.index(after: colonIdx)...]).trimmingCharacters(in: .whitespaces)
-                return value.count == 8 && !value.contains("T")
-            }
-            return false
+            let value = String(line[line.index(after: colonIdx)...]).trimmingCharacters(in: .whitespaces)
+            return value.count == 8 && !value.contains("T")
         }
         return false
     }
@@ -673,7 +670,7 @@ actor CalDAVProvider: CalendarProvider {
             let params = line[..<colonIdx].split(separator: ";").dropFirst()  // skip "DTSTART"
             let value = String(line[line.index(after: colonIdx)...]).trimmingCharacters(in: .whitespaces)
             // All-day: a VALUE=DATE param, or a bare 8-digit value with no time.
-            if params.contains(where: { $0.uppercased() == "VALUE=DATE" })
+            if ICSValueType.statesDate(line[..<colonIdx])
                 || (value.count == 8 && !value.contains("T")) {
                 return .allDay
             }
@@ -1210,7 +1207,7 @@ actor CalDAVProvider: CalendarProvider {
 
         // Date-only (all-day) — emits midnight in the resource's effective tz.
         // ICS all-day uses VALUE=DATE; fall back on a bare 8-digit value too.
-        let isDateOnly = header.uppercased().contains("VALUE=DATE")
+        let isDateOnly = ICSValueType.statesDate(header)
             || (value.count == 8 && !value.contains("T"))
         if isDateOnly {
             let fmt = DateFormatter()
