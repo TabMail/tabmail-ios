@@ -518,13 +518,165 @@ struct ExchangeDeltaCursorTests {
         }
     }
 
+    // MARK: - The capture walk resumes where it stopped
+
+    /// The `$skiptoken` of each walk request (the initial round's pages; the held
+    /// cursor's own delta carries a `$deltatoken` and is left out), "0" for page 1.
+    private static func walkPages(_ http: FakeHTTP.Scenario) -> [String] {
+        deltaRequests(http).compactMap { url -> String? in
+            let items = URLComponents(string: url)?.queryItems ?? []
+            if items.contains(where: { $0.name == "$deltatoken" }) { return nil }
+            return items.first { $0.name == "$skiptoken" }?.value ?? "0"
+        }
+    }
+
+    /// A walk that stops partway keeps its place on the provider: the next walk
+    /// of the same folder starts at the page it had not got, not at page 1. A kept
+    /// page link Graph refuses restarts the walk at page 1 within the same call; a
+    /// walk of another folder starts at its own page 1; a finished walk keeps
+    /// nothing. Pages are 100 messages (the `Prefer` size), five per walk.
+    @Test("A walk that stopped partway resumes from its next page; a refused kept link or another folder starts at page 1")
+    func walkResumesWhereItStopped() async throws {
+        let walk = InboxModel(messageCount: 500)
+        // One failure, served once, for the page whose `$skiptoken` is the key.
+        let failOnce = Mutex<[String: Int]>([:])
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        http.register(path: "/v1.0/me") { request in
+            let items = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+            let page = items.first { $0.name == "$skiptoken" }?.value ?? "0"
+            if let status = failOnce.withLock({ $0.removeValue(forKey: page) }) { return .status(status) }
+            if request.url.path.hasSuffix("/messages/delta") { return walk.serve(request) }
+            return .status(404)
+        }
+        let provider = Self.provider("deltawalkresume", http)
+        var seen = 0
+        func newPages() -> [String] {
+            let all = Self.walkPages(http)
+            defer { seen = all.count }
+            return Array(all.dropFirst(seen))
+        }
+
+        // A server error on page 3 fails the walk after two pages.
+        failOnce.withLock { $0["200"] = 503 }
+        await #expect(throws: (any Error).self) { _ = try await provider.getCurrentDeltaLink(folderId: Self.inboxId) }
+        #expect(newPages() == ["0", "100", "200"])
+
+        // The next walk resumes at page 3 and finishes.
+        #expect(try await provider.getCurrentDeltaLink(folderId: Self.inboxId) == InboxModel.finalDeltaLink)
+        #expect(newPages() == ["200", "300", "400"], "the walk resumed where it stopped")
+
+        // A finished walk keeps nothing: the next one starts at page 1.
+        #expect(try await provider.getCurrentDeltaLink(folderId: Self.inboxId) == InboxModel.finalDeltaLink)
+        #expect(newPages() == ["0", "100", "200", "300", "400"])
+
+        // Stopped again at page 3; then Graph refuses the kept link (410 Gone):
+        // the same call starts again at page 1 and finishes.
+        failOnce.withLock { $0["200"] = 503 }
+        await #expect(throws: (any Error).self) { _ = try await provider.getCurrentDeltaLink(folderId: Self.inboxId) }
+        #expect(newPages() == ["0", "100", "200"])
+        failOnce.withLock { $0["200"] = 410 }
+        #expect(try await provider.getCurrentDeltaLink(folderId: Self.inboxId) == InboxModel.finalDeltaLink)
+        #expect(newPages() == ["200", "0", "100", "200", "300", "400"], "a refused kept link restarts the walk")
+
+        // Stopped at page 2 of the Inbox; a walk of another folder starts at its own page 1.
+        failOnce.withLock { $0["100"] = 503 }
+        await #expect(throws: (any Error).self) { _ = try await provider.getCurrentDeltaLink(folderId: Self.inboxId) }
+        #expect(newPages() == ["0", "100"])
+        let before = Self.deltaRequests(http).count
+        _ = try await provider.getCurrentDeltaLink(folderId: "f-other")
+        let otherFirst = Self.deltaRequests(http).dropFirst(before).first.map { $0.removingPercentEncoding ?? $0 }
+        #expect(otherFirst?.contains("/mailFolders/f-other/messages/delta") == true,
+                "another folder's walk starts at its own page 1: \(otherFirst ?? "none")")
+    }
+
+    /// The capture walk runs inside the foreground pass, which
+    /// `AccountManager.foregroundSyncOne` cuts at a per-account deadline. A large
+    /// Inbox's walk can need longer than one pass has: each pass then walks the
+    /// pages it has time for and the next pass continues, so within a bounded
+    /// number of passes the full sync is recorded with a fresh link, and the
+    /// walk requests stay near the folder's page count (a cut pass redoes at most
+    /// the page it was waiting on). Passes run under production `withTimeout`.
+    @Test("A capture walk longer than the pass deadline finishes over later passes without starting again")
+    func walkLongerThanTheDeadlineFinishes() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+        let accountId = "deltawalkdeadline"
+        _ = try Self.seedAccount(id: accountId, cursor: Self.heldCursor, pool: pool)
+
+        let pages = 24
+        let pageSeconds = 0.25
+        let deadline = 2.0
+        let maxPasses = 12
+        let walk = InboxModel(messageCount: pages * SyncConfig.graphDeltaCursorWalkPageSize)
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        http.register(path: "/v1.0/me") { request in
+            let url = request.url.absoluteString.removingPercentEncoding ?? request.url.absoluteString
+            let path = request.url.path
+            if url == Self.heldCursor { return .json(raw: "{\"value\": [], \"@odata.deltaLink\": \"\(Self.heldCursor)\"}") }
+            if path.hasSuffix("/messages/delta") {
+                return .parked {
+                    Thread.sleep(forTimeInterval: pageSeconds)
+                    return walk.serve(request)
+                }
+            }
+            if path == "/v1.0/me/mailFolders" {
+                return .json(raw: "{\"value\": [{\"id\":\"\(Self.inboxId)\",\"displayName\":\"Inbox\",\"unreadItemCount\":0,\"totalItemCount\":0,\"childFolderCount\":0}]}")
+            }
+            if path.hasSuffix("/messages") { return .json(raw: "{\"value\": []}") }
+            return .status(404)
+        }
+        let provider = Self.provider(accountId, http)
+        let engine = SyncEngine()
+        await engine.register(accountId: accountId, provider: provider, workQueue: ProviderWorkQueue(provider: provider, maxConcurrency: 1))
+
+        var passes = 0
+        var timedOut = 0
+        var recorded = false
+        while passes < maxPasses, !recorded {
+            // A later poll: the last pass is past the 15 s recent-sync skip.
+            try await pool.write { db in
+                _ = try Account.filter(Column("id") == accountId)
+                    .updateAll(db, Column("lastSyncedAt").set(to: Date().addingTimeInterval(-300)))
+            }
+            let account = try #require(try await pool.read { try Account.fetchOne($0, key: accountId) })
+            passes += 1
+            do {
+                _ = try await withTimeout(seconds: deadline) { try await engine.sync(account: account) }
+            } catch is TimeoutError {
+                timedOut += 1
+            }
+            // A cut pass unwinds after `withTimeout` returns; wait until it has
+            // handed the turn back before reading what it left.
+            let unwindBy = Date().addingTimeInterval(10)
+            while await engine.syncPassRunning.contains(accountId), Date() < unwindBy {
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            #expect(await !engine.syncPassRunning.contains(accountId), "the cut pass handed the turn back")
+            let stored = try #require(try await pool.read { try Account.fetchOne($0, key: accountId) })
+            recorded = stored.lastFullSyncAt != nil && stored.lastHistoryId == InboxModel.finalDeltaLink
+        }
+        await engine.cancelAllFTSTasks()
+
+        let walked = Self.walkPages(http)
+        #expect(timedOut >= 1, "precondition: the walk is longer than one pass's deadline (passes \(passes))")
+        #expect(recorded, "the full sync is recorded with a fresh link within \(maxPasses) passes (walk requests \(walked.count))")
+        #expect(walked.count <= pages + passes, "the walk continued instead of starting again: \(walked.count) requests for \(pages) pages over \(passes) passes")
+        #expect(walked.filter { $0 == "0" }.count == 1, "page 1 is walked once: \(walked.prefix(12))")
+    }
+
     /// The initial delta round over an Inbox of `messageCount` messages.
     ///
     /// Page size: `Prefer: odata.maxpagesize` is the documented control ("to set
     /// the maximum number of messages in a response"). What `$top` does in a
     /// message delta is not documented, so the model takes the pessimistic
     /// reading the cost concern rests on, that it caps the page. With neither,
-    /// the page is Graph's default of 10.
+    /// the model returns 10 per page: what Graph has been observed to return, not a
+    /// documented default.
     private struct InboxModel: Sendable {
         let messageCount: Int
         static let defaultPageSize = 10

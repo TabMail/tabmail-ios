@@ -47,6 +47,15 @@ actor ExchangeProvider: EmailProvider {
     private var deletedItemsFolderId: String?
     private var inboxFolderId: String?
 
+    /// Where an unfinished `getCurrentDeltaLink` walk stopped: the folder it walks
+    /// and the `@odata.nextLink` of its next page. The walk runs inside a sync pass
+    /// that a deadline can cut, and a large folder can need more pages than one
+    /// pass has time for; the next call resumes here instead of at page 1, so the
+    /// walk finishes within a bounded number of passes. Recorded after every page,
+    /// so a cut keeps the pages already walked. In memory only: a new provider
+    /// starts the walk again.
+    private var deltaWalkContinuation: (folderId: String, nextLink: String)?
+
     /// Test-only session override. Production call sites omit; tests register
     /// `FakeHTTP` URLProtocol on this session to intercept Graph API calls.
     private let testSession: URLSession?
@@ -1599,26 +1608,58 @@ actor ExchangeProvider: EmailProvider {
     /// the whole folder. Pages are sized with `Prefer: odata.maxpagesize`, the
     /// documented control, sent on every page as Graph's examples do; the round
     /// asks for ids only.
+    ///
+    /// A walk that was cut (see `deltaWalkContinuation`) resumes from its next
+    /// page when it is the same folder. If Graph refuses that kept page link, the
+    /// walk starts again at page 1 in the same call.
     func getCurrentDeltaLink(folderId: String) async throws -> String? {
         let encodedFolderId = try Self.encodedGraphPathSegment(folderId, context: "Graph folder id")
-        var nextLink: String? = "/mailFolders/\(encodedFolderId)/messages/delta?$select=id"
-        var deltaLink: String?
+        let firstPage = "/mailFolders/\(encodedFolderId)/messages/delta?$select=id"
         let pageSize = ["Prefer": "odata.maxpagesize=\(SyncConfig.graphDeltaCursorWalkPageSize)"]
+
+        var resumed = false
+        var nextLink: String? = firstPage
+        if let kept = deltaWalkContinuation {
+            if kept.folderId == folderId {
+                nextLink = kept.nextLink
+                resumed = true
+            } else {
+                deltaWalkContinuation = nil
+            }
+        }
+        BackgroundSyncLogger.logDebug("[Exchange] Delta cursor walk: \(resumed ? "resuming" : "starting")")
 
         // Walk through all pages to get the final deltaLink
         while let link = nextLink {
             let data: Data
-            if link.hasPrefix("http") {
-                data = try await requestAbsolute(url: link, extraHeaders: pageSize)
-            } else {
-                data = try await request(path: link, extraHeaders: pageSize)
+            do {
+                if link.hasPrefix("http") {
+                    data = try await requestAbsolute(url: link, extraHeaders: pageSize)
+                } else {
+                    data = try await request(path: link, extraHeaders: pageSize)
+                }
+            } catch {
+                if Self.graphRefusedDeltaToken(error) {
+                    deltaWalkContinuation = nil
+                    if resumed {
+                        BackgroundSyncLogger.logDebug("[Exchange] Delta cursor walk: kept page link refused, starting again")
+                        resumed = false
+                        nextLink = firstPage
+                        continue
+                    }
+                }
+                throw error
             }
             let response = try JSONDecoder().decode(GraphDeltaResponse.self, from: data)
-            deltaLink = response.odataDeltaLink
+            if let deltaLink = response.odataDeltaLink {
+                deltaWalkContinuation = nil
+                return deltaLink
+            }
             nextLink = response.odataNextLink
+            deltaWalkContinuation = nextLink.map { (folderId: folderId, nextLink: $0) }
         }
 
-        return deltaLink
+        return nil
     }
 
     // MARK: - HTTP
