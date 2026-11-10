@@ -634,6 +634,12 @@ enum SyncConfig {
     static let gmailWorkQueueConcurrency: Int = 10
     /// Max concurrent operations for Exchange/Graph API providers.
     static let exchangeWorkQueueConcurrency: Int = 10
+    /// Messages per page asked for (`Prefer: odata.maxpagesize`) while walking an
+    /// Outlook folder's initial delta round for a new cursor (every full sync takes one). The round
+    /// returns every message in the folder, so the page size sets the request count.
+    /// Graph documents no default page size for message delta; without this header
+    /// it has been observed to return 10 (observed, not documented).
+    static let graphDeltaCursorWalkPageSize: Int = 100
 
     // MARK: - Outbox Send Throttle
 
