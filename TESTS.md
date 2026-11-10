@@ -152,6 +152,21 @@ These tests read what each provider sent, or what the fake server ends up holdin
   - a split whose new start can't be dated refused before the series is capped;
   - the stored recurrence restored exactly when the create fails.
 
+## Google attendee edits — the others stay as stored
+
+Google stores the attendee list an edit sends as it is sent, so an attendee sent by address alone
+loses their optional flag, answer, comment and additional guests. `GoogleAttendeeEditTests` reads
+the PATCH body the fake calendar received:
+
+- adding an attendee sends every other attendee exactly as stored (organizer, optional, resource,
+  additional guests) and the new one by address and name;
+- removing one drops only that attendee;
+- an address in another letter case still matches its stored entry, on either side, and the list
+  keeps the order the edit asks for;
+- adding the first attendee to an event with none sends just that attendee;
+- an edit that names no attendee change sends no attendee list;
+- an occurrence edit keeps that occurrence's own stored attendees.
+
 ## Inbox list — layered test architecture
 
 the unified inbox read (ADR-IOS-055) replaced four disagreeing inbox-list read paths with one unified reader (`InboxListReader` → `InboxListComposer.compose`). Getting this right — and *keeping* it right as the code evolves — needs coverage at four distinct layers, each catching a different class of bug. A 5-round adversarial audit of the refactor found two HIGH-severity findings (F1, F2) that lived entirely *between* layers, invisible to any single layer's test suite — that's why the fourth layer (E2E) exists.

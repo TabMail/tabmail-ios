@@ -3,7 +3,7 @@
 **Keywords:** `splitSeries`, this-and-following, new part, capped series, occurrence override,
 `seriesSplitResources`, `occurrenceOverrideResource`, `CalDAVEventCopies`, `splitNewPartJSON`,
 `serverOwnedEventKeys`, `splitCopiedKeys`, `splitSelect`, `splitReschedules`, `applyAttendeeRule`, `insertEventJSON`,
-`conferenceDataVersion`, `supportsAttachments`, `splitRecurrence`, `filterDateList`, `RecurrenceTail`,
+`conferenceDataVersion`, `supportsAttachments`, `splitRecurrence`, `keptAttendeesJSON`, `editJSON`, `filterDateList`, `RecurrenceTail`,
 EXDATE, RDATE, COUNT, recurrenceTimeZone, attendee answers, `needsAction`, write order,
 create first cap last, lost cap response, retry, own cap, `successorIsOurs`, `capEndDate`.
 
@@ -114,6 +114,15 @@ response was lost, the series it reads is already capped.
   to `needsAction`. An added attendee is asked; one left out is removed.
 - **Outlook:** the new part's attendees start unanswered. Graph lets only the attendee write a
   response, and Outlook's own split does the same.
+
+## Google attendee edits (#564)
+
+The same attendee rule holds for an ordinary Google edit. Google stores the attendee list it is
+sent as sent, so an edit that adds or removes someone (`updateEvent`, `updateOccurrence`) writes
+each attendee it keeps as the stored event holds them (`keptAttendeesJSON`, via `editJSON`),
+matched by address in any letter case, and only a new one by address and name. An occurrence edit
+matches against that occurrence's own stored attendees. An edit that names no attendee change
+sends no attendee list. Tests: `GoogleAttendeeEditTests`.
 
 ## Tests
 

@@ -468,11 +468,11 @@ actor GoogleCalendarProvider: CalendarProvider {
         // PATCH" for events — this matches CalDAV's natural full-resource
         // PUT and the Exchange Graph fix where partial PATCH on master
         // recurrence silently rewrote start/end. Defense-in-depth.
-        let existing = try await getEvent(calendarId: calendarId, eventId: eventId)
+        let (existing, existingJSON) = try await getEventAndJSON(calendarId: calendarId, eventId: eventId)
         let merged = Self.mergeExistingEventWithPatch(existing: existing, patch: event)
         let encodedCalId = try Self.encodedPathSegment(calendarId, "Google calendar id")
         let encodedEventId = try Self.encodedPathSegment(eventId, "Google event id")
-        let body = try JSONSerialization.data(withJSONObject: merged.toJSON())
+        let body = try JSONSerialization.data(withJSONObject: Self.editJSON(merged, stored: existingJSON))
         let data = try await request(
             path: "/calendars/\(encodedCalId)/events/\(encodedEventId)?sendUpdates=\(sendUpdates)",
             method: "PATCH",
@@ -540,10 +540,10 @@ actor GoogleCalendarProvider: CalendarProvider {
         // defensive full-payload pattern as `updateEvent`. Then strip
         // `recurrence`: an instance/exception cannot carry a series rule and
         // Google rejects PATCHes that include one.
-        let existingInstance = try await getEvent(calendarId: calendarId, eventId: instanceId)
+        let (existingInstance, instanceJSON) = try await getEventAndJSON(calendarId: calendarId, eventId: instanceId)
         var instancePatch = Self.mergeExistingEventWithPatch(existing: existingInstance, patch: event)
         instancePatch.recurrence = nil
-        let body = try JSONSerialization.data(withJSONObject: instancePatch.toJSON())
+        let body = try JSONSerialization.data(withJSONObject: Self.editJSON(instancePatch, stored: instanceJSON))
         let data = try await request(
             path: "/calendars/\(encodedCalId)/events/\(encodedInstanceId)?sendUpdates=\(sendUpdates)",
             method: "PATCH",
@@ -1105,15 +1105,7 @@ actor GoogleCalendarProvider: CalendarProvider {
         guard !stored.isEmpty || patch.attendees != nil else { return json }
         func email(_ attendee: [String: Any]) -> String? { (attendee["email"] as? String)?.lowercased() }
         let organizerEmail = master.organizer?.email?.lowercased()
-        var attendees = stored
-        if let wanted = patch.attendees {
-            attendees = wanted.map { want in
-                if let kept = stored.first(where: { email($0) == want.email.lowercased() }) { return kept }
-                var added: [String: Any] = ["email": want.email]
-                if let name = want.name { added["displayName"] = name }
-                return added
-            }
-        }
+        let attendees = patch.attendees.map { keptAttendeesJSON(stored: stored, wanted: $0) } ?? stored
         let askAgain = splitReschedules(unchanged, edited)
         json["attendees"] = attendees.map { attendee -> [String: Any] in
             let isOrganizer = (attendee["organizer"] as? Bool) == true
@@ -1123,6 +1115,31 @@ actor GoogleCalendarProvider: CalendarProvider {
                 copy["responseStatus"] = "needsAction"
             }
             return copy
+        }
+        return json
+    }
+
+    /// The attendee list an edit writes when it changes who attends: each attendee it keeps, as the
+    /// stored event holds them (optional flag, answer, comment, additional guests, resource); each
+    /// one it adds by address and name. Google replaces the whole list with what it is sent, so an
+    /// attendee sent by address alone loses the rest.
+    static func keptAttendeesJSON(stored: [[String: Any]], wanted: [(email: String, name: String?)]) -> [[String: Any]] {
+        wanted.map { want in
+            if let kept = stored.first(where: { ($0["email"] as? String)?.lowercased() == want.email.lowercased() }) {
+                return kept
+            }
+            var added: [String: Any] = ["email": want.email]
+            if let name = want.name { added["displayName"] = name }
+            return added
+        }
+    }
+
+    /// The PATCH body of an edit: `merged` as JSON, with the attendees it names as the stored event
+    /// `stored` holds them (`keptAttendeesJSON`).
+    static func editJSON(_ merged: GCalEventInput, stored: [String: Any]) -> [String: Any] {
+        var json = merged.toJSON()
+        if let wanted = merged.attendees {
+            json["attendees"] = keptAttendeesJSON(stored: stored["attendees"] as? [[String: Any]] ?? [], wanted: wanted)
         }
         return json
     }
@@ -1173,11 +1190,12 @@ actor GoogleCalendarProvider: CalendarProvider {
     /// helper makes that pattern available everywhere.
     ///
     /// Attendees are deliberately NOT inherited from `existing`: re-sending
-    /// the existing attendees in a PATCH would reset their `responseStatus`
-    /// fields (Graph/Google treat re-sent attendees as newly invited). We
-    /// only include attendees when `patch` explicitly changes them; the
+    /// them by address and name alone would reset what the server holds for
+    /// them (their answer, optional flag, comment). We only include
+    /// attendees when `patch` explicitly changes them; the
     /// caller is responsible for delta-resolving against the existing list
-    /// (see `AccountManager.resolveAttendeeDelta`).
+    /// (see `AccountManager.resolveAttendeeDelta`), and `editJSON` writes
+    /// each attendee the list keeps as the stored event holds them.
     static func mergeExistingEventWithPatch(existing: GCalEvent, patch: GCalEventInput) -> GCalEventInput {
         var merged = GCalEventInput()
         merged.summary = patch.summary ?? existing.summary
