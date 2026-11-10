@@ -378,15 +378,21 @@ actor SyncEngine {
         let provider = queue.provider
 
         // A foreground pass of the same account running now finishes first
-        // (`oneSyncAtATime`); then this delta runs.
+        // (`oneSyncAtATime`); then this delta runs, on the account's row as it is
+        // when its turn starts.
         return try await oneSyncAtATime(accountId: account.id) {
-            try await self.backgroundDeltaPass(account: account, queue: queue, provider: provider, inboxOnly: inboxOnly)
+            try await self.backgroundDeltaPass(accountId: account.id, queue: queue, provider: provider, inboxOnly: inboxOnly)
         }
     }
 
     private func backgroundDeltaPass(
-        account: Account, queue: ProviderWorkQueue, provider: any EmailProvider, inboxOnly: Bool
+        accountId: String, queue: ProviderWorkQueue, provider: any EmailProvider, inboxOnly: Bool
     ) async throws -> (changed: Bool, reason: String) {
+        guard let account = try await accountAtTurnStart(accountId) else {
+            BackgroundSyncLogger.logDebug("[Sync:bg] Account \(accountId.prefix(8)) was removed before its turn — skipping")
+            return (false, "noAccount")
+        }
+
         // Pool creates connections on demand via checkout — no explicit connect needed.
         // Callers (AccountManager.backgroundSyncOne) already call ensureConnected() upstream.
 
@@ -400,7 +406,6 @@ actor SyncEngine {
 
         // Publish sync phase so push-triggered/background syncs show "Checking..."
         // in the subtitle, not just the foreground path. Defer clears on return.
-        let accountId = account.id
         defer {
             Task { @MainActor in AccountManagerState.shared.setSyncPhase(nil, forAccount: accountId) }
         }
@@ -465,22 +470,28 @@ actor SyncEngine {
         }
         let provider = queue.provider
 
+        // The work queue has several slots and does not serialize passes: a pass
+        // of the same account running now finishes first (`oneSyncAtATime`).
+        return try await oneSyncAtATime(accountId: account.id) {
+            try await self.foregroundPass(accountId: account.id, queue: queue, provider: provider)
+        }
+    }
+
+    private func foregroundPass(accountId: String, queue: ProviderWorkQueue, provider: any EmailProvider) async throws -> Bool {
+        guard let account = try await accountAtTurnStart(accountId) else {
+            BackgroundSyncLogger.logDebug("[Sync] Account \(accountId.prefix(8)) was removed before its turn — skipping")
+            return false
+        }
+
         // Skip if this account was synced very recently — prevents redundant syncs
         // from overlapping callers (RootView.task, SyncScheduler, InboxViewModel).
+        // Read from the row as it is now, so a pass that waited behind one that
+        // has just synced skips too.
         if let lastSync = account.lastSyncedAt, Date().timeIntervalSince(lastSync) < 15 {
             BackgroundSyncLogger.logDebug("[Sync] Skipping \(account.emailAddress) — synced \(Int(Date().timeIntervalSince(lastSync)))s ago")
             return false
         }
 
-        // The work queue has several slots and does not serialize passes: a pass
-        // of the same account running now finishes first (`oneSyncAtATime`).
-        return try await oneSyncAtATime(accountId: account.id) {
-            try await self.foregroundPass(account: account, queue: queue, provider: provider)
-        }
-    }
-
-    private func foregroundPass(account: Account, queue: ProviderWorkQueue, provider: any EmailProvider) async throws -> Bool {
-        let accountId = account.id
         defer {
             Task { @MainActor in AccountManagerState.shared.setSyncPhase(nil, forAccount: accountId) }
         }

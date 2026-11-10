@@ -15,17 +15,29 @@ pass's full sync while another pass's delta was in flight, and both write the ac
 **Decision:**
 1. **One semaphore per account, first in first out** (`SyncEngine.oneSyncAtATime`). Both entry points
    run their whole pass inside it. A pass that arrives while another of the same account runs waits its
-   turn and then runs as it would have, on the account values its caller read before the wait; a
-   caller's timeout includes the wait. The turn is released on every exit, a throw included,
-   and handed straight to the oldest waiter, so a later arrival cannot overtake.
-2. **Nothing else changes** (owner: "the full sync and delta sync work the same as right now ... If one
+   turn and then runs; a caller's timeout includes the wait. The turn is released on every exit, a throw
+   included, and handed straight to the oldest waiter, so a later arrival cannot overtake.
+2. **A pass never acts on account sync state read before its turn** (owner, 2026-11-10, choosing the fix
+   at the cause over blessing the gap). The pass's first step inside its turn re-reads the account row
+   (`SyncEngine.accountAtTurnStart`), and the pass bodies (`foregroundPass`, `backgroundDeltaPass`) take
+   only the account id, so no cursor path can reach the caller's copy. The delta cursor
+   (`Account.lastHistoryId`), the full-sync-due decision (`lastFullSyncAt`) and the 15-second recent-sync
+   check (`lastSyncedAt`) all come from that fresh row. So a pass that waited never clears or overwrites
+   a cursor a pass ahead of it wrote, and two queued passes never both run a full sync only one was due
+   for. Census at the ruling: every write of `lastHistoryId` runs inside a pass (the Gmail and Outlook
+   delta's advance and clear, `captureSyncCursors`; the extension writes only its own mirror), so nothing
+   moves the cursor while a pass holds the turn and no compare-and-set is needed. The writers of
+   `lastFullSyncAt` outside a pass (`StartupMigrations`, the epoch rebuild, Settings' resync) only clear it
+   to make a full sync due, which the fresh read honours. This is live sync state, not a setting, so the
+   snapshot-at-operation-start rule does not apply to it ("settings versus the world").
+3. **Nothing else changes** (owner: "the full sync and delta sync work the same as right now ... If one
    is running, the other just waits. It's a simple semaphore. Do not change anything of the timing
-   logic"). There is no joining, no coalescing, no skipping and no new trigger. The 15-minute full-sync
-   interval, the 15-second recent-sync check (still taken before the wait, from the caller's account),
-   the delta-then-full-sync order inside a pass and every scheduler stay as they were.
-3. **No time cap on the wait.** A waiter whose task was cancelled still takes its turn; its pass then
+   logic"). There is no joining, no coalescing and no new trigger. The 15-minute full-sync interval, the
+   15-second recent-sync check (now on the fresh row, item 2), the delta-then-full-sync order inside a
+   pass and every scheduler stay as they were.
+4. **No time cap on the wait.** A waiter whose task was cancelled still takes its turn; its pass then
    stops at its first work-queue call, which is cancellation-aware.
-4. **Not inside it:** single-folder syncs (`SyncEngine.syncFolderMessages`: pull to refresh through
+5. **Not inside it:** single-folder syncs (`SyncEngine.syncFolderMessages`: pull to refresh through
    `AccountManager.syncFolders`, message detail, the operation executor, the outbox, on-demand fetches,
    and the UIDVALIDITY reaction under its own per-folder single flight, ADR-IOS-061), backfill, FTS
    indexing and the AI queues. None of them runs a delta or a full sync, or writes the account's delta
@@ -35,10 +47,16 @@ pass's full sync while another pass's delta was in flight, and both write the ac
 plain semaphore, and both change what a caller's pass does); a wait cap that drops the waiter (a
 skipped pass); relying on the work queue (it has several slots by design, for throughput).
 
-**Consequence:** a push wake that arrives during a foreground full sync now waits for it. No caller
+**Consequence:** a push wake that arrives during a foreground full sync now waits for it, then runs its
+delta from the cursor that full sync captured. A foreground pass that waited behind one that has just
+synced skips (the 15-second check). The epoch rebuild's immediate resync, which clears `lastFullSyncAt`
+and then passes accounts it read before the clear, now runs the full sync it exists to force; on the
+caller's copy it did not when a full sync had run in the last 15 minutes. No caller
 calls a pass from inside a pass (census at the ruling: the account-manager entry points, account setup,
 three Settings actions and the launch-time epoch-rebuild kick), so the non-reentrant semaphore cannot
 deadlock; a new caller from inside a pass would. Tests: `OneSyncAtATimeTests` (a second pass, foreground
-or background, waits until the first pass's full sync is done; a pass that throws hands the turn on;
-passes waiting their turn run one at a time in arrival order, and one arriving during a handed-over turn
-waits too; another account's pass does not wait).
+or background, waits until the first pass's full sync is done, and a waiting foreground pass then skips
+rather than sync again; a delta that waited behind a full sync runs from the cursor it captured; a full
+sync made due after the caller read the account still runs; a pass that throws hands the turn on; passes
+waiting their turn run one at a time in arrival order, and one arriving during a handed-over turn waits
+too; another account's pass does not wait).

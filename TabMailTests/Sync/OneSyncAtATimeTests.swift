@@ -12,7 +12,10 @@ import Testing
 /// account are never in flight together, whichever entry point started them; a
 /// pass that arrives while another runs waits its turn and then runs; and a pass
 /// that throws still hands the turn on. Passes waiting their turn each run, one
-/// at a time, in arrival order, and the turn is per account.
+/// at a time, in arrival order, and the turn is per account. A pass never acts on
+/// account sync state its caller read before its turn: a pass that waited never
+/// clears or overwrites a cursor a pass ahead of it wrote, and never runs a full
+/// sync that pass already ran.
 ///
 /// The first two drive production `SyncEngine.sync(account:)` and
 /// `SyncEngine.backgroundDeltaSync(account:)` end to end on `FakeHTTP` with a
@@ -57,12 +60,16 @@ struct OneSyncAtATimeTests {
         try await body(pool)
     }
 
-    /// A Gmail account with a cursor and no full sync yet, so every foreground
-    /// pass runs its delta and then its full sync.
-    private static func makeAccount(pool: DatabasePool) throws -> Account {
+    /// A Gmail account with a cursor and, by default, no full sync yet, so every
+    /// foreground pass runs its delta and then its full sync.
+    private static func makeAccount(
+        pool: DatabasePool, lastFullSyncAt: Date? = nil, lastSyncedAt: Date? = nil
+    ) throws -> Account {
         var account = Account(emailAddress: "\(accountId)@example.com", displayName: "One sync", provider: .gmail)
         account.id = accountId
         account.lastHistoryId = "1000"
+        account.lastFullSyncAt = lastFullSyncAt
+        account.lastSyncedAt = lastSyncedAt
         let toInsert = account
         try pool.write { db in
             try toInsert.insert(db)
@@ -138,7 +145,10 @@ struct OneSyncAtATimeTests {
     }
 
     /// RED on main: the work queue let the first pass's full sync run while the
-    /// second pass's delta was in flight.
+    /// second pass's delta was in flight. A background delta then runs its delta;
+    /// a foreground pass finds, on the row as it is when its turn starts, that the
+    /// first pass synced moments ago, and runs neither a delta nor a second full
+    /// sync (RED while it decided on its caller's copy).
     @Test("A second pass waits until the first pass's full sync is done", arguments: SecondPass.allCases)
     func secondPassWaitsForTheFirst(second: SecondPass) async throws {
         try await Self.withAppDB { pool in
@@ -159,15 +169,31 @@ struct OneSyncAtATimeTests {
                 }
             }
             _ = try await first.value
-            // Bounded, so a turn that is never handed on fails here instead of hanging the suite.
-            #expect(try await Self.waitForHistoryRequests(2, wire: wire), "the second pass never ran")
-            if wire.snapshot.historyRequests == 2 { try await secondTask.value }
+            switch second {
+            case .backgroundDelta:
+                // Bounded, so a turn that is never handed on fails here instead of hanging the suite.
+                #expect(try await Self.waitForHistoryRequests(2, wire: wire), "the second pass never ran")
+                if wire.snapshot.historyRequests == 2 { try await secondTask.value }
+            case .foreground:
+                let finished = await Self.eventually {
+                    let free = await engine.syncPassRunning.isEmpty
+                    let waiting = await engine.syncPassWaiters[Self.accountId]
+                    return free && waiting == nil
+                }
+                #expect(finished, "the second pass never took its turn")
+                if finished { try await secondTask.value }
+            }
 
             let seen = wire.snapshot
             #expect(!seen.overlapped, "a delta and a full sync of one account were in flight together")
-            #expect(seen.historyRequests == 2, "both passes must run their delta (none is skipped or joined)")
-            #expect(seen.labelsRequests >= 1, "precondition: the first pass ran its full sync")
-            #expect(seen.historyAfterFirstLabels, "the second pass's delta must start after the first pass's full sync")
+            #expect(seen.labelsRequests == 1, "the first pass ran the full sync, and only it")
+            switch second {
+            case .backgroundDelta:
+                #expect(seen.historyRequests == 2, "both passes must run their delta (none is skipped or joined)")
+                #expect(seen.historyAfterFirstLabels, "the second pass's delta must start after the first pass's full sync")
+            case .foreground:
+                #expect(seen.historyRequests == 1, "a pass that waited behind a pass that has just synced syncs again")
+            }
             await engine.remove(accountId: Self.accountId)
         }
     }
@@ -196,6 +222,117 @@ struct OneSyncAtATimeTests {
                     "the pass waiting behind a pass that threw never ran")
             if wire.snapshot.historyRequests == 2 { await secondTask.value }
             #expect(!wire.snapshot.overlapped)
+            await engine.remove(accountId: Self.accountId)
+        }
+    }
+
+    /// What the fake server saw for the cursor tests below: the `startHistoryId`
+    /// of every `history` request, in order, and how many `labels` requests (full
+    /// syncs) arrived.
+    final class CursorWire: Sendable {
+        struct State {
+            var historyStarts: [String] = []
+            var labelsRequests = 0
+        }
+        let state = Mutex(State())
+        /// Released by the test to answer the first `labels` request.
+        let releaseFirstLabels = DispatchSemaphore(value: 0)
+
+        var snapshot: State { state.withLock { $0 } }
+    }
+
+    /// The server has expired cursor `1000` (its `history` answers 404) and is
+    /// at `2000` now (`profile`); a `history` from any other cursor answers
+    /// `2001` with no changes. With `parkFirstLabels`, the first full sync's
+    /// `labels` request waits for the test to release it.
+    private static func cursorScenario(wire: CursorWire, parkFirstLabels: Bool) -> FakeHTTP.Scenario {
+        let scenario = FakeHTTP.Scenario()
+        scenario.register(path: "/history", method: "GET") { request in
+            let start = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?
+                .queryItems?.first { $0.name == "startHistoryId" }?.value ?? ""
+            wire.state.withLock { $0.historyStarts.append(start) }
+            return start == "1000" ? .status(404) : .json(raw: #"{ "historyId": "2001" }"#)
+        }
+        scenario.register(path: "/labels", method: "GET") { _ in
+            let order: Int = wire.state.withLock { state in
+                state.labelsRequests += 1
+                return state.labelsRequests
+            }
+            let labels = #"{ "labels": [ { "id": "INBOX", "name": "INBOX", "type": "system" } ] }"#
+            guard parkFirstLabels, order == 1 else { return .json(raw: labels) }
+            return .parked {
+                _ = wire.releaseFirstLabels.wait(timeout: .now() + .seconds(10))
+                return .json(raw: labels)
+            }
+        }
+        scenario.register(path: "/messages", method: "GET", response: .json(raw: #"{ "resultSizeEstimate": 0 }"#))
+        scenario.register(path: "/profile", method: "GET", response: .json(
+            raw: #"{ "emailAddress": "one-sync-gmail@example.com", "historyId": "2000" }"#))
+        return scenario
+    }
+
+    private static func storedCursor(_ pool: DatabasePool) throws -> String? {
+        try pool.read { db in try Account.fetchOne(db, key: accountId)?.lastHistoryId }
+    }
+
+    /// RED while a pass ran on its caller's copy (C1): a push delta queued
+    /// behind the launch's full sync carried the expired cursor `1000`, found it
+    /// expired again, and cleared the cursor that full sync had just captured,
+    /// so new mail waited for the next full sync.
+    @Test("A delta that waited behind a full sync runs from the cursor that full sync captured")
+    func waitingDeltaKeepsTheFreshCursor() async throws {
+        try await Self.withAppDB { pool in
+            let account = try Self.makeAccount(pool: pool)
+            let wire = CursorWire()
+            let scenario = Self.cursorScenario(wire: wire, parkFirstLabels: true)
+            defer { scenario.close() }
+            let provider = GmailProvider(
+                userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: scenario.session)
+            let engine = await Self.engine(provider: provider)
+
+            let first = Task { try await engine.sync(account: account) }
+            #expect(await Self.eventually { wire.snapshot.labelsRequests == 1 },
+                    "precondition: the first pass reached its full sync")
+            // The caller's copy still names the expired cursor.
+            let second = Task { _ = try await engine.backgroundDeltaSync(account: account) }
+            #expect(await Self.eventually { await engine.syncPassWaiters[Self.accountId]?.count == 1 },
+                    "precondition: the delta waits its turn behind the full sync")
+            wire.releaseFirstLabels.signal()
+
+            _ = try await first.value
+            try await second.value
+
+            #expect(wire.snapshot.historyStarts == ["1000", "2000"],
+                    "the waiting delta must ask from the cursor the full sync captured, not its caller's")
+            #expect(try Self.storedCursor(pool) == "2001", "the cursor the full sync captured was cleared")
+            await engine.remove(accountId: Self.accountId)
+        }
+    }
+
+    /// RED while a pass ran on its caller's copy: the epoch rebuild (and
+    /// Settings' resync) clears `lastFullSyncAt` to make the full sync due, then
+    /// syncs with an account it read before the clear, whose copy still said a
+    /// full sync ran a minute ago.
+    @Test("A full sync made due after the caller read the account still runs")
+    func fullSyncMadeDueAfterTheReadRuns() async throws {
+        try await Self.withAppDB { pool in
+            let aMinuteAgo = Date().addingTimeInterval(-60)
+            let account = try Self.makeAccount(pool: pool, lastFullSyncAt: aMinuteAgo, lastSyncedAt: aMinuteAgo)
+            try await pool.write { db in
+                _ = try Account.filter(Column("id") == Self.accountId)
+                    .updateAll(db, Column("lastHistoryId").set(to: "1500"), Column("lastFullSyncAt").set(to: nil as Date?))
+            }
+            let wire = CursorWire()
+            let scenario = Self.cursorScenario(wire: wire, parkFirstLabels: false)
+            defer { scenario.close() }
+            let provider = GmailProvider(
+                userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: scenario.session)
+            let engine = await Self.engine(provider: provider)
+
+            _ = try await engine.sync(account: account)
+
+            #expect(wire.snapshot.historyStarts == ["1500"], "the delta must run from the stored cursor")
+            #expect(wire.snapshot.labelsRequests == 1, "the full sync the row says is due did not run")
             await engine.remove(accountId: Self.accountId)
         }
     }
