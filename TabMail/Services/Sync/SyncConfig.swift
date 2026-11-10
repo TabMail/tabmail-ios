@@ -178,10 +178,11 @@ enum BackfillProfile {
         }
     }
 
-    /// Concurrent body fetches for Gmail/Exchange (HTTP) in FTS indexing.
+    /// Concurrent body fetches requested of an HTTP provider in backfill and FTS indexing.
     /// Gmail: 250 quota units/sec, messages.get = 5 units → ~50 req/sec max.
     /// At ~200ms RTT, 25 concurrent ≈ 125 req/sec peak — within limit with margin.
-    /// Exchange limit is ~16 qps — 429/403 retry with backoff handles overshoot.
+    /// The width is a ceiling: a provider whose service limits concurrency serves
+    /// the request narrower, inside the provider (ADR-IOS-103).
     var gmailBodyConcurrency: Int {
         switch self {
         case .low: return 3
@@ -633,6 +634,12 @@ enum SyncConfig {
     static let gmailWorkQueueConcurrency: Int = 10
     /// Max concurrent operations for Exchange/Graph API providers.
     static let exchangeWorkQueueConcurrency: Int = 10
+    /// Messages per page asked for (`Prefer: odata.maxpagesize`) while walking an
+    /// Outlook folder's initial delta round for a new cursor (every full sync takes one). The round
+    /// returns every message in the folder, so the page size sets the request count.
+    /// Graph documents no default page size for message delta; without this header
+    /// it has been observed to return 10 (observed, not documented).
+    static let graphDeltaCursorWalkPageSize: Int = 100
 
     // MARK: - Outbox Send Throttle
 

@@ -485,13 +485,21 @@ struct AccountDetailView: View {
     }
 
     private func setFolderRole(_ folder: Folder, role: FolderRole) {
-        try? dbPool.write { db in
-            try db.execute(
-                sql: "UPDATE folder SET role = ? WHERE id = ?",
-                arguments: [role.rawValue, folder.id]
-            )
+        let inboxChanged = try? dbPool.write { db in
+            try FolderRoleEdit.set(role, folderId: folder.id, accountId: account.id, db: db)
         }
         reloadFolders()
+        syncIfInboxChanged(inboxChanged)
+    }
+
+    /// After a role edit that changed which folder is the Inbox, which marked the
+    /// account's full sync due (`FolderRoleEdit`), starts the account's sync with
+    /// the account read back from the database, so that pass runs the full sync.
+    private func syncIfInboxChanged(_ inboxChanged: Bool?) {
+        guard inboxChanged == true else { return }
+        reloadAccount()
+        let account = account
+        Task { _ = try? await manager.syncAccount(account) }
     }
 
     // MARK: - Re-authentication
@@ -661,28 +669,19 @@ struct AccountDetailView: View {
         // write-then-read coherence with the synchronous reloadFolders() (the IOS-SETTINGS-002 "failure
         // visibly reverts" property). Converting safely needs a per-account serial tail (modeled on
         // AccountFieldPersistenceStore), NOT a bare async write. See IOS-PERF-010.
-        // Clear the role from any other folder first, then assign
-        try? dbPool.write { db in
-            try db.execute(
-                sql: "UPDATE folder SET role = ? WHERE accountId = ? AND role = ?",
-                arguments: [FolderRole.custom.rawValue, account.id, role.rawValue]
-            )
-            try db.execute(
-                sql: "UPDATE folder SET role = ? WHERE id = ?",
-                arguments: [role.rawValue, folder.id]
-            )
+        let inboxChanged = try? dbPool.write { db in
+            try FolderRoleEdit.assign(role, to: folder.id, accountId: account.id, db: db)
         }
         reloadFolders()
+        syncIfInboxChanged(inboxChanged)
     }
 
     private func clearRole(_ role: FolderRole) {
-        try? dbPool.write { db in
-            try db.execute(
-                sql: "UPDATE folder SET role = ? WHERE accountId = ? AND role = ?",
-                arguments: [FolderRole.custom.rawValue, account.id, role.rawValue]
-            )
+        let inboxChanged = try? dbPool.write { db in
+            try FolderRoleEdit.clear(role, accountId: account.id, db: db)
         }
         reloadFolders()
+        syncIfInboxChanged(inboxChanged)
     }
 
     private func formatETA(_ seconds: Double) -> String {

@@ -90,7 +90,7 @@ struct Account: Codable, FetchableRecord, PersistableRecord, Identifiable, Senda
     var calendarSetupFailed: Bool = false
 
     // Incremental sync cursors
-    var lastHistoryId: String? // Gmail only — tracks history.list cursor
+    var lastHistoryId: String? // Gmail: the history.list cursor; Outlook: the Inbox's Graph delta link
 
     /// Whether this account type supports server-side push notifications.
     /// Gmail (Pub/Sub) and Outlook (Graph subscriptions) have push; IMAP/iCloud do not.

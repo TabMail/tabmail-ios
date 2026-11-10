@@ -813,6 +813,14 @@ extension AccountManager {
                 return false
             }
         }
+        // A server that asked to be tried again later (the transport decides which
+        // refusals mean that, ADR-IOS-103) does not say the message is wrong, so it
+        // stays queued without a strike. Other server errors stay strikes: they can
+        // repeat for the same message every time.
+        if case ProviderError.networkError(let underlying) = error,
+           let httpError = underlying as? HTTPError, httpError.asksToRetryLater {
+            return true
+        }
         // URL/network errors are transient
         if (error as NSError).domain == NSURLErrorDomain { return true }
         // NIO connection errors are transient

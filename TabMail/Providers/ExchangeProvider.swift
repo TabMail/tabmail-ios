@@ -47,9 +47,23 @@ actor ExchangeProvider: EmailProvider {
     private var deletedItemsFolderId: String?
     private var inboxFolderId: String?
 
+    /// Where an unfinished `getCurrentDeltaLink` walk stopped: the folder it walks
+    /// and the `@odata.nextLink` of its next page. The walk runs inside a sync pass
+    /// that a deadline can cut, and a large folder can need more pages than one
+    /// pass has time for; the next call resumes here instead of at page 1, so the
+    /// walk finishes within a bounded number of passes. Recorded after every page,
+    /// so a cut keeps the pages already walked. In memory only: a new provider
+    /// starts the walk again.
+    private var deltaWalkContinuation: (folderId: String, nextLink: String)?
+
     /// Test-only session override. Production call sites omit; tests register
     /// `FakeHTTP` URLProtocol on this session to intercept Graph API calls.
     private let testSession: URLSession?
+
+    /// Graph allows four concurrent requests per app and mailbox (#426). Every
+    /// request this provider sends holds a slot of this mailbox's gate while on the
+    /// wire; the mailbox's `ExchangeCalendarProvider` looks up the same one.
+    private let mailboxGate: HTTPConcurrencyGate
 
     init(
         userEmail: String,
@@ -59,6 +73,7 @@ actor ExchangeProvider: EmailProvider {
         self.userEmail = userEmail
         self.accessToken = accessToken
         self.testSession = session
+        self.mailboxGate = GraphMailboxGates.gate(for: userEmail)
     }
 
     func connect() async throws {
@@ -504,9 +519,13 @@ actor ExchangeProvider: EmailProvider {
     /// Combined header+body fetch for unified backfill. Adds `body` to existing header $select fields
     /// so one API call returns both header metadata and body content.
     /// Yields results as they complete — caller writes GRDB headers + FTS bodies while more fetches are in flight.
+    ///
+    /// The caller's `concurrency` is a ceiling: Graph allows four concurrent requests
+    /// per mailbox, shared with sync, actions and sends, so the width is at most
+    /// `GraphConfig.bodyFetchConcurrency` (ADR-IOS-103).
     func fetchBackfillBatch(ids: [String], concurrency: Int) async -> AsyncStream<BackfillResult> {
         let capturedIds = ids
-        let capturedConcurrency = concurrency
+        let capturedConcurrency = min(concurrency, GraphConfig.bodyFetchConcurrency)
         let provider = self
         return AsyncStream { continuation in
             let task = Task {
@@ -552,9 +571,10 @@ actor ExchangeProvider: EmailProvider {
 
     /// Streaming body-only fetch for FTS indexing.
     /// Yields results as they complete — caller can write FTS while more fetches are in flight.
+    /// `concurrency` is a ceiling, at most `GraphConfig.bodyFetchConcurrency` (ADR-IOS-103).
     func fetchTextBodiesStream(ids: [String], concurrency: Int) async -> AsyncStream<TextBodyFetchResult> {
         let capturedIds = ids
-        let capturedConcurrency = concurrency
+        let capturedConcurrency = min(concurrency, GraphConfig.bodyFetchConcurrency)
         let provider = self
         return AsyncStream { continuation in
             let task = Task {
@@ -596,9 +616,9 @@ actor ExchangeProvider: EmailProvider {
 
     func fetchTextBodies(ids: [String], folder: String) async throws -> [TextBodyFetchResult] {
         var results: [TextBodyFetchResult] = []
-        // Provider-owned concurrency: Exchange Graph API ~16 qps with backoff
-        let concurrency = BackfillProfile.normal.gmailBodyConcurrency
-        let stream = await fetchTextBodiesStream(ids: ids, concurrency: concurrency)
+        // Graph's binding limit is four concurrent requests per mailbox (#426);
+        // `mailboxGate` enforces it, and this width leaves room under it.
+        let stream = await fetchTextBodiesStream(ids: ids, concurrency: GraphConfig.bodyFetchConcurrency)
         for await result in stream {
             results.append(result)
         }
@@ -1228,7 +1248,8 @@ actor ExchangeProvider: EmailProvider {
             put.httpBody = attachment.data.subdata(in: offset..<end)
             let response: URLResponse
             do {
-                (_, response) = try await (testSession ?? sharedEphemeralSession).data(for: put)
+                let session = testSession ?? sharedEphemeralSession
+                (_, response) = try await mailboxGate.withSlot { try await session.data(for: put) }
             } catch let error as URLError {
                 // The session URL carries a pre-authenticated token, and a URLError
                 // carries its failing URL into every log line that prints the error
@@ -1272,9 +1293,11 @@ actor ExchangeProvider: EmailProvider {
         )
         // Exchange may auto-delete drafts after send. A 404 means already gone — treat as success.
         let token = try await accessToken(false)
+        let policy = HTTPRetryPolicy.graph
         let result = try await performHTTPRequestWithRetry(
             url: baseURL + "/messages/\(encodedDraftId)", method: "DELETE", body: nil, token: token,
-            retryableStatusCodes: [429], session: testSession, logLabel: "Exchange"
+            retryableStatusCodes: policy.retryableStatusCodes, maxAttempts: policy.maxAttempts,
+            initialDelay: policy.initialDelay, session: testSession, logLabel: "Exchange", gate: mailboxGate
         )
         if result.statusCode == 404 {
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] deleteDraft: draft \(draftId) already deleted (404) — treating as success") }
@@ -1283,7 +1306,7 @@ actor ExchangeProvider: EmailProvider {
         if result.data != nil { return }
         if result.statusCode == 401 {
             let freshToken = try await accessToken(true)
-            let retry = try await performHTTPRequest(url: baseURL + "/messages/\(encodedDraftId)", method: "DELETE", body: nil, token: freshToken, session: testSession)
+            let retry = try await performHTTPRequest(url: baseURL + "/messages/\(encodedDraftId)", method: "DELETE", body: nil, token: freshToken, session: testSession, gate: mailboxGate)
             if retry.statusCode == 404 || retry.data != nil { return }
             throw ProviderError.networkError(underlying: NSError(domain: "Exchange", code: retry.statusCode))
         }
@@ -1482,10 +1505,11 @@ actor ExchangeProvider: EmailProvider {
             do {
                 data = try await requestAbsolute(url: link)
             } catch {
-                if link == historyId {
-                    // First request failed — delta link expired
-                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] Delta link expired — need full sync") }
-                    BackgroundSyncLogger.log("exchange.fetchHistory: delta link expired (first request failed: \(error.localizedDescription))")
+                // Graph can refuse the round on any page (a reset is `410 Gone` wherever it
+                // lands), and a refused round needs a full sync from a new cursor.
+                if Self.graphRefusedDeltaToken(error) {
+                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] Delta link refused — need full sync") }
+                    BackgroundSyncLogger.log("exchange.fetchHistory: delta link refused (\(link == historyId ? "first" : "later") request failed: \(error.localizedDescription))")
                     return nil
                 }
                 BackgroundSyncLogger.log("exchange.fetchHistory: page request failed: \(error.localizedDescription)")
@@ -1522,6 +1546,19 @@ actor ExchangeProvider: EmailProvider {
             labelsAdded: [],
             labelsRemoved: []
         )
+    }
+
+    /// Whether a failed delta request, on any page, means Graph refused the round,
+    /// so the cursor is discarded and the next full sync takes a new one. Graph
+    /// answers an expired token with "a 40X-series error with error codes such as
+    /// `syncStateNotFound`" and a reset with `410 Gone` (delta-query-overview).
+    /// An authorization failure (401, 403), a timeout (408), a throttle (429), a
+    /// server error (5xx) or a dropped connection says nothing about the token, so
+    /// the error is rethrown and the cursor kept for the next delta pass.
+    private static func graphRefusedDeltaToken(_ error: Error) -> Bool {
+        guard case ProviderError.networkError(let underlying) = error,
+              case HTTPError.networkError(let status) = underlying else { return false }
+        return (400..<500).contains(status) && ![401, 403, 408, 429].contains(status)
     }
 
     /// Protocol-required: fetch message headers by ID (non-batched version for delta sync).
@@ -1566,39 +1603,78 @@ actor ExchangeProvider: EmailProvider {
     }
 
     /// Get the current delta link for a folder (used to initialize the incremental sync cursor).
+    ///
+    /// The initial delta round returns every message in the folder, so this walks
+    /// the whole folder. Pages are sized with `Prefer: odata.maxpagesize`, the
+    /// documented control, sent on every page as Graph's examples do; the round
+    /// asks for ids only.
+    ///
+    /// A walk that was cut (see `deltaWalkContinuation`) resumes from its next
+    /// page when it is the same folder. If Graph refuses any page of a resumed
+    /// walk (its round is gone), the walk starts again at page 1 once, in the
+    /// same call; a refusal of a walk that started at page 1 throws.
     func getCurrentDeltaLink(folderId: String) async throws -> String? {
-        // Request delta with no changes to get the current delta link
         let encodedFolderId = try Self.encodedGraphPathSegment(folderId, context: "Graph folder id")
-        var nextLink: String? = "/mailFolders/\(encodedFolderId)/messages/delta?$select=id&\(topParam(1))"
-        var deltaLink: String?
+        let firstPage = "/mailFolders/\(encodedFolderId)/messages/delta?$select=id"
+        let pageSize = ["Prefer": "odata.maxpagesize=\(SyncConfig.graphDeltaCursorWalkPageSize)"]
+
+        var resumed = false
+        var nextLink: String? = firstPage
+        if let kept = deltaWalkContinuation {
+            if kept.folderId == folderId {
+                nextLink = kept.nextLink
+                resumed = true
+            } else {
+                deltaWalkContinuation = nil
+            }
+        }
+        BackgroundSyncLogger.logDebug("[Exchange] Delta cursor walk: \(resumed ? "resuming" : "starting")")
 
         // Walk through all pages to get the final deltaLink
         while let link = nextLink {
             let data: Data
-            if link.hasPrefix("http") {
-                data = try await requestAbsolute(url: link)
-            } else {
-                data = try await request(path: link)
+            do {
+                if link.hasPrefix("http") {
+                    data = try await requestAbsolute(url: link, extraHeaders: pageSize)
+                } else {
+                    data = try await request(path: link, extraHeaders: pageSize)
+                }
+            } catch {
+                if Self.graphRefusedDeltaToken(error) {
+                    deltaWalkContinuation = nil
+                    if resumed {
+                        BackgroundSyncLogger.logDebug("[Exchange] Delta cursor walk: resumed walk refused, starting again")
+                        resumed = false
+                        nextLink = firstPage
+                        continue
+                    }
+                }
+                throw error
             }
             let response = try JSONDecoder().decode(GraphDeltaResponse.self, from: data)
-            deltaLink = response.odataDeltaLink
+            if let deltaLink = response.odataDeltaLink {
+                deltaWalkContinuation = nil
+                return deltaLink
+            }
             nextLink = response.odataNextLink
+            deltaWalkContinuation = nextLink.map { (folderId: folderId, nextLink: $0) }
         }
 
-        return deltaLink
+        return nil
     }
 
     // MARK: - HTTP
 
     /// Lazily-built `AuthedHTTP` for Exchange/Graph. Shared 401-retry via
-    /// `AccountAuthSource`; rate-limit policy `.graph` = 429 only.
+    /// `AccountAuthSource`; rate-limit policy `.graph` (429 and 503, after
+    /// `Retry-After`); every request holds a slot of `mailboxGate`.
     private var authedHTTPCached: AuthedHTTP?
     private var authedHTTP: AuthedHTTP {
         if let cached = authedHTTPCached { return cached }
         let built = AuthedHTTP(
             auth: AccountAuthSource(accountId: userEmail, accessToken: accessToken),
             retry: .graph, logLabel: "Exchange", session: testSession,
-            onFailure: Self.logGraphFailure
+            onFailure: Self.logGraphFailure, gate: mailboxGate
         )
         authedHTTPCached = built
         return built
@@ -1664,7 +1740,7 @@ actor ExchangeProvider: EmailProvider {
     }
 
     /// Used by delta pagination — the next/delta links are absolute URLs.
-    private func requestAbsolute(url: String) async throws -> Data {
+    private func requestAbsolute(url: String, extraHeaders: [String: String] = [:]) async throws -> Data {
         guard let components = URLComponents(string: url),
               components.scheme == "https",
               components.host?.lowercased() == "graph.microsoft.com",
@@ -1676,7 +1752,7 @@ actor ExchangeProvider: EmailProvider {
         }
 
         do {
-            return try await authedHTTP.get(url)
+            return try await authedHTTP.get(url, extraHeaders: extraHeaders)
         } catch let e as HTTPError {
             throw ProviderError.networkError(underlying: e)
         }

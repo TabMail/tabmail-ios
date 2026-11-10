@@ -53,11 +53,12 @@ flips, or give a test seam a default that differs from production's initial valu
 - **MIS-IOS-027** — **subtracted screen-px `getBoundingClientRect().height` from CSS-px `margin-bottom`** in `tmFitQuoteContent`; a sender `transform` doubled it; tell = rect geometry written back into a style as px (×1)
 - **MIS-IOS-028** — scheduled a later `withPromptStore` from a `Task` created INSIDE a hold; it inherited `PromptSemaphore.holding` and was refused as nested; create it under `$holding.withValue(nil)`.
 - **MIS-IOS-029** — declared a surviving mutant "equivalent" after tracing only the state at the call, then deleted the guard; a survivor is a missing test until one fails on it.
+- **MIS-IOS-034** — kept an Outlook-only fact as per-account state on `SyncEngine`; it belongs on the provider.
 
 ## Build & test ops
 
 - **MIS-IOS-005** — ran bare `xcodegen generate`; literal `${DEVELOPMENT_TEAM}` → NSE never launches → smart push silently dies while background push still works. (×2)
-- **MIS-IOS-006** — recorded a baseline from a stale `.xctest`; a new file is not in the target until `./Scripts/xcodegen.sh` runs, and a peer build holding `build.db` makes `test-without-building` measure the PREVIOUS bundle. **Verify new tests by NAME; gate on `TEST BUILD SUCCEEDED`; one simulator per concurrent test job; a 0-total `-only-testing:` run is a failure, not a pass.** (×11)
+- **MIS-IOS-006** — recorded a baseline from a stale `.xctest`; a new file is not in the target until `./Scripts/xcodegen.sh` runs, and a peer build holding `build.db` makes `test-without-building` measure the PREVIOUS bundle. **Verify new tests by NAME; gate on `TEST BUILD SUCCEEDED`; one simulator per concurrent test job; a 0-total `-only-testing:` run is a failure, not a pass.** (×12)
 - **MIS-IOS-014** — wrote a red-first proof that **could not run red**: a fixture SIZED in situ went NEGATIVE once the inverted code bisected to 0, and `String(repeating:count:)` **TRAPS**, burying 101 real failures. **`Fatal error`, or >1 `Test run with` line, = not evidence.** (×1)
 
 ## Companion tree — the proof that stopped running

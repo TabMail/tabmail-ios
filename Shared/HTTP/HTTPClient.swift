@@ -21,6 +21,33 @@ enum HTTPConfig {
     /// (`BackendClient.llmSession`, `SyncConfig.llmResourceTimeoutSeconds`) and
     /// is unaffected.
     static let sharedResourceTimeoutSeconds: TimeInterval = 300
+    /// The most one `performHTTPRequestWithRetry` call sleeps across all its
+    /// retries, `Retry-After` waits and back-off alike. A retry whose wait would
+    /// pass it is not made: the call returns the refusal, and the caller's own
+    /// retry (the next sync pass, the queue's next drain) comes later. The
+    /// back-off without a header (1 + 2 + 4 s) fits inside it unchanged. It bounds
+    /// sleeping only; a caller with a deadline also sets `HTTPDeadline.current`,
+    /// which bounds the time the retries take, requests included.
+    static let retryWaitBudgetSeconds: TimeInterval = 10
+    /// Statuses with which a server says "come back later" rather than "this
+    /// request is wrong": 429 Too Many Requests and 503 Service Unavailable
+    /// (RFC 9110 §15.6.4, RFC 6585 §4). Read through `HTTPError.asksToRetryLater`.
+    static let retryLaterStatusCodes: Set<Int> = [429, 503]
+}
+
+/// The moment by which the caller needs an answer, when it has one: the queue
+/// sets it to its operation deadline (`SyncConfig.pendingOperationTimeoutSeconds`)
+/// around each queued action. `performHTTPRequestWithRetry` makes a retry only if
+/// its wait plus one more request (as long as the one just answered took, slot
+/// wait included) ends before it, and otherwise returns the refusal it holds, so
+/// a refusal received in time reaches the caller as a refusal rather than being
+/// cut off by the caller's timeout, as long as the next request is no slower than
+/// the last one. A retry that runs slower, and any request still on the wire when
+/// the deadline passes, has an unknown outcome, and the caller's timeout handles it.
+/// Nil (sync passes, the notification service extension) leaves only
+/// `HTTPConfig.retryWaitBudgetSeconds`.
+enum HTTPDeadline {
+    @TaskLocal static var current: ContinuousClock.Instant?
 }
 
 /// Shared ephemeral URLSession for all HTTP providers (Gmail, Exchange, backend calls).
@@ -54,11 +81,23 @@ struct HTTPRequestResult: Sendable {
     /// defaulted `let` is baked in as a fixed constant and cannot be
     /// customized per instance.
     var errorBody: Data? = nil
+    /// The response's `Retry-After`, in seconds, when it gives a non-negative
+    /// number of seconds (the form Microsoft Graph sends on 429 and 503). `nil`
+    /// when the header is absent or is an HTTP date.
+    var retryAfter: TimeInterval? = nil
+}
+
+/// `Retry-After` as delta-seconds (RFC 9110, section 10.2.3), or nil.
+func retryAfterSeconds(_ response: URLResponse) -> TimeInterval? {
+    guard let raw = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Retry-After"),
+          let seconds = Int(raw.trimmingCharacters(in: .whitespaces)), seconds >= 0 else { return nil }
+    return TimeInterval(seconds)
 }
 
 /// Execute an HTTP request with Bearer token authentication.
 /// Shared by every REST provider (Gmail, Exchange, Google Calendar, Exchange Calendar, BackendClient).
 /// Handles URL construction, headers, Content-Type for JSON body, and optional error logging.
+/// With a `gate`, the request holds one of its slots while it is on the wire.
 func performHTTPRequest(
     url urlString: String,
     method: String,
@@ -66,9 +105,10 @@ func performHTTPRequest(
     token: String,
     extraHeaders: [String: String] = [:],
     session: URLSession? = nil,
-    logLabel: String? = nil
+    logLabel: String? = nil,
+    gate: HTTPConcurrencyGate? = nil
 ) async throws -> HTTPRequestResult {
-    let session = session ?? sharedEphemeralSession
+    let session = session ?? AuthedHTTP.sessionOverride ?? sharedEphemeralSession
     guard let url = URL(string: urlString) else {
         throw HTTPError.invalidURL(urlString)
     }
@@ -86,7 +126,11 @@ func performHTTPRequest(
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
     }
 
-    let (data, response) = try await session.data(for: req)
+    let (data, response) = if let gate {
+        try await gate.withSlot { try await session.data(for: req) }
+    } else {
+        try await session.data(for: req)
+    }
     let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
     if 200..<300 ~= statusCode {
         return HTTPRequestResult(data: data, statusCode: statusCode)
@@ -100,12 +144,21 @@ func performHTTPRequest(
         #endif
     }
 
-    return HTTPRequestResult(data: nil, statusCode: statusCode, errorBody: data.isEmpty ? nil : data)
+    return HTTPRequestResult(
+        data: nil, statusCode: statusCode, errorBody: data.isEmpty ? nil : data,
+        retryAfter: retryAfterSeconds(response))
 }
 
-/// Execute an HTTP request with automatic retry on rate-limiting status codes.
-/// Uses exponential backoff (initialDelay, 2×, 4×, ...) up to `maxAttempts` retries.
-/// Gmail uses `[429, 403]` (per-user rateLimitExceeded is 403); Graph uses `[429]`.
+/// Execute an HTTP request with automatic retry on rate-limiting status codes,
+/// up to `maxAttempts` retries. Each retry waits for the response's `Retry-After`
+/// when it has one, as Graph asks ("Wait the number of seconds specified in the
+/// Retry-After header"), and otherwise backs off exponentially (initialDelay, 2×,
+/// 4×, ...). The sleeps of one call add up to at most
+/// `HTTPConfig.retryWaitBudgetSeconds`, and under an `HTTPDeadline` a retry is
+/// made only if its wait plus a request as long as the last one ends before the
+/// deadline; a retry outside either bound is not made and the refusal is
+/// returned. Gmail retries `[429, 403]` (per-user rateLimitExceeded is 403);
+/// Graph retries `[429, 503]`.
 func performHTTPRequestWithRetry(
     url urlString: String,
     method: String,
@@ -116,29 +169,55 @@ func performHTTPRequestWithRetry(
     maxAttempts: Int = 3,
     initialDelay: TimeInterval = 1.0,
     session: URLSession? = nil,
-    logLabel: String? = nil
+    logLabel: String? = nil,
+    gate: HTTPConcurrencyGate? = nil
 ) async throws -> HTTPRequestResult {
+    let clock = ContinuousClock()
+    var started = clock.now
     var result = try await performHTTPRequest(
         url: urlString, method: method, body: body, token: token,
-        extraHeaders: extraHeaders, session: session, logLabel: logLabel
+        extraHeaders: extraHeaders, session: session, logLabel: logLabel, gate: gate
     )
+    // How long the last request took, slot wait included: the estimate of the
+    // next one that the deadline check below uses.
+    var lastRequest = clock.now - started
 
     if result.data != nil || !retryableStatusCodes.contains(result.statusCode) {
         return result
     }
 
+    var waited: TimeInterval = 0
     for attempt in 0..<maxAttempts {
-        let delay = initialDelay * Double(1 << attempt)
+        let delay = result.retryAfter ?? initialDelay * Double(1 << attempt)
+        guard waited + delay <= HTTPConfig.retryWaitBudgetSeconds else {
+            if let logLabel {
+                #if DEBUG
+                print("[\(logLabel)] HTTP \(result.statusCode): a \(delay)s wait would pass the \(HTTPConfig.retryWaitBudgetSeconds)s retry budget; not retrying now")
+                #endif
+            }
+            return result
+        }
+        if let deadline = HTTPDeadline.current, clock.now + .seconds(delay) + lastRequest > deadline {
+            if let logLabel {
+                #if DEBUG
+                print("[\(logLabel)] HTTP \(result.statusCode): a retry after \(delay)s would not end before the caller's deadline; not retrying now")
+                #endif
+            }
+            return result
+        }
+        waited += delay
         if let logLabel {
             #if DEBUG
             print("[\(logLabel)] Rate limited (\(result.statusCode)), retrying in \(delay)s (attempt \(attempt + 1)/\(maxAttempts))")
             #endif
         }
         try await Task.sleep(for: .seconds(delay))
+        started = clock.now
         result = try await performHTTPRequest(
             url: urlString, method: method, body: body, token: token,
-            extraHeaders: extraHeaders, session: session, logLabel: logLabel
+            extraHeaders: extraHeaders, session: session, logLabel: logLabel, gate: gate
         )
+        lastRequest = clock.now - started
         if result.data != nil { return result }
         if !retryableStatusCodes.contains(result.statusCode) { break }
     }
@@ -159,4 +238,15 @@ enum HTTPError: Error, Sendable {
     /// Graph's `ErrorInvalidIdMalformed` 400) instead of guessing from the
     /// status code alone.
     case networkErrorWithBody(statusCode: Int, body: Data)
+
+    /// The server refused for now and asked to be tried again later (throttled or
+    /// temporarily unavailable). Graph and Gmail both document these as retryable
+    /// after a delay, so a caller that keeps the work for its own next pass loses
+    /// nothing.
+    var asksToRetryLater: Bool {
+        if case .networkError(let statusCode) = self {
+            return HTTPConfig.retryLaterStatusCodes.contains(statusCode)
+        }
+        return false
+    }
 }
