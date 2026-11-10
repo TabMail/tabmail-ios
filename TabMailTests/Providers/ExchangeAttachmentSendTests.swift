@@ -169,7 +169,7 @@ struct ExchangeAttachmentSendTests {
                 }
             }
             http.register(path: "/messages/", method: "DELETE") { request in
-                if self.refuseDeletes.withLock({ $0 }) { return .status(503) }
+                if self.refuseDeletes.withLock({ $0 }) { return .graphUnavailableBeyondRetry }
                 let id = Self.messageId(request) ?? ""
                 return self.state.withLock { $0.drafts.removeValue(forKey: id) } == nil ? .status(404) : .status(204)
             }

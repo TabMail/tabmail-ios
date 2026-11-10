@@ -63,6 +63,75 @@ struct GraphOnlineMeetingBodyTests {
         #expect(out == GraphFixture.htmlHead + "Bring &lt;laptop&gt; &amp; charger<br>\r\nRoom 2\r\n" + section)
     }
 
+    /// The notes `replacingNotes` writes for `notes`, between the document's start and the join section.
+    private func writtenNotes(_ notes: String) throws -> String {
+        let out = try #require(GraphOnlineMeetingBody.replacingNotes(
+            in: GraphFixture.htmlHead + "Old\r\n" + section, joinUrl: joinUrl, with: notes))
+        #expect(out.hasPrefix(GraphFixture.htmlHead) && out.hasSuffix("\r\n" + section), "the notes' surroundings changed")
+        return String(out.dropFirst(GraphFixture.htmlHead.count).dropLast(("\r\n" + section).count))
+    }
+
+    @Test("a web, mail or phone link in new notes is written as a link", arguments: [
+        ("See [the agenda](https://example.com/a?b=1&c=2) now", "See <a href=\"https://example.com/a?b=1&amp;c=2\">the agenda</a> now"),
+        ("[Old page](http://example.com/)", "<a href=\"http://example.com/\">Old page</a>"),
+        ("Ask [Ana](mailto:ana@example.com)", "Ask <a href=\"mailto:ana@example.com\">Ana</a>"),
+        ("[Call in](tel:+15550100)", "<a href=\"tel:+15550100\">Call in</a>"),
+        ("[Upper](HTTPS://example.com/x)", "<a href=\"HTTPS://example.com/x\">Upper</a>"),
+        ("[Doc](https://example.com:8443/:w:/a?t=10:30)", "<a href=\"https://example.com:8443/:w:/a?t=10:30\">Doc</a>"),
+    ])
+    func linksAreWrittenAsLinks(_ notes: String, _ html: String) throws {
+        #expect(try writtenNotes(notes) == html)
+    }
+
+    @Test("a link as a read gives it is written with the read's escapes reversed")
+    func readEscapesAreReversed() throws {
+        let notes = "[Terms &amp; \\[beta\\]](https://example.com/t\\(1\\))"
+        #expect(try writtenNotes(notes) == "<a href=\"https://example.com/t(1)\">Terms &amp; [beta]</a>")
+    }
+
+    @Test("a link to any other kind of destination stays as its text", arguments: [
+        "[x](javascript:alert)", "[file](file:///etc/hosts)", "[here](/relative/path)", "[data](data:text/html,hi)",
+    ])
+    func otherLinksStayText(_ notes: String) throws {
+        let html = try writtenNotes(notes)
+        #expect(!html.contains("<a"), "written as a link: \(html)")
+        #expect(html == notes, "the link's text changed: \(html)")
+    }
+
+    @Test("a link to any other kind of destination is written as escaped text", arguments: [
+        "[<b>x</b> & \"q\"  y](javascript:a<b>&\"c)",
+        "[\\<img src=x onerror=y\\>](javascript:x)",
+    ])
+    func otherLinksAreEscaped(_ notes: String) throws {
+        let html = try writtenNotes(notes)
+        #expect(!html.contains("<"), "markup in the written notes: \(html)")
+        #expect(EmailFilter.htmlToPlainText(html, keepingSpacing: true) == notes, "read back: \(html)")
+    }
+
+    @Test("a link's label and destination can't add markup or leave the link")
+    func linkCannotBreakOut() throws {
+        let html = try writtenNotes("[<b>x</b>](https://example.com/?q=\"a\"onclick=y)")
+        #expect(html == "<a href=\"https://example.com/?q=&quot;a&quot;onclick=y\">&lt;b&gt;x&lt;/b&gt;</a>")
+    }
+
+    @Test("a quote or < joined to a mark that combines with it is still escaped",
+          arguments: ["\"\u{301}", "\u{600}\"", "\"\u{200D}", "\"\u{903}"])
+    func joinedQuoteCannotBreakOut(_ quote: String) throws {
+        let html = try writtenNotes("[x](https://example.com/\(quote)/onmouseover=y//) a<\u{301}b")
+        let quotes = html.unicodeScalars.filter { $0 == "\"" }.count
+        #expect(quotes == 2, "a raw quote ends the href early: \(html.unicodeScalars.map { String($0) })")
+        let opens = html.unicodeScalars.filter { $0 == "<" }.count
+        #expect(opens == 2, "a raw < opens a tag: \(html)")
+        #expect(html.hasPrefix("<a href=\"https://example.com/"))
+    }
+
+    @Test("runs of spaces, and spaces that start or end a line, are kept")
+    func spacingIsKept() throws {
+        let html = try writtenNotes("Two  spaces,   three\n  indented [a  link](https://example.com)\nend ")
+        #expect(html == "Two &nbsp;spaces, &nbsp;&nbsp;three<br>\r\n&nbsp;&nbsp;indented "
+                + "<a href=\"https://example.com\">a &nbsp;link</a><br>\r\nend&nbsp;")
+    }
+
     @Test("the notes start after a body tag with attributes, or at the start when there is none")
     func bodyTagForms() throws {
         let withAttributes = "<html><body lang=\"en\" dir=\"ltr\">Old" + section

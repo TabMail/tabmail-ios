@@ -897,8 +897,9 @@ enum CalendarToolHelpers {
     ///
     /// The `isAllDay` a caller passes decides the UNTIL's VALUE TYPE (RFC 5545 §3.3.10), so an edit
     /// that does not restate `all_day` has to learn it from the event before it can build a legal
-    /// rule — and learning it costs a `getEvent`. This predicate is what keeps that fetch off every
-    /// other edit: it answers "is an UNTIL actually at stake here?" and nothing else.
+    /// rule — and learning it costs a `getEvent`. This predicate is the UNTIL half of that fetch's
+    /// gate (the other half is a `start_iso`/`end_iso` the edit gives, which the same flag renders;
+    /// see the `.edit` case): it answers "is an UNTIL actually at stake here?" and nothing else.
     ///
     /// It MIRRORS the recurrence branch of `buildGCalEventInput` deliberately, in the same order and
     /// on the same cases, because a predicate that disagrees with the producer it guards is worse
@@ -925,6 +926,26 @@ enum CalendarToolHelpers {
         if case .double = rec["count"] { return false }
         if case .string = rec["until"] { return true }
         return false
+    }
+
+    /// Why an all-day edit's `end_iso` cannot be written, or nil when it can.
+    ///
+    /// An all-day end is EXCLUSIVE (the day after the last day; RFC 5545 §3.6.1, and Google's and
+    /// Graph's `end.date`), so an end on or before the start is a zero-length or inverted event.
+    /// Compared by DATE, the `prefix(10)` `buildGCalEventInput` writes for an all-day start and end:
+    /// the end is `end_iso`'s date, the start is `start_iso`'s date or, when the edit gives only an
+    /// end, `targetStartDate`: the date of the start the edit keeps (the event's stored start, or for
+    /// one occurrence or a split the occurrence's own date; the caller decides which). On iOS an edit
+    /// that gives only an end keeps its start on every provider, so an end on or before that start
+    /// is refused here rather than written as an inverted event. Nil, never a refusal, when `allDay`
+    /// is not true, when the edit gives no `end_iso` (a start alone keeps the event's length), or
+    /// when there is no start to compare against.
+    static func allDayEditEndRefusal(_ arguments: [String: JSONValue], allDay: Bool?, targetStartDate: String?) -> String? {
+        guard allDay == true, let endIso = stringArgOpt(arguments, "end_iso") else { return nil }
+        guard let startDay = stringArgOpt(arguments, "start_iso").map({ String($0.prefix(10)) }) ?? targetStartDate.map({ String($0.prefix(10)) })
+        else { return nil }
+        guard String(endIso.prefix(10)) <= startDay else { return nil }
+        return "an all-day event's end_iso is the day after its last day, so it must be later than start_iso: give the next day, or all_day: false for a timed event"
     }
 
     /// RFC 5545 `FREQ` is a closed token set. Returns the canonical token, or nil if unrecognised.

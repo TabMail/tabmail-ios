@@ -136,6 +136,31 @@ struct EmailFilterTests {
         #expect(EmailFilter.snippetFromPlainText("[a [b](https://example.com) c") == "[a b c")
     }
 
+    @Test("markdownPieces gives each link's label and destination with the read's escapes reversed")
+    func markdownPiecesUnescape() {
+        let source = "[Terms &amp; \\[beta\\]](https://example.com/t\\(1\\))"
+        #expect(EmailFilter.markdownPieces("See " + source + " now") == [
+            .text("See "),
+            .link(label: "Terms & [beta]", destination: "https://example.com/t(1)", source: source),
+            .text(" now"),
+        ])
+    }
+
+    @Test("markdownPieces gives the text back when its pieces are joined", arguments: [
+        "", "plain", "[a](b)[c](d)", "see [note] and (aside)", "[label](https://example.com/unterminated",
+        "[x] (https://example.com)", "[a\nb](https://example.com)", "[a](x\\", "[[x](y)", "\\[a](b)",
+        String(repeating: "[](", count: 200),
+    ])
+    func markdownPiecesJoinBack(_ text: String) {
+        let joined = EmailFilter.markdownPieces(text).map { piece -> String in
+            switch piece {
+            case .text(let text): text
+            case .link(_, _, let source): source
+            }
+        }.joined()
+        #expect(joined == text)
+    }
+
     @Test("snippetFromPlainText rejects whitespace, a trailing backslash, or an escaped newline inside a link")
     func snippetKeepsMalformedLinks() {
         // Prose that merely looks like a link — the destination has a space

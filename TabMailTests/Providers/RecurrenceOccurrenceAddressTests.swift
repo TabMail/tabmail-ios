@@ -803,7 +803,7 @@ struct CalendarQueueUntilValueTypeTests {
         END:VEVENT\r
         END:VCALENDAR\r
         """
-        let merged = CalDAVProvider.mergePatchIntoICS(masterICS, patch: r.updates[0].event)
+        let merged = try CalDAVProvider.mergePatchIntoICS(masterICS, patch: r.updates[0].event)
         let lines = merged.split(whereSeparator: \.isNewline).map(String.init)
         let dtstart = lines.first { $0.hasPrefix("DTSTART") }
         let rrule = lines.first { $0.hasPrefix("RRULE:") }

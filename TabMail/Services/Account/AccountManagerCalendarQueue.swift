@@ -840,15 +840,19 @@ extension AccountManager {
             // stating it is how the agent converts a timed event to all-day and back, and overriding
             // that would break the conversion.
             //
-            // ⚠️ **THIS FLAG ALSO RENDERS START/END, AND THE PROVIDERS DIVERGE.**
-            // `buildGCalEventInput` picks `startDate`/`endDate` over `startDateTime`/`endDateTime`
-            // from it, so a timed `start_iso` on an all-day resource now emits a bare date. On CalDAV
-            // that is a GAIN, not a loss: `mergePatchIntoICS` takes the value type from
-            // `masterDTStartKind` and `formatDTLine`'s `.allDay` arm reads only `patch.startDate`, so
-            // a timed patch left DTSTART untouched while the RRULE was replaced — that pair WAS the
-            // §3.3.10 mismatch. On Google and Exchange `mergeExistingEventWithPatch` passes the
-            // patch's start through, so there the cost is a conversion the timed `start_iso` used to
-            // perform implicitly — which CalDAV cannot express here at all.
+            // **THE SAME FLAG DECIDES A MOVE'S KIND, SO A MOVE RESOLVES IT TOO.**
+            // `buildGCalEventInput` renders `start_iso`/`end_iso` as `startDate`/`endDate` only when
+            // this flag is true. An edit that moves an all-day event and leaves `all_day` out (the
+            // tool documents it as "Omit to keep existing") rendered its dates as
+            // `startDateTime`/`endDateTime`: Google's `mergeExistingEventWithPatch` passed them
+            // through and Exchange's `toGraphEventJSON` stamped `isAllDay: false`, so the event was
+            // saved as a timed one, and on CalDAV `formatDTLine`'s `.allDay` arm reads only
+            // `patch.startDate`, so the same edit did not move the event at all. The rule, the
+            // Thunderbird add-on's for the same defect: the edit's kind is `all_day` when the edit
+            // states it, otherwise the event's own kind. So an all-day event given new dates stays
+            // all-day on those dates (a time of day in them is dropped, `prefix(10)`), and a timed
+            // one given a date alone (`…T00:00:00`) stays timed, at midnight. A stated `all_day`
+            // still wins both ways, and `.create` is unchanged (missing means timed).
             //
             // ⚠️ **TYPE-OF-CHECK / TYPE-OF-USE, accepted.** This GET is not the GET the write merges
             // against, so a conversion between the two reads mismatches the pair in EITHER direction
@@ -858,19 +862,26 @@ extension AccountManager {
             // two symbols for the codes and for what happens when the retire itself cannot persist.
             // Case table and why it stays unfixed: memory 115, residual 4.
             //
-            // Bounded on purpose: gated on `recurrenceUntilIsAtStake`, so no edit that does not emit
-            // an UNTIL pays a round trip. An edit that changes attendees AND sets an UNTIL fetches
-            // twice, because `resolveAttendeeDelta` fetches independently above; that is two GETs on
-            // one narrow combination, and it is accepted rather than refactoring that function's
+            // The gate: an absent `all_day` is resolved when the edit gives `start_iso` or `end_iso`
+            // (the flag renders them) or when `recurrenceUntilIsAtStake` (the flag types the UNTIL).
+            // It is resolved here, once, before the scope switch, so every provider's edit and every
+            // `edit_scope` gets its kind from the same place. An edit that moves nothing and sets no
+            // UNTIL (a rename, a description, attendees alone) pays no round trip. An edit that
+            // changes attendees AND resolves the kind fetches twice, because `resolveAttendeeDelta`
+            // fetches independently above; that is accepted rather than refactoring that function's
             // signature to thread the event back out.
             //
             // A failed fetch does NOT guess: the throw propagates and the drain classifies it —
             // transient ⇒ retried, permanent ⇒ retired with a reason. Fail closed, per THE MANTRA; a
-            // defaulted value here would be the same wrong-value-type write, chosen by us instead of
-            // the model.
+            // defaulted value here would be the same wrong-kind write, chosen by us instead of the
+            // model.
+            let movesTime = CalendarToolHelpers.stringArgOpt(resolvedArgs, "start_iso") != nil
+                || CalendarToolHelpers.stringArgOpt(resolvedArgs, "end_iso") != nil
+            var stored: GCalEvent? = nil
             if resolvedAllDay == nil,
-               CalendarToolHelpers.recurrenceUntilIsAtStake(resolvedArgs) {
+               movesTime || CalendarToolHelpers.recurrenceUntilIsAtStake(resolvedArgs) {
                 let current = try await provider.getEvent(calendarId: calId, eventId: eventId)
+                stored = current
                 // `GCalDateTime.date` is populated only for an all-day event, on every provider:
                 // `ICSParser.makeGCalDateTime` (CalDAV), `ExchangeCalendarProvider.toGCalDateTime`,
                 // `DemoCalendarProvider`, and Google's own JSON all put the timed form in `dateTime`.
@@ -878,17 +889,61 @@ extension AccountManager {
                 // Gated per global rule 12 — this is a new diagnostic, and the surrounding ungated
                 // `print`s are the pre-existing corpus registered as `IOS-LOG-003`, not a licence.
                 if DebugModeManager.isLoggingEnabled() {
-                    BackgroundSyncLogger.logDebug("[CalendarQueue] Edit sets an RRULE UNTIL with no all_day argument — resolved allDay=\(resolvedAllDay == true) from the resource")
+                    BackgroundSyncLogger.logDebug("[CalendarQueue] Edit moves the event or sets an RRULE UNTIL with no all_day argument — resolved allDay=\(resolvedAllDay == true) from the resource")
                 }
             }
-            let input = try CalendarToolHelpers.buildGCalEventInput(resolvedArgs, isAllDay: resolvedAllDay)
-
             // Route by edit_scope (calendar_event_edit-v1.5.21+). Default: 'all'
             // when no recurrence_id, 'this_only' when recurrence_id is present
             // (back-compat with the earlier schema where recurrence_id alone
             // implied single-occurrence override).
             let explicitScope = CalendarToolHelpers.stringArgOpt(resolvedArgs, "edit_scope")?.lowercased()
             let recurrenceId = CalendarToolHelpers.stringArgOpt(resolvedArgs, "recurrence_id")
+            let scope: String = explicitScope
+                ?? (recurrenceId != nil ? "this_only" : "all")
+
+            // THE EDIT TARGET'S START DATE, resolved once here with the scope: on `this_only` and
+            // `this_and_following` the target is the occurrence, whose start is `recurrence_id`'s date
+            // (the start the override or the new series keeps), with no read; on `all` it is the
+            // event's stored start, taken from the read above when there was one. The master's start
+            // is earlier than any later occurrence's, so a scoped edit compared with it would pass an
+            // end on the occurrence's own start. On `all` the event is read here only when the
+            // refusal below needs it (an explicit `all_day: true` skipped the read above and the edit
+            // gives an end but no start); otherwise the value stays nil. The KIND still comes from the
+            // stored event above, on every scope: an occurrence has its series' kind.
+            let movesEndOnly = CalendarToolHelpers.stringArgOpt(resolvedArgs, "end_iso") != nil
+                && CalendarToolHelpers.stringArgOpt(resolvedArgs, "start_iso") == nil
+            let targetStartDate: String?
+            switch scope {
+            case "this_only", "this_and_following":
+                targetStartDate = recurrenceId.map { String($0.prefix(10)) }
+            case "all":
+                var target = stored
+                if target == nil, resolvedAllDay == true, movesEndOnly {
+                    target = try await provider.getEvent(calendarId: calId, eventId: eventId)
+                }
+                targetStartDate = target.flatMap { $0.start?.date ?? $0.start?.dateTime.map { String($0.prefix(10)) } }
+            default:
+                // An unrecognized scope is refused by the switch below.
+                targetStartDate = nil
+            }
+
+            // An all-day end is the day after the last day, so an all-day edit whose end is on or
+            // before its start would write a zero-length event (an all-day event given times of one
+            // day without `all_day`, or `all_day: true` with a same-day end). Refused here, before
+            // the scope switch and so before a split's first write, as a terminal `notSupported`
+            // the drain retires and announces. The start is `start_iso`'s date when the edit gives
+            // one, else the target's start date above, which an end-only edit keeps on every
+            // provider. A start given alone is never refused: Google, Outlook and the CalDAV
+            // whole-series merge carry the end by the event's length. A CalDAV single-occurrence
+            // override given a start alone does not yet carry its end, a known gap this check does
+            // not cover. An edit that gives no times is not checked, so an event already stored
+            // that way can still be renamed.
+            if resolvedAllDay == true,
+               let reason = CalendarToolHelpers.allDayEditEndRefusal(resolvedArgs, allDay: true, targetStartDate: targetStartDate) {
+                throw CalendarProviderError.notSupported(reason)
+            }
+            let input = try CalendarToolHelpers.buildGCalEventInput(resolvedArgs, isAllDay: resolvedAllDay)
+
             // 🚨 THE OTHER HALF OF THE OCCURRENCE ADDRESS. `recurrence_id` is a
             // naive wall clock with no offset; on its own it does not name an
             // instant. `calendar_event_edit`'s schema already publishes the frame
@@ -900,8 +955,6 @@ extension AccountManager {
             // never carried across — the calendar instance of THE ADDRESS PROBLEM.
             // Resolving it here, once, is what lets every provider agree.
             let recurrenceIdZone = CalendarToolHelpers.resolveTimeZone(resolvedArgs)
-            let scope: String = explicitScope
-                ?? (recurrenceId != nil ? "this_only" : "all")
 
             switch scope {
             case "this_only":

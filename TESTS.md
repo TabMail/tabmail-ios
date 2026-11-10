@@ -83,6 +83,16 @@ description; `CalendarToolHelpersTests` pins the `conference_url:` line after th
 event pill's notes (join link first); `ToolCachingTests` checks that the search and direct-read pill
 caches carry the join link (including a read that finds the event by scanning every calendar), and
 that in a new session a pill tap that fetches the event live shows it.
+Notes written back as HTML (#577): `GraphOnlineMeetingBodyTests` writes a web, mail or phone link in
+new notes as a link (with the read's escapes reversed), keeps a link to any other kind of destination
+as its text (escaped, so markup in its label or destination stays text), writes a link whose
+destination holds more colons (a port, a path, a query) as a link, escapes a label or destination so it can't add markup or leave the link (also a quote or
+`<` joined to a combining, joining, spacing or Prepend mark), and keeps runs of spaces and spaces that
+start or end a line; `ExchangeCalendarEditPreservationTests` reads back notes with links (web, mail,
+phone, and one carrying every escape a read writes in a label or destination) and runs of spaces
+exactly as written, for an online meeting and a plain event, and checks
+that a description read and written back keeps its link as a link; `EmailFilterTests` pins
+`markdownPieces` (unescaped label and destination, and the pieces joining back to the text).
 
 ## Inbox list — layered test architecture
 
@@ -279,7 +289,10 @@ search request the way Gmail reads a query string (`&` separates parameters,
 `=` splits name from value, `+` is a space) and asserts that the user's text,
 including `&`, `+`, `=`, `%`, `#`, non-ASCII characters, literal percent escapes
 such as `%26` (which must not be decoded first) and a `from:` address with a `+`
-tag, comes back as exactly one `q`, with no stray parameter.
+tag, comes back as exactly one `q`, with no stray parameter. Search text holding
+the synthetic All Mail marker is sent as typed: `GmailProviderMockTests.syntheticFolderGuard`
+asserts the guard refuses the marker in the path and in folder parameters such as
+`labelIds`, and never in `q`.
 
 ## Delta detail fetches — a failed fetch is never taken for a deleted message
 
@@ -311,6 +324,30 @@ calendar, and with nothing resolvable it says so and queues nothing; an edit or
 delete given a bare event id reads the event through the resolved calendar (the
 card shows the real event) but still queues nothing and sends nothing, and with
 nothing resolvable it is refused before any card.
+
+## Google Calendar search text and OAuth token bodies on the wire
+
+`GoogleCalendarSearchEncodingTests.searchTextReachesGoogleCalendarIntact`
+decodes the recorded `listEvents` request the same way and asserts that the
+event search text (with `&`, `+`, `=`, `%`, `#`, non-ASCII characters and
+literal percent escapes) comes back as exactly one `q`, with no stray parameter.
+`OAuthTokenRequestTests` builds the Google and Microsoft code-exchange and
+refresh requests and reads each body as a form, asserting that a code,
+verifier or refresh token holding `+`, `&`, `=`, `/` or a literal `%2B` arrives
+exactly as given, every field appears once, and the endpoint, method and
+content type are the token endpoint's. The same suite drives the four real
+sign-in and refresh calls (`OAuthService` with a fake token transport) and
+asserts each sends its own grant, once, to its own provider's endpoint.
+`GmailProviderExactDraftResourceTests` serves a later drafts page only for the
+exact page token it issued (one holding `+`, `/`, `=`, `&` and a space) and
+reads the second request's query as a form. `CredentialRefreshContractTests` reads
+the notification extension's refresh body the same way, with a grant holding
+`+`, `&`, `=` and `/`. All four use `FormDecoding` (test helper). Every one of
+these values, and Graph ids and search text, Gmail search and the Gmail
+drafts.list and history.list page tokens, is encoded by the single
+`StrictPercentEncoding` in `Shared/HTTP`. A synthetic folder marker that reaches
+the bad-request-preserving entry (`modifyMessage`) is refused before any network
+call, as at the ordinary request entry.
 
 ## Gmail older-mail paging — one failed message does not stop the page
 
@@ -399,3 +436,43 @@ answers whole numbers at the ends of `Int`, with tolerances whose window edge fa
 range, by leaving that side of the window unbounded; `MemoryIndexTests` reads a turn with no session
 through a window whose upper or lower edge falls past that range. The delete tests check that a fractional id
 in `unique_ids` is dropped, not truncated.
+
+## CalDAV series edits — moving a series' time
+
+`CalDAVSeriesStartShiftTests` checks what an edit that moves a repeating
+CalDAV series' start does to the values tied to that start. `SeriesOracle`
+reads a weekly series independently of the code under test (occurrences on
+the wall clock from `DTSTART`, cut by `UNTIL` or `COUNT`, matched against
+`EXDATE` and each override's `RECURRENCE-ID` as instants), and each move must
+keep every occurrence in the same state: deleted, changed, or shown, the last
+one included. Cases cover a same-day time change, a one-week move across a
+daylight-saving change, values a server stored in UTC, all-day and floating
+series, an RRULE the edit writes itself, `RDATE` and `PERIOD` values, a
+folded `EXDATE`, and a zone the device does not know (moved on the wall clock
+when no conversion is needed, refused when one is).
+`CalDAVSeriesStartShiftWireTests` drives the same through `updateEvent` over
+the fake CalDAV store: a movable series lands whole in one `PUT`; an
+unmovable one is refused with no `PUT` and the server keeps the original.
+
+## Calendar edits keep the event's kind
+
+`CalendarEditKeepsKindTests.swift` drains real `.edit` rows through `AccountManager.drainCalendarQueue`.
+An edit that leaves `all_day` out keeps the event's kind: an all-day event given new dates stays all-day on
+those dates (a time of day in them is dropped), a start alone carries the end by whole days, and a timed
+event given a date alone stays timed at midnight. A stated `all_day` changes the kind either way. The Google
+and Outlook suites run the providers against stateful fakes on `FakeHTTP` (PATCH replaces the properties it
+names) and assert on the stored event, for a single event, one occurrence and, on Google, a split's new
+series. The CalDAV suite asserts on the stored `.ics`: a move lands as `VALUE=DATE` lines, and a split's new
+series starts on the date given; a start given alone moves `DTEND` with it, so an all-day event keeps its
+days and a timed one its length across the March daylight-saving change. `CalDAVSeriesStartShiftTests` checks
+the same on the merge alone, plus a `DTEND` in another zone from `DTSTART`, a `DURATION` master (no `DTEND`
+added), an end the patch gives (written as given, even over a `DTEND` that could not be moved), and a `DTEND`
+that cannot be read or converted (refused). An all-day edit whose end date is on or before its start date is
+refused before any write on every `edit_scope`, including a split's cap `PUT`, and retired with the reason.
+An end given alone is compared with the start the edit keeps: the stored start (a timed one's date included)
+on `all`, the occurrence's own date on `this_only` and `this_and_following`; a start the edit gives is what the
+end is compared with on every scope. An edit that gives no times
+still saves an all-day event stored with its end on its start. The queue suite counts
+`getEvent` calls: an edit that moves nothing and sets no UNTIL makes none, and a failed read on a move writes
+nothing and stays queued. `calendar_event_edit` refuses a stated `all_day: true` with a same-day end before
+its card, and does not refuse times of one day when `all_day` is not stated.

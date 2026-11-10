@@ -294,6 +294,26 @@ enum EmailFilter {
     /// Mac, on the main actor (#162 review). This scanner: ~2 ms. Callers bound the
     /// INPUT (`snippetLinkScanChars` scalars).
     static func unwrapMarkdownLinks(_ text: String) -> String {
+        markdownPieces(text).map { piece in
+            switch piece {
+            case .text(let text): text
+            case .link(let label, _, _): label
+            }
+        }.joined()
+    }
+
+    /// A run of text in `htmlToPlainText`'s link form: plain text, or a Markdown link.
+    enum MarkdownPiece: Equatable, Sendable {
+        case text(String)
+        /// `label` and `destination` with `HTMLText.finishLink`'s escapes reversed; `source` is the
+        /// link as written.
+        case link(label: String, destination: String, source: String)
+    }
+
+    /// `text` split into plain text and Markdown links, by the grammar `unwrapMarkdownLinks`
+    /// documents. Joining every piece's text (a link's `source`) gives `text` back. Linear in the
+    /// input, so it takes a user's notes at full length.
+    static func markdownPieces(_ text: String) -> [MarkdownPiece] {
         let s = Array(text.unicodeScalars)
         let n = s.count
         let fail = -1
@@ -315,30 +335,45 @@ enum EmailFilter {
             }
             j -= 1
         }
-        var out = String.UnicodeScalarView()
-        out.reserveCapacity(n)
+        /// The scalars in `range` with each escape pair's `\` dropped.
+        func unescaped(_ range: Range<Int>) -> String {
+            var out = String.UnicodeScalarView()
+            var i = range.lowerBound
+            while i < range.upperBound {
+                if s[i].value == 0x5C, i + 1 < range.upperBound { i += 1 }
+                out.append(s[i])
+                i += 1
+            }
+            return String(out)
+        }
+        var pieces: [MarkdownPiece] = []
+        var plain = String.UnicodeScalarView()
+        plain.reserveCapacity(n)
         var c = 0
         while c < n {
             if s[c].value == 0x5B {
                 let k = labelEnd[c + 1]
                 if k != fail, k + 1 < n, s[k + 1].value == 0x28, destEnd[k + 2] != fail {
-                    // A link: emit the label with its escapes reversed, skip the destination.
-                    var label = String.UnicodeScalarView()
-                    var i = c + 1
-                    while i < k {
-                        if s[i].value == 0x5C, i + 1 < k { i += 1 }
-                        label.append(s[i])
-                        i += 1
+                    let close = destEnd[k + 2]
+                    if !plain.isEmpty {
+                        pieces.append(.text(String(plain)))
+                        plain = String.UnicodeScalarView()
                     }
-                    out.append(contentsOf: String(label).replacingOccurrences(of: "&amp;", with: "&").unicodeScalars)
-                    c = destEnd[k + 2] + 1
+                    var source = String.UnicodeScalarView()
+                    source.append(contentsOf: s[c...close])
+                    pieces.append(.link(
+                        label: unescaped(c + 1 ..< k).replacingOccurrences(of: "&amp;", with: "&"),
+                        destination: unescaped(k + 2 ..< close),
+                        source: String(source)))
+                    c = close + 1
                     continue
                 }
             }
-            out.append(s[c])
+            plain.append(s[c])
             c += 1
         }
-        return String(out)
+        if !plain.isEmpty { pieces.append(.text(String(plain))) }
+        return pieces
     }
 
     /// ICU's line terminators — what `.` refuses and what `\v` matches: LF, VT, FF,

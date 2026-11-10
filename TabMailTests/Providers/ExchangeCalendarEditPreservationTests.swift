@@ -603,14 +603,15 @@ private func attendeeTypes(_ event: [String: Any]) -> [String: String] {
     return out
 }
 
-/// Asserts a description edit wrote `notes`: as the text body of an event that is
+/// Asserts a description edit wrote `notes`: as the HTML body of an event that is
 /// no online meeting; for an online meeting, in place of the stored notes, with
 /// the join section and everything after it as stored, and the meeting on.
 private func expectNewNotes(_ notes: String, before: [String: Any], after: [String: Any], label: String) {
     let body = after["body"] as? [String: Any]
     guard before["onlineMeeting"] is [String: Any] else {
-        #expect(body?["contentType"] as? String == "text", "\(label): the description was not written as text")
-        #expect(body?["content"] as? String == notes, "\(label): the description written is \(body?["content"] ?? "none")")
+        #expect(body?["contentType"] as? String == "html", "\(label): the description was not written as HTML")
+        #expect(body?["content"] as? String == notes.replacingOccurrences(of: "\n", with: "<br>\r\n"),
+                "\(label): the description written is \(body?["content"] ?? "none")")
         return
     }
     let was = (before["body"] as? [String: Any])?["content"] as? String ?? ""
@@ -697,7 +698,8 @@ private func expectOnlyEdited(
 
 /// A provider whose sign-in hands out "stale-token" until it is asked to refresh.
 private func makeProvider(_ http: FakeHTTP.Scenario) -> ExchangeCalendarProvider {
-    ExchangeCalendarProvider(accessToken: { forceRefresh in forceRefresh ? "fresh-token" : "stale-token" },
+    ExchangeCalendarProvider(mailbox: "calendar@example.com",
+                             accessToken: { forceRefresh in forceRefresh ? "fresh-token" : "stale-token" },
                              session: http.session)
 }
 
@@ -722,7 +724,7 @@ struct ExchangeCalendarEditPreservationTests {
         #expect(graph.ids == GraphFixture.calendar().ids, "an edit created or removed an event")
     }
 
-    @Test("a description edit writes the text and nothing else")
+    @Test("a description edit writes the notes and nothing else")
     func plainDescription() async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
@@ -736,8 +738,8 @@ struct ExchangeCalendarEditPreservationTests {
         let after = try #require(graph.event("ev-plain"))
         expectOnlyEdited(.newDescription, before: before, after: after, label: "plain event")
         let body = try #require(after["body"] as? [String: Any])
-        #expect(body["contentType"] as? String == "text")
-        #expect(body["content"] as? String == UserCalendarEdit.newDescriptionText)
+        #expect(body["contentType"] as? String == "html")
+        #expect(body["content"] as? String == "New notes<br>\r\nSecond line")
     }
 
     @Test("an edit of a whole series leaves every property it did not edit as it was",
@@ -1267,11 +1269,62 @@ struct ExchangeCalendarEditPreservationTests {
         _ = try await provider.updateEvent(eventId: "ev-online", event: patch)
 
         let after = try #require(graph.event("ev-online"))
-        expectNewNotes(read + "\nAdded line", before: before, after: after, label: "online meeting, read and written back")
         for property in watchedProperties where property != "body" && property != "bodyPreview" {
             #expect(canonical(after[property]) == canonical(before[property]), "the round trip changed \(property)")
         }
+        #expect(after["isOnlineMeeting"] as? Bool == true, "the edit turned the online meeting off")
+        let was = try #require((before["body"] as? [String: Any])?["content"] as? String)
+        let content = try #require((after["body"] as? [String: Any])?["content"] as? String)
+        let section = try #require(was.range(of: GraphFixture.joinSection).map { String(was[$0.lowerBound...]) })
+        #expect(content.hasSuffix(section), "the join section was not kept as stored")
+        // The notes' link is still a link, not its `[label](url)` text.
+        #expect(read.contains("[linked doc](https://example.com/doc)"), "setup: the read gives the link as \(read)")
+        #expect(content.contains("<a href=\"https://example.com/doc\">linked doc</a>"), "the link was not written as a link")
+        #expect(!content.contains("[linked doc]"), "the link was written as its text")
         #expect(try await provider.getEvent(eventId: "ev-online").description == read + "\nAdded line")
+    }
+
+    @Test("notes with links and runs of spaces read back as they were written", arguments: ["ev-online", "ev-plain"])
+    func notesReadBackAsWritten(_ id: String) async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = GraphFixture.calendar()
+        graph.install(on: http)
+        let provider = makeProvider(http)
+        let online = try #require(graph.event(id))["isOnlineMeeting"] as? Bool
+        // The third line is a link as a read writes it, with every escape a label or a
+        // destination can carry.
+        let notes = "Plan  with [Terms &amp; Conditions](https://example.com/doc?a=1&b=2)\n"
+            + "   indented, [mail me](mailto:ana@example.com) or [call](tel:+15550100)\n"
+            + #"[a\_b \*c\* \`d\` \~e\~ \<f\> \\g \[h\]](http://example.com/p\(1\)\;x\<y\>\\z)"#
+            + "\n\nlast   line"
+        var patch = GCalEventInput()
+        patch.description = notes
+
+        _ = try await provider.updateEvent(eventId: id, event: patch)
+
+        #expect(try #require(graph.event(id))["isOnlineMeeting"] as? Bool == online, "\(id): the meeting changed")
+        #expect(try await provider.getEvent(eventId: id).description == notes, "\(id)")
+    }
+
+    @Test("a plain event's description read and written back keeps its link as a link")
+    func plainDescriptionRoundTrip() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = GraphFixture.calendar()
+        graph.install(on: http)
+        let provider = makeProvider(http)
+        let read = try #require(try await provider.getEvent(eventId: "ev-plain").description)
+        #expect(read.contains("[link](https://example.com/doc)"), "setup: the read gives the link as \(read)")
+        var patch = GCalEventInput()
+        patch.description = read
+
+        _ = try await provider.updateEvent(eventId: "ev-plain", event: patch)
+
+        let content = try #require((graph.event("ev-plain")?["body"] as? [String: Any])?["content"] as? String)
+        #expect(content.contains("<a href=\"https://example.com/doc\">link</a>") && !content.contains("[link]"),
+                "the link was written as its text: \(content)")
+        #expect(try await provider.getEvent(eventId: "ev-plain").description == read)
     }
 
     @Test("clearing an online meeting's description keeps its join section")
@@ -1294,7 +1347,7 @@ struct ExchangeCalendarEditPreservationTests {
         #expect(content == GraphFixture.htmlHead + "\r\n" + GraphFixture.joinSection + GraphFixture.htmlTail)
     }
 
-    @Test("an online meeting whose join section is not recognised gets the description as text, as any event does")
+    @Test("an online meeting whose join section is not recognised gets the description as its whole body, as any event does")
     func unrecognisedJoinSection() async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
@@ -1309,7 +1362,7 @@ struct ExchangeCalendarEditPreservationTests {
             eventId: "ev-unknown-layout", event: UserCalendarEdit.newDescription.patch(start: GraphFixture.start))
 
         let sent = try #require(graph.patches("ev-unknown-layout").first?["body"] as? [String: Any])
-        #expect(sent["contentType"] as? String == "text")
-        #expect(sent["content"] as? String == UserCalendarEdit.newDescriptionText)
+        #expect(sent["contentType"] as? String == "html")
+        #expect(sent["content"] as? String == "New notes<br>\r\nSecond line")
     }
 }
