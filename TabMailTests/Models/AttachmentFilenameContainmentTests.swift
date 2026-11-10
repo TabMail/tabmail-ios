@@ -475,41 +475,45 @@ struct AttachmentFilenameContainmentTests {
     /// TWO facts, and this test pins both, because either one alone licenses
     /// nothing:
     ///
-    /// 1. the verdict is the same at every base of **depth ≥ 1**; and
-    /// 2. the base `isSafeFileComponent` actually uses has depth ≥ 1.
+    /// 1. the verdict is the same at every fixed base of **depth ≥ 1**, the
+    ///    predicate's own `/probe` among them; and
+    /// 2. `isSafeFileComponent` itself refuses every escaping name and accepts an
+    ///    ordinary one, on the OS the test runs on.
+    ///
+    /// The production probe is a local inside `isSafeFileComponent`, not a
+    /// separate symbol, so `/probe` is restated here the same way the rule 2 test
+    /// restates it; fact 2 is what ties the restatement back to the predicate.
     ///
     /// ⚠️ **This test asserted a STRONGER, FALSE property until 2026-08-12: that
     /// the verdict is base-independent FULL STOP, "which is a property of
     /// `appendingPathComponent` — it transforms the component the same way whatever
-    /// the base is."** Both the claim and the mechanism were wrong.
+    /// the base is."** Both the claim and the mechanism were wrong: the verdict
+    /// comes from **`.standardized`**, which collapses a `..` against the base's own
+    /// **depth** (`/a/..` collapses to `/`, whose parent is not `/a`, so the
+    /// parent-equality test says "escaped"), and at depth 0 there is no depth left
+    /// to collapse against.
     ///
-    /// - The claim: **at the ROOT, `".."`, `"."`, `""`, `"\u{0}"` and `"..\u{0}"`
-    ///   all PASS**, and at every depth ≥ 1 they all fail. Measured on this
-    ///   toolchain; the old fixture set varied four bases but never depth 0, so it
-    ///   could not see this and stayed green on a false invariant.
-    /// - The mechanism: the verdict comes from **`.standardized`**, not from
-    ///   `appendingPathComponent`. `.standardized` collapses a `..` against the
-    ///   base's own **depth** — `/a/..` collapses to `/`, whose parent is `/`, so
-    ///   the parent-equality test says "escaped"; `/..` collapses to `/` too, but
-    ///   there `deletingLastPathComponent` is a FIXPOINT (`/`'s parent is `/`), so
-    ///   the same test says "contained". `appendingPathComponent` is base-oblivious
-    ///   exactly as claimed, and that is not the step the verdict turns on.
+    /// ⚠️ **Until 2026-11-10 this test also pinned what Foundation does AT THE ROOT,
+    /// and that half was removed because it pinned Foundation, not this code.** On
+    /// iOS 26.5 `".."`, `"."`, `""`, `"\u{0}"` and `"..\u{0}"` all read as direct
+    /// children of `/`; on iOS 27.0 `/..` standardises to `/..` instead of `/`, so
+    /// `".."` and `"..\u{0}"` no longer do. The predicate is correct on both,
+    /// because its probe is not the root — which is exactly what fact 2 asserts.
     ///
-    /// **Operational impact at the time of writing is nil** — `isSafeFileComponent`
-    /// hardcodes `/probe`, depth 1. The defect is the INVARIANT: a false
-    /// base-independence claim is what would license relocating that probe later
-    /// and silently disarming rule 1. Fact 2 is asserted BEHAVIOURALLY below rather
-    /// than by reading the probe's path, so it stays true through any refactor that
-    /// keeps the predicate's contract.
-    @Test("The containment verdict is invariant across bases of depth >= 1, and diverges at the root")
-    func containmentVerdictIsInvariantBelowTheRootAndDivergesAtIt() {
-        let root = URL(fileURLWithPath: "/", isDirectory: true)
+    /// The bases are FIXED paths for the same reason. On iOS 27.0 a base under
+    /// `FileManager.default.temporaryDirectory` reads `"..\u{0}"` and `"\u{0}"` as
+    /// direct children, while every fixed base below still refuses them on both
+    /// runtimes. That difference cannot reach the predicate's verdict — both names
+    /// carry a NUL, which rule 3 refuses before the probe runs — so it is left
+    /// unpinned rather than asserted either way.
+    @Test("The containment verdict is invariant across fixed bases of depth >= 1, and the predicate refuses every escaping name")
+    func containmentVerdictIsInvariantBelowTheRootAndThePredicateRefusesEscapes() {
         let bases = [
+            URL(fileURLWithPath: "/probe", isDirectory: true),
             URL(fileURLWithPath: "/a", isDirectory: true),
             URL(fileURLWithPath: "/tmp/ns/attempt", isDirectory: true),
             URL(fileURLWithPath: "/var/mobile/Containers/Data/Application/ABC/Documents/drafts/slot",
                 isDirectory: true),
-            FileManager.default.temporaryDirectory.appendingPathComponent("x", isDirectory: true),
         ]
         func readsAsDirectChild(of base: URL, _ name: String) -> Bool {
             base.appendingPathComponent(name).standardized
@@ -517,10 +521,9 @@ struct AttachmentFilenameContainmentTests {
         }
         let escapingNames = ["..", ".", "..\u{0}", "\u{0}", ""]
 
-        // FACT 1a — every ACCEPTED name lands as a direct child of every depth-≥1
-        // base, and of the root as well: an ordinary name never depended on depth.
+        // FACT 1a — every ACCEPTED name lands as a direct child of every base.
         for (label, name) in Self.acceptedNames {
-            for base in bases + [root] {
+            for base in bases {
                 #expect(
                     readsAsDirectChild(of: base, name),
                     "\(label) does not land as a direct child of \(base.path)"
@@ -540,35 +543,30 @@ struct AttachmentFilenameContainmentTests {
                 )
             }
         }
-        // THE KNOWN DIVERGENCE, pinned as an equality so it cannot rot into a
-        // silent assumption: at the ROOT the same five names read as CONTAINED.
-        for escaping in escapingNames {
+        // FACT 2 — the PRODUCTION property, on the running OS: the predicate
+        // refuses every escaping name, including one that names a sibling through
+        // the parent, and accepts an ordinary name.
+        for escaping in escapingNames + ["../x"] {
             #expect(
-                readsAsDirectChild(of: root, escaping),
-                """
-                \(escaping.debugDescription) at the ROOT is expected to read as a direct child — if \
-                this now fails, `.standardized`/`deletingLastPathComponent` changed and the probe's \
-                depth requirement should be re-derived, not deleted
-                """
+                !AttachmentFilename.isSafeFileComponent(escaping),
+                "isSafeFileComponent accepted the escaping name \(escaping.debugDescription)"
             )
         }
-        // FACT 2 — the production probe is NOT the root, asserted behaviourally.
-        // Fact 1 alone licenses nothing: all five names are CONTAINED at depth 0,
-        // so a root probe would make rule 1 vacuous.
-        //
-        // Only three of the five discriminate. `"\u{0}"` and `"..\u{0}"` carry a
-        // NUL, which rule 3 refuses on its own, so they would stay refused under a
-        // root probe and prove nothing about the probe's depth. `""`, `"."` and
-        // `".."` are refusable by rule 1 ALONE — no `/`, no refused scalar, nothing
-        // unassigned, no combining run, inside the budget — so the predicate saying
-        // NO to them is only possible if its probe has depth >= 1.
+        #expect(AttachmentFilename.isSafeFileComponent("invoice.pdf"), "an ordinary name was refused")
+        // Only three of the escaping names say anything about the probe's DEPTH.
+        // `"\u{0}"` and `"..\u{0}"` carry a NUL, which rule 3 refuses on its own,
+        // and `"../x"` carries a `/`, which rule 2's scalar test refuses on its own.
+        // `""`, `"."` and `".."` are refusable by rule 1 ALONE — no `/`, no refused
+        // scalar, nothing unassigned, no combining run, inside the budget — so the
+        // predicate saying NO to them is only possible if its probe can say NO,
+        // which at the root it cannot be relied on to do.
         for onlyRuleOneRefuses in ["", ".", ".."] {
             #expect(
                 !AttachmentFilename.isSafeFileComponent(onlyRuleOneRefuses),
                 """
                 isSafeFileComponent accepted \(onlyRuleOneRefuses.debugDescription), which only rule 1 \
-                can refuse — its containment probe has been moved to the filesystem root, where rule 1 \
-                cannot refuse anything
+                can refuse — its containment probe no longer refuses traversal names, for example \
+                because it was moved to the filesystem root
                 """
             )
         }
