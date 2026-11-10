@@ -57,9 +57,9 @@ enum GmailAPI {
     static let historyMaxPages = 40
 
     /// Most history records, and most distinct changed messages, one delta
-    /// takes on. The app's delta fetches each changed message with one
-    /// sequential GET and saves those messages and the new cursor only after
-    /// the GETs, all under the per-account sync deadline, so a delta bigger
+    /// takes on. The app's delta fetches each changed message with its own
+    /// GET, `maxConcurrentRequests` at a time, and saves those messages and the
+    /// new cursor only after the GETs, all under the per-account sync deadline, so a delta bigger
     /// than the deadline can carry times out before its cursor moves and fails
     /// the same way on every poll. One record can name many
     /// messages (a conversation-wide archive or label change names each

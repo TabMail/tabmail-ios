@@ -384,6 +384,18 @@ during the rate-limit backoff still fails that folder's fetch. On Outlook, a mes
 never succeeds is bounded by the poll's cursor capture after its full sync, which walks the inbox's
 delta pages to the final link; the next ordinary poll's delta from that link lands what changed after
 it.
+The Gmail detail fetch keeps the request gate's full width of gets in flight (so a delta of a few
+dozen messages fits the background deadline), never more: a later request on the same account waits
+behind at most one window of gets, not the whole delta: with the first window held, a request waiting
+at the gate takes the first slot one answer frees, ahead of any further get. A fetch larger than its window still fails on
+one message's failure, and gone messages filling the whole first window do not end it early: every
+readable message after them is still fetched. Cancelled while its gets wait out a 429 backoff, the fetch
+throws the cancellation (never a partial list), sends nothing more, and a full window can run after it.
+`GmailDetailWindowFuzzTests` runs seeded schedules (latency; readable, gone, failing, dropped and
+rate-limited answers; a request joining the full gate; a cancel while a get awaits its answer or its
+backoff) and checks the first window is all on the wire before any answer, the first freed slot,
+the returned multiset, throw semantics, termination and gate reuse
+(`GMAIL_DETAIL_FUZZ_ITERATIONS`, `GMAIL_DETAIL_FUZZ_SEED`, `TEST_RUNNER_` prefix on the CLI).
 
 ## Calendar chat tools — the resolved calendar account
 
