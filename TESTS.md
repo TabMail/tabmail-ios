@@ -203,3 +203,16 @@ during the rate-limit backoff still fails that folder's fetch. On Outlook, a mes
 never succeeds is bounded by the poll's cursor capture after its full sync, which walks the inbox's
 delta pages to the final link; the next ordinary poll's delta from that link lands what changed after
 it.
+
+## Calendar chat tools — the resolved calendar account
+
+`CalendarProviderDispatchResolveTests` pins which calendar
+`CalendarProviderDispatch.resolve` names: the demo calendar or nothing in demo
+mode, never the demo calendar outside it, an active preferred account first,
+otherwise the first active registered one. `CalendarToolResolvedAccountTests`
+pins what the tools do with that answer, through the real tool entry points: a
+confirmed create reaches the resolved account's calendar and no other registered
+calendar, and with nothing resolvable it says so and queues nothing; an edit or
+delete given a bare event id reads the event through the resolved calendar (the
+card shows the real event) but still queues nothing and sends nothing, and with
+nothing resolvable it is refused before any card.
