@@ -1410,7 +1410,8 @@ actor GmailProvider: EmailProvider {
 
     /// Infinite-scroll page plus what the SERVER covered for it. The paging
     /// consumer's continuation signal is a coverage question, and the loop below
-    /// drops records `parseGmailMessage` refuses — see `FetchCoverage`.
+    /// names, without loading, the records `parseGmailMessage` refuses and the
+    /// messages whose answer is unusable — see `FetchCoverage`.
     func fetchOlderMessagesWithCoverage(
         folder: String, before: Date, limit: Int
     ) async throws -> (messages: [MessageHeaderInfo], coverage: FetchCoverage) {
@@ -1434,11 +1435,24 @@ actor GmailProvider: EmailProvider {
         var headers: [MessageHeaderInfo] = []
         var unmaterialised = Set<String>()
         for ref in messageRefs {
-            let msgData = try await request(path: "/messages/\(ref.id)\(GmailAPI.metadataQuery)")
-            let msg = try JSONDecoder().decode(GmailMessage.self, from: msgData)
-            if let header = parseGmailMessage(msg) {
-                headers.append(header)
-            } else {
+            do {
+                let msgData = try await request(path: "/messages/\(ref.id)\(GmailAPI.metadataQuery)")
+                let msg = try JSONDecoder().decode(GmailMessage.self, from: msgData)
+                if let header = parseGmailMessage(msg) {
+                    headers.append(header)
+                } else {
+                    unmaterialised.insert(ref.id)
+                }
+            } catch where Self.isUnreadableAnswerForOneMessage(error) {
+                // The folder page's rule (`fetchMessagesWithObservedEpoch`):
+                // the server answered for this one message and the answer is
+                // unusable, a gone message included. It stays named but not
+                // loaded and the rest of the page still loads, so one message
+                // that keeps failing never stops older mail from paging in.
+                // Once an older message on this page loads, no later page asks
+                // for it again (the cursor follows the oldest local row); the
+                // backfill walk loads it when it reaches it.
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Gmail] fetchOlderMessages: \(ref.id) unreadable (\(error)) — not loaded") }
                 unmaterialised.insert(ref.id)
             }
         }
@@ -1554,8 +1568,10 @@ actor GmailProvider: EmailProvider {
     /// used: an HTTP error status for the message, or a body that does not
     /// decode. A status reaching here comes after `AuthedHTTP`'s own retries
     /// and token refresh, so it is taken as the server's answer for that
-    /// message, even one that may be about the server (5xx, 429); counting it
-    /// unmaterialised only keeps the row. 401 is the exception: after the
+    /// message, even one that may be about the server (5xx, 429). On the folder
+    /// page, counting it unmaterialised only keeps the row; on the older-mail
+    /// page it lets paging pass the message, which the backfill walk loads
+    /// later (see `fetchOlderMessagesWithCoverage`). 401 is the exception: after the
     /// refresh it means the credentials are bad, and the folder must fail.
     /// A dropped connection, cancellation or any other error is not an answer
     /// and returns false.

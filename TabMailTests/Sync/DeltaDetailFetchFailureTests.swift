@@ -112,7 +112,7 @@ struct DeltaDetailFetchFailureTests {
         return #"{ "historyId": "1002", "history": [ \#(records.joined(separator: ", ")) ] }"#
     }
 
-    private static func gmailMessageJSON(id: String, dated: Bool = true) -> String {
+    static func gmailMessageJSON(id: String, dated: Bool = true) -> String {
         let internalDate = dated ? #""internalDate": "\#(Int64(Date().timeIntervalSince1970 * 1000))","# : ""
         return """
         {

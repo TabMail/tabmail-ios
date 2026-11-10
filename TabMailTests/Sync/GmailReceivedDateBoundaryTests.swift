@@ -252,6 +252,51 @@ struct GmailReceivedDateBoundaryTests {
                 "cutoff is the oldest providerDate (anchor-b), not the oldest display date (anchor-a)")
     }
 
+    /// INVARIANT through the real caller: a full older page on which Gmail
+    /// lists a message it then cannot serve still pages on. The continuation
+    /// counts the records Gmail listed, not the ones that loaded, so the pull
+    /// after it reaches the deeper message. The unreadable message gets no row
+    /// and the rows already stored stay.
+    @Test("A full older page with one unreadable message still pages on to deeper mail")
+    func olderPageWithAnUnreadableMessageStillPagesOn() async throws {
+        let clock = FixtureClock()
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let accountId = "gm-older-unreadable"
+        let folder = try Self.makeGmailAccount(pool: pool, accountId: accountId)
+        try Self.insertLocal(pool: pool, accountId: accountId, messageId: "anchor", date: clock.daysAgo(1), providerDate: clock.daysAgo(1))
+
+        let pageLimit = SyncConfig.infiniteScrollFetchLimit
+        let page = (0..<pageLimit).map { "page-\($0)" }
+        let unreadable = page[pageLimit / 2]
+        let deeperDay = Double(pageLimit + 10)
+        var seeds = [seed("anchor", internalDate: clock.daysAgo(1), received: nil)]
+        seeds += page.enumerated().map { day, id in seed(id, internalDate: clock.daysAgo(Double(day + 2)), received: nil) }
+        seeds.append(seed("deeper", internalDate: clock.daysAgo(deeperDay), received: nil))
+        let server = StatefulGmailActionServer(messages: seeds)
+        defer { server.close() }
+        server.injectUnclassified400OnGet(providerMessageId: unreadable)
+        let engine = await Self.registeredEngine(accountId: accountId, provider: server.provider())
+
+        // Pull as the scroller does: again for as long as the last pull says
+        // there may be more. Two pulls reach the deeper message; the bound
+        // only stops a runaway loop.
+        let maxPulls = 4
+        var pulls = 0
+        var mayHaveMore = true
+        while mayHaveMore && pulls < maxPulls {
+            mayHaveMore = try await engine.fetchOlderMessages(folders: [folder]).mayHaveMore
+            pulls += 1
+        }
+
+        #expect(server.unclassified400OnGetServedCount() >= 1, "precondition: the unreadable message was asked for")
+        let rows = try Self.localRows(pool: pool, accountId: accountId)
+        #expect(rows["deeper"] != nil, "paging stopped after \(pulls) pull(s), before the deeper message")
+        #expect(rows[unreadable] == nil, "the unreadable message got a row")
+        #expect(Set(rows.keys) == Set(["anchor", "deeper"] + page.filter { $0 != unreadable }),
+                "rows: \(rows.keys.sorted())")
+    }
+
     // MARK: - SyncEngine.runBackfill (page walk + insertBackfillBatchGuardable)
 
     private static func registeredEngine(accountId: String, provider: GmailProvider) async -> SyncEngine {

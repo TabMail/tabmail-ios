@@ -228,3 +228,15 @@ drafts.list and history.list page tokens, is encoded by the single
 `StrictPercentEncoding` in `Shared/HTTP`. A synthetic folder marker that reaches
 the bad-request-preserving entry (`modifyMessage`) is refused before any network
 call, as at the ordinary request entry.
+
+## Gmail older-mail paging — one failed message does not stop the page
+
+`GmailOlderPageFailureTests` drives `GmailProvider.fetchOlderMessagesWithCoverage` on `FakeHTTP`. A
+page where messages answer 404, 410, 400, 503 and an unreadable body still loads every other
+message, reports those five as named but not loaded, and counts the whole page as covered. A 401
+the token refresh does not cure, or a dropped connection, still fails the page, and so does a page
+cancelled while a message waits out the rate-limit backoff: it never reports coverage and asks for
+nothing more. Through the real caller, `GmailReceivedDateBoundaryTests` pulls older mail with
+`SyncEngine.fetchOlderMessages` the way the scroller does: a full page with one message Gmail cannot
+serve still says there may be more, so the next pull loads the message beyond it, the unreadable
+message gets no row, and the stored rows stay.
