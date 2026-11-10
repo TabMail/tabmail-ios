@@ -659,6 +659,12 @@ event reaches the card and is written. Controls on the shared rule: a timed even
 time, an event that was not read, a stated conversion, midnight dates and an edit giving no times are not
 refused.
 
+A stated `all_day` that differs from the stored kind, on CalDAV (`CalDAVCalendarEditKeepsKindTests`): with a
+start and an end, an all-day event becomes timed at those times and a timed one (stored with `DTEND` or with
+`DURATION`) becomes all-day on those dates, with the rest of the event kept. A change that gives only a start,
+and a change on a repeating event on every `edit_scope`, are refused with nothing written and the stored
+event byte-identical.
+
 ## ICS value types — `VALUE=DATE-TIME` is timed
 
 `ICSValueTypeTests` checks that a `DTSTART` stating `VALUE=DATE-TIME` (the default, which another client may

@@ -197,6 +197,19 @@ user. A date at midnight (`…T00:00:00`, the read tools' shape for an all-day d
 (`namesTimeOfDay`). A stated `all_day` is still taken at its word (item 3): `true` keeps the date, `false`
 converts. The Thunderbird add-on refuses the same edit the same way.
 
+**CalDAV changes an event's kind since 2026-11-10; "not expressible through `CalDAVProvider.updateEvent`
+at all" above is kept as written and no longer holds.** A stated `all_day` that differs from the stored
+kind used to render a patch `formatDTLine` could not express in the stored kind, so `mergePatchIntoICS`
+left `DTSTART`/`DTEND` alone and the edit reported success with the event unchanged.
+`CalDAVProvider.kindToWrite` now decides the kind the merge writes. A whole event that does not repeat (no
+rule, no extra or excluded dates, no changed occurrence), given both a start and an end of the other kind,
+is rewritten in that kind: an all-day event becomes timed in UTC (the same instants, no VTIMEZONE needed),
+a timed one becomes all-day, and a `DURATION` goes. Everything else is refused (`notSupported`) before any
+write: a change of kind on a repeating event on any `edit_scope` (the copies an occurrence edit and a split
+make never change kind), and a change that gives only one of start and end. An all-day copy still takes the
+date of a time the patch gives (`mergePatchKeepingLength`), as before. Google and Outlook convert in their
+own write and are unchanged.
+
 **Also corrected at the code on 2026-08-12 (R3), recorded here because the argument is not needed at the
 call site.** `validatedRRuleUntil`'s note claimed the pre-fix alternative on the split path was "a capped
 master plus a failed successor create under a best-effort rollback, i.e. destroyed occurrences".
