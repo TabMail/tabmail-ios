@@ -584,17 +584,13 @@ actor GoogleCalendarProvider: CalendarProvider {
         // what is left of its COUNT. Worked out here, before the cap PATCH in
         // step 4, so a split the series cannot take (it already ends before the
         // split, or its COUNT cannot be counted) is refused with nothing written.
-        // A patch that brings its own recurrence replaces the rule outright
-        // (`mergeMasterAndPatch` prefers it and ignores this value), so the
-        // original end is neither carried over nor checked then.
-        let newSeriesRRule: String
-        if let patchRecurrence = patch.recurrence, !patchRecurrence.isEmpty {
-            newSeriesRRule = originalRRule
-        } else {
-            let days = Self.splitDaysInMasterFrame(master: master, recurrenceId: recurrenceId, recurrenceIdZone: recurrenceIdZone)
-            newSeriesRRule = try RecurrenceTail.newSeriesRule(
-                from: originalRRule, seriesStart: days.seriesStart, split: days.split, capUntil: untilValue)
-        }
+        // A patch that brings its own recurrence is still written as given
+        // (`mergeMasterAndPatch` prefers it), but the check runs all the same:
+        // it is also what stops the cap from moving the end of a series that
+        // already ended before the split.
+        let days = Self.splitDaysInMasterFrame(master: master, recurrenceId: recurrenceId, recurrenceIdZone: recurrenceIdZone)
+        let newSeriesRRule = try RecurrenceTail.newSeriesRule(
+            from: originalRRule, seriesStart: days.seriesStart, split: days.split, capUntil: untilValue)
 
         // 3. Build the capped-master patch. The semantic change is recurrence-
         //    only, but defensive-include the master's existing start/end so

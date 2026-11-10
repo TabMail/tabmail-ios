@@ -88,6 +88,16 @@ struct RecurrenceTailCountTests {
              rrule: "RRULE:FREQ=DAILY;COUNT=10", start: "1997-09-02", split: "1997-08-30", expected: 0),
         Case(name: "the day after the first keeps only DTSTART",
              rrule: "RRULE:FREQ=DAILY;COUNT=10", start: "1997-09-02", split: "1997-09-03", expected: 1),
+        Case(name: "daily on weekdays: two working weeks",
+             rrule: "RRULE:FREQ=DAILY;BYDAY=MO,TU,WE,TH,FR", start: "1997-09-01", split: "1997-09-15", expected: 10),
+        Case(name: "daily limited to the 1st and 15th: 1 and 15 Sep, 1 and 15 Oct",
+             rrule: "RRULE:FREQ=DAILY;BYMONTHDAY=1,15", start: "1997-09-01", split: "1997-11-01", expected: 4),
+        Case(name: "weekly on Tuesdays, January only: the four January Tuesdays of 1998",
+             rrule: "RRULE:FREQ=WEEKLY;BYMONTH=1;BYDAY=TU", start: "1998-01-06", split: "1998-03-01", expected: 4),
+        Case(name: "monthly on the 15th, January and July only: 15 Jan and 15 Jul 1998",
+             rrule: "RRULE:FREQ=MONTHLY;BYMONTH=1,7;BYMONTHDAY=15", start: "1998-01-15", split: "1999-01-01", expected: 2),
+        Case(name: "yearly with BYMONTHDAY expands to every month: 1 Jan, 1 Feb, 1 Mar",
+             rrule: "RRULE:FREQ=YEARLY;BYMONTHDAY=1", start: "1998-01-01", split: "1998-04-01", expected: 3),
     ]
 
     static let unsupportedCases: [Case] = [

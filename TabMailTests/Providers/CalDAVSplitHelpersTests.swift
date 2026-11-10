@@ -598,6 +598,9 @@ struct CalDAVRecurringHelpersTests {
         // isAllDay: the event is timed (TZID datetime), not all-day — must NOT
         // be misled by the VTIMEZONE's bare-ish DTSTART lines.
         #expect(CalDAVProvider.icsIsAllDay(ics) == false)
+        // DTSTART day: the event's, not the timezone's 2007 DTSTART, so a
+        // split counts the series' occurrences from the series' own start.
+        #expect(CalDAVProvider.masterDTStartDay(from: ics) == RecurrenceTail.Day(year: 2026, month: 5, day: 13))
         // Duration: 45 min from the EVENT's DTSTART/DTEND, not the timezone's.
         #expect(CalDAVProvider.extractMasterDuration(from: ics) == TimeInterval(45 * 60))
     }
@@ -2042,12 +2045,33 @@ struct CalDAVSplitSeriesTailTests {
         #expect(out.successorRRule == "RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR", "got \(String(describing: out.successorRRule))")
     }
 
-    @Test("A patch that brings its own recurrence is written as given, even when the original COUNT is used up")
-    func patchRecurrenceIsNotChecked() async throws {
+    @Test("A DAILY COUNT series' new half gets the occurrences the original had left")
+    func dailyCountCarriesOver() async throws {
+        let out = try await split(rrule: "RRULE:FREQ=DAILY;COUNT=10")
+        #expect(out.error == nil, "got \(String(describing: out.error))")
+        #expect(out.successorRRule == "RRULE:FREQ=DAILY;COUNT=3",
+                "seven daily occurrences fall before the split, three are left. got \(String(describing: out.successorRRule))")
+    }
+
+    @Test("A patch that brings its own recurrence is written as given")
+    func patchRecurrenceIsWrittenAsGiven() async throws {
+        var patch = GCalEventInput()
+        patch.recurrence = ["RRULE:FREQ=DAILY;COUNT=4"]
+        let out = try await split(rrule: "RRULE:FREQ=WEEKLY;COUNT=10;BYDAY=MO,WE,FR", patch: patch)
+        #expect(out.error == nil, "got \(String(describing: out.error))")
+        #expect(out.successorRRule == "RRULE:FREQ=DAILY;COUNT=4", "got \(String(describing: out.successorRRule))")
+    }
+
+    @Test("A patch that brings its own recurrence is still refused when the series ended before the split")
+    func patchRecurrenceDoesNotSkipTheEndCheck() async throws {
         var patch = GCalEventInput()
         patch.recurrence = ["RRULE:FREQ=DAILY;COUNT=4"]
         let out = try await split(rrule: "RRULE:FREQ=WEEKLY;COUNT=3;BYDAY=MO,WE,FR", patch: patch)
-        #expect(out.error == nil, "got \(String(describing: out.error))")
-        #expect(out.successorRRule == "RRULE:FREQ=DAILY;COUNT=4", "got \(String(describing: out.successorRRule))")
+        #expect(isRefusal(out.error), """
+            the cap would move the end of a series that already ended to the day before the \
+            split, and start a new series past its end. got \(String(describing: out.error))
+            """)
+        #expect(out.puts.isEmpty, "got \(out.puts.map(\.path))")
+        #expect(out.master == out.originalMaster, "the master must be untouched")
     }
 }

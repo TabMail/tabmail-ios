@@ -505,19 +505,15 @@ actor CalDAVProvider: CalendarProvider {
         // what is left of its COUNT. Worked out here, before the cap PUT in
         // step 3, so a split the series cannot take (it already ends before the
         // split, or its COUNT cannot be counted) is refused with nothing written.
-        // A patch that brings its own recurrence replaces the rule outright
-        // (`buildNewSeriesInput` prefers it and ignores this value), so the
-        // original end is neither carried over nor checked then.
-        let newSeriesRRule: String
-        if let patchRecurrence = patch.recurrence, !patchRecurrence.isEmpty {
-            newSeriesRRule = originalRRule
-        } else {
-            newSeriesRRule = try RecurrenceTail.newSeriesRule(
-                from: originalRRule,
-                seriesStart: Self.masterDTStartDay(from: masterICS),
-                split: RecurrenceTail.Day(iso: masterFrameRecurrenceId),
-                capUntil: untilValue)
-        }
+        // A patch that brings its own recurrence is still written as given
+        // (`buildNewSeriesInput` prefers it), but the check runs all the same:
+        // it is also what stops the cap from moving the end of a series that
+        // already ended before the split.
+        let newSeriesRRule = try RecurrenceTail.newSeriesRule(
+            from: originalRRule,
+            seriesStart: Self.masterDTStartDay(from: masterICS),
+            split: RecurrenceTail.Day(iso: masterFrameRecurrenceId),
+            capUntil: untilValue)
         let cappedRRule = GoogleCalendarProvider.replaceOrAppendUntil(in: originalRRule, untilValue: untilValue)
         let cappedICS = Self.replaceRRule(in: masterICS, newRRule: cappedRRule)
 

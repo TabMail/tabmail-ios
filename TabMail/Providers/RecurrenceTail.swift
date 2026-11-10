@@ -141,8 +141,11 @@ enum RecurrenceTail {
                 throw CalendarProviderError.notSupported(
                     "Can't split this series: its repeat rule has an invalid COUNT (\(counts[0])).")
             }
-            guard let seriesStart, let split,
-                  let before = occurrences(of: rrule, seriesStart: seriesStart, before: split) else {
+            guard let seriesStart, let split else {
+                throw CalendarProviderError.notSupported(
+                    "Can't split this series: it ends after \(count) occurrences, and the dates of its first occurrence or of \(splitText) can't be read, so the new series' length can't be worked out. Edit the whole series instead.")
+            }
+            guard let before = occurrences(of: rrule, seriesStart: seriesStart, before: split) else {
                 throw CalendarProviderError.notSupported(
                     "Can't split this series: it ends after \(count) occurrences, and its repeat rule (\(body)) is not one TabMail can count, so the new series' length can't be worked out. Edit the whole series instead.")
             }

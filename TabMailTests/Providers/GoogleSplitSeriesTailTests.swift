@@ -167,13 +167,33 @@ struct GoogleSplitSeriesTailTests {
         #expect(out.created == ["RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR"], "got \(String(describing: out.created))")
     }
 
-    @Test("A patch that brings its own recurrence is written as given, even when the original COUNT is used up")
-    func patchRecurrenceIsNotChecked() async throws {
+    @Test("A DAILY COUNT series' new half gets the occurrences the original had left")
+    func dailyCountCarriesOver() async throws {
+        let out = try await split(rrule: "RRULE:FREQ=DAILY;COUNT=10")
+        #expect(out.error == nil, "got \(String(describing: out.error))")
+        #expect(out.created == ["RRULE:FREQ=DAILY;COUNT=3"],
+                "seven daily occurrences fall before the split, three are left. got \(String(describing: out.created))")
+    }
+
+    @Test("A patch that brings its own recurrence is written as given")
+    func patchRecurrenceIsWrittenAsGiven() async throws {
+        var patch = GCalEventInput()
+        patch.recurrence = ["RRULE:FREQ=DAILY;COUNT=4"]
+        let out = try await split(rrule: "RRULE:FREQ=WEEKLY;COUNT=10;BYDAY=MO,WE,FR", patch: patch)
+        #expect(out.error == nil, "got \(String(describing: out.error))")
+        #expect(out.created == ["RRULE:FREQ=DAILY;COUNT=4"], "got \(String(describing: out.created))")
+    }
+
+    @Test("A patch that brings its own recurrence is still refused when the series ended before the split")
+    func patchRecurrenceDoesNotSkipTheEndCheck() async throws {
         var patch = GCalEventInput()
         patch.recurrence = ["RRULE:FREQ=DAILY;COUNT=4"]
         let out = try await split(rrule: "RRULE:FREQ=WEEKLY;COUNT=3;BYDAY=MO,WE,FR", patch: patch)
-        #expect(out.error == nil, "got \(String(describing: out.error))")
-        #expect(out.created == ["RRULE:FREQ=DAILY;COUNT=4"], "got \(String(describing: out.created))")
+        #expect(isRefusal(out.error), """
+            the cap would move the end of a series that already ended to the day before the \
+            split, and start a new series past its end. got \(String(describing: out.error))
+            """)
+        #expect(out.wire == ["GET \(Self.masterPath)"], "got \(out.wire)")
     }
 
     @Test("An all-day COUNT series counts on its own dates")
