@@ -120,6 +120,15 @@ struct RecurrenceTailCountTests {
         Case(name: "a part given twice", rrule: "RRULE:FREQ=DAILY;INTERVAL=2;INTERVAL=3;COUNT=4", start: "1997-09-02", split: "1997-09-05", expected: nil),
         Case(name: "a weekday code that does not exist", rrule: "RRULE:FREQ=WEEKLY;BYDAY=XX;COUNT=4", start: "1997-09-02", split: "1997-09-05", expected: nil),
         Case(name: "no FREQ", rrule: "RRULE:COUNT=4", start: "1997-09-02", split: "1997-09-05", expected: nil),
+        // Numbers that would overflow the counter's arithmetic, or trap in `abs`.
+        Case(name: "a YEARLY INTERVAL past any four-digit year", rrule: "RRULE:FREQ=YEARLY;INTERVAL=30000000000000000;COUNT=3", start: "1997-09-02", split: "1999-09-05", expected: nil),
+        Case(name: "a DAILY INTERVAL of Int.max", rrule: "RRULE:FREQ=DAILY;INTERVAL=9223372036854775807;COUNT=3", start: "1997-09-02", split: "1997-09-05", expected: nil),
+        Case(name: "a WEEKLY INTERVAL of Int.max", rrule: "RRULE:FREQ=WEEKLY;INTERVAL=9223372036854775807;COUNT=3", start: "1997-09-02", split: "1997-09-05", expected: nil),
+        Case(name: "a MONTHLY INTERVAL of Int.max", rrule: "RRULE:FREQ=MONTHLY;INTERVAL=9223372036854775807;COUNT=3", start: "1997-09-02", split: "1997-12-05", expected: nil),
+        Case(name: "a BYMONTH of Int.min", rrule: "RRULE:FREQ=YEARLY;BYMONTH=-9223372036854775808;COUNT=3", start: "1997-09-02", split: "1999-12-05", expected: nil),
+        Case(name: "a BYMONTHDAY of Int.min", rrule: "RRULE:FREQ=MONTHLY;BYMONTHDAY=-9223372036854775808;COUNT=3", start: "1997-09-02", split: "1997-12-05", expected: nil),
+        Case(name: "a BYSETPOS of Int.min", rrule: "RRULE:FREQ=MONTHLY;BYDAY=MO;BYSETPOS=-9223372036854775808;COUNT=3", start: "1997-09-01", split: "1997-12-05", expected: nil),
+        Case(name: "a BYDAY number of Int.min", rrule: "RRULE:FREQ=MONTHLY;BYDAY=-9223372036854775808MO;COUNT=3", start: "1997-09-01", split: "1997-12-05", expected: nil),
     ]
 
     @Test("RFC 5545 examples", arguments: rfcCases)
@@ -135,6 +144,17 @@ struct RecurrenceTailCountTests {
     @Test("Rules outside the supported subset are not counted", arguments: unsupportedCases)
     func unsupportedRules(_ c: Case) throws {
         try check(c)
+    }
+
+    @Test("INTERVAL is counted up to its bound and not above it")
+    func intervalBound() throws {
+        let start = try #require(RecurrenceTail.Day(iso: "1997-09-02"))
+        let split = try #require(RecurrenceTail.Day(iso: "1997-09-05"))
+        let atBound = "RRULE:FREQ=DAILY;INTERVAL=\(RecurrenceTail.maxInterval)"
+        let aboveBound = "RRULE:FREQ=DAILY;INTERVAL=\(RecurrenceTail.maxInterval + 1)"
+        #expect(RecurrenceTail.occurrences(of: atBound, seriesStart: start, before: split) == 1,
+                "only DTSTART falls before the split")
+        #expect(RecurrenceTail.occurrences(of: aboveBound, seriesStart: start, before: split) == nil)
     }
 
     private func check(_ c: Case) throws {
@@ -184,6 +204,17 @@ struct RecurrenceTailNewSeriesRuleTests {
         }
     }
 
+    /// The refusal's message; fails the test when the rule is not refused.
+    private func refusal(_ rrule: String, start: RecurrenceTail.Day? = start, split: RecurrenceTail.Day? = split) throws -> String {
+        do {
+            let written = try rule(rrule, start: start, split: split)
+            Issue.record("expected a refusal, got \(written)")
+            return ""
+        } catch CalendarProviderError.notSupported(let message) {
+            return message
+        }
+    }
+
     @Test("A series with no end keeps its rule unchanged")
     func noEnd() throws {
         #expect(try rule("RRULE:FREQ=WEEKLY;BYDAY=MO,WE") == "RRULE:FREQ=WEEKLY;BYDAY=MO,WE")
@@ -211,6 +242,26 @@ struct RecurrenceTailNewSeriesRuleTests {
         #expect(refuses("RRULE:FREQ=DAILY;COUNT=10", split: nil))
         #expect(refuses("RRULE:FREQ=DAILY;COUNT=0"))
         #expect(refuses("RRULE:FREQ=DAILY;COUNT=ten"))
+    }
+
+    @Test("The refusal names its cause: dates that can't be read, or a rule that can't be counted")
+    func uncountableRefusalNamesItsCause() throws {
+        let datesPhrase = "the dates of its first occurrence"
+        for message in [try refusal("RRULE:FREQ=DAILY;COUNT=10", start: nil),
+                        try refusal("RRULE:FREQ=DAILY;COUNT=10", split: nil)] {
+            #expect(message.contains(datesPhrase), "got \(message)")
+            #expect(!message.contains("not one TabMail can count"), "got \(message)")
+        }
+        let uncountable = try refusal("RRULE:FREQ=YEARLY;BYYEARDAY=1;COUNT=10")
+        #expect(uncountable.contains("(FREQ=YEARLY;BYYEARDAY=1;COUNT=10) is not one TabMail can count"), "got \(uncountable)")
+        #expect(!uncountable.contains(datesPhrase), "got \(uncountable)")
+    }
+
+    @Test("A COUNT rule whose numbers would overflow the counter is refused, not a crash")
+    func overflowingCountIsRefused() {
+        #expect(refuses("RRULE:FREQ=YEARLY;INTERVAL=30000000000000000;COUNT=3"))
+        #expect(refuses("RRULE:FREQ=DAILY;INTERVAL=9223372036854775807;COUNT=3"))
+        #expect(refuses("RRULE:FREQ=MONTHLY;BYMONTHDAY=-9223372036854775808;COUNT=3"))
     }
 
     @Test("A UTC UNTIL at or after the split is kept verbatim")

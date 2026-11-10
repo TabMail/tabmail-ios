@@ -184,6 +184,16 @@ struct GoogleSplitSeriesTailTests {
         #expect(out.created == ["RRULE:FREQ=DAILY;COUNT=4"], "got \(String(describing: out.created))")
     }
 
+    @Test("A COUNT master whose numbers would overflow the counter is refused before any write")
+    func overflowingCountMasterIsRefused() async throws {
+        for rrule in ["RRULE:FREQ=YEARLY;INTERVAL=30000000000000000;COUNT=3",
+                      "RRULE:FREQ=MONTHLY;BYMONTHDAY=-9223372036854775808;COUNT=3"] {
+            let out = try await split(rrule: rrule)
+            #expect(isRefusal(out.error), "\(rrule): got \(String(describing: out.error))")
+            #expect(out.wire == ["GET \(Self.masterPath)"], "\(rrule): got \(out.wire)")
+        }
+    }
+
     @Test("A patch that brings its own recurrence is still refused when the series ended before the split")
     func patchRecurrenceDoesNotSkipTheEndCheck() async throws {
         var patch = GCalEventInput()

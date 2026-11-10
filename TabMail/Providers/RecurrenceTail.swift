@@ -230,6 +230,13 @@ enum RecurrenceTail {
         let weekday: Weekday
     }
 
+    /// The largest INTERVAL the counter accepts: the days four-digit years
+    /// span (10000 years of at most 366 days). A larger step, in any unit,
+    /// places no second occurrence before a split such a year can name, and
+    /// the bound keeps every step of the counter's arithmetic far from
+    /// overflow. A rule above it is not counted.
+    static let maxInterval = 10_000 * 366
+
     /// The parts of an RRULE the counter expands.
     struct Rule: Sendable {
         enum Frequency: Sendable { case daily, weekly, monthly, yearly }
@@ -266,7 +273,7 @@ enum RecurrenceTail {
             }
 
             if let text = values["INTERVAL"] {
-                guard let n = Int(text), n >= 1 else { return nil }
+                guard let n = Int(text), (1...RecurrenceTail.maxInterval).contains(n) else { return nil }
                 interval = n
             } else {
                 interval = 1
@@ -511,11 +518,12 @@ enum RecurrenceTail {
 
     /// A comma-separated list of non-zero integers whose magnitude is in
     /// `allowed`; an absent part is an empty list. nil when malformed.
-    fileprivate static func numbers(_ text: String?, allowed: ClosedRange<Int>, signed: Bool) -> [Int]? {
+    /// The magnitude is compared as `UInt`: `abs` traps on `Int.min`.
+    fileprivate static func numbers(_ text: String?, allowed: ClosedRange<UInt>, signed: Bool) -> [Int]? {
         guard let text else { return [] }
         var out: [Int] = []
         for item in text.split(separator: ",", omittingEmptySubsequences: false) {
-            guard let n = Int(item), allowed.contains(abs(n)), signed || n > 0 else { return nil }
+            guard let n = Int(item), allowed.contains(n.magnitude), signed || n > 0 else { return nil }
             out.append(n)
         }
         return out
@@ -526,8 +534,8 @@ enum RecurrenceTail {
         guard text.count >= 2, let weekday = Weekday(code: String(text.suffix(2))) else { return nil }
         let numberText = String(text.dropLast(2))
         if numberText.isEmpty { return WeekdayNum(ordinal: nil, weekday: weekday) }
-        let maxWeekNumber = 53
-        guard let n = Int(numberText), n != 0, abs(n) <= maxWeekNumber else { return nil }
+        let maxWeekNumber: UInt = 53
+        guard let n = Int(numberText), n != 0, n.magnitude <= maxWeekNumber else { return nil }
         return WeekdayNum(ordinal: n, weekday: weekday)
     }
 }
