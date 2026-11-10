@@ -622,7 +622,18 @@ nothing is ever decided about a UID whose numbering is unproven (ADR-IOS-107). C
 - **Removals.** A removal applies only when the server proves it: an expunged UID goes, while a UID
   whose FETCH record is missing (a short FETCH) but which `UID SEARCH` still finds stays.
 - **Queued ops.** A queued flag op wins over the server's value, per message.
-- **Budget.** An exhausted budget resumes on the next pass from the stored UID cursor.
+- **Budget.** An exhausted budget resumes on the next pass from the stored UID cursor. No request
+  starts after the budget is spent, the removal proof included.
+- **Not the backfill.** With a partial backfill, no command names a UID below the lowest local UID or
+  above the highest, and no row is inserted.
+- **Always-expensive network.** After `SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds` without a
+  completed listing, a folder lists on an expensive network: one never listed, one on a server
+  without CONDSTORE, and one whose listing was parked. The first sight of a folder on an expensive
+  network writes when the wait began and makes no request.
+- **A new folder.** A folder the full sync itself created follows an older-mail change on the next
+  pass.
+- **A just-completed user action** wins over a stale listing, per message.
+- **Order.** Under budget pressure the folder whose listing completed longest ago goes first.
 - **Epoch.**
   - A state from another UIDVALIDITY restarts the listing at UID 1.
   - A turnover seen on the wire applies nothing (no row removed even though none of the local UIDs
@@ -634,8 +645,11 @@ nothing is ever decided about a UID whose numbering is unproven (ADR-IOS-107). C
 - **Nothing due.** No request is sent when HIGHESTMODSEQ is unchanged and the daily check is not due.
 - **Network.** The daily check waits for a non-expensive network, while a HIGHESTMODSEQ change still
   lists on an expensive one.
+- **Turnover shapes.** A turnover that reuses the same UIDs applies no flags; one that lands between
+  a range's listing and its removal proof removes nothing.
 - **The pure plan.** `catchUpPlan` is checked for the cheap check, the interval, the network, a
-  server without CONDSTORE, and a listing in progress keeping its first stamp.
+  server without CONDSTORE, a listing in progress keeping its first stamp and waiting on an expensive
+  network, and the bounded wait.
 
 `CatchUpApplyTests` covers the generic apply on stub results:
 

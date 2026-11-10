@@ -12,12 +12,12 @@ import GRDB
 // through the paths the rest of sync already uses:
 //   - read/flag updates: the merge rule of `runSyncMessages` (provider-address
 //     ownership proven; a queued flag op or a recent completion wins);
-//   - new messages: `insertBackfillBatch`, the existing insert path, with its
-//     in-transaction epoch premise;
 //   - removals: `deleteConfirmedGhostHeaders`, the ONE removal path every
 //     server-confirmed deletion takes;
 //   - the provider's new opaque state, in the SAME transaction as the flag updates
 //     and removals, so a crash resumes from the last write.
+// It changes or removes only rows the device already holds. It never inserts: new
+// mail is the ordinary sync's job and older mail is the backfill's.
 // No provider is named here: the step does the same thing for every provider, and a
 // provider without catch-up returns nothing.
 
@@ -123,35 +123,11 @@ extension SyncEngine {
         }
     }
 
-    /// Apply one folder's catch-up result. New messages first, through the insert
-    /// path (it owns its chunked transactions and is idempotent by key, so a crash
-    /// before the state write only repeats them); then ONE write transaction for the
-    /// flag updates, the removals and the new state.
+    /// Apply one folder's catch-up result: ONE write transaction for the flag
+    /// updates, the removals and the new state. Nothing is ever inserted.
     @discardableResult
     func applyCatchUpResult(_ result: CatchUpFolderResult, windowMode: StaleWindowMode) async -> CatchUpApplyOutcome {
         let folderId = result.folderId
-
-        if !result.newMessages.isEmpty {
-            guard let folder = try? await dbPool.read({ db in try Folder.fetchOne(db, key: folderId) }) else {
-                return .skipped
-            }
-            switch await insertBackfillBatch(
-                result.newMessages, folderId: folderId, accountId: folder.accountId,
-                folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox,
-                epochPremise: .init(result.epoch), observedEpoch: result.epoch
-            ) {
-            case .refused:
-                BackgroundSyncLogger.logDebug("[CatchUp] \(folder.name): insert refused — the folder no longer holds the epoch the result was served in; nothing applied")
-                return .skipped
-            case .landed(let inserted, let ftsRecords, _):
-                if inserted > 0, !ftsRecords.isEmpty {
-                    await indexHeadersForFTS(ftsRecords)
-                    await BackfillBodyQueue.shared.enqueueItems(
-                        ftsRecords: ftsRecords, accountId: folder.accountId,
-                        folderPath: folder.path, isInInbox: folder.role == .inbox)
-                }
-            }
-        }
 
         let outcome: CatchUpApplyOutcome
         do {
@@ -166,10 +142,10 @@ extension SyncEngine {
         switch outcome {
         case .applied(let updatedFlags, let removedIds):
             if !removedIds.isEmpty { removeHeadersFromFTS(removedIds) }
-            if updatedFlags > 0 || !removedIds.isEmpty || !result.newMessages.isEmpty {
+            if updatedFlags > 0 || !removedIds.isEmpty {
                 await UnreadCountManager.shared.requestRecount(folderId: folderId)
             }
-            BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): applied flags=\(updatedFlags) removed=\(removedIds.count) new=\(result.newMessages.count)")
+            BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): applied flags=\(updatedFlags) removed=\(removedIds.count)")
         case .turnover(let accountId, let folderPath, let stored, let observed):
             // The "stop" half is the transaction writing nothing; this is the
             // "recover" half, exactly as the deletion-reconcile walk does it.

@@ -55,12 +55,14 @@ struct IMAPCatchUpTests {
     private static func withWorld(
         _ name: String, serverUIDs: [Int], localUIDs: [Int],
         storedEpoch: UInt32? = IMAPCatchUpTests.epoch,
+        otherMailboxes: [String: [Int]] = [:],
         _ body: (World) async throws -> Void
     ) async throws {
-        let server = FakeIMAPServer(
-            capabilities: capabilities,
-            mailboxes: ["INBOX": [], path: serverUIDs.map(message)])
+        var mailboxes: [String: [FakeIMAPServer.Message]] = ["INBOX": [], path: serverUIDs.map(message)]
+        for (name, uids) in otherMailboxes { mailboxes[name] = uids.map(message) }
+        let server = FakeIMAPServer(capabilities: capabilities, mailboxes: mailboxes)
         server.setUidValidity(Int(epoch), for: path)
+        for name in otherMailboxes.keys { server.setUidValidity(Int(epoch), for: name) }
         try server.start()
         defer { server.stop() }
 
@@ -88,11 +90,11 @@ struct IMAPCatchUpTests {
 
     /// What the full sync's folder upsert does before the catch-up runs: write this
     /// pass's STATUS HIGHESTMODSEQ to the folder row.
-    private static func refreshModSeq(_ world: World) async throws {
+    private static func refreshModSeq(_ world: World, path: String = IMAPCatchUpTests.path) async throws {
         let infos = try await world.provider.fetchFolders()
         let modseq = try #require(infos.first { $0.path == path }?.highestModSeq,
                                   "precondition: a CONDSTORE server reports HIGHESTMODSEQ in STATUS")
-        let folderId = world.folderId
+        let folderId = "\(world.accountId):\(path)"
         try await world.pool.write { db in
             try db.execute(sql: "UPDATE folder SET lastKnownHighestModSeq = ? WHERE id = ?", arguments: [modseq, folderId])
         }
@@ -121,8 +123,8 @@ struct IMAPCatchUpTests {
         server.recordedCommands().filter { $0.uppercased().hasPrefix("UID FETCH") }.count
     }
 
-    private static func rows(_ world: World) throws -> [String: (isRead: Bool, isFlagged: Bool)] {
-        let folderId = world.folderId
+    private static func rows(_ world: World, path: String = IMAPCatchUpTests.path) throws -> [String: (isRead: Bool, isFlagged: Bool)] {
+        let folderId = "\(world.accountId):\(path)"
         return try world.pool.read { db in
             var out: [String: (isRead: Bool, isFlagged: Bool)] = [:]
             for row in try Row.fetchAll(db, sql: "SELECT messageId, isRead, isFlagged FROM messageHeader WHERE folderId = ?", arguments: [folderId]) {
@@ -172,6 +174,29 @@ struct IMAPCatchUpTests {
             let state = try #require(try Self.state(world), "the full sync wrote the folder's catch-up state")
             #expect(state.epoch == Self.epoch && state.listing == nil && state.lastCompletedAt != nil)
             #expect(try Self.rows(world).count == 3, "every message is still on the server; nothing is removed")
+        }
+    }
+
+    /// A folder the full sync itself creates (here INBOX, which no fixture
+    /// pre-inserts) must be on the cheap check from its first listing.
+    @Test("A folder the full sync created follows an older-mail change on the next pass",
+          .enabled(if: !NetworkMonitor.checkExpensive()))
+    func newFolderIsOnTheCheapCheck() async throws {
+        try await Self.withWorld("cu-new-folder", serverUIDs: [1], localUIDs: [1], otherMailboxes: ["INBOX": [1, 2, 3]]) { world in
+            let accountId = world.accountId
+            let account = try #require(try await world.pool.read { db in try Account.fetchOne(db, key: accountId) })
+            await world.engine.register(
+                accountId: world.accountId, provider: world.provider,
+                workQueue: ProviderWorkQueue(provider: world.provider, maxConcurrency: 1))
+            try await world.engine.fullSync(account: account, provider: world.provider)
+            #expect(try Self.rows(world, path: "INBOX")["1"]?.isRead == false, "precondition: the full sync brought INBOX in, unread")
+
+            world.server.setFlags(["\\Seen"], in: "INBOX", uid: 1)
+            try await Self.refreshModSeq(world, path: "INBOX")
+            await world.engine.runCatchUp(provider: world.provider, folderIds: ["\(accountId):INBOX"], context: Self.unlimited())
+
+            #expect(try Self.rows(world, path: "INBOX")["1"]?.isRead == true,
+                    "the change moved HIGHESTMODSEQ past the first listing's stamp, so the folder is listed again")
         }
     }
 
@@ -229,7 +254,96 @@ struct IMAPCatchUpTests {
         }
     }
 
+    /// The race the in-transaction read exists for: the user's op drained (so it is
+    /// no longer pending) after the listing read the server's older value.
+    @Test("A just-completed user action wins over a stale listing")
+    func recentCompletionWins() async throws {
+        try await Self.withWorld("cu-recent", serverUIDs: [1, 2], localUIDs: [1, 2]) { world in
+            world.server.setFlags(["\\Seen"], in: Self.path, uid: 1)
+            world.server.setFlags(["\\Seen"], in: Self.path, uid: 2)
+            await AccountManager.shared.recordRecentlyCompleted(messageIds: ["2"])
+            await Self.pass(world)
+
+            let rows = try Self.rows(world)
+            #expect(rows["2"]?.isRead == false, "the user's completed action is newer than the listing")
+            #expect(rows["1"]?.isRead == true, "the protection is per message, not per folder")
+        }
+    }
+
+    // MARK: - The catch-up is not the backfill
+
+    /// A folder with a partial backfill: the device holds UIDs 4...6 of a mailbox
+    /// that runs from 1 to 10. The catch-up may look only at what the device holds.
+    @Test("With a partial backfill, nothing outside the local range is listed and nothing is inserted")
+    func staysInsideTheLocalRange() async throws {
+        try await Self.withWorld("cu-frontier", serverUIDs: [1, 2, 3, 4, 6, 7, 8, 9, 10], localUIDs: [4, 5, 6]) { world async throws in
+            world.server.setFlags(["\\Seen"], in: Self.path, uid: 6)
+            let before = world.server.recordedCommands().count
+            await Self.pass(world)
+
+            let sent = world.server.recordedCommands().dropFirst(before)
+                .filter { $0.uppercased().hasPrefix("UID FETCH") || $0.uppercased().hasPrefix("UID SEARCH") }
+            #expect(sent.contains { $0.uppercased().hasPrefix("UID FETCH") }, "precondition: the folder was listed")
+            #expect(sent.contains { $0.uppercased().hasPrefix("UID SEARCH") }, "precondition: the removal proof ran")
+            for command in sent {
+                let named = command.split(whereSeparator: { !$0.isNumber }).compactMap { Int($0) }
+                #expect(named.allSatisfy { (4...6).contains($0) }, "\(command) names a UID the device does not hold")
+            }
+            let rows = try Self.rows(world)
+            #expect(Set(rows.keys) == ["4", "6"], "UID 5 is gone from the server; no other row appears: \(rows.keys.sorted())")
+            #expect(rows["6"]?.isRead == true)
+        }
+    }
+
     // MARK: - Resume, restart, and the first-stamp invariant
+
+    @Test("No request starts after the budget is spent, the removal proof included")
+    func removalProofWaitsForBudget() async throws {
+        // UID 2 is gone from the server. The budget ends after the range's FETCH.
+        try await Self.withWorld("cu-proof-budget", serverUIDs: [1], localUIDs: [1, 2]) { world async throws in
+            world.server.setFlags(["\\Seen"], in: Self.path, uid: 1)
+            let before = world.server.recordedCommands().count
+            await Self.pass(world, context: Self.oneRangePerPass(world.server))
+
+            let searches = world.server.recordedCommands().dropFirst(before).filter { $0.uppercased().hasPrefix("UID SEARCH") }
+            #expect(searches.isEmpty, "the removal proof is a request; it must not start after the budget: \(searches)")
+            #expect(try Self.rows(world)["2"] != nil, "an unproven removal applies nothing")
+            #expect(try Self.rows(world)["1"]?.isRead == true, "the range's flags still count")
+            #expect(try Self.state(world)?.listing?.nextUid == 1, "the cursor stays, so the range is listed again")
+
+            await Self.pass(world)
+            #expect(try Self.rows(world)["2"] == nil, "the next pass proves and applies the removal")
+        }
+    }
+
+    @Test("Under budget pressure the folder whose listing completed longest ago goes first")
+    func oldestCompletedFolderFirst() async throws {
+        let other = "Older"
+        try await Self.withWorld("cu-order", serverUIDs: [1], localUIDs: [1], otherMailboxes: [other: [1]]) { world in
+            try FolderEpochTestFixture.insertFolder(
+                accountId: world.accountId, path: other, role: .custom, pool: world.pool,
+                totalCount: 1, lastKnownUidValidity: Int(Self.epoch))
+            try FolderEpochTestFixture.insertHeaders(accountId: world.accountId, path: other, uids: [1], pool: world.pool)
+            let otherId = "\(world.accountId):\(other)"
+            let day = SyncConfig.catchUpFullCheckIntervalSeconds
+            try Self.setState(IMAPCatchUpState(
+                epoch: Self.epoch, completionStamp: nil, lastCompletedAt: Date().addingTimeInterval(-2 * day), listing: nil), world)
+            let older = IMAPCatchUpState(
+                epoch: Self.epoch, completionStamp: nil, lastCompletedAt: Date().addingTimeInterval(-3 * day), listing: nil).encoded()
+            try await world.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET catchUpState = ? WHERE id = ?", arguments: [older, otherId])
+            }
+            world.server.setFlags(["\\Seen"], in: Self.path, uid: 1)
+            world.server.setFlags(["\\Seen"], in: other, uid: 1)
+
+            // The caller names the newer-completed folder first; the budget allows one listing.
+            await world.engine.runCatchUp(
+                provider: world.provider, folderIds: [world.folderId, otherId], context: Self.oneRangePerPass(world.server))
+
+            #expect(try Self.rows(world, path: other)["1"]?.isRead == true, "the folder that waited longest was listed")
+            #expect(try Self.rows(world)["1"]?.isRead == false, "the budget ended before the other folder")
+        }
+    }
 
     @Test("Budget exhaustion resumes on the next pass")
     func budgetExhaustionResumes() async throws {
@@ -277,6 +391,48 @@ struct IMAPCatchUpTests {
             await Self.pass(world)
 
             #expect(try Self.rows(world).count == 3, "no row may be removed under a turned-over epoch (C3)")
+            #expect(try Self.state(world) == nil, "nothing is written for the folder")
+            #expect(raised.withLock { $0 } == [Self.epoch + 1], "the turnover reaction is raised")
+        }
+    }
+
+    /// The same UIDs exist under the new epoch, so the range has no removal
+    /// candidate and only the listing's own epoch check stands between the new
+    /// numbering's flags and the old numbering's rows.
+    @Test("A turnover that reuses the same UIDs applies no flags")
+    func turnoverWithReusedUIDsAppliesNoFlags() async throws {
+        let raised = Mutex<[UInt32]>([])
+        AccountManager.shared.setUidValidityChangeHandlerForTesting { _, _, _, observed in
+            raised.withLock { $0.append(observed) }
+        }
+        defer { AccountManager.shared.resetUidValidityChangeHandlerForTesting() }
+        try await Self.withWorld("cu-turnover-reuse", serverUIDs: [1, 2, 3], localUIDs: [1, 2, 3]) { world async throws in
+            world.server.setFlags(["\\Seen"], in: Self.path, uid: 1)
+            world.server.setUidValidity(Int(Self.epoch + 1), for: Self.path)
+            await Self.pass(world)
+
+            #expect(try Self.rows(world)["1"]?.isRead == false, "a flag from another numbering is another message's (C3)")
+            #expect(try Self.state(world) == nil, "nothing is written for the folder")
+            #expect(raised.withLock { $0 } == [Self.epoch + 1], "the turnover reaction is raised")
+        }
+    }
+
+    @Test("A turnover between a range's listing and its removal proof removes nothing")
+    func turnoverBeforeTheRemovalProofRemovesNothing() async throws {
+        let raised = Mutex<[UInt32]>([])
+        AccountManager.shared.setUidValidityChangeHandlerForTesting { _, _, _, observed in
+            raised.withLock { $0.append(observed) }
+        }
+        defer { AccountManager.shared.resetUidValidityChangeHandlerForTesting() }
+        // UID 3 is missing from the listing, so it is a removal candidate. The
+        // mailbox turns over right after the FETCH answers.
+        try await Self.withWorld("cu-turnover-proof", serverUIDs: [1, 2], localUIDs: [1, 2, 3]) { world async throws in
+            world.server.resetMailboxAfterNextSuccessfulResponse(
+                containing: "UID FETCH", mailbox: Self.path, uidValidity: Int(Self.epoch + 1),
+                messages: [Self.message(1), Self.message(2)])
+            await Self.pass(world)
+
+            #expect(try Self.rows(world)["3"] != nil, "absence under another numbering proves nothing")
             #expect(try Self.state(world) == nil, "nothing is written for the folder")
             #expect(raised.withLock { $0 } == [Self.epoch + 1], "the turnover reaction is raised")
         }
@@ -361,13 +517,40 @@ struct IMAPCatchUpTests {
         }
     }
 
+    /// A device that is always on an expensive network (cellular, a hotspot, Low
+    /// Data Mode) must still get a full catch-up.
+    @Test("A folder never listed lists on an expensive network once it has waited long enough")
+    func expensiveNetworkWaitIsBounded() async throws {
+        try await Self.withWorld("cu-always-expensive", serverUIDs: [1, 2], localUIDs: [1, 2]) { world in
+            world.server.setFlags(["\\Seen"], in: Self.path, uid: 2)
+
+            await Self.pass(world, context: Self.unlimited(expensive: true))
+            #expect(Self.fetchCount(world.server) == 0, "the first listing waits for a non-expensive network")
+            let waiting = try #require(try Self.state(world), "the first sight records when the wait began")
+            #expect(waiting.createdAt != nil && waiting.listing == nil && waiting.lastCompletedAt == nil)
+
+            await Self.pass(world, context: Self.unlimited(expensive: true))
+            #expect(Self.fetchCount(world.server) == 0, "and keeps waiting inside the limit")
+            #expect(try Self.state(world) == waiting, "without restarting the wait")
+
+            var waited = waiting
+            waited.createdAt = Date().addingTimeInterval(-SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds - 60)
+            try Self.setState(waited, world)
+            await Self.pass(world, context: Self.unlimited(expensive: true))
+            #expect(try Self.rows(world)["2"]?.isRead == true, "after the limit the network no longer holds the folder back")
+            #expect(try Self.state(world)?.lastCompletedAt != nil)
+        }
+    }
+
     @Test("The plan: cheap check, interval, network")
     func planDecision() {
         let now = Date()
         let fresh = now.addingTimeInterval(-60)
         let stale = now.addingTimeInterval(-2 * SyncConfig.catchUpFullCheckIntervalSeconds)
-        func state(_ stamp: Int?, _ completed: Date?, listing: IMAPCatchUpState.Listing? = nil) -> IMAPCatchUpState {
-            IMAPCatchUpState(epoch: 1, completionStamp: stamp, lastCompletedAt: completed, listing: listing)
+        func state(
+            _ stamp: Int?, _ completed: Date?, listing: IMAPCatchUpState.Listing? = nil, created: Date? = nil
+        ) -> IMAPCatchUpState {
+            IMAPCatchUpState(epoch: 1, completionStamp: stamp, lastCompletedAt: completed, listing: listing, createdAt: created)
         }
         typealias P = IMAPProvider
         #expect(P.catchUpPlan(state: state(5, fresh), freshModSeq: 5, isExpensiveNetwork: false, now: now) == .none)
@@ -383,6 +566,28 @@ struct IMAPCatchUpTests {
         let resuming = IMAPCatchUpState.Listing(firstStamp: 3, nextUid: 2001)
         #expect(P.catchUpPlan(state: state(3, fresh, listing: resuming), freshModSeq: 9, isExpensiveNetwork: false, now: now)
                 == .list(resuming), "a listing in progress keeps its first stamp")
+
+        // A listing in progress on an expensive network: it waits, unless MODSEQ moved.
+        let parked = IMAPCatchUpState.Listing(firstStamp: 5, nextUid: 2001)
+        #expect(P.catchUpPlan(state: state(5, stale, listing: parked), freshModSeq: 5, isExpensiveNetwork: true, now: now) == .none,
+                "continuing a full check waits for a non-expensive network")
+        #expect(P.catchUpPlan(state: state(5, stale, listing: parked), freshModSeq: 6, isExpensiveNetwork: true, now: now)
+                == .list(parked))
+
+        // The wait on an expensive network is bounded.
+        let limit = SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds
+        let tooLong = now.addingTimeInterval(-limit - 60)
+        let notYet = now.addingTimeInterval(-limit + 60)
+        #expect(P.catchUpPlan(state: state(nil, nil, created: tooLong), freshModSeq: 5, isExpensiveNetwork: true, now: now)
+                == .list(.init(firstStamp: 5, nextUid: 1)), "a folder never listed")
+        #expect(P.catchUpPlan(state: state(nil, nil, created: notYet), freshModSeq: 5, isExpensiveNetwork: true, now: now) == .none)
+        #expect(P.catchUpPlan(state: state(nil, tooLong), freshModSeq: nil, isExpensiveNetwork: true, now: now)
+                == .list(.init(firstStamp: nil, nextUid: 1)), "a server without CONDSTORE")
+        #expect(P.catchUpPlan(state: state(nil, notYet), freshModSeq: nil, isExpensiveNetwork: true, now: now) == .none)
+        #expect(P.catchUpPlan(state: state(5, tooLong, listing: parked), freshModSeq: 5, isExpensiveNetwork: true, now: now)
+                == .list(parked), "a parked listing")
+        #expect(P.catchUpPlan(state: state(5, tooLong, created: now), freshModSeq: 5, isExpensiveNetwork: true, now: now)
+                == .list(.init(firstStamp: 5, nextUid: 1)), "the wait counts from the last completed listing")
     }
 }
 
@@ -406,17 +611,6 @@ struct CatchUpApplyTests {
         try pool.read { db in try String.fetchOne(db, sql: "SELECT catchUpState FROM folder WHERE id = ?", arguments: [folderId]) }
     }
 
-    private static func header(_ uid: Int) -> MessageHeaderInfo {
-        MessageHeaderInfo(
-            messageId: "\(uid)", rfc822MessageId: "catch-up-new-\(uid)@example.com", inReplyTo: nil,
-            references: [], threadId: nil, subject: "new \(uid)",
-            from: "Sender", fromAddress: "sender@example.com",
-            to: "recipient@example.com", cc: "", bcc: "",
-            replyTo: nil, date: Date(), snippet: "",
-            isRead: false, isFlagged: false, hasAttachments: false,
-            isReplied: false, isForwarded: false, actionTag: nil)
-    }
-
     @Test("Results and the new state land together")
     func resultsAndStateLandTogether() async throws {
         let w = try Self.world("cua-land", storedEpoch: Self.epoch)
@@ -425,7 +619,6 @@ struct CatchUpApplyTests {
         var result = CatchUpFolderResult(folderId: w.folderId, epoch: Self.epoch)
         result.flagUpdates = [CatchUpFlagUpdate(messageId: "1", isRead: true, isFlagged: true)]
         result.removedIds = ["3"]
-        result.newMessages = [Self.header(9)]
         result.newState = "opaque-state"
         let outcome = await SyncEngine().applyCatchUpResult(result, windowMode: .uid)
 
@@ -434,7 +627,7 @@ struct CatchUpApplyTests {
         let ids = try await w.pool.read { db in
             try Set(String.fetchAll(db, sql: "SELECT messageId FROM messageHeader WHERE folderId = ?", arguments: [folderId]))
         }
-        #expect(ids == ["1", "2", "9"], "the removal went, the new message arrived through the insert path")
+        #expect(ids == ["1", "2"], "the removal went, and nothing else changed which rows exist")
         let one = try await w.pool.read { db in try MessageHeader.filter(Column("folderId") == folderId && Column("messageId") == "1").fetchOne(db) }
         #expect(one?.isRead == true && one?.isFlagged == true)
         #expect(try Self.catchUpState(w.pool, w.folderId) == "opaque-state")

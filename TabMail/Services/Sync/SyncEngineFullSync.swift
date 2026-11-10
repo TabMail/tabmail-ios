@@ -160,6 +160,9 @@ extension SyncEngine {
                     var folder = Folder(name: info.name, path: info.path, role: info.role, accountId: account.id)
                     folder.totalCount = info.totalCount
                     folder.lastKnownUidNext = info.uidNext
+                    // This STATUS is the folder's first: the catch-up's first listing
+                    // stamps itself with it (ADR-IOS-107).
+                    folder.lastKnownHighestModSeq = info.highestModSeq
                     // A brand-new row is by definition a first observation — the same
                     // bootstrap rule, which here also filters the `0` = "not reported"
                     // sentinel out of the column.

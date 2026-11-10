@@ -81,10 +81,9 @@ struct CatchUpFolderResult: Sendable {
     /// sync applies nothing unless this equals the folder's stored known epoch; a
     /// result whose epoch DIFFERS from a known stored one reports a turnover.
     let epoch: UInt32?
+    /// Changes to rows the device already holds. There is no field for a message
+    /// without a local row: the catch-up never inserts (ADR-IOS-107).
     var flagUpdates: [CatchUpFlagUpdate] = []
-    /// Messages the provider found that have no local row yet; they go through the
-    /// existing insert path.
-    var newMessages: [MessageHeaderInfo] = []
     /// Provider ids the server has PROVEN absent. They go through the one removal
     /// path (`SyncEngine.deleteConfirmedGhostHeaders`).
     var removedIds: [String] = []
