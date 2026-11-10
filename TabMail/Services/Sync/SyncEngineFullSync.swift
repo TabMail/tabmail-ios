@@ -1018,6 +1018,22 @@ extension SyncEngine {
         }
     }
 
+    /// The placeholder message ids (`draft-…`) of `accountId`'s local drafts that
+    /// have never reached the server (no `serverDraftId`). The full sync never
+    /// stale-deletes these (#519): the server cannot list what it never received,
+    /// and the placeholder header is the only row such a draft opens from
+    /// (`LocallyAuthoredDraftOpenAuthority.resolve`). A placeholder whose draft is
+    /// gone (sent, deleted, evicted) or has a server copy is not in this set and
+    /// is removed as before.
+    nonisolated static func neverUploadedDraftPlaceholderIds(accountId: String, db: Database) throws -> Set<String> {
+        let drafts = try Draft.filter(Column("accountId") == accountId).fetchAll(db)
+        return Set(drafts.compactMap { draft -> String? in
+            guard (draft.serverDraftId ?? "").isEmpty,
+                  let epoch = draft.instanceEpoch, !epoch.isEmpty else { return nil }
+            return PendingOperation.draftPlaceholderMessageId(draftId: draft.id, instanceEpoch: epoch)
+        })
+    }
+
     /// The identity an rfc822 Message-ID column carries, or nil when it carries
     /// NONE. Normalized (angle brackets/whitespace stripped) so a stored
     /// `<a@example.com>` and an incoming `a@example.com` are the same identity,
@@ -1558,11 +1574,27 @@ extension SyncEngine {
             }
 
             let uidMigratedSet = Set(uidMigratedOldMsgIds)
+            // Absence from the server is no evidence against a draft that never
+            // reached it (#519): its placeholder header is the only row the draft
+            // opens from. Read inside this transaction, like the pending ops.
+            let neverUploadedDraftIds: Set<String>
+            if stale.contains(where: { isSyntheticPlaceholderId($0.messageId) }) {
+                neverUploadedDraftIds = try Self.neverUploadedDraftPlaceholderIds(accountId: accountId, db: db)
+            } else {
+                neverUploadedDraftIds = []
+            }
+            if DebugModeManager.isLoggingEnabled() {
+                let kept = stale.filter { neverUploadedDraftIds.contains($0.messageId) }
+                if !kept.isEmpty {
+                    print("[Sync] \(folder.name): keeping \(kept.count) never-uploaded draft placeholder(s): \(kept.map(\.messageId))")
+                }
+            }
             let isProtected: (MessageHeader) -> Bool = { msg in
                 protectedIds.containsAnyKey(messageId: msg.messageId, rfc822MessageId: msg.rfc822MessageId) ||
                 recentlyCompleted[msg.messageId] != nil ||
                 (msg.rfc822MessageId.map { recentlyCompleted[$0] != nil } ?? false) ||
-                (msg.rfc822MessageId.map { outboxProtectedRfc822s.contains($0) } ?? false)
+                (msg.rfc822MessageId.map { outboxProtectedRfc822s.contains($0) } ?? false) ||
+                neverUploadedDraftIds.contains(msg.messageId)
             }
             let staleFiltered = stale.filter { !isProtected($0) && !uidMigratedSet.contains($0.messageId) }
             // Append, never assign — re-keyed old ids ride ftsRekeys (the FTS

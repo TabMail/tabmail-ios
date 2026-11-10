@@ -64,10 +64,11 @@ struct LocallyAuthoredDraftOpenAuthority: Sendable, Equatable {
         }
     }
 
-    /// The database half of `ServerDraftComposeLoader.resolveLocallyAuthoredDraft`
-    /// for every runtime except Gmail (whose resolution needs a provider round trip
-    /// to turn a contained MESSAGE id into a draft RESOURCE id, so it cannot live in
-    /// a read transaction).
+    /// The database half of `ServerDraftComposeLoader.resolveOpenAuthority`: every
+    /// runtime's rows, except a Gmail row with a server id (its resolution needs a
+    /// provider round trip to turn a contained MESSAGE id into a draft RESOURCE id,
+    /// so it cannot live in a read transaction). A Gmail placeholder row resolves
+    /// here like any other.
     ///
     /// Extracted so the INVARIANT — *given a database and a Drafts header, exactly
     /// the locally-authored `Draft` that owns that header comes back, and nothing
