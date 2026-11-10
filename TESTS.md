@@ -242,3 +242,16 @@ nothing more. Through the real caller, `GmailReceivedDateBoundaryTests` pulls ol
 `SyncEngine.fetchOlderMessages` the way the scroller does: a full page with one message Gmail cannot
 serve still says there may be more, so the next pull loads the message beyond it, the unreadable
 message gets no row, and the stored rows stay.
+
+## Plan picker — no in-app purchase while a web subscription is live
+
+`WebSubscriptionGateTests` decodes `/whoami` bodies through the real `AccountInfo` parser. A web
+subscription that is active, trialing, past due, cancelled but not yet ended, unpaid, incomplete,
+paused, or has no status counts as live, and `PlanPickerView.webManagedNote(for:)` then returns the
+one plain sentence that replaces the purchase options. An ended or never-completed web subscription,
+an Apple subscription, a signup trial (running or ended), no subscription, and an account not yet
+loaded all leave the plans on sale. A status the app does not know counts as live.
+`viewHidesEveryPurchaseOptionBehindTheGate` reads the view's source (a hosted `PlanPickerView`
+fetches its own account) and pins the two gates: the billing toggle, plan cards, footnotes and Apple
+disclosure sit in the `else` of the sentence, Restore Purchases sits inside its own gate, and Cancel /
+Manage Subscription sits outside both.
