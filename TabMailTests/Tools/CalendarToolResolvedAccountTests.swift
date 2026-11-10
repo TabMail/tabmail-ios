@@ -92,10 +92,11 @@ struct CalendarToolResolvedAccountTests {
 
         var failure: Error?
         do {
+            let accounts = [(id(.a), "a@example.com"), (id(.b), "b@example.com")]
             try await pool.write { db in
-                for (role, email) in [(Role.a, "a@example.com"), (Role.b, "b@example.com")] {
+                for (accountId, email) in accounts {
                     var account = Account(emailAddress: email, displayName: "Test", provider: .gmail)
-                    account.id = id(role)
+                    account.id = accountId
                     account.isActive = true
                     try account.insert(db)
                 }
