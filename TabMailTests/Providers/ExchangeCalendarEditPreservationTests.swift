@@ -589,7 +589,8 @@ private func expectOnlyEdited(
 
 /// A provider whose sign-in hands out "stale-token" until it is asked to refresh.
 private func makeProvider(_ http: FakeHTTP.Scenario) -> ExchangeCalendarProvider {
-    ExchangeCalendarProvider(accessToken: { forceRefresh in forceRefresh ? "fresh-token" : "stale-token" },
+    ExchangeCalendarProvider(mailbox: "calendar@example.com",
+                             accessToken: { forceRefresh in forceRefresh ? "fresh-token" : "stale-token" },
                              session: http.session)
 }
 
