@@ -933,11 +933,10 @@ extension AccountManager {
             // the scope switch and so before a split's first write, as a terminal `notSupported`
             // the drain retires and announces. The start is `start_iso`'s date when the edit gives
             // one, else the target's start date above, which an end-only edit keeps on every
-            // provider. A start given alone is never refused: Google, Outlook and the CalDAV
-            // whole-series merge carry the end by the event's length. A CalDAV single-occurrence
-            // override given a start alone does not yet carry its end, a known gap this check does
-            // not cover. An edit that gives no times is not checked, so an event already stored
-            // that way can still be renamed.
+            // provider. A start given alone is never refused: Google, Outlook, the CalDAV
+            // whole-series merge and the CalDAV single-occurrence override all carry the end by
+            // the event's length. An edit that gives no times is not checked, so an event already
+            // stored that way can still be renamed.
             if resolvedAllDay == true,
                let reason = CalendarToolHelpers.allDayEditEndRefusal(resolvedArgs, allDay: true, targetStartDate: targetStartDate) {
                 throw CalendarProviderError.notSupported(reason)
