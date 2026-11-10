@@ -19,8 +19,8 @@ other side opens once it has ended.
 2. **The plan picker hides every purchase option** for such an account (billing toggle, plan cards,
    footnotes, the Apple disclosure and Restore Purchases) and shows one plain sentence in their
    place: "Your subscription is managed on tabmail.ai, so it can't be changed in this app. For help,
-   contact support." (`PlanPickerView.webManagedNote(for:)`, rendered with `Text(verbatim:)` so the
-   domain is never a link). No link and no button: outside the US storefront App Review guidelines
+   contact support." (wording approved 2026-11-09; `PlanPickerView.webManagedNote(for:)`, rendered
+   with `Text(verbatim:)` so the domain is never a link). No link and no button: outside the US storefront App Review guidelines
    3.1.1(a) and 3.1.3 forbid calls to action toward other purchase methods, and a statement of where
    a subscription is managed is not one. 3.1.3(b) holds because the plans are still sold in the app
    to everyone else.
