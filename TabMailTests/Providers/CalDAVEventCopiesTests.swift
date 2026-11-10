@@ -386,11 +386,11 @@ struct CalDAVOccurrenceOverrideTests {
             #expect(Fixture.attendee(block, "alice@example.com") == "ATTENDEE;CN=Alice;PARTSTAT=ACCEPTED:mailto:alice@example.com",
                     Comment(rawValue: block.joined(separator: "\n")))
             let start = try #require(block.first { $0.hasPrefix("DTSTART") })
-            #expect(CalDAVProvider.parseICSDateTime(start) == CalDAVProvider.parseICSDateTime("DTSTART;TZID=\(zone):20990520T170000"),
+            #expect(try CalDAVProvider.parseICSDateTime(start, zones: .none) == CalDAVProvider.parseICSDateTime("DTSTART;TZID=\(zone):20990520T170000", zones: .none),
                     Comment(rawValue: start))
             #expect(!block.contains { $0.hasPrefix("DURATION") })
             if let end = block.first(where: { $0.hasPrefix("DTEND") }) {
-                #expect(CalDAVProvider.parseICSDateTime(end) == CalDAVProvider.parseICSDateTime(start),
+                #expect(try CalDAVProvider.parseICSDateTime(end, zones: .none) == CalDAVProvider.parseICSDateTime(start, zones: .none),
                         "the override gained a length: \(end)")
             }
         }
@@ -697,12 +697,12 @@ struct CalDAVWholeSeriesEditTests {
     }
 
     @Test("a repeating alarm's interval is not the event's length")
-    func alarmDurationIsNotTheLength() {
+    func alarmDurationIsNotTheLength() throws {
         let ics = Fixture.series([
             "BEGIN:VEVENT", "UID:series-1", "DTSTART:20990506T170000Z", "DURATION:PT1H", "RRULE:FREQ=WEEKLY",
             "BEGIN:VALARM", "ACTION:DISPLAY", "TRIGGER:-PT15M", "REPEAT:2", "DURATION:PT5M", "END:VALARM",
             "END:VEVENT",
         ])
-        #expect(CalDAVProvider.extractMasterDuration(from: ics) == 3600)
+        #expect(try CalDAVProvider.extractMasterDuration(from: ics) == 3600)
     }
 }

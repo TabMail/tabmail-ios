@@ -287,7 +287,9 @@ actor CalDAVProvider: CalendarProvider {
         }
         let etag = getResponse.value(forHTTPHeaderField: "ETag")
 
-        let mergedICS = try Self.mergePatchIntoICS(existingICS, patch: event)
+        // The stored resource's zone context, read once for every zone this write resolves.
+        let zones = CalendarTimeZoneContext(calendarText: existingICS)
+        let mergedICS = try Self.mergePatchIntoICS(existingICS, patch: event, zones: zones)
         // No ETag ⇒ `.unconditional`, NEVER `.ifNoneMatchAny`. The GET above
         // returned a non-empty body for this exact URL, so the resource
         // PROVABLY exists; `If-None-Match: *` asserts it does NOT, which
@@ -366,16 +368,18 @@ actor CalDAVProvider: CalendarProvider {
         //    differently-framed string appends a duplicate VEVENT sharing
         //    UID+RECURRENCE-ID instead of replacing it — a malformed resource
         //    servers resolve nondeterministically.
+        // The stored resource's zone context, read once for every zone this write resolves.
+        let zones = CalendarTimeZoneContext(calendarText: masterICS)
         let masterKind = Self.masterDTStartKind(from: masterICS)
-        guard let masterFrameRecurrenceId = Self.recurrenceIdInMasterFrame(
-            recurrenceId, declaredZone: recurrenceIdZone, kind: masterKind
+        guard let masterFrameRecurrenceId = try Self.recurrenceIdInMasterFrame(
+            recurrenceId, declaredZone: recurrenceIdZone, kind: masterKind, zones: zones
         ) else {
             throw CalendarProviderError.notSupported(
                 "Could not express recurrence_id '\(recurrenceId)' (\(recurrenceIdZone.identifier)) in this event's timezone — refusing to write an override that may name a different occurrence."
             )
         }
         let updatedICS = try Self.occurrenceOverrideResource(
-            storedICS: masterICS, recurrenceIdNaive: masterFrameRecurrenceId, patch: event, now: Date()
+            storedICS: masterICS, recurrenceIdNaive: masterFrameRecurrenceId, patch: event, now: Date(), zones: zones
         )
 
         // 3. PUT back — atomic at the CalDAV resource level (one HTTP call).
@@ -453,9 +457,11 @@ actor CalDAVProvider: CalendarProvider {
         // from fields, and a `.utc` master's value was re-read in the device
         // zone, which moved the successor's start by the device's UTC offset
         // while `untilValue` above stayed on the correct instant.)
+        // The stored resource's zone context, read once for every zone this write resolves.
+        let zones = CalendarTimeZoneContext(calendarText: masterICS)
         let masterKindForSplit = Self.masterDTStartKind(from: masterICS)
-        guard let masterFrameRecurrenceId = Self.recurrenceIdInMasterFrame(
-            recurrenceId, declaredZone: recurrenceIdZone, kind: masterKindForSplit
+        guard let masterFrameRecurrenceId = try Self.recurrenceIdInMasterFrame(
+            recurrenceId, declaredZone: recurrenceIdZone, kind: masterKindForSplit, zones: zones
         ) else {
             throw CalendarProviderError.notSupported(
                 "Could not express recurrence_id '\(recurrenceId)' (\(recurrenceIdZone.identifier)) in this event's timezone — refusing to split a series at an occurrence we cannot name."
@@ -488,7 +494,7 @@ actor CalDAVProvider: CalendarProvider {
         let newUid = GoogleCalendarProvider.deterministicSplitEventId(masterId: eventId, recurrenceId: recurrenceId)
         let resources = try Self.seriesSplitResources(
             storedICS: masterICS, slotNaiveISO: masterFrameRecurrenceId,
-            cappedRRule: cappedRRule, newRRule: newSeriesRRule, newUid: newUid, patch: patch, now: Date())
+            cappedRRule: cappedRRule, newRRule: newSeriesRRule, newUid: newUid, patch: patch, now: Date(), zones: zones)
         // The new part read the way a listing reads it, so the caller gets the
         // series it will see. Read BEFORE any write: a part we cannot read back
         // is refused with nothing written.
@@ -798,7 +804,11 @@ actor CalDAVProvider: CalendarProvider {
     /// UNTIL and its changed occurrences' RECURRENCE-IDs along (their own
     /// times stay where the user put them). An override is merged without its
     /// RECURRENCE-ID and holds no dates or rule, so it has nothing to move.
-    static func mergePatchIntoICS(_ ics: String, patch: GCalEventInput) throws -> String {
+    ///
+    /// `zones` is the zone context of the stored resource the write started from. Throws the
+    /// zone-naming refusal when a start or end has to be worked out in a zone TabMail does not
+    /// recognize.
+    static func mergePatchIntoICS(_ ics: String, patch: GCalEventInput, zones: CalendarTimeZoneContext) throws -> String {
         var result = ics
 
         if let summary = patch.summary, !summary.isEmpty {
@@ -848,8 +858,8 @@ actor CalDAVProvider: CalendarProvider {
         // DTSTART / DTEND — re-emit in the master's existing value type
         // (all-day / zoned / utc / floating) so RFC 5545 §3.8.4.4 is preserved.
         let kind = masterDTStartKind(from: result)
-        let patchedEnd = formatDTLine(name: "DTEND", patch: patch, isStart: false, kind: kind)
-        if let dtstart = formatDTLine(name: "DTSTART", patch: patch, isStart: true, kind: kind) {
+        let patchedEnd = try formatDTLine(name: "DTEND", patch: patch, isStart: false, kind: kind, zones: zones)
+        if let dtstart = try formatDTLine(name: "DTSTART", patch: patch, isStart: true, kind: kind, zones: zones) {
             let oldStart = try masterStartWallTime(in: result)
             result = replaceOrAppendInMasterVEvent(in: result, propertyKey: "DTSTART", newLine: dtstart)
             // Moving the start moves everything RFC 5545 ties to it. An RRULE
@@ -859,7 +869,7 @@ actor CalDAVProvider: CalendarProvider {
             // an end the patch gives is written below instead.
             if let oldStart, let newStart = try masterStartWallTime(in: result), newStart != oldStart {
                 result = try shiftSeriesAnchoredValues(
-                    in: result, by: SeriesStartShift(old: oldStart, new: newStart),
+                    in: result, by: SeriesStartShift(old: oldStart, new: newStart, zones: zones),
                     moveUntil: patchedRRule == nil, moveEnd: patchedEnd == nil)
             }
         }
@@ -966,8 +976,11 @@ actor CalDAVProvider: CalendarProvider {
 
     /// Build a DTSTART / DTEND line for the merge path, re-using the master's
     /// existing value type so the line we substitute in keeps the same form
-    /// (all-day / zoned / utc / floating).
-    private static func formatDTLine(name: String, patch: GCalEventInput, isStart: Bool, kind: MasterDTStartKind) -> String? {
+    /// (all-day / zoned / utc / floating). Throws the zone-naming refusal when the zone the line is
+    /// written in is one TabMail does not recognize: its wall clock could not be worked out.
+    private static func formatDTLine(
+        name: String, patch: GCalEventInput, isStart: Bool, kind: MasterDTStartKind, zones: CalendarTimeZoneContext
+    ) throws -> String? {
         if case .allDay = kind {
             let date = isStart ? patch.startDate : patch.endDate
             if let d = date {
@@ -983,10 +996,16 @@ actor CalDAVProvider: CalendarProvider {
             return nil // handled above
         case .zoned(let masterTz):
             let chosenTz = tzid?.isEmpty == false ? tzid! : masterTz
+            let lineZone = try zone(forTZID: chosenTz, zones: zones)
+            // An edit naming the event's own zone by another name (the IANA name of a stored
+            // Windows name) keeps the TZID as stored: the resource's VTIMEZONE is for that TZID.
+            let sameZone = chosenTz != masterTz
+                && CalendarTimeZoneResolver.zone(named: masterTz, in: zones)?.identifier == lineZone.identifier
+            let writtenTz = sameZone ? masterTz : chosenTz
             let fmt = DateFormatter()
             fmt.dateFormat = "yyyyMMdd'T'HHmmss"
-            fmt.timeZone = TimeZone(identifier: chosenTz) ?? .current
-            return "\(name);TZID=\(chosenTz):\(fmt.string(from: date))"
+            fmt.timeZone = lineZone
+            return "\(name);TZID=\(writtenTz):\(fmt.string(from: date))"
         case .utc:
             let fmt = DateFormatter()
             fmt.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
@@ -1038,12 +1057,14 @@ actor CalDAVProvider: CalendarProvider {
     ///
     /// Returns nil when the value cannot be re-expressed; callers MUST fail closed
     /// rather than fall back to the raw digits, which is the pre-fix behaviour and
-    /// the defect itself.
+    /// the defect itself. Throws the zone-naming refusal when the master's TZID is a
+    /// zone TabMail does not recognize; `zones` is the master resource's zone context.
     static func recurrenceIdInMasterFrame(
         _ recurrenceId: String,
         declaredZone: TimeZone,
-        kind: MasterDTStartKind
-    ) -> String? {
+        kind: MasterDTStartKind,
+        zones: CalendarTimeZoneContext
+    ) throws -> String? {
         switch kind {
         case .allDay:
             // A calendar DATE has no zone. Shifting one by a UTC offset is how
@@ -1059,7 +1080,7 @@ actor CalDAVProvider: CalendarProvider {
                 recurrenceId, from: declaredZone, to: TimeZone(identifier: "UTC") ?? declaredZone
             )
         case .zoned(let tzid):
-            guard let masterZone = TimeZone(identifier: tzid) else { return nil }
+            let masterZone = try zone(forTZID: tzid, zones: zones)
             return RecurrenceOccurrenceResolver.renderNaive(recurrenceId, from: declaredZone, to: masterZone)
         }
     }
@@ -1157,7 +1178,10 @@ actor CalDAVProvider: CalendarProvider {
     /// no terminal arm — the account's whole calendar lane wedged. Reuses
     /// `ICSParser.addDuration`, the tree's existing ISO-8601 duration parser,
     /// rather than adding a second grammar.
-    static func extractMasterDuration(from ics: String) -> TimeInterval? {
+    ///
+    /// `zones` is the resource's zone context. Throws the zone-naming refusal when a
+    /// start or end is in a zone TabMail does not recognize.
+    static func extractMasterDuration(from ics: String, zones: CalendarTimeZoneContext) throws -> TimeInterval? {
         var startDate: Date?
         var startLine: String?
         var endDate: Date?
@@ -1166,11 +1190,11 @@ actor CalDAVProvider: CalendarProvider {
         // The VEVENT's own lines only: a repeating alarm's `DURATION` is not the event's length.
         for line in masterTopLevelLines(ics) {
             if line.hasPrefix("DTSTART") {
-                startDate = parseICSDateTime(line)
+                startDate = try parseICSDateTime(line, zones: zones)
                 startLine = line
             } else if line.hasPrefix("DTEND") {
                 hasEndOrDuration = true
-                endDate = parseICSDateTime(line)
+                endDate = try parseICSDateTime(line, zones: zones)
             } else if line.hasPrefix("DURATION") {
                 hasEndOrDuration = true
                 guard let colonIdx = line.firstIndex(of: ":") else { continue }
@@ -1182,7 +1206,7 @@ actor CalDAVProvider: CalendarProvider {
         // Neither line at all: the end RFC 5545 implies. An end line that can't be read stays a refusal.
         if !hasEndOrDuration, let start = startLine.flatMap(icsProperty),
            let end = ICSParser.impliedEndValue(dtstartParams: start.params, dtstartValue: start.value) {
-            endDate = parseICSDateTime("DTEND\(start.params):\(end)")
+            endDate = try parseICSDateTime("DTEND\(start.params):\(end)", zones: zones)
         }
         // DTEND wins when present. A non-conforming resource carrying both then
         // keeps the pre-existing reading rather than silently changing meaning.
@@ -1200,7 +1224,10 @@ actor CalDAVProvider: CalendarProvider {
     /// (`DTSTART;TZID=America/Los_Angeles:20260520T170000`), and date-only
     /// all-day (`DTSTART;VALUE=DATE:20260520` or `DTSTART:20260520`).
     /// Returns nil on any parse failure so callers can decide how to handle it.
-    static func parseICSDateTime(_ line: String) -> Date? {
+    /// `zones` is the zone context of the resource the line is in (`.none` for a
+    /// line from no resource). Throws the zone-naming refusal for a TZID TabMail
+    /// does not recognize.
+    static func parseICSDateTime(_ line: String, zones: CalendarTimeZoneContext) throws -> Date? {
         guard let colonIdx = line.firstIndex(of: ":") else { return nil }
         let header = String(line[..<colonIdx])  // e.g. "DTSTART;TZID=America/Los_Angeles"
         let value = String(line[line.index(after: colonIdx)...]).trimmingCharacters(in: .whitespaces)
@@ -1230,18 +1257,11 @@ actor CalDAVProvider: CalendarProvider {
         let tzid = extractTZID(from: header)
         let resolvedZone: TimeZone
         if let tzid {
-            // A TZID is present but unresolvable (e.g. a Windows-style name
-            // like "Central European Standard Time" from an Outlook export).
-            // Refuse to parse rather than silently reinterpreting in the
-            // device timezone — a wrong absolute instant here would corrupt
+            // A TZID TabMail does not recognize is refused rather than read in
+            // the device timezone — a wrong absolute instant here would corrupt
             // `extractMasterDuration` (the new series would get a duration off
-            // by the timezone offset). Returning nil makes the caller
-            // (`seriesSplitResources`) fail fast with a clear error instead.
-            guard let zone = TimeZone(identifier: tzid) else {
-                BackgroundSyncLogger.logDebug("[CalDAV] parseICSDateTime: unresolvable TZID '\(tzid)' — refusing to guess")
-                return nil
-            }
-            resolvedZone = zone
+            // by the timezone offset) and every value written from it.
+            resolvedZone = try zone(forTZID: tzid, zones: zones)
         } else {
             // No TZID → RFC 5545 "floating time": interpret in device-local.
             resolvedZone = .current
@@ -1250,6 +1270,18 @@ actor CalDAVProvider: CalendarProvider {
         fmt.dateFormat = "yyyyMMdd'T'HHmmss"
         fmt.timeZone = resolvedZone
         return fmt.date(from: value)
+    }
+
+    /// The zone a TZID names in a CalDAV resource whose zone context is `zones`,
+    /// through `CalendarTimeZoneResolver`. Every CalDAV write that needs a stored
+    /// zone reads it here, so a zone TabMail does not recognize is refused the same
+    /// way on each: nothing is written, and the message names the zone.
+    static func zone(forTZID tzid: String, zones: CalendarTimeZoneContext) throws -> TimeZone {
+        guard let zone = CalendarTimeZoneResolver.zone(named: tzid, in: zones) else {
+            BackgroundSyncLogger.logDebug("[CalDAV] unrecognized TZID '\(tzid)' — refusing to guess")
+            throw CalendarProviderError.unrecognizedTimeZone(tzid, consequence: "it did not change the event")
+        }
+        return zone
     }
 
     /// Extract `TZID=Foo/Bar` from an ICS property header. Returns nil if no

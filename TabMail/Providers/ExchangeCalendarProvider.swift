@@ -830,7 +830,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         let wall = DateFormatter()
         wall.locale = Locale(identifier: "en_US_POSIX")
         wall.calendar = Calendar(identifier: .gregorian)
-        wall.timeZone = timeZone.flatMap(TimeZone.init(identifier:)) ?? .current
+        wall.timeZone = timeZone.flatMap { CalendarTimeZoneResolver.zone(named: $0, in: .none) } ?? .current
         wall.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
         guard let instant = wall.date(from: String(graphNaiveDateTime(dateTime).prefix(19))) else {
             return String(dateTime.prefix(10))
@@ -887,7 +887,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         var candidates: [OccurrenceCandidate] = []
         for ev in resp.value {
             guard let id = ev.id, let start = ev.start, let dt = start.dateTime else { continue }
-            guard let startZone = TimeZone(identifier: start.timeZone ?? "UTC") else {
+            guard let startZone = CalendarTimeZoneResolver.zone(named: start.timeZone ?? "UTC", in: .none) else {
                 throw CalendarProviderError.notSupported(
                     "Microsoft Graph returned an occurrence of \(masterId) in an unrecognized timezone ('\(start.timeZone ?? "")') — refusing to edit an occurrence that may not be the one you named."
                 )
@@ -1168,15 +1168,17 @@ actor ExchangeCalendarProvider: CalendarProvider {
     private func convertToRFC3339(_ dateTime: String, timeZone: String) -> String {
         // Graph returns "2024-01-15T14:30:00.0000000" with separate timeZone
         // We need to convert to RFC 3339: "2024-01-15T14:30:00+00:00"
+        // A read: a zone the resolver does not recognize is read in the device's zone, as before.
+        let zone = CalendarTimeZoneResolver.zone(named: timeZone, in: .none) ?? .current
         let fmt = DateFormatter()
         fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        fmt.timeZone = TimeZone(identifier: timeZone) ?? .current
+        fmt.timeZone = zone
 
         // Try parsing with fractional seconds
         let cleanDateTime = String(dateTime.prefix(19)) // Strip fractional seconds
         guard let date = fmt.date(from: cleanDateTime) else { return dateTime }
 
-        return date.iso8601String(timeZone: TimeZone(identifier: timeZone) ?? .current)
+        return date.iso8601String(timeZone: zone)
     }
 
     /// Drop the trailing offset/`Z` from an ISO 8601 datetime so the resulting
@@ -1285,7 +1287,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
             // device's): Graph reads the range's dates there. The start's wall time is the one
             // sent above, in that zone; an all-day series has none, and its rule's UNTIL is a bare
             // date, which `graphEndDate` keeps as written in any zone.
-            let rangeZone = input.startTimeZone.flatMap { TimeZone(identifier: $0) } ?? .current
+            let rangeZone = input.startTimeZone.flatMap { CalendarTimeZoneResolver.zone(named: $0, in: .none) } ?? .current
             let startWallTime = input.startDateTime.map(Self.graphNaiveDateTime)
             var graphRec = parseRRULEToGraphRecurrence(rrule, eventStart: recEventStart, timeZone: rangeZone, startWallTime: startWallTime)
             if var range = graphRec["range"] as? [String: Any], range["startDate"] == nil {

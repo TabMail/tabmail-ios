@@ -83,4 +83,82 @@ struct CalendarQueueArgumentValidationTests {
         #expect(!remaining.contains { $0.status == PendingStatus.queued.rawValue })
         #expect(!remaining.contains { $0.status == PendingStatus.inFlight.rawValue })
     }
+
+    @Test("a queued create or edit whose timezone TabMail does not recognize is retired naming the zone and never sent",
+          arguments: [CalendarOperationType.create, .edit])
+    func unrecognizedTimeZoneIsRetired(type: CalendarOperationType) async throws {
+        let accountId = "cal-tz-\(type.rawValue)"
+        let (pool, dir, previous) = try makeTestDB(accountId: accountId)
+        let mock = MockCalendarProvider()
+        await AccountManager.shared.registerCalendarProviderForTesting(accountId: accountId, provider: mock)
+        defer {
+            Task { await AccountManager.shared.unregisterCalendarProviderForTesting(accountId: accountId) }
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir)
+        }
+
+        let args: [String: JSONValue] = [
+            "title": .string("Standup"),
+            "all_day": .bool(false),
+            "start_iso": .string("2099-07-15T10:00:00"),
+            "end_iso": .string("2099-07-15T11:00:00"),
+            "timezone": .string("Not/AZone"),
+        ]
+        let op = PendingCalendarOperation(
+            operationType: type, accountId: accountId,
+            eventId: type == .edit ? "evt-1" : nil,
+            calendarId: "primary", arguments: args)
+        try await pool.write { db in try op.insert(db) }
+
+        async let outcome = AccountManager.shared.awaitCalendarOpOutcome(opId: op.id, timeoutSeconds: 5.0)
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        await AccountManager.shared.drainCalendarQueue()
+        let result = await outcome
+
+        if case .permanentFailure(let reason) = result {
+            #expect(reason.contains("This event uses the time zone \"Not/AZone\", which TabMail does not recognize"),
+                    "reason: \(reason)")
+        } else {
+            #expect(Bool(false), "the drain reported \(result) for an operation whose timezone is not recognized")
+        }
+        let created = await mock.createdEvents
+        let updated = await mock.updatedEvents
+        #expect(created.isEmpty && updated.isEmpty,
+                "nothing should reach the provider: \(created.count) create(s), \(updated.count) update(s)")
+    }
+
+    @Test("a queued create whose timezone is a Windows zone name is written in that zone")
+    func windowsTimeZoneIsWrittenInThatZone() async throws {
+        let accountId = "cal-tz-windows"
+        let (pool, dir, previous) = try makeTestDB(accountId: accountId)
+        let mock = MockCalendarProvider()
+        await AccountManager.shared.registerCalendarProviderForTesting(accountId: accountId, provider: mock)
+        defer {
+            Task { await AccountManager.shared.unregisterCalendarProviderForTesting(accountId: accountId) }
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir)
+        }
+
+        let op = PendingCalendarOperation(
+            operationType: .create, accountId: accountId, eventId: nil, calendarId: "primary",
+            arguments: [
+                "title": .string("Standup"),
+                "start_iso": .string("2099-07-15T10:00:00"),
+                "end_iso": .string("2099-07-15T11:00:00"),
+                "timezone": .string("Tokyo Standard Time"),
+            ])
+        try await pool.write { db in try op.insert(db) }
+        await AccountManager.shared.drainCalendarQueue()
+
+        let created = await mock.createdEvents
+        #expect(created.count == 1)
+        guard created.count == 1 else { return }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        let zone = try #require(TimeZone(identifier: "Asia/Tokyo"))
+        formatter.timeZone = zone
+        let expected = try #require(formatter.date(from: "2099-07-15T10:00:00"))
+        #expect(created[0].event.startTimeZone == "Asia/Tokyo")
+        #expect(created[0].event.startDateTime.flatMap { Date.fromISO8601($0) } == expected,
+                "\(String(describing: created[0].event.startDateTime))")
+    }
 }

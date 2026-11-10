@@ -11,6 +11,24 @@
 > both the override's `RECURRENCE-ID` and `spliceOrReplaceOverride`, so the splice replaces the
 > override rather than appending a second VEVENT with the same UID and RECURRENCE-ID. Detail:
 > `Companion/Memory/Current/142-a-copy-of-a-repeating-series-keeps-the-series-properties.md`.
+>
+> **Amendment (2026-11-10): how a TZID is recognised; clause (c)'s fail-closed rule now names the
+> zone.** Every calendar zone name is now read through one resolver,
+> `CalendarTimeZoneResolver` (`Shared/ICS/CalendarTimeZoneResolver.swift`), over a per-resource
+> `CalendarTimeZoneContext` built from the stored calendar text. A name is recognised as an IANA
+> identifier, as a Windows zone name through the CLDR table (`Shared/ICS/WindowsTimeZones.swift`,
+> which replaces the old 14-name map), or through the `X-LIC-LOCATION` of the resource's own
+> VTIMEZONE. Windows names (for example `Tokyo Standard Time`) and VTIMEZONE locations therefore
+> resolve, where they were previously unrecognised.
+>
+> Clause (c)'s "an unrecognised TZID returns nil and the edit fails closed" is superseded in its
+> mechanism, not its outcome: `recurrenceIdInMasterFrame` now throws, and every write that needs
+> the instant of an unrecognised TZID (time edit, override, split, series start move, and the
+> assistant's `timezone` argument on create or edit) refuses with a message naming the zone. A
+> write is never re-read in the device zone. Reads never refuse, unchanged. A title-only edit of
+> such an event still lands. Pinned by `CalDAVTimeZoneWireTests.unrecognizedZoneIsRefused`,
+> `CalDAVOccurrenceFrameTests.unknownMasterZoneFailsClosed` and `windowsMasterZoneIsRecognized`,
+> and `CalendarTimeZoneResolverTests`.
 <!-- KNOWN-ISSUES-AMENDMENT-END -->
 > Routed from `KNOWN_ISSUES.md` line 1133 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 dfa31256dfc43d25d741408ed6e33e2e58ae9984d7cc825a2d59c6c1ae1b6535`).
 

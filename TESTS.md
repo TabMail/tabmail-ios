@@ -611,6 +611,31 @@ parameter through `ICSValueType.statesDate`, which compares it whole, never as a
 timed event and keeps its length, and such a weekly series split this-and-following is capped with a date-time
 `UNTIL` and continues as a timed series at the new time, in its own zone, with the same length.
 
+## Calendar zone names — one resolver, per-resource context
+
+Every calendar zone name is read through `CalendarTimeZoneResolver` over a per-resource
+`CalendarTimeZoneContext`: an IANA name, a Windows name (CLDR table), or the `X-LIC-LOCATION` of the
+resource's own VTIMEZONE. Fixtures name every zone and use dates in 2099.
+
+- `CalendarTimeZoneContextTests` (`TabMailTests/Shared/`, new): `CalendarTimeZoneResolverTests` (IANA and
+  Windows names, every CLDR target exists, a name before the location, a location tried as a name, a rules-only
+  zone unrecognised); `CalendarTimeZoneContextTests` (folded and quoted TZIDs, first definition wins, only direct
+  VTIMEZONE children, a hostile resource bounded in time); `CalendarToolHelpersWriteTimeZoneTests` (a Windows
+  argument, an unknown zone refused with the exact message, the device zone as default).
+- `CalDAVEventTimeZoneTests` (`TabMailTests/Providers/`, new): `ICSParserTimeZoneTests` and
+  `ICSBuilderTimeZoneTests` read at the zone's instant (Tokyo, Windows, X-LIC zone; every name of the old
+  14-name map reads the same; an unrecognised zone is still shown). `CalDAVTimeZoneWireTests`, against the
+  fake CalDAV server: a time edit, series move, override and split land at the right instants and keep the
+  stored TZID; an unrecognised zone is refused on each write, naming the zone, while a title-only edit lands.
+  `CalendarTimeZoneResolverFenceTests` fails on any zone lookup outside the resolver and pins the five
+  context construction sites.
+- Changed: `CalDAVRecurringHelpersTests` (`parseICSDateTimeUnknownTZID`, `extractMasterDurationUnknownTZID`)
+  and `CalDAVOccurrenceFrameTests` (`unknownMasterZoneFailsClosed`) expect the named refusal;
+  `windowsMasterZoneIsRecognized` re-expresses a Windows master zone. Added: Exchange and Google Windows-zone
+  reads, splits and patches (`ExchangeCalendarTests`, `GoogleCalendarTypesTests`, `GCalEventInputICSTests`);
+  tool and queue refusals of an unrecognised `timezone` (`CalendarEventToolTests`, `CalendarToolHelpersTests`,
+  `CalendarQueueArgumentValidationTests`, which also checks a Windows zone is written in that zone).
+
 ## Catch-up of older mail (IMAP and the generic apply)
 
 `IMAPCatchUpTests` drives the real `IMAPProvider.catchUp` against `FakeIMAPServer` (with `CONDSTORE`)

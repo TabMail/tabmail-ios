@@ -1403,6 +1403,37 @@ struct CalendarToolHelpersTimezoneTests {
         #expect(tz == .current)
     }
 
+    @Test("resolveTimeZone reads a Windows zone name as its CLDR zone")
+    func windowsTimeZoneArgument() {
+        let args: [String: JSONValue] = ["timezone": .string("Pacific Standard Time")]
+        #expect(CalendarToolHelpers.resolveTimeZone(args).identifier == "America/Los_Angeles")
+    }
+
+    @Test("buildGCalEventInput reads a Windows timezone at that zone's instants and refuses an unknown one")
+    func buildInputTimeZone() throws {
+        let input = try CalendarToolHelpers.buildGCalEventInput([
+            "title": .string("Planning"), "start_iso": .string("2099-07-15T10:00:00"),
+            "end_iso": .string("2099-07-15T11:00:00"), "timezone": .string("Pacific Standard Time"),
+        ], isAllDay: false)
+        #expect(input.startTimeZone == "America/Los_Angeles")
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        let zone = try #require(TimeZone(identifier: "America/Los_Angeles"))
+        formatter.timeZone = zone
+        let expected = try #require(formatter.date(from: "2099-07-15T10:00:00"))
+        #expect(input.startDateTime.flatMap { Date.fromISO8601($0) } == expected, "\(String(describing: input.startDateTime))")
+        #expect {
+            _ = try CalendarToolHelpers.buildGCalEventInput([
+                "title": .string("Planning"), "start_iso": .string("2099-07-15T10:00:00"),
+                "timezone": .string("Not/AZone"),
+            ], isAllDay: false)
+        } throws: { error in
+            guard case CalendarProviderError.notSupported(let reason) = error else { return false }
+            return reason.contains("\"Not/AZone\"")
+        }
+    }
+
     @Test("resolveTimeZone ignores empty string")
     func resolveTimeZoneEmpty() {
         let args: [String: JSONValue] = ["timezone": .string("")]

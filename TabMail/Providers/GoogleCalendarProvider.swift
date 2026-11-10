@@ -49,6 +49,13 @@ enum CalendarProviderError: Error {
     /// The provider can't natively perform this operation (e.g. recurring-series
     /// split on Exchange/CalDAV/Demo before those implementations land).
     case notSupported(String)
+
+    /// The refusal for a write that needs a time zone `CalendarTimeZoneResolver` does not
+    /// recognize. The one wording for every such refusal; `consequence` is the only part that
+    /// changes, and says what TabMail therefore did not do ("it did not change the event").
+    static func unrecognizedTimeZone(_ name: String, consequence: String) -> CalendarProviderError {
+        .notSupported("This event uses the time zone \"\(name)\", which TabMail does not recognize, so \(consequence). Change the time in your calendar app instead.")
+    }
 }
 
 // Default protocol methods: provide a fallback for providers that haven't
@@ -983,7 +990,8 @@ actor GoogleCalendarProvider: CalendarProvider {
         if master.isAllDay {
             return (master.start?.date.flatMap { RecurrenceTail.Day(iso: $0) }, RecurrenceTail.Day(iso: recurrenceId))
         }
-        guard let tzid = master.start?.timeZone, let masterZone = TimeZone(identifier: tzid) else { return (nil, nil) }
+        guard let tzid = master.start?.timeZone,
+              let masterZone = CalendarTimeZoneResolver.zone(named: tzid, in: .none) else { return (nil, nil) }
         let dayFormatter = DateFormatter()
         dayFormatter.locale = Locale(identifier: "en_US_POSIX")
         dayFormatter.dateFormat = "yyyy-MM-dd"
@@ -1029,7 +1037,8 @@ actor GoogleCalendarProvider: CalendarProvider {
         guard allDay else { return naiveInstant(naiveISO, zone: zone) }
         let digits = naiveISO.prefix(10).replacingOccurrences(of: "-", with: "")
         guard digits.count == 8, digits.allSatisfy(\.isNumber) else { return nil }
-        return CalDAVProvider.parseICSDateTime("DTSTART;VALUE=DATE:\(digits)")
+        // A DATE has no zone, so this cannot throw; `try?` only satisfies the signature.
+        return try? CalDAVProvider.parseICSDateTime("DTSTART;VALUE=DATE:\(digits)", zones: .none)
     }
 
     /// A series' `recurrence` lines, split at `slot` for a this-and-following edit. The rule becomes
@@ -1047,8 +1056,8 @@ actor GoogleCalendarProvider: CalendarProvider {
                 capped.append(cappedRRule)
                 tail.append(tailRRule)
             case "EXDATE", "RDATE":
-                capped += try CalDAVProvider.filterDateList(line, keep: { $0 < slot })
-                tail += try CalDAVProvider.filterDateList(line, keep: { $0 >= slot })
+                capped += try CalDAVProvider.filterDateList(line, zones: .none, keep: { $0 < slot })
+                tail += try CalDAVProvider.filterDateList(line, zones: .none, keep: { $0 >= slot })
             default:
                 capped.append(line)
                 tail.append(line)
@@ -1251,7 +1260,7 @@ actor GoogleCalendarProvider: CalendarProvider {
                 }
             } else if let sdt = patch.startDateTime, let startInstant = Date.fromISO8601(sdt) {
                 let endInstant = startInstant.addingTimeInterval(duration)
-                let tz = patch.startTimeZone.flatMap { TimeZone(identifier: $0) } ?? .current
+                let tz = patch.startTimeZone.flatMap { CalendarTimeZoneResolver.zone(named: $0, in: .none) } ?? .current
                 merged.endDateTime = endInstant.iso8601String(timeZone: tz)
                 merged.endTimeZone = patch.startTimeZone ?? existing.end?.timeZone
             } else {
@@ -1272,7 +1281,7 @@ actor GoogleCalendarProvider: CalendarProvider {
                 }
             } else if let edt = patch.endDateTime, let endInstant = Date.fromISO8601(edt) {
                 let startInstant = endInstant.addingTimeInterval(-duration)
-                let tz = patch.endTimeZone.flatMap { TimeZone(identifier: $0) } ?? .current
+                let tz = patch.endTimeZone.flatMap { CalendarTimeZoneResolver.zone(named: $0, in: .none) } ?? .current
                 merged.startDateTime = startInstant.iso8601String(timeZone: tz)
                 merged.startTimeZone = patch.endTimeZone ?? existing.start?.timeZone
             }

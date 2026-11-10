@@ -116,6 +116,18 @@ struct CalendarEventEditTool: AgentTool, Sendable {
                 "event_id": compoundId,
             ] as [String: Any])
         }
+        // A `timezone` TabMail does not recognize is refused before the card, rather than read as
+        // the device's zone (which would move the event to the wrong time). The queue refuses it
+        // the same way (`resolveWriteTimeZone`) for an edit that reaches it.
+        do {
+            _ = try CalendarToolHelpers.resolveWriteTimeZone(arguments, consequence: "it did not change the event")
+        } catch CalendarProviderError.notSupported(let reason) {
+            return ToolJSON.string(from: [
+                "ok": false,
+                "error": "calendar_event_edit failed: \(reason) The event was NOT changed. Name the zone by its IANA name (e.g. 'America/Los_Angeles') and call calendar_event_edit again.",
+                "event_id": compoundId,
+            ] as [String: Any])
+        }
         // Resolve the recurring-edit scope up front — it drives both the
         // confirmation-card date math (which occurrence to show) and the
         // scope clause appended to `changes`. Resolved here, before the API

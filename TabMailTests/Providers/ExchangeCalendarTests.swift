@@ -761,4 +761,46 @@ struct ExchangeCalendarRecurringTests {
         #expect(ExchangeCalendarProvider.day(nil, "2099-05-15T2000", in: nil) == "2099-05-15")
         #expect(ExchangeCalendarProvider.day("2099-05-15", nil, in: nil) == "2099-05-15")
     }
+
+    /// Two Windows zone names nineteen hours apart, so whatever the device's zone, at least one of
+    /// them is not it and a read in the device's zone instead shows.
+    static let windowsZones: [(windows: String, iana: String, wall: String)] = [
+        ("Tokyo Standard Time", "Asia/Tokyo", "2099-07-15T03:00:00"),
+        ("Hawaiian Standard Time", "Pacific/Honolulu", "2099-07-15T21:00:00"),
+    ]
+
+    @Test("an event Graph returns in a Windows zone is read at that zone's instant")
+    func windowsZoneIsReadAtItsInstant() async throws {
+        let provider = makeProvider()
+        var differing = 0
+        for zone in Self.windowsZones {
+            let event = try decodeMSEvent("""
+            {"id": "e1", "subject": "Planning",
+             "start": {"dateTime": "\(zone.wall).0000000", "timeZone": "\(zone.windows)"},
+             "end": {"dateTime": "\(zone.wall).0000000", "timeZone": "\(zone.windows)"}}
+            """)
+            let gcal = await provider.toGCalEvent(event)
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+            let ianaZone = try #require(TimeZone(identifier: zone.iana))
+            formatter.timeZone = ianaZone
+            let expected = try #require(formatter.date(from: zone.wall))
+            #expect(gcal.start?.dateTime.flatMap { Date.fromISO8601($0) } == expected, "\(zone.windows)")
+            if ianaZone.secondsFromGMT(for: expected) != TimeZone.current.secondsFromGMT(for: expected) { differing += 1 }
+        }
+        #expect(differing > 0, "non-vacuity: device zone \(TimeZone.current.identifier)")
+    }
+
+    @Test("the day of a start in a Windows zone is the day of that zone's instant")
+    func dayOfAStartInAWindowsZone() {
+        var moved = 0
+        for zone in Self.windowsZones {
+            let day = ExchangeCalendarProvider.day(nil, zone.wall, in: zone.windows)
+            #expect(day == ExchangeCalendarProvider.day(nil, zone.wall, in: zone.iana), "\(zone.windows)")
+            // Read in the device's zone instead, the start would be on the day it is written with.
+            if day != String(zone.wall.prefix(10)) { moved += 1 }
+        }
+        #expect(moved > 0, "non-vacuity: device zone \(TimeZone.current.identifier)")
+    }
 }

@@ -62,6 +62,7 @@ extension CalDAVProvider {
     ///   - newUid: the new part's UID (deterministic, so a retry targets the same resource).
     ///   - patch: the user's edit.
     ///   - now: the split's time, written as the new part's `DTSTAMP`.
+    ///   - zones: the zone context of `storedICS`.
     static func seriesSplitResources(
         storedICS: String,
         slotNaiveISO: String,
@@ -69,7 +70,8 @@ extension CalDAVProvider {
         newRRule: String,
         newUid: String,
         patch: GCalEventInput,
-        now: Date
+        now: Date,
+        zones: CalendarTimeZoneContext
     ) throws -> SeriesSplitResources {
         let kind = masterDTStartKind(from: storedICS)
         guard let dtstart = masterTopLevelLines(storedICS).first(where: { icsProperty($0)?.name == "DTSTART" }),
@@ -80,10 +82,10 @@ extension CalDAVProvider {
             throw CalendarProviderError.notSupported("Invalid recurrence_id '\(slotNaiveISO)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
         }
         let slotLine = "DTSTART\(dtstartProperty.params):\(slotValue)"
-        guard let slotInstant = parseICSDateTime(slotLine) else {
+        guard let slotInstant = try parseICSDateTime(slotLine, zones: zones) else {
             throw CalendarProviderError.notSupported("The repeating event's time zone can't be read, so it can't be split.")
         }
-        guard let duration = extractMasterDuration(from: storedICS) else {
+        guard let duration = try extractMasterDuration(from: storedICS, zones: zones) else {
             throw CalendarProviderError.notSupported("The repeating event's length can't be read, so it can't be split.")
         }
         let stamp = utcStamp(now)
@@ -91,14 +93,14 @@ extension CalDAVProvider {
         // 1. The capped series: the cap, and nothing at or after the slot.
         let capped = try rewriteVEvents(in: storedICS) { block, isMaster in
             if !isMaster {
-                return try recurrenceInstant(of: block) < slotInstant ? block : nil
+                return try recurrenceInstant(of: block, zones: zones) < slotInstant ? block : nil
             }
             return try rewriteTopLevel(block) { unit, name in
                 switch name {
                 case "RRULE":
                     return [cappedRRule]
                 case "EXDATE", "RDATE":
-                    return try filterDateList(unit.text, keep: { $0 < slotInstant })
+                    return try filterDateList(unit.text, zones: zones, keep: { $0 < slotInstant })
                 default:
                     return nil
                 }
@@ -108,7 +110,7 @@ extension CalDAVProvider {
         // 2. The new part, re-anchored at the slot.
         let anchored = try rewriteVEvents(in: storedICS) { block, isMaster in
             if !isMaster {
-                guard try recurrenceInstant(of: block) >= slotInstant else { return nil }
+                guard try recurrenceInstant(of: block, zones: zones) >= slotInstant else { return nil }
             }
             var sawStamp = false
             var out = try rewriteTopLevel(block) { unit, name in
@@ -123,14 +125,14 @@ extension CalDAVProvider {
                 case "DTSTART" where isMaster:
                     return [slotLine]
                 case "DTEND" where isMaster:
-                    guard let end = formatLike(unit.text, instant: slotInstant.addingTimeInterval(duration)) else {
+                    guard let end = try formatLike(unit.text, instant: slotInstant.addingTimeInterval(duration), zones: zones) else {
                         throw CalendarProviderError.notSupported("The repeating event's end time zone can't be read, so it can't be split.")
                     }
                     return [end]
                 case "RRULE" where isMaster:
                     return [newRRule]
                 case "EXDATE" where isMaster, "RDATE" where isMaster:
-                    return try filterDateList(unit.text, keep: { $0 >= slotInstant })
+                    return try filterDateList(unit.text, zones: zones, keep: { $0 >= slotInstant })
                 default:
                     return nil
                 }
@@ -140,8 +142,8 @@ extension CalDAVProvider {
         }
 
         // 3. The user's patch, then 4. attendee answers.
-        let patched = try mergePatchKeepingLength(patch, into: anchored, length: duration)
-        let newPart = applyAttendeeRule(before: anchored, after: patched)
+        let patched = try mergePatchKeepingLength(patch, into: anchored, length: duration, zones: zones)
+        let newPart = try applyAttendeeRule(before: anchored, after: patched, zones: zones)
         return SeriesSplitResources(cappedSeries: capped, newPart: newPart)
     }
 
@@ -163,11 +165,14 @@ extension CalDAVProvider {
     ///     (`recurrenceIdInMasterFrame`).
     ///   - patch: the user's edit.
     ///   - now: the edit's time, written as a new override's `DTSTAMP`.
+    ///   - zones: the zone context of `storedICS`. The override is merged on its own, outside the
+    ///     resource, and its zones are read through this.
     static func occurrenceOverrideResource(
         storedICS: String,
         recurrenceIdNaive: String,
         patch: GCalEventInput,
-        now: Date
+        now: Date,
+        zones: CalendarTimeZoneContext
     ) throws -> String {
         let kind = masterDTStartKind(from: storedICS)
         let units = icsUnits(storedICS)
@@ -184,7 +189,7 @@ extension CalDAVProvider {
         var ridParams = dtstartProperty.params
         if case .allDay = kind, !ICSValueType.statesDate(ridParams) { ridParams += ";VALUE=DATE" }
         let ridLine = "RECURRENCE-ID\(ridParams):\(ridValue)"
-        guard let ridInstant = parseICSDateTime(ridLine) else {
+        guard let ridInstant = try parseICSDateTime(ridLine, zones: zones) else {
             throw CalendarProviderError.notSupported("The repeating event's time zone can't be read, so one occurrence of it can't be changed.")
         }
 
@@ -196,7 +201,7 @@ extension CalDAVProvider {
         }) {
             base = existing
         } else {
-            guard let duration = copyLength(storedICS) else {
+            guard let duration = try copyLength(storedICS, zones: zones) else {
                 throw CalendarProviderError.notSupported("The repeating event's length can't be read, so one occurrence of it can't be changed.")
             }
             let stamp = utcStamp(now)
@@ -211,7 +216,7 @@ extension CalDAVProvider {
                 case "DTSTART":
                     return ["DTSTART\(dtstartProperty.params):\(ridValue)"]
                 case "DTEND":
-                    guard let end = formatLike(unit.text, instant: ridInstant.addingTimeInterval(duration)) else {
+                    guard let end = try formatLike(unit.text, instant: ridInstant.addingTimeInterval(duration), zones: zones) else {
                         throw CalendarProviderError.notSupported("The repeating event's end time zone can't be read, so one occurrence of it can't be changed.")
                     }
                     return [end]
@@ -231,14 +236,14 @@ extension CalDAVProvider {
         }
         let bare = base.filter { icsProperty($0.text)?.name != "RECURRENCE-ID" }
         let wrapped = (["BEGIN:VCALENDAR"] + bare.flatMap(\.physical) + ["END:VCALENDAR"]).joined(separator: "\r\n")
-        guard let length = copyLength(wrapped) else {
+        guard let length = try copyLength(wrapped, zones: zones) else {
             throw CalendarProviderError.notSupported("A changed occurrence of the repeating event can't be read, so it can't be changed again.")
         }
         // A repeat rule belongs to the series: an occurrence never takes one from the edit.
         var occurrencePatch = patch
         occurrencePatch.recurrence = nil
-        let patched = try mergePatchKeepingLength(occurrencePatch, into: wrapped, length: length)
-        let answered = applyAttendeeRule(before: wrapped, after: patched)
+        let patched = try mergePatchKeepingLength(occurrencePatch, into: wrapped, length: length, zones: zones)
+        let answered = try applyAttendeeRule(before: wrapped, after: patched, zones: zones)
         guard var block = veventBlocks(icsUnits(answered)).first else {
             throw CalendarProviderError.notSupported("A changed occurrence of the repeating event can't be read, so it can't be changed again.")
         }
@@ -263,7 +268,9 @@ extension CalDAVProvider {
     /// resolved its times). A new start with no end keeps the copy's `length`; an end replaces a
     /// `DURATION`, since RFC 5545 forbids both in one VEVENT. An all-day copy takes the date of a
     /// start or end the patch gives as a date-time.
-    private static func mergePatchKeepingLength(_ patch: GCalEventInput, into ics: String, length: TimeInterval) throws -> String {
+    private static func mergePatchKeepingLength(
+        _ patch: GCalEventInput, into ics: String, length: TimeInterval, zones: CalendarTimeZoneContext
+    ) throws -> String {
         var effective = patch
         effective.startTimeZone = nil
         effective.endTimeZone = nil
@@ -286,13 +293,13 @@ extension CalDAVProvider {
                 effective.endDateTime = startDate.addingTimeInterval(length).iso8601String(timeZone: TimeZone(identifier: "UTC") ?? .current)
             }
         }
-        return try mergePatchIntoICS(base, patch: effective)
+        return try mergePatchIntoICS(base, patch: effective, zones: zones)
     }
 
     /// `after` with the attendee rule applied to its series VEVENT: an attendee who was in `before`
     /// keeps their answer unless the patch rescheduled the event; anyone else other than the organizer
     /// is asked (`PARTSTAT=NEEDS-ACTION;RSVP=TRUE`).
-    private static func applyAttendeeRule(before: String, after: String) -> String {
+    private static func applyAttendeeRule(before: String, after: String, zones: CalendarTimeZoneContext) throws -> String {
         let prior = masterTopLevelLines(before)
         let organizer = prior.first(where: { icsProperty($0)?.name == "ORGANIZER" })
             .flatMap { icsProperty($0) }.flatMap { mailtoAddress($0.value) }
@@ -300,7 +307,7 @@ extension CalDAVProvider {
             guard let p = icsProperty(line), p.name == "ATTENDEE" else { return nil }
             return mailtoAddress(p.value)
         })
-        let rescheduled = reschedules(before: before, after: after)
+        let rescheduled = try reschedules(before: before, after: after, zones: zones)
         return rewriteMasterVEvent(in: after) { block in
             rewriteTopLevel(block) { unit, name in
                 guard name == "ATTENDEE", let p = icsProperty(unit.text),
@@ -316,12 +323,14 @@ extension CalDAVProvider {
 
     /// True when the patch moved the start or end, changed the rule, or changed the location: the
     /// changes after which attendees are asked again. Compared on effective values, so restating the
-    /// same start is not a change. Anything that can't be read counts as a change.
-    static func reschedules(before: String, after: String) -> Bool {
+    /// same start is not a change. Anything that can't be read counts as a change; a zone TabMail does
+    /// not recognize is refused (`zone(forTZID:zones:)`). `zones` is the stored resource's zone context.
+    static func reschedules(before: String, after: String, zones: CalendarTimeZoneContext) throws -> Bool {
         let a = masterTopLevelLines(before)
         let b = masterTopLevelLines(after)
-        guard let startA = effectiveStart(a), let startB = effectiveStart(b),
-              let endA = effectiveEnd(a, start: startA), let endB = effectiveEnd(b, start: startB) else {
+        guard let startA = try effectiveStart(a, zones: zones), let startB = try effectiveStart(b, zones: zones),
+              let endA = try effectiveEnd(a, start: startA, zones: zones),
+              let endB = try effectiveEnd(b, start: startB, zones: zones) else {
             return true
         }
         if startA != startB || endA != endB { return true }
@@ -329,13 +338,14 @@ extension CalDAVProvider {
         return propertyText(a, "LOCATION") != propertyText(b, "LOCATION")
     }
 
-    private static func effectiveStart(_ lines: [String]) -> Date? {
-        lines.first(where: { icsProperty($0)?.name == "DTSTART" }).flatMap(parseICSDateTime)
+    private static func effectiveStart(_ lines: [String], zones: CalendarTimeZoneContext) throws -> Date? {
+        guard let dtstart = lines.first(where: { icsProperty($0)?.name == "DTSTART" }) else { return nil }
+        return try parseICSDateTime(dtstart, zones: zones)
     }
 
-    private static func effectiveEnd(_ lines: [String], start: Date) -> Date? {
+    private static func effectiveEnd(_ lines: [String], start: Date, zones: CalendarTimeZoneContext) throws -> Date? {
         if let dtend = lines.first(where: { icsProperty($0)?.name == "DTEND" }) {
-            return parseICSDateTime(dtend)
+            return try parseICSDateTime(dtend, zones: zones)
         }
         if let duration = lines.first(where: { icsProperty($0)?.name == "DURATION" }).flatMap(icsProperty) {
             return ICSParser.addDuration(duration.value.trimmingCharacters(in: .whitespaces), to: start)
@@ -345,14 +355,15 @@ extension CalDAVProvider {
               let end = ICSParser.impliedEndValue(dtstartParams: dtstart.params, dtstartValue: dtstart.value) else {
             return nil
         }
-        return parseICSDateTime("DTEND\(dtstart.params):\(end)")
+        return try parseICSDateTime("DTEND\(dtstart.params):\(end)", zones: zones)
     }
 
     /// The length of the resource's series VEVENT (its end minus its start), or nil when either can't
     /// be read.
-    private static func copyLength(_ ics: String) -> TimeInterval? {
+    private static func copyLength(_ ics: String, zones: CalendarTimeZoneContext) throws -> TimeInterval? {
         let lines = masterTopLevelLines(ics)
-        guard let start = effectiveStart(lines), let end = effectiveEnd(lines, start: start), end >= start else { return nil }
+        guard let start = try effectiveStart(lines, zones: zones), let end = try effectiveEnd(lines, start: start, zones: zones),
+              end >= start else { return nil }
         return end.timeIntervalSince(start)
     }
 
@@ -599,10 +610,10 @@ extension CalDAVProvider {
         return out
     }
 
-    /// The instant an override VEVENT's `RECURRENCE-ID` names.
-    private static func recurrenceInstant(of block: [ICSUnit]) throws -> Date {
+    /// The instant an override VEVENT's `RECURRENCE-ID` names, in a resource whose zone context is `zones`.
+    private static func recurrenceInstant(of block: [ICSUnit], zones: CalendarTimeZoneContext) throws -> Date {
         guard let unit = topLevel(block).first(where: { icsProperty($0.text)?.name == "RECURRENCE-ID" }),
-              let instant = parseICSDateTime(unit.text) else {
+              let instant = try parseICSDateTime(unit.text, zones: zones) else {
             throw CalendarProviderError.notSupported("A changed occurrence of the repeating event can't be read, so it can't be split.")
         }
         return instant
@@ -610,13 +621,14 @@ extension CalDAVProvider {
 
     /// Keep the values of an `EXDATE`/`RDATE` line whose instant passes `keep`; an empty result drops
     /// the line. A `PERIOD` value is placed by its start. Also splits a Google series' `recurrence`
-    /// lines (`GoogleCalendarProvider.splitRecurrence`).
-    static func filterDateList(_ line: String, keep: (Date) -> Bool) throws -> [String] {
+    /// lines (`GoogleCalendarProvider.splitRecurrence`). `zones` is the zone context of the resource
+    /// the line is in (`.none` for a Google `recurrence` line, which comes from no resource).
+    static func filterDateList(_ line: String, zones: CalendarTimeZoneContext, keep: (Date) -> Bool) throws -> [String] {
         guard let p = icsProperty(line) else { return [line] }
         var kept: [String] = []
         for value in p.value.split(separator: ",").map(String.init) {
             let start = value.split(separator: "/").first.map(String.init) ?? value
-            guard let instant = parseICSDateTime("\(p.rawName)\(p.params):\(start)") else {
+            guard let instant = try parseICSDateTime("\(p.rawName)\(p.params):\(start)", zones: zones) else {
                 throw CalendarProviderError.notSupported("An excluded or added date of the repeating event can't be read, so it can't be split.")
             }
             if keep(instant) { kept.append(value) }
@@ -645,8 +657,9 @@ extension CalDAVProvider {
     }
 
     /// Write `instant` in the same form as `line` (date, UTC, zoned or floating), keeping its name and
-    /// parameters. Nil when the line names a zone that can't be resolved.
-    private static func formatLike(_ line: String, instant: Date) -> String? {
+    /// parameters. Nil when the line can't be read; throws the zone-naming refusal when it names a zone
+    /// TabMail does not recognize. `zones` is the zone context of the resource the line is in.
+    private static func formatLike(_ line: String, instant: Date, zones: CalendarTimeZoneContext) throws -> String? {
         guard let p = icsProperty(line) else { return nil }
         let value = p.value.trimmingCharacters(in: .whitespaces)
         let fmt = DateFormatter()
@@ -659,9 +672,8 @@ extension CalDAVProvider {
             fmt.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
             fmt.timeZone = TimeZone(identifier: "UTC")
         } else if let tzid = splitParams(p.params).first(where: { $0.uppercased().hasPrefix("TZID=") }) {
-            guard let zone = TimeZone(identifier: String(tzid.dropFirst("TZID=".count))) else { return nil }
             fmt.dateFormat = "yyyyMMdd'T'HHmmss"
-            fmt.timeZone = zone
+            fmt.timeZone = try zone(forTZID: String(tzid.dropFirst("TZID=".count)), zones: zones)
         } else {
             fmt.dateFormat = "yyyyMMdd'T'HHmmss"
             fmt.timeZone = .current

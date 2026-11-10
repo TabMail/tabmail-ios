@@ -105,10 +105,43 @@ struct CalendarEventEditToolTests {
         #expect(result.contains("missing event_id"))
     }
 
+    @Test("An unrecognized timezone is refused before the card, naming the zone")
+    func unrecognizedTimeZoneIsRefused() async throws {
+        let tool = CalendarEventEditTool(context: try makeContext())
+        let result = try await tool.execute(arguments: [
+            "event_id": .string("evt-1"), "start_iso": .string("2099-07-15T10:00:00"), "timezone": .string("Not/AZone"),
+        ])
+        let json = try #require(try JSONSerialization.jsonObject(with: Data(result.utf8)) as? [String: Any], "\(result)")
+        let error = try #require(json["error"] as? String, "\(result)")
+        #expect(json["ok"] as? Bool == false)
+        #expect(error.contains("This event uses the time zone \"Not/AZone\", which TabMail does not recognize"), "\(error)")
+        #expect(error.contains("The event was NOT changed"), "\(error)")
+    }
+
     @Test("Boolean event_id returns error")
     func booleanEventId() async throws {
         let tool = CalendarEventEditTool(context: try makeContext())
         let result = try await tool.execute(arguments: ["event_id": .bool(true)])
         #expect(result.contains("missing event_id"))
+    }
+}
+
+// MARK: - CalendarEventCreateTool
+
+@Suite("CalendarEventCreateTool time zone")
+struct CalendarEventCreateToolTimeZoneTests {
+
+    @Test("An unrecognized timezone is refused before the card, naming the zone")
+    func unrecognizedTimeZoneIsRefused() async throws {
+        let tool = CalendarEventCreateTool(context: ToolContext(db: try TestDatabase.make(), translator: MockChatIdTranslator()))
+        let result = try await tool.execute(arguments: [
+            "title": .string("Planning"), "start_iso": .string("2099-07-15T10:00:00"),
+            "end_iso": .string("2099-07-15T11:00:00"), "timezone": .string("Not/AZone"),
+        ])
+        let json = try #require(try JSONSerialization.jsonObject(with: Data(result.utf8)) as? [String: Any], "\(result)")
+        let error = try #require(json["error"] as? String, "\(result)")
+        #expect(json["ok"] as? Bool == false)
+        #expect(error.contains("This event uses the time zone \"Not/AZone\", which TabMail does not recognize"), "\(error)")
+        #expect(error.contains("The event was NOT created"), "\(error)")
     }
 }

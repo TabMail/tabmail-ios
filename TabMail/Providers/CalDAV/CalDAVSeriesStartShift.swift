@@ -41,6 +41,9 @@ extension CalDAVProvider {
     struct SeriesStartShift {
         let old: ICSWallTime
         let new: ICSWallTime
+        /// The zone context of the resource the series is in, for a value that has to move
+        /// through its instant.
+        let zones: CalendarTimeZoneContext
 
         /// Whole days plus the wall-clock difference, each start read in its
         /// own frame.
@@ -73,9 +76,9 @@ extension CalDAVProvider {
             guard CalDAVProvider.namesAnInstant(old.frame), CalDAVProvider.namesAnInstant(value.frame) else {
                 return ICSWallTime(frame: value.frame, wall: value.wall + delta)
             }
-            let own = try CalDAVProvider.knownZone(value.frame)
-            let seriesBefore = try CalDAVProvider.knownZone(old.frame)
-            let seriesAfter = try CalDAVProvider.knownZone(new.frame)
+            let own = try CalDAVProvider.knownZone(value.frame, zones: zones)
+            let seriesBefore = try CalDAVProvider.knownZone(old.frame, zones: zones)
+            let seriesAfter = try CalDAVProvider.knownZone(new.frame, zones: zones)
             guard let instant = CalDAVProvider.instant(ofWall: value.wall, in: own),
                   let seriesWall = CalDAVProvider.wall(of: instant, in: seriesBefore),
                   let movedInstant = CalDAVProvider.instant(ofWall: seriesWall + delta, in: seriesAfter),
@@ -287,15 +290,16 @@ extension CalDAVProvider {
         }
     }
 
-    /// The zone a timed frame's wall clock is read in. Throws for a `TZID` this
-    /// device does not know: converting through a guessed zone would write a
-    /// value no occurrence has.
-    private static func knownZone(_ frame: MasterDTStartKind) throws -> TimeZone {
+    /// The zone a timed frame's wall clock is read in (`CalendarTimeZoneResolver`,
+    /// through the resource's zone context). Throws for a `TZID` TabMail does not
+    /// recognize: converting through a guessed zone would write a value no
+    /// occurrence has.
+    private static func knownZone(_ frame: MasterDTStartKind, zones: CalendarTimeZoneContext) throws -> TimeZone {
         switch frame {
         case .zoned(let tzid):
-            guard let zone = TimeZone(identifier: tzid) else {
-                throw CalendarProviderError.notSupported(
-                    "This event uses the time zone \"\(tzid)\", which TabMail does not recognize, so it could not move the series' deleted and changed occurrences with it and did not change the event. Change the time in your calendar app instead.")
+            guard let zone = CalendarTimeZoneResolver.zone(named: tzid, in: zones) else {
+                throw CalendarProviderError.unrecognizedTimeZone(
+                    tzid, consequence: "it could not move the series' deleted and changed occurrences with it and did not change the event")
             }
             return zone
         case .utc, .allDay, .floating:

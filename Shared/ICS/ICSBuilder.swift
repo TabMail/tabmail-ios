@@ -219,6 +219,8 @@ enum ICSBuilder {
     /// Parse an incoming ICS text and extract the first VEVENT.
     /// Handles unfolding (RFC 5545 §3.1), common date formats, and parameters.
     static func parseIncoming(_ icsText: String) -> ParsedInvite? {
+        // What the invite's VTIMEZONE components say about its zone names, read once.
+        let zones = CalendarTimeZoneContext(calendarText: icsText)
         // Unfold continuation lines (CRLF + space/tab → join)
         let unfolded = icsText
             .replacingOccurrences(of: "\r\n ", with: "")
@@ -298,8 +300,8 @@ enum ICSBuilder {
         // Parse dates
         let isAllDay = dtstartParams.map { ICSValueType.statesDate($0) } == true
             || (dtstart.map { $0.count == 8 } ?? false)
-        let startDate = dtstart.flatMap { parseICSDate($0, params: dtstartParams) }
-        let endDate = dtend.flatMap { parseICSDate($0, params: dtendParams) }
+        let startDate = dtstart.flatMap { parseICSDate($0, params: dtstartParams, zones: zones) }
+        let endDate = dtend.flatMap { parseICSDate($0, params: dtendParams, zones: zones) }
 
         // Parse organizer
         let organizer = organizerLine.flatMap(parseParticipant)
@@ -465,8 +467,9 @@ enum ICSBuilder {
         return nil
     }
 
-    /// Parse an ICS date string (YYYYMMDD or YYYYMMDDTHHMMSS or YYYYMMDDTHHMMSSZ).
-    private static func parseICSDate(_ value: String, params: String?) -> Date? {
+    /// Parse an ICS date string (YYYYMMDD or YYYYMMDDTHHMMSS or YYYYMMDDTHHMMSSZ). `zones` is the
+    /// invite's own zone context.
+    private static func parseICSDate(_ value: String, params: String?, zones: CalendarTimeZoneContext) -> Date? {
         let cleaned = value.trimmingCharacters(in: .whitespaces)
 
         let fmt = DateFormatter()
@@ -488,7 +491,9 @@ enum ICSBuilder {
         // Date-time with optional timezone
         fmt.dateFormat = "yyyyMMdd'T'HHmmss"
         if let params, let tzid = extractTZID(params) {
-            fmt.timeZone = TimeZone(identifier: tzid) ?? mapWindowsTimezone(tzid)
+            // A zone the resolver does not recognize is read in the device's zone: this is a
+            // read-only summary of an incoming invite, never written anywhere.
+            fmt.timeZone = CalendarTimeZoneResolver.zone(named: tzid, in: zones) ?? .current
         } else {
             fmt.timeZone = .current
         }
@@ -502,30 +507,6 @@ enum ICSBuilder {
             if kv.count == 2 && kv[0].trimmingCharacters(in: .whitespaces).uppercased() == "TZID" {
                 return String(kv[1]).trimmingCharacters(in: .whitespaces)
             }
-        }
-        return nil
-    }
-
-    /// Map common Windows timezone names to IANA identifiers.
-    private static func mapWindowsTimezone(_ windowsTZ: String) -> TimeZone? {
-        let map: [String: String] = [
-            "Eastern Standard Time": "America/New_York",
-            "Central Standard Time": "America/Chicago",
-            "Mountain Standard Time": "America/Denver",
-            "Pacific Standard Time": "America/Los_Angeles",
-            "GMT Standard Time": "Europe/London",
-            "W. Europe Standard Time": "Europe/Berlin",
-            "Romance Standard Time": "Europe/Paris",
-            "Central European Standard Time": "Europe/Warsaw",
-            "E. Europe Standard Time": "Europe/Bucharest",
-            "Tokyo Standard Time": "Asia/Tokyo",
-            "China Standard Time": "Asia/Shanghai",
-            "India Standard Time": "Asia/Kolkata",
-            "AUS Eastern Standard Time": "Australia/Sydney",
-            "UTC": "UTC",
-        ]
-        if let iana = map[windowsTZ] {
-            return TimeZone(identifier: iana)
         }
         return nil
     }
