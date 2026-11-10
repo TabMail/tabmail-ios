@@ -125,13 +125,17 @@ yet) has no address on a server.
 `TabMailTests/Services/PlaceholderActionAdmissionTests.swift` runs these producers
 of a message action (the agent's delete, a user move, mark unread, flag, applying
 and removing a label from the label menu, removing a label from the row, and the
-reply flag set when a reply finishes sending) on Gmail, Outlook and IMAP. Mark
-read and undo move go through the same admission check but have no case here.
+reply and forward flags set when a reply or forward finishes sending) on Gmail,
+Outlook and IMAP. Mark read and undo move go through the same admission check but have no case here.
 On a placeholder alone, each action queues nothing and changes nothing locally,
 and the agent's delete reports the row pending; the same action on a real row
 queues an op for it. For the actions that take several rows, a placeholder and a
 real message together reach the provider with only the real id, and the
 placeholder row stays as it was.
+
+An open message shows what was stored. When a read toggle from the message view
+(the focused message, or a message in its thread) is refused for a placeholder,
+the view returns to the stored row; on a real row it keeps the toggled state.
 
 The same file covers what happens once a draft save lands. On Gmail, Outlook and
 IMAP the row takes the server's id, its search entry moves to that id, and an

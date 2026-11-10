@@ -25,7 +25,7 @@ struct PlaceholderActionAdmissionTests {
     /// `AccountManager.admittedOrdinaryActionTargets`.
     enum Action: String, CaseIterable, Sendable {
         case agentDelete, userMove, markUnread, flag
-        case applyLabel, removeLabel, removeUserLabel, replyFlag
+        case applyLabel, removeLabel, removeUserLabel, replyFlag, forwardFlag
 
         /// The actions that take several rows in one gesture.
         static let multiRow: [Action] = [.agentDelete, .userMove, .markUnread, .flag]
@@ -222,6 +222,7 @@ struct PlaceholderActionAdmissionTests {
         let isRead: Bool
         let isFlagged: Bool
         let isReplied: Bool
+        let isForwarded: Bool
         let labelIds: Set<String>
     }
 
@@ -232,7 +233,7 @@ struct PlaceholderActionAdmissionTests {
                 db, sql: "SELECT userLabelId FROM messageUserLabel WHERE messageId = ?", arguments: [headerId])
             return RowState(
                 folderPath: header.folderPath, isRead: header.isRead, isFlagged: header.isFlagged,
-                isReplied: header.isReplied, labelIds: Set(labelIds))
+                isReplied: header.isReplied, isForwarded: header.isForwarded, labelIds: Set(labelIds))
         }
     }
 
@@ -263,16 +264,18 @@ struct PlaceholderActionAdmissionTests {
             })
             let vm = InboxViewModel(folders: [folder])
             await vm.removeUserLabel(labels.applied, from: MessageSnapshot(from: header))
-        case .replyFlag:
-            // A reply to `header` has been sent and appended: the outbox
-            // completion flags the original as replied.
+        case .replyFlag, .forwardFlag:
+            // A reply to (or a forward of) `header` has been sent and appended:
+            // the outbox completion flags the original as replied (forwarded).
+            let isForward = action == .forwardFlag
             var outbox = OutboxMessage(
                 accountId: f.accountId,
                 draft: DraftMessage(
-                    to: ["sender@example.com"], subject: "Re: \(header.subject)", body: "reply",
+                    to: ["sender@example.com"],
+                    subject: "\(isForward ? "Fwd" : "Re"): \(header.subject)", body: "reply",
                     inReplyTo: "<\(header.rfc822MessageId ?? "")>"),
                 originalMessageHeaderId: header.id,
-                isForward: false)
+                isForward: isForward)
             outbox.status = OutboxStatus.sending.rawValue
             outbox.sentAt = Date()
             outbox.appendedToSent = true
@@ -374,7 +377,7 @@ struct PlaceholderActionAdmissionTests {
             await AccountManager.shared.markUnread([placeholder, real])
         case .flag:
             await AccountManager.shared.markFlagged([placeholder, real], flagged: true)
-        case .applyLabel, .removeLabel, .removeUserLabel, .replyFlag:
+        case .applyLabel, .removeLabel, .removeUserLabel, .replyFlag, .forwardFlag:
             Issue.record("single-row action in the multi-row matrix")
         }
         await AccountManager.shared.awaitWriteQueueDrain()
@@ -388,6 +391,85 @@ struct PlaceholderActionAdmissionTests {
         let placeholderAfter = try await rowState(f, placeholder.id)
         #expect(placeholderAfter == placeholderBefore,
                 "the placeholder row changed locally: \(String(describing: placeholderBefore)) -> \(String(describing: placeholderAfter))")
+        await finish(f)
+    }
+
+    // MARK: - An open message shows what was stored
+
+    /// Where the open message view shows the row: as the message it opened, or
+    /// as a message of its thread.
+    enum OpenView: String, CaseIterable, Sendable {
+        case focused, thread
+    }
+
+    struct OpenViewCase: Sendable, CustomTestStringConvertible {
+        let kind: Kind
+        let view: OpenView
+        var testDescription: String { "\(kind.rawValue) \(view.rawValue)" }
+    }
+
+    static let openViewCases = Kind.server.flatMap { kind in
+        OpenView.allCases.map { OpenViewCase(kind: kind, view: $0) }
+    }
+
+    /// Toggles read on `row` in an open message view, runs the gesture to its
+    /// end, and returns what the view shows and what is stored once the view
+    /// has settled (or the stored value with the view's last value if it never
+    /// does).
+    @MainActor
+    private func toggleReadInOpenView(
+        _ row: MessageHeader, view: OpenView, opened: MessageHeader, fixture f: Fixture
+    ) async throws -> (shown: Bool?, stored: Bool?) {
+        let vm = MessageDetailViewModel(
+            messageId: opened.id, dbPool: f.pool, fetchBodyOverride: { _ in }, observeNotifications: true)
+        defer { vm.cancelBodyPollForTesting() }
+        vm._testSeedMessage(opened)
+        func shown() -> Bool? {
+            view == .focused ? vm.message?.isRead : vm.threadMessages.first { $0.id == row.id }?.isRead
+        }
+        switch view {
+        case .focused:
+            vm.toggleRead()
+        case .thread:
+            vm.threadMessages = [row]
+            vm.toggleReadForThread(row)
+        }
+        #expect(shown() == !row.isRead, "precondition: the view did not show the gesture")
+        await AccountManager.shared.awaitWriteQueueDrain()
+        var stored: Bool?
+        for _ in 0..<200 {
+            stored = try await f.pool.read { db in try MessageHeader.fetchOne(db, key: row.id)?.isRead }
+            if shown() == stored { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        return (shown(), stored)
+    }
+
+    /// The view sets its own copy of the row when the gesture is made. When
+    /// admission refuses the row, nothing is stored, and the view must come
+    /// back to the stored value rather than keep showing a change that never
+    /// happened. The same gesture on a real row is stored and stays shown.
+    @Test("A refused read toggle in an open message shows the stored value again; on a real row it stays",
+          arguments: openViewCases)
+    @MainActor
+    func openViewSettlesOnTheStoredRow(_ testCase: OpenViewCase) async throws {
+        let f = try fixture(kind: testCase.kind, suffix: "open-\(testCase.view.rawValue)")
+        let placeholder = try seedHeader(f, messageId: placeholderId(.sent), folderPath: "SENT")
+        let real = try seedHeader(f, messageId: realProviderId(testCase.kind), folderPath: "SENT")
+        let opened = testCase.view == .focused ? placeholder : real
+
+        let refused = try await toggleReadInOpenView(placeholder, view: testCase.view, opened: opened, fixture: f)
+        #expect(refused.stored == true, "precondition: the refused toggle changed the stored row")
+        #expect(refused.shown == refused.stored,
+                "the open message shows read = \(String(describing: refused.shown)) while the stored row says \(String(describing: refused.stored))")
+        let queued = try await f.pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(queued.isEmpty, "the refused toggle queued \(queued.map { "\($0.type) \($0.messageIds)" })")
+
+        // Control: on a real row the toggle is stored, and the view keeps it.
+        let landed = try await toggleReadInOpenView(
+            real, view: testCase.view, opened: testCase.view == .focused ? real : placeholder, fixture: f)
+        #expect(landed.stored == false, "precondition: the real row's toggle was not stored")
+        #expect(landed.shown == false, "the open message lost the real row's toggle")
         await finish(f)
     }
 
