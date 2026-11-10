@@ -13,9 +13,11 @@ import GRDB
 // "Label name exists or conflicts"; the menu then looks the label up by name
 // and applies it, rather than failing the gesture. When the lookup finds no such
 // label (it was deleted elsewhere in between), the gesture fails and nothing is
-// written: no label row, no menu entry, no queued label change. The control case
-// shows a free name still creates a new label, so the conflict cannot be
-// satisfied by a fake that refuses every create.
+// written: no label row, no menu entry, no queued label change. Any other create
+// failure is refused the same way, even when Gmail does list a label by that
+// name, so only the 409 leads to the lookup. The control case shows a free name
+// still creates a new label, so the conflict cannot be satisfied by a fake that
+// refuses every create.
 
 @Suite("Gmail label create: a name Gmail already has applies the existing label", .serialized, .processGlobalState)
 struct UserLabelCreateExistingNameTests {
@@ -153,6 +155,8 @@ struct UserLabelCreateExistingNameTests {
         let result = try await createAndApply("Receipts", accountId: "label-409-listed", listedProviderLabelId: "Label_7", listedName: "Old receipts")
         #expect(result.created, "the create gesture failed on Gmail's 409")
         #expect(result.added == ["Label_7"], "Gmail was asked to add \(result.added ?? [])")
+        #expect(only("Label_7", in: result.stored)?.name == "Receipts",
+                "the stored label keeps the old name, so the menu shows it again on reopen — stored rows: \(result.stored.map { "\($0.providerLabelId)=\($0.name)" })")
         #expect(result.menu.count == 1, "menu: \(result.menu.map { "\($0.providerLabelId)=\($0.name)" })")
         let listed = only("Label_7", in: result.menu)
         #expect(listed?.name == "Receipts", "menu: \(result.menu.map { "\($0.providerLabelId)=\($0.name)" })")
@@ -164,6 +168,26 @@ struct UserLabelCreateExistingNameTests {
     func conflictWithNoListedLabelWritesNothing() async throws {
         let result = try await createAndApply("Invoices", accountId: "label-409-gone") { $0.refuseNextCreateWithConflict() }
         #expect(!result.created, "the gesture reported success with no label to apply")
+        #expect(result.stored.isEmpty, "stored rows: \(result.stored.map { "\($0.providerLabelId)=\($0.name)" })")
+        #expect(result.menu.isEmpty, "menu: \(result.menu.map { "\($0.providerLabelId)=\($0.name)" })")
+        #expect(result.appliedIds.isEmpty)
+        #expect(result.queued == 0, "queued operations: \(result.queued)")
+        #expect(result.modifyCalls == 0, "Gmail was asked to change the message \(result.modifyCalls) times")
+    }
+
+    @Test("A create that fails other than with 409 is refused even though Gmail lists the name, and nothing is written")
+    @MainActor
+    func nonConflictCreateFailureWritesNothing() async throws {
+        // Gmail lists "Receipts", so a lookup would find it: only the refusal
+        // itself can keep this gesture from applying a label.
+        let script = FakeHTTP.ResponseScript([500])
+        let result = try await createAndApply("Receipts", accountId: "label-create-500") {
+            $0.http.register(path: "https://gmail.googleapis.com/gmail/v1/users/me/labels", method: "POST") { _ in
+                .status(script.next())
+            }
+        }
+        #expect(script.served == [500], "setup: the create was not answered with the scripted 500 — served \(script.served)")
+        #expect(!result.created, "a failed create was turned into a label application")
         #expect(result.stored.isEmpty, "stored rows: \(result.stored.map { "\($0.providerLabelId)=\($0.name)" })")
         #expect(result.menu.isEmpty, "menu: \(result.menu.map { "\($0.providerLabelId)=\($0.name)" })")
         #expect(result.appliedIds.isEmpty)

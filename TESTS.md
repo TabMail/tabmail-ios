@@ -230,5 +230,7 @@ existing label: the gesture succeeds, Gmail is asked to add that label's id, the
 menu entry carry Gmail's spelling of the name, and a label already in the menu, under an older name, is
 listed once under Gmail's name. A 409 for a name the label listing no longer has (deleted elsewhere in
 between) fails the gesture and writes nothing: no label row, no menu entry, no queued label change. A
+create that fails with any other status (a 500) is refused the same way and writes nothing, even
+though Gmail lists a label by that name, so only the 409 leads to the lookup. A
 free name still creates and applies a new label. The 409 is read through `httpStatus(of:)`; a check of the
 bridged `NSError` code on the thrown error never sees the HTTP status.
