@@ -8,17 +8,57 @@ import Foundation
 /// Uses ICSBuilder's existing parseICSDate and unescapeText logic for consistency.
 enum ICSParser {
 
-    /// Parse a VCALENDAR string (potentially containing multiple VEVENTs) into GCalEvent(s).
-    /// For recurring events with exceptions, returns only the master VEVENT (no RECURRENCE-ID).
+    /// The SERIES view of a calendar object resource: its master VEVENT (the
+    /// first one with no RECURRENCE-ID) as one event, or nothing when the
+    /// resource has no master. A repeating event comes back once, at its first
+    /// date, with its rule in `recurrence`; its changed occurrences are not
+    /// returned. `getEvent` by a series id and a split's read-back use this.
+    /// A listing must not: it lists occurrences (`CalDAVOccurrences.listing`).
     /// `resourceHref` is used as the event ID (for CalDAV GET/PUT/DELETE operations).
-    /// `etag` is stored for conflict detection on updates.
     static func parse(icsText: String, resourceHref: String, etag: String?) -> [GCalEvent] {
+        guard let master = components(icsText: icsText, resourceHref: resourceHref)
+            .first(where: { $0.recurrenceId == nil }) else { return [] }
+        return [master.event]
+    }
+
+    /// A property's parameters (the text between the name and the colon, without
+    /// the leading `;`) and its value, as written.
+    struct PropertyValue: Sendable {
+        let params: String?
+        let value: String
+    }
+
+    /// One VEVENT of a resource: the app's event model of it (id = the resource
+    /// href), plus the parts a recurrence expansion needs.
+    struct VEventComponent: Sendable {
+        let event: GCalEvent
+        let dtstart: PropertyValue?
+        let dtend: PropertyValue?
+        /// The DURATION value, when the VEVENT gives one instead of a DTEND.
+        let duration: String?
+        let isAllDay: Bool
+        let startDate: Date?
+        let endDate: Date?
+        /// The values of the RRULE lines (without `RRULE:`).
+        let rrules: [String]
+        let hasExRule: Bool
+        let rdates: [PropertyValue]
+        let exdates: [PropertyValue]
+        /// Set on an override (a changed or cancelled occurrence), nil on the master.
+        let recurrenceId: PropertyValue?
+        /// The zone context of the resource the VEVENT is in, so a recurrence
+        /// expansion reads its wall times through the same resolver this parser does.
+        let zones: CalendarTimeZoneContext
+    }
+
+    /// Every VEVENT in the resource, masters and overrides, in document order.
+    static func components(icsText: String, resourceHref: String) -> [VEventComponent] {
         // What the resource's VTIMEZONE components say about its zone names, read once for all its events.
         let zones = CalendarTimeZoneContext(calendarText: icsText)
         let unfolded = unfold(icsText)
         let lines = unfolded.components(separatedBy: .newlines)
 
-        var events: [GCalEvent] = []
+        var components: [VEventComponent] = []
         var inEvent = false
         var eventLines: [String] = []
 
@@ -31,34 +71,20 @@ enum ICSParser {
             }
             if trimmed == "END:VEVENT" {
                 inEvent = false
-                if let event = parseVEvent(lines: eventLines, resourceHref: resourceHref, etag: etag, zones: zones) {
-                    events.append(event)
-                }
+                components.append(parseVEvent(lines: eventLines, resourceHref: resourceHref, zones: zones))
                 continue
             }
             if inEvent {
                 eventLines.append(trimmed)
             }
         }
-
-        // For Phase 1: return only the master VEVENT (no RECURRENCE-ID)
-        let master = events.filter { event in
-            // Master events don't have recurrence-id info embedded
-            // We check via the original lines for RECURRENCE-ID
-            true // All events parsed without RECURRENCE-ID filtering for now
-        }
-
-        // If we have events with and without recurrence info, prefer the master
-        if master.count > 1 {
-            return [master[0]]
-        }
-        return master
+        return components
     }
 
     // MARK: - Private
 
     /// `zones` is the zone context of the resource the event is in.
-    private static func parseVEvent(lines: [String], resourceHref: String, etag: String?, zones: CalendarTimeZoneContext) -> GCalEvent? {
+    private static func parseVEvent(lines: [String], resourceHref: String, zones: CalendarTimeZoneContext) -> VEventComponent {
         var summary = ""
         var location: String?
         var description: String?
@@ -75,7 +101,11 @@ enum ICSParser {
         var created: String?
         var lastModified: String?
         var url: String?
-        var hasRecurrenceId = false
+        var recurrenceId: PropertyValue?
+        var rrules: [String] = []
+        var hasExRule = false
+        var rdates: [PropertyValue] = []
+        var exdates: [PropertyValue] = []
 
         for line in lines {
             if line.hasPrefix("SUMMARY") {
@@ -96,10 +126,17 @@ enum ICSParser {
                 duration = extractValue(line)
             } else if line.hasPrefix("RRULE:") {
                 recurrence.append(line)
+                rrules.append(String(line.dropFirst("RRULE:".count)))
+            } else if line.hasPrefix("EXRULE") {
+                hasExRule = true
             } else if line.hasPrefix("EXDATE") {
                 recurrence.append(line)
+                let (params, val) = splitPropertyLine(line)
+                exdates.append(PropertyValue(params: params, value: val))
             } else if line.hasPrefix("RDATE") {
                 recurrence.append(line)
+                let (params, val) = splitPropertyLine(line)
+                rdates.append(PropertyValue(params: params, value: val))
             } else if line.hasPrefix("TRANSP") {
                 transparency = extractValue(line).lowercased() == "transparent" ? "transparent" : "opaque"
             } else if line.hasPrefix("STATUS") {
@@ -121,12 +158,10 @@ enum ICSParser {
             } else if line.hasPrefix("URL") {
                 url = extractValue(line)
             } else if line.hasPrefix("RECURRENCE-ID") {
-                hasRecurrenceId = true
+                let (params, val) = splitPropertyLine(line)
+                recurrenceId = PropertyValue(params: params, value: val)
             }
         }
-
-        // Skip recurrence exceptions (Phase 1)
-        if hasRecurrenceId { return nil }
 
         // Parse dates
         let isAllDay = dtstartParams.map { ICSValueType.statesDate($0) } == true
@@ -173,7 +208,7 @@ enum ICSParser {
         let createdRFC = created.flatMap { icsDateToRFC3339($0) }
         let updatedRFC = lastModified.flatMap { icsDateToRFC3339($0) }
 
-        return GCalEvent(
+        let event = GCalEvent(
             id: resourceHref,
             summary: summary.isEmpty ? nil : summary,
             location: location,
@@ -188,6 +223,21 @@ enum ICSParser {
             htmlLink: url,
             created: createdRFC,
             updated: updatedRFC
+        )
+        return VEventComponent(
+            event: event,
+            dtstart: dtstart.map { PropertyValue(params: dtstartParams, value: $0) },
+            dtend: dtend.map { PropertyValue(params: dtendParams, value: $0) },
+            duration: duration,
+            isAllDay: isAllDay,
+            startDate: startDate,
+            endDate: endDate,
+            rrules: rrules,
+            hasExRule: hasExRule,
+            rdates: rdates,
+            exdates: exdates,
+            recurrenceId: recurrenceId,
+            zones: zones
         )
     }
 
@@ -267,7 +317,7 @@ enum ICSParser {
         return nil
     }
 
-    private static func extractTZID(_ params: String) -> String? {
+    static func extractTZID(_ params: String) -> String? {
         for part in params.split(separator: ";") {
             let kv = part.split(separator: "=", maxSplits: 1)
             if kv.count == 2 && kv[0].trimmingCharacters(in: .whitespaces).uppercased() == "TZID" {
@@ -293,16 +343,23 @@ enum ICSParser {
             return fmt.date(from: cleaned)
         }
         fmt.dateFormat = "yyyyMMdd'T'HHmmss"
-        if let params, let tzid = extractTZID(params) {
-            // A read never refuses. A zone the resolver does not recognize (one a VTIMEZONE defines
-            // only by its rules, say) is read in the device's zone, so the event is still shown; that
-            // reading is wrong whenever the two zones differ. Writes of such an event are refused
-            // instead (`CalDAVProvider.zone(forTZID:zones:)`).
-            fmt.timeZone = CalendarTimeZoneResolver.zone(named: tzid, in: zones) ?? .current
-        } else {
-            fmt.timeZone = .current
-        }
+        fmt.timeZone = wallTimeZone(params: params, zones: zones)
         return fmt.date(from: cleaned)
+    }
+
+    /// The zone this parser reads a DATE-TIME's wall time in: the zone the TZID
+    /// the parameters name resolves to (`CalendarTimeZoneResolver`, in the
+    /// resource's context `zones`), else the device's (a floating time). The
+    /// recurrence expansion reads its wall times in the same zone, so a series'
+    /// occurrences line up with its first date.
+    ///
+    /// A read never refuses. A zone the resolver does not recognize (one a VTIMEZONE defines
+    /// only by its rules, say) is read in the device's zone, so the event is still shown; that
+    /// reading is wrong whenever the two zones differ. Writes of such an event are refused
+    /// instead (`CalDAVProvider.zone(forTZID:zones:)`).
+    static func wallTimeZone(params: String?, zones: CalendarTimeZoneContext) -> TimeZone {
+        guard let params, let tzid = extractTZID(params) else { return .current }
+        return CalendarTimeZoneResolver.zone(named: tzid, in: zones) ?? .current
     }
 
     private static func icsDateToRFC3339(_ icsDate: String) -> String? {

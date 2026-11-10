@@ -1668,6 +1668,11 @@ struct GCalEvent: Codable, Sendable {
     /// The first day of the week a series' rule is kept with (Outlook's `firstDayOfWeek`), read
     /// as `recurrenceTimeZoneName` is. Nil when the calendar names none; in memory only.
     var recurrenceFirstDayOfWeek: String? = nil
+    /// True on a row that stands for a whole repeating series whose occurrences a
+    /// listing could not work out: the row is the series, at its first date, and
+    /// the tools say its occurrences are not listed instead of showing that date as
+    /// one (CalDAV, `CalDAVOccurrences`, ADR-IOS-108). nil elsewhere.
+    var occurrencesNotListed: Bool? = nil
 }
 
 // Convenience initializer that fills in `eventType`/`iCalUID`/`kind`/`visibility`

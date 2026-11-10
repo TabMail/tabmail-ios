@@ -75,6 +75,12 @@ enum RecurrenceTail {
 
         fileprivate var weekday: Weekday { RecurrenceTail.weekday(ofOrdinal: ordinal) }
 
+        /// The day `count` days after this one (before it for a negative `count`).
+        func adding(days count: Int) -> Day { Day(ordinal: ordinal + count) }
+
+        /// Whole days from `other` to this day (negative when this day is earlier).
+        func days(since other: Day) -> Int { ordinal - other.ordinal }
+
         static func < (lhs: Day, rhs: Day) -> Bool {
             (lhs.year, lhs.month, lhs.day) < (rhs.year, rhs.month, rhs.day)
         }
@@ -319,12 +325,27 @@ enum RecurrenceTail {
         /// Days before DTSTART inside its own period are included here; the
         /// caller drops them.
         func periods(from start: Day, before split: Day) -> [[Int]] {
+            periods(from: start, before: split, maxSteps: nil) ?? []
+        }
+
+        /// `periods(from:before:)`, walking at most `maxSteps` periods (days,
+        /// weeks, months or years, by FREQ, counting the ones the BY parts
+        /// leave empty). nil when getting to `split` would take more. No limit
+        /// when `maxSteps` is nil.
+        func periods(from start: Day, before split: Day, maxSteps: Int?) -> [[Int]]? {
             let end = split.ordinal
             var out: [[Int]] = []
+            var steps = 0
+            func overLimit() -> Bool {
+                steps += 1
+                guard let maxSteps else { return false }
+                return steps > maxSteps
+            }
             switch frequency {
             case .daily:
                 var o = start.ordinal
                 while o < end {
+                    if overLimit() { return nil }
                     if matchesLimits(Day(ordinal: o)) { out.append([o]) }
                     o += interval
                 }
@@ -334,6 +355,7 @@ enum RecurrenceTail {
                 var weekFirst = start.ordinal - offset
                 let wanted = byDay.isEmpty ? [start.weekday] : byDay.map(\.weekday)
                 while weekFirst < end {
+                    if overLimit() { return nil }
                     let days = (0..<daysPerWeek)
                         .map { weekFirst + $0 }
                         .filter { wanted.contains(RecurrenceTail.weekday(ofOrdinal: $0)) }
@@ -344,6 +366,7 @@ enum RecurrenceTail {
             case .monthly:
                 var (y, m) = (start.year, start.month)
                 while let monthFirst = Day(year: y, month: m, day: 1), monthFirst.ordinal < end {
+                    if overLimit() { return nil }
                     out.append(monthDays(year: y, month: m, start: start))
                     let next = m - 1 + interval
                     y += next / 12
@@ -352,11 +375,31 @@ enum RecurrenceTail {
             case .yearly:
                 var y = start.year
                 while let yearFirst = Day(year: y, month: 1, day: 1), yearFirst.ordinal < end {
+                    if overLimit() { return nil }
                     out.append(yearDays(year: y, start: start))
                     y += interval
                 }
             }
             return out
+        }
+
+        /// The days the rule's occurrences fall on, from `start` (DTSTART's
+        /// day) through `last`, earliest first. DTSTART is always the first
+        /// (RFC 5545 §3.3.10), whether or not the rule's parts name its day.
+        /// COUNT and UNTIL are not applied here: the caller applies them,
+        /// because UNTIL can be an instant and needs the time of day.
+        ///
+        /// nil when walking from DTSTART to `last` would take more than
+        /// `maxSteps` periods (see `periods(from:before:maxSteps:)`).
+        func days(from start: Day, through last: Day, maxSteps: Int) -> [Day]? {
+            guard start < last else { return [start] }
+            guard let walked = periods(from: start, before: last.adding(days: 1), maxSteps: maxSteps) else {
+                return nil
+            }
+            let first = start.ordinal
+            let end = last.ordinal
+            let later = Set(walked.joined().filter { $0 > first && $0 <= end }).sorted()
+            return [start] + later.map(Day.init(ordinal:))
         }
 
         /// DAILY: BYMONTH, BYMONTHDAY and BYDAY each limit the day.

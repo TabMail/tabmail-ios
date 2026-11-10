@@ -819,6 +819,50 @@ final class FakeCalDAVStore: Sendable {
             value.resources[path] = Resource(ics: ics, etag: etag)
         }
     }
+
+    /// An RFC 4791 §7.8 `calendar-query` REPORT: every resource under the
+    /// collection the request addresses, each with its entity tag and its WHOLE
+    /// calendar data (a series together with its changed occurrences, as a real
+    /// server returns it), in a 207 multistatus. The query's time-range filter is
+    /// not modelled: every resource is returned, so it is the client's own range
+    /// check that decides which occurrences a listing shows.
+    func handleREPORT(_ request: FakeHTTP.Request) -> FakeHTTP.CannedResponse {
+        let collection = request.url.path
+        let matches: [(path: String, etag: String, ics: String)] = state.withLock { value in
+            value.resources
+                .filter { $0.key.hasPrefix(collection) && $0.key != collection }
+                .sorted { $0.key < $1.key }
+                .map { (path: $0.key, etag: $0.value.etag, ics: $0.value.ics) }
+        }
+        var xml = #"<?xml version="1.0" encoding="utf-8"?>"# + "\n"
+        xml += #"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">"# + "\n"
+        for match in matches {
+            xml += "<d:response><d:href>\(Self.xmlEscaped(match.path))</d:href><d:propstat><d:prop>"
+            xml += "<d:getetag>\(Self.xmlEscaped(match.etag))</d:getetag>"
+            xml += "<c:calendar-data>\(Self.xmlEscaped(match.ics))</c:calendar-data>"
+            xml += "</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>\n"
+        }
+        xml += "</d:multistatus>"
+        return .raw(
+            statusCode: 207,
+            headers: ["Content-Type": "application/xml; charset=utf-8"],
+            body: Data(xml.utf8))
+    }
+
+    /// A WebDAV `DELETE` (RFC 4918 §9.6): the resource is gone for good, 204, or
+    /// 404 when there was none. Removing it for real is what lets a test assert
+    /// the series is still there rather than only that no request was counted.
+    func handleDELETE(_ request: FakeHTTP.Request) -> FakeHTTP.CannedResponse {
+        let path = request.url.path
+        let removed = state.withLock { $0.resources.removeValue(forKey: path) }
+        return .raw(statusCode: removed == nil ? 404 : 204)
+    }
+
+    private static func xmlEscaped(_ text: String) -> String {
+        text.replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+    }
 }
 
 /// The shared wire fixture for every `CalDAVProvider`-over-HTTP suite in this

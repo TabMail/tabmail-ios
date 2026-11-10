@@ -233,6 +233,10 @@ enum CalendarToolHelpers {
         var keyToCalendarId: [Key: String] = [:]
         for entry in events {
             guard let masterId = entry.event.recurringEventId, !masterId.isEmpty else { continue }
+            // An occurrence that already carries its series' rule (CalDAV lists
+            // them that way, ADR-IOS-108) needs no read of the series: the
+            // summary shows the row's own rule first.
+            if entry.event.recurrence?.contains(where: { $0.uppercased().hasPrefix("RRULE:") }) == true { continue }
             let key = Key(accountId: entry.accountId, masterId: masterId)
             // First-seen wins. Different occurrences of the same master always
             // share the same calendar, so any one occurrence's calendar id is
@@ -276,6 +280,13 @@ enum CalendarToolHelpers {
     /// distinctively so the agent doesn't try to act on them like real
     /// titled events.
     static let freeBusyAccessRole = "freeBusyReader"
+
+    /// What a grouped-summary row says about a repeating event whose occurrences
+    /// the provider could not work out (`GCalEvent.occurrencesNotListed`): the row
+    /// is the whole series, shown at its first date, and its occurrences are missing
+    /// from the listing. Must not contain ")" (see the recurrence marker).
+    static let occurrencesNotListedNote =
+        "repeating event, its occurrences are not listed: TabMail can't work out this rule, so the series is shown once, on its first date"
 
     /// Cleanup helper for the free/busy "Source: …" label. Email-style
     /// calendar ids ("alice@example.com") get reduced to the local-part.
@@ -354,6 +365,15 @@ enum CalendarToolHelpers {
             // because Lightning's recurrenceInfo lives on the parent item.
             let recurMark: String = {
                 if isFreeBusy { return "" }
+                // A series whose occurrences the provider could not work out is
+                // listed once, at its first date (CalDAV, ADR-IOS-108). Saying so is
+                // what keeps that date from reading as an occurrence. No ")" inside
+                // the marker: the pill title strips "(↻" up to the first ")".
+                if entry.event.occurrencesNotListed == true {
+                    let rule = entry.event.recurrence?.first(where: { $0.uppercased().hasPrefix("RRULE:") })
+                        ?? entry.event.recurrence?.first ?? ""
+                    return " (↻ \(rule); \(Self.occurrencesNotListedNote))"
+                }
                 if let recArr = entry.event.recurrence, !recArr.isEmpty,
                    let rrule = recArr.first(where: { $0.uppercased().hasPrefix("RRULE:") }) {
                     return " (↻ \(rrule))"
@@ -503,6 +523,13 @@ enum CalendarToolHelpers {
         var lines: [String] = []
         let eventIdOutput = accountId.isEmpty ? (event.id ?? "") : CompoundEventId.make(accountId: accountId, eventId: event.id ?? "")
         lines.append("event_id: \(eventIdOutput)")
+        // One occurrence of a repeating event names its whole series too, so an
+        // action meant for every occurrence (deleting the series, where a provider
+        // can't delete one occurrence) has an id to act on.
+        if let seriesId = event.recurringEventId, !seriesId.isEmpty, seriesId != event.id {
+            let seriesIdOutput = accountId.isEmpty ? seriesId : CompoundEventId.make(accountId: accountId, eventId: seriesId)
+            lines.append("series_event_id: \(seriesIdOutput)")
+        }
         let isFreeBusy = (accessRole == Self.freeBusyAccessRole)
         if isFreeBusy {
             let display = Self.freeBusyDisplayName(calendarName: calendarName, calendarId: calendarId)

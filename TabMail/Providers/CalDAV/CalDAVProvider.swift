@@ -194,7 +194,10 @@ actor CalDAVProvider: CalendarProvider {
         var events: [GCalEvent] = []
         for resp in responses {
             guard let icsText = resp.calendarData, !icsText.isEmpty else { continue }
-            let parsed = ICSParser.parse(icsText: icsText, resourceHref: resp.href, etag: resp.etag)
+            // One row per occurrence in the range, as Google and Outlook list a
+            // repeating event (ADR-IOS-108).
+            let parsed = CalDAVOccurrences.listing(
+                icsText: icsText, href: resp.href, timeMin: timeMin, timeMax: timeMax)
             // Cache ETags for later updates
             if let etag = resp.etag {
                 etagCache[resp.href] = etag
@@ -221,8 +224,12 @@ actor CalDAVProvider: CalendarProvider {
         return events
     }
 
+    /// A series id reads the series (its first date, with its rule); an occurrence id a
+    /// listing gave (`CalDAVOccurrences.OccurrenceId`) reads that one occurrence, as a
+    /// listing shows it, and throws `notFound` when the series no longer has it.
     func getEvent(calendarId: String, eventId: String) async throws -> GCalEvent {
-        let eventURL = try resolveEventURL(eventId, calendarId: calendarId)
+        let (seriesHref, occurrenceKey) = try CalDAVOccurrences.OccurrenceId.split(eventId)
+        let eventURL = try resolveEventURL(seriesHref, calendarId: calendarId)
 
         let (data, response) = try await client.get(url: eventURL)
         guard let icsText = String(data: data, encoding: .utf8), !icsText.isEmpty else {
@@ -231,10 +238,16 @@ actor CalDAVProvider: CalendarProvider {
 
         let etag = response.value(forHTTPHeaderField: "ETag")
         if let etag {
-            etagCache[eventId] = etag
+            etagCache[seriesHref] = etag
         }
 
-        let events = ICSParser.parse(icsText: icsText, resourceHref: eventId, etag: etag)
+        if let occurrenceKey {
+            guard let occurrence = CalDAVOccurrences.occurrence(key: occurrenceKey, icsText: icsText, href: seriesHref) else {
+                throw CalDAVError.notFound
+            }
+            return occurrence
+        }
+        let events = ICSParser.parse(icsText: icsText, resourceHref: seriesHref, etag: etag)
         guard let event = events.first else {
             throw CalDAVError.parseError("No VEVENT found in \(eventId)")
         }
@@ -285,7 +298,16 @@ actor CalDAVProvider: CalendarProvider {
         event: GCalEventInput,
         sendUpdates: String
     ) async throws -> GCalEvent {
-        let eventURL = try resolveEventURL(eventId, calendarId: calendarId)
+        // This is the edit of the whole series (edit_scope "all"), so an occurrence id a
+        // listing gave edits its SERIES, every occurrence, as the tool promises; one
+        // occurrence alone is `updateOccurrence` (this_only). How the event repeats is not
+        // changed through an occurrence id (ADR-IOS-108).
+        let (seriesHref, occurrenceKey) = try CalDAVOccurrences.OccurrenceId.split(eventId)
+        if occurrenceKey != nil, event.recurrence != nil {
+            throw CalendarProviderError.notSupported(
+                "How an event repeats belongs to the whole series, so it can't be changed through one occurrence's id. Nothing was changed. Edit the series by its series id (series_event_id in calendar_event_read)")
+        }
+        let eventURL = try resolveEventURL(seriesHref, calendarId: calendarId)
 
         // CalDAV PUT is a FULL-RESOURCE replace, not a PATCH — sending only the
         // patched fields wipes DTSTART/SUMMARY/VTIMEZONE/etc. (iCloud rejects
@@ -315,10 +337,10 @@ actor CalDAVProvider: CalendarProvider {
             precondition: etag.map(CalDAVPutPrecondition.ifMatch) ?? .unconditional)
 
         // Clear cached ETag (it changed)
-        etagCache.removeValue(forKey: eventId)
+        etagCache.removeValue(forKey: seriesHref)
 
         return GCalEvent(
-            id: eventId,
+            id: seriesHref,
             summary: event.summary,
             location: event.location,
             description: event.description,
@@ -340,6 +362,14 @@ actor CalDAVProvider: CalendarProvider {
         eventId: String,
         sendUpdates: String
     ) async throws {
+        // An occurrence id is refused before anything is sent. A WebDAV DELETE removes the
+        // whole resource, which holds every occurrence of the series, so deleting by one
+        // occurrence's id would delete them all (ADR-IOS-108). Removing one occurrence would
+        // be an EXDATE written into the series, which is not built yet.
+        if try CalDAVOccurrences.OccurrenceId.split(eventId).key != nil {
+            throw CalendarProviderError.notSupported(
+                "Deleting one occurrence of a repeating CalDAV event is not supported yet, so nothing was deleted. The whole series can be deleted by its series id (series_event_id in calendar_event_read)")
+        }
         let eventURL = try resolveEventURL(eventId, calendarId: calendarId)
         let (_, _) = try await client.delete(url: eventURL)
         etagCache.removeValue(forKey: eventId)
@@ -383,7 +413,10 @@ actor CalDAVProvider: CalendarProvider {
         event: GCalEventInput,
         sendUpdates: String
     ) async throws -> GCalEvent {
-        let eventURL = try resolveEventURL(eventId, calendarId: calendarId)
+        // An occurrence id addresses its series' resource; `recurrenceId` names the
+        // occurrence, as on Google (`resolveToMaster`).
+        let seriesHref = try CalDAVOccurrences.OccurrenceId.split(eventId).seriesHref
+        let eventURL = try resolveEventURL(seriesHref, calendarId: calendarId)
 
         // 1. GET current ICS + ETag
         let (data, getResponse) = try await client.get(url: eventURL)
@@ -425,7 +458,7 @@ actor CalDAVProvider: CalendarProvider {
         _ = try await client.put(
             url: eventURL, body: updatedICS,
             precondition: etag.map(CalDAVPutPrecondition.ifMatch) ?? .unconditional)
-        etagCache.removeValue(forKey: eventId)
+        etagCache.removeValue(forKey: seriesHref)
 
         return GCalEvent(
             id: eventId, summary: event.summary, location: event.location,
@@ -458,7 +491,11 @@ actor CalDAVProvider: CalendarProvider {
         patch: GCalEventInput,
         sendUpdates: String
     ) async throws -> GCalEvent {
-        let eventURL = try resolveEventURL(eventId, calendarId: calendarId)
+        // An occurrence id addresses its series' resource, and the split's new part is
+        // named from the series' href whichever id the edit was given, so a retry and the
+        // same split asked for through the series id land on one resource.
+        let seriesHref = try CalDAVOccurrences.OccurrenceId.split(eventId).seriesHref
+        let eventURL = try resolveEventURL(seriesHref, calendarId: calendarId)
 
         // 1. GET master ICS + ETag
         let (data, getResponse) = try await client.get(url: eventURL)
@@ -527,7 +564,7 @@ actor CalDAVProvider: CalendarProvider {
         // recurrence_id) so a retry after a lost ACK on the successor PUT below
         // re-targets the SAME resource instead of creating a duplicate series at
         // a fresh random URL.
-        let newUid = GoogleCalendarProvider.deterministicSplitEventId(masterId: eventId, recurrenceId: recurrenceId)
+        let newUid = GoogleCalendarProvider.deterministicSplitEventId(masterId: seriesHref, recurrenceId: recurrenceId)
         let resources = try Self.seriesSplitResources(
             storedICS: masterICS, slotNaiveISO: masterFrameRecurrenceId,
             cappedRRule: cappedRRule, newRRule: newSeriesRRule, newUid: newUid, patch: patch, now: Date(), zones: zones)
@@ -573,7 +610,7 @@ actor CalDAVProvider: CalendarProvider {
         //    it now stands; the new part already exists, so nothing the series held at
         //    the split's read is lost. A change another client made to the later
         //    occurrences after that read is not on the new part and the cap removes it.
-        etagCache.removeValue(forKey: eventId)
+        etagCache.removeValue(forKey: seriesHref)
         _ = try await client.put(
             url: eventURL, body: resources.cappedSeries,
             precondition: etag.map(CalDAVPutPrecondition.ifMatch) ?? .unconditional)
@@ -1399,7 +1436,15 @@ actor CalDAVProvider: CalendarProvider {
     /// Short IDs (no `/`) come from the create flow (e.g., `tmXXX`). These must be
     /// resolved as `calendarURL/tmXXX.ics` — the same way createEvent builds the URL.
     /// Full hrefs (containing `/`) come from listEvents and are resolved normally.
+    ///
+    /// An id that still carries a `#` is refused: a URL drops its fragment from the request,
+    /// so an occurrence id (`CalDAVOccurrences.OccurrenceId`) would address its whole
+    /// series' resource. Every caller splits an occurrence id into its series href first.
     private func resolveEventURL(_ eventId: String, calendarId: String) throws -> URL {
+        guard !eventId.contains(CalDAVOccurrences.OccurrenceId.separator) else {
+            throw CalendarProviderError.notSupported(
+                "'\(eventId)' names one occurrence of a repeating event, not a calendar resource; refusing to send a request for the whole series")
+        }
         if eventId.contains("/") {
             return try resolveURL(eventId)
         }
