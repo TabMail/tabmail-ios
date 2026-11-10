@@ -34,7 +34,7 @@ enum GraphOnlineMeetingBody {
     /// section is not recognised (`joinSection`).
     static func replacingNotes(in html: String, joinUrl: String, with notes: String) -> String? {
         guard let found = joinSection(in: html, joinUrl: joinUrl) else { return nil }
-        return String(html[..<found.notesStart]) + "\r\n" + notesHTML(notes) + "\r\n" + String(html[found.sectionStart...])
+        return String(html[..<found.notesStart]) + "\r\n" + GraphNotesHTML.html(notes) + "\r\n" + String(html[found.sectionStart...])
     }
 
     /// `html` up to its join section: the document's start and the notes, which
@@ -140,17 +140,5 @@ enum GraphOnlineMeetingBody {
             guard !tag.hasPrefix("</"), !tag.hasPrefix("<!"), !tag.hasSuffix("/>") else { return start }
             start = open
         }
-    }
-
-    /// Plain-text notes as HTML: escaped, each line break a `<br>`. Trailing line
-    /// breaks are dropped: a `<br>` right before the join section would be read
-    /// as part of it (`openingTagsStart`) and kept by every later edit.
-    private static func notesHTML(_ notes: String) -> String {
-        var text = Substring(notes)
-        while text.last?.isNewline == true { text = text.dropLast() }
-        return ICSBuilder.escapeHTML(String(text))
-            .replacingOccurrences(of: "\r\n", with: "\n")
-            .replacingOccurrences(of: "\r", with: "\n")
-            .replacingOccurrences(of: "\n", with: "<br>\r\n")
     }
 }

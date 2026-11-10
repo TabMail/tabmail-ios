@@ -83,6 +83,16 @@ description; `CalendarToolHelpersTests` pins the `conference_url:` line after th
 event pill's notes (join link first); `ToolCachingTests` checks that the search and direct-read pill
 caches carry the join link (including a read that finds the event by scanning every calendar), and
 that in a new session a pill tap that fetches the event live shows it.
+Notes written back as HTML (#577): `GraphOnlineMeetingBodyTests` writes a web, mail or phone link in
+new notes as a link (with the read's escapes reversed), keeps a link to any other kind of destination
+as its text (escaped, so markup in its label or destination stays text), writes a link whose
+destination holds more colons (a port, a path, a query) as a link, escapes a label or destination so it can't add markup or leave the link (also a quote or
+`<` joined to a combining, joining, spacing or Prepend mark), and keeps runs of spaces and spaces that
+start or end a line; `ExchangeCalendarEditPreservationTests` reads back notes with links (web, mail,
+phone, and one carrying every escape a read writes in a label or destination) and runs of spaces
+exactly as written, for an online meeting and a plain event, and checks
+that a description read and written back keeps its link as a link; `EmailFilterTests` pins
+`markdownPieces` (unescaped label and destination, and the pieces joining back to the text).
 
 ## Inbox list — layered test architecture
 
