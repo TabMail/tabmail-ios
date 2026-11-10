@@ -558,5 +558,12 @@ struct ExchangeCalendarRecurringTests {
         #expect(ExchangeCalendarProvider.graphNaiveDateTime("2026-05-15T20:00:00") == "2026-05-15T20:00:00")
         // The `-` in the date portion must NOT be mistaken for an offset.
         #expect(ExchangeCalendarProvider.graphNaiveDateTime("2026-05-15T20:00:00.123-0700") == "2026-05-15T20:00:00.123")
+        // A wall time without seconds gets `:00`, with or without an offset; one
+        // that is no wall time keeps its form.
+        #expect(ExchangeCalendarProvider.graphNaiveDateTime("2099-05-15T20:00") == "2099-05-15T20:00:00")
+        #expect(ExchangeCalendarProvider.graphNaiveDateTime("2099-05-15T20:00Z") == "2099-05-15T20:00:00")
+        #expect(ExchangeCalendarProvider.graphNaiveDateTime("2099-05-15T20:00-07:00") == "2099-05-15T20:00:00")
+        #expect(ExchangeCalendarProvider.graphNaiveDateTime("2099-05-15T2000") == "2099-05-15T2000")
+        #expect(ExchangeCalendarProvider.graphNaiveDateTime("2099-05-15T20") == "2099-05-15T20")
     }
 }

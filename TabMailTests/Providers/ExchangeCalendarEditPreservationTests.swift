@@ -291,14 +291,17 @@ enum GraphFixture {
         return fmt.string(from: date)
     }
 
-    /// The device's date of the start Graph stores as `wall` in `zone`.
+    /// The device's date of the start Graph stores as `wall` in `zone`, written
+    /// with or without seconds.
     static func deviceDay(wall: String, in zone: String) -> String? {
         guard let tz = TimeZone(identifier: zone) else { return nil }
         let fmt = DateFormatter()
         fmt.locale = Locale(identifier: "en_US_POSIX")
         fmt.timeZone = tz
         fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        return fmt.date(from: String(wall.prefix(19))).map(deviceDay)
+        if let instant = fmt.date(from: String(wall.prefix(19))) { return deviceDay(instant) }
+        fmt.dateFormat = "yyyy-MM-dd'T'HH:mm"
+        return fmt.date(from: String(wall.prefix(16))).map(deviceDay)
     }
 
     static func weekday(_ date: Date) -> String {
@@ -474,6 +477,23 @@ enum OffsetSpelledMove: String, CaseIterable, CustomTestStringConvertible, Senda
     }
 
     var movesDate: Bool { self != .laterSameDay }
+}
+
+/// How the tools may spell that new start and pass it through as given: with a
+/// UTC offset, or without seconds (bare or with `Z`).
+enum StartSpelling: String, CaseIterable, CustomTestStringConvertible, Sendable {
+    case z = "Z", fractionZ = ".000Z", plusZero = "+00:00", noSeconds = "HH:mm", noSecondsZ = "HH:mmZ"
+
+    var testDescription: String { rawValue }
+
+    /// `wall` (`yyyy-MM-dd'T'HH:mm:ss`) spelled this way.
+    func spell(_ wall: String) -> String {
+        switch self {
+        case .z, .fractionZ, .plusZero: wall + rawValue
+        case .noSeconds: String(wall.prefix(16))
+        case .noSecondsZ: String(wall.prefix(16)) + "Z"
+        }
+    }
 }
 
 /// Every property a user can see on an Outlook event and an edit must not touch
@@ -750,7 +770,8 @@ struct ExchangeCalendarEditPreservationTests {
     }
 
     /// The tools pass a start they cannot read through as given, so a start can
-    /// arrive without an offset (`…T10:00`). Its date is the one written.
+    /// arrive without an offset or seconds (`…T10:00`). It is read like any other
+    /// start: the wall time in its label, dated on the device.
     @Test("a whole series moved to another date by a start written without an offset keeps its recurrence at the new date")
     func wholeSeriesMovedByNaiveStart() async throws {
         let http = FakeHTTP.Scenario()
@@ -774,14 +795,14 @@ struct ExchangeCalendarEditPreservationTests {
         #expect(canonical(now["pattern"]) == canonical((before["recurrence"] as? [String: Any])?["pattern"]), "the move changed the pattern")
     }
 
-    /// The tools pass a start spelled with an offset through as given and label
-    /// it with the edit's zone, and Graph stores the wall time in that zone. The
-    /// series' date is that stored start's, read on the device: a move within
-    /// the device's day writes no recurrence, and a move to another day writes
-    /// the range at that day.
-    @Test("a series moved by a start spelled with an offset is dated where Graph stores it",
-          arguments: OffsetSpelledMove.allCases, ["Z", ".000Z", "+00:00"])
-    func seriesMovedByOffsetSpelledStart(_ move: OffsetSpelledMove, _ offset: String) async throws {
+    /// The tools pass a start spelled with an offset, or without seconds, through
+    /// as given and label it with the edit's zone, and Graph stores the wall time
+    /// in that zone. The series' date is that stored start's, read on the device:
+    /// a move within the device's day writes no recurrence, and a move to another
+    /// day writes the range at that day.
+    @Test("a series moved by a start spelled with an offset or without seconds is dated where Graph stores it",
+          arguments: OffsetSpelledMove.allCases, StartSpelling.allCases)
+    func seriesMovedByOffsetSpelledStart(_ move: OffsetSpelledMove, _ spelling: StartSpelling) async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
         let seriesStart = GraphFixture.onDevice(days: 0, hour: 10)
@@ -789,8 +810,8 @@ struct ExchangeCalendarEditPreservationTests {
         graph.install(on: http)
         let zone = GraphFixture.farEast
         let patch = CalendarToolHelpers.buildGCalEventInput([
-            "start_iso": .string(GraphFixture.wall(move.newStart, in: zone) + offset),
-            "end_iso": .string(GraphFixture.wall(move.newStart.addingTimeInterval(1_800), in: zone) + offset),
+            "start_iso": .string(spelling.spell(GraphFixture.wall(move.newStart, in: zone))),
+            "end_iso": .string(spelling.spell(GraphFixture.wall(move.newStart.addingTimeInterval(1_800), in: zone))),
             "timezone": .string(zone),
         ], isAllDay: false)
 

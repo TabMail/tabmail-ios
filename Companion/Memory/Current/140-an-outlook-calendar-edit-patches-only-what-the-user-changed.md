@@ -47,8 +47,12 @@ that aren't included in the request body maintain their previous values".
   labelled with the device's zone is 00:30 on the device, not the evening before (found in review:
   reading the offset as the instant wrote a recurrence, resetting exceptions, for a same-day time
   change, and missed or misdated a real date move). A start whose offset matches its label (`Z` with
-  `UTC`) is the instant it spells. A wall time without seconds (`…T10:00`) is taken at its own date,
-  as written.
+  `UTC`) is the instant it spells. A wall time without seconds (`…T10:00`, bare or with an offset) is
+  read the same way: `graphNaiveDateTime` writes it with `:00` (Graph documents `dateTime` with
+  seconds) and `day` reads that same string, so the writer and the date check share one form (found
+  in review: dating it as written misdated a seconds-less start labelled with another zone). Only a
+  string that is no wall time at all is dated as written. The tools still pass unknown start
+  spellings through unparsed; reading them once at the tool boundary is #543.
   `day` reads the device's zone while the stored range keeps its `recurrenceTimeZone`; where the two
   disagree on the date, the range start can be a day off (#463).
 - A rule the edit gives is written as before (rebuilt from the RRULE by `toGraphEventJSON`). It still

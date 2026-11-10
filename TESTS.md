@@ -44,9 +44,10 @@ another date, timed and all day (its end moving with it), keeps its stored recur
 range's start date; an
 occurrence edit never writes a rule or the master. Also covered: an event made recurring, a series
 given a new rule and a new date (the new rule is written), a series moved by a start written
-without an offset, a series moved by a start spelled with an offset (`Z`, `.000Z`, `+00:00`) but
-labelled with another zone, as the tools pass one through (dated where Graph stores it: within the
-device's day no recurrence, to another day the range at that day), an all-day end-only edit (the
+without an offset, a series moved by a start spelled with an offset (`Z`, `.000Z`, `+00:00`) or
+without seconds (`…T10:00`, bare or with `Z`) but labelled with another zone, as the tools pass one
+through (dated where Graph stores it: within the device's day no recurrence, to another day the
+range at that day; a start without seconds is written with `:00`), an all-day end-only edit (the
 start stays), a move across UTC midnight within the device's day (no recurrence) and across
 the device's midnight within one UTC date (range start = the device's date; both skipped within
 about an hour of UTC), an occurrence named by its own id, an empty edit writing nothing, a PATCH

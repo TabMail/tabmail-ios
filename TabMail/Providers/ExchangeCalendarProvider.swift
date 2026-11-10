@@ -668,7 +668,8 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// So `…T00:30:00Z` labelled with the device's zone is 00:30 on the device,
     /// and a start whose offset matches its label (`Z` with `UTC`) is the instant
     /// it spells. A wall time without seconds (`…T10:00`), which the tools pass
-    /// through as given, is dated as written, as the range's `startDate` always was.
+    /// through as given, is read the same way: `graphNaiveDateTime` writes it with
+    /// `:00`. Only a string that is no wall time at all is dated as written.
     nonisolated static func day(_ date: String?, _ dateTime: String?, in timeZone: String?) -> String? {
         if let date { return String(date.prefix(10)) }
         guard let dateTime else { return nil }
@@ -1003,14 +1004,21 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// string is the naive wall-time form Graph expects in `start.dateTime` /
     /// `end.dateTime`. Searches AFTER the `T` so the date's `-` separators
     /// aren't mistaken for an offset.
+    ///
+    /// A wall time without seconds (`…T10:00`, which the tools pass through as
+    /// given) gets `:00`: Graph documents `dateTime` with seconds, and `day`
+    /// reads this same string, so the date an edit is judged by is the date of
+    /// the start Graph stores.
     nonisolated static func graphNaiveDateTime(_ iso: String) -> String {
         guard let tIdx = iso.firstIndex(of: "T") else { return iso }
         let afterT = iso.index(after: tIdx)
         let timePart = iso[afterT...]
-        if let offsetIdx = timePart.firstIndex(where: { $0 == "Z" || $0 == "+" || $0 == "-" }) {
-            return String(iso[..<offsetIdx])
+        let naive = timePart.firstIndex(where: { $0 == "Z" || $0 == "+" || $0 == "-" }).map { iso[..<$0] } ?? iso[...]
+        let time = Array(naive[afterT...])
+        if time.count == 5, time[2] == ":", [0, 1, 3, 4].allSatisfy({ time[$0].isASCII && time[$0].isNumber }) {
+            return String(naive) + ":00"
         }
-        return iso
+        return String(naive)
     }
 
     /// `attendeeTypes` (lowercased address → Graph type) keeps an existing
