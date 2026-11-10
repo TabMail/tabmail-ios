@@ -16,6 +16,34 @@
 > See the fifth runtime exit in
 > [the normative rule](../../../Rules/Active/never-drop-user-intention.md).
 <!-- KNOWN-ISSUES-AMENDMENT-END -->
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+> **Current amendment (2026-11-10, tabmail-ios #534): the mail-side signal gap is FIXED.** The
+> visibility gap this row registered (a revoked Google or Microsoft grant halting mail actions,
+> sends and sync with no prompt, `MIS-IOS-008`) no longer holds. Every Gmail API and Microsoft Graph
+> request, mail and calendar alike, gets its token from the accessor `AccountManager.makeOAuthAccessor`
+> builds, and that accessor now raises `markAuthFailed(accountId)` when the token refresh fails with
+> `OAuthError.tokenExchangeFailed` carrying one of the three codes
+> `AccountManager.isGrantLevelOAuthFailure` accepts (`invalid_grant`, `invalid_client`,
+> `unauthorized_client`). That is the narrow shape the row demanded: `temporarily_unavailable`,
+> `server_error`, the `"unknown"` fallback, `invalid_scope`, an offline device, a timeout and an
+> undecodable body raise nothing. The signal is skipped when the account was removed or the user
+> has already installed a new sign-in (the stored generation moved), so a late refusal of the old
+> grant cannot re-raise the prompt after re-authentication. The user sees the existing warning
+> (`RootView` opens Settings after a launch connect, the `SettingsView` row icon, the
+> `AccountDetailView` banner), and it clears as before when `connectAccount` succeeds after
+> re-authentication.
+>
+> The error is rethrown unchanged, so no disposition changed. Ordinary message actions on Gmail and
+> Graph receive it wrapped as `AuthError.refreshFailed` by `AccountAuthSource`, which the fifth
+> runtime exit does not charge, so they stay queued however long the grant is refused and drain
+> after sign-in. Outbox sends keep ADR-IOS-019's existing three-strike policy: the row is never
+> dropped, becomes `failed` (visible, with Retry) after three refused drains, and goes out after
+> sign-in on the next drain or on Retry. Not covered: the notification service extension (a
+> separate process with its own token path and no banner), and `AccountManager.freshAccessToken`
+> (push subscription), which calls the refresh coordinator directly. IMAP and iCloud accounts sign
+> in with a password and have no grant; their connect-time refusal was already signalled through
+> `AccountManager.isAuthError`. Tests: `RevokedMailGrantSignalTests`.
+<!-- KNOWN-ISSUES-AMENDMENT-END -->
 # IOS-QUEUE-009
 
 > Routed from `KNOWN_ISSUES.md` line 1208 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 dfa31256dfc43d25d741408ed6e33e2e58ae9984d7cc825a2d59c6c1ae1b6535`).
