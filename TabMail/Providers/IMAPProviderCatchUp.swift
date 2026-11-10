@@ -15,14 +15,17 @@ struct IMAPCatchUpState: Codable, Equatable, Sendable {
     /// change landing in an already-listed range while the listing is still running
     /// moves the server's counter past this value, so the folder is listed again.
     var completionStamp: Int?
-    /// When the last listing completed. Drives the full-check interval and the
-    /// oldest-first order.
+    /// When the last listing completed. Drives the full-check interval.
     var lastCompletedAt: Date?
     /// The listing in progress, if any.
     var listing: Listing?
     /// When the catch-up first saw the folder under this epoch. Until a listing
     /// completes, the expensive-network wait is counted from here.
     var createdAt: Date?
+    /// When the catch-up last tried a listing for the folder, whether or not it
+    /// succeeded. Drives the order: a folder that keeps failing goes to the back,
+    /// so it cannot hold the others' catch-up past its bound.
+    var lastAttemptAt: Date?
 
     struct Listing: Codable, Equatable, Sendable {
         /// HIGHESTMODSEQ taken when this listing started, before its first range.
@@ -97,17 +100,21 @@ extension IMAPProvider {
     /// known: the cheap check (this pass's HIGHESTMODSEQ against the stored
     /// completion stamp, no request), and when that or the full-check interval
     /// calls for it, a flags-only listing by UID ranges that resumes across passes.
-    /// Oldest-completed folder first. Every request is preceded by a budget check
+    /// Least recently attempted folder first. Every request is preceded by a budget check
     /// and bounded by `SyncConfig.catchUpRequestTimeoutSeconds`; a timeout or any
     /// failure ends the folder's work for the pass, keeping what was proven.
     func catchUp(
         folders: [Folder], localRows: any CatchUpLocalRowReader, context: CatchUpContext
     ) async -> [CatchUpFolderResult] {
-        // Oldest first: never-completed folders, then by completion time. The sort is
-        // stable on the caller's order for ties.
+        // Least recently tried first: never-tried folders, then by the last try
+        // (a completion is a try). A folder whose requests keep failing
+        // therefore goes behind the others. The sort is stable on the caller's order
+        // for ties.
+        func lastAttempt(_ folder: Folder) -> Date {
+            IMAPCatchUpState.decode(folder.catchUpState)?.lastAttemptAt ?? .distantPast
+        }
         let ordered = folders.enumerated().sorted { lhs, rhs in
-            let l = IMAPCatchUpState.decode(lhs.element.catchUpState)?.lastCompletedAt ?? .distantPast
-            let r = IMAPCatchUpState.decode(rhs.element.catchUpState)?.lastCompletedAt ?? .distantPast
+            let l = lastAttempt(lhs.element), r = lastAttempt(rhs.element)
             return l == r ? lhs.offset < rhs.offset : l < r
         }.map(\.element)
 
@@ -228,6 +235,7 @@ extension IMAPProvider {
         }
 
         var newState = state ?? IMAPCatchUpState(epoch: epoch, createdAt: context.clock())
+        newState.lastAttemptAt = context.clock()
         if completed {
             newState.completionStamp = listing.firstStamp
             newState.lastCompletedAt = context.clock()

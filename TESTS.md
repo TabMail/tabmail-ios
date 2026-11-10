@@ -633,7 +633,10 @@ nothing is ever decided about a UID whose numbering is unproven (ADR-IOS-107). C
 - **A new folder.** A folder the full sync itself created follows an older-mail change on the next
   pass.
 - **A just-completed user action** wins over a stale listing, per message.
-- **Order.** Under budget pressure the folder whose listing completed longest ago goes first.
+- **Order.** Under budget pressure the folder whose listing was tried longest ago goes first.
+  A folder whose request fails on every pass goes behind the others, and so does one that completes
+  and is due again, so the folder behind is listed on the next pass (`failingFolderGoesToTheBack`,
+  `completedFolderGoesToTheBack`).
 - **A request that stalls or fails.** A stalled listing or removal proof is abandoned at the request
   timeout and applies nothing (`FakeIMAPServer.stallNextCommand`). A failed listing keeps what earlier
   ranges proved and resumes at the failed range; a failed proof removes nothing and is retried; one

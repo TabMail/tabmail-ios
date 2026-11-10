@@ -413,7 +413,7 @@ struct IMAPCatchUpTests {
         }
     }
 
-    @Test("Under budget pressure the folder whose listing completed longest ago goes first")
+    @Test("Under budget pressure the folder whose listing was tried longest ago goes first")
     func oldestCompletedFolderFirst() async throws {
         let other = "Older"
         try await Self.withWorld("cu-order", serverUIDs: [1], localUIDs: [1], otherMailboxes: [other: [1]]) { world in
@@ -424,9 +424,11 @@ struct IMAPCatchUpTests {
             let otherId = "\(world.accountId):\(other)"
             let day = SyncConfig.catchUpFullCheckIntervalSeconds
             try Self.setState(IMAPCatchUpState(
-                epoch: Self.epoch, completionStamp: nil, lastCompletedAt: Date().addingTimeInterval(-2 * day), listing: nil), world)
+                epoch: Self.epoch, completionStamp: nil, lastCompletedAt: Date().addingTimeInterval(-2 * day), listing: nil,
+                lastAttemptAt: Date().addingTimeInterval(-2 * day)), world)
             let older = IMAPCatchUpState(
-                epoch: Self.epoch, completionStamp: nil, lastCompletedAt: Date().addingTimeInterval(-3 * day), listing: nil).encoded()
+                epoch: Self.epoch, completionStamp: nil, lastCompletedAt: Date().addingTimeInterval(-3 * day), listing: nil,
+                lastAttemptAt: Date().addingTimeInterval(-3 * day)).encoded()
             try await world.pool.write { db in
                 try db.execute(sql: "UPDATE folder SET catchUpState = ? WHERE id = ?", arguments: [older, otherId])
             }
@@ -439,6 +441,72 @@ struct IMAPCatchUpTests {
 
             #expect(try Self.rows(world, path: other)["1"]?.isRead == true, "the folder that waited longest was listed")
             #expect(try Self.rows(world)["1"]?.isRead == false, "the budget ended before the other folder")
+        }
+    }
+
+    /// The bound on every folder's catch-up holds only if one folder cannot keep
+    /// the front of the queue: each pass's budget goes to the folder that has
+    /// waited longest since its last ATTEMPT.
+    @Test("A folder whose request fails on every pass does not hold back the folder behind it")
+    func failingFolderGoesToTheBack() async throws {
+        let other = "Older"
+        try await Self.withWorld("cu-starve", serverUIDs: [7], localUIDs: [7], otherMailboxes: [other: [1]]) { world async throws in
+            try FolderEpochTestFixture.insertFolder(
+                accountId: world.accountId, path: other, role: .custom, pool: world.pool,
+                totalCount: 1, lastKnownUidValidity: Int(Self.epoch))
+            try FolderEpochTestFixture.insertHeaders(accountId: world.accountId, path: other, uids: [1], pool: world.pool)
+            let otherId = "\(world.accountId):\(other)"
+            world.server.setFlags(["\\Seen"], in: other, uid: 1)
+            // Both folders completed a listing before and are due again; the one that
+            // will fail was tried longest ago, so it goes first.
+            let day = SyncConfig.catchUpFullCheckIntervalSeconds
+            try Self.setState(IMAPCatchUpState(
+                epoch: Self.epoch, completionStamp: nil, lastCompletedAt: Date().addingTimeInterval(-3 * day), listing: nil,
+                lastAttemptAt: Date().addingTimeInterval(-3 * day)), world)
+            let behind = IMAPCatchUpState(
+                epoch: Self.epoch, completionStamp: nil, lastCompletedAt: Date().addingTimeInterval(-2 * day), listing: nil,
+                lastAttemptAt: Date().addingTimeInterval(-2 * day)).encoded()
+            try await world.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET catchUpState = ? WHERE id = ?", arguments: [behind, otherId])
+            }
+
+            // Each pass's budget allows one listing request, and the first folder's fails.
+            world.server.failNextCommand(containing: "UID FETCH 7")
+            await world.engine.runCatchUp(
+                provider: world.provider, folderIds: [world.folderId, otherId], context: Self.oneRangePerPass(world.server))
+            #expect(world.server.consumedInjectedFailureCount() == 1, "precondition: the first folder's request failed")
+            #expect(try Self.rows(world, path: other)["1"]?.isRead == false, "precondition: the budget ended before the second folder")
+
+            world.server.failNextCommand(containing: "UID FETCH 7")
+            await world.engine.runCatchUp(
+                provider: world.provider, folderIds: [world.folderId, otherId], context: Self.oneRangePerPass(world.server))
+            #expect(try Self.rows(world, path: other)["1"]?.isRead == true, "the folder behind the failing one got the next pass")
+        }
+    }
+
+    @Test("A folder that completes a listing goes behind one not yet listed, even when it is due again")
+    func completedFolderGoesToTheBack() async throws {
+        let other = "Older"
+        try await Self.withWorld("cu-rotate", serverUIDs: [7], localUIDs: [7], otherMailboxes: [other: [1]]) { world async throws in
+            try FolderEpochTestFixture.insertFolder(
+                accountId: world.accountId, path: other, role: .custom, pool: world.pool,
+                totalCount: 1, lastKnownUidValidity: Int(Self.epoch))
+            try FolderEpochTestFixture.insertHeaders(accountId: world.accountId, path: other, uids: [1], pool: world.pool)
+            let otherId = "\(world.accountId):\(other)"
+            world.server.setFlags(["\\Seen"], in: other, uid: 1)
+            try await Self.refreshModSeq(world)
+
+            await world.engine.runCatchUp(
+                provider: world.provider, folderIds: [world.folderId, otherId], context: Self.oneRangePerPass(world.server))
+            #expect(try Self.state(world)?.lastCompletedAt != nil, "precondition: the first folder's listing completed")
+            #expect(try Self.rows(world, path: other)["1"]?.isRead == false, "precondition: the budget ended before the second folder")
+
+            // The first folder changes again, so it is due on the next pass too.
+            world.server.setFlags(["\\Seen"], in: Self.path, uid: 7)
+            try await Self.refreshModSeq(world)
+            await world.engine.runCatchUp(
+                provider: world.provider, folderIds: [world.folderId, otherId], context: Self.oneRangePerPass(world.server))
+            #expect(try Self.rows(world, path: other)["1"]?.isRead == true, "the folder not yet listed got the next pass")
         }
     }
 
