@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import Synchronization
 import Testing
 @testable import TabMail
 
@@ -178,13 +179,13 @@ struct ExchangeOutboxSentMessageIdTests {
         // moment it is asked for: the optimistic row the send left. This fake's
         // Sent folder is empty, so once that sync ends it has removed the row;
         // the row is read here, before it can.
-        let sentRowsAtListing = SentRowsBox()
+        let sentRowsAtListing = Mutex<[String?]?>(nil)
         let sentFolderId = "\(accountId):SentItems"
         http.register(path: Self.sentListingPath, method: "GET") { [pool] _ in
             let keys = (try? pool.read { db in
                 try MessageHeader.filter(Column("folderId") == sentFolderId).fetchAll(db).map(\.rfc822MessageId)
             }) ?? []
-            sentRowsAtListing.recordFirst(keys)
+            sentRowsAtListing.withLock { first in if first == nil { first = keys } }
             return .json(raw: #"{"value":[]}"#)
         }
         let provider = ExchangeProvider(userEmail: "\(accountId)@example.com", accessToken: { _ in "token" }, session: http.session)
@@ -212,7 +213,7 @@ struct ExchangeOutboxSentMessageIdTests {
         let wireId = try #require(message["internetMessageId"] as? String,
                                   "the Outbox send must ask Graph for the claim's Message-ID")
 
-        let rows = try #require(sentRowsAtListing.first, "the post-send Sent sync listed the Sent folder")
+        let rows = try #require(sentRowsAtListing.withLock { $0 }, "the post-send Sent sync listed the Sent folder")
         #expect(rows.count == 1, "the send leaves one optimistic Sent row")
         guard rows.count == 1 else { return }
         #expect(EmailFilter.normalizeMessageId(wireId) == rows[0],
@@ -221,16 +222,91 @@ struct ExchangeOutboxSentMessageIdTests {
                 "the row is keyed by the claim's id, which a retry sends again")
     }
 
+    /// Where Graph refuses an Outlook send: `sendMail` for a message without
+    /// files, or, for one with files, the draft create or its `/send`.
+    enum RefusedStep: String, CaseIterable, Sendable {
+        case sendMail, draftCreate, draftSend
+    }
+
+    /// The Outbox parks a row as failed after its third counted refusal.
+    private static let countedAttempts = 3
+    private static let refusalStatus = 400
+
+    @Test("A refused Outlook send asks Graph for the first claim's id on every attempt, and parks after its counted attempts",
+          arguments: RefusedStep.allCases)
+    func refusedSendKeepsItsIdAndParks(step: RefusedStep) async throws {
+        let accountId = "outlook-refused-\(UUID().uuidString)"
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .outlook, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: "SentItems", role: .sent, pool: pool)
+
+        let files = step == .sendMail
+            ? []
+            : [DraftAttachment(filename: "a.txt", mimeType: "text/plain", data: Data("file".utf8))]
+        let queued = OutboxMessage(
+            accountId: accountId,
+            draft: DraftMessage(to: ["recipient@example.com"], subject: "Refused send", body: "Body", attachments: files))
+        try OutboxMessage.saveAttachments(files, dirName: queued.id)
+        defer { queued.deleteAttachments() }
+        try await pool.write { db in try queued.insert(db) }
+
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let refusal = FakeHTTP.CannedResponse.status(Self.refusalStatus)
+        http.register(path: "/sendMail", method: "POST", response: step == .sendMail ? refusal : .status(202))
+        http.register(path: "/mailFolders/drafts/messages", method: "POST",
+                      response: step == .draftCreate ? refusal : .json(raw: #"{"id":"g1"}"#, statusCode: 201))
+        http.register(path: "/messages/g1/attachments", method: "GET", response: .json(raw: #"{"value":[]}"#))
+        http.register(path: "/messages/g1/attachments", method: "POST", response: .json(raw: #"{"id":"a1"}"#, statusCode: 201))
+        http.register(path: "/messages/g1/send", method: "POST", response: step == .draftSend ? refusal : .status(202))
+        http.register(path: "/messages/g1", method: "DELETE", response: .status(204))
+        let provider = ExchangeProvider(userEmail: "\(accountId)@example.com", accessToken: { _ in "token" }, session: http.session)
+
+        // Each attempt is the drain's own pair: the claim, then the send of the
+        // row the claim left, with the id the claim stored.
+        var claimIds: [String?] = []
+        var afterAttempts: [OutboxMessage] = []
+        try await TestProviderRegistry.withRegisteredProvider(accountId: accountId, provider: provider) {
+            for _ in 0..<Self.countedAttempts {
+                #expect(await AccountManager.shared.atomicClaimForTesting(queued),
+                        "a refusal leaves the row claimable until it is parked")
+                let claimed = try #require(try await pool.read { db in try OutboxMessage.fetchOne(db, key: queued.id) })
+                claimIds.append(claimed.sentMessageId)
+                let messageId = try #require(claimed.sentMessageId, "the claim stores the id it sends under")
+                await AccountManager.shared.sendClaimedOutboxMessageForTesting(claimed, messageId: messageId)
+                afterAttempts.append(try #require(try await pool.read { db in try OutboxMessage.fetchOne(db, key: queued.id) }))
+            }
+        }
+
+        let firstId = try #require(claimIds.first ?? nil)
+        #expect(claimIds.allSatisfy { $0 == firstId }, "every claim reuses the first claim's Message-ID")
+        let carriers = http.recordedCalls().filter {
+            $0.method == "POST" && $0.url.contains(step == .sendMail ? "/sendMail" : "/mailFolders/drafts/messages")
+        }
+        #expect(carriers.count == Self.countedAttempts, "each attempt reached Graph once")
+        for carrier in carriers {
+            let top = try #require(try JSONSerialization.jsonObject(with: carrier.body ?? Data()) as? [String: Any])
+            let message = try #require(step == .sendMail ? (top["message"] as? [String: Any]) : top)
+            #expect((message["internetMessageId"] as? String).map(EmailFilter.normalizeMessageId)
+                        == EmailFilter.normalizeMessageId(firstId),
+                    "every attempt asks Graph for the first claim's id")
+        }
+
+        #expect(afterAttempts.map(\.retryCount) == Array(1...Self.countedAttempts), "each refusal is counted")
+        #expect(afterAttempts.map(\.outboxStatus)
+                    == Array(repeating: OutboxStatus.queued, count: Self.countedAttempts - 1) + [.failed],
+                "the row is retried until its last counted attempt, then shown as failed")
+        #expect(afterAttempts.allSatisfy { $0.sentAt == nil && $0.sentMessageId == firstId },
+                "a refused row is never marked sent and keeps its id for Retry")
+        let sentRows = try await pool.read { db in
+            try MessageHeader.filter(Column("folderId") == "\(accountId):SentItems").fetchCount(db)
+        }
+        #expect(sentRows == 0, "a refused send leaves no Sent row")
+    }
+
     private static let sentListingPath = "/mailFolders/SentItems/messages"
 
-    /// The Sent rows' Message-ID keys at the first Sent listing, written from
-    /// the fake's handler thread and read by the test.
-    private final class SentRowsBox: @unchecked Sendable {
-        private let lock = NSLock()
-        private var stored: [String?]?
-        func recordFirst(_ keys: [String?]) { lock.lock(); if stored == nil { stored = keys }; lock.unlock() }
-        var first: [String?]? { lock.lock(); defer { lock.unlock() }; return stored }
-    }
     private static let settleAttempts = 500
     private static let settleInterval = Duration.milliseconds(10)
 
