@@ -638,4 +638,45 @@ struct EventPillLiveFetchTests {
         #expect(detail?.notes == "Join: \(link)\nAgenda")
         await translator.clearAll()
     }
+
+    @Test("a read that finds the event by scanning every calendar caches its join link in the pill's notes")
+    func scannedReadCachesTheJoinLink() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pools: [pool], queues: [], directory: dir)
+        }
+        let accountId = "pill-scan"
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .gmail, pool: pool)
+        let link = "https://meet.example.com/meet/0000000000"
+        let mock = MockCalendarProvider()
+        await mock.setListCalendarsResult([GCalCalendar(
+            id: "work", summary: "Work", primary: true, accessRole: "owner", backgroundColor: nil, selected: true)])
+        await mock.setGetEventResult(GCalEvent(
+            id: "evt-online", summary: "Planning", location: nil, description: "Agenda",
+            start: nil, end: nil, attendees: nil, organizer: nil, recurrence: nil, transparency: nil, status: nil,
+            htmlLink: nil, created: nil, updated: nil, conferenceUrl: link
+        ))
+        await AccountManager.shared.registerCalendarProviderForTesting(accountId: accountId, provider: mock)
+        defer { Task { await AccountManager.shared.unregisterCalendarProviderForTesting(accountId: accountId) } }
+        // No calendar is known for the id, so the read scans every account's calendars.
+        let translator = MockChatIdTranslator()
+        await translator.seed(82, realId: "evt-online")
+
+        let output = try await CalendarEventReadTool(context: ToolContext(db: try DatabaseQueue(), translator: translator))
+            .execute(arguments: ["event_id": .string("82")])
+        #expect(output.contains("conference_url: \(link)"), "setup: the scan did not reach the event: \(output)")
+        #expect(await mock.callLog.contains("listCalendars"), "setup: the read did not scan the calendars")
+
+        // The read caches the pill detail in a detached task.
+        let compoundId = CompoundEventId.make(accountId: accountId, eventId: "evt-online")
+        let numericId = await translator.toNumericId(compoundId)
+        var notes: String?
+        for _ in 0..<200 {
+            notes = await translator.resolveEventDetail(numericId)?.notes
+            if notes != nil { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        #expect(notes == "Join: \(link)\nAgenda")
+    }
 }

@@ -81,8 +81,8 @@ them, are recognised as the clean body is, within a time limit a scan that resta
 exceeds. `ExchangeCalendarTests` maps an HTML, text or missing body to the
 description; `CalendarToolHelpersTests` pins the `conference_url:` line after the description and an
 event pill's notes (join link first); `ToolCachingTests` checks that the search and direct-read pill
-caches carry the join link, and that in a new session a pill tap that fetches the event live shows
-it.
+caches carry the join link (including a read that finds the event by scanning every calendar), and
+that in a new session a pill tap that fetches the event live shows it.
 
 ## Inbox list — layered test architecture
 

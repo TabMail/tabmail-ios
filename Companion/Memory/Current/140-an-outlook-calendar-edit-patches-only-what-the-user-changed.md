@@ -118,3 +118,16 @@ zone 14 hours ahead (`seriesMovedByOffsetSpelledStart`, built by `buildGCalEvent
 where Graph stores it; an all-day edit that gives only the end keeps the start. `GraphFixture` stores its UTC
 start at the hour that puts the device on the same date, so the suite holds at any host offset from
 -12 to +14 hours.
+
+`TabMailTests/Providers/GraphOnlineMeetingBodyTests.swift` pins the join-section split (#511): a notes
+edit keeps the stored join section byte for byte, a notes-only body is written as HTML, and a body with
+thousands of link copies is split in linear time (`manyLinkCopies`). `ExchangeCalendarEditPreservationTests`
+pins the edit end to end on the fake Graph calendar. `ToolCachingTests` pins the pill's join link at every
+cache site: the read tool's cached-calendar path, its scan of every calendar
+(`scannedReadCachesTheJoinLink`), and the live re-fetch (`liveFetchShowsTheJoinLink`);
+`CalendarToolHelpersTests` pins `eventPillNotes(from:)`.
+
+Correction to memory 064 (frozen fragment, not edited): an event pill's notes no longer come from
+`GCalEvent.description` alone. Every cache site and the live re-fetch use
+`CalendarToolHelpers.eventPillNotes(from:)`, which puts `Join: <conferenceUrl>` on the first line,
+because an Outlook online meeting's description is its notes without the join section.
