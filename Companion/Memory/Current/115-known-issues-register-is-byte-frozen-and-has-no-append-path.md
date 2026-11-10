@@ -174,8 +174,13 @@ assistant can ask the user before any card is shown, and the queue again before 
 can change between the card and the drain.
 The start compared is `start_iso`'s date when the edit gives one; for an end-only edit it is the start the
 edit keeps, which is per scope: on `all` the event's stored start (from the read above, or one more read
-when an explicit `all_day: true` skipped it), on `this_only` and `this_and_following` the occurrence's own
-date, `recurrence_id`'s, with no read. The master's stored start is earlier than the occurrence's, so
+when an explicit `all_day: true` skipped it), on `this_and_following` the occurrence's own date,
+`recurrence_id`'s, with no read, and on `this_only` the day the occurrence starts on now
+(`CalendarProvider.occurrenceStartDay`, asked only for an end given alone on one all-day occurrence). Google
+and Outlook resolve `recurrence_id` against each instance's current start, so that day is `recurrence_id`'s
+date (the protocol default, no read). CalDAV addresses an occurrence by its original slot (`RECURRENCE-ID`),
+so an occurrence moved on its own starts on another day; `CalDAVProvider` reads the resource and returns the
+override's own `DTSTART` date. A failed read is retried in the queue and shows no card in the tool. The master's stored start is earlier than the occurrence's, so
 comparing with it there would let a same-day end through to the cap and a zero-length successor or
 override. On iOS an end-only edit keeps its start on every provider, so an inverted end is refused rather
 than written; this differs from the Thunderbird add-on, which keeps the event's length first and so never

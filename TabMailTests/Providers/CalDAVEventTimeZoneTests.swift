@@ -523,7 +523,8 @@ struct CalendarTimeZoneResolverFenceTests {
         }
         #expect(scanned > 100, "non-vacuity: only \(scanned) files were scanned")
         #expect(offenders.isEmpty, "zone names read outside CalendarTimeZoneResolver:\n\(offenders.joined(separator: "\n"))")
-        // `ICSParser.parse`, `ICSBuilder.parseIncoming`, and CalDAV's three write operations.
-        #expect(contexts == ["ICSParser.swift": 1, "ICSBuilder.swift": 1, "CalDAVProvider.swift": 3], "\(contexts)")
+        // `ICSParser.parse`, `ICSBuilder.parseIncoming`, CalDAV's three write operations, and its
+        // read of the day a moved all-day occurrence starts on (`occurrenceStartDay`).
+        #expect(contexts == ["ICSParser.swift": 1, "ICSBuilder.swift": 1, "CalDAVProvider.swift": 4], "\(contexts)")
     }
 }

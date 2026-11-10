@@ -968,18 +968,30 @@ enum CalendarToolHelpers {
     /// event's (`storedStart`, nil when the event was not read). A time of day is refused only for a
     /// kind taken from the stored event (`allDayEditTimeRefusal`). The end is compared with
     /// `start_iso`, else with the start the edit keeps: the stored start on `all`, the occurrence's
-    /// own date (`recurrence_id`'s) on `this_only` and `this_and_following` (`allDayEditEndRefusal`).
-    static func allDayEditRefusal(_ arguments: [String: JSONValue], storedStart: GCalDateTime?, scope: String, recurrenceId: String?) -> String? {
+    /// own date on `this_only` and `this_and_following` (`allDayEditEndRefusal`): `recurrence_id`'s,
+    /// or on `this_only` the day the occurrence starts on now (`occurrenceStartDay`), which differs
+    /// when the occurrence was moved on its own and which the caller reads when
+    /// `needsOccurrenceStartDay` says the rule depends on it.
+    static func allDayEditRefusal(_ arguments: [String: JSONValue], storedStart: GCalDateTime?, scope: String, recurrenceId: String?, occurrenceStartDay: String? = nil) -> String? {
         let stated = boolArg(arguments, "all_day")
         guard stated ?? (storedStart?.date != nil) else { return nil }
         if stated == nil, let reason = allDayEditTimeRefusal(arguments) { return reason }
         let targetStartDate: String?
         switch scope {
-        case "this_only", "this_and_following": targetStartDate = recurrenceId.map { String($0.prefix(10)) }
+        case "this_only": targetStartDate = occurrenceStartDay ?? recurrenceId.map { String($0.prefix(10)) }
+        case "this_and_following": targetStartDate = recurrenceId.map { String($0.prefix(10)) }
         case "all": targetStartDate = storedStart.flatMap { $0.date ?? $0.dateTime.map { String($0.prefix(10)) } }
         default: targetStartDate = nil
         }
         return allDayEditEndRefusal(arguments, allDay: true, targetStartDate: targetStartDate)
+    }
+
+    /// True when `allDayEditRefusal` compares the edit's end with the start one occurrence keeps:
+    /// a `this_only` edit of an all-day event that gives an end and no start. The occurrence may
+    /// have been moved on its own, so its start is read from the provider (`occurrenceStartDay`).
+    static func needsOccurrenceStartDay(_ arguments: [String: JSONValue], storedStart: GCalDateTime?, scope: String) -> Bool {
+        guard scope == "this_only", boolArg(arguments, "all_day") ?? (storedStart?.date != nil) else { return false }
+        return stringArgOpt(arguments, "end_iso") != nil && stringArgOpt(arguments, "start_iso") == nil
     }
 
     /// Why an edit that leaves `all_day` out cannot give an all-day event these times, or nil.

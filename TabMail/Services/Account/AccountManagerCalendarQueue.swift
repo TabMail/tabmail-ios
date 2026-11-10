@@ -917,6 +917,22 @@ extension AccountManager {
                 target = try await provider.getEvent(calendarId: calId, eventId: eventId)
             }
 
+            // 🚨 THE OTHER HALF OF THE OCCURRENCE ADDRESS. `recurrence_id` is a
+            // naive wall clock with no offset; on its own it does not name an
+            // instant. `calendar_event_edit`'s schema already publishes the frame
+            // ("all naive ISO8601 datetime parameters are interpreted in this
+            // timezone", default: the device zone), the durable operation already
+            // persists the whole argument dictionary including `timezone`, and
+            // `formatDetailedEvent` already MINTS `start_iso` in that same zone.
+            // The frame was present on both ends the entire time and was simply
+            // never carried across — the calendar instance of THE ADDRESS PROBLEM.
+            // Resolving it here, once, is what lets every provider agree.
+            // A `timezone` the resolver does not recognize is refused here, before
+            // the occurrence read below uses it as the frame, through the same
+            // function `buildGCalEventInput` uses.
+            let recurrenceIdZone = try CalendarToolHelpers.resolveWriteTimeZone(
+                resolvedArgs, consequence: "it did not change the event")
+
             // An all-day end is the day after the last day, so an all-day edit whose end is on or
             // before its start would write a zero-length event (an all-day event given times of one
             // day without `all_day`, or `all_day: true` with a same-day end). Refused here, before
@@ -935,26 +951,22 @@ extension AccountManager {
             // refusals tell the assistant to ask the user. The edit tool applies the same rule
             // (`allDayEditRefusal`) before its confirmation card; it is applied again here because
             // the event can change between the card and the drain.
+            //
+            // On `this_only` the start an end-only edit keeps is the occurrence's CURRENT start, which
+            // is later than `recurrence_id`'s date when the occurrence was moved on its own, so it is
+            // read from the provider. A failed read throws and the operation is retried.
+            var occurrenceStartDay: String? = nil
+            if let rid = recurrenceId,
+               CalendarToolHelpers.needsOccurrenceStartDay(resolvedArgs, storedStart: stored?.start, scope: scope) {
+                occurrenceStartDay = try await provider.occurrenceStartDay(
+                    calendarId: calId, eventId: eventId, recurrenceId: rid, recurrenceIdZone: recurrenceIdZone)
+            }
             if let reason = CalendarToolHelpers.allDayEditRefusal(
-                resolvedArgs, storedStart: target?.start, scope: scope, recurrenceId: recurrenceId) {
+                resolvedArgs, storedStart: target?.start, scope: scope, recurrenceId: recurrenceId,
+                occurrenceStartDay: occurrenceStartDay) {
                 throw CalendarProviderError.notSupported(reason)
             }
             let input = try CalendarToolHelpers.buildGCalEventInput(resolvedArgs, isAllDay: resolvedAllDay)
-
-            // 🚨 THE OTHER HALF OF THE OCCURRENCE ADDRESS. `recurrence_id` is a
-            // naive wall clock with no offset; on its own it does not name an
-            // instant. `calendar_event_edit`'s schema already publishes the frame
-            // ("all naive ISO8601 datetime parameters are interpreted in this
-            // timezone", default: the device zone), the durable operation already
-            // persists the whole argument dictionary including `timezone`, and
-            // `formatDetailedEvent` already MINTS `start_iso` in that same zone.
-            // The frame was present on both ends the entire time and was simply
-            // never carried across — the calendar instance of THE ADDRESS PROBLEM.
-            // Resolving it here, once, is what lets every provider agree.
-            // A `timezone` the resolver does not recognize was already refused by
-            // `buildGCalEventInput` above, through the same function.
-            let recurrenceIdZone = try CalendarToolHelpers.resolveWriteTimeZone(
-                resolvedArgs, consequence: "it did not change the event")
 
             switch scope {
             case "this_only":

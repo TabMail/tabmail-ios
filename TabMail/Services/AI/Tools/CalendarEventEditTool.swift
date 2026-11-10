@@ -152,7 +152,9 @@ struct CalendarEventEditTool: AgentTool, Sendable {
 
         // Fetch current event details from API for confirmation card
         var fetchedEvent: GCalEvent?
+        var fetchedCalendarId: String?
         if let provider, let calId = calendarId {
+            fetchedCalendarId = calId
             fetchedEvent = try? await provider.getEvent(calendarId: calId, eventId: eventId)
             if let event = fetchedEvent {
                 Task {
@@ -165,6 +167,7 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         } else if let provider {
             // calendarId unknown — try default calendar, then scan all calendars
             let defaultCalId = await CalendarProviderDispatch.defaultCalendarIdForCreation(for: provider)
+            fetchedCalendarId = defaultCalId
             fetchedEvent = try? await provider.getEvent(calendarId: defaultCalId, eventId: eventId)
             if let event = fetchedEvent {
                 // Found on default calendar — update cache so future edit/delete use correct calendarId
@@ -198,8 +201,29 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         // its start, is refused here, before the card, now that the stored kind is known: the
         // assistant asks the user instead of the user confirming an edit that is then refused.
         // The queue applies the same rule again before the write.
+        //
+        // On `this_only` an end given alone is checked against the start the occurrence has now,
+        // which is not `recurrence_id`'s date when the occurrence was moved on its own. It is read
+        // from the provider; when that read fails the edit is not offered, since the card would
+        // show an end that may be refused.
+        var occurrenceStartDay: String?
+        if let provider, let calId = fetchedCalendarId, let rid = recurrenceIdArg,
+           CalendarToolHelpers.needsOccurrenceStartDay(arguments, storedStart: fetchedEvent?.start, scope: resolvedScope) {
+            do {
+                occurrenceStartDay = try await provider.occurrenceStartDay(
+                    calendarId: calId, eventId: eventId, recurrenceId: rid,
+                    recurrenceIdZone: CalendarToolHelpers.resolveTimeZone(arguments))
+            } catch {
+                return ToolJSON.string(from: [
+                    "ok": false,
+                    "error": "calendar_event_edit failed: could not read the occurrence at \(rid) to check the new end (\(error.localizedDescription)). The event was NOT changed. Check recurrence_id with calendar_event_read, then retry.",
+                    "event_id": compoundId,
+                ] as [String: Any])
+            }
+        }
         if let reason = CalendarToolHelpers.allDayEditRefusal(
-            arguments, storedStart: fetchedEvent?.start, scope: resolvedScope, recurrenceId: recurrenceIdArg) {
+            arguments, storedStart: fetchedEvent?.start, scope: resolvedScope, recurrenceId: recurrenceIdArg,
+            occurrenceStartDay: occurrenceStartDay) {
             return ToolJSON.string(from: [
                 "ok": false,
                 "error": "calendar_event_edit failed: \(reason). The event was NOT changed.",

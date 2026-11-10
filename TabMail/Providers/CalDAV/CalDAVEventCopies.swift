@@ -149,6 +149,27 @@ extension CalDAVProvider {
 
     // MARK: - One-occurrence override
 
+    /// The day (`yyyy-MM-dd`) an all-day occurrence starts on now: its override's own `DTSTART`
+    /// when the occurrence was changed on its own, else its slot (`recurrenceIdNaive`, already in
+    /// the series' frame). Nil when the occurrence is timed.
+    static func occurrenceStartDay(storedICS: String, recurrenceIdNaive: String) -> String? {
+        let kind = masterDTStartKind(from: storedICS)
+        let override = veventBlocks(icsUnits(storedICS)).first(where: { block in
+            guard let rid = topLevel(block).first(where: { icsProperty($0.text)?.name == "RECURRENCE-ID" }),
+                  let value = icsProperty(rid.text)?.value else { return false }
+            return recurrenceIdsMatch(value, recurrenceIdNaive, allDay: kind == .allDay)
+        })
+        guard let override else {
+            guard case .allDay = kind else { return nil }
+            return String(recurrenceIdNaive.prefix(10))
+        }
+        guard let start = topLevel(override).first(where: { icsProperty($0.text)?.name == "DTSTART" }),
+              let parts = icsProperty(start.text) else { return nil }
+        let digits = parts.value.trimmingCharacters(in: .whitespaces)
+        guard digits.count == 8, digits.allSatisfy(\.isNumber) else { return nil }
+        return "\(digits.prefix(4))-\(digits.dropFirst(4).prefix(2))-\(digits.suffix(2))"
+    }
+
     /// The series' resource after a `this_only` edit of one occurrence.
     ///
     /// The override VEVENT is a copy of the occurrence as it stands: the existing override for that

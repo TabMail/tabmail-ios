@@ -586,7 +586,13 @@ refused before any write on every `edit_scope`, including a split's cap `PUT`, a
 that tells the assistant to ask the user how many days it should last.
 An end given alone is compared with the start the edit keeps: the stored start (a timed one's date included)
 on `all`, the occurrence's own date on `this_only` and `this_and_following`; a start the edit gives is what the
-end is compared with on every scope. An edit that gives no times
+end is compared with on every scope. On `this_only` the occurrence's date is the day it starts on now
+(`CalendarProvider.occurrenceStartDay`): CalDAV addresses an occurrence by its original slot, so one moved on
+its own is read from the resource (its own `DTSTART`), and an end on or before the moved start is refused while
+an end after it is written, including one on the original day when the occurrence was moved earlier; Google and
+Outlook address an occurrence by its current start, so the default is `recurrence_id`'s date. The queue and the
+tool read it only for an end given alone on one all-day occurrence; a failed read keeps the edit queued (queue)
+or shows no card (tool). An edit that gives no times
 still saves an all-day event stored with its end on its start. The queue suite counts
 `getEvent` calls: an edit that moves nothing and sets no UNTIL makes none, and a failed read on a move writes
 nothing and stays queued. `calendar_event_edit` applies the same rule (`allDayEditRefusal`, one function for
