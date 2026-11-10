@@ -394,3 +394,20 @@ answers whole numbers at the ends of `Int`, with tolerances whose window edge fa
 range, by leaving that side of the window unbounded; `MemoryIndexTests` reads a turn with no session
 through a window whose upper or lower edge falls past that range. The delete tests check that a fractional id
 in `unique_ids` is dropped, not truncated.
+
+## CalDAV series edits — moving a series' time
+
+`CalDAVSeriesStartShiftTests` checks what an edit that moves a repeating
+CalDAV series' start does to the values tied to that start. `SeriesOracle`
+reads a weekly series independently of the code under test (occurrences on
+the wall clock from `DTSTART`, cut by `UNTIL` or `COUNT`, matched against
+`EXDATE` and each override's `RECURRENCE-ID` as instants), and each move must
+keep every occurrence in the same state: deleted, changed, or shown, the last
+one included. Cases cover a same-day time change, a one-week move across a
+daylight-saving change, values a server stored in UTC, all-day and floating
+series, an RRULE the edit writes itself, `RDATE` and `PERIOD` values, a
+folded `EXDATE`, and a zone the device does not know (moved on the wall clock
+when no conversion is needed, refused when one is).
+`CalDAVSeriesStartShiftWireTests` drives the same through `updateEvent` over
+the fake CalDAV store: a movable series lands whole in one `PUT`; an
+unmovable one is refused with no `PUT` and the server keeps the original.
