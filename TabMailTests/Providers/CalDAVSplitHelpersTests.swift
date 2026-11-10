@@ -1974,8 +1974,11 @@ struct CalDAVSplitSeriesTailTests {
         }
         let newUid = GoogleCalendarProvider.deterministicSplitEventId(
             masterId: CalDAVWireFixture.masterEventId, recurrenceId: recurrenceId)
+        // The event's own rule. The new resource carries the series' VTIMEZONE, whose
+        // STANDARD/DAYLIGHT blocks have RRULE lines of their own and come first.
         let successorRRule = store.storedICS(path: "/cal/\(newUid).ics")?
             .components(separatedBy: "\r\n")
+            .drop { $0 != "BEGIN:VEVENT" }
             .first { $0.hasPrefix("RRULE:") }
         return Outcome(
             error: thrown, originalMaster: original,
