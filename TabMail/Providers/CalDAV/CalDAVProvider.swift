@@ -953,8 +953,9 @@ actor CalDAVProvider: CalendarProvider {
     /// of the existing ICS, leaving VTIMEZONE, ORGANIZER, RECURRENCE-ID
     /// overrides, and every other field untouched — except that a patch which
     /// moves the series' start also moves every value tied to it (EXDATE,
-    /// RDATE, an UNTIL the patch did not write, and each override's
-    /// RECURRENCE-ID; see `shiftSeriesAnchoredValues`). Throws, before any
+    /// RDATE, an UNTIL the patch did not write, each override's
+    /// RECURRENCE-ID, and the DTEND when the patch gives no end; see
+    /// `shiftSeriesAnchoredValues`). Throws, before any
     /// write, when one of those values cannot be moved correctly.
     ///
     /// NOT used for: occurrence overrides (`spliceOrReplaceOverride`) or
@@ -1009,17 +1010,22 @@ actor CalDAVProvider: CalendarProvider {
         // DTSTART / DTEND — re-emit in the master's existing value type
         // (all-day / zoned / utc / floating) so RFC 5545 §3.8.4.4 is preserved.
         let kind = masterDTStartKind(from: result)
+        let patchedEnd = formatDTLine(name: "DTEND", patch: patch, isStart: false, kind: kind)
         if let dtstart = formatDTLine(name: "DTSTART", patch: patch, isStart: true, kind: kind) {
             let oldStart = try masterStartWallTime(in: result)
             result = replaceOrAppendInMasterVEvent(in: result, propertyKey: "DTSTART", newLine: dtstart)
             // Moving the start moves everything RFC 5545 ties to it. An RRULE
             // the patch wrote was written for the new start, so its UNTIL stays.
+            // A start moved with no end moves the existing DTEND by the same
+            // shift, so the event keeps its length, as Google and Outlook do;
+            // an end the patch gives is written below instead.
             if let oldStart, let newStart = try masterStartWallTime(in: result), newStart != oldStart {
                 result = try shiftSeriesAnchoredValues(
-                    in: result, by: SeriesStartShift(old: oldStart, new: newStart), moveUntil: patchedRRule == nil)
+                    in: result, by: SeriesStartShift(old: oldStart, new: newStart),
+                    moveUntil: patchedRRule == nil, moveEnd: patchedEnd == nil)
             }
         }
-        if let dtend = formatDTLine(name: "DTEND", patch: patch, isStart: false, kind: kind) {
+        if let dtend = patchedEnd {
             result = replaceOrAppendInMasterVEvent(in: result, propertyKey: "DTEND", newLine: dtend)
         }
         if let attendees = patch.attendees {

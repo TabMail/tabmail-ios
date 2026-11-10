@@ -156,6 +156,28 @@ three … in `validatedRRuleUntil` and `recurrenceUntilIsAtStake`" above a four-
    `ExchangeCalendarProvider.toGraphEventJSON` emit `start.dateTime` (Graph additionally stamps
    `isAllDay: false`), so there a timed `start_iso` used to convert the event and now does not.
 
+**The resolving GET's gate widened on 2026-11-10 (#583); the text above is kept as written.** Until then
+the `.edit` case resolved an absent `all_day` only when `recurrenceUntilIsAtStake`, so everything above
+about "the resolving GET" applied to UNTIL edits alone. That left a move without `all_day` rendering
+`startDateTime`/`endDateTime`: Google and Outlook saved an all-day event as timed, and CalDAV did not move
+it. The `.edit` case now resolves an absent `all_day` from the event whenever the edit gives `start_iso` or
+`end_iso`, as well as when an UNTIL is at stake; an edit that moves nothing and sets no UNTIL still makes no
+GET. What that changes here: item 3 is unchanged (a stated `all_day` still wins both ways); residual 4's
+window (a second client converting the event between the resolving GET and the merge GET) now also applies
+to plain moves, with the same disposition; and item 5's "a timed `start_iso` used to convert the event and
+now does not" now holds for every move, which is the rule the tool documents ("Omit to keep existing").
+Added at the same time: the queue refuses an all-day edit whose end date is on or before its start date
+(`CalendarToolHelpers.allDayEditEndRefusal`, `notSupported`, before any write including a split's cap
+`PUT`), and `calendar_event_edit` refuses it before its card when `all_day: true` is stated with both dates.
+The start compared is `start_iso`'s date when the edit gives one; for an end-only edit it is the start the
+edit keeps, which is per scope: on `all` the event's stored start (from the read above, or one more read
+when an explicit `all_day: true` skipped it), on `this_only` and `this_and_following` the occurrence's own
+date, `recurrence_id`'s, with no read. The master's stored start is earlier than the occurrence's, so
+comparing with it there would let a same-day end through to the cap and a zero-length successor or
+override. On iOS an end-only edit keeps its start on every provider, so an inverted end is refused rather
+than written; this differs from the Thunderbird add-on, which keeps the event's length first and so never
+refuses an end-only edit.
+
 **Also corrected at the code on 2026-08-12 (R3), recorded here because the argument is not needed at the
 call site.** `validatedRRuleUntil`'s note claimed the pre-fix alternative on the split path was "a capped
 master plus a failed successor create under a best-effort rollback, i.e. destroyed occurrences".

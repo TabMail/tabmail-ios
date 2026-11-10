@@ -885,7 +885,7 @@ struct CalDAVMergePatchTests {
 /// structurally guaranteed to fail, so it would have stayed green against the
 /// defect this suite exists to pin — and a green suite over an impossible
 /// rollback is exactly how that defect survived repeated review.
-private final class FakeCalDAVStore: Sendable {
+final class FakeCalDAVStore: Sendable {
     private struct Resource: Sendable {
         var ics: String
         var etag: String

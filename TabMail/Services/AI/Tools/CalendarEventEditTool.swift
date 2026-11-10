@@ -116,6 +116,17 @@ struct CalendarEventEditTool: AgentTool, Sendable {
                 "event_id": compoundId,
             ] as [String: Any])
         }
+        // An all-day end on or before its start, refused before the card when the kind is known
+        // without a read (a stated `all_day: true` with both dates). The queue applies the same rule
+        // once the kind is resolved from the event, so every other such edit is refused there.
+        if let reason = CalendarToolHelpers.allDayEditEndRefusal(
+            arguments, allDay: CalendarToolHelpers.boolArg(arguments, "all_day"), targetStartDate: nil) {
+            return ToolJSON.string(from: [
+                "ok": false,
+                "error": "calendar_event_edit failed: \(reason). The event was NOT changed. Correct the arguments and call calendar_event_edit again.",
+                "event_id": compoundId,
+            ] as [String: Any])
+        }
 
         // Resolve the recurring-edit scope up front — it drives both the
         // confirmation-card date math (which occurrence to show) and the

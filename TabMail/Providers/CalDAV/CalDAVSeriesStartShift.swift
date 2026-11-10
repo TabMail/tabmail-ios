@@ -81,7 +81,7 @@ extension CalDAVProvider {
                   let movedInstant = CalDAVProvider.instant(ofWall: seriesWall + delta, in: seriesAfter),
                   let movedWall = CalDAVProvider.wall(of: movedInstant, in: own) else {
                 throw CalendarProviderError.notSupported(
-                    "TabMail could not work out where this repeating event's \(CalDAVProvider.renderICSWallTime(value)) goes when its time changes, so it did not change the series. Change the time in your calendar app instead.")
+                    "TabMail could not work out where this event's \(CalDAVProvider.renderICSWallTime(value)) goes when its time changes, so it did not change the event. Change the time in your calendar app instead.")
             }
             return ICSWallTime(frame: value.frame, wall: movedWall)
         }
@@ -106,12 +106,16 @@ extension CalDAVProvider {
 
     /// Move every value RFC 5545 ties to the series' start: the master's
     /// `EXDATE` and `RDATE` values and, when `moveUntil`, its `RRULE`'s
-    /// `UNTIL`, and each override's `RECURRENCE-ID`. Only a VEVENT's own
+    /// `UNTIL`, and each override's `RECURRENCE-ID`. When `moveEnd`, the
+    /// master's `DTEND` moves the same way, so an event whose start moves
+    /// keeps its length (in days for an all-day event, on the wall clock for a
+    /// timed one); a master with `DURATION` and no `DTEND` has nothing to move.
+    /// Only a VEVENT's own
     /// properties are read; a VTIMEZONE's `RDATE`/`RRULE` and a VALARM belong
     /// to something else. A property whose values do not change keeps its
     /// exact bytes, folding included; a rewritten one is written on one line,
     /// like every other property this merge writes.
-    static func shiftSeriesAnchoredValues(in ics: String, by shift: SeriesStartShift, moveUntil: Bool) throws -> String {
+    static func shiftSeriesAnchoredValues(in ics: String, by shift: SeriesStartShift, moveUntil: Bool, moveEnd: Bool) throws -> String {
         let lines = physicalICSLines(ics)
         var output: [String] = []
         var handledMaster = false
@@ -134,7 +138,10 @@ extension CalDAVProvider {
             } else if !handledMaster {
                 // The master is the first VEVENT with no RECURRENCE-ID, as in
                 // every other helper of this merge.
-                names = moveUntil ? ["EXDATE", "RDATE", "RRULE"] : ["EXDATE", "RDATE"]
+                var master: Set<String> = ["EXDATE", "RDATE"]
+                if moveUntil { master.insert("RRULE") }
+                if moveEnd { master.insert("DTEND") }
+                names = master
                 handledMaster = true
             } else {
                 names = []
@@ -217,7 +224,7 @@ extension CalDAVProvider {
     private static func readValue(_ text: String, property: ICSProperty, tzid: String?, isDate: Bool) throws -> ICSWallTime {
         guard let value = parseICSWallTime(text, tzid: tzid, isDate: isDate) else {
             throw CalendarProviderError.notSupported(
-                "TabMail could not read this repeating event's \(property.name) value \"\(text)\", so it did not change the series' time. Change the time in your calendar app instead.")
+                "TabMail could not read this event's \(property.name) value \"\(text)\", so it did not change the event's time. Change the time in your calendar app instead.")
         }
         return value
     }
@@ -288,7 +295,7 @@ extension CalDAVProvider {
         case .zoned(let tzid):
             guard let zone = TimeZone(identifier: tzid) else {
                 throw CalendarProviderError.notSupported(
-                    "This repeating event uses the time zone \"\(tzid)\", which TabMail does not recognize, so it could not move the series' deleted and changed occurrences with it and did not change the series. Change the time in your calendar app instead.")
+                    "This event uses the time zone \"\(tzid)\", which TabMail does not recognize, so it could not move the series' deleted and changed occurrences with it and did not change the event. Change the time in your calendar app instead.")
             }
             return zone
         case .utc, .allDay, .floating:

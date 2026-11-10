@@ -265,6 +265,126 @@ struct CalDAVSeriesStartShiftTests {
         #expect(merged.contains("UNTIL=20990330T150000"))
     }
 
+    // MARK: - A start moved with no end keeps the event's length
+
+    // Google and Outlook carry the end when an edit gives only a start; CalDAV
+    // writes DTEND only from the patch, so the merge must move the existing one.
+
+    private static func startOnly(_ start: String, zone: String) -> GCalEventInput {
+        var patch = GCalEventInput()
+        patch.startDateTime = start
+        patch.startTimeZone = zone
+        return patch
+    }
+
+    private static func line(_ ics: String, _ name: String) -> String? {
+        let masterEnd = ics.range(of: "END:VEVENT").map { String(ics[..<$0.lowerBound]) } ?? ics
+        return masterEnd.components(separatedBy: "\r\n").last { $0.hasPrefix(name + ";") || $0.hasPrefix(name + ":") }
+    }
+
+    @Test("An all-day event given only a new start keeps its length in days")
+    func allDayStartAloneKeepsItsDays() throws {
+        let ics = Self.series(master: ["DTSTART;VALUE=DATE:20990302", "DTEND;VALUE=DATE:20990304"], timezone: false)
+        var patch = GCalEventInput()
+        patch.startDate = "2099-03-10"
+        let merged = try CalDAVProvider.mergePatchIntoICS(ics, patch: patch)
+        #expect(Self.line(merged, "DTSTART") == "DTSTART;VALUE=DATE:20990310")
+        #expect(Self.line(merged, "DTEND") == "DTEND;VALUE=DATE:20990312",
+                "a two-day event lost its length: \(Self.line(merged, "DTEND") ?? "<none>")")
+    }
+
+    @Test("A timed event given only a new start keeps its length, across the March daylight-saving change too")
+    func timedStartAloneKeepsItsLength() throws {
+        let ics = Self.series(master: [
+            "DTSTART;TZID=America/Los_Angeles:20990302T100000",
+            "DTEND;TZID=America/Los_Angeles:20990302T113000",
+        ])
+        let sameDay = try CalDAVProvider.mergePatchIntoICS(
+            ics, patch: Self.startOnly("2099-03-02T15:00:00-08:00", zone: "America/Los_Angeles"))
+        #expect(Self.line(sameDay, "DTEND") == "DTEND;TZID=America/Los_Angeles:20990302T163000",
+                "end: \(Self.line(sameDay, "DTEND") ?? "<none>")")
+        // 2099-03-08 is the change; the event still runs 10:00 to 11:30 a week later.
+        let nextWeek = try CalDAVProvider.mergePatchIntoICS(
+            ics, patch: Self.startOnly("2099-03-09T10:00:00-07:00", zone: "America/Los_Angeles"))
+        #expect(Self.line(nextWeek, "DTSTART") == "DTSTART;TZID=America/Los_Angeles:20990309T100000")
+        #expect(Self.line(nextWeek, "DTEND") == "DTEND;TZID=America/Los_Angeles:20990309T113000",
+                "end: \(Self.line(nextWeek, "DTEND") ?? "<none>")")
+    }
+
+    @Test("An end in another zone from the start moves to the same instant after the start, in its own zone")
+    func endInAnotherZoneMovesInItsZone() throws {
+        // 10:00 New York to 16:30 London is 90 minutes in early March (EST, GMT).
+        let ics = Self.series(master: [
+            "DTSTART;TZID=America/New_York:20990302T100000",
+            "DTEND;TZID=Europe/London:20990302T163000",
+        ], timezone: false)
+        // A week later New York is on EDT and London still on GMT: 90 minutes after
+        // 10:00 EDT is 15:30 in London.
+        let merged = try CalDAVProvider.mergePatchIntoICS(
+            ics, patch: Self.startOnly("2099-03-09T10:00:00-04:00", zone: "America/New_York"))
+        #expect(Self.line(merged, "DTEND") == "DTEND;TZID=Europe/London:20990309T153000",
+                "end: \(Self.line(merged, "DTEND") ?? "<none>")")
+    }
+
+    @Test("A master with DURATION and no DTEND gains no DTEND when its start moves")
+    func durationMasterNeedsNothing() throws {
+        let ics = Self.series(master: [
+            "DTSTART;TZID=America/Los_Angeles:20990302T100000",
+            "DURATION:PT1H30M",
+        ])
+        let merged = try CalDAVProvider.mergePatchIntoICS(
+            ics, patch: Self.startOnly("2099-03-02T15:00:00-08:00", zone: "America/Los_Angeles"))
+        #expect(Self.line(merged, "DTSTART") == "DTSTART;TZID=America/Los_Angeles:20990302T150000")
+        #expect(Self.line(merged, "DTEND") == nil, "a DTEND was added: \(Self.line(merged, "DTEND") ?? "")")
+        #expect(merged.contains("\r\nDURATION:PT1H30M\r\n"))
+    }
+
+    @Test("An end the patch gives is written as given, not moved with the start")
+    func explicitEndWins() throws {
+        let ics = Self.series(master: [
+            "DTSTART;TZID=America/Los_Angeles:20990302T100000",
+            "DTEND;TZID=America/Los_Angeles:20990302T113000",
+        ])
+        let merged = try CalDAVProvider.mergePatchIntoICS(
+            ics, patch: Self.timedPatch(start: "2099-03-02T15:00:00-08:00", end: "2099-03-02T15:20:00-08:00"))
+        #expect(Self.line(merged, "DTEND") == "DTEND;TZID=America/Los_Angeles:20990302T152000",
+                "end: \(Self.line(merged, "DTEND") ?? "<none>")")
+    }
+
+    @Test("A DTEND that cannot be read or converted refuses the move instead of writing half of it")
+    func unmovableEndRefuses() throws {
+        let unreadable = Self.series(master: [
+            "DTSTART;TZID=America/Los_Angeles:20990302T100000",
+            "DTEND;TZID=America/Los_Angeles:2099030T110000",
+        ])
+        #expect(throws: CalendarProviderError.self) {
+            _ = try CalDAVProvider.mergePatchIntoICS(
+                unreadable, patch: Self.startOnly("2099-03-02T15:00:00-08:00", zone: "America/Los_Angeles"))
+        }
+        // An end in a zone this device does not know, from a start in a known one,
+        // can only move through an instant it cannot compute.
+        let unknownZone = Self.series(master: [
+            "DTSTART;TZID=America/Los_Angeles:20990302T100000",
+            "DTEND;TZID=Example Unknown Zone:20990302T110000",
+        ])
+        #expect(throws: CalendarProviderError.self) {
+            _ = try CalDAVProvider.mergePatchIntoICS(
+                unknownZone, patch: Self.startOnly("2099-03-02T15:00:00-08:00", zone: "America/Los_Angeles"))
+        }
+    }
+
+    @Test("The same unmovable DTENDs are not read when the patch gives the end: it is written as given")
+    func unmovableEndIsReplacedWhenTheEndIsGiven() throws {
+        for end in ["DTEND;TZID=America/Los_Angeles:2099030T110000", "DTEND;TZID=Example Unknown Zone:20990302T110000"] {
+            let ics = Self.series(master: ["DTSTART;TZID=America/Los_Angeles:20990302T100000", end])
+            let merged = try CalDAVProvider.mergePatchIntoICS(
+                ics, patch: Self.timedPatch(start: "2099-03-02T15:00:00-08:00", end: "2099-03-02T16:00:00-08:00",
+                                            zone: "America/Los_Angeles"))
+            #expect(Self.line(merged, "DTEND") == "DTEND;TZID=America/Los_Angeles:20990302T160000",
+                    "\(end): end is \(Self.line(merged, "DTEND") ?? "<none>")")
+        }
+    }
+
     // MARK: - What does not move
 
     @Test("Time-zone rules, alarms and an override's own times are not the series' and stay byte for byte")
