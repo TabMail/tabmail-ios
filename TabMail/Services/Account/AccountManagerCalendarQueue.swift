@@ -901,9 +901,11 @@ extension AccountManager {
             let scope: String = explicitScope
                 ?? (recurrenceId != nil ? "this_only" : "all")
 
-            // THE EDIT TARGET'S START DATE, resolved once here with the scope: on `this_only` and
-            // `this_and_following` the target is the occurrence, whose start is `recurrence_id`'s date
-            // (the start the override or the new series keeps), with no read; on `all` it is the
+            // THE EDIT TARGET'S START DATE, resolved once here with the scope: on `this_and_following`
+            // the target is the occurrence, whose start is `recurrence_id`'s date (the start the new
+            // series keeps), with no read; on `this_only` it is the day the occurrence starts on now,
+            // which the provider answers below (`occurrenceStartDay`) for an end given alone on an
+            // all-day occurrence, and otherwise `recurrence_id`'s date; on `all` it is the
             // event's stored start, taken from the read above when there was one. The master's start
             // is earlier than any later occurrence's, so a scoped edit compared with it would pass an
             // end on the occurrence's own start. On `all` the event is read here only when the
@@ -953,8 +955,11 @@ extension AccountManager {
             // the event can change between the card and the drain.
             //
             // On `this_only` the start an end-only edit keeps is the occurrence's CURRENT start, which
-            // is later than `recurrence_id`'s date when the occurrence was moved on its own, so it is
-            // read from the provider. A failed read throws and the operation is retried.
+            // can differ from `recurrence_id`'s date, earlier or later, when the occurrence was moved
+            // on its own, so it is read from the provider. A failed read throws and the drain
+            // classifies it as any other error: a transport error keeps the edit queued for a retry,
+            // while `notSupported` (a `recurrence_id` the series' zone cannot express) and `notFound`
+            // (the event is gone) retire it with a reason.
             var occurrenceStartDay: String? = nil
             if let rid = recurrenceId,
                CalendarToolHelpers.needsOccurrenceStartDay(resolvedArgs, storedStart: stored?.start, scope: scope) {

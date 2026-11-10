@@ -27,13 +27,14 @@ protocol CalendarProvider: Sendable {
     /// See the invariant on `RecurrenceOccurrenceResolver`.
     func updateOccurrence(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, event: GCalEventInput, sendUpdates: String) async throws -> GCalEvent
 
-    /// The day (`yyyy-MM-dd`) the all-day occurrence addressed by `recurrenceId` starts on NOW; nil
-    /// when it is timed. An edit that gives the occurrence a new end alone keeps this start, and
-    /// the end is checked against it. The default is `recurrenceId`'s own date, which is right
-    /// wherever an occurrence is addressed by the start it has now (Google and Outlook match
-    /// `recurrenceId` against each instance's current start). CalDAV addresses an occurrence by its
-    /// original slot (`RECURRENCE-ID`), so an occurrence moved on its own starts on another day
-    /// there, and `CalDAVProvider` reads it from the resource.
+    /// The day (`yyyy-MM-dd`) the all-day occurrence addressed by `recurrenceId` starts on NOW. An
+    /// edit that gives the occurrence a new end alone keeps this start, and the end is checked
+    /// against it; callers ask only for an all-day occurrence (`needsOccurrenceStartDay`). The
+    /// default returns `recurrenceId`'s own date, with no request, which is right wherever an
+    /// occurrence is addressed by the start it has now (Google and Outlook match `recurrenceId`
+    /// against each instance's current start). CalDAV addresses an occurrence by its original slot
+    /// (`RECURRENCE-ID`), so an occurrence moved on its own starts on another day there, and
+    /// `CalDAVProvider` reads it from the resource (nil when the series turns out to be timed).
     func occurrenceStartDay(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone) async throws -> String?
 
     /// Split a recurring series at `recurrenceId` (this_and_following edit_scope):

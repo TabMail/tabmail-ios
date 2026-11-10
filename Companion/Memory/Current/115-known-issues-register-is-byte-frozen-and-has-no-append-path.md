@@ -180,7 +180,9 @@ when an explicit `all_day: true` skipped it), on `this_and_following` the occurr
 and Outlook resolve `recurrence_id` against each instance's current start, so that day is `recurrence_id`'s
 date (the protocol default, no read). CalDAV addresses an occurrence by its original slot (`RECURRENCE-ID`),
 so an occurrence moved on its own starts on another day; `CalDAVProvider` reads the resource and returns the
-override's own `DTSTART` date. A failed read is retried in the queue and shows no card in the tool. The master's stored start is earlier than the occurrence's, so
+override's own `DTSTART` date. In the queue a failed read is classified as any error is: a transport error
+keeps the edit queued for a retry, while `notSupported` (a `recurrence_id` the series' zone cannot express)
+and `notFound` (the event is gone) retire it with a reason. In the tool a failed read shows no card. The master's stored start is earlier than the occurrence's, so
 comparing with it there would let a same-day end through to the cap and a zero-length successor or
 override. On iOS an end-only edit keeps its start on every provider, so an inverted end is refused rather
 than written; this differs from the Thunderbird add-on, which keeps the event's length first and so never

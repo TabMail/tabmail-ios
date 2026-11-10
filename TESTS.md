@@ -589,10 +589,16 @@ on `all`, the occurrence's own date on `this_only` and `this_and_following`; a s
 end is compared with on every scope. On `this_only` the occurrence's date is the day it starts on now
 (`CalendarProvider.occurrenceStartDay`): CalDAV addresses an occurrence by its original slot, so one moved on
 its own is read from the resource (its own `DTSTART`), and an end on or before the moved start is refused while
-an end after it is written, including one on the original day when the occurrence was moved earlier; Google and
-Outlook address an occurrence by its current start, so the default is `recurrence_id`'s date. The queue and the
-tool read it only for an end given alone on one all-day occurrence; a failed read keeps the edit queued (queue)
-or shows no card (tool). An edit that gives no times
+an end after it is written, including one on the original day when the occurrence was moved earlier, both with
+`all_day` left out and with a stated `all_day: true` (which skips the queue's read of the event, so the stated
+kind alone asks for the occurrence's day); Google and
+Outlook address an occurrence by its current start, so the default is `recurrence_id`'s date: through the real
+providers, an end alone on one all-day occurrence's own day is refused with no write, and one two days later is
+written with the occurrence's start unchanged. The queue and the
+tool read it only for an end given alone on one all-day occurrence (an edit of one occurrence that gives no end,
+even with `all_day: true`, reads nothing; in the tool a rename goes through though the read would fail); a
+failed read in transport keeps the edit queued (queue) or shows no card (tool). The tool reads it on the
+calendar it knows for a numeric event id, in the edit's zone. An edit that gives no times
 still saves an all-day event stored with its end on its start. The queue suite counts
 `getEvent` calls: an edit that moves nothing and sets no UNTIL makes none, and a failed read on a move writes
 nothing and stays queued. `calendar_event_edit` applies the same rule (`allDayEditRefusal`, one function for

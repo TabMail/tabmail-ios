@@ -335,10 +335,9 @@ actor CalDAVProvider: CalendarProvider {
         BackgroundSyncLogger.logDebug("[CalDAV] Deleted event \(eventId)")
     }
 
-    /// Single-occurrence override (this_only). CalDAV represents overrides as
-    /// additional VEVENT blocks in the SAME .ics resource sharing the master's
-    /// UID, distinguished by a RECURRENCE-ID property. We GET the resource,
-    /// splice (or replace) an override VEVENT, PUT it back atomically.
+    /// The day an all-day occurrence starts on now. CalDAV addresses an occurrence by its original
+    /// slot (`RECURRENCE-ID`), so one moved on its own is read from the resource: its override's own
+    /// `DTSTART` (`CalDAVProvider.occurrenceStartDay(storedICS:recurrenceIdNaive:)`).
     func occurrenceStartDay(
         calendarId: String,
         eventId: String,
@@ -361,6 +360,10 @@ actor CalDAVProvider: CalendarProvider {
         return Self.occurrenceStartDay(storedICS: ics, recurrenceIdNaive: rid)
     }
 
+    /// Single-occurrence override (this_only). CalDAV represents overrides as
+    /// additional VEVENT blocks in the SAME .ics resource sharing the master's
+    /// UID, distinguished by a RECURRENCE-ID property. We GET the resource,
+    /// splice (or replace) an override VEVENT, PUT it back atomically.
     func updateOccurrence(
         calendarId: String,
         eventId: String,

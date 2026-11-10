@@ -989,6 +989,8 @@ enum CalendarToolHelpers {
     /// True when `allDayEditRefusal` compares the edit's end with the start one occurrence keeps:
     /// a `this_only` edit of an all-day event that gives an end and no start. The occurrence may
     /// have been moved on its own, so its start is read from the provider (`occurrenceStartDay`).
+    /// True does not mean the end rule decides: with `all_day` left out, `allDayEditRefusal`
+    /// refuses a time of day first (`allDayEditTimeRefusal`), and the day read is then unused.
     static func needsOccurrenceStartDay(_ arguments: [String: JSONValue], storedStart: GCalDateTime?, scope: String) -> Bool {
         guard scope == "this_only", boolArg(arguments, "all_day") ?? (storedStart?.date != nil) else { return false }
         return stringArgOpt(arguments, "end_iso") != nil && stringArgOpt(arguments, "start_iso") == nil

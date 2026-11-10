@@ -288,6 +288,31 @@ struct GoogleCalendarEditKeepsKindTests {
         #expect(start(occ)?["dateTime"] == nil, "the occurrence was saved as timed: \(start(occ) ?? [:])")
     }
 
+    @Test("an end alone on one all-day occurrence is checked against the day it starts on: refused on it, written after it")
+    func occurrenceEndAloneIsCheckedAgainstItsDay() async throws {
+        // Google addresses an occurrence by the start it has now, so the day it keeps is
+        // recurrence_id's own (the protocol's default answer, with no request of its own).
+        let seed = [
+            FakeGoogleCalendar.allDay(id: "ser-end", start: day(0), end: day(1), recurring: true),
+            FakeGoogleCalendar.allDay(id: "ser-end_occ", start: day(7), end: day(8), master: "ser-end"),
+        ]
+        func edit(endingOn end: String) -> [String: JSONValue] {
+            ["edit_scope": .string("this_only"), "recurrence_id": .string("\(day(7))T00:00:00"),
+             "end_iso": .string(end), "timezone": .string("UTC")]
+        }
+        let refused = try await run(seed, eventId: "ser-end", edit(endingOn: day(7)), account: "kind-g-occ-end-refuse")
+        #expect(refused.calendar.writes.isEmpty, "an occurrence ending on its start was written: \(refused.calendar.writes)")
+        #expect(refused.rows.count == 1 && refused.rows.first?.status == PendingStatus.failed.rawValue
+                    && refused.rows.first?.failureReason?.contains(allDayEndHint) == true,
+                "rows: \(refused.rows.map { "\($0.status) \($0.failureReason ?? "")" })")
+        let written = try await run(seed, eventId: "ser-end", edit(endingOn: day(9)), account: "kind-g-occ-end-ok")
+        let occ = written.calendar.event("ser-end_occ")
+        #expect(written.calendar.writes == ["PATCH ser-end_occ"], "writes: \(written.calendar.writes)")
+        #expect(written.rows.isEmpty, "the change was refused: \(written.rows.map { $0.failureReason ?? $0.status })")
+        #expect(start(occ)?["date"] as? String == day(7), "the occurrence's start moved: \(start(occ) ?? [:])")
+        #expect(end(occ)?["date"] as? String == day(9), "occurrence end is \(end(occ) ?? [:])")
+    }
+
     @Test("splitting an all-day series with a move starts the new series all-day on the given date")
     func allDaySplitStartsOnTheGivenDate() async throws {
         let rid = "\(day(7))T00:00:00"
@@ -442,6 +467,39 @@ struct ExchangeCalendarEditKeepsKindTests {
         #expect(occ["isAllDay"] as? Bool == true, "the occurrence was saved as timed: \(occ["start"] ?? "none")")
         #expect(dateTime(occ["start"])?.hasPrefix(day(9)) == true, "occurrence start is \(occ["start"] ?? "none")")
         #expect(dateTime(occ["end"])?.hasPrefix(day(10)) == true, "occurrence end is \(occ["end"] ?? "none")")
+    }
+
+    @Test("an end alone on one all-day occurrence is checked against the day it starts on: refused on it, written after it")
+    func occurrenceEndAloneIsCheckedAgainstItsDay() async throws {
+        // Outlook addresses an occurrence by the start it has now, so the day it keeps is
+        // recurrence_id's own (the protocol's default answer, with no request of its own).
+        let occurrenceDay = GraphFixture.utcDay(GraphFixture.occurrenceStart)
+        let twoDaysLater = GraphFixture.utcDay(GraphFixture.occurrenceStart.addingTimeInterval(2 * 86_400))
+        func graph() -> FakeGraphCalendar {
+            FakeGraphCalendar([
+                GraphFixture.event(id: "ser-end", online: false, recurring: true, allDay: true),
+                GraphFixture.event(id: "ser-end-occ", start: GraphFixture.occurrenceStart, online: false,
+                                   seriesMasterId: "ser-end", allDay: true),
+            ])
+        }
+        func edit(endingOn end: String) -> [String: JSONValue] {
+            ["edit_scope": .string("this_only"), "recurrence_id": .string("\(occurrenceDay)T00:00:00"),
+             "end_iso": .string(end), "timezone": .string("UTC")]
+        }
+        let refusedGraph = graph()
+        let refused = try await run(refusedGraph, eventId: "ser-end", edit(endingOn: occurrenceDay), account: "kind-x-occ-end-refuse")
+        #expect(refusedGraph.patches("ser-end-occ").isEmpty, "an occurrence ending on its start was written")
+        #expect(refused.count == 1 && refused.first?.status == PendingStatus.failed.rawValue
+                    && refused.first?.failureReason?.contains(allDayEndHint) == true,
+                "rows: \(refused.map { "\($0.status) \($0.failureReason ?? "")" })")
+        let writtenGraph = graph()
+        let written = try await run(writtenGraph, eventId: "ser-end", edit(endingOn: twoDaysLater), account: "kind-x-occ-end-ok")
+        let occ = try #require(writtenGraph.event("ser-end-occ"))
+        #expect(writtenGraph.patches("ser-end-occ").count == 1, "rows: \(written.map { $0.failureReason ?? $0.status })")
+        #expect(written.isEmpty, "the change was refused: \(written.map { $0.failureReason ?? $0.status })")
+        #expect(dateTime(occ["start"])?.hasPrefix(occurrenceDay) == true, "the occurrence's start moved: \(occ["start"] ?? "none")")
+        #expect(dateTime(occ["end"])?.hasPrefix(twoDaysLater) == true, "occurrence end is \(occ["end"] ?? "none")")
+        #expect(occ["isAllDay"] as? Bool == true, "the occurrence was saved as timed: \(occ["start"] ?? "none")")
     }
 
     @Test("an explicit all_day: false makes an all-day event timed (control)")
@@ -677,17 +735,21 @@ struct CalDAVCalendarEditKeepsKindTests {
     }
 
     @Test("an end alone on a moved occurrence is compared with the day it starts on now, not its original day",
-          arguments: [8, 9])
-    func endOnOrBeforeTheMovedStartIsRefused(_ endOffset: Int) async throws {
+          arguments: [8, 9], [false, true])
+    func endOnOrBeforeTheMovedStartIsRefused(_ endOffset: Int, _ statesAllDay: Bool) async throws {
         // The occurrence of day 7 now starts on day 9: an end on day 8 or 9 is after its original
-        // day and on or before the start it keeps.
+        // day and on or before the start it keeps. A stated `all_day: true` skips the queue's read
+        // of the event, so the kind the rule needs is the stated one.
         let store = FakeCalDAVStore(servesETags: true)
         let series = Self.seriesWithMovedOccurrence(uid: "mv-\(endOffset)")
         store.seed(path: "/cal/mv.ics", ics: series)
-        let rows = try await run(store, eventId: "/cal/mv.ics", [
+        var arguments: [String: JSONValue] = [
             "edit_scope": .string("this_only"), "recurrence_id": .string("\(day(7))T00:00:00"),
             "end_iso": .string(day(endOffset)), "timezone": .string("UTC"),
-        ], account: "kind-c-moved-refuse-\(endOffset)")
+        ]
+        if statesAllDay { arguments["all_day"] = .bool(true) }
+        let rows = try await run(store, eventId: "/cal/mv.ics", arguments,
+                                 account: "kind-c-moved-refuse-\(endOffset)-\(statesAllDay)")
         #expect(store.recordedPuts().isEmpty, "an occurrence ending on or before its start was written")
         #expect(store.storedICS(path: "/cal/mv.ics") == series, "the series changed")
         #expect(rows.count == 1 && rows.first?.failureReason?.contains(allDayEndHint) == true,
@@ -711,19 +773,23 @@ struct CalDAVCalendarEditKeepsKindTests {
                 "occurrence end: \(line(override, "DTEND") ?? "<none>")")
     }
 
-    @Test("an occurrence moved to an earlier day takes an end its original day would have refused")
-    func endAfterAnEarlierMovedStartIsWritten() async throws {
+    @Test("an occurrence moved to an earlier day takes an end its original day would have refused",
+          arguments: [false, true])
+    func endAfterAnEarlierMovedStartIsWritten(_ statesAllDay: Bool) async throws {
         // The occurrence of day 7 now starts on day 5 and ends on day 6; a new end on day 7 is on
-        // its original day and after the start it keeps.
+        // its original day and after the start it keeps. A stated `all_day: true` skips the queue's
+        // read of the event, so the kind the rule needs is the stated one.
         let store = FakeCalDAVStore(servesETags: true)
         let series = Self.seriesWithMovedOccurrence(uid: "mv-early")
             .replacingOccurrences(of: "DTSTART;VALUE=DATE:\(compact(day(9)))", with: "DTSTART;VALUE=DATE:\(compact(day(5)))")
             .replacingOccurrences(of: "DTEND;VALUE=DATE:\(compact(day(10)))", with: "DTEND;VALUE=DATE:\(compact(day(6)))")
         store.seed(path: "/cal/mv.ics", ics: series)
-        let rows = try await run(store, eventId: "/cal/mv.ics", [
+        var arguments: [String: JSONValue] = [
             "edit_scope": .string("this_only"), "recurrence_id": .string("\(day(7))T00:00:00"),
             "end_iso": .string(day(7)), "timezone": .string("UTC"),
-        ], account: "kind-c-moved-early")
+        ]
+        if statesAllDay { arguments["all_day"] = .bool(true) }
+        let rows = try await run(store, eventId: "/cal/mv.ics", arguments, account: "kind-c-moved-early-\(statesAllDay)")
         #expect(rows.isEmpty, "the change was refused: \(rows.first?.failureReason ?? "<none>")")
         let blocks = (store.storedICS(path: "/cal/mv.ics") ?? "").components(separatedBy: "BEGIN:VEVENT")
         let override = blocks.first { $0.contains("RECURRENCE-ID") }
@@ -1012,6 +1078,13 @@ struct CalendarQueueEditKindTests {
             "end_iso": .string("\(day(7))T10:00:00"),
         ], account: "kind-q-noread-timed", resource: timedResource(), occurrenceStartDay: day(20))
         #expect(timed.occurrenceReads == 0 && timed.writes == 1)
+        // No end, no read: a stated all-day kind and one occurrence are not enough on their own.
+        let titleOnly = try await drain([
+            "edit_scope": .string("this_only"), "recurrence_id": rid, "all_day": .bool(true),
+            "title": .string("Renamed"),
+        ], account: "kind-q-noread-title", resource: allDayResource(), occurrenceStartDay: day(20))
+        #expect(titleOnly.occurrenceReads == 0 && titleOnly.writes == 1,
+                "reads \(titleOnly.occurrenceReads) writes \(titleOnly.writes)")
     }
 
     @Test("a failed read of the occurrence writes nothing and keeps the edit queued")
@@ -1067,8 +1140,12 @@ struct CalendarEditToolAllDayEndTests {
     /// Runs the tool against a provider holding `event`, with the app's database installed (the
     /// tool queues its edit there) and the account in it; returns its output, the provider's
     /// writes, the edits left in the queue and the confirmation cards shown.
+    /// `knownCalendarId` passes the event as the read tools leave it, a numeric id whose calendar
+    /// the translator knows; without it the event id is a compound id and the calendar is found
+    /// by the tool.
     private func run(_ arguments: [String: JSONValue], account: String, event: GCalEvent,
-                     occurrenceStartDay: String? = nil, occurrenceReadThrows: Error? = nil) async throws -> (out: String, writes: Int, queued: Int, cards: Int) {
+                     occurrenceStartDay: String? = nil, occurrenceReadThrows: Error? = nil,
+                     knownCalendarId: String? = nil) async throws -> (out: String, writes: Int, queued: Int, cards: Int, log: [String]) {
         let mock = MockCalendarProvider()
         await mock.setGetEventResult(event)
         await mock.setUpdateOccurrenceResult(event)
@@ -1094,14 +1171,27 @@ struct CalendarEditToolAllDayEndTests {
             InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir)
         }
         let db = try TestDatabase.make()
+        let translator = MockChatIdTranslator()
         var args = arguments
-        args["event_id"] = .string(CompoundEventId.make(accountId: account, eventId: "ev-1"))
+        let compoundId = CompoundEventId.make(accountId: account, eventId: "ev-1")
+        if let knownCalendarId {
+            let numericId = 41
+            await translator.seed(compoundId, as: numericId)
+            await translator.cacheEventDetail(
+                realId: "ev-1", accountId: account, calendarId: knownCalendarId, calendarName: "Team",
+                title: event.summary ?? "", startDate: nil, endDate: nil, isAllDay: event.start?.date != nil,
+                location: nil, attendees: [], isRecurring: true, recurrenceRule: nil, availability: "busy",
+                htmlLink: nil, eventTimeZone: nil)
+            args["event_id"] = .string(String(numericId))
+        } else {
+            args["event_id"] = .string(compoundId)
+        }
         let sink = CountingConfirmSink()
-        let out = try await CalendarEventEditTool(context: ToolContext(db: db, translator: MockChatIdTranslator())).execute(
+        let out = try await CalendarEventEditTool(context: ToolContext(db: db, translator: translator)).execute(
             arguments: args, invocation: ToolInvocation(uiSink: sink, sessionKey: "kind-tool-\(account)"))
         let writes = await mock.updatedEvents.count + (await mock.updatedOccurrences.count) + (await mock.splitSeriesCalls.count)
         let queued = try await pool.read { try PendingCalendarOperation.fetchCount($0) }
-        return (out, writes, queued, await sink.cards)
+        return (out, writes, queued, await sink.cards, await mock.callLog)
     }
 
     @Test("an all-day event given a time of day without all_day is refused before the card, and nothing is queued")
@@ -1150,6 +1240,30 @@ struct CalendarEditToolAllDayEndTests {
             "edit_scope": .string("this_only"), "recurrence_id": .string("\(day(7))T00:00:00"),
             "end_iso": .string(day(7)),
         ], account: "kind-tool-moved-ok", event: stored(allDay: true), occurrenceStartDay: day(5))
+        #expect(r.cards == 1 && r.writes == 1, "cards \(r.cards) writes \(r.writes) \(r.out)")
+    }
+
+    @Test("an event whose calendar is known is read on that calendar, in the edit's zone")
+    func knownCalendarOccurrenceIsReadThere() async throws {
+        // Moved to day 5: an end on day 7 is on the original day and after the start it keeps.
+        let r = try await run([
+            "edit_scope": .string("this_only"), "recurrence_id": .string("\(day(7))T00:00:00"),
+            "end_iso": .string(day(7)), "timezone": .string("America/Vancouver"),
+        ], account: "kind-tool-known-cal", event: stored(allDay: true), occurrenceStartDay: day(5),
+           knownCalendarId: "team-calendar")
+        let read = r.log.first { $0.hasPrefix("occurrenceStartDay(") }
+        #expect(read == "occurrenceStartDay(calendarId:team-calendar,eventId:ev-1,recurrenceId:\(day(7))T00:00:00,recurrenceIdZone:America/Vancouver)",
+                "read: \(read ?? "<none>")")
+        #expect(r.cards == 1 && r.writes == 1, "cards \(r.cards) writes \(r.writes) \(r.out)")
+    }
+
+    @Test("an edit of one occurrence that gives no end reads no occurrence, so a failing read does not stop it")
+    func editWithoutAnEndReadsNoOccurrence() async throws {
+        let r = try await run([
+            "edit_scope": .string("this_only"), "recurrence_id": .string("\(day(7))T00:00:00"),
+            "title": .string("Renamed"),
+        ], account: "kind-tool-rename", event: stored(allDay: true),
+           occurrenceReadThrows: URLError(.notConnectedToInternet))
         #expect(r.cards == 1 && r.writes == 1, "cards \(r.cards) writes \(r.writes) \(r.out)")
     }
 
