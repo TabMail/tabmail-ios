@@ -277,10 +277,11 @@ enum JSONValue: Sendable, Codable {
     /// The whole number this value holds: an `.int`, or a `.double` with no
     /// fractional part that fits in `Int`. nil for anything else.
     ///
-    /// Every integer a tool reads from its arguments goes through here. A JSON
-    /// number too large for `Int` decodes as `.double` (see `init(from:)`), and
-    /// `Int(_: Double)` stops the app on a value outside `Int`'s range, so a
-    /// plain `Int(d)` on an argument is never safe.
+    /// Tool arguments read integers through here, so a fraction or a number
+    /// outside `Int`'s range is refused rather than truncated or rounded. Both
+    /// argument decoders (`BackendClient.jsonValueFromAny` for live calls and
+    /// `PendingCalendarOperation.arguments` for stored ones) give such a number
+    /// as `.double`.
     var wholeNumber: Int? {
         switch self {
         case .int(let n): return n

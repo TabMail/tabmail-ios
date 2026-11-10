@@ -9,10 +9,11 @@ import GRDB
 
 // MARK: - Whole-number tool arguments
 //
-// Integer tool arguments arrive as JSON numbers. A number `Int` cannot hold decodes as
-// `.double` (`JSONValue.init(from:)` tries `Int` first), and so does any fraction. Every tool
-// reads an integer argument through `JSONValue.wholeNumber`, and refuses a value that is not a
-// whole number rather than truncating or rounding it.
+// Integer tool arguments arrive as JSON numbers. A number `Int` cannot hold arrives as
+// `.double` from both argument decoders (`BackendClient.jsonValueFromAny` and
+// `PendingCalendarOperation.arguments`), and so does any fraction. Every tool reads an integer
+// argument through `JSONValue.wholeNumber`, and refuses a value that is not a whole number
+// rather than truncating or rounding it.
 
 @Suite("Tool argument validation: whole numbers")
 struct ToolArgumentWholeNumberTests {
@@ -147,21 +148,22 @@ struct ToolArgumentWholeNumberTests {
     }
 
     @Test("calendar create and edit refuse a bad recurrence before the confirmation card",
-          arguments: [JSONValue.double(1e300), .double(2.5), .int(0)])
-    func createAndEditRefuse(count: JSONValue) async throws {
+          arguments: ["interval", "count"], [JSONValue.double(1e300), .double(2.5), .int(0)])
+    func createAndEditRefuse(key: String, value: JSONValue) async throws {
         let ctx = try makeContext()
-        let rec = recurrence("count", count)
+        let rec = recurrence(key, value)
+        let reason = "recurrence.\(key) must be a whole number of 1 or more"
 
         var createArgs = rec
         createArgs["title"] = .string("Standup")
         let created = try await CalendarEventCreateTool(context: ctx).execute(arguments: createArgs)
-        #expect(created.contains("recurrence.count must be a whole number of 1 or more"))
+        #expect(created.contains(reason))
         #expect(created.contains("NOT created"))
 
         var editArgs = rec
         editArgs["event_id"] = .string("evt-1")
         let edited = try await CalendarEventEditTool(context: ctx).execute(arguments: editArgs)
-        #expect(edited.contains("recurrence.count must be a whole number of 1 or more"))
+        #expect(edited.contains(reason))
         #expect(edited.contains("NOT changed"))
     }
 
@@ -175,10 +177,11 @@ struct ToolArgumentWholeNumberTests {
 
     // MARK: - No other path from a JSON number to Int
 
-    /// Every integer argument goes through `JSONValue.wholeNumber`. A new `.double` binding in a
-    /// tool is a new conversion that skips it. `AttachmentReadPdfTool.parsePage` is the one
-    /// exception: it bounds its page number to `Int32` before converting.
-    @Test("tools read numbers only through JSONValue.wholeNumber")
+    /// A `.double` binding in a tool is a conversion of a JSON number that skips
+    /// `JSONValue.wholeNumber`. `AttachmentReadPdfTool.parsePage` is the one exception: it bounds
+    /// its page number to `Int32` before converting. (This checks `.double` bindings only; the
+    /// per-tool rows above pin the behaviour.)
+    @Test("no tool binds a JSON number as .double outside JSONValue.wholeNumber")
     func noOtherDoubleConversion() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()   // Tools
@@ -187,7 +190,7 @@ struct ToolArgumentWholeNumberTests {
         // Recursive: the agent tools and their helpers live under Services/AI, and the calendar
         // queue that replays tool arguments lives under Services/Account.
         let dirs = ["TabMail/Services/AI", "TabMail/Services/Account"]
-        let binding = try Regex(#"case\s+(let\s+)?\.double\((let\s+)?\w+\)"#)
+        let binding = try Regex(#"case\s+((let|var)\s+)?\.double\(((let|var)\s+)?\w+\)"#)
         var found: [String: Int] = [:]
         var scanned = 0
         for dir in dirs {

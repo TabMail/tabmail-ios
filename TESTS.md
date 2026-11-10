@@ -378,4 +378,8 @@ else, and calendar create and edit refuse it before the confirmation card. A sou
 a new `.double` binding appears under `Services/AI` or `Services/Account`, the one allowed being
 the PDF tool's page number, which is bounded before it converts. `CalendarQueueArgumentValidationTests`
 stores a create and an edit carrying such a count, as an earlier build could have queued them. The
-drain retires each one with its reason and sends nothing to the provider.
+drain retires each one with its reason and sends nothing to the provider. `MemoryReadToolTests`
+refuses a `timestamp` that is not a whole number (including `"1e300"`, `"nan"` and a fraction) and
+answers whole numbers at the ends of `Int`, with tolerances whose window edge falls past Int64's
+range, by leaving that side of the window unbounded. The delete tests check that a fractional id
+in `unique_ids` is dropped, not truncated.

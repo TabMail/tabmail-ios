@@ -71,8 +71,8 @@ struct CalendarSearchTool: AgentTool, Sendable {
     ) -> String {
         let totalEvents = events.count
         let totalPages = (totalEvents + Config.eventsPerPage - 1) / Config.eventsPerPage
-        // Compare pages before computing an offset: `page_index` can be any whole number `Int`
-        // holds, and `(pageIndex - 1) * eventsPerPage` overflows for the largest of them.
+        // Compare pages before computing an offset, so any whole-number `page_index` past the
+        // end gets the beyond-the-last-page reply.
         guard pageIndex <= totalPages else {
             return "Page \(pageIndex) is beyond the last page (\(totalPages)). Total events: \(totalEvents)."
         }

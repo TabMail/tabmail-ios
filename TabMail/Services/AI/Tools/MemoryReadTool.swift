@@ -19,12 +19,12 @@ struct MemoryReadTool: AgentTool, Sendable {
     }
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
-        // Parse required timestamp (epoch ms).
-        let timestampMs: Double
-        if case .int(let t) = arguments["timestamp"] {
-            timestampMs = Double(t)
-        } else if case .string(let s) = arguments["timestamp"], let t = Double(s) {
-            timestampMs = t
+        // Parse required timestamp (epoch ms), a whole number.
+        let target: Int64
+        if let t = arguments["timestamp"]?.wholeNumber {
+            target = Int64(t)
+        } else if case .string(let s) = arguments["timestamp"], let t = Int64(s) {
+            target = t
         } else {
             return #"{"error": "Invalid or missing timestamp. Use a timestamp value from memory_search results."}"#
         }
@@ -32,7 +32,7 @@ struct MemoryReadTool: AgentTool, Sendable {
         // Parse optional tolerance_minutes.
         let defaultTolMinutes = SearchConfig.memoryReadDefaultToleranceMs / 60_000
         let toleranceMinutes: Int
-        if case .int(let t) = arguments["tolerance_minutes"] {
+        if let t = arguments["tolerance_minutes"]?.wholeNumber {
             toleranceMinutes = max(1, t)
         } else if case .string(let s) = arguments["tolerance_minutes"], let t = Int(s) {
             toleranceMinutes = max(1, t)
@@ -42,7 +42,7 @@ struct MemoryReadTool: AgentTool, Sendable {
 
         // Parse optional max_turns.
         let maxTurns: Int
-        if case .int(let t) = arguments["max_turns"] {
+        if let t = arguments["max_turns"]?.wholeNumber {
             maxTurns = max(1, t)
         } else if case .string(let s) = arguments["max_turns"], let t = Int(s) {
             maxTurns = max(1, t)
@@ -50,8 +50,9 @@ struct MemoryReadTool: AgentTool, Sendable {
             maxTurns = SearchConfig.memoryReadMaxTurns
         }
 
-        let toleranceMs = Int64(toleranceMinutes) * 60 * 1000
-        let target = Int64(timestampMs)
+        // A tolerance too long to express in milliseconds leaves the window unbounded.
+        let (scaled, tooLong) = Int64(toleranceMinutes).multipliedReportingOverflow(by: 60 * 1000)
+        let toleranceMs = tooLong ? Int64.max : scaled
         BackgroundSyncLogger.logDebug("[MemoryReadTool] ENTER timestampMs=\(target) toleranceMin=\(toleranceMinutes) maxTurns=\(maxTurns)")
 
         let hits = await MemoryIndex.shared.readByTimestamp(
