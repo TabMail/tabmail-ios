@@ -25,6 +25,65 @@ settlement through the database returned as usable.
 `AccountManagerQueueDrainTests` retains startup-only coverage of cancelled-row
 cleanup and unrelated queued work.
 
+## Outlook calendar edits — server-side oracle
+
+`ExchangeCalendarEditPreservationTests` drives `ExchangeCalendarProvider.updateEvent` and
+`updateOccurrence` over `FakeHTTP` against `FakeGraphCalendar`, which applies Graph's documented
+event-update semantics (unsent properties keep their values; writing `location` replaces
+`locations`; `$select` returns only what it names). For seven edit kinds (rename, move an hour, move
+only the end, change the room, add an attendee, remove an attendee, mark busy) on a single event, a whole series and one
+occurrence, and a description edit of a plain event and a rule edit of a series, it asserts on the
+stored event, not on our payload: every property the edit did not set (body, `showAs`, `locations`, attendee types, recurrence, start and end) comes back
+unchanged, and the edited property holds what was asked (a removed attendee is gone, the rest keep
+their types). The fake also models the recurrence
+behaviour measured live for #423 (a range written without a zone is stored as UTC; a written rule
+that differs from the stored one resets the series' exceptions; a `recurrence` PATCHed without
+`start` moves the series to UTC midnight; a range without `startDate` is refused with a 400): a
+whole-series edit that gives no rule writes no `recurrence` and resets nothing; a series moved to
+another date, timed and all day (its end moving with it), keeps its stored recurrence but for the
+range's start date; an
+occurrence edit never writes a rule or the master. Also covered: an event made recurring, a series
+given a new rule and a new date (the new rule is written), a series moved by a start written
+without an offset, a series moved by a start spelled with an offset (`Z`, `.000Z`, `+00:00`) or
+without seconds (`…T10:00`, bare or with `Z`) but labelled with another zone, as the tools pass one
+through (dated where Graph stores it: within the device's day no recurrence, to another day the
+range at that day; a start without seconds is written with `:00`), an all-day end-only edit (the
+start stays), a move across UTC midnight within the device's day (no recurrence) and across
+the device's midnight within one UTC date (range start = the device's date; both skipped within
+about an hour of UTC), an occurrence named by its own id, an empty edit writing nothing, a PATCH
+retried after a 401 with a refreshed sign-in, and an attendee stored in mixed case keeping its
+type. The fixtures hold at any host offset from -12 to +14 hours.
+
+Online meetings (#511): the online fixture's body follows the layout a Teams meeting on a work
+account stored when checked live (notes, then a join section between two lines of underscores with a
+short "Join:" link and the long `meetup-join` one; every link, id, number and passcode a
+placeholder), and the fake models what that check measured: a body written without the join link
+turns the online meeting off (`isOnlineMeeting` false, `onlineMeetingProvider` `unknown`,
+`onlineMeeting` null). A description edit is one of the edit kinds on the online single event,
+series and occurrence: the notes are replaced, the join section and everything after it are kept byte
+for byte, and the meeting stays on. Also: a read gives the stored notes as the description at full
+length (past the 255-character preview), an online meeting's without its join section and with its
+join link as `conferenceUrl`, by `getEvent` and by a `calendarView` listing (the fake lists single
+events and occurrences, never a series master); a description read, added to and written back keeps
+the notes and the meeting; after the join link is written into the notes, the next description edit
+still keeps the meeting; clearing the notes keeps the join section; and a layout without a separator
+line gets the description as text, as before.
+`GraphOnlineMeetingBodyTests` pins the recogniser over the live layout (found by either join link) and
+the older layout of Graph's online-meeting samples: bare-text and element notes, escaping and line
+breaks, a `<body>` tag with attributes or none, a join link
+written raw, a separator nested in several elements, the cases it does not recognise (no link, the
+separator only after it, a line shorter than `separatorMinUnderscores`, an unclosed `<body` tag, an
+empty link) and where the notes end; a copy of the join link in the notes (as written and with
+`&amp;`) and a line of underscores in the notes are part of the notes; with both, the join section is
+still kept whole; trailing line breaks in new notes are dropped, so repeated edits do not grow the
+body; and thousands of copies of the join link in the notes, with or without a join section after
+them, are recognised as the clean body is, within a time limit a scan that restarts for each copy
+exceeds. `ExchangeCalendarTests` maps an HTML, text or missing body to the
+description; `CalendarToolHelpersTests` pins the `conference_url:` line after the description and an
+event pill's notes (join link first); `ToolCachingTests` checks that the search and direct-read pill
+caches carry the join link (including a read that finds the event by scanning every calendar), and
+that in a new session a pill tap that fetches the event live shows it.
+
 ## Inbox list — layered test architecture
 
 the unified inbox read (ADR-IOS-055) replaced four disagreeing inbox-list read paths with one unified reader (`InboxListReader` → `InboxListComposer.compose`). Getting this right — and *keeping* it right as the code evolves — needs coverage at four distinct layers, each catching a different class of bug. A 5-round adversarial audit of the refactor found two HIGH-severity findings (F1, F2) that lived entirely *between* layers, invisible to any single layer's test suite — that's why the fourth layer (E2E) exists.
@@ -87,6 +146,42 @@ unchanged and lands once the failure clears; a user move into Sent or Drafts is 
 queued on IMAP. `MoveFolderPickerTests.gmailOmitsTheLabelsGmailKeeps` covers the
 picker, and `DraftDeletionTests` pins that an "Invalid label" body is not an
 authoritative rejection.
+
+## Local placeholder rows never reach the provider
+
+A `sent-…` row (the optimistic Sent copy of a sent message, written before sync
+lists the server's copy) or a `draft-…` row (a draft the server has not saved
+yet) has no address on a server.
+`TabMailTests/Services/PlaceholderActionAdmissionTests.swift` runs these producers
+of a message action (the agent's delete, a user move, mark unread, flag, applying
+and removing a label from the label menu, removing a label from the row, and the
+reply and forward flags set when a reply or forward finishes sending) on Gmail,
+Outlook and IMAP. Mark read and undo move go through the same admission check but have no case here.
+On a placeholder alone, each action queues nothing and changes nothing locally,
+and the agent's delete reports the row pending; the same action on a real row
+queues an op for it. For the actions that take several rows, a placeholder and a
+real message together reach the provider with only the real id, and the
+placeholder row stays as it was.
+
+An open message shows what was stored. When a read toggle from the message view
+(the focused message, or a message in its thread) is refused for a placeholder,
+the view returns to the stored row; on a real row it keeps the toggled state.
+
+The same file covers what happens once a draft save lands. On Gmail, Outlook and
+IMAP the row takes the server's id, its search entry moves to that id, and an
+agent delete reaches that id. A Gmail
+save that returns no contained message id leaves the placeholder, which an agent
+delete reports pending. An Outlook re-save onto a server row the Drafts sync had
+already listed drops the placeholder row, its cached body and its search entry,
+and an agent delete reaches the server id. When the re-keyed row cannot be
+written, the draft records no server copy (the save and the re-key are one
+write), and the retry lands both.
+
+On the demo account the mailbox is the local database and nothing ever replaces
+a placeholder, so `DemoProvider` is the one provider that can act on one
+(`EmailProvider.placeholderIdsAreAddressable`). With the real `DemoProvider`, the
+Sent copy of a demo send can be marked unread, flagged and deleted, and a saved
+demo draft's row can be deleted.
 
 ## Server-draft dismissal UI
 
@@ -240,3 +335,79 @@ nothing more. Through the real caller, `GmailReceivedDateBoundaryTests` pulls ol
 `SyncEngine.fetchOlderMessages` the way the scroller does: a full page with one message Gmail cannot
 serve still says there may be more, so the next pull loads the message beyond it, the unreadable
 message gets no row, and the stored rows stay.
+
+## Plan picker — no in-app purchase while a web subscription is live
+
+`WebSubscriptionGateTests` decodes `/whoami` bodies through the real `AccountInfo` parser. A web
+subscription that is active, trialing, past due, cancelled but not yet ended, unpaid, incomplete,
+paused, or has no status counts as live, and `PlanPickerView.webManagedNote(for:)` then returns the
+one plain sentence that replaces the purchase options. An ended or never-completed web subscription,
+an Apple subscription, a signup trial (running or ended), no subscription, and an account not yet
+loaded all leave the plans on sale. A status the app does not know counts as live.
+`viewHidesEveryPurchaseOptionBehindTheGate` reads the view's source (a hosted `PlanPickerView`
+fetches its own account) and pins the two gates: the billing toggle, plan cards, footnotes and Apple
+disclosure sit in the `else` of the sentence, Restore Purchases sits inside its own gate, and Cancel /
+Manage Subscription sits outside both.
+
+## Draft placeholders and the Drafts sync window
+
+`DraftPlaceholderStaleWindowTests` saves a draft through `AccountManager.queueDraftSave`, lets that
+save land with no server address, re-saves it ten days later, and then runs the production sync
+merge over a full Drafts page whose oldest draft is newer than the first save but older than the
+latest one. The placeholder is not on the page and its latest save is inside it, so sync removes it
+and the draft is not shown twice. The second case leaves the latest save queued: the same sync keeps
+the placeholder, because the queued save names it, and the sync after that save lands removes it.
+
+## Recurring series split — the new series' end
+
+`RecurrenceTailCountTests` checks `RecurrenceTail.occurrences` against the worked examples of
+RFC 5545 §3.8.5.3, whose occurrence lists are the oracle (the expected counts were also checked
+against python-dateutil), plus the edges the RFC states in prose and every rule shape the counter
+refuses, including INTERVAL above `RecurrenceTail.maxInterval` and BY values of `Int.min`, which would
+otherwise overflow or trap. `RecurrenceTailNewSeriesRuleTests` covers the rule a split's new series
+gets: COUNT reduced in place, a used-up or uncountable COUNT refused (the message names unreadable
+dates or the uncountable rule, whichever it was), an UNTIL at or after the split kept, one before it
+refused, a DATE UNTIL covering its whole day, and an UNTIL equal to the split's own cap read as a
+retry. `GoogleSplitSeriesTailTests` and `CalDAVSplitSeriesTailTests` drive the real providers on
+`FakeHTTP` with a series zoned to Pacific/Auckland at 07:00 and the split declared in UTC, so a rule
+read in the wrong frame counts other weekdays. A refused split sends no write: Google sends only the
+master GET, and CalDAV sends no PUT.
+
+## Outlook sends carry the Outbox's Message-ID
+
+`ExchangeSentMessageIdTests` reads the requests `ExchangeProvider.send` makes on `FakeHTTP`. The
+Outbox keys its optimistic Sent row by the Message-ID it generated, and sync replaces that row only
+with a Sent Items copy whose `internetMessageId` matches; Graph answers a send with no id of its own.
+A send without files asks `sendMail` for that id as the message's `internetMessageId`, in angle
+brackets whether or not the stored id has them, and it normalizes to the key the row holds. A send
+with files creates its draft carrying the id, then sends that draft. A reply, on either route, carries
+the id together with In-Reply-To (`String 0x1042`) and References (`String 0x1039`) and no other
+extended property. A draft save (create and update) does not set the id: `DraftStore` gives every
+save a fresh one, and a Message-ID once set should stay constant. `ExchangeOutboxSentMessageIdTests`
+drives the real Outbox send (`sendClaimedOutboxMessageForTesting`) for an Outlook account over
+`FakeHTTP`, on both routes, and checks that the id Graph is asked for, the optimistic Sent row's key
+and the claim's `sentMessageId` are one id. Its refusal case runs the real claim and send three times
+while Graph refuses the send at `sendMail`, at the files route's draft create, or at its `/send`: every
+claim reuses the first claim's id, every attempt asks Graph for it, each refusal is counted, the row
+is shown as failed after the third, it is never marked sent, and no Sent row is written.
+
+## Agent tool arguments — whole numbers
+
+`ToolArgumentWholeNumberTests` covers `JSONValue.wholeNumber`, the one way a tool reads an integer
+argument. A JSON number `Int` cannot hold decodes as `.double`, so the accessor accepts an `.int`
+or a `.double` holding a whole number in `Int`'s range, and nothing else. It then drives every tool
+that reads an integer argument with values outside `Int` either way and with a fraction: the
+message tools' `unique_id`, `EmailDeleteTool.parseUniqueIds`, the settings value, the template id,
+the contact-search `limit` and the calendar-search `page_index`. Each one refuses the value rather
+than truncating it. The calendar-search reply for the largest page is checked too. The recurrence
+`interval` and `count` must be whole numbers of 1 or more: the event builder throws on anything
+else, and calendar create and edit refuse it before the confirmation card. A source check fails if
+a new `.double` binding appears under `Services/AI` or `Services/Account`, the one allowed being
+the PDF tool's page number, which is bounded before it converts. `CalendarQueueArgumentValidationTests`
+stores a create and an edit carrying such a count, as an earlier build could have queued them. The
+drain retires each one with its reason and sends nothing to the provider. `MemoryReadToolTests`
+refuses a `timestamp` that is not a whole number (including `"1e300"`, `"nan"` and a fraction) and
+answers whole numbers at the ends of `Int`, with tolerances whose window edge falls past Int64's
+range, by leaving that side of the window unbounded; `MemoryIndexTests` reads a turn with no session
+through a window whose upper or lower edge falls past that range. The delete tests check that a fractional id
+in `unique_ids` is dropped, not truncated.

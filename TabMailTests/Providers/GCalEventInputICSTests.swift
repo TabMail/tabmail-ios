@@ -351,20 +351,20 @@ struct GCalEventInputJSONTests {
     /// property: model-supplied tool arguments in, ICS text out, no injected property. It stays
     /// meaningful if the validation moves to a different layer.
     @Test("A poisoned freq cannot become an ICS property, end to end from tool arguments")
-    func poisonedFreqCannotInjectThroughToolPath() {
+    func poisonedFreqCannotInjectThroughToolPath() throws {
         let args: [String: JSONValue] = [
             "recurrence": .dictionary([
                 "freq": .string("DAILY\r\nATTENDEE;ROLE=REQ-PARTICIPANT:mailto:attacker@evil.example")
             ])
         ]
-        let ics = CalendarToolHelpers.buildGCalEventInput(args, isAllDay: false).toICS(uid: "u")
+        let ics = try CalendarToolHelpers.buildGCalEventInput(args, isAllDay: false).toICS(uid: "u")
         let lines = ics.split(whereSeparator: \.isNewline).map(String.init)
         #expect(!lines.contains { $0.hasPrefix("ATTENDEE") }, "injected ATTENDEE became a property:\n\(ics)")
 
         // Two-sided: a legitimate freq must still produce a rule, or the assertion above would also
         // hold for a build path that silently emitted no recurrence at all.
         let legalArgs: [String: JSONValue] = ["recurrence": .dictionary(["freq": .string("weekly")])]
-        let legalICS = CalendarToolHelpers.buildGCalEventInput(legalArgs, isAllDay: false).toICS(uid: "u")
+        let legalICS = try CalendarToolHelpers.buildGCalEventInput(legalArgs, isAllDay: false).toICS(uid: "u")
         #expect(legalICS.split(whereSeparator: \.isNewline).map(String.init)
             .contains { $0.hasPrefix("RRULE:FREQ=WEEKLY") }, "legal recurrence dropped:\n\(legalICS)")
     }

@@ -712,7 +712,7 @@ extension AccountManager {
         switch type {
         case .create:
             let allDay = CalendarToolHelpers.boolArg(args, "all_day")
-            var input = CalendarToolHelpers.buildGCalEventInput(args, isAllDay: allDay)
+            var input = try CalendarToolHelpers.buildGCalEventInput(args, isAllDay: allDay)
             // Use the pre-generated event id for idempotent retries.
             //
             // ⚠ THIS SAID "(Google only — Exchange ignores it)" UNTIL R13-U8 AND
@@ -881,7 +881,7 @@ extension AccountManager {
                     BackgroundSyncLogger.logDebug("[CalendarQueue] Edit sets an RRULE UNTIL with no all_day argument — resolved allDay=\(resolvedAllDay == true) from the resource")
                 }
             }
-            let input = CalendarToolHelpers.buildGCalEventInput(resolvedArgs, isAllDay: resolvedAllDay)
+            let input = try CalendarToolHelpers.buildGCalEventInput(resolvedArgs, isAllDay: resolvedAllDay)
 
             // Route by edit_scope (calendar_event_edit-v1.5.21+). Default: 'all'
             // when no recurrence_id, 'this_only' when recurrence_id is present

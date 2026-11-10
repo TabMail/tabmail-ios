@@ -555,7 +555,8 @@ actor GoogleCalendarProvider: CalendarProvider {
     /// Split a recurring series at `recurrenceId`:
     /// 1. PATCH the master to add UNTIL = recurrenceId - 1 second (silent — sendUpdates="none")
     /// 2. POST a new event with the same fields as the master, the `patch` applied,
-    ///    DTSTART = recurrenceId, and the master's RRULE without UNTIL/COUNT.
+    ///    DTSTART = recurrenceId, and the master's RRULE ending where the original
+    ///    series ended (`RecurrenceTail.newSeriesRule`).
     /// If step 2 fails after step 1 succeeded, attempt to revert step 1.
     /// Invitations (`sendUpdates`) fire only on the new series.
     func splitSeries(
@@ -584,7 +585,17 @@ actor GoogleCalendarProvider: CalendarProvider {
             throw CalendarProviderError.notSupported("Invalid recurrence_id '\(recurrenceId)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
         }
         let cappedRRule = Self.replaceOrAppendUntil(in: originalRRule, untilValue: untilValue)
-        let rruleWithoutCap = Self.stripUntilAndCount(originalRRule)
+        // The new series ends where the original one did: the same UNTIL, or
+        // what is left of its COUNT. Worked out here, before the cap PATCH in
+        // step 4, so a split the series cannot take (it already ends before the
+        // split, or its COUNT cannot be counted) is refused with nothing written.
+        // A patch that brings its own recurrence is still written as given
+        // (`mergeMasterAndPatch` prefers it), but the check runs all the same:
+        // it is also what stops the cap from moving the end of a series that
+        // already ended before the split.
+        let days = Self.splitDaysInMasterFrame(master: master, recurrenceId: recurrenceId, recurrenceIdZone: recurrenceIdZone)
+        let newSeriesRRule = try RecurrenceTail.newSeriesRule(
+            from: originalRRule, seriesStart: days.seriesStart, split: days.split, capUntil: untilValue)
 
         // 3. Build the capped-master patch. The semantic change is recurrence-
         //    only, but defensive-include the master's existing start/end so
@@ -622,7 +633,7 @@ actor GoogleCalendarProvider: CalendarProvider {
             patch: patch,
             newStartNaiveISO: recurrenceId,
             newStartZone: recurrenceIdZone,
-            newRecurrence: [rruleWithoutCap]
+            newRecurrence: [newSeriesRRule]
         )
         let newSeriesId = Self.deterministicSplitEventId(masterId: eventId, recurrenceId: recurrenceId)
         newSeriesInput.id = newSeriesId
@@ -998,6 +1009,32 @@ actor GoogleCalendarProvider: CalendarProvider {
         return out.string(from: untilDate)
     }
 
+    /// The original series' first day and the split occurrence's day, both in
+    /// the frame the master's RRULE expands in: plain dates for an all-day
+    /// series, the master's `start.timeZone` for a timed one. A day that cannot
+    /// be placed is nil, and `RecurrenceTail.newSeriesRule` refuses any end
+    /// that needs it.
+    static func splitDaysInMasterFrame(
+        master: GCalEvent,
+        recurrenceId: String,
+        recurrenceIdZone: TimeZone
+    ) -> (seriesStart: RecurrenceTail.Day?, split: RecurrenceTail.Day?) {
+        if master.isAllDay {
+            return (master.start?.date.flatMap { RecurrenceTail.Day(iso: $0) }, RecurrenceTail.Day(iso: recurrenceId))
+        }
+        guard let tzid = master.start?.timeZone, let masterZone = TimeZone(identifier: tzid) else { return (nil, nil) }
+        let dayFormatter = DateFormatter()
+        dayFormatter.locale = Locale(identifier: "en_US_POSIX")
+        dayFormatter.dateFormat = "yyyy-MM-dd"
+        dayFormatter.timeZone = masterZone
+        let seriesStart = master.start?.dateTime
+            .flatMap { Date.fromISO8601($0) }
+            .flatMap { RecurrenceTail.Day(iso: dayFormatter.string(from: $0)) }
+        let split = RecurrenceOccurrenceResolver.renderNaive(recurrenceId, from: recurrenceIdZone, to: masterZone)
+            .flatMap { RecurrenceTail.Day(iso: $0) }
+        return (seriesStart, split)
+    }
+
     /// Drop any existing UNTIL=... or COUNT=... segments, then append the new UNTIL.
     static func replaceOrAppendUntil(in rrule: String, untilValue: String) -> String {
         // RRULE format: "RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=10"
@@ -1258,8 +1295,8 @@ actor GoogleCalendarProvider: CalendarProvider {
             }
         }
 
-        // Recurrence: caller-supplied `newRecurrence` is the default (master's
-        // RRULE stripped of UNTIL/COUNT). If `patch.recurrence` is non-nil, the
+        // Recurrence: caller-supplied `newRecurrence` is the default (the
+        // master's RRULE as the split rewrites it). If `patch.recurrence` is non-nil, the
         // LLM/user explicitly asked for a different pattern on the new series —
         // honor that. This keeps iOS consistent with the TB bridge, which also
         // respects patch.recurrence when present.
@@ -1380,6 +1417,10 @@ struct GCalEvent: Codable, Sendable {
     /// the LLM-facing search output with the master's RRULE so a recurring
     /// series's UNTIL/COUNT is visible on every occurrence line.
     let recurringEventId: String?
+    /// An online meeting's join link, shown to the assistant on its own line
+    /// (`conference_url`, as the Thunderbird add-on names it) rather than inside
+    /// the description. Outlook's `onlineMeeting.joinUrl` (#511); nil elsewhere.
+    var conferenceUrl: String? = nil
 }
 
 // Convenience initializer that fills in `eventType`/`iCalUID`/`kind`/`visibility`
@@ -1402,7 +1443,8 @@ extension GCalEvent {
         htmlLink: String?,
         created: String?,
         updated: String?,
-        recurringEventId: String? = nil
+        recurringEventId: String? = nil,
+        conferenceUrl: String? = nil
     ) {
         self.init(
             id: id, summary: summary, location: location, description: description,
@@ -1410,7 +1452,7 @@ extension GCalEvent {
             recurrence: recurrence, transparency: transparency, status: status,
             htmlLink: htmlLink, created: created, updated: updated,
             eventType: nil, iCalUID: nil, kind: nil, visibility: nil,
-            recurringEventId: recurringEventId
+            recurringEventId: recurringEventId, conferenceUrl: conferenceUrl
         )
     }
 }

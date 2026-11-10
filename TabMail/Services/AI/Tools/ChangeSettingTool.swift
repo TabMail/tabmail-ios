@@ -100,10 +100,8 @@ struct ChangeSettingTool: AgentTool, Sendable {
 
         case .number:
             let num: Int
-            if case .int(let i) = arguments["value"] {
-                num = i
-            } else if case .double(let d) = arguments["value"] {
-                num = Int(d)
+            if let whole = arguments["value"]?.wholeNumber {
+                num = whole
             } else if case .string(let s) = arguments["value"], let parsed = Int(s) {
                 num = parsed
             } else {
