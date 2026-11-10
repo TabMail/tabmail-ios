@@ -275,7 +275,7 @@ struct OneSyncAtATimeTests {
         try pool.read { db in try Account.fetchOne(db, key: accountId)?.lastHistoryId }
     }
 
-    /// RED while a pass ran on its caller's copy (C1): a push delta queued
+    /// RED while a pass ran on its caller's copy: a push delta queued
     /// behind the launch's full sync carried the expired cursor `1000`, found it
     /// expired again, and cleared the cursor that full sync had just captured,
     /// so new mail waited for the next full sync.
@@ -333,6 +333,57 @@ struct OneSyncAtATimeTests {
 
             #expect(wire.snapshot.historyStarts == ["1500"], "the delta must run from the stored cursor")
             #expect(wire.snapshot.labelsRequests == 1, "the full sync the row says is due did not run")
+            await engine.remove(accountId: Self.accountId)
+        }
+    }
+
+    /// A foreground pass and a background delta wait behind a held turn; the
+    /// account is removed before their turns start. Each must then do nothing (no
+    /// request, no write that brings the row back), report no change, and hand
+    /// the turn on. Without the removal, the same two passes do sync: that keeps
+    /// the zero-request check from passing for some other reason.
+    @Test("Passes whose account was removed while they waited do nothing and hand the turn on",
+          arguments: [true, false])
+    func removedWhileWaitingDoesNothing(removed: Bool) async throws {
+        try await Self.withAppDB { pool in
+            let account = try Self.makeAccount(pool: pool)
+            let wire = CursorWire()
+            let scenario = Self.cursorScenario(wire: wire, parkFirstLabels: false)
+            defer { scenario.close() }
+            let provider = GmailProvider(
+                userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: scenario.session)
+            let engine = await Self.engine(provider: provider)
+            let log = PassLog()
+            let held = AsyncStream<Void>.makeStream()
+            let holder = Self.heldPass(engine: engine, accountId: Self.accountId, name: "held", log: log, release: held.stream)
+            #expect(await Self.eventually { log.snapshot == ["start held"] }, "precondition: the turn is held")
+
+            // Both callers pass the copy they read before the wait.
+            let foreground = Task { try await engine.sync(account: account) }
+            let delta = Task { try await engine.backgroundDeltaSync(account: account) }
+            #expect(await Self.eventually { await engine.syncPassWaiters[Self.accountId]?.count == 2 },
+                    "precondition: both passes wait their turn")
+            if removed {
+                _ = try await pool.write { db in try Account.deleteOne(db, key: Self.accountId) }
+            }
+            held.continuation.yield()
+            await holder.value
+            let changed = try await foreground.value
+            let deltaResult = try await delta.value
+
+            if removed {
+                #expect(!changed, "a pass whose account is gone reported a change")
+                #expect(deltaResult.changed == false && deltaResult.reason == "noAccount",
+                        "a delta whose account is gone must report no change, for the removed account")
+                #expect(wire.snapshot.historyStarts.isEmpty && wire.snapshot.labelsRequests == 0,
+                        "a pass whose account is gone made a request")
+                #expect(try await pool.read { db in try Account.fetchOne(db, key: Self.accountId) } == nil,
+                        "a pass whose account is gone wrote its row back")
+            } else {
+                #expect(!wire.snapshot.historyStarts.isEmpty, "non-vacuity: the same passes sync when the account is there")
+            }
+            #expect(await engine.syncPassRunning.isEmpty, "the turn was not handed on")
+            #expect(await engine.syncPassWaiters[Self.accountId] == nil)
             await engine.remove(accountId: Self.accountId)
         }
     }

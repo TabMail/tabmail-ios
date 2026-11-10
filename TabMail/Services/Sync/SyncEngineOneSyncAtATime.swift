@@ -12,7 +12,8 @@ extension SyncEngine {
     /// inside its turn is `accountAtTurnStart`. The turn is released on every
     /// exit, a throw included, and handed straight to the oldest waiter.
     /// A waiter whose task was cancelled still takes its turn, and its pass
-    /// stops at its first work-queue call.
+    /// stops at its first cancellation-aware step (the turn-start read, else its
+    /// first work-queue call).
     ///
     /// The provider's `ProviderWorkQueue` does not do this: it has several
     /// slots, so without this two passes of one account ran side by side, each
