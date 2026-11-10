@@ -91,39 +91,14 @@ where being wrong cannot be undone. **Never widen its evidence.** A source copy 
 `\Deleted`-but-present is an accepted, recoverable cost; expunging without proof is a wrong-message
 deletion.
 
-> **Stated negatively, because this absolute was wrong for two years and walked reviewers past two
-> live hazards.** "Never permanently deletes" is true of MAIL, **not of DRAFTS OR CALENDAR EVENTS**,
-> and the `COPYUID`-gated purge is **not** the only irreversible wire operation. There are **seven**:
-> (1) the `COPYUID`-gated source expunge; (2) `IMAPProvider.deleteDraftStrong`; (3) `saveDraft`'s
-> old-copy replacement; (4) Gmail's `DELETE /drafts/{id}`, which Google documents as permanent rather
-> than a trash; (5) `CalDAVProvider.deleteEvent` — WebDAV `DELETE` on the event's `.ics` resource,
-> for which RFC 4918/4791 define **no** trash, undelete or restore (added 2026-08-05; iCloud's
-> whole-calendar snapshot rollback is not a per-item recovery and does not exempt it). The draft
-> family **destroys a draft outright** rather than moving it to Trash.
-> Further scope: (2) and (3) are irreversible only under UIDPLUS — without it `expungeScopedToTargets`
-> issues nothing; Gmail's `.gmailContainedMessage` arm trashes rather than destroys; and
-> `ExchangeProvider.deleteDraft`, `ExchangeCalendarProvider.deleteEvent` and
-> `GoogleCalendarProvider.deleteEvent` are excluded on **positive** documented per-item recovery
-> (Graph Recoverable Items; Google Calendar's 30-day event trash), not on the absence of evidence.
-> **(6) is not a DELETE at all: `CalDAVProvider.splitSeries`' cap `PUT`** replaces the master `.ics`
-> with an `UNTIL=`-capped `RRULE`, destroying every occurrence after the split point; it is
-> written only after the new part holds what it removes (ADR-IOS-106), with no rollback.
-> **(7) `ExchangeProvider.replaceDraftAttachments`' attachment `DELETE`** (#217) removes a file the
-> local Outlook draft no longer names, only after every add succeeded.
-> **⚠ Membership is defined by a PROPERTY — content that existed on the server no longer does, with
-> no documented per-item recovery the call reaches — NOT by the verb `DELETE`. Do not restate this
-> integer without re-running its predicate.** The greps are a **LOWER BOUND**, not the definition:
-> five `--multiline` searches over `TabMail/ Shared/ TabMailNotificationService/` —
-> `method\s*:\s*"DELETE"`, `httpMethod\s*=\s*"DELETE"`, `expunge\(`, plus the REPLACEMENT axis
-> `httpMethod\s*=\s*"PUT"` and `method\s*:\s*"PUT"` — because **both** HTTP spellings occur, and the
-> count was "four" for a day precisely because the earlier census saw only the first (`MIS-007`).
-> **It is wrong the moment** a further spelling appears (a computed/enum HTTP verb, or deletion
-> tunnelled through `POST` like Gmail `batchDelete` or Graph `permanentDelete`), a non-HTTP/non-IMAP
-> destructive surface is added, an excluded call loses its documented recovery, or
-> `GoogleCalendarProvider` gains a *this-and-following* series delete.
-> **Consequence for design:** a fail-closed argument that leans on "nothing is ever destroyed" is
-> valid for mail and invalid for drafts and CalDAV events — for those paths, say why the specific
-> loss is acceptable.
+> **"Never permanently deletes" is true of MAIL, not of DRAFTS OR CALENDAR EVENTS.** There are **seven**
+> irreversible wire operations: (1) the `COPYUID`-gated source expunge; (2) `IMAPProvider.deleteDraftStrong`;
+> (3) `saveDraft`'s old-copy replacement; (4) Gmail `DELETE /drafts/{id}`; (5) `CalDAVProvider.deleteEvent`;
+> (6) `CalDAVProvider.splitSeries`' cap `PUT`; (7) `ExchangeProvider.replaceDraftAttachments`' attachment
+> `DELETE`. Membership is a PROPERTY (server content gone with no documented per-item recovery), not the verb
+> `DELETE`; do not restate the count without re-running its predicate. A fail-closed argument that leans on
+> "nothing is ever destroyed" is invalid for drafts and CalDAV events. Full text, exclusions and the census greps:
+> [`seven-irreversible-wire-operations-inline-text.md`](Companion/Rules/Active/seven-irreversible-wire-operations-inline-text.md).
 > Detail and evidence: [`Companion/Memory/Current/102-there-are-four-irreversible-wire-operations-not-one.md`](Companion/Memory/Current/102-there-are-four-irreversible-wire-operations-not-one.md)
 > (filename preserved; its count is now seven).
 
@@ -143,18 +118,11 @@ again (a dropped intention) or names whatever now occupies that UID (**C3** wron
 That is why a composed read-then-move records the read **strictly before** the move, inside the same
 queued closure.
 
-**The problem itself is fixed — do not re-derive it, and do not design around it as if it were still
-open.** `copyProvenSourceUIDs` now returns `destinationProviderId` / `destinationUidValidity`, and
-`MessageHeaderRekey.finishMove` re-keys the row to the destination UID and epoch at drain time from
-the `COPYUID` already in hand. Undo is an ordinary reverse move (`AccountManager.undoMove`), not a
-rollback and not a Message-ID `SEARCH`; the two surviving `searchByMessageId` callers (`currentUIDs`,
-`appendToSentFolder`) are both **non-mutating**, so the banned D4 direction — a SEARCH selecting a
-mutation target (ADR-IOS-068, `IOS-IMAP-002`) — no longer exists in the tree.
-
-**The lesson worth keeping:** four audit rounds argued about *which evidence retires an operation*
-when the real defect was decision **granularity** — the wire had already proved the destination
-address and the code threw it away. Before designing a receipt, alias table, two-door identity scheme
-or outcome enum, ask first whether the wire already handed you the answer.
+**The problem is fixed; do not re-derive it or design around it.** The drain re-keys the row to the
+destination UID and epoch from the `COPYUID` in hand (`MessageHeaderRekey.finishMove`); undo is an ordinary
+reverse move (`AccountManager.undoMove`); no `SEARCH` selects a mutation target (ADR-IOS-068). Before
+designing a receipt, alias table or outcome enum, ask whether the wire already handed you the answer. Status
+and lesson in full: [`address-problem-solved-status-and-lesson.md`](Companion/Rules/Active/address-problem-solved-status-and-lesson.md).
 
 > Full text, byte-for-byte: [Companion/Memory/Current/111-the-address-problem-root-cause-behind-most-action-queue-complexity.md](Companion/Memory/Current/111-the-address-problem-root-cause-behind-most-action-queue-complexity.md).
 
@@ -167,11 +135,7 @@ or outcome enum, ask first whether the wire already handed you the answer.
 3. **If headers exist, bodies should eventually be fetchable** — If an IMAP FETCH returns no data for a UID that we have a header for, that's a bug to investigate (connection died, UID renumbered, etc.), NOT a case to paper over.
 4. **NEVER use a DATE window/cursor for IMAP sync — UID and message-date are DECORRELATED (ADR-IOS-042).** This caused real, multi-month Archive DATA LOSS that required a forced re-sync of affected users (commit `4145d2a`, migration `v59`). IMAP `fetchMessages(limit:)` returns the **highest UIDs**, and a UID is **archive-time**, not message-date: archiving one OLD-dated email gives it a fresh HIGH UID. So a date-based stale-detection "overlap window" drags its floor back to that old date and sweeps in **months of mid-range Archive mail the fetch never returned → deletes them** (searchable-but-unopenable orphans; multi-month gaps). The RULE: any SYNC query that decides **what to fetch, keep, delete, or where the cursor/floor sits** for an IMAP folder MUST window by **UID** (`CAST(messageId AS INTEGER)` — `messageId` is the UID), NEVER by `date`. The single source of truth is `SyncEngine.selectStaleHeaders` gated on `provider.staleWindowMode` (`.uid` for IMAP, `.date` for Gmail/Exchange) — do not bypass it or add a parallel date-based sync path. **DISPLAY ordering is exempt** (the inbox/folder list orders by `date` for human reading, and the `messageHeader_folderId[_isRead]_date` composite indexes accelerate THAT — display only). The distinction is: *display* may use date; *sync/stale/cursor decisions* on IMAP must use UID.
 5. **A registered migration is IMMUTABLE the moment ANY database has run it — including your own simulator. "Uncommitted" ≠ "unapplied".** GRDB records applied state by the migration's NAME, per database. So a migration that is still uncommitted has nonetheless already run on every dev simulator/device that launched the branch, and from that point BOTH of these are broken:
-   - **Appending to an applied migration's body** — the new statements NEVER execute on any DB that already ran it. The column silently does not exist while the code assumes it does.
-   - **Renaming it to cover the additions** — GRDB reads the new name as a brand-new migration and re-runs the WHOLE body, which fails on the columns that already exist (`duplicate column name: …`). `AppDatabase` init throws, `shared` stays nil, and `AppDatabase.rawPool`'s force-unwrap **crashes the app at launch before any UI appears**.
-
-   Both were done to one migration on the abandoned post-`v1.6.38` line (2026-07-25) and produced exactly that launch crash. The RULE: once a migration has been run anywhere, freeze its name AND its body; every subsequent schema change gets its own new `vNN`. A fresh install (run vNN then vNN+1) and an existing DB (skip vNN, run vNN+1) must converge on the same schema — state that convergence in a comment when you split.
-   **Diff review CANNOT catch this** — the defect lives in the divergence between the diff and already-applied DB state. Verify against reality instead: `sqlite3 "<simulator>/Library/Application Support/TabMail/tabmail.sqlite" "SELECT identifier FROM grdb_migrations ORDER BY rowid DESC LIMIT 5;"` and `PRAGMA table_info(<table>);`.
+   Never append to or rename an applied migration; every later schema change gets its own new `vNN`. Diff review cannot catch this: check `grdb_migrations` on a real simulator database. Failure modes, the launch crash and the exact check: [`migration-immutability-failure-modes.md`](Companion/Rules/Active/migration-immutability-failure-modes.md).
 
 > Pre-compaction snapshot of this section at `0bcc851`, preserved byte-for-byte: [Companion/Rules/Active/data-integrity.md](Companion/Rules/Active/data-integrity.md).
 
