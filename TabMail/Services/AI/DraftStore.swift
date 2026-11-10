@@ -895,22 +895,30 @@ actor DraftStore {
             throw error
         }
 
-        let completion = try await AppDatabase.dbPool.write { db in
-            try Self.applyPushCompletion(
+        // Completion and the placeholder's migration to the server's id are ONE
+        // write. As two writes, a draft could carry `serverDraftId` while its
+        // placeholder header still said `draft-…` (between them, or for good when the
+        // second write failed), and an action on that row had no address to use.
+        // If this write throws, the completion rolls back with the migration and
+        // the save is retried (the existing one-stray cost, see above).
+        let (completion, rekeyed) = try await AppDatabase.dbPool.write { db -> (PushCompletion, Bool) in
+            let completion = try Self.applyPushCompletion(
                 context: context,
                 outcome: outcome,
                 runtimeKind: runtimeKind,
                 draftsFolderPath: draftsFolderPath,
                 db: db)
+            guard completion.applied, let migration = completion.migration else {
+                return (completion, false)
+            }
+            let rekeyed = try Self.migrateExactPlaceholder(
+                migration, freshRfc: context.freshRfc, db: db)
+            return (completion, rekeyed)
         }
 
         guard completion.applied else { return .notApplied }
 
         if let migration = completion.migration {
-            let rekeyed = try await AppDatabase.dbPool.write { db in
-                try Self.migrateExactPlaceholder(
-                    migration, freshRfc: context.freshRfc, db: db)
-            }
             if rekeyed {
                 try? await SearchIndex.shared.rekeyHeaders([(
                     oldKey: ContentKey(rawValue: migration.oldHeaderId),

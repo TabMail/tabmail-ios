@@ -122,6 +122,12 @@ struct EmailSearchToolSortTests {
             let past = try await tool.execute(arguments: ["query": .string(marker), "page_index": .int(6)])
             #expect(try object(past)["page"] as? Int == 5)
             #expect(try dates(past) == Array(shown.suffix(20)))
+            // `page_index` is read as a whole number: a whole double is that page, the largest
+            // `Int` is past the end, and a number that is not a whole number is no page (page 1).
+            for (value, page) in [(JSONValue.double(2.0), 2), (.int(Int.max), 5), (.double(1e300), 1), (.double(2.5), 1)] {
+                let result = try await tool.execute(arguments: ["query": .string(marker), "page_index": value])
+                #expect(try object(result)["page"] as? Int == page, "\(value)")
+            }
         }
     }
 

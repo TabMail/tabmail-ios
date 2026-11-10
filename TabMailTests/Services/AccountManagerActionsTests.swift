@@ -1271,10 +1271,12 @@ struct AccountManagerActionsTagClearTests {
             try drafts.insert(db)
             try custom.insert(db)
         }
-        let archiveCandidate = makeDurableHeader(folder: drafts, messageId: "draft-archive-refused")
-        let moveCandidate = makeDurableHeader(folder: drafts, messageId: "draft-move-refused")
-        let customMoveCandidate = makeDurableHeader(folder: drafts, messageId: "draft-custom-move-refused")
-        let trashCandidate = makeDurableHeader(folder: drafts, messageId: "draft-trash-allowed")
+        // Server-shaped ids: a `draft-…` id is a local placeholder, which admission
+        // refuses before the Drafts-source rule is reached.
+        let archiveCandidate = makeDurableHeader(folder: drafts, messageId: "server-archive-refused")
+        let moveCandidate = makeDurableHeader(folder: drafts, messageId: "server-move-refused")
+        let customMoveCandidate = makeDurableHeader(folder: drafts, messageId: "server-custom-move-refused")
+        let trashCandidate = makeDurableHeader(folder: drafts, messageId: "server-trash-allowed")
         try await pool.writeWithoutTransaction { db in
             try archiveCandidate.insert(db)
             try moveCandidate.insert(db)

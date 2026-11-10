@@ -162,16 +162,12 @@ struct EmailDeleteTool: AgentTool, Sendable {
     static func parseUniqueIds(_ arguments: [String: JSONValue]) -> [Int] {
         if case .array(let arr) = arguments["unique_ids"] {
             return arr.compactMap { item -> Int? in
-                switch item {
-                case .int(let n): return n
-                case .string(let s): return Int(s)
-                case .double(let d): return Int(d)
-                default: return nil
-                }
+                if case .string(let s) = item { return Int(s) }
+                return item.wholeNumber
             }
         }
         // Also accept a single unique_id for convenience
-        if case .int(let n) = arguments["unique_id"] {
+        if let n = arguments["unique_id"]?.wholeNumber {
             return [n]
         }
         if case .string(let s) = arguments["unique_id"], let n = Int(s) {

@@ -23,11 +23,11 @@ struct EmailDeleteToolParseTests {
         #expect(result == [10, 20])
     }
 
-    @Test("Array of doubles returns truncated ints")
+    @Test("Array of doubles keeps the whole numbers and drops a fraction")
     func arrayOfDoubles() {
         let args: [String: JSONValue] = ["unique_ids": .array([.double(5.0), .double(7.9)])]
         let result = EmailDeleteTool.parseUniqueIds(args)
-        #expect(result == [5, 7])
+        #expect(result == [5])
     }
 
     @Test("Mixed array extracts all convertible items")

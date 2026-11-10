@@ -26,8 +26,8 @@ struct ContactSearchTool: AgentTool, Sendable {
         }
 
         var limit = Config.defaultLimit
-        if case .int(let n) = arguments["limit"] { limit = n }
-        else if case .double(let d) = arguments["limit"] { limit = Int(d) }
+        if let n = arguments["limit"]?.wholeNumber { limit = n }
+        else if case .double = arguments["limit"] { return #"{"error": "limit must be a whole number"}"# }
         else if case .string(let s) = arguments["limit"], let n = Int(s) { limit = n }
         limit = min(max(limit, 1), Config.maxLimit)
 

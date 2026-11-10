@@ -233,6 +233,7 @@ struct ExchangeCalendarEmptySurfaceTests {
             "subject": "Quarterly Review",
             "location": {"displayName": "HQ"},
             "bodyPreview": "Bring slides",
+            "body": {"contentType": "html", "content": "<html><body><p>Bring slides</p></body></html>"},
             "attendees": [{"emailAddress": {"address": "bob@example.com"}}],
             "showAs": "busy",
             "isAllDay": false
@@ -246,6 +247,19 @@ struct ExchangeCalendarEmptySurfaceTests {
         #expect(gcal.location == "HQ")
         #expect(gcal.description == "Bring slides")
         #expect(gcal.attendees?.count == 1)
+    }
+
+    @Test("the description is the stored body at full length, never the 255-character preview, and nil without a body")
+    func descriptionFromTheBody() async throws {
+        let long = String(repeating: "Notes past the preview. ", count: 20).trimmingCharacters(in: .whitespaces)
+        let provider = makeProvider()
+        let html = try decodeMSEvent(#"{"id": "evt-html", "bodyPreview": "Notes past", "body": {"contentType": "html", "content": "<p>\#(long)</p>"}}"#)
+        #expect(await provider.toGCalEvent(html).description == long)
+        let text = try decodeMSEvent(#"{"id": "evt-text", "bodyPreview": "Line one", "body": {"contentType": "text", "content": "Line one\r\nLine two"}}"#)
+        #expect(await provider.toGCalEvent(text).description == "Line one\r\nLine two")
+        let none = try decodeMSEvent(#"{"id": "evt-none", "bodyPreview": "Preview only"}"#)
+        #expect(await provider.toGCalEvent(none).description == nil)
+        #expect(await provider.toGCalEvent(none).conferenceUrl == nil)
     }
 }
 
@@ -558,5 +572,22 @@ struct ExchangeCalendarRecurringTests {
         #expect(ExchangeCalendarProvider.graphNaiveDateTime("2026-05-15T20:00:00") == "2026-05-15T20:00:00")
         // The `-` in the date portion must NOT be mistaken for an offset.
         #expect(ExchangeCalendarProvider.graphNaiveDateTime("2026-05-15T20:00:00.123-0700") == "2026-05-15T20:00:00.123")
+        // A wall time without seconds gets `:00`, with or without an offset; one
+        // that is no wall time keeps its form.
+        #expect(ExchangeCalendarProvider.graphNaiveDateTime("2099-05-15T20:00") == "2099-05-15T20:00:00")
+        #expect(ExchangeCalendarProvider.graphNaiveDateTime("2099-05-15T20:00Z") == "2099-05-15T20:00:00")
+        #expect(ExchangeCalendarProvider.graphNaiveDateTime("2099-05-15T20:00-07:00") == "2099-05-15T20:00:00")
+        #expect(ExchangeCalendarProvider.graphNaiveDateTime("2099-05-15T2000") == "2099-05-15T2000")
+        #expect(ExchangeCalendarProvider.graphNaiveDateTime("2099-05-15T20") == "2099-05-15T20")
+    }
+
+    /// A series' range date follows its start even when the start is in no form
+    /// the wall-time reader knows: such a start is dated as written, so moving the
+    /// series to another day still moves its range rather than leaving the old date.
+    @Test("a start in no known wall-time form is dated as written")
+    func dayOfAnUnreadableStartIsItsWrittenDate() {
+        #expect(ExchangeCalendarProvider.day(nil, "2099-05-15T9:00", in: "UTC") == "2099-05-15")
+        #expect(ExchangeCalendarProvider.day(nil, "2099-05-15T2000", in: nil) == "2099-05-15")
+        #expect(ExchangeCalendarProvider.day("2099-05-15", nil, in: nil) == "2099-05-15")
     }
 }

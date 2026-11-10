@@ -19,6 +19,10 @@ actor DemoProvider: EmailProvider {
         self.accountId = accountId
     }
 
+    /// The demo mailbox is the local database, so a `sent-…` Sent copy is the
+    /// message itself: nothing ever syncs a real row in to replace it.
+    static let placeholderIdsAreAddressable = true
+
     // MARK: - Connection / lifecycle
 
     func connect() async throws { /* no-op — local */ }

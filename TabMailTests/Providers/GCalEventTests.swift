@@ -323,25 +323,25 @@ struct GCalEventInputTests {
 struct BuildGCalEventInputTests {
 
     @Test("buildGCalEventInput with title and location")
-    func titleAndLocation() {
+    func titleAndLocation() throws {
         let args: [String: JSONValue] = [
             "title": .string("Team Meeting"),
             "location": .string("Room 42"),
             "description": .string("Weekly sync"),
         ]
-        let input = CalendarToolHelpers.buildGCalEventInput(args, isAllDay: false)
+        let input = try CalendarToolHelpers.buildGCalEventInput(args, isAllDay: false)
         #expect(input.summary == "Team Meeting")
         #expect(input.location == "Room 42")
         #expect(input.description == "Weekly sync")
     }
 
     @Test("buildGCalEventInput with timed event start/end")
-    func timedEvent() {
+    func timedEvent() throws {
         let args: [String: JSONValue] = [
             "start_iso": .string("2024-06-15T10:00:00"),
             "end_iso": .string("2024-06-15T11:00:00"),
         ]
-        let input = CalendarToolHelpers.buildGCalEventInput(args, isAllDay: false)
+        let input = try CalendarToolHelpers.buildGCalEventInput(args, isAllDay: false)
         #expect(input.startDateTime != nil)
         #expect(input.startTimeZone != nil)
         #expect(input.endDateTime != nil)
@@ -351,12 +351,12 @@ struct BuildGCalEventInputTests {
     }
 
     @Test("buildGCalEventInput with all-day event")
-    func allDayEvent() {
+    func allDayEvent() throws {
         let args: [String: JSONValue] = [
             "start_iso": .string("2024-12-25T00:00:00"),
             "end_iso": .string("2024-12-26T00:00:00"),
         ]
-        let input = CalendarToolHelpers.buildGCalEventInput(args, isAllDay: true)
+        let input = try CalendarToolHelpers.buildGCalEventInput(args, isAllDay: true)
         #expect(input.startDate == "2024-12-25")
         #expect(input.endDate == "2024-12-26")
         // Should NOT have dateTime fields
@@ -365,28 +365,28 @@ struct BuildGCalEventInputTests {
     }
 
     @Test("buildGCalEventInput with transparency free")
-    func transparencyFree() {
+    func transparencyFree() throws {
         let args: [String: JSONValue] = ["transparency": .string("free")]
-        let input = CalendarToolHelpers.buildGCalEventInput(args, isAllDay: false)
+        let input = try CalendarToolHelpers.buildGCalEventInput(args, isAllDay: false)
         #expect(input.transparency == "transparent")
     }
 
     @Test("buildGCalEventInput with transparency busy")
-    func transparencyBusy() {
+    func transparencyBusy() throws {
         let args: [String: JSONValue] = ["transparency": .string("busy")]
-        let input = CalendarToolHelpers.buildGCalEventInput(args, isAllDay: false)
+        let input = try CalendarToolHelpers.buildGCalEventInput(args, isAllDay: false)
         #expect(input.transparency == "opaque")
     }
 
     @Test("buildGCalEventInput with attendees as dictionaries")
-    func attendeesAsDicts() {
+    func attendeesAsDicts() throws {
         let args: [String: JSONValue] = [
             "attendees": .array([
                 .dictionary(["email": .string("alice@test.com"), "name": .string("Alice")]),
                 .dictionary(["email": .string("bob@test.com")]),
             ])
         ]
-        let input = CalendarToolHelpers.buildGCalEventInput(args, isAllDay: false)
+        let input = try CalendarToolHelpers.buildGCalEventInput(args, isAllDay: false)
         #expect(input.attendees?.count == 2)
         #expect(input.attendees?[0].email == "alice@test.com")
         #expect(input.attendees?[0].name == "Alice")
@@ -395,21 +395,21 @@ struct BuildGCalEventInputTests {
     }
 
     @Test("buildGCalEventInput with attendees as strings")
-    func attendeesAsStrings() {
+    func attendeesAsStrings() throws {
         let args: [String: JSONValue] = [
             "attendees": .array([
                 .string("alice@test.com"),
                 .string("bob@test.com"),
             ])
         ]
-        let input = CalendarToolHelpers.buildGCalEventInput(args, isAllDay: false)
+        let input = try CalendarToolHelpers.buildGCalEventInput(args, isAllDay: false)
         #expect(input.attendees?.count == 2)
         #expect(input.attendees?[0].email == "alice@test.com")
         #expect(input.attendees?[0].name == nil)
     }
 
     @Test("buildGCalEventInput with recurrence")
-    func recurrence() {
+    func recurrence() throws {
         let args: [String: JSONValue] = [
             "recurrence": .dictionary([
                 "freq": .string("weekly"),
@@ -417,7 +417,7 @@ struct BuildGCalEventInputTests {
                 "count": .int(10),
             ])
         ]
-        let input = CalendarToolHelpers.buildGCalEventInput(args, isAllDay: false)
+        let input = try CalendarToolHelpers.buildGCalEventInput(args, isAllDay: false)
         #expect(input.recurrence?.count == 1)
         let rrule = input.recurrence?[0] ?? ""
         #expect(rrule.contains("FREQ=WEEKLY"))
@@ -426,9 +426,9 @@ struct BuildGCalEventInputTests {
     }
 
     @Test("buildGCalEventInput empty args produces empty input")
-    func emptyArgs() {
+    func emptyArgs() throws {
         let args: [String: JSONValue] = [:]
-        let input = CalendarToolHelpers.buildGCalEventInput(args, isAllDay: false)
+        let input = try CalendarToolHelpers.buildGCalEventInput(args, isAllDay: false)
         #expect(input.summary == nil)
         #expect(input.location == nil)
         #expect(input.startDateTime == nil)
@@ -437,7 +437,7 @@ struct BuildGCalEventInputTests {
     }
 
     @Test("buildGCalEventInput skips empty email attendees")
-    func skipsEmptyEmailAttendees() {
+    func skipsEmptyEmailAttendees() throws {
         let args: [String: JSONValue] = [
             "attendees": .array([
                 .dictionary(["email": .string("")]),
@@ -445,7 +445,7 @@ struct BuildGCalEventInputTests {
                 .dictionary(["email": .string("valid@test.com")]),
             ])
         ]
-        let input = CalendarToolHelpers.buildGCalEventInput(args, isAllDay: false)
+        let input = try CalendarToolHelpers.buildGCalEventInput(args, isAllDay: false)
         #expect(input.attendees?.count == 1)
         #expect(input.attendees?[0].email == "valid@test.com")
     }
