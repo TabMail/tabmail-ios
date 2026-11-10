@@ -954,8 +954,9 @@ enum AttachmentFilename {
     /// `appendingPathComponent` transforms the component independently of the base,
     /// so the verdict cannot depend on which directory it is checked against". The
     /// claim is false and so is the mechanism it cites.
-    /// - Measured: **at the root, `"."`, `".."`, `""`, `"\u{0}"` and `"..\u{0}"` all
-    ///   PASS**; at every depth ≥ 1 they all fail. `/probe` (depth 1) is what makes
+    /// - Measured on iOS 26.5: **at the root, `"."`, `".."`, `""`, `"\u{0}"` and
+    ///   `"..\u{0}"` all PASS**; at every depth ≥ 1 they all fail. The root's
+    ///   verdict differs between runtimes, so nothing may rely on it. `/probe` (depth 1) is what makes
     ///   rule 1 able to refuse anything at all.
     /// - The verdict turns on **`.standardized`**, not on `appendingPathComponent`.
     ///   `.standardized` collapses `..` against the base's own DEPTH: `/a/..`
@@ -965,9 +966,8 @@ enum AttachmentFilename {
     ///   `appendingPathComponent` really is base-oblivious; it is simply not the
     ///   step the verdict comes from.
     /// The property that actually holds — invariance across bases of depth ≥ 1,
-    /// PLUS the divergence at depth 0, PLUS this predicate's own probe being
-    /// non-root — is pinned by
-    /// `containmentVerdictIsInvariantBelowTheRootAndDivergesAtIt`. **If this probe
+    /// and this predicate refusing every escaping name — is pinned by
+    /// `containmentVerdictIsInvariantBelowTheRootAndThePredicateRefusesEscapes`. **If this probe
     /// is ever relocated, it must stay below the root**, or rule 1 silently accepts
     /// every traversal name it exists to refuse.
     ///
