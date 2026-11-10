@@ -2124,8 +2124,8 @@ struct CalDAVSeriesStartShiftWireTests {
         var patch = GCalEventInput()
         patch.startDateTime = "2099-03-02T15:00:00-08:00"
         patch.endDateTime = "2099-03-02T16:00:00-08:00"
-        patch.startTimeZone = "America/Vancouver"
-        patch.endTimeZone = "America/Vancouver"
+        patch.startTimeZone = "America/Los_Angeles"
+        patch.endTimeZone = "America/Los_Angeles"
         return patch
     }
 
@@ -2135,7 +2135,7 @@ struct CalDAVSeriesStartShiftWireTests {
         defer { http.close() }
         let store = FakeCalDAVStore(servesETags: true)
         let path = "/cal/series-move.ics"
-        let seed = Self.series(zone: "America/Vancouver", until: "UNTIL=20990330T170000Z")
+        let seed = Self.series(zone: "America/Los_Angeles", until: "UNTIL=20990330T170000Z")
         #expect(try SeriesOracle.states(seed) == [.shown, .shown, .deleted, .changed, .shown], "non-vacuity")
         store.seed(path: path, ics: seed)
         Self.route(http, to: store)
@@ -2144,7 +2144,7 @@ struct CalDAVSeriesStartShiftWireTests {
             calendarId: Self.calendarId, eventId: path, event: Self.moveTo15(), sendUpdates: "none")
 
         let stored = try #require(store.storedICS(path: path))
-        #expect(stored.contains("DTSTART;TZID=America/Vancouver:20990302T150000"), "non-vacuity: the start moved")
+        #expect(stored.contains("DTSTART;TZID=America/Los_Angeles:20990302T150000"), "non-vacuity: the start moved")
         #expect(try SeriesOracle.states(stored) == [.shown, .shown, .deleted, .changed, .shown])
         #expect(store.recordedPuts().filter { $0.path == path }.count == 1)
     }
