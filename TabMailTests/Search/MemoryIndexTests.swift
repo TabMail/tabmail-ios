@@ -956,6 +956,25 @@ struct MemoryIndexTests {
         #expect(hits.isEmpty)
     }
 
+    /// A window edge past Int64's range leaves that side of the window unbounded, so a turn
+    /// inside the tolerance is still read. (0, Int64.max) puts the upper edge past the range;
+    /// (-2, Int64.max) puts the lower edge past it. The turn has no session, so the window
+    /// itself is what is read.
+    @Test("readByTimestamp: a window edge past Int64's range leaves that side unbounded",
+          arguments: [Int64(0), -2])
+    func readByTimestamp_edgePastRangeIsUnbounded(timestampOffset: Int64) async throws {
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
+
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "edge", sessionId: nil, role: "user", dateMs: now, text: "edge turn")
+
+        // Offset 0 reads at the turn itself; -2 reads just before the epoch.
+        let target = timestampOffset == 0 ? now : timestampOffset
+        let hits = await MemoryIndex.shared.readByTimestamp(timestampMs: target, toleranceMs: Int64.max, maxTurns: 10)
+        #expect(hits.map(\.dateMs) == [now])
+    }
+
     // MARK: - Pool survives re-init
 
     @Test("Pool survives reinstall — rows persist across _testReset + reinstall")

@@ -22,6 +22,11 @@ enum AccountPlanConfig {
     /// `subscription_provider` value that marks the server-granted signup trial —
     /// as opposed to a purchase made through a payment provider.
     static let signupProviderKey = "signup"
+    /// `subscription_provider` value of a subscription bought on the website.
+    static let webProviderKey = "stripe"
+    /// `subscription_status` values of a web subscription that has ended. Any
+    /// other status, and a missing one, means it is still live (ADR-IOS-105).
+    static let endedWebSubscriptionStatuses: Set<String> = ["canceled", "incomplete_expired"]
     /// Length of the free trial a new subscription starts with. Must match the
     /// introductory offer configured in App Store Connect (and the Stripe trial);
     /// the plan picker's trial banner names it.
@@ -99,6 +104,20 @@ extension AccountInfo {
         }
 
         return .noTrial
+    }
+
+    /// Whether the account has a subscription bought on the website that has
+    /// not ended. It is managed only there, so the app sells this account no
+    /// plan until it has ended (ADR-IOS-105).
+    ///
+    /// Reads `subscription_provider` and `subscription_status` only, never
+    /// `has_subscription`: an unpaid, incomplete or paused subscription grants
+    /// no access and is still live. A missing status counts as live, so a
+    /// response without one never opens the purchase options.
+    var hasLiveWebSubscription: Bool {
+        guard subscriptionProvider == AccountPlanConfig.webProviderKey else { return false }
+        guard let subscriptionStatus else { return true }
+        return !AccountPlanConfig.endedWebSubscriptionStatuses.contains(subscriptionStatus)
     }
 
     /// Denominator for the account dashboard's daily-quota chart, or `nil` when

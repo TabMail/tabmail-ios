@@ -2,7 +2,7 @@
 
 **Class:** design-process
 **Severity:** medium (three review rounds; a main-actor multi-second stall would have shipped)
-**First seen:** 2026-09 · **Recurrences:** 1 · **Status:** Active
+**First seen:** 2026-09 · **Recurrences:** 2 (2: #511, a re-scan loop over an organizer's HTML) · **Status:** Active
 **Related:** `MIS-005` (root; the per-group cap was the bug's mirror image, instance 28) · `Companion/Memory/Current/125-html-links-in-converted-text.md` (#162 section) · **Rule owner:** root `CLAUDE.md` § Code Quality 6 (warnings) has no analogue; this entry is the rule
 
 ## The tell
@@ -33,6 +33,18 @@ preview leaked because the window cut a link. Widened to 32,000 with a happy-pat
   `[b c](y)`.
 - Replaced the regex with a linear precomputed-closure scanner; fuzzed equal to the regex on
   600,000 strings; round 4 clean on the construct, rounds 5–6 on tests only.
+
+## Recurrence 2: #511, a loop that re-scanned for each candidate (2026-11)
+
+No bound was widened this time; the second form of the same tell. To pass over copies of an online
+meeting's join link in the organizer's notes, `GraphOnlineMeetingBody.joinSection` looped over every
+copy and, for each, re-scanned the notes from their start for a line of underscores. That is O(k·n)
+in the copies k and the body n, on HTML any meeting organizer writes, run on every Outlook calendar
+read. The tier-1 reviewer found it by reading. The fix replaced the algorithm, as this entry's rule
+says: a copy has a line before it exactly when it starts after the first line is complete, so one
+search from that point is linear and returns the same anchor. `manyLinkCopies` is the bounded-time
+test with a hostile fixture. The tell to watch: a loop whose body scans from a FIXED start (not from
+where the loop stands) over content someone else writes.
 
 ## Why it is not obvious
 

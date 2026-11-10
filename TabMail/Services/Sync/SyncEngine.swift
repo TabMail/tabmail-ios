@@ -45,6 +45,11 @@ actor SyncEngine {
     /// (delete-twice is a no-op) but waste a full-folder SEARCH pass.
     var deletionReconcileInFlight: Set<String> = []
 
+    /// The accounts with a sync pass running, and for each the passes waiting
+    /// their turn, oldest first (`oneSyncAtATime`).
+    var syncPassRunning: Set<String> = []
+    var syncPassWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+
     /// Embedding rebuild task (one at a time).
 
     /// One-shot flag so the `recoverIncompleteHeaders` EXPLAIN QUERY PLAN probe
@@ -372,10 +377,21 @@ actor SyncEngine {
         }
         let provider = queue.provider
 
-        // No syncing guard here — background delta syncs run concurrently with
-        // foreground syncs. Delta operations are idempotent (upserts, no-op deletes),
-        // and historyId/deltaToken writes are monotonically increasing, so concurrent
-        // execution is safe and prevents pushes from being blocked by slow foreground polls.
+        // A foreground pass of the same account running now finishes first
+        // (`oneSyncAtATime`); then this delta runs, on the account's row as it is
+        // when its turn starts.
+        return try await oneSyncAtATime(accountId: account.id) {
+            try await self.backgroundDeltaPass(accountId: account.id, queue: queue, provider: provider, inboxOnly: inboxOnly)
+        }
+    }
+
+    private func backgroundDeltaPass(
+        accountId: String, queue: ProviderWorkQueue, provider: any EmailProvider, inboxOnly: Bool
+    ) async throws -> (changed: Bool, reason: String) {
+        guard let account = try await accountAtTurnStart(accountId) else {
+            BackgroundSyncLogger.logDebug("[Sync:bg] Account \(accountId.prefix(8)) was removed before its turn — skipping")
+            return (false, "noAccount")
+        }
 
         // Pool creates connections on demand via checkout — no explicit connect needed.
         // Callers (AccountManager.backgroundSyncOne) already call ensureConnected() upstream.
@@ -390,7 +406,6 @@ actor SyncEngine {
 
         // Publish sync phase so push-triggered/background syncs show "Checking..."
         // in the subtitle, not just the foreground path. Defer clears on return.
-        let accountId = account.id
         defer {
             Task { @MainActor in AccountManagerState.shared.setSyncPhase(nil, forAccount: accountId) }
         }
@@ -446,7 +461,7 @@ actor SyncEngine {
 
     /// Foreground sync: always tries delta first, then runs full sync separately
     /// if it's been >15 min since the last one (self-healing safety net).
-    /// Pull-to-refresh also uses this — delta is always the fast path.
+    /// Delta is always the fast path.
     @discardableResult
     func sync(account: Account) async throws -> Bool {
         guard let queue = workQueues[account.id] else {
@@ -455,16 +470,28 @@ actor SyncEngine {
         }
         let provider = queue.provider
 
+        // The work queue has several slots and does not serialize passes: a pass
+        // of the same account running now finishes first (`oneSyncAtATime`).
+        return try await oneSyncAtATime(accountId: account.id) {
+            try await self.foregroundPass(accountId: account.id, queue: queue, provider: provider)
+        }
+    }
+
+    private func foregroundPass(accountId: String, queue: ProviderWorkQueue, provider: any EmailProvider) async throws -> Bool {
+        guard let account = try await accountAtTurnStart(accountId) else {
+            BackgroundSyncLogger.logDebug("[Sync] Account \(accountId.prefix(8)) was removed before its turn — skipping")
+            return false
+        }
+
         // Skip if this account was synced very recently — prevents redundant syncs
         // from overlapping callers (RootView.task, SyncScheduler, InboxViewModel).
+        // Read from the row as it is now, so a pass that waited behind one that
+        // has just synced skips too.
         if let lastSync = account.lastSyncedAt, Date().timeIntervalSince(lastSync) < 15 {
             BackgroundSyncLogger.logDebug("[Sync] Skipping \(account.emailAddress) — synced \(Int(Date().timeIntervalSince(lastSync)))s ago")
             return false
         }
 
-        // No per-account sync guard — ProviderWorkQueue handles concurrency.
-        // Duplicate foreground syncs for the same account serialize through the work queue.
-        let accountId = account.id
         defer {
             Task { @MainActor in AccountManagerState.shared.setSyncPhase(nil, forAccount: accountId) }
         }

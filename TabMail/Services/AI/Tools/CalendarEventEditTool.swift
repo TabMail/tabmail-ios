@@ -105,13 +105,16 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         if let v = CalendarToolHelpers.stringArgOpt(arguments, "transparency") {
             changes.append("availability → \(v)")
         }
-        if case .dictionary(let rec) = arguments["recurrence"],
-           case .string(let freq) = rec["freq"] {
-            var desc = freq.lowercased()
-            if case .int(let n) = rec["interval"], n > 1 { desc = "every \(n) \(desc)" }
-            if case .int(let count) = rec["count"] { desc += " (\(count) times)" }
-            else if case .string(let until) = rec["until"] { desc += " (until \(until))" }
-            changes.append("recurrence → \(desc)")
+        do {
+            if let desc = try CalendarToolHelpers.recurrenceSummary(arguments) {
+                changes.append("recurrence → \(desc)")
+            }
+        } catch CalendarProviderError.notSupported(let reason) {
+            return ToolJSON.string(from: [
+                "ok": false,
+                "error": "calendar_event_edit failed: \(reason). The event was NOT changed. Correct the arguments and call calendar_event_edit again.",
+                "event_id": compoundId,
+            ] as [String: Any])
         }
 
         // Resolve the recurring-edit scope up front — it drives both the

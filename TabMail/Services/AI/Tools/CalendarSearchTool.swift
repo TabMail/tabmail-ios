@@ -17,19 +17,19 @@ struct CalendarSearchTool: AgentTool, Sendable {
     }
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
-        let backends = await CalendarProviderDispatch.resolveAll()
-        guard !backends.isEmpty else {
-            return CalendarProviderDispatch.notAvailableMessage
-        }
-
         guard case .string(let query) = arguments["query"],
               !query.trimmingCharacters(in: .whitespaces).isEmpty else {
             return #"{"error": "missing required 'query' string"}"#
         }
 
         var pageIndex = 1
-        if case .int(let n) = arguments["page_index"] { pageIndex = max(1, n) }
-        else if case .double(let d) = arguments["page_index"] { pageIndex = max(1, Int(d)) }
+        if let n = arguments["page_index"]?.wholeNumber { pageIndex = max(1, n) }
+        else if case .double = arguments["page_index"] { return #"{"error": "page_index must be a whole number"}"# }
+
+        let backends = await CalendarProviderDispatch.resolveAll()
+        guard !backends.isEmpty else {
+            return CalendarProviderDispatch.notAvailableMessage
+        }
 
         let (startDate, endDate) = CalendarToolHelpers.resolveDateRange(arguments)
         let trimmedQuery = query.trimmingCharacters(in: .whitespaces)
@@ -64,19 +64,20 @@ struct CalendarSearchTool: AgentTool, Sendable {
         )
     }
 
-    private func paginateAndFormat(
+    func paginateAndFormat(
         events: [(event: GCalEvent, accountId: String, calendarId: String, accessRole: String?)],
         calendarNames: [String: String], pageIndex: Int, timeZone: TimeZone? = nil,
         masterRRuleById: [String: String] = [:]
     ) -> String {
         let totalEvents = events.count
         let totalPages = (totalEvents + Config.eventsPerPage - 1) / Config.eventsPerPage
-        let startIdx = (pageIndex - 1) * Config.eventsPerPage
-        let endIdx = min(startIdx + Config.eventsPerPage, totalEvents)
-
-        guard startIdx < totalEvents else {
+        // Compare pages before computing an offset, so any whole-number `page_index` past the
+        // end gets the beyond-the-last-page reply.
+        guard pageIndex <= totalPages else {
             return "Page \(pageIndex) is beyond the last page (\(totalPages)). Total events: \(totalEvents)."
         }
+        let startIdx = (pageIndex - 1) * Config.eventsPerPage
+        let endIdx = min(startIdx + Config.eventsPerPage, totalEvents)
 
         let pageEvents = Array(events[startIdx..<endIdx])
         var output = CalendarToolHelpers.formatGroupedSummary(

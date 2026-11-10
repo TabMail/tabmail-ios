@@ -644,7 +644,24 @@ extension AccountManager {
         let isDemo = accountId == DemoSeed.demoAccountId
         let isIMAP = !isDemo && (account.provider == .imap || account.provider == .icloud)
         if !isIMAP {
-            let admitted = messages.filter { !$0.messageId.isEmpty }
+            // A local placeholder row (`sent-…`, `draft-…`) has no address on
+            // a server, so unless the account's provider can act on it
+            // (`EmailProvider.placeholderIdsAreAddressable`, only the local demo
+            // mailbox) it is never admitted: the action is reported pending and
+            // nothing retries it, so the user repeats it once the real row
+            // exists. A saved draft's row normally takes its real id in the same
+            // write that records the save (`DraftStore.pushDraftToServer`); a
+            // placeholder re-created after that write stays until the draft's
+            // next save or a sync. A Sent copy's real row arrives with a later
+            // sync, which also removes the placeholder. On Gmail a
+            // draft placeholder the save could not re-key stays refused until a
+            // Drafts sync whose page reaches its latest save drops it. The IMAP
+            // arm below refuses it too, as a non-UID.
+            let placeholdersAddressable = placeholderIdsAreAddressable(for: account)
+            let admitted = messages.filter {
+                !$0.messageId.isEmpty
+                    && (placeholdersAddressable || !isSyntheticPlaceholderId($0.messageId))
+            }
             guard !admitted.isEmpty else { return nil }
             return (admitted, admitted.map(\.messageId), nil)
         }
@@ -699,8 +716,9 @@ extension AccountManager {
     ///     reaction, which full sync re-drives every cycle.
     ///   * a missing `Folder` or `Account` row — the admission fails closed on
     ///     it, but nothing about it is provider-authoritative.
-    ///   * a malformed/empty provider address — a broken LOCAL row, which is
-    ///     also not the provider telling us anything.
+    ///   * a malformed/empty provider address or a local placeholder id
+    ///     (`isSyntheticPlaceholderId`) — a LOCAL row with no server address,
+    ///     which is also not the provider telling us anything.
     /// Widening the terminal arm to any of these would drop a user intention
     /// on an unknown, which is exactly what exit 4 is written to forbid.
     ///
@@ -723,7 +741,8 @@ extension AccountManager {
         guard let account = try Account.fetchOne(db, key: accountId) else { return all(.retainedForRetry) }
         let isDemo = accountId == DemoSeed.demoAccountId
         let isIMAP = !isDemo && (account.provider == .imap || account.provider == .icloud)
-        // Non-IMAP-family: the only refusal cause is an empty provider id.
+        // Non-IMAP-family: the refusal causes are an empty provider id and a
+        // local placeholder id. Neither is the provider telling us anything.
         guard isIMAP else { return all(.retainedForRetry) }
 
         guard let folder = try Folder.fetchOne(
@@ -2429,6 +2448,13 @@ extension AccountManager {
                 header.bcc = bcc
                 header.snippet = snippet
                 header.date = Date(timeIntervalSince1970: draft.updatedAt)
+                // On a date-windowed provider, sync judges this placeholder stale
+                // only when its provider date is at or above the oldest draft on
+                // a partial Drafts page, which holds the newest drafts. Following
+                // each save keeps it there; left at its first save, it falls
+                // below that page once enough newer drafts exist and is not
+                // reconciled away while that lasts.
+                header.providerDate = header.date
                 header.isRead = true
                 header.observedUidValidity = nil
                 try header.save(db)

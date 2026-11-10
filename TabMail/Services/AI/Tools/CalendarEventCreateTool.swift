@@ -102,13 +102,16 @@ struct CalendarEventCreateTool: AgentTool, Sendable {
         if let transparency = CalendarToolHelpers.stringArgOpt(arguments, "transparency") {
             details.append("availability: \(transparency)")
         }
-        if case .dictionary(let rec) = arguments["recurrence"],
-           case .string(let freq) = rec["freq"] {
-            var desc = freq.lowercased()
-            if case .int(let n) = rec["interval"], n > 1 { desc = "every \(n) \(desc)" }
-            if case .int(let count) = rec["count"] { desc += " (\(count) times)" }
-            else if case .string(let until) = rec["until"] { desc += " (until \(until))" }
-            details.append("recurrence: \(desc)")
+        do {
+            if let desc = try CalendarToolHelpers.recurrenceSummary(arguments) {
+                details.append("recurrence: \(desc)")
+            }
+        } catch CalendarProviderError.notSupported(let reason) {
+            return ToolJSON.string(from: [
+                "ok": false,
+                "error": "calendar_event_create failed: \(reason). The event was NOT created. Correct the arguments and call calendar_event_create again.",
+                "event_title": eventTitle,
+            ])
         }
 
         // ADR-IOS-024: Show confirmation card and await user response
@@ -232,8 +235,11 @@ struct CalendarEventCreateTool: AgentTool, Sendable {
         // render "Repeats weekly" etc. before the event drains to the provider.
         // Reuses the same builder the drain runs, so the cached value matches
         // exactly what the provider will store.
+        // `try?`: `execute` already refused any recurrence the builder would throw on, before the
+        // card was shown, and the op is queued by now; a missing cached rule only costs the pill
+        // its "Repeats" line.
         let createdRRule: String? = {
-            let input = CalendarToolHelpers.buildGCalEventInput(queuedArgs, isAllDay: isAllDay)
+            guard let input = try? CalendarToolHelpers.buildGCalEventInput(queuedArgs, isAllDay: isAllDay) else { return nil }
             return (input.recurrence ?? []).first(where: { $0.uppercased().hasPrefix("RRULE:") })
         }()
         // Cache event details for pill popovers and subsequent edit/delete confirmations

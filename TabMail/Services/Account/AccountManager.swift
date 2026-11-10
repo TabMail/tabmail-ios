@@ -1181,6 +1181,17 @@ actor AccountManager {
             BackgroundSyncLogger.logInbox("[AccountManager] executeIntentCycle — cancel-out no-op for \(id)")
         }
         releaseOverlayEntry(id: id)
+        // A write above can be refused and leave the row as it was: admission
+        // withholds a row with no server address (a `sent-…`/`draft-…`
+        // placeholder on a provider that talks to a server). An open message
+        // view set its own copy when the gesture was made and re-reads the row
+        // only on this per-message notification, so post it; the re-read keeps
+        // any newer gesture's overlay on top (`MessageDetailViewModel.applyRefresh`).
+        if wroteAnything {
+            Task { @MainActor in
+                NotificationCenter.default.post(name: .messageDataDidChange, object: id)
+            }
+        }
     }
 
     /// Test seam: snapshot the intent-cycle register (hygiene checks —

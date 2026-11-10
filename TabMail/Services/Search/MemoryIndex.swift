@@ -949,8 +949,11 @@ actor MemoryIndex {
     func readByTimestamp(timestampMs: Int64, toleranceMs: Int64, maxTurns: Int) -> [MemoryHit] {
         ensureReady()
         guard let dbPool else { return [] }
-        let lowerBound = timestampMs - toleranceMs
-        let upperBound = timestampMs + toleranceMs
+        // A window edge past Int64's range leaves that side unbounded.
+        let (lower, lowerPast) = timestampMs.subtractingReportingOverflow(toleranceMs)
+        let (upper, upperPast) = timestampMs.addingReportingOverflow(toleranceMs)
+        let lowerBound = lowerPast ? Int64.min : lower
+        let upperBound = upperPast ? Int64.max : upper
         // Demo isolation: the matched turn (and therefore the session window)
         // must come from the current mode's rows only.
         let scope = Self.demoScopeSQL(demoActive: DemoModeStore.isDemoActive, alias: "memory_meta")
