@@ -34,35 +34,94 @@ struct AccountPasswordUpdateTests {
     // MARK: - Fake CalDAV server
 
     /// A CalDAV server that serves discovery to requests carrying one accepted
-    /// password (HTTP Basic) and answers 401 to every other.
+    /// password (HTTP Basic) and answers 401 to every other. It can instead fail
+    /// every request without refusing the password (`failEveryRequest`), or hold
+    /// its next request until the test releases it (`stallNextRequest`).
     final class FakeCalendarServer: Sendable {
-        /// The `Authorization` header the server accepts. A class of its own so
-        /// the request handler can hold it without holding the server.
-        private final class Accepted: Sendable {
-            let header: Mutex<String>
-            init(_ header: String) { self.header = Mutex(header) }
+        /// A failure that is not a refusal of the password.
+        enum Failure: Sendable {
+            case serverError
+            case transportError
+        }
+
+        /// One held request: `entered` yields once the request arrives; the
+        /// response is produced only after `release()`.
+        final class Stall: Sendable {
+            let entered: AsyncStream<Void>
+            private let enteredContinuation: AsyncStream<Void>.Continuation
+            private let gate = DispatchSemaphore(value: 0)
+
+            init() {
+                (entered, enteredContinuation) = AsyncStream.makeStream()
+            }
+
+            fileprivate func arrive() {
+                enteredContinuation.yield()
+                enteredContinuation.finish()
+            }
+
+            fileprivate func waitForRelease() { gate.wait() }
+
+            func release() { gate.signal() }
+        }
+
+        /// What the request handler reads. A class of its own so the handler can
+        /// hold it without holding the server.
+        private final class State: Sendable {
+            let acceptedHeader: Mutex<String>
+            let failure = Mutex<Failure?>(nil)
+            let nextStall = Mutex<Stall?>(nil)
+            init(_ header: String) { acceptedHeader = Mutex(header) }
         }
 
         let http = FakeHTTP.Scenario()
-        private let accepted: Accepted
+        private let state: State
 
         init(username: String, accepting password: String) {
-            let accepted = Accepted(Self.authorization(username: username, password: password))
-            self.accepted = accepted
+            let state = State(Self.authorization(username: username, password: password))
+            self.state = state
             let principalXML = Self.principalXML
             let homeXML = Self.homeXML
             http.register(path: "/", method: "PROPFIND") { request in
-                guard request.header("Authorization") == accepted.header.withLock({ $0 }) else {
-                    return .status(401)
+                let response: FakeHTTP.CannedResponse
+                switch state.failure.withLock({ $0 }) {
+                case .serverError:
+                    response = .status(500)
+                case .transportError:
+                    response = .transportError(.networkConnectionLost)
+                case nil:
+                    if request.header("Authorization") == state.acceptedHeader.withLock({ $0 }) {
+                        let xml = request.url.path.hasPrefix("/principals/") ? homeXML : principalXML
+                        response = .raw(statusCode: 207, headers: ["Content-Type": "application/xml; charset=utf-8"],
+                                        body: Data(xml.utf8))
+                    } else {
+                        response = .status(401)
+                    }
                 }
-                let xml = request.url.path.hasPrefix("/principals/") ? homeXML : principalXML
-                return .raw(statusCode: 207, headers: ["Content-Type": "application/xml; charset=utf-8"],
-                            body: Data(xml.utf8))
+                guard let stall = state.nextStall.withLock({ held -> Stall? in
+                    defer { held = nil }
+                    return held
+                }) else { return response }
+                stall.arrive()
+                return .parked {
+                    stall.waitForRelease()
+                    return response
+                }
             }
         }
 
         func accept(username: String, password: String) {
-            accepted.header.withLock { $0 = Self.authorization(username: username, password: password) }
+            state.acceptedHeader.withLock { $0 = Self.authorization(username: username, password: password) }
+        }
+
+        func failEveryRequest(_ failure: Failure) {
+            state.failure.withLock { $0 = failure }
+        }
+
+        func stallNextRequest() -> Stall {
+            let stall = Stall()
+            state.nextStall.withLock { $0 = stall }
+            return stall
         }
 
         var requestCount: Int { http.recordedCalls().count }
@@ -421,6 +480,66 @@ struct AccountPasswordUpdateTests {
         }
     }
 
+    struct CalendarFailureCase: Sendable, CustomTestStringConvertible {
+        let kind: AccountProvider
+        let failure: FakeCalendarServer.Failure
+        var testDescription: String { "\(kind) \(failure)" }
+    }
+
+    @Test("a calendar failure that is not a refusal saves nothing, keeps the providers, and is not called a wrong password",
+          arguments: [
+            CalendarFailureCase(kind: .imap, failure: .serverError),
+            CalendarFailureCase(kind: .imap, failure: .transportError),
+            CalendarFailureCase(kind: .icloud, failure: .serverError),
+            CalendarFailureCase(kind: .icloud, failure: .transportError),
+          ])
+    func calendarFailureThatIsNotARefusal(_ c: CalendarFailureCase) async throws {
+        try await withAccount(c.kind, calendar: .samePassword) { f in
+            f.calendarServer.failEveryRequest(c.failure)
+
+            let thrown = await Self.update(Self.newPassword, for: f.account)
+
+            let error = try #require(thrown, "\(c.testDescription): the update went ahead")
+            let line = AccountReauthAlert.passwordUpdateLine(for: error, host: "127.0.0.1")
+            #expect(line == nil || line == AccountReauthAlert.setupLine,
+                    "\(c.testDescription): unexpected alert line for \(error)")
+            #expect(line != AccountReauthAlert.passwordLine, "\(c.testDescription): a calendar failure was called a wrong password")
+            #expect(f.calendarServer.requestCount > 0, "\(c.testDescription): the calendar was not asked")
+            #expect(Self.storedMailPassword(f) == Self.oldPassword, "\(c.testDescription): the mail password was saved")
+            #expect(Self.storedCalendarPassword(f) == Self.oldPassword, "\(c.testDescription): the calendar password was saved")
+            #expect(await Self.liveMail(f) === f.oldMail, "\(c.testDescription): the mail provider was replaced")
+            #expect(await Self.liveCalendar(f) === f.oldCalendar, "\(c.testDescription): the calendar provider was replaced")
+            #expect(await !Self.isMarked(f), "\(c.testDescription): the account was marked for signing in again")
+        }
+    }
+
+    @Test("an account removed while its new password is being checked: nothing is saved, and the alert says so",
+          arguments: [AccountProvider.imap, .icloud])
+    func accountRemovedDuringTheChecks(kind: AccountProvider) async throws {
+        try await withAccount(kind, calendar: .samePassword) { f in
+            let config = try #require(f.config)
+            let stall = f.calendarServer.stallNextRequest()
+            defer { stall.release() }
+            let account = f.account
+
+            let update = Task { await Self.update(Self.newPassword, for: account) }
+            for await _ in stall.entered { break }
+            // The mail server has accepted; the calendar check is in flight.
+            await AccountManager.shared.disconnectAccount(account, deletingCredentials: [config.id])
+            stall.release()
+            let thrown = await update.value
+
+            let error = try #require(thrown, "\(kind): the update went ahead for a removed account")
+            #expect(AccountReauthAlert.passwordUpdateLine(for: error, host: "127.0.0.1") == AccountReauthAlert.accountChangedLine,
+                    "\(kind): the alert did not say so (\(error))")
+            #expect(Self.mailLoginCount(f) > 0, "\(kind): the mail check did not run before the removal")
+            #expect(Self.storedMailPassword(f) == nil, "\(kind): a mail password was saved for a removed account")
+            #expect(Self.storedCalendarPassword(f) == nil, "\(kind): a calendar password was saved for a removed account")
+            #expect(await Self.liveMail(f) == nil, "\(kind): a removed account got a live mail provider")
+            #expect(await Self.liveCalendar(f) == nil, "\(kind): a removed account got a live calendar provider")
+        }
+    }
+
     // MARK: - 5. Calendar only
 
     @Test("calendar only: a good password updates the calendar alone")
@@ -454,17 +573,28 @@ struct AccountPasswordUpdateTests {
 
     // MARK: - 6. Account removed or replaced while the prompt was open
 
+    /// How the stored account differs from the one the prompt opened on: gone,
+    /// or different in one field that decides how it signs in.
     enum MidPromptChange: String, CaseIterable, Sendable {
         case removed
-        case replaced
+        case replaced // another user name
+        case otherHost
+        case otherPort
+        case otherAddress
+        case otherProvider
+        case nowCalendarOnly
     }
 
     @Test("an account removed or replaced while the prompt was open: nothing is saved, and the alert says so",
           arguments: MidPromptChange.allCases)
     func accountChangedWhilePromptOpen(_ change: MidPromptChange) async throws {
         try await withAccount(.imap, calendar: .samePassword) { f in
-            // The prompt opened on `f.account`; then the account changed.
+            // The prompt opened on `promptAccount`; the stored row now differs
+            // from it. Where a field differs, the prompt holds the other value and
+            // the stored row stays a working account, so an update that ignored
+            // the field would go through.
             let accountId = f.account.id
+            var promptAccount = f.account
             switch change {
             case .removed:
                 try await f.pool.write { db in _ = try Account.deleteOne(db, key: accountId) }
@@ -473,9 +603,19 @@ struct AccountPasswordUpdateTests {
                     try db.execute(sql: "UPDATE account SET imapUsername = ? WHERE id = ?",
                                    arguments: ["someone-else@example.com", accountId])
                 }
+            case .otherHost:
+                promptAccount.imapHost = "imap.example.com"
+            case .otherPort:
+                promptAccount.imapPort = (f.account.imapPort ?? 0) + 1
+            case .otherAddress:
+                promptAccount.emailAddress = "someone-else@example.com"
+            case .otherProvider:
+                promptAccount.provider = .icloud
+            case .nowCalendarOnly:
+                promptAccount.calendarOnly = true
             }
 
-            let thrown = await Self.update(Self.newPassword, for: f.account)
+            let thrown = await Self.update(Self.newPassword, for: promptAccount)
 
             let error = try #require(thrown, "\(change): the save went ahead")
             #expect(AccountReauthAlert.passwordUpdateLine(for: error, host: "127.0.0.1") == AccountReauthAlert.accountChangedLine,
