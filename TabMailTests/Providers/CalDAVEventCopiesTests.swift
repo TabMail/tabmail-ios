@@ -859,6 +859,15 @@ struct CalDAVWholeSeriesEditTests {
         #expect(block[..<alarm].filter { $0.hasPrefix("ATTENDEE") }.count == 3, "an attendee was written after the alarm")
     }
 
+    @Test("a new attendee's name with a double quote is written with single quotes, inside one quoted CN")
+    func newAttendeeNameQuoteIsSwapped() throws {
+        var patch = GCalEventInput()
+        patch.attendeeChange = AttendeeChange(adds: [.init(email: "robert@example.com", name: "Robert \"Bob\" Smith")])
+        let out = try CalDAVProvider.mergePatchIntoICS(Fixture.richSeries, patch: patch)
+        #expect(Fixture.attendee(Fixture.master(out), "robert@example.com")
+                == "ATTENDEE;CN=\"Robert 'Bob' Smith\";ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:robert@example.com")
+    }
+
     /// A series with a cancelled occurrence and a changed one that dropped Bob on its own (#620).
     static let seriesWithOverrides = Fixture.series([
         "BEGIN:VEVENT", "UID:series-20", "DTSTART:20990506T170000Z", "DTEND:20990506T174500Z", "RRULE:FREQ=WEEKLY",

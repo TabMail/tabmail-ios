@@ -55,6 +55,11 @@ of the resource, which holds every occurrence (irreversible wire operation #5, n
      delta or a move's all-day kind (`resolveAttendeeDelta`, the all-day resolution), so through the
      tool nothing is WRITTEN. A whole-series change from an occurrence returns with the series
      time-shift work, which reads a new time relative to the occurrence named.
+     **Amendment (2026-11-11, #620):** the queue no longer reads the event for an attendee delta:
+     `resolveAttendeeDelta` is deleted, and an edit carries the guest change itself
+     (`GCalEventInput.attendeeChange`), which the provider's write applies to the guests of each
+     item it covers. The queue's other read (`CalendarSeriesScope.read`) is unchanged, and so is
+     "through the tool nothing is WRITTEN".
    - Edit, one occurrence or a split: `updateOccurrence` (this_only) and `splitSeries`
      (this_and_following) address the resource and make ONE check before they write anything,
      `CalDAVOccurrences.scopedEditSlot`. It picks the occurrence `recurrence_id` names with the

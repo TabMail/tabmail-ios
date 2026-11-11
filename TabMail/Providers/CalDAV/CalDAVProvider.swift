@@ -1198,11 +1198,11 @@ actor CalDAVProvider: CalendarProvider {
     }
 
     /// The resource with an edit's guest change applied to every VEVENT in it, each from its own
-    /// attendees (#620): the series VEVENT, and each changed occurrence under the one rule
-    /// `AttendeeChange.changedOccurrenceGuests` names (a resource with no series VEVENT changes each
-    /// of its occurrences from its own). A cancelled occurrence (`STATUS:CANCELLED`) is left as
-    /// stored: nobody is invited to an occurrence that does not take place. A VEVENT the change
-    /// leaves as it was goes back byte for byte.
+    /// attendees (#620): the series VEVENT and each changed occurrence get the change applied to
+    /// their own guests, so a guest an occurrence added on its own stays and one it dropped on its
+    /// own is not invited back. A cancelled occurrence (`STATUS:CANCELLED`) is left as stored:
+    /// nobody is invited to an occurrence that does not take place. A VEVENT the change leaves as
+    /// it was goes back byte for byte.
     ///
     /// An attendee who stays keeps their own line: role, answer, RSVP and every other parameter the
     /// server holds, and so does one whose address is not `mailto:` (#607). Rewriting it would reset
@@ -1228,23 +1228,19 @@ actor CalDAVProvider: CalendarProvider {
                 "ATTENDEE;CN=\"\(cn)\";ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:\(add.email)")
             return ICSUnit(physical: [line], text: line)
         }
-        let seriesAfter = veventBlocks(icsUnits(ics)).first(where: { !isOverride($0) })
-            .map { change.apply(to: ownAttendees($0), address: address, make: make) }
-        return rewriteVEvents(in: ics) { block, isSeries in
+        var counts: [String] = []
+        let result = rewriteVEvents(in: ics) { block, isSeries in
+            if !isSeries && isCancelled(block) { return block }
             let own = ownAttendees(block)
-            let after: [ICSUnit]
-            if isSeries {
-                after = change.apply(to: own, address: address, make: make)
-            } else if isCancelled(block) {
-                return block
-            } else if let seriesAfter {
-                after = change.applyToChangedOccurrence(own: own, seriesAfter: seriesAfter, address: address, make: make)
-            } else {
-                after = change.apply(to: own, address: address, make: make)
-            }
+            let after = change.apply(to: own, address: address, make: make)
+            counts.append("\(own.count)->\(after.count)")
             guard after.map(\.text) != own.map(\.text) else { return block }
             return replacingAttendees(in: block, with: after)
         }
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[CalDAV] applyAttendeeChange: \(counts.count) VEVENTs, guests before->after \(counts.joined(separator: ", "))")
+        }
+        return result
     }
 
     /// The VEVENT's own `ATTENDEE` lines (not an alarm's), in order.

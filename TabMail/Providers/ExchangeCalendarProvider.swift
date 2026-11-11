@@ -901,7 +901,9 @@ actor ExchangeCalendarProvider: CalendarProvider {
     ///   (#423, measured);
     /// - the edit's guest change applied to the stored attendees of the item read: each one kept
     ///   is written as stored, a new one `required` and unanswered (`appliedAttendeesJSON`, #622,
-    ///   #620). Graph applies a series' list to its changed occurrences itself;
+    ///   #620). Graph applies a series' list to its changed occurrences itself, measured for an
+    ///   added and a removed guest on renamed and moved occurrences that held the series' guests;
+    ///   what a series change does to an occurrence with guests of its own is NOT measured on Outlook;
     /// - a new description of an online meeting replaces only the notes in the
     ///   stored body, keeping its join section (`onlineMeetingBody`, #511); the
     ///   description the assistant read is those notes (`notes(of:)`).
@@ -962,7 +964,12 @@ actor ExchangeCalendarProvider: CalendarProvider {
             json["recurrence"] = rule
         }
         if let change = patch.attendeeChange {
-            json["attendees"] = Self.appliedAttendeesJSON(change, to: existing.raw["attendees"] as? [[String: Any]] ?? [])
+            let own = existing.raw["attendees"] as? [[String: Any]] ?? []
+            let after = Self.appliedAttendeesJSON(change, to: own)
+            json["attendees"] = after
+            if DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[ExchangeCalendar] graphPatchJSON: guest change applied to 1 item, guests \(own.count)->\(after.count)")
+            }
         }
         if allowRecurrence, sparse.recurrence == nil, movesTime,
            var stored = existing.raw["recurrence"] as? [String: Any],

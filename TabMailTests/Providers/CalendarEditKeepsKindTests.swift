@@ -74,11 +74,14 @@ private let kindChangeTimesHint = "to change this event between all-day and time
 /// one, are dropped, as Google did when a series was moved from 08:00 to 13:00 (measured on a
 /// personal account, 2026-11-10).
 ///
-/// A PATCH of a series' `attendees` gives the new list to every stored occurrence whose attendees
-/// were the series' own, as stored, before the PATCH. Measured on a test account (2026-11-10): a
-/// guest added to a series reached its renamed occurrence and its unchanged ones. NOT measured: a
-/// guest removed, a moved occurrence, and an occurrence whose guests differ from the series'. The
-/// fake carries the first two by the same rule and leaves the third as stored.
+/// A PATCH of a series' `attendees` is applied by the server to every stored occurrence of the
+/// series, on top of that occurrence's own guests: each guest the PATCH removes from the series
+/// (by address, any letter case) goes, each guest it adds is appended unless the occurrence holds
+/// them already, and every other guest the occurrence holds stays as stored, its own extra guests
+/// included, while a guest it dropped on its own stays dropped unless the PATCH adds them.
+/// Measured on a test account (2026-11-11), through the API and Google Calendar web alike, for an
+/// added and a removed guest, on renamed, moved and unchanged occurrences and on occurrences with
+/// guest differences of their own.
 final class FakeGoogleCalendar: Sendable {
     private let events: Mutex<[String: Data]>
     private let writeLog = Mutex<[String]>([])
@@ -158,14 +161,21 @@ final class FakeGoogleCalendar: Sendable {
                     }
                 }
             }
-            if isSeries, let written = patch["attendees"] {
-                let seriesGuests = Self.canonical(stored["attendees"])
+            if isSeries, let written = patch["attendees"] as? [[String: Any]] {
+                func address(_ guest: [String: Any]) -> String? { (guest["email"] as? String)?.lowercased() }
+                let was = Set((stored["attendees"] as? [[String: Any]] ?? []).compactMap(address))
+                let removed = was.subtracting(written.compactMap(address))
+                let added = written.filter { address($0).map { !was.contains($0) } ?? false }
                 events.withLock { all in
                     for (id, data) in all {
                         guard var occurrence = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-                              occurrence["recurringEventId"] as? String == parts[0],
-                              Self.canonical(occurrence["attendees"]) == seriesGuests else { continue }
-                        occurrence["attendees"] = written
+                              occurrence["recurringEventId"] as? String == parts[0] else { continue }
+                        let own = occurrence["attendees"] as? [[String: Any]] ?? []
+                        var guests = own.filter { address($0).map { !removed.contains($0) } ?? true }
+                        let held = Set(guests.compactMap(address))
+                        guests += added.filter { address($0).map { !held.contains($0) } ?? false }
+                        guard Self.canonical(guests) != Self.canonical(own) else { continue }
+                        occurrence["attendees"] = guests
                         // swiftlint:disable:next force_try
                         all[id] = try! JSONSerialization.data(withJSONObject: occurrence)
                     }

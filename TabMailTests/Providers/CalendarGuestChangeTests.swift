@@ -27,9 +27,15 @@ import GRDB
 //
 // It is checked on what the fake SERVER holds after the real calendar queue drains the edit
 // (`drainEdit`), never on the request the app built. CalDAV covers the change itself, on every
-// VEVENT; Google and Outlook carry a series' new list to its changed occurrences server-side
-// (measured for an added guest, modelled by `FakeGoogleCalendar` and `FakeGraphCalendar`), so
-// there the app writes the item it read, once.
+// VEVENT. On Google and Outlook the app writes the item it read, once, and the server carries a
+// series' change to its occurrences:
+// - Google applies it on top of each occurrence's own guests, those with guest differences of
+//   their own included, moved and renamed ones too (measured for an added and a removed guest,
+//   API and web alike; modelled by `FakeGoogleCalendar`), so its whole-series cases check every
+//   occurrence with the oracle;
+// - Outlook carries it to occurrences that held the series' guests (measured for an added and a
+//   removed guest); what it does to an occurrence with guests of its own is NOT measured, so
+//   `FakeGraphCalendar` leaves those as stored and its cases check the others only.
 //
 // RED BEFORE THE FIX, each for the reason its test names: the queue worked out ONE full list from
 // the event it read (the series) and the CalDAV write put it on the series VEVENT alone, so the
@@ -267,7 +273,7 @@ enum CalDAVGuests {
             .joined(separator: "\r\n") + "\r\n"
     }
 
-    /// The series the design names: guests the organizer, A and B; week 2 renamed, week 3 moved an
+    /// The series these tests use: guests the organizer, A and B; week 2 renamed, week 3 moved an
     /// hour later (A declined it), week 4 with C as well, week 5 without B. Weeks 0, 1, 6 and 7
     /// are as the series puts them.
     static func changedSeries() -> String {
@@ -610,7 +616,7 @@ enum GoogleGuests {
         return e
     }
 
-    /// The design's series, with weeks 1 and 6 stored as Google lists them, unchanged.
+    /// The series these tests use, with weeks 1 and 6 stored as Google lists them, unchanged.
     static func seed() -> [[String: Any]] {
         [
             series([org, a, b]),
@@ -663,22 +669,31 @@ struct GoogleGuestChangeTests {
     typealias F = GuestFixture
     typealias G = GoogleGuests
 
-    @Test("13. adding a guest to the whole series is one PATCH of the series, which the server carries to the occurrences that had the series' guests")
-    func seriesAddIsOnePatch() async throws {
+    /// The whole-series change `change`, by `eventId`: every item (the series and each occurrence,
+    /// weeks 4 and 5 with guests of their own included) must hold the change on its own guests, and
+    /// the app writes no occurrence (the server carries the series' change to them).
+    private func runAll(_ change: GuestChangeOracle.Change, eventId: String = G.seriesId, account: String) async throws {
         let seed = G.seed()
         let before = G.guests(FakeGoogleCalendar(seed), G.everyId)
-        let r = try await G.run(seed, eventId: G.seriesId, F.addD.arguments, account: "guests-g-series")
+        let arguments = change.arguments.merging(["edit_scope": .string("all")]) { mine, _ in mine }
+        let r = try await G.run(seed, eventId: eventId, arguments, account: account)
         #expect(r.rows.isEmpty, "the edit did not land: \(r.rows.map { $0.failureReason ?? $0.status })")
-        #expect(r.calendar.writes == ["PATCH \(G.seriesId)"], "writes: \(r.calendar.writes)")
-        let after = G.guests(r.calendar, G.everyId)
+        let occurrenceWrites = r.calendar.writes.filter { $0 != "PATCH \(G.seriesId)" }
+        #expect(occurrenceWrites.isEmpty, "the app wrote an occurrence: \(r.calendar.writes)")
         let problems = GuestChangeOracle.problems(
-            item: G.seriesId, before: before[G.seriesId] ?? [], after: after[G.seriesId] ?? [],
-            change: F.addD, isUnanswered: G.isUnanswered)
+            before: before, after: G.guests(r.calendar, G.everyId), inScope: Set(G.everyId),
+            change: change, isUnanswered: G.isUnanswered)
         #expect(problems.isEmpty, Comment(rawValue: problems.joined(separator: "\n")))
-        for week in [1, 2, 3, 6] {
-            #expect(after[G.instanceId(week: week)] == after[G.seriesId],
-                    "week \(week) does not hold the series' new guests: \(after[G.instanceId(week: week)] ?? [])")
-        }
+    }
+
+    @Test("13. adding a guest to the whole series reaches the series and every occurrence, each keeping its own guests, with no write to an occurrence")
+    func seriesAddReachesEveryOccurrence() async throws {
+        try await runAll(F.addD, account: "guests-g-series")
+    }
+
+    @Test("18. removing a guest from the whole series removes them from the series and every occurrence, with no write to an occurrence")
+    func seriesRemoveReachesEveryOccurrence() async throws {
+        try await runAll(GuestChangeOracle.Change(removes: [F.guestB]), account: "guests-g-series-remove")
     }
 
     @Test("14. one occurrence edited by the series id gets the guest added to its own guests (#596)")
@@ -695,25 +710,10 @@ struct GoogleGuestChangeTests {
         #expect(problems.isEmpty, Comment(rawValue: problems.joined(separator: "\n")))
     }
 
-    @Test("17. a change of every occurrence named by one changed occurrence's id is one PATCH of the series, from the series' own guests (#560)")
+    @Test("17. a change of every occurrence named by one changed occurrence's id reaches the series from its own guests, and every occurrence from its own (#560)")
     func everyOccurrenceNamedByAnOccurrenceId() async throws {
         // Week 4 holds C on its own: the series must not take C.
-        let seed = G.seed()
-        let before = G.guests(FakeGoogleCalendar(seed), G.everyId)
-        let r = try await G.run(seed, eventId: G.instanceId(week: 4),
-                                F.addD.arguments.merging(["edit_scope": .string("all")]) { mine, _ in mine },
-                                account: "guests-g-all-by-occurrence")
-        #expect(r.rows.isEmpty, "the edit did not land: \(r.rows.map { $0.failureReason ?? $0.status })")
-        #expect(r.calendar.writes == ["PATCH \(G.seriesId)"], "writes: \(r.calendar.writes)")
-        let after = G.guests(r.calendar, G.everyId)
-        let problems = GuestChangeOracle.problems(
-            item: G.seriesId, before: before[G.seriesId] ?? [], after: after[G.seriesId] ?? [],
-            change: F.addD, isUnanswered: G.isUnanswered)
-        #expect(problems.isEmpty, Comment(rawValue: problems.joined(separator: "\n")))
-        for week in [1, 2, 3, 6] {
-            #expect(after[G.instanceId(week: week)] == after[G.seriesId],
-                    "week \(week) does not hold the series' new guests: \(after[G.instanceId(week: week)] ?? [])")
-        }
+        try await runAll(F.addD, eventId: G.instanceId(week: 4), account: "guests-g-all-by-occurrence")
     }
 
     @Test("15. a guest stored with no address is kept through an add (#597)")
@@ -785,7 +785,7 @@ enum GraphGuests {
         return e
     }
 
-    /// The design's series (Graph keeps the organizer out of `attendees`), with weeks 1 and 6
+    /// The series these tests use (Graph keeps the organizer out of `attendees`), with weeks 1 and 6
     /// unchanged occurrences.
     static func seed() -> [[String: Any]] {
         [

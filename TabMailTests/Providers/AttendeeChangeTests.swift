@@ -139,35 +139,14 @@ struct AttendeeChangeArgumentsTests {
 
 @Suite("A changed occurrence under a guest change of its series")
 struct AttendeeChangeChangedOccurrenceTests {
-    typealias Entry = AttendeeChangeApplyTests.Entry
     typealias T = AttendeeChangeApplyTests
 
-    static let ownBob = T.stored("bob@example.com", "Bob <bob@example.com> declined this week")
-    static let change = AttendeeChange(adds: [T.add("dave@example.com", "Dave")], removes: ["carol@example.com"])
-
-    static func onOccurrence(own: [Entry], series: [Entry], rule: AttendeeChange.ChangedOccurrenceGuests) -> [Entry] {
-        let make: (AttendeeChange.Add) -> Entry = { Entry(address: $0.email.lowercased(), raw: "new \($0.email) (\($0.name ?? "no name"))") }
-        let seriesAfter = change.apply(to: series, address: \.address, make: make)
-        return change.applyToChangedOccurrence(own: own, seriesAfter: seriesAfter, address: \.address, make: make, rule: rule)
-    }
-
-    @Test("the rule every write applies is the change on the occurrence's own guests")
-    func defaultRule() {
-        #expect(AttendeeChange.changedOccurrenceGuests == .ownGuestsChanged)
-    }
-
-    @Test("own guests changed: a guest the occurrence added stays, one it dropped is not invited back")
+    @Test("the change on the occurrence's own guests: a guest it added stays, one it dropped is not invited back")
     func ownGuestsChanged() {
         // The series has Alice, Bob and Carol; the occurrence dropped Bob and added Erin on its own.
+        let change = AttendeeChange(adds: [T.add("dave@example.com", "Dave")], removes: ["carol@example.com"])
         let erin = T.stored("erin@example.com", "Erin <erin@example.com> accepted")
-        let out = Self.onOccurrence(own: [T.alice, T.carol, erin], series: [T.alice, T.bob, T.carol], rule: .ownGuestsChanged)
+        let out = T.apply(change, to: [T.alice, T.carol, erin])
         #expect(out == [T.alice, erin, T.stored("dave@example.com", "new dave@example.com (Dave)")])
-    }
-
-    @Test("series guests: the series' new list, each guest the occurrence held as it stored them")
-    func seriesGuests() {
-        let erin = T.stored("erin@example.com", "Erin <erin@example.com> accepted")
-        let out = Self.onOccurrence(own: [T.alice, Self.ownBob, erin], series: [T.alice, T.bob, T.carol], rule: .seriesGuests)
-        #expect(out == [T.alice, Self.ownBob, T.stored("dave@example.com", "new dave@example.com (Dave)")])
     }
 }

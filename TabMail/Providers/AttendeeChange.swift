@@ -11,7 +11,11 @@ import Foundation
 /// from one item. Each provider's write applies it (`apply`) to the stored guest list of every item
 /// the write covers, so each item keeps its own guests (#620): a CalDAV write to every VEVENT of
 /// the resource it covers (`CalDAVProvider.applyAttendeeChange`), a Google or Outlook write to the
-/// event or occurrence it reads. The Thunderbird add-on applies the same rule (`applyGuestChange`).
+/// event or occurrence it reads (a series write reaches its changed occurrences on the server).
+///
+/// The Thunderbird add-on's `applyGuestChange` is the same rule, with two differences: a cancelled
+/// CalDAV occurrence (`STATUS:CANCELLED`) is left as stored here, where the add-on changes it too;
+/// and a removal of `mailto:*` removes everyone here, where the add-on reads it as naming no one.
 ///
 /// Nothing here is persisted: the queue stores the tool's arguments, and the change is built from
 /// them when the edit is written (`CalendarToolHelpers.buildGCalEventInput`).
@@ -90,40 +94,5 @@ struct AttendeeChange: Sendable, Equatable {
         }
         return lines(adds.map { $0.name ?? $0.email }, "+")
             + lines((clearAll ? ["all attendees"] : []) + removes, "−")
-    }
-
-    // MARK: - A changed occurrence under a change of its series
-
-    /// What a changed occurrence (one with its own copy: a CalDAV override VEVENT) holds after a
-    /// guest change of its whole series, or of the new part of a split that carries it.
-    enum ChangedOccurrenceGuests: Sendable {
-        /// The change applied to the occurrence's own guests: a guest it added on its own stays, and
-        /// one it dropped on its own is not invited back. The Thunderbird add-on's rule.
-        case ownGuestsChanged
-        /// The series' guests after the change, each guest the occurrence held kept as it stored
-        /// them: Google Calendar web's rule for the fields an "All events" edit writes (measured
-        /// for the title and the place, not for guests).
-        case seriesGuests
-    }
-
-    /// The one rule every write applies (decided 2026-11-11: the Thunderbird add-on's, until
-    /// Google Calendar web is measured for guests).
-    static let changedOccurrenceGuests: ChangedOccurrenceGuests = .ownGuestsChanged
-
-    /// A changed occurrence's guests after the change, under `rule`: `own` is what the occurrence
-    /// stored, `seriesAfter` the series' guests with the change already applied.
-    func applyToChangedOccurrence<Entry>(
-        own: [Entry], seriesAfter: [Entry], address: (Entry) -> String?, make: (Add) -> Entry,
-        rule: ChangedOccurrenceGuests = Self.changedOccurrenceGuests
-    ) -> [Entry] {
-        switch rule {
-        case .ownGuestsChanged:
-            return apply(to: own, address: address, make: make)
-        case .seriesGuests:
-            return seriesAfter.map { entry in
-                guard let guest = address(entry) else { return entry }
-                return own.first { address($0) == guest } ?? entry
-            }
-        }
     }
 }

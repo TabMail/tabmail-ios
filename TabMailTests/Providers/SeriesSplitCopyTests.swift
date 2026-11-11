@@ -358,6 +358,18 @@ struct GoogleSeriesSplitCopyTests {
                 "a staying attendee lost their entry: \(canonical(alice))")
     }
 
+    @Test("a guest the edit adds to a series with no guests is the new part's only guest, unanswered")
+    func firstGuestOnASeriesWithNone() async throws {
+        var master = GoogleSplitFixture.master()
+        master.removeValue(forKey: "attendees")
+        var patch = GCalEventInput()
+        patch.attendeeChange = AttendeeChange(adds: [.init(email: "dave@example.com", name: "Dave")])
+        let wire = try await GoogleSplitFixture.split(master, patch: patch)
+        let attendees = wire.created?["attendees"] as? [[String: Any]] ?? []
+        #expect(attendees.map { canonical($0) } == [canonical(["email": "dave@example.com", "displayName": "Dave"])],
+                "the new part's guests: \(attendees.map { canonical($0) })")
+    }
+
     @Test("""
     the new part is created before the cap; a cap whose response is lost, then a retry, keeps the \
     excluded and added dates after the split on the new part
