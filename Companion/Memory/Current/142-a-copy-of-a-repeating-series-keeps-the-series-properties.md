@@ -86,9 +86,10 @@ response was lost, the series it reads is already capped.
   split's cap (`capEndDate`); kept, the new part would end before it starts, so `splitNewPartJSON`
   writes it as `noEnd`, the own-cap rule `RecurrenceTail.newSeriesRule` applies. Such a new part
   repeats with no end where the series had an end date; editing its end repairs it.
-- **Google writes a rule from the edit as given:** a rule in the patch replaces the whole
-  `recurrence` array, so the excluded and added dates after the split are not carried. CalDAV
-  replaces only the RRULE line and keeps them.
+- **A rule from the edit replaces only the RRULE line on every provider** (#513): Google's
+  `GoogleCalendarProvider.recurrence(_:withRuleFrom:)` keeps the excluded and added dates after the
+  split (and on a whole-series edit, the series' own), as CalDAV does. Before #513 Google wrote the
+  patch's rule alone and dropped them.
 
 ## Dates and rules
 

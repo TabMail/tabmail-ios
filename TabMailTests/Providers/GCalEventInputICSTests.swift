@@ -392,9 +392,16 @@ struct GCalEventInputJSONTests {
                 "freq": .string("DAILY\r\nATTENDEE;ROLE=REQ-PARTICIPANT:mailto:attacker@evil.example")
             ])
         ]
-        let ics = try CalendarToolHelpers.buildGCalEventInput(args, isAllDay: false).toICS(uid: "u")
-        let lines = ics.split(whereSeparator: \.isNewline).map(String.init)
-        #expect(!lines.contains { $0.hasPrefix("ATTENDEE") }, "injected ATTENDEE became a property:\n\(ics)")
+        // The builder refuses the poisoned value (#513: an invalid field is refused, never dropped),
+        // so no ICS is built from it at all.
+        do {
+            let ics = try CalendarToolHelpers.buildGCalEventInput(args, isAllDay: false).toICS(uid: "u")
+            let lines = ics.split(whereSeparator: \.isNewline).map(String.init)
+            #expect(!lines.contains { $0.hasPrefix("ATTENDEE") }, "injected ATTENDEE became a property:\n\(ics)")
+            Issue.record("a poisoned freq was not refused:\n\(ics)")
+        } catch CalendarProviderError.notSupported(let reason) {
+            #expect(reason.contains("recurrence.freq"), "reason: \(reason)")
+        }
 
         // Two-sided: a legitimate freq must still produce a rule, or the assertion above would also
         // hold for a build path that silently emitted no recurrence at all.

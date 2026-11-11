@@ -245,6 +245,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
             calPath = "/calendars/\(encodedCalId)"
         }
 
+        try Self.refuseUnrepresentableRule(event.recurrence)
         let body = try JSONSerialization.data(withJSONObject: createEventJSON(event))
         if DebugModeManager.isLoggingEnabled() {
             if let bodyStr = String(data: body, encoding: .utf8) {
@@ -277,6 +278,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // (#423). The description was then the 255-character `bodyPreview`; it is
         // now the full notes (`notes(of:)`). Every edit wrote all of that back.
         // `graphPatchJSON` says what rides along and why.
+        try Self.refuseUnrepresentableRule(event.recurrence)
         let existing = try await fetchForEdit(eventId: eventId)
         let json = try graphPatchJSON(patch: event, existing: existing, allowRecurrence: true)
         guard !json.isEmpty else {
@@ -377,6 +379,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // don't carry the series `recurrence`; only the master does. Resolve
         // via `seriesMasterId` (mapped onto `recurringEventId` by toGCalEvent)
         // so a split aimed at an occurrence id still finds the series to cap.
+        try Self.refuseUnrepresentableRule(patch.recurrence)
         let (eventId, snapshot) = try await resolveToMaster(eventId: eventId, select: Self.splitSelect)
         let master = snapshot.event
         guard let masterRecurrence = master.recurrence, !masterRecurrence.isEmpty,
@@ -719,7 +722,8 @@ actor ExchangeCalendarProvider: CalendarProvider {
     ///   beside it: PATCHing `recurrence` alone makes Graph rewrite a master's
     ///   start and end to UTC midnight at the range's `startDate` (see
     ///   `splitSeries`' cap PATCH). The rule keeps the stored `firstDayOfWeek`
-    ///   and `recurrenceTimeZone` (the start's zone when none is stored);
+    ///   unless it names its own (`WKST`), and the stored `recurrenceTimeZone`
+    ///   (the start's zone when none is stored);
     /// - when a series' start moves to another date and the rule does not
     ///   change, the stored recurrence exactly as Graph holds it, with only the
     ///   range's `startDate` moved, because Graph requires it to match the start.
@@ -767,6 +771,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         if allowRecurrence {
             sparse.recurrence = seriesRuleToWrite(patch, existing: current, stored: storedRecurrence, rangeZone: rangeZone)
         }
+        let storedFirstDay = (storedRecurrence?["pattern"] as? [String: Any])?["firstDayOfWeek"] as? String
         if movesTime || sparse.recurrence != nil {
             sparse.startDate = merged.startDate
             sparse.startDateTime = merged.startDateTime
@@ -775,18 +780,15 @@ actor ExchangeCalendarProvider: CalendarProvider {
             sparse.endDateTime = merged.endDateTime
             sparse.endTimeZone = merged.endTimeZone
         }
-        var json = toGraphEventJSON(sparse, rangeZone: rangeZone)
-        // A rule that changes the series keeps the series' first day of the week and zone
-        // (#423): the rebuilt rule names Sunday and no zone, and Graph stores a range written
-        // without a zone as UTC. With none stored, the zone is the one the start is written in.
+        // The encoder writes the series' first day of the week unless the rule names its own
+        // (`WKST`), the same output `seriesRuleToWrite` compared.
+        var json = toGraphEventJSON(sparse, rangeZone: rangeZone, firstDayOfWeek: storedFirstDay)
+        // A rule that changes the series keeps the series' zone (#423): the rebuilt rule names
+        // no zone, and Graph stores a range written without a zone as UTC. With none stored, the
+        // zone is the one the start is written in.
         if var rule = json["recurrence"] as? [String: Any],
-           var pattern = rule["pattern"] as? [String: Any],
            var range = rule["range"] as? [String: Any] {
-            if let firstDay = (storedRecurrence?["pattern"] as? [String: Any])?["firstDayOfWeek"] as? String {
-                pattern["firstDayOfWeek"] = firstDay
-            }
             range["recurrenceTimeZone"] = storedZoneName ?? (json["start"] as? [String: Any])?["timeZone"] as? String
-            rule["pattern"] = pattern
             rule["range"] = range
             json["recurrence"] = rule
         }
@@ -827,7 +829,8 @@ actor ExchangeCalendarProvider: CalendarProvider {
         probe.startDate = merged.startDate
         probe.startDateTime = merged.startDateTime
         probe.startTimeZone = merged.startTimeZone
-        guard let rebuilt = toGraphEventJSON(probe, rangeZone: rangeZone)["recurrence"] as? [String: Any],
+        let storedFirstDay = (stored["pattern"] as? [String: Any])?["firstDayOfWeek"] as? String
+        guard let rebuilt = toGraphEventJSON(probe, rangeZone: rangeZone, firstDayOfWeek: storedFirstDay)["recurrence"] as? [String: Any],
               Self.sameRule(rebuilt, as: stored)
         else { return rule }
         return nil
@@ -853,7 +856,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
 
     /// The card's stand-in for the recurrence Graph stores for `event` (#423): its RRULE rebuilt in
     /// Graph's form beside the event's own start, in the series' zone (`recurrenceTimeZoneName`),
-    /// with that zone. Nil when it can't stand in: no RRULE, a zone `CalendarTimeZoneResolver` does
+    /// with that zone and its stored first day of the week (`recurrenceFirstDayOfWeek`). Nil when it can't stand in: no RRULE, a zone `CalendarTimeZoneResolver` does
     /// not recognize, or a rebuilt pattern whose RRULE (`rrule(_:)`) is not the event's.
     nonisolated func storedRuleBaseline(_ event: GCalEvent) -> (recurrence: [String: Any], rangeZone: TimeZone?)? {
         guard let storedRule = event.recurrence?.first(where: { $0.uppercased().hasPrefix("RRULE:") }) else { return nil }
@@ -868,7 +871,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         storedInput.startDate = start.startDate
         storedInput.startDateTime = start.startDateTime
         storedInput.startTimeZone = start.startTimeZone
-        guard let stored = toGraphEventJSON(storedInput, rangeZone: rangeZone)["recurrence"] as? [String: Any],
+        guard let stored = toGraphEventJSON(storedInput, rangeZone: rangeZone, firstDayOfWeek: event.recurrenceFirstDayOfWeek)["recurrence"] as? [String: Any],
               let data = try? JSONSerialization.data(withJSONObject: stored),
               let decoded = try? JSONDecoder().decode(MSPatternedRecurrence.self, from: data),
               Self.rrule(decoded).map(GoogleCalendarProvider.canonicalRRULE) == [GoogleCalendarProvider.canonicalRRULE(storedRule)]
@@ -928,14 +931,20 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// Whether `rebuilt`, an edit's rule as `toGraphEventJSON` writes it, means the rule the
     /// series already has (`stored`, as Graph holds it) (#423). Graph fills the properties a
     /// pattern or range does not use with defaults, and the rebuilt rule names every property
-    /// its own type uses, so only those are compared, the days of the week in any order. Two are
-    /// left out: `firstDayOfWeek`, which an RRULE does not carry (a changed rule keeps the stored
-    /// one), and the range's `startDate`, which follows the start: a series moved to another
+    /// its own type uses, so only those are compared, the days of the week in any order. The
+    /// first day of the week is compared like the rest: the encoder writes the stored one unless
+    /// the rule names its own (`WKST`), so a rule without `WKST` matches it by construction and a
+    /// changed `WKST` is a rule change. Whether Graph resets a series' exceptions on a change of
+    /// only the first day is not measured; it is assumed to, like any other pattern change. The
+    /// range's `startDate` is left out: it follows the start, and a series moved to another
     /// date with its own rule is a date move.
     nonisolated static func sameRule(_ rebuilt: [String: Any], as stored: [String: Any]) -> Bool {
         for part in ["pattern", "range"] {
-            guard let mine = rebuilt[part] as? [String: Any], let theirs = stored[part] as? [String: Any] else { return false }
-            for (key, value) in mine where key != "firstDayOfWeek" && key != "startDate" {
+            guard let mine = rebuilt[part] as? [String: Any], var theirs = stored[part] as? [String: Any] else { return false }
+            if part == "pattern" {
+                theirs["index"] = Self.storedIndex(type: theirs["type"] as? String, index: theirs["index"] as? String)
+            }
+            for (key, value) in mine where key != "startDate" {
                 if key == "daysOfWeek" {
                     guard Set(value as? [String] ?? []) == Set(theirs[key] as? [String] ?? []) else { return false }
                 } else if !(value as AnyObject).isEqual(theirs[key]) {
@@ -1196,13 +1205,22 @@ actor ExchangeCalendarProvider: CalendarProvider {
         return !hasSubject && !hasAttendees && !hasLocation && !hasBody
     }
 
+    /// A stored relative pattern's `index`, with a missing one read as `first`, Graph's
+    /// default for `relativeMonthly` and `relativeYearly`. Measured: a relative series created
+    /// with no index comes back with `first`; normalized here in case an older item lacks it. The reader (`rrule(_:)`) and the comparison (`sameRule`) both read the stored
+    /// index through this, so the card and the write compare the same pattern.
+    nonisolated static func storedIndex(type: String?, index: String?) -> String? {
+        guard index == nil, let type = type?.lowercased(), type == "relativemonthly" || type == "relativeyearly" else { return index }
+        return "first"
+    }
+
     /// A Graph recurrence as an RFC 5545 RRULE (`toGCalEvent`); `[]` when it has no pattern.
     nonisolated static func rrule(_ rec: MSPatternedRecurrence) -> [String] {
         guard let pattern = rec.pattern else { return [] }
         let dayMap = ["sunday": "SU", "monday": "MO", "tuesday": "TU", "wednesday": "WE", "thursday": "TH", "friday": "FR", "saturday": "SA"]
         let byDay = (pattern.daysOfWeek ?? []).compactMap { dayMap[$0.lowercased()] }.joined(separator: ",")
         let indexToSetPos = ["first": 1, "second": 2, "third": 3, "fourth": 4, "last": -1]
-        let bySetPos = pattern.index.flatMap { indexToSetPos[$0.lowercased()] }
+        let bySetPos = Self.storedIndex(type: pattern.type, index: pattern.index).flatMap { indexToSetPos[$0.lowercased()] }
 
         var parts: [String] = []
         switch pattern.type?.lowercased() {
@@ -1311,6 +1329,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
             conferenceUrl: e.onlineMeeting?.joinUrl
         )
         event.recurrenceTimeZoneName = e.recurrence?.range?.recurrenceTimeZone.flatMap { $0.isEmpty ? nil : $0 }
+        event.recurrenceFirstDayOfWeek = e.recurrence?.pattern?.firstDayOfWeek.flatMap { $0.isEmpty ? nil : $0 }
         return event
     }
 
@@ -1393,7 +1412,9 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// attendee's type; an attendee it does not name is `required`.
     /// `rangeZone` is the zone a rule's range is read in when it is not the
     /// start's: an edit's series' stored `recurrenceTimeZone` (`graphPatchJSON`).
-    nonisolated func toGraphEventJSON(_ input: GCalEventInput, attendeeTypes: [String: String] = [:], rangeZone storedRangeZone: TimeZone? = nil) -> [String: Any] {
+    /// `firstDayOfWeek` is an edit's series' stored first day of the week, written
+    /// unless the rule names its own (`WKST`).
+    nonisolated func toGraphEventJSON(_ input: GCalEventInput, attendeeTypes: [String: String] = [:], rangeZone storedRangeZone: TimeZone? = nil, firstDayOfWeek storedFirstDay: String? = nil) -> [String: Any] {
         var json: [String: Any] = [:]
 
         if let summary = input.summary { json["subject"] = summary }
@@ -1489,7 +1510,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
                 }
                 return nil
             }()
-            var graphRec = parseRRULEToGraphRecurrence(rrule, eventStart: recEventStart, timeZone: rangeZone, startWallTime: startWallTime)
+            var graphRec = parseRRULEToGraphRecurrence(rrule, eventStart: recEventStart, timeZone: rangeZone, startWallTime: startWallTime, firstDayOfWeek: storedFirstDay)
             if var range = graphRec["range"] as? [String: Any], range["startDate"] == nil {
                 let startDateStr: String? = {
                     if let sd = input.startDate { return sd }                       // already YYYY-MM-DD
@@ -1582,6 +1603,92 @@ actor ExchangeCalendarProvider: CalendarProvider {
         return local.string(from: lastInstant)
     }
 
+    /// Why Graph cannot hold `rrule`, or nil when `parseRRULEToGraphRecurrence` maps it exactly (#513).
+    ///
+    /// Graph's `recurrencePattern` holds one shape per type: `daily`; `weekly` (`daysOfWeek`);
+    /// `absoluteMonthly` (one `dayOfMonth`, 1 to 31); `relativeMonthly` (`daysOfWeek` and one `index`,
+    /// first to fourth or last); `absoluteYearly` (one `month` and one `dayOfMonth`); `relativeYearly`
+    /// (one `month`, `daysOfWeek` and `index`). With several `daysOfWeek` a relative pattern falls on
+    /// the first of them that matches, not on each. A rule outside these shapes would be written as a
+    /// different series, so it is refused, naming the field, and the assistant can offer one Outlook
+    /// can hold. Every shape an everyday request makes maps exactly: weekly on several days, monthly
+    /// on a date or on the nth (or last) weekday, yearly on a date or on the nth weekday of a month.
+    /// A rule that leaves the day out (the start's day is implied) is not checked here.
+    nonisolated static func graphRecurrenceRefusal(_ rrule: String) -> String? {
+        var fields: [String: [String]] = [:]
+        for part in rrule.replacingOccurrences(of: "RRULE:", with: "").split(separator: ";") {
+            let kv = part.split(separator: "=", maxSplits: 1).map(String.init)
+            guard kv.count == 2 else { continue }
+            fields[kv[0].uppercased()] = kv[1].uppercased().split(separator: ",").map(String.init)
+        }
+        let freq = fields["FREQ"]?.first ?? ""
+        let byDay = fields["BYDAY"] ?? []
+        let byMonthDay = fields["BYMONTHDAY"] ?? []
+        let byMonth = fields["BYMONTH"] ?? []
+        let ordinals = byDay.map { Int($0.dropLast(2)) }
+        func refuse(_ field: String, _ values: [String], _ why: String) -> String {
+            "Outlook calendars can't repeat \(why), so recurrence.\(field) [\(values.joined(separator: ","))] can't be saved there. Offer the user a repeat Outlook can hold"
+        }
+        guard ["DAILY", "WEEKLY", "MONTHLY", "YEARLY"].contains(freq) else {
+            return "Outlook calendars can't repeat with freq \(freq). Offer the user a repeat Outlook can hold"
+        }
+        // A position over plain weekdays is Graph's relative pattern: `index` counts over the
+        // union of `daysOfWeek` ("the second Thursday or Friday"), which is RFC 5545's
+        // BYDAY=TH,FR;BYSETPOS=2. The reader writes a stored relative pattern this way (`rrule(_:)`).
+        let bySetPos = fields["BYSETPOS"] ?? []
+        if !bySetPos.isEmpty {
+            if freq != "MONTHLY", freq != "YEARLY" { return refuse("bySetPos", bySetPos, "on a position over the chosen days except with freq MONTHLY or YEARLY") }
+            if bySetPos.count > 1 { return refuse("bySetPos", bySetPos, "on more than one position") }
+            if let n = Int(bySetPos[0]), !(1...4).contains(n), n != -1 {
+                return refuse("bySetPos", bySetPos, "on a position other than first to fourth or last")
+            }
+            if Int(bySetPos[0]) == nil { return refuse("bySetPos", bySetPos, "on that position") }
+            if byDay.isEmpty || ordinals.contains(where: { $0 != nil }) || !byMonthDay.isEmpty {
+                return refuse("bySetPos", bySetPos, "on a position over anything but weekdays without their own positions (give byDay as day codes such as TU,TH)")
+            }
+        }
+        if freq != "YEARLY", !byMonth.isEmpty { return refuse("byMonth", byMonth, "in chosen months except with freq YEARLY") }
+        if byMonth.count > 1 { return refuse("byMonth", byMonth, "yearly in more than one month") }
+        if freq == "DAILY", !byDay.isEmpty { return refuse("byDay", byDay, "daily on chosen weekdays (use freq WEEKLY with these days)") }
+        if freq == "DAILY", !byMonthDay.isEmpty { return refuse("byMonthDay", byMonthDay, "daily on chosen days of the month") }
+        if freq == "MONTHLY" || freq == "YEARLY" {
+            if !byDay.isEmpty, !byMonthDay.isEmpty { return refuse("byMonthDay", byMonthDay, "on a weekday and a day of the month together") }
+            if byMonthDay.count > 1 { return refuse("byMonthDay", byMonthDay, "on more than one day of the month") }
+            if let day = byMonthDay.first.flatMap({ Int($0) }), day < 1 {
+                return refuse("byMonthDay", byMonthDay, day == -1 ? "on the last day of the month" : "on a day counted from the end of the month")
+            }
+            if freq == "YEARLY", !byMonthDay.isEmpty, byMonth.isEmpty {
+                return refuse("byMonthDay", byMonthDay, "yearly on a day of the month without the month (add byMonth)")
+            }
+            if !byDay.isEmpty, !bySetPos.isEmpty, freq == "YEARLY", byMonth.isEmpty {
+                return refuse("bySetPos", bySetPos, "yearly on a position over weekdays without the month (add byMonth)")
+            }
+            if !byDay.isEmpty, bySetPos.isEmpty {
+                if ordinals.contains(where: { $0 == nil }) {
+                    return refuse("byDay", byDay, "on every such weekday of the \(freq == "MONTHLY" ? "month" : "year") (give one position, such as 1MO or -1FR)")
+                }
+                if byDay.count > 1 { return refuse("byDay", byDay, "on more than one numbered weekday") }
+                if let n = ordinals.first ?? nil, !(1...4).contains(n), n != -1 {
+                    return refuse("byDay", byDay, "on a weekday numbered other than first to fourth or last")
+                }
+                if freq == "YEARLY", byMonth.isEmpty {
+                    return refuse("byDay", byDay, "yearly on a numbered weekday without the month (add byMonth)")
+                }
+            }
+        }
+        return nil
+    }
+
+    nonisolated func recurrenceRuleRefusal(_ rrule: String) -> String? { Self.graphRecurrenceRefusal(rrule) }
+
+    /// The writer's half of `graphRecurrenceRefusal`: a rule Graph can't hold is refused before
+    /// anything is sent, for an operation that reaches the writer without the tools' check.
+    nonisolated static func refuseUnrepresentableRule(_ recurrence: [String]?) throws {
+        guard let rrule = recurrence?.first(where: { $0.uppercased().hasPrefix("RRULE:") }),
+              let reason = graphRecurrenceRefusal(rrule) else { return }
+        throw CalendarProviderError.notSupported(reason)
+    }
+
     /// Convert an RFC 5545 `RRULE` to a Microsoft Graph `patternedRecurrence`.
     ///
     /// Graph's `recurrencePattern.type` is a CLOSED enum — `daily`, `weekly`,
@@ -1604,7 +1711,10 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// `UNTIL` that names a UTC instant is dated there, and one earlier in its
     /// day than the series' start time (`startWallTime`, the start's wall time
     /// in that zone) ends the series the day before; see `graphEndDate`.
-    nonisolated func parseRRULEToGraphRecurrence(_ rrule: String, eventStart: Date?, timeZone: TimeZone, startWallTime: String?) -> [String: Any] {
+    ///
+    /// `firstDayOfWeek` is the series' stored first day of the week, kept unless the rule names
+    /// its own (`WKST`); with neither, a weekly pattern starts its weeks on Sunday.
+    nonisolated func parseRRULEToGraphRecurrence(_ rrule: String, eventStart: Date?, timeZone: TimeZone, startWallTime: String?, firstDayOfWeek storedFirstDay: String? = nil) -> [String: Any] {
         let parts = rrule.replacingOccurrences(of: "RRULE:", with: "").split(separator: ";")
         var freq = "weekly"
         var interval = 1
@@ -1614,6 +1724,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         var byMonthDay: Int?
         var byMonth: Int?
         var bySetPos: Int?
+        var wkst: String?
 
         let abbrevToDay = ["SU": "sunday", "MO": "monday", "TU": "tuesday", "WE": "wednesday", "TH": "thursday", "FR": "friday", "SA": "saturday"]
 
@@ -1629,6 +1740,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
             case "BYMONTHDAY": byMonthDay = Int(kv[1])
             case "BYMONTH": byMonth = Int(kv[1])
             case "BYSETPOS": bySetPos = Int(kv[1])
+            case "WKST": wkst = abbrevToDay[String(kv[1]).uppercased()]
             default: break
             }
         }
@@ -1684,7 +1796,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
             // FREQ=WEEKLY with no BYDAY recurs on DTSTART's weekday.
             pattern["daysOfWeek"] = !plainDays.isEmpty ? plainDays
                 : (startWeekday.map { [$0] } ?? ["monday"])
-            pattern["firstDayOfWeek"] = "sunday"
+            pattern["firstDayOfWeek"] = wkst ?? storedFirstDay ?? "sunday"
 
         case "monthly":
             if !plainDays.isEmpty {
@@ -1715,6 +1827,11 @@ actor ExchangeCalendarProvider: CalendarProvider {
             // Unknown FREQ (SECONDLY/MINUTELY/HOURLY — not expressible in Graph).
             // Emit a well-formed daily body rather than an invalid `type`.
             pattern["type"] = "daily"
+        }
+        // An edit's other pattern kinds keep the series' first day of the week too, unless the
+        // rule names its own (#423).
+        if pattern["firstDayOfWeek"] == nil, let storedFirstDay {
+            pattern["firstDayOfWeek"] = wkst ?? storedFirstDay
         }
 
         return [
@@ -1860,6 +1977,7 @@ struct MSRecurrencePattern: Decodable {
     let dayOfMonth: Int?
     let index: String?   // first | second | third | fourth | last
     let month: Int?
+    let firstDayOfWeek: String?
 }
 
 struct MSRecurrenceRange: Decodable {

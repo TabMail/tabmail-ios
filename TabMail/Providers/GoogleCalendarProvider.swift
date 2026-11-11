@@ -58,6 +58,14 @@ protocol CalendarProvider: Sendable {
     /// its rule. Pure: it reads only `event`, the series as already read, and makes no request.
     /// The edit's confirmation card says so when it does (#423).
     func editResetsChangedOccurrences(_ event: GCalEvent, edit: GCalEventInput) -> Bool
+
+    /// Why this provider cannot hold a repeat rule, or nil when it can. `rrule` is an RFC 5545
+    /// `RRULE:` line whose tokens are already valid (`CalendarToolHelpers.recurrenceDayParts`); the
+    /// answer is about what the provider's own recurrence model can express. The calendar tools
+    /// ask before the confirmation card, so a rule the provider would have to change is refused
+    /// naming the field, with nothing sent; the provider's writer refuses it the same way. Default:
+    /// nil (Google and CalDAV store the rule as written).
+    func recurrenceRuleRefusal(_ rrule: String) -> String?
 }
 
 /// Errors common to calendar providers when an operation isn't supported.
@@ -84,6 +92,7 @@ extension CalendarProvider {
     func occurrenceStartDay(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone) async throws -> String? {
         String(recurrenceId.prefix(10))
     }
+    func recurrenceRuleRefusal(_ rrule: String) -> String? { nil }
     func splitSeries(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, patch: GCalEventInput, sendUpdates: String) async throws -> GCalEvent {
         throw CalendarProviderError.notSupported("Splitting a recurring series at a given occurrence is not yet supported on this calendar provider. Edit the whole series or use the Thunderbird add-on for this-and-following edits.")
     }
@@ -488,6 +497,20 @@ actor GoogleCalendarProvider: CalendarProvider {
         event: GCalEventInput,
         sendUpdates: String = "all"
     ) async throws -> GCalEvent {
+        try await patchEvent(calendarId: calendarId, eventId: eventId, event: event, sendUpdates: sendUpdates, keepStoredDates: true)
+    }
+
+    /// `updateEvent`'s write. With `keepStoredDates`, a rule in `event` replaces only the stored
+    /// `RRULE` line and the series' EXDATE and RDATE lines are kept (`recurrence(_:withRuleFrom:)`,
+    /// #513): an edit gives a rule, never the dates. Without it, `event.recurrence` is written as
+    /// given: the split's cap, which carries the complete array it computed (`splitRecurrence`).
+    private func patchEvent(
+        calendarId: String,
+        eventId: String,
+        event: GCalEventInput,
+        sendUpdates: String,
+        keepStoredDates: Bool
+    ) async throws -> GCalEvent {
         // Always fetch the existing event and merge the patch onto it, so we
         // PATCH a FULL payload. Google's docs say partial PATCH preserves
         // unspecified fields and even recommend "prefer GET + UPDATE over
@@ -495,7 +518,11 @@ actor GoogleCalendarProvider: CalendarProvider {
         // PUT and the Exchange Graph fix where partial PATCH on master
         // recurrence silently rewrote start/end. Defense-in-depth.
         let (existing, existingJSON) = try await getEventAndJSON(calendarId: calendarId, eventId: eventId)
-        let merged = Self.mergeExistingEventWithPatch(existing: existing, patch: event)
+        var edit = event
+        if keepStoredDates, let rule = event.recurrence {
+            edit.recurrence = Self.recurrence(existing.recurrence, withRuleFrom: rule)
+        }
+        let merged = Self.mergeExistingEventWithPatch(existing: existing, patch: edit)
         let encodedCalId = try Self.encodedPathSegment(calendarId, "Google calendar id")
         let encodedEventId = try Self.encodedPathSegment(eventId, "Google event id")
         let body = try JSONSerialization.data(withJSONObject: Self.editJSON(merged, stored: existingJSON))
@@ -718,11 +745,12 @@ actor GoogleCalendarProvider: CalendarProvider {
 
         // 6. PATCH master silently. A failure is rethrown; the new series exists,
         //    so the retry proves the duplicate above and writes the cap again.
-        let _: GCalEvent = try await updateEvent(
+        let _: GCalEvent = try await patchEvent(
             calendarId: calendarId,
             eventId: eventId,
             event: cappedMasterInput,
-            sendUpdates: "none"
+            sendUpdates: "none",
+            keepStoredDates: false
         )
         return created
     }
@@ -1083,6 +1111,18 @@ actor GoogleCalendarProvider: CalendarProvider {
             }
         }
         return (capped, tail)
+    }
+
+    /// A series' `recurrence` lines with the rule replaced by the one `patch` writes (#513): the
+    /// patch's `RRULE` line takes the place of the stored one, and every other stored line
+    /// (`EXDATE`, `RDATE`) is kept, as CalDAV keeps them (`mergePatchIntoICS` replaces only the
+    /// `RRULE` line). Google replaces the whole `recurrence` array on a write, so writing the
+    /// patch's lines alone would bring back every deleted occurrence and remove every added date.
+    /// A patch with no `RRULE` line (`[]`, which clears the rule) is written as given.
+    static func recurrence(_ stored: [String]?, withRuleFrom patch: [String]) -> [String] {
+        func isRule(_ line: String) -> Bool { line.prefix(while: { $0 != ":" && $0 != ";" }).uppercased() == "RRULE" }
+        guard patch.contains(where: isRule) else { return patch }
+        return patch + (stored ?? []).filter { !isRule($0) && !patch.contains($0) }
     }
 
     /// Keys of a stored event that the server owns or that name the stored event; a copy written
@@ -1501,7 +1541,7 @@ actor GoogleCalendarProvider: CalendarProvider {
         // honor that. This keeps iOS consistent with the TB bridge, which also
         // respects patch.recurrence when present.
         if let patchRecurrence = patch.recurrence, !patchRecurrence.isEmpty {
-            out.recurrence = patchRecurrence
+            out.recurrence = GoogleCalendarProvider.recurrence(newRecurrence, withRuleFrom: patchRecurrence)
         } else {
             out.recurrence = newRecurrence
         }
@@ -1625,6 +1665,9 @@ struct GCalEvent: Codable, Sendable {
     /// `recurrenceTimeZone`), so a provider can read the rule as it does for a write
     /// (`CalendarProvider.editResetsChangedOccurrences`). Nil when the calendar names none; in memory only.
     var recurrenceTimeZoneName: String? = nil
+    /// The first day of the week a series' rule is kept with (Outlook's `firstDayOfWeek`), read
+    /// as `recurrenceTimeZoneName` is. Nil when the calendar names none; in memory only.
+    var recurrenceFirstDayOfWeek: String? = nil
 }
 
 // Convenience initializer that fills in `eventType`/`iCalUID`/`kind`/`visibility`

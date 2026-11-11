@@ -172,6 +172,16 @@ struct GoogleSeriesSplitCopyTests {
         ], "the new part: \(canonical(wire.created?["recurrence"]))")
     }
 
+    @Test("a new rule on the new part keeps the excluded and added dates after the split")
+    func newRuleKeepsTheTailDates() async throws {
+        var patch = GCalEventInput()
+        patch.recurrence = ["RRULE:FREQ=WEEKLY;BYDAY=MO,WE"]
+        let wire = try await GoogleSplitFixture.split(GoogleSplitFixture.master(), patch: patch)
+        #expect(wire.created?["recurrence"] as? [String] == [
+            "RRULE:FREQ=WEEKLY;BYDAY=MO,WE", "EXDATE:20990527T170000Z", "RDATE:20990529T170000Z",
+        ], "the new part: \(canonical(wire.created?["recurrence"]))")
+    }
+
     @Test("an excluded or added date exactly at the split goes to the new part only", arguments: ["EXDATE", "RDATE"])
     func splitPointGoesToTheNewPart(_ kind: String) async throws {
         let master = GoogleSplitFixture.master(recurrence: [

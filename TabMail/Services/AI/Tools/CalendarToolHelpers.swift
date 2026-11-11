@@ -850,27 +850,166 @@ enum CalendarToolHelpers {
         // `freq` and `until` are model-supplied strings that get interpolated into a structured RRULE
         // line, which cannot be run through the ICS text escaper (that would corrupt the `;` and `,`
         // separators the rule depends on). FREQ is a closed token set in RFC 5545, so validate it
-        // instead of escaping it: an unrecognised value drops the recurrence rather than emitting a
-        // rule built from arbitrary text. `GCalEventInputICS.sanitizeICSLine` is the backstop that
+        // instead of escaping it: an unrecognised value is refused (`recurrenceFreq`) rather than
+        // emitting a rule built from arbitrary text. `GCalEventInputICS.sanitizeICSLine` is the backstop that
         // stops any residue from splitting the line into a second ICS property.
+        //
+        // The day fields (byDay, byMonthDay, byMonth, wkst) are written too, each token validated
+        // (`recurrenceDayParts`); an invalid one is refused, never dropped (#513).
         if case .dictionary(let rec) = arguments["recurrence"],
-           case .string(let rawFreq) = rec["freq"],
-           let freq = Self.validatedRRuleFreq(rawFreq) {
+           let freq = try Self.recurrenceFreq(rec) {
             var rrule = "RRULE:FREQ=\(freq)"
             if let n = try Self.recurrenceNumber(rec, "interval"), n > 1 { rrule += ";INTERVAL=\(n)" }
             if let count = try Self.recurrenceNumber(rec, "count") { rrule += ";COUNT=\(count)" }
-            else if case .string(let until) = rec["until"],
-                    // `allDay:`/`zone:` are not decoration — UNTIL's value type is dictated by the
-                    // DTSTART this same builder emits (RFC 5545 §3.3.10), and the naive→UTC conversion
-                    // needs the event's zone to name an instant at all. Both are already resolved above
-                    // for start/end.
-                    let normalizedUntil = Self.validatedRRuleUntil(until, allDay: isAllDay == true, zone: resolvedTz) {
+            // `allDay:`/`zone:` are not decoration — UNTIL's value type is dictated by the
+            // DTSTART this same builder emits (RFC 5545 §3.3.10), and the naive→UTC conversion
+            // needs the event's zone to name an instant at all. Both are already resolved above
+            // for start/end. An invalid `until` is refused, never dropped (`recurrenceUntil`).
+            else if let normalizedUntil = try Self.recurrenceUntil(rec, allDay: isAllDay == true, zone: resolvedTz) {
                 rrule += ";UNTIL=\(normalizedUntil)"
             }
+            for part in try Self.recurrenceDayParts(rec, freq: freq) { rrule += ";\(part)" }
             input.recurrence = [rrule]
         }
 
         return input
+    }
+
+    /// The `FREQ` of a `recurrence` argument, or nil when it sets no rule (no `freq` and no other
+    /// field). A `freq` that is not one of RFC 5545's tokens, or other fields without a `freq`,
+    /// is refused (`notSupported`) naming the field and the value, so it is never dropped.
+    static func recurrenceFreq(_ rec: [String: JSONValue]) throws -> String? {
+        guard let value = rec["freq"], !isNullArgument(value) else {
+            if rec.values.allSatisfy(isNullArgument) { return nil }
+            throw CalendarProviderError.notSupported("recurrence.freq is missing: give one of DAILY, WEEKLY, MONTHLY, YEARLY")
+        }
+        guard case .string(let raw) = value, let freq = validatedRRuleFreq(raw) else {
+            throw CalendarProviderError.notSupported(
+                "recurrence.freq has an invalid value \(Self.shownRecurrenceValue(value)): one of DAILY, WEEKLY, MONTHLY, YEARLY")
+        }
+        return freq
+    }
+
+    /// RFC 5545 weekday codes, in `Calendar.weekday` order (Sunday first).
+    static let rruleWeekdays = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"]
+
+    /// One `BYDAY` token: an optional signed position (1 to 53) and a weekday code.
+    struct RRuleWeekdayNum: Equatable {
+        let ordinal: Int?
+        let weekday: String
+
+        /// Parses `MO`, `2TU`, `+1WE`, `-1FR` (any letter case); nil for anything else.
+        init?(_ raw: String) {
+            let token = raw.uppercased()
+            guard token.count >= 2, CalendarToolHelpers.rruleWeekdays.contains(String(token.suffix(2))) else { return nil }
+            weekday = String(token.suffix(2))
+            let prefix = token.dropLast(2)
+            if prefix.isEmpty { ordinal = nil; return }
+            let digits = prefix.first == "+" || prefix.first == "-" ? prefix.dropFirst() : prefix[...]
+            guard (1...2).contains(digits.count), digits.allSatisfy({ $0.isASCII && $0.isNumber }),
+                  let n = Int(digits), (1...53).contains(n) else { return nil }
+            ordinal = prefix.first == "-" ? -n : n
+        }
+
+        var token: String { (ordinal.map(String.init) ?? "") + weekday }
+    }
+
+    /// The RRULE parts for a `recurrence` argument's day fields, in RFC 5545 form:
+    /// `BYDAY` (`byDay`), `BYMONTHDAY` (`byMonthDay`), `BYMONTH` (`byMonth`) and `WKST` (`wkst`).
+    /// An absent, null or empty field writes nothing. Every token is validated, and a value outside
+    /// its field's form, or a combination RFC 5545 forbids (a position in `byDay` outside MONTHLY and
+    /// YEARLY, `byMonthDay` with WEEKLY), is refused (`notSupported`) naming the field and the value.
+    /// The confirmation card (`recurrenceSummary`) and the builder both read the fields through this,
+    /// so a value the builder would refuse is refused before the card.
+    static func recurrenceDayParts(_ rec: [String: JSONValue], freq: String) throws -> [String] {
+        var parts: [String] = []
+        let days = try recurrenceList(rec, "byDay", allowed: "day codes MO..SU, optionally with a position such as 2TU or -1FR") { value -> String? in
+            guard case .string(let raw) = value, let day = RRuleWeekdayNum(raw) else { return nil }
+            return day.token
+        }
+        if !days.isEmpty {
+            if freq != "MONTHLY", freq != "YEARLY", let numbered = days.first(where: { RRuleWeekdayNum($0)?.ordinal != nil }) {
+                throw CalendarProviderError.notSupported(
+                    "recurrence.byDay has an invalid value \"\(numbered)\": a position such as 1MO or -1FR is allowed only with freq MONTHLY or YEARLY")
+            }
+            parts.append("BYDAY=\(days.joined(separator: ","))")
+        }
+        let monthDays = try recurrenceList(rec, "byMonthDay", allowed: "integers from 1 to 31 or -31 to -1") { value -> String? in
+            guard let n = value.wholeNumber, n != 0, (-31...31).contains(n) else { return nil }
+            return String(n)
+        }
+        if !monthDays.isEmpty {
+            if freq == "WEEKLY" {
+                throw CalendarProviderError.notSupported(
+                    "recurrence.byMonthDay has an invalid value [\(monthDays.joined(separator: ","))]: days of the month are not allowed with freq WEEKLY")
+            }
+            parts.append("BYMONTHDAY=\(monthDays.joined(separator: ","))")
+        }
+        let months = try recurrenceList(rec, "byMonth", allowed: "integers from 1 to 12") { value -> String? in
+            guard let n = value.wholeNumber, (1...12).contains(n) else { return nil }
+            return String(n)
+        }
+        if !months.isEmpty { parts.append("BYMONTH=\(months.joined(separator: ","))") }
+        if let value = rec["wkst"], !isNullArgument(value) {
+            guard case .string(let raw) = value, rruleWeekdays.contains(raw.uppercased()) else {
+                throw CalendarProviderError.notSupported(
+                    "recurrence.wkst has an invalid value \(Self.shownRecurrenceValue(value)): one of MO, TU, WE, TH, FR, SA, SU")
+            }
+            parts.append("WKST=\(raw.uppercased())")
+        }
+        return parts
+    }
+
+    /// The canonical tokens of a list-valued recurrence field, or `[]` when it is absent or null.
+    /// A value that is not a list, or an element `token` rejects, is refused naming the field and
+    /// the value.
+    private static func recurrenceList(
+        _ rec: [String: JSONValue], _ key: String, allowed: String, token: (JSONValue) -> String?
+    ) throws -> [String] {
+        guard let value = rec[key], !isNullArgument(value) else { return [] }
+        guard case .array(let elements) = value else {
+            throw CalendarProviderError.notSupported(
+                "recurrence.\(key) has an invalid value \(shownRecurrenceValue(value)): a list of \(allowed)")
+        }
+        return try elements.map { element in
+            guard let t = token(element) else {
+                throw CalendarProviderError.notSupported(
+                    "recurrence.\(key) has an invalid value \(shownRecurrenceValue(element)): \(allowed)")
+            }
+            return t
+        }
+    }
+
+    private static func isNullArgument(_ value: JSONValue) -> Bool {
+        if case .null = value { return true }
+        return false
+    }
+
+    /// A tool argument as a refusal quotes it: a string in quotes, anything else as JSON.
+    private static func shownRecurrenceValue(_ value: JSONValue) -> String {
+        if case .string(let s) = value { return "\"\(s)\"" }
+        guard let data = try? JSONEncoder().encode(value) else { return "\(value)" }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    /// The rule a `recurrence` argument writes, without its end (`COUNT` or `UNTIL`), for asking a
+    /// provider before the confirmation card whether it can hold it
+    /// (`CalendarProvider.recurrenceRuleRefusal`). Nil when the arguments set no rule. Throws the
+    /// builder's refusals for an invalid field.
+    static func recurrenceRuleShape(_ arguments: [String: JSONValue]) throws -> String? {
+        guard case .dictionary(let rec) = arguments["recurrence"], let freq = try recurrenceFreq(rec) else { return nil }
+        var rrule = "RRULE:FREQ=\(freq)"
+        if let n = try recurrenceNumber(rec, "interval"), n > 1 { rrule += ";INTERVAL=\(n)" }
+        for part in try recurrenceDayParts(rec, freq: freq) { rrule += ";\(part)" }
+        return rrule
+    }
+
+    /// Why `provider` cannot hold the rule the arguments write, or nil: asked before the
+    /// confirmation card, so a rule the provider would have to change is refused with nothing sent.
+    /// Throws the builder's refusals for an invalid field.
+    static func recurrenceProviderRefusal(_ arguments: [String: JSONValue], provider: (any CalendarProvider)?) throws -> String? {
+        guard let provider, let rule = try recurrenceRuleShape(arguments) else { return nil }
+        return provider.recurrenceRuleRefusal(rule)
     }
 
     /// A recurrence `interval` or `count` from the tool arguments: nil when absent or null, the
@@ -885,16 +1024,39 @@ enum CalendarToolHelpers {
         return n
     }
 
-    /// The confirmation-card text for a `recurrence` argument (`every 2 weekly (5 times)`), or nil
-    /// when there is none. Reads `interval` and `count` through `recurrenceNumber`, so it throws on
-    /// the same values the builder refuses and a tool can refuse the call before its card is shown.
+    /// A recurrence `until` as the RRULE `UNTIL` value (`validatedRRuleUntil`), or nil when it is
+    /// absent or null. A value that is not a string, or that `validatedRRuleUntil` cannot read (a
+    /// malformed or impossible date or time), is refused (`notSupported`) naming the field and the
+    /// value, never dropped: dropping it would save a bounded series as an endless one.
+    ///
+    /// The confirmation card (`recurrenceSummary`) asks with `allDay: false` in UTC, the strictest
+    /// reading (it checks the time too, and has no zone gap), so a value the builder would refuse is
+    /// refused before the card, except a naive until inside a DST gap in the event's zone, which only
+    /// the builder refuses (at the queue, nothing written); an all-day event's out-of-range time,
+    /// which the builder would only drop, is refused there too.
+    static func recurrenceUntil(_ rec: [String: JSONValue], allDay: Bool, zone: TimeZone) throws -> String? {
+        guard let value = rec["until"], !isNullArgument(value) else { return nil }
+        guard case .string(let raw) = value, let until = validatedRRuleUntil(raw, allDay: allDay, zone: zone) else {
+            throw CalendarProviderError.notSupported(
+                "recurrence.until has an invalid value \(shownRecurrenceValue(value)): a date such as 2027-12-31 or a date and time such as 2027-12-31T17:00:00")
+        }
+        return until
+    }
+
+    /// The confirmation-card text for a `recurrence` argument (`every 2 weekly on Monday, Wednesday
+    /// (5 times)`), or nil when there is none. Reads every field through the builder's own readers
+    /// (`recurrenceFreq`, `recurrenceNumber`, `recurrenceDayParts`), so it throws on the same values
+    /// the builder refuses and a tool can refuse the call before its card is shown, and it names the
+    /// days the builder writes.
     static func recurrenceSummary(_ arguments: [String: JSONValue]) throws -> String? {
-        guard case .dictionary(let rec) = arguments["recurrence"],
-              case .string(let freq) = rec["freq"] else { return nil }
+        guard case .dictionary(let rec) = arguments["recurrence"], let freq = try recurrenceFreq(rec) else { return nil }
         var desc = freq.lowercased()
         if let n = try recurrenceNumber(rec, "interval"), n > 1 { desc = "every \(n) \(desc)" }
+        let days = try recurrenceDayParts(rec, freq: freq)
+        if let text = recurrenceDaysText(days) { desc += " \(text)" }
         if let count = try recurrenceNumber(rec, "count") { desc += " (\(count) times)" }
-        else if case .string(let until) = rec["until"] { desc += " (until \(until))" }
+        else if try recurrenceUntil(rec, allDay: false, zone: TimeZone(identifier: "UTC") ?? .gmt) != nil,
+                case .string(let until) = rec["until"] { desc += " (until \(until))" }
         return desc
     }
 
@@ -903,6 +1065,43 @@ enum CalendarToolHelpers {
     /// and moved occurrences when its rule, start or end changes (#423, measured), and other
     /// calendars may when its rule does.
     static let ruleChangeResetNote = "Occurrences you changed individually may be reset."
+    /// The days a rule's day parts name, in words for the confirmation card: `on Monday, Wednesday`,
+    /// `on the first Monday`, `on day 1, day 15`, `on the last day`, `in March`, `week starts Monday`. Nil when there are none.
+    private static func recurrenceDaysText(_ parts: [String]) -> String? {
+        let names = ["SU": "Sunday", "MO": "Monday", "TU": "Tuesday", "WE": "Wednesday",
+                     "TH": "Thursday", "FR": "Friday", "SA": "Saturday"]
+        let months = ["January", "February", "March", "April", "May", "June", "July",
+                      "August", "September", "October", "November", "December"]
+        func position(_ n: Int) -> String {
+            let words = ["first", "second", "third", "fourth", "fifth"]
+            let word = (1...words.count).contains(abs(n)) ? words[abs(n) - 1] : "\(abs(n))th"
+            if n == -1 { return "last" }
+            return n < 0 ? "\(word) to last" : word
+        }
+        var phrases: [String] = []
+        for part in parts {
+            let kv = part.split(separator: "=", maxSplits: 1).map(String.init)
+            guard kv.count == 2 else { continue }
+            let values = kv[1].split(separator: ",").map(String.init)
+            switch kv[0] {
+            case "BYDAY":
+                let days = values.compactMap(RRuleWeekdayNum.init).map { day in
+                    day.ordinal.map { "the \(position($0)) \(names[day.weekday] ?? day.weekday)" } ?? (names[day.weekday] ?? day.weekday)
+                }
+                phrases.append("on \(days.joined(separator: ", "))")
+            case "BYMONTHDAY":
+                let days = values.compactMap(Int.init).map { $0 < 0 ? "the \(position($0)) day" : "day \($0)" }
+                phrases.append("on \(days.joined(separator: ", "))")
+            case "BYMONTH":
+                phrases.append("in \(values.compactMap(Int.init).map { months[$0 - 1] }.joined(separator: ", "))")
+            case "WKST":
+                phrases.append("week starts \(names[kv[1]] ?? kv[1])")
+            default:
+                continue
+            }
+        }
+        return phrases.isEmpty ? nil : phrases.joined(separator: " ")
+    }
 
     /// Could `buildGCalEventInput(arguments:isAllDay:)` emit an `UNTIL` for these arguments?
     ///
@@ -937,7 +1136,8 @@ enum CalendarToolHelpers {
     ///
     /// Whether that string survives `validatedRRuleUntil` is not asked (see the headline). A dropped
     /// clause is harmless on the update path and NOT on the split path — see `validatedRRuleUntil` on
-    /// what an omitted UNTIL costs a `this_and_following` successor.
+    /// what an omitted UNTIL costs a `this_and_following` successor. (Since 2026-11-10 an invalid
+    /// `until` is refused, not dropped, so a true answer for one costs only the wasted `getEvent`.)
     static func recurrenceUntilIsAtStake(_ arguments: [String: JSONValue]) -> Bool {
         guard case .dictionary(let rec) = arguments["recurrence"],
               case .string(let rawFreq) = rec["freq"],
@@ -1046,9 +1246,9 @@ enum CalendarToolHelpers {
     /// RFC 5545 `FREQ` is a closed token set. Returns the canonical token, or nil if unrecognised.
     ///
     /// Validated rather than escaped because an RRULE is structured: passing it through the ICS text
-    /// escaper would escape the `;` and `,` that separate its own parts. Returning nil drops the
-    /// recurrence — the event is still created, just non-recurring, which is recoverable by one user
-    /// edit. See `GCalEventInputICS.sanitizeICSLine` for why an unvalidated value is dangerous.
+    /// escaper would escape the `;` and `,` that separate its own parts. The builder refuses a
+    /// value this returns nil for (`recurrenceFreq`), naming it, rather than dropping the rule (#513).
+    /// See `GCalEventInputICS.sanitizeICSLine` for why an unvalidated value is dangerous.
     static func validatedRRuleFreq(_ raw: String) -> String? {
         let token = raw.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
         let legal: Set<String> = ["SECONDLY", "MINUTELY", "HOURLY", "DAILY", "WEEKLY", "MONTHLY", "YEARLY"]
@@ -1080,7 +1280,8 @@ enum CalendarToolHelpers {
     /// stating it is how a timed event is converted to all-day and vice versa; a model that states it
     /// while changing nothing else can still produce a mismatched pair.
     ///
-    /// ⚠️ **WHAT `nil` COSTS ON THE SPLIT PATH.** Returning nil drops the `UNTIL` clause while
+    /// ⚠️ **WHAT `nil` COSTS ON THE SPLIT PATH (history: no longer reachable since 2026-11-10, when
+    /// `recurrenceUntil` began refusing a nil here instead of dropping the clause).** Returning nil drops the `UNTIL` clause while
     /// `buildGCalEventInput` still assigns a non-empty `input.recurrence` (`RRULE:FREQ=…`, plus any
     /// INTERVAL — a numeric COUNT takes an earlier `else if` and cannot coexist with an UNTIL). On
     /// `edit_scope: "this_and_following"`, `CalDAVProvider.seriesSplitResources` writes a non-empty
@@ -1116,9 +1317,12 @@ enum CalendarToolHelpers {
     /// it as midnight would drop every occurrence on the day the user named, and returning nil would
     /// leave the series unbounded, which is worse than either.
     ///
-    /// Anything unparseable returns nil and the UNTIL clause is omitted — an unbounded recurrence,
-    /// deliberately preferred over emitting arbitrary text into a structured rule, and visible and
-    /// editable by the user. **"Unparseable" means both halves**: the SHAPE check below, and the
+    /// Anything unparseable returns nil. **Superseded (2026-11-10):** the builder no longer omits the
+    /// UNTIL clause on nil; `recurrenceUntil` refuses the call naming the field and the value, before
+    /// the confirmation card, so nothing is written. The previous choice, kept as history: "the UNTIL
+    /// clause is omitted — an unbounded recurrence, deliberately preferred over emitting arbitrary
+    /// text into a structured rule, and visible and editable by the user." Refusing keeps the first
+    /// half (no arbitrary text in the rule) without the unbounded series. **"Unparseable" means both halves**: the SHAPE check below, and the
     /// numeric field RANGES in `rruleUntilDateIsInRange` / `rruleUntilTimeIsInRange`. This sentence
     /// claimed both while the function checked only the shape; those two helpers carry the measured
     /// list of out-of-range values every arm used to emit, and one of them was a silent three-day
