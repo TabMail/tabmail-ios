@@ -224,7 +224,7 @@ These tests read what each provider sent, or what the fake server ends up holdin
   - a new place replacing the stored places;
   - the stored pattern written verbatim on both parts;
   - the range rules for noEnd, endDate and numbered series (a numbered one stays numbered with
-    what is left), and a range already ending on this split's cap (a retry after the cap landed)
+    what is left; the stored 0 count of a noEnd or endDate range is not sent back), and a range already ending on this split's cap (a retry after the cap landed)
     written with no end;
   - the cap of each of those three series as sent: an end date at the split and no count, with the
     stored range's `recurrenceTimeZone` and the stored pattern's `firstDayOfWeek`;
@@ -592,7 +592,8 @@ occurrences followed by the new part's are exactly the series', with an occurren
 deleted, moved, or both (as measured, they still count), the split at the last occurrence, a range
 starting the day before its first occurrence, every-other-week series whose weeks start on Sunday
 and on Monday, a `relativeMonthly` series on the second Tuesday (plain, and with its range starting
-the day before, a day the pattern does not name), and an all-day series ahead of UTC. A split with nothing left, or in a range zone
+the day before, a day the pattern does not name), and all-day series in a zone ahead of UTC and in
+one behind it (a daily series split at midnight UTC, so a split day read in a zone moves back a day). A split with nothing left, or in a range zone
 TabMail does not recognize, sends only GETs and creates nothing. A Google split asked to send the user's invitations sends them
 only with the new series' create; the cap of the original goes out with `sendUpdates=none`.
 

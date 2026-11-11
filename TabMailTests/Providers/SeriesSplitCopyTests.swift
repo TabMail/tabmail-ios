@@ -600,7 +600,9 @@ struct ExchangeSeriesSplitCopyTests {
         #expect(newRange["recurrenceTimeZone"] as? String == "Pacific Standard Time", "\(rangeType): the range's zone was dropped")
         switch rangeType {
         case "endDate":
-            #expect(newRange["type"] as? String == "endDate" && newRange["endDate"] as? String == range["endDate"] as? String,
+            // The stored 0 count Graph fills on every non-numbered range is not sent back.
+            #expect(newRange["type"] as? String == "endDate" && newRange["endDate"] as? String == range["endDate"] as? String
+                    && newRange["numberOfOccurrences"] == nil,
                     "the new part lost the series' end date: \(canonical(newRange))")
         case "numbered":
             // What is left of the count; the exact number is held to the series in
@@ -1151,15 +1153,30 @@ struct ExchangeNumberedSplitTests {
         #expect(range?["type"] as? String == "numbered" && range?["endDate"] == nil, "\(c.name): \(canonical(range))")
     }
 
-    @Test("an all-day series in a zone ahead of UTC is split the same way, its split day a date")
-    func allDaySeries() async throws {
+    struct AllDayCase: CustomTestStringConvertible, Sendable {
+        let name: String
+        /// The range's `recurrenceTimeZone` as Graph names it, and the same zone's IANA name.
+        let rangeZone: String
+        let ianaZone: String
+        let interval: Int
+        var testDescription: String { name }
+    }
+
+    /// The split is declared at midnight UTC. Read in a zone behind UTC that instant is the day
+    /// before, which a daily series counts as one fewer occurrence before the split; so only the
+    /// date, never a zone, may place an all-day split.
+    @Test("an all-day series is split at its date, whatever zone the series repeats in", arguments: [
+        AllDayCase(name: "every other day, in a zone ahead of UTC", rangeZone: "Tokyo Standard Time", ianaZone: "Asia/Tokyo", interval: 2),
+        AllDayCase(name: "every day, in a zone behind UTC", rangeZone: "Pacific Standard Time", ianaZone: "America/Los_Angeles", interval: 1),
+    ])
+    func allDaySeries(_ c: AllDayCase) async throws {
         let first = GraphFixture.utcDay(GraphFixture.start)
         let midnight = try #require(EKEventStoreHelper.parseNaiveISO(first, timeZone: .gmt))
         var series = GraphFixture.event(id: "ser-1", start: midnight, online: false, recurring: true, allDay: true)
         series["recurrence"] = [
-            "pattern": ["type": "daily", "interval": 2, "month": 0, "dayOfMonth": 0, "firstDayOfWeek": "sunday", "index": "first"],
+            "pattern": ["type": "daily", "interval": c.interval, "month": 0, "dayOfMonth": 0, "firstDayOfWeek": "sunday", "index": "first"],
             "range": ["type": "numbered", "startDate": first, "endDate": "0001-01-01",
-                      "recurrenceTimeZone": "Tokyo Standard Time", "numberOfOccurrences": 6],
+                      "recurrenceTimeZone": c.rangeZone, "numberOfOccurrences": 6],
         ]
         let original = try #require(FakeGraphCalendar.rangeDays(series))
         #expect(original.count == 6, "setup: \(original)")
@@ -1167,7 +1184,7 @@ struct ExchangeNumberedSplitTests {
         let day = original[2]
         var occurrence = GraphFixture.event(id: "ser-1-occ", start: try #require(EKEventStoreHelper.parseNaiveISO(day, timeZone: .gmt)),
                                             online: false, seriesMasterId: "ser-1", allDay: true)
-        occurrence["originalStart"] = GraphFixture.allDayPlace(day, in: "Asia/Tokyo")
+        occurrence["originalStart"] = GraphFixture.allDayPlace(day, in: c.ianaZone)
         let http = FakeHTTP.Scenario()
         defer { http.close() }
         let graph = FakeGraphCalendar([series, occurrence])
@@ -1175,11 +1192,11 @@ struct ExchangeNumberedSplitTests {
         _ = try await NumberedSplitFixture.provider(http).splitSeries(
             eventId: "ser-1", recurrenceId: day + "T00:00:00", recurrenceIdZone: .gmt, patch: GCalEventInput())
 
-        let created = try #require(graph.created.first, "no new part: \(http.servedCallSequence())")
+        let created = try #require(graph.created.first, "\(c.name): no new part: \(http.servedCallSequence())")
         let range = (created["recurrence"] as? [String: Any])?["range"] as? [String: Any]
-        let newPart = try #require(FakeGraphCalendar.rangeDays(created), "the new part has no end: \(canonical(range))")
+        let newPart = try #require(FakeGraphCalendar.rangeDays(created), "\(c.name): the new part has no end: \(canonical(range))")
         let capped = try #require(graph.rangeDays(of: "ser-1"))
-        #expect(capped + newPart == original, "capped \(capped) and new \(newPart), not the series' \(original)")
+        #expect(capped + newPart == original, "\(c.name): capped \(capped) and new \(newPart), not the series' \(original)")
     }
 
     @Test("a split that leaves no occurrence of the number, or can't count them, writes nothing", arguments: [
