@@ -366,14 +366,13 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// The occurrence of `eventId`'s series that starts at `recurrenceId` now
     /// (`CalendarProvider.occurrence`): the one `updateOccurrence` would change, found by the same
     /// lookup (`resolveInstanceId`), read as `getEvent` reads it (with its `originalStart`).
-    /// Nothing is written. `forSplit` is not read: a moved occurrence is found here, and only
-    /// `splitSeries` refuses a split at one.
+    /// Nothing is written. A moved occurrence is found here; only `splitSeries` refuses a split at
+    /// one.
     func occurrence(
         calendarId: String = "primary",
         eventId: String,
         recurrenceId: String,
-        recurrenceIdZone: TimeZone,
-        forSplit: Bool
+        recurrenceIdZone: TimeZone
     ) async throws -> GCalEvent {
         let (masterId, _) = try await resolveToMaster(eventId: eventId)
         return try await occurrence(

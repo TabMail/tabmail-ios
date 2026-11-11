@@ -840,7 +840,7 @@ extension AccountManager {
                 ?? (CalendarToolHelpers.stringArgOpt(args, "recurrence_id") != nil ? "this_only" : "all")
             let named = try await CalendarSeriesScope.read(
                 eventId: eventId, recurrenceId: CalendarToolHelpers.stringArgOpt(args, "recurrence_id"),
-                scope: givenScope, calendarId: calId, zone: recurrenceIdZone, provider: provider)
+                calendarId: calId, zone: recurrenceIdZone, provider: provider)
             let routed = try CalendarSeriesScope.route(args, scope: givenScope, named: named, zone: recurrenceIdZone)
             // The tool makes an "all" edit that moves a later occurrence to another date a split before
             // its card; one that reaches the queue as "all" was confirmed as a change of every

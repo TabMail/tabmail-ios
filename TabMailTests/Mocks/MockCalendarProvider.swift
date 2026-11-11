@@ -63,7 +63,7 @@ actor MockCalendarProvider: CalendarProvider {
     /// never moved (`syntheticOccurrence`).
     var occurrenceResult: GCalEvent?
     var occurrenceThrows: Error?
-    var occurrenceCalls: [(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, forSplit: Bool)] = []
+    var occurrenceCalls: [(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone)] = []
 
     // MARK: - CalendarProvider Protocol
 
@@ -143,9 +143,9 @@ actor MockCalendarProvider: CalendarProvider {
     func setOccurrenceResult(_ event: GCalEvent?) { occurrenceResult = event }
     func setOccurrenceThrows(_ error: Error?) { occurrenceThrows = error }
 
-    func occurrence(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, forSplit: Bool) async throws -> GCalEvent {
-        callLog.append("occurrence(calendarId:\(calendarId),eventId:\(eventId),recurrenceId:\(recurrenceId),recurrenceIdZone:\(recurrenceIdZone.identifier),forSplit:\(forSplit))")
-        occurrenceCalls.append((calendarId: calendarId, eventId: eventId, recurrenceId: recurrenceId, recurrenceIdZone: recurrenceIdZone, forSplit: forSplit))
+    func occurrence(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone) async throws -> GCalEvent {
+        callLog.append("occurrence(calendarId:\(calendarId),eventId:\(eventId),recurrenceId:\(recurrenceId),recurrenceIdZone:\(recurrenceIdZone.identifier))")
+        occurrenceCalls.append((calendarId: calendarId, eventId: eventId, recurrenceId: recurrenceId, recurrenceIdZone: recurrenceIdZone))
         if let error = occurrenceThrows { throw error }
         return occurrenceResult ?? Self.syntheticOccurrence(of: eventId, at: recurrenceId, in: recurrenceIdZone)
     }

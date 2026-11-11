@@ -54,14 +54,13 @@ enum CalendarSeriesScope {
         var isOccurrence: Bool { seriesId != eventId }
     }
 
-    /// Read what an edit in `scope` names: `eventId`, its series when it names an occurrence, and
+    /// Read what an edit names: `eventId`, its series when it names an occurrence, and
     /// the occurrence it names, by its `recurrence_id` (read in `zone`) or, for an occurrence id
     /// given without one, by the start it has now. The occurrence is found by the provider's own
-    /// lookup, the one its one-occurrence edit and split make, with `forSplit` on a
-    /// `this_and_following` edit; so what the lookup refuses is refused here, before the card. A split
-    /// at an occurrence moved from its place is not looked for here on Google and Outlook: `route`
-    /// may make it an edit of the whole series (the first occurrence), and the split itself throws
-    /// at one (#563).
+    /// lookup, the one its one-occurrence edit and split make; so what the lookup refuses is refused
+    /// here, before the card, for every scope alike. A split at an occurrence moved from its place is
+    /// not looked for here: `route` may make it an edit of the whole series (the first occurrence),
+    /// and the split itself throws at one (#563).
     ///
     /// Throws, with nothing written: what the provider throws (its not-found error when no
     /// occurrence starts at `recurrence_id`, `notSupported` for an occurrence id that names another
@@ -69,22 +68,21 @@ enum CalendarSeriesScope {
     /// refuses), and `notSupported` for a deleted occurrence or one whose start can't be read. A
     /// failed read is thrown, never replaced: the edit tool refuses, or the drain classifies it.
     static func read(
-        eventId: String, recurrenceId: String?, scope: String, calendarId: String, zone: TimeZone,
+        eventId: String, recurrenceId: String?, calendarId: String, zone: TimeZone,
         provider: any CalendarProvider
     ) async throws -> Named {
         let event = try await provider.getEvent(calendarId: calendarId, eventId: eventId)
         return try await read(
-            event: event, eventId: eventId, recurrenceId: recurrenceId, scope: scope,
+            event: event, eventId: eventId, recurrenceId: recurrenceId,
             calendarId: calendarId, zone: zone, provider: provider)
     }
 
     /// `read`, with `eventId` already read (`event`): the edit tool reads it on its own, to tell a
     /// wrong event id from an occurrence it does not name.
     static func read(
-        event: GCalEvent, eventId: String, recurrenceId: String?, scope: String, calendarId: String, zone: TimeZone,
+        event: GCalEvent, eventId: String, recurrenceId: String?, calendarId: String, zone: TimeZone,
         provider: any CalendarProvider
     ) async throws -> Named {
-        let forSplit = scope == "this_and_following"
         if let seriesId = event.recurringEventId, !seriesId.isEmpty, seriesId != eventId {
             guard let named = recurrenceId ?? shownStart(of: event, zone: zone) else {
                 throw CalendarProviderError.notSupported(
@@ -96,14 +94,14 @@ enum CalendarSeriesScope {
             }
             let series = try await provider.getEvent(calendarId: calendarId, eventId: seriesId)
             let occurrence = try await provider.occurrence(
-                calendarId: calendarId, eventId: eventId, recurrenceId: named, recurrenceIdZone: zone, forSplit: forSplit)
+                calendarId: calendarId, eventId: eventId, recurrenceId: named, recurrenceIdZone: zone)
             return Named(eventId: eventId, event: event, seriesId: seriesId, series: series, occurrence: occurrence)
         }
         guard let recurrenceId, !(event.recurrence ?? []).isEmpty else {
             return Named(eventId: eventId, event: event, seriesId: eventId, series: event, occurrence: nil)
         }
         let occurrence = try await provider.occurrence(
-            calendarId: calendarId, eventId: eventId, recurrenceId: recurrenceId, recurrenceIdZone: zone, forSplit: forSplit)
+            calendarId: calendarId, eventId: eventId, recurrenceId: recurrenceId, recurrenceIdZone: zone)
         return Named(eventId: eventId, event: event, seriesId: eventId, series: event, occurrence: occurrence)
     }
 

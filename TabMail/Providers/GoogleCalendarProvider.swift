@@ -49,13 +49,13 @@ protocol CalendarProvider: Sendable {
     ///   was deleted), the authoritative absence `AccountManager.isCalendarNotFoundError` claims;
     /// - `notSupported` for a malformed or ambiguous `recurrence_id`, and for an occurrence id whose
     ///   occurrence is not the one `recurrenceId` names; on CalDAV also for everything
-    ///   `scopedEditSlot` refuses (a stored zone TabMail does not recognize, and, with `forSplit`,
-    ///   an occurrence moved from its place in the series, among them).
-    /// A moved occurrence is otherwise found: on Google and Outlook only the split itself refuses
-    /// one (`splitSeries`), where a split is written.
+    ///   `scopedEditSlot` refuses for a one-occurrence edit (a stored zone TabMail does not
+    ///   recognize, among them).
+    /// An occurrence moved from its place in the series is found like any other: only the split
+    /// itself refuses one (`splitSeries`), where a split is written.
     /// `CalendarSeriesScope.read` asks it for the edit tool's card and again for the queue's write.
     /// Default: refused, as `updateOccurrence` and `splitSeries` are on a calendar without them.
-    func occurrence(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, forSplit: Bool) async throws -> GCalEvent
+    func occurrence(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone) async throws -> GCalEvent
 
     /// Split a recurring series at `recurrenceId` (this_and_following edit_scope):
     /// cap the original series with UNTIL = recurrenceId - 1, then create a new
@@ -116,7 +116,7 @@ extension CalendarProvider {
         String(recurrenceId.prefix(10))
     }
     func recurrenceRuleRefusal(_ rrule: String) -> String? { nil }
-    func occurrence(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, forSplit: Bool) async throws -> GCalEvent {
+    func occurrence(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone) async throws -> GCalEvent {
         throw CalendarProviderError.notSupported("Changing one occurrence of a repeating event, or the occurrences from one on, is not yet supported on this calendar provider. Edit the whole series instead.")
     }
     func splitSeries(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, patch: GCalEventInput, sendUpdates: String) async throws -> GCalEvent {
@@ -675,14 +675,13 @@ actor GoogleCalendarProvider: CalendarProvider {
 
     /// The occurrence of `eventId`'s series that starts at `recurrenceId` now
     /// (`CalendarProvider.occurrence`): the one `updateOccurrence` would change, found by the same
-    /// lookup (`resolveInstance`), as Google lists it. Nothing is written. `forSplit` is not read:
-    /// a moved occurrence is found here, and only `splitSeries` refuses a split at one.
+    /// lookup (`resolveInstance`), as Google lists it. Nothing is written. A moved occurrence is
+    /// found here; only `splitSeries` refuses a split at one.
     func occurrence(
         calendarId: String = "primary",
         eventId: String,
         recurrenceId: String,
-        recurrenceIdZone: TimeZone,
-        forSplit: Bool
+        recurrenceIdZone: TimeZone
     ) async throws -> GCalEvent {
         let (masterId, _, _) = try await resolveToMaster(calendarId: calendarId, eventId: eventId)
         return try await occurrence(

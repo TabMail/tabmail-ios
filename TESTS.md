@@ -803,8 +803,11 @@ check counts its undatable place as moved (`allDaySeriesWithoutAZoneIsNotSplit`)
 own cap is not checked again (`RecurrenceTail.isCapped`, pinned in `RecurrenceTailTests`; on Outlook
 `ownCapRetryDoesNotLookTheOccurrenceUp`: no instances read, and an occurrence moved there does not stop it).
 `CalDAVOccurrenceEditToolToWireTests`: "all" and no `edit_scope` by a CalDAV occurrence id write the series
-(#560); a moved occurrence's `this_and_following` writes nothing and leaves no write queued (#563; CalDAV's
-#613 check refuses it before the card).
+(#560); a moved later occurrence's `this_and_following`, by either id, shows the split's card, then errors at
+the write with nothing `PUT` or deleted and the row left failed (#563; CalDAV's #613 check in its
+`splitSeries`); `this_and_following` at a moved FIRST occurrence, by either id, is shown and written as an
+edit of the whole series, one `PUT` of the series (`followingAtAMovedFirstOccurrenceEditsTheSeries`, red
+while CalDAV's lookup took the split's scope).
 
 The queue suite's `getEvent` counts are one per edit: that read tells an occurrence from its series. A
 Google or Outlook occurrence edit or split adds one instances read.

@@ -457,16 +457,16 @@ actor CalDAVProvider: CalendarProvider {
 
     /// The occurrence an edit names (`CalendarProvider.occurrence`), read with nothing written:
     /// the one `updateOccurrence` would change and `splitSeries` would split at, by their own
-    /// check (`CalDAVOccurrences.scopedEdit`, with what it refuses: a stored zone TabMail does not
-    /// recognize, an occurrence id whose key names another occurrence, with `forSplit` a moved
+    /// check made as `updateOccurrence` makes it (`CalDAVOccurrences.scopedEdit`, with what it
+    /// refuses: a stored zone TabMail does not recognize, an occurrence id whose key names another
     /// occurrence, and the rest), as a listing shows it, with its place in the series
-    /// (`originalStartTime`, from its key).
+    /// (`originalStartTime`, from its key). An occurrence moved from its place is found here; only
+    /// `splitSeries`' own check refuses a split at one.
     func occurrence(
         calendarId: String,
         eventId: String,
         recurrenceId: String,
-        recurrenceIdZone: TimeZone,
-        forSplit: Bool
+        recurrenceIdZone: TimeZone
     ) async throws -> GCalEvent {
         let (seriesHref, occurrenceKey) = try CalDAVOccurrences.OccurrenceId.split(eventId)
         let eventURL = try resolveEventURL(seriesHref, calendarId: calendarId)
@@ -476,7 +476,7 @@ actor CalDAVProvider: CalendarProvider {
         }
         let named = try CalDAVOccurrences.scopedEdit(
             icsText: ics, href: seriesHref, key: occurrenceKey,
-            recurrenceId: recurrenceId, zone: recurrenceIdZone, forSplit: forSplit)
+            recurrenceId: recurrenceId, zone: recurrenceIdZone, forSplit: false)
         guard let found = CalDAVOccurrences.occurrence(key: named.key, icsText: ics, href: seriesHref) else {
             throw CalDAVError.notFound
         }
