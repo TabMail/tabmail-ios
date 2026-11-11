@@ -49,14 +49,19 @@ not, and the move back to the first date, on where it is NOW (`start`).
 
 **A split at an occurrence moved from its place in the series is not supported** (owner ruling,
 option A; #563 tracks splitting there, #687 the follow-up). It is a plain thrown error with nothing
-written (`CalendarProviderError.notSupported("split at a moved occurrence")`, thrown by the Google and
-Outlook occurrence lookup with `forSplit`; CalDAV's #613 check refuses it in `scopedEditSlot`). It is
-deliberately NOT a finished refusal: no dedicated wording and no work to order it before the card
-(coordinator ruling, 2026-11-11). On the `this_and_following` path the lookup runs in `read`, so it
-throws there; on the "all" path (a new date named at a moved later occurrence, which `route` makes a
-split there) the card is shown and the queued split throws at the drain, nothing written and the row
-left failed. `wasMoved(_:seriesZone:)` compares the occurrence's `start` with its `originalStartTime`
-(all-day: by date in the series' zone).
+written (`CalendarProviderError.notSupported("split at a moved occurrence")`). On Google and Outlook it
+is thrown ONLY by `splitSeries`' own check, where a split is written, never by the occurrence lookup
+(`occurrence(...)` finds a moved occurrence like any other and does not read `forSplit`). CalDAV's
+#613 check still refuses it in `scopedEditSlot`, untouched. It is deliberately NOT a finished refusal:
+no dedicated wording and no work to order it before the card (coordinator rulings, 2026-11-11). So:
+- a split at a moved LATER occurrence (`this_and_following` named there, or an "all" new date named
+  there, which `route` makes a split) shows its card, then the queued split throws at the drain, nothing
+  written and the row left failed;
+- `this_and_following` at a moved FIRST occurrence is routed to "all" (from the first occurrence on is
+  every occurrence) and is written as an edit of the whole series; no split is written.
+`wasMoved(_:seriesZone:)` compares the occurrence's `start` with its `originalStartTime` (all-day: by
+date in the series' zone; an all-day place given as an instant, whose series' zone is not known, counts
+as moved, so such a series is not split).
 
 **Dates are the series' own, in its zone** (`GCalEvent.seriesZone` = `recurrenceTimeZoneName ??
 start.timeZone`, resolved by `CalendarTimeZoneResolver` alone; ONE source for every caller). Outlook
@@ -90,8 +95,7 @@ the provider layer asks which provider it is (ADR-IOS-060).
   refuse (#649). `originalStartTime` is filled from the occurrence's key (`originalStart(ofKey:in:)`),
   so a moved CalDAV occurrence carries its place and its current start.
 
-`forSplit` is set when the GIVEN scope is `this_and_following`, so a moved occurrence named with
-`this_and_following` (the first one included) throws the plain error in `read`.
+`forSplit` is set when the GIVEN scope is `this_and_following`; only CalDAV's lookup reads it.
 
 `read` runs for every scope (one extra read per edit; a rename included), since only the event says
 whether it is an occurrence.
@@ -143,8 +147,9 @@ ends on the cap). CalDAV's split is checked by #613.
 
 For every (event_id, start_iso) pair the listing shows, an edit is either refused before the card (no
 card, nothing queued, nothing written) or, once the queue has drained, the calendar holds what the card
-said. Never a refusal after confirmation, except a split at a moved occurrence: an error with nothing
-written and no write left queued, wherever it is thrown (#563, #687). `CalendarSeriesScopeTests.swift`
+said. Never a refusal after confirmation, except a split at a moved later occurrence: its card, then an
+error at the write with nothing written and the row left failed (#563, #687). `this_and_following` at a
+moved first occurrence is a written whole-series edit. `CalendarSeriesScopeTests.swift`
 (`GoogleSeriesScopeInvariantTests`, `ExchangeSeriesScopeInvariantTests`) runs it table-driven over
 states (unmoved, moved far, moved onto another (Google only), first moved, deleted), naming forms (own
 id; own id and start; series id and start), scopes, and changes (rename, time of day, date with named
@@ -179,6 +184,9 @@ rule above when #613 settled that an occurrence is named where it is now.
   commit) a dedicated `movedSplitRefusal` before the card in `route`, with a proof that CalDAV refused
   it before the card. Replaced by the coordinator ruling (2026-11-11): a plain error, nothing written,
   no dedicated wording, no before-the-card ordering.
+- That plain error was first thrown by the Google and Outlook occurrence lookup when `forSplit` was set,
+  so `read` threw it before the card, and `this_and_following` at a moved FIRST occurrence (a whole-series
+  edit) failed too. Replaced (review r1 ruling, 2026-11-11): only `splitSeries`' own check throws it.
 - The superseded items of the first build's own review (a later occurrence's new time of day split; the
   place compared in the edit's zone; Outlook's all-day `originalStart` read as a date) stay superseded.
 

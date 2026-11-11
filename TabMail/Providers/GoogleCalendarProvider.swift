@@ -47,10 +47,12 @@ protocol CalendarProvider: Sendable {
     /// shown to the user:
     /// - the provider's not-found error when no occurrence starts there (none ever did, or it
     ///   was deleted), the authoritative absence `AccountManager.isCalendarNotFoundError` claims;
-    /// - `notSupported` for a malformed or ambiguous `recurrence_id`, for an occurrence id whose
-    ///   occurrence is not the one `recurrenceId` names, and, with `forSplit`, for an occurrence
-    ///   that was moved from its place in the series; on CalDAV also for everything
-    ///   `scopedEditSlot` refuses (a stored zone TabMail does not recognize, among them).
+    /// - `notSupported` for a malformed or ambiguous `recurrence_id`, and for an occurrence id whose
+    ///   occurrence is not the one `recurrenceId` names; on CalDAV also for everything
+    ///   `scopedEditSlot` refuses (a stored zone TabMail does not recognize, and, with `forSplit`,
+    ///   an occurrence moved from its place in the series, among them).
+    /// A moved occurrence is otherwise found: on Google and Outlook only the split itself refuses
+    /// one (`splitSeries`), where a split is written.
     /// `CalendarSeriesScope.read` asks it for the edit tool's card and again for the queue's write.
     /// Default: refused, as `updateOccurrence` and `splitSeries` are on a calendar without them.
     func occurrence(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, forSplit: Bool) async throws -> GCalEvent
@@ -673,7 +675,8 @@ actor GoogleCalendarProvider: CalendarProvider {
 
     /// The occurrence of `eventId`'s series that starts at `recurrenceId` now
     /// (`CalendarProvider.occurrence`): the one `updateOccurrence` would change, found by the same
-    /// lookup (`resolveInstance`), as Google lists it. Nothing is written.
+    /// lookup (`resolveInstance`), as Google lists it. Nothing is written. `forSplit` is not read:
+    /// a moved occurrence is found here, and only `splitSeries` refuses a split at one.
     func occurrence(
         calendarId: String = "primary",
         eventId: String,
@@ -681,17 +684,17 @@ actor GoogleCalendarProvider: CalendarProvider {
         recurrenceIdZone: TimeZone,
         forSplit: Bool
     ) async throws -> GCalEvent {
-        let (masterId, master, _) = try await resolveToMaster(calendarId: calendarId, eventId: eventId)
+        let (masterId, _, _) = try await resolveToMaster(calendarId: calendarId, eventId: eventId)
         return try await occurrence(
-            calendarId: calendarId, named: eventId, masterId: masterId, master: master,
-            recurrenceId: recurrenceId, zone: recurrenceIdZone, forSplit: forSplit)
+            calendarId: calendarId, named: eventId, masterId: masterId,
+            recurrenceId: recurrenceId, zone: recurrenceIdZone)
     }
 
     /// `occurrence`, with the series already read (`resolveToMaster`): `named` is the id the edit
-    /// gave, `masterId` and `master` its series. Also the split's own check (`splitSeries`).
+    /// gave, `masterId` its series. Also the split's own lookup (`splitSeries`).
     private func occurrence(
-        calendarId: String, named: String, masterId: String, master: GCalEvent,
-        recurrenceId: String, zone: TimeZone, forSplit: Bool
+        calendarId: String, named: String, masterId: String,
+        recurrenceId: String, zone: TimeZone
     ) async throws -> GCalEvent {
         let found = try await resolveInstance(
             calendarId: try Self.encodedPathSegment(calendarId, "Google calendar id"),
@@ -700,11 +703,6 @@ actor GoogleCalendarProvider: CalendarProvider {
             zone: zone,
             naming: named == masterId ? nil : named
         )
-        if forSplit, RecurrenceOccurrenceResolver.wasMoved(found.instance, seriesZone: master.seriesZone) {
-            // A split at an occurrence moved from its place is not supported (#563): a plain error,
-            // nothing written.
-            throw CalendarProviderError.notSupported("split at a moved occurrence")
-        }
         return found.instance
     }
 
@@ -771,14 +769,19 @@ actor GoogleCalendarProvider: CalendarProvider {
             masterRecurrence, cappedRRule: cappedRRule,
             tailRRule: newSeriesRRule, slot: slot)
 
-        // The new part starts at an occurrence that starts at `recurrenceId` now and was not moved
-        // from its place in the series, the one `occurrence(forSplit:)` finds; otherwise the split
+        // The new part starts at an occurrence that starts at `recurrenceId` now, the one
+        // `occurrence` finds, and was not moved from its place in the series; otherwise the split
         // throws with nothing written. Not asked on a retry after this split's own cap, which
         // ended the series before that occurrence.
         if !RecurrenceTail.isCapped(originalRRule, at: untilValue) {
-            _ = try await occurrence(
-                calendarId: calendarId, named: named, masterId: eventId, master: master,
-                recurrenceId: recurrenceId, zone: recurrenceIdZone, forSplit: true)
+            let found = try await occurrence(
+                calendarId: calendarId, named: named, masterId: eventId,
+                recurrenceId: recurrenceId, zone: recurrenceIdZone)
+            if RecurrenceOccurrenceResolver.wasMoved(found, seriesZone: master.seriesZone) {
+                // A split at an occurrence moved from its place is not supported (#563): a plain
+                // error, nothing written.
+                throw CalendarProviderError.notSupported("split at a moved occurrence")
+            }
         }
 
         // 3. Build the new series: a copy of the stored series, re-anchored at

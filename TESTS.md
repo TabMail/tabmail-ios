@@ -720,7 +720,8 @@ every occurrence goes where Google Calendar takes it (#559):
 
 An occurrence is named where it is now (its current start, the #613 contract), found by the provider's own
 lookup (`CalendarProvider.occurrence`) before the card. A split at an occurrence moved from its place in the
-series is not supported (#563, #687): a plain error with nothing written, wherever it is thrown. Whether a new start keeps an occurrence's date
+series is not supported (#563, #687): the split's card is shown, then `splitSeries`' own check throws a plain
+error with nothing written. `this_and_following` at a moved FIRST occurrence is an edit of the whole series. Whether a new start keeps an occurrence's date
 is judged in the series' own zone (`GCalEvent.seriesZone`); a series whose zone is not known takes the
 refusing side.
 
@@ -733,9 +734,10 @@ moved; deleted), naming forms (own id; own id and current start; series id and c
 (all, `this_and_following`, `this_only`) and changes (rename; a new time of day; another date on a named-day
 rule; another date on a rule naming no days; another date with a new rule). The oracle is Google Calendar's
 behaviour; the card's scope line is the extent checked (whole series, one occurrence, from here on). One
-exception: a split at an occurrence moved from its place (`this_and_following` at any moved occurrence, the
-moved first one included, and an "all" new date from a moved later one) is not supported (#563, #687); its
-rows expect an error with nothing written and no write left queued, wherever it is thrown.
+exception: a split at a later occurrence moved from its place (`this_and_following` there, and an "all" new
+date from it) is not supported (#563, #687); its rows expect the split's card, then an error at the write
+with nothing written and the row left failed. `this_and_following` at a moved first occurrence expects a
+written whole-series edit (named-day date moves excepted, refused before the card).
 
 The Google and Outlook queue suites (`GoogleCalendarSeriesScopeTests`, `ExchangeCalendarSeriesScopeTests`)
 drain real `.edit` rows against `FakeGoogleCalendar` and `FakeGraphCalendar`, whose occurrences carry their
@@ -750,8 +752,6 @@ cancelled instance out of the list; the Graph fake refuses a PATCH moving an occ
   time (one `PATCH` of the series), moved occurrence included;
 - `this_and_following` at the first occurrence moves the series; before the first, between two occurrences
   or off the series' days it is refused as not found, with nothing written;
-- a moved occurrence's split, named by its id and current start, writes nothing and leaves no write queued
-  (the one test of the `this_and_following` path);
 - an occurrence moved onto another's time, named by its own id and that time, is the one changed; the
   series' id with that time is refused (ambiguous); an occurrence id with a time that is its place, or
   another occurrence's start, is refused (not found / `namesAnotherOccurrence`);
@@ -769,8 +769,10 @@ no days moves (control).
 to another date becomes a split on Google and Outlook; a new time of day on its date moves the whole series;
 `this_and_following` at the first occurrence moves the series; the question and named-day refusals come
 before any card with nothing queued; the card names an occurrence by one time, where it is now (no
-"originally"); an "all" new date named at a later occurrence moved from its place (a split there, #563)
-writes nothing on Outlook and leaves no write queued (the one test of that path).
+"originally"). A split at a later occurrence moved from its place (#563) shows its card, then errors at the
+write with nothing written and the row failed: `this_and_following` named there (Google) and an "all" new date
+named there (Outlook), one test per path. `this_and_following` at a moved FIRST occurrence is shown and
+written as an edit of the whole series (Google; red before the moved check left the occurrence lookup).
 
 `CalendarSeriesScopeResetNoteTests` (PROOF P2, red-first against asking the occurrence with the edit as
 given): an "all" time edit named by a later occurrence's id, or a shift from the first occurrence's id, shows
@@ -795,11 +797,14 @@ and scope of an edit of a series whose stored zone TabMail does not recognize is
 
 A split starts at one of the series' own occurrences (`GoogleSeriesSplitCopyTests`,
 `ExchangeSeriesSplitCopyTests`): a `recurrence_id` between two occurrences, off the series' days, at a
-deleted occurrence or at a moved occurrence's place is refused with only `GET`s on the wire (not found). A
-retry after this split's own
-cap is not checked again (`RecurrenceTail.isCapped`, pinned in `RecurrenceTailTests`).
+deleted occurrence or at a moved occurrence's place is refused with only `GET`s on the wire (not found). An
+Outlook all-day series whose zone is not known is not split: its occurrence is found, and the split's own
+check counts its undatable place as moved (`allDaySeriesWithoutAZoneIsNotSplit`). A retry after this split's
+own cap is not checked again (`RecurrenceTail.isCapped`, pinned in `RecurrenceTailTests`; on Outlook
+`ownCapRetryDoesNotLookTheOccurrenceUp`: no instances read, and an occurrence moved there does not stop it).
 `CalDAVOccurrenceEditToolToWireTests`: "all" and no `edit_scope` by a CalDAV occurrence id write the series
-(#560); a moved occurrence's `this_and_following` writes nothing and leaves no write queued (#563).
+(#560); a moved occurrence's `this_and_following` writes nothing and leaves no write queued (#563; CalDAV's
+#613 check refuses it before the card).
 
 The queue suite's `getEvent` counts are one per edit: that read tells an occurrence from its series. A
 Google or Outlook occurrence edit or split adds one instances read.

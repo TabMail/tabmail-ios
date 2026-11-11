@@ -366,7 +366,8 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// The occurrence of `eventId`'s series that starts at `recurrenceId` now
     /// (`CalendarProvider.occurrence`): the one `updateOccurrence` would change, found by the same
     /// lookup (`resolveInstanceId`), read as `getEvent` reads it (with its `originalStart`).
-    /// Nothing is written.
+    /// Nothing is written. `forSplit` is not read: a moved occurrence is found here, and only
+    /// `splitSeries` refuses a split at one.
     func occurrence(
         calendarId: String = "primary",
         eventId: String,
@@ -374,27 +375,20 @@ actor ExchangeCalendarProvider: CalendarProvider {
         recurrenceIdZone: TimeZone,
         forSplit: Bool
     ) async throws -> GCalEvent {
-        let (masterId, master) = try await resolveToMaster(eventId: eventId)
+        let (masterId, _) = try await resolveToMaster(eventId: eventId)
         return try await occurrence(
-            named: eventId, masterId: masterId, master: master.event,
-            recurrenceId: recurrenceId, zone: recurrenceIdZone, forSplit: forSplit)
+            named: eventId, masterId: masterId,
+            recurrenceId: recurrenceId, zone: recurrenceIdZone)
     }
 
     /// `occurrence`, with the series already read (`resolveToMaster`): `named` is the id the edit
-    /// gave, `masterId` and `master` its series. Also the split's own check (`splitSeries`).
+    /// gave, `masterId` its series. Also the split's own lookup (`splitSeries`).
     private func occurrence(
-        named: String, masterId: String, master: GCalEvent,
-        recurrenceId: String, zone: TimeZone, forSplit: Bool
+        named: String, masterId: String, recurrenceId: String, zone: TimeZone
     ) async throws -> GCalEvent {
         let instanceId = try await resolveInstanceId(
             masterId: masterId, recurrenceId: recurrenceId, zone: zone, naming: named == masterId ? nil : named)
-        let found = try await getEvent(eventId: instanceId)
-        if forSplit, RecurrenceOccurrenceResolver.wasMoved(found, seriesZone: master.seriesZone) {
-            // A split at an occurrence moved from its place is not supported (#563): a plain error,
-            // nothing written.
-            throw CalendarProviderError.notSupported("split at a moved occurrence")
-        }
-        return found
+        return try await getEvent(eventId: instanceId)
     }
 
     /// Series split (this_and_following). For Graph:
@@ -441,15 +435,20 @@ actor ExchangeCalendarProvider: CalendarProvider {
         guard let capEndDate = Self.graphEndDateBefore(naiveISO: recurrenceId, allDay: master.isAllDay, zone: recurrenceIdZone) else {
             throw CalendarProviderError.notSupported("Invalid recurrence_id '\(recurrenceId)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
         }
-        // The split is at an occurrence that starts at `recurrenceId` now and was not moved from
-        // its place in the series, the one `occurrence(forSplit:)` finds; otherwise it throws with
-        // nothing written. Not asked on a retry after this split's own cap, which ended the series
-        // before that occurrence.
+        // The split is at an occurrence that starts at `recurrenceId` now, the one `occurrence`
+        // finds, and was not moved from its place in the series; otherwise it throws with nothing
+        // written. Not asked on a retry after this split's own cap, which ended the series before
+        // that occurrence.
         let ownCap = storedRange["type"] as? String == "endDate" && storedRange["endDate"] as? String == capEndDate
         if !ownCap {
-            _ = try await occurrence(
-                named: named, masterId: eventId, master: master,
-                recurrenceId: recurrenceId, zone: recurrenceIdZone, forSplit: true)
+            let found = try await occurrence(
+                named: named, masterId: eventId, recurrenceId: recurrenceId, zone: recurrenceIdZone)
+            if RecurrenceOccurrenceResolver.wasMoved(found, seriesZone: master.seriesZone) {
+                // A split at an occurrence moved from its place is not supported (#563): a plain
+                // error, nothing written. An all-day place whose series' zone is not known can't be
+                // dated, so it counts as moved.
+                throw CalendarProviderError.notSupported("split at a moved occurrence")
+            }
         }
         var capRange = storedRange
         capRange["type"] = "endDate"

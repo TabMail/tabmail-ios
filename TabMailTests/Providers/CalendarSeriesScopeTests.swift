@@ -32,9 +32,10 @@ import GRDB
 // **INVARIANT 4 (the property).** *An occurrence is named by where it is now* (`recurrence_id` is
 // the start the listing shows), *and an edit is either refused before its card (no card, nothing
 // queued, nothing written) or, once the queue has drained, the calendar holds what the card said.*
-// Never a refusal after the user confirmed, with one exception: a split at an occurrence moved from
-// its place in the series is not supported (#563, #687) and is a plain error with nothing written,
-// wherever it is thrown.
+// Never a refusal after the user confirmed, with one exception: a split at a later occurrence moved
+// from its place in the series is not supported (#563, #687): its card is shown, and the write is a
+// plain error with nothing written. A change of a moved FIRST occurrence and the following ones is
+// an edit of the whole series, and is written.
 //
 // The assertions run on what the provider ends up holding (the Google and Graph fakes apply PATCH and
 // POST to stored events, the CalDAV fake PUT), on the durable row, and, for the edit tool, on its card
@@ -329,24 +330,6 @@ struct GoogleCalendarSeriesScopeTests {
             #expect(r.calendar.writes.isEmpty, "\(rid): writes \(r.calendar.writes)")
             #expect(r.rows.first?.failureReason?.contains(notFoundOnServer) == true, "\(rid): rows \(reasons(r.rows))")
         }
-    }
-
-    /// A change of the occurrence `eventId` names and the following ones, at `recurrenceId`, renaming them.
-    private func renameFollowing(_ seed: [[String: Any]], eventId: String, at recurrenceId: String, account: String)
-        async throws -> (calendar: FakeGoogleCalendar, rows: [PendingCalendarOperation]) {
-        try await google(seed, eventId: eventId, [
-            "edit_scope": .string("this_and_following"), "recurrence_id": .string(recurrenceId),
-            "title": .string("Team standup"), "timezone": .string("UTC"),
-        ], account: account)
-    }
-
-    @Test("a change of a moved occurrence and the following ones, named by its id and where it is now, writes nothing (#563)")
-    func movedOccurrenceSplitWritesNothing() async throws {
-        let seed = GoogleSeries.calendar + [GoogleSeries.moved(day(14), start: "\(day(14))T13:00:00", end: "\(day(14))T13:30:00")]
-        let rid = "\(day(14))T13:00:00"
-        let r = try await renameFollowing(seed, eventId: GoogleSeries.instanceId(day(14)), at: rid, account: "series-g-moved")
-        #expect(r.calendar.writes.isEmpty, "writes: \(r.calendar.writes)")
-        #expect(r.rows.allSatisfy { $0.status == PendingStatus.failed.rawValue }, "a write is still queued: \(reasons(r.rows))")
     }
 
     @Test("an occurrence moved onto another's time, named by its id and that time, is the one changed, never the other")
@@ -932,8 +915,23 @@ struct CalendarEditToolSeriesScopeTests {
                 "writes: \(r.calendar.writes); \(r.run.out)")
     }
 
-    @Test("Outlook: a new date of every occurrence named at a later occurrence moved from its place writes nothing (#563)")
-    func everyOccurrenceToAnotherDateAtAMovedOccurrenceWritesNothing() async throws {
+    @Test("Google: a change of a moved later occurrence and the following ones shows its card, then errors at the write with nothing written (#563)")
+    func followingAtAMovedLaterOccurrenceErrorsAtTheWrite() async throws {
+        // Day 14's occurrence, moved on its own to 13:00, named by its id and where it is now.
+        let seed = GoogleSeries.calendar + [GoogleSeries.moved(day(14), start: "\(day(14))T13:00:00", end: "\(day(14))T13:30:00")]
+        let r = try await googleTool([
+            "edit_scope": .string("this_and_following"), "recurrence_id": .string("\(day(14))T13:00:00"),
+            "title": .string("Team standup"), "timezone": .string("UTC"),
+        ], eventId: GoogleSeries.instanceId(day(14)), account: "series-tool-g-moved-following", seed: seed)
+        #expect(r.run.cards.count == 1 && r.run.cards.first.map { Extent(changes: $0.changes) } == .fromHereOn,
+                "no card for the split: \(r.run.cards.map(\.changes)); \(r.run.out)")
+        #expect(r.calendar.writes.isEmpty, "writes: \(r.calendar.writes)")
+        #expect(r.run.queued.count == 1 && r.run.queued.allSatisfy { $0.status == PendingStatus.failed.rawValue },
+                "the split did not end failed: \(reasons(r.run.queued))")
+    }
+
+    @Test("Outlook: a new date of every occurrence named at a moved later occurrence shows the split's card, then errors at the write with nothing written (#563)")
+    func everyOccurrenceToAnotherDateAtAMovedOccurrenceErrorsAtTheWrite() async throws {
         // The later occurrence, moved on its own two days on, named by its id; the series every seventh
         // day names no days. Its new date is a split there, which is not supported.
         let place = GraphFixture.occurrenceStart
@@ -943,9 +941,31 @@ struct CalendarEditToolSeriesScopeTests {
             "edit_scope": .string("all"), "start_iso": .string(GraphFixture.naive(now.addingTimeInterval(86_400))),
             "timezone": .string("UTC"),
         ], eventId: GraphSeries.later, account: "series-tool-x-moved-all")
+        #expect(r.cards.count == 1 && r.cards.first.map { Extent(changes: $0.changes) } == .fromHereOn,
+                "no card for the split: \(r.cards.map(\.changes)); \(r.out)")
         #expect(graph.created.isEmpty && graph.patches("ser-1").isEmpty && graph.patches(GraphSeries.later).isEmpty,
                 "written: created \(graph.created.count); \(r.out)")
-        #expect(r.queued.allSatisfy { $0.status == PendingStatus.failed.rawValue }, "a write is still queued: \(reasons(r.queued))")
+        #expect(r.queued.count == 1 && r.queued.allSatisfy { $0.status == PendingStatus.failed.rawValue },
+                "the split did not end failed: \(reasons(r.queued))")
+    }
+
+    @Test("Google: a change of the series' first occurrence and the following ones, moved from its place, is an edit of the whole series and is written")
+    func followingAtAMovedFirstOccurrenceEditsTheSeries() async throws {
+        // The first occurrence, moved on its own a day on, named by its id and where it is now. From the
+        // first occurrence on is every occurrence: no split is written, so its move does not matter.
+        let seed = GoogleSeries.calendar.filter { $0["id"] as? String != GoogleSeries.first }
+            + [GoogleSeries.moved(day(0), start: "\(day(1))T09:00:00", end: "\(day(1))T09:30:00")]
+        let r = try await googleTool([
+            "edit_scope": .string("this_and_following"), "recurrence_id": .string("\(day(1))T09:00:00"),
+            "title": .string("Team standup"), "timezone": .string("UTC"),
+        ], eventId: GoogleSeries.first, account: "series-tool-g-moved-first-following", seed: seed)
+        #expect(r.run.cards.count == 1 && r.run.cards.first.map { Extent(changes: $0.changes) } == .whole,
+                "not shown as the whole series: \(r.run.cards.map(\.changes)); \(r.run.out)")
+        #expect(r.calendar.event(GoogleSeries.id)?["summary"] as? String == "Team standup",
+                "the series was not renamed; writes: \(r.calendar.writes); \(r.run.out)")
+        #expect(r.calendar.writes == ["PATCH \(GoogleSeries.id)"], "writes: \(r.calendar.writes)")
+        #expect(r.run.queued.isEmpty, "rows: \(reasons(r.run.queued))")
+        #expect(r.run.out.contains("edit_scope: all"), "\(r.run.out)")
     }
 
     @Test("Google: a series on named weekdays, named from a later occurrence and moved to another date, is refused before the card")
@@ -1677,8 +1697,8 @@ enum ChangeKind: String, CaseIterable, CustomTestStringConvertible, Sendable {
 }
 
 /// How much of the series an edit changes, as its card says; `refused` before any card; `error` a
-/// split at an occurrence moved from its place, not supported (#563, #687): an error, with nothing
-/// written and no write left queued, wherever it is thrown.
+/// split at a later occurrence moved from its place, not supported (#563, #687): the split's card,
+/// then an error at the write, with nothing written and the row left failed.
 enum Extent: String, Sendable {
     case refused, error, whole, one, fromHereOn
 
@@ -1711,12 +1731,17 @@ struct InvariantCase: CustomTestStringConvertible, Sendable {
         case "this_only":
             return .one
         case "this_and_following":
-            // A split at an occurrence moved from its place (#563): the provider's lookup for a split
-            // finds it moved (the first occurrence included).
-            if state != .unmoved { return .error }
-            // A series on named days to another date with no new rule.
+            // A series on named days to another date with no new rule, refused before the card.
             if kind == .dateNamedDays { return .refused }
-            return .fromHereOn
+            switch state {
+            case .unmoved: return .fromHereOn
+            // From the first occurrence on is every occurrence: an edit of the whole series.
+            case .firstMoved: return .whole
+            // A split at a later occurrence moved from its place (#563): its card, then an error
+            // at the write, with nothing written.
+            case .movedFar, .movedOntoAnother: return .error
+            case .deleted: return .refused
+            }
         default:
             switch kind {
             case .rename, .timeOfDay: return .whole
@@ -1725,7 +1750,8 @@ struct InvariantCase: CustomTestStringConvertible, Sendable {
                 switch state {
                 case .unmoved: return .fromHereOn
                 case .firstMoved: return .whole
-                // A new date from a later occurrence is a split there; it was moved (#563).
+                // A new date from a later occurrence is a split there; it was moved (#563): its card,
+                // then an error at the write.
                 case .movedFar, .movedOntoAnother: return .error
                 case .deleted: return .refused
                 }
@@ -1770,8 +1796,10 @@ private func invariantArguments(_ entry: InvariantCase, now: Date) -> [String: J
 private func checkProperty(_ entry: InvariantCase, run: ToolRun, wrote: Bool) -> Extent? {
     let label = entry.testDescription
     if entry.expected == .error {
-        #expect(!wrote && run.queued.allSatisfy { $0.status == PendingStatus.failed.rawValue },
-                "\(label): a split at a moved occurrence wrote \(wrote), or left a write queued: \(reasons(run.queued)): \(run.out)")
+        #expect(run.cards.count == 1 && run.cards.first.map { Extent(changes: $0.changes) } == .fromHereOn,
+                "\(label): the split's card was not shown: \(run.cards.map(\.changes)): \(run.out)")
+        #expect(!wrote && run.queued.count == 1 && run.queued.allSatisfy { $0.status == PendingStatus.failed.rawValue },
+                "\(label): a split at a moved occurrence wrote \(wrote), or did not end failed: \(reasons(run.queued)): \(run.out)")
         return nil
     }
     if entry.expected == .refused {

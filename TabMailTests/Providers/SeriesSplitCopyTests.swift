@@ -625,6 +625,26 @@ struct ExchangeSeriesSplitCopyTests {
         #expect(range["startDate"] as? String == String(GraphSplitFixture.recurrenceId.prefix(10)), "\(canonical(range))")
     }
 
+    @Test("a retry after this split's own cap does not look its occurrence up again: no instances read, and an occurrence moved there does not stop it")
+    func ownCapRetryDoesNotLookTheOccurrenceUp() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let cap = try #require(ExchangeCalendarProvider.graphEndDateBefore(
+            naiveISO: GraphSplitFixture.recurrenceId, allDay: false, zone: .current))
+        let series = GraphSplitFixture.series(range: ["type": "endDate", "endDate": cap, "numberOfOccurrences": 0])
+        // An occurrence at the split's place, moved on its own an hour later: looked up, it would stop
+        // the split (nothing starts at the place now, and the one there was moved).
+        var moved = GraphFixture.event(id: "ser-1-occ", start: GraphSplitFixture.occurrence, online: false, seriesMasterId: "ser-1")
+        moved["start"] = ["dateTime": GraphFixture.naive(GraphSplitFixture.occurrence.addingTimeInterval(3_600)), "timeZone": "UTC"]
+        let graph = FakeGraphCalendar([series, moved])
+        graph.install(on: http)
+        _ = try await GraphSplitFixture.provider(http).splitSeries(
+            eventId: "ser-1", recurrenceId: GraphSplitFixture.recurrenceId, recurrenceIdZone: .current, patch: GCalEventInput())
+        #expect(!http.recordedCalls().contains { $0.url.contains("/instances") },
+                "the occurrence was looked up on a retry: \(http.servedCallSequence())")
+        #expect(graph.created.count == 1, "no new part: \(http.servedCallSequence())")
+    }
+
     @Test("attendees keep their name and type; one the edit adds is required")
     func attendeesKeepTheirType() async throws {
         let series = GraphSplitFixture.series(range: GraphSplitFixture.noEnd)
@@ -821,20 +841,30 @@ struct ExchangeSeriesSplitCopyTests {
         }
     }
 
-    @Test("an all-day series whose own zone is not known is not split")
+    @Test("an all-day series whose own zone is not known is not split: its occurrence's place can't be dated, so the split's own check counts it as moved")
     func allDaySeriesWithoutAZoneIsNotSplit() async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
         let date = GraphFixture.utcDay(GraphSplitFixture.occurrence)
+        // The occurrence is where its place puts it (`GraphFixture.event` gives it that place); only the
+        // series' zone, which Graph's all-day place is dated in, is not one TabMail recognizes.
         let graph = FakeGraphCalendar([Self.allDaySeries(zone: "Not a zone"),
                                        GraphFixture.event(id: "ser-1-occ", start: GraphSplitFixture.occurrence,
                                                           online: false, seriesMasterId: "ser-1", allDay: true)])
         graph.install(on: http)
-        await #expect(throws: CalendarProviderError.self) {
+        var reason: String?
+        do {
             _ = try await GraphSplitFixture.provider(http).splitSeries(
                 eventId: "ser-1", recurrenceId: date + "T00:00:00", recurrenceIdZone: .current, patch: GCalEventInput())
+        } catch CalendarProviderError.notSupported(let thrown) {
+            reason = thrown
         }
+        // The occurrence was found (read by its id), and the split's own check refused it there.
+        #expect(http.recordedCalls().contains { $0.method == "GET" && $0.url.contains("/events/ser-1-occ") },
+                "the occurrence was not found: \(http.servedCallSequence())")
+        #expect(reason == "split at a moved occurrence", "\(reason ?? "not refused")")
         #expect(http.recordedCalls().allSatisfy { $0.method == "GET" }, "written: \(http.servedCallSequence())")
+        #expect(graph.created.isEmpty && graph.patches("ser-1").isEmpty, "the series was split")
     }
 
     /// A weekly all-day series repeating in `zone` (a Windows zone name, as Graph's range gives it).

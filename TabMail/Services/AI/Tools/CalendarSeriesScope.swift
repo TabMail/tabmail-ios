@@ -58,7 +58,10 @@ enum CalendarSeriesScope {
     /// the occurrence it names, by its `recurrence_id` (read in `zone`) or, for an occurrence id
     /// given without one, by the start it has now. The occurrence is found by the provider's own
     /// lookup, the one its one-occurrence edit and split make, with `forSplit` on a
-    /// `this_and_following` edit; so what the write would refuse is refused here, before the card.
+    /// `this_and_following` edit; so what the lookup refuses is refused here, before the card. A split
+    /// at an occurrence moved from its place is not looked for here on Google and Outlook: `route`
+    /// may make it an edit of the whole series (the first occurrence), and the split itself throws
+    /// at one (#563).
     ///
     /// Throws, with nothing written: what the provider throws (its not-found error when no
     /// occurrence starts at `recurrence_id`, `notSupported` for an occurrence id that names another
