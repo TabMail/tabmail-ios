@@ -20,16 +20,16 @@ import Synchronization
 //
 // It is checked for every scope the tool takes (all, none given, none given with a
 // recurrence_id, this_only, this_and_following) and both ids a listing hands out (the
-// series' own, one occurrence's). An edit of the whole event given ONE occurrence's id is
-// the case the card cannot describe on CalDAV, where the whole event is every occurrence:
-// it must be refused, and the test pins that it is, so the property can't be met by
-// refusing everything.
+// series' own, one occurrence's). An edit of the whole event given ONE occurrence's id
+// changes the whole series, and its card shows the series (#560).
 //
 // The same matrix runs on a MOVED occurrence (week 2's moved past weeks 3 and 4 into week 5),
 // named by where the listing shows it. There the card's "this and all future occurrences"
 // would start at the occurrence's place in the series (week 2), a wider write than the card
-// shows, so that split is refused by name with nothing written, by either id; this_only
-// changes exactly the moved occurrence where it is.
+// shows, so that split is not supported (#563): its card, then an error at the write, with
+// nothing written, by either id; this_only changes exactly the moved occurrence where it is.
+// A change of the series' FIRST occurrence and the following ones, moved from its place, is an
+// edit of the whole series and is written.
 //
 // The chain is a user's: the model passes the number the chat translator gave it, the user
 // confirms the card, and the queued edit drains through the real `CalDAVProvider` onto a
@@ -72,16 +72,17 @@ struct CalDAVOccurrenceEditToolToWireTests {
         let editScope: String?
         let givesRecurrenceId: Bool
         let refused: Bool
-        /// Refused only once the event was read: the refusal may follow a GET, never a write.
-        var refusedAfterReading = false
+        /// Not supported (a split at a moved occurrence, #563): the split's card, then an error at
+        /// the write, with nothing written and no write left queued.
+        var errorNothingWritten = false
     }
 
-    /// Every scope the tool takes, by each id kind. Refused: the whole event by one
-    /// occurrence's id, with edit_scope all or with no scope and no recurrence_id.
+    /// Every scope the tool takes, by each id kind. None is refused: the whole event by one
+    /// occurrence's id is an edit of the series (#560).
     static let cases: [Case] = [false, true].flatMap { byOccurrence in
         [
-            Case(label: "edit_scope all", occurrenceId: byOccurrence, editScope: "all", givesRecurrenceId: false, refused: byOccurrence),
-            Case(label: "no edit_scope", occurrenceId: byOccurrence, editScope: nil, givesRecurrenceId: false, refused: byOccurrence),
+            Case(label: "edit_scope all", occurrenceId: byOccurrence, editScope: "all", givesRecurrenceId: false, refused: false),
+            Case(label: "no edit_scope", occurrenceId: byOccurrence, editScope: nil, givesRecurrenceId: false, refused: false),
             Case(label: "no edit_scope, a recurrence_id", occurrenceId: byOccurrence, editScope: nil, givesRecurrenceId: true, refused: false),
             Case(label: "edit_scope this_only", occurrenceId: byOccurrence, editScope: "this_only", givesRecurrenceId: true, refused: false),
             Case(label: "edit_scope this_and_following", occurrenceId: byOccurrence, editScope: "this_and_following", givesRecurrenceId: true, refused: false),
@@ -96,15 +97,15 @@ struct CalDAVOccurrenceEditToolToWireTests {
         try W.makeMoved(week: movedFromWeek, toWeek: movedToWeek)
     }
 
-    /// Every scope by each id kind, on the moved occurrence. Refused: the whole event by one
-    /// occurrence's id (as above), and a split at it by either id.
+    /// Every scope by each id kind, on the moved occurrence. The split's card, then an error at the
+    /// write with nothing written: a split at it by either id.
     static let movedCases: [Case] = [false, true].flatMap { byOccurrence in
         [
-            Case(label: "edit_scope all", occurrenceId: byOccurrence, editScope: "all", givesRecurrenceId: false, refused: byOccurrence),
-            Case(label: "no edit_scope", occurrenceId: byOccurrence, editScope: nil, givesRecurrenceId: false, refused: byOccurrence),
+            Case(label: "edit_scope all", occurrenceId: byOccurrence, editScope: "all", givesRecurrenceId: false, refused: false),
+            Case(label: "no edit_scope", occurrenceId: byOccurrence, editScope: nil, givesRecurrenceId: false, refused: false),
             Case(label: "no edit_scope, a recurrence_id", occurrenceId: byOccurrence, editScope: nil, givesRecurrenceId: true, refused: false),
             Case(label: "edit_scope this_only", occurrenceId: byOccurrence, editScope: "this_only", givesRecurrenceId: true, refused: false),
-            Case(label: "edit_scope this_and_following", occurrenceId: byOccurrence, editScope: "this_and_following", givesRecurrenceId: true, refused: true, refusedAfterReading: true),
+            Case(label: "edit_scope this_and_following", occurrenceId: byOccurrence, editScope: "this_and_following", givesRecurrenceId: true, refused: true, errorNothingWritten: true),
         ]
     }
 
@@ -170,6 +171,17 @@ struct CalDAVOccurrenceEditToolToWireTests {
         let (cards, confirmedAt) = await MainActor.run {
             (sink.confirmations.flatMap(\.calendarEvents), sink.requestsAtConfirmation)
         }
+        if entry.errorNothingWritten {
+            #expect(cards.count == 1 && cards.first.map { Extent(changes: $0.changes) } == .fromHereOn,
+                    "\(label): the split's card was not shown: \(cards.map(\.changes)): \(output)")
+            #expect(harness.store.recordedPuts().isEmpty, "\(label): written: \(harness.store.recordedPuts().map(\.path))")
+            #expect(H.deletes(harness.http).isEmpty, "\(label): deleted: \(H.deletes(harness.http))")
+            #expect(harness.store.storedICS(path: W.seriesPath) == fixture.ics, "\(label): the series is not on the server as it was")
+            let ops = try await harness.pool.read { db in try PendingCalendarOperation.fetchAll(db) }
+            #expect(ops.count == 1 && ops.allSatisfy { $0.status == PendingStatus.failed.rawValue },
+                    "\(label): the split did not end failed, or a write is still queued: \(ops.map { $0.status })")
+            return
+        }
         #expect(cards.count == 1 && confirmedAt.count == 1, "\(label): expected one confirmed card, got \(cards.count): \(output)")
         guard cards.count == 1, confirmedAt.count == 1 else { return }
         let card = cards[0]
@@ -177,12 +189,7 @@ struct CalDAVOccurrenceEditToolToWireTests {
         let refused = output.contains("NOT changed")
         #expect(refused == entry.refused, "\(label): \(entry.refused ? "was not refused" : "was refused"): \(output)")
 
-        if refused, entry.refusedAfterReading {
-            let sent = harness.http.recordedCalls().dropFirst(confirmedAt[0]).map(\.method)
-            #expect(sent.allSatisfy { $0 == "GET" }, "\(label): a refused split sent more than a read after the user confirmed: \(sent)")
-            #expect(output.contains("was moved from its place in the series") && output.contains("this_only"),
-                    "\(label): the refusal does not name the moved occurrence and what works instead: \(output)")
-        } else if refused {
+        if refused {
             #expect(sentAfterConfirming == 0, "\(label): a refused edit sent \(sentAfterConfirming) request(s) after the user confirmed: \(harness.http.servedCallSequence())")
         }
         if refused {
@@ -210,6 +217,61 @@ struct CalDAVOccurrenceEditToolToWireTests {
             let changed = extent.covers(start, cardStart: card.startDate)
             #expect(row.summary == (changed ? Self.newTitle : "Standup"),
                     "\(label): the occurrence at \(row.start?.dateTime ?? "nil") \(changed ? "does not show" : "shows") the edit; the card named \(extent) from \(card.startDate)")
+        }
+    }
+
+    // MARK: A change of the moved first occurrence and the following ones
+
+    @Test("a change of the series' first occurrence and the following ones, moved from its place, is an edit of the whole series and is written, by either id")
+    func followingAtAMovedFirstOccurrenceEditsTheSeries() async throws {
+        // The first occurrence, moved on its own to the next day at 10:00, named where the listing
+        // shows it. From the first occurrence on is every occurrence: no split is written, so its
+        // move does not matter.
+        for byOccurrence in [false, true] {
+            let session = "caldav-edit-moved-first-\(byOccurrence)"
+            let label = byOccurrence ? "occurrence id" : "series id"
+            let harness = try await H.makeHarness(accountId: session, fixture: try W.makeMoved(week: 0, toWeek: 0))
+            defer { H.tearDown(harness) }
+            let fixture = harness.fixture
+            let shown = try fixture.movedStart(toWeek: 0)
+            let eventId = byOccurrence ? try fixture.occurrenceId(0) : W.seriesPath
+            let before = try await Self.listing(fixture, http: harness.http)
+
+            let translator = ChatIdTranslator.createIsolated()
+            let compound = CompoundEventId.make(accountId: harness.accountId, eventId: eventId)
+            let forModel = await translator.processToolOutputForLLM("event_id: \(compound)")
+            let numericId = try #require(H.eventIds(in: forModel).first.flatMap { Int($0) }, "\(label): no numeric event id for the model: \(forModel)")
+            await H.recordCalendar(of: eventId, accountId: harness.accountId, translator: translator)
+            let arguments: [String: JSONValue] = [
+                "event_id": .string(String(numericId)),
+                "edit_scope": .string("this_and_following"),
+                "recurrence_id": .string(OccurrenceFixture.naive(shown, fixture.zone)),
+                "title": .string(Self.newTitle),
+                "timezone": .string(fixture.zone.identifier),
+            ]
+            let sink = H.ConfirmingSink(http: harness.http)
+            let output = try await CalendarEventEditTool(context: ToolContext(db: harness.pool, translator: translator)).execute(
+                arguments: arguments, invocation: ToolInvocation(uiSink: sink, sessionKey: session))
+            await AccountManager.shared.drainCalendarQueue()
+
+            let cards = await MainActor.run { sink.confirmations.flatMap(\.calendarEvents) }
+            #expect(cards.count == 1 && cards.first.map { Extent(changes: $0.changes) } == .whole,
+                    "\(label): not shown as the whole series: \(cards.map(\.changes)): \(output)")
+            #expect(!output.contains("NOT changed") && output.contains("edit_scope: all"), "\(label): \(output)")
+            #expect(harness.store.recordedPuts().map(\.path) == [W.seriesPath],
+                    "\(label): not one write of the series: \(harness.store.recordedPuts().map(\.path))")
+            #expect(H.deletes(harness.http).isEmpty, "\(label): deleted: \(H.deletes(harness.http))")
+            let ops = try await harness.pool.read { db in try PendingCalendarOperation.fetchAll(db) }
+            #expect(ops.isEmpty, "\(label): the edit did not drain: \(ops.map { "\($0.status) \($0.failureReason ?? "")" })")
+
+            // Every occurrence is where it was, and the series' own (all but the moved one, which an
+            // edit of the whole event leaves as its own) shows the edit.
+            let after = try await Self.listing(fixture, http: harness.http)
+            #expect(after.compactMap(\.startDate) == before.compactMap(\.startDate),
+                    "\(label): the edit moved, added or removed an occurrence: \(after.map { $0.start?.dateTime ?? "nil" })")
+            for row in after where row.startDate != shown {
+                #expect(row.summary == Self.newTitle, "\(label): the occurrence at \(row.start?.dateTime ?? "nil") does not show the edit")
+            }
         }
     }
 
@@ -272,5 +334,65 @@ struct CalDAVOccurrenceEditToolToWireTests {
         guard ops.count == 1 else { return }
         #expect(ops[0].status == PendingStatus.failed.rawValue, "the retried edit did not end, so the queue would keep running it: \(ops[0].status)")
         #expect(ops[0].failureReason?.contains("not found") == true, "the retried edit did not end as not found: \(ops[0].failureReason ?? "nil")")
+    }
+}
+
+extension CalDAVOccurrenceEditToolToWireTests {
+
+    // MARK: A split whose cap's response was lost
+
+    @Test("a change of an occurrence and the following ones, whose cap's response is lost, ends complete on its retry: the edit from that occurrence on, every occurrence once, nothing queued or failed")
+    func splitWhoseCapResponseWasLostEndsComplete() async throws {
+        let session = "caldav-split-cap-lost"
+        let harness = try await H.makeHarness(accountId: session)
+        defer { H.tearDown(harness) }
+        let fixture = harness.fixture
+        let slot = try fixture.occurrence(2)
+        let before = try await Self.listing(fixture, http: harness.http)
+
+        // The new part is written first; the cap, written last to the series, is applied and the
+        // connection drops before its response arrives. Every later write is answered.
+        let store = harness.store
+        let lostOnce = Mutex(true)
+        harness.http.register(path: W.seriesPath, method: "PUT") { request in
+            let response = store.handlePUT(request)
+            let lose = lostOnce.withLock { lose in defer { lose = false }; return lose }
+            return lose ? .transportError(.networkConnectionLost) : response
+        }
+
+        let translator = ChatIdTranslator.createIsolated()
+        let compound = CompoundEventId.make(accountId: harness.accountId, eventId: W.seriesPath)
+        let forModel = await translator.processToolOutputForLLM("event_id: \(compound)")
+        let numericId = try #require(H.eventIds(in: forModel).first.flatMap { Int($0) }, "no numeric event id for the model: \(forModel)")
+        await H.recordCalendar(of: W.seriesPath, accountId: harness.accountId, translator: translator)
+
+        let arguments: [String: JSONValue] = [
+            "event_id": .string(String(numericId)),
+            "edit_scope": .string("this_and_following"),
+            "recurrence_id": .string(OccurrenceFixture.naive(slot, fixture.zone)),
+            "title": .string(Self.newTitle),
+            "timezone": .string(fixture.zone.identifier),
+        ]
+        let sink = H.ConfirmingSink(http: harness.http)
+        let output = try await CalendarEventEditTool(context: ToolContext(db: harness.pool, translator: translator)).execute(
+            arguments: arguments, invocation: ToolInvocation(uiSink: sink, sessionKey: session))
+        // The first attempt's cap response is lost, so the split is retried by a later drain.
+        await AccountManager.shared.drainCalendarQueue()
+        await AccountManager.shared.drainCalendarQueue()
+
+        let ops = try await harness.pool.read { db in try PendingCalendarOperation.fetchAll(db) }
+        #expect(ops.isEmpty, "the split did not end complete: \(ops.map { "\($0.status) \($0.failureReason ?? "")" }), tool said: \(output)")
+        #expect(lostOnce.withLock { !$0 }, "the cap was never written")
+
+        // Every occurrence is listed once, where it was, and the edit is on exactly those from the
+        // split on.
+        let after = try await Self.listing(fixture, http: harness.http)
+        #expect(after.compactMap(\.startDate) == before.compactMap(\.startDate),
+                "the split moved, added or removed an occurrence: \(after.map { $0.start?.dateTime ?? "nil" })")
+        for row in after {
+            guard let start = row.startDate else { continue }
+            #expect(row.summary == (start >= slot ? Self.newTitle : "Standup"),
+                    "the occurrence at \(row.start?.dateTime ?? "nil") \(start >= slot ? "does not show" : "shows") the edit")
+        }
     }
 }

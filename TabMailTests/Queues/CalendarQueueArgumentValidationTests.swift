@@ -19,6 +19,14 @@ import GRDB
 @Suite("Calendar queue: recurrence argument validation", .serialized, .processGlobalState)
 struct CalendarQueueArgumentValidationTests {
 
+    /// The event an edit names: a one-off, timed event.
+    private static let oneOff = GCalEvent(
+        id: "evt-1", summary: "Standup", location: nil, description: nil,
+        start: GCalDateTime(dateTime: "2099-07-15T09:00:00Z", date: nil, timeZone: "UTC"),
+        end: GCalDateTime(dateTime: "2099-07-15T09:30:00Z", date: nil, timeZone: "UTC"),
+        attendees: nil, organizer: nil, recurrence: nil,
+        transparency: nil, status: nil, htmlLink: nil, created: nil, updated: nil)
+
     private func makeTestDB(accountId: String) throws -> (pool: DatabasePool, dir: URL, previous: AppDatabase?) {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -49,7 +57,9 @@ struct CalendarQueueArgumentValidationTests {
             InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir)
         }
 
-        // `all_day` is stated so the edit path never needs to read the event first.
+        // An edit reads the event first, to find what it names (#560), so the edit is of a one-off
+        // event; `all_day` is stated so the edit path needs no other read.
+        if type == .edit { await mock.setGetEventResult(Self.oneOff) }
         let args: [String: JSONValue] = [
             "title": .string("Standup"),
             "all_day": .bool(false),

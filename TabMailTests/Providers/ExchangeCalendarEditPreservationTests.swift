@@ -38,6 +38,14 @@ import Synchronization
 /// - a recurrence whose range has no `startDate` is refused with a 400
 ///   (`recurrenceRange`: "Required");
 /// - `$select` returns only the properties it names (`event-get`);
+/// - a series' instances list (`/events/{id}/instances`) holds the occurrences stored with its
+///   `seriesMasterId` that START, where they are now, inside the window the request names; of a
+///   series whose range ends on a date (`type` `endDate`), only those whose place in the series
+///   (`originalStart`) is on or before that date in the range's `recurrenceTimeZone`: Graph lists
+///   none after a series' end (measured: a series capped by a split no longer listed the
+///   occurrences from the split on);
+/// - an occurrence moved onto the time another occurrence of its series starts at is refused with
+///   a 400 (`ErrorOccurrenceCrossingBoundary`), and nothing changes;
 /// - `calendarView` lists single events and occurrences, never a series master
 ///   (`user-list-calendarview`); this fake lists every stored one, whatever the
 ///   window, in no particular order;
@@ -56,21 +64,33 @@ import Synchronization
 ///   stored status kept their answer.
 ///
 /// Starts and ends are returned as stored, whatever zone `Prefer` names: a
-/// fixture stores them as Graph renders them for the device.
+/// fixture stores them as Graph renders them for the device. An occurrence's
+/// `originalStart` (stored as any ISO 8601 date-time) is returned as Graph returns
+/// it (measured 2026-11-11 on all-day series in Pacific Standard Time, Tokyo
+/// Standard Time and Asia/Kathmandu): written in the zone `Prefer:
+/// outlook.timezone` names, with that zone's offset (`…T00:00:00+09:00`), and as
+/// a UTC instant (`…Z`) when the request names none. The zone is the one Graph
+/// knows by that name: `zones`, else `CalendarTimeZoneResolver`.
 final class FakeGraphCalendar: Sendable {
     private let events: Mutex<[String: Data]>
     private let resets = Mutex(0)
     private let patchLog = Mutex<[(id: String, body: Data)]>([])
     private let patchAuthorizationLog = Mutex<[String]>([])
     private let failingRequests = Mutex<[String: [Int]]>([:])
+    private let lostResponses = Mutex<[String: Int]>([:])
+    private let readLog = Mutex<[(id: String, zone: String?)]>([])
 
-    init(_ seed: [[String: Any]]) {
+    /// Zones the server knows by a name TabMail may not (`Prefer` reads them).
+    private let zones: [String: TimeZone]
+
+    init(_ seed: [[String: Any]], zones: [String: TimeZone] = [:]) {
         var map: [String: Data] = [:]
         for event in seed {
             // swiftlint:disable:next force_try
             map[event["id"] as! String] = try! JSONSerialization.data(withJSONObject: event)
         }
         events = Mutex(map)
+        self.zones = zones
     }
 
     func event(_ id: String) -> [String: Any]? {
@@ -89,6 +109,22 @@ final class FakeGraphCalendar: Sendable {
     private func takeFailure(_ method: String) -> Int? {
         failingRequests.withLock { $0[method]?.isEmpty == false ? $0[method]?.removeFirst() : nil }
     }
+
+    /// The next `method` write is applied, and its response is lost: the connection drops before
+    /// it arrives (`PATCH` and `POST`).
+    func loseNextResponse(_ method: String) { lostResponses.withLock { $0[method, default: 0] += 1 } }
+
+    private func takeLoss(_ method: String) -> Bool {
+        lostResponses.withLock { lost in
+            guard let count = lost[method], count > 0 else { return false }
+            lost[method] = count - 1
+            return true
+        }
+    }
+
+    /// The zone `Prefer: outlook.timezone` named on each read of `id` by its own id (nil: none),
+    /// in order.
+    func readZones(_ id: String) -> [String?] { readLog.withLock { $0 }.filter { $0.id == id }.map(\.zone) }
 
     /// The PATCH bodies sent for `id`, in order.
     func patches(_ id: String) -> [[String: Any]] {
@@ -111,14 +147,21 @@ final class FakeGraphCalendar: Sendable {
             if let status = takeFailure("GET") { return .status(status) }
             let parts = Self.pathParts(request.url)
             let select = Self.selected(request.url)
+            let preferName = Self.preferredZoneName(request)
+            let prefer = preferName.flatMap { zones[$0] ?? CalendarTimeZoneResolver.zone(named: $0, in: .none) }
             if parts.count == 2, parts[1] == "instances" {
+                let window = Self.window(request.url)
+                let master = event(parts[0])
                 let instances = events.withLock { Array($0.values) }
                     .compactMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
                     .filter { $0["seriesMasterId"] as? String == parts[0] }
-                return Self.json(["value": instances.map { Self.only(select, of: $0) }])
+                    .filter { Self.starts($0, in: window) }
+                    .filter { Self.isInSeries($0, master: master) }
+                return Self.json(["value": instances.map { Self.only(select, of: Self.rendered($0, in: prefer)) }])
             }
+            if parts.count == 1 { readLog.withLock { $0.append((id: parts[0], zone: preferName)) } }
             guard parts.count == 1, let stored = event(parts[0]) else { return .status(404) }
-            return Self.json(Self.only(select, of: stored))
+            return Self.json(Self.only(select, of: Self.rendered(stored, in: prefer)))
         }
         http.register(path: "/v1.0/me/calendarView", method: "GET") { [self] request in
             if let status = takeFailure("GET") { return .status(status) }
@@ -140,6 +183,11 @@ final class FakeGraphCalendar: Sendable {
             if let attendees = patch["attendees"] as? [[String: Any]], attendees.contains(where: { $0["status"] == nil }) {
                 return .json(raw: #"{"error":{"code":"UnknownError","message":""}}"#, statusCode: 405)
             }
+            if let master = stored["seriesMasterId"] as? String, let start = patch["start"],
+               let at = Self.instant(start), occurrence(of: master, other: parts[0], startsAt: at) {
+                return .json(raw: #"{"error":{"code":"ErrorOccurrenceCrossingBoundary","message":"An occurrence can't be moved onto another occurrence of its series."}}"#,
+                             statusCode: 400)
+            }
             patchLog.withLock { $0.append((id: parts[0], body: body)) }
             let changesRule = patch["recurrence"].map { Self.canonicalJSON($0) != Self.canonicalJSON(stored["recurrence"]) } ?? false
             let isSeries = stored["recurrence"] != nil && !(stored["recurrence"] is NSNull)
@@ -151,6 +199,7 @@ final class FakeGraphCalendar: Sendable {
             }
             Self.apply(patch, to: &stored)
             store(stored)
+            if takeLoss("PATCH") { return .transportError(.networkConnectionLost) }
             return Self.json(stored)
         }
         http.register(path: "/v1.0/me/events", method: "POST") { [self] request in
@@ -162,8 +211,71 @@ final class FakeGraphCalendar: Sendable {
             created["id"] = Self.createdPrefix + String(ids.filter { $0.hasPrefix(Self.createdPrefix) }.count + 1)
             Self.defaultRecurrenceZone(in: &created)
             store(created)
+            if takeLoss("POST") { return .transportError(.networkConnectionLost) }
             return Self.json(created)
         }
+    }
+
+    /// The instances window a request names (`startDateTime`, `endDateTime`: naive UTC wall times),
+    /// nil when it names none.
+    private static func window(_ url: URL) -> (from: Date, to: Date)? {
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        func value(_ name: String) -> Date? {
+            items.first { $0.name == name }?.value.flatMap { EKEventStoreHelper.parseNaiveISO(String($0.prefix(19)), timeZone: .gmt) }
+        }
+        guard let from = value("startDateTime"), let to = value("endDateTime") else { return nil }
+        return (from, to)
+    }
+
+    /// Whether `event` starts NOW (where it is, not its place in the series) inside `window`, as
+    /// Graph's instances list filters; every event when there is no window.
+    private static func starts(_ event: [String: Any], in window: (from: Date, to: Date)?) -> Bool {
+        guard let window else { return true }
+        guard let at = instant(event["start"]) else { return false }
+        return at >= window.from && at < window.to
+    }
+
+    /// The zone name a request's `Prefer: outlook.timezone="…"` gives; nil when it gives none.
+    private static func preferredZoneName(_ request: FakeHTTP.Request) -> String? {
+        guard let prefer = request.header("Prefer"), let open = prefer.range(of: "outlook.timezone=\"") else { return nil }
+        return String(prefer[open.upperBound...].prefix { $0 != "\"" })
+    }
+
+    /// `event` as a read in `zone` returns it: its `originalStart` written with `zone`'s offset, or
+    /// in UTC when the read names no zone.
+    private static func rendered(_ event: [String: Any], in zone: TimeZone?) -> [String: Any] {
+        guard let stored = event["originalStart"] as? String, let instant = Date.fromISO8601(stored) else { return event }
+        var out = event
+        out["originalStart"] = instant.iso8601String(timeZone: zone ?? .gmt)
+        return out
+    }
+
+    /// Whether `occurrence`'s place in the series (`originalStart`, else its start) is on or before
+    /// the end of `master`'s range when it ends on a date, that date read in the range's zone.
+    private static func isInSeries(_ occurrence: [String: Any], master: [String: Any]?) -> Bool {
+        guard let range = (master?["recurrence"] as? [String: Any])?["range"] as? [String: Any],
+              range["type"] as? String == "endDate", let end = range["endDate"] as? String,
+              let zoneName = range["recurrenceTimeZone"] as? String,
+              let zone = CalendarTimeZoneResolver.zone(named: zoneName, in: .none),
+              let place = (occurrence["originalStart"] as? String).flatMap({ Date.fromISO8601($0) }) ?? instant(occurrence["start"])
+        else { return true }
+        return EKEventStoreHelper.dayKey(place, timeZone: zone) <= end
+    }
+
+    /// The instant a stored or written start names: its wall time read in the zone it is labelled
+    /// with (an all-day one at that date's midnight there).
+    private static func instant(_ value: Any?) -> Date? {
+        guard let value = value as? [String: Any], let dateTime = value["dateTime"] as? String,
+              let zone = CalendarTimeZoneResolver.zone(named: value["timeZone"] as? String ?? "UTC", in: .none) else { return nil }
+        return EKEventStoreHelper.parseNaiveISO(String(dateTime.prefix(19)), timeZone: zone)
+    }
+
+    /// Whether an occurrence of `master` other than `other` starts at `at` now: Graph refuses a move
+    /// of an occurrence onto another one of its series.
+    private func occurrence(of master: String, other: String, startsAt at: Date) -> Bool {
+        events.withLock { Array($0.values) }
+            .compactMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
+            .contains { $0["seriesMasterId"] as? String == master && $0["id"] as? String != other && Self.instant($0["start"]) == at }
     }
 
     /// Whether a written start or end names the stored one: the same wall time to the
@@ -302,6 +414,13 @@ enum GraphFixture {
 
     /// The date `date` falls on in UTC and on the device.
     static func utcDay(_ date: Date) -> String { String(naive(date).prefix(10)) }
+    /// Where Graph places an all-day occurrence of a series repeating in `zone` on `date`
+    /// (`originalStart`): the instant the date begins there, in UTC.
+    static func allDayPlace(_ date: String, in zone: String = "America/Los_Angeles") -> String {
+        guard let tz = TimeZone(identifier: zone),
+              let midnight = EKEventStoreHelper.parseNaiveISO(date, timeZone: tz) else { return date + "T00:00:00Z" }
+        return midnight.iso8601String(timeZone: .gmt)
+    }
     static func deviceDay(_ date: Date) -> String {
         let fmt = DateFormatter()
         fmt.locale = Locale(identifier: "en_US_POSIX")
@@ -523,7 +642,13 @@ enum GraphFixture {
                           "recurrenceTimeZone": "Pacific Standard Time", "numberOfOccurrences": 0],
             ]
         }
-        if let seriesMasterId { e["seriesMasterId"] = seriesMasterId }
+        if let seriesMasterId {
+            e["seriesMasterId"] = seriesMasterId
+            // An occurrence's place in its series, as Graph gives it (measured): an instant in UTC,
+            // with no zone named; an all-day occurrence's is the instant its date begins in the
+            // series' zone (the range's `recurrenceTimeZone` above, Pacific).
+            e["originalStart"] = allDay ? allDayPlace(utcDay(start)) : rfc3339(start)
+        }
         return e
     }
 

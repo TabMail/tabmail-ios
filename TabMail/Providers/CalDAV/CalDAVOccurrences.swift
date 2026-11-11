@@ -168,7 +168,7 @@ enum CalDAVOccurrences {
                   let key = occurrenceKey(ofValue: rid.value, params: rid.params, in: series),
                   overridden.insert(key).inserted else { continue }
             guard let overrideSpan = spanOf(override), overlaps(overrideSpan, timeMin: timeMin, timeMax: timeMax) else { continue }
-            rows.append((key, occurrenceRow(override.event, href: href, key: key, recurrence: series.recurrenceLines)))
+            rows.append((key, occurrenceRow(override.event, href: href, key: key, recurrence: series.recurrenceLines, frame: series.frame)))
         }
         for instance in found where !overridden.contains(instance.key) {
             guard overlaps((start: instance.start, end: instance.end), timeMin: timeMin, timeMax: timeMax) else { continue }
@@ -190,7 +190,7 @@ enum CalDAVOccurrences {
                   let key = standaloneKey(of: rid, zones: override.zones),
                   let overrideSpan = spanOf(override),
                   overlaps(overrideSpan, timeMin: timeMin, timeMax: timeMax) else { return nil }
-            return (key, occurrenceRow(override.event, href: href, key: key, recurrence: nil))
+            return (key, occurrenceRow(override.event, href: href, key: key, recurrence: nil, frame: .floating))
         }
     }
 
@@ -202,7 +202,7 @@ enum CalDAVOccurrences {
         let overrides = components.filter { $0.recurrenceId != nil }
         guard let master = components.first(where: { $0.recurrenceId == nil }) else {
             return overrides.first { override in override.recurrenceId.flatMap { standaloneKey(of: $0, zones: override.zones) } == wanted }
-                .map { occurrenceRow($0.event, href: href, key: wanted, recurrence: nil) }
+                .map { occurrenceRow($0.event, href: href, key: wanted, recurrence: nil, frame: .floating) }
         }
         guard case .series(let series) = shape(of: master, overrides: overrides) else { return nil }
         return occurrence(key: wanted, in: series, overrides: overrides, href: href)
@@ -215,7 +215,7 @@ enum CalDAVOccurrences {
             guard let rid = component.recurrenceId else { return false }
             return occurrenceKey(ofValue: rid.value, params: rid.params, in: series) == wanted
         }) {
-            return occurrenceRow(override.event, href: href, key: wanted, recurrence: series.recurrenceLines)
+            return occurrenceRow(override.event, href: href, key: wanted, recurrence: series.recurrenceLines, frame: series.frame)
         }
         // A UTC key's date is a day either side of the occurrence's date in the series' zone
         // at most (UTC offsets stay within 14 hours).
@@ -256,6 +256,15 @@ enum CalDAVOccurrences {
     static func scopedEditSlot(
         icsText: String, href: String, key: String?, recurrenceId: String, zone: TimeZone, forSplit: Bool
     ) throws -> String {
+        try scopedEdit(icsText: icsText, href: href, key: key, recurrenceId: recurrenceId, zone: zone, forSplit: forSplit).slot
+    }
+
+    /// `scopedEditSlot`, with the key of the occurrence it names as well: the one check, for the
+    /// writers (`scopedEditSlot`) and for `CalDAVProvider.occurrence`, which reads that occurrence
+    /// before the edit's card is shown.
+    static func scopedEdit(
+        icsText: String, href: String, key: String?, recurrenceId: String, zone: TimeZone, forSplit: Bool
+    ) throws -> (key: String, slot: String) {
         let invalid = "Invalid recurrence_id '\(recurrenceId)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00') or a date (e.g. '2026-05-20')."
         guard let center = RecurrenceOccurrenceResolver.windowCenter(recurrenceId: recurrenceId, zone: zone) else {
             throw CalendarProviderError.notSupported(invalid)
@@ -312,8 +321,7 @@ enum CalDAVOccurrences {
         switch RecurrenceOccurrenceResolver.select(candidates, recurrenceId: recurrenceId, zone: zone) {
         case .resolved(let named):
             if let key, key != named {
-                throw CalendarProviderError.notSupported(
-                    "recurrence_id '\(recurrenceId)' names another occurrence than this event_id does, so nothing was changed. Use the event_id listed for the occurrence with its start_iso as recurrence_id.")
+                throw CalendarProviderError.notSupported(RecurrenceOccurrenceResolver.namesAnotherOccurrence(recurrenceId))
             }
             guard let slot = OccurrenceId.recurrenceId(ofKey: named, in: zone) else {
                 throw CalendarProviderError.notSupported(
@@ -326,7 +334,7 @@ enum CalDAVOccurrences {
                 throw CalendarProviderError.notSupported(
                     "The occurrence recurrence_id '\(recurrenceId)' names was moved from its place in the series, so TabMail can't split the series at it. Nothing was changed. Use edit_scope this_only to change just this occurrence, or ask the user to change this and the following occurrences in their calendar app.")
             }
-            return slot
+            return (named, slot)
         case .absent:
             throw CalDAVError.notFound
         case .ambiguous(let count):
@@ -940,23 +948,38 @@ enum CalDAVOccurrences {
             end = GCalDateTime(dateTime: instance.end.iso8601String(), date: nil, timeZone: tzid)
         }
         let master = series.master.event
-        return GCalEvent(
+        var row = GCalEvent(
             id: OccurrenceId.make(seriesHref: href, key: instance.key),
             summary: master.summary, location: master.location, description: master.description,
             start: start, end: end, attendees: master.attendees, organizer: master.organizer,
             recurrence: series.recurrenceLines, transparency: master.transparency, status: master.status,
             htmlLink: master.htmlLink, created: master.created, updated: master.updated,
             recurringEventId: href, conferenceUrl: master.conferenceUrl)
+        row.originalStartTime = originalStart(ofKey: instance.key, in: series.frame)
+        return row
     }
 
-    private static func occurrenceRow(_ event: GCalEvent, href: String, key: String, recurrence: [String]?) -> GCalEvent {
-        GCalEvent(
+    /// `frame` places a floating key (`seriesSlot`): the series' own, or `.floating` for a changed
+    /// occurrence in a resource without its series, read like every other floating time.
+    private static func occurrenceRow(_ event: GCalEvent, href: String, key: String, recurrence: [String]?, frame: Frame) -> GCalEvent {
+        var row = GCalEvent(
             id: OccurrenceId.make(seriesHref: href, key: key),
             summary: event.summary, location: event.location, description: event.description,
             start: event.start, end: event.end, attendees: event.attendees, organizer: event.organizer,
             recurrence: recurrence, transparency: event.transparency, status: event.status,
             htmlLink: event.htmlLink, created: event.created, updated: event.updated,
             recurringEventId: href, conferenceUrl: event.conferenceUrl)
+        row.originalStartTime = originalStart(ofKey: key, in: frame)
+        return row
+    }
+
+    /// An occurrence's place in its series (`GCalEvent.originalStartTime`), from its key: where
+    /// the series puts it (`seriesSlot`), which a moved occurrence keeps. A date for an all-day
+    /// key, the instant otherwise. Nil for a value that is not a key.
+    private static func originalStart(ofKey key: String, in frame: Frame) -> GCalDateTime? {
+        guard let slot = seriesSlot(ofKey: key, in: frame) else { return nil }
+        if let date = slot.dateOnly { return GCalDateTime(dateTime: nil, date: date, timeZone: nil) }
+        return slot.instant.map { GCalDateTime(dateTime: $0.iso8601String(), date: nil, timeZone: nil) }
     }
 
     private static func notListedRow(_ master: ICSParser.VEventComponent, href: String, reason: String) -> GCalEvent {

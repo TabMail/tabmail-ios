@@ -65,6 +65,17 @@ struct GoogleSplitSeriesTailTests {
         """.utf8)
     }
 
+    /// The series' instances list: an occurrence at each place (`originalStartTime`), as
+    /// `events.instances` gives it.
+    private static func instances(_ places: [[String: String]]) -> Data {
+        let items = places.enumerated().map { index, place -> [String: Any] in
+            ["id": "\(masterId)_\(index)", "status": "confirmed", "recurringEventId": masterId,
+             "start": place, "originalStartTime": place]
+        }
+        // swiftlint:disable:next force_try
+        return try! JSONSerialization.data(withJSONObject: ["items": items])
+    }
+
     private struct Outcome {
         let error: Error?
         let wire: [String]
@@ -78,7 +89,9 @@ struct GoogleSplitSeriesTailTests {
     /// Split a Monday/Wednesday/Friday series the following Monday. Three
     /// occurrences fall before the split in Auckland (Monday, Wednesday,
     /// Friday); read in UTC the same days are Sunday, Tuesday and Thursday.
-    private func split(rrule: String, patch: GCalEventInput = GCalEventInput(), sendUpdates: String = "none") async throws -> Outcome {
+    /// `listed`: whether the series lists its occurrence at the split.
+    private func split(rrule: String, patch: GCalEventInput = GCalEventInput(), sendUpdates: String = "none",
+                       listed: Bool = true) async throws -> Outcome {
         let start = try Self.mondayInAuckland()
         let splitAt = try Self.aucklandDays(7, after: start)
         let recurrenceId = Self.format(splitAt, "yyyy-MM-dd'T'HH:mm:ss", Self.utc)
@@ -88,6 +101,9 @@ struct GoogleSplitSeriesTailTests {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
         http.register(path: Self.masterPath, method: "GET", response: .raw(statusCode: 200, headers: json, body: master))
+        http.register(path: Self.masterPath + "/instances", method: "GET", response: .raw(
+            statusCode: 200, headers: json,
+            body: Self.instances(listed ? [["dateTime": recurrenceId + "Z", "timeZone": "Pacific/Auckland"]] : [])))
         http.register(path: Self.masterPath, method: "PATCH", response: .raw(statusCode: 200, headers: json, body: master))
         http.register(path: Self.createPath, method: "POST",
                       response: .raw(statusCode: 200, headers: json, body: Data(#"{"id":"successor","status":"confirmed"}"#.utf8)))
@@ -177,7 +193,9 @@ struct GoogleSplitSeriesTailTests {
         let start = try Self.mondayInAuckland()
         let recurrenceId = Self.format(try Self.aucklandDays(7, after: start), "yyyy-MM-dd'T'HH:mm:ss", Self.utc)
         let cap = try #require(GoogleCalendarProvider.googleUntilString(beforeNaiveISO: recurrenceId, allDay: false, zone: Self.utc))
-        let out = try await split(rrule: "RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR;UNTIL=\(cap)")
+        // The cap ended the series before the occurrence, so the series no longer lists it: this
+        // split's own cap is not asked again.
+        let out = try await split(rrule: "RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR;UNTIL=\(cap)", listed: false)
         #expect(out.recurrenceId == recurrenceId, "setup: the cap must be the one this split computes")
         #expect(out.error == nil, """
             refusing here retires the operation while the master stays capped with no new \
@@ -240,6 +258,8 @@ struct GoogleSplitSeriesTailTests {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
         http.register(path: Self.masterPath, method: "GET", response: .raw(statusCode: 200, headers: json, body: master))
+        http.register(path: Self.masterPath + "/instances", method: "GET",
+                      response: .raw(statusCode: 200, headers: json, body: Self.instances([["date": splitDate]])))
         http.register(path: Self.masterPath, method: "PATCH", response: .raw(statusCode: 200, headers: json, body: master))
         http.register(path: Self.createPath, method: "POST",
                       response: .raw(statusCode: 200, headers: json, body: Data(#"{"id":"successor","status":"confirmed"}"#.utf8)))

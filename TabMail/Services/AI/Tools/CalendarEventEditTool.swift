@@ -22,6 +22,8 @@ struct CalendarEventEditTool: AgentTool, Sendable {
     /// ADR-IOS-053: real entry point — delivers the confirmation card to the
     /// invoking session via `invocation.uiSink` (nil sink → declined fast-fail).
     func execute(arguments: [String: JSONValue], invocation: ToolInvocation) async throws -> String {
+        // `CalendarSeriesScope.route` may make an edit of every occurrence a split before the card.
+        var arguments = arguments
         guard case .string(let rawEventId) = arguments["event_id"],
               !rawEventId.trimmingCharacters(in: .whitespaces).isEmpty else {
             return #"{"error": "missing event_id — use calendar_event_read or calendar_search to look up the event first"}"#
@@ -143,48 +145,39 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         // fetch, so a missing recurrence_id fails fast.
         // (calendar_event_edit-v1.5.21+.)
         let scopeRaw = CalendarToolHelpers.stringArgOpt(arguments, "edit_scope")?.lowercased()
-        let recurrenceIdArg = CalendarToolHelpers.stringArgOpt(arguments, "recurrence_id")
-        let resolvedScope: String = scopeRaw
+        var recurrenceIdArg = CalendarToolHelpers.stringArgOpt(arguments, "recurrence_id")
+        var resolvedScope: String = scopeRaw
             ?? (recurrenceIdArg != nil ? "this_only" : "all")
         if resolvedScope == "this_only" || resolvedScope == "this_and_following" {
-            guard let rid = recurrenceIdArg else {
+            guard recurrenceIdArg != nil else {
                 throw ToolDeclinedError(output: ToolJSON.string(from: [
                     "error": "edit_scope='\(resolvedScope)' requires recurrence_id (the start_iso of the target occurrence). Use calendar_event_read or calendar_read to find it, then retry.",
                 ] as [String: Any]))
             }
-            if resolvedScope == "this_only" {
-                changes.append("scope → just this occurrence (\(rid))")
-            } else {
-                changes.append("scope → this and all future occurrences (starting \(rid))")
-            }
         }
+        let tz = CalendarToolHelpers.resolveTimeZone(arguments)
 
-        // Fetch current event details from API for confirmation card
+        // Fetch current event details from API for confirmation card: the event, and when it names
+        // an occurrence of a series, its series and that occurrence (`CalendarSeriesScope.read`), as
+        // the queue reads them again before the write. calendarId unknown — the default calendar.
         var fetchedEvent: GCalEvent?
         var fetchedCalendarId: String?
-        if let provider, let calId = calendarId {
-            fetchedCalendarId = calId
-            fetchedEvent = try? await provider.getEvent(calendarId: calId, eventId: eventId)
-            if let event = fetchedEvent {
-                Task {
-                    await CalendarToolHelpers.cacheEventDetailsForPills(
-                        [event], accountId: resolvedAccountId, calendarId: calId,
-                        calendarName: calendarName, translator: ctx.translator
-                    )
-                }
+        if let provider {
+            let lookupCalId: String
+            if let calendarId {
+                lookupCalId = calendarId
+            } else {
+                lookupCalId = await CalendarProviderDispatch.defaultCalendarIdForCreation(for: provider)
             }
-        } else if let provider {
-            // calendarId unknown — try default calendar, then scan all calendars
-            let defaultCalId = await CalendarProviderDispatch.defaultCalendarIdForCreation(for: provider)
-            fetchedCalendarId = defaultCalId
-            fetchedEvent = try? await provider.getEvent(calendarId: defaultCalId, eventId: eventId)
+            fetchedCalendarId = lookupCalId
+            fetchedEvent = try? await provider.getEvent(calendarId: lookupCalId, eventId: eventId)
             if let event = fetchedEvent {
-                // Found on default calendar — update cache so future edit/delete use correct calendarId
+                // Cache it so future edit/delete use the calendar it was found on
                 let accId = resolvedAccountId
                 let translator = ctx.translator
                 Task {
                     await CalendarToolHelpers.cacheEventDetailsForPills(
-                        [event], accountId: accId, calendarId: defaultCalId,
+                        [event], accountId: accId, calendarId: lookupCalId,
                         calendarName: calendarName, translator: translator
                     )
                 }
@@ -197,7 +190,7 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         // provider returned 404. Either way we cannot meaningfully describe what
         // the user would be confirming. Surface a structured error so the agent
         // can re-search (calendar_event_read / calendar_search) and retry.
-        guard fetchedEvent != nil else {
+        guard let provider, let lookupCalId = fetchedCalendarId, let fetchedEvent else {
             BackgroundSyncLogger.logDebug("[CalendarEventEditTool] Could not dereference event_id='\(eventId.prefix(50))' (compound='\(compoundId.prefix(50))') — refusing edit")
             return ToolJSON.string(from: [
                 "ok": false,
@@ -205,6 +198,79 @@ struct CalendarEventEditTool: AgentTool, Sendable {
                 "event_id": compoundId,
             ] as [String: Any])
         }
+
+        // The occurrence the edit names, found by the provider's own lookup (the one its write
+        // makes), and refused here, before the card, when none starts there, it was deleted, the
+        // event id and recurrence_id name different ones, or the provider's write would refuse it.
+        let named: CalendarSeriesScope.Named
+        do {
+            named = try await CalendarSeriesScope.read(
+                event: fetchedEvent, eventId: eventId, recurrenceId: recurrenceIdArg,
+                calendarId: lookupCalId, zone: tz, splitting: false, provider: provider)
+        } catch CalendarProviderError.notSupported(let reason) {
+            return ToolJSON.string(from: [
+                "ok": false,
+                "error": "calendar_event_edit failed: \(reason). The event was NOT changed.",
+                "event_id": compoundId,
+            ] as [String: Any])
+        } catch where AccountManager.isCalendarNotFoundError(error) {
+            return ToolJSON.string(from: [
+                "ok": false,
+                "error": "calendar_event_edit failed: \(CalendarSeriesScope.namesNoOccurrence(recurrenceIdArg)). The event was NOT changed.",
+                "event_id": compoundId,
+            ] as [String: Any])
+        } catch {
+            return ToolJSON.string(from: [
+                "ok": false,
+                "error": "calendar_event_edit failed: could not read the occurrence this edit names (\(error.localizedDescription)). The event was NOT changed. Check event_id and recurrence_id with calendar_event_read, then retry.",
+                "event_id": compoundId,
+            ] as [String: Any])
+        }
+
+        // An edit of a series goes where Google Calendar takes it, before the card
+        // (`CalendarSeriesScope.route`), so the card, the queued edit and the result all say where:
+        // named at the first occurrence it is the whole series; a new date named from a later
+        // occurrence is a change of it and the following ones; a new time of day named from one is
+        // the whole series' new time, its start and end moved to the first occurrence's date. When
+        // the assistant must ask the user which occurrences, it is refused here. A move to another
+        // date of a series whose rule names its days, with no new rule, is refused here too
+        // (`CalendarSeriesScope.dayMoveRefusal`, which the queue applies again before the write).
+        let queuedEventId: String
+        do {
+            let given = arguments
+            let routed = try CalendarSeriesScope.route(arguments, scope: resolvedScope, named: named, zone: tz)
+            arguments = routed.args
+            resolvedScope = routed.scope
+            recurrenceIdArg = routed.recurrenceId
+            queuedEventId = routed.eventId
+            // The card lists the start and end the edit now writes.
+            for (key, label) in [("start_iso", "start"), ("end_iso", "end")] {
+                if let old = CalendarToolHelpers.stringArgOpt(given, key),
+                   let new = CalendarToolHelpers.stringArgOpt(arguments, key), new != old,
+                   let line = changes.firstIndex(of: "\(label) → \(old)") {
+                    changes[line] = "\(label) → \(new)"
+                }
+            }
+            if let reason = CalendarSeriesScope.dayMoveRefusal(arguments, named: named, scope: resolvedScope, zone: tz) {
+                throw CalendarProviderError.notSupported(reason)
+            }
+        } catch CalendarProviderError.notSupported(let reason) {
+            return ToolJSON.string(from: [
+                "ok": false,
+                "error": "calendar_event_edit failed: \(reason). The event was NOT changed.",
+                "event_id": compoundId,
+            ] as [String: Any])
+        }
+        if let rid = recurrenceIdArg {
+            if resolvedScope == "this_only" {
+                changes.append("scope → just this occurrence (\(rid))")
+            } else if resolvedScope == "this_and_following" {
+                changes.append("scope → this and all future occurrences (starting \(rid))")
+            }
+        }
+        // The event the card shows and the checks below read: the series on an edit of every
+        // occurrence, which is what the queue writes; otherwise the event named.
+        let shown = resolvedScope == "all" ? named.series : fetchedEvent
 
         // An all-day event given a time of day without `all_day`, an all-day end on or before
         // its start, or a stated `all_day` of the other kind with no start or end, is refused
@@ -217,12 +283,12 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         // from the provider; when that read fails the edit is not offered, since the card would
         // show an end that may be refused.
         var occurrenceStartDay: String?
-        if let provider, let calId = fetchedCalendarId, let rid = recurrenceIdArg,
-           CalendarToolHelpers.needsOccurrenceStartDay(arguments, storedStart: fetchedEvent?.start, scope: resolvedScope) {
+        if let rid = recurrenceIdArg,
+           CalendarToolHelpers.needsOccurrenceStartDay(arguments, storedStart: shown.start, scope: resolvedScope) {
             do {
                 occurrenceStartDay = try await provider.occurrenceStartDay(
-                    calendarId: calId, eventId: eventId, recurrenceId: rid,
-                    recurrenceIdZone: CalendarToolHelpers.resolveTimeZone(arguments))
+                    calendarId: lookupCalId, eventId: eventId, recurrenceId: rid,
+                    recurrenceIdZone: tz)
             } catch {
                 return ToolJSON.string(from: [
                     "ok": false,
@@ -232,7 +298,7 @@ struct CalendarEventEditTool: AgentTool, Sendable {
             }
         }
         if let reason = CalendarToolHelpers.allDayEditRefusal(
-            arguments, storedStart: fetchedEvent?.start, scope: resolvedScope, recurrenceId: recurrenceIdArg,
+            arguments, storedStart: shown.start, scope: resolvedScope, recurrenceId: recurrenceIdArg,
             occurrenceStartDay: occurrenceStartDay) {
             return ToolJSON.string(from: [
                 "ok": false,
@@ -246,24 +312,23 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         // card must show the TARGET OCCURRENCE — not the series master — otherwise it
         // misleadingly displays the wrong date (e.g. the master on the 14th when the user is
         // editing the occurrence on the 21st). Keyed off `resolvedScope`, NOT raw recurrence_id
-        // presence, so an `all`-scope edit that happens to carry a stale recurrence_id still
-        // shows the event its event_id names (the master for a series id, the occurrence for
-        // an occurrence id).
-        let tz = CalendarToolHelpers.resolveTimeZone(arguments)
+        // presence, so an `all`-scope edit shows the series it writes.
+        //
         // A whole-series edit may reset the occurrences the user changed one by one (#423): on
         // Outlook any change of the series' rule, start or end does. Say so on the card. The
-        // series' calendar decides, as its write does, from the event already read and the same
-        // edit; a rename, or a rule equal to the stored one, which the assistant re-sends with
-        // other edits, gets no line.
-        if resolvedScope == "all", let provider, let series = fetchedEvent, series.recurrence?.isEmpty == false,
+        // series' calendar decides, as its write does, from the series the edit writes
+        // (`named.series`, read above) and the edit as routed, which is what the queue writes; a
+        // rename, or a rule equal to the stored one, which the assistant re-sends with other edits,
+        // gets no line.
+        if resolvedScope == "all", named.series.recurrence?.isEmpty == false,
            let edit = try? CalendarToolHelpers.buildGCalEventInput(
-               arguments, isAllDay: CalendarToolHelpers.boolArg(arguments, "all_day") ?? series.isAllDay),
-           provider.editResetsChangedOccurrences(series, edit: edit) {
+               arguments, isAllDay: CalendarToolHelpers.boolArg(arguments, "all_day") ?? named.series.isAllDay),
+           provider.editResetsChangedOccurrences(named.series, edit: edit) {
             changes.append(CalendarToolHelpers.ruleChangeResetNote)
         }
         let showsOccurrence = resolvedScope != "all"
         let masterDuration: TimeInterval? = {
-            guard let s = fetchedEvent?.startDate, let e = fetchedEvent?.endDate else { return nil }
+            guard let s = shown.startDate, let e = shown.endDate else { return nil }
             return e.timeIntervalSince(s)
         }()
         // The confirmation card shows the event's CURRENT state — i.e. what
@@ -276,25 +341,25 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         // the user's expectation of "old at top, changes below".
         //
         // For an occurrence-scope edit (this_only / this_and_following),
-        // current = the specific occurrence (recurrence_id + master
-        // duration) rather than the master.
+        // current = the specific occurrence (recurrence_id, the start it has
+        // now, + master duration) rather than the master: one time per occurrence.
         let cardStart: Date?
         if showsOccurrence, let rid = recurrenceIdArg,
            let occ = EKEventStoreHelper.parseNaiveISO(rid, timeZone: tz) {
             cardStart = occ
         } else {
-            cardStart = fetchedEvent?.startDate
+            cardStart = shown.startDate
         }
         let cardEnd: Date?
         if showsOccurrence, let start = cardStart, let dur = masterDuration {
             cardEnd = start.addingTimeInterval(dur)
         } else {
-            cardEnd = fetchedEvent?.endDate
+            cardEnd = shown.endDate
         }
 
         // Resolve event title: prefer argument, then current event state, then fallback
         let proposedTitle = CalendarToolHelpers.stringArgOpt(arguments, "title")
-            ?? fetchedEvent?.summary
+            ?? shown.summary
             ?? "(Event)"
 
         // Attendees are delta-based (v1.5.21+): parse add_attendees / remove_attendees,
@@ -304,7 +369,7 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         let addAttendees = CalendarToolHelpers.parseAttendeeAdds(arguments["add_attendees"])
         let removeAttendees = CalendarToolHelpers.parseAttendeeRemoves(arguments["remove_attendees"])
         var attendeeNames: [String] = []
-        let baseAttendees: [(email: String, name: String?)] = (fetchedEvent?.attendees ?? []).compactMap { att in
+        let baseAttendees: [(email: String, name: String?)] = (shown.attendees ?? []).compactMap { att in
             guard let raw = att.email, !raw.isEmpty else { return nil }
             let email = CalendarToolHelpers.stripMailto(raw)
             return (email: email, name: att.displayName)
@@ -331,7 +396,7 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         // list below enumerates every patched field. `proposedTitle` is
         // used downstream (queue, LLM result string) since it represents
         // the FINAL title; the card itself shows the old title at top.
-        let currentTitle: String = (fetchedEvent?.summary?.isEmpty == false ? fetchedEvent!.summary! : "(Event)")
+        let currentTitle: String = (shown.summary?.isEmpty == false ? shown.summary ?? "(Event)" : "(Event)")
         let (confirmed, cardState) = await AgentToolRouter.ActionConfirmation.awaitConfirmation(
             action: .calendarEventEdit,
             calendarEvents: [.init(
@@ -340,7 +405,7 @@ struct CalendarEventEditTool: AgentTool, Sendable {
                 title: currentTitle,
                 startDate: cardStart ?? Date(),
                 endDate: cardEnd ?? Date(),
-                isAllDay: fetchedEvent?.isAllDay ?? false,
+                isAllDay: shown.isAllDay,
                 changes: changes,
                 attendees: attendeeNames,
                 timeZoneId: CalendarToolHelpers.stringArgOpt(arguments, "timezone"),
@@ -360,17 +425,19 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         guard !resolvedAccountId.isEmpty else {
             return CalendarProviderDispatch.notAvailableMessage
         }
-        return try await queueCalendarEdit(accountId: resolvedAccountId, calendarId: calendarId, calendarName: calendarName, eventId: eventId, compoundId: compoundId, arguments: arguments, resolvedScope: resolvedScope, recurrenceId: recurrenceIdArg, cardState: cardState, eventTitle: proposedTitle, translator: ctx.translator)
+        // Queued with the id `route` gives: the series' for a new time of every occurrence named from
+        // one of them, which the queue reads as a move of the series on its own date.
+        return try await queueCalendarEdit(accountId: resolvedAccountId, calendarId: calendarId, calendarName: calendarName, eventId: eventId, queuedEventId: queuedEventId, compoundId: compoundId, arguments: arguments, resolvedScope: resolvedScope, recurrenceId: recurrenceIdArg, cardState: cardState, eventTitle: proposedTitle, translator: ctx.translator)
     }
 
     // MARK: - Calendar (Queued)
 
-    private func queueCalendarEdit(accountId: String, calendarId: String?, calendarName: String?, eventId: String, compoundId: String, arguments: [String: JSONValue], resolvedScope: String, recurrenceId: String?, cardState: AgentToolRouter.ActionConfirmation.ResponseState, eventTitle: String, translator: any ChatIdTranslating) async throws -> String {
+    private func queueCalendarEdit(accountId: String, calendarId: String?, calendarName: String?, eventId: String, queuedEventId: String, compoundId: String, arguments: [String: JSONValue], resolvedScope: String, recurrenceId: String?, cardState: AgentToolRouter.ActionConfirmation.ResponseState, eventTitle: String, translator: any ChatIdTranslating) async throws -> String {
         let manager = AccountManager.shared
         let op = try await manager.queueCalendarOperation(
             type: .edit,
             accountId: accountId,
-            eventId: eventId,
+            eventId: queuedEventId,
             calendarId: calendarId,
             arguments: arguments
         )

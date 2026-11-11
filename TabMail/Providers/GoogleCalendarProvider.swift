@@ -37,6 +37,26 @@ protocol CalendarProvider: Sendable {
     /// `CalDAVProvider` reads it from the resource (nil when the series turns out to be timed).
     func occurrenceStartDay(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone) async throws -> String?
 
+    /// The one occurrence an edit names, read with nothing written: the occurrence of the
+    /// repeating event `eventId` (its series, or one of its occurrences) that STARTS at
+    /// `recurrenceId` read in `recurrenceIdZone` now, where the read tools show it. The answer
+    /// carries both of its times: `start`, where it is now, and `originalStartTime`, its place in
+    /// the series. It is found by the same lookup the provider's own one-occurrence edit and
+    /// split make (Google and Outlook: the instances around that time; CalDAV:
+    /// `CalDAVOccurrences.scopedEditSlot`), so it refuses what they refuse, before anything is
+    /// shown to the user:
+    /// - the provider's not-found error when no occurrence starts there (none ever did, or it
+    ///   was deleted), the authoritative absence `AccountManager.isCalendarNotFoundError` claims;
+    /// - `notSupported` for a malformed or ambiguous `recurrence_id`, and for an occurrence id whose
+    ///   occurrence is not the one `recurrenceId` names; on CalDAV also for everything
+    ///   `scopedEditSlot` refuses for a one-occurrence edit (a stored zone TabMail does not
+    ///   recognize, among them).
+    /// An occurrence moved from its place in the series is found like any other: only the split
+    /// itself refuses one (`splitSeries`), where a split is written.
+    /// `CalendarSeriesScope.read` asks it for the edit tool's card and again for the queue's write.
+    /// Default: refused, as `updateOccurrence` and `splitSeries` are on a calendar without them.
+    func occurrence(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone) async throws -> GCalEvent
+
     /// Split a recurring series at `recurrenceId` (this_and_following edit_scope):
     /// cap the original series with UNTIL = recurrenceId - 1, then create a new
     /// series with the same RRULE starting at `recurrenceId` with `patch` applied.
@@ -52,6 +72,14 @@ protocol CalendarProvider: Sendable {
     /// declared frame in only one of them would make one argument mean two
     /// different instants depending on `edit_scope`.
     func splitSeries(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, patch: GCalEventInput, sendUpdates: String) async throws -> GCalEvent
+
+    /// The `UNTIL` this calendar's `splitSeries` ends a series with when it splits it at
+    /// `recurrenceId` (read in `zone`; `allDay`: the series is all-day), as the series' RRULE
+    /// (`GCalEvent.recurrence`) reads once that cap is written. Pure, no request. Nil for a
+    /// `recurrenceId` that can't be read, and on a calendar that does not split (the default).
+    /// Read only through `isOwnSplitCap`.
+    func splitCapUntil(beforeNaiveISO recurrenceId: String, allDay: Bool, zone: TimeZone) -> String?
+
     /// Whether the whole-series edit `edit` (the input the write is given) resets the
     /// occurrences of `event` changed one by one, as this calendar's write treats them: on
     /// Outlook and Google, any change of the series' rule, start or end; on CalDAV, a change of
@@ -96,8 +124,25 @@ extension CalendarProvider {
         String(recurrenceId.prefix(10))
     }
     func recurrenceRuleRefusal(_ rrule: String) -> String? { nil }
+    func occurrence(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone) async throws -> GCalEvent {
+        throw CalendarProviderError.notSupported("Changing one occurrence of a repeating event, or the occurrences from one on, is not yet supported on this calendar provider. Edit the whole series instead.")
+    }
     func splitSeries(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, patch: GCalEventInput, sendUpdates: String) async throws -> GCalEvent {
         throw CalendarProviderError.notSupported("Splitting a recurring series at a given occurrence is not yet supported on this calendar provider. Edit the whole series or use the Thunderbird add-on for this-and-following edits.")
+    }
+    func splitCapUntil(beforeNaiveISO recurrenceId: String, allDay: Bool, zone: TimeZone) -> String? { nil }
+
+    /// 🚨 THE ONE TEST FOR "THIS SPLIT ALREADY CAPPED THE SERIES": whether `series` (as read)
+    /// ends with the cap `splitSeries` writes when it splits it at `recurrenceId` (read in `zone`).
+    /// Only then do the series' occurrences end just before the split, and a split of it there is
+    /// a retry after its own cap. The providers' `splitSeries` asks it before looking for the
+    /// occurrence the split starts at, and the calendar queue (`CalendarSeriesScope.read`) before
+    /// its own lookup; neither looks for that occurrence then, as the cap ended the series before
+    /// it, and the split goes on to the write it did not finish.
+    func isOwnSplitCap(of series: GCalEvent, at recurrenceId: String, zone: TimeZone) -> Bool {
+        guard let cap = splitCapUntil(beforeNaiveISO: recurrenceId, allDay: series.isAllDay, zone: zone),
+              let rule = series.recurrence?.first(where: { $0.uppercased().hasPrefix("RRULE:") }) else { return false }
+        return RecurrenceTail.isCapped(rule, at: cap)
     }
 }
 
@@ -229,6 +274,45 @@ enum RecurrenceOccurrenceResolver {
         if matches.count == 1 { return .resolved(matches[0].id) }
         if matches.isEmpty { return .absent }
         return .ambiguous(matches.count)
+    }
+
+    /// `select`, for an edit that names an occurrence by its own id (`named`) as well: when that
+    /// occurrence starts at `recurrenceId` it is the one, even if another occurrence was moved
+    /// onto the same time; otherwise the occurrence `select` finds, which the caller refuses when
+    /// it is not `named` (`namesAnotherOccurrence`).
+    static func select(
+        _ candidates: [OccurrenceCandidate],
+        recurrenceId: String,
+        zone: TimeZone,
+        naming named: String?
+    ) -> OccurrenceMatch {
+        if let named, case .resolved(let id) = select(candidates.filter { $0.id == named }, recurrenceId: recurrenceId, zone: zone) {
+            return .resolved(id)
+        }
+        return select(candidates, recurrenceId: recurrenceId, zone: zone)
+    }
+
+    /// Why an edit that names an occurrence by its id and by a `recurrence_id` naming another one
+    /// is refused, with nothing written: the two disagree on which occurrence is meant. The one
+    /// wording on every calendar.
+    static func namesAnotherOccurrence(_ recurrenceId: String) -> String {
+        "recurrence_id '\(recurrenceId)' names another occurrence than this event_id does, so nothing was changed. Use the event_id listed for the occurrence with its start_iso as recurrence_id."
+    }
+
+    /// Whether `occurrence` starts somewhere other than its place in the series
+    /// (`originalStartTime`). A timed one compares instants, an all-day one dates, as text (every
+    /// provider gives an all-day occurrence's place as a date: Outlook's read in the series' zone,
+    /// `ExchangeCalendarProvider.allDayOccurrence`). True when it can't be told (no place, a time
+    /// that can't be read, an all-day start whose place is no date), the side that refuses a split.
+    static func wasMoved(_ occurrence: GCalEvent) -> Bool {
+        guard let place = occurrence.originalStartTime, let start = occurrence.start else { return true }
+        if let date = start.date {
+            guard let placeDate = place.date else { return true }
+            return String(date.prefix(10)) != String(placeDate.prefix(10))
+        }
+        guard let startTime = start.dateTime, let placeTime = place.dateTime,
+              let now = Date.fromISO8601(startTime), let original = Date.fromISO8601(placeTime) else { return true }
+        return now != original
     }
 
     /// The centre of the enumeration window for `recurrenceId` read in `zone`.
@@ -528,7 +612,20 @@ actor GoogleCalendarProvider: CalendarProvider {
         let merged = Self.mergeExistingEventWithPatch(existing: existing, patch: edit)
         let encodedCalId = try Self.encodedPathSegment(calendarId, "Google calendar id")
         let encodedEventId = try Self.encodedPathSegment(eventId, "Google event id")
-        let body = try JSONSerialization.data(withJSONObject: Self.editJSON(merged, stored: existingJSON))
+        var json = Self.editJSON(merged, stored: existingJSON)
+        // A series edit whose start and end are the series' own as Google reads them (`googleTimes`,
+        // through `movesSeriesTime`: the one decision the card's reset note takes too) sends neither,
+        // so Google keeps the stored pair and its zone, and resets nothing. The pair is decided
+        // together: when either differs, both are sent, as merged (`mergeExistingEventWithPatch`
+        // derives a side the edit does not give from the stored duration), so Google never gets a
+        // start without its end, or one side changed against the other's stored zone. Omitting both
+        // is safe because PATCH keeps what it is not sent: the stored pair, already consistent.
+        if keepStoredDates, existing.recurrence?.isEmpty == false,
+           !Self.movesSeriesTime(edit, existing: existing, as: Self.googleTimes) {
+            json["start"] = nil
+            json["end"] = nil
+        }
+        let body = try JSONSerialization.data(withJSONObject: json)
         let data = try await request(
             path: "/calendars/\(encodedCalId)/events/\(encodedEventId)?sendUpdates=\(sendUpdates)",
             method: "PATCH",
@@ -568,6 +665,7 @@ actor GoogleCalendarProvider: CalendarProvider {
         // `/events/{id}/instances` endpoint requires the master id — passing an
         // instance returns 400. Resolve up front via the instance's
         // `recurringEventId` pointer.
+        let named = eventId
         let (eventId, _, _) = try await resolveToMaster(calendarId: calendarId, eventId: eventId)
         let encodedCalId = try Self.encodedPathSegment(calendarId, "Google calendar id")
         let encodedMasterId = try Self.encodedPathSegment(eventId, "Google master event id")
@@ -584,12 +682,13 @@ actor GoogleCalendarProvider: CalendarProvider {
         // could-not-determine-laundered-as-authoritative failure this round exists
         // to remove. Enumerating a bounded window and matching instants locally is
         // verifiable in a unit test against a fixed payload; the filter is not.
-        let instanceId = try await resolveInstanceId(
+        let instanceId = try await resolveInstance(
             calendarId: encodedCalId,
             masterId: encodedMasterId,
             recurrenceId: recurrenceId,
-            zone: recurrenceIdZone
-        )
+            zone: recurrenceIdZone,
+            naming: named == eventId ? nil : named
+        ).id
         let encodedInstanceId = try Self.encodedPathSegment(instanceId, "Google occurrence id")
 
         // Fetch the actual instance event and merge the patch onto it — same
@@ -606,6 +705,43 @@ actor GoogleCalendarProvider: CalendarProvider {
             body: body
         )
         return try JSONDecoder().decode(GCalEvent.self, from: data)
+    }
+
+    /// The occurrence of `eventId`'s series that starts at `recurrenceId` now
+    /// (`CalendarProvider.occurrence`): the one `updateOccurrence` would change, found by the same
+    /// lookup (`resolveInstance`), as Google lists it. Nothing is written. A moved occurrence is
+    /// found here; only `splitSeries` refuses a split at one.
+    func occurrence(
+        calendarId: String = "primary",
+        eventId: String,
+        recurrenceId: String,
+        recurrenceIdZone: TimeZone
+    ) async throws -> GCalEvent {
+        let (masterId, _, _) = try await resolveToMaster(calendarId: calendarId, eventId: eventId)
+        return try await occurrence(
+            calendarId: calendarId, named: eventId, masterId: masterId,
+            recurrenceId: recurrenceId, zone: recurrenceIdZone)
+    }
+
+    /// `occurrence`, with the series already read (`resolveToMaster`): `named` is the id the edit
+    /// gave, `masterId` its series. Also the split's own lookup (`splitSeries`).
+    private func occurrence(
+        calendarId: String, named: String, masterId: String,
+        recurrenceId: String, zone: TimeZone
+    ) async throws -> GCalEvent {
+        let found = try await resolveInstance(
+            calendarId: try Self.encodedPathSegment(calendarId, "Google calendar id"),
+            masterId: try Self.encodedPathSegment(masterId, "Google master event id"),
+            recurrenceId: recurrenceId,
+            zone: zone,
+            naming: named == masterId ? nil : named
+        )
+        return found.instance
+    }
+
+    /// The cap `splitSeries` writes: the master's RRULE `UNTIL` (`googleUntilString`).
+    nonisolated func splitCapUntil(beforeNaiveISO recurrenceId: String, allDay: Bool, zone: TimeZone) -> String? {
+        Self.googleUntilString(beforeNaiveISO: recurrenceId, allDay: allDay, zone: zone)
     }
 
     /// Split a recurring series at `recurrenceId`:
@@ -637,6 +773,7 @@ actor GoogleCalendarProvider: CalendarProvider {
         //    the master does. Resolve via `recurringEventId` so a split aimed at
         //    an occurrence id still finds the series to cap. The stored JSON is
         //    what the new part is copied from (`splitNewPartJSON`).
+        let named = eventId
         let (eventId, master, masterJSON) = try await resolveToMaster(calendarId: calendarId, eventId: eventId)
         guard let masterRecurrence = master.recurrence, !masterRecurrence.isEmpty else {
             throw CalendarProviderError.notSupported("Event \(eventId) is not recurring; can't split.")
@@ -669,6 +806,21 @@ actor GoogleCalendarProvider: CalendarProvider {
         let recurrenceParts = try Self.splitRecurrence(
             masterRecurrence, cappedRRule: cappedRRule,
             tailRRule: newSeriesRRule, slot: slot)
+
+        // The new part starts at an occurrence that starts at `recurrenceId` now, the one
+        // `occurrence` finds, and was not moved from its place in the series; otherwise the split
+        // throws with nothing written. Not asked on a retry after this split's own cap, which
+        // ended the series before that occurrence.
+        if !isOwnSplitCap(of: master, at: recurrenceId, zone: recurrenceIdZone) {
+            let found = try await occurrence(
+                calendarId: calendarId, named: named, masterId: eventId,
+                recurrenceId: recurrenceId, zone: recurrenceIdZone)
+            if RecurrenceOccurrenceResolver.wasMoved(found) {
+                // A split at an occurrence moved from its place is not supported (#563): a plain
+                // error, nothing written.
+                throw CalendarProviderError.notSupported("split at a moved occurrence")
+            }
+        }
 
         // 3. Build the new series: a copy of the stored series, re-anchored at
         //    the split, with the patch applied. Pin a DETERMINISTIC id so a retry
@@ -921,12 +1073,19 @@ actor GoogleCalendarProvider: CalendarProvider {
     /// later calendar op on that account forever. A wedge is in the same
     /// non-recoverable set as a dropped intention. Both dispositions being wrong is
     /// what proved the disposition was never the bug; the ADDRESS was.
-    private func resolveInstanceId(
+    ///
+    /// `named` is the occurrence id the edit gave, when it gave one (nil for the series' own id):
+    /// that occurrence answers to `recurrenceId` before any other
+    /// (`RecurrenceOccurrenceResolver.select(_:recurrenceId:zone:naming:)`), and another one is
+    /// refused (`namesAnotherOccurrence`). Returns the instance as Google lists it: where it starts
+    /// now (`start`) and its place in the series (`originalStartTime`).
+    private func resolveInstance(
         calendarId: String,
         masterId: String,
         recurrenceId: String,
-        zone: TimeZone
-    ) async throws -> String {
+        zone: TimeZone,
+        naming named: String?
+    ) async throws -> (id: String, instance: GCalEvent) {
         guard let centerDate = RecurrenceOccurrenceResolver.windowCenter(recurrenceId: recurrenceId, zone: zone) else {
             throw CalendarProviderError.notSupported(
                 "Invalid recurrence_id '\(recurrenceId)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00') or a date (e.g. '2026-05-20')."
@@ -949,8 +1108,10 @@ actor GoogleCalendarProvider: CalendarProvider {
         let items = resp.items ?? []
 
         var candidates: [OccurrenceCandidate] = []
+        var instances: [String: GCalEvent] = [:]
         for ev in items {
             guard let id = ev.id else { continue }
+            instances[id] = ev
             if let date = ev.start?.date {
                 candidates.append(OccurrenceCandidate(id: id, instant: nil, dateOnly: String(date.prefix(10))))
                 continue
@@ -969,9 +1130,15 @@ actor GoogleCalendarProvider: CalendarProvider {
             candidates.append(OccurrenceCandidate(id: id, instant: instant, dateOnly: nil))
         }
 
-        switch RecurrenceOccurrenceResolver.select(candidates, recurrenceId: recurrenceId, zone: zone) {
+        switch RecurrenceOccurrenceResolver.select(candidates, recurrenceId: recurrenceId, zone: zone, naming: named) {
         case .resolved(let id):
-            return id
+            if let named, id != named {
+                throw CalendarProviderError.notSupported(RecurrenceOccurrenceResolver.namesAnotherOccurrence(recurrenceId))
+            }
+            guard let instance = instances[id] else {
+                throw CalendarProviderError.notSupported("recurrence_id '\(recurrenceId)' matched an occurrence of \(masterId) that Google did not list, so nothing was changed.")
+            }
+            return (id, instance)
         case .absent:
             throw GoogleCalendarError.eventNotFound
         case .ambiguous(let count):
@@ -1282,18 +1449,37 @@ actor GoogleCalendarProvider: CalendarProvider {
     /// instant (its RFC 3339 string when it does not parse), each with the zone it names. So the
     /// series' own times spelled otherwise are its own, and the same instant in another zone,
     /// which Google stores and repeats the series in, is a move.
+    ///
+    /// Each zone is compared as `googleZone` keys it at that time's own instant.
     nonisolated static func googleTimes(_ merged: GCalEventInput) -> NSDictionary {
         func time(_ date: String?, _ dateTime: String?, _ zone: String?) -> [String: Any] {
             var value: [String: Any] = [:]
+            let instant = dateTime.flatMap { Date.fromISO8601($0) }
             if let date { value["date"] = date }
-            if let dateTime { value["dateTime"] = Date.fromISO8601(dateTime).map { "\($0.timeIntervalSince1970)" } ?? dateTime }
-            if let zone { value["timeZone"] = zone }
+            if let dateTime { value["dateTime"] = instant.map { "\($0.timeIntervalSince1970)" } ?? dateTime }
+            if let zone { value["timeZone"] = googleZone(zone, at: instant) }
             return value
         }
         return NSDictionary(dictionary: [
             "start": time(merged.startDate, merged.startDateTime, merged.startTimeZone),
             "end": time(merged.endDate, merged.endDateTime, merged.endTimeZone),
         ])
+    }
+
+    /// The zone `name` names, as a key that is equal exactly for the zones a Google time at
+    /// `instant` repeats in alike: two zones are the same when they resolve to one zone
+    /// (`CalendarTimeZoneResolver`: an edit's "UTC", which the write names "GMT", is the series'
+    /// own "UTC"), or when neither changes its clocks after `instant` and both are at the same
+    /// offset there ("Etc/UTC" and "UTC"). Two zones that change their clocks are never the same
+    /// for an offset they share at `instant`: their rules may part later. A name that resolves to
+    /// no zone is the same only as itself, as written. A time with no instant (an all-day date)
+    /// compares resolved zones alone. The Google test fake resets a series on this same key.
+    nonisolated static func googleZone(_ name: String, at instant: Date?) -> String {
+        guard let zone = CalendarTimeZoneResolver.zone(named: name, in: .none) else { return "name:\(name)" }
+        if let instant, zone.nextDaylightSavingTimeTransition(after: instant) == nil {
+            return "offset:\(zone.secondsFromGMT(for: instant))"
+        }
+        return "zone:\(zone.identifier)"
     }
 
     /// Whether two `recurrence` arrays differ in meaning, as sets of lines: an RRULE line as
@@ -1676,6 +1862,21 @@ struct GCalEvent: Codable, Sendable {
     /// the tools say its occurrences are not listed instead of showing that date as
     /// one (CalDAV, `CalDAVOccurrences`, ADR-IOS-108). nil elsewhere.
     var occurrencesNotListed: Bool? = nil
+    /// An occurrence's place in its series: the start the series' rule gives it, which a moved
+    /// occurrence keeps. Google's `originalStartTime` on an instance; Graph's `originalStart` on an
+    /// occurrence or exception, as a UTC instant (`ExchangeCalendarProvider.toGCalEvent`); the
+    /// occurrence's key on CalDAV (`CalDAVOccurrences`). Nil on a series and on a one-off event.
+    /// `CalendarSeriesScope` reads it to tell the series' first occurrence from a later one; where
+    /// an occurrence is NOW is its `start`, the start the read tools show and a `recurrence_id` names.
+    var originalStartTime: GCalDateTime? = nil
+
+    /// The zone a series' rule repeats in, where its dates are read: the zone its calendar keeps
+    /// the rule in (`recurrenceTimeZoneName`, Outlook's), else its start's (Google's and CalDAV's
+    /// own zone), through `CalendarTimeZoneResolver` alone. Nil when the resolver recognizes none,
+    /// or none is named (a CalDAV time in UTC or floating, which the parser gives no zone name).
+    var seriesZone: TimeZone? {
+        (recurrenceTimeZoneName ?? start?.timeZone).flatMap { CalendarTimeZoneResolver.zone(named: $0, in: .none) }
+    }
 }
 
 // Convenience initializer that fills in `eventType`/`iCalUID`/`kind`/`visibility`

@@ -815,13 +815,57 @@ extension AccountManager {
                     "the queued calendar edit carries no event id and can never be executed")
             }
             var resolvedAllDay = CalendarToolHelpers.boolArg(args, "all_day")
+            // 🚨 THE OTHER HALF OF THE OCCURRENCE ADDRESS. `recurrence_id` is a
+            // naive wall clock with no offset; on its own it does not name an
+            // instant. `calendar_event_edit`'s schema already publishes the frame
+            // ("all naive ISO8601 datetime parameters are interpreted in this
+            // timezone", default: the device zone), the durable operation already
+            // persists the whole argument dictionary including `timezone`, and
+            // `formatDetailedEvent` already MINTS `start_iso` in that same zone.
+            // The frame was present on both ends the entire time and was simply
+            // never carried across — the calendar instance of THE ADDRESS PROBLEM.
+            // Resolving it here, once, is what lets every provider agree.
+            // A `timezone` the resolver does not recognize is refused here, before
+            // the occurrence reads below use it as the frame, through the same
+            // function `buildGCalEventInput` uses.
+            let recurrenceIdZone = try CalendarToolHelpers.resolveWriteTimeZone(
+                args, consequence: "it did not change the event")
+            // The same reading and routing the edit tool made before its card
+            // (`CalendarSeriesScope`): the event, its series and the occurrence it names, by the
+            // provider's own lookup, then where the edit goes. The tool queues the edit as it routed
+            // it, which routes to itself, so this decides the same unless the calendar changed since
+            // the card. A failed read is thrown as the provider gave it, and the drain classifies it
+            // (an occurrence that no longer starts there is the provider's not-found).
+            let givenScope = CalendarToolHelpers.stringArgOpt(args, "edit_scope")?.lowercased()
+                ?? (CalendarToolHelpers.stringArgOpt(args, "recurrence_id") != nil ? "this_only" : "all")
+            // A split's retry after its own cap is not looked up again (`read`'s `splitting`): it
+            // goes on to `splitSeries` below, which writes what the interrupted attempt did not.
+            let named = try await CalendarSeriesScope.read(
+                eventId: eventId, recurrenceId: CalendarToolHelpers.stringArgOpt(args, "recurrence_id"),
+                calendarId: calId, zone: recurrenceIdZone, splitting: givenScope == "this_and_following",
+                provider: provider)
+            let routed = try CalendarSeriesScope.route(args, scope: givenScope, named: named, zone: recurrenceIdZone)
+            // The tool makes an "all" edit that moves a later occurrence to another date a split before
+            // its card; one that reaches the queue as "all" was confirmed as a change of every
+            // occurrence and the series changed since. It is not split here.
+            if givenScope == "all", routed.scope == "this_and_following" {
+                throw CalendarProviderError.notSupported(
+                    CalendarSeriesScope.laterOccurrenceRefusal(routed.recurrenceId ?? "?"))
+            }
+            // An edit of every occurrence writes the series (#560), whichever of its occurrences the
+            // edit names.
+            let writeId = routed.scope == "all" ? named.seriesId : routed.eventId
             // calendar_event_edit-v1.5.21+: attendees are delta-based. If args carries
             // add_attendees or remove_attendees, fetch the current event and resolve the
             // delta against its attendee list before building the update input — so the
             // existing attendees are preserved instead of being overwritten.
             let resolvedArgs = try await resolveAttendeeDelta(
-                args: args, eventId: eventId, calendarId: calId, provider: provider
+                args: routed.args, eventId: writeId, calendarId: calId, provider: provider
             )
+            if !named.afterOwnSplitCap, let reason = CalendarSeriesScope.dayMoveRefusal(
+                resolvedArgs, named: named, scope: routed.scope, zone: recurrenceIdZone) {
+                throw CalendarProviderError.notSupported(reason)
+            }
             // 🚨 AN RRULE `UNTIL`'S VALUE TYPE BELONGS TO THE DTSTART, AND ON AN EDIT THE DTSTART
             // BELONGS TO THE RESOURCE. RFC 5545 §3.3.10: "The value of the UNTIL rule part MUST have
             // the same value type as the DTSTART property." `buildGCalEventInput` renders the UNTIL
@@ -865,11 +909,9 @@ extension AccountManager {
             // The gate: an absent `all_day` is resolved when the edit gives `start_iso` or `end_iso`
             // (the flag renders them) or when `recurrenceUntilIsAtStake` (the flag types the UNTIL).
             // It is resolved here, once, before the scope switch, so every provider's edit and every
-            // `edit_scope` gets its kind from the same place. An edit that moves nothing and sets no
-            // UNTIL (a rename, a description, attendees alone) pays no round trip. An edit that
-            // changes attendees AND resolves the kind fetches twice, because `resolveAttendeeDelta`
-            // fetches independently above; that is accepted rather than refactoring that function's
-            // signature to thread the event back out.
+            // `edit_scope` gets its kind from the same place. The event is the one
+            // `CalendarSeriesScope.read` read above: the series for an edit of every occurrence, which
+            // is what is written, else the event the edit names (an occurrence has its series' kind).
             //
             // A failed fetch does NOT guess: the throw propagates and the drain classifies it —
             // transient ⇒ retried, permanent ⇒ retired with a reason. Fail closed, per THE MANTRA; a
@@ -877,15 +919,15 @@ extension AccountManager {
             // model.
             let movesTime = CalendarToolHelpers.stringArgOpt(resolvedArgs, "start_iso") != nil
                 || CalendarToolHelpers.stringArgOpt(resolvedArgs, "end_iso") != nil
+            let written = routed.scope == "all" ? named.series : named.event
             var stored: GCalEvent? = nil
             if resolvedAllDay == nil,
                movesTime || CalendarToolHelpers.recurrenceUntilIsAtStake(resolvedArgs) {
-                let current = try await provider.getEvent(calendarId: calId, eventId: eventId)
-                stored = current
+                stored = written
                 // `GCalDateTime.date` is populated only for an all-day event, on every provider:
                 // `ICSParser.makeGCalDateTime` (CalDAV), `ExchangeCalendarProvider.toGCalDateTime`,
                 // `DemoCalendarProvider`, and Google's own JSON all put the timed form in `dateTime`.
-                resolvedAllDay = (current.start?.date != nil)
+                resolvedAllDay = (written.start?.date != nil)
                 // Gated per global rule 12 — this is a new diagnostic, and the surrounding ungated
                 // `print`s are the pre-existing corpus registered as `IOS-LOG-003`, not a licence.
                 if DebugModeManager.isLoggingEnabled() {
@@ -896,10 +938,8 @@ extension AccountManager {
             // when no recurrence_id, 'this_only' when recurrence_id is present
             // (back-compat with the earlier schema where recurrence_id alone
             // implied single-occurrence override).
-            let explicitScope = CalendarToolHelpers.stringArgOpt(resolvedArgs, "edit_scope")?.lowercased()
-            let recurrenceId = CalendarToolHelpers.stringArgOpt(resolvedArgs, "recurrence_id")
-            let scope: String = explicitScope
-                ?? (recurrenceId != nil ? "this_only" : "all")
+            let recurrenceId = routed.recurrenceId
+            let scope = routed.scope
 
             // THE EDIT TARGET'S START DATE, resolved once here with the scope: on `this_and_following`
             // the target is the occurrence, whose start is `recurrence_id`'s date (the start the new
@@ -908,32 +948,16 @@ extension AccountManager {
             // all-day occurrence, and otherwise `recurrence_id`'s date; on `all` it is the
             // event's stored start, taken from the read above when there was one. The master's start
             // is earlier than any later occurrence's, so a scoped edit compared with it would pass an
-            // end on the occurrence's own start. On `all` the event is read here only when the
-            // refusal below needs it (an explicit `all_day: true` skipped the read above and the edit
-            // gives an end but no start); otherwise the value stays nil. The KIND still comes from the
-            // stored event above, on every scope: an occurrence has its series' kind.
+            // end on the occurrence's own start. On `all` the series read above is the target only when
+            // the refusal below needs it (an explicit `all_day: true` skipped the kind above and the
+            // edit gives an end but no start); otherwise the value stays nil. The KIND still comes from
+            // the stored event above, on every scope: an occurrence has its series' kind.
             let movesEndOnly = CalendarToolHelpers.stringArgOpt(resolvedArgs, "end_iso") != nil
                 && CalendarToolHelpers.stringArgOpt(resolvedArgs, "start_iso") == nil
             var target = stored
             if scope == "all", target == nil, resolvedAllDay == true, movesEndOnly {
-                target = try await provider.getEvent(calendarId: calId, eventId: eventId)
+                target = written
             }
-
-            // 🚨 THE OTHER HALF OF THE OCCURRENCE ADDRESS. `recurrence_id` is a
-            // naive wall clock with no offset; on its own it does not name an
-            // instant. `calendar_event_edit`'s schema already publishes the frame
-            // ("all naive ISO8601 datetime parameters are interpreted in this
-            // timezone", default: the device zone), the durable operation already
-            // persists the whole argument dictionary including `timezone`, and
-            // `formatDetailedEvent` already MINTS `start_iso` in that same zone.
-            // The frame was present on both ends the entire time and was simply
-            // never carried across — the calendar instance of THE ADDRESS PROBLEM.
-            // Resolving it here, once, is what lets every provider agree.
-            // A `timezone` the resolver does not recognize is refused here, before
-            // the occurrence read below uses it as the frame, through the same
-            // function `buildGCalEventInput` uses.
-            let recurrenceIdZone = try CalendarToolHelpers.resolveWriteTimeZone(
-                resolvedArgs, consequence: "it did not change the event")
 
             // An all-day end is the day after the last day, so an all-day edit whose end is on or
             // before its start would write a zero-length event (an all-day event given times of one
@@ -964,7 +988,7 @@ extension AccountManager {
             if let rid = recurrenceId,
                CalendarToolHelpers.needsOccurrenceStartDay(resolvedArgs, storedStart: stored?.start, scope: scope) {
                 occurrenceStartDay = try await provider.occurrenceStartDay(
-                    calendarId: calId, eventId: eventId, recurrenceId: rid, recurrenceIdZone: recurrenceIdZone)
+                    calendarId: calId, eventId: writeId, recurrenceId: rid, recurrenceIdZone: recurrenceIdZone)
             }
             if let reason = CalendarToolHelpers.allDayEditRefusal(
                 resolvedArgs, storedStart: target?.start, scope: scope, recurrenceId: recurrenceId,
@@ -979,7 +1003,7 @@ extension AccountManager {
                     throw CalendarProviderError.notSupported("edit_scope='this_only' requires recurrence_id")
                 }
                 _ = try await provider.updateOccurrence(
-                    calendarId: calId, eventId: eventId, recurrenceId: rid,
+                    calendarId: calId, eventId: writeId, recurrenceId: rid,
                     recurrenceIdZone: recurrenceIdZone,
                     event: input, sendUpdates: "all"
                 )
@@ -989,7 +1013,7 @@ extension AccountManager {
                     throw CalendarProviderError.notSupported("edit_scope='this_and_following' requires recurrence_id")
                 }
                 let created = try await provider.splitSeries(
-                    calendarId: calId, eventId: eventId, recurrenceId: rid,
+                    calendarId: calId, eventId: writeId, recurrenceId: rid,
                     recurrenceIdZone: recurrenceIdZone,
                     patch: input, sendUpdates: "all"
                 )
@@ -1001,8 +1025,8 @@ extension AccountManager {
                 // miss for any occurrence on or after `rid`.
                 return (created.id, nil)
             case "all":
-                _ = try await provider.updateEvent(calendarId: calId, eventId: eventId, event: input, sendUpdates: "all")
-                BackgroundSyncLogger.logDebug("[CalendarQueue] Updated event id=\(eventId) scope=all")
+                _ = try await provider.updateEvent(calendarId: calId, eventId: writeId, event: input, sendUpdates: "all")
+                BackgroundSyncLogger.logDebug("[CalendarQueue] Updated event id=\(writeId) scope=all")
             default:
                 // Unknown edit_scope value — reject rather than silently defaulting
                 // to a series-wide write (which could surprise the user). The

@@ -222,7 +222,11 @@ struct CalendarProviderRuleChangedTests {
 
     enum GoogleTimeEdit: String, CaseIterable, CustomTestStringConvertible {
         case laterStart, rename, ownTimesSpelledOtherwise, sameInstantOtherZone, endOnly, allDayMovedDate, allDayOwnDate
+        case unrecognizedZoneOwn, unrecognizedZoneOther
         var testDescription: String { rawValue }
+
+        /// The series' zone: a name no zone resolves to for the unrecognized cases, UTC otherwise.
+        var storedZone: String { [.unrecognizedZoneOwn, .unrecognizedZoneOther].contains(self) ? "Custom/Unrecognized" : "UTC" }
 
         /// The series is all-day for the all-day cases, from 2099-01-05 for one day; timed otherwise,
         /// 09:00 to 09:30 UTC.
@@ -257,12 +261,20 @@ struct CalendarProviderRuleChangedTests {
             case .allDayOwnDate:
                 input.startDate = "2099-01-05"
                 input.endDate = "2099-01-06"
+            case .unrecognizedZoneOwn, .unrecognizedZoneOther:
+                // The series' own instants, in its own unrecognized zone or in another unrecognized one.
+                let zone = self == .unrecognizedZoneOwn ? storedZone : "Custom/Another"
+                input.startDateTime = "2099-01-05T09:00:00Z"
+                input.startTimeZone = zone
+                input.endDateTime = "2099-01-05T09:30:00Z"
+                input.endTimeZone = zone
             }
             return input
         }
 
-        /// A new start or end, or the same instant in another zone, resets the series.
-        var resets: Bool { [.laterStart, .sameInstantOtherZone, .endOnly, .allDayMovedDate].contains(self) }
+        /// A new start or end, or the same instant in another zone, resets the series. A zone name
+        /// that resolves to no zone is the same only as itself.
+        var resets: Bool { [.laterStart, .sameInstantOtherZone, .endOnly, .allDayMovedDate, .unrecognizedZoneOther].contains(self) }
     }
 
     /// Google resets a series' changed occurrences when a whole-series edit moves its start or
@@ -278,6 +290,10 @@ struct CalendarProviderRuleChangedTests {
             ? FakeGoogleCalendar.allDay(id: "ser-g", start: "2099-01-05", end: "2099-01-06")
             : FakeGoogleCalendar.timed(id: "ser-g", day: "2099-01-05")
         master["recurrence"] = ["RRULE:FREQ=WEEKLY;COUNT=5"]
+        if !edit.allDay {
+            master["start"] = ["dateTime": "2099-01-05T09:00:00Z", "timeZone": edit.storedZone]
+            master["end"] = ["dateTime": "2099-01-05T09:30:00Z", "timeZone": edit.storedZone]
+        }
         // The occurrence of 2099-01-12, moved a day or an hour later.
         var moved = edit.allDay
             ? FakeGoogleCalendar.allDay(id: "ser-g_20990112T090000Z", start: "2099-01-13", end: "2099-01-14")

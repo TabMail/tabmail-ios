@@ -37,9 +37,14 @@ checker's report, and the before and after instance data is the evidence. Measur
 same day, with the request bodies saved: a series PATCH that re-sends the series' unchanged start, end
 and recurrence with a new summary does NOT reset changed occurrences (the deleted occurrence stays
 deleted, the moved one keeps its time and `originalStartTime`), and neither does a summary-only PATCH.
-So Google resets only when the times actually change; its write, which sends the merged start and end
-on every edit, needs no change. Google: a change of only the zone label on the same instant is treated
-as a move (warn side); Google's reset for it is unmeasured.
+So Google resets only when the times actually change. Google's series write, like Outlook's, sends start
+and end only when the edit moves them (2026-11-11): `patchEvent` omits both when
+`movesSeriesTime(…, as: googleTimes)` says the series' own, the one decision the card's reset note takes.
+Zones are compared by `googleZone`: one zone when they resolve to one, or when neither changes its clocks
+after the instant and both are at the same offset (Tokyo and Seoul; Etc/UTC and UTC). So the same instant
+under such a zone name is no move, warns nothing and writes no start or end; another zone (a different
+offset, or a clock-changing one) is a move, and both start and end are sent together. (Old text in
+"Superseded" at the end.)
 
 So every edit, even a rename, replaced the body with its preview (losing HTML, links, everything past
 the preview and an online meeting's join block), narrowed the rest, and reset a series' exceptions.
@@ -188,7 +193,9 @@ that aren't included in the request body maintain their previous values".
   Google measurement above, true when the edit moves the series' start or end
   (`GoogleCalendarProvider.movesSeriesTime` with `googleTimes`, the date or instant and the zone Google
   reads, so its own times spelled otherwise are no move and the same instant in another zone is one;
-  Outlook shared this function until a consult gave it its own comparison, now by instant, above). Google's write sends the merged start and end every time, unchanged; CalDAV replaces
+  Outlook shared this function until a consult gave it its own comparison, now by instant, above). (SUPERSEDED: "Google's write sends the merged start and end every time, unchanged".)
+  Current: a Google whole-series edit whose times compare equal (`googleTimes`) now omits start and end;
+  a same-instant re-zone between equal fixed-offset zones is not written, the same limit Outlook has (#667). CalDAV replaces
   only the RRULE line, so it answers by that line alone; the demo calendar stores no rule. Replaced in
   review: a card-side normaliser (`CalendarToolHelpers.ruleChanges` over a `RuleMeaning` of the two
   RRULEs) that could disagree with the write, deleted. Creates and the split's new
@@ -327,3 +334,11 @@ in the day than the series' start ends the series the day before, as Google Cale
 end arrives as 23:59:59 local, so it always stays the day the user named. A bare date or a floating
 value keeps its own date digits; there is no branch for the floating form, since no producer emits it
 for Outlook.
+
+## Superseded
+
+Replaced 2026-11-11 (the Google series write now omits an unmoved start and end; see "What happened"):
+
+> So Google resets only when the times actually change; its write, which sends the merged start and end
+> on every edit, needs no change. Google: a change of only the zone label on the same instant is treated
+> as a move (warn side); Google's reset for it is unmeasured.

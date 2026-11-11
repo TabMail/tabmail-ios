@@ -18,6 +18,14 @@ actor CalDAVProvider: CalendarProvider {
         return edited != rule(event.recurrence)
     }
 
+    /// The cap `splitSeries` writes: the master's RRULE `UNTIL`, as Google's
+    /// (`GoogleCalendarProvider.googleUntilString`). The split computes it from the occurrence's
+    /// slot, which is `recurrenceId` for every occurrence it splits at (one moved from its place is
+    /// refused there).
+    nonisolated func splitCapUntil(beforeNaiveISO recurrenceId: String, allDay: Bool, zone: TimeZone) -> String? {
+        GoogleCalendarProvider.googleUntilString(beforeNaiveISO: recurrenceId, allDay: allDay, zone: zone)
+    }
+
     private let client: CalDAVClient
     private let calendarHomeURL: URL
     private let serverBaseURL: URL
@@ -453,6 +461,34 @@ actor CalDAVProvider: CalendarProvider {
             )
         }
         return Self.occurrenceStartDay(storedICS: ics, recurrenceIdNaive: rid)
+    }
+
+    /// The occurrence an edit names (`CalendarProvider.occurrence`), read with nothing written:
+    /// the one `updateOccurrence` would change and `splitSeries` would split at, by their own
+    /// check made as `updateOccurrence` makes it (`CalDAVOccurrences.scopedEdit`, with what it
+    /// refuses: a stored zone TabMail does not recognize, an occurrence id whose key names another
+    /// occurrence, and the rest), as a listing shows it, with its place in the series
+    /// (`originalStartTime`, from its key). An occurrence moved from its place is found here; only
+    /// `splitSeries`' own check refuses a split at one.
+    func occurrence(
+        calendarId: String,
+        eventId: String,
+        recurrenceId: String,
+        recurrenceIdZone: TimeZone
+    ) async throws -> GCalEvent {
+        let (seriesHref, occurrenceKey) = try CalDAVOccurrences.OccurrenceId.split(eventId)
+        let eventURL = try resolveEventURL(seriesHref, calendarId: calendarId)
+        let (data, _) = try await client.get(url: eventURL)
+        guard let ics = String(data: data, encoding: .utf8), !ics.isEmpty else {
+            throw CalDAVError.parseError("Empty response for event \(eventId)")
+        }
+        let named = try CalDAVOccurrences.scopedEdit(
+            icsText: ics, href: seriesHref, key: occurrenceKey,
+            recurrenceId: recurrenceId, zone: recurrenceIdZone, forSplit: false)
+        guard let found = CalDAVOccurrences.occurrence(key: named.key, icsText: ics, href: seriesHref) else {
+            throw CalDAVError.notFound
+        }
+        return found
     }
 
     /// Single-occurrence override (this_only). CalDAV represents overrides as

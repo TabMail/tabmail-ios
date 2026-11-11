@@ -96,23 +96,52 @@ private enum GoogleSplitFixture {
         let methods: [String]
     }
 
-    /// Split `master` at `recurrenceId` with `patch` against a fake Google calendar.
-    static func split(_ master: [String: Any], recurrenceId: String = recurrenceId,
+    /// An occurrence of `master-1` as `events.instances` lists it, at `place` (a UTC wall time, or a
+    /// date for an all-day series), its place in the series (`originalStartTime`) the same.
+    static func occurrence(_ place: String) -> [String: Any] {
+        let at: [String: Any] = place.count == 10 ? ["date": place] : ["dateTime": place + "Z", "timeZone": "UTC"]
+        return ["id": "master-1_\(place.filter(\.isNumber))", "status": "confirmed", "recurringEventId": "master-1",
+                "start": at, "originalStartTime": at]
+    }
+
+    /// The instances list of `master-1`.
+    static func instances(_ items: [[String: Any]]) -> Data {
+        // swiftlint:disable:next force_try
+        try! JSONSerialization.data(withJSONObject: ["items": items])
+    }
+
+    /// Split `master` at `recurrenceId` with `patch` against a fake Google calendar whose instances
+    /// list is `listed` (by default the occurrence split at).
+    static func split(_ master: [String: Any], recurrenceId: String = recurrenceId, listed: [[String: Any]]? = nil,
                       patch: GCalEventInput) async throws -> Wire {
+        let attempt = await attempt(master, recurrenceId: recurrenceId, listed: listed, patch: patch)
+        if let error = attempt.error { throw error }
+        return attempt.wire
+    }
+
+    /// `split`, returning what reached the wire whether or not the split was refused.
+    static func attempt(_ master: [String: Any], recurrenceId: String = recurrenceId, listed: [[String: Any]]? = nil,
+                        patch: GCalEventInput) async -> (wire: Wire, error: Error?) {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
         let ok = ["Content-Type": "application/json"]
         // swiftlint:disable:next force_try
         let stored = try! JSONSerialization.data(withJSONObject: master)
         http.register(path: masterPath, method: "GET", response: .raw(statusCode: 200, headers: ok, body: stored))
+        http.register(path: masterPath + "/instances", method: "GET",
+                      response: .raw(statusCode: 200, headers: ok, body: instances(listed ?? [occurrence(recurrenceId)])))
         http.register(path: masterPath, method: "PATCH", response: .raw(statusCode: 200, headers: ok, body: stored))
         http.register(path: createPath, method: "POST") { request in
             .raw(statusCode: 200, headers: ok, body: request.body ?? Data())
         }
         let provider = GoogleCalendarProvider(accessToken: { _ in "test-token" }, session: http.session)
-        _ = try await provider.splitSeries(
-            eventId: "master-1", recurrenceId: recurrenceId, recurrenceIdZone: utc, patch: patch)
-        return wire(http)
+        do {
+            _ = try await provider.splitSeries(
+                eventId: "master-1", recurrenceId: recurrenceId, recurrenceIdZone: utc, patch: patch)
+            return (wire(http), nil)
+        } catch {
+            return (wire(http), error)
+        }
     }
 
     static func wire(_ http: FakeHTTP.Scenario) -> Wire {
@@ -184,13 +213,22 @@ struct GoogleSeriesSplitCopyTests {
 
     @Test("an excluded or added date exactly at the split goes to the new part only", arguments: ["EXDATE", "RDATE"])
     func splitPointGoesToTheNewPart(_ kind: String) async throws {
-        let master = GoogleSplitFixture.master(recurrence: [
-            "RRULE:FREQ=WEEKLY;UNTIL=20991230T170000Z", "\(kind):20990520T170000Z",
-        ])
-        let wire = try await GoogleSplitFixture.split(master, patch: GCalEventInput())
+        let recurrence = ["RRULE:FREQ=WEEKLY;UNTIL=20991230T170000Z", "\(kind):20990520T170000Z"]
+        // How the lines are split. A split reaches an excluded date at the split only on a retry after
+        // its own cap, the occurrence deleted in between: the series does not list an excluded
+        // occurrence, so a first split there is refused (`splitAtNoOccurrenceWritesNothing`).
+        let parts = try GoogleCalendarProvider.splitRecurrence(
+            recurrence, cappedRRule: "RRULE:FREQ=WEEKLY;UNTIL=20990520T165959Z",
+            tailRRule: "RRULE:FREQ=WEEKLY;UNTIL=20991230T170000Z",
+            slot: try #require(Date.fromISO8601("2099-05-20T17:00:00Z")))
+        #expect(parts.capped == ["RRULE:FREQ=WEEKLY;UNTIL=20990520T165959Z"], "\(kind): the capped series: \(parts.capped)")
+        #expect(parts.tail == recurrence, "\(kind): the new part: \(parts.tail)")
+        guard kind == "RDATE" else { return }
+        // On the wire, for an added date on an occurrence the series lists.
+        let wire = try await GoogleSplitFixture.split(GoogleSplitFixture.master(recurrence: recurrence), patch: GCalEventInput())
         #expect(wire.patchedRecurrences == [["RRULE:FREQ=WEEKLY;UNTIL=20990520T165959Z"]],
                 "\(kind): the capped series: \(wire.patchedRecurrences)")
-        #expect(wire.created?["recurrence"] as? [String] == ["RRULE:FREQ=WEEKLY;UNTIL=20991230T170000Z", "\(kind):20990520T170000Z"],
+        #expect(wire.created?["recurrence"] as? [String] == recurrence,
                 "\(kind): the new part: \(canonical(wire.created?["recurrence"]))")
     }
 
@@ -354,6 +392,15 @@ struct GoogleSeriesSplitCopyTests {
                 return .raw(statusCode: 200, headers: ok, body: json(body))
             }
         }
+        http.register(path: GoogleSplitFixture.masterPath + "/instances", method: "GET") { _ in
+            // The series lists the occurrence at the split until the cap ends it before it, so the
+            // retry finds none there: it is this split's own cap, and is not asked again.
+            let capped = server.withLock { state in
+                (state.master["recurrence"] as? [String] ?? []).contains { $0.contains("UNTIL=20990520T165959Z") }
+            }
+            return .raw(statusCode: 200, headers: ok,
+                        body: GoogleSplitFixture.instances(capped ? [] : [GoogleSplitFixture.occurrence(GoogleSplitFixture.recurrenceId)]))
+        }
         http.register(path: GoogleSplitFixture.createPath + "/", method: "GET") { request in
             let id = String(request.url.path.split(separator: "/").last ?? "")
             guard let event = server.withLock({ state in state.created[id].map { json($0) } }) else { return .raw(statusCode: 404) }
@@ -407,6 +454,34 @@ struct GoogleSeriesSplitCopyTests {
         }
         #expect(http.recordedCalls().allSatisfy { $0.method == "GET" }, "a write was sent: \(http.servedCallSequence())")
     }
+
+    @Test("a split at a recurrence_id at which no occurrence starts now writes nothing, and is the provider's absence", arguments: [
+        "a time between two occurrences", "a date off the series' days", "a deleted occurrence", "a moved occurrence's place",
+    ])
+    func splitAtNoOccurrenceWritesNothing(_ label: String) async throws {
+        // The series lists its occurrence on 2099-05-20 at 17:00 (its place) unless the case says otherwise.
+        var master = GoogleSplitFixture.master()
+        var listed = [GoogleSplitFixture.occurrence(GoogleSplitFixture.recurrenceId)]
+        var recurrenceId = GoogleSplitFixture.recurrenceId
+        switch label {
+        case "a time between two occurrences": recurrenceId = "2099-05-20T17:30:00"
+        case "a date off the series' days": recurrenceId = "2099-05-21T17:00:00"
+        case "a deleted occurrence":
+            // Deleted: excluded from the rule, and not listed.
+            master["recurrence"] = ["RRULE:FREQ=WEEKLY;UNTIL=20991230T170000Z", "EXDATE:20990520T170000Z"]
+            listed = []
+        default:
+            // Moved on its own to 18:00: nothing starts at its place (17:00) now. A recurrence_id
+            // names an occurrence where it is now, never by its place in the series.
+            listed[0]["start"] = ["dateTime": "2099-05-20T18:00:00Z", "timeZone": "UTC"]
+        }
+        var patch = GCalEventInput()
+        patch.startDateTime = "2099-05-20T19:00:00Z"
+        let attempt = await GoogleSplitFixture.attempt(master, recurrenceId: recurrenceId, listed: listed, patch: patch)
+        #expect(attempt.wire.methods.allSatisfy { $0 == "GET" }, "\(label): written: \(attempt.wire.methods)")
+        let error = try #require(attempt.error, "\(label): not refused")
+        #expect(AccountManager.isCalendarNotFoundError(error), "\(label): \(error)")
+    }
 }
 
 // MARK: - Outlook
@@ -457,6 +532,12 @@ private enum GraphSplitFixture {
     static func provider(_ http: FakeHTTP.Scenario) -> ExchangeCalendarProvider {
         ExchangeCalendarProvider(mailbox: "calendar@example.com", accessToken: { _ in "test-token" }, session: http.session)
     }
+
+    /// A calendar holding `series` and, when `listed`, its occurrence at the split, as Graph lists it.
+    static func calendar(_ series: [String: Any], listed: Bool = true) -> FakeGraphCalendar {
+        FakeGraphCalendar([series] + (listed ? [GraphFixture.event(id: "ser-1-occ", start: occurrence, online: false,
+                                                                   seriesMasterId: "ser-1")] : []))
+    }
 }
 
 @Suite("Outlook split keeps the series' properties", .serialized)
@@ -467,12 +548,13 @@ struct ExchangeSeriesSplitCopyTests {
         return (graph, created)
     }
 
-    /// The split, with the create's body exactly as it was sent.
-    private func splitOnTheWire(_ series: [String: Any], patch: GCalEventInput)
+    /// The split, with the create's body exactly as it was sent. `listed`: whether the series lists
+    /// its occurrence at the split.
+    private func splitOnTheWire(_ series: [String: Any], listed: Bool = true, patch: GCalEventInput)
         async throws -> (FakeGraphCalendar, [String: Any], [String: Any]) {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
-        let graph = FakeGraphCalendar([series])
+        let graph = GraphSplitFixture.calendar(series, listed: listed)
         graph.install(on: http)
         _ = try await GraphSplitFixture.provider(http).splitSeries(
             eventId: "ser-1", recurrenceId: GraphSplitFixture.recurrenceId, recurrenceIdZone: .current, patch: patch)
@@ -532,13 +614,35 @@ struct ExchangeSeriesSplitCopyTests {
         let cap = try #require(ExchangeCalendarProvider.graphEndDateBefore(
             naiveISO: GraphSplitFixture.recurrenceId, allDay: false, zone: .current))
         let series = GraphSplitFixture.series(range: ["type": "endDate", "endDate": cap, "numberOfOccurrences": 0])
-        let (_, _, sent) = try await splitOnTheWire(series, patch: GCalEventInput())
+        // The cap ended the series before the occurrence, so the series no longer lists it: this
+        // split's own cap is not asked again.
+        let (_, _, sent) = try await splitOnTheWire(series, listed: false, patch: GCalEventInput())
 
         let recurrence = try #require(sent["recurrence"] as? [String: Any])
         let range = try #require(recurrence["range"] as? [String: Any])
         #expect(range["type"] as? String == "noEnd" && range["endDate"] == nil,
                 "the new part would end before it starts: \(canonical(range))")
         #expect(range["startDate"] as? String == String(GraphSplitFixture.recurrenceId.prefix(10)), "\(canonical(range))")
+    }
+
+    @Test("a retry after this split's own cap does not look its occurrence up again: no instances read, and an occurrence moved there does not stop it")
+    func ownCapRetryDoesNotLookTheOccurrenceUp() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let cap = try #require(ExchangeCalendarProvider.graphEndDateBefore(
+            naiveISO: GraphSplitFixture.recurrenceId, allDay: false, zone: .current))
+        let series = GraphSplitFixture.series(range: ["type": "endDate", "endDate": cap, "numberOfOccurrences": 0])
+        // An occurrence at the split's place, moved on its own an hour later: looked up, it would stop
+        // the split (nothing starts at the place now, and the one there was moved).
+        var moved = GraphFixture.event(id: "ser-1-occ", start: GraphSplitFixture.occurrence, online: false, seriesMasterId: "ser-1")
+        moved["start"] = ["dateTime": GraphFixture.naive(GraphSplitFixture.occurrence.addingTimeInterval(3_600)), "timeZone": "UTC"]
+        let graph = FakeGraphCalendar([series, moved])
+        graph.install(on: http)
+        _ = try await GraphSplitFixture.provider(http).splitSeries(
+            eventId: "ser-1", recurrenceId: GraphSplitFixture.recurrenceId, recurrenceIdZone: .current, patch: GCalEventInput())
+        #expect(!http.recordedCalls().contains { $0.url.contains("/instances") },
+                "the occurrence was looked up on a retry: \(http.servedCallSequence())")
+        #expect(graph.created.count == 1, "no new part: \(http.servedCallSequence())")
     }
 
     @Test("attendees keep their name and type; one the edit adds is required")
@@ -644,7 +748,9 @@ struct ExchangeSeriesSplitCopyTests {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
         let series = GraphSplitFixture.series(range: GraphSplitFixture.noEnd)
-        let graph = FakeGraphCalendar([series])
+        // With its occurrence listed, so the split's lookup finds it on that date and the new part's
+        // start is what refuses it.
+        let graph = GraphSplitFixture.calendar(series)
         graph.install(on: http)
         // A timed series given only a date for the occurrence: the new part's start can't be read.
         let dateOnly = String(GraphSplitFixture.recurrenceId.prefix(10))
@@ -662,7 +768,7 @@ struct ExchangeSeriesSplitCopyTests {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
         let series = GraphSplitFixture.series(range: GraphSplitFixture.numbered)
-        let graph = FakeGraphCalendar([series])
+        let graph = GraphSplitFixture.calendar(series)
         graph.install(on: http)
         graph.failNext("POST", with: 400)
         await #expect(throws: (any Error).self) {
@@ -673,5 +779,194 @@ struct ExchangeSeriesSplitCopyTests {
         #expect(canonical(graph.event("ser-1")?["recurrence"]) == canonical(series["recurrence"]),
                 "the series' recurrence was not restored: \(canonical(graph.event("ser-1")?["recurrence"]))")
         #expect(graph.created.isEmpty)
+    }
+
+    @Test("a split at a recurrence_id at which no occurrence starts now writes nothing, and is the provider's absence", arguments: [
+        "a time between two occurrences", "a date off the series' days", "a deleted occurrence", "a moved occurrence's place",
+    ])
+    func splitAtNoOccurrenceWritesNothing(_ label: String) async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let series = GraphSplitFixture.series(range: GraphSplitFixture.noEnd)
+        var occurrence = GraphFixture.event(id: "ser-1-occ", start: GraphSplitFixture.occurrence, online: false,
+                                            seriesMasterId: "ser-1")
+        var recurrenceId = GraphSplitFixture.recurrenceId
+        var seed = [series, occurrence]
+        switch label {
+        case "a time between two occurrences":
+            recurrenceId = GraphFixture.wall(GraphSplitFixture.occurrence.addingTimeInterval(1_800), in: GraphSplitFixture.zone)
+        case "a date off the series' days":
+            recurrenceId = GraphFixture.wall(GraphSplitFixture.occurrence.addingTimeInterval(86_400), in: GraphSplitFixture.zone)
+        case "a deleted occurrence":
+            seed = [series]
+        default:
+            // Moved on its own an hour later: nothing starts at its place now. A recurrence_id names
+            // an occurrence where it is now, never by its place in the series.
+            occurrence["start"] = ["dateTime": GraphFixture.naive(GraphSplitFixture.occurrence.addingTimeInterval(3_600)), "timeZone": "UTC"]
+            seed = [series, occurrence]
+        }
+        let graph = FakeGraphCalendar(seed)
+        graph.install(on: http)
+        var patch = GCalEventInput()
+        patch.summary = "Planning (phase 2)"
+        var thrown: Error?
+        do {
+            _ = try await GraphSplitFixture.provider(http).splitSeries(
+                eventId: "ser-1", recurrenceId: recurrenceId, recurrenceIdZone: .current, patch: patch)
+        } catch {
+            thrown = error
+        }
+        let error = try #require(thrown, "\(label): not refused")
+        #expect(AccountManager.isCalendarNotFoundError(error), "\(label): \(error)")
+        #expect(http.recordedCalls().allSatisfy { $0.method == "GET" }, "\(label): written: \(http.servedCallSequence())")
+        #expect(canonical(graph.event("ser-1")?["recurrence"]) == canonical(series["recurrence"]), "\(label): the series was changed")
+    }
+
+    @Test("an all-day series' occurrence is found at the date its place begins in the series' own zone")
+    func allDayPlaceIsDatedInTheSeriesZone() async throws {
+        // Measured: Graph gives an all-day occurrence's place as the instant its date begins in the
+        // series' zone, which it names on the series only (its range's `recurrenceTimeZone`); read
+        // in that zone, its date is the place. Tokyo's date begins the day before in UTC; Los
+        // Angeles' the same day.
+        for (zone, windows) in [("Asia/Tokyo", "Tokyo Standard Time"), ("America/Los_Angeles", "Pacific Standard Time")] {
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            let date = GraphFixture.utcDay(GraphSplitFixture.occurrence)
+            let series = Self.allDaySeries(zone: windows)
+            var occurrence = GraphFixture.event(id: "ser-1-occ", start: GraphSplitFixture.occurrence, online: false,
+                                                seriesMasterId: "ser-1", allDay: true)
+            occurrence["originalStart"] = GraphFixture.allDayPlace(date, in: zone)
+            let graph = FakeGraphCalendar([series, occurrence])
+            graph.install(on: http)
+            // In UTC, where `GraphFixture.event` renders an all-day occurrence's start.
+            _ = try await GraphSplitFixture.provider(http).splitSeries(
+                eventId: "ser-1", recurrenceId: date + "T00:00:00", recurrenceIdZone: .gmt, patch: GCalEventInput())
+            #expect(graph.created.count == 1, "\(zone): no new part: \(http.servedCallSequence())")
+        }
+    }
+
+    @Test("an all-day series in a zone TabMail does not recognize is split like any other: its occurrence's place is read in that zone as Graph names it, and needs no zone of TabMail's")
+    func allDaySeriesInAZoneTabMailDoesNotRecognizeIsSplit() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let date = GraphFixture.utcDay(GraphSplitFixture.occurrence)
+        // A zone the server knows by a name TabMail does not (here Kathmandu's, 5:45 ahead of UTC);
+        // the occurrence is where its place puts it.
+        let serverZone = "Custom Server Zone"
+        let kathmandu = try #require(TimeZone(identifier: "Asia/Kathmandu"))
+        #expect(CalendarTimeZoneResolver.zone(named: serverZone, in: .none) == nil, "TabMail recognizes the zone")
+        var occurrence = GraphFixture.event(id: "ser-1-occ", start: GraphSplitFixture.occurrence, online: false,
+                                            seriesMasterId: "ser-1", allDay: true)
+        occurrence["originalStart"] = GraphFixture.allDayPlace(date, in: kathmandu.identifier)
+        let graph = FakeGraphCalendar([Self.allDaySeries(zone: serverZone), occurrence], zones: [serverZone: kathmandu])
+        graph.install(on: http)
+        _ = try await GraphSplitFixture.provider(http).splitSeries(
+            eventId: "ser-1", recurrenceId: date + "T00:00:00", recurrenceIdZone: .gmt, patch: GCalEventInput())
+        #expect(graph.readZones("ser-1-occ") == [serverZone], "the occurrence was not read in the series' zone: \(graph.readZones("ser-1-occ"))")
+        #expect(graph.created.count == 1, "no new part: \(http.servedCallSequence())")
+    }
+
+    @Test("an all-day series whose range names no zone is not split, and its occurrence is not read in another zone: a plain error with nothing written")
+    func allDaySeriesWithoutARangeZoneIsRefused() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let date = GraphFixture.utcDay(GraphSplitFixture.occurrence)
+        var series = Self.allDaySeries(zone: "Tokyo Standard Time")
+        var recurrence = try #require(series["recurrence"] as? [String: Any])
+        var range = try #require(recurrence["range"] as? [String: Any])
+        range.removeValue(forKey: "recurrenceTimeZone")
+        recurrence["range"] = range
+        series["recurrence"] = recurrence
+        var occurrence = GraphFixture.event(id: "ser-1-occ", start: GraphSplitFixture.occurrence, online: false,
+                                            seriesMasterId: "ser-1", allDay: true)
+        occurrence["originalStart"] = GraphFixture.allDayPlace(date, in: "Asia/Tokyo")
+        let graph = FakeGraphCalendar([series, occurrence])
+        graph.install(on: http)
+        var reason: String?
+        do {
+            _ = try await GraphSplitFixture.provider(http).splitSeries(
+                eventId: "ser-1", recurrenceId: date + "T00:00:00", recurrenceIdZone: .gmt, patch: GCalEventInput())
+        } catch CalendarProviderError.notSupported(let thrown) {
+            reason = thrown
+        }
+        #expect(reason?.contains("Outlook gives no time zone for this all-day repeating event") == true, "refused by: \(reason ?? "not refused")")
+        #expect(graph.readZones("ser-1-occ").isEmpty, "the occurrence was read in a zone the series does not name: \(graph.readZones("ser-1-occ"))")
+        #expect(graph.created.isEmpty && graph.patches("ser-1").isEmpty, "written: \(http.servedCallSequence())")
+    }
+
+    @Test("an all-day series' occurrence is read in the series' own zone, as Graph names it: split at a plain one, a plain error with nothing written at a moved one, in zones ahead of UTC and behind it")
+    func allDayOccurrenceIsReadInTheSeriesZone() async throws {
+        // Measured on Graph: an all-day series every two days; a plain occurrence, and one moved a
+        // day earlier. Read in the series' zone, `originalStart` is midnight there with its offset,
+        // and its date is the occurrence's place; read in UTC it is the instant, the day before in
+        // Tokyo and Kathmandu.
+        let first = GraphFixture.utcDay(GraphSplitFixture.start)
+        for (name, iana) in [("Tokyo Standard Time", "Asia/Tokyo"), ("Asia/Kathmandu", "Asia/Kathmandu"),
+                             ("Pacific Standard Time", "America/Los_Angeles")] {
+            for moved in [false, true] {
+                let label = "\(name), \(moved ? "moved" : "plain")"
+                let http = FakeHTTP.Scenario()
+                defer { http.close() }
+                // The plain one is on its place, the third date; the moved one's place is the fifth
+                // date, and it is on the fourth.
+                let place = try Self.date(first, plus: moved ? 4 : 2)
+                let now = try Self.date(first, plus: moved ? 3 : 2)
+                var occurrence = GraphFixture.event(id: "ser-1-occ", start: try Self.midnight(now), online: false,
+                                                    seriesMasterId: "ser-1", allDay: true)
+                occurrence["originalStart"] = GraphFixture.allDayPlace(place, in: iana)
+                let graph = FakeGraphCalendar([try Self.everyTwoDays(from: first, zone: name), occurrence])
+                graph.install(on: http)
+                var reason: String?
+                do {
+                    _ = try await GraphSplitFixture.provider(http).splitSeries(
+                        eventId: "ser-1", recurrenceId: now + "T00:00:00", recurrenceIdZone: .gmt, patch: GCalEventInput())
+                } catch CalendarProviderError.notSupported(let thrown) {
+                    reason = thrown
+                }
+                #expect(graph.readZones("ser-1-occ") == [name], "\(label): the occurrence was not read in the series' zone: \(graph.readZones("ser-1-occ"))")
+                if moved {
+                    #expect(reason == "split at a moved occurrence", "\(label): \(reason ?? "not refused")")
+                    #expect(graph.created.isEmpty && graph.patches("ser-1").isEmpty, "\(label): written: \(http.servedCallSequence())")
+                } else {
+                    #expect(reason == nil, "\(label): refused: \(reason ?? "")")
+                    #expect(graph.created.count == 1, "\(label): no new part: \(http.servedCallSequence())")
+                }
+            }
+        }
+    }
+
+    /// `date` (`yyyy-MM-dd`) `days` later.
+    private static func date(_ date: String, plus days: Int) throws -> String {
+        GraphFixture.utcDay(try midnight(date).addingTimeInterval(Double(days) * 86_400))
+    }
+
+    /// UTC midnight of `date`, where `GraphFixture.event` puts an all-day event on that date.
+    private static func midnight(_ date: String) throws -> Date {
+        try #require(EKEventStoreHelper.parseNaiveISO(date, timeZone: .gmt))
+    }
+
+    /// An all-day series every two days from `first`, repeating in `zone` (the name Graph gives).
+    private static func everyTwoDays(from first: String, zone: String) throws -> [String: Any] {
+        var series = GraphFixture.event(id: "ser-1", start: try midnight(first), online: false, recurring: true, allDay: true)
+        var recurrence = series["recurrence"] as? [String: Any] ?? [:]
+        recurrence["pattern"] = ["type": "daily", "interval": 2, "month": 0, "dayOfMonth": 0,
+                                 "firstDayOfWeek": "sunday", "index": "first"]
+        var range = recurrence["range"] as? [String: Any] ?? [:]
+        range["recurrenceTimeZone"] = zone
+        range["startDate"] = first
+        recurrence["range"] = range
+        series["recurrence"] = recurrence
+        return series
+    }
+
+    /// A weekly all-day series repeating in `zone` (a Windows zone name, as Graph's range gives it).
+    private static func allDaySeries(zone: String) -> [String: Any] {
+        var series = GraphFixture.event(id: "ser-1", start: GraphSplitFixture.start, online: false, recurring: true, allDay: true)
+        var recurrence = series["recurrence"] as? [String: Any] ?? [:]
+        var range = recurrence["range"] as? [String: Any] ?? [:]
+        range["recurrenceTimeZone"] = zone
+        recurrence["range"] = range
+        series["recurrence"] = recurrence
+        return series
     }
 }
