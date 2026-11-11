@@ -1313,7 +1313,7 @@ actor AccountManager {
 
     #if DEBUG
     /// Test seam: `IMAPProvider`'s TLS override for providers this factory builds,
-    /// so the factory and `updateIMAPPassword` can be driven against the plain-TCP
+    /// so the factory and `updatePassword` can be driven against the plain-TCP
     /// `FakeIMAPServer`. `nil` (production) lets SwiftMail choose.
     private nonisolated let imapUseTLSOverrideBox = Mutex<Bool?>(nil)
     nonisolated func setIMAPUseTLSOverrideForTesting(_ useTLS: Bool?) {
@@ -1323,6 +1323,26 @@ actor AccountManager {
     #else
     private nonisolated var imapUseTLSOverride: Bool? { nil }
     #endif
+
+    #if DEBUG
+    /// Test seam: the URL session for CalDAV clients `makeCalDAVClient` builds, so
+    /// a password update's calendar check can be driven against a `URLProtocol`
+    /// fake. `nil` (production) uses the client's own session.
+    private nonisolated let calDAVSessionOverrideBox = Mutex<URLSession?>(nil)
+    nonisolated func setCalDAVSessionOverrideForTesting(_ session: URLSession?) {
+        calDAVSessionOverrideBox.withLock { $0 = session }
+    }
+    #endif
+
+    /// A CalDAV client for `username` signing in with `password`.
+    nonisolated func makeCalDAVClient(username: String, password: String) -> CalDAVClient {
+        #if DEBUG
+        if let session = calDAVSessionOverrideBox.withLock({ $0 }) {
+            return CalDAVClient(username: username, password: password, session: session)
+        }
+        #endif
+        return CalDAVClient(username: username, password: password)
+    }
 
     /// Make an accepted, saved password probe the account's live provider. Attaches
     /// the account's real sign-in reporter and stores the provider in ONE actor

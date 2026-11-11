@@ -5,12 +5,47 @@
 import Foundation
 import GRDB
 
-enum AccountProvider: String, Codable, Sendable {
+/// How an account signs in, which decides what "Re-authenticate" asks for.
+enum SignInMethod: Sendable, Equatable {
+    /// The user types a password (an app-specific password for iCloud).
+    case password
+    /// The provider's web sign-in.
+    case oauth
+}
+
+enum AccountProvider: String, Codable, Sendable, CaseIterable {
     case gmail
     case outlook
     case imap
     case icloud
     case caldav
+
+    /// How accounts of this kind sign in. Written exhaustively so a new kind
+    /// must choose.
+    var signInMethod: SignInMethod {
+        switch self {
+        case .imap, .icloud, .caldav: return .password
+        case .gmail, .outlook: return .oauth
+        }
+    }
+
+    /// What the user calls the password this kind signs in with.
+    var passwordName: String {
+        switch self {
+        case .icloud: return "app-specific password"
+        case .imap, .caldav, .gmail, .outlook: return "password"
+        }
+    }
+
+    /// True when one password signs in to both the account's mail and its
+    /// calendar, so a new password must be accepted by both before either is
+    /// saved (iCloud's app-specific password serves IMAP and CalDAV).
+    var mailAndCalendarShareOnePassword: Bool {
+        switch self {
+        case .icloud: return true
+        case .imap, .caldav, .gmail, .outlook: return false
+        }
+    }
 
     /// Brand-correct name for display in UI. `rawValue.capitalized` mangles
     /// these ("Icloud", "Imap", "Caldav") — always use this instead.
@@ -96,6 +131,19 @@ struct Account: Codable, FetchableRecord, PersistableRecord, Identifiable, Senda
     /// Gmail (Pub/Sub) and Outlook (Graph subscriptions) have push; IMAP/iCloud do not.
     var hasPushSupport: Bool {
         provider == .gmail || provider == .outlook
+    }
+
+    /// Whether `other` is this account signing in as the same user to the same
+    /// servers. Fields the user edits freely (name, signature) and sync state do
+    /// not count.
+    func signsInLike(_ other: Account) -> Bool {
+        id == other.id
+            && provider == other.provider
+            && calendarOnly == other.calendarOnly
+            && emailAddress == other.emailAddress
+            && imapUsername == other.imapUsername
+            && imapHost == other.imapHost
+            && imapPort == other.imapPort
     }
 
     init(

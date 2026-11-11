@@ -151,6 +151,19 @@ struct IMAPLoginRefusalSignInTests {
         await finish()
     }
 
+    /// `withFactoryAccount`, with the account's row stored in an installed test
+    /// database, as `updatePassword` reads it when it starts.
+    private func withStoredFactoryAccount(
+        _ body: (FakeIMAPServer, Account) async throws -> Void
+    ) async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir) }
+        try await withFactoryAccount { server, account in
+            try await pool.write { db in try account.insert(db) }
+            try await body(server, account)
+        }
+    }
+
     @Test("the factory injects the reporter into the live provider, and not into a password probe")
     func factoryInjectsReporterIntoLiveProviderOnly() async throws {
         try await withFactoryAccount { server, account in
@@ -172,11 +185,11 @@ struct IMAPLoginRefusalSignInTests {
 
     @Test("Update Password with a refused password never marks the account")
     func refusedProbeNeverMarks() async throws {
-        try await withFactoryAccount { server, account in
+        try await withStoredFactoryAccount { server, account in
             let manager = AccountManager.shared
             server.failNextCommand(containing: "LOGIN", message: "[AUTHENTICATIONFAILED] Invalid credentials")
             var thrown: (any Error)?
-            do { try await manager.updateIMAPPassword("mistyped", for: account) } catch { thrown = error }
+            do { try await manager.updatePassword("mistyped", for: account) } catch { thrown = error }
             let error = try #require(thrown, "the refused probe did not reach the caller")
             #expect(AccountReauthAlert.passwordUpdateLine(for: error, host: "127.0.0.1") == AccountReauthAlert.passwordLine,
                     "a refused password did not get the password line: \(error)")
@@ -186,9 +199,9 @@ struct IMAPLoginRefusalSignInTests {
 
     @Test("after Update Password the live provider reports: a refusal marks, a later login clears")
     func updatedPasswordProviderReportsWithoutRelaunch() async throws {
-        try await withFactoryAccount { server, account in
+        try await withStoredFactoryAccount { server, account in
             let manager = AccountManager.shared
-            try await manager.updateIMAPPassword(server.password, for: account)
+            try await manager.updatePassword(server.password, for: account)
             let live = try #require(await manager.provider(for: account) as? IMAPProvider)
             #expect(live.hasSignInOutcomeReporter)
 
@@ -206,13 +219,13 @@ struct IMAPLoginRefusalSignInTests {
 
     @Test("a late refusal from the provider Update Password replaced never marks the account")
     func replacedProviderLateRefusalNeverMarks() async throws {
-        try await withFactoryAccount { server, account in
+        try await withStoredFactoryAccount { server, account in
             let manager = AccountManager.shared
             let old = try await manager.createIMAPProvider(for: account)
             await manager.registerProviderForTesting(accountId: account.id, provider: old)
             #expect(old.hasSignInOutcomeReporter)
 
-            try await manager.updateIMAPPassword(server.password, for: account)
+            try await manager.updatePassword(server.password, for: account)
             #expect(!old.hasSignInOutcomeReporter, "the replaced provider kept the account's reporter")
 
             // The replaced provider still holds the old password; its login is refused.

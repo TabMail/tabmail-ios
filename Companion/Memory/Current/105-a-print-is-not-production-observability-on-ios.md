@@ -204,7 +204,7 @@ build**. The error's text stays in the debug-gated logs only.
   sign-in reporter in the same actor turn as the swap, so a late refusal of the old password cannot mark
   the account the user just fixed.
 - **Re-auth alert by phase.** Refused password: the password line (the probe records the refusal through
-  its own local reporter, and `updateIMAPPassword` rethrows it as `ProviderError.authenticationFailed`);
+  its own local reporter, and `updateIMAPPassword` (since 2026-11-11 `updatePassword`, topic 145) rethrows it as `ProviderError.authenticationFailed`);
   TLS minimum not met: the existing TLS sentence for the account's host; anything after the password was
   accepted (save, sync) or a temporary refusal: "Couldn't finish setting up the account. Try again.";
   offline: no alert.

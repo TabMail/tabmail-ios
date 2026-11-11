@@ -11,6 +11,9 @@ struct AccountDetailView: View {
     private var manager: AccountManager { AccountManager.shared }
     private var state: AccountManagerState { AccountManagerState.shared }
     @State private var showPasswordPrompt = false
+    /// The account as it was when the password prompt opened; the update works
+    /// from it.
+    @State private var passwordPromptAccount: Account?
     @State private var newPassword = ""
     @State private var isReauthenticating = false
     @State private var reauthError: String?
@@ -394,10 +397,13 @@ struct AccountDetailView: View {
         }
         .alert("Update Password", isPresented: $showPasswordPrompt) {
             SecureField("New Password", text: $newPassword)
-            Button("Cancel", role: .cancel) { newPassword = "" }
+            Button("Cancel", role: .cancel) {
+                newPassword = ""
+                passwordPromptAccount = nil
+            }
             Button("Update") { updatePassword() }
         } message: {
-            Text("Enter the new password for \(account.imapUsername ?? account.emailAddress).")
+            Text(PasswordPrompt.message(for: passwordPromptAccount ?? account))
         }
         .alert("Re-authentication Failed", isPresented: Binding(
             get: { reauthError != nil },
@@ -498,33 +504,38 @@ struct AccountDetailView: View {
                     .foregroundStyle(.secondary)
             }
         } else {
-            Button {
-                if account.provider == .imap {
+            switch account.provider.signInMethod {
+            case .password:
+                Button {
+                    passwordPromptAccount = account
                     showPasswordPrompt = true
-                } else {
-                    reauthenticateOAuth()
+                } label: {
+                    Label("Update Password", systemImage: "key")
                 }
-            } label: {
-                Label(
-                    account.provider == .imap ? "Update Password" : "Re-authenticate",
-                    systemImage: account.provider == .imap ? "key" : "arrow.clockwise"
-                )
+            case .oauth:
+                Button {
+                    reauthenticateOAuth()
+                } label: {
+                    Label("Re-authenticate", systemImage: "arrow.clockwise")
+                }
             }
         }
     }
 
     private func updatePassword() {
-        guard !newPassword.isEmpty else { return }
         let password = newPassword
         newPassword = ""
+        guard let promptAccount = passwordPromptAccount else { return }
+        passwordPromptAccount = nil
+        guard !password.isEmpty else { return }
         isReauthenticating = true
         Task {
             do {
-                try await manager.updateIMAPPassword(password, for: account)
-                try await manager.syncAccount(account)
+                try await manager.updatePassword(password, for: promptAccount)
+                try await manager.syncAccount(promptAccount)
             } catch {
                 if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Reauth] Password update failed: \(error)") }
-                if let line = AccountReauthAlert.passwordUpdateLine(for: error, host: account.imapHost ?? "") {
+                if let line = AccountReauthAlert.passwordUpdateLine(for: error, host: promptAccount.imapHost ?? "") {
                     reauthError = line
                 }
             }
@@ -536,14 +547,7 @@ struct AccountDetailView: View {
         isReauthenticating = true
         Task {
             do {
-                switch account.provider {
-                case .gmail:
-                    try await manager.reauthenticateGmail(for: account)
-                case .outlook:
-                    try await manager.reauthenticateMicrosoft(for: account)
-                case .imap, .icloud, .caldav:
-                    break
-                }
+                try await manager.reauthenticateOAuth(for: account)
                 try await manager.syncAccount(account)
             } catch {
                 if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Reauth] Re-authentication failed: \(error)") }
@@ -713,6 +717,8 @@ enum AccountReauthAlert {
     static let setupLine = "Couldn't finish setting up the account. Try again."
     /// An OAuth re-authentication failed.
     static let oauthLine = "Sign-in did not complete. Please try again."
+    /// The account was removed or changed while the password prompt was open.
+    static let accountChangedLine = "This account was removed or changed while the password prompt was open. Nothing was saved."
 
     /// The server cannot meet TabMail's TLS minimum: the existing fixed copy for
     /// that case, built from the account's own host, not from the error.
@@ -723,10 +729,11 @@ enum AccountReauthAlert {
     /// The alert line for a failed password update, or `nil` when the alert stays
     /// closed (offline, as before).
     static func passwordUpdateLine(for error: Error, host: String) -> String? {
+        if case ReauthenticationError.accountChanged = error { return accountChangedLine }
         if error is IMAPTransportSecurityError { return tlsLine(host: host) }
         if SyncEngine.isConnectionError(error) { return nil }
-        // `updateIMAPPassword` reports a refused password as this typed case,
-        // recorded by the probe's own sign-in reporter.
+        // `updatePassword` reports a refused password as this typed case: the
+        // mail probe's own sign-in reporter, or a refused calendar sign-in.
         if case ProviderError.authenticationFailed = error { return passwordLine }
         return setupLine
     }
@@ -734,5 +741,14 @@ enum AccountReauthAlert {
     /// The alert line for a failed OAuth re-authentication, or `nil` (offline).
     static func oauthLine(for error: Error) -> String? {
         SyncEngine.isConnectionError(error) ? nil : oauthLine
+    }
+}
+
+/// The password prompt's copy.
+enum PasswordPrompt {
+    /// Names the password the account signs in with (an app-specific password
+    /// for iCloud) and who it is for.
+    static func message(for account: Account) -> String {
+        "Enter the new \(account.provider.passwordName) for \(account.imapUsername ?? account.emailAddress)."
     }
 }
