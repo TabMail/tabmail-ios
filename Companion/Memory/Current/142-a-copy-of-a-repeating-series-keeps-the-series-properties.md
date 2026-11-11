@@ -5,7 +5,9 @@
 `serverOwnedEventKeys`, `splitCopiedKeys`, `splitSelect`, `splitReschedules`, `applyAttendeeRule`, `insertEventJSON`,
 `conferenceDataVersion`, `supportsAttachments`, `splitRecurrence`, `keptAttendeesJSON`, `editJSON`, `filterDateList`, `RecurrenceTail`,
 EXDATE, RDATE, COUNT, recurrenceTimeZone, attendee answers, `needsAction`, write order,
-create first cap last, lost cap response, retry, own cap, `successorIsOurs`, `capEndDate`.
+create first cap last, lost cap response, retry, own cap, `successorIsOurs`, `capEndDate`,
+RFC 6638 §3.2.8, PARTSTAT reset, `this_only` move asks again, Thunderbird add-on split only,
+LOCATION, `changedOccurrenceKeepsItsOwnProperties`, #604.
 
 ## The rule
 
@@ -119,6 +121,28 @@ response was lost, the series it reads is already capped.
 - **Outlook:** the new part's attendees start unanswered. Graph lets only the attendee write a
   response, and Outlook's own split does the same.
 
+**Amendment (2026-11-10, #604): which copies ask again, compared with the Thunderbird add-on and
+the servers.** The CalDAV bullet above is unchanged and holds for both copies. The doc comment on
+`CalDAVEventCopies.swift` called it "one rule shared with the Thunderbird add-on" until this
+amendment; that was true of the split only.
+
+- The add-on asks attendees again only on a split's new part and the changed occurrences carried
+  into it (`tmCalendar.sys.mjs`), a new event that no server's reset reaches. Its one-occurrence
+  edit leaves the stored answers as they were.
+- iOS also asks again when a one-occurrence edit moves the occurrence. A scheduling CalDAV server
+  does the same to the stored answers itself: RFC 6638 §3.2.8 has it reset every attendee but the
+  organizer to `NEEDS-ACTION` on a change of start, end, duration or rule that moves an occurrence.
+  On a server that does not schedule, nothing else resets them, and the attendees then show as not
+  yet answered for the new time.
+- A change of place (`LOCATION`) asks again too. That is the CalDAV-side behaviour mirrored here:
+  RFC 6638 lets the organizer's client reset the answers on a change of place, and the add-on's
+  split counts a place change as a reschedule. Google's behaviour for a change of place has not
+  been checked. For a change of date or time, user reports (not Google's documentation) say Google
+  asks guests again.
+- #604 (an occurrence edit that reset every answer and dropped the occurrence's alerts and status)
+  described the override builder before #610; the copy above already fixed it.
+  `changedOccurrenceKeepsItsOwnProperties` pins it.
+
 ## Google attendee edits (#564)
 
 The same attendee rule holds for an ordinary Google edit. Google stores the attendee list it is
@@ -134,4 +158,7 @@ sends no attendee list. Tests: `GoogleAttendeeEditTests`.
 (in `CalDAVSplitHelpersTests`, against `FakeCalDAVStore`; the write order, the partition of
 changed occurrences and dates, and the retry after a lost cap response), `SeriesSplitCopyTests` (Google and Outlook, against
 `FakeGraphCalendar`; the Outlook create body is checked as sent).
+`CalDAVOccurrenceOverrideTests.changedOccurrenceKeepsItsOwnProperties` (#604): an occurrence
+changed on its own keeps its status, alert, categories, link, revision, `X-` line and attendees
+through a rename, an attendee added and a move.
 See `TESTS.md`, "Repeating events — copies keep the series' properties".

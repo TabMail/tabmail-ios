@@ -154,9 +154,16 @@ These tests read what each provider sent, or what the fake server ends up holdin
   `occurrenceOverrideResource`, built from one rich series. The series has class, categories,
   priority, URL, alarms, attendee parameters, organizer and X-properties; excluded and added dates
   are checked on other fixtures. Every property line the edit does not change must come through as
-  stored.
+  stored, the attendees' types (`CUTYPE`) included; a one-occurrence override also keeps the
+  series' `SEQUENCE`, which a split's new part starts without.
   - When the edit moves the meeting (a new start and end, end alone, an earlier start with the
-    same end, place, or a split's new rule), attendees are asked again.
+    same end, place, or a split's new rule), attendees are asked again, keeping their role and type.
+  - An occurrence changed on its own (`CalDAVOccurrenceOverrideTests`,
+    `changedOccurrenceKeepsItsOwnProperties`, #604): cancelled, with its own alert, categories,
+    link, revision, `X-` line and attendee answers and parameters, none of them the series'. A
+    rename, an attendee added and a move each keep all of them; an added attendee is asked, and a
+    move asks Alice and the room again while keeping their role and type. Dates are relative to
+    today.
   - An all-day series with no end lasts its one day (`ICSParser.impliedEndValue`, RFC 5545
     §3.6.1): restating the date keeps the answers, moving it asks again (both copies), and the
     series can be split. A timed series with no end still can't be split, and a one-occurrence edit

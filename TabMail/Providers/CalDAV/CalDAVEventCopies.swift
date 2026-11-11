@@ -14,10 +14,13 @@ import Foundation
 /// parameters. Only what the operation is about changes (identity, anchor, rule), and then the user's
 /// patch is applied with `mergePatchIntoICS`, exactly as an edit of the whole series applies it.
 ///
-/// Attendee answers follow one rule shared with the Thunderbird add-on: the copy keeps them, unless
-/// the patch reschedules it (a different start, end, rule or location), in which case every attendee
-/// other than the organizer is asked again (`PARTSTAT=NEEDS-ACTION;RSVP=TRUE`). Attendees the patch
-/// adds are always asked.
+/// Attendee answers: the copy keeps them, unless the patch reschedules it (a different start, end,
+/// rule or location), in which case every attendee other than the organizer is asked again
+/// (`PARTSTAT=NEEDS-ACTION;RSVP=TRUE`). Attendees the patch adds are always asked. The Thunderbird
+/// add-on applies the same rule to a split's new part only, and leaves a one-occurrence edit's
+/// answers as stored. Here the override is asked again too. A scheduling CalDAV server resets the
+/// stored answers itself when a change of start, end or rule moves an occurrence (RFC 6638 §3.2.8);
+/// a change of location is one the RFC lets the organizer's client reset.
 ///
 /// Every throw here is `CalendarProviderError.notSupported`. Each is a pure function of the stored
 /// resource and the arguments, so a retry would throw the same way; an unclassified error would
