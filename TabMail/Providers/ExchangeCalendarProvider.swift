@@ -334,9 +334,10 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // `/events/{id}/instances` endpoint requires the master id — resolve
         // via seriesMasterId before the instance lookup.
         let named = eventId
-        let (eventId, _) = try await resolveToMaster(eventId: eventId)
+        let (eventId, master) = try await resolveToMaster(eventId: eventId)
         let instanceId = try await resolveInstanceId(
-            masterId: eventId, recurrenceId: recurrenceId, zone: recurrenceIdZone, naming: named == eventId ? nil : named)
+            masterId: eventId, series: master.event, recurrenceId: recurrenceId, zone: recurrenceIdZone,
+            naming: named == eventId ? nil : named)
         let encodedInstanceId = try Self.encodedGraphPathSegment(instanceId, context: "Graph event instance id")
         // Only the properties the user changed, as in `updateEvent` (#421), and
         // never `recurrence`: an instance cannot carry a series rule and Graph
@@ -390,7 +391,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         named: String, masterId: String, series: GCalEvent, recurrenceId: String, zone: TimeZone
     ) async throws -> GCalEvent {
         let instanceId = try await resolveInstanceId(
-            masterId: masterId, recurrenceId: recurrenceId, zone: zone, naming: named == masterId ? nil : named)
+            masterId: masterId, series: series, recurrenceId: recurrenceId, zone: zone, naming: named == masterId ? nil : named)
         guard series.isAllDay else { return try await getEvent(eventId: instanceId) }
         return try await allDayOccurrence(instanceId: instanceId, series: series)
     }
@@ -1201,19 +1202,31 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// one implementation, not two).
     ///
     /// Graph-specific note: `request` sends `Prefer: outlook.timezone="<device zone>"`,
-    /// so instance starts come back as a naive `dateTime` plus the IANA `timeZone`
+    /// so a timed instance start comes back as a naive `dateTime` plus the IANA `timeZone`
     /// we asked for. That pairing is what makes the instant computable at all —
     /// unlike Google, the wire value carries NO offset. If Graph ever answers with
     /// a zone identifier Foundation cannot resolve (a Windows-style name such as
     /// "Pacific Standard Time"), we do not guess: an unplaceable candidate could
     /// be the one being addressed, and defaulting it to UTC would compute a wrong
-    /// instant, which is how a wrong occurrence gets PATCHed.
+    /// instant, which is how a wrong occurrence gets PATCHed. An all-day series is
+    /// read differently (next paragraph).
+    ///
+    /// An occurrence of an ALL-DAY `series` is a date, not an instant (the resolver's Rule 3): each
+    /// start is taken as its date, as every all-day start is read (`toGCalDateTime(_:isAllDay:
+    /// true)`). Graph RELABELS an all-day start, it does not convert it (measured): every read gives
+    /// midnight of the occurrence's own date, labelled with the zone `Prefer` names, so the zone the
+    /// instances are read in changes no date. Read as an instant, that was midnight on the DEVICE, so
+    /// an edit whose zone differs from the device's matched it in another frame: from a zone west of
+    /// the device's, a date named the next day's occurrence, and the start the read tools show
+    /// named none (#647).
     ///
     /// `named` is the occurrence id the edit gave, when it gave one (nil for the series' own id):
     /// that occurrence answers to `recurrenceId` before any other
     /// (`RecurrenceOccurrenceResolver.select(_:recurrenceId:zone:naming:)`), and another one is
     /// refused (`namesAnotherOccurrence`).
-    private func resolveInstanceId(masterId: String, recurrenceId: String, zone: TimeZone, naming named: String?) async throws -> String {
+    private func resolveInstanceId(
+        masterId: String, series: GCalEvent, recurrenceId: String, zone: TimeZone, naming named: String?
+    ) async throws -> String {
         guard let centerDate = RecurrenceOccurrenceResolver.windowCenter(recurrenceId: recurrenceId, zone: zone) else {
             throw CalendarProviderError.notSupported(
                 "Invalid recurrence_id '\(recurrenceId)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00') or a date (e.g. '2026-05-20')."
@@ -1231,7 +1244,8 @@ actor ExchangeCalendarProvider: CalendarProvider {
         let encodedMaster = try Self.encodedGraphPathSegment(masterId, context: "Graph series master id")
         let encodedStart = startQS.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? startQS
         let encodedEnd = endQS.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? endQS
-        let data = try await request(path: "/events/\(encodedMaster)/instances?startDateTime=\(encodedStart)&endDateTime=\(encodedEnd)&$select=id,start")
+        let data = try await request(
+            path: "/events/\(encodedMaster)/instances?startDateTime=\(encodedStart)&endDateTime=\(encodedEnd)&$select=id,start")
 
         struct InstancesResponse: Decodable { let value: [MSEvent] }
         let resp = try JSONDecoder().decode(InstancesResponse.self, from: data)
@@ -1239,6 +1253,10 @@ actor ExchangeCalendarProvider: CalendarProvider {
         var candidates: [OccurrenceCandidate] = []
         for ev in resp.value {
             guard let id = ev.id, let start = ev.start, let dt = start.dateTime else { continue }
+            if series.isAllDay {
+                candidates.append(OccurrenceCandidate(id: id, instant: nil, dateOnly: toGCalDateTime(start, isAllDay: true)?.date))
+                continue
+            }
             guard let startZone = CalendarTimeZoneResolver.zone(named: start.timeZone ?? "UTC", in: .none) else {
                 throw CalendarProviderError.notSupported(
                     "Microsoft Graph returned an occurrence of \(masterId) in an unrecognized timezone ('\(start.timeZone ?? "")') — refusing to edit an occurrence that may not be the one you named."
