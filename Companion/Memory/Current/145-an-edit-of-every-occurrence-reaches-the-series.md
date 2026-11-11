@@ -77,7 +77,8 @@ series needs no zone: its places are dates on every provider (`CalendarSeriesSco
 zone TabMail does not recognize is edited and split like any other.
 
 Also refused, with nothing written: an occurrence whose place or start can't be read; a series whose
-start can't be read; a deleted (`cancelled`) occurrence; an occurrence id with a `recurrence_id`
+start can't be read; a deleted (`cancelled`) occurrence (the provider's lookup lists none: its
+not-found, so the queue retires it; no separate status check); an occurrence id with a `recurrence_id`
 naming ANOTHER occurrence (`namesAnotherOccurrence`); a `recurrence_id` at which two occurrences start,
 named by the series' id (ambiguous).
 
@@ -115,7 +116,12 @@ whether it is an occurrence.
   queued edit and the result all carry the routed scope; an "all" edit is queued with the series' id
   (`queuedEventId`). The card's reset note (`editResetsChangedOccurrences`, #423) is asked of
   `named.series` with the ROUTED arguments (PROOF P2): asked of the occurrence (no rule on Google and
-  Outlook) with the edit as given, the card would show no note while the write resets.
+  Outlook) with the edit as given, the card would show no note while the write resets. Google's check
+  (`GoogleCalendarProvider.googleTimes`) compares zones as `CalendarTimeZoneResolver` resolves them,
+  so an edit's "UTC", which the write names "GMT", is the series' own "UTC"; a same-instant change to
+  another zone (Atlantic/Reykjavik) is a move. "Etc/UTC" resolves to another zone than "UTC". The
+  Google fake resets on the same model; whether Google itself resets a series whose zone is only
+  renamed "UTC" to "GMT" is unmeasured.
 - `AccountManagerCalendarQueue`, `.edit`: the same `read` and `route` again, writing `writeId`. An "all"
   edit that `route` sends to a later occurrence is refused (`laterOccurrenceRefusal`): it reaches the
   queue as "all" only when the series changed after the card, and the user confirmed every occurrence.
@@ -250,7 +256,7 @@ stored instances. `drainEdit(..., drains:)` drains once per attempt.
     the same release. Google (which creates the new part first): the retry may be reported "not found"
     although both writes landed; no data is lost. Whether Google answers a read of an instance past the
     new UNTIL with 404 (not found) or with the instance `cancelled` (handled: the own-cap check runs
-    before the cancelled guard) is unmeasured (#601).
+    before the occurrence lookup) is unmeasured (#601).
 
 ## Superseded (rebuilt from main, 2026-11-10)
 

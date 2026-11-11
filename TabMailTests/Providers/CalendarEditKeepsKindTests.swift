@@ -70,7 +70,7 @@ private let kindChangeTimesHint = "to change this event between all-day and time
 /// replaces each top-level property the body names (Google's patch semantics: a supplied `start`
 /// replaces the stored `start` whole), and `POST` stores a new event under the `id` it carries.
 /// A PATCH of a series that changes its `recurrence`, or its start or end (another date or
-/// instant, or another zone), resets the series: its stored occurrences, the ones changed one by
+/// instant, or another zone, `sameTime`), resets the series: its stored occurrences, the ones changed one by
 /// one, are dropped, as Google did when a series was moved from 08:00 to 13:00 (measured on a
 /// personal account, 2026-11-10).
 final class FakeGoogleCalendar: Sendable {
@@ -194,14 +194,21 @@ final class FakeGoogleCalendar: Sendable {
     }
 
     /// Whether a written start or end is the stored one as Google reads it: the same date, or the
-    /// same instant, and the same zone.
+    /// same instant, and the same zone. Zones are compared as the zones their names resolve to
+    /// (`CalendarTimeZoneResolver`, so "UTC" and "GMT" are one), a name that resolves to none as
+    /// written: the model `GoogleCalendarProvider.googleTimes` holds. Unmeasured on Google: whether
+    /// a series whose zone is renamed "UTC" to "GMT" at the same instant is reset.
     private static func sameTime(_ written: Any, _ stored: Any?) -> Bool {
         guard let written = written as? [String: Any], let stored = stored as? [String: Any] else { return false }
         func instant(_ value: [String: Any]) -> Date? { (value["dateTime"] as? String).flatMap { Date.fromISO8601($0) } }
+        func zone(_ value: [String: Any]) -> AnyHashable? {
+            guard let name = value["timeZone"] as? String else { return nil }
+            return CalendarTimeZoneResolver.zone(named: name, in: .none).map(AnyHashable.init) ?? AnyHashable(name)
+        }
         return written["date"] as? String == stored["date"] as? String
             && instant(written) == instant(stored)
             && (written["dateTime"] == nil) == (stored["dateTime"] == nil)
-            && written["timeZone"] as? String == stored["timeZone"] as? String
+            && zone(written) == zone(stored)
     }
 
     private static func pathParts(_ url: URL) -> [String] {

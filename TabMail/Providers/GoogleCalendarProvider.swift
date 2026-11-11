@@ -1436,12 +1436,18 @@ actor GoogleCalendarProvider: CalendarProvider {
     /// instant (its RFC 3339 string when it does not parse), each with the zone it names. So the
     /// series' own times spelled otherwise are its own, and the same instant in another zone,
     /// which Google stores and repeats the series in, is a move.
+    ///
+    /// The zone is the one its name resolves to (`CalendarTimeZoneResolver`), compared as a zone:
+    /// an edit's "UTC", which the write names "GMT" (`buildGCalEventInput` writes the resolved
+    /// zone's identifier), is the series' own "UTC". Only names that resolve to one zone are one
+    /// zone ("UTC" and "GMT"; "Etc/UTC" is another). A name it does not resolve is compared as
+    /// written, as before: a zone that can't be told is the same only under its own name.
     nonisolated static func googleTimes(_ merged: GCalEventInput) -> NSDictionary {
         func time(_ date: String?, _ dateTime: String?, _ zone: String?) -> [String: Any] {
             var value: [String: Any] = [:]
             if let date { value["date"] = date }
             if let dateTime { value["dateTime"] = Date.fromISO8601(dateTime).map { "\($0.timeIntervalSince1970)" } ?? dateTime }
-            if let zone { value["timeZone"] = zone }
+            if let zone { value["timeZone"] = CalendarTimeZoneResolver.zone(named: zone, in: .none).map { $0 as NSTimeZone as Any } ?? zone }
             return value
         }
         return NSDictionary(dictionary: [

@@ -78,8 +78,9 @@ enum CalendarSeriesScope {
     /// Throws, with nothing written: what the provider throws (its not-found error when no
     /// occurrence starts at `recurrence_id`, `notSupported` for an occurrence id that names another
     /// occurrence than `recurrence_id`, an ambiguous or malformed one, and what CalDAV's own check
-    /// refuses), and `notSupported` for a deleted occurrence or one whose start can't be read. A
-    /// failed read is thrown, never replaced: the edit tool refuses, or the drain classifies it.
+    /// refuses; a deleted occurrence is its not-found), and `notSupported` for an occurrence whose
+    /// start can't be read. A failed read is thrown, never replaced: the edit tool refuses, or the
+    /// drain classifies it.
     static func read(
         eventId: String, recurrenceId: String?, calendarId: String, zone: TimeZone,
         splitting: Bool, provider: any CalendarProvider
@@ -102,14 +103,12 @@ enum CalendarSeriesScope {
                     "the start of the occurrence this event_id names can't be read; pass recurrence_id (the occurrence's start_iso as calendar_event_read shows it)")
             }
             let series = try await provider.getEvent(calendarId: calendarId, eventId: seriesId)
-            // Before the occurrence's own status: past this split's cap it may read as deleted.
+            // Before the lookup: past this split's cap the occurrence may read as deleted.
             if splitting, provider.isOwnSplitCap(of: series, at: named, zone: zone) {
                 return Named(eventId: eventId, event: event, seriesId: seriesId, series: series, occurrence: nil, afterOwnSplitCap: true)
             }
-            // Google reads a deleted occurrence as an event with status `cancelled`; CalDAV does too.
-            guard event.status?.lowercased() != "cancelled" else {
-                throw CalendarProviderError.notSupported(namesNoOccurrence(named))
-            }
+            // A deleted occurrence, which Google and CalDAV read by its id with status `cancelled`,
+            // is the lookup's not-found: no provider's lookup finds one.
             let occurrence = try await provider.occurrence(
                 calendarId: calendarId, eventId: eventId, recurrenceId: named, recurrenceIdZone: zone)
             return Named(eventId: eventId, event: event, seriesId: seriesId, series: series, occurrence: occurrence)

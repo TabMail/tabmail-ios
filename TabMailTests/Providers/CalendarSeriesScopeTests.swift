@@ -1042,6 +1042,21 @@ struct CalendarSeriesScopeResetNoteTests {
         #expect(r.calendar.event(GoogleSeries.id)?["summary"] as? String == "Team standup", "\(r.run.out)")
     }
 
+    @Test("Google: a later occurrence's own time given back in another zone at the same instant moves the zone: the note, and the series is reset")
+    func googleSameInstantInAnotherZoneWarnsAndResets() async throws {
+        // Atlantic/Reykjavik is UTC+0 all year: the same clock digits are the same instant in a zone
+        // that is not the series' UTC.
+        let r = try await googleTool([
+            "start_iso": .string("\(day(7))T09:00:00"), "end_iso": .string("\(day(7))T09:30:00"),
+            "title": .string("Team standup"), "timezone": .string("Atlantic/Reykjavik"),
+        ], eventId: GoogleSeries.later, account: "series-note-g-zone")
+        #expect(r.run.cards.first?.changes.contains(CalendarToolHelpers.ruleChangeResetNote) == true,
+                "card: \(r.run.cards.first?.changes ?? [])")
+        #expect(r.calendar.seriesResets == 1, "the write did not reset the series: \(r.calendar.writes)")
+        let start = r.calendar.event(GoogleSeries.id)?["start"] as? [String: Any]
+        #expect(start?["timeZone"] as? String == "Atlantic/Reykjavik", "start: \(String(describing: start))")
+    }
+
     @Test("Outlook: a new time of every occurrence named from a later occurrence warns on the card, and the series is reset")
     func outlookLaterOccurrenceTimeWarnsAndResets() async throws {
         let graph = GraphSeries.calendar()
