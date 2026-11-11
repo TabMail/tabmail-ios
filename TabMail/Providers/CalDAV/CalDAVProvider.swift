@@ -792,7 +792,7 @@ actor CalDAVProvider: CalendarProvider {
     }
 
     /// How a date-time property line (`DTSTART`, `RECURRENCE-ID`) expresses its value.
-    private static func valueKind(ofLine line: String) -> MasterDTStartKind {
+    static func valueKind(ofLine line: String) -> MasterDTStartKind {
         guard let colonIdx = line.firstIndex(of: ":") else { return .floating }
         let params = line[..<colonIdx].split(separator: ";").dropFirst()  // skip the property name
         let value = String(line[line.index(after: colonIdx)...]).trimmingCharacters(in: .whitespaces)

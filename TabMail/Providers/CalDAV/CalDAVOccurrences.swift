@@ -270,8 +270,11 @@ enum CalDAVOccurrences {
             // A series zone TabMail does not recognize is refused by name before any expansion:
             // the expansion would read it in the device's zone and could report the occurrence
             // not found, or pick another one. Same refusal every CalDAV write gives such a zone.
-            if let dtstart = master.dtstart, !dtstart.value.uppercased().hasSuffix("Z"),
-               let tzid = dtstart.params.flatMap(ICSParser.extractTZID) {
+            // Only a start the writers read as zoned (`CalDAVProvider.valueKind`) needs its zone:
+            // an all-day start is a plain date whatever TZID it carries, and stays editable.
+            if let dtstart = master.dtstart,
+               case .zoned(let tzid) = CalDAVProvider.valueKind(
+                   ofLine: "DTSTART\(dtstart.params.map { ";\($0)" } ?? ""):\(dtstart.value)") {
                 _ = try CalDAVProvider.zone(forTZID: tzid, zones: master.zones)
             }
             var series: Series
