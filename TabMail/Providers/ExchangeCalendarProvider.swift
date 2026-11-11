@@ -902,11 +902,15 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// - the edit's guest change applied to the stored attendees of the item read: each one kept
     ///   is written as stored, a new one `required` and unanswered (`appliedAttendeesJSON`, #622,
     ///   #620). A series write is the only write the app makes for a change of every occurrence:
-    ///   Graph applies the series' guest change to each of its occurrences on top of that
-    ///   occurrence's own guests, those with guest differences of their own included (a guest an
-    ///   occurrence added stays, one it dropped stays dropped unless the change adds them), renamed
-    ///   and moved ones too, and an exception stays an exception. Measured on a test account for an
-    ///   added and a removed guest (2026-11-11);
+    ///   Graph carries the series' resulting difference to each of its occurrences, on top of that
+    ///   occurrence's own guests: each guest the written list drops from the series' stored list is
+    ///   removed, each guest it holds that the stored list did not is added, and every other guest
+    ///   the occurrence holds stays (a guest it added on its own stays; one it dropped on its own
+    ///   comes back only when the series gains them), renamed and moved ones too, and an exception
+    ///   stays an exception. Measured on a test account (2026-11-11) for an added and a removed
+    ///   guest, for a series emptied of its guests (an exception kept the guest it held on its
+    ///   own) and for a series list written back unchanged (an exception that had dropped a guest
+    ///   stayed without them), as on Google (`AttendeeChange.seriesDifference`);
     /// - a new description of an online meeting replaces only the notes in the
     ///   stored body, keeping its join section (`onlineMeetingBody`, #511); the
     ///   description the assistant read is those notes (`notes(of:)`).

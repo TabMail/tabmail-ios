@@ -8,14 +8,21 @@ import Foundation
 /// (`add_attendees`), guests removed (`remove_attendees`), `"*"` removing everyone.
 ///
 /// An edit carries the change itself (`GCalEventInput.attendeeChange`), never a list worked out
-/// from one item. Each provider's write applies it (`apply`) to the stored guest list of every item
-/// the write covers, so each item keeps its own guests (#620): a CalDAV write to every VEVENT of
-/// the resource it covers (`CalDAVProvider.applyAttendeeChange`), a Google or Outlook write to the
-/// event or occurrence it reads (a series write reaches its changed occurrences on the server).
+/// from one item. Each provider's write applies it (`apply`) to the stored guest list of the item
+/// it writes, so each item keeps its own guests (#620): the event, the series, or the one
+/// occurrence an edit names. The Thunderbird add-on's `applyGuestChange` is the same rule.
 ///
-/// The Thunderbird add-on's `applyGuestChange` is the same rule, with two differences: a cancelled
-/// CalDAV occurrence (`STATUS:CANCELLED`) is left as stored here, where the add-on changes it too;
-/// and a removal of `mailto:*` removes everyone here, where the add-on reads it as naming no one.
+/// A change of a whole series reaches each of its changed occurrences as the series' resulting
+/// difference (`seriesDifference`): the guests the series lost are removed from the occurrence, the
+/// guests it gained are added, on top of the occurrence's own guests. That is what Google Calendar
+/// and Outlook do with a series' guest list, measured on test accounts (2026-11-11): a series
+/// emptied of its guests left an occurrence the extra guest it held on its own, and a series list
+/// written back unchanged did not invite back a guest an occurrence had dropped on its own. Google
+/// is the reference, so every provider ends the same (CalDAV in
+/// `CalDAVProvider.applyAttendeeChange`; Google and Outlook write the series alone and the server
+/// carries it). The add-on applies the change itself to each changed occurrence instead
+/// (`applyGuestChangeToSeries`); the two differ only for `"*"` and for an add of a guest the series
+/// already holds.
 ///
 /// Nothing here is persisted: the queue stores the tool's arguments, and the change is built from
 /// them when the edit is written (`CalendarToolHelpers.buildGCalEventInput`).
@@ -33,14 +40,23 @@ struct AttendeeChange: Sendable, Equatable {
     /// `"*"` was among the removals: everyone goes.
     let clearAll: Bool
 
-    /// The change `adds` and `removes` describe. A removal of `"*"` removes everyone; every other
-    /// removal is an address, matched in any letter case, with any `mailto:` prefix stripped.
+    /// The change `adds` and `removes` describe. A removal of `"*"` (only that, so `mailto:*`
+    /// names nobody, as in the add-on) removes everyone; every other removal is an address, matched
+    /// in any letter case, with any `mailto:` prefix stripped. A guest added twice, in any letter
+    /// case, is added once, as first given.
     init(adds: [Add] = [], removes: [String] = []) {
-        self.adds = adds
-        let addresses = removes.map { CalendarToolHelpers.stripMailto($0).lowercased() }
-        self.clearAll = addresses.contains("*")
+        self.init(
+            adds: adds,
+            addresses: removes.map { CalendarToolHelpers.stripMailto($0).lowercased() }.filter { $0 != "*" },
+            clearAll: removes.contains { $0.trimmingCharacters(in: .whitespacesAndNewlines) == "*" })
+    }
+
+    private init(adds: [Add], addresses: [String], clearAll: Bool) {
+        var added = Set<String>()
+        self.adds = adds.filter { added.insert($0.email.lowercased()).inserted }
         var seen = Set<String>()
-        self.removes = addresses.filter { $0 != "*" && !$0.isEmpty && seen.insert($0).inserted }
+        self.removes = addresses.filter { !$0.isEmpty && seen.insert($0).inserted }
+        self.clearAll = clearAll
     }
 
     /// The change an edit's arguments name, or nil when they name nobody: no `add_attendees` and no
@@ -76,23 +92,41 @@ struct AttendeeChange: Sendable, Equatable {
         return out
     }
 
+    /// The series' resulting difference as a change: `before` is the series' guest list, `after`
+    /// the same list with this change applied (`apply`). It removes each address `before` holds
+    /// and `after` does not, and adds each address `after` holds and `before` did not, as this
+    /// change adds it (a new, unanswered guest). Matched by address, lowercased; a guest with no
+    /// address is in neither. A whole-series write applies it to each changed occurrence, as Google
+    /// and Outlook do (see the type's comment): a guest the series held before and after (an add
+    /// of a guest it held, or one removed and added back) is no change for an occurrence, and
+    /// `"*"` removes from an occurrence only the guests the series held.
+    func seriesDifference<Entry>(before: [Entry], after: [Entry], address: (Entry) -> String?) -> AttendeeChange {
+        let had = Set(before.compactMap(address))
+        let has = Set(after.compactMap(address))
+        return AttendeeChange(
+            adds: adds.filter { has.contains($0.email.lowercased()) && !had.contains($0.email.lowercased()) },
+            addresses: before.compactMap(address).filter { !has.contains($0) },
+            clearAll: false)
+    }
+
     // MARK: - The confirmation card
 
     /// How many added, and how many removed, guests the card names before "and N more" (as many as
     /// the Thunderbird add-on's card names).
     static let cardNamesShown = 3
 
-    /// The edit card's lines for the change: each guest added (by name, else address) and each
-    /// removed (by address; `"*"` as all attendees), up to `cardNamesShown` of each. No resulting
-    /// list or count is shown: the change is applied to each item the edit covers, and their guests
-    /// can differ.
+    /// The edit card's lines for the change: each guest added, as "Name <address>" (the address
+    /// alone when no name is given), so the user sees where the invitation goes before confirming;
+    /// and each removed (by address; `"*"` as all attendees), up to `cardNamesShown` of each. No
+    /// resulting list or count is shown: the change is applied to each item the edit covers, and
+    /// their guests can differ.
     var cardLines: [String] {
         func lines(_ labels: [String], _ sign: String) -> [String] {
             let shown = labels.prefix(Self.cardNamesShown).map { "attendees \(sign) \($0)" }
             let more = labels.count - shown.count
             return shown + (more > 0 ? ["attendees \(sign) and \(more) more"] : [])
         }
-        return lines(adds.map { $0.name ?? $0.email }, "+")
+        return lines(adds.map { add in add.name.map { "\($0) <\(add.email)>" } ?? add.email }, "+")
             + lines((clearAll ? ["all attendees"] : []) + removes, "−")
     }
 }

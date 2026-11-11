@@ -1403,11 +1403,16 @@ actor GoogleCalendarProvider: CalendarProvider {
 
     /// The PATCH body of an edit: `merged` as JSON, with its guest change applied to the attendees
     /// of the item it writes, `stored` as read for the write. A series write is the only write the
-    /// app makes for a change of every occurrence: Google applies the series' guest change to each
-    /// of its occurrences on top of that occurrence's own guests, those with guest differences of
-    /// their own included (a guest an occurrence added stays, one it dropped stays dropped unless
-    /// the change adds them), moved and renamed ones too. Measured on a test account, through the
-    /// API and through Google Calendar web, for an added and a removed guest (2026-11-11).
+    /// app makes for a change of every occurrence: Google carries the series' resulting difference
+    /// to each of its occurrences, on top of that occurrence's own guests: each guest the written
+    /// list drops from the series' stored list is removed, each guest it holds that the stored list
+    /// did not is added, and every other guest the occurrence holds stays (a guest it added on its
+    /// own stays; one it dropped on its own comes back only when the series gains them), moved and
+    /// renamed occurrences too. Measured on a test account (2026-11-11), through the API and
+    /// through Google Calendar web, for an added and a removed guest, for a series emptied of its
+    /// guests (an occurrence kept the guest it held on its own) and for a series list written back
+    /// unchanged (an occurrence that had dropped a guest stayed without them). This is the rule
+    /// every provider follows (`AttendeeChange.seriesDifference`).
     static func editJSON(_ merged: GCalEventInput, stored: [String: Any]) -> [String: Any] {
         var json = merged.toJSON()
         if let change = merged.attendeeChange {

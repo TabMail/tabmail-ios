@@ -412,8 +412,10 @@ struct CalendarToolResolvedAccountTests {
 
     /// The card of a guest change names the guests added and removed, as the Thunderbird add-on's
     /// does, and never a resulting list: the write applies the change to each item the edit
-    /// covers, whose guests can differ (#620).
-    @Test("A guest change's card names the guests added and removed, never a resulting list")
+    /// covers, whose guests can differ (#620). Each added guest shows the address the invitation
+    /// goes to, after the name when one is given, so a wrong address is caught before the user
+    /// confirms (ADR-IOS-024).
+    @Test("A guest change's card names the guests added, with their addresses, and removed, never a resulting list")
     func guestChangeCardNamesTheChange() async throws {
         let stored = ["alice@example.com", "bob@example.com"].map {
             GCalAttendee(email: $0, displayName: nil, responseStatus: "accepted", organizer: nil, self: nil)
@@ -431,11 +433,36 @@ struct CalendarToolResolvedAccountTests {
                         "remove_attendees": .array([.string("mailto:Bob@Example.com"), .string("*")])],
             answer: false)
         #expect(card.lines == [
-            "attendees + Carol", "attendees + dave@example.com", "attendees + erin@example.com",
+            "attendees + Carol <carol@example.com>", "attendees + dave@example.com", "attendees + erin@example.com",
             "attendees + and 2 more",
             "attendees − all attendees", "attendees − bob@example.com",
         ], "the card shows \(card.lines)")
         #expect(card.attendees.isEmpty, "the card shows a guest list: \(card.attendees)")
+    }
+
+    /// A guest named twice (the same address in another letter case, under another name) is one
+    /// added guest and one card line, and so is an address removed twice: the card's rows are keyed
+    /// by their text, so a repeated line could drop a row. Four guests added show three and
+    /// "and 1 more".
+    @Test("A guest change's card names a guest added or removed twice once, and four added as three and 1 more")
+    func guestChangeCardNamesEachGuestOnce() async throws {
+        let adds: [JSONValue] = [
+            .dictionary(["email": .string("carol@example.com"), "name": .string("Carol")]),
+            .dictionary(["email": .string("Carol@Example.com"), "name": .string("Carol Two")]),
+            .string("dave@example.com"),
+            .string("erin@example.com"),
+            .string("frank@example.com"),
+        ]
+        let card = try await cardLines(
+            series: Self.series(attendees: []),
+            arguments: ["add_attendees": .array(adds),
+                        "remove_attendees": .array([.string("bob@example.com"), .string("Bob@Example.com")])],
+            answer: false)
+        #expect(card.lines == [
+            "attendees + Carol <carol@example.com>", "attendees + dave@example.com", "attendees + erin@example.com",
+            "attendees + and 1 more",
+            "attendees − bob@example.com",
+        ], "the card shows \(card.lines)")
     }
 
     /// Outlook resets a series' deleted and moved occurrences when a whole-series edit

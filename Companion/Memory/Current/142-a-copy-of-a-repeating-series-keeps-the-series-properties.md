@@ -8,6 +8,7 @@
 `MissingMonthDay`, `lastDay`, month end, 31st, February 29, leap day, `absoluteMonthly`, `absoluteYearly`,
 `rangeDays`, #474, #562,
 `AttendeeChange`, `attendeeChange`, `applyAttendeeChange`, guest change, `resolveAttendeeDelta` (retired), #620,
+`seriesDifference`, series difference, remove everyone, `"*"`, `mailto:*`, re-add, cancelled occurrence,
 EXDATE, RDATE, COUNT, recurrenceTimeZone, attendee answers, `needsAction`, write order,
 create first cap last, lost cap response, retry, own cap, `successorIsOurs`, `capEndDate`,
 RFC 6638 §3.2.8, PARTSTAT reset, `this_only` move asks again, Thunderbird add-on split only,
@@ -241,43 +242,82 @@ sends no attendee list. Tests: `GoogleAttendeeEditTests`.
 `remove_attendees` (`"*"` for everyone) become `GCalEventInput.attendeeChange`
 (`AttendeeChange(arguments:)`, in `buildGCalEventInput`); the queue no longer reads one item and
 works out one full list (`resolveAttendeeDelta` is deleted). Each write applies the change with the
-one function `AttendeeChange.apply` to the stored guests of every item it covers, read for that
+one function `AttendeeChange.apply` to the stored guests of the item it writes, read for that
 write: removals first, every other stored guest kept as stored (one with no address too), each new
 address appended once and unanswered (a guest removed and added back keeps their stored entry).
-- **CalDAV** (`mergePatchIntoICS` → `CalDAVProvider.applyAttendeeChange`): every VEVENT of the
-  resource the write covers: the series and each changed occurrence, a split's new part and the
-  changed occurrences it carries, a one-occurrence override (#596). A changed occurrence takes the
-  change on its OWN guests, the Thunderbird add-on's rule: a guest it added on its own stays, one
-  it dropped on its own is not invited back. (Until review on 2026-11-11 a switch named
-  `AttendeeChange.changedOccurrenceGuests` offered a second rule, `.seriesGuests`; nothing used
-  it and it was deleted, with `applyToChangedOccurrence`.) A `STATUS:CANCELLED` occurrence is
-  left as stored (the add-on changes it too), and a VEVENT the change leaves as it was goes
-  back byte for byte. A new line is `ATTENDEE;CN="…";ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE`.
-  No ORGANIZER is written there: `putEvent` adds it (ADR-IOS-109).
+
+**The whole-series rule is the series' DIFFERENCE (Google is the reference; owner decision,
+option A of review round 2, 2026-11-11).** A change of a whole series reaches each changed
+occurrence as `AttendeeChange.seriesDifference(before:after:address:)`: from the series' list
+before and after the change, removes = before - after and adds = after - before (by lowercased
+address; an add keeps the change's new entry, a guest with no address is in neither), applied on
+top of the occurrence's own guests. Measured on Google AND Outlook, organizer side, 2026-11-11:
+series [X] -> [] left an occurrence holding [X, Y] (its own extra Y) as [Y]; series [X, Y] written
+back unchanged left an occurrence that had dropped Y on its own as [X]. It differs from applying
+the change itself only for `"*"` and for an add of a guest the series already holds (or a remove
+and re-add of one): "remove everyone" leaves an occurrence the guests it added on its own, and
+"add B" does not invite B back to an occurrence that dropped B, when the series held B.
+- **CalDAV** (`mergePatchIntoICS` → `CalDAVProvider.applyAttendeeChange`): the series VEVENT gets
+  the change itself; every override VEVENT in the same resource gets the series' difference. A
+  one-item write keeps the change itself: a `this_only` override is merged on its own as the
+  series VEVENT of a resource of one (`occurrenceOverrideResource`, #596). A split's new part
+  (`seriesSplitResources`) is a whole-series write for the changed occurrences it carries, as on
+  Google: its series VEVENT gets the change, the carried overrides the new series' difference. A
+  resource with no series VEVENT has no series to take a difference from, so each VEVENT gets the
+  change itself. A cancelled occurrence (`STATUS:CANCELLED`) is changed like any other, as the
+  add-on changes it (the cancelled skip and `isCancelled` were deleted in review round 2), and a
+  VEVENT the change leaves as it was goes back byte for byte. A new line is
+  `ATTENDEE;CN="…";ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE`. No ORGANIZER is written
+  there: `putEvent` adds it (ADR-IOS-109).
+- **History (superseded 2026-11-11, review round 2, kept for the record):** the CalDAV rule was
+  "every VEVENT of the resource the write covers: the series and each changed occurrence, a
+  split's new part and the changed occurrences it carries, a one-occurrence override (#596). A
+  changed occurrence takes the change on its OWN guests, the Thunderbird add-on's rule: a guest it
+  added on its own stays, one it dropped on its own is not invited back." It was wrong for `"*"`
+  and for an add of a guest the series held, where Google and Outlook give the difference. (Until
+  review on 2026-11-11 a switch named `AttendeeChange.changedOccurrenceGuests` offered a second
+  rule, `.seriesGuests`; nothing used it and it was deleted, with `applyToChangedOccurrence`.) A
+  `STATUS:CANCELLED` occurrence was left as stored.
 - **Google and Outlook:** the change is applied to the event or occurrence the write reads
   (`GoogleCalendarProvider.applied` via `editJSON` and `splitNewPartJSON`;
   `ExchangeCalendarProvider.appliedAttendeesJSON` and the split's `splitNewPartJSON`). A series
   write is the app's only write for a change of every occurrence; the server carries it to the
   occurrences:
   - **Google** (measured 2026-11-11, test account, API PATCH and Google Calendar web "All events"
-    alike): the series' change is applied on top of EVERY occurrence's own guests, those with
-    guest differences of their own included, moved and renamed ones too: a guest an occurrence
-    added stays, one it removed stays removed unless the change adds them. The same rule as the
-    app's, so the app writes no occurrence. `FakeGoogleCalendar` models it.
+    alike): the series' resulting difference (stored list vs written list) is applied on top of
+    EVERY occurrence's own guests, those with guest differences of their own included, moved and
+    renamed ones too: a guest an occurrence added stays, even when the series is emptied; one it
+    removed comes back only when the series gains them. Measured for an added and a removed
+    guest, a series emptied ([X] -> []) and a series list written back unchanged. This is the
+    rule every provider follows, so the app writes no occurrence. `FakeGoogleCalendar` models it.
+    (Earlier the same day this read "the series' change is applied ... one it removed stays
+    removed unless the change adds them. The same rule as the app's": wrong for `"*"` and for an
+    add of a guest the series held, where the change and the difference differ; corrected after
+    the second measurement.)
   - **Outlook** (measured 2026-11-11, test account, Graph PATCH of the series, for an added and a
-    removed guest): the same as Google. The series' change is applied on top of EVERY
-    occurrence's own guests, exceptions with guest differences of their own included, renamed
-    and moved ones too, and an exception stays an exception: an exception that had dropped a
-    series guest on its own still lacked them after the series added another guest (it took only
-    the added guest, not the series' whole new list). So the app writes no occurrence.
-    `FakeGraphCalendar` models it. (Earlier the same day only occurrences that held the series'
-    guests were measured, and an occurrence with guests of its own was recorded as NOT measured
-    and left as stored by the fake; the second measurement closed that.)
-- **Demo** (`DemoCalendarProvider.updateEvent`) applies the same function to the stored guests;
-  the edit card (`CalendarEventEditTool`) shows the change itself (`AttendeeChange.cardLines`:
-  the people added and removed, three of each and "and N more"), never a resulting list.
-- **Where the add-on differs:** a cancelled CalDAV occurrence (above), and a removal of
-  `mailto:*`, which removes everyone here and names no one in the add-on.
+    removed guest, a series emptied and a series list written back unchanged): the same as
+    Google, the series' resulting difference: the emptied series left an exception its own extra
+    guest, and the unchanged list did not give back a guest an exception had dropped. An
+    exception stays an exception. So the app writes no occurrence. `FakeGraphCalendar` models it.
+    (The first note, kept: "The series' change is applied on top of EVERY occurrence's own
+    guests, exceptions with guest differences of their own included, renamed and moved ones too,
+    and an exception stays an exception: an exception that had dropped a series guest on its own
+    still lacked them after the series added another guest (it took only the added guest, not the
+    series' whole new list)." Earlier the same day only occurrences that held the series' guests
+    were measured, and an occurrence with guests of its own was recorded as NOT measured and left
+    as stored by the fake; the second measurement closed that.)
+- **Demo** (`DemoCalendarProvider.updateEvent`) applies the same function to the stored guests
+  (an event left with none stores no list); the edit card (`CalendarEventEditTool`) shows the
+  change itself (`AttendeeChange.cardLines`: the people added, as "Name <address>" or the address
+  alone, and removed, three of each and "and N more"), never a resulting list. A guest added twice
+  (any letter case) is one add (`init(adds:removes:)` dedupes), so the card never repeats a line
+  (its rows are keyed by text).
+- **Where the add-on differs:** only the whole-series rule. The add-on applies the change itself
+  to each exception (`applyGuestChangeToSeries`); the app follows Google, the difference (a
+  Thunderbird twin is to be filed in that repo). A cancelled occurrence and `mailto:*` now match
+  the add-on: the cancelled one is changed, and `mailto:*` names nobody (only a trimmed `"*"` is
+  "everyone": `AttendeeChange.init` and `parseAttendeeRemoves`). (Until review round 2 the app
+  left a cancelled CalDAV occurrence as stored and read `mailto:*` as everyone.)
 - A debug-gated line (`BackgroundSyncLogger.logDebug`) where the change is applied
   (`applyAttendeeChange`, `editJSON`, `graphPatchJSON`) gives the items and the guest counts
   before and after, never an address.

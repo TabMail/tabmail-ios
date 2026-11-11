@@ -1681,20 +1681,22 @@ enum CalendarToolHelpers {
     }
 
     /// Parse a `remove_attendees`-shaped argument into a list of emails (or `"*"` literal
-    /// for clear-all). Accepts `[{ "email": "..." }]` or `["bare@email.com"]`.
+    /// for clear-all). Accepts `[{ "email": "..." }]` or `["bare@email.com"]`. Only `"*"` itself
+    /// is clear-all: `mailto:*` names nobody and is dropped, as the Thunderbird add-on reads it.
     static func parseAttendeeRemoves(_ value: JSONValue?) -> [String] {
         guard case .array(let arr) = value else { return [] }
         return arr.compactMap { item -> String? in
-            if case .dictionary(let dict) = item,
-               case .string(let raw) = dict["email"] {
-                let trimmed = stripMailto(raw).trimmingCharacters(in: .whitespaces)
-                return trimmed.isEmpty ? nil : trimmed
+            let raw: String
+            if case .dictionary(let dict) = item, case .string(let email) = dict["email"] {
+                raw = email
+            } else if case .string(let email) = item {
+                raw = email
+            } else {
+                return nil
             }
-            if case .string(let raw) = item {
-                let trimmed = stripMailto(raw).trimmingCharacters(in: .whitespaces)
-                return trimmed.isEmpty ? nil : trimmed
-            }
-            return nil
+            if raw.trimmingCharacters(in: .whitespacesAndNewlines) == "*" { return "*" }
+            let address = stripMailto(raw).trimmingCharacters(in: .whitespaces)
+            return address.isEmpty || address == "*" ? nil : address
         }
     }
 

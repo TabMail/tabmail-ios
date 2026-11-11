@@ -60,6 +60,10 @@ of the resource, which holds every occurrence (irreversible wire operation #5, n
      (`GCalEventInput.attendeeChange`), which the provider's write applies to the guests of each
      item it covers. The queue's other read (`CalendarSeriesScope.read`) is unchanged, and so is
      "through the tool nothing is WRITTEN".
+     **Amendment (2026-11-11, #620 review round 2):** "applies to the guests of each item it
+     covers" is refined: the written item takes the change itself, and a whole-series write gives
+     each changed occurrence the series' resulting difference (`AttendeeChange.seriesDifference`),
+     Google's and Outlook's measured rule, Google the reference (memory 142).
    - Edit, one occurrence or a split: `updateOccurrence` (this_only) and `splitSeries`
      (this_and_following) address the resource and make ONE check before they write anything,
      `CalDAVOccurrences.scopedEditSlot`. It picks the occurrence `recurrence_id` names with the

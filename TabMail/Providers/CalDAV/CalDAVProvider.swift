@@ -1010,9 +1010,9 @@ actor CalDAVProvider: CalendarProvider {
     /// RECURRENCE-ID, and the DTEND when the patch gives no end; see
     /// `shiftSeriesAnchoredValues`). Throws, before any
     /// write, when one of those values cannot be moved correctly. The
-    /// patch's guest change is the exception to "master only": it is applied
-    /// to every VEVENT of the resource, each from its own attendees
-    /// (`applyAttendeeChange`, #620).
+    /// patch's guest change is the exception to "master only": it reaches
+    /// every VEVENT of the resource, each from its own attendees, a changed
+    /// occurrence as the series' difference (`applyAttendeeChange`, #620).
     ///
     /// Also applied to the copies a split and a one-occurrence edit make
     /// (`seriesSplitResources`, `occurrenceOverrideResource`), so the patch
@@ -1198,11 +1198,19 @@ actor CalDAVProvider: CalendarProvider {
     }
 
     /// The resource with an edit's guest change applied to every VEVENT in it, each from its own
-    /// attendees (#620): the series VEVENT and each changed occurrence get the change applied to
-    /// their own guests, so a guest an occurrence added on its own stays and one it dropped on its
-    /// own is not invited back. A cancelled occurrence (`STATUS:CANCELLED`) is left as stored:
-    /// nobody is invited to an occurrence that does not take place. A VEVENT the change leaves as
-    /// it was goes back byte for byte.
+    /// attendees (#620). The series VEVENT gets the change itself. Each changed occurrence gets the
+    /// series' resulting difference (`AttendeeChange.seriesDifference`) on its own guests, as Google
+    /// Calendar and Outlook carry a series' guest change to its changed occurrences (measured; see
+    /// `AttendeeChange`): a guest an occurrence added on its own stays, and one it dropped on its
+    /// own is invited back only when the series gains them. A cancelled occurrence is changed like
+    /// any other, as the Thunderbird add-on changes it. A resource with no series VEVENT (only
+    /// changed occurrences) has no series to take a difference from: each VEVENT gets the change
+    /// itself. A VEVENT the change leaves as it was goes back byte for byte.
+    ///
+    /// Every caller that writes one item merges it on its own, as the series VEVENT of a resource
+    /// of one (`occurrenceOverrideResource`), so it gets the change itself. A whole-series write
+    /// (`updateEvent`) and a split's new part (`seriesSplitResources`, a whole-series write for the
+    /// changed occurrences it carries, as on Google) give the changed occurrences the difference.
     ///
     /// An attendee who stays keeps their own line: role, answer, RSVP and every other parameter the
     /// server holds, and so does one whose address is not `mailto:` (#607). Rewriting it would reset
@@ -1228,11 +1236,15 @@ actor CalDAVProvider: CalendarProvider {
                 "ATTENDEE;CN=\"\(cn)\";ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:\(add.email)")
             return ICSUnit(physical: [line], text: line)
         }
+        let occurrenceChange = veventBlocks(icsUnits(ics)).first(where: { !isOverride($0) }).map { series -> AttendeeChange in
+            let own = ownAttendees(series)
+            return change.seriesDifference(before: own, after: change.apply(to: own, address: address, make: make),
+                                           address: address)
+        } ?? change
         var counts: [String] = []
         let result = rewriteVEvents(in: ics) { block, isSeries in
-            if !isSeries && isCancelled(block) { return block }
             let own = ownAttendees(block)
-            let after = change.apply(to: own, address: address, make: make)
+            let after = (isSeries ? change : occurrenceChange).apply(to: own, address: address, make: make)
             counts.append("\(own.count)->\(after.count)")
             guard after.map(\.text) != own.map(\.text) else { return block }
             return replacingAttendees(in: block, with: after)
@@ -1246,14 +1258,6 @@ actor CalDAVProvider: CalendarProvider {
     /// The VEVENT's own `ATTENDEE` lines (not an alarm's), in order.
     private static func ownAttendees(_ block: [ICSUnit]) -> [ICSUnit] {
         topLevel(block).filter { icsProperty($0.text)?.name == "ATTENDEE" }
-    }
-
-    /// True for a VEVENT whose own `STATUS` is `CANCELLED`.
-    private static func isCancelled(_ block: [ICSUnit]) -> Bool {
-        topLevel(block).contains { unit in
-            guard let p = icsProperty(unit.text), p.name == "STATUS" else { return false }
-            return p.value.trimmingCharacters(in: .whitespaces).uppercased() == "CANCELLED"
-        }
     }
 
     /// The VEVENT with its own attendee lines replaced by `attendees`, written where the first one

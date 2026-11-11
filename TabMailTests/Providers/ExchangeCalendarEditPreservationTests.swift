@@ -67,17 +67,19 @@ import Synchronization
 ///   Measured on an Outlook.com account (#622): a list with every entry
 ///   carrying its status was accepted, and a kept attendee sent with their
 ///   stored status kept their answer;
-/// - a PATCH of a series' `attendees` is applied by the server to every stored
-///   occurrence of the series, on top of that occurrence's own guests: each
-///   guest the PATCH removes from the series (by address, any letter case)
-///   goes, each guest it adds is appended unless the occurrence holds them
-///   already, and every other guest the occurrence holds stays as stored, its
-///   own extra guests included, while a guest it dropped on its own stays
-///   dropped unless the PATCH adds them. An exception stays an exception.
-///   Measured on an Outlook.com test account (2026-11-11), for an added and a
-///   removed guest, on renamed, moved and unchanged occurrences and on
-///   exceptions with guest differences of their own (one that had dropped a
-///   series guest on its own still lacked them after the series added another).
+/// - a PATCH of a series' `attendees` reaches every stored occurrence of the
+///   series as the difference between the series' stored list and the written
+///   one, applied on top of that occurrence's own guests: each guest the
+///   written list drops from the stored one (by address, any letter case)
+///   goes, each guest it holds that the stored one did not is appended unless
+///   the occurrence holds them already, and every other guest the occurrence
+///   holds stays as stored. So an exception's own extra guest stays even when
+///   the series is emptied, and a guest it dropped on its own stays dropped
+///   when the series' list is written back unchanged. An exception stays an
+///   exception. Measured on an Outlook.com test account (2026-11-11), for an
+///   added and a removed guest, a series emptied of its guests and a series
+///   list written back unchanged, on renamed, moved and unchanged occurrences
+///   and on exceptions with guest differences of their own.
 ///
 /// A timed event's starts and ends are returned as stored, whatever zone `Prefer` names: a
 /// fixture stores them as Graph renders them for the device. An all-day event's `start` and `end`

@@ -886,8 +886,8 @@ struct CalDAVWholeSeriesEditTests {
         "END:VEVENT",
     ])
 
-    @Test("a guest change of the series reaches each changed occurrence from its own guests, and leaves a cancelled one as stored")
-    func guestChangeReachesOverridesButNotCancelledOnes() throws {
+    @Test("a guest change of the series reaches each changed occurrence from its own guests, a cancelled one too, as the add-on changes it")
+    func guestChangeReachesEveryOverride() throws {
         var patch = GCalEventInput()
         patch.attendeeChange = AttendeeChange(adds: [.init(email: "carol@example.com", name: "Carol")])
         let out = try CalDAVProvider.mergePatchIntoICS(Self.seriesWithOverrides, patch: patch)
@@ -895,7 +895,12 @@ struct CalDAVWholeSeriesEditTests {
         let storedOverrides = Fixture.overrides(Self.seriesWithOverrides)
         #expect(overrides.count == 2 && storedOverrides.count == 2, Comment(rawValue: out))
         guard overrides.count == 2, storedOverrides.count == 2 else { return }
-        #expect(overrides[0] == storedOverrides[0], "the cancelled occurrence changed:\n\(overrides[0].joined(separator: "\n"))")
+        let cancelled = overrides[0]
+        #expect(cancelled.contains("STATUS:CANCELLED"), "the cancelled occurrence lost its status")
+        #expect(Fixture.attendee(cancelled, "bob@example.com") == "ATTENDEE;CN=Bob;PARTSTAT=TENTATIVE:mailto:bob@example.com")
+        #expect(Fixture.attendee(cancelled, "carol@example.com")
+                == "ATTENDEE;CN=\"Carol\";ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:carol@example.com",
+                "the cancelled occurrence did not get the change:\n\(cancelled.joined(separator: "\n"))")
         let moved = overrides[1]
         #expect(Fixture.attendee(moved, "alice@example.com") == "ATTENDEE;CN=Alice;PARTSTAT=DECLINED:mailto:alice@example.com")
         #expect(Fixture.attendee(moved, "bob@example.com") == nil, "the series' guest was copied to the occurrence that dropped him")
@@ -917,6 +922,32 @@ struct CalDAVWholeSeriesEditTests {
         #expect(overrides.count == 2 && storedOverrides.count == 2, Comment(rawValue: out))
         guard overrides.count == 2, storedOverrides.count == 2 else { return }
         #expect(overrides[1] == storedOverrides[1], "an occurrence without Bob was rewritten")
+        #expect(Fixture.attendee(Fixture.master(out), "bob@example.com") == nil)
+    }
+
+    @Test("a changed occurrence the series' difference leaves as it was keeps its attendee lines where they were, between other properties")
+    func unchangedVEventKeepsInterleavedAttendees() throws {
+        // The series loses Bob; the occurrence never held him, and lists its attendees around
+        // another property, so a rewrite would move them together.
+        let override = [
+            "BEGIN:VEVENT", "UID:series-21", "RECURRENCE-ID:20990513T170000Z",
+            "DTSTART:20990513T180000Z", "DTEND:20990513T184500Z",
+            "ATTENDEE;CN=Alice;PARTSTAT=DECLINED:mailto:alice@example.com",
+            "SUMMARY:Sync, moved",
+            "ATTENDEE;CN=Room 4;CUTYPE=ROOM;PARTSTAT=ACCEPTED:mailto:room-4@example.com",
+            "END:VEVENT",
+        ]
+        let ics = Fixture.series([
+            "BEGIN:VEVENT", "UID:series-21", "DTSTART:20990506T170000Z", "DTEND:20990506T174500Z", "RRULE:FREQ=WEEKLY",
+            "SUMMARY:Sync",
+            "ATTENDEE;CN=Alice;PARTSTAT=ACCEPTED:mailto:alice@example.com",
+            "ATTENDEE;CN=Bob;PARTSTAT=TENTATIVE:mailto:bob@example.com",
+            "END:VEVENT",
+        ] + override)
+        var patch = GCalEventInput()
+        patch.attendeeChange = AttendeeChange(removes: ["bob@example.com"])
+        let out = try CalDAVProvider.mergePatchIntoICS(ics, patch: patch)
+        #expect(Fixture.overrides(out) == [override], "the occurrence was rewritten:\n\(out)")
         #expect(Fixture.attendee(Fixture.master(out), "bob@example.com") == nil)
     }
 

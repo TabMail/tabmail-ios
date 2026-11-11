@@ -74,14 +74,17 @@ private let kindChangeTimesHint = "to change this event between all-day and time
 /// one, are dropped, as Google did when a series was moved from 08:00 to 13:00 (measured on a
 /// personal account, 2026-11-10).
 ///
-/// A PATCH of a series' `attendees` is applied by the server to every stored occurrence of the
-/// series, on top of that occurrence's own guests: each guest the PATCH removes from the series
-/// (by address, any letter case) goes, each guest it adds is appended unless the occurrence holds
-/// them already, and every other guest the occurrence holds stays as stored, its own extra guests
-/// included, while a guest it dropped on its own stays dropped unless the PATCH adds them.
-/// Measured on a test account (2026-11-11), through the API and Google Calendar web alike, for an
-/// added and a removed guest, on renamed, moved and unchanged occurrences and on occurrences with
-/// guest differences of their own.
+/// A PATCH of a series' `attendees` reaches every stored occurrence of the series as the
+/// difference between the series' stored list and the written one, applied on top of that
+/// occurrence's own guests: each guest the written list drops from the stored one (by address,
+/// any letter case) goes, each guest it holds that the stored one did not is appended unless the
+/// occurrence holds them already, and every other guest the occurrence holds stays as stored. So
+/// an occurrence's own extra guest stays even when the series is emptied, and a guest it dropped
+/// on its own stays dropped when the series' list is written back unchanged. Measured on a test
+/// account (2026-11-11), through the API and Google Calendar web alike, for an added and a
+/// removed guest, a series emptied of its guests and a series list written back unchanged, on
+/// renamed, moved and unchanged occurrences and on occurrences with guest differences of their
+/// own.
 final class FakeGoogleCalendar: Sendable {
     private let events: Mutex<[String: Data]>
     private let writeLog = Mutex<[String]>([])

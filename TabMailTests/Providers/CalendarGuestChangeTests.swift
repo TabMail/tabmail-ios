@@ -11,9 +11,13 @@ import GRDB
 //
 // INVARIANT (system property). After `calendar_event_edit` changes who attends (`add_attendees`,
 // `remove_attendees`, `"*"` for everyone) with an edit scope:
-// - every item the scope covers holds the change applied to ITS OWN guest list from before the
-//   edit: each guest it keeps exactly as that item stored them, each new guest unanswered, each
-//   removed guest gone;
+// - the item the edit writes (the event, the series, or the one occurrence a `this_only` edit
+//   names) holds the change applied to ITS OWN guest list from before the edit: each guest it
+//   keeps exactly as that item stored them, each new guest unanswered, each removed guest gone;
+// - for a whole-series edit, every changed occurrence holds the SERIES' RESULTING DIFFERENCE
+//   applied to its own guest list: the guests the series lost removed, the guests it gained
+//   added (new and unanswered), every other guest it holds kept as stored
+//   (`GuestChangeOracle.seriesDifference`);
 // - every item outside the scope holds its guests exactly as before;
 // - a change that names nobody changes no guest list.
 // "Item" is what a calendar stores a guest list on: a CalDAV VEVENT (the series and each changed
@@ -25,17 +29,19 @@ import GRDB
 // then each added address not already there appended once, as the item stored them when it held
 // them before (removed and added back), else new and unanswered.
 //
+// The difference rule is Google Calendar's, and Outlook's: the app writes a whole-series change
+// to the series alone, and the server carries the difference between the series' stored list and
+// the written one to each occurrence, on top of the occurrence's own guests. Measured on test
+// accounts (2026-11-11), API and web alike on Google, for an added and a removed guest, for a
+// series emptied of its guests (an occurrence with an extra guest of its own kept that guest) and
+// for a series list written back unchanged (an occurrence that had dropped a guest on its own
+// stayed without them); modelled by `FakeGoogleCalendar` and `FakeGraphCalendar`. Google is the
+// reference, so CalDAV gives its changed occurrences the same difference. It differs from the
+// change itself only for `"*"` and for an add of a guest the series already holds (case 3).
+//
 // It is checked on what the fake SERVER holds after the real calendar queue drains the edit
-// (`drainEdit`), never on the request the app built. CalDAV covers the change itself, on every
-// VEVENT. On Google and Outlook the app writes the item it read, once, and the server carries a
-// series' change to its occurrences:
-// - Google applies it on top of each occurrence's own guests, those with guest differences of
-//   their own included, moved and renamed ones too (measured for an added and a removed guest,
-//   API and web alike; modelled by `FakeGoogleCalendar`);
-// - Outlook does the same: it applies it on top of each occurrence's own guests, exceptions with
-//   guest differences of their own included, moved and renamed ones too, and an exception stays
-//   an exception (measured for an added and a removed guest; modelled by `FakeGraphCalendar`).
-// So the whole-series cases of both check every occurrence with the oracle.
+// (`drainEdit`), never on the request the app built. On Google and Outlook the app writes the
+// item it read, once, and the server carries a series' change to its occurrences.
 //
 // RED BEFORE THE FIX, each for the reason its test names: the queue worked out ONE full list from
 // the event it read (the series) and the CalDAV write put it on the series VEVENT alone, so the
@@ -122,6 +128,27 @@ enum GuestChangeOracle {
         return out
     }
 
+    /// A whole-series change as each changed occurrence takes it: the difference between the
+    /// series' guests before and after `change` (`expected(seriesBefore, change)`). It removes each
+    /// address the series held and no longer holds, and adds each address it holds that it did
+    /// not, as `change` adds it. A guest with no address is in neither.
+    static func seriesDifference(_ seriesBefore: [Guest], _ change: Change) -> Change {
+        let had = Set(seriesBefore.compactMap(\.address))
+        let has = Set(expected(seriesBefore, change).compactMap { entry -> String? in
+            switch entry {
+            case .kept(let guest): return guest.address
+            case .added(let address): return address
+            }
+        })
+        var seen = Set<String>()
+        return Change(
+            adds: change.adds.filter { add in
+                let address = normalized(add.email)
+                return has.contains(address) && !had.contains(address) && seen.insert(address).inserted
+            },
+            removes: seriesBefore.compactMap(\.address).filter { !has.contains($0) })
+    }
+
     /// What is wrong with one item's guests after `change`, or nothing.
     static func problems(item: String, before: [Guest], after: [Guest], change: Change,
                          isUnanswered: (Guest) -> Bool) -> [String] {
@@ -153,15 +180,19 @@ enum GuestChangeOracle {
     }
 
     /// What is wrong with a calendar's items after `change`: those in `inScope` must hold the
-    /// change applied to their own list, every other one its guests exactly as before.
+    /// change applied to their own list, every other one its guests exactly as before. For a
+    /// whole-series edit, `series` names the series' item: it takes `change`, and every other item
+    /// in scope (each occurrence) takes the series' difference (`seriesDifference`).
     static func problems(before: [String: [Guest]], after: [String: [Guest]], inScope: Set<String>,
-                         change: Change, isUnanswered: (Guest) -> Bool) -> [String] {
+                         change: Change, series: String? = nil, isUnanswered: (Guest) -> Bool) -> [String] {
         var out: [String] = []
+        let occurrenceChange = series.map { seriesDifference(before[$0] ?? [], change) } ?? change
         for item in Set(before.keys).union(after.keys).sorted() {
             guard let was = before[item] else { out.append("\(item): an item that was not there before"); continue }
             guard let now = after[item] else { out.append("\(item): the item is gone"); continue }
             if inScope.contains(item) {
-                out += problems(item: item, before: was, after: now, change: change, isUnanswered: isUnanswered)
+                out += problems(item: item, before: was, after: now, change: item == series ? change : occurrenceChange,
+                                isUnanswered: isUnanswered)
             } else if was != now {
                 out.append("\(item): outside the edit's scope, its guests changed from \(was) to \(now)")
             }
@@ -221,6 +252,48 @@ enum GuestFixture {
     static func thisOnly(week: Int) -> [String: JSONValue] {
         ["edit_scope": .string("this_only"), "recurrence_id": .string(naiveUTC(slot(week))),
          "timezone": .string("UTC")]
+    }
+}
+
+/// The whole-series changes whose difference for a changed occurrence is not the change itself
+/// (case 3), on the series every provider's suite uses: the series holds the organizer (when the
+/// provider lists them as a guest), A and B; week 4 holds C as well, week 5 dropped B.
+enum SeriesDifferenceShape: String, CaseIterable, Sendable, CustomTestStringConvertible {
+    case removeEveryone = "removes everyone with *"
+    case removeEveryoneAddBack = "removes everyone with * and adds B back"
+    case addHeldGuest = "adds B, whom the series holds and week 5 dropped"
+    case removeAndAddBack = "removes B and adds B back, where week 5 lacks B"
+
+    var testDescription: String { rawValue }
+
+    var change: GuestChangeOracle.Change {
+        let b = GuestChangeOracle.Add(email: GuestFixture.guestB, name: "Guest B")
+        switch self {
+        case .removeEveryone: return .init(removes: ["*"])
+        case .removeEveryoneAddBack: return .init(adds: [b], removes: ["*"])
+        case .addHeldGuest: return .init(adds: [b])
+        case .removeAndAddBack: return .init(adds: [b], removes: [GuestFixture.guestB])
+        }
+    }
+
+    /// The addresses week 4 holds afterwards, worked out by hand: the guests the series lost go,
+    /// its own C stays. `organizer` is the organizer's address where the provider lists them.
+    func week4(organizer: [String]) -> Set<String> {
+        let F = GuestFixture.self
+        switch self {
+        case .removeEveryone: return [F.guestC]
+        case .removeEveryoneAddBack: return [F.guestB, F.guestC]
+        case .addHeldGuest, .removeAndAddBack: return Set(organizer + [F.guestA, F.guestB, F.guestC])
+        }
+    }
+
+    /// The addresses week 5 holds afterwards: B, which the series held before and after, is not
+    /// invited back.
+    func week5(organizer: [String]) -> Set<String> {
+        switch self {
+        case .removeEveryone, .removeEveryoneAddBack: return []
+        case .addHeldGuest, .removeAndAddBack: return Set(organizer + [GuestFixture.guestA])
+        }
     }
 }
 
@@ -344,9 +417,12 @@ enum CalDAVGuests {
         return value == "NEEDS-ACTION"
     }
 
-    static func problems(before: String, after: String?, inScope: Set<String>, _ change: GuestChangeOracle.Change) -> [String] {
+    /// `wholeSeries`: the edit changes the whole series, so each changed occurrence takes the
+    /// series' difference (`GuestChangeOracle.seriesDifference`).
+    static func problems(before: String, after: String?, inScope: Set<String>, _ change: GuestChangeOracle.Change,
+                         wholeSeries: Bool = false) -> [String] {
         GuestChangeOracle.problems(before: guests(before), after: guests(after), inScope: inScope,
-                                   change: change, isUnanswered: isUnanswered)
+                                   change: change, series: wholeSeries ? seriesKey : nil, isUnanswered: isUnanswered)
     }
 
     static func newPartPath(splitAtWeek week: Int) -> String {
@@ -368,7 +444,8 @@ struct CalDAVGuestChangeTests {
         let run = C.serve(seed)
         defer { run.http.close() }
         let rows = try await C.drain(run, change.arguments, account: account)
-        return (C.problems(before: seed, after: run.store.storedICS(path: C.seriesPath), inScope: Self.everyItem, change), rows)
+        return (C.problems(before: seed, after: run.store.storedICS(path: C.seriesPath), inScope: Self.everyItem, change,
+                           wholeSeries: true), rows)
     }
 
     // RED on main: the series VEVENT alone is written; the changed occurrences keep their guests.
@@ -387,11 +464,21 @@ struct CalDAVGuestChangeTests {
         #expect(r.problems.isEmpty, Comment(rawValue: r.problems.joined(separator: "\n")))
     }
 
-    @Test("3. removing everyone from the whole series leaves no guest on any VEVENT")
-    func removeEveryoneReachesEveryOccurrence() async throws {
-        let r = try await runAll(Change(removes: ["*"]), account: "guests-c-clear")
-        #expect(r.rows.isEmpty, "the edit did not land: \(r.rows.map { $0.failureReason ?? $0.status })")
-        #expect(r.problems.isEmpty, Comment(rawValue: r.problems.joined(separator: "\n")))
+    @Test("3. a whole-series change reaches each changed occurrence as the series' difference: its own guests stay, and a guest it dropped is not invited back", arguments: SeriesDifferenceShape.allCases)
+    func seriesDifferenceReachesEveryOccurrence(_ shape: SeriesDifferenceShape) async throws {
+        let seed = C.changedSeries()
+        let run = C.serve(seed)
+        defer { run.http.close() }
+        let rows = try await C.drain(run, shape.change.arguments, account: "guests-c-shape-\(shape)")
+        #expect(rows.isEmpty, "the edit did not land: \(rows.map { $0.failureReason ?? $0.status })")
+        let after = run.store.storedICS(path: C.seriesPath)
+        let problems = C.problems(before: seed, after: after, inScope: Self.everyItem, shape.change, wholeSeries: true)
+        #expect(problems.isEmpty, Comment(rawValue: problems.joined(separator: "\n")))
+        let guests = C.guests(after)
+        #expect(Set((guests[C.key(week: 4)] ?? []).compactMap(\.address)) == shape.week4(organizer: [F.organizer]),
+                "week 4 holds \(guests[C.key(week: 4)] ?? [])")
+        #expect(Set((guests[C.key(week: 5)] ?? []).compactMap(\.address)) == shape.week5(organizer: [F.organizer]),
+                "week 5 holds \(guests[C.key(week: 5)] ?? [])")
     }
 
     @Test("6. one occurrence edited by the series id gets the guest added to its own guests (#596)")
@@ -438,8 +525,31 @@ struct CalDAVGuestChangeTests {
         let taken = [C.seriesKey, C.key(week: 4), C.key(week: 5)]
         let problems = GuestChangeOracle.problems(
             before: before.filter { taken.contains($0.key) }, after: C.guests(newPart), inScope: Set(taken),
-            change: F.addD, isUnanswered: C.isUnanswered)
+            change: F.addD, series: C.seriesKey, isUnanswered: C.isUnanswered)
         #expect(problems.isEmpty, Comment(rawValue: problems.joined(separator: "\n")))
+    }
+
+    @Test("19. a split's new part is a whole-series write for the changed occurrences it takes: they get the new series' difference, as on Google", arguments: SeriesDifferenceShape.allCases)
+    func splitGivesTakenOccurrencesTheDifference(_ shape: SeriesDifferenceShape) async throws {
+        let seed = C.changedSeries()
+        let run = C.serve(seed)
+        defer { run.http.close() }
+        let rows = try await C.drain(run, shape.change.arguments.merging([
+            "edit_scope": .string("this_and_following"), "recurrence_id": .string(F.naiveUTC(F.slot(4))),
+            "timezone": .string("UTC"),
+        ]) { mine, _ in mine }, account: "guests-c-split-shape-\(shape)")
+        #expect(rows.isEmpty, "the split did not land: \(rows.map { $0.failureReason ?? $0.status })")
+        let before = C.guests(seed)
+        let newPart = C.guests(run.store.storedICS(path: C.newPartPath(splitAtWeek: 4)))
+        let taken = [C.seriesKey, C.key(week: 4), C.key(week: 5)]
+        let problems = GuestChangeOracle.problems(
+            before: before.filter { taken.contains($0.key) }, after: newPart, inScope: Set(taken),
+            change: shape.change, series: C.seriesKey, isUnanswered: C.isUnanswered)
+        #expect(problems.isEmpty, Comment(rawValue: problems.joined(separator: "\n")))
+        #expect(Set((newPart[C.key(week: 4)] ?? []).compactMap(\.address)) == shape.week4(organizer: [F.organizer]),
+                "week 4 holds \(newPart[C.key(week: 4)] ?? [])")
+        #expect(Set((newPart[C.key(week: 5)] ?? []).compactMap(\.address)) == shape.week5(organizer: [F.organizer]),
+                "week 5 holds \(newPart[C.key(week: 5)] ?? [])")
     }
 
     @Test("8. a changed occurrence with no guests and no organizer gains the guest, on a server that refuses guests without an organizer")
@@ -455,7 +565,7 @@ struct CalDAVGuestChangeTests {
         let rows = try await C.drain(run, F.addD.arguments, account: "guests-c-organizer")
         #expect(rows.isEmpty, "the edit did not land: \(rows.map { $0.failureReason ?? $0.status })")
         let after = run.store.storedICS(path: C.seriesPath)
-        let problems = C.problems(before: seed, after: after, inScope: [C.seriesKey, C.key(week: 2)], F.addD)
+        let problems = C.problems(before: seed, after: after, inScope: [C.seriesKey, C.key(week: 2)], F.addD, wholeSeries: true)
         #expect(problems.isEmpty, Comment(rawValue: problems.joined(separator: "\n")))
     }
 
@@ -469,7 +579,8 @@ struct CalDAVGuestChangeTests {
                                      F.addD.arguments.merging(["edit_scope": .string("all")]) { mine, _ in mine },
                                      account: "guests-c-all-by-occurrence")
         #expect(rows.isEmpty, "the edit did not land: \(rows.map { $0.failureReason ?? $0.status })")
-        let problems = C.problems(before: seed, after: run.store.storedICS(path: C.seriesPath), inScope: Self.everyItem, F.addD)
+        let problems = C.problems(before: seed, after: run.store.storedICS(path: C.seriesPath), inScope: Self.everyItem, F.addD,
+                                  wholeSeries: true)
         #expect(problems.isEmpty, Comment(rawValue: problems.joined(separator: "\n")))
     }
 
@@ -488,7 +599,7 @@ struct CalDAVGuestChangeTests {
             #expect(VEventOracle.own(block, "ATTENDEE").contains(C.room),
                     "\(item) lost the room:\n\(block.joined(separator: "\n"))")
         }
-        let problems = C.problems(before: seed, after: after, inScope: [C.seriesKey, C.key(week: 2)], F.addD)
+        let problems = C.problems(before: seed, after: after, inScope: [C.seriesKey, C.key(week: 2)], F.addD, wholeSeries: true)
         #expect(problems.isEmpty, Comment(rawValue: problems.joined(separator: "\n")))
     }
 
@@ -511,7 +622,7 @@ struct CalDAVGuestChangeTests {
         #expect(VEventOracle.own(after[C.seriesKey] ?? [], "ATTENDEE").contains(C.b), "the series' B was not kept as stored")
         #expect(VEventOracle.own(after[C.key(week: 2)] ?? [], "ATTENDEE").contains(bDeclined), "the occurrence's B was not kept as stored")
         let problems = C.problems(before: seed, after: run.store.storedICS(path: C.seriesPath),
-                                  inScope: [C.seriesKey, C.key(week: 2)], change)
+                                  inScope: [C.seriesKey, C.key(week: 2)], change, wholeSeries: true)
         #expect(problems.isEmpty, Comment(rawValue: problems.joined(separator: "\n")))
     }
 
@@ -530,7 +641,7 @@ struct CalDAVGuestChangeTests {
         let rows = try await C.drain(run, change.arguments, account: "guests-c-case")
         #expect(rows.isEmpty, "the edit did not land: \(rows.map { $0.failureReason ?? $0.status })")
         let problems = C.problems(before: seed, after: run.store.storedICS(path: C.seriesPath),
-                                  inScope: [C.seriesKey, C.key(week: 2)], change)
+                                  inScope: [C.seriesKey, C.key(week: 2)], change, wholeSeries: true)
         #expect(problems.isEmpty, Comment(rawValue: problems.joined(separator: "\n")))
     }
 
@@ -669,10 +780,13 @@ struct GoogleGuestChangeTests {
     typealias F = GuestFixture
     typealias G = GoogleGuests
 
-    /// The whole-series change `change`, by `eventId`: every item (the series and each occurrence,
-    /// weeks 4 and 5 with guests of their own included) must hold the change on its own guests, and
-    /// the app writes no occurrence (the server carries the series' change to them).
-    private func runAll(_ change: GuestChangeOracle.Change, eventId: String = G.seriesId, account: String) async throws {
+    /// The whole-series change `change`, by `eventId`: the series must hold the change on its own
+    /// guests, every occurrence (weeks 4 and 5 with guests of their own included) the series'
+    /// difference on its own, and the app writes no occurrence (the server carries the series'
+    /// change to them). Returns every item's guests afterwards.
+    @discardableResult
+    private func runAll(_ change: GuestChangeOracle.Change, eventId: String = G.seriesId, account: String) async throws
+        -> [String: [GuestChangeOracle.Guest]] {
         let seed = G.seed()
         let before = G.guests(FakeGoogleCalendar(seed), G.everyId)
         let arguments = change.arguments.merging(["edit_scope": .string("all")]) { mine, _ in mine }
@@ -680,10 +794,12 @@ struct GoogleGuestChangeTests {
         #expect(r.rows.isEmpty, "the edit did not land: \(r.rows.map { $0.failureReason ?? $0.status })")
         let occurrenceWrites = r.calendar.writes.filter { $0 != "PATCH \(G.seriesId)" }
         #expect(occurrenceWrites.isEmpty, "the app wrote an occurrence: \(r.calendar.writes)")
+        let after = G.guests(r.calendar, G.everyId)
         let problems = GuestChangeOracle.problems(
-            before: before, after: G.guests(r.calendar, G.everyId), inScope: Set(G.everyId),
-            change: change, isUnanswered: G.isUnanswered)
+            before: before, after: after, inScope: Set(G.everyId),
+            change: change, series: G.seriesId, isUnanswered: G.isUnanswered)
         #expect(problems.isEmpty, Comment(rawValue: problems.joined(separator: "\n")))
+        return after
     }
 
     @Test("13. adding a guest to the whole series reaches the series and every occurrence, each keeping its own guests, with no write to an occurrence")
@@ -694,6 +810,14 @@ struct GoogleGuestChangeTests {
     @Test("18. removing a guest from the whole series removes them from the series and every occurrence, with no write to an occurrence")
     func seriesRemoveReachesEveryOccurrence() async throws {
         try await runAll(GuestChangeOracle.Change(removes: [F.guestB]), account: "guests-g-series-remove")
+    }
+
+    @Test("3. a whole-series change reaches each changed occurrence as the series' difference: its own guests stay, and a guest it dropped is not invited back", arguments: SeriesDifferenceShape.allCases)
+    func seriesDifferenceReachesEveryOccurrence(_ shape: SeriesDifferenceShape) async throws {
+        let after = try await runAll(shape.change, account: "guests-g-shape-\(shape)")
+        let week4 = after[G.instanceId(week: 4)] ?? [], week5 = after[G.instanceId(week: 5)] ?? []
+        #expect(Set(week4.compactMap(\.address)) == shape.week4(organizer: [F.organizer]), "week 4 holds \(week4)")
+        #expect(Set(week5.compactMap(\.address)) == shape.week5(organizer: [F.organizer]), "week 5 holds \(week5)")
     }
 
     @Test("14. one occurrence edited by the series id gets the guest added to its own guests (#596)")
@@ -838,10 +962,13 @@ struct OutlookGuestChangeTests {
     typealias F = GuestFixture
     typealias X = GraphGuests
 
-    /// The whole-series change `change`, by `eventId`: every item (the series and each occurrence,
-    /// weeks 4 and 5 with guests of their own included) must hold the change on its own guests, and
-    /// the app writes no occurrence (the server carries the series' change to them).
-    private func runAll(_ change: GuestChangeOracle.Change, eventId: String = X.seriesId, account: String) async throws {
+    /// The whole-series change `change`, by `eventId`: the series must hold the change on its own
+    /// guests, every occurrence (weeks 4 and 5 with guests of their own included) the series'
+    /// difference on its own, and the app writes no occurrence (the server carries the series'
+    /// change to them). Returns every item's guests afterwards.
+    @discardableResult
+    private func runAll(_ change: GuestChangeOracle.Change, eventId: String = X.seriesId, account: String) async throws
+        -> [String: [GuestChangeOracle.Guest]] {
         let graph = FakeGraphCalendar(X.seed())
         let before = X.guests(graph, X.everyId)
         let arguments = change.arguments.merging(["edit_scope": .string("all")]) { mine, _ in mine }
@@ -849,10 +976,12 @@ struct OutlookGuestChangeTests {
         #expect(rows.isEmpty, "the edit did not land: \(rows.map { $0.failureReason ?? $0.status })")
         let occurrencePatches = graph.patchedIds.filter { $0 != X.seriesId }
         #expect(occurrencePatches.isEmpty, "the app wrote an occurrence: \(graph.patchedIds)")
+        let after = X.guests(graph, X.everyId)
         let problems = GuestChangeOracle.problems(
-            before: before, after: X.guests(graph, X.everyId), inScope: Set(X.everyId),
-            change: change, isUnanswered: X.isUnanswered)
+            before: before, after: after, inScope: Set(X.everyId),
+            change: change, series: X.seriesId, isUnanswered: X.isUnanswered)
         #expect(problems.isEmpty, Comment(rawValue: problems.joined(separator: "\n")))
+        return after
     }
 
     @Test("13. adding a guest to the whole series reaches the series and every occurrence, each keeping its own guests, with no write to an occurrence")
@@ -863,6 +992,15 @@ struct OutlookGuestChangeTests {
     @Test("18. removing a guest from the whole series removes them from the series and every occurrence, with no write to an occurrence")
     func seriesRemoveReachesEveryOccurrence() async throws {
         try await runAll(GuestChangeOracle.Change(removes: [F.guestB]), account: "guests-x-series-remove")
+    }
+
+    @Test("3. a whole-series change reaches each changed occurrence as the series' difference: its own guests stay, and a guest it dropped is not invited back", arguments: SeriesDifferenceShape.allCases)
+    func seriesDifferenceReachesEveryOccurrence(_ shape: SeriesDifferenceShape) async throws {
+        // Graph keeps the organizer out of `attendees`.
+        let after = try await runAll(shape.change, account: "guests-x-shape-\(shape)")
+        let week4 = after[X.instanceId(week: 4)] ?? [], week5 = after[X.instanceId(week: 5)] ?? []
+        #expect(Set(week4.compactMap(\.address)) == shape.week4(organizer: []), "week 4 holds \(week4)")
+        #expect(Set(week5.compactMap(\.address)) == shape.week5(organizer: []), "week 5 holds \(week5)")
     }
 
     @Test("14. one occurrence edited by the series id gets the guest added to its own guests (#596)")
@@ -1092,5 +1230,14 @@ struct DemoGuestChangeTests {
         #expect(try await Self.storedGuests(pool, created.id)
                 == [["email": "alice@example.com", "name": "Alice"], ["email": "carol@example.com", "name": "Carol"]],
                 "an edit that names nobody changed the guests")
+
+        var clear = create
+        clear.attendees = nil
+        clear.attendeeChange = AttendeeChange(removes: ["*"])
+        _ = try await provider.updateEvent(calendarId: "primary", eventId: created.id ?? "", event: clear, sendUpdates: "none")
+        let rawAfterClear = try await pool.read { db in
+            try String.fetchOne(db, sql: "SELECT attendeesJSON FROM demoCalendarEvent WHERE id = ?", arguments: [created.id])
+        }
+        #expect(rawAfterClear == nil, "an event left with no guests stores \(rawAfterClear ?? "nil"), not no guest list, as a new event with none does")
     }
 }
