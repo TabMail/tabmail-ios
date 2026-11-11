@@ -416,17 +416,12 @@ struct GmailReceivedDateBoundaryTests {
         try Self.insertLocal(pool: pool, accountId: accountId, messageId: "orphan", date: clock.daysAgo(20), providerDate: clock.daysAgo(20),
                              folderId: "\(accountId):ARCHIVE")
 
-        let server = StatefulGmailActionServer(messages: [
-            seed("pushed", internalDate: clock.daysAgo(30), received: clock.daysAgo(0.5)),
-            seed("orphan", internalDate: clock.daysAgo(3), received: clock.daysAgo(0.75)),
-        ])
+        // Both arrive after the account's cursor; the fake's `/history` reports them.
+        let server = StatefulGmailActionServer(messages: [])
         defer { server.close() }
-        server.http.register(path: "/history", method: "GET", response: .json(raw: """
-            { "historyId": "1001", "history": [
-                { "messagesAdded": [ { "message": { "id": "pushed" } } ] },
-                { "messagesAdded": [ { "message": { "id": "orphan" } } ] }
-            ] }
-            """))
+        #expect(account.lastHistoryId == String(StatefulGmailActionServer.initialHistoryId))
+        server.addMessage(seed("pushed", internalDate: clock.daysAgo(30), received: clock.daysAgo(0.5)))
+        server.addMessage(seed("orphan", internalDate: clock.daysAgo(3), received: clock.daysAgo(0.75)))
 
         let outcome = try await SyncEngine().performDeltaSync(account: account, provider: server.provider())
         #expect(outcome.succeeded)
