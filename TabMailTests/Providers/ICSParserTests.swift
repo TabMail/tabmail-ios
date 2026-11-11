@@ -501,4 +501,106 @@ struct ICSParserTests {
         #expect(events[0].end?.date == "2024-04-02")
         #expect(events[0].start?.timeZone == nil)
     }
+
+    // MARK: - How a VEVENT's lines are read (pinned before that reading changes)
+
+    /// 10:00 UTC two weeks from today, as an ICS UTC value, and the same instant as the parser
+    /// gives it.
+    private static let pinStart: (ics: String, iso: String) = {
+        var cal = Calendar(identifier: .gregorian)
+        let utc = TimeZone(identifier: "UTC") ?? .current
+        cal.timeZone = utc
+        let date = cal.startOfDay(for: Date().addingTimeInterval(14 * 86_400)).addingTimeInterval(10 * 3_600)
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.timeZone = utc
+        fmt.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime]
+        iso.timeZone = utc
+        return (fmt.string(from: date), iso.string(from: date))
+    }()
+
+    @Test("trailing whitespace after a value is not part of it")
+    func trailingWhitespaceIsTrimmed() {
+        let ics = [
+            "BEGIN:VCALENDAR", "BEGIN:VEVENT",
+            "SUMMARY:Planning  ", "LOCATION:Room 1\t", "DESCRIPTION:Agenda \t ",
+            "DTSTART:\(Self.pinStart.ics) ", "URL:https://example.com/agenda ",
+            "ATTENDEE;CN=Alice;PARTSTAT=ACCEPTED:mailto:alice@example.com  ",
+            "END:VEVENT", "END:VCALENDAR",
+        ].joined(separator: "\r\n")
+        let events = ICSParser.parse(icsText: ics, resourceHref: "/cal/x.ics", etag: nil)
+        #expect(events.count == 1)
+        guard events.count == 1 else { return }
+        #expect(events[0].summary == "Planning")
+        #expect(events[0].location == "Room 1")
+        #expect(events[0].description == "Agenda")
+        #expect(events[0].start?.dateTime == Self.pinStart.iso)
+        #expect(events[0].htmlLink == "https://example.com/agenda")
+        #expect(events[0].attendees?.map(\.email) == ["alice@example.com"])
+    }
+
+    @Test("a line folded with CRLF or with a bare LF, after a space or a tab, is read as one line",
+          arguments: ["\r\n", "\n"], [" ", "\t"])
+    func foldedLinesAreJoined(_ newline: String, _ fold: String) {
+        let ics = [
+            "BEGIN:VCALENDAR", "BEGIN:VEVENT",
+            "SUMMARY:Quarterly plan", "\(fold)ning review",
+            "DESCRIPTION:Bring the num", "\(fold)bers\\, the risks", "\(fold) and the dates",
+            "DTSTART:\(Self.pinStart.ics)",
+            "ATTENDEE;CN=Alice;PARTSTAT=ACC", "\(fold)EPTED:mailto:alice@exa", "\(fold)mple.com",
+            "END:VEVENT", "END:VCALENDAR",
+        ].joined(separator: newline)
+        let events = ICSParser.parse(icsText: ics, resourceHref: "/cal/x.ics", etag: nil)
+        #expect(events.count == 1)
+        guard events.count == 1 else { return }
+        #expect(events[0].summary == "Quarterly planning review")
+        #expect(events[0].description == "Bring the numbers, the risks and the dates")
+        #expect(events[0].start?.dateTime == Self.pinStart.iso)
+        #expect(events[0].attendees?.map(\.email) == ["alice@example.com"])
+        #expect(events[0].attendees?.map(\.responseStatus) == ["accepted"])
+    }
+
+    @Test("the series is read when a changed occurrence comes before it in the resource")
+    func masterReadWhenOverrideComesFirst() {
+        let ics = [
+            "BEGIN:VCALENDAR",
+            "BEGIN:VEVENT", "UID:series-1", "RECURRENCE-ID:\(Self.pinStart.ics)",
+            "SUMMARY:Planning (moved)", "DESCRIPTION:Moved notes", "LOCATION:Room 9",
+            "DTSTART:\(Self.pinStart.ics)", "DURATION:PT2H",
+            "ATTENDEE;PARTSTAT=DECLINED:mailto:bob@example.com", "END:VEVENT",
+            "BEGIN:VEVENT", "UID:series-1", "SUMMARY:Planning", "DESCRIPTION:Agenda", "LOCATION:Room 1",
+            "DTSTART:\(Self.pinStart.ics)", "DURATION:PT1H", "RRULE:FREQ=WEEKLY",
+            "ATTENDEE;PARTSTAT=ACCEPTED:mailto:alice@example.com", "END:VEVENT",
+            "END:VCALENDAR",
+        ].joined(separator: "\r\n")
+        let events = ICSParser.parse(icsText: ics, resourceHref: "/cal/x.ics", etag: nil)
+        #expect(events.count == 1)
+        guard events.count == 1 else { return }
+        #expect(events[0].summary == "Planning")
+        #expect(events[0].description == "Agenda")
+        #expect(events[0].location == "Room 1")
+        #expect(events[0].recurrence == ["RRULE:FREQ=WEEKLY"])
+        #expect(events[0].attendees?.map(\.email) == ["alice@example.com"])
+    }
+
+    @Test("a component opened and closed in lower case ends there: the event's later properties are read")
+    func lowercaseNestedComponentEnds() {
+        let ics = [
+            "BEGIN:VCALENDAR", "BEGIN:VEVENT", "UID:series-1", "SUMMARY:Planning",
+            "DTSTART:\(Self.pinStart.ics)",
+            "begin:valarm", "ACTION:AUDIO", "TRIGGER:-PT15M", "end:valarm",
+            "LOCATION:Room 1", "DESCRIPTION:Agenda", "DURATION:PT1H",
+            "END:VEVENT", "END:VCALENDAR",
+        ].joined(separator: "\r\n")
+        let events = ICSParser.parse(icsText: ics, resourceHref: "/cal/x.ics", etag: nil)
+        #expect(events.count == 1)
+        guard events.count == 1 else { return }
+        #expect(events[0].summary == "Planning")
+        #expect(events[0].location == "Room 1")
+        #expect(events[0].description == "Agenda")
+        #expect(events[0].start?.dateTime == Self.pinStart.iso)
+        #expect(events[0].end != nil)
+    }
 }

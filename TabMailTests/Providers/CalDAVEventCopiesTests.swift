@@ -138,9 +138,10 @@ private enum Fixture {
 
     static func split(_ ics: String, slot: String = "2099-05-20T17:00:00", patch: GCalEventInput,
                       newRRule: String = "RRULE:FREQ=WEEKLY;UNTIL=20991230T170000Z",
+                      cappedRRule: String = "RRULE:FREQ=WEEKLY;UNTIL=20990520T165959Z",
                       now: Date = Date()) throws -> CalDAVProvider.SeriesSplitResources {
         try CalDAVProvider.seriesSplitResources(
-            storedICS: ics, slotNaiveISO: slot, cappedRRule: "RRULE:FREQ=WEEKLY;UNTIL=20990520T165959Z",
+            storedICS: ics, slotNaiveISO: slot, cappedRRule: cappedRRule,
             newRRule: newRRule, newUid: "series-1-split", patch: patch, now: now)
     }
 
@@ -314,6 +315,63 @@ struct CalDAVEventCopiesTests {
         let (moved, _) = try kind.copy(of: ics, patch: Fixture.patch(start: "2099-05-20T18:00:00Z"))
         #expect(moved.contains("DTSTART:20990520T180000Z"))
         #expect(moved.contains("DURATION:PT1H") && !moved.contains { $0.hasPrefix("DTEND") }, Comment(rawValue: moved.joined(separator: "\n")))
+    }
+
+    /// The edits of the issue's case that leave the notes alone: a rename, and a move in time.
+    enum NotesUntouchedEdit: String, CaseIterable, Sendable {
+        case rename = "a rename"
+        case move = "a move in time"
+    }
+
+    @Test("a series with an alert and no notes, edited without its notes, gives a copy with no notes and the alert as stored",
+          arguments: CopyKind.allCases, NotesUntouchedEdit.allCases)
+    func alertOnlySeriesCopyHasNoNotes(_ kind: CopyKind, _ edit: NotesUntouchedEdit) throws {
+        // Dates relative to today: a weekly series from 17:00 UTC a week from now, changed at its
+        // third occurrence.
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = TimeZone(identifier: "UTC") ?? .current
+        let start = utc.startOfDay(for: Date().addingTimeInterval(7 * 86_400)).addingTimeInterval(17 * 3_600)
+        let slot = start.addingTimeInterval(14 * 86_400)
+        func format(_ date: Date, _ pattern: String) -> String {
+            let fmt = DateFormatter()
+            fmt.locale = Locale(identifier: "en_US_POSIX")
+            fmt.timeZone = utc.timeZone
+            fmt.dateFormat = pattern
+            return fmt.string(from: date)
+        }
+        let alarm = ["BEGIN:VALARM", "ACTION:DISPLAY", "DESCRIPTION:Reminder", "TRIGGER:-PT15M", "END:VALARM"]
+        let ics = Fixture.series([
+            "BEGIN:VEVENT", "UID:series-1", "DTSTAMP:\(Fixture.stamp(Date()))",
+            "DTSTART:\(Fixture.stamp(start))", "DTEND:\(Fixture.stamp(start.addingTimeInterval(45 * 60)))",
+            "RRULE:FREQ=WEEKLY", "SUMMARY:Sync",
+        ] + alarm + ["END:VEVENT"])
+        let patch: GCalEventInput
+        switch edit {
+        case .rename:
+            patch = Fixture.patch(summary: "Sync, moved room")
+        case .move:
+            let moved = slot.addingTimeInterval(3_600)
+            patch = Fixture.patch(start: format(moved, "yyyy-MM-dd'T'HH:mm:ss'Z'"),
+                                  end: format(moved.addingTimeInterval(45 * 60), "yyyy-MM-dd'T'HH:mm:ss'Z'"))
+        }
+        let naiveSlot = format(slot, "yyyy-MM-dd'T'HH:mm:ss")
+        let resource: String
+        let block: [String]
+        switch kind {
+        case .occurrenceOverride:
+            resource = try Fixture.overrideEdit(ics, recurrenceId: naiveSlot, patch: patch)
+            block = try #require(VEventOracle.overrides(resource).first, "no override was written:\n\(resource)")
+        case .splitNewPart:
+            resource = try Fixture.split(
+                ics, slot: naiveSlot, patch: patch, newRRule: "RRULE:FREQ=WEEKLY",
+                cappedRRule: "RRULE:FREQ=WEEKLY;UNTIL=\(Fixture.stamp(slot.addingTimeInterval(-1)))").newPart
+            block = try #require(VEventOracle.master(resource), "the new part has no VEVENT:\n\(resource)")
+        }
+        let text = block.joined(separator: "\n")
+        // Non-vacuity: the copy is the series' event, carrying its own title or the new one.
+        #expect(!VEventOracle.own(block, "SUMMARY").isEmpty, Comment(rawValue: text))
+        #expect(VEventOracle.own(block, "DESCRIPTION").isEmpty, "the \(kind.rawValue) has notes:\n\(text)")
+        #expect(VEventOracle.alarms(block) == [alarm.joined(separator: "\r\n")], "the alert changed:\n\(text)")
     }
 }
 

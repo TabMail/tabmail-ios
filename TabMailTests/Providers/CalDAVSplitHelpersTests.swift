@@ -585,6 +585,129 @@ struct CalDAVRecurringHelpersTests {
         """.replacingOccurrences(of: "\n", with: "\r\n")
         #expect(try CalDAVProvider.extractMasterDuration(from: ics) == nil)
     }
+
+    @Test("the series' UID, rule and start are read from the series alone, in every resource layout",
+          arguments: MasterReadFixture.Frame.allCases, MasterReadFixture.Layout.allCases)
+    func masterReadersReadTheSeriesOwnLines(_ frame: MasterReadFixture.Frame, _ layout: MasterReadFixture.Layout) throws {
+        let ics = MasterReadFixture.resource(frame, layout)
+        #expect(CalDAVProvider.extractUID(from: ics) == MasterReadFixture.uid)
+        #expect(CalDAVProvider.extractRRule(from: ics) == MasterReadFixture.rrule)
+        #expect(CalDAVProvider.masterDTStartDay(from: ics) == MasterReadFixture.startDay)
+        #expect(CalDAVProvider.icsIsAllDay(ics) == (frame == .allDay))
+        #expect(CalDAVProvider.masterDTStartKind(from: ics) == frame.kind)
+        #expect(try CalDAVProvider.masterStartWallTime(in: ics) == MasterReadFixture.wallTime(frame))
+    }
+}
+
+/// A resource whose series is preceded by everything a reader of the series must skip: a
+/// VTIMEZONE with its own `DTSTART` and `RRULE` (zoned series), and a changed occurrence with its
+/// own `UID` line and a `DTSTART` on another day. The series' alarm comes after its properties
+/// (RFC 5545 order) and carries its own `UID` (RFC 9074). Dates are relative to today.
+enum MasterReadFixture {
+    static let uid = "series-603"
+    static let rrule = "RRULE:FREQ=WEEKLY;INTERVAL=1;BYDAY=MO,WE,FR"
+
+    enum Frame: String, CaseIterable, Sendable {
+        case allDay, utc, floating, zoned
+
+        var kind: CalDAVProvider.MasterDTStartKind {
+            switch self {
+            case .allDay: return .allDay
+            case .utc: return .utc
+            case .floating: return .floating
+            case .zoned: return .zoned("America/New_York")
+            }
+        }
+    }
+
+    enum Layout: String, CaseIterable, Sendable {
+        /// CRLF line endings.
+        case crlf
+        /// Bare LF line endings.
+        case bareLF
+        /// CRLF, with the series' UID, rule and start folded across lines.
+        case folded
+        /// The series' alarm opened and closed in lower case.
+        case lowercaseAlarm
+    }
+
+    private static let utcZone = TimeZone(identifier: "UTC") ?? .current
+
+    /// The series' first day: two weeks from today.
+    static let startDate: Date = {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = utcZone
+        return cal.startOfDay(for: Date().addingTimeInterval(14 * 86_400))
+    }()
+
+    static var startDay: RecurrenceTail.Day? {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = utcZone
+        let parts = cal.dateComponents([.year, .month, .day], from: startDate)
+        guard let year = parts.year, let month = parts.month, let day = parts.day else { return nil }
+        return RecurrenceTail.Day(year: year, month: month, day: day)
+    }
+
+    private static func compact(_ date: Date, time: String?) -> String {
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.timeZone = utcZone
+        fmt.dateFormat = "yyyyMMdd"
+        return fmt.string(from: date) + (time.map { "T\($0)" } ?? "")
+    }
+
+    /// The series' `DTSTART` line, 17:00 on its first day in a timed frame.
+    static func dtstart(_ frame: Frame, day: Date = startDate) -> String {
+        switch frame {
+        case .allDay: return "DTSTART;VALUE=DATE:\(compact(day, time: nil))"
+        case .utc: return "DTSTART:\(compact(day, time: "170000"))Z"
+        case .floating: return "DTSTART:\(compact(day, time: "170000"))"
+        case .zoned: return "DTSTART;TZID=America/New_York:\(compact(day, time: "170000"))"
+        }
+    }
+
+    /// The wall clock the series' start names: its first day at 00:00 (all-day) or 17:00, as
+    /// seconds from 1970 read as if UTC.
+    static func wallTime(_ frame: Frame) -> CalDAVProvider.ICSWallTime {
+        let seconds = Int(startDate.timeIntervalSince1970) + (frame == .allDay ? 0 : 17 * 3_600)
+        return CalDAVProvider.ICSWallTime(frame: frame.kind, wall: seconds)
+    }
+
+    /// `line` split after `at` characters into a folded continuation.
+    private static func fold(_ line: String, at: Int) -> [String] {
+        [String(line.prefix(at)), " " + String(line.dropFirst(at))]
+    }
+
+    static func resource(_ frame: Frame, _ layout: Layout) -> String {
+        var lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Example//Test//EN"]
+        if frame == .zoned {
+            lines += ["BEGIN:VTIMEZONE", "TZID:America/New_York",
+                      "BEGIN:DAYLIGHT", "DTSTART:20070311T020000", "RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU",
+                      "TZOFFSETFROM:-0500", "TZOFFSETTO:-0400", "END:DAYLIGHT",
+                      "BEGIN:STANDARD", "DTSTART:20071104T020000", "RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU",
+                      "TZOFFSETFROM:-0400", "TZOFFSETTO:-0500", "END:STANDARD", "END:VTIMEZONE"]
+        }
+        let changedDay = startDate.addingTimeInterval(2 * 86_400)
+        let recurrenceId = dtstart(frame, day: changedDay).replacingOccurrences(of: "DTSTART", with: "RECURRENCE-ID")
+        lines += ["BEGIN:VEVENT", "UID:\(uid)", recurrenceId,
+                  dtstart(frame, day: changedDay.addingTimeInterval(86_400)), "SUMMARY:Planning (moved)", "END:VEVENT"]
+
+        let folds = layout == .folded
+        lines += ["BEGIN:VEVENT"]
+        lines += folds ? fold("UID:\(uid)", at: 7) : ["UID:\(uid)"]
+        lines += ["DTSTAMP:\(compact(Date(), time: "000000"))Z"]
+        lines += folds ? fold(dtstart(frame), at: 12) : [dtstart(frame)]
+        lines += frame == .allDay ? ["DURATION:P1D"] : ["DURATION:PT1H"]
+        lines += folds ? fold(rrule, at: 20) : [rrule]
+        lines += ["SUMMARY:Planning"]
+        let alarm = ["BEGIN:VALARM", "UID:alarm-of-\(uid)", "ACTION:DISPLAY", "DESCRIPTION:Reminder",
+                     "TRIGGER:-PT15M", "END:VALARM"]
+        lines += layout == .lowercaseAlarm
+            ? alarm.map { $0.hasPrefix("BEGIN:") || $0.hasPrefix("END:") ? $0.lowercased() : $0 }
+            : alarm
+        lines += ["END:VEVENT", "END:VCALENDAR"]
+        return lines.joined(separator: layout == .bareLF ? "\n" : "\r\n") + (layout == .bareLF ? "\n" : "\r\n")
+    }
 }
 
 // MARK: - mergePatchIntoICS
