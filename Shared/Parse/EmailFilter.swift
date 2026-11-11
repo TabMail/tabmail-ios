@@ -769,6 +769,8 @@ enum EmailFilter {
         #"\n\s*From:\s*.+?\n\s*(?:Sent|Date):\s*.+?\n\s*To:\s*.+?\n"#,
         // Outlook short: From:/Sent:
         #"\n\s*From:\s*.+?\n\s*(?:Sent|Date):\s*.+?\n"#,
+        // Japanese Outlook: 差出人 (From) / 送信 or 送信日時 (Sent), ASCII or full-width colon
+        "\\n\\s*\u{5DEE}\u{51FA}\u{4EBA}\\s*[:\u{FF1A}]\\s*.+?\\n\\s*\u{9001}\u{4FE1}(?:\u{65E5}\u{6642})?\\s*[:\u{FF1A}]\\s*.+?\\n",
         // Thunderbird forward
         #"\n\s*-{4,}\s*Forwarded Message\s*-{4,}\s*\n"#,
         // Generic forward/original message
