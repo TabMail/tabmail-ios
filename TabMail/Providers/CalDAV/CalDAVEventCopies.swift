@@ -169,8 +169,8 @@ extension CalDAVProvider {
     /// The override VEVENT the resource already holds for the occurrence `recurrenceIdNaive` names
     /// (its `RECURRENCE-ID` matches in the series' frame), or nil when the occurrence has no changes
     /// of its own. `occurrenceStartDay` (the check of an end given alone) and
-    /// `occurrenceOverrideResource` (the write) both find the occurrence here, so the start the
-    /// check compares with is the start the write keeps.
+    /// `occurrenceOverrideResource` (the write, which copies the block found here) both use it, so
+    /// the start the check compares with is the start the write keeps.
     private static func existingOverride(in units: [ICSUnit], recurrenceIdNaive: String, kind: MasterDTStartKind) -> [ICSUnit]? {
         veventBlocks(units).first { block in
             guard let rid = topLevel(block).first(where: { icsProperty($0.text)?.name == "RECURRENCE-ID" }),
