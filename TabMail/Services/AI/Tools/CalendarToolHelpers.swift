@@ -25,10 +25,12 @@ enum CalendarToolHelpers {
     /// Resolve the `timezone` argument for a WRITE: the zone the argument names, or the device's zone
     /// when there is none. A zone the resolver does not recognize is refused (`notSupported`, naming
     /// the zone) instead of being replaced by the device's zone, which would write every time in the
-    /// edit at the wrong instant. `consequence` says what was therefore not done.
-    static func resolveWriteTimeZone(_ arguments: [String: JSONValue], consequence: String) throws -> TimeZone {
+    /// edit at the wrong instant. `consequence` says what was therefore not done; `remedy`, when
+    /// given, replaces the default advice that follows it.
+    static func resolveWriteTimeZone(_ arguments: [String: JSONValue], consequence: String, remedy: String? = nil) throws -> TimeZone {
         guard let tzId = stringArgOpt(arguments, "timezone"), !tzId.isEmpty else { return .current }
         guard let tz = CalendarTimeZoneResolver.zone(named: tzId, in: .none) else {
+            if let remedy { throw CalendarProviderError.unrecognizedTimeZone(tzId, consequence: consequence, remedy: remedy) }
             throw CalendarProviderError.unrecognizedTimeZone(tzId, consequence: consequence)
         }
         return tz

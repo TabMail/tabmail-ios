@@ -99,18 +99,26 @@ the popover line pinned by `popoverLineUnchanged`).
 
 **The delete card also serves `calendar_event_edit`'s `exdates_add` (#694, 2026-11-11).** Before
 #694 no iOS code read `exdates_add`: the edit wrote an unchanged series (or nothing) and answered
-"updated successfully". Now (`CalendarEventEditExdates`) it is a call of its own (any other change in
-the call, or an `edit_scope` other than "all", is refused by name, telling the assistant to send that
-change as a second call); every date is looked up before the card against the SERIES (also when
+"updated successfully". Now (`CalendarEventEditExdates`) it is a call of its own: any argument outside
+an allow-list (`event_id`, `calendar_id`, `exdates_add`, `timezone`, `send_invitations`, and `edit_scope`
+only as "all") is refused by name, failing closed for keys outside the schema too, and the refusal tells
+the assistant to send the other change FIRST as its own call, then read the event again and send
+`exdates_add` alone, naming the occurrences by their starts as they are then. **The order matters:** on
+Google and Outlook a change to the series (its times, its rule, a split) brings back occurrences deleted
+before it (`editResetsChangedOccurrences`, measured 2026-11-10); CalDAV moves its `EXDATE`s with
+`DTSTART`. Every date is looked up before the card against the SERIES (also when
 `event_id` names an occurrence) in the call's `timezone`, through `CalendarProvider.occurrence` only (a
 date alone on a timed series names the one occurrence that day; none there, already deleted, ambiguous
 or malformed refuses the whole call, nothing queued); the card is the delete card, one row per
 occurrence with `occurrenceDeleteNote`; the same occurrences are queued as ordinary `.delete` ops in ONE
 write (`AccountManager.queueCalendarOperations`, all or none; the executor is unchanged, so guests are
 notified as every delete notifies them and CalDAV goes through #661's `EXDATE` write); the answer names
-each date deleted, queued or NOT deleted with its reason, never "updated". A CalDAV resource holding
-only changed occurrences is refused by the lookup before the card. Two dates naming one occurrence
-delete it once. Pinned by `CalendarEditExdatesTests` (Google, Outlook, CalDAV fakes).
+each date beside the start of the occurrence it named (so a date that resolved to another occurrence
+shows), deleted, queued or NOT deleted with its reason, never "updated". A CalDAV resource holding
+only changed occurrences is refused by the lookup before the card; a one-off event, and an occurrence
+id equal to the series' own, are refused locally. Two dates naming one occurrence delete it once (one
+card row, one delete, both dates named). Pinned by `CalendarEditExdatesTests` (Google, Outlook, CalDAV
+fakes; the refused keys are pinned against a copy of the published schema's properties).
 
 ## Pinned by
 

@@ -22,10 +22,14 @@ import GRDB
 // - a date-only value on a timed series names the one occurrence that day;
 // - a date that names no occurrence, an already deleted one, an ambiguous or a malformed one
 //   refuses the WHOLE call: no card, nothing queued, nothing written;
-// - exdates_add combined with any other change is refused by name;
+// - exdates_add with any other argument (every schema change field, and keys outside the schema)
+//   is refused by name, telling the assistant to send the other change FIRST and exdates_add after
+//   a fresh read; a one-off event is refused; a declined card deletes nothing;
 // - the card is the delete card, one row per occurrence, the shared occurrence line;
 // - the deletes are queued in ONE write, all or none;
-// - the result names each date; a delete that fails after the card is named with its reason;
+// - the card shows each occurrence's own start; two dates naming one occurrence delete it once;
+// - the result names each date beside the occurrence it named; a delete that fails after the card
+//   is named with its reason, one that fails for a passing reason is named queued;
 // - Google deletes notify guests as every iOS delete does (`sendUpdates=all`);
 // - CalDAV goes through #661's EXDATE write, and refuses a resource holding only changed
 //   occurrences before the card.
@@ -44,24 +48,50 @@ private func day(_ offset: Int) -> String {
 
 private func compact(_ day: String) -> String { day.replacingOccurrences(of: "-", with: "") }
 
+/// The instant `time` UTC on `day`.
+private func instant(_ day: String, _ time: String = "09:00:00") -> Date {
+    ISO8601DateFormatter().date(from: "\(day)T\(time)Z")!
+}
+
 /// The words no exdates_add answer may carry: the edit tool's success for a change it did not make.
 private let updatedWord = "updated"
 /// What every refusal of an exdates_add call says.
 private let nothingDeleted = "Nothing was deleted"
+/// A combined call's refusal: the other change goes FIRST (a series change on Google and Outlook
+/// brings back occurrences deleted before it), then exdates_add alone, after a fresh read.
+private let otherChangeFirst = "First send the other change as its own calendar_event_edit call, without exdates_add"
+private let exdatesAfterARead = "Then read the event again and call calendar_event_edit with only event_id and exdates_add"
+
+/// The refusal sends the other change first and exdates_add after a fresh read, in that order.
+private func expectOtherChangeFirst(_ out: String, sourceLocation: SourceLocation = #_sourceLocation) {
+    let first = out.range(of: otherChangeFirst), then = out.range(of: exdatesAfterARead)
+    #expect(first != nil && then != nil && first!.lowerBound < then!.lowerBound,
+            "the refusal does not send the other change first and exdates_add after a fresh read: \(out)",
+            sourceLocation: sourceLocation)
+}
+
+/// The answer's line for `date`: the date, the start of the occurrence it named, and what happened.
+private func answerLine(_ out: String, date: String) -> String? {
+    out.components(separatedBy: "\n").first { $0.hasPrefix("- \(date) (occurrence starting ") }
+}
 
 // MARK: - Running the tool
 
-/// Confirms every card and keeps it; runs `beforeConfirming`, when given, after the card is shown
-/// and before it is confirmed (another client's change in between).
+/// Answers every card (`confirm`: confirms, else declines) and keeps it; runs `beforeConfirming`,
+/// when given, after the card is shown and before it is answered (another client's change in between).
 @MainActor
 private final class KeepingSink: AgentUISink {
     var confirmations: [AgentToolRouter.ActionConfirmation] = []
+    private let confirm: Bool
     private let beforeConfirming: (@Sendable () -> Void)?
-    nonisolated init(beforeConfirming: (@Sendable () -> Void)? = nil) { self.beforeConfirming = beforeConfirming }
+    nonisolated init(confirm: Bool = true, beforeConfirming: (@Sendable () -> Void)? = nil) {
+        self.confirm = confirm
+        self.beforeConfirming = beforeConfirming
+    }
     func deliverConfirmation(_ confirmation: AgentToolRouter.ActionConfirmation) {
         confirmations.append(confirmation)
         beforeConfirming?()
-        confirmation.onRespond(true)
+        confirmation.onRespond(confirm)
     }
 }
 
@@ -79,6 +109,7 @@ private func run(
     _ arguments: [String: JSONValue], eventId: String, account: String, provider: any CalendarProvider,
     accountProvider: AccountProvider = .gmail,
     prepare: (@Sendable (Database) throws -> Void)? = nil,
+    confirm: Bool = true,
     beforeConfirming: (@Sendable () -> Void)? = nil
 ) async throws -> Run {
     let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -103,7 +134,7 @@ private func run(
     }
     var args = arguments
     args["event_id"] = .string(CompoundEventId.make(accountId: account, eventId: eventId))
-    let sink = KeepingSink(beforeConfirming: beforeConfirming)
+    let sink = KeepingSink(confirm: confirm, beforeConfirming: beforeConfirming)
     let out: String
     do {
         out = try await CalendarEventEditTool(context: ToolContext(db: try TestDatabase.make(), translator: MockChatIdTranslator()))
@@ -138,8 +169,9 @@ private func expectRefused(_ r: Run, writes: [String], naming words: [String] = 
 }
 
 /// What a call that deleted `ids` leaves: one delete card row per occurrence, with the occurrence
-/// line, the answer naming each date deleted, and nothing left queued.
-private func expectDeleted(_ r: Run, ids: [String], dates: [String],
+/// line and (for each id in `starts`) that occurrence's own start, the answer naming each date
+/// deleted beside the start of the occurrence it named, and nothing left queued.
+private func expectDeleted(_ r: Run, ids: [String], dates: [String], starts: [String: Date] = [:],
                            sourceLocation: SourceLocation = #_sourceLocation) {
     #expect(r.actions == [.calendarEventDelete], "expected one delete card: \(r.actions); \(r.out)", sourceLocation: sourceLocation)
     #expect(Set(r.cards.map(\.eventId)) == Set(ids) && r.cards.count == ids.count,
@@ -148,8 +180,14 @@ private func expectDeleted(_ r: Run, ids: [String], dates: [String],
             "a card row does not carry the occurrence line: \(r.cards.map(\.changes))", sourceLocation: sourceLocation)
     #expect(r.failureReasons.allSatisfy { $0 == nil }, "the card shows a failure: \(r.failureReasons)", sourceLocation: sourceLocation)
     #expect(!r.out.contains(updatedWord), "the answer says \"updated\": \(r.out)", sourceLocation: sourceLocation)
+    for card in r.cards {
+        guard let start = starts[card.eventId] else { continue }
+        #expect(card.startDate == start, "the card row for \(card.eventId) shows \(card.startDate), not its occurrence's start \(start)",
+                sourceLocation: sourceLocation)
+    }
     for date in dates {
-        #expect(r.out.contains("- \(date): deleted"), "the answer does not name \(date) deleted: \(r.out)", sourceLocation: sourceLocation)
+        #expect(answerLine(r.out, date: date)?.hasSuffix("): deleted") == true,
+                "the answer does not name \(date) deleted: \(r.out)", sourceLocation: sourceLocation)
     }
     #expect(r.queued.isEmpty, "rows left: \(r.queued.map { "\($0.status) \($0.failureReason ?? "")" })", sourceLocation: sourceLocation)
 }
@@ -180,7 +218,7 @@ private enum GoogleWeekly {
 private func google(
     _ arguments: [String: JSONValue], eventId: String = GoogleWeekly.id, account: String,
     seed: [[String: Any]] = GoogleWeekly.calendar, prepare: (@Sendable (Database) throws -> Void)? = nil,
-    beforeConfirming: (@Sendable (FakeGoogleCalendar) -> Void)? = nil
+    confirm: Bool = true, beforeConfirming: (@Sendable (FakeGoogleCalendar) -> Void)? = nil
 ) async throws -> (calendar: FakeGoogleCalendar, run: Run) {
     let http = FakeHTTP.Scenario()
     defer { http.close() }
@@ -189,7 +227,7 @@ private func google(
     let provider = GoogleCalendarProvider(accessToken: { _ in "test-token" }, session: http.session)
     let hook = beforeConfirming.map { hook in { @Sendable in hook(calendar) } }
     let r = try await run(arguments, eventId: eventId, account: account, provider: provider,
-                          prepare: prepare, beforeConfirming: hook)
+                          prepare: prepare, confirm: confirm, beforeConfirming: hook)
     return (calendar, r)
 }
 
@@ -210,7 +248,45 @@ struct CalendarEditExdatesGoogleTests {
         }
         #expect(g.calendar.event(GoogleWeekly.instanceId(day(0)))?["status"] as? String == "confirmed", "another occurrence was deleted")
         #expect(g.calendar.deleteSendUpdates == ["all", "all"], "guests were not notified as every delete notifies them: \(g.calendar.deleteSendUpdates)")
-        expectDeleted(g.run, ids: ids, dates: dates)
+        // Each row shows its own occurrence's start, never the series' (day 0).
+        expectDeleted(g.run, ids: ids, dates: dates, starts: [ids[0]: instant(day(7)), ids[1]: instant(day(14))])
+    }
+
+    @Test("a declined card deletes nothing: the card was shown, nothing is queued or written, and the answer says cancelled")
+    func declinedCardDeletesNothing() async throws {
+        let g = try await google([
+            "exdates_add": .array([.string("\(day(7))T09:00:00"), .string("\(day(14))T09:00:00")]), "timezone": .string("UTC"),
+        ], account: "exdates-g-declined", confirm: false)
+        #expect(g.run.actions == [.calendarEventDelete] && g.run.cards.count == 2, "the card was not shown: \(g.run.actions); \(g.run.out)")
+        #expect(g.run.queued.isEmpty, "rows were queued: \(g.run.queued.map(\.operationType))")
+        #expect(g.calendar.writes.isEmpty, "the calendar was written: \(g.calendar.writes)")
+        #expect(g.run.out.contains("cancelled"), "the answer does not say cancelled: \(g.run.out)")
+        #expect(!g.run.out.contains(updatedWord) && !g.run.out.contains("deleted successfully"), "\(g.run.out)")
+    }
+
+    @Test("two dates naming one occurrence give one card row and one delete, and both dates are named deleted")
+    func twoDatesNamingOneOccurrenceDeleteItOnce() async throws {
+        let dates = [day(7), "\(day(7))T09:00:00"]
+        let id = GoogleWeekly.instanceId(day(7))
+        let g = try await google([
+            "exdates_add": .array(dates.map { .string($0) }), "timezone": .string("UTC"),
+        ], account: "exdates-g-same-occurrence")
+        #expect(g.calendar.writes == ["DELETE \(id)"], "writes: \(g.calendar.writes); \(g.run.out)")
+        expectDeleted(g.run, ids: [id], dates: dates, starts: [id: instant(day(7))])
+    }
+
+    @Test("a one-off event is refused: it has no occurrences to delete, no card, nothing queued or written")
+    func oneOffEventIsRefused() async throws {
+        let oneOff: [String: Any] = [
+            "id": "one-off", "summary": "Lunch", "status": "confirmed",
+            "start": ["dateTime": "\(day(7))T12:00:00Z", "timeZone": "UTC"],
+            "end": ["dateTime": "\(day(7))T13:00:00Z", "timeZone": "UTC"],
+        ]
+        let g = try await google([
+            "exdates_add": .array([.string("\(day(7))T12:00:00")]), "timezone": .string("UTC"),
+        ], eventId: "one-off", account: "exdates-g-one-off", seed: [oneOff])
+        expectRefused(g.run, writes: g.calendar.writes, naming: ["does not repeat"])
+        #expect(g.calendar.event("one-off") != nil, "the event was deleted")
     }
 
     @Test("an occurrence's own id given with another occurrence's date deletes that other occurrence: the date is looked up against the series")
@@ -230,6 +306,8 @@ struct CalendarEditExdatesGoogleTests {
         ], account: "exdates-g-date-only")
         #expect(g.calendar.writes == ["DELETE \(GoogleWeekly.instanceId(day(7)))"], "writes: \(g.calendar.writes); \(g.run.out)")
         expectDeleted(g.run, ids: [GoogleWeekly.instanceId(day(7))], dates: [day(7)])
+        // The line names the occurrence the date resolved to, beside the date as given.
+        #expect(answerLine(g.run.out, date: day(7)) == "- \(day(7)) (occurrence starting \(day(7))T09:00:00): deleted", "\(g.run.out)")
     }
 
     @Test("the dates are read in the call's timezone")
@@ -269,17 +347,53 @@ struct CalendarEditExdatesGoogleTests {
         expectRefused(g.run, writes: g.calendar.writes, naming: [bad.date])
     }
 
-    @Test("exdates_add with any other change is refused by name, telling the assistant to send the other change as a second call",
-          arguments: [
-            ["title": JSONValue.string("Team standup")],
-            ["edit_scope": .string("this_only"), "recurrence_id": .string("2099-01-05T09:00:00")],
-            ["add_attendees": .array([.dictionary(["email": .string("new@example.com")])])],
-          ])
-    func combinedCallIsRefused(other: [String: JSONValue]) async throws {
-        var arguments: [String: JSONValue] = ["exdates_add": .array([.string("\(day(7))T09:00:00")]), "timezone": .string("UTC")]
-        arguments.merge(other) { $1 }
-        let g = try await google(arguments, account: "exdates-g-combined-\(other.keys.sorted().joined())")
-        expectRefused(g.run, writes: g.calendar.writes, naming: other.keys.sorted() + ["second calendar_event_edit call"])
+    /// The published `calendar_event_edit` schema's properties (the backend's
+    /// `calendar_event_edit-v1.5.21.json`, the same in v1.11.2), copied here so this list is
+    /// independent of the code under test. A property added to the schema must be classified here.
+    static let schemaProperties = [
+        "add_attendees", "all_day", "calendar_id", "description", "edit_scope", "end_iso", "event_id",
+        "exdates_add", "location", "recurrence", "recurrence_id", "remove_attendees", "send_invitations",
+        "start_iso", "timezone", "title", "transparency",
+    ]
+    /// What an exdates_add call may carry (edit_scope only as "all", tested on its own below).
+    static let allowedWithExdates: Set<String> = ["calendar_id", "edit_scope", "event_id", "exdates_add", "send_invitations", "timezone"]
+    /// Every schema property that is a change, and one key outside the schema the edit path applies.
+    static let refusedKeys = schemaProperties.filter { !allowedWithExdates.contains($0) } + ["attendees"]
+    static let refusedKeyCount = 12
+
+    /// A value of the shape each key takes.
+    static func value(for key: String) -> JSONValue {
+        switch key {
+        case "all_day": return .bool(true)
+        case "add_attendees", "attendees": return .array([.dictionary(["email": .string("new@example.com")])])
+        case "remove_attendees": return .array([.string("guest@example.com")])
+        case "recurrence": return .dictionary(["freq": .string("DAILY")])
+        case "recurrence_id": return .string("\(day(7))T09:00:00")
+        case "start_iso": return .string("\(day(7))T10:00:00")
+        case "end_iso": return .string("\(day(7))T10:30:00")
+        default: return .string("Team standup")
+        }
+    }
+
+    @Test("exdates_add with any other argument is refused by name, telling the assistant to send the other change FIRST and exdates_add after a fresh read",
+          arguments: 0..<refusedKeyCount)
+    func combinedCallIsRefused(index: Int) async throws {
+        #expect(Self.refusedKeys.count == Self.refusedKeyCount, "classify the schema's properties: \(Self.refusedKeys)")
+        let key = Self.refusedKeys[index]
+        let g = try await google([
+            "exdates_add": .array([.string("\(day(7))T09:00:00")]), "timezone": .string("UTC"), key: Self.value(for: key),
+        ], account: "exdates-g-combined-\(key)")
+        expectRefused(g.run, writes: g.calendar.writes, naming: [key])
+        expectOtherChangeFirst(g.run.out)
+    }
+
+    @Test("exdates_add with an edit_scope other than \"all\" is refused by name, the other change first")
+    func scopeOtherThanAllIsRefused() async throws {
+        let g = try await google([
+            "exdates_add": .array([.string("\(day(7))T09:00:00")]), "timezone": .string("UTC"), "edit_scope": .string("this_only"),
+        ], account: "exdates-g-combined-scope")
+        expectRefused(g.run, writes: g.calendar.writes, naming: ["edit_scope"])
+        expectOtherChangeFirst(g.run.out)
     }
 
     @Test("the deletes are queued all or none: when the second row can't be written, nothing is queued and nothing deleted")
@@ -309,8 +423,8 @@ struct CalendarEditExdatesGoogleTests {
             calendar.remove(GoogleWeekly.instanceId(day(14)))
         })
         #expect(g.calendar.writes == ["DELETE \(GoogleWeekly.instanceId(day(7)))"], "writes: \(g.calendar.writes)")
-        #expect(g.run.out.contains("- \(kept): deleted"), "\(g.run.out)")
-        #expect(g.run.out.contains("- \(gone): NOT deleted"), "\(g.run.out)")
+        #expect(answerLine(g.run.out, date: kept)?.hasSuffix("): deleted") == true, "\(g.run.out)")
+        #expect(answerLine(g.run.out, date: gone)?.contains("): NOT deleted") == true, "\(g.run.out)")
         #expect(!g.run.out.contains("deleted successfully") && !g.run.out.contains(updatedWord), "\(g.run.out)")
         #expect(g.run.failureReasons.count == 1 && g.run.failureReasons.first??.contains(gone) == true,
                 "the card does not name the date that failed: \(g.run.failureReasons)")
@@ -350,11 +464,11 @@ private enum GraphWeekly {
     }
 }
 
-private func outlook(_ arguments: [String: JSONValue], eventId: String = "ser-1", account: String)
+private func outlook(_ arguments: [String: JSONValue], eventId: String = "ser-1", account: String,
+                     graph: FakeGraphCalendar = GraphWeekly.calendar())
     async throws -> (calendar: FakeGraphCalendar, run: Run) {
     let http = FakeHTTP.Scenario()
     defer { http.close() }
-    let graph = GraphWeekly.calendar()
     graph.install(on: http)
     let provider = ExchangeCalendarProvider(mailbox: "calendar@example.com", accessToken: { _ in "test-token" },
                                             session: http.session)
@@ -375,7 +489,33 @@ struct CalendarEditExdatesOutlookTests {
                 "deleted: \(o.calendar.deleted); \(o.run.out)")
         #expect(o.calendar.event("ser-1") != nil, "the series was deleted")
         #expect(o.calendar.patches("ser-1").isEmpty, "the series was written: \(o.calendar.patches("ser-1"))")
-        expectDeleted(o.run, ids: [GraphWeekly.first, GraphWeekly.later], dates: dates)
+        expectDeleted(o.run, ids: [GraphWeekly.first, GraphWeekly.later], dates: dates,
+                      starts: [GraphWeekly.first: GraphFixture.start, GraphWeekly.later: GraphFixture.occurrenceStart])
+    }
+
+    @Test("a one-off event is refused: it has no occurrences to delete, no card, nothing deleted")
+    func oneOffEventIsRefused() async throws {
+        let graph = FakeGraphCalendar([GraphWeekly.onDevice(GraphFixture.event(id: "one-off"), start: GraphFixture.start)])
+        let o = try await outlook([
+            "exdates_add": .array([.string(GraphFixture.naive(GraphFixture.start))]), "timezone": .string("UTC"),
+        ], eventId: "one-off", account: "exdates-o-one-off", graph: graph)
+        expectRefused(o.run, writes: o.calendar.deleted + o.calendar.patches("one-off").map { "\($0)" }, naming: ["does not repeat"])
+        #expect(o.calendar.event("one-off") != nil, "the event was deleted")
+    }
+
+    @Test("a delete that fails for a passing reason is reported queued, never deleted or failed")
+    func transientFailureIsReportedQueued() async throws {
+        let graph = GraphWeekly.calendar()
+        graph.failNext("DELETE", with: 500)
+        let date = GraphFixture.naive(GraphFixture.occurrenceStart)
+        let o = try await outlook([
+            "exdates_add": .array([.string(date)]), "timezone": .string("UTC"),
+        ], account: "exdates-o-transient", graph: graph)
+        #expect(answerLine(o.run.out, date: date)?.hasSuffix("): queued, will be deleted shortly") == true, "\(o.run.out)")
+        #expect(o.run.out.hasPrefix("Occurrence deletion queued successfully."), "\(o.run.out)")
+        #expect(!o.run.out.contains("deleted successfully") && !o.run.out.contains("NOT deleted") && !o.run.out.contains(updatedWord),
+                "\(o.run.out)")
+        #expect(o.run.failureReasons.allSatisfy { $0 == nil }, "the card shows a failure: \(o.run.failureReasons)")
     }
 
     @Test("an occurrence's own id given with another occurrence's date deletes that other occurrence")
@@ -403,8 +543,8 @@ struct CalendarEditExdatesOutlookTests {
             "exdates_add": .array([.string(GraphFixture.naive(GraphFixture.occurrenceStart))]), "timezone": .string("UTC"),
             "title": .string("Team planning"),
         ], account: "exdates-o-combined")
-        expectRefused(o.run, writes: o.calendar.deleted + o.calendar.patches("ser-1").map { "\($0)" },
-                      naming: ["title", "second calendar_event_edit call"])
+        expectRefused(o.run, writes: o.calendar.deleted + o.calendar.patches("ser-1").map { "\($0)" }, naming: ["title"])
+        expectOtherChangeFirst(o.run.out)
     }
 }
 
@@ -464,7 +604,8 @@ struct CalendarEditExdatesCalDAVTests {
         }
         #expect(lines.filter { !exdates.contains($0) }.joined(separator: "\r\n") == fixture.ics,
                 "the rest of the series changed on the wire: \(stored)")
-        expectDeleted(r, ids: [try fixture.occurrenceId(2), try fixture.occurrenceId(3)], dates: dates)
+        expectDeleted(r, ids: [try fixture.occurrenceId(2), try fixture.occurrenceId(3)], dates: dates,
+                      starts: [try fixture.occurrenceId(2): try fixture.occurrence(2), try fixture.occurrenceId(3): try fixture.occurrence(3)])
     }
 
     @Test("an occurrence's own id given with another occurrence's date excludes that other occurrence")

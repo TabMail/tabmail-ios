@@ -9,8 +9,10 @@ import Foundation
 /// by the id the provider's own lookup gives it, so it reaches the same write as
 /// `calendar_event_delete` given that occurrence's id (CalDAV: the `EXDATE` write, #661).
 ///
-/// - `exdates_add` is a call of its own: any other change in the same call is refused by name,
-///   before anything is read, and the assistant is told to send that change as a second call.
+/// - `exdates_add` is a call of its own: any argument outside `allowedKeys` is refused by name,
+///   before anything is read, and the assistant is told to send that change FIRST, then read the
+///   event again and send `exdates_add` alone (a series change on Google and Outlook brings back
+///   occurrences deleted before it).
 /// - Every date is looked up before the card, against the series (also when `event_id` names one
 ///   of its occurrences), read in the call's `timezone`, through `CalendarProvider.occurrence`
 ///   only. A date that names no occurrence (none there, or already deleted or cancelled), an
@@ -18,7 +20,8 @@ import Foundation
 /// - The card is the delete card: one row per occurrence, each with `occurrenceDeleteNote`.
 /// - The occurrences the card shows are the ones queued, one delete each, in ONE write
 ///   (`AccountManager.queueCalendarOperations`): all or nothing. Nothing is looked up again.
-/// - The result names each date, deleted, queued or failed with the reason; never "updated".
+/// - The result names each date beside the start of the occurrence it named, deleted, queued or
+///   failed with the reason; never "updated". An occurrence id equal to the series' is refused.
 /// - Deletes notify guests as every iOS calendar delete does (`sendUpdates` "all", in the queue).
 enum CalendarEventEditExdates {
 
@@ -26,11 +29,21 @@ enum CalendarEventEditExdates {
     /// done: the wait every calendar tool gives one write (`awaitCalendarOpOutcome`).
     static let outcomeWaitSeconds: Double = 10
 
-    /// The edit arguments that change the event. `edit_scope` is one too, unless it is "all".
-    static let changeKeys = [
-        "title", "start_iso", "end_iso", "all_day", "location", "description", "transparency",
-        "add_attendees", "remove_attendees", "recurrence", "recurrence_id",
+    /// The only arguments an `exdates_add` call may carry. Any other key, in the schema or not, is a
+    /// change this path would not make, so it is refused by name (fails closed). `edit_scope` is
+    /// allowed only when it is "all" (`isAllScope`).
+    static let allowedKeys: Set<String> = [
+        "event_id", "calendar_id", "exdates_add", "timezone", "send_invitations", "edit_scope",
     ]
+
+    /// Whether `edit_scope` is absent, null or "all": the default, which changes nothing here.
+    private static func isAllScope(_ value: JSONValue?) -> Bool {
+        switch value {
+        case .none, .null?: return true
+        case .string(let scope)?: return scope.lowercased() == "all"
+        default: return false
+        }
+    }
 
     /// Whether the call asks to remove occurrences.
     static func isRequested(_ arguments: [String: JSONValue]) -> Bool {
@@ -53,16 +66,17 @@ enum CalendarEventEditExdates {
         case refused(String)
     }
 
-    /// The call's own checks: `exdates_add` alone (no other change), a non-empty list of dates
-    /// (strings), and a `timezone` TabMail recognizes.
+    /// The call's own checks: `exdates_add` alone (no other argument outside `allowedKeys`), a
+    /// non-empty list of dates (strings), and a `timezone` TabMail recognizes.
     static func check(_ arguments: [String: JSONValue], compoundId: String) -> Checked {
-        var others = changeKeys.filter { given(arguments[$0]) }
-        if let scope = CalendarToolHelpers.stringArgOpt(arguments, "edit_scope"), scope.lowercased() != "all" {
-            others.append("edit_scope")
-        }
+        var others = arguments.keys.filter { !allowedKeys.contains($0) }.sorted()
+        if !isAllScope(arguments["edit_scope"]) { others.append("edit_scope") }
+        // The other change goes FIRST: on Google and Outlook a change to the series (its times, its
+        // rule, a split) brings back occurrences deleted before it, so the deletes come after it,
+        // named by the occurrences' starts as they are then.
         guard others.isEmpty else {
             return .refused(refusal(
-                "exdates_add deletes occurrences and must be sent on its own, but this call also sets \(others.joined(separator: ", ")). The event was NOT changed. Nothing was deleted. Call calendar_event_edit with only event_id and exdates_add (and timezone) to delete the occurrences, then send the other change as a second calendar_event_edit call",
+                "exdates_add deletes occurrences and must be sent on its own, but this call also sets \(others.joined(separator: ", ")). The event was NOT changed. Nothing was deleted. First send the other change as its own calendar_event_edit call, without exdates_add. Then read the event again and call calendar_event_edit with only event_id and exdates_add (and timezone), naming the occurrences by their start_iso as they are then",
                 compoundId: compoundId))
         }
         guard case .array(let items) = arguments["exdates_add"], !items.isEmpty else {
@@ -82,17 +96,24 @@ enum CalendarEventEditExdates {
         }
         // A zone TabMail does not recognize is refused, never read as the device's zone (which
         // would name other occurrences), as every calendar write refuses it.
-        guard let name = CalendarToolHelpers.stringArgOpt(arguments, "timezone"), !name.isEmpty else {
-            return .dates(dates, zone: .current)
+        do {
+            let zone = try CalendarToolHelpers.resolveWriteTimeZone(
+                arguments, consequence: "it did not delete any occurrence",
+                remedy: "Nothing was deleted. Name the zone by its IANA name (e.g. 'America/Los_Angeles') and call calendar_event_edit again")
+            return .dates(dates, zone: zone)
+        } catch CalendarProviderError.notSupported(let reason) {
+            return .refused(refusal(reason, compoundId: compoundId))
+        } catch {
+            return .refused(refusal("\(error.localizedDescription). Nothing was deleted", compoundId: compoundId))
         }
-        guard let zone = CalendarTimeZoneResolver.zone(named: name, in: .none) else {
-            switch CalendarProviderError.unrecognizedTimeZone(
-                name, consequence: "it did not delete any occurrence",
-                remedy: "Nothing was deleted. Name the zone by its IANA name (e.g. 'America/Los_Angeles') and call calendar_event_edit again") {
-            case .notSupported(let reason): return .refused(refusal(reason, compoundId: compoundId))
-            }
-        }
-        return .dates(dates, zone: zone)
+    }
+
+    /// An occurrence's start as the read tools show it (`formatDetailedEvent`'s `start_iso`): an
+    /// all-day date as its own date, a timed start in the call's zone.
+    private static func startISO(_ event: GCalEvent, zone: TimeZone) -> String {
+        if event.isAllDay, let day = event.start?.date { return CalendarToolHelpers.allDayNaiveISO(day) }
+        guard let start = event.startDate else { return "(start unknown)" }
+        return EKEventStoreHelper.toNaiveISO(start, timeZone: zone)
     }
 
     private static func refusal(_ reason: String, compoundId: String) -> String {
@@ -156,7 +177,8 @@ enum CalendarEventEditExdates {
                     "could not look up the occurrence at exdates_add '\(date)' (\(error.localizedDescription)). Nothing was deleted",
                     compoundId: target.compoundId)
             }
-            guard let id = occurrence.id, !id.isEmpty else {
+            // An id of its own, never the series': a delete by the series' id removes every occurrence.
+            guard let id = occurrence.id, !id.isEmpty, id != seriesId else {
                 return refusal(
                     "the occurrence at exdates_add '\(date)' has no id of its own, so it can't be deleted alone. Nothing was deleted",
                     compoundId: target.compoundId)
@@ -222,22 +244,25 @@ enum CalendarEventEditExdates {
         for entry in occurrences {
             await translator.evictEventDetail(realId: CompoundEventId.make(accountId: target.accountId, eventId: entry.id))
         }
-        let opByOccurrence = Dictionary(uniqueKeysWithValues: ops.compactMap { op in op.eventId.map { ($0, op.id) } })
 
         var lines: [String] = []
         var failures: [String] = []
         var allDeleted = true
         for entry in found {
-            let outcome = opByOccurrence[entry.id].flatMap { outcomes[$0] } ?? .timedOut
+            // `ops` is built from `occurrences`, index for index.
+            let opId = occurrences.firstIndex { $0.id == entry.id }.map { ops[$0].id }
+            let outcome = opId.flatMap { outcomes[$0] } ?? .timedOut
+            // Each date beside the start of the occurrence it named, so a mismatch is visible.
+            let named = "- \(entry.date) (occurrence starting \(startISO(entry.occurrence, zone: zone)))"
             switch outcome {
             case .success:
-                lines.append("- \(entry.date): deleted")
+                lines.append("\(named): deleted")
             case .permanentFailure(let reason):
-                lines.append("- \(entry.date): NOT deleted (\(reason))")
+                lines.append("\(named): NOT deleted (\(reason))")
                 failures.append("\(entry.date): \(reason)")
                 allDeleted = false
             case .stillQueued, .timedOut:
-                lines.append("- \(entry.date): queued, will be deleted shortly")
+                lines.append("\(named): queued, will be deleted shortly")
                 allDeleted = false
             }
         }
