@@ -181,6 +181,18 @@ alert's recipient as an attendee; notes "added to" overwrote the event's own wit
   `END:VEVENT`); `ICSParserTests.lowercaseAlarmIsNotTheEvents`; `TESTS.md`, "Repeating events —
   copies keep the series' properties".
 
+**Amendment (2026-11-11, #711, ADR-IOS-109): the organizer moved from the override copy to the
+PUT.** `occurrenceOverrideResource` used to give an override with guests and no organizer the
+series' organizer, and nothing else wrote one. That rule is deleted. Every CalDAV PUT (create,
+whole-event edit, one-occurrence edit, both PUTs of a split) now goes through
+`CalDAVProvider.putEvent`, which runs `organized(_:own:)` on the final body: a VEVENT with its own
+ATTENDEE and no ORGANIZER takes the resource's own organizer (the series', else the first
+override's, copied byte for byte), else the address the server advertises in
+`calendar-user-address-set` (only for a resource with a series VEVENT), else none. The copies above
+are unchanged otherwise. Tests: `CalDAVOrganizerTests`, `CalDAVOrganizerStepTests`; the old pin
+`CalDAVOccurrenceOverrideTests.overrideGetsOrganizer` moved to the wire as
+`CalDAVOrganizerTests` test 3b.
+
 ## Google attendee edits (#564)
 
 The same attendee rule holds for an ordinary Google edit. Google stores the attendee list it is

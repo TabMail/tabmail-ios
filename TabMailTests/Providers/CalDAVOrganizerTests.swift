@@ -226,7 +226,9 @@ final class FakeCalDAVPrincipal: Sendable {
         if body.contains("calendar-user-address-set") {
             addressSetCount.withLock { $0 += 1 }
             if let addressSetAnswer { return addressSetAnswer }
-            guard request.url.path == Self.principalPath else { return .status(404) }
+            // `URL.path` drops a trailing slash; the components keep the path as sent.
+            let path = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?.path
+            guard path == Self.principalPath else { return .status(404) }
             guard let advertised else {
                 return Self.multistatus(path: request.url.path, prop: "<c:calendar-user-address-set/>", status: "404 Not Found")
             }
@@ -661,4 +663,157 @@ private final class LostFirstResponse: Sendable {
     }
 
     var storedAfterFirst: String? { state.withLock { $0.stored } }
+}
+
+// MARK: - The organizer step, the chooser and the PUT fence
+
+/// The pure step every CalDAV PUT runs (`CalDAVProvider.organized`), the address chooser
+/// (`organizerHref`), and the fence that keeps every PUT going through `putEvent`.
+@Suite("CalDAV organizer step")
+struct CalDAVOrganizerStepTests {
+
+    private static func ics(_ lines: [String]) -> String {
+        (["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Example//EN"] + lines + ["END:VCALENDAR"])
+            .joined(separator: "\r\n") + "\r\n"
+    }
+
+    private static let series = [
+        "BEGIN:VEVENT", "UID:step-1", "DTSTART:20990506T170000Z", "DURATION:PT1H",
+        "RRULE:FREQ=WEEKLY", "SUMMARY:Sync",
+        "ATTENDEE;CN=Guest:mailto:guest@example.com", "END:VEVENT",
+    ]
+
+    private static func override(_ extra: [String]) -> [String] {
+        ["BEGIN:VEVENT", "UID:step-1", "RECURRENCE-ID:20990520T170000Z",
+         "DTSTART:20990520T170000Z", "DURATION:PT1H", "SUMMARY:Sync"] + extra + ["END:VEVENT"]
+    }
+
+    private static func lines(_ text: String) -> [String] {
+        text.components(separatedBy: "\r\n")
+    }
+
+    @Test("a body that needs no organizer is returned byte for byte", arguments: [
+        // Organizer already there.
+        ["BEGIN:VEVENT", "UID:step-1", "DTSTART:20990506T170000Z", "DURATION:PT1H", "SUMMARY:Sync",
+         "ORGANIZER:mailto:other@example.com", "ATTENDEE:mailto:guest@example.com", "END:VEVENT"],
+        // No guests.
+        ["BEGIN:VEVENT", "UID:step-1", "DTSTART:20990506T170000Z", "DURATION:PT1H", "SUMMARY:Sync", "END:VEVENT"],
+        // An EMAIL alarm's attendee is the alarm's.
+        ["BEGIN:VEVENT", "UID:step-1", "DTSTART:20990506T170000Z", "DURATION:PT1H", "SUMMARY:Sync",
+         "BEGIN:VALARM", "ACTION:EMAIL", "TRIGGER:-PT15M", "SUMMARY:Soon", "DESCRIPTION:Soon",
+         "ATTENDEE:mailto:guest@example.com", "END:VALARM", "END:VEVENT"],
+    ])
+    func untouched(_ vevent: [String]) {
+        let body = Self.ics(vevent)
+        #expect(CalDAVProvider.organized(body, own: "mailto:user@example.com") == body)
+        #expect(!CalDAVProvider.needsOwnAddress(body))
+    }
+
+    @Test("the own address goes in right after UID, and nothing else changes")
+    func ownAfterUID() throws {
+        let body = Self.ics(Self.series)
+        #expect(CalDAVProvider.needsOwnAddress(body))
+        let out = Self.lines(CalDAVProvider.organized(body, own: "mailto:user@example.com"))
+        var expected = Self.lines(body)
+        let uid = try #require(expected.firstIndex(of: "UID:step-1"))
+        expected.insert("ORGANIZER:mailto:user@example.com", at: uid + 1)
+        #expect(out == expected)
+    }
+
+    @Test("with no own address and nothing to copy, nothing is written")
+    func noAddressNoOrganizer() {
+        let body = Self.ics(Self.series)
+        #expect(CalDAVProvider.organized(body, own: nil) == body)
+    }
+
+    @Test("an override takes the series' folded organizer, every physical line, ahead of its own guest")
+    func foldedCopy() throws {
+        let organizer = ["ORGANIZER;CN=\"Olivia Organizer of the Weekly Sync\";SENT-BY=\"mailto:as", " sistant@example.com\":mailto:olivia@example.com"]
+        var seriesLines = Self.series
+        seriesLines.insert(contentsOf: organizer, at: 2)
+        let body = Self.ics(seriesLines + Self.override(["ATTENDEE:mailto:guest@example.com"]))
+        #expect(!CalDAVProvider.needsOwnAddress(body))
+        let out = Self.lines(CalDAVProvider.organized(body, own: "mailto:user@example.com"))
+        let overrideStart = try #require(out.lastIndex(of: "BEGIN:VEVENT"))
+        let overrideLines = Array(out[overrideStart...])
+        #expect(overrideLines.contains("RECURRENCE-ID:20990520T170000Z"))
+        let at = try #require(overrideLines.firstIndex(of: organizer[0]))
+        let guest = try #require(overrideLines.firstIndex(of: "ATTENDEE:mailto:guest@example.com"))
+        guard overrideLines.count > at + 1 else { return }
+        #expect(overrideLines[at + 1] == organizer[1])
+        #expect(at < guest)
+        #expect(!out.contains("ORGANIZER:mailto:user@example.com"))
+    }
+
+    @Test("a series without an organizer takes its override's")
+    func seriesTakesOverrides() {
+        let body = Self.ics(Self.series + Self.override(["ORGANIZER:mailto:other@example.com", "ATTENDEE:mailto:guest@example.com"]))
+        #expect(!CalDAVProvider.needsOwnAddress(body))
+        let out = CalDAVProvider.organized(body, own: "mailto:user@example.com")
+        #expect(Self.lines(out).filter { $0 == "ORGANIZER:mailto:other@example.com" }.count == 2)
+        #expect(!out.contains("user@example.com"))
+    }
+
+    @Test("a resource of changed occurrences only never gets the account's address")
+    func overridesOnly() {
+        let body = Self.ics(Self.override(["ATTENDEE:mailto:guest@example.com"]))
+        #expect(!CalDAVProvider.needsOwnAddress(body))
+        #expect(CalDAVProvider.organized(body, own: "mailto:user@example.com") == body)
+    }
+
+    @Test("the step is idempotent")
+    func idempotent() {
+        for body in [Self.ics(Self.series), Self.ics(Self.series + Self.override(["ATTENDEE:mailto:guest@example.com"]))] {
+            let once = CalDAVProvider.organized(body, own: "mailto:user@example.com")
+            #expect(CalDAVProvider.organized(once, own: "mailto:alias@example.com") == once)
+            #expect(!CalDAVProvider.needsOwnAddress(once))
+        }
+    }
+
+    @Test("the chooser", arguments: [
+        (["urn:uuid:0711", "mailto:alias@example.com", "mailto:User@Example.com", "/principals/user/"],
+         "user@example.com", Optional("mailto:User@Example.com")),
+        (["mailto:alias@example.com", "mailto:second@example.com"], "user@example.com", Optional("mailto:alias@example.com")),
+        (["urn:uuid:0711", "/principals/user/", "mailto:"], "user@example.com", nil),
+        ([], "user@example.com", nil),
+        (["mailto:intruder@example.com\r\nATTENDEE:mailto:x@example.com", "mailto:alias@example.com"],
+         "intruder@example.com", Optional("mailto:alias@example.com")),
+        (["MAILTO:user@example.com"], "user", Optional("MAILTO:user@example.com")),
+    ])
+    func chooser(_ advertised: [String], _ signIn: String, _ expected: String?) {
+        #expect(CalDAVProvider.organizerHref(advertised: advertised, signIn: signIn) == expected)
+    }
+
+    @Test("every CalDAV PUT goes through putEvent: one client.put call site")
+    func onePutCallSite() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()   // Providers
+            .deletingLastPathComponent()   // TabMailTests
+            .deletingLastPathComponent()   // repository root
+        // `CalDAVClient.put(url:body:precondition:)`, whatever the receiver is called and however
+        // the call is wrapped.
+        let call = try NSRegularExpression(pattern: #"\.put\(\s*(url\s*:|$)"#)
+        var sites: [String] = []
+        var scanned = 0
+        for directory in ["TabMail", "Shared", "TabMailNotificationService"] {
+            let base = root.appendingPathComponent(directory)
+            guard let files = FileManager.default.enumerator(at: base, includingPropertiesForKeys: nil) else { continue }
+            for case let url as URL in files where url.pathExtension == "swift" {
+                scanned += 1
+                let source = try String(contentsOf: url, encoding: .utf8)
+                for (number, line) in source.components(separatedBy: "\n").enumerated() {
+                    let code = line.components(separatedBy: "//").first ?? line
+                    let range = NSRange(code.startIndex..., in: code)
+                    if call.firstMatch(in: code, range: range) != nil { sites.append("\(url.lastPathComponent):\(number + 1)") }
+                }
+            }
+        }
+        #expect(scanned > 100, "the scan found the sources")
+        #expect(sites.count == 1 && sites.first?.hasPrefix("CalDAVProvider.swift:") == true, Comment(rawValue: sites.joined(separator: ", ")))
+        let provider = try String(contentsOf: root.appendingPathComponent("TabMail/Providers/CalDAV/CalDAVProvider.swift"), encoding: .utf8)
+        let putEvent = try #require(provider.range(of: "private func putEvent("))
+        let put = try #require(provider.range(of: "client.put("))
+        let body = provider[putEvent.upperBound..<put.lowerBound]
+        #expect(body.contains("withOrganizer(") && !body.contains("\n    }\n"), "client.put is called inside putEvent, after the organizer step")
+    }
 }

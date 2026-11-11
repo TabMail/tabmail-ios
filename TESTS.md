@@ -970,3 +970,31 @@ naming the field and the value, with nothing sent.
 - `RecurrenceDaysToolTests`: the cards name the days; every invalid field, and an invalid `until`
   on Google, Outlook and CalDAV, is refused before both cards with nothing sent; a rule Outlook
   can't hold is refused before both cards.
+
+## CalDAV organizer — every event with guests names its organizer
+
+`TabMailTests/Providers/CalDAVOrganizerTests.swift` pins ADR-IOS-109 (#711): every CalDAV PUT runs
+one organizer step, so a VEVENT with its own attendees is written with an organizer whenever the
+resource names one or the server advertises the user's address, and never with a guessed one.
+
+- `CalDAVOrganizerTests`: the real calendar queue against `FakeCalDAVStore` in its iCloud-like mode
+  (a VEVENT with attendees and no organizer is refused with 403, `refusesAttendeesWithoutOrganizer`)
+  and `FakeCalDAVPrincipal` (`calendar-user-address-set`, configurable or absent). The invariant is
+  checked on the stored resource: a create, a first guest on the whole series, on one occurrence and
+  on a split, and a title-only split of a series whose stored guests have no organizer all land with
+  the advertised address; an existing organizer stays byte for byte (a folded one too) and is copied
+  to the VEVENT that needs it, with no lookup; the sign-in is written only when advertised, in the
+  server's spelling, else the first advertised `mailto:`; nothing advertised writes nothing (a
+  lenient server stores it, a refusing one retires the edit with the 403 reason and no change); a
+  lookup 503 or transport error writes nothing and leaves the edit queued; a lookup 404 is never
+  "event not found"; no guests, or only an alarm's recipient, makes no lookup; a resource of someone
+  else's changed occurrences never gets the account's address; the address set is read once per
+  provider; an advertised href with a line break is skipped; a replay after a lost PUT response
+  leaves the server unchanged.
+- `CalDAVOrganizerStepTests`: the pure step (`organized`) returns a body that needs nothing byte for
+  byte, inserts after `UID`, copies every physical line of a folded organizer, reads only a VEVENT's
+  own properties, never gives an override-only resource the own address, and is idempotent; the
+  chooser (`organizerHref`); and a source fence: one `CalDAVClient.put` call site, inside `putEvent`
+  after the organizer step.
+- `MultistatusParserTests.parsePropertyWithSeveralHrefs`: a property with several hrefs gives every
+  one, in order (`propertyHrefs`); `properties` is unchanged.

@@ -91,6 +91,11 @@ of the resource, which holds every occurrence (irreversible wire operation #5, n
      §3.8.4.4 writes every `RECURRENCE-ID` of one event in the same value type and zone), adds no
      VEVENT, and adds no organizer, having no series to copy one from. The resource's own id, which
      names no series, and every split are refused.
+     **Amendment (2026-11-11, ADR-IOS-109, #711):** "adds no organizer" becomes "adds only an
+     organizer the resource already names". Every CalDAV PUT now runs one organizer step
+     (`CalDAVProvider.putEvent`): a changed occurrence with guests and no organizer takes one that
+     another VEVENT of the resource names. Such a resource never gets the account's own address,
+     which would forge the meeting's identity (ADR-IOS-052).
    - Delete: `deleteEvent` by an occurrence id is REFUSED before any request ("Deleting one
      occurrence of a repeating CalDAV event is not supported yet, so nothing was deleted. The user can
      delete it in their calendar app."). The queue retires it as unsupported and the card and the
