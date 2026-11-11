@@ -234,13 +234,19 @@ stored instances. `drainEdit(..., drains:)` drains once per attempt.
 6. A retried edit whose first response was lost can report "not found" after the change applied (the
    #683 class): a first-occurrence date shift. A split interrupted after its cap is finished by its retry
    (`isOwnSplitCap`), except an Outlook split queued with an occurrence id, whose id Graph no longer has
-   after the cap (as on `main`).
+   after the cap (as on `main`; limit 10).
 7. Graph's series start can fall before the series' first occurrence. First or later is judged against
    the series' start (`firstPlace`), so a date move named from the real first occurrence is taken as a
    later one and becomes a split there.
 8. A split of a CalDAV resource that holds only changed occurrences is refused after its card, at the
    drain, as on `main` (its lookup no longer takes the split's scope): refused at the write, nothing
    written.
+9. An Outlook all-day series with no recurrence zone name is refused by the occurrence lookup, nothing
+   written. Expected unreachable: Graph reads a range written without a zone back labelled UTC
+   (measured 2026-11-07).
+10. An Outlook "this and following" split queued with an occurrence's own id and interrupted after its
+    cap is retired as not found on retry, as on `main`: Graph no longer has that occurrence once the
+    series is capped. #601 (create the new part first) closes it in the same release.
 
 ## Superseded (rebuilt from main, 2026-11-10)
 
