@@ -978,8 +978,18 @@ enum CalendarToolHelpers {
     /// or on `this_only` the day the occurrence starts on now (`occurrenceStartDay`), which differs
     /// when the occurrence was moved on its own and which the caller reads when
     /// `needsOccurrenceStartDay` says the rule depends on it.
+    ///
+    /// First, a stated `all_day` of the other kind than the stored event's, with neither `start_iso`
+    /// nor `end_iso`, is refused: the patch carries the kind only in its start and end, so no
+    /// provider would change anything and the edit would report success with the event as it was.
+    /// Only a known stored kind is compared; with `storedStart` nil (the queue made no read) this
+    /// check does not guess.
     static func allDayEditRefusal(_ arguments: [String: JSONValue], storedStart: GCalDateTime?, scope: String, recurrenceId: String?, occurrenceStartDay: String? = nil) -> String? {
         let stated = boolArg(arguments, "all_day")
+        if let stated, let storedStart, stated != (storedStart.date != nil),
+           stringArgOpt(arguments, "start_iso") == nil, stringArgOpt(arguments, "end_iso") == nil {
+            return allDayKindChangeNeedsTimesRefusal
+        }
         guard stated ?? (storedStart?.date != nil) else { return nil }
         if stated == nil, let reason = allDayEditTimeRefusal(arguments) { return reason }
         let targetStartDate: String?
@@ -1015,6 +1025,10 @@ enum CalendarToolHelpers {
         guard times.contains(where: namesTimeOfDay) else { return nil }
         return "this is an all-day event, and the edit gives a time of day without all_day. Ask the user whether it should stay all-day (dates only, with end_iso the day after its last day) or \(allDayOrTimedQuestion)"
     }
+
+    /// Why an edit that states `all_day` of the other kind, with no start or end, cannot be written.
+    private static let allDayKindChangeNeedsTimesRefusal =
+        "to change this event between all-day and timed, give its new start_iso and end_iso as well as all_day (for all-day, start_iso is the first day and end_iso the day after the last day), then retry. If you are not sure of the times or dates, ask the user"
 
     /// The second half of both all-day refusals: the timed alternative the assistant offers the user.
     private static let allDayOrTimedQuestion =

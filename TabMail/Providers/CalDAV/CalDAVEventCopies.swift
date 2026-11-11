@@ -292,8 +292,7 @@ extension CalDAVProvider {
     /// Apply the user's patch to a copy (`mergePatchIntoICS` on the resource's series VEVENT). The
     /// copy stays in its own zone, so the patch's zones are dropped (`Date.fromISO8601` has already
     /// resolved its times). A new start with no end keeps the copy's `length`; an end replaces a
-    /// `DURATION`, since RFC 5545 forbids both in one VEVENT. An all-day copy takes the date of a
-    /// start or end the patch gives as a date-time.
+    /// `DURATION`, since RFC 5545 forbids both in one VEVENT.
     private static func mergePatchKeepingLength(
         _ patch: GCalEventInput, into ics: String, length: TimeInterval, zones: CalendarTimeZoneContext
     ) throws -> String {
@@ -303,10 +302,6 @@ extension CalDAVProvider {
         var base = ics
         let hasDuration = masterTopLevelLines(ics).contains { icsProperty($0)?.name == "DURATION" }
         if case .allDay = masterDTStartKind(from: ics) {
-            effective.startDate = effective.startDate ?? effective.startDateTime.map { String($0.prefix(10)) }
-            effective.endDate = effective.endDate ?? effective.endDateTime.map { String($0.prefix(10)) }
-            effective.startDateTime = nil
-            effective.endDateTime = nil
             if effective.endDate != nil {
                 if hasDuration { base = removeFromMasterVEvent(in: base, propertyKey: "DURATION") }
             } else if let start = effective.startDate, !hasDuration {

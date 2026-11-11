@@ -458,7 +458,7 @@ struct CalDAVOccurrenceOverrideTests {
         #expect(block.contains(dtstart), Comment(rawValue: block.joined(separator: "\n")))
     }
 
-    @Test("an occurrence moved takes the series' value type for its new times")
+    @Test("an occurrence moved takes the series' value type for its new times; times on an all-day occurrence are refused")
     func movedOccurrenceTimes() throws {
         let zoned = Fixture.series([
             "BEGIN:VEVENT", "UID:series-5", "DTSTART;TZID=America/Vancouver:20990506T170000",
@@ -477,12 +477,20 @@ struct CalDAVOccurrenceOverrideTests {
         var byDate = GCalEventInput()
         byDate.startDate = "2099-05-21"
         byDate.endDate = "2099-05-22"
-        for patch in [byDate, Fixture.patch(start: "2099-05-21T09:30:00", end: "2099-05-22T09:30:00")] {
-            let out = try Fixture.overrideEdit(allDay, recurrenceId: "2099-05-20", patch: patch)
-            let block = try #require(Fixture.overrides(out).first)
-            #expect(block.contains("DTSTART;VALUE=DATE:20990521") && block.contains("DTEND;VALUE=DATE:20990522"),
-                    Comment(rawValue: block.joined(separator: "\n")))
-            #expect(!block.contains { $0.contains("T0930") }, "an all-day occurrence took a time")
+        let byDateOut = try Fixture.overrideEdit(allDay, recurrenceId: "2099-05-20", patch: byDate)
+        let byDateBlock = try #require(Fixture.overrides(byDateOut).first)
+        #expect(byDateBlock.contains("DTSTART;VALUE=DATE:20990521") && byDateBlock.contains("DTEND;VALUE=DATE:20990522"),
+                Comment(rawValue: byDateBlock.joined(separator: "\n")))
+        // Times on an all-day occurrence would make it timed, which a copy of the series never is:
+        // refused, never written as the dates with the times dropped.
+        #expect {
+            _ = try Fixture.overrideEdit(allDay, recurrenceId: "2099-05-20",
+                                         patch: Fixture.patch(start: "2099-05-21T09:30:00", end: "2099-05-22T09:30:00"))
+        } throws: { error in
+            if case CalendarProviderError.notSupported(let reason) = error {
+                return reason == CalDAVProvider.kindChangeOnRepeatingMessage
+            }
+            return false
         }
     }
 

@@ -197,6 +197,34 @@ user. A date at midnight (`…T00:00:00`, the read tools' shape for an all-day d
 (`namesTimeOfDay`). A stated `all_day` is still taken at its word (item 3): `true` keeps the date, `false`
 converts. The Thunderbird add-on refuses the same edit the same way.
 
+**CalDAV changes an event's kind since 2026-11-10; "not expressible through `CalDAVProvider.updateEvent`
+at all" above is kept as written and no longer holds.** A stated `all_day` that differs from the stored
+kind used to render a patch `formatDTLine` could not express in the stored kind, so `mergePatchIntoICS`
+left `DTSTART`/`DTEND` alone and the edit reported success with the event unchanged.
+`CalDAVProvider.kindToWrite` now decides the kind the merge writes. A whole event that does not repeat (no
+rule, no extra or excluded dates, no changed occurrence), given both a start and an end of the other kind,
+is rewritten in that kind: an all-day event becomes timed in UTC (the same instants, no VTIMEZONE needed),
+a timed one becomes all-day, and a `DURATION` goes. Everything else is refused (`notSupported`) before any
+write: a change of kind on a repeating event on any `edit_scope`, in both directions (the copies an
+occurrence edit and a split make never change kind, so times on an all-day series' occurrence or split are
+refused, before a split's create and cap), and a change that gives only one of start and end, or one that
+cannot be read in the new kind. The copies' merge (`mergePatchKeepingLength`) no longer turns the times a
+patch gives an all-day copy into their dates; that dropped the time, reported success, and for times on one
+day wrote an end equal to the start. Two cases that relied on it are now refused too, both recoverable with
+one edit that states `all_day` with dates: an all-day changed occurrence of a timed series, edited with
+`all_day` left out (read with the series' timed kind, #633), and residual 4's window on a copy. What
+repeats is read from the series as the writer sees it (`masterTopLevelLines`), so a VTIMEZONE's own rules
+never count. Google and Outlook convert in their own write and are unchanged.
+
+**A stated `all_day` of the other kind with no `start_iso` or `end_iso` is refused since 2026-11-10, on every
+provider (item 3 narrowed).** The patch carries the kind only in its start and end (`GCalEventInput` has no
+all-day field), so Google's merge kept the stored start and end, Outlook wrote `isAllDay` only with a start,
+and CalDAV kept the stored kind: each reported success with the event as it was. `allDayEditRefusal` now
+refuses it first, when the stored kind is known and differs from the stated one, telling the assistant to
+give the new `start_iso` and `end_iso` (for all-day, the first day and the day after the last) and to ask the
+user if unsure. The edit tool always has the stored event, so the refusal comes before its card. The queue
+reads no event for such an edit and so does not apply it; it does not guess the kind.
+
 **Also corrected at the code on 2026-08-12 (R3), recorded here because the argument is not needed at the
 call site.** `validatedRRuleUntil`'s note claimed the pre-fix alternative on the split path was "a capped
 master plus a failed successor create under a best-effort rollback, i.e. destroyed occurrences".

@@ -300,7 +300,7 @@ actor CalDAVProvider: CalendarProvider {
 
         // The stored resource's zone context, read once for every zone this write resolves.
         let zones = CalendarTimeZoneContext(calendarText: existingICS)
-        let mergedICS = try Self.mergePatchIntoICS(existingICS, patch: event, zones: zones)
+        let mergedICS = try Self.mergePatchIntoICS(existingICS, patch: event, zones: zones, mayChangeKind: true)
         // No ETag ⇒ `.unconditional`, NEVER `.ifNoneMatchAny`. The GET above
         // returned a non-empty body for this exact URL, so the resource
         // PROVABLY exists; `If-None-Match: *` asserts it does NOT, which
@@ -844,7 +844,14 @@ actor CalDAVProvider: CalendarProvider {
     /// `zones` is the zone context of the stored resource the write started from. Throws the
     /// zone-naming refusal when a start or end has to be worked out in a zone TabMail does not
     /// recognize.
-    static func mergePatchIntoICS(_ ics: String, patch: GCalEventInput, zones: CalendarTimeZoneContext) throws -> String {
+    ///
+    /// A patch whose start or end is of the other kind than the stored event's
+    /// (a time for an all-day event, a date for a timed one) is the user turning
+    /// the event into the other kind. It is either written in full or refused,
+    /// never dropped: see `kindToWrite`.
+    static func mergePatchIntoICS(
+        _ ics: String, patch: GCalEventInput, zones: CalendarTimeZoneContext, mayChangeKind: Bool = false
+    ) throws -> String {
         var result = ics
 
         if let summary = patch.summary, !summary.isEmpty {
@@ -892,10 +899,25 @@ actor CalDAVProvider: CalendarProvider {
             }
         }
         // DTSTART / DTEND — re-emit in the master's existing value type
-        // (all-day / zoned / utc / floating) so RFC 5545 §3.8.4.4 is preserved.
-        let kind = masterDTStartKind(from: result)
+        // (all-day / zoned / utc / floating) so RFC 5545 §3.8.4.4 is preserved,
+        // unless the patch turns the event into the other kind.
+        let storedKind = masterDTStartKind(from: result)
+        let kind = try kindToWrite(in: result, stored: storedKind, patch: patch, mayChangeKind: mayChangeKind)
         let patchedEnd = try formatDTLine(name: "DTEND", patch: patch, isStart: false, kind: kind, zones: zones)
-        if let dtstart = try formatDTLine(name: "DTSTART", patch: patch, isStart: true, kind: kind, zones: zones) {
+        if kind != storedKind {
+            // The event changes kind: both lines are written in the new kind (the
+            // end below), and a DURATION, which is in the old one, goes.
+            // `kindToWrite` allowed this only for an event that does not repeat, so
+            // nothing else is tied to the start. One line of each kind is not a
+            // valid event, so a start or end missing, or not readable in the new
+            // kind, refuses the edit.
+            guard let dtstart = try formatDTLine(name: "DTSTART", patch: patch, isStart: true, kind: kind, zones: zones),
+                  patchedEnd != nil else {
+                throw CalendarProviderError.notSupported(Self.kindChangeNeedsBothMessage)
+            }
+            result = removeFromMasterVEvent(in: result, propertyKey: "DURATION")
+            result = replaceOrAppendInMasterVEvent(in: result, propertyKey: "DTSTART", newLine: dtstart)
+        } else if let dtstart = try formatDTLine(name: "DTSTART", patch: patch, isStart: true, kind: kind, zones: zones) {
             let oldStart = try masterStartWallTime(in: result)
             result = replaceOrAppendInMasterVEvent(in: result, propertyKey: "DTSTART", newLine: dtstart)
             // Moving the start moves everything RFC 5545 ties to it. An RRULE
@@ -916,6 +938,44 @@ actor CalDAVProvider: CalendarProvider {
             result = replaceAttendeesInMasterVEvent(in: result, attendees: attendees)
         }
         return result
+    }
+
+    static let kindChangeNeedsBothMessage =
+        "To change this event between all-day and timed, give both its new start and its new end, each as a date or a date and time. Nothing was changed."
+    static let kindChangeOnRepeatingMessage =
+        "This edit gives the start or end as all-day where this event or occurrence is timed, or the other way round, and on this calendar TabMail can't change that for an event that repeats. Nothing was changed. If the user did not ask to change between all-day and timed, retry with all_day matching how this occurrence is shown; otherwise the user can change it in their calendar app."
+
+    /// The value type the merge writes `DTSTART` / `DTEND` in. It is the stored
+    /// event's, unless the patch gives a start or end of the other kind: a time
+    /// for an all-day event (the user is making it timed) or a date for a timed
+    /// one (making it all-day). `formatDTLine` cannot express such a value in
+    /// the stored kind, so writing in it would leave the event as it was while
+    /// the edit reported success.
+    ///
+    /// The change is made only on a whole event that does not repeat
+    /// (`mayChangeKind`, no rule, no extra or excluded dates, no changed
+    /// occurrence). The merge then writes both the start and the end in the new
+    /// kind, and refuses when the patch does not give both: one line of each
+    /// kind is not a valid event. Every other case throws before anything is
+    /// written. A newly timed event is written in UTC, which names the same
+    /// instants and needs no VTIMEZONE. The series is read as the writer sees
+    /// it (`masterTopLevelLines`), so the two never disagree on what repeats.
+    static func kindToWrite(
+        in ics: String, stored: MasterDTStartKind, patch: GCalEventInput, mayChangeKind: Bool
+    ) throws -> MasterDTStartKind {
+        let givesTime = patch.startDateTime != nil || patch.endDateTime != nil
+        let givesDate = patch.startDate != nil || patch.endDate != nil
+        let toTimed = stored == .allDay && givesTime
+        let toAllDay = stored != .allDay && givesDate
+        guard toTimed || toAllDay else { return stored }
+        let repeats = masterTopLevelLines(ics).contains { line in
+            guard let name = icsProperty(line)?.name else { return false }
+            return ["RRULE", "RDATE", "EXDATE"].contains(name)
+        } || icsUnits(ics).contains { icsProperty($0.text)?.name == "RECURRENCE-ID" }
+        guard mayChangeKind, !repeats else {
+            throw CalendarProviderError.notSupported(kindChangeOnRepeatingMessage)
+        }
+        return toTimed ? .utc : .allDay
     }
 
     /// Replace the MASTER VEVENT's own property named `propertyKey` (the first one, with its folded
