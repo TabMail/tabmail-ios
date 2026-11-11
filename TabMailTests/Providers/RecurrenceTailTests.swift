@@ -413,6 +413,22 @@ struct RecurrenceTailMissingMonthDayTests {
         #expect(days == measured, "measured: the leap day, then February 28 twice")
     }
 
+    @Test("Outlook: a monthly rule with no day of the month repeats the start's 31st on each shorter month's last day")
+    func outlookMonthlyFromTheStartDay() throws {
+        let y = Self.nextYear(leap: false)
+        let expected = try [Self.on(y, 1, 31), Self.on(y, 2, 28), Self.on(y, 3, 31), Self.on(y, 4, 30), Self.on(y, 5, 31), Self.on(y, 6, 30)]
+        let rule = try #require(RecurrenceTail.Rule("RRULE:FREQ=MONTHLY;WKST=SU", missingDay: .lastDay))
+        #expect(rule.days(from: expected[0], through: expected[5], maxSteps: 12) == expected)
+    }
+
+    @Test("Outlook: a yearly rule with no day of the month repeats the start's February 29 on February 28 in a common year")
+    func outlookYearlyFromTheStartDay() throws {
+        let leap = Self.nextYear(leap: true)
+        let expected = try [Self.on(leap, 2, 29), Self.on(leap + 1, 2, 28), Self.on(leap + 2, 2, 28), Self.on(leap + 3, 2, 28), Self.on(leap + 4, 2, 29)]
+        let rule = try #require(RecurrenceTail.Rule("RRULE:FREQ=YEARLY;WKST=SU", missingDay: .lastDay))
+        #expect(rule.days(from: expected[0], through: expected[4], maxSteps: 12) == expected)
+    }
+
     @Test("Outlook: a month-end occurrence counts toward the number, so a split after a short month leaves N less the ones before it")
     func outlookCountsTheMonthEnd() throws {
         let y = Self.nextYear(leap: false)
