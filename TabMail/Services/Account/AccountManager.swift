@@ -1661,7 +1661,27 @@ actor AccountManager {
                !tokens.accessToken.isEmpty, tokens.expiresAt.map({ $0 > Date().addingTimeInterval(60) }) ?? true {
                 return tokens.accessToken
             }
-            let token = try await coordinator.refresh(accountId: accountId, email: email, using: refresher)
+            let token: String
+            do {
+                token = try await coordinator.refresh(accountId: accountId, email: email, using: refresher)
+            } catch {
+                // Every Gmail API and Graph request (sync, queued actions, sends,
+                // connect, calendar) gets its token here, so this is where a
+                // revoked sign-in tells the user to sign in again (#534). Only
+                // the three grant-level codes the token endpoint itself returns
+                // count; a 5xx, an offline device, `temporarily_unavailable` or
+                // a body without an `error` field says nothing about the grant.
+                // A refusal of a sign-in the user has already replaced is not
+                // reported. The error is rethrown unchanged, so each caller
+                // keeps its own disposition: queued actions and sends are kept.
+                if case OAuthError.tokenExchangeFailed(let reason) = error,
+                   Self.isGrantLevelOAuthFailure(reason),
+                   !self.isRuntimeRemoved(accountId),
+                   store.activation(accountId: accountId)?.generation == generation {
+                    await self.markAuthFailed(accountId)
+                }
+                throw error
+            }
             guard !self.isRuntimeRemoved(accountId) else {
                 throw ProviderError.authenticationFailed
             }
