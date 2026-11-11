@@ -728,12 +728,16 @@ struct CalendarSeriesDayMoveTests {
 
 // MARK: - The edit tool
 
-/// Confirms every card and keeps what each showed.
+/// Confirms every card and keeps what each showed; runs `beforeConfirming`, when given, after the
+/// card is shown and before it is confirmed (another client's change in between).
 @MainActor
 private final class RecordingCardSink: AgentUISink {
     var cards: [AgentToolRouter.ActionConfirmation.CalendarEventDetail] = []
+    private let beforeConfirming: (@Sendable () -> Void)?
+    nonisolated init(beforeConfirming: (@Sendable () -> Void)? = nil) { self.beforeConfirming = beforeConfirming }
     func deliverConfirmation(_ confirmation: AgentToolRouter.ActionConfirmation) {
         cards.append(contentsOf: confirmation.calendarEvents)
+        beforeConfirming?()
         confirmation.onRespond(true)
     }
 }
@@ -749,7 +753,8 @@ private struct ToolRun {
 /// Runs `calendar_event_edit` for `eventId` on `account`, with `provider` registered for it and the
 /// app's database installed (the tool queues its edit there, and waits for the drain to write it).
 private func runTool(_ arguments: [String: JSONValue], eventId: String, account: String,
-                     provider: any CalendarProvider) async throws -> ToolRun {
+                     provider: any CalendarProvider,
+                     beforeConfirming: (@Sendable () -> Void)? = nil) async throws -> ToolRun {
     let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     var config = Configuration()
@@ -772,7 +777,7 @@ private func runTool(_ arguments: [String: JSONValue], eventId: String, account:
     let db = try TestDatabase.make()
     var args = arguments
     args["event_id"] = .string(CompoundEventId.make(accountId: account, eventId: eventId))
-    let sink = RecordingCardSink()
+    let sink = RecordingCardSink(beforeConfirming: beforeConfirming)
     let out: String
     var declined = false
     do {
@@ -787,14 +792,17 @@ private func runTool(_ arguments: [String: JSONValue], eventId: String, account:
 }
 
 private func googleTool(_ arguments: [String: JSONValue], eventId: String, account: String,
-                        rule: String = GoogleSeries.weekly, seed: [[String: Any]]? = nil)
+                        rule: String = GoogleSeries.weekly, seed: [[String: Any]]? = nil,
+                        beforeConfirming: (@Sendable (FakeGoogleCalendar) -> Void)? = nil)
     async throws -> (calendar: FakeGoogleCalendar, run: ToolRun) {
     let http = FakeHTTP.Scenario()
     defer { http.close() }
     let calendar = FakeGoogleCalendar(seed ?? GoogleSeries.calendar(rule: rule))
     calendar.install(on: http)
     let provider = GoogleCalendarProvider(accessToken: { _ in "test-token" }, session: http.session)
-    return (calendar, try await runTool(arguments, eventId: eventId, account: account, provider: provider))
+    let hook = beforeConfirming.map { hook in { @Sendable in hook(calendar) } }
+    return (calendar, try await runTool(arguments, eventId: eventId, account: account, provider: provider,
+                                        beforeConfirming: hook))
 }
 
 private func outlookTool(_ graph: FakeGraphCalendar, _ arguments: [String: JSONValue], eventId: String,
@@ -1748,6 +1756,74 @@ struct CalDAVSeriesScopeTests {
     }
 }
 
+// MARK: - An occurrence deleted after the card
+
+/// An occurrence deleted by another client after the card was shown is the provider's not-found at
+/// the drain: the row is retired as stale (`AccountManager.isCalendarNotFoundError`), nothing is
+/// written, and no row stays queued.
+@Suite("An occurrence deleted after the card is retired as stale at the drain", .serialized, .processGlobalState)
+struct DeletedAfterTheCardTests {
+    typealias W = OccurrenceWireFixture
+    typealias H = CalDAVToolWire
+
+    /// The drain's retirement of an edit whose event is not found on the server.
+    private static let staleReason = "event not found on server"
+
+    @Test("Google: the occurrence deleted after its card, the drain retires the row as stale and writes nothing")
+    func googleDeletedAfterTheCard() async throws {
+        let r = try await googleTool([
+            "edit_scope": .string("this_only"), "recurrence_id": .string("\(day(7))T09:00:00"),
+            "title": .string("Team standup"), "timezone": .string("UTC"),
+        ], eventId: GoogleSeries.later, account: "deleted-after-card-g",
+           beforeConfirming: { $0.store(GoogleSeries.deleted(day(7))) })
+        #expect(r.run.cards.count == 1, "no card: \(r.run.out)")
+        #expect(r.calendar.writes.isEmpty, "writes: \(r.calendar.writes)")
+        #expect(r.run.queued.count == 1 && r.run.queued.allSatisfy {
+            $0.status == PendingStatus.failed.rawValue && $0.failureReason == Self.staleReason
+        }, "rows: \(reasons(r.run.queued))")
+        #expect(r.calendar.event(GoogleSeries.later)?["summary"] as? String == "Standup")
+    }
+
+    @Test("CalDAV: the occurrence deleted after its card, the drain retires the row as stale and writes nothing")
+    func calDAVDeletedAfterTheCard() async throws {
+        let session = "deleted-after-card-c"
+        let harness = try await H.makeHarness(accountId: session)
+        defer { H.tearDown(harness) }
+        let fixture = harness.fixture
+        let occurrence = try fixture.occurrence(2)
+        let eventId = try fixture.occurrenceId(2)
+        // The series with that occurrence deleted, as another client leaves it: an EXDATE.
+        let wall = OccurrenceFixture.wall(occurrence, fixture.zone)
+        let deleted = fixture.ics.replacingOccurrences(
+            of: "RRULE:FREQ=WEEKLY", with: "RRULE:FREQ=WEEKLY\r\nEXDATE;TZID=America/New_York:\(wall)")
+        try #require(deleted != fixture.ics, "the fixture has no rule line to add the EXDATE after")
+
+        let translator = ChatIdTranslator.createIsolated()
+        let compound = CompoundEventId.make(accountId: harness.accountId, eventId: eventId)
+        let forModel = await translator.processToolOutputForLLM("event_id: \(compound)")
+        let numericId = try #require(H.eventIds(in: forModel).first.flatMap { Int($0) })
+        await H.recordCalendar(of: eventId, accountId: harness.accountId, translator: translator)
+        let store = harness.store
+        let sink = RecordingCardSink(beforeConfirming: { store.seed(path: W.seriesPath, ics: deleted) })
+        let output = try await CalendarEventEditTool(context: ToolContext(db: harness.pool, translator: translator)).execute(
+            arguments: [
+                "event_id": .string(String(numericId)), "edit_scope": .string("this_only"),
+                "recurrence_id": .string(OccurrenceFixture.naive(occurrence, fixture.zone)),
+                "title": .string("Retitled"), "timezone": .string(fixture.zone.identifier),
+            ],
+            invocation: ToolInvocation(uiSink: sink, sessionKey: session))
+        let cards = await sink.cards
+        #expect(cards.count == 1, "no card: \(output)")
+        #expect(harness.store.recordedPuts().isEmpty, "PUT: \(harness.store.recordedPuts().map(\.path))")
+        #expect(H.deletes(harness.http).isEmpty, "DELETE: \(H.deletes(harness.http))")
+        let ops = try await harness.pool.read { db in try PendingCalendarOperation.fetchAll(db) }
+        #expect(ops.count == 1 && ops.allSatisfy {
+            $0.status == PendingStatus.failed.rawValue && $0.failureReason == Self.staleReason
+        }, "rows: \(reasons(ops))")
+        #expect(harness.store.storedICS(path: W.seriesPath) == deleted, "the series was changed")
+    }
+}
+
 // MARK: - The property: refused before the card, or the calendar holds what the card said
 
 /// Where an occurrence is in the invariant suites' series.
@@ -1949,6 +2025,15 @@ struct GoogleSeriesScopeInvariantTests {
         let eventId = entry.form == .seriesIdAndStart ? GoogleSeries.id : occurrenceId
         let r = try await googleTool(invariantArguments(entry, now: now), eventId: eventId,
                                      account: "inv-g-\(entry.testDescription)", seed: seed)
+        // A deleted occurrence is refused as one the edit names none of: the lookup finds no
+        // deleted occurrence. (Its own id with no recurrence_id is refused for one occurrence, or
+        // it and the following ones, by the tool's argument check first.)
+        if entry.state == .deleted, entry.form != .ownId || entry.scope == "all" {
+            let error = (try? JSONSerialization.jsonObject(with: Data(r.run.out.utf8)) as? [String: Any])?["error"] as? String ?? ""
+            let recurrenceId = entry.form == .ownId ? nil : GraphFixture.naive(now)
+            #expect(error.contains(CalendarSeriesScope.namesNoOccurrence(recurrenceId)),
+                    "\(entry.testDescription): not refused as naming no occurrence: \(r.run.out)")
+        }
         guard let extent = checkProperty(entry, run: r.run, wrote: !r.calendar.writes.isEmpty) else { return }
         let label = entry.testDescription
         let card = r.run.cards[0]

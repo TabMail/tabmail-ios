@@ -163,7 +163,8 @@ final class FakeGoogleCalendar: Sendable {
         }
     }
 
-    private func store(_ event: [String: Any]) {
+    /// Puts `event` in the calendar, replacing the one with its id: a write, or another client's change.
+    func store(_ event: [String: Any]) {
         // swiftlint:disable:next force_try
         let data = try! JSONSerialization.data(withJSONObject: event)
         // swiftlint:disable:next force_cast
