@@ -491,4 +491,107 @@ struct CalDAVOccurrenceDeleteWireTests {
         #expect(Self.writes(http).isEmpty, "\(change): the refused delete wrote: \(Self.writes(http))")
         #expect(store.storedICS(path: W.seriesPath) == changed, "\(change): the series is not on the server as it was")
     }
+
+    /// Which VEVENT of `paddedMarkersKeepEveryOtherVEvent`'s resource ends with a padded
+    /// `END:VEVENT` line (a trailing space).
+    enum PaddedEnd: String, CaseIterable { case changedCopy, series }
+
+    @Test("an END:VEVENT line with trailing space, after the deleted occurrence's changed copy or after the series, is read as the end of that VEVENT, so the next changed occurrence is kept",
+          arguments: PaddedEnd.allCases)
+    func paddedMarkersKeepEveryOtherVEvent(_ padded: PaddedEnd) async throws {
+        let series = try Series(.zoned)
+        let wall = { (date: Date) in OccurrenceFixture.wall(date, series.zone) }
+        let slot = try series.slot(2)
+        let keptSlot = try series.slot(3)
+        let target = [
+            "UID:standup-1", "RECURRENCE-ID;TZID=America/New_York:\(wall(slot))",
+            "DTSTAMP:\(OccurrenceFixture.utcValue(series.first))",
+            "DTSTART;TZID=America/New_York:\(wall(slot.addingTimeInterval(60 * 60)))",
+            "DTEND;TZID=America/New_York:\(wall(slot.addingTimeInterval(90 * 60)))",
+            "SUMMARY:Standup (later)",
+        ].joined(separator: "\n")
+        let kept = [
+            "UID:standup-1", "RECURRENCE-ID;TZID=America/New_York:\(wall(keptSlot))",
+            "DTSTAMP:\(OccurrenceFixture.utcValue(series.first))",
+            "DTSTART;TZID=America/New_York:\(wall(keptSlot))",
+            "DTEND;TZID=America/New_York:\(wall(keptSlot.addingTimeInterval(series.length)))",
+            "SUMMARY:Standup (retitled)",
+        ].joined(separator: "\n")
+        let master = try series.master()
+        let lastLine = padded == .series ? "RRULE:FREQ=WEEKLY" : "SUMMARY:Standup (later)"
+        let pad = { (ics: String) in
+            ics.replacingOccurrences(of: "\(lastLine)\r\nEND:VEVENT\r\n", with: "\(lastLine)\r\nEND:VEVENT \r\n")
+        }
+        let ics = pad(OccurrenceFixture.ics([master, target, kept]))
+        #expect(ics.contains("END:VEVENT \r\n"), "\(padded): setup: no padded END:VEVENT line")
+        let (store, http) = W.serve(W(zone: series.zone, first: series.first, ics: ics))
+        defer { http.close() }
+        let provider = W.makeProvider(http)
+        let deleted = try series.occurrenceId(2)
+
+        let before = try await Self.listing(provider, series)
+        #expect(before.contains { $0.hasPrefix(deleted + " |") && $0.contains("Standup (later)") }, "\(padded): setup: the changed occurrence is not listed: \(before)")
+        #expect(before.contains { $0.contains("Standup (retitled)") }, "\(padded): setup: the other changed occurrence is not listed: \(before)")
+
+        try await provider.deleteEvent(calendarId: W.calendarId, eventId: deleted, sendUpdates: "all")
+
+        let after = try await Self.listing(provider, series)
+        #expect(after == Self.without(deleted, before), "\(padded): the listing did not lose exactly that occurrence.\nbefore: \(before)\nafter: \(after)")
+        let stored = try #require(store.storedICS(path: W.seriesPath))
+        let (rest, count) = Self.removingLine(try series.exdate(2), from: stored)
+        let expected = padded == .series ? pad(OccurrenceFixture.ics([master, kept])) : OccurrenceFixture.ics([master, kept])
+        #expect(count == 1 && rest == expected, "\(padded): the series is not what it was less that changed copy plus the EXDATE.\nsent: \(stored)")
+    }
+
+    /// What the check before the PUT is handed in `rebuiltResourceThatLosesMoreIsRefused`.
+    enum Rebuilt: String, CaseIterable {
+        /// As the delete builds it: the EXDATE added and the occurrence's changed copy removed.
+        case asBuilt
+        /// Another changed occurrence removed too.
+        case anotherChangedCopyLost
+        /// The series VEVENT removed.
+        case seriesLost
+    }
+
+    @Test("the check before the PUT refuses a rebuilt resource that lost the series or another changed occurrence, nothing deleted, and passes the one the delete builds",
+          arguments: Rebuilt.allCases)
+    func rebuiltResourceThatLosesMoreIsRefused(_ rebuilt: Rebuilt) throws {
+        let series = try Series(.zoned)
+        let wall = { (date: Date) in OccurrenceFixture.wall(date, series.zone) }
+        let override = { (week: Int, title: String) throws -> String in
+            let slot = try series.slot(week)
+            return [
+                "UID:standup-1", "RECURRENCE-ID;TZID=America/New_York:\(wall(slot))",
+                "DTSTAMP:\(OccurrenceFixture.utcValue(series.first))",
+                "DTSTART;TZID=America/New_York:\(wall(slot.addingTimeInterval(60 * 60)))",
+                "DTEND;TZID=America/New_York:\(wall(slot.addingTimeInterval(90 * 60)))",
+                "SUMMARY:\(title)",
+            ].joined(separator: "\n")
+        }
+        let master = try series.master()
+        let target = try override(2, "Standup (later)")
+        let other = try override(3, "Standup (retitled)")
+        let stored = OccurrenceFixture.ics([master, target, other])
+        let key = try #require(try CalDAVOccurrences.OccurrenceId.split(try series.occurrenceId(2)).key)
+        let deletion = try CalDAVOccurrences.deletion(icsText: stored, href: W.seriesPath, key: key)
+        let excluded = master + "\n" + (try series.exdate(2))
+        let updated: String
+        switch rebuilt {
+        case .asBuilt: updated = OccurrenceFixture.ics([excluded, other])
+        case .anotherChangedCopyLost: updated = OccurrenceFixture.ics([excluded])
+        case .seriesLost: updated = OccurrenceFixture.ics([other])
+        }
+
+        guard rebuilt != .asBuilt else {
+            try CalDAVOccurrences.requireDeletedAlone(deletion, updatedICS: updated, href: W.seriesPath)
+            return
+        }
+        #expect("\(rebuilt): the check let it through") {
+            try CalDAVOccurrences.requireDeletedAlone(deletion, updatedICS: updated, href: W.seriesPath)
+        } throws: { error in
+            guard case CalendarProviderError.notSupported(let reason) = error else { return false }
+            return reason.contains("would not keep the rest of it") && reason.contains("Nothing was deleted")
+                && reason.contains("calendar app")
+        }
+    }
 }

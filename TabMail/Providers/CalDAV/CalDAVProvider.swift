@@ -386,7 +386,8 @@ actor CalDAVProvider: CalendarProvider {
     /// ETag. A 412 is thrown as `preconditionFailed`, as every other conditional CalDAV write
     /// throws it. The PUT is an irreversible wire operation (memory 102): it removes the
     /// changed copy's content with no per-item recovery, so nothing is written unless the
-    /// occurrence is found, and unless the resource it builds no longer has that occurrence.
+    /// occurrence is found, and unless the resource it builds has lost that occurrence and
+    /// nothing else (`CalDAVOccurrences.requireDeletedAlone`).
     private func deleteOccurrence(calendarId: String, seriesHref: String, key: String) async throws {
         let eventURL = try resolveEventURL(seriesHref, calendarId: calendarId)
         let (data, getResponse) = try await client.get(url: eventURL)
@@ -404,17 +405,13 @@ actor CalDAVProvider: CalendarProvider {
             deletion.slotInUTC, declaredZone: .gmt, kind: Self.masterDTStartKind(from: storedICS), zones: zones
         ) else {
             throw CalendarProviderError.notSupported(
-                "This occurrence's place in the repeating event can't be written in the event's timezone, so it was not deleted. Nothing was deleted.")
+                "This occurrence's place in the repeating event can't be written in the event's timezone, so it was not deleted. Nothing was deleted. The user can delete it in their calendar app.")
         }
         let updatedICS = try Self.occurrenceDeletedResource(
-            storedICS: storedICS, key: key, slotNaive: slotInSeriesFrame, keyOfRecurrenceId: deletion.keyOfRecurrenceId)
-        // The write must remove the occurrence it names. One whose EXDATE the series would not
-        // read as that occurrence, written anyway, would lose its changed copy and put it back
-        // at its place in the series.
-        guard CalDAVOccurrences.occurrence(key: key, icsText: updatedICS, href: seriesHref) == nil else {
-            throw CalendarProviderError.notSupported(
-                "TabMail can't write the exclusion of this occurrence in a form the repeating event reads, so it was not deleted. Nothing was deleted.")
-        }
+            storedICS: storedICS, deletion: deletion, slotNaive: slotInSeriesFrame)
+        // The write must remove the occurrence it names and nothing else: the series and every
+        // other changed occurrence stay, and the series no longer reads the occurrence.
+        try CalDAVOccurrences.requireDeletedAlone(deletion, updatedICS: updatedICS, href: seriesHref)
         // No ETag ⇒ `.unconditional`, as every CalDAV write of a resource the GET above proved
         // exists (see `updateEvent`).
         _ = try await client.put(

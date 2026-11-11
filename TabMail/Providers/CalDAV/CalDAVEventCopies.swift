@@ -308,50 +308,39 @@ extension CalDAVProvider {
     /// `EXDATE` added to the series VEVENT at the occurrence's place in the series, in the series
     /// DTSTART's value type and zone (a DATE for an all-day series), and the occurrence's changed
     /// copy, if it has one, removed. A moved occurrence is excluded at its place in the series,
-    /// the slot its RECURRENCE-ID names, not where it was moved to. Its changed copy is found by
-    /// its occurrence key (`keyOfRecurrenceId`), never by comparing RECURRENCE-ID text, so a copy
-    /// written in another form or zone is still the one removed. Every other line goes back byte
-    /// for byte.
+    /// the slot its RECURRENCE-ID names, not where it was moved to. Which VEVENT is the series
+    /// and which are the changed copies comes from the delete's one parse of `storedICS`
+    /// (`CalDAVOccurrences.OccurrenceDeletion`), by position: `rewriteVEvents` takes the VEVENTs
+    /// in the order and framing `ICSParser.components` reads them (`isMarker`, `takeVEvent`),
+    /// so a changed copy is matched by its occurrence key as the listing reads it, never by
+    /// RECURRENCE-ID text read again here. Every other line goes back byte for byte.
     ///
     /// - Parameters:
     ///   - storedICS: the series' resource exactly as the server returned it.
-    ///   - key: the occurrence's key (`CalDAVOccurrences.OccurrenceId`).
+    ///   - deletion: what the delete's check read from `storedICS`.
     ///   - slotNaive: the occurrence's place in the series, already in the series' frame
     ///     (`recurrenceIdInMasterFrame`).
-    ///   - keyOfRecurrenceId: the key a RECURRENCE-ID (value, parameters without the leading
-    ///     `;`) names in this series, from the one parse of `storedICS` the delete's check made
-    ///     (`CalDAVOccurrences.OccurrenceDeletion`).
     static func occurrenceDeletedResource(
-        storedICS: String, key: String, slotNaive: String,
-        keyOfRecurrenceId: (_ value: String, _ params: String?) -> String?
+        storedICS: String, deletion: CalDAVOccurrences.OccurrenceDeletion, slotNaive: String
     ) throws -> String {
         let kind = masterDTStartKind(from: storedICS)
         guard let value = icsDateValue(fromNaive: slotNaive, kind: kind) else {
-            throw CalendarProviderError.notSupported("The occurrence's place in the repeating event can't be written, so it can't be deleted. Nothing was deleted.")
+            throw CalendarProviderError.notSupported("The occurrence's place in the repeating event can't be written, so it can't be deleted. Nothing was deleted. The user can delete it in their calendar app.")
         }
-        var excluded = false
-        let updated = try rewriteVEvents(in: storedICS) { block, isMaster in
-            if isMaster {
-                guard !excluded else { return block }
+        var position = -1
+        return try rewriteVEvents(in: storedICS) { block, _ in
+            position += 1
+            if position == deletion.seriesPosition {
                 guard let dtstart = topLevel(block).first(where: { icsProperty($0.text)?.name == "DTSTART" }),
                       let dtstartProperty = icsProperty(dtstart.text) else {
-                    throw CalendarProviderError.notSupported("The repeating event has no start, so one occurrence of it can't be deleted. Nothing was deleted.")
+                    throw CalendarProviderError.notSupported("The repeating event has no start, so one occurrence of it can't be deleted. Nothing was deleted. The user can delete it in their calendar app.")
                 }
-                excluded = true
                 return insertBeforeSubcomponents(block, lines: [
                     slotLine("EXDATE", dtstartParams: dtstartProperty.params, value: value, kind: kind),
                 ])
             }
-            guard let rid = topLevel(block).first(where: { icsProperty($0.text)?.name == "RECURRENCE-ID" }),
-                  let property = icsProperty(rid.text) else { return block }
-            let params = property.params.hasPrefix(";") ? String(property.params.dropFirst()) : property.params
-            let overrideKey = keyOfRecurrenceId(property.value.trimmingCharacters(in: .whitespaces), params.isEmpty ? nil : params)
-            return overrideKey == key ? nil : block
+            return deletion.changedCopyPositions.contains(position) ? nil : block
         }
-        guard excluded else {
-            throw CalendarProviderError.notSupported("The repeating event can't be found in its calendar entry, so one occurrence of it can't be deleted. Nothing was deleted.")
-        }
-        return updated
     }
 
     // MARK: - Patch and attendee answers

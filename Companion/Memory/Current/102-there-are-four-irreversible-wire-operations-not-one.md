@@ -596,11 +596,14 @@ one parse of the resource, as the listing finds it (`CalDAVOccurrences.deletion`
 missing, excluded or cancelled occurrence is `notFound`, and a resource holding only changed
 occurrences, an event that does not repeat or a series TabMail can't expand is refused
 (`notSupported`, never `notFound`), all with nothing written; the changed copy is matched by
-occurrence key (`OccurrenceDeletion.keyOfRecurrenceId`), never by RECURRENCE-ID text; the built resource must no longer have
-the occurrence (else nothing is written, so a copy is never removed while its slot comes back); and
+occurrence key in that one parse and removed by its position among the VEVENTs, which the rewrite
+frames as the reader does (`veventBlocks`, `isMarker`, #603), never by RECURRENCE-ID text; the built
+resource must keep the series and every other changed occurrence and must no longer have the
+occurrence (`CalDAVOccurrences.requireDeletedAlone`; else nothing is written, so a copy is never
+removed while its slot comes back, and no neighbour's changed copy is ever lost with it); and
 the `PUT` is conditional on the GET's ETag (`.unconditional` only when the server sends none, as
 every CalDAV write of a resource the GET proved exists).
 
 **Negative case.** Re-adjudicate if the delete ever writes more than one occurrence's `EXDATE` per
-`PUT`, removes an override whose key differs from the one named, writes without the post-build
-check, or sends the `PUT` without `If-Match` when the server gave an ETag.
+`PUT`, removes an override whose key differs from the one named, writes without
+`requireDeletedAlone`, or sends the `PUT` without `If-Match` when the server gave an ETag.

@@ -103,18 +103,21 @@ of the resource, which holds every occurrence (irreversible wire operation #5, n
      `preconditionFailed`, as every conditional CalDAV write throws it): an `EXDATE` added to the
      series VEVENT at the occurrence's place in the series, in the series DTSTART's value type and
      zone (`VALUE=DATE` all-day, `TZID` wall time, UTC `Z`, floating), and the occurrence's changed
-     copy removed, matched by occurrence key (`OccurrenceDeletion.keyOfRecurrenceId`), never by
-     RECURRENCE-ID text (`CalDAVProvider.occurrenceDeletedResource`). A moved occurrence is excluded at its
+     copy removed, matched by occurrence key in that one parse and removed by its position among
+     the VEVENTs, framed as the reader frames them (#603), never by RECURRENCE-ID text
+     (`CalDAVProvider.occurrenceDeletedResource`). A moved occurrence is excluded at its
      original slot. A missing, excluded or cancelled occurrence is `CalDAVError.notFound` with
      nothing written (so a retry after a lost response is retired as not found, as on Google and
      Outlook); a resource that holds only changed occurrences is refused with nothing written; and
-     the built resource must no longer have the occurrence, or nothing is written. The PUT is an
+     the built resource must keep the series and every other changed occurrence and no longer have
+     the occurrence (`CalDAVOccurrences.requireDeletedAlone`), or nothing is written. The PUT is an
      irreversible wire operation (memory 102). Tests: `CalDAVOccurrenceDeleteWireTests` (every
      series frame; a moved occurrence with another changed one kept, in every frame and with its
      RECURRENCE-ID in the series' form, another form or another zone; missing/cancelled/repeated;
      changed-only; a series changed into one TabMail can't expand or that no longer repeats,
-     refused, not not-found; the post-build check refusing an EXDATE that would exclude nothing;
-     412; a server without ETags), `CalDAVOccurrenceDeleteToolToWireTests` (end to end from the tools).
+     refused, not not-found; the check before the PUT refusing an EXDATE that would exclude
+     nothing, and a rebuilt resource that lost the series or another changed occurrence; a padded
+     `END:VEVENT` keeping the next changed occurrence; 412; a server without ETags), `CalDAVOccurrenceDeleteToolToWireTests` (end to end from the tools).
    - No series id is added to the tools' output. `calendar_event_read` shows `event_id` only, on every
      provider, exactly as before this ADR (a `series_event_id` line was tried and pulled back: on
      Google and Outlook it handed the assistant a series id it would edit with an occurrence's date,
