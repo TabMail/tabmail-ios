@@ -40,6 +40,10 @@ enum CalDAVOccurrences {
         /// The length of a day, for a DURATION given in days and for the margin before a
         /// range's first day (RFC 5545 §3.3.6 counts `P1D` as a nominal day).
         static let secondsPerDay: TimeInterval = 24 * 60 * 60
+        /// How far either side of a `recurrence_id` the edit check looks for the occurrence it
+        /// names: the window Google's and Outlook's `resolveInstanceId` enumerate. It only has
+        /// to contain the occurrence; `RecurrenceOccurrenceResolver` does the matching.
+        static let resolverWindow: TimeInterval = 25 * 60 * 60
     }
 
     // MARK: - Occurrence ids
@@ -92,7 +96,8 @@ enum CalDAVOccurrences {
         /// (the shape the tools give one in): the date at midnight for an all-day key, the wall
         /// time as written for a floating one, and the instant's wall time in `zone` for every
         /// other. `scopedEditSlot` hands it to the writers of a one-occurrence edit and a split,
-        /// so the provider's conversion into the series' own frame lands on the occurrence.
+        /// so the provider's conversion into the resource's RECURRENCE-ID frame lands on the
+        /// occurrence.
         static func recurrenceId(ofKey key: String, in zone: TimeZone) -> String? {
             guard isKey(key) else { return nil }
             var wall = key
@@ -122,13 +127,7 @@ enum CalDAVOccurrences {
         guard let master = components.first(where: { $0.recurrenceId == nil }) else {
             // Only changed occurrences, no series (an invitation to single occurrences,
             // RFC 4791 §4.1): each is listed where it is.
-            return overrides.compactMap { override in
-                guard let rid = override.recurrenceId,
-                      let key = standaloneKey(of: rid, zones: override.zones),
-                      let overrideSpan = spanOf(override),
-                      overlaps(overrideSpan, timeMin: timeMin, timeMax: timeMax) else { return nil }
-                return occurrenceRow(override.event, href: href, key: key, recurrence: nil)
-            }
+            return standaloneRows(overrides, href: href, timeMin: timeMin, timeMax: timeMax).map(\.row)
         }
         let series: Series
         switch shape(of: master, overrides: overrides) {
@@ -139,34 +138,60 @@ enum CalDAVOccurrences {
         case .series(let s):
             series = s
         }
-        guard let timeMax, let lastDay = series.frame.day(of: timeMax) else {
+        guard let timeMax else {
             return [notListedRow(master, href: href, reason: "the listing has no end")]
         }
+        guard let rows = occurrenceRows(of: series, overrides: overrides, href: href, timeMin: timeMin, timeMax: timeMax) else {
+            return [notListedRow(master, href: href, reason: "more than \(Config.maxRuleSteps) repeats before the range")]
+        }
+        return rows.map(\.row)
+    }
+
+    /// The occurrences of `series` that overlap the range, where each is now, with its key:
+    /// every override at its own time, and every other occurrence where the series puts it.
+    /// A cancelled one is a row with status `cancelled`. nil when the rule takes more than
+    /// `Config.maxRuleSteps` periods to reach the range's end.
+    private static func occurrenceRows(
+        of series: Series, overrides: [ICSParser.VEventComponent], href: String, timeMin: Date?, timeMax: Date
+    ) -> [(key: String, row: GCalEvent)]? {
+        guard let lastDay = series.frame.day(of: timeMax) else { return nil }
         // Occurrences on days before this one end before the range starts.
         let firstNeeded = timeMin
             .flatMap { series.frame.day(of: $0.addingTimeInterval(-series.lengthForRange)) }?
             .adding(days: -1)
-        guard let found = expandInstances(of: series, from: firstNeeded, through: lastDay) else {
-            return [notListedRow(master, href: href, reason: "more than \(Config.maxRuleSteps) repeats before the range")]
-        }
+        guard let found = expandInstances(of: series, from: firstNeeded, through: lastDay) else { return nil }
 
-        var rows: [GCalEvent] = []
+        var rows: [(key: String, row: GCalEvent)] = []
         var overridden = Set<String>()
         for override in overrides {
             guard let rid = override.recurrenceId,
                   let key = occurrenceKey(ofValue: rid.value, params: rid.params, in: series),
                   overridden.insert(key).inserted else { continue }
             guard let overrideSpan = spanOf(override), overlaps(overrideSpan, timeMin: timeMin, timeMax: timeMax) else { continue }
-            rows.append(occurrenceRow(override.event, href: href, key: key, recurrence: series.recurrenceLines))
+            rows.append((key, occurrenceRow(override.event, href: href, key: key, recurrence: series.recurrenceLines)))
         }
         for instance in found where !overridden.contains(instance.key) {
             guard overlaps((start: instance.start, end: instance.end), timeMin: timeMin, timeMax: timeMax) else { continue }
-            rows.append(instanceRow(instance, of: series, href: href))
+            rows.append((instance.key, instanceRow(instance, of: series, href: href)))
         }
         if DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[CalDAV] occurrences: \(href) has \(rows.count) row(s) in range from \(found.count) occurrence(s) and \(overrides.count) override(s)")
         }
         return rows
+    }
+
+    /// The changed occurrences of a resource that holds no series, each where it is, with the
+    /// key its own RECURRENCE-ID gives it (`standaloneKey`).
+    private static func standaloneRows(
+        _ overrides: [ICSParser.VEventComponent], href: String, timeMin: Date?, timeMax: Date?
+    ) -> [(key: String, row: GCalEvent)] {
+        overrides.compactMap { override in
+            guard let rid = override.recurrenceId,
+                  let key = standaloneKey(of: rid, zones: override.zones),
+                  let overrideSpan = spanOf(override),
+                  overlaps(overrideSpan, timeMin: timeMin, timeMax: timeMax) else { return nil }
+            return (key, occurrenceRow(override.event, href: href, key: key, recurrence: nil))
+        }
     }
 
     /// The occurrence `key` names in the resource, as a listing shows it, or nil when the
@@ -203,99 +228,102 @@ enum CalDAVOccurrences {
     // MARK: - One occurrence's edit or split
 
     /// The one check a one-occurrence edit or a split (`CalDAVProvider.updateOccurrence`,
-    /// `CalDAVProvider.splitSeries`) makes before it writes anything: that its `recurrence_id`
-    /// (`recurrenceId`, a naive wall time in `zone`) names an occurrence the series has now.
-    /// Returns the `recurrence_id` to write with, a naive wall time in the same `zone`;
-    /// anything else throws `notSupported`, so nothing is written. Without it, an override was
-    /// written at a time the series has no occurrence, which changes no occurrence and adds
-    /// one to the listing, and a split re-anchored the series' later occurrences there.
+    /// `CalDAVProvider.splitSeries`) makes before it writes anything: which occurrence its
+    /// `recurrence_id` (`recurrenceId`, a naive wall time or date in `zone`) names. The
+    /// occurrence is picked by the matching Google and Outlook use,
+    /// `RecurrenceOccurrenceResolver.select`, from the occurrences the resource has now within
+    /// `Config.resolverWindow` of that time, each where the listing shows it: a changed one at
+    /// its own time, a cancelled one not at all. So a timed `recurrence_id` names the occurrence
+    /// that starts at that instant, a date alone the one occurrence on that day.
     ///
-    /// - With the series id, `recurrenceId` must be a place the series puts an occurrence: a
-    ///   date of its rule or an extra date that is not removed, or the place of a changed
-    ///   occurrence. It is written as given. A moved occurrence's new time is not one (unless
-    ///   another occurrence is there); the listing's id for the moved occurrence names it.
-    /// - With an occurrence id, its `key` names the occurrence, and `recurrenceId` must name
-    ///   the same one: by its place in the series (the key) or by where it is now, the start
-    ///   the listing shows, which for a moved occurrence is its new time. The write uses the
-    ///   key's place (`OccurrenceId.recurrenceId(ofKey:in:)`): an override and a split are
-    ///   placed where the series puts the occurrence, never where it was moved to. That is
-    ///   the `recurrence_id` the series id would have been given, so both name a split's new
-    ///   part alike.
+    /// Returns the `recurrence_id` the writers take: the named occurrence's place in the series
+    /// (its key, `OccurrenceId.recurrenceId(ofKey:in:)`) as a naive wall time in `zone`, so an
+    /// override is changed in place and a split starts where the series puts the occurrence,
+    /// never where it was moved to; the series id and an occurrence id name a split's new part
+    /// alike. Nothing is written when it throws:
+    /// - `CalDAVError.notFound` when no occurrence starts there, the authoritative absence
+    ///   Google and Outlook report for it;
+    /// - `notSupported` for a malformed or ambiguous `recurrence_id`, for an occurrence id whose
+    ///   key names another occurrence than `recurrenceId` does, for an event that does not repeat
+    ///   and for a series this type can't expand.
     ///
-    /// An event that does not repeat, a series this type can't expand, and a cancelled
-    /// occurrence have no occurrence to name. `ignoringEnd` reads the rule without its COUNT
-    /// or UNTIL, for a split: where the series ends is `RecurrenceTail.newSeriesRule`'s check,
-    /// which also knows a series this same split already capped (a retry).
+    /// A resource that holds only changed occurrences (an invitation to single occurrences,
+    /// RFC 4791 §4.1) has one of them edited through the occurrence id the listing gave it; it
+    /// has no series to split or to address by the resource's own id. `forSplit` reads the rule
+    /// without its COUNT or UNTIL: where the series ends is `RecurrenceTail.newSeriesRule`'s
+    /// check, which also knows a series this same split already capped (a retry).
     static func scopedEditSlot(
-        icsText: String, href: String, key: String?, recurrenceId: String, zone: TimeZone, ignoringEnd: Bool
+        icsText: String, href: String, key: String?, recurrenceId: String, zone: TimeZone, forSplit: Bool
     ) throws -> String {
+        let invalid = "Invalid recurrence_id '\(recurrenceId)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00') or a date (e.g. '2026-05-20')."
+        guard let center = RecurrenceOccurrenceResolver.windowCenter(recurrenceId: recurrenceId, zone: zone) else {
+            throw CalendarProviderError.notSupported(invalid)
+        }
+        let timeMin = center.addingTimeInterval(-Config.resolverWindow)
+        let timeMax = center.addingTimeInterval(Config.resolverWindow)
         let components = ICSParser.components(icsText: icsText, resourceHref: href)
         let overrides = components.filter { $0.recurrenceId != nil }
-        guard let master = components.first(where: { $0.recurrenceId == nil }) else {
-            throw CalendarProviderError.notSupported(
-                "This calendar entry holds changed occurrences without their repeating event, so TabMail can't change them one at a time. Nothing was changed.")
-        }
-        var series: Series
-        switch shape(of: master, overrides: overrides) {
-        case .single:
-            throw CalendarProviderError.notSupported(
-                "This event does not repeat, so it has no single occurrence to change. Nothing was changed. Edit the whole event with edit_scope all.")
-        case .unexpandable:
-            throw CalendarProviderError.notSupported(
-                "TabMail can't work out the occurrences of this repeating event, so it can't change one of them or split the series at one. Nothing was changed.")
-        case .series(let s):
-            series = s
-        }
-        if ignoringEnd { series = series.withoutEnd }
-
-        let named = occurrenceKey(ofRecurrenceId: recurrenceId, zone: zone, in: series)
-        if let wanted = key ?? named,
-           let target = occurrence(key: wanted, in: series, overrides: overrides, href: href),
-           target.status?.lowercased() != "cancelled" {
-            guard let key, named != key else { return recurrenceId }
-            if startsAt(target, recurrenceId: recurrenceId, zone: zone, in: series),
-               let slot = OccurrenceId.recurrenceId(ofKey: key, in: zone) {
-                return slot
+        let rows: [(key: String, row: GCalEvent)]
+        if let master = components.first(where: { $0.recurrenceId == nil }) {
+            var series: Series
+            switch shape(of: master, overrides: overrides) {
+            case .single:
+                throw CalendarProviderError.notSupported(
+                    "This event does not repeat, so it has no single occurrence to change. Nothing was changed. Edit the whole event with edit_scope all.")
+            case .unexpandable:
+                throw CalendarProviderError.notSupported(
+                    "TabMail can't work out the occurrences of this repeating event, so it can't change one of them or split the series at one. Nothing was changed.")
+            case .series(let s):
+                series = s
             }
+            if forSplit { series = series.withoutEnd }
+            guard let found = occurrenceRows(of: series, overrides: overrides, href: href, timeMin: timeMin, timeMax: timeMax) else {
+                throw CalendarProviderError.notSupported(
+                    "TabMail can't work out the occurrences of this repeating event, so it can't change one of them or split the series at one. Nothing was changed.")
+            }
+            rows = found
+        } else {
+            guard key != nil, !forSplit else {
+                throw CalendarProviderError.notSupported(
+                    "This calendar entry holds changed occurrences without their repeating event, so TabMail can change one of them only through the event_id listed for it, and can't split it. Nothing was changed.")
+            }
+            rows = standaloneRows(overrides, href: href, timeMin: timeMin, timeMax: timeMax)
         }
-        throw CalendarProviderError.notSupported(
-            "recurrence_id '\(recurrenceId)' is not an occurrence of this repeating event\(key == nil ? "" : " that this event_id names"), so nothing was changed. Look the occurrence up with calendar_read or calendar_search, and use the event_id listed for it with its start_iso as recurrence_id.")
-    }
 
-    /// The occurrence key a tool's `recurrence_id` (naive `yyyy-MM-dd` or
-    /// `yyyy-MM-ddTHH:mm:ss`, a wall time in `zone`) names in `series`, read as
-    /// `CalDAVProvider.recurrenceIdInMasterFrame` reads it: by its date alone in an all-day
-    /// series, by its wall time as written in a floating one, and as an instant in every
-    /// other. nil when it can't be read, or gives no time for a timed series.
-    private static func occurrenceKey(ofRecurrenceId naive: String, zone: TimeZone, in series: Series) -> String? {
-        guard let day = RecurrenceTail.Day(iso: naive) else { return nil }
-        guard series.timeOfDay != nil else { return dateKey(day) }
-        guard let time = naiveTime(naive) else { return nil }
-        if case .floating = series.frame {
-            return wallKey(day: day, hour: time.hour, minute: time.minute, second: time.second)
+        var candidates: [OccurrenceCandidate] = []
+        for (rowKey, row) in rows where row.status?.lowercased() != "cancelled" {
+            if let date = row.start?.date {
+                candidates.append(OccurrenceCandidate(id: rowKey, instant: nil, dateOnly: String(date.prefix(10))))
+                continue
+            }
+            // An occurrence that can't be placed could be the one named: refuse rather than
+            // match another (the same rule as Google's `resolveInstanceId`).
+            guard let instant = row.startDate else {
+                throw CalendarProviderError.notSupported(
+                    "An occurrence of this repeating event has a start TabMail can't read, so it can't tell which occurrence recurrence_id '\(recurrenceId)' names. Nothing was changed.")
+            }
+            candidates.append(OccurrenceCandidate(id: rowKey, instant: instant, dateOnly: nil))
         }
-        return wallInstant(day: day, hour: time.hour, minute: time.minute, second: time.second, in: zone).flatMap(utcKey)
-    }
 
-    /// Whether `recurrenceId`, read as `occurrenceKey(ofRecurrenceId:)` reads it, is where `occurrence`
-    /// starts now: its date for an all-day one, its instant for a timed one.
-    private static func startsAt(_ occurrence: GCalEvent, recurrenceId naive: String, zone: TimeZone, in series: Series) -> Bool {
-        guard let day = RecurrenceTail.Day(iso: naive) else { return false }
-        if let date = occurrence.start?.date { return RecurrenceTail.Day(iso: date) == day }
-        guard let start = occurrence.startDate, let time = naiveTime(naive) else { return false }
-        let readIn: TimeZone
-        if case .floating = series.frame { readIn = .current } else { readIn = zone }
-        return wallInstant(day: day, hour: time.hour, minute: time.minute, second: time.second, in: readIn) == start
-    }
-
-    /// The `HH:mm:ss` after the date of a naive `yyyy-MM-ddTHH:mm:ss` value.
-    private static func naiveTime(_ naive: String) -> (hour: Int, minute: Int, second: Int)? {
-        let c = Array(naive)
-        guard c.count >= 19, c[10] == "T", c[13] == ":", c[16] == ":",
-              [c[11], c[12], c[14], c[15], c[17], c[18]].allSatisfy({ $0.isASCII && $0.isNumber }),
-              let hour = Int(String(c[11..<13])), let minute = Int(String(c[14..<16])), let second = Int(String(c[17..<19])),
-              hour < 24, minute < 60, second < 61 else { return nil }
-        return (hour, minute, second)
+        switch RecurrenceOccurrenceResolver.select(candidates, recurrenceId: recurrenceId, zone: zone) {
+        case .resolved(let named):
+            if let key, key != named {
+                throw CalendarProviderError.notSupported(
+                    "recurrence_id '\(recurrenceId)' names another occurrence than this event_id does, so nothing was changed. Use the event_id listed for the occurrence with its start_iso as recurrence_id.")
+            }
+            guard let slot = OccurrenceId.recurrenceId(ofKey: named, in: zone) else {
+                throw CalendarProviderError.notSupported(
+                    "TabMail can't express the occurrence recurrence_id '\(recurrenceId)' names in \(zone.identifier), so nothing was changed.")
+            }
+            return slot
+        case .absent:
+            throw CalDAVError.notFound
+        case .ambiguous(let count):
+            throw CalendarProviderError.notSupported(
+                "recurrence_id '\(recurrenceId)' (\(zone.identifier)) matched \(count) occurrences of this repeating event — refusing to guess which one you meant. Re-read the event and use the exact start_iso of the occurrence you want.")
+        case .malformed:
+            throw CalendarProviderError.notSupported(invalid)
+        }
     }
 
     // MARK: - Series

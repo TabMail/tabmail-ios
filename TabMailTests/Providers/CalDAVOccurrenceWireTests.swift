@@ -17,10 +17,12 @@ import Foundation
 // by an occurrence id address that occurrence inside its series' resource.
 //
 // A second property for the edits: one occurrence's edit or a split writes only at an
-// occurrence the series has (the one an occurrence id names, or one a series id's
-// `recurrence_id` names), and an edit of the whole series through an occurrence id sets
-// nothing that places the series in time. Anything else is refused with nothing written,
-// asserted on what the fake server holds afterwards and on what a listing then shows.
+// occurrence the resource has now (the one an occurrence id names, or the one a series id's
+// `recurrence_id` names where it is now), and an edit of the whole event (edit_scope all)
+// given an occurrence id is refused by the provider before it sends any request: the user
+// confirmed ONE occurrence, and on CalDAV the whole event is every occurrence. Anything
+// else is refused with nothing written, asserted on what the fake server holds afterwards
+// and on what a listing then shows.
 //
 // Dates are worked out from `Date()`; none is written as a literal.
 
@@ -152,6 +154,13 @@ struct CalDAVOccurrenceWireTests {
         return reason.contains(phrase)
     }
 
+    /// The authoritative absence Google and Outlook report for an occurrence that isn't
+    /// there, which the calendar queue retires as not found.
+    private static func isNotFound(_ error: any Error) -> Bool {
+        if case CalDAVError.notFound = error { return true }
+        return false
+    }
+
     @Test("listEvents lists each occurrence in the range, each with its own id")
     func listEventsListsEachOccurrence() async throws {
         let fixture = try W.make()
@@ -258,79 +267,85 @@ struct CalDAVOccurrenceWireTests {
         #expect(store.storedICS(path: W.seriesPath) == nil)
     }
 
-    @Test("an edit of the whole series (edit_scope all) by an occurrence id sets its title, location, description and busy status, and moves nothing")
-    func allEditByOccurrenceIdSetsFieldsThatPlaceNothingInTime() async throws {
-        let fixture = try W.makeChanged()
-        let (store, http) = W.serve(fixture)
-        defer { http.close() }
-        let provider = W.makeProvider(http)
-        var patch = GCalEventInput()
-        patch.summary = "Team standup"
-        patch.location = "Room 2"
-        patch.description = "Bring notes"
-        patch.transparency = "transparent"
-        let secondId = try fixture.occurrenceId(2)
-        let movedId = try fixture.occurrenceId(W.movedWeek)
-        let before = try await Self.listWeeks(provider, fixture, through: 4)
-
-        // `updateEvent` is what the calendar queue runs for edit_scope "all".
-        _ = try await provider.updateEvent(
-            calendarId: W.calendarId, eventId: secondId, event: patch, sendUpdates: "all")
-
-        #expect(store.recordedPuts().map(\.path) == [W.seriesPath], "the edit was not written into the series' resource")
-        let after = try await Self.listWeeks(provider, fixture, through: 4)
-        #expect(after.compactMap(\.id) == before.compactMap(\.id), "the edit added, removed or renamed an occurrence")
-        #expect(after.compactMap(\.startDate) == before.compactMap(\.startDate), "the edit moved an occurrence")
-        #expect(after.compactMap(\.endDate) == before.compactMap(\.endDate), "the edit changed an occurrence's end")
-        let series = after.filter { $0.id != movedId }
-        #expect(series.count == 3, "setup: weeks 0, 2 and 4 are the series' own occurrences in range, got \(series.count)")
-        #expect(series.allSatisfy {
-            $0.summary == "Team standup" && $0.location == "Room 2" && $0.description == "Bring notes" && $0.transparency == "transparent"
-        }, "the series' occurrences do not show the edit: \(series.map { [$0.summary, $0.location, $0.description, $0.transparency] })")
-        let stored = try #require(store.storedICS(path: W.seriesPath))
-        for name in ["DTSTART", "DTEND", "RRULE", "EXDATE", "RECURRENCE-ID"] {
-            #expect(Self.lines(of: stored, named: name) == Self.lines(of: fixture.ics, named: name),
-                    "the edit changed the series' \(name): \(Self.lines(of: stored, named: name))")
-        }
-    }
-
-    @Test("an edit of the whole series by an occurrence id that sets a start, an end, guests or a rule is refused before any request")
-    func allEditByOccurrenceIdCannotPlaceTheSeries() async throws {
+    @Test("an edit of the whole event (edit_scope all) given an occurrence id, a changed occurrence's id included, is refused at the provider before any request, whatever it sets")
+    func allEditByOccurrenceIdIsRefused() async throws {
         let fixture = try W.makeChanged()
         let shown = try fixture.occurrence(2)
         let hour: TimeInterval = 60 * 60
+        let day = OccurrenceFixture.isoDate
+        var title = GCalEventInput()
+        title.summary = "Team standup"
+        var location = GCalEventInput()
+        location.location = "Room 2"
+        var notes = GCalEventInput()
+        notes.description = "Bring notes"
+        var busy = GCalEventInput()
+        busy.transparency = "transparent"
         var start = GCalEventInput()
         start.startDateTime = shown.addingTimeInterval(hour).iso8601String()
         start.startTimeZone = "America/New_York"
         var end = GCalEventInput()
         end.endDateTime = shown.addingTimeInterval(45 * 60).iso8601String()
         end.endTimeZone = "America/New_York"
-        var allDay = GCalEventInput()
-        allDay.startDate = OccurrenceFixture.isoDate(shown, fixture.zone)
+        var allDayStart = GCalEventInput()
+        allDayStart.startDate = day(shown, fixture.zone)
+        // An all-day event given only end_iso sends exactly this (`buildGCalEventInput`).
+        var allDayEnd = GCalEventInput()
+        allDayEnd.endDate = day(shown.addingTimeInterval(OccurrenceFixture.days(2)), fixture.zone)
         var guests = GCalEventInput()
         guests.attendees = [(email: "guest@example.com", name: nil)]
         var rule = GCalEventInput()
         rule.recurrence = ["RRULE:FREQ=DAILY"]
-        var titleAndStart = start
-        titleAndStart.summary = "Standup, an hour later"
         let patches: [(label: String, patch: GCalEventInput)] = [
-            ("a start", start), ("an end", end), ("an all-day date", allDay), ("guests", guests),
-            ("a repeat rule", rule), ("a title with a start", titleAndStart),
+            ("a title", title), ("a location", location), ("notes", notes), ("busy status", busy),
+            ("a start", start), ("an end", end), ("an all-day start", allDayStart), ("an all-day end alone", allDayEnd),
+            ("guests", guests), ("a repeat rule", rule),
         ]
         let secondId = try fixture.occurrenceId(2)
+        let movedId = try fixture.occurrenceId(W.movedWeek)
+        let ids: [(label: String, eventId: String)] = [
+            ("week 2's id", secondId),
+            ("the moved occurrence's id", movedId),
+        ]
 
-        for entry in patches {
-            let (store, http) = W.serve(fixture)
-            defer { http.close() }
-            await #expect("an edit by an occurrence id setting \(entry.label) was not refused") {
-                _ = try await W.makeProvider(http).updateEvent(
-                    calendarId: W.calendarId, eventId: secondId, event: entry.patch, sendUpdates: "all")
-            } throws: { error in
-                Self.isRefusal(error, saying: "nothing was changed")
+        for id in ids {
+            for entry in patches {
+                let (store, http) = W.serve(fixture)
+                defer { http.close() }
+                // `updateEvent` is what the calendar queue runs for edit_scope "all", and for an
+                // edit given neither edit_scope nor recurrence_id.
+                await #expect("\(id.label), setting \(entry.label), was not refused") {
+                    _ = try await W.makeProvider(http).updateEvent(
+                        calendarId: W.calendarId, eventId: id.eventId, event: entry.patch, sendUpdates: "all")
+                } throws: { error in
+                    Self.isRefusal(error, saying: "nothing was changed")
+                        && Self.isRefusal(error, saying: "edit_scope this_only")
+                        && Self.isRefusal(error, saying: "calendar app")
+                }
+                #expect(http.recordedCalls().isEmpty, "\(id.label), \(entry.label): a request went out: \(http.servedCallSequence())")
+                #expect(store.storedICS(path: W.seriesPath) == fixture.ics, "\(id.label), \(entry.label): the series is not on the server as it was")
             }
-            #expect(http.recordedCalls().isEmpty, "\(entry.label): a request went out: \(http.servedCallSequence())")
-            #expect(store.storedICS(path: W.seriesPath) == fixture.ics, "\(entry.label): the series is not on the server as it was")
         }
+    }
+
+    @Test("Control: the series id still edits the whole series, every occurrence, as before")
+    func allEditBySeriesIdEditsTheSeries() async throws {
+        let fixture = try W.make()
+        let (store, http) = W.serve(fixture)
+        defer { http.close() }
+        let provider = W.makeProvider(http)
+        var patch = GCalEventInput()
+        patch.summary = "Team standup"
+        let before = try await Self.listWeeks(provider, fixture, through: 4)
+
+        _ = try await provider.updateEvent(
+            calendarId: W.calendarId, eventId: W.seriesPath, event: patch, sendUpdates: "all")
+
+        #expect(store.recordedPuts().map(\.path) == [W.seriesPath], "the harness must be able to write, or the refusals prove nothing")
+        let after = try await Self.listWeeks(provider, fixture, through: 4)
+        #expect(after.compactMap(\.startDate) == before.compactMap(\.startDate), "the edit moved an occurrence")
+        #expect(after.count == 5 && after.allSatisfy { $0.summary == "Team standup" },
+                "the series' occurrences do not all show the edit: \(after.map(\.summary))")
     }
 
     @Test("this_only by an occurrence id changes that occurrence only, inside the series' resource")
@@ -471,7 +486,7 @@ struct CalDAVOccurrenceWireTests {
         #expect(rows.filter { $0.startDate == moved }.map(\.summary) == ["Standup (moved)"], "the moved occurrence is not listed once, as it was")
     }
 
-    @Test("a recurrence_id that names another occurrence than the event_id does is refused, and nothing is written")
+    @Test("a recurrence_id that names another occurrence than the event_id does is refused, one that names none is not found, and nothing is written")
     func recurrenceIdDisagreeingWithTheIdIsRefused() async throws {
         let fixture = try W.makeChanged()
         let (store, http) = W.serve(fixture)
@@ -481,10 +496,13 @@ struct CalDAVOccurrenceWireTests {
         let movedId = try fixture.occurrenceId(W.movedWeek)
         let fourth = OccurrenceFixture.naive(try fixture.occurrence(4), fixture.zone)
         let besideMoved = OccurrenceFixture.naive(try fixture.movedStart().addingTimeInterval(60 * 60), fixture.zone)
-        let cases: [(label: String, eventId: String, recurrenceId: String)] = [
-            ("week 2's id with week 4's start", secondId, fourth),
-            ("the moved occurrence's id an hour after where it is", movedId, besideMoved),
+        // A recurrence_id that names an occurrence is refused when the id names another; one
+        // that names none is the authoritative absence (`isNotFound`).
+        let cases: [(label: String, eventId: String, recurrenceId: String, namesNone: Bool)] = [
+            ("week 2's id with week 4's start", secondId, fourth, false),
+            ("the moved occurrence's id an hour after where it is", movedId, besideMoved, true),
         ]
+        let disagreement = "names another occurrence than this event_id does"
 
         for entry in cases {
             await #expect("this_only, \(entry.label), was not refused") {
@@ -492,21 +510,21 @@ struct CalDAVOccurrenceWireTests {
                     calendarId: W.calendarId, eventId: entry.eventId, recurrenceId: entry.recurrenceId,
                     recurrenceIdZone: fixture.zone, event: GCalEventInput(), sendUpdates: "all")
             } throws: { error in
-                Self.isRefusal(error, saying: "is not an occurrence of this repeating event")
+                entry.namesNone ? Self.isNotFound(error) : Self.isRefusal(error, saying: disagreement)
             }
             await #expect("this_and_following, \(entry.label), was not refused") {
                 _ = try await provider.splitSeries(
                     calendarId: W.calendarId, eventId: entry.eventId, recurrenceId: entry.recurrenceId,
                     recurrenceIdZone: fixture.zone, patch: GCalEventInput(), sendUpdates: "all")
             } throws: { error in
-                Self.isRefusal(error, saying: "is not an occurrence of this repeating event")
+                entry.namesNone ? Self.isNotFound(error) : Self.isRefusal(error, saying: disagreement)
             }
         }
         #expect(store.recordedPuts().isEmpty, "a refused edit wrote: \(store.recordedPuts().map(\.path))")
         #expect(store.storedICS(path: W.seriesPath) == fixture.ics, "the series is not on the server as it was")
     }
 
-    @Test("the series id with a recurrence_id that names no occurrence (a moved one's new time, a removed one, a time between) writes nothing")
+    @Test("the series id with a recurrence_id that names no occurrence now (a removed one, a time between, a moved one's old place) writes nothing, and with a moved one's new time edits that occurrence in place")
     func seriesIdWithNoOccurrenceAtTheTimeWritesNothing() async throws {
         let fixture = try W.makeChanged()
         let (store, http) = W.serve(fixture)
@@ -514,43 +532,258 @@ struct CalDAVOccurrenceWireTests {
         let provider = W.makeProvider(http)
         let naive = { (date: Date) in OccurrenceFixture.naive(date, fixture.zone) }
         let cases: [(label: String, recurrenceId: String)] = [
-            ("the moved occurrence's new time", naive(try fixture.movedStart())),
             ("the removed occurrence's time", naive(try fixture.occurrence(W.excludedWeek))),
             ("an hour after an occurrence", naive(try fixture.occurrence(2).addingTimeInterval(60 * 60))),
+            ("the moved occurrence's old place", naive(try fixture.occurrence(W.movedWeek))),
         ]
         var patch = GCalEventInput()
         patch.location = "Room 2"
 
         for entry in cases {
-            await #expect("this_only at \(entry.label) was not refused") {
+            await #expect("this_only at \(entry.label) was not reported not found") {
                 _ = try await provider.updateOccurrence(
                     calendarId: W.calendarId, eventId: W.seriesPath, recurrenceId: entry.recurrenceId,
                     recurrenceIdZone: fixture.zone, event: patch, sendUpdates: "all")
             } throws: { error in
-                Self.isRefusal(error, saying: "use the event_id listed for it")
+                Self.isNotFound(error)
             }
-            await #expect("this_and_following at \(entry.label) was not refused") {
+            await #expect("this_and_following at \(entry.label) was not reported not found") {
                 _ = try await provider.splitSeries(
                     calendarId: W.calendarId, eventId: W.seriesPath, recurrenceId: entry.recurrenceId,
                     recurrenceIdZone: fixture.zone, patch: patch, sendUpdates: "all")
             } throws: { error in
-                Self.isRefusal(error, saying: "use the event_id listed for it")
+                Self.isNotFound(error)
             }
         }
         #expect(store.recordedPuts().isEmpty, "a recurrence_id that names no occurrence wrote: \(store.recordedPuts().map(\.path))")
         #expect(store.storedICS(path: W.seriesPath) == fixture.ics, "the series is not on the server as it was")
 
-        // Control: the series id with the moved occurrence's place in the series edits it.
-        let slot = naive(try fixture.occurrence(W.movedWeek))
+        // The moved occurrence's new time names it, as the listing shows it: the edit changes its
+        // own override in place and adds no occurrence (before the fix, a second override was
+        // written at that time, an occurrence the series never had).
         _ = try await provider.updateOccurrence(
-            calendarId: W.calendarId, eventId: W.seriesPath, recurrenceId: slot,
+            calendarId: W.calendarId, eventId: W.seriesPath, recurrenceId: naive(try fixture.movedStart()),
             recurrenceIdZone: fixture.zone, event: patch, sendUpdates: "all")
         let stored = try #require(store.storedICS(path: W.seriesPath))
         #expect(store.recordedPuts().map(\.path) == [W.seriesPath], "the harness must be able to write, or the refusals prove nothing")
-        #expect(Self.lines(of: stored, named: "BEGIN:VEVENT").count == 2, "the edit at the moved occurrence's place added an occurrence")
+        #expect(Self.lines(of: stored, named: "BEGIN:VEVENT").count == 2, "the edit at the moved occurrence's new time added an occurrence")
+        #expect(Self.lines(of: stored, named: "RECURRENCE-ID") == Self.lines(of: fixture.ics, named: "RECURRENCE-ID"),
+                "the edit did not change the moved occurrence's own override")
         let rows = try await Self.listWeeks(provider, fixture, through: 4)
         let movedId = try fixture.occurrenceId(W.movedWeek)
-        #expect(rows.filter { $0.location == "Room 2" }.compactMap(\.id) == [movedId], "the series id at the moved occurrence's place did not edit it")
+        #expect(rows.filter { $0.location == "Room 2" }.compactMap(\.id) == [movedId], "the series id at the moved occurrence's new time did not edit it")
+    }
+
+    // MARK: Where the series ends, cancelled occurrences, and what can't be addressed
+
+    @Test("this_only after a COUNT series' last occurrence is not found and writes nothing; at its last occurrence it writes")
+    func thisOnlyAfterTheSeriesEndWritesNothing() async throws {
+        let base = try W.make()
+        let fixture = OccurrenceWireFixture(
+            zone: base.zone, first: base.first,
+            ics: base.ics.replacingOccurrences(of: "RRULE:FREQ=WEEKLY", with: "RRULE:FREQ=WEEKLY;COUNT=3"))
+        let (store, http) = W.serve(fixture)
+        defer { http.close() }
+        let provider = W.makeProvider(http)
+        let afterEnd = OccurrenceFixture.naive(try fixture.occurrence(3), fixture.zone)
+        var patch = GCalEventInput()
+        patch.location = "Room 2"
+
+        let afterEndId = try fixture.occurrenceId(3)
+        for eventId in [W.seriesPath, afterEndId] {
+            await #expect("this_only after the series' end by \(eventId) was not reported not found") {
+                _ = try await provider.updateOccurrence(
+                    calendarId: W.calendarId, eventId: eventId, recurrenceId: afterEnd,
+                    recurrenceIdZone: fixture.zone, event: patch, sendUpdates: "all")
+            } throws: { error in
+                Self.isNotFound(error)
+            }
+        }
+        #expect(store.recordedPuts().isEmpty, "an edit after the series' end wrote: \(store.recordedPuts().map(\.path))")
+        #expect(store.storedICS(path: W.seriesPath) == fixture.ics, "the series is not on the server as it was")
+
+        // Control: the last occurrence is still one.
+        _ = try await provider.updateOccurrence(
+            calendarId: W.calendarId, eventId: W.seriesPath,
+            recurrenceId: OccurrenceFixture.naive(try fixture.occurrence(2), fixture.zone),
+            recurrenceIdZone: fixture.zone, event: patch, sendUpdates: "all")
+        #expect(store.recordedPuts().map(\.path) == [W.seriesPath], "the harness must be able to write, or the refusals prove nothing")
+    }
+
+    @Test("this_only and this_and_following at a cancelled occurrence are not found, and nothing is written")
+    func scopedEditAtACancelledOccurrenceWritesNothing() async throws {
+        let base = try W.make()
+        let cancelled = try base.occurrence(2)
+        let wall = { (date: Date) in OccurrenceFixture.wall(date, base.zone) }
+        let override = """
+            BEGIN:VEVENT\r
+            UID:standup-1\r
+            RECURRENCE-ID;TZID=America/New_York:\(wall(cancelled))\r
+            DTSTART;TZID=America/New_York:\(wall(cancelled))\r
+            DTEND;TZID=America/New_York:\(wall(cancelled.addingTimeInterval(30 * 60)))\r
+            STATUS:CANCELLED\r
+            END:VEVENT\r
+            END:VCALENDAR
+            """
+        let fixture = OccurrenceWireFixture(
+            zone: base.zone, first: base.first, ics: base.ics.replacingOccurrences(of: "END:VCALENDAR", with: override))
+        let (store, http) = W.serve(fixture)
+        defer { http.close() }
+        let provider = W.makeProvider(http)
+        let recurrenceId = OccurrenceFixture.naive(cancelled, fixture.zone)
+        var patch = GCalEventInput()
+        patch.location = "Room 2"
+
+        let cancelledId = try fixture.occurrenceId(2)
+        for eventId in [W.seriesPath, cancelledId] {
+            await #expect("this_only at the cancelled occurrence by \(eventId) was not reported not found") {
+                _ = try await provider.updateOccurrence(
+                    calendarId: W.calendarId, eventId: eventId, recurrenceId: recurrenceId,
+                    recurrenceIdZone: fixture.zone, event: patch, sendUpdates: "all")
+            } throws: { error in
+                Self.isNotFound(error)
+            }
+            await #expect("this_and_following at the cancelled occurrence by \(eventId) was not reported not found") {
+                _ = try await provider.splitSeries(
+                    calendarId: W.calendarId, eventId: eventId, recurrenceId: recurrenceId,
+                    recurrenceIdZone: fixture.zone, patch: patch, sendUpdates: "all")
+            } throws: { error in
+                Self.isNotFound(error)
+            }
+        }
+        #expect(store.recordedPuts().isEmpty, "an edit at a cancelled occurrence wrote: \(store.recordedPuts().map(\.path))")
+        #expect(store.storedICS(path: W.seriesPath) == fixture.ics, "the series is not on the server as it was")
+    }
+
+    @Test("a series the expansion can't read (EXRULE) refuses this_only and this_and_following, and nothing is written")
+    func scopedEditOfAnUnreadableSeriesWritesNothing() async throws {
+        let base = try W.make()
+        let fixture = OccurrenceWireFixture(
+            zone: base.zone, first: base.first,
+            ics: base.ics.replacingOccurrences(of: "RRULE:FREQ=WEEKLY", with: "RRULE:FREQ=WEEKLY\r\nEXRULE:FREQ=MONTHLY"))
+        let (store, http) = W.serve(fixture)
+        defer { http.close() }
+        let provider = W.makeProvider(http)
+        let recurrenceId = OccurrenceFixture.naive(try fixture.occurrence(2), fixture.zone)
+
+        await #expect("this_only on an unreadable series was not refused") {
+            _ = try await provider.updateOccurrence(
+                calendarId: W.calendarId, eventId: W.seriesPath, recurrenceId: recurrenceId,
+                recurrenceIdZone: fixture.zone, event: GCalEventInput(), sendUpdates: "all")
+        } throws: { error in
+            Self.isRefusal(error, saying: "can't work out the occurrences")
+        }
+        await #expect("this_and_following on an unreadable series was not refused") {
+            _ = try await provider.splitSeries(
+                calendarId: W.calendarId, eventId: W.seriesPath, recurrenceId: recurrenceId,
+                recurrenceIdZone: fixture.zone, patch: GCalEventInput(), sendUpdates: "all")
+        } throws: { error in
+            Self.isRefusal(error, saying: "can't work out the occurrences")
+        }
+        #expect(store.recordedPuts().isEmpty, "a scoped edit of an unreadable series wrote: \(store.recordedPuts().map(\.path))")
+        #expect(store.storedICS(path: W.seriesPath) == fixture.ics, "the series is not on the server as it was")
+    }
+
+    // MARK: A resource that holds only changed occurrences
+
+    /// A resource holding only changed occurrences, as a server stores an invitation to single
+    /// occurrences of another organizer's series (RFC 4791 §4.1): one, moved an hour later than
+    /// its place in the series, with its RECURRENCE-ID written in `form` (`tzid`, `utc` or `date`).
+    private static func overrideOnly(_ fixture: W, form: String) throws -> (ics: String, slot: Date, start: Date, key: String) {
+        let slot = try fixture.occurrence(2)
+        let zone = fixture.zone
+        let wall = { (date: Date) in OccurrenceFixture.wall(date, zone) }
+        let head = ["UID:invite-1", "DTSTAMP:\(OccurrenceFixture.utcValue(fixture.first))"]
+        let tail = ["SUMMARY:Planning", "ORGANIZER:mailto:organizer@example.com", "ATTENDEE:mailto:user@example.com"]
+        switch form {
+        case "date":
+            let start = try #require(OccurrenceFixture.calendar(zone).date(byAdding: .day, value: 1, to: slot))
+            let lines = head + [
+                "RECURRENCE-ID;VALUE=DATE:\(OccurrenceFixture.dateValue(slot, zone))",
+                "DTSTART;VALUE=DATE:\(OccurrenceFixture.dateValue(start, zone))",
+                "DTEND;VALUE=DATE:\(OccurrenceFixture.dateValue(start.addingTimeInterval(OccurrenceFixture.days(1)), zone))",
+            ] + tail
+            return (OccurrenceFixture.ics([lines.joined(separator: "\n")]), slot, start, OccurrenceFixture.dateValue(slot, zone))
+        default:
+            let start = slot.addingTimeInterval(60 * 60)
+            let recurrenceId = form == "utc"
+                ? "RECURRENCE-ID:\(OccurrenceFixture.utcValue(slot))"
+                : "RECURRENCE-ID;TZID=America/New_York:\(wall(slot))"
+            let lines = head + [
+                recurrenceId,
+                "DTSTART;TZID=America/New_York:\(wall(start))",
+                "DTEND;TZID=America/New_York:\(wall(start.addingTimeInterval(30 * 60)))",
+            ] + tail
+            return (OccurrenceFixture.ics([lines.joined(separator: "\n")]), slot, start, OccurrenceFixture.utcValue(slot))
+        }
+    }
+
+    @Test("this_only by the id of an occurrence in a resource that holds only changed occurrences changes that occurrence on the server, and says so")
+    func thisOnlyInAnOverrideOnlyResourceChangesThatOccurrence() async throws {
+        let fixture = try W.make()
+        let path = "/cal/invite.ics"
+        for form in ["tzid", "utc", "date"] {
+            let invite = try Self.overrideOnly(fixture, form: form)
+            let (store, http) = W.serve(fixture)
+            defer { http.close() }
+            store.seed(path: path, ics: invite.ics)
+            let provider = W.makeProvider(http)
+            let eventId = CalDAVOccurrences.OccurrenceId.make(seriesHref: path, key: invite.key)
+            // The recurrence_id the listing gives it: its start_iso, where it is now.
+            let recurrenceId = form == "date"
+                ? OccurrenceFixture.isoDate(invite.start, fixture.zone)
+                : OccurrenceFixture.naive(invite.start, fixture.zone)
+            var patch = GCalEventInput()
+            patch.summary = "Planning (agenda)"
+
+            let edited = try await provider.updateOccurrence(
+                calendarId: W.calendarId, eventId: eventId, recurrenceId: recurrenceId,
+                recurrenceIdZone: fixture.zone, event: patch, sendUpdates: "all")
+
+            #expect(edited.id == eventId && edited.summary == "Planning (agenda)", "\(form): the result does not report the change: \(edited.id ?? "nil") \(edited.summary ?? "nil")")
+            #expect(store.recordedPuts().map(\.path) == [path], "\(form): the edit was not written into the resource")
+            let stored = try #require(store.storedICS(path: path))
+            #expect(Self.lines(of: stored, named: "BEGIN:VEVENT").count == 1, "\(form): the edit added a VEVENT")
+            for name in ["RECURRENCE-ID", "DTSTART", "DTEND", "ORGANIZER", "ATTENDEE"] {
+                #expect(Self.lines(of: stored, named: name) == Self.lines(of: invite.ics, named: name),
+                        "\(form): the edit changed the occurrence's \(name): \(Self.lines(of: stored, named: name))")
+            }
+            #expect(Self.lines(of: stored, named: "SUMMARY") == ["SUMMARY:Planning (agenda)"], "\(form): the occurrence's title was not changed on the server")
+            let read = try await provider.getEvent(calendarId: W.calendarId, eventId: eventId)
+            #expect(read.summary == "Planning (agenda)", "\(form): the occurrence does not read back changed")
+        }
+    }
+
+    @Test("a resource that holds only changed occurrences refuses this_only by its own id and any split, and nothing is written")
+    func overrideOnlyResourceRefusesWhatItCannotAddress() async throws {
+        let fixture = try W.make()
+        let path = "/cal/invite.ics"
+        let invite = try Self.overrideOnly(fixture, form: "tzid")
+        let (store, http) = W.serve(fixture)
+        defer { http.close() }
+        store.seed(path: path, ics: invite.ics)
+        let provider = W.makeProvider(http)
+        let occurrenceId = CalDAVOccurrences.OccurrenceId.make(seriesHref: path, key: invite.key)
+        let recurrenceId = OccurrenceFixture.naive(invite.start, fixture.zone)
+
+        await #expect("this_only by the resource's own id was not refused") {
+            _ = try await provider.updateOccurrence(
+                calendarId: W.calendarId, eventId: path, recurrenceId: recurrenceId,
+                recurrenceIdZone: fixture.zone, event: GCalEventInput(), sendUpdates: "all")
+        } throws: { error in
+            Self.isRefusal(error, saying: "without their repeating event")
+        }
+        for eventId in [path, occurrenceId] {
+            await #expect("this_and_following by \(eventId) was not refused") {
+                _ = try await provider.splitSeries(
+                    calendarId: W.calendarId, eventId: eventId, recurrenceId: recurrenceId,
+                    recurrenceIdZone: fixture.zone, patch: GCalEventInput(), sendUpdates: "all")
+            } throws: { error in
+                Self.isRefusal(error, saying: "without their repeating event")
+            }
+        }
+        #expect(store.recordedPuts().isEmpty, "a refused edit wrote: \(store.recordedPuts().map(\.path))")
+        #expect(store.storedICS(path: path) == invite.ics, "the resource is not on the server as it was")
     }
 
     @Test("this_only and this_and_following on an event that does not repeat are refused, and nothing is written")

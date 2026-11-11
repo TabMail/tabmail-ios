@@ -25,18 +25,23 @@ import GRDB
 // the series' own id and does delete the series, which is what makes the absences here
 // mean something.
 
-@Suite("calendar tools: one day of a CalDAV repeating event never deletes the series", .serialized, .processGlobalState)
-struct CalDAVOccurrenceDeleteToolToWireTests {
+/// The calendar tools over the real `CalDAVProvider` on a fake CalDAV server holding one
+/// weekly series (`OccurrenceWireFixture`), for the tool-to-wire suites.
+enum CalDAVToolWire {
     typealias W = OccurrenceWireFixture
 
-    /// Confirms every card, as a user tapping Delete would, and keeps it so the test can
-    /// read what the card ends up showing.
+    /// Confirms every card, as a user tapping the card's button would, and keeps it so the
+    /// test can read what the card showed and ends up showing. Given the fake server, it
+    /// also notes how many requests the server had served when each card was confirmed.
     @MainActor
-    private final class ConfirmingSink: AgentUISink {
+    final class ConfirmingSink: AgentUISink {
         var confirmations: [AgentToolRouter.ActionConfirmation] = []
-        nonisolated init() {}
+        var requestsAtConfirmation: [Int] = []
+        private let http: FakeHTTP.Scenario?
+        nonisolated init(http: FakeHTTP.Scenario? = nil) { self.http = http }
         func deliverConfirmation(_ confirmation: AgentToolRouter.ActionConfirmation) {
             confirmations.append(confirmation)
+            if let http { requestsAtConfirmation.append(http.recordedCalls().count) }
             confirmation.onRespond(true)
         }
     }
@@ -54,7 +59,7 @@ struct CalDAVOccurrenceDeleteToolToWireTests {
         </d:multistatus>
         """
 
-    private struct Harness {
+    struct Harness {
         let accountId: String
         let pool: DatabasePool
         let dir: URL
@@ -66,7 +71,7 @@ struct CalDAVOccurrenceDeleteToolToWireTests {
 
     /// A test database holding one active CalDAV account, and the real `CalDAVProvider`
     /// for it over a fake server holding one weekly series.
-    private static func makeHarness(accountId: String) async throws -> Harness {
+    static func makeHarness(accountId: String) async throws -> Harness {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         var config = Configuration()
@@ -97,7 +102,7 @@ struct CalDAVOccurrenceDeleteToolToWireTests {
             fixture: fixture, store: store, http: http)
     }
 
-    private static func tearDown(_ harness: Harness) {
+    static func tearDown(_ harness: Harness) {
         let accountId = harness.accountId
         Task { await AccountManager.shared.unregisterCalendarProviderForTesting(accountId: accountId) }
         harness.http.close()
@@ -105,14 +110,14 @@ struct CalDAVOccurrenceDeleteToolToWireTests {
     }
 
     /// Every `event_id:` value in a tool's output.
-    private static func eventIds(in output: String) -> [String] {
+    static func eventIds(in output: String) -> [String] {
         output.matches(of: /(?:^|\t)event_id:\s+(\S+)/.anchorsMatchLineEndings()).map { String($0.1) }
     }
 
     /// The calendar a listed event is in, as the read tools' pill cache records it for
     /// the translator (the tools write it from a background task into the shared
     /// translator; the test writes it into its own).
-    private static func recordCalendar(
+    static func recordCalendar(
         of eventId: String, accountId: String, translator: ChatIdTranslator
     ) async {
         await translator.cacheEventDetail(
@@ -122,14 +127,21 @@ struct CalDAVOccurrenceDeleteToolToWireTests {
             availability: "busy", htmlLink: nil)
     }
 
-    private static func deletes(_ http: FakeHTTP.Scenario) -> [String] {
+    static func deletes(_ http: FakeHTTP.Scenario) -> [String] {
         http.recordedCalls().filter { $0.method == "DELETE" }.map(\.url)
     }
+}
+
+@Suite("calendar tools: one day of a CalDAV repeating event never deletes the series", .serialized, .processGlobalState)
+struct CalDAVOccurrenceDeleteToolToWireTests {
+    typealias W = OccurrenceWireFixture
+    typealias H = CalDAVToolWire
+    typealias ConfirmingSink = CalDAVToolWire.ConfirmingSink
 
     @Test("read and search for one day name that day's occurrence, and deleting it is refused with the series left on the server")
     func deletingOneDayNeverDeletesTheSeries() async throws {
-        let harness = try await Self.makeHarness(accountId: "caldav-one-day-delete")
-        defer { Self.tearDown(harness) }
+        let harness = try await H.makeHarness(accountId: "caldav-one-day-delete")
+        defer { H.tearDown(harness) }
         let fixture = harness.fixture
         let occurrenceId = try fixture.occurrenceId(2)
         let expected = CompoundEventId.make(accountId: harness.accountId, eventId: occurrenceId)
@@ -143,16 +155,16 @@ struct CalDAVOccurrenceDeleteToolToWireTests {
         // 1. The listing tools name that day's occurrence, not the series.
         let readOutput = try await CalendarReadTool().execute(arguments: oneDay)
         let searchOutput = try await CalendarSearchTool().execute(arguments: search)
-        #expect(Self.eventIds(in: readOutput) == [expected], "calendar_read for one day did not name that day's occurrence: \(readOutput)")
-        #expect(Self.eventIds(in: searchOutput) == [expected], "calendar_search for one day did not name that day's occurrence: \(searchOutput)")
+        #expect(H.eventIds(in: readOutput) == [expected], "calendar_read for one day did not name that day's occurrence: \(readOutput)")
+        #expect(H.eventIds(in: searchOutput) == [expected], "calendar_search for one day did not name that day's occurrence: \(searchOutput)")
 
         // 2. The model is handed a number that maps back to that occurrence.
         let translator = ChatIdTranslator.createIsolated()
         let forModel = await translator.processToolOutputForLLM(readOutput)
-        let numericId = try #require(Self.eventIds(in: forModel).first.flatMap { Int($0) }, "no numeric event id for the model: \(forModel)")
+        let numericId = try #require(H.eventIds(in: forModel).first.flatMap { Int($0) }, "no numeric event id for the model: \(forModel)")
         let mapped = await translator.toRealId(numericId)
         #expect(mapped == expected)
-        await Self.recordCalendar(of: occurrenceId, accountId: harness.accountId, translator: translator)
+        await H.recordCalendar(of: occurrenceId, accountId: harness.accountId, translator: translator)
 
         // 3. The user asks to delete it and confirms the card.
         let sink = ConfirmingSink()
@@ -163,8 +175,8 @@ struct CalDAVOccurrenceDeleteToolToWireTests {
         await AccountManager.shared.drainCalendarQueue()
 
         // The series is on the server exactly as it was.
-        #expect(Self.deletes(harness.http).isEmpty,
-                "a DELETE reached the server for one day of the series, which deletes every occurrence: \(Self.deletes(harness.http))")
+        #expect(H.deletes(harness.http).isEmpty,
+                "a DELETE reached the server for one day of the series, which deletes every occurrence: \(H.deletes(harness.http))")
         #expect(harness.store.storedICS(path: W.seriesPath) == fixture.ics, "the series is not on the server as it was")
         #expect(harness.store.recordedPuts().isEmpty, "the refused delete wrote to the series")
 
@@ -185,15 +197,15 @@ struct CalDAVOccurrenceDeleteToolToWireTests {
 
     @Test("Control: the series' own id deletes the series through the same harness")
     func seriesOwnIdDeletesTheSeries() async throws {
-        let harness = try await Self.makeHarness(accountId: "caldav-series-delete-control")
-        defer { Self.tearDown(harness) }
+        let harness = try await H.makeHarness(accountId: "caldav-series-delete-control")
+        defer { H.tearDown(harness) }
         // The series' own id, handed to the model as an event_id, as a listing names a
         // series it shows once. No calendar is recorded for it: the delete tool finds it as
         // it finds any id the pill cache doesn't know.
         let translator = ChatIdTranslator.createIsolated()
         let seriesCompound = CompoundEventId.make(accountId: harness.accountId, eventId: W.seriesPath)
         let forModel = await translator.processToolOutputForLLM("event_id: \(seriesCompound)")
-        let seriesNumber = try #require(Self.eventIds(in: forModel).first.flatMap { Int($0) }, "no numeric series id for the model: \(forModel)")
+        let seriesNumber = try #require(H.eventIds(in: forModel).first.flatMap { Int($0) }, "no numeric series id for the model: \(forModel)")
         let mapped = await translator.toRealId(seriesNumber)
         #expect(mapped == seriesCompound)
 
@@ -202,7 +214,7 @@ struct CalDAVOccurrenceDeleteToolToWireTests {
             arguments: ["event_id": .string(String(seriesNumber))],
             invocation: ToolInvocation(uiSink: sink, sessionKey: "caldav-series-delete-control"))
 
-        #expect(Self.deletes(harness.http).count == 1,
+        #expect(H.deletes(harness.http).count == 1,
                 "the harness must be able to send a DELETE, or the refusal's absence proves nothing: \(output)")
         #expect(harness.store.storedICS(path: W.seriesPath) == nil, "deleting by the series id left the series on the server")
     }

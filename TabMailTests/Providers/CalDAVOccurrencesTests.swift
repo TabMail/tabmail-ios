@@ -230,6 +230,27 @@ struct CalDAVOccurrenceExpansionTests {
         #expect(keys == expected, "COUNT=5 with the second date excluded is four occurrences, the last on day 5")
     }
 
+    @Test("COUNT is counted from the series' first date, not from the range's: a range that starts later still ends where the series does")
+    func countIsAppliedBeforeTheRangeStarts() {
+        let first = F.topOfHour(hoursFromNow: 24)
+        let ics = F.ics(["""
+            UID:count-later-range
+            DTSTART:\(F.utcValue(first))
+            DTEND:\(F.utcValue(first.addingTimeInterval(60 * 60)))
+            SUMMARY:Course
+            RRULE:FREQ=DAILY;COUNT=5
+            """])
+
+        let keys = F.listing(ics, from: first.addingTimeInterval(F.days(3) - 60), to: first.addingTimeInterval(F.days(10)))
+            .compactMap(\.id).sorted()
+
+        let expected = [3, 4].map { F.occurrenceId(F.utcValue(first.addingTimeInterval(F.days($0)))) }
+        #expect(keys == expected, "a COUNT=5 series listed from its fourth day has its fourth and fifth occurrences only: \(keys)")
+        let afterEnd = F.utcValue(first.addingTimeInterval(F.days(5)))
+        #expect(CalDAVOccurrences.occurrence(key: afterEnd, icsText: ics, href: F.href) == nil,
+                "a date after the series' fifth occurrence reads back as an occurrence")
+    }
+
     @Test("a DATE in an EXDATE takes out that day's occurrence of a timed series")
     func dateExclusionTakesOutThatDay() {
         let first = F.topOfHour(hoursFromNow: 30)
@@ -274,6 +295,52 @@ struct CalDAVOccurrenceExpansionTests {
         #expect(F.listing(timed(until: third), from: range.from, to: range.to).count == 3, "an UNTIL on an occurrence includes it")
         #expect(F.listing(timed(until: third.addingTimeInterval(-1)), from: range.from, to: range.to).count == 2,
                 "an UNTIL a second before an occurrence excludes it")
+    }
+
+    @Test("UNTIL in a timed series in its own zone: a DATE includes its whole day, a time without Z is read in the series' zone, and a UTC instant on the previous UTC date keeps the last occurrence")
+    func untilFormsInAZonedSeries() throws {
+        func series(_ zone: String, first: Date, until: String) -> String {
+            let tz = TimeZone(identifier: zone) ?? .gmt
+            return F.ics(["""
+                UID:until-forms
+                DTSTART;TZID=\(zone):\(F.wall(first, tz))
+                DTEND;TZID=\(zone):\(F.wall(first.addingTimeInterval(30 * 60), tz))
+                SUMMARY:Call
+                RRULE:FREQ=DAILY;UNTIL=\(until)
+                """])
+        }
+        func firstAt(_ hour: Int, in zone: TimeZone) throws -> Date {
+            let calendar = F.calendar(zone)
+            let tomorrow = try #require(calendar.date(byAdding: .day, value: 1, to: Date()))
+            return try #require(calendar.date(bySettingHour: hour, minute: 0, second: 0, of: tomorrow))
+        }
+        let newYork = try #require(TimeZone(identifier: "America/New_York"))
+        let tokyo = try #require(TimeZone(identifier: "Asia/Tokyo"))
+
+        // New York, 09:00 daily, ending on its third day.
+        let nyFirst = try firstAt(9, in: newYork)
+        let nyThird = try #require(F.calendar(newYork).date(byAdding: .day, value: 2, to: nyFirst))
+        let nyRange = (from: nyFirst.addingTimeInterval(-60), to: nyFirst.addingTimeInterval(F.days(10)))
+        let cases: [(label: String, ics: String, from: Date, to: Date)] = [
+            ("a DATE UNTIL", series("America/New_York", first: nyFirst, until: F.dateValue(nyThird, newYork)), nyRange.from, nyRange.to),
+            ("an UNTIL without Z", series("America/New_York", first: nyFirst, until: F.wall(nyThird, newYork)), nyRange.from, nyRange.to),
+        ]
+        for entry in cases {
+            let rows = F.listing(entry.ics, from: entry.from, to: entry.to)
+            #expect(rows.count == 3 && rows.allSatisfy { $0.occurrencesNotListed == nil },
+                    "\(entry.label): three occurrences, the last on the UNTIL's day, got \(rows.count): \(rows.map { $0.start?.dateTime ?? "nil" })")
+        }
+
+        // Tokyo, 08:00 daily (23:00 UTC the day before), ending exactly at its third occurrence.
+        let tokyoFirst = try firstAt(8, in: tokyo)
+        let tokyoThird = try #require(F.calendar(tokyo).date(byAdding: .day, value: 2, to: tokyoFirst))
+        #expect(F.dateValue(tokyoThird, tokyo) != F.dateValue(tokyoThird, .gmt), "setup: 08:00 in Tokyo has the same date in UTC")
+        let tokyoRows = F.listing(
+            series("Asia/Tokyo", first: tokyoFirst, until: F.utcValue(tokyoThird)),
+            from: tokyoFirst.addingTimeInterval(-60), to: tokyoFirst.addingTimeInterval(F.days(10)))
+            .sorted { ($0.startDate ?? .distantPast) < ($1.startDate ?? .distantPast) }
+        #expect(tokyoRows.compactMap(\.startDate).last == tokyoThird && tokyoRows.count == 3,
+                "a UTC UNTIL on the last occurrence dropped it: \(tokyoRows.map { $0.start?.dateTime ?? "nil" })")
     }
 
     @Test("RDATE adds occurrences, and a PERIOD gives its occurrence its own length")
@@ -668,6 +735,61 @@ struct CalDAVOccurrenceLookupTests {
                 #expect(read?.id == row.id && read?.startDate == start, "\(entry.zone): \(id) does not read back as listed")
             }
         }
+    }
+
+    @Test("a resource that holds only changed occurrences lists each where it is, keyed by its own RECURRENCE-ID in any form, and each reads back by its id")
+    func overrideOnlyResourceListsAndReadsBack() throws {
+        let newYork = try #require(TimeZone(identifier: "America/New_York"))
+        let calendar = F.calendar(newYork)
+        let tomorrow = try #require(calendar.date(byAdding: .day, value: 1, to: Date()))
+        let zonedSlot = try #require(calendar.date(bySettingHour: 9, minute: 0, second: 0, of: tomorrow))
+        let utcSlot = zonedSlot.addingTimeInterval(F.days(7))
+        let farSlot = zonedSlot.addingTimeInterval(F.days(60))
+        let hour: TimeInterval = 60 * 60
+        func changed(_ recurrenceId: String, start: Date, title: String) -> String {
+            """
+            UID:invite-1
+            \(recurrenceId)
+            DTSTART;TZID=America/New_York:\(F.wall(start, newYork))
+            DTEND;TZID=America/New_York:\(F.wall(start.addingTimeInterval(30 * 60), newYork))
+            SUMMARY:\(title)
+            """
+        }
+        let timed = F.ics([
+            changed("RECURRENCE-ID;TZID=America/New_York:\(F.wall(zonedSlot, newYork))", start: zonedSlot.addingTimeInterval(hour), title: "Planning moved"),
+            changed("RECURRENCE-ID:\(F.utcValue(utcSlot))", start: utcSlot, title: "Planning"),
+            changed("RECURRENCE-ID:\(F.utcValue(farSlot))", start: farSlot, title: "Planning later"),
+        ])
+
+        let rows = F.listing(timed, from: zonedSlot.addingTimeInterval(-60), to: zonedSlot.addingTimeInterval(F.days(30)))
+            .sorted { ($0.startDate ?? .distantPast) < ($1.startDate ?? .distantPast) }
+
+        let expectedIds = [F.occurrenceId(F.utcValue(zonedSlot)), F.occurrenceId(F.utcValue(utcSlot))]
+        #expect(rows.compactMap(\.id) == expectedIds, "the occurrences in range are not keyed by their RECURRENCE-ID: \(rows.map(\.id))")
+        #expect(rows.compactMap(\.startDate) == [zonedSlot.addingTimeInterval(hour), utcSlot], "an occurrence is not listed where it is")
+        #expect(rows.allSatisfy { $0.recurringEventId == F.href })
+        for row in rows {
+            let id = try #require(row.id)
+            let key = try #require(try CalDAVOccurrences.OccurrenceId.split(id).key, "\(id) is not an occurrence id")
+            let read = CalDAVOccurrences.occurrence(key: key, icsText: timed, href: F.href)
+            #expect(read?.id == row.id && read?.startDate == row.startDate && read?.summary == row.summary, "\(id) does not read back as listed")
+        }
+        let moved = CalDAVOccurrences.occurrence(key: F.utcValue(zonedSlot.addingTimeInterval(hour)), icsText: timed, href: F.href)
+        #expect(moved == nil, "an occurrence read back by where it moved to rather than by its RECURRENCE-ID")
+
+        // An all-day one, keyed by its date.
+        let day = try #require(calendar.date(byAdding: .day, value: 3, to: tomorrow))
+        let allDay = F.ics(["""
+            UID:invite-2
+            RECURRENCE-ID;VALUE=DATE:\(F.dateValue(day, .current))
+            DTSTART;VALUE=DATE:\(F.dateValue(day, .current))
+            DTEND;VALUE=DATE:\(F.dateValue(day.addingTimeInterval(F.days(1)), .current))
+            SUMMARY:Offsite
+            """])
+        let allDayRows = F.listing(allDay, from: Date(), to: Date().addingTimeInterval(F.days(10)))
+        #expect(allDayRows.compactMap(\.id) == [F.occurrenceId(F.dateValue(day, .current))], "the all-day occurrence is not keyed by its date")
+        #expect(allDayRows.first?.start?.date == F.isoDate(day, .current))
+        #expect(CalDAVOccurrences.occurrence(key: F.dateValue(day, .current), icsText: allDay, href: F.href)?.summary == "Offsite")
     }
 
     @Test("occurrence ids: a series id has no key, a damaged one is refused, and each key names its recurrence_id")

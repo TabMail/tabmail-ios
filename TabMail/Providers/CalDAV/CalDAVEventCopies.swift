@@ -192,10 +192,15 @@ extension CalDAVProvider {
     /// RFC 5545 lets an override inherit nothing, and iCloud and Apple Calendar show only what the
     /// override itself carries.
     ///
+    /// A resource that holds only changed occurrences (an invitation to single occurrences,
+    /// RFC 4791 §4.1) has no series VEVENT: an edit of one of its overrides changes that override
+    /// in place, and an occurrence it does not hold can't be copied from anything, so it is
+    /// refused with nothing written.
+    ///
     /// - Parameters:
     ///   - storedICS: the series' resource exactly as the server returned it.
-    ///   - recurrenceIdNaive: the occurrence's original start, already in the series' frame
-    ///     (`recurrenceIdInMasterFrame`).
+    ///   - recurrenceIdNaive: the occurrence's original start, already in the resource's
+    ///     RECURRENCE-ID frame (`recurrenceIdInMasterFrame` with `recurrenceIdKind`).
     ///   - patch: the user's edit.
     ///   - now: the edit's time, written as a new override's `DTSTAMP`.
     ///   - zones: the zone context of `storedICS`. The override is merged on its own, outside the
@@ -207,29 +212,30 @@ extension CalDAVProvider {
         now: Date,
         zones: CalendarTimeZoneContext
     ) throws -> String {
-        let kind = masterDTStartKind(from: storedICS)
+        let kind = recurrenceIdKind(from: storedICS)
         let units = icsUnits(storedICS)
-        guard let masterBlock = veventBlocks(units).first(where: { !isOverride($0) }),
-              let dtstart = topLevel(masterBlock).first(where: { icsProperty($0.text)?.name == "DTSTART" }),
-              let dtstartProperty = icsProperty(dtstart.text) else {
-            throw CalendarProviderError.notSupported("The repeating event has no start, so one occurrence of it can't be changed.")
-        }
-        guard let ridValue = icsDateValue(fromNaive: recurrenceIdNaive, kind: kind) else {
-            throw CalendarProviderError.notSupported("Invalid recurrence_id '\(recurrenceIdNaive)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
-        }
-        // RFC 5545 §3.8.4.4: RECURRENCE-ID takes the series DTSTART's value type and zone. A date
-        // value must say so, even where the series' own DTSTART leaves it implicit.
-        var ridParams = dtstartProperty.params
-        if case .allDay = kind, !ICSValueType.statesDate(ridParams) { ridParams += ";VALUE=DATE" }
-        let ridLine = "RECURRENCE-ID\(ridParams):\(ridValue)"
-        guard let ridInstant = try parseICSDateTime(ridLine, zones: zones) else {
-            throw CalendarProviderError.notSupported("The repeating event's time zone can't be read, so one occurrence of it can't be changed.")
-        }
+        let masterBlock = veventBlocks(units).first(where: { !isOverride($0) })
 
         let base: [ICSUnit]
         if let existing = existingOverride(in: units, recurrenceIdNaive: recurrenceIdNaive, kind: kind) {
             base = existing
         } else {
+            guard let masterBlock,
+                  let dtstart = topLevel(masterBlock).first(where: { icsProperty($0.text)?.name == "DTSTART" }),
+                  let dtstartProperty = icsProperty(dtstart.text) else {
+                throw CalendarProviderError.notSupported("The repeating event has no start, so one occurrence of it can't be changed.")
+            }
+            guard let ridValue = icsDateValue(fromNaive: recurrenceIdNaive, kind: kind) else {
+                throw CalendarProviderError.notSupported("Invalid recurrence_id '\(recurrenceIdNaive)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
+            }
+            // RFC 5545 §3.8.4.4: RECURRENCE-ID takes the series DTSTART's value type and zone. A date
+            // value must say so, even where the series' own DTSTART leaves it implicit.
+            var ridParams = dtstartProperty.params
+            if case .allDay = kind, !ICSValueType.statesDate(ridParams) { ridParams += ";VALUE=DATE" }
+            let ridLine = "RECURRENCE-ID\(ridParams):\(ridValue)"
+            guard let ridInstant = try parseICSDateTime(ridLine, zones: zones) else {
+                throw CalendarProviderError.notSupported("The repeating event's time zone can't be read, so one occurrence of it can't be changed.")
+            }
             guard let duration = try copyLength(storedICS, zones: zones) else {
                 throw CalendarProviderError.notSupported("The repeating event's length can't be read, so one occurrence of it can't be changed.")
             }
@@ -279,9 +285,10 @@ extension CalDAVProvider {
         block = insertAfterUID(block, ridUnit)
         // RFC 5545 §3.8.4.3, enforced by iCloud with an HTTP 403: a VEVENT with attendees carries
         // its organizer. A copy of the series already has it; an override written without one gets
-        // the series' organizer.
+        // the series' organizer, when the resource holds the series.
         let top = topLevel(block).compactMap { icsProperty($0.text)?.name }
         if top.contains("ATTENDEE"), !top.contains("ORGANIZER"),
+           let masterBlock,
            let organizer = topLevel(masterBlock).first(where: { icsProperty($0.text)?.name == "ORGANIZER" }) {
             block = insertAfterUID(block, organizer)
         }
