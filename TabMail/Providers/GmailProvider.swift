@@ -101,7 +101,20 @@ actor GmailProvider: EmailProvider {
     /// in inbox, sent, trash, spam, or drafts. Every folder-scoped method MUST use
     /// this (and omit `labelIds`) when `folder == archivePath` — the synthetic path
     /// is not a real Gmail label ID and the API rejects it with 400 "Invalid label".
-    static let allMailExclusionQuery = "-in:inbox -in:sent -in:trash -in:spam -in:draft"
+    static let allMailExclusionQuery = allMailExcludedLabelIds.map { "-in:\($0.lowercased())" }.joined(separator: " ")
+
+    /// The system labels whose presence keeps a message OUT of the synthetic All
+    /// Mail folder. The single source of All Mail membership: the listing query
+    /// above is built from it, and the history delta asks
+    /// `folder(_:containsMessageWithLabels:)`, so listing and delta apply one rule.
+    nonisolated static let allMailExcludedLabelIds = ["INBOX", "SENT", "TRASH", "SPAM", "DRAFT"]
+
+    /// Whether a message carrying `labelIds` belongs in the local folder `path`:
+    /// All Mail holds every message without an excluded label; every other
+    /// folder is the Gmail label of the same id.
+    nonisolated static func folder(_ path: String, containsMessageWithLabels labelIds: [String]) -> Bool {
+        path == archivePath ? !labelIds.contains(where: allMailExcludedLabelIds.contains) : labelIds.contains(path)
+    }
     private static let draftResourceLookupPageSize = 500
 
     private let accessToken: @Sendable (_ forceRefresh: Bool) async throws -> String

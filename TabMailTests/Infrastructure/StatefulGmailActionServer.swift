@@ -92,8 +92,26 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         case gone410
     }
 
+    /// One change the fake applied, served back by `GET /history` the way
+    /// Gmail's `history.list` reports it.
+    private enum HistoryChange: Sendable {
+        case messageAdded
+        case messageDeleted
+        case labelsAdded([String])
+        case labelsRemoved([String])
+    }
+
+    private struct HistoryEvent: Sendable {
+        let id: Int
+        let providerMessageId: String
+        let change: HistoryChange
+    }
+
     private struct State: Sendable {
         var messagesByProviderId: [String: Message]
+        /// The mailbox's current `historyId`; every recorded change advances it.
+        var historyId = StatefulGmailActionServer.initialHistoryId
+        var history: [HistoryEvent] = []
         var userLabels: [String: String]
         let createdLabelId: String?
         /// Label creates still to refuse with 409 whatever `/labels` lists: a
@@ -177,6 +195,20 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         /// spurious `nextPageToken` even though the implied next page is
         /// empty — models a dangling-pagination edge case (SPEC-B3).
         var spuriousNextPageTokenTargets: Set<String> = []
+
+        /// Record the label difference between `before` and `after` as history,
+        /// as Gmail does for every label change it applies.
+        mutating func recordLabelChange(_ providerMessageId: String, before: Set<String>, after: Set<String>) {
+            let added = after.subtracting(before).sorted()
+            let removed = before.subtracting(after).sorted()
+            if !added.isEmpty { record(providerMessageId, .labelsAdded(added)) }
+            if !removed.isEmpty { record(providerMessageId, .labelsRemoved(removed)) }
+        }
+
+        mutating func record(_ providerMessageId: String, _ change: HistoryChange) {
+            historyId += 1
+            history.append(HistoryEvent(id: historyId, providerMessageId: providerMessageId, change: change))
+        }
     }
 
     private final class StateBox: Sendable {
@@ -189,6 +221,9 @@ final class StatefulGmailActionServer: @unchecked Sendable {
 
     let http = FakeHTTP.Scenario()
     private let state: StateBox
+
+    /// The `historyId` a fresh fake reports before any change is applied.
+    static let initialHistoryId = 1000
 
     /// System labels (`INBOX`, `SENT`, …) served by `/labels` with
     /// `type: system`, so `GmailProvider.fetchFolders` — and therefore a real
@@ -303,7 +338,42 @@ final class StatefulGmailActionServer: @unchecked Sendable {
     /// The message is gone from the mailbox (deleted from another client):
     /// every later request naming it gets Gmail's `404`.
     func removeMessage(providerMessageId: String) {
-        _ = state.value.withLock { $0.messagesByProviderId.removeValue(forKey: providerMessageId) }
+        state.value.withLock { model in
+            guard model.messagesByProviderId.removeValue(forKey: providerMessageId) != nil else { return }
+            model.record(providerMessageId, .messageDeleted)
+        }
+    }
+
+    /// A new message arrives in the mailbox; `/history` reports it as added.
+    func addMessage(_ seed: Seed) {
+        state.value.withLock { model in
+            model.messagesByProviderId[seed.providerMessageId] = Message(
+                rfc822MessageId: seed.rfc822MessageId,
+                providerMessageId: seed.providerMessageId,
+                labels: seed.labels,
+                internalDate: seed.internalDate,
+                received: seed.received
+            )
+            model.record(seed.providerMessageId, .messageAdded)
+        }
+    }
+
+    /// Another client changes a message's labels (read, star, archive, trash,
+    /// a user label); `/history` reports the change like any other.
+    func applyLabelChange(providerMessageId: String, add: Set<String> = [], remove: Set<String> = []) {
+        state.value.withLock { model in
+            guard var message = model.messagesByProviderId[providerMessageId] else { return }
+            let before = message.labels
+            message.labels.formUnion(add)
+            message.labels.subtract(remove)
+            model.messagesByProviderId[providerMessageId] = message
+            model.recordLabelChange(providerMessageId, before: before, after: message.labels)
+        }
+    }
+
+    /// The mailbox's current `historyId`, the cursor a synced client holds.
+    func currentHistoryId() -> String {
+        state.value.withLock { String($0.historyId) }
     }
 
     /// A `/messages/{id}/trash` or `/untrash` failure that says nothing about
@@ -604,6 +674,32 @@ final class StatefulGmailActionServer: @unchecked Sendable {
             ])) ?? Data()
             return .bytes(body, contentType: "application/json")
         }
+        // `history.list`: every recorded change newer than `startHistoryId`,
+        // one record each, with the mailbox's current `historyId`. A cursor
+        // older than the fake's first id is still answered (no expiry modelled).
+        http.register(path: "/history", method: "GET") { [state] request in
+            let start = (URLComponents(url: request.url, resolvingAgainstBaseURL: false)?.queryItems ?? [])
+                .first(where: { $0.name == "startHistoryId" })?.value.flatMap(Int.init) ?? 0
+            let (records, historyId) = state.value.withLock { model -> ([[String: Any]], Int) in
+                let records = model.history.filter { $0.id > start }.map { event -> [String: Any] in
+                    let message: [String: Any] = ["id": event.providerMessageId, "threadId": "thread-\(event.providerMessageId)"]
+                    var record: [String: Any] = ["id": String(event.id)]
+                    switch event.change {
+                    case .messageAdded: record["messagesAdded"] = [["message": message]]
+                    case .messageDeleted: record["messagesDeleted"] = [["message": message]]
+                    case .labelsAdded(let labels): record["labelsAdded"] = [["message": message, "labelIds": labels]]
+                    case .labelsRemoved(let labels): record["labelsRemoved"] = [["message": message, "labelIds": labels]]
+                    }
+                    return record
+                }
+                return (records, model.historyId)
+            }
+            let body = (try? JSONSerialization.data(withJSONObject: [
+                "history": records,
+                "historyId": String(historyId),
+            ])) ?? Data()
+            return .bytes(body, contentType: "application/json")
+        }
         http.register(path: "/messages/", method: "GET") { [state] request in
             let providerId = request.url.pathComponents.last ?? ""
             if state.value.withLock({ $0.invalidIdOnGetProviderIds.contains(providerId) }) {
@@ -776,9 +872,11 @@ final class StatefulGmailActionServer: @unchecked Sendable {
             }
             let found = state.value.withLock { model -> Bool in
                 guard var message = model.messagesByProviderId[providerId] else { return false }
+                let before = message.labels
                 message.labels.formUnion(additions)
                 message.labels.subtract(removals)
                 model.messagesByProviderId[providerId] = message
+                model.recordLabelChange(providerId, before: before, after: message.labels)
                 return true
             }
             return found ? .json(raw: "{}") : .status(404)
@@ -808,8 +906,10 @@ final class StatefulGmailActionServer: @unchecked Sendable {
             }
             let found = state.value.withLock { model -> Bool in
                 guard var message = model.messagesByProviderId[providerId] else { return false }
+                let before = message.labels
                 if trash { message.labels.insert("TRASH") } else { message.labels.remove("TRASH") }
                 model.messagesByProviderId[providerId] = message
+                model.recordLabelChange(providerId, before: before, after: message.labels)
                 return true
             }
             return found ? .json(raw: "{}") : .status(404)
@@ -842,7 +942,7 @@ final class StatefulGmailActionServer: @unchecked Sendable {
     /// `{SENT, UNREAD}`) resolves in archive scope — the OLD hardcoded set
     /// mirrored the provider bug that silently no-opped Undo-of-archive for
     /// self-sent mail.
-    private static func satisfiesQueryExclusions(_ query: String, labels: Set<String>) -> Bool {
+    static func satisfiesQueryExclusions(_ query: String, labels: Set<String>) -> Bool {
         let roleByToken: [String: String] = [
             "-in:inbox": "INBOX",
             "-in:sent": "SENT",

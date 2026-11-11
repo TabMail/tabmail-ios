@@ -896,18 +896,20 @@ struct StatefulGmailActionServerTests {
         server.http.register(path: "/drafts/\(providerMessageId)", method: "DELETE") { _ in
             .status(draftDelete.next())
         }
-        server.http.register(
-            path: "/history",
-            method: "GET",
-            response: .json(raw: #"{"historyId":"424242","history":[{"messagesAdded":[{"message":{"id":"gmail-history-added-1","labelIds":["INBOX"]}}]}]}"#)
-        )
+        // The fake's own `/history` route reports the arrival below.
+        let cursor = server.currentHistoryId()
+        server.addMessage(.init(
+            rfc822MessageId: "gmail-history-added@example.com",
+            providerMessageId: "gmail-history-added-1",
+            labels: ["INBOX"]
+        ))
 
         try await provider.deleteDraft(identity: .gmail(resourceId: providerMessageId))
 
-        let history = try await provider.fetchHistory(since: "424241")
+        let history = try await provider.fetchHistory(since: cursor)
         #expect(history != nil, "fetchHistory returned nil — the canned delta never arrived, so the request did not reach the fake")
         guard let history else { return }
-        #expect(history.newHistoryId == "424242")
+        #expect(history.newHistoryId == server.currentHistoryId())
         #expect(history.messagesAdded.count == 1)
         #expect(history.messagesAdded.first?.messageId == "gmail-history-added-1")
 

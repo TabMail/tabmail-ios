@@ -176,14 +176,12 @@ extension SyncEngine {
                     let isPendingDestructive = snapshot.destructive.containsAnyKey(messageId: info.messageId, rfc822MessageId: info.rfc822MessageId)
 
                     // Check all tracked folders for this message.
-                    // Skip synthetic "All Mail" folder — membership is defined by absence of other
-                    // labels, so labelIds.contains() can never match. Full sync handles it correctly.
-                    for folder in folders where folder.path != GmailProvider.archivePath {
+                    for folder in folders {
                         let existing = try MessageHeader
                             .filter(Column("messageId") == info.messageId && Column("folderId") == folder.id)
                             .fetchOne(db)
                         let existsLocally = existing != nil
-                        let belongsInFolder = labelIds.contains(folder.path)
+                        let belongsInFolder = GmailProvider.folder(folder.path, containsMessageWithLabels: labelIds)
 
                         if existsLocally && !belongsInFolder && !isPendingAny {
                             // Message was removed from this folder (e.g., archived from inbox)
