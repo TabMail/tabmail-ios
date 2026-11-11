@@ -759,7 +759,7 @@ extension AccountManager {
     ///
     /// `promptAccount` is the account as it was when the password prompt opened.
     /// If it was removed since, or now signs in differently, the update stops here.
-    private func passwordUpdatePlan(for promptAccount: Account) async throws -> PasswordUpdatePlan {
+    private func passwordUpdatePlan(for promptAccount: Account, newPassword: String) async throws -> PasswordUpdatePlan {
         guard promptAccount.provider.signInMethod == .password else {
             throw ReauthenticationError.signInMethodMismatch
         }
@@ -785,11 +785,13 @@ extension AccountManager {
             return PasswordUpdatePlan(account: stored, updatesMail: true, calendar: calendar, calendarMustAccept: true)
         }
         // A calendar added to a mail account follows the new mail password only
-        // when it had the same password. Compared here in memory; neither value
-        // is kept or logged.
+        // when it had the same password, or already has the new one (an earlier
+        // update saved the calendar and then failed to save the mail). Compared
+        // here in memory; no value is kept or logged.
         let mailPassword = KeychainHelper.loadString(key: KeychainHelper.passwordKey(accountId: accountId))
         let calendarPassword = KeychainHelper.loadString(key: "caldav_password_\(calendar.id)")
-        let calendarFollowsMail = mailPassword != nil && mailPassword == calendarPassword
+        let calendarFollowsMail = calendarPassword != nil
+            && (calendarPassword == mailPassword || calendarPassword == newPassword)
         return PasswordUpdatePlan(
             account: stored,
             updatesMail: true,
@@ -813,9 +815,10 @@ extension AccountManager {
     /// live. The one entry point for every account that signs in with a password:
     /// - Mail and calendar on one password (iCloud): both must accept it, then
     ///   both are saved. Any failure saves nothing.
-    /// - Mail with a calendar that had the same password: the mail must accept
-    ///   it; the calendar follows only if it accepts too, and is otherwise left
-    ///   as it was. A calendar with a different password is left as it is.
+    /// - Mail with a calendar that had the same password, or already has the new
+    ///   one: the mail must accept it; the calendar follows only if it accepts
+    ///   too, and is otherwise left as it was. A calendar with a different
+    ///   password is left as it is.
     /// - Calendar only: the calendar must accept it.
     ///
     /// `promptAccount` is the account as it was when the password prompt opened;
@@ -824,7 +827,7 @@ extension AccountManager {
     /// thrown as `ProviderError.authenticationFailed`. The checks never mark the
     /// account for signing in again; the mail provider made live reports.
     func updatePassword(_ newPassword: String, for promptAccount: Account) async throws {
-        let plan = try await passwordUpdatePlan(for: promptAccount)
+        let plan = try await passwordUpdatePlan(for: promptAccount, newPassword: newPassword)
         let account = plan.account
 
         // Test the mail connection with the new password before saving. The probe

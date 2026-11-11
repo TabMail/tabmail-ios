@@ -4,12 +4,31 @@
 
 import Foundation
 import Security
+import Synchronization
 
 enum KeychainHelper {
     private static let service = "ai.tabmail.ios"
     private static let accessGroup = "group.ai.tabmail"
 
+    #if DEBUG
+    /// A key whose next save fails once (tests only).
+    private static let failNextSaveKeyForTesting = Mutex<String?>(nil)
+
+    /// Make the next save to `key` throw once, without writing. `nil` clears it.
+    static func failNextSaveForTesting(key: String?) {
+        failNextSaveKeyForTesting.withLock { $0 = key }
+    }
+    #endif
+
     static func save(_ data: Data, for key: String) throws {
+        #if DEBUG
+        let failThisSave = failNextSaveKeyForTesting.withLock { pending -> Bool in
+            guard pending == key else { return false }
+            pending = nil
+            return true
+        }
+        if failThisSave { throw KeychainError.saveFailed(errSecIO) }
+        #endif
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,

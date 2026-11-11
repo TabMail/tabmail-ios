@@ -393,6 +393,34 @@ struct AccountPasswordUpdateTests {
         }
     }
 
+    @Test("a mail save that fails after the calendar save is repaired by trying the same password again",
+          arguments: [AccountProvider.icloud, .imap])
+    func failedMailSaveIsRepairedByRetry(kind: AccountProvider) async throws {
+        try await withAccount(kind, calendar: .samePassword) { f in
+            await AccountManager.shared.markAuthFailed(f.account.id)
+            KeychainHelper.failNextSaveForTesting(key: KeychainHelper.passwordKey(accountId: f.account.id))
+            defer { KeychainHelper.failNextSaveForTesting(key: nil) }
+
+            let first = await Self.update(Self.newPassword, for: f.account)
+
+            #expect(first is KeychainError, "\(kind): the failed mail save was not reported: \(String(describing: first))")
+            #expect(Self.storedCalendarPassword(f) == Self.newPassword, "\(kind): the calendar save did not happen first")
+            #expect(Self.storedMailPassword(f) == Self.oldPassword, "\(kind): the mail password changed despite the failed save")
+            #expect(await Self.liveMail(f) === f.oldMail, "\(kind): the mail provider was replaced after a failed save")
+            #expect(await Self.isMarked(f), "\(kind): a failed save cleared the sign-in mark")
+
+            let retry = await Self.update(Self.newPassword, for: f.account)
+
+            #expect(retry == nil, "\(kind): the retry failed: \(String(describing: retry))")
+            #expect(Self.storedMailPassword(f) == Self.newPassword, "\(kind): the retry did not save the mail password")
+            #expect(Self.storedCalendarPassword(f) == Self.newPassword, "\(kind): the calendar lost the new password")
+            #expect(await Self.liveMail(f) !== f.oldMail, "\(kind): the retry did not replace the mail provider")
+            let calendar = try #require(await Self.liveCalendar(f), "\(kind): no live calendar provider after the retry")
+            #expect(calendar !== f.oldCalendar, "\(kind): the calendar provider still signs in with the old password")
+            #expect(await !Self.isMarked(f), "\(kind): the retry did not clear the sign-in mark")
+        }
+    }
+
     // MARK: - 5. Calendar only
 
     @Test("calendar only: a good password updates the calendar alone")

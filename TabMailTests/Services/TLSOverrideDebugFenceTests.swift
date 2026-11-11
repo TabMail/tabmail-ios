@@ -7,15 +7,16 @@ import Testing
 
 /// The IMAP TLS override lets tests reach a plain-TCP fake server through the real
 /// provider factory, and the CalDAV session override lets them reach a
-/// `URLProtocol` fake through `makeCalDAVClient`. Neither may exist in a release
-/// build: their names may appear in app source only inside the `#if DEBUG` branch
-/// of a conditional.
-@Suite("IMAP TLS and CalDAV session test overrides are fenced to DEBUG builds")
+/// `URLProtocol` fake through `makeCalDAVClient`, and the Keychain save fault
+/// lets them fail one save. None may exist in a release build: their names may
+/// appear in app source only inside the `#if DEBUG` branch of a conditional.
+@Suite("IMAP TLS, CalDAV session and Keychain save test overrides are fenced to DEBUG builds")
 struct TLSOverrideDebugFenceTests {
 
     private static let fencedNames = [
         "setIMAPUseTLSOverrideForTesting", "imapUseTLSOverrideBox",
         "setCalDAVSessionOverrideForTesting", "calDAVSessionOverrideBox",
+        "failNextSaveForTesting", "failNextSaveKeyForTesting",
     ]
 
     private static var appSourceRoot: URL {
