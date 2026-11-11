@@ -866,6 +866,34 @@ struct ExchangeSeriesSplitCopyTests {
         #expect(graph.created.count == 1, "no new part: \(http.servedCallSequence())")
     }
 
+    @Test("an all-day series whose range names no zone is not split, and its occurrence is not read in another zone: a plain error with nothing written")
+    func allDaySeriesWithoutARangeZoneIsRefused() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let date = GraphFixture.utcDay(GraphSplitFixture.occurrence)
+        var series = Self.allDaySeries(zone: "Tokyo Standard Time")
+        var recurrence = try #require(series["recurrence"] as? [String: Any])
+        var range = try #require(recurrence["range"] as? [String: Any])
+        range.removeValue(forKey: "recurrenceTimeZone")
+        recurrence["range"] = range
+        series["recurrence"] = recurrence
+        var occurrence = GraphFixture.event(id: "ser-1-occ", start: GraphSplitFixture.occurrence, online: false,
+                                            seriesMasterId: "ser-1", allDay: true)
+        occurrence["originalStart"] = GraphFixture.allDayPlace(date, in: "Asia/Tokyo")
+        let graph = FakeGraphCalendar([series, occurrence])
+        graph.install(on: http)
+        var reason: String?
+        do {
+            _ = try await GraphSplitFixture.provider(http).splitSeries(
+                eventId: "ser-1", recurrenceId: date + "T00:00:00", recurrenceIdZone: .gmt, patch: GCalEventInput())
+        } catch CalendarProviderError.notSupported(let thrown) {
+            reason = thrown
+        }
+        #expect(reason?.contains("Outlook gives no time zone for this all-day repeating event") == true, "refused by: \(reason ?? "not refused")")
+        #expect(graph.readZones("ser-1-occ").isEmpty, "the occurrence was read in a zone the series does not name: \(graph.readZones("ser-1-occ"))")
+        #expect(graph.created.isEmpty && graph.patches("ser-1").isEmpty, "written: \(http.servedCallSequence())")
+    }
+
     @Test("an all-day series' occurrence is read in the series' own zone, as Graph names it: split at a plain one, a plain error with nothing written at a moved one, in zones ahead of UTC and behind it")
     func allDayOccurrenceIsReadInTheSeriesZone() async throws {
         // Measured on Graph: an all-day series every two days; a plain occurrence, and one moved a

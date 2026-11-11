@@ -1177,19 +1177,24 @@ struct CalendarSeriesScopeRouteTests {
 
     @Test("the days back to the first occurrence are calendar days in the series' zone, so a time of day across a change of summer time is kept")
     func movedToFirstCountsCalendarDays() throws {
-        // A New York series. Two weeks either side of a DST change are not a multiple of 24 hours.
+        // A New York series from a week before its next change of summer time, at 09:00 there, and
+        // its occurrence two weeks later, at 09:00 again: the days between are not a multiple of
+        // 24 hours. Placed by the next change from today, so the two weeks always cross one.
         let zone = try #require(TimeZone(identifier: "America/New_York"))
-        let first = try #require(EKEventStoreHelper.parseNaiveISO("\(day(0))T09:00:00", timeZone: zone))
-        let later = try #require(Calendar(identifier: .gregorian).date(byAdding: .day, value: 14, to: first))
+        let change = try #require(zone.nextDaylightSavingTimeTransition(after: Date()))
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = zone
-        let laterAt = try #require(cal.date(bySettingHour: 9, minute: 0, second: 0, of: later))
+        let weekBefore = try #require(cal.date(byAdding: .day, value: -7, to: cal.startOfDay(for: change)))
+        let first = try #require(cal.date(bySettingHour: 9, minute: 0, second: 0, of: weekBefore))
+        let laterAt = try #require(cal.date(byAdding: .day, value: 14, to: first))
+        #expect(laterAt.timeIntervalSince(first) != 14 * 86_400, "setup: the two weeks cross no change of summer time")
         let series = gcalEvent(id: "ser", start: GCalDateTime(dateTime: first.iso8601String(), date: nil, timeZone: zone.identifier),
                                end: nil, recurrence: ["RRULE:FREQ=WEEKLY"])
         let occurrence = Self.occurrence(GCalDateTime(dateTime: laterAt.iso8601String(), date: nil, timeZone: zone.identifier))
+        let firstDay = EKEventStoreHelper.dayKey(first, timeZone: zone)
         let laterDay = EKEventStoreHelper.dayKey(laterAt, timeZone: zone)
         let went = try route(["start_iso": .string("\(laterDay)T10:00:00")], Self.named(series, occurrence: occurrence), zone: zone)
-        #expect(went == Went(scope: "all", start: "\(day(0))T10:00:00"), "\(went)")
+        #expect(went == Went(scope: "all", start: "\(firstDay)T10:00:00"), "\(went)")
     }
 
     @Test("a start written without seconds is read for the date comparison, as the tools read a start")
