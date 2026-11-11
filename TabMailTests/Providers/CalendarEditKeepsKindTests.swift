@@ -266,6 +266,23 @@ func drainEdit(
     provider: any CalendarProvider,
     drains: Int = 1
 ) async throws -> [PendingCalendarOperation] {
+    try await drainCalendarOperation(
+        type: .edit, accountId: accountId, eventId: eventId, calendarId: calendarId,
+        arguments: arguments, provider: provider, drains: drains)
+}
+
+/// One calendar operation of `type` drained through `AccountManager.drainCalendarQueue` against
+/// `provider`, `drains` times on the same database (a later drain runs an op the earlier one left
+/// queued), and the durable rows afterwards. A create uses `eventId` as its pre-generated id.
+func drainCalendarOperation(
+    type: CalendarOperationType,
+    accountId: String,
+    eventId: String,
+    calendarId: String,
+    arguments: [String: JSONValue],
+    provider: any CalendarProvider,
+    drains: Int = 1
+) async throws -> [PendingCalendarOperation] {
     let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     var config = Configuration()
@@ -287,7 +304,7 @@ func drainEdit(
     }
 
     let op = PendingCalendarOperation(
-        operationType: .edit, accountId: accountId, eventId: eventId,
+        operationType: type, accountId: accountId, eventId: eventId,
         calendarId: calendarId, arguments: arguments)
     try await pool.write { db in try op.insert(db) }
 

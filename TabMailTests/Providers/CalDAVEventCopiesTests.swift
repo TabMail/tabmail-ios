@@ -628,23 +628,6 @@ struct CalDAVOccurrenceOverrideTests {
         }
     }
 
-    @Test("an override with attendees but no organizer gets the series' organizer ahead of them")
-    func overrideGetsOrganizer() throws {
-        let ics = Fixture.series([
-            "BEGIN:VEVENT", "UID:series-3", "DTSTART:20990506T170000Z", "DTEND:20990506T174500Z",
-            "RRULE:FREQ=WEEKLY", "SUMMARY:Sync", "ORGANIZER:mailto:olivia@example.com",
-            "ATTENDEE;PARTSTAT=ACCEPTED:mailto:alice@example.com", "END:VEVENT",
-            "BEGIN:VEVENT", "UID:series-3", "RECURRENCE-ID:20990520T170000Z",
-            "DTSTART:20990520T170000Z", "DTEND:20990520T174500Z", "SUMMARY:Sync",
-            "ATTENDEE;PARTSTAT=ACCEPTED:mailto:alice@example.com", "END:VEVENT",
-        ])
-        let out = try Fixture.overrideEdit(ics, patch: Fixture.patch(summary: "Sync, other room"))
-        let block = try #require(Fixture.overrides(out).first)
-        let organizer = try #require(block.firstIndex(of: "ORGANIZER:mailto:olivia@example.com"), Comment(rawValue: block.joined(separator: "\n")))
-        let attendee = try #require(block.firstIndex(of: "ATTENDEE;PARTSTAT=ACCEPTED:mailto:alice@example.com"))
-        #expect(organizer < attendee)
-    }
-
     @Test("the override's identity and times take the series' value type", arguments: [
         ("DTSTART:20990506T170000", "DTEND:20990506T174500", "2099-05-20T17:00:00",
          "RECURRENCE-ID:20990520T170000", "DTSTART:20990520T170000"),

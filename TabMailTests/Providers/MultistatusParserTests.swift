@@ -180,6 +180,39 @@ struct MultistatusParserTests {
         #expect(responses[0].properties["calendar-home-set"] == "/calendars/user/")
     }
 
+    @Test("a property with several hrefs gives every one, in order; one-href properties are as before")
+    func parsePropertyWithSeveralHrefs() throws {
+        let xml = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <multistatus xmlns="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+          <response>
+            <href>/principals/user/</href>
+            <propstat>
+              <prop>
+                <C:calendar-user-address-set>
+                  <href>urn:uuid:0711</href>
+                  <href>mailto:alias@example.com</href>
+                  <href>mailto:user@example.com</href>
+                  <href>/principals/user/</href>
+                </C:calendar-user-address-set>
+                <C:calendar-home-set>
+                  <href>/calendars/user/</href>
+                </C:calendar-home-set>
+              </prop>
+            </propstat>
+          </response>
+        </multistatus>
+        """
+        let responses = try MultistatusParser.parse(data: Data(xml.utf8))
+        guard responses.count == 1 else { Issue.record("expected one response"); return }
+        #expect(responses[0].propertyHrefs["calendar-user-address-set"] == [
+            "urn:uuid:0711", "mailto:alias@example.com", "mailto:user@example.com", "/principals/user/",
+        ])
+        #expect(responses[0].propertyHrefs["calendar-home-set"] == ["/calendars/user/"])
+        #expect(responses[0].properties["calendar-home-set"] == "/calendars/user/")
+        #expect(responses[0].href == "/principals/user/")
+    }
+
     @Test("Parse getctag property")
     func parseGetctag() throws {
         let xml = """

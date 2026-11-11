@@ -970,3 +970,44 @@ naming the field and the value, with nothing sent.
 - `RecurrenceDaysToolTests`: the cards name the days; every invalid field, and an invalid `until`
   on Google, Outlook and CalDAV, is refused before both cards with nothing sent; a rule Outlook
   can't hold is refused before both cards.
+
+## CalDAV organizer — every event with guests names its organizer
+
+`TabMailTests/Providers/CalDAVOrganizerTests.swift` pins ADR-IOS-109 (#711): every CalDAV PUT runs
+one organizer step, so a VEVENT with its own attendees is written with an organizer whenever the
+resource names one or the server advertises the user's address, and never with a guessed one.
+
+- `CalDAVOrganizerTests`: the real calendar queue against `FakeCalDAVStore` in its iCloud-like mode
+  (a VEVENT with attendees and no organizer is refused with 403, `refusesAttendeesWithoutOrganizer`)
+  and `FakeCalDAVPrincipal` (`calendar-user-address-set`, configurable or absent). The invariant is
+  checked on the stored resource: a create, a first guest on the whole series, on one occurrence
+  (the guest-less series gets the organizer too, RFC 6638 §3.1) and on a split, and a title-only split of a series whose stored guests have no organizer all land with
+  the advertised address; an existing organizer stays byte for byte (a folded one too) and is copied
+  to the VEVENT that needs it, with no lookup; the sign-in is written only when advertised, in the
+  server's spelling, else the first advertised `mailto:`; nothing advertised writes nothing (a
+  lenient server stores it, a refusing one retires the edit with the 403 reason and no change); a
+  lookup 503 or transport error writes nothing and leaves the edit queued; a lookup 404 is never
+  "event not found"; no guests, or only an alarm's recipient, makes no lookup; a resource of someone
+  else's changed occurrences never gets the account's address (test 16, the one test written
+  through the provider's one-occurrence edit rather than the queue, because the queue's series read
+  can't read such a resource; it moves back to the queue path when #720 is fixed); the address set is read once per
+  provider, while an answer read as none is not kept and the next guest write asks again; an
+  advertised href with a line break is skipped; a replay after a lost PUT response
+  leaves the server unchanged. The lookup's error classes (T1-T6): a 403, 405 or 400 means none
+  advertised; a 408, 409, 423, 425 or 429 keeps the edit queued with nothing written; a failed
+  lookup is never kept, so the retry asks again; an answer that is not XML, or a server with no
+  principal, means none; a principal answered 404 is never "event not found"; a split whose capped
+  series alone needs the address looks it up before its first PUT; a lookup answered 401 sends no
+  PUT and is retired by the auth arm with its reason (T7). Deleting one occurrence of a series whose
+  guests have no organizer writes its `EXDATE` PUT with the advertised address (test 20).
+- `CalDAVOrganizerStepTests`: the pure step (`organized`) returns a body that needs nothing byte for
+  byte (a series with its organizer and guests beside a changed occurrence with neither too),
+  gives every VEVENT without an organizer the same one once any VEVENT needs it (one that has
+  its own keeps it), inserts after `UID`, copies every physical line of a folded organizer, reads only a VEVENT's
+  own properties, never gives an override-only resource the own address, and is idempotent; the
+  chooser (`organizerHref`, the sign-in matched in any letter case and with surrounding spaces);
+  and a source fence: one `CalDAVClient.put` call site, inside `putEvent` after the organizer step
+  (the site is looked for after `putEvent`'s declaration, so a stray call fails the test instead of
+  trapping it).
+- `MultistatusParserTests.parsePropertyWithSeveralHrefs`: a property with several hrefs gives every
+  one, in order (`propertyHrefs`); `properties` is unchanged.

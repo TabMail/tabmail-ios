@@ -40,6 +40,23 @@ enum CalDAVDiscovery {
         return DiscoveryResult(principalURL: principalURL, calendarHomeURL: calendarHomeURL)
     }
 
+    /// Every href of the principal's `calendar-user-address-set` (RFC 6638 §2.4.1), in the server's
+    /// order: the addresses the server says are the user's. Empty when the server does not have the
+    /// property (a 404 propstat, or no such property in the answer).
+    static func calendarUserAddresses(principalURL: URL, client: CalDAVClient) async throws -> [String] {
+        let body = """
+        <?xml version="1.0" encoding="utf-8"?>
+        <d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+          <d:prop>
+            <c:calendar-user-address-set/>
+          </d:prop>
+        </d:propfind>
+        """
+
+        let (data, _) = try await client.propfind(url: principalURL, body: body, depth: 0)
+        return try MultistatusParser.parse(data: data).flatMap { $0.propertyHrefs["calendar-user-address-set"] ?? [] }
+    }
+
     // MARK: - Private
 
     private static func discoverPrincipal(baseURL: URL, client: CalDAVClient) async throws -> URL {

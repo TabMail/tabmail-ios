@@ -96,6 +96,16 @@ protocol CalendarProvider: Sendable {
     func recurrenceRuleRefusal(_ rrule: String) -> String?
 }
 
+/// HTTP statuses that mean "come back later", not "the request is wrong": 408 Request Timeout,
+/// 409 Conflict, 423 Locked, 425 Too Early, 429 Too Many Requests. The one set for the calendar
+/// queue's retirement rule (`AccountManager.isCalendarBadRequestError`) and the CalDAV organizer
+/// lookup (`CalDAVProvider.advertisedAddresses`), so the two cannot drift apart.
+enum CalendarHTTPStatus {
+    static func isComeBackLater(_ code: Int) -> Bool {
+        code == 408 || code == 409 || code == 423 || code == 425 || code == 429
+    }
+}
+
 /// Errors common to calendar providers when an operation isn't supported.
 enum CalendarProviderError: Error {
     /// The provider can't natively perform this operation (e.g. recurring-series
