@@ -591,11 +591,12 @@ grep-hit-versus-caller blindness recorded above (round-13 U9). It is counted by 
 occurrence's changed copy (override VEVENT). The changed copy's content (its own title, time,
 notes, attendees) no longer exists on the server afterwards, and WebDAV/CalDAV define no per-item
 recovery (the same reasoning that counts (5) and (6)). Even with no changed copy, the occurrence is
-gone until someone removes the `EXDATE` by hand. Its guards: the occurrence is found through the
-same check a one-occurrence edit makes (`CalDAVOccurrences.deletionSlot` over `scopedEditSlot`); a
-missing, excluded or cancelled occurrence is `notFound` and a resource holding only changed
-occurrences is refused, both with nothing written; the changed copy is matched by occurrence key
-(`CalDAVOccurrences.seriesKey`), never by RECURRENCE-ID text; the built resource must no longer have
+gone until someone removes the `EXDATE` by hand. Its guards: the occurrence is found by its key in
+one parse of the resource, as the listing finds it (`CalDAVOccurrences.deletion`); a
+missing, excluded or cancelled occurrence is `notFound`, and a resource holding only changed
+occurrences, an event that does not repeat or a series TabMail can't expand is refused
+(`notSupported`, never `notFound`), all with nothing written; the changed copy is matched by
+occurrence key (`OccurrenceDeletion.keyOfRecurrenceId`), never by RECURRENCE-ID text; the built resource must no longer have
 the occurrence (else nothing is written, so a copy is never removed while its slot comes back); and
 the `PUT` is conditional on the GET's ETag (`.unconditional` only when the server sends none, as
 every CalDAV write of a resource the GET proved exists).

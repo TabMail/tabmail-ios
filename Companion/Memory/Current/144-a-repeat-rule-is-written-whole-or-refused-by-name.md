@@ -75,7 +75,7 @@ occurrence names its series in `recurringEventId` on every provider (a CalDAV oc
 carries the series' rule), so its card gets no such line. **Since the #639 follow-up (2026-11-10)**
 an occurrence's card says "One occurrence of a repeating event; the rest of the series stays."
 (`occurrenceDeleteNote`), keyed on `recurringEventId` alone: true on every provider (Google and
-Outlook delete only it; CalDAV refuses, ADR-IOS-108), including a CalDAV row of a resource holding
+Outlook delete only it; CalDAV, since #661, deletes only it too with an `EXDATE`, and refuses with nothing deleted where it can't, ADR-IOS-108), including a CalDAV row of a resource holding
 only changed occurrences, which carries no rule. Do not key it on the rule being absent. The stored rule is worded by
 `storedRecurrenceSummary`, which shares `recurrenceText` with `recurrenceSummary`, so a stored and
 a given rule read the same; a stored UTC `UNTIL` is shown as its day in the device's zone. A stored

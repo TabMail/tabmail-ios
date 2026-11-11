@@ -14,7 +14,8 @@ import Synchronization
 // occurrence exactly as before (its id, start, end and title, a changed one included), and
 // the deleted one nowhere: not where a changed copy had moved it, and not back at its place
 // in the series. The series resource is never DELETEd, the write is ONE PUT conditional on
-// the ETag the provider read, and the resource on the server is the one it read plus one
+// the ETag the provider read (unconditional only on a server that sends none, IOS-CAL-002),
+// and the resource on the server is the one it read plus one
 // EXDATE (less the deleted occurrence's changed copy, when it had one), byte for byte.
 // Whatever the provider can't delete that way is refused with nothing written.
 //
@@ -71,6 +72,12 @@ struct CalDAVOccurrenceDeleteWireTests {
                 try frame.line("DTSTART", first), try frame.line("DTEND", first.addingTimeInterval(length)),
                 "SUMMARY:Standup", "RRULE:FREQ=WEEKLY",
             ].joined(separator: "\n")
+        }
+
+        /// Where an occurrence starting at `start` ends: half an hour later, or the next day.
+        func end(_ start: Date) throws -> Date {
+            guard frame == .allDay else { return start.addingTimeInterval(length) }
+            return try #require(OccurrenceFixture.calendar(zone).date(byAdding: .day, value: 1, to: start))
         }
 
         /// The EXDATE line that removes week `week`'s occurrence, in the series' own form.
@@ -163,30 +170,62 @@ struct CalDAVOccurrenceDeleteWireTests {
         #expect(rest == ics, "\(frame): the rest of the series changed on the wire.\nsent: \(stored)")
     }
 
-    @Test("a moved occurrence is excluded at its place in the series and its changed copy removed, matched by its key whatever form its RECURRENCE-ID takes; another changed occurrence is kept")
-    func movedOccurrenceIsExcludedAtItsSlot() async throws {
-        let series = try Series(.zoned)
+    /// How a changed occurrence's RECURRENCE-ID names its place in the series. Only the series'
+    /// own form reads like the occurrence's key, so the other two tell a match by key from a
+    /// match by text.
+    enum Spelling: String, CaseIterable {
+        /// The series DTSTART's own form: a DATE, a floating or UTC value, or a wall time in its TZID.
+        case seriesForm
+        /// UTC for a timed series (as Google spells it); the date with no VALUE parameter for an
+        /// all-day one.
+        case otherForm
+        /// A wall time in another zone than the series' (`otherZoneId`) naming the same instant;
+        /// for an all-day series a DATE-TIME at the start of that day.
+        case otherZone
+
+        static let otherZoneId = "Asia/Kolkata"
+
+        func line(_ frame: Frame, _ slot: Date, zone: TimeZone) throws -> String {
+            switch (self, frame) {
+            case (.seriesForm, _):
+                return try frame.line("RECURRENCE-ID", slot)
+            case (.otherForm, .allDay):
+                return "RECURRENCE-ID:\(OccurrenceFixture.dateValue(slot, zone))"
+            case (.otherZone, .allDay):
+                return "RECURRENCE-ID:\(OccurrenceFixture.dateValue(slot, zone))T000000"
+            case (.otherForm, _):
+                return "RECURRENCE-ID:\(OccurrenceFixture.utcValue(slot))"
+            case (.otherZone, _):
+                let other = try #require(TimeZone(identifier: Self.otherZoneId))
+                return "RECURRENCE-ID;TZID=\(Self.otherZoneId):\(OccurrenceFixture.wall(slot, other))"
+            }
+        }
+    }
+
+    @Test("a moved occurrence is excluded at its place in the series and its changed copy removed, matched by its key whatever form its RECURRENCE-ID takes, in every series frame; another changed occurrence is kept",
+          arguments: Frame.allCases, Spelling.allCases)
+    func movedOccurrenceIsExcludedAtItsSlot(_ frame: Frame, _ spelling: Spelling) async throws {
+        let series = try Series(frame)
         let zone = series.zone
         let calendar = OccurrenceFixture.calendar(zone)
-        let wall = { (date: Date) in OccurrenceFixture.wall(date, zone) }
+        let label = "\(frame)/\(spelling)"
+        // Week 2's occurrence moved to the next day (10:00, or that whole day) and retitled.
         let movedSlot = try series.slot(2)
         let dayAfter = try #require(calendar.date(byAdding: .day, value: 1, to: movedSlot))
-        let movedTo = try #require(calendar.date(bySettingHour: 10, minute: 0, second: 0, of: dayAfter))
+        let movedTo = frame == .allDay
+            ? calendar.startOfDay(for: dayAfter)
+            : try #require(calendar.date(bySettingHour: 10, minute: 0, second: 0, of: dayAfter))
         let keptSlot = try series.slot(3)
-        // Written by another client with its RECURRENCE-ID in UTC, not in the series' zone: the
-        // same occurrence, spelled differently from the EXDATE the delete writes.
         let movedOverride = [
-            "UID:standup-1", "RECURRENCE-ID:\(OccurrenceFixture.utcValue(movedSlot))",
+            "UID:standup-1", try spelling.line(frame, movedSlot, zone: zone),
             "DTSTAMP:\(OccurrenceFixture.utcValue(series.first))",
-            "DTSTART;TZID=America/New_York:\(wall(movedTo))",
-            "DTEND;TZID=America/New_York:\(wall(movedTo.addingTimeInterval(series.length)))",
+            try frame.line("DTSTART", movedTo), try frame.line("DTEND", try series.end(movedTo)),
             "SUMMARY:Standup (moved)",
         ].joined(separator: "\n")
         let keptOverride = [
-            "UID:standup-1", "RECURRENCE-ID;TZID=America/New_York:\(wall(keptSlot))",
+            "UID:standup-1", try frame.line("RECURRENCE-ID", keptSlot),
             "DTSTAMP:\(OccurrenceFixture.utcValue(series.first))",
-            "DTSTART;TZID=America/New_York:\(wall(keptSlot))",
-            "DTEND;TZID=America/New_York:\(wall(keptSlot.addingTimeInterval(series.length)))",
+            try frame.line("DTSTART", keptSlot), try frame.line("DTEND", try series.end(keptSlot)),
             "SUMMARY:Standup (retitled)",
         ].joined(separator: "\n")
         let master = try series.master()
@@ -198,24 +237,78 @@ struct CalDAVOccurrenceDeleteWireTests {
 
         let before = try await Self.listing(provider, series)
         let movedRow = before.first { $0.hasPrefix(deleted + " |") }
-        #expect(movedRow?.contains("Standup (moved)") == true, "setup: the moved occurrence is not listed as moved: \(before)")
-        #expect(before.contains { $0.contains("Standup (retitled)") }, "setup: the other changed occurrence is not listed: \(before)")
+        #expect(movedRow?.contains("Standup (moved)") == true, "\(label): setup: the moved occurrence is not listed as moved: \(before)")
+        #expect(before.contains { $0.contains("Standup (retitled)") }, "\(label): setup: the other changed occurrence is not listed: \(before)")
 
         try await provider.deleteEvent(calendarId: W.calendarId, eventId: deleted, sendUpdates: "all")
 
         let after = try await Self.listing(provider, series)
         #expect(after == Self.without(deleted, before),
-                "the listing did not lose exactly the moved occurrence (or it came back at its place).\nbefore: \(before)\nafter: \(after)")
-        #expect(Self.writes(http).count == 1 && store.recordedPuts().count == 1, "expected one PUT and nothing else: \(Self.writes(http))")
+                "\(label): the listing did not lose exactly the moved occurrence (or it came back at its place).\nbefore: \(before)\nafter: \(after)")
+        #expect(Self.writes(http).count == 1 && store.recordedPuts().count == 1, "\(label): expected one PUT and nothing else: \(Self.writes(http))")
 
         // The EXDATE names the original slot, in the series' own form; the moved copy is gone and
         // the other changed occurrence is kept byte for byte.
         let stored = try #require(store.storedICS(path: W.seriesPath))
         let exdate = try series.exdate(2)
         let (rest, count) = Self.removingLine(exdate, from: stored)
-        #expect(count == 1, "expected exactly one '\(exdate)' line: \(stored)")
+        #expect(count == 1, "\(label): expected exactly one '\(exdate)' line: \(stored)")
         #expect(rest == OccurrenceFixture.ics([master, keptOverride]),
-                "the series is not what it was less the moved copy plus the EXDATE.\nsent: \(stored)")
+                "\(label): the series is not what it was less the moved copy plus the EXDATE.\nsent: \(stored)")
+    }
+
+    @Test("an exclusion the series would not read as the occurrence is never written: an occurrence added in UTC in the repeated hour of a fall-back day, with and without a changed copy, is refused and nothing is written",
+          arguments: [false, true])
+    func exclusionTheSeriesWouldNotReadIsNeverWritten(withChangedCopy: Bool) async throws {
+        let zone = try #require(TimeZone(identifier: "America/New_York"))
+        // The next change back to standard time (the UTC offset goes down), whatever today's date.
+        var transition = try #require(zone.nextDaylightSavingTimeTransition(after: Date()))
+        if zone.secondsFromGMT(for: transition) >= zone.secondsFromGMT(for: transition.addingTimeInterval(-60)) {
+            transition = try #require(zone.nextDaylightSavingTimeTransition(after: transition))
+        }
+        #expect(zone.secondsFromGMT(for: transition) < zone.secondsFromGMT(for: transition.addingTimeInterval(-60)),
+                "setup: no change back to standard time found")
+        // The second of the two 01:30s that day, in standard time. Its wall time in the series'
+        // zone names the first 01:30 (RFC 5545 §3.3.5), so an EXDATE written in that zone
+        // excludes nothing.
+        let repeated = transition.addingTimeInterval(30 * 60)
+        let calendar = OccurrenceFixture.calendar(zone)
+        let twoWeeksBefore = try #require(calendar.date(byAdding: .day, value: -14, to: transition))
+        let first = try #require(calendar.date(bySettingHour: 9, minute: 0, second: 0, of: twoWeeksBefore))
+        let wall = { (date: Date) in OccurrenceFixture.wall(date, zone) }
+        var vevents = [[
+            "UID:standup-1", "DTSTAMP:\(OccurrenceFixture.utcValue(first))",
+            "DTSTART;TZID=America/New_York:\(wall(first))",
+            "DTEND;TZID=America/New_York:\(wall(first.addingTimeInterval(30 * 60)))",
+            "SUMMARY:Standup", "RRULE:FREQ=WEEKLY", "RDATE:\(OccurrenceFixture.utcValue(repeated))",
+        ].joined(separator: "\n")]
+        if withChangedCopy {
+            let movedTo = repeated.addingTimeInterval(60 * 60)
+            vevents.append([
+                "UID:standup-1", "RECURRENCE-ID:\(OccurrenceFixture.utcValue(repeated))",
+                "DTSTAMP:\(OccurrenceFixture.utcValue(first))",
+                "DTSTART:\(OccurrenceFixture.utcValue(movedTo))",
+                "DTEND:\(OccurrenceFixture.utcValue(movedTo.addingTimeInterval(30 * 60)))",
+                "SUMMARY:Standup (changed)",
+            ].joined(separator: "\n"))
+        }
+        let ics = OccurrenceFixture.ics(vevents)
+        let (store, http) = W.serve(W(zone: zone, first: first, ics: ics))
+        defer { http.close() }
+        let provider = W.makeProvider(http)
+        let id = CalDAVOccurrences.OccurrenceId.make(seriesHref: W.seriesPath, key: OccurrenceFixture.utcValue(repeated))
+
+        let listed = try await Self.listing(provider, first: repeated, through: repeated.addingTimeInterval(60 * 60))
+        #expect(listed.contains { $0.hasPrefix(id + " |") }, "setup: the occurrence in the repeated hour is not listed: \(listed)")
+
+        await #expect("the delete was not refused") {
+            try await provider.deleteEvent(calendarId: W.calendarId, eventId: id, sendUpdates: "all")
+        } throws: { error in
+            guard case CalendarProviderError.notSupported(let reason) = error else { return false }
+            return reason.contains("in a form the repeating event reads") && reason.contains("Nothing was deleted")
+        }
+        #expect(Self.writes(http).isEmpty, "the refused delete wrote: \(Self.writes(http))")
+        #expect(store.storedICS(path: W.seriesPath) == ics, "the series is not on the server as it was")
     }
 
     @Test("an occurrence the series no longer has (excluded, cancelled, never there, or already deleted) is not found and nothing is written")
@@ -333,5 +426,69 @@ struct CalDAVOccurrenceDeleteWireTests {
         #expect(count == 1 && rest == concurrentICS,
                 "the retry did not delete the occurrence from the series as the other client left it: \(stored)")
         #expect(http.recordedCalls().allSatisfy { $0.method != "DELETE" }, "a DELETE reached the server")
+    }
+
+    @Test("on a server that sends no ETag the delete is one unconditional PUT (IOS-CAL-002) that still removes exactly that occurrence")
+    func serverWithoutETagsGetsOneUnconditionalPut() async throws {
+        let fixture = try W.make()
+        let store = FakeCalDAVStore(servesETags: false)
+        store.seed(path: W.seriesPath, ics: fixture.ics)
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        http.register(path: "/cal/", method: "GET") { store.handleGET($0) }
+        http.register(path: "/cal/", method: "PUT") { store.handlePUT($0) }
+        http.register(path: "/cal/", method: "DELETE") { store.handleDELETE($0) }
+        let provider = W.makeProvider(http)
+
+        try await provider.deleteEvent(calendarId: W.calendarId, eventId: try fixture.occurrenceId(2), sendUpdates: "all")
+
+        let puts = store.recordedPuts()
+        #expect(puts.count == 1 && puts.first?.ifMatch == nil && puts.first?.ifNoneMatch == nil,
+                "expected one PUT with no precondition: \(puts.map { "If-Match \($0.ifMatch ?? "nil"), If-None-Match \($0.ifNoneMatch ?? "nil")" })")
+        let stored = try #require(store.storedICS(path: W.seriesPath))
+        let exdate = "EXDATE;TZID=America/New_York:\(OccurrenceFixture.wall(try fixture.occurrence(2), fixture.zone))"
+        let (rest, count) = Self.removingLine(exdate, from: stored)
+        #expect(count == 1 && rest == fixture.ics, "the series is not what it was plus the one EXDATE: \(stored)")
+        let writes = Self.writes(http)
+        #expect(writes.count == 1 && writes.allSatisfy { $0.hasPrefix("PUT ") && $0.hasSuffix(W.seriesPath) },
+                "expected one PUT of the series and nothing else: \(writes)")
+    }
+
+    /// How another client changes the series between the listing and the delete.
+    enum LaterChange: String, CaseIterable {
+        case secondRule, exRule, ruleRemoved
+
+        func apply(to ics: String) -> String {
+            let rule = "RRULE:FREQ=WEEKLY"
+            switch self {
+            case .secondRule: return ics.replacingOccurrences(of: rule, with: "\(rule)\r\nRRULE:FREQ=MONTHLY")
+            case .exRule: return ics.replacingOccurrences(of: rule, with: "\(rule)\r\nEXRULE:FREQ=MONTHLY")
+            case .ruleRemoved: return ics.replacingOccurrences(of: "\(rule)\r\n", with: "")
+            }
+        }
+    }
+
+    @Test("a series changed after the listing into one TabMail can't expand, or into one that no longer repeats, is refused as such, never reported not found, and nothing is written",
+          arguments: LaterChange.allCases)
+    func seriesTabMailCantReadIsRefusedNotReportedMissing(_ change: LaterChange) async throws {
+        let fixture = try W.make()
+        let (store, http) = W.serve(fixture)
+        defer { http.close() }
+        let provider = W.makeProvider(http)
+        let id = try fixture.occurrenceId(2)
+        let listed = try await Self.listing(provider, first: fixture.first, through: try fixture.occurrence(5))
+        #expect(listed.contains { $0.hasPrefix(id + " |") }, "\(change): setup: the occurrence is not listed: \(listed)")
+        let changed = change.apply(to: fixture.ics)
+        #expect(changed != fixture.ics, "\(change): setup: the series did not change")
+        store.replaceOutOfBand(path: W.seriesPath, ics: changed)
+
+        await #expect("\(change): the delete was not refused as unsupported") {
+            try await provider.deleteEvent(calendarId: W.calendarId, eventId: id, sendUpdates: "all")
+        } throws: { error in
+            guard case CalendarProviderError.notSupported(let reason) = error else { return false }
+            return reason.contains("Nothing was deleted")
+        }
+        #expect(Self.writes(http).isEmpty, "\(change): the refused delete wrote: \(Self.writes(http))")
+        #expect(store.storedICS(path: W.seriesPath) == changed, "\(change): the series is not on the server as it was")
     }
 }

@@ -309,17 +309,22 @@ extension CalDAVProvider {
     /// DTSTART's value type and zone (a DATE for an all-day series), and the occurrence's changed
     /// copy, if it has one, removed. A moved occurrence is excluded at its place in the series,
     /// the slot its RECURRENCE-ID names, not where it was moved to. Its changed copy is found by
-    /// its occurrence key (`CalDAVOccurrences.seriesKey`), never by comparing RECURRENCE-ID text,
-    /// so a copy written in another form or zone is still the one removed. Every other line goes
-    /// back byte for byte.
+    /// its occurrence key (`keyOfRecurrenceId`), never by comparing RECURRENCE-ID text, so a copy
+    /// written in another form or zone is still the one removed. Every other line goes back byte
+    /// for byte.
     ///
     /// - Parameters:
     ///   - storedICS: the series' resource exactly as the server returned it.
-    ///   - href: the resource's href.
     ///   - key: the occurrence's key (`CalDAVOccurrences.OccurrenceId`).
     ///   - slotNaive: the occurrence's place in the series, already in the series' frame
     ///     (`recurrenceIdInMasterFrame`).
-    static func occurrenceDeletedResource(storedICS: String, href: String, key: String, slotNaive: String) throws -> String {
+    ///   - keyOfRecurrenceId: the key a RECURRENCE-ID (value, parameters without the leading
+    ///     `;`) names in this series, from the one parse of `storedICS` the delete's check made
+    ///     (`CalDAVOccurrences.OccurrenceDeletion`).
+    static func occurrenceDeletedResource(
+        storedICS: String, key: String, slotNaive: String,
+        keyOfRecurrenceId: (_ value: String, _ params: String?) -> String?
+    ) throws -> String {
         let kind = masterDTStartKind(from: storedICS)
         guard let value = icsDateValue(fromNaive: slotNaive, kind: kind) else {
             throw CalendarProviderError.notSupported("The occurrence's place in the repeating event can't be written, so it can't be deleted. Nothing was deleted.")
@@ -340,9 +345,7 @@ extension CalDAVProvider {
             guard let rid = topLevel(block).first(where: { icsProperty($0.text)?.name == "RECURRENCE-ID" }),
                   let property = icsProperty(rid.text) else { return block }
             let params = property.params.hasPrefix(";") ? String(property.params.dropFirst()) : property.params
-            let overrideKey = CalDAVOccurrences.seriesKey(
-                ofRecurrenceId: property.value.trimmingCharacters(in: .whitespaces),
-                params: params.isEmpty ? nil : params, icsText: storedICS, href: href)
+            let overrideKey = keyOfRecurrenceId(property.value.trimmingCharacters(in: .whitespaces), params.isEmpty ? nil : params)
             return overrideKey == key ? nil : block
         }
         guard excluded else {

@@ -11,8 +11,8 @@ import GRDB
 //
 // INVARIANT (system property): the confirmation card for a delete that removes a repeating
 // series says so, and names its rule, before any delete request is sent; a card for one
-// occurrence says the rest of the series stays instead, true on every provider (Google and
-// Outlook delete only it, CalDAV refuses); an event that does not repeat gets no line. Google
+// occurrence says the rest of the series stays instead, true on every provider (Google,
+// Outlook and CalDAV delete only it; CalDAV refuses with nothing deleted where it can't); an event that does not repeat gets no line. Google
 // Calendar asks the same question in its delete dialog. The event the card is built from is
 // the one the tool reads, so the shapes below are the ones each provider reads back: a series
 // (a rule, no series it belongs to), a Google or Outlook occurrence (no rule, its series

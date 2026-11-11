@@ -379,8 +379,8 @@ actor CalDAVProvider: CalendarProvider {
     }
 
     /// Delete one occurrence of a repeating event, as Google Calendar deletes one: the rest of
-    /// the series stays. GET the series' resource, find the occurrence through the check a
-    /// one-occurrence edit makes (`CalDAVOccurrences.deletionSlot`, over `scopedEditSlot`), then
+    /// the series stays. GET the series' resource, check that it has the occurrence now
+    /// (`CalDAVOccurrences.deletion`, one parse of the resource), then
     /// ONE PUT of the resource with an EXDATE at the occurrence's place in the series and the
     /// occurrence's changed copy removed (`occurrenceDeletedResource`), conditional on the GET's
     /// ETag. A 412 is thrown as `preconditionFailed`, as every other conditional CalDAV write
@@ -395,20 +395,19 @@ actor CalDAVProvider: CalendarProvider {
         }
         let etag = getResponse.value(forHTTPHeaderField: "ETag")
 
+        let deletion = try CalDAVOccurrences.deletion(icsText: storedICS, href: seriesHref, key: key)
         // The occurrence's place is read as an instant in UTC, which has no wall time a change
         // of UTC offset skips or repeats; `recurrenceIdInMasterFrame` writes it in the series'
         // own frame, and leaves an all-day date or a floating wall time as it is.
-        let slotZone = TimeZone.gmt
-        let slot = try CalDAVOccurrences.deletionSlot(icsText: storedICS, href: seriesHref, key: key, zone: slotZone)
         let zones = CalendarTimeZoneContext(calendarText: storedICS)
         guard let slotInSeriesFrame = try Self.recurrenceIdInMasterFrame(
-            slot, declaredZone: slotZone, kind: Self.masterDTStartKind(from: storedICS), zones: zones
+            deletion.slotInUTC, declaredZone: .gmt, kind: Self.masterDTStartKind(from: storedICS), zones: zones
         ) else {
             throw CalendarProviderError.notSupported(
                 "This occurrence's place in the repeating event can't be written in the event's timezone, so it was not deleted. Nothing was deleted.")
         }
         let updatedICS = try Self.occurrenceDeletedResource(
-            storedICS: storedICS, href: seriesHref, key: key, slotNaive: slotInSeriesFrame)
+            storedICS: storedICS, key: key, slotNaive: slotInSeriesFrame, keyOfRecurrenceId: deletion.keyOfRecurrenceId)
         // The write must remove the occurrence it names. One whose EXDATE the series would not
         // read as that occurrence, written anyway, would lose its changed copy and put it back
         // at its place in the series.
