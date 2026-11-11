@@ -30,6 +30,10 @@ import Synchronization
 //
 // Every date is relative to today; every address is at example.com. The sign-in is
 // `user@example.com`.
+//
+// One exception to "after the real calendar queue drains": test 16 (a resource that holds only
+// changed occurrences) writes through the provider's one-occurrence edit, because the queue's series
+// read can't read such a resource (#720). It moves back to the queue path when #720 is fixed.
 
 // MARK: - Fixture
 
@@ -724,7 +728,8 @@ struct CalDAVOrganizerTests {
         defer { run.http.close() }
         let occurrenceId = "\(F.path)#\(F.icsUTC(F.occurrence))"
         // Through the provider's one-occurrence edit, as `CalDAVOccurrenceWireTests` edits such a
-        // resource: the queue's series read (`CalendarSeriesScope.read`) reads its series first.
+        // resource: the queue's series read (`CalendarSeriesScope.read`) reads its series first, and
+        // this resource has none (#720). This moves back to the queue path when #720 is fixed.
         var patch = GCalEventInput()
         patch.summary = "Planning, new agenda"
         _ = try await run.provider.updateOccurrence(

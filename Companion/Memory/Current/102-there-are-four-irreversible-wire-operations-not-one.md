@@ -607,3 +607,15 @@ every CalDAV write of a resource the GET proved exists).
 **Negative case.** Re-adjudicate if the delete ever writes more than one occurrence's `EXDATE` per
 `PUT`, removes an override whose key differs from the one named, writes without
 `requireDeletedAlone`, or sends the `PUT` without `If-Match` when the server gave an ETag.
+
+**Amended 2026-11-11 (#711, ADR-IOS-109): every CalDAV PUT goes through `putEvent`.** The
+`client.put(` call sites in `CalDAVProvider.swift` went from 6 to 1, the one inside
+`CalDAVProvider.putEvent(url:body:precondition:)`, which first runs the organizer step
+(`withOrganizer` → `organized(_:own:)`) on the final body. A source fence
+(`CalDAVOrganizerStepTests.onePutCallSite`) holds it at one. So from now on count the CALLERS of
+`putEvent(` (6: the create, the whole-event edit, the one-occurrence edit, the one-occurrence
+delete, and the split's new-part and cap PUTs), not `client.put(` sites, when re-running this
+census. The census greps were re-run and are unchanged (8 / 3 / 5 / 3 / 2). Items (6) and (8) are
+unchanged: the organizer step runs after `requireDeletedAlone` and before the PUT, and it only
+inserts ORGANIZER lines (it never removes or rewrites a VEVENT, so no VEVENT's identity changes),
+and a lookup that fails throws before the PUT, so nothing is written then.

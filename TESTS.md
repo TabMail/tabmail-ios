@@ -988,7 +988,9 @@ resource names one or the server advertises the user's address, and never with a
   lenient server stores it, a refusing one retires the edit with the 403 reason and no change); a
   lookup 503 or transport error writes nothing and leaves the edit queued; a lookup 404 is never
   "event not found"; no guests, or only an alarm's recipient, makes no lookup; a resource of someone
-  else's changed occurrences never gets the account's address; the address set is read once per
+  else's changed occurrences never gets the account's address (test 16, the one test written
+  through the provider's one-occurrence edit rather than the queue, because the queue's series read
+  can't read such a resource; it moves back to the queue path when #720 is fixed); the address set is read once per
   provider, while an answer read as none is not kept and the next guest write asks again; an
   advertised href with a line break is skipped; a replay after a lost PUT response
   leaves the server unchanged. The lookup's error classes (T1-T6): a 403, 405 or 400 means none

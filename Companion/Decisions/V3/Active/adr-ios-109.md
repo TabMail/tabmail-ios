@@ -113,6 +113,8 @@ series with no organizer, and both halves of a split were all written without it
 **Tests:** `CalDAVOrganizerTests` (against `FakeCalDAVStore` in its iCloud-like mode that refuses
 attendees without an organizer, and `FakeCalDAVPrincipal`; the invariant on the stored resource after
 the real queue drains, on every write path, for each address case, the lookup's failures, the cache,
-an href with a line break, and a replay after a lost response), `CalDAVOrganizerStepTests` (the pure
+an href with a line break, and a replay after a lost response; the one exception is test 16, a
+resource that holds only changed occurrences, written through the provider's one-occurrence edit
+because the queue's series read can't read such a resource, until #720 is fixed), `CalDAVOrganizerStepTests` (the pure
 step byte for byte, the chooser, and the one-`client.put` fence) and
 `MultistatusParserTests.parsePropertyWithSeveralHrefs`. Closes #711.
