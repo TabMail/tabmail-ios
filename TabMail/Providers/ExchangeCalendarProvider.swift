@@ -438,7 +438,8 @@ actor ExchangeCalendarProvider: CalendarProvider {
     ///    — Graph's `endDate` is inclusive and date-only, so we set the day before splitDate. The
     ///    stored pattern is written back exactly.
     /// 2. POST the new part: a copy of the stored series (`splitNewPartJSON`) starting at
-    ///    recurrenceId, with `patch` applied.
+    ///    recurrenceId, ending where the series did (a numbered series: what is left of its
+    ///    number, `occurrencesLeft`), with `patch` applied.
     /// On step-2 failure, attempt a best-effort revert of step 1 to the stored recurrence.
     func splitSeries(
         calendarId: String = "primary",
@@ -704,19 +705,21 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// - Attendees keep their address, name and type; one the patch adds is `required`. Their
     ///   answers are not copied: Graph lets only the attendee write a response, so the new part's
     ///   attendees start unanswered, as they do when Outlook splits a series itself.
-    /// - The recurrence keeps the stored pattern exactly. Its range keeps its end date and zone and
-    ///   starts on the new start's date; a range that ended after a number of occurrences has no
-    ///   end, because the number left after the split is not known here. A range that already
-    ///   ends on this split's cap (`capEndDate`) has no end either: it is a retry after the cap was
-    ///   written and the create was not, and that end is the cap, not the series' own (the rule
-    ///   `RecurrenceTail.newSeriesRule` applies on Google and CalDAV). A rule in the patch
-    ///   replaces the stored recurrence.
+    /// - The recurrence keeps the stored pattern exactly. Its range keeps its end date (verbatim)
+    ///   and zone and starts on the new start's date; a range that ends after a number of
+    ///   occurrences stays numbered with what is left of the number (`occurrencesLeft`), as on
+    ///   Google and CalDAV. A range that already ends on this split's cap (`capEndDate`) has no
+    ///   end: it is a retry after the cap was written and the create was not, and that end is the
+    ///   cap, not the series' own (the rule `RecurrenceTail.newSeriesRule` applies on Google and
+    ///   CalDAV). A rule in the patch replaces the stored recurrence.
     /// - A new place in the patch replaces the stored places (`locations`).
     /// - New notes on an online series replace only the notes in the copied body; its join section
     ///   is kept as stored (`onlineMeetingBody`). The new part is not an online meeting of its own:
     ///   its body carries the series' join link.
     ///
-    /// Throws `notSupported` when the new start can't be dated; nothing has been written then.
+    /// Throws `notSupported` when the new start can't be dated, or when a numbered series has no
+    /// occurrence left from the split on or can't be counted (`occurrencesLeft`); nothing has been
+    /// written then.
     nonisolated func splitNewPartJSON(
         stored: EditSnapshot,
         patch: GCalEventInput,
@@ -758,19 +761,85 @@ actor ExchangeCalendarProvider: CalendarProvider {
         }
         if patch.recurrence?.isEmpty ?? true,
            var recurrence = stored.raw["recurrence"] as? [String: Any],
-           var range = recurrence["range"] as? [String: Any] {
+           let storedRange = recurrence["range"] as? [String: Any] {
+            var range = storedRange
             range["startDate"] = newDay
-            if range["type"] as? String == "numbered" { range["type"] = "noEnd" }
-            if range["type"] as? String == "endDate", range["endDate"] as? String == capEndDate {
+            switch range["type"] as? String {
+            case "numbered":
+                // What is left of the count, as Google and CalDAV write it (`RecurrenceTail`). The
+                // stored `endDate` of a numbered range is a placeholder ("0001-01-01", measured).
+                range["numberOfOccurrences"] = try Self.occurrencesLeft(
+                    stored: stored, storedRange: storedRange, splitNaiveISO: newStartNaiveISO, splitZone: newStartZone)
+                range.removeValue(forKey: "endDate")
+            case "endDate" where range["endDate"] as? String == capEndDate:
                 range["type"] = "noEnd"
+                range.removeValue(forKey: "endDate")
+                range.removeValue(forKey: "numberOfOccurrences")
+            case "endDate":
+                range.removeValue(forKey: "numberOfOccurrences")
+            default:
+                range.removeValue(forKey: "endDate")
+                range.removeValue(forKey: "numberOfOccurrences")
             }
-            if range["type"] as? String != "endDate" { range.removeValue(forKey: "endDate") }
-            range.removeValue(forKey: "numberOfOccurrences")
             recurrence["range"] = range
             json["recurrence"] = recurrence
         }
         json["transactionId"] = transactionId
         return json
+    }
+
+    /// The `numberOfOccurrences` of a split's new part when the stored series' range is numbered:
+    /// the stored count less the occurrences the series keeps before the split
+    /// (`RecurrenceTail.newSeriesEnd`), so the two parts hold the series' count between them and
+    /// the new part ends on the series' last occurrence.
+    ///
+    /// Measured on Outlook (a weekly series of six, its third occurrence deleted and its fourth
+    /// moved a day): the range stayed numbered with six, and the series still ended on its sixth
+    /// week. A deleted and a moved occurrence still count toward `numberOfOccurrences`, so the
+    /// occurrences before the split are the ones the pattern generates, whatever has happened to
+    /// them since; the instances list is not read for this.
+    ///
+    /// Counted as Graph applies the pattern: from the range's `startDate`, a date in the range's
+    /// zone that is an occurrence only when the pattern names it (`.patternStart`; measured: a
+    /// `startDate` the pattern does not name does not count toward the number, and Graph moves
+    /// such a `startDate`, with the event's start, forward to the first pattern day when the series
+    /// is created); the split
+    /// occurrence's day in the same zone (`GCalEvent.seriesZone`; an all-day split is a date); and
+    /// weeks starting on the pattern's `firstDayOfWeek` (the rule's `WKST`), which decides which
+    /// weeks a series repeating every few weeks falls in; and a month without the pattern's
+    /// `dayOfMonth` (`absoluteMonthly`, `absoluteYearly`) holding the occurrence on its last day,
+    /// counted (`MissingMonthDay.lastDay`; measured: monthly on the 31st, numbered 4, gave January
+    /// 31, February 28, March 31 and April 30), where RFC 5545, and so Google and CalDAV, skip it.
+    ///
+    /// Throws `notSupported`, before anything is written, when no occurrence is left from the split
+    /// on, or the count can't be worked out (a day that can't be placed, a pattern
+    /// `RecurrenceTail` does not count, or a stored count that is no number of occurrences).
+    nonisolated static func occurrencesLeft(
+        stored: EditSnapshot,
+        storedRange: [String: Any],
+        splitNaiveISO: String,
+        splitZone: TimeZone
+    ) throws -> Int {
+        guard let count = storedRange["numberOfOccurrences"] as? Int, count >= 1,
+              let rrule = stored.event.recurrence?.first(where: { $0.uppercased().hasPrefix("RRULE:") }) else {
+            throw CalendarProviderError.notSupported(
+                "Can't split this series: Outlook gives no number of occurrences for it, so the new series' length can't be worked out. Edit the whole series instead.")
+        }
+        let weekStarts = ["sunday": "SU", "monday": "MO", "tuesday": "TU", "wednesday": "WE",
+                          "thursday": "TH", "friday": "FR", "saturday": "SA"]
+        let wkst = stored.event.recurrenceFirstDayOfWeek.flatMap { weekStarts[$0.lowercased()] }
+        let rule = rrule + (wkst.map { ";WKST=\($0)" } ?? "")
+        let seriesStart = (storedRange["startDate"] as? String).flatMap { RecurrenceTail.Day(iso: $0) }
+        let split: RecurrenceTail.Day?
+        if stored.event.isAllDay {
+            split = RecurrenceTail.Day(iso: splitNaiveISO)
+        } else {
+            split = stored.event.seriesZone
+                .flatMap { RecurrenceOccurrenceResolver.renderNaive(splitNaiveISO, from: splitZone, to: $0) }
+                .flatMap { RecurrenceTail.Day(iso: $0) }
+        }
+        return try RecurrenceTail.newSeriesEnd(
+            count: count, of: rule, seriesStart: seriesStart, split: split, anchor: .patternStart, missingDay: .lastDay)
     }
 
     // MARK: - Edits (#421)

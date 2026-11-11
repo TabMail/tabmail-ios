@@ -223,8 +223,9 @@ These tests read what each provider sent, or what the fake server ends up holdin
   - attendee names and types;
   - a new place replacing the stored places;
   - the stored pattern written verbatim on both parts;
-  - the range rules for noEnd, endDate and numbered series, and a range already ending on this
-    split's cap (a retry after the cap landed) written with no end;
+  - the range rules for noEnd, endDate and numbered series (a numbered one stays numbered with
+    what is left; the stored 0 count of a noEnd or endDate range is not sent back), and a range already ending on this split's cap (a retry after the cap landed)
+    written with no end;
   - the cap of each of those three series as sent: an end date at the split and no count, with the
     stored range's `recurrenceTimeZone` and the stored pattern's `firstDayOfWeek`;
   - the transaction id;
@@ -583,7 +584,25 @@ refused, a DATE UNTIL covering its whole day, and an UNTIL equal to the split's 
 retry. `GoogleSplitSeriesTailTests` and `CalDAVSplitSeriesTailTests` drive the real providers on
 `FakeHTTP` with a series zoned to Pacific/Auckland at 07:00 and the split declared in UTC, so a rule
 read in the wrong frame counts other weekdays. A refused split sends no write: Google sends only the
-master GET, and CalDAV sends no PUT. A Google split asked to send the user's invitations sends them
+master GET, and CalDAV sends no PUT. `RecurrenceTailNewSeriesEndTests` pins the count's two anchors:
+RFC 5545's DTSTART always counts, Outlook's range `startDate` only when the pattern names its day.
+`RecurrenceTailMissingMonthDayTests` pins the measured Outlook month end (`MissingMonthDay.lastDay`:
+monthly on the 31st gives January 31, February 28, March 31, April 30; yearly on February 29 gives
+the leap day, then February 28 twice; the month end counts toward the number) against RFC 5545's
+skip, which Google and CalDAV keep (the control also writes a Google/CalDAV COUNT across short
+months). Years are the next common or leap year from today.
+`ExchangeNumberedSplitTests` splits an Outlook numbered series on `FakeGraphCalendar` and holds the
+two parts to the series through the fake's own range expansion (`rangeDays`): the capped part's
+occurrences followed by the new part's are exactly the series', with an occurrence before the split
+deleted, moved, or both (as measured, they still count), the split at the last occurrence, a range
+starting the day before its first occurrence, every-other-week series whose weeks start on Sunday
+and on Monday, a `relativeMonthly` series on the second Tuesday (plain, and with its range starting
+the day before, a day the pattern does not name), the two measured month-end shapes split after a
+short month (`monthEndSeries`: the fake's `absoluteMonthly`/`absoluteYearly` expansion first
+reproduces the measurement, then the new part must be numbered N less the occurrences before it,
+month ends included), and all-day series in a zone ahead of UTC and in
+one behind it (a daily series split at midnight UTC, so a split day read in a zone moves back a day). A split with nothing left, or in a range zone
+TabMail does not recognize, sends only GETs and creates nothing. A Google split asked to send the user's invitations sends them
 only with the new series' create; the cap of the original goes out with `sendUpdates=none`.
 
 ## Outlook sends carry the Outbox's Message-ID

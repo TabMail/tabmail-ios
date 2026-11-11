@@ -147,19 +147,7 @@ enum RecurrenceTail {
                 throw CalendarProviderError.notSupported(
                     "Can't split this series: its repeat rule has an invalid COUNT (\(counts[0])).")
             }
-            guard let seriesStart, let split else {
-                throw CalendarProviderError.notSupported(
-                    "Can't split this series: it ends after \(count) occurrences, and the dates of its first occurrence or of \(splitText) can't be read, so the new series' length can't be worked out. Edit the whole series instead.")
-            }
-            guard let before = occurrences(of: rrule, seriesStart: seriesStart, before: split) else {
-                throw CalendarProviderError.notSupported(
-                    "Can't split this series: it ends after \(count) occurrences, and its repeat rule (\(body)) is not one TabMail can count, so the new series' length can't be worked out. Edit the whole series instead.")
-            }
-            guard before < count else {
-                throw CalendarProviderError.notSupported(
-                    "Can't split this series at \(splitText): the series ends after \(count) occurrences, all before it, so there are no occurrences from that point on to change.")
-            }
-            let remaining = count - before
+            let remaining = try newSeriesEnd(count: count, of: rrule, seriesStart: seriesStart, split: split)
             return prefix + parts
                 .map { $0.uppercased().hasPrefix("COUNT=") ? "COUNT=\(remaining)" : $0 }
                 .joined(separator: ";")
@@ -168,6 +156,78 @@ enum RecurrenceTail {
             throw CalendarProviderError.notSupported(
                 "Can't split this series: its repeat rule (\(body)) has more than one end (UNTIL/COUNT).")
         }
+    }
+
+    /// The number of occurrences the new series of a split gets when the original series ends after
+    /// `count` of them: `count` less the occurrences the original keeps before the split. The one
+    /// rule for every provider: Google and CalDAV write it as the new RRULE's `COUNT`
+    /// (`newSeriesRule`), Outlook as the new range's `numberOfOccurrences`.
+    ///
+    /// The occurrences before the split are the ones the rule generates (`occurrences`), so one that
+    /// was deleted or moved still counts: RFC 5545 counts an EXDATE'd occurrence toward COUNT, and on
+    /// Outlook a deleted and a moved occurrence still count toward `numberOfOccurrences` (measured).
+    ///
+    /// - `rrule`: the original rule (its COUNT and UNTIL are not read here).
+    /// - `seriesStart`: the day the count starts on, as `anchor` reads it; `split`: the split
+    ///   occurrence's day. Both in the frame the rule repeats in.
+    /// - `missingDay`: what a month without the rule's day of the month does (`MissingMonthDay`).
+    ///
+    /// Throws `CalendarProviderError.notSupported` when either day is unknown, when the rule is not
+    /// one `occurrences` counts, or when no occurrence is left from the split on.
+    static func newSeriesEnd(
+        count: Int,
+        of rrule: String,
+        seriesStart: Day?,
+        split: Day?,
+        anchor: Anchor = .dtstart,
+        missingDay: MissingMonthDay = .skip
+    ) throws -> Int {
+        let prefix = "RRULE:"
+        let body = rrule.hasPrefix(prefix) ? String(rrule.dropFirst(prefix.count)) : rrule
+        let splitText = split.map { "the occurrence on \($0)" } ?? "the chosen occurrence"
+        guard let seriesStart, let split else {
+            throw CalendarProviderError.notSupported(
+                "Can't split this series: it ends after \(count) occurrences, and the dates of its first occurrence or of \(splitText) can't be read, so the new series' length can't be worked out. Edit the whole series instead.")
+        }
+        guard let before = occurrences(of: rrule, seriesStart: seriesStart, before: split, anchor: anchor, missingDay: missingDay) else {
+            throw CalendarProviderError.notSupported(
+                "Can't split this series: it ends after \(count) occurrences, and its repeat rule (\(body)) is not one TabMail can count, so the new series' length can't be worked out. Edit the whole series instead.")
+        }
+        guard before < count else {
+            throw CalendarProviderError.notSupported(
+                "Can't split this series at \(splitText): the series ends after \(count) occurrences, all before it, so there are no occurrences from that point on to change.")
+        }
+        return count - before
+    }
+
+    /// Where a series' occurrences are counted from.
+    enum Anchor: Sendable {
+        /// RFC 5545 §3.3.10: DTSTART is the first occurrence, whether or not the rule's parts name
+        /// its day.
+        case dtstart
+        /// Outlook's `recurrenceRange.startDate`: "the date to start applying the recurrence
+        /// pattern. The first occurrence of the meeting may be this date or later, depending on the
+        /// recurrence pattern" (Graph's `recurrenceRange`). That day is an occurrence only when the
+        /// pattern names it (measured on Outlook: a numbered series of four whose `startDate` was a
+        /// day the pattern does not name had four occurrences, all on pattern days). Graph also
+        /// normalizes such a series when it is created, moving the event's start and the range's
+        /// `startDate` forward to the first pattern day (measured), so a series made by Outlook
+        /// usually starts on one; the anchor still holds for one that does not.
+        case patternStart
+    }
+
+    /// What a month that lacks the rule's day of the month does (the 31st in April, the 29th of
+    /// February in a common year).
+    enum MissingMonthDay: Sendable {
+        /// RFC 5545 §3.3.10: "Recurrence rules may generate recurrence instances with an invalid
+        /// date ... Such recurrence instances MUST be ignored and MUST NOT be counted as part of
+        /// the recurrence set." The month has no occurrence.
+        case skip
+        /// Outlook's `absoluteMonthly` and `absoluteYearly`: the occurrence moves to the month's
+        /// last day, and it counts toward `numberOfOccurrences`. Measured on Outlook: monthly on the
+        /// 31st, numbered 4, gave January 31, February 28, March 31 and April 30; yearly on February
+        /// 29, numbered 3, gave the leap day, then February 28 twice.
+        case lastDay
     }
 
     /// Whether `rrule`'s `UNTIL` is `capUntil`: this split's own cap, written by an earlier attempt
@@ -197,7 +257,10 @@ enum RecurrenceTail {
     // MARK: - Counting
 
     /// The number of occurrences the rule generates on days from `seriesStart`
-    /// up to, but not including, `before`. DTSTART counts as the first.
+    /// up to, but not including, `before`. With `anchor` `.dtstart` (RFC 5545)
+    /// `seriesStart` counts as the first; with `.patternStart` (Outlook's range
+    /// `startDate`) it counts only when the rule's parts name its day. A month
+    /// without the rule's day of the month does what `missingDay` says.
     /// COUNT and UNTIL are ignored: this counts what the pattern generates.
     ///
     /// Returns nil for a rule outside the supported subset:
@@ -207,13 +270,20 @@ enum RecurrenceTail {
     /// DAILY and unknown parts are not supported, nor are BYMONTHDAY with
     /// WEEKLY, a numbered BYDAY with DAILY or WEEKLY or alongside BYMONTHDAY,
     /// and any other BYSETPOS.
-    static func occurrences(of rrule: String, seriesStart: Day, before split: Day) -> Int? {
-        guard let rule = Rule(rrule) else { return nil }
+    static func occurrences(
+        of rrule: String, seriesStart: Day, before split: Day, anchor: Anchor = .dtstart, missingDay: MissingMonthDay = .skip
+    ) -> Int? {
+        guard let rule = Rule(rrule, missingDay: missingDay) else { return nil }
         guard seriesStart < split else { return 0 }
         let first = seriesStart.ordinal
         let end = split.ordinal
-        var count = 1  // DTSTART
-        for days in rule.periods(from: seriesStart, before: split) {
+        let periods = rule.periods(from: seriesStart, before: split)
+        var count: Int
+        switch anchor {
+        case .dtstart: count = 1
+        case .patternStart: count = periods.contains { $0.contains(first) } ? 1 : 0
+        }
+        for days in periods {
             count += days.filter { $0 > first && $0 < end }.count
         }
         return count
@@ -262,9 +332,12 @@ enum RecurrenceTail {
         let byDay: [WeekdayNum]
         let bySetPos: [Int]
         let weekStart: Weekday
+        /// What a month without a BYMONTHDAY day, or DTSTART's day, does.
+        let missingDay: MissingMonthDay
 
         /// nil for anything outside the supported subset (see `occurrences`).
-        init?(_ rrule: String) {
+        init?(_ rrule: String, missingDay: MissingMonthDay = .skip) {
+            self.missingDay = missingDay
             let prefix = "RRULE:"
             let body = rrule.hasPrefix(prefix) ? String(rrule.dropFirst(prefix.count)) : rrule
             var values: [String: String] = [:]
@@ -414,7 +487,7 @@ enum RecurrenceTail {
         private func matchesLimits(_ day: Day) -> Bool {
             if !byMonth.isEmpty, !byMonth.contains(day.month) { return false }
             if !byMonthDay.isEmpty,
-               !RecurrenceTail.resolve(monthDays: byMonthDay, year: day.year, month: day.month).contains(day.day) {
+               !RecurrenceTail.resolve(monthDays: byMonthDay, year: day.year, month: day.month, missingDay: missingDay).contains(day.day) {
                 return false
             }
             if !byDay.isEmpty, !byDay.contains(where: { $0.weekday == day.weekday }) { return false }
@@ -426,7 +499,7 @@ enum RecurrenceTail {
             if !byMonth.isEmpty, !byMonth.contains(month) { return [] }
             var days: [Int]
             if !byMonthDay.isEmpty {
-                days = RecurrenceTail.resolve(monthDays: byMonthDay, year: year, month: month)
+                days = RecurrenceTail.resolve(monthDays: byMonthDay, year: year, month: month, missingDay: missingDay)
                     .compactMap { Day(year: year, month: month, day: $0)?.ordinal }
                 if !byDay.isEmpty {
                     days = days.filter { o in byDay.contains { $0.weekday == RecurrenceTail.weekday(ofOrdinal: o) } }
@@ -434,7 +507,8 @@ enum RecurrenceTail {
             } else if !byDay.isEmpty {
                 days = byDay.flatMap { RecurrenceTail.days(of: $0, inMonth: month, year: year) }
             } else {
-                days = Day(year: year, month: month, day: start.day).map { [$0.ordinal] } ?? []
+                days = RecurrenceTail.resolve(monthDays: [start.day], year: year, month: month, missingDay: missingDay)
+                    .compactMap { Day(year: year, month: month, day: $0)?.ordinal }
             }
             return RecurrenceTail.applySetPos(bySetPos, to: days)
         }
@@ -446,11 +520,14 @@ enum RecurrenceTail {
             var days: [Int]
             if byMonthDay.isEmpty, byDay.isEmpty {
                 let months = byMonth.isEmpty ? [start.month] : byMonth
-                days = months.compactMap { Day(year: year, month: $0, day: start.day)?.ordinal }
+                days = months.flatMap { m in
+                    RecurrenceTail.resolve(monthDays: [start.day], year: year, month: m, missingDay: missingDay)
+                        .compactMap { Day(year: year, month: m, day: $0)?.ordinal }
+                }
             } else if !byMonthDay.isEmpty {
                 let months = byMonth.isEmpty ? Array(1...12) : byMonth
                 days = months.flatMap { m in
-                    RecurrenceTail.resolve(monthDays: byMonthDay, year: year, month: m)
+                    RecurrenceTail.resolve(monthDays: byMonthDay, year: year, month: m, missingDay: missingDay)
                         .compactMap { Day(year: year, month: m, day: $0)?.ordinal }
                 }
                 if !byDay.isEmpty {
@@ -513,10 +590,14 @@ enum RecurrenceTail {
     }
 
     /// BYMONTHDAY values as days of the given month: negatives count from the
-    /// end, and a day the month does not have is dropped.
-    fileprivate static func resolve(monthDays: [Int], year: Int, month: Int) -> [Int] {
+    /// end, and a day the month does not have is dropped, or with `.lastDay`
+    /// a day past the month's end is its last day (`MissingMonthDay`).
+    fileprivate static func resolve(monthDays: [Int], year: Int, month: Int, missingDay: MissingMonthDay) -> [Int] {
         let length = daysIn(month: month, year: year)
-        let days = monthDays.map { $0 > 0 ? $0 : length + 1 + $0 }.filter { (1...length).contains($0) }
+        let days = monthDays
+            .map { $0 > 0 ? $0 : length + 1 + $0 }
+            .map { missingDay == .lastDay && $0 > length ? length : $0 }
+            .filter { (1...length).contains($0) }
         return Array(Set(days)).sorted()
     }
 

@@ -57,6 +57,11 @@ import Synchronization
 ///   notes kept the meeting and its join link;
 /// - a create (`POST /me/events`) stores the event it is sent under a new id,
 ///   with the same recurrence rules as a PATCH;
+/// - the days a stored series repeats on (`rangeDays`): its pattern applied from the range's
+///   `startDate` for its count or through its end date, deleted and moved occurrences included
+///   (measured: they still count toward a numbered range), and a monthly or yearly day a month
+///   lacks on that month's last day (measured: it counts), so a split's two parts can be held to
+///   the series they came from;
 /// - a PATCH whose `attendees` holds any entry without a `status` is refused
 ///   with 405 `UnknownError` and an empty message, and changes nothing.
 ///   Measured on an Outlook.com account (#622): a list with every entry
@@ -141,6 +146,127 @@ final class FakeGraphCalendar: Sendable {
     }
 
     private static let createdPrefix = "created-"
+
+    /// The days the stored series `id` repeats on (`rangeDays(_:)`).
+    func rangeDays(of id: String) -> [String]? { event(id).flatMap(Self.rangeDays) }
+
+    /// The days a series' recurrence repeats on, `yyyy-MM-dd` in its range's zone, as Graph applies
+    /// it (`recurrencePattern`, `recurrenceRange`): from the range's `startDate` ("the first
+    /// occurrence of the meeting may be this date or later, depending on the recurrence pattern"),
+    /// every day the pattern names, for `numberOfOccurrences` of them (`numbered`) or through
+    /// `endDate` (`endDate`). A deleted or moved occurrence is still one of them: measured on
+    /// Outlook, a weekly series of six with its third occurrence deleted and its fourth moved still
+    /// read `numbered` six and still ended on its sixth week.
+    ///
+    /// Patterns: `daily` every `interval` days from `startDate`; `weekly` on `daysOfWeek` in every
+    /// `interval`-th week, counted from the week holding `startDate`, weeks starting on
+    /// `firstDayOfWeek`; `relativeMonthly` on one weekday at its `index` in the month, in every
+    /// `interval`-th month counted from the month holding `startDate`; `absoluteMonthly` and
+    /// `absoluteYearly` on `dayOfMonth`, or the month's last day when the month is shorter
+    /// (measured). Worked out here day by day, apart from the app's counter, so a test can
+    /// hold the app's split to it. nil for a `noEnd` range (it has no last day), another pattern
+    /// type, or a range this can't read.
+    static func rangeDays(_ event: [String: Any]) -> [String]? {
+        guard let recurrence = event["recurrence"] as? [String: Any],
+              let pattern = recurrence["pattern"] as? [String: Any],
+              let range = recurrence["range"] as? [String: Any],
+              let startText = range["startDate"] as? String else { return nil }
+        let names = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
+        let cal: Calendar = {
+            var cal = Calendar(identifier: .gregorian)
+            cal.timeZone = TimeZone(identifier: "UTC")!
+            return cal
+        }()
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.calendar = cal
+        fmt.timeZone = cal.timeZone
+        fmt.dateFormat = "yyyy-MM-dd"
+        guard let start = fmt.date(from: startText) else { return nil }
+        let interval = max(pattern["interval"] as? Int ?? 1, 1)
+        func dayNumber(_ date: Date) -> Int { cal.dateComponents([.day], from: start, to: date).day ?? 0 }
+        func name(_ date: Date) -> String { names[cal.component(.weekday, from: date) - 1] }
+        let isOccurrence: (Date) -> Bool
+        switch pattern["type"] as? String {
+        case "daily":
+            isOccurrence = { dayNumber($0) % interval == 0 }
+        case "weekly":
+            guard let days = pattern["daysOfWeek"] as? [String], !days.isEmpty,
+                  let firstDay = (pattern["firstDayOfWeek"] as? String).flatMap({ names.firstIndex(of: $0.lowercased()) })
+            else { return nil }
+            let wanted = Set(days.map { $0.lowercased() })
+            // The first day of the week holding `startDate`, as a day number from it (0 or less).
+            let weekFirst = -((cal.component(.weekday, from: start) - 1 - firstDay + 7) % 7)
+            isOccurrence = { date in
+                let week = (dayNumber(date) - weekFirst) / 7
+                return wanted.contains(name(date)) && week % interval == 0
+            }
+        case "relativeMonthly":
+            // One weekday at its `index` in the month ("the second Tuesday"), in every
+            // `interval`-th month counted from the month holding `startDate`. A pattern naming
+            // more than one weekday ("the first day that satisfies the pattern") is not modelled.
+            let places = ["first": 1, "second": 2, "third": 3, "fourth": 4, "last": -1]
+            guard let days = pattern["daysOfWeek"] as? [String], days.count == 1,
+                  let place = (pattern["index"] as? String).flatMap({ places[$0.lowercased()] })
+            else { return nil }
+            let wanted = days[0].lowercased()
+            func month(_ date: Date) -> Int { cal.component(.year, from: date) * 12 + cal.component(.month, from: date) }
+            let startMonth = month(start)
+            isOccurrence = { date in
+                guard name(date) == wanted, (month(date) - startMonth) % interval == 0 else { return false }
+                let dayOfMonth = cal.component(.day, from: date)
+                guard place > 0 else {
+                    let monthLength = cal.range(of: .day, in: .month, for: date)?.count ?? 0
+                    return dayOfMonth + 7 > monthLength
+                }
+                return (dayOfMonth - 1) / 7 + 1 == place
+            }
+        case "absoluteMonthly", "absoluteYearly":
+            // `dayOfMonth` in every `interval`-th month (monthly) or in `month` of every
+            // `interval`-th year (yearly), counted from `startDate`'s. A month without that day
+            // holds the occurrence on its last day, and it counts (measured: monthly on the 31st,
+            // numbered 4, gave January 31, February 28, March 31 and April 30; yearly on February 29,
+            // numbered 3, gave the leap day, then February 28 twice).
+            let yearly = pattern["type"] as? String == "absoluteYearly"
+            guard let dayOfMonth = pattern["dayOfMonth"] as? Int, (1...31).contains(dayOfMonth) else { return nil }
+            let inMonth = pattern["month"] as? Int ?? 0
+            guard !yearly || (1...12).contains(inMonth) else { return nil }
+            func month(_ date: Date) -> Int { cal.component(.year, from: date) * 12 + cal.component(.month, from: date) }
+            let startMonth = month(start)
+            let startYear = cal.component(.year, from: start)
+            isOccurrence = { date in
+                if yearly {
+                    guard cal.component(.month, from: date) == inMonth,
+                          (cal.component(.year, from: date) - startYear) % interval == 0 else { return false }
+                } else {
+                    guard (month(date) - startMonth) % interval == 0 else { return false }
+                }
+                let monthLength = cal.range(of: .day, in: .month, for: date)?.count ?? 0
+                return cal.component(.day, from: date) == min(dayOfMonth, monthLength)
+            }
+        default:
+            return nil
+        }
+        let last: (_ day: Date, _ found: Int) -> Bool
+        switch range["type"] as? String {
+        case "numbered":
+            guard let count = range["numberOfOccurrences"] as? Int, count >= 1 else { return nil }
+            last = { _, found in found == count }
+        case "endDate":
+            guard let endText = range["endDate"] as? String, let end = fmt.date(from: endText) else { return nil }
+            last = { day, _ in day > end }
+        default:
+            return nil
+        }
+        let maxDays = 3_660
+        var out: [String] = []
+        for offset in 0..<maxDays {
+            guard let day = cal.date(byAdding: .day, value: offset, to: start) else { return nil }
+            if last(day, out.count) { return out }
+            if isOccurrence(day) { out.append(fmt.string(from: day)) }
+        }
+        return nil
+    }
 
     func install(on http: FakeHTTP.Scenario) {
         http.register(path: "/v1.0/me/events/", method: "GET") { [self] request in
