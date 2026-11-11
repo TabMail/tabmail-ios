@@ -993,6 +993,22 @@ struct CalDAVOccurrenceWireTests {
         #expect(store.storedICS(path: path) == invite.ics, "the resource is not on the server as it was")
     }
 
+    @Test("a read of a resource with no VEVENT at all stays a parse error, never the refusal that its series is not in this calendar")
+    func resourceWithNoEventStaysAParseError() async throws {
+        let fixture = try W.make()
+        let path = "/cal/empty.ics"
+        let (store, http) = W.serve(fixture)
+        defer { http.close() }
+        store.seed(path: path, ics: OccurrenceFixture.ics([]))
+        let provider = W.makeProvider(http)
+        await #expect("a resource with no VEVENT was not read as a parse error") {
+            _ = try await provider.getEvent(calendarId: W.calendarId, eventId: path)
+        } throws: { error in
+            if case CalDAVError.parseError = error { return true }
+            return false
+        }
+    }
+
     @Test("this_only and this_and_following on an event that does not repeat are refused, and nothing is written")
     func scopedEditOfAnEventThatDoesNotRepeatWritesNothing() async throws {
         let fixture = try W.make()
