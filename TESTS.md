@@ -190,8 +190,10 @@ These tests read what each provider sent, or what the fake server ends up holdin
     helpers: trailing whitespace, CRLF and bare-LF folding, the series read when a changed
     occurrence comes first, a lower-case nested component, a `BEGIN:VEVENT`/`END:VEVENT` line with
     trailing whitespace (read by `ICSParserTests`; read and written by `CalDAVMergePatchTests`,
-    through the merge, `replaceRRule`, a moved start's `shiftSeriesAnchoredValues`, and a new or
-    repeated one-occurrence change's `spliceOrReplaceOverride`),
+    through the merge, `replaceRRule`, a moved start's `shiftSeriesAnchoredValues`, a new or
+    repeated one-occurrence change's `spliceOrReplaceOverride` (also with a padded `END:VCALENDAR`)
+    and a split's `seriesSplitResources`; a folded continuation reading ` END:VEVENT` is not a
+    component line), a lower-case EMAIL alarm after the event's properties (`ICSParserTests`),
     the master readers (`extractUID` … `masterStartWallTime`) across frames and layouts
     (`CalDAVRecurringHelpersTests`), and `ICSParserOutputPinTests`, a field-by-field pin of
     `ICSParser.parse` for alarm-free resources.

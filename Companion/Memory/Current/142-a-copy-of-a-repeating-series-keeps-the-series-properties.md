@@ -154,12 +154,18 @@ its length. Those values then went back to the server through edits (an attendee
 alert's recipient as an attendee; notes "added to" overwrote the event's own with the alert text).
 
 - `ICSParser.components` reads each VEVENT through `CalDAVProvider.icsUnits`, `veventBlocks` and
-  `topLevel`: one depth rule shared by reader and writer, for masters and overrides alike, so the
-  occurrence listing (`CalDAVOccurrences`) reads the same way.
+  `topLevel`: one depth rule shared by reader and writer, for masters and overrides alike. Every
+  caller reads the same way: `getEvent`, the split's read-back in `splitSeries`, the occurrence
+  listing and lookups (`CalDAVOccurrences`), and the demo import
+  (`ICSCalendarImporter.importIntoDemoCalendar`). The demo import used to take a DISPLAY alarm's
+  text as the event's notes, and ADR-IOS-052's sanitizer gives every DISPLAY alarm a
+  `DESCRIPTION`, so every imported event with an alert showed its text as notes.
 - `masterVEventLines` (a whole-block reader) is gone; `extractUID`, `extractRRule`,
-  `masterDTStartDay`, `icsIsAllDay`, `masterDTStartKind`, `recurrenceIdKind` and
-  `masterStartWallTime` read `masterTopLevelLines`. An alarm's own `UID` (RFC 9074) placed before
-  the event's no longer answers `successorIsOurs`.
+  `masterDTStartDay`, `icsIsAllDay`, `masterDTStartKind` and `masterStartWallTime` read
+  `masterTopLevelLines`, and so does `recurrenceIdKind`'s check for a series VEVENT. Its fallback
+  for a resource that holds only changed occurrences still scans the whole resource with
+  `icsLines` for the first `RECURRENCE-ID` (no nested component carries one). An alarm's own `UID`
+  (RFC 9074) placed before the event's no longer answers `successorIsOurs`.
 - `CalDAVProvider.isMarker` (and `ICSUnit.isMarker`) is the one rule for matching `BEGIN:VEVENT`,
   `END:VEVENT` and `END:VCALENDAR` in the CalDAV path: trailing whitespace ignored, leading not (on
   a physical line it makes a folded continuation). The shared helpers, `replaceRRule`,
@@ -170,8 +176,10 @@ alert's recipient as an attendee; notes "added to" overwrote the event's own wit
 - Not moved, each with its own rule outside the CalDAV path: `ICSBuilder.parseIncoming` and
   `ICSSanitizer` (Shared, trimmed and case-insensitive already), and the diagnostic VEVENT count
   in `ICSCalendarImporter`'s debug log line.
-- Tests: `CalDAVAlarmIsNotTheEventTests`; `TESTS.md`, "Repeating events — copies keep the series'
-  properties".
+- Tests: `CalDAVAlarmIsNotTheEventTests`; the padded-line pins in `CalDAVMergePatchTests`
+  (`PaddedSeries`: rule, moved start, one-occurrence change, split, and a continuation that reads
+  `END:VEVENT`); `ICSParserTests.lowercaseAlarmIsNotTheEvents`; `TESTS.md`, "Repeating events —
+  copies keep the series' properties".
 
 ## Google attendee edits (#564)
 

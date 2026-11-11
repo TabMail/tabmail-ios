@@ -604,6 +604,24 @@ struct ICSParserTests {
         #expect(events[0].end != nil)
     }
 
+    @Test("a lower-case alarm after the event's properties is the alarm's: its text and subject are not the event's")
+    func lowercaseAlarmIsNotTheEvents() {
+        let ics = [
+            "BEGIN:VCALENDAR", "BEGIN:VEVENT", "UID:series-1", "SUMMARY:Planning",
+            "DTSTART:\(Self.pinStart.ics)", "DURATION:PT1H",
+            "ATTENDEE;PARTSTAT=ACCEPTED:mailto:alice@example.com",
+            "begin:valarm", "ACTION:EMAIL", "DESCRIPTION:Reminder", "SUMMARY:Alarm notification",
+            "ATTENDEE:mailto:alerts@example.com", "TRIGGER:-PT15M", "end:valarm",
+            "END:VEVENT", "END:VCALENDAR",
+        ].joined(separator: "\r\n")
+        let events = ICSParser.parse(icsText: ics, resourceHref: "/cal/x.ics", etag: nil)
+        #expect(events.count == 1)
+        guard events.count == 1 else { return }
+        #expect(events[0].summary == "Planning")
+        #expect(events[0].description == nil, "the alarm's text was read as the notes")
+        #expect(events[0].attendees?.map(\.email) == ["alice@example.com"])
+    }
+
     @Test("a VEVENT whose BEGIN or END line ends in whitespace is read",
           arguments: ["BEGIN:VEVENT ", "BEGIN:VEVENT\t", "BEGIN:VEVENT"], ["END:VEVENT ", "END:VEVENT\t", "END:VEVENT"])
     func paddedVEventMarkersAreRead(_ begin: String, _ end: String) {
