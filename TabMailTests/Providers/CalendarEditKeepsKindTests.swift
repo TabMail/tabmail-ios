@@ -63,9 +63,17 @@ private let allDayTimeHint = "this is an all-day event, and the edit gives a tim
 /// An in-memory Google calendar: `GET` returns the stored event (or a series' instances), `PATCH`
 /// replaces each top-level property the body names (Google's patch semantics: a supplied `start`
 /// replaces the stored `start` whole), and `POST` stores a new event under the `id` it carries.
+/// A PATCH of a series that changes its `recurrence`, or its start or end (another date or
+/// instant, or another zone), resets the series: its stored occurrences, the ones changed one by
+/// one, are dropped, as Google did when a series was moved from 08:00 to 13:00 (measured on a
+/// personal account, 2026-11-10).
 final class FakeGoogleCalendar: Sendable {
     private let events: Mutex<[String: Data]>
     private let writeLog = Mutex<[String]>([])
+    private let resets = Mutex(0)
+
+    /// How many PATCHes reset a series' changed occurrences.
+    var seriesResets: Int { resets.withLock { $0 } }
 
     init(_ seed: [[String: Any]]) {
         var map: [String: Data] = [:]
@@ -104,6 +112,17 @@ final class FakeGoogleCalendar: Sendable {
             guard parts.count == 1, var stored = event(parts[0]), let body = request.body,
                   let patch = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any]
             else { return .status(400) }
+            let isSeries = (stored["recurrence"] as? [String])?.isEmpty == false
+            let changesRule = patch["recurrence"].map { ($0 as? [String]) != (stored["recurrence"] as? [String]) } ?? false
+            let movesTime = ["start", "end"].contains { key in patch[key].map { !Self.sameTime($0, stored[key]) } ?? false }
+            if isSeries, changesRule || movesTime {
+                resets.withLock { $0 += 1 }
+                events.withLock { all in
+                    all = all.filter { _, data in
+                        ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["recurringEventId"] as? String != parts[0]
+                    }
+                }
+            }
             for (key, value) in patch { stored[key] = value }
             store(stored)
             writeLog.withLock { $0.append("PATCH \(parts[0])") }
@@ -125,6 +144,17 @@ final class FakeGoogleCalendar: Sendable {
         let data = try! JSONSerialization.data(withJSONObject: event)
         // swiftlint:disable:next force_cast
         events.withLock { $0[event["id"] as! String] = data }
+    }
+
+    /// Whether a written start or end is the stored one as Google reads it: the same date, or the
+    /// same instant, and the same zone.
+    private static func sameTime(_ written: Any, _ stored: Any?) -> Bool {
+        guard let written = written as? [String: Any], let stored = stored as? [String: Any] else { return false }
+        func instant(_ value: [String: Any]) -> Date? { (value["dateTime"] as? String).flatMap { Date.fromISO8601($0) } }
+        return written["date"] as? String == stored["date"] as? String
+            && instant(written) == instant(stored)
+            && (written["dateTime"] == nil) == (stored["dateTime"] == nil)
+            && written["timeZone"] as? String == stored["timeZone"] as? String
     }
 
     private static func pathParts(_ url: URL) -> [String] {

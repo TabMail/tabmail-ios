@@ -7,6 +7,17 @@ import Foundation
 /// CalDAV calendar provider conforming to CalendarProvider protocol.
 /// Uses CalDAVClient for HTTP operations and ICSParser for response parsing.
 actor CalDAVProvider: CalendarProvider {
+    /// A CalDAV edit replaces only the master's RRULE line, with the edit's own, and keeps the
+    /// rest of the series as stored; so the rule changes when the edit's RRULE differs from the
+    /// stored one (`GoogleCalendarProvider.canonicalRRULE`), and an edit with none changes nothing.
+    nonisolated func editResetsChangedOccurrences(_ event: GCalEvent, edit: GCalEventInput) -> Bool {
+        func rule(_ lines: [String]?) -> String? {
+            lines?.first { $0.uppercased().hasPrefix("RRULE:") }.map(GoogleCalendarProvider.canonicalRRULE)
+        }
+        guard let edited = rule(edit.recurrence) else { return false }
+        return edited != rule(event.recurrence)
+    }
+
     private let client: CalDAVClient
     private let calendarHomeURL: URL
     private let serverBaseURL: URL

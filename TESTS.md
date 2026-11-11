@@ -40,10 +40,58 @@ on Outlook.com for #622, an attendee PATCH in which any entry has no `status`
 (`fakeRefusesAttendeeWithoutStatus`). The fake also models the recurrence
 behaviour measured live for #423 (a range written without a zone is stored as UTC; a written rule
 that differs from the stored one resets the series' exceptions; a `recurrence` PATCHed without
-`start` moves the series to UTC midnight; a range without `startDate` is refused with a 400): a
-whole-series edit that gives no rule writes no `recurrence` and resets nothing; a series moved to
+`start` moves the series to UTC midnight; a range without `startDate` is refused with a 400) and the
+2026-11-10 measurement on a work-tenant account (a whole-series start or end that differs from the
+stored one resets the series' exceptions, with no `recurrence` written): a
+whole-series edit that gives no rule writes no `recurrence`, and resets nothing unless it moves the
+series' start or end (`wholeSeriesKeepsRule` expects the reset for its time moves); a series moved to
 another date, timed and all day (its end moving with it), keeps its stored recurrence but for the
-range's start date; an
+range's start date; a whole-series edit that re-sends the series' own rule (weekly with no end,
+relative monthly to a date, absolute yearly and every other day for a count; alone or with a
+rename) resets nothing and leaves the series as it was (`resentRuleResetsNothing`, and with its days in
+another order `resentRuleInAnotherDayOrder`), and with a date
+move keeps the stored recurrence but for the range's start date (`resentRuleWithDateMove`); a rule
+change keeps the series' stored `recurrenceTimeZone` and `firstDayOfWeek`
+(`ruleChangeKeepsZoneAndFirstDay`), a changed rule's end and its range's start date are dated in the
+stored Windows zone when it differs from the start's (`ruleChangeEndsInTheStoredZone`), a change of
+only the series' end (a new COUNT, an UNTIL added to an open series, COUNT changed to UNTIL) is
+written as a rule change (`endOnlyChangeIsWritten`), a rule edit of a series whose stored zone
+TabMail does not recognize is refused by that name with nothing written
+(`ruleEditInUnrecognizedZoneIsRefused`, where the card's `editResetsChangedOccurrences` answers true), a series
+with no stored zone (absent or empty) gets the zone its start is written in
+(`ruleChangeWithNoStoredZone`), a weekly rule with no day for a Tokyo series is the start's weekday
+in Tokyo and the stored rule (`bareWeeklyIsTheSeriesWeekday`; on a create,
+`ExchangeCalendarTests.weeklyNoByDayInEventZone`), and for every stored rule kind, re-sent or with a
+new end, interval or kind, or a time-only move (alone or with the rule re-sent), or the series' own
+start and end sent back or the same instant under another zone label (each with and without a
+rename; same instants means no time change, so neither sends start, end or recurrence nor resets),
+or the series' own start with a later end, and a series
+stored with a Windows zone name renamed with its own wall times under the IANA name is no move (no
+start, end or recurrence sent, no warning) while the same wall time in another zone or an
+unresolvable label is one, sent, warned of and reset (`zoneLabelsCompareByResolvedZone`), a series at
+00:00 UTC made all-day on the same date or the reverse is sent and warned of
+(`allDayChangeIsAMove`; the fake resets a series on an `isAllDay` change), a series kept in a zone
+with daylight saving (Eastern) read on a device in one without (Tokyo), and the reverse, renamed with
+the read times echoed in the device's zone sends no start, end or recurrence, is not warned of,
+resets nothing and keeps its stored zone (`readTimesEchoedAreNoMove`; the explicit same-instant
+re-zone is not supported, iOS #667), the card's rebuilt stored rule is `sameRule` with
+the raw stored recurrence for every stored rule kind (`cardBaselineIsTheStoredRule`),
+`editResetsChangedOccurrences` answers whether the fake counted a reset and whether the PATCH carries
+start and end (`cardAnswerIsTheWrites`), also when the edit moves the start (a bare weekly to another weekday, a
+bare monthly to another day, an UNTIL whose end day shifts with the start time;
+`cardAnswerIsTheWritesWithStartMove`, where the rule is also written), and a stored pattern its RRULE
+does not say exactly answers true (`unmappedPatternAnswersChanged`); Google's and CalDAV's
+`editResetsChangedOccurrences` (`CalendarProviderRuleChangedTests`: Google resets unless the lines are
+the same, however spelled; CalDAV by its RRULE line alone, and not for a time move with no rule,
+`timeMoveWithNoRule`; Google for a moved start or end too, its answer matching whether
+`FakeGoogleCalendar`, which drops a series' stored occurrences on a PATCH that changes its rule, start
+or end as measured on Google 2026-11-10, reset the series: a later start, a later end alone, the same
+instant in another zone and an all-day series' new date reset, a rename, its own times spelled
+otherwise and an all-day series' own date do not, `googleTimeEdit`); the edit tool's confirmation card says occurrences changed individually may be
+reset when the series' calendar says the whole-series edit resets them, whatever the rule, and for a
+time-only move (`CalendarToolResolvedAccountTests`: `resettingEditCardWarns`), and not when it says the
+edit resets nothing, a re-sent rule or a rename (`quietEditCardHasNoWarning`), or, without asking it,
+for an event with no rule or part of a series (`noLineEditCardHasNoWarning`); an
 occurrence edit never writes a rule or the master. Also covered: an event made recurring, a series
 given a new rule and a new date (the new rule is written), a series moved by a start written
 without an offset, a series moved by a start spelled with an offset (`Z`, `.000Z`, `+00:00`) or
@@ -147,7 +195,8 @@ These tests read what each provider sent, or what the fake server ends up holdin
   - the stored pattern written verbatim on both parts;
   - the range rules for noEnd, endDate and numbered series, and a range already ending on this
     split's cap (a retry after the cap landed) written with no end;
-  - the cap of each of those three series as sent: an end date at the split and no count;
+  - the cap of each of those three series as sent: an end date at the split and no count, with the
+    stored range's `recurrenceTimeZone` and the stored pattern's `firstDayOfWeek`;
   - the transaction id;
   - a rule in the edit becoming the new part's rule while the capped series keeps its own;
   - new notes on an online series keeping its join section as stored;

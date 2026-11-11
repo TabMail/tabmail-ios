@@ -278,7 +278,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // now the full notes (`notes(of:)`). Every edit wrote all of that back.
         // `graphPatchJSON` says what rides along and why.
         let existing = try await fetchForEdit(eventId: eventId)
-        let json = graphPatchJSON(patch: event, existing: existing, allowRecurrence: true)
+        let json = try graphPatchJSON(patch: event, existing: existing, allowRecurrence: true)
         guard !json.isEmpty else {
             BackgroundSyncLogger.logDebug("[ExchangeCalendar] updateEvent: the edit changes nothing — no PATCH")
             return existing.event
@@ -337,7 +337,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // never `recurrence`: an instance cannot carry a series rule and Graph
         // 400s on a PATCH that includes one.
         let existingInstance = try await fetchForEdit(eventId: instanceId)
-        let json = graphPatchJSON(patch: event, existing: existingInstance, allowRecurrence: false)
+        let json = try graphPatchJSON(patch: event, existing: existingInstance, allowRecurrence: false)
         guard !json.isEmpty else {
             BackgroundSyncLogger.logDebug("[ExchangeCalendar] updateOccurrence: the edit changes nothing — no PATCH")
             return existingInstance.event
@@ -711,11 +711,15 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// changed property needs with it —
     ///
     /// - start and end together when either moves (`mergeExistingEventWithPatch`
-    ///   derives the side the user did not give from the event's duration);
-    /// - `recurrence` (when `allowRecurrence`) only when the edit gives a rule,
-    ///   with start and end beside it: PATCHing `recurrence` alone makes Graph
-    ///   rewrite a master's start and end to UTC midnight at the range's
-    ///   `startDate` (see `splitSeries`' cap PATCH);
+    ///   derives the side the user did not give from the event's duration); for a
+    ///   series, only when the edit moves them (`movesSeriesTime`), since Graph resets
+    ///   a series' changed occurrences on any start or end change (#423, measured);
+    /// - `recurrence` (when `allowRecurrence`) only when the edit gives a rule
+    ///   the series does not already have (`sameRule`), with start and end
+    ///   beside it: PATCHing `recurrence` alone makes Graph rewrite a master's
+    ///   start and end to UTC midnight at the range's `startDate` (see
+    ///   `splitSeries`' cap PATCH). The rule keeps the stored `firstDayOfWeek`
+    ///   and `recurrenceTimeZone` (the start's zone when none is stored);
     /// - when a series' start moves to another date and the rule does not
     ///   change, the stored recurrence exactly as Graph holds it, with only the
     ///   range's `startDate` moved, because Graph requires it to match the start.
@@ -729,10 +733,16 @@ actor ExchangeCalendarProvider: CalendarProvider {
     ///   description the assistant read is those notes (`notes(of:)`).
     ///
     /// Empty when the patch changes nothing.
-    nonisolated func graphPatchJSON(patch: GCalEventInput, existing: EditSnapshot, allowRecurrence: Bool) -> [String: Any] {
+    ///
+    /// Throws when the edit gives a rule and the series' stored `recurrenceTimeZone` is a zone
+    /// `CalendarTimeZoneResolver` does not recognize: the rule's end is dated in that zone.
+    nonisolated func graphPatchJSON(patch: GCalEventInput, existing: EditSnapshot, allowRecurrence: Bool) throws -> [String: Any] {
         let current = existing.event
-        let movesTime = patch.startDate != nil || patch.startDateTime != nil
-            || patch.endDate != nil || patch.endDateTime != nil
+        // A whole-series edit sends start and end only when they move the series (#423): the
+        // card asks the same question (`editResetsChangedOccurrences`).
+        let movesTime = allowRecurrence && current.recurrence?.isEmpty == false
+            ? movesSeriesTime(patch, existing: current)
+            : patch.startDate != nil || patch.startDateTime != nil || patch.endDate != nil || patch.endDateTime != nil
         let merged = GoogleCalendarProvider.mergeExistingEventWithPatch(existing: current, patch: patch)
 
         var sparse = GCalEventInput()
@@ -741,7 +751,22 @@ actor ExchangeCalendarProvider: CalendarProvider {
         sparse.description = patch.description
         sparse.transparency = patch.transparency
         sparse.attendees = patch.attendees
-        if allowRecurrence { sparse.recurrence = patch.recurrence }
+        // The series' own zone (#423): a rule the edit gives is dated and labelled in it.
+        let storedRecurrence = existing.raw["recurrence"] as? [String: Any]
+        let storedZoneName = ((storedRecurrence?["range"] as? [String: Any])?["recurrenceTimeZone"] as? String)
+            .flatMap { $0.isEmpty ? nil : $0 }
+        var rangeZone: TimeZone?
+        if allowRecurrence, patch.recurrence != nil, let storedZoneName {
+            guard let zone = CalendarTimeZoneResolver.zone(named: storedZoneName, in: .none) else {
+                throw CalendarProviderError.unrecognizedTimeZone(storedZoneName, consequence: "it did not change the event")
+            }
+            rangeZone = zone
+        }
+        // A rule the series already has is no rule (#423), so an equal rule leaves the
+        // date-move step below to keep the range.
+        if allowRecurrence {
+            sparse.recurrence = seriesRuleToWrite(patch, existing: current, stored: storedRecurrence, rangeZone: rangeZone)
+        }
         if movesTime || sparse.recurrence != nil {
             sparse.startDate = merged.startDate
             sparse.startDateTime = merged.startDateTime
@@ -750,7 +775,21 @@ actor ExchangeCalendarProvider: CalendarProvider {
             sparse.endDateTime = merged.endDateTime
             sparse.endTimeZone = merged.endTimeZone
         }
-        var json = toGraphEventJSON(sparse)
+        var json = toGraphEventJSON(sparse, rangeZone: rangeZone)
+        // A rule that changes the series keeps the series' first day of the week and zone
+        // (#423): the rebuilt rule names Sunday and no zone, and Graph stores a range written
+        // without a zone as UTC. With none stored, the zone is the one the start is written in.
+        if var rule = json["recurrence"] as? [String: Any],
+           var pattern = rule["pattern"] as? [String: Any],
+           var range = rule["range"] as? [String: Any] {
+            if let firstDay = (storedRecurrence?["pattern"] as? [String: Any])?["firstDayOfWeek"] as? String {
+                pattern["firstDayOfWeek"] = firstDay
+            }
+            range["recurrenceTimeZone"] = storedZoneName ?? (json["start"] as? [String: Any])?["timeZone"] as? String
+            rule["pattern"] = pattern
+            rule["range"] = range
+            json["recurrence"] = rule
+        }
         if let wanted = sparse.attendees {
             json["attendees"] = Self.editAttendeesJSON(stored: existing.raw["attendees"] as? [[String: Any]] ?? [], wanted: wanted)
         }
@@ -767,6 +806,144 @@ actor ExchangeCalendarProvider: CalendarProvider {
             json["body"] = body
         }
         return json
+    }
+
+    /// The rule a whole-series edit `patch` writes on the series `existing` (#423): nil when it
+    /// gives none, or gives the series' own. The assistant re-sends the rule it read, and
+    /// writing it rebuilt would reset the series' exceptions. The edit is merged with the series
+    /// as the write merges it (`mergeExistingEventWithPatch`: the edit's start, zone and rule),
+    /// its rule built as `toGraphEventJSON` writes it beside that start, in `rangeZone`, and
+    /// compared with `stored`, the series' recurrence in Graph's form (`sameRule`). With nothing
+    /// stored, the rule is written. The one decision both the write (`graphPatchJSON`) and the
+    /// edit's card (`editResetsChangedOccurrences`) take, so the two cannot differ.
+    nonisolated func seriesRuleToWrite(
+        _ patch: GCalEventInput, existing: GCalEvent, stored: [String: Any]?, rangeZone: TimeZone?
+    ) -> [String]? {
+        guard let rule = patch.recurrence else { return nil }
+        guard let stored else { return rule }
+        let merged = GoogleCalendarProvider.mergeExistingEventWithPatch(existing: existing, patch: patch)
+        var probe = GCalEventInput()
+        probe.recurrence = rule
+        probe.startDate = merged.startDate
+        probe.startDateTime = merged.startDateTime
+        probe.startTimeZone = merged.startTimeZone
+        guard let rebuilt = toGraphEventJSON(probe, rangeZone: rangeZone)["recurrence"] as? [String: Any],
+              Self.sameRule(rebuilt, as: stored)
+        else { return rule }
+        return nil
+    }
+
+    /// Whether the whole-series edit `edit` resets the occurrences of `event` changed one by one
+    /// (#423). Graph resets a series' deleted and moved occurrences when a PATCH changes its
+    /// rule, and when it changes its start or end (measured on a work account, 2026-11-10: a
+    /// start/end PATCH alone brought a deleted occurrence back and made a moved one a plain
+    /// occurrence at the new time). So: when the edit moves the series' start or end
+    /// (`movesSeriesTime`), or when the rule the write would write (`seriesRuleToWrite`) is not
+    /// the stored one. The stored rule is `event`'s RRULE in Graph's form, beside the event's
+    /// own start, in the series' zone (`recurrenceTimeZoneName`, read with the event). The rule
+    /// changes when the event has none, when its zone is one `CalendarTimeZoneResolver` does not
+    /// recognize (the write refuses that edit), and when its Graph pattern does not come back
+    /// the same through an RRULE (`rrule(_:)`), so its RRULE does not say what is stored.
+    nonisolated func editResetsChangedOccurrences(_ event: GCalEvent, edit: GCalEventInput) -> Bool {
+        if movesSeriesTime(edit, existing: event) { return true }
+        guard edit.recurrence != nil else { return false }
+        guard let baseline = storedRuleBaseline(event) else { return true }
+        return seriesRuleToWrite(edit, existing: event, stored: baseline.recurrence, rangeZone: baseline.rangeZone) != nil
+    }
+
+    /// The card's stand-in for the recurrence Graph stores for `event` (#423): its RRULE rebuilt in
+    /// Graph's form beside the event's own start, in the series' zone (`recurrenceTimeZoneName`),
+    /// with that zone. Nil when it can't stand in: no RRULE, a zone `CalendarTimeZoneResolver` does
+    /// not recognize, or a rebuilt pattern whose RRULE (`rrule(_:)`) is not the event's.
+    nonisolated func storedRuleBaseline(_ event: GCalEvent) -> (recurrence: [String: Any], rangeZone: TimeZone?)? {
+        guard let storedRule = event.recurrence?.first(where: { $0.uppercased().hasPrefix("RRULE:") }) else { return nil }
+        var rangeZone: TimeZone?
+        if let name = event.recurrenceTimeZoneName {
+            guard let zone = CalendarTimeZoneResolver.zone(named: name, in: .none) else { return nil }
+            rangeZone = zone
+        }
+        let start = GoogleCalendarProvider.mergeExistingEventWithPatch(existing: event, patch: GCalEventInput())
+        var storedInput = GCalEventInput()
+        storedInput.recurrence = [storedRule]
+        storedInput.startDate = start.startDate
+        storedInput.startDateTime = start.startDateTime
+        storedInput.startTimeZone = start.startTimeZone
+        guard let stored = toGraphEventJSON(storedInput, rangeZone: rangeZone)["recurrence"] as? [String: Any],
+              let data = try? JSONSerialization.data(withJSONObject: stored),
+              let decoded = try? JSONDecoder().decode(MSPatternedRecurrence.self, from: data),
+              Self.rrule(decoded).map(GoogleCalendarProvider.canonicalRRULE) == [GoogleCalendarProvider.canonicalRRULE(storedRule)]
+        else { return nil }
+        return (stored, rangeZone)
+    }
+
+    /// Whether the whole-series edit `patch` moves the series `existing`'s start or end (#423).
+    /// A series' time moves when the instant of its start or end changes, or its all-day date, or
+    /// anything else the encoder writes beside them (all-day or timed): the whole of what
+    /// `toGraphEventJSON` writes for the start and end the write would send (the edit merged as
+    /// the write merges it) against the same for the series' own, each timed start and end read
+    /// as its instant (`graphTimes`). The same instant under another zone name is no move: a read
+    /// gives the times in the zone it asks for, so an edit that echoes them restates the series'
+    /// own. A time that can't be read as an instant is a move. The one decision both the write
+    /// (`graphPatchJSON`, which sends a series' start and end only for a move or beside a rule)
+    /// and the edit's card (`editResetsChangedOccurrences`) take, so the two cannot differ.
+    nonisolated func movesSeriesTime(_ patch: GCalEventInput, existing: GCalEvent) -> Bool {
+        guard patch.startDate != nil || patch.startDateTime != nil || patch.endDate != nil || patch.endDateTime != nil
+        else { return false }
+        guard let sent = graphTimes(GoogleCalendarProvider.mergeExistingEventWithPatch(existing: existing, patch: patch)),
+              let own = graphTimes(GoogleCalendarProvider.mergeExistingEventWithPatch(existing: existing, patch: GCalEventInput()))
+        else { return true }
+        return !sent.isEqual(own)
+    }
+
+    /// What `toGraphEventJSON` writes for `merged`'s start and end, with each timed start and end
+    /// replaced by the instant it names: its wall time in the zone `CalendarTimeZoneResolver`
+    /// resolves its label to. An all-day start and end stay as written (dates). Nil when a label
+    /// does not resolve or a wall time does not parse.
+    nonisolated func graphTimes(_ merged: GCalEventInput) -> NSDictionary? {
+        var times = GCalEventInput()
+        times.startDate = merged.startDate
+        times.startDateTime = merged.startDateTime
+        times.startTimeZone = merged.startTimeZone
+        times.endDate = merged.endDate
+        times.endDateTime = merged.endDateTime
+        times.endTimeZone = merged.endTimeZone
+        var json = toGraphEventJSON(times)
+        guard json["isAllDay"] as? Bool != true else { return NSDictionary(dictionary: json) }
+        let wall = DateFormatter()
+        wall.locale = Locale(identifier: "en_US_POSIX")
+        wall.calendar = Calendar(identifier: .gregorian)
+        wall.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        for (key, value) in json {
+            guard let part = value as? [String: Any], let label = part["timeZone"] as? String else { continue }
+            guard let zone = CalendarTimeZoneResolver.zone(named: label, in: .none),
+                  let dateTime = part["dateTime"] as? String
+            else { return nil }
+            wall.timeZone = zone
+            guard let instant = wall.date(from: String(dateTime.prefix(19))) else { return nil }
+            json[key] = ["instant": instant.timeIntervalSince1970]
+        }
+        return NSDictionary(dictionary: json)
+    }
+
+    /// Whether `rebuilt`, an edit's rule as `toGraphEventJSON` writes it, means the rule the
+    /// series already has (`stored`, as Graph holds it) (#423). Graph fills the properties a
+    /// pattern or range does not use with defaults, and the rebuilt rule names every property
+    /// its own type uses, so only those are compared, the days of the week in any order. Two are
+    /// left out: `firstDayOfWeek`, which an RRULE does not carry (a changed rule keeps the stored
+    /// one), and the range's `startDate`, which follows the start: a series moved to another
+    /// date with its own rule is a date move.
+    nonisolated static func sameRule(_ rebuilt: [String: Any], as stored: [String: Any]) -> Bool {
+        for part in ["pattern", "range"] {
+            guard let mine = rebuilt[part] as? [String: Any], let theirs = stored[part] as? [String: Any] else { return false }
+            for (key, value) in mine where key != "firstDayOfWeek" && key != "startDate" {
+                if key == "daysOfWeek" {
+                    guard Set(value as? [String] ?? []) == Set(theirs[key] as? [String] ?? []) else { return false }
+                } else if !(value as AnyObject).isEqual(theirs[key]) {
+                    return false
+                }
+            }
+        }
+        return true
     }
 
     /// The status a new attendee is written with: unanswered, with no response time (the form
@@ -1019,6 +1196,63 @@ actor ExchangeCalendarProvider: CalendarProvider {
         return !hasSubject && !hasAttendees && !hasLocation && !hasBody
     }
 
+    /// A Graph recurrence as an RFC 5545 RRULE (`toGCalEvent`); `[]` when it has no pattern.
+    nonisolated static func rrule(_ rec: MSPatternedRecurrence) -> [String] {
+        guard let pattern = rec.pattern else { return [] }
+        let dayMap = ["sunday": "SU", "monday": "MO", "tuesday": "TU", "wednesday": "WE", "thursday": "TH", "friday": "FR", "saturday": "SA"]
+        let byDay = (pattern.daysOfWeek ?? []).compactMap { dayMap[$0.lowercased()] }.joined(separator: ",")
+        let indexToSetPos = ["first": 1, "second": 2, "third": 3, "fourth": 4, "last": -1]
+        let bySetPos = pattern.index.flatMap { indexToSetPos[$0.lowercased()] }
+
+        var parts: [String] = []
+        switch pattern.type?.lowercased() {
+        case "daily":
+            parts.append("FREQ=DAILY")
+        case "weekly":
+            parts.append("FREQ=WEEKLY")
+            if !byDay.isEmpty { parts.append("BYDAY=\(byDay)") }
+        case "absolutemonthly":
+            parts.append("FREQ=MONTHLY")
+            if let d = pattern.dayOfMonth { parts.append("BYMONTHDAY=\(d)") }
+        case "relativemonthly":
+            parts.append("FREQ=MONTHLY")
+            if !byDay.isEmpty { parts.append("BYDAY=\(byDay)") }
+            if let sp = bySetPos { parts.append("BYSETPOS=\(sp)") }
+        case "absoluteyearly":
+            parts.append("FREQ=YEARLY")
+            if let m = pattern.month { parts.append("BYMONTH=\(m)") }
+            if let d = pattern.dayOfMonth { parts.append("BYMONTHDAY=\(d)") }
+        case "relativeyearly":
+            parts.append("FREQ=YEARLY")
+            if let m = pattern.month { parts.append("BYMONTH=\(m)") }
+            if !byDay.isEmpty { parts.append("BYDAY=\(byDay)") }
+            if let sp = bySetPos { parts.append("BYSETPOS=\(sp)") }
+        default:
+            // Unknown Graph type — emit a bare weekly so the value is at
+            // least a valid FREQ rather than garbage.
+            parts.append("FREQ=WEEKLY")
+            if !byDay.isEmpty { parts.append("BYDAY=\(byDay)") }
+        }
+        if let interval = pattern.interval, interval > 1 { parts.append("INTERVAL=\(interval)") }
+        // Gate UNTIL/COUNT emission on `range.type` — Graph ALWAYS fills
+        // `endDate` (with the sentinel "0001-01-01" for `noEnd`) and
+        // ALWAYS fills `numberOfOccurrences` (with 0 for non-numbered).
+        // Without the type check we emit `UNTIL=00010101` for every
+        // open-ended series, which (a) shows the LLM/user a garbage RRULE
+        // and (b) round-trips on subsequent edits into Graph as a real
+        // capped series ending in year 0001.
+        let rangeType = rec.range?.type?.lowercased()
+        if rangeType == "enddate",
+           let endDate = rec.range?.endDate, !endDate.isEmpty, endDate != "0001-01-01" {
+            parts.append("UNTIL=\(endDate.replacingOccurrences(of: "-", with: ""))")
+        } else if rangeType == "numbered",
+                  let count = rec.range?.numberOfOccurrences, count > 0 {
+            parts.append("COUNT=\(count)")
+        }
+        // `noEnd` (or any unknown type) → emit no UNTIL/COUNT.
+        return ["RRULE:" + parts.joined(separator: ";")]
+    }
+
     func toGCalEvent(_ e: MSEvent) -> GCalEvent {
         let transparency: String?
         switch e.showAs {
@@ -1054,63 +1288,9 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // the LLM and (b) round-trips through `parseRRULEToGraphRecurrence` to
         // `default → daily`, silently turning a monthly Exchange series daily
         // on split.
-        let recurrence: [String]? = e.recurrence.map { rec in
-            guard let pattern = rec.pattern else { return [] }
-            let dayMap = ["sunday": "SU", "monday": "MO", "tuesday": "TU", "wednesday": "WE", "thursday": "TH", "friday": "FR", "saturday": "SA"]
-            let byDay = (pattern.daysOfWeek ?? []).compactMap { dayMap[$0.lowercased()] }.joined(separator: ",")
-            let indexToSetPos = ["first": 1, "second": 2, "third": 3, "fourth": 4, "last": -1]
-            let bySetPos = pattern.index.flatMap { indexToSetPos[$0.lowercased()] }
+        let recurrence: [String]? = e.recurrence.map(Self.rrule)
 
-            var parts: [String] = []
-            switch pattern.type?.lowercased() {
-            case "daily":
-                parts.append("FREQ=DAILY")
-            case "weekly":
-                parts.append("FREQ=WEEKLY")
-                if !byDay.isEmpty { parts.append("BYDAY=\(byDay)") }
-            case "absolutemonthly":
-                parts.append("FREQ=MONTHLY")
-                if let d = pattern.dayOfMonth { parts.append("BYMONTHDAY=\(d)") }
-            case "relativemonthly":
-                parts.append("FREQ=MONTHLY")
-                if !byDay.isEmpty { parts.append("BYDAY=\(byDay)") }
-                if let sp = bySetPos { parts.append("BYSETPOS=\(sp)") }
-            case "absoluteyearly":
-                parts.append("FREQ=YEARLY")
-                if let m = pattern.month { parts.append("BYMONTH=\(m)") }
-                if let d = pattern.dayOfMonth { parts.append("BYMONTHDAY=\(d)") }
-            case "relativeyearly":
-                parts.append("FREQ=YEARLY")
-                if let m = pattern.month { parts.append("BYMONTH=\(m)") }
-                if !byDay.isEmpty { parts.append("BYDAY=\(byDay)") }
-                if let sp = bySetPos { parts.append("BYSETPOS=\(sp)") }
-            default:
-                // Unknown Graph type — emit a bare weekly so the value is at
-                // least a valid FREQ rather than garbage.
-                parts.append("FREQ=WEEKLY")
-                if !byDay.isEmpty { parts.append("BYDAY=\(byDay)") }
-            }
-            if let interval = pattern.interval, interval > 1 { parts.append("INTERVAL=\(interval)") }
-            // Gate UNTIL/COUNT emission on `range.type` — Graph ALWAYS fills
-            // `endDate` (with the sentinel "0001-01-01" for `noEnd`) and
-            // ALWAYS fills `numberOfOccurrences` (with 0 for non-numbered).
-            // Without the type check we emit `UNTIL=00010101` for every
-            // open-ended series, which (a) shows the LLM/user a garbage RRULE
-            // and (b) round-trips on subsequent edits into Graph as a real
-            // capped series ending in year 0001.
-            let rangeType = rec.range?.type?.lowercased()
-            if rangeType == "enddate",
-               let endDate = rec.range?.endDate, !endDate.isEmpty, endDate != "0001-01-01" {
-                parts.append("UNTIL=\(endDate.replacingOccurrences(of: "-", with: ""))")
-            } else if rangeType == "numbered",
-                      let count = rec.range?.numberOfOccurrences, count > 0 {
-                parts.append("COUNT=\(count)")
-            }
-            // `noEnd` (or any unknown type) → emit no UNTIL/COUNT.
-            return ["RRULE:" + parts.joined(separator: ";")]
-        }
-
-        return GCalEvent(
+        var event = GCalEvent(
             id: e.id,
             summary: e.subject,
             location: e.location?.displayName,
@@ -1130,6 +1310,8 @@ actor ExchangeCalendarProvider: CalendarProvider {
             recurringEventId: e.seriesMasterId,
             conferenceUrl: e.onlineMeeting?.joinUrl
         )
+        event.recurrenceTimeZoneName = e.recurrence?.range?.recurrenceTimeZone.flatMap { $0.isEmpty ? nil : $0 }
+        return event
     }
 
     /// An event's description: the notes in its stored body as text, at full
@@ -1193,9 +1375,25 @@ actor ExchangeCalendarProvider: CalendarProvider {
         return String(iso[..<offsetIdx])
     }
 
+    /// A naive `yyyy-MM-ddTHH:mm:ss` wall time in `zone` as the same instant's wall time in
+    /// `other`; as given when the two are the same zone or the wall time does not parse.
+    nonisolated static func wallTime(_ wall: String, from zone: TimeZone, to other: TimeZone) -> String {
+        guard zone != other else { return wall }
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.calendar = Calendar(identifier: .gregorian)
+        fmt.timeZone = zone
+        fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        guard let instant = fmt.date(from: String(wall.prefix(19))) else { return wall }
+        fmt.timeZone = other
+        return fmt.string(from: instant)
+    }
+
     /// `attendeeTypes` (lowercased address → Graph type) keeps an existing
     /// attendee's type; an attendee it does not name is `required`.
-    nonisolated func toGraphEventJSON(_ input: GCalEventInput, attendeeTypes: [String: String] = [:]) -> [String: Any] {
+    /// `rangeZone` is the zone a rule's range is read in when it is not the
+    /// start's: an edit's series' stored `recurrenceTimeZone` (`graphPatchJSON`).
+    nonisolated func toGraphEventJSON(_ input: GCalEventInput, attendeeTypes: [String: String] = [:], rangeZone storedRangeZone: TimeZone? = nil) -> [String: Any] {
         var json: [String: Any] = [:]
 
         if let summary = input.summary { json["subject"] = summary }
@@ -1261,29 +1459,43 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // from the event's own start — which is exactly what Graph wants
         // ("Must be the same value as the start property of the recurring event").
         if let recurrence = input.recurrence, let rrule = recurrence.first {
+            // The event's zone, as a timed `start` is sent above (`input.startTimeZone`, else the
+            // device's): Graph reads the range's dates there, unless the range names its own zone
+            // (`storedRangeZone`, #423). The start's wall time is the one sent above, read in the
+            // range's zone; an all-day series has none, and its rule's UNTIL is a bare date, which
+            // `graphEndDate` keeps as written in any zone.
+            let startZone = input.startTimeZone.flatMap { CalendarTimeZoneResolver.zone(named: $0, in: .none) } ?? .current
+            let rangeZone = storedRangeZone ?? startZone
+            let startWallTime = input.startDateTime.map {
+                Self.wallTime(Self.graphNaiveDateTime($0), from: startZone, to: rangeZone)
+            }
             // Derive the event's start so weekly/monthly/yearly rules that omit
             // BYDAY/BYMONTHDAY get the implied field filled from it (Graph
-            // rejects a weekly pattern with no daysOfWeek, etc.).
+            // rejects a weekly pattern with no daysOfWeek, etc.). A timed start is
+            // its wall time in the range's zone, where Graph reads the pattern; an
+            // all-day start is its date there.
             let recEventStart: Date? = {
-                if let sdt = input.startDateTime { return Date.fromISO8601(sdt) }
+                let f = DateFormatter()
+                f.locale = Locale(identifier: "en_US_POSIX")
+                f.calendar = Calendar(identifier: .gregorian)
+                f.timeZone = rangeZone
+                if let startWallTime {
+                    f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+                    return f.date(from: String(startWallTime.prefix(19)))
+                }
                 if let sd = input.startDate {
-                    let f = DateFormatter()
                     f.dateFormat = "yyyy-MM-dd"
-                    f.timeZone = .current
                     return f.date(from: sd)
                 }
                 return nil
             }()
-            // The event's zone, as a timed `start` is sent above (`input.startTimeZone`, else the
-            // device's): Graph reads the range's dates there. The start's wall time is the one
-            // sent above, in that zone; an all-day series has none, and its rule's UNTIL is a bare
-            // date, which `graphEndDate` keeps as written in any zone.
-            let rangeZone = input.startTimeZone.flatMap { CalendarTimeZoneResolver.zone(named: $0, in: .none) } ?? .current
-            let startWallTime = input.startDateTime.map(Self.graphNaiveDateTime)
             var graphRec = parseRRULEToGraphRecurrence(rrule, eventStart: recEventStart, timeZone: rangeZone, startWallTime: startWallTime)
             if var range = graphRec["range"] as? [String: Any], range["startDate"] == nil {
                 let startDateStr: String? = {
                     if let sd = input.startDate { return sd }                       // already YYYY-MM-DD
+                    // Graph reads the range's start date in the stored zone and requires it to
+                    // match the start: the start's wall time there (#423).
+                    if storedRangeZone != nil, let startWallTime { return String(startWallTime.prefix(10)) }
                     if let sdt = input.startDateTime { return String(sdt.prefix(10)) } // RFC3339 → date part
                     return nil
                 }()
@@ -1386,7 +1598,9 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// field correctly instead of emitting a body Graph rejects with HTTP 400.
     ///
     /// `timeZone` is the zone Graph reads the range in: the event's start zone
-    /// (`recurrenceTimeZone` is never sent, so Graph uses the event's own). An
+    /// (a create sends no `recurrenceTimeZone`, so Graph uses the event's own), or
+    /// the series' stored `recurrenceTimeZone` for an edit's rule, which is
+    /// labelled with it (`graphPatchJSON`). An
     /// `UNTIL` that names a UTC instant is dated there, and one earlier in its
     /// day than the series' start time (`startWallTime`, the start's wall time
     /// in that zone) ends the series the day before; see `graphEndDate`.
@@ -1432,9 +1646,10 @@ actor ExchangeCalendarProvider: CalendarProvider {
             range = ["type": "endDate", "endDate": endDate]
         }
 
-        // Calendar fields implied by DTSTART when the RRULE doesn't spell them out.
+        // Calendar fields implied by DTSTART when the RRULE doesn't spell them out, on its
+        // date in the zone Graph reads the range in (#655).
         var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = .current
+        cal.timeZone = timeZone
         let weekdayNames = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
         let startComps = eventStart.map { cal.dateComponents([.weekday, .day, .month], from: $0) }
         let startWeekday = startComps?.weekday.map { weekdayNames[($0 - 1) % 7] }
@@ -1651,4 +1866,5 @@ struct MSRecurrenceRange: Decodable {
     let type: String?
     let endDate: String?
     let numberOfOccurrences: Int?
+    let recurrenceTimeZone: String?
 }

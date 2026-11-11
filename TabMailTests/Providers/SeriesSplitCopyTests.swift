@@ -586,9 +586,16 @@ struct ExchangeSeriesSplitCopyTests {
         let (graph, _) = try await split(series, patch: GCalEventInput())
         // The cap as sent: an end date and no count, so a numbered series can't
         // be read as still running for its stored count.
-        let capRange = (graph.patches("ser-1").first?["recurrence"] as? [String: Any])?["range"] as? [String: Any]
+        let capRecurrence = graph.patches("ser-1").first?["recurrence"] as? [String: Any]
+        let capRange = capRecurrence?["range"] as? [String: Any]
         #expect(capRange?["type"] as? String == "endDate" && capRange?["numberOfOccurrences"] == nil,
                 "\(rangeType): the cap sent \(canonical(capRange))")
+        // As sent, not only as stored: a range sent with no zone is stored as UTC, and a pattern
+        // sent without the stored first day of the week makes it Sunday.
+        #expect(capRange?["recurrenceTimeZone"] as? String == "Pacific Standard Time",
+                "\(rangeType): the cap sent the range zone \(capRange?["recurrenceTimeZone"] as? String ?? "none")")
+        #expect((capRecurrence?["pattern"] as? [String: Any])?["firstDayOfWeek"] as? String == "monday",
+                "\(rangeType): the cap sent \(canonical(capRecurrence?["pattern"]))")
         let capped = try #require(graph.event("ser-1"))
         let storedRecurrence = try #require(series["recurrence"] as? [String: Any])
         let recurrence = try #require(capped["recurrence"] as? [String: Any])
