@@ -206,7 +206,7 @@ final class SyncScheduler {
                 BackgroundSyncLogger.log("drainPendingSyncs: ABORTED mid-drain — network lost at \(email)")
                 break
             }
-            let changed = await manager.backgroundSyncForAccount(email: email)
+            let changed = await manager.backgroundSyncForAccount(email: email).hadChanges
             if changed { anyChanges = true }
             // Only dequeue if network still connected after sync (sync likely completed).
             // If network dropped mid-sync, item stays in queue for next drain.
@@ -958,12 +958,13 @@ final class SyncScheduler {
         }
 
         let t0 = CFAbsoluteTimeGetCurrent()
-        let anyChanges: Bool
+        let runResult: AccountManager.SyncResult
         if let email = accountEmail {
-            anyChanges = await manager.backgroundSyncForAccount(email: email)
+            runResult = await manager.backgroundSyncForAccount(email: email)
         } else {
-            anyChanges = await manager.backgroundSyncAll(inboxOnly: inboxOnly)
+            runResult = await manager.backgroundSyncAll(inboxOnly: inboxOnly)
         }
+        let anyChanges = runResult.hadChanges
 
         lastPollTime = Date()
 
@@ -998,8 +999,11 @@ final class SyncScheduler {
         // stamped, which left the subtitle stale after a silent-push / NSE wake.
         // Stamp on completion-with-connectivity even when nothing changed (the
         // no-network case returns false earlier and is correctly skipped).
+        // The run's own banner line wins over its own timestamp advance: a run
+        // where one account failed keeps the inbox banner up
+        // (`AccountManagerState.finishSyncRun`).
         AccountManagerState.shared.lastSyncFailed = false
-        AccountManagerState.shared.lastSyncCompletedAt = Date()
+        AccountManagerState.shared.finishSyncRun(bannerText: runResult.bannerText, completed: true)
 
         return true
     }
@@ -1033,9 +1037,9 @@ final class SyncScheduler {
             let result = await manager.foregroundSyncAll()
             anyChanges = result.hadChanges
             AccountManagerState.shared.lastSyncFailed = result.failed
-            if !result.failed {
-                AccountManagerState.shared.lastSyncCompletedAt = Date()
-            }
+            // One call publishes both: the run's own banner line wins over its
+            // own timestamp advance (`AccountManagerState.finishSyncRun`).
+            AccountManagerState.shared.finishSyncRun(bannerText: result.bannerText, completed: !result.failed)
             // Clear phases after a short delay so the terminal per-account phase
             // emission has a chance to render through the subtitle's throttle
             // before being wiped. Without this the phase lifetime is sub-ms.

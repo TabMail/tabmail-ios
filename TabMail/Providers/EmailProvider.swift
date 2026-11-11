@@ -997,6 +997,38 @@ enum ProviderError: LocalizedError {
     }
 }
 
+/// What a provider learned about the account's sign-in from a login the server
+/// answered. Reported through a closure the account layer injects, so the
+/// "sign in again" signal is raised and cleared without anything above
+/// `EmailProvider` knowing which provider answered.
+enum SignInOutcome: Sendable, Equatable {
+    /// The server accepted the credentials.
+    case accepted
+    /// The server refused the credentials themselves (not a temporary refusal).
+    case credentialsRefused
+}
+
+/// The closure shape a provider uses to report a `SignInOutcome`. It is awaited
+/// before the provider returns or rethrows, so the signal is in place by the time
+/// the caller sees the result.
+typealias SignInOutcomeReporter = @Sendable (SignInOutcome) async -> Void
+
+/// A server refused a request for now and said so (for example an IMAP login
+/// answered `NO [UNAVAILABLE]`). The next sync cycle retries; it says nothing
+/// about the user's credentials.
+///
+/// It keeps the original error's description and localized description, so
+/// every classifier that reads an error's text (the outbox's send classifier,
+/// `SyncEngine.isConnectionError`, the queue drain's retry charge) treats it
+/// exactly as it treated the original error. Only `SyncEngine.isTransientError`
+/// knows this type.
+struct ProviderTemporaryRefusal: Error, CustomStringConvertible, LocalizedError {
+    let underlying: any Error
+
+    var description: String { String(describing: underlying) }
+    var errorDescription: String? { underlying.localizedDescription }
+}
+
 /// True when `id` matches a TabMail-internal optimistic-placeholder shape.
 /// `sent-<UUID>` (`AccountManager.insertOptimisticSentHeader`, in
 /// `AccountManagerOutbox.swift`) and `draft-<UUID>`

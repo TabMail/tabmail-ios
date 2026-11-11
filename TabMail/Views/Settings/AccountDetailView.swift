@@ -523,8 +523,9 @@ struct AccountDetailView: View {
                 try await manager.updateIMAPPassword(password, for: account)
                 try await manager.syncAccount(account)
             } catch {
-                if !SyncEngine.isConnectionError(error) {
-                    reauthError = error.localizedDescription
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Reauth] Password update failed: \(error)") }
+                if let line = AccountReauthAlert.line(for: error, isPassword: true) {
+                    reauthError = line
                 }
             }
             isReauthenticating = false
@@ -545,8 +546,9 @@ struct AccountDetailView: View {
                 }
                 try await manager.syncAccount(account)
             } catch {
-                if !SyncEngine.isConnectionError(error) {
-                    reauthError = error.localizedDescription
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Reauth] Re-authentication failed: \(error)") }
+                if let line = AccountReauthAlert.line(for: error, isPassword: false) {
+                    reauthError = line
                 }
             }
             isReauthenticating = false
@@ -698,5 +700,22 @@ struct AccountDetailView: View {
         case .spam: return "xmark.bin"
         case .custom: return "folder"
         }
+    }
+}
+
+/// The re-authentication alert's copy: fixed plain lines only, never text
+/// derived from the error (which stays in the debug-gated log).
+enum AccountReauthAlert {
+    static let passwordLine = "The server did not accept the sign-in. Check the password and try again."
+    static let oauthLine = "Sign-in did not complete. Please try again."
+
+    /// Every line the alert can show. Tests assert membership in this set.
+    static let allLines: Set<String> = [passwordLine, oauthLine]
+
+    /// The alert line for `error`, or `nil` when the alert stays closed (offline,
+    /// as before).
+    static func line(for error: Error, isPassword: Bool) -> String? {
+        if SyncEngine.isConnectionError(error) { return nil }
+        return isPassword ? passwordLine : oauthLine
     }
 }

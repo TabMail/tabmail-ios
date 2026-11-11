@@ -132,6 +132,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// the port (993 → implicit TLS, 143 → plain). Tests set `false` to point
     /// IMAPProvider at an in-process plain-TCP fake on an ephemeral port.
     private let useTLS: Bool?
+    /// Reports what a login the server answered says about the account's
+    /// sign-in. Injected by the account layer; `nil` reports nothing.
+    private let signInOutcome: SignInOutcomeReporter?
 
     // MARK: - UIDVALIDITY epoch observation (T1.2b)
 
@@ -833,7 +836,8 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         senderEmail: String? = nil,
         smtpHost: String,
         smtpPort: Int = 587,
-        useTLS: Bool? = nil
+        useTLS: Bool? = nil,
+        signInOutcome: SignInOutcomeReporter? = nil
     ) {
         self.host = host
         self.port = port
@@ -843,6 +847,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         self.smtpHost = smtpHost
         self.smtpPort = smtpPort
         self.useTLS = useTLS
+        self.signInOutcome = signInOutcome
         // Start from the persisted server limit (learned from a prior
         // max_userip_connections rejection) so backfill's parallel walk never
         // re-oversubscribes a server whose cap we already know.
@@ -953,7 +958,21 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // error 0.)" — permanent, actionable, and named nowhere.
             throw Self.mapTransportSecurityFailure(error, host: host)
         }
-        try await server.login(username: username, password: password)
+        do {
+            try await server.login(username: username, password: password)
+        } catch IMAPError.loginFailed(let reason) {
+            // The server answered the login and refused it. Decide by the RFC 5530
+            // response code, never by the server's prose (`leadingResponseCode`
+            // reads only the leading bracketed atom).
+            if Self.isTemporaryLoginRefusal(reason: reason) {
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] \(senderEmail) login refused for now: \(reason)") }
+                throw ProviderTemporaryRefusal(underlying: IMAPError.loginFailed(reason))
+            }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] \(senderEmail) login refused (credentials): \(reason)") }
+            await signInOutcome?(.credentialsRefused)
+            throw IMAPError.loginFailed(reason)
+        }
+        await signInOutcome?(.accepted)
         // The oracle's birth mark — see `serverCreatedTestHook`.
         serverCreatedTestHook.withLock { $0 }?(server, diagSite)
         return server
@@ -4527,6 +4546,21 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         "TRYCREATE", "NOPERM", "CANNOT", "NONEXISTENT",
     ]
 
+    /// RFC 5530 codes on a refused LOGIN that describe a condition that clears by
+    /// itself: the server is unavailable, the account is busy, the server hit a
+    /// bug, or a connection limit was reached. Every other refusal, including one
+    /// with no code and `AUTHENTICATIONFAILED`, `AUTHORIZATIONFAILED`, `EXPIRED`
+    /// and `CONTACTADMIN`, means the credentials need the user.
+    static let temporaryLoginRefusalCodes: Set<String> = [
+        "UNAVAILABLE", "INUSE", "SERVERBUG", "LIMIT",
+    ]
+
+    /// Whether a refused LOGIN, as SwiftMail renders its reason, is temporary.
+    static func isTemporaryLoginRefusal(reason: String) -> Bool {
+        guard let code = leadingResponseCode(inRenderedReason: reason) else { return false }
+        return temporaryLoginRefusalCodes.contains(code)
+    }
+
     /// The LEADING response code of a tagged failure as SwiftMail renders it, or
     /// `nil` when the resp-text carries none.
     ///
@@ -4570,8 +4604,8 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// `mapTransportSecurityFailure` and `mapRole`: it is a pure function whose
     /// structural contract is pinned directly by a unit test
     /// (`IMAPMoveWireContractTests.leadingResponseCodeIsReadStructurally`), and
-    /// a fragile-contract pin that cannot be called is not a pin. It has one
-    /// production caller, in `move`'s atomic route.
+    /// a fragile-contract pin that cannot be called is not a pin. Production
+    /// callers: `move`'s atomic route and `isTemporaryLoginRefusal(reason:)`.
     static func leadingResponseCode(inRenderedReason reason: String) -> String? {
         var body = Substring(reason)
         if body.hasSuffix(")") {

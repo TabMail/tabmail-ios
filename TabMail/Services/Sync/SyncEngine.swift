@@ -962,7 +962,12 @@ actor SyncEngine {
     /// around our `HTTPError.networkError(statusCode:)` enum, and around the
     /// `NSError(domain: "Gmail"/"Exchange", code: statusCode)` form that the HTTP
     /// providers throw (mirrors the unwrap in `isHttpGoneStatus`).
+    ///
+    /// Also true for `ProviderTemporaryRefusal`: a server that answered and said
+    /// "not now" (an IMAP login refused with `UNAVAILABLE`, `INUSE`, `SERVERBUG` or
+    /// `LIMIT`). `isConnectionError` deliberately does not learn it.
     nonisolated static func isTransientError(_ error: Error) -> Bool {
+        if error is ProviderTemporaryRefusal { return true }
         guard case ProviderError.networkError(let underlying) = error else { return false }
         let status: Int
         if case HTTPError.networkError(let statusCode) = underlying {

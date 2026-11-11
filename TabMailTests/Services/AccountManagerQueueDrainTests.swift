@@ -5,6 +5,7 @@
 import Testing
 import Foundation
 import GRDB
+import SwiftMail
 import Synchronization
 @testable import TabMail
 
@@ -629,6 +630,48 @@ struct AccountManagerQueueDrainTests {
                 "the ordinary recovery disposition did not apply once writes worked again")
         #expect(try fetchOp(cancelledOp.id, pool: pool) == nil,
                 "the cancelled row survived a recovery that was allowed to commit")
+    }
+
+    // MARK: - A temporary refusal leaves the queue exactly as the error it replaces
+
+    /// A temporary IMAP login refusal now reaches the drain as
+    /// `ProviderTemporaryRefusal` instead of SwiftMail's login error. The same
+    /// move, failed once by each, must get the same disposition and leave the same
+    /// durable row: never-drop behaviour does not change.
+    @Test("a queued move failed by a temporary refusal is kept exactly as with the login error it replaces")
+    func temporaryRefusalKeepsQueueDisposition() async throws {
+        let (pool, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+
+        let reason = "no([UNAVAILABLE] Service temporarily unavailable)"
+        let cases: [(String, any Error)] = [
+            ("temp-refusal-old", IMAPError.loginFailed(reason)),
+            ("temp-refusal-new", ProviderTemporaryRefusal(underlying: IMAPError.loginFailed(reason))),
+        ]
+        var observed: [(QueueAttemptDisposition, PendingOperation?)] = []
+        for (accountId, error) in cases {
+            try insertStableProviderFixture(accountId: accountId, pool: pool)
+            try await pool.writeWithoutTransaction { db in
+                try Folder(name: "Archive", path: "Archive", role: .archive, accountId: accountId).insert(db)
+            }
+            let provider = MockEmailProvider()
+            await provider.setMoveThrows(error)
+            let op = PendingOperation(type: .move, messageIds: ["m1"], accountId: accountId,
+                                      folderPath: "INBOX", destinationPath: "Archive")
+            try insertOp(op, pool: pool)
+            let outcome = await executeAndSchedule(op, provider: provider,
+                                                   context: AccountOperationExecutor.DrainContext())
+            observed.append((outcome, try fetchOp(op.id, pool: pool)))
+        }
+        guard observed.count == 2 else { return }
+        let (oldOutcome, oldRow) = observed[0]
+        let (newOutcome, newRow) = observed[1]
+        #expect(newOutcome == oldOutcome)
+        #expect(oldRow != nil, "the login error dropped the queued move")
+        #expect(newRow != nil, "the temporary refusal dropped the queued move")
+        #expect(newRow?.status == oldRow?.status)
+        #expect(newRow?.retryCount == oldRow?.retryCount)
+        #expect(newRow?.messageIds == oldRow?.messageIds)
     }
 
     // MARK: - 9. GAP2: MockEmailProvider.setMoveThrowsOnId — partial-batch progress + requeue-then-retry

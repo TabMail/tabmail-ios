@@ -36,10 +36,11 @@ extension AccountManager {
     }
 
     /// Background delta sync for one account: ensure connection → delta sync only.
-    /// Returns true if changes were found.
+    /// Returns whether changes were found and the inbox banner line this
+    /// account's failure raises (`InboxErrorBanner.text`), if any.
     /// Self-contained — safe to launch in parallel for multiple accounts.
     /// - Parameter inboxOnly: When true, IMAP accounts only check inbox (BGAppRefresh path).
-    func backgroundSyncOne(_ account: Account, inboxOnly: Bool = false) async -> Bool {
+    func backgroundSyncOne(_ account: Account, inboxOnly: Bool = false) async -> SyncResult {
         let t0 = CFAbsoluteTimeGetCurrent()
         // Log to main sync log only — bgAppRefresh log reserved for BGAppRefresh lifecycle events.
         BackgroundSyncLogger.log("bgSync: START \(account.emailAddress)\(inboxOnly ? " (inbox-only)" : "")")
@@ -59,13 +60,13 @@ extension AccountManager {
             }
             let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
             BackgroundSyncLogger.log("bgSync: END \(account.emailAddress): \(elapsed)ms, changes=\(changed), reason=\(reason)")
-            return changed
-        } catch is TimeoutError {
+            return SyncResult(hadChanges: changed, failed: false)
+        } catch let error as TimeoutError {
             let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
             BackgroundSyncLogger.logDebug("[SyncScheduler:bg] Delta sync timed out for \(account.emailAddress)")
             BackgroundSyncLogger.logError("timeout", source: "bgSync:\(account.emailAddress)")
             BackgroundSyncLogger.log("bgSync: TIMEOUT \(account.emailAddress) after \(elapsed)ms")
-            return false
+            return SyncResult(hadChanges: false, failed: true, bannerText: InboxErrorBanner.text(for: error))
         } catch {
             let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
             BackgroundSyncLogger.logDebug("[SyncScheduler:bg] Sync failed for \(account.emailAddress): \(error)")
@@ -73,7 +74,7 @@ extension AccountManager {
                 BackgroundSyncLogger.logError("\(error)", source: "bgSync:\(account.emailAddress)")
             }
             BackgroundSyncLogger.log("bgSync: FAILED \(account.emailAddress) after \(elapsed)ms: \(error.localizedDescription)")
-            return false
+            return SyncResult(hadChanges: false, failed: true, bannerText: InboxErrorBanner.text(for: error))
         }
     }
 
@@ -81,6 +82,16 @@ extension AccountManager {
     struct SyncResult {
         let hadChanges: Bool
         let failed: Bool
+        /// The inbox banner line this result raises, or `nil`. Aggregated over a
+        /// run's accounts: any account's line raises it for the run.
+        var bannerText: String? = nil
+
+        /// The banner line of a run made of `results`: any account's line raises
+        /// it for the whole run, so a run where one account fails and another
+        /// succeeds still raises it (`AccountManagerState.finishSyncRun`).
+        static func runBannerText(_ results: [SyncResult]) -> String? {
+            results.lazy.compactMap(\.bannerText).first
+        }
     }
 
     /// Foreground sync for one account: ensure connection → full sync (delta + periodic full).
@@ -104,9 +115,9 @@ extension AccountManager {
                 try await self.syncEngine.sync(account: account)
             }
             return SyncResult(hadChanges: changed, failed: false)
-        } catch is TimeoutError {
+        } catch let error as TimeoutError {
             BackgroundSyncLogger.logDebug("[SyncScheduler] Sync timed out for \(account.emailAddress) after \(SyncConfig.perAccountSyncTimeoutSeconds)s")
-            return SyncResult(hadChanges: false, failed: true)
+            return SyncResult(hadChanges: false, failed: true, bannerText: InboxErrorBanner.text(for: error))
         } catch let error where SyncEngine.isTransientError(error) {
             // Transient provider blip (HTTP 5xx/429 from a reachable server) — not a
             // real sync failure. Report `failed: false` so the foreground poll doesn't
@@ -123,16 +134,16 @@ extension AccountManager {
             if !SyncEngine.isConnectionError(error) && !(error is CancellationError) {
                 BackgroundSyncLogger.logError("\(error)", source: "fgSync:\(account.emailAddress)")
             }
-            return SyncResult(hadChanges: false, failed: true)
+            return SyncResult(hadChanges: false, failed: true, bannerText: InboxErrorBanner.text(for: error))
         }
     }
 
     // MARK: - Parallel Launchers
 
     /// Background delta sync ALL active accounts in parallel.
-    /// Returns true if any account had changes.
+    /// Returns whether any account had changes and the run's banner line.
     /// All account types (Gmail, Exchange, IMAP, iCloud) sync on every opportunity.
-    func backgroundSyncAll(inboxOnly: Bool = false) async -> Bool {
+    func backgroundSyncAll(inboxOnly: Bool = false) async -> SyncResult {
         let t0 = CFAbsoluteTimeGetCurrent()
         let accounts: [Account]
         do {
@@ -141,36 +152,39 @@ extension AccountManager {
             }
         } catch {
             BackgroundSyncLogger.logDebug("[SyncScheduler:bg] Failed to load accounts: \(error)")
-            return false
+            return SyncResult(hadChanges: false, failed: true)
         }
-        guard !accounts.isEmpty else { return false }
+        guard !accounts.isEmpty else { return SyncResult(hadChanges: false, failed: false) }
         let label = "bgSyncAll"
         BackgroundSyncLogger.log("\(label) START (\(accounts.count) accounts)")
 
-        return await withTaskGroup(of: (String, Bool).self) { group in
+        return await withTaskGroup(of: (String, SyncResult).self) { group in
             for account in accounts {
                 group.addTask {
-                    let changed = await self.backgroundSyncOne(account, inboxOnly: inboxOnly)
-                    return (account.emailAddress, changed)
+                    let result = await self.backgroundSyncOne(account, inboxOnly: inboxOnly)
+                    return (account.emailAddress, result)
                 }
             }
             var hadChanges = false
+            var accountResults: [SyncResult] = []
             var results: [(String, Bool)] = []
-            for await (email, changed) in group {
-                results.append((email, changed))
-                if changed { hadChanges = true }
+            for await (email, result) in group {
+                results.append((email, result.hadChanges))
+                accountResults.append(result)
+                if result.hadChanges { hadChanges = true }
             }
+            let bannerText = SyncResult.runBannerText(accountResults)
             let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
             let summary = results.map { "\($0.0)=\($0.1)" }.joined(separator: ", ")
             BackgroundSyncLogger.log("\(label) END in \(elapsed)ms: [\(summary)]")
-            return hadChanges
+            return SyncResult(hadChanges: hadChanges, failed: false, bannerText: bannerText)
         }
     }
 
     /// Background delta sync for a single account identified by email address.
     /// Used by silent push handler to sync only the pushed account.
-    /// Returns true if changes were found.
-    func backgroundSyncForAccount(email: String) async -> Bool {
+    /// Returns whether changes were found and the run's banner line.
+    func backgroundSyncForAccount(email: String) async -> SyncResult {
         guard let account = try? await AppDatabase.dbPool.read({ db in
             try Account
                 .filter(Column("emailAddress") == email)
@@ -178,7 +192,7 @@ extension AccountManager {
                 .fetchOne(db)
         }) else {
             BackgroundSyncLogger.logDebug("[SyncScheduler:bg] No active account for email \(email)")
-            return false
+            return SyncResult(hadChanges: false, failed: false)
         }
         return await backgroundSyncOne(account)
     }
@@ -205,11 +219,14 @@ extension AccountManager {
             }
             var hadChanges = false
             var allFailed = true
+            var accountResults: [SyncResult] = []
             for await result in group {
+                accountResults.append(result)
                 if result.hadChanges { hadChanges = true }
                 if !result.failed { allFailed = false }
             }
-            return SyncResult(hadChanges: hadChanges, failed: allFailed)
+            return SyncResult(hadChanges: hadChanges, failed: allFailed,
+                              bannerText: SyncResult.runBannerText(accountResults))
         }
     }
 

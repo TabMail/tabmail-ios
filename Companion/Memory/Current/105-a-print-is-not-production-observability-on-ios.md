@@ -165,6 +165,33 @@ which hides the condition from any walker keyed on the flag), and the register r
 > is a user-visible surface" is now TRUE — but only for non-connection errors.** State it with that
 > qualifier or it becomes the same over-broad claim the correction above was written to retract.
 
+
+### 5. REVERSED (2026-11-10) — the inbox error banner no longer has a developer (raw text) branch
+
+§4 above kept a debug-gated DETAIL: with logging unlocked the banner showed the stored
+`error.localizedDescription`. That rule is reversed; §4 stays as history. The banner and the account
+re-authentication alert now show **only fixed plain lines, never text derived from an error, in every
+build**. The error's text stays in the debug-gated logs only.
+
+- **Why.** The stored text was a library rendering, and it reached users: a temporary IMAP login refusal
+  appeared as `Login failed: no([UNAVAILABLE] …)`. Debug unlocks are used on real devices too.
+- **Where the decision lives.** `InboxErrorBanner.text(for: Error)` (in `AccountManagerState.swift`)
+  returns `genericMessage` or `nil`; `nil` for cancellation, database suspension, transient refusals
+  (`SyncEngine.isTransientError`, which now includes `ProviderTemporaryRefusal`), connection errors
+  (offline still shows no banner) and `AuthError.refreshFailed` (a refused sign-in is told by the
+  per-account `SignInAgainBanner`, which reads `authFailedAccounts`). `AccountReauthAlert.line(for:)`
+  in `AccountDetailView.swift` does the same for the alert. `text(for:loggingEnabled:)` is deleted.
+- **Sync banner state.** Sync failures publish to `AccountManagerState.syncErrorBanner` through one call,
+  `finishSyncRun(bannerText:completed:)`, from all three paths that advance `lastSyncCompletedAt`
+  (`InboxViewModel.performSync`, `SyncScheduler.poll`, `SyncScheduler.backgroundPoll`). A run's own
+  banner line wins over its own timestamp advance, so the banner is cleared only by a completed run that
+  raised nothing and stays steady while one account keeps failing. The older-messages catch writes the
+  same fixed line to `InboxViewModel.error`.
+- **The IOS-SCROLL-003 qualifier in §4 still holds**: a connection failure during pagination raises no
+  banner, as before.
+- Tests: `InboxErrorBannerTests` (every typed error plus an unknown one maps to a fixed line or nothing;
+  ten-run steady banner; clearing on a completed background run), `IMAPLoginRefusalSignInTests`.
+
 ---
 
 ## The residual record of `f947acb4c` was wrong, and residual records are where this keeps happening (2026-08-12)

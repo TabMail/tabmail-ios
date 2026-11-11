@@ -244,14 +244,13 @@ actor AccountManager {
     }
 
     /// Check if an error is a genuine authentication failure (not a timeout or network error).
+    ///
+    /// Typed only. A refused IMAP login is classified by its response code where
+    /// it happens (`IMAPProvider.createServer`), which reports through the
+    /// injected `SignInOutcomeReporter`; matching the error's text here would let a
+    /// temporary refusal whose prose says "login failed" ask the user to sign in.
     nonisolated func isAuthError(_ error: Error) -> Bool {
         if case ProviderError.authenticationFailed = error { return true }
-        let msg = "\(error)"
-        // IMAP LOGIN failures contain "NO [AUTHENTICATIONFAILED]" or "LOGIN failed"
-        if msg.contains("AUTHENTICATIONFAILED") { return true }
-        if msg.contains("LOGIN failed") || msg.contains("login failed") { return true }
-        // Reject app-specific password errors
-        if msg.contains("Application-specific password required") { return true }
         return false
     }
 
@@ -1297,6 +1296,28 @@ actor AccountManager {
         authFailedAccounts.remove(accountId)
     }
 
+    /// Apply what a provider learned from a login the server answered: a refusal of
+    /// the credentials raises "sign in again", an accepted login clears it. An
+    /// account being removed is not marked. Clearing an unmarked account publishes
+    /// nothing, since every pooled connection reports its own login.
+    func recordSignInOutcome(_ outcome: SignInOutcome, accountId: String) {
+        switch outcome {
+        case .credentialsRefused:
+            guard !isRuntimeRemoved(accountId) else { return }
+            authFailedAccounts.insert(accountId)
+        case .accepted:
+            guard authFailedAccounts.contains(accountId) else { return }
+            authFailedAccounts.remove(accountId)
+        }
+    }
+
+    /// The reporter the provider factory injects for `accountId`.
+    nonisolated func makeSignInOutcomeReporter(accountId: String) -> SignInOutcomeReporter {
+        return { @Sendable outcome in
+            await self.recordSignInOutcome(outcome, accountId: accountId)
+        }
+    }
+
     func setFastSyncMode(_ active: Bool) {
         fastSyncModeActive = active
     }
@@ -1737,7 +1758,8 @@ actor AccountManager {
             password: password,
             senderEmail: account.emailAddress,
             smtpHost: account.smtpHost ?? host.replacingOccurrences(of: "imap", with: "smtp"),
-            smtpPort: account.smtpPort ?? 587
+            smtpPort: account.smtpPort ?? 587,
+            signInOutcome: makeSignInOutcomeReporter(accountId: account.id)
         )
     }
 }

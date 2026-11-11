@@ -53,6 +53,8 @@ final class InboxViewModel {
     var isRefreshing = false
     var isLoadingOlder = false
     var hasMoreMessages = true
+    /// The older-messages banner line: only ever one of `InboxErrorBanner`'s fixed
+    /// lines. Sync failures publish to `AccountManagerState.syncErrorBanner`.
     var error: String?
     var filterUnread = false
     var filterLabelIds: Set<String> = []
@@ -1354,8 +1356,9 @@ final class InboxViewModel {
                 // Task cancelled (e.g., view disappeared) — not user-facing
             } catch {
                 if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[InfiniteScroll] Error: \(error)") }
-                if !SyncEngine.isConnectionError(error) {
-                    self.error = "Failed to load older messages: \(error.localizedDescription)"
+                // Fixed line only; the error's text stays in the debug-gated log above.
+                if let line = InboxErrorBanner.text(for: error) {
+                    self.error = line
                 }
             }
         }
@@ -1810,7 +1813,7 @@ final class InboxViewModel {
             try await manager.syncFolders(folders)
 
             AccountManagerState.shared.lastSyncFailed = false
-            AccountManagerState.shared.lastSyncCompletedAt = Date()
+            AccountManagerState.shared.finishSyncRun(bannerText: nil, completed: true)
         } catch is CancellationError {
             // Task cancelled (e.g., user navigated away) — not user-facing
         } catch let error where SyncEngine.isTransientError(error) {
@@ -1827,9 +1830,9 @@ final class InboxViewModel {
         } catch {
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Sync] Error: \(error)") }
             AccountManagerState.shared.lastSyncFailed = true
-            if !SyncEngine.isConnectionError(error) {
-                self.error = error.localizedDescription
-            }
+            // Fixed line only (never the error's text). The run raised it, so the
+            // run does not advance the timestamp either.
+            AccountManagerState.shared.finishSyncRun(bannerText: InboxErrorBanner.text(for: error), completed: false)
         }
 
         // Refresh loaded messages to pick up changes from sync.

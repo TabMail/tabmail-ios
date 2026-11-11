@@ -281,4 +281,31 @@ struct OutboxReliabilityTests {
         let error = NSError(domain: "com.test.unknown", code: 42, userInfo: nil)
         #expect(AccountManager.isTransientSendError(error) == false)
     }
+
+    // MARK: - A temporary refusal is classified exactly like the error it replaces
+
+    /// A temporary IMAP login refusal now reaches the outbox as
+    /// `ProviderTemporaryRefusal` instead of SwiftMail's login error. Every input
+    /// the outbox's send-failure classification reads (fatal, transient, and the
+    /// stored error text) must be identical for the two, so a send keeps exactly
+    /// the disposition it had before.
+    @Test("outbox classifies a temporary refusal exactly as the login error it replaces")
+    func temporaryRefusalKeepsOutboxDisposition() {
+        let reasons = [
+            "no([UNAVAILABLE] Service temporarily unavailable)",
+            "no([INUSE] Mailbox in use)",
+            "no([SERVERBUG] Internal error)",
+            "no([LIMIT] Too many connections from this address)",
+            "no([UNAVAILABLE] connection limit reached, try later)",
+        ]
+        for reason in reasons {
+            let old: any Error = IMAPError.loginFailed(reason)
+            let new: any Error = ProviderTemporaryRefusal(underlying: IMAPError.loginFailed(reason))
+            #expect(AccountManager.isFatalSendError(new) == AccountManager.isFatalSendError(old), "\(reason)")
+            #expect(AccountManager.isTransientSendError(new) == AccountManager.isTransientSendError(old), "\(reason)")
+            #expect(String(describing: new) == String(describing: old), "\(reason)")
+            #expect(new.localizedDescription == old.localizedDescription, "\(reason)")
+            #expect(SyncEngine.isConnectionError(new) == SyncEngine.isConnectionError(old), "\(reason)")
+        }
+    }
 }

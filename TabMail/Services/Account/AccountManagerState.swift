@@ -118,5 +118,65 @@ final class AccountManagerState {
         }
     }
 
+    /// The inbox-wide sync failure banner line, or `nil`. Only ever one of
+    /// `InboxErrorBanner`'s fixed lines; never text derived from an error.
+    var syncErrorBanner: String?
+
+    /// The single place a sync run (pull-to-refresh, foreground poll, background
+    /// poll) publishes its end state.
+    ///
+    /// - `bannerText`: what the run's own failures say (`InboxErrorBanner.text`
+    ///   aggregated over the run's accounts), or `nil` when nothing in the run
+    ///   raises the banner.
+    /// - `completed`: whether this run advances `lastSyncCompletedAt`.
+    ///
+    /// The banner may be cleared only by a run that itself raised no banner, so a
+    /// run in which one account fails and another succeeds keeps the banner up:
+    /// the run's own error wins over its own timestamp advance. That keeps the
+    /// banner steady (never cleared and re-raised per poll) while one account
+    /// keeps failing, and clears it on the first completed run that raises none.
+    func finishSyncRun(bannerText: String?, completed: Bool) {
+        if let bannerText {
+            syncErrorBanner = bannerText
+        } else if completed {
+            syncErrorBanner = nil
+        }
+        if completed {
+            lastSyncCompletedAt = Date()
+        }
+    }
+
     private init() {}
+}
+
+/// The inbox error banner's copy and the decision of which errors raise it.
+///
+/// The banner shows only fixed plain lines, never text derived from an error.
+/// An error's description is developer text (library renderings, errno dumps,
+/// server prose); it stays in the debug-gated logs. This replaces the earlier
+/// rule that showed the raw text when debug logging was unlocked.
+enum InboxErrorBanner {
+    /// The one line the banner shows. Every inbox list carries `.refreshable`, so
+    /// pull-to-refresh is genuinely the recovery gesture.
+    static let genericMessage = "Unable to refresh mail. Pull to retry."
+
+    /// Every line the banner can show. Tests assert membership in this set.
+    static let allLines: Set<String> = [genericMessage]
+
+    /// The banner line a sync or page-load failure raises, or `nil` for none.
+    ///
+    /// - `nil` for cancellation, a database suspension, a transient refusal
+    ///   (HTTP 5xx/429, a temporary IMAP login refusal), and a connection error
+    ///   (offline shows no banner).
+    /// - `nil` for `AuthError.refreshFailed`: a refused sign-in is told by the
+    ///   per-account "sign in again" banner, which reads `authFailedAccounts`.
+    /// - `genericMessage` for every other error.
+    nonisolated static func text(for error: Error) -> String? {
+        if error is CancellationError { return nil }
+        if error.isDatabaseSuspensionAbort { return nil }
+        if case AuthError.refreshFailed = error { return nil }
+        if SyncEngine.isTransientError(error) { return nil }
+        if SyncEngine.isConnectionError(error) { return nil }
+        return genericMessage
+    }
 }
