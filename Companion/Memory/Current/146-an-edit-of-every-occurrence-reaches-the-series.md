@@ -77,7 +77,9 @@ names its IANA zone on `start`; CalDAV its TZID. When the zone is not known (an 
 CalDAV floating time; a CalDAV time written in UTC with no `TZID`, #679), a timed series' new start is
 taken to be on another date: the side that splits, asks or refuses, never a wrong write. An all-day
 series needs no zone: its places are dates on every provider (`CalendarSeriesScope.place`), so one in a
-zone TabMail does not recognize is edited and split like any other.
+zone TabMail does not recognize is edited and split like any other. On Outlook the same zone, as the
+range names it, is also the label of every start and end written to the series, timed (#719) or all
+day (#747: another label is stored two days longer; memory 140).
 
 Also refused, with nothing written: an occurrence whose place or start can't be read; a series whose
 start can't be read; a deleted (`cancelled`) occurrence (the provider's lookup lists none: its
@@ -209,7 +211,11 @@ occurrence and one moved a day earlier each; read by id and through `/instances`
 offset (`2026-11-20T00:00:00+09:00`), and its date is the original day, for a plain occurrence equal to
 its start's date. With no `Prefer` or `Prefer` UTC it is the UTC instant (`2026-11-19T15:00:00Z`), the day
 before for a zone ahead of UTC. Graph accepted an IANA name for a series' zone (and gave it back as
-given) and refused a made-up one (400 `TimeZoneNotSupportedException`). So the provider's occurrence
+given) and refused a made-up one (400 `TimeZoneNotSupportedException`). It also refuses a series
+PATCH whose timed start is labelled with a zone other than the series' own (400
+`ErrorPropertyValidationFailure`, measured 2026-11-11 with `America/Vancouver` and `America/New_York`
+on a series kept in Pacific Standard Time), so the series' zone governs writes too: every timed time
+written to an Outlook series is labelled with that zone as Graph names it (#719, memory 140). So the provider's occurrence
 lookup (`occurrence`, which `CalendarSeriesScope.read` and `splitSeries` use) reads an all-day series'
 occurrence by its id with `Prefer` naming `recurrenceTimeZoneName` exactly as Graph gave it, with no
 device lookup of the zone (`allDayOccurrence`, `request(timeZoneName:)`), and takes the date part of

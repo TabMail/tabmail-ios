@@ -78,6 +78,51 @@ that aren't included in the request body maintain their previous values".
   stored recurrence for every stored rule kind (`cardBaselineIsTheStoredRule`). Not supported: an
   explicit re-zone of a series to another zone at the same instant (iOS #667); it is no move, so it is
   not written.
+- **Times written to an existing series carry the series' stored zone (#719, 2026-11-11).** Every
+  timed start and end the app writes to an Outlook series (`graphPatchJSON` for a whole-series edit,
+  the split's cap and its revert, the split's new part when it copies the stored range) is labelled
+  with the range's `recurrenceTimeZone` exactly as Graph returned it, its wall time converted so the
+  instant is unchanged (`ExchangeCalendarProvider.inSeriesZone`). Measured on a work account
+  (2026-11-11): Exchange refuses a series PATCH whose start is labelled with another zone with 400
+  `ErrorPropertyValidationFailure` (`IanaTimeZoneConstraint` on `StartTimeZoneIanaName`: "the rules
+  for ... do not match" the Windows zone stored in `TimeZoneDefinitionStart`). Refused:
+  `America/Vancouver` on a series kept in `Pacific Standard Time` (British Columbia has been on UTC-7
+  all year since 2026-11-01, so Exchange maps Vancouver to "Pacific Time (British Columbia)", and every
+  series made there before that date is kept in Pacific Standard Time), and `America/New_York` on the
+  same series (any other zone, not only a renamed one). Accepted: the stored name, and
+  `America/Los_Angeles`. Not checked (measured accepted): an end alone, and a PATCH of one occurrence (an
+  exception keeps the label it is given). Before this,
+  the label was the read's (`Prefer`, the device's zone) or the edit's `timezone`, so every series time
+  change and every split from a device in British Columbia, or from any device whose zone differs from
+  the series', failed after its card and was retired as a bad request. The relabel runs after the
+  `movesSeriesTime` decision, so it never makes a same-instant edit a move; it changes no read, no
+  single event (no range zone) and no one-occurrence edit. A zone named in the edit ("9:00 New York
+  time") writes that instant in the series' zone, as Google Calendar does; re-zoning a series is #667.
+  A stored zone the app can't convert (`Customized Time Zone`, not recognized by
+  `CalendarTimeZoneResolver`) keeps the label the write had before #719, unchanged; what Exchange does
+  with it is not measured (#746). Reads still ask for the device's zone, so a write no longer echoes
+  the read's label. Pinned by `ExchangeSeriesZoneLabelTests` (through the queue, on
+  `FakeGraphCalendar`'s measured refusal) and `ExchangeSeriesZoneHelperTests`.
+- **An all-day series' dates are written under the series' stored zone too (#747, 2026-11-11).** The
+  same sites write an all-day series' start and end labelled with the range's `recurrenceTimeZone`
+  verbatim, the date unchanged (a relabel, no conversion, no zone lookup, so any stored name works;
+  `inSeriesZone(allDay: true)`). Measured on a work account (all-day weekly series kept in
+  `Pacific Standard Time`): a start and end labelled `UTC` (the app's earlier all-day label) are
+  ACCEPTED (200/201) but stored with every occurrence two days longer: a date move with the stored
+  recurrence beside it 1 -> 3 days, the start and end alone 1 -> 3 and not moved, a length edit 2 -> 4,
+  and a create carrying the range (the split's new part) 3 days from creation. Kept in
+  `Tokyo Standard Time`, the same write stored 2-day occurrences, moved the series a day early and
+  read its range zone back as `UTC`. Labelled with the range's own name (`Pacific Standard Time`,
+  `Tokyo Standard Time`) or `America/Los_Angeles`, every length was kept. Unaffected (measured): one
+  occurrence moved under either label, a single all-day event, a series whose range zone is `UTC`
+  (the app's own creates send no range zone, which Graph stores as `UTC`), the all-day split cap (it
+  writes the recurrence alone, as an all-day master's start is read as a date), and a recurrence-only
+  move is no alternative (2 days). A plain read of an all-day series reports start and end labelled
+  `UTC` and `originalStartTimeZone: "UTC"` whatever zone it was written in: the series' zone is only in
+  `recurrence.range.recurrenceTimeZone`. Series damaged before the fix are not repaired (no migration);
+  a later move keeps their stored length. Pinned by `ExchangeAllDaySeriesLengthTests` (move, length edit
+  and split through the queue, on `FakeGraphCalendar.allDaySeriesLengthened`, which models the measured
+  lengthening for any zone other than the range's) and `ExchangeSeriesZoneHelperTests` U7.
 - A whole-series edit that gives no rule writes no `recurrence`, unless its start moves to another
   date: then the stored recurrence is written exactly as Graph holds it (from `fetchForEdit`'s raw
   read), with only the range's `startDate` moved to the new date, because the two must match. The

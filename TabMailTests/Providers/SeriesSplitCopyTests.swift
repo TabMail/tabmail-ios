@@ -606,16 +606,17 @@ struct ExchangeSeriesSplitCopyTests {
         #expect(created["transactionId"] as? String == GoogleCalendarProvider.deterministicSplitEventId(
             masterId: "ser-1", recurrenceId: GraphSplitFixture.recurrenceId))
 
+        // At the split's instant, written in the series' stored zone (#719).
         let start = try #require(created["start"] as? [String: Any])
-        let startWall = try #require(start["dateTime"] as? String)
-        #expect(String(startWall.prefix(19)) == GraphSplitFixture.recurrenceId && start["timeZone"] as? String == GraphSplitFixture.zone,
+        #expect(GraphFixture.instant(start) == GraphFixture.instant(["dateTime": GraphSplitFixture.recurrenceId, "timeZone": GraphSplitFixture.zone])
+                    && start["timeZone"] as? String == "Pacific Standard Time",
                 "\(rangeType): the new part does not start at the split: \(start)")
 
         let storedRecurrence = try #require(series["recurrence"] as? [String: Any])
         let recurrence = try #require(created["recurrence"] as? [String: Any])
         #expect(canonical(recurrence["pattern"]) == canonical(storedRecurrence["pattern"]), "\(rangeType): the pattern changed")
         let newRange = try #require(recurrence["range"] as? [String: Any])
-        #expect(newRange["startDate"] as? String == String(startWall.prefix(10)), "\(rangeType): \(canonical(newRange))")
+        #expect(newRange["startDate"] as? String == String(GraphSplitFixture.recurrenceId.prefix(10)), "\(rangeType): \(canonical(newRange))")
         #expect(newRange["recurrenceTimeZone"] as? String == "Pacific Standard Time", "\(rangeType): the range's zone was dropped")
         switch rangeType {
         case "endDate":
@@ -750,7 +751,7 @@ struct ExchangeSeriesSplitCopyTests {
         #expect(pattern["type"] as? String == "daily", "the stored rule replaced the edited one: \(canonical(pattern))")
         let startWall = try #require((created["start"] as? [String: Any])?["dateTime"] as? String)
         let range = try #require(recurrence["range"] as? [String: Any])
-        #expect(range["startDate"] as? String == String(startWall.prefix(10)), "\(canonical(range))")
+        #expect(range["startDate"] as? String == String(GraphSplitFixture.recurrenceId.prefix(10)), "\(canonical(range))")
 
         let storedRecurrence = try #require(series["recurrence"] as? [String: Any])
         let capped = try #require(graph.event("ser-1")?["recurrence"] as? [String: Any])

@@ -15,6 +15,7 @@ import Foundation
 // `FakeGraphCalendar.seriesStartZoneRefusal`). So every timed start and end the app writes to a series
 // is labelled with the series' stored zone, as Graph names it, at the same instant. All dates are
 // relative to today; the fixtures play a device in each zone through the labels Graph returns.
+// An all-day series' dates are labelled the same way (#747, `ExchangeAllDaySeriesLengthTests` below).
 
 private let utc = TimeZone(identifier: "UTC")!
 
@@ -312,28 +313,6 @@ struct ExchangeSeriesZoneLabelTests {
                 "the write is labelled \(canonical(sent?["start"])) to \(canonical(sent?["end"])), not the series' stored name")
     }
 
-    @Test("T8: an all-day series moved to another date is still written as a plain date (UTC), and accepted")
-    func allDaySeriesDateMoveUntouched() async throws {
-        let http = FakeHTTP.Scenario()
-        defer { http.close() }
-        let graph = ZoneSeries.calendar(start: at(day(0), "00:00:00", in: Self.pacific), label: Self.vancouver,
-                                        stored: Self.pacific, allDay: true)
-        graph.install(on: http)
-        var patch = GCalEventInput()
-        patch.startDate = day(1)
-        patch.endDate = day(2)
-        let provider = ExchangeCalendarProvider(mailbox: "calendar@example.com", accessToken: { _ in "test-token" },
-                                                session: http.session)
-        _ = try await provider.updateEvent(eventId: ZoneSeries.id, event: patch)
-
-        let sent = graph.patches(ZoneSeries.id).last
-        #expect(sent?["isAllDay"] as? Bool == true, "the write is not all-day: \(canonical(sent))")
-        #expect(canonical(sent?["start"]) == canonical(["dateTime": "\(day(1))T00:00:00", "timeZone": "UTC"]),
-                "the all-day start is written \(canonical(sent?["start"]))")
-        #expect(canonical(sent?["end"]) == canonical(["dateTime": "\(day(2))T00:00:00", "timeZone": "UTC"]),
-                "the all-day end is written \(canonical(sent?["end"]))")
-    }
-
     @Test("T10: a split whose new part fails puts the series back as it was, through a revert the server accepts")
     func splitWhoseCreateFailsIsReverted() async throws {
         let stored = ZoneSeries.storedOtherThanDevice
@@ -358,5 +337,92 @@ struct ExchangeSeriesZoneLabelTests {
                 "\(what): the series' recurrence is \(canonical(after?["recurrence"]))")
         #expect(instant(after?["start"]) == start, "\(what): the series moved: \(canonical(after?["start"]))")
         #expect(graph.created.isEmpty, "\(what): a new part was stored")
+    }
+}
+
+/// The length of an all-day start and end (`{dateTime, timeZone}`), in whole days of their dates.
+private func days(_ start: Any?, _ end: Any?) -> Int? {
+    func date(_ side: Any?) -> Date? {
+        ((side as? [String: Any])?["dateTime"] as? String).flatMap {
+            EKEventStoreHelper.parseNaiveISO(String($0.prefix(10)) + "T00:00:00", timeZone: utc)
+        }
+    }
+    guard let from = date(start), let to = date(end) else { return nil }
+    return Int((to.timeIntervalSince(from) / 86_400).rounded())
+}
+
+private func dateOf(_ side: Any?) -> String? { ((side as? [String: Any])?["dateTime"] as? String).map { String($0.prefix(10)) } }
+
+// INVARIANT (system property, #747): an edit of an existing Outlook all-day series keeps every
+// occurrence the length the series has, or the length the edit asks for, and keeps the series'
+// zone. Graph stores an all-day series whose start and end are written labelled with a zone other
+// than its range's `recurrenceTimeZone` with every occurrence two days longer (measured 2026-11-11;
+// `FakeGraphCalendar.allDaySeriesLengthened`), so the app writes them labelled with the stored zone,
+// on the same dates. The series is read as Graph reads it with no `Prefer`: start and end labelled
+// `UTC`, the range kept in the series' zone.
+@Suite("An all-day Outlook series keeps its occurrences' length when edited (#747)", .serialized, .processGlobalState)
+struct ExchangeAllDaySeriesLengthTests {
+    static let zones = ["Pacific Standard Time", "Tokyo Standard Time", "America/Los_Angeles"]
+
+    static func series(kept stored: String) -> FakeGraphCalendar {
+        ZoneSeries.calendar(start: at(day(0), "00:00:00", in: stored), label: "UTC", stored: stored, allDay: true)
+    }
+
+    @Test("a whole-series move to another date lands there, one day long, in the series' zone", arguments: zones)
+    func moveKeepsTheLength(_ stored: String) async throws {
+        // The provider's whole-series write, as the issue's start-only date move reaches it (the
+        // queue asks first when the new date is not the first occurrence's).
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = Self.series(kept: stored)
+        graph.install(on: http)
+        var patch = GCalEventInput()
+        patch.startDate = day(1)
+        let provider = ExchangeCalendarProvider(mailbox: "calendar@example.com", accessToken: { _ in "test-token" },
+                                                session: http.session)
+        _ = try await provider.updateEvent(eventId: ZoneSeries.id, event: patch)
+
+        let series = graph.event(ZoneSeries.id)
+        #expect(dateOf(series?["start"]) == day(1), "\(stored): the series starts \(canonical(series?["start"]))")
+        #expect(days(series?["start"], series?["end"]) == 1,
+                "\(stored): each occurrence is \(days(series?["start"], series?["end"]).map(String.init) ?? "?") days long, the series' was 1")
+        #expect(rangeOf(series)?["recurrenceTimeZone"] as? String == stored, "\(stored): the series' zone is \(canonical(rangeOf(series)))")
+        #expect(rangeOf(series)?["startDate"] as? String == day(1), "\(stored): the range starts \(canonical(rangeOf(series)))")
+    }
+
+    @Test("a length edit of every occurrence stores exactly the length asked", arguments: zones)
+    func lengthEditKeepsTheAskedLength(_ stored: String) async throws {
+        let graph = Self.series(kept: stored)
+        let rows = try await outlook(graph, [
+            "edit_scope": .string("all"), "start_iso": .string(day(0)), "end_iso": .string(day(2)), "all_day": .bool(true),
+        ], account: "allday-747-length-\(stored)")
+
+        #expect(rows.isEmpty, "\(stored): the edit was not written: \(reasons(rows))")
+        let series = graph.event(ZoneSeries.id)
+        #expect(dateOf(series?["start"]) == day(0), "\(stored): the series starts \(canonical(series?["start"]))")
+        #expect(days(series?["start"], series?["end"]) == 2,
+                "\(stored): each occurrence is \(days(series?["start"], series?["end"]).map(String.init) ?? "?") days long, the edit asked 2")
+        #expect(rangeOf(series)?["recurrenceTimeZone"] as? String == stored, "\(stored): the series' zone is \(canonical(rangeOf(series)))")
+    }
+
+    @Test("a change of an occurrence and the following ones keeps both parts' length", arguments: zones)
+    func splitKeepsTheLength(_ stored: String) async throws {
+        let graph = Self.series(kept: stored)
+        let rows = try await outlook(graph, [
+            "edit_scope": .string("this_and_following"), "recurrence_id": .string("\(day(7))T00:00:00"),
+            "title": .string("Renamed"), "all_day": .bool(true),
+        ], account: "allday-747-split-\(stored)")
+
+        #expect(rows.isEmpty, "\(stored): the split was not written: \(reasons(rows))")
+        #expect(graph.created.count == 1, "\(stored): \(graph.created.count) new parts")
+        guard graph.created.count == 1 else { return }
+        let created = graph.created[0]
+        #expect(dateOf(created["start"]) == day(7), "\(stored): the new part starts \(canonical(created["start"]))")
+        #expect(days(created["start"], created["end"]) == 1,
+                "\(stored): each new occurrence is \(days(created["start"], created["end"]).map(String.init) ?? "?") days long, the series' was 1")
+        #expect(rangeOf(created)?["recurrenceTimeZone"] as? String == stored, "\(stored): the new part's zone is \(canonical(rangeOf(created)))")
+        let series = graph.event(ZoneSeries.id)
+        #expect(dateOf(series?["start"]) == day(0) && days(series?["start"], series?["end"]) == 1,
+                "\(stored): the capped series is \(canonical(series?["start"])) to \(canonical(series?["end"]))")
     }
 }

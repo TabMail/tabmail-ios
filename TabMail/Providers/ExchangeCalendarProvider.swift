@@ -623,18 +623,24 @@ actor ExchangeCalendarProvider: CalendarProvider {
         capRange.removeValue(forKey: "numberOfOccurrences")
         var cappedRecurrence = storedRecurrence
         cappedRecurrence["range"] = capRange
+        // Restated in the series' own zone at the same instant (#719): Exchange refuses a series
+        // start labelled with another zone, and the read's label is the device's. Timed only: an
+        // all-day master's start and end are read as dates, so an all-day cap writes the
+        // recurrence alone (measured to keep the series' length and start). The first split and
+        // a retried one (`finishSplit`) both write this cap.
+        let seriesZone = capRange["recurrenceTimeZone"] as? String
         var cappedJSON: [String: Any] = ["recurrence": cappedRecurrence]
         if let startISO = master.start?.dateTime, let startTz = master.start?.timeZone {
-            cappedJSON["start"] = [
+            cappedJSON["start"] = inSeriesZone([
                 "dateTime": graphNaiveDateTime(startISO),
                 "timeZone": startTz,
-            ]
+            ], seriesZone: seriesZone, allDay: false)
         }
         if let endISO = master.end?.dateTime, let endTz = master.end?.timeZone {
-            cappedJSON["end"] = [
+            cappedJSON["end"] = inSeriesZone([
                 "dateTime": graphNaiveDateTime(endISO),
                 "timeZone": endTz,
-            ]
+            ], seriesZone: seriesZone, allDay: false)
         }
         return cappedJSON
     }
@@ -793,6 +799,14 @@ actor ExchangeCalendarProvider: CalendarProvider {
             }
             recurrence["range"] = range
             json["recurrence"] = recurrence
+            // The new part is written in the zone its copied range names: a timed one at the same
+            // instant (#719), as Google Calendar keeps a series' zone on "this and following", an
+            // all-day one on the same dates (#747), or Graph stores it two days longer.
+            let seriesZone = storedRange["recurrenceTimeZone"] as? String
+            let allDay = json["isAllDay"] as? Bool ?? (written.startDate != nil)
+            for key in ["start", "end"] {
+                if let time = json[key] as? [String: Any] { json[key] = Self.inSeriesZone(time, seriesZone: seriesZone, allDay: allDay) }
+            }
         }
         json["transactionId"] = transactionId
         return json
@@ -919,6 +933,8 @@ actor ExchangeCalendarProvider: CalendarProvider {
     ///   A series edit that keeps its date writes no recurrence: any recurrence
     ///   write that differs from the stored one resets the series' exceptions
     ///   (#423, measured);
+    /// - a series' start and end, when sent, labelled with its stored zone: a timed one at the
+    ///   same instant, an all-day one on the same dates (`inSeriesZone`, #719, #747);
     /// - the edit's guest change applied to the stored attendees of the item read: each one kept
     ///   is written as stored, a new one `required` and unanswered (`appliedAttendeesJSON`, #622,
     ///   #620). A series write is the only write the app makes for a change of every occurrence:
@@ -981,6 +997,17 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // The encoder writes the series' first day of the week unless the rule names its own
         // (`WKST`), the same output `seriesRuleToWrite` compared.
         var json = toGraphEventJSON(sparse, rangeZone: rangeZone, firstDayOfWeek: storedFirstDay)
+        // A series' start and end are written in the series' own zone: a timed one at the same
+        // instant (#719), as Exchange refuses a series start labelled with another zone; an
+        // all-day one on the same dates (#747), as Graph otherwise stores every occurrence two
+        // days longer. After the `movesTime` decision, so a relabel never makes a same-instant
+        // edit a move.
+        if allowRecurrence {
+            let allDay = json["isAllDay"] as? Bool ?? (sparse.startDate != nil || sparse.endDate != nil)
+            for key in ["start", "end"] {
+                if let time = json[key] as? [String: Any] { json[key] = Self.inSeriesZone(time, seriesZone: storedZoneName, allDay: allDay) }
+            }
+        }
         // A rule that changes the series keeps the series' zone (#423): the rebuilt rule names
         // no zone, and Graph stores a range written without a zone as UTC. With none stored, the
         // zone is the one the start is written in.
@@ -1646,6 +1673,47 @@ actor ExchangeCalendarProvider: CalendarProvider {
         guard let instant = fmt.date(from: String(wall.prefix(19))) else { return wall }
         fmt.timeZone = other
         return fmt.string(from: instant)
+    }
+
+    /// A start or end (`{dateTime, timeZone}`, as `toGraphEventJSON` writes it) for an existing
+    /// series kept in `seriesZone` (its range's `recurrenceTimeZone`, as Graph returned it),
+    /// labelled with that name verbatim. A timed one is the same instant as its wall time in that
+    /// zone (#719); an all-day one keeps its date, only the label changes (#747).
+    /// Exchange refuses a series PATCH whose start is labelled with another zone (400
+    /// `ErrorPropertyValidationFailure`, `IanaTimeZoneConstraint`; measured 2026-11-11 with
+    /// `America/Vancouver` and `America/New_York` on a series kept in `Pacific Standard Time`), and
+    /// the stored name is the one label measured accepted that needs no mapping table.
+    ///
+    /// Given as it is when there is no series zone, or when the label, the series zone or the wall
+    /// time can't be read: the write keeps the label it had before #719. What Exchange does with a
+    /// series kept in a zone the app does not recognize (`Customized Time Zone`) is not measured
+    /// (#746).
+    ///
+    /// All day: Graph stores an all-day series whose start and end are labelled with a zone other
+    /// than its range's (the app's `UTC`) with every occurrence two days longer, and east of UTC a
+    /// day early with its range moved to UTC (measured 2026-11-11 on series kept in
+    /// `Pacific Standard Time` and `Tokyo Standard Time`, with and without a recurrence in the
+    /// same write, and on a create carrying the range); labelled with the range's own name the
+    /// length is kept. The date is a date, so no zone is read: any stored name is written back.
+    nonisolated static func inSeriesZone(_ time: [String: Any], seriesZone: String?, allDay: Bool) -> [String: Any] {
+        guard let seriesZone, !seriesZone.isEmpty else { return time }
+        if allDay {
+            var relabelled = time
+            relabelled["timeZone"] = seriesZone
+            return relabelled
+        }
+        guard let stored = CalendarTimeZoneResolver.zone(named: seriesZone, in: .none),
+              let label = time["timeZone"] as? String, let given = CalendarTimeZoneResolver.zone(named: label, in: .none),
+              let wall = time["dateTime"] as? String
+        else { return time }
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.calendar = Calendar(identifier: .gregorian)
+        fmt.timeZone = given
+        fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        guard let instant = fmt.date(from: String(wall.prefix(19))) else { return time }
+        fmt.timeZone = stored
+        return ["dateTime": fmt.string(from: instant), "timeZone": seriesZone]
     }
 
     /// `attendeeTypes` (lowercased address → Graph type) keeps an existing
