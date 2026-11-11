@@ -129,6 +129,44 @@ struct OccurrenceWireFixture {
             seriesHref: Self.seriesPath, key: OccurrenceFixture.utcValue(try occurrence(weeks)))
     }
 
+    /// The forms a RECURRENCE-ID is written in (`overrideOnly(form:)`).
+    static let overrideOnlyForms = ["tzid", "utc", "date"]
+
+    /// A resource holding only changed occurrences, as a server stores an invitation to single
+    /// occurrences of another organizer's series (RFC 4791 §4.1): week 2's occurrence, with its
+    /// RECURRENCE-ID written in `form` (`tzid`, `utc` or `date`, the date form an all-day
+    /// occurrence). `moved`: it starts an hour (the date form: a day) later than its place in the
+    /// series; otherwise at its place. `slot` is its place, `start` where it is, `key` the key a
+    /// listing gives it.
+    func overrideOnly(form: String, moved: Bool = true) throws -> (ics: String, slot: Date, start: Date, key: String) {
+        let slot = try occurrence(2)
+        let zone = self.zone
+        let wall = { (date: Date) in OccurrenceFixture.wall(date, zone) }
+        let head = ["UID:invite-1", "DTSTAMP:\(OccurrenceFixture.utcValue(first))"]
+        let tail = ["SUMMARY:Planning", "ORGANIZER:mailto:organizer@example.com", "ATTENDEE:mailto:user@example.com"]
+        switch form {
+        case "date":
+            let start = try #require(OccurrenceFixture.calendar(zone).date(byAdding: .day, value: moved ? 1 : 0, to: slot))
+            let lines = head + [
+                "RECURRENCE-ID;VALUE=DATE:\(OccurrenceFixture.dateValue(slot, zone))",
+                "DTSTART;VALUE=DATE:\(OccurrenceFixture.dateValue(start, zone))",
+                "DTEND;VALUE=DATE:\(OccurrenceFixture.dateValue(start.addingTimeInterval(OccurrenceFixture.days(1)), zone))",
+            ] + tail
+            return (OccurrenceFixture.ics([lines.joined(separator: "\n")]), slot, start, OccurrenceFixture.dateValue(slot, zone))
+        default:
+            let start = slot.addingTimeInterval(moved ? 60 * 60 : 0)
+            let recurrenceId = form == "utc"
+                ? "RECURRENCE-ID:\(OccurrenceFixture.utcValue(slot))"
+                : "RECURRENCE-ID;TZID=America/New_York:\(wall(slot))"
+            let lines = head + [
+                recurrenceId,
+                "DTSTART;TZID=America/New_York:\(wall(start))",
+                "DTEND;TZID=America/New_York:\(wall(start.addingTimeInterval(30 * 60)))",
+            ] + tail
+            return (OccurrenceFixture.ics([lines.joined(separator: "\n")]), slot, start, OccurrenceFixture.utcValue(slot))
+        }
+    }
+
     /// A store holding the series, and a scenario that routes every CalDAV method the
     /// provider uses to it.
     static func serve(_ fixture: OccurrenceWireFixture) -> (store: FakeCalDAVStore, http: FakeHTTP.Scenario) {
@@ -878,44 +916,12 @@ struct CalDAVOccurrenceWireTests {
 
     // MARK: A resource that holds only changed occurrences
 
-    /// A resource holding only changed occurrences, as a server stores an invitation to single
-    /// occurrences of another organizer's series (RFC 4791 §4.1): one, moved an hour later than
-    /// its place in the series, with its RECURRENCE-ID written in `form` (`tzid`, `utc` or `date`).
-    private static func overrideOnly(_ fixture: W, form: String) throws -> (ics: String, slot: Date, start: Date, key: String) {
-        let slot = try fixture.occurrence(2)
-        let zone = fixture.zone
-        let wall = { (date: Date) in OccurrenceFixture.wall(date, zone) }
-        let head = ["UID:invite-1", "DTSTAMP:\(OccurrenceFixture.utcValue(fixture.first))"]
-        let tail = ["SUMMARY:Planning", "ORGANIZER:mailto:organizer@example.com", "ATTENDEE:mailto:user@example.com"]
-        switch form {
-        case "date":
-            let start = try #require(OccurrenceFixture.calendar(zone).date(byAdding: .day, value: 1, to: slot))
-            let lines = head + [
-                "RECURRENCE-ID;VALUE=DATE:\(OccurrenceFixture.dateValue(slot, zone))",
-                "DTSTART;VALUE=DATE:\(OccurrenceFixture.dateValue(start, zone))",
-                "DTEND;VALUE=DATE:\(OccurrenceFixture.dateValue(start.addingTimeInterval(OccurrenceFixture.days(1)), zone))",
-            ] + tail
-            return (OccurrenceFixture.ics([lines.joined(separator: "\n")]), slot, start, OccurrenceFixture.dateValue(slot, zone))
-        default:
-            let start = slot.addingTimeInterval(60 * 60)
-            let recurrenceId = form == "utc"
-                ? "RECURRENCE-ID:\(OccurrenceFixture.utcValue(slot))"
-                : "RECURRENCE-ID;TZID=America/New_York:\(wall(slot))"
-            let lines = head + [
-                recurrenceId,
-                "DTSTART;TZID=America/New_York:\(wall(start))",
-                "DTEND;TZID=America/New_York:\(wall(start.addingTimeInterval(30 * 60)))",
-            ] + tail
-            return (OccurrenceFixture.ics([lines.joined(separator: "\n")]), slot, start, OccurrenceFixture.utcValue(slot))
-        }
-    }
-
     @Test("this_only by the id of an occurrence in a resource that holds only changed occurrences changes that occurrence on the server, and says so")
     func thisOnlyInAnOverrideOnlyResourceChangesThatOccurrence() async throws {
         let fixture = try W.make()
         let path = "/cal/invite.ics"
-        for form in ["tzid", "utc", "date"] {
-            let invite = try Self.overrideOnly(fixture, form: form)
+        for form in W.overrideOnlyForms {
+            let invite = try fixture.overrideOnly(form: form)
             let (store, http) = W.serve(fixture)
             defer { http.close() }
             store.seed(path: path, ics: invite.ics)
@@ -946,11 +952,11 @@ struct CalDAVOccurrenceWireTests {
         }
     }
 
-    @Test("a resource that holds only changed occurrences refuses this_only by its own id and any split, and nothing is written")
+    @Test("a resource that holds only changed occurrences refuses this_only by its own id, any split and a read of its own id, as its series not being in this calendar, and nothing is written")
     func overrideOnlyResourceRefusesWhatItCannotAddress() async throws {
         let fixture = try W.make()
         let path = "/cal/invite.ics"
-        let invite = try Self.overrideOnly(fixture, form: "tzid")
+        let invite = try fixture.overrideOnly(form: "tzid")
         let (store, http) = W.serve(fixture)
         defer { http.close() }
         store.seed(path: path, ics: invite.ics)
@@ -963,7 +969,7 @@ struct CalDAVOccurrenceWireTests {
                 calendarId: W.calendarId, eventId: path, recurrenceId: recurrenceId,
                 recurrenceIdZone: fixture.zone, event: GCalEventInput(), sendUpdates: "all")
         } throws: { error in
-            Self.isRefusal(error, saying: "without their repeating event")
+            Self.isRefusal(error, saying: "is not in this calendar")
         }
         for eventId in [path, occurrenceId] {
             await #expect("this_and_following by \(eventId) was not refused") {
@@ -971,11 +977,36 @@ struct CalDAVOccurrenceWireTests {
                     calendarId: W.calendarId, eventId: eventId, recurrenceId: recurrenceId,
                     recurrenceIdZone: fixture.zone, patch: GCalEventInput(), sendUpdates: "all")
             } throws: { error in
-                Self.isRefusal(error, saying: "without their repeating event")
+                Self.isRefusal(error, saying: "is not in this calendar")
+            }
+        }
+        // Read by its own id, as an edit of every occurrence and a split read their series: the
+        // final answer that the series is not in this calendar, every time (#720).
+        for attempt in 1...2 {
+            await #expect("read \(attempt) of the resource's own id was not refused as holding no series") {
+                _ = try await provider.getEvent(calendarId: W.calendarId, eventId: path)
+            } throws: { error in
+                Self.isRefusal(error, saying: "is not in this calendar")
             }
         }
         #expect(store.recordedPuts().isEmpty, "a refused edit wrote: \(store.recordedPuts().map(\.path))")
         #expect(store.storedICS(path: path) == invite.ics, "the resource is not on the server as it was")
+    }
+
+    @Test("a read of a resource with no VEVENT at all stays a parse error, never the refusal that its series is not in this calendar")
+    func resourceWithNoEventStaysAParseError() async throws {
+        let fixture = try W.make()
+        let path = "/cal/empty.ics"
+        let (store, http) = W.serve(fixture)
+        defer { http.close() }
+        store.seed(path: path, ics: OccurrenceFixture.ics([]))
+        let provider = W.makeProvider(http)
+        await #expect("a resource with no VEVENT was not read as a parse error") {
+            _ = try await provider.getEvent(calendarId: W.calendarId, eventId: path)
+        } throws: { error in
+            if case CalDAVError.parseError = error { return true }
+            return false
+        }
     }
 
     @Test("this_only and this_and_following on an event that does not repeat are refused, and nothing is written")

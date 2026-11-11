@@ -396,3 +396,111 @@ extension CalDAVOccurrenceEditToolToWireTests {
         }
     }
 }
+
+// MARK: - A resource that holds only changed occurrences, from the edit tool down to the wire
+
+/// A resource that holds only changed occurrences, with no series VEVENT (an invitation to single
+/// occurrences of another organizer's series, RFC 4791 §4.1), edited by the occurrence id a listing
+/// gives it, for every RECURRENCE-ID form and every scope the tool takes.
+///
+/// PROPERTY (memory 146 invariant 4, with "the series is not in this calendar" as a dimension): the
+/// edit is refused before its card (no card, nothing queued, nothing written), or, once the queue has
+/// drained, the calendar holds what the card said. One occurrence (`this_only`, or a `recurrence_id`
+/// with no scope) is written to that occurrence alone; every occurrence or a split is refused before
+/// the card, the resource byte for byte as it was, so an edit of the series never reaches a write of
+/// the resource that names no series.
+extension CalDAVOccurrenceEditToolToWireTests {
+
+    struct OverrideOnlyCase: CustomTestStringConvertible, Sendable {
+        let form: String
+        let scope: String?
+        let givesRecurrenceId: Bool
+        /// The edit is of that one occurrence, so it is written; otherwise refused before the card.
+        var written: Bool { scope == "this_only" || (scope == nil && givesRecurrenceId) }
+        var testDescription: String { "\(form), \(scope ?? "no edit_scope")\(givesRecurrenceId ? ", a recurrence_id" : "")" }
+    }
+
+    static let overrideOnlyCases: [OverrideOnlyCase] = W.overrideOnlyForms.flatMap { form in
+        [
+            OverrideOnlyCase(form: form, scope: "this_only", givesRecurrenceId: true),
+            OverrideOnlyCase(form: form, scope: nil, givesRecurrenceId: true),
+            OverrideOnlyCase(form: form, scope: "all", givesRecurrenceId: false),
+            OverrideOnlyCase(form: form, scope: nil, givesRecurrenceId: false),
+            OverrideOnlyCase(form: form, scope: "this_and_following", givesRecurrenceId: true),
+        ]
+    }
+
+    /// The lines of `ics` for property `name`.
+    private static func lines(_ ics: String, named name: String) -> [String] {
+        ics.components(separatedBy: .newlines).filter { $0.hasPrefix("\(name):") || $0.hasPrefix("\(name);") }
+    }
+
+    @Test("an occurrence in a resource that holds only changed occurrences: one occurrence is written as its card said, every occurrence or a split is refused before the card with nothing written",
+          arguments: overrideOnlyCases)
+    func overrideOnlyResourceWriteMatchesTheCardOrIsRefusedBeforeIt(_ entry: OverrideOnlyCase) async throws {
+        let session = "caldav-override-only-\(entry.form)-\(entry.scope ?? "none")-\(entry.givesRecurrenceId)"
+        let harness = try await H.makeHarness(accountId: session)
+        defer { H.tearDown(harness) }
+        let fixture = harness.fixture
+        let (path, ics, occurrenceId) = try H.seedOverrideOnly(harness, form: entry.form)
+        let invite = try fixture.overrideOnly(form: entry.form)
+        let label = entry.testDescription
+
+        // The listing hands out the occurrence's own id, where it is now.
+        let listed = try await Self.listing(fixture, http: harness.http)
+        #expect(listed.contains { $0.id == occurrenceId }, "\(label): the listing does not give the occurrence's id: \(listed.map { $0.id ?? "nil" })")
+
+        let translator = ChatIdTranslator.createIsolated()
+        let compound = CompoundEventId.make(accountId: harness.accountId, eventId: occurrenceId)
+        let forModel = await translator.processToolOutputForLLM("event_id: \(compound)")
+        let numericId = try #require(H.eventIds(in: forModel).first.flatMap { Int($0) }, "\(label): no numeric event id for the model: \(forModel)")
+        await H.recordCalendar(of: occurrenceId, accountId: harness.accountId, translator: translator)
+
+        var arguments: [String: JSONValue] = [
+            "event_id": .string(String(numericId)),
+            "title": .string(Self.newTitle),
+            "timezone": .string(fixture.zone.identifier),
+        ]
+        if let scope = entry.scope { arguments["edit_scope"] = .string(scope) }
+        if entry.givesRecurrenceId {
+            // Its start_iso, as the read tools show it: a date for the all-day form.
+            arguments["recurrence_id"] = .string(entry.form == "date"
+                ? OccurrenceFixture.isoDate(invite.start, fixture.zone)
+                : OccurrenceFixture.naive(invite.start, fixture.zone))
+        }
+
+        let sink = H.ConfirmingSink(http: harness.http)
+        let output = try await CalendarEventEditTool(context: ToolContext(db: harness.pool, translator: translator)).execute(
+            arguments: arguments, invocation: ToolInvocation(uiSink: sink, sessionKey: session))
+        await AccountManager.shared.drainCalendarQueue()
+
+        let cards = await MainActor.run { sink.confirmations.flatMap(\.calendarEvents) }
+        let ops = try await harness.pool.read { db in try PendingCalendarOperation.fetchAll(db) }
+        #expect(H.deletes(harness.http).isEmpty, "\(label): deleted: \(H.deletes(harness.http))")
+
+        guard entry.written else {
+            #expect(cards.isEmpty, "\(label): a card was shown for an edit the resource can't take: \(cards.map(\.changes)): \(output)")
+            #expect(output.contains("NOT changed") && output.contains("this_only"),
+                    "\(label): not refused, or the refusal does not say one occurrence can be changed: \(output)")
+            #expect(ops.isEmpty, "\(label): queued: \(ops.map(\.status))")
+            #expect(harness.store.recordedPuts().isEmpty, "\(label): written: \(harness.store.recordedPuts().map(\.path))")
+            #expect(harness.store.storedICS(path: path) == ics, "\(label): the resource is not on the server as it was")
+            return
+        }
+
+        #expect(cards.count == 1 && cards.first.map { Extent(changes: $0.changes) } == .one,
+                "\(label): not one card for just this occurrence: \(cards.map(\.changes)): \(output)")
+        #expect(!output.contains("NOT changed"), "\(label): refused: \(output)")
+        #expect(ops.isEmpty, "\(label): the edit did not drain: \(ops.map { "\($0.status) \($0.failureReason ?? "")" })")
+        #expect(harness.store.recordedPuts().map(\.path) == [path], "\(label): not one write of the resource: \(harness.store.recordedPuts().map(\.path))")
+        let stored = try #require(harness.store.storedICS(path: path))
+        #expect(Self.lines(stored, named: "BEGIN").filter { $0 == "BEGIN:VEVENT" }.count == 1, "\(label): the edit added a VEVENT")
+        for name in ["RECURRENCE-ID", "DTSTART", "DTEND", "ORGANIZER", "ATTENDEE"] {
+            #expect(Self.lines(stored, named: name) == Self.lines(ics, named: name),
+                    "\(label): the edit changed the occurrence's \(name): \(Self.lines(stored, named: name))")
+        }
+        #expect(Self.lines(stored, named: "SUMMARY") == ["SUMMARY:\(Self.newTitle)"], "\(label): the occurrence's title was not changed on the server")
+        let read = try await W.makeProvider(harness.http).getEvent(calendarId: W.calendarId, eventId: occurrenceId)
+        #expect(read.summary == Self.newTitle, "\(label): the occurrence does not read back changed")
+    }
+}

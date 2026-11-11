@@ -842,8 +842,8 @@ extension AccountManager {
             // goes on to `splitSeries` below, which writes what the interrupted attempt did not.
             let named = try await CalendarSeriesScope.read(
                 eventId: eventId, recurrenceId: CalendarToolHelpers.stringArgOpt(args, "recurrence_id"),
-                calendarId: calId, zone: recurrenceIdZone, splitting: givenScope == "this_and_following",
-                provider: provider)
+                scope: givenScope, calendarId: calId, zone: recurrenceIdZone,
+                splitting: givenScope == "this_and_following", provider: provider)
             let routed = try CalendarSeriesScope.route(args, scope: givenScope, named: named, zone: recurrenceIdZone)
             // The tool makes an "all" edit that moves a later occurrence to another date a split before
             // its card; one that reaches the queue as "all" was confirmed as a change of every
@@ -919,7 +919,7 @@ extension AccountManager {
             // model.
             let movesTime = CalendarToolHelpers.stringArgOpt(resolvedArgs, "start_iso") != nil
                 || CalendarToolHelpers.stringArgOpt(resolvedArgs, "end_iso") != nil
-            let written = routed.scope == "all" ? named.series : named.event
+            let written = routed.scope == "all" ? try named.readSeries() : named.event
             var stored: GCalEvent? = nil
             if resolvedAllDay == nil,
                movesTime || CalendarToolHelpers.recurrenceUntilIsAtStake(resolvedArgs) {
