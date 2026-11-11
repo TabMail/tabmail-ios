@@ -41,6 +41,9 @@ actor MockCalendarProvider: CalendarProvider {
     var updatedOccurrences: [(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, event: GCalEventInput, sendUpdates: String)] = []
     var splitSeriesCalls: [(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, patch: GCalEventInput, sendUpdates: String)] = []
     var updateOccurrenceResult: GCalEvent?
+    /// What `occurrenceStartDay` returns; nil gives `recurrenceId`'s own date, the protocol default.
+    var occurrenceStartDayResult: String?
+    var occurrenceStartDayThrows: Error?
     var updateOccurrenceThrows: Error?
     var splitSeriesResult: GCalEvent?
     var splitSeriesThrows: Error?
@@ -99,6 +102,15 @@ actor MockCalendarProvider: CalendarProvider {
         deletedEvents.append((calendarId: calendarId, eventId: eventId, sendUpdates: sendUpdates))
         if let deleteEventHook { await deleteEventHook() }
         if let error = deleteEventThrows { throw error }
+    }
+
+    func setOccurrenceStartDayResult(_ day: String?) { occurrenceStartDayResult = day }
+    func setOccurrenceStartDayThrows(_ error: Error?) { occurrenceStartDayThrows = error }
+
+    func occurrenceStartDay(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone) async throws -> String? {
+        callLog.append("occurrenceStartDay(calendarId:\(calendarId),eventId:\(eventId),recurrenceId:\(recurrenceId),recurrenceIdZone:\(recurrenceIdZone.identifier))")
+        if let error = occurrenceStartDayThrows { throw error }
+        return occurrenceStartDayResult ?? String(recurrenceId.prefix(10))
     }
 
     func updateOccurrence(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, event: GCalEventInput, sendUpdates: String) async throws -> GCalEvent {

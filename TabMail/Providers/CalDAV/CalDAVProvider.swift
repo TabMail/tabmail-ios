@@ -335,6 +335,31 @@ actor CalDAVProvider: CalendarProvider {
         BackgroundSyncLogger.logDebug("[CalDAV] Deleted event \(eventId)")
     }
 
+    /// The day an all-day occurrence starts on now. CalDAV addresses an occurrence by its original
+    /// slot (`RECURRENCE-ID`), so one moved on its own is read from the resource: its override's own
+    /// `DTSTART` (`CalDAVProvider.occurrenceStartDay(storedICS:recurrenceIdNaive:)`).
+    func occurrenceStartDay(
+        calendarId: String,
+        eventId: String,
+        recurrenceId: String,
+        recurrenceIdZone: TimeZone
+    ) async throws -> String? {
+        let eventURL = try resolveEventURL(eventId, calendarId: calendarId)
+        let (data, _) = try await client.get(url: eventURL)
+        guard let ics = String(data: data, encoding: .utf8), !ics.isEmpty else {
+            throw CalDAVError.parseError("Empty response for event \(eventId)")
+        }
+        let kind = Self.masterDTStartKind(from: ics)
+        guard let rid = try Self.recurrenceIdInMasterFrame(
+            recurrenceId, declaredZone: recurrenceIdZone, kind: kind, zones: CalendarTimeZoneContext(calendarText: ics)
+        ) else {
+            throw CalendarProviderError.notSupported(
+                "Could not express recurrence_id '\(recurrenceId)' (\(recurrenceIdZone.identifier)) in this event's timezone."
+            )
+        }
+        return Self.occurrenceStartDay(storedICS: ics, recurrenceIdNaive: rid)
+    }
+
     /// Single-occurrence override (this_only). CalDAV represents overrides as
     /// additional VEVENT blocks in the SAME .ics resource sharing the master's
     /// UID, distinguished by a RECURRENCE-ID property. We GET the resource,

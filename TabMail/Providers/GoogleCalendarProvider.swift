@@ -27,6 +27,16 @@ protocol CalendarProvider: Sendable {
     /// See the invariant on `RecurrenceOccurrenceResolver`.
     func updateOccurrence(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, event: GCalEventInput, sendUpdates: String) async throws -> GCalEvent
 
+    /// The day (`yyyy-MM-dd`) the all-day occurrence addressed by `recurrenceId` starts on NOW. An
+    /// edit that gives the occurrence a new end alone keeps this start, and the end is checked
+    /// against it; callers ask only for an all-day occurrence (`needsOccurrenceStartDay`). The
+    /// default returns `recurrenceId`'s own date, with no request, which is right wherever an
+    /// occurrence is addressed by the start it has now (Google and Outlook match `recurrenceId`
+    /// against each instance's current start). CalDAV addresses an occurrence by its original slot
+    /// (`RECURRENCE-ID`), so an occurrence moved on its own starts on another day there, and
+    /// `CalDAVProvider` reads it from the resource (nil when the series turns out to be timed).
+    func occurrenceStartDay(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone) async throws -> String?
+
     /// Split a recurring series at `recurrenceId` (this_and_following edit_scope):
     /// cap the original series with UNTIL = recurrenceId - 1, then create a new
     /// series with the same RRULE starting at `recurrenceId` with `patch` applied.
@@ -64,6 +74,9 @@ enum CalendarProviderError: Error {
 extension CalendarProvider {
     func updateOccurrence(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, event: GCalEventInput, sendUpdates: String) async throws -> GCalEvent {
         throw CalendarProviderError.notSupported("Editing a single occurrence of a recurring event is not yet supported on this calendar provider. Edit the whole series or use the Thunderbird add-on for fine-grained occurrence edits.")
+    }
+    func occurrenceStartDay(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone) async throws -> String? {
+        String(recurrenceId.prefix(10))
     }
     func splitSeries(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, patch: GCalEventInput, sendUpdates: String) async throws -> GCalEvent {
         throw CalendarProviderError.notSupported("Splitting a recurring series at a given occurrence is not yet supported on this calendar provider. Edit the whole series or use the Thunderbird add-on for this-and-following edits.")
