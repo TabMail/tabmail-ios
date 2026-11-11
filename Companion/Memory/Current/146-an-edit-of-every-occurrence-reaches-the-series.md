@@ -193,7 +193,8 @@ crosses a date boundary on any host (the series east of the device; the edit nam
 one west of it), daily and weekly: a date, and the `DT00:00:00` form, name exactly their own date's
 occurrence (this_only edit and the occurrence read); the start the read tools show (the listing and a read
 by id, through `formatDetailedEvent`), given with the series' id or the occurrence's own, changes exactly
-that occurrence; and an occurrence id with no `recurrence_id` changes itself. Still assumed (unchanged):
+that occurrence; and an edit of every occurrence named by an occurrence id alone (`shownStart`) finds it
+and renames the series, no occurrence. Still assumed (unchanged):
 `/instances`' `startDateTime`/`endDateTime`, sent without an offset, are read as UTC whatever `Prefer`
 names. [Superseded the same day: the first version of this paragraph assumed Graph converts an all-day
 `start` like `originalStart`, named a London series edited from New York as the failing case, and had the

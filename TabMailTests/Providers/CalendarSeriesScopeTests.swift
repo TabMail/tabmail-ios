@@ -715,7 +715,11 @@ struct ExchangeAllDayOccurrenceDateTests {
         let id = GraphAllDaySeries.occurrence(GraphAllDaySeries.named)
         let event: GCalEvent?
         switch shown {
-        case .listing: event = try await provider.listEvents().first { $0.id == id }
+        case .listing:
+            // A listing names a window (`calendarView`), as the read tools' does.
+            let from = EKEventStoreHelper.parseNaiveISO(day(GraphAllDaySeries.named - 1), timeZone: utc)
+            let to = EKEventStoreHelper.parseNaiveISO(day(GraphAllDaySeries.named + 2), timeZone: utc)
+            event = try await provider.listEvents(timeMin: from, timeMax: to).first { $0.id == id }
         case .read: event = try await provider.getEvent(eventId: id)
         }
         let text = event.map { CalendarToolHelpers.formatDetailedEvent($0, timeZone: zone) } ?? ""
@@ -749,16 +753,24 @@ struct ExchangeAllDayOccurrenceDateTests {
         }
     }
 
-    @Test("an edit naming an occurrence by its own id with no recurrence_id changes that occurrence and no other")
+    @Test("an edit of every occurrence naming an occurrence by its own id alone, read where the read tools show it, renames the series and no occurrence")
     func occurrenceIdAloneNamesThatOccurrence() async throws {
+        // With no recurrence_id the occurrence is named by the start the read tools show for it
+        // (`CalendarSeriesScope.shownStart`); the lookup must find it there, or the edit is
+        // refused as naming none.
         #expect(GraphAllDaySeries.crossesOnThisHost, "device offset \(GraphAllDaySeries.deviceHours)h")
         for (index, row) in GraphAllDaySeries.rows.enumerated() {
             let label = GraphAllDaySeries.label(row.daily, row.zone, "own id, no recurrence_id")
             let graph = GraphAllDaySeries.calendar(daily: row.daily)
             let rows = try await outlook(graph, eventId: GraphAllDaySeries.occurrence(GraphAllDaySeries.named), [
-                "edit_scope": .string("this_only"), "title": .string("Holiday (renamed)"), "timezone": .string(row.zone),
+                "title": .string("Holiday (renamed)"), "timezone": .string(row.zone),
             ], account: "allday-own-\(index)")
-            onlyOccurrencePatched(GraphAllDaySeries.named, daily: row.daily, graph: graph, rows: rows, label)
+            #expect(graph.patches(GraphAllDaySeries.id).count == 1 && graph.event(GraphAllDaySeries.id)?["subject"] as? String == "Holiday (renamed)",
+                    "\(label): the series was not renamed; rows \(reasons(rows))")
+            for offset in GraphAllDaySeries.offsets(daily: row.daily) {
+                #expect(graph.patches(GraphAllDaySeries.occurrence(offset)).isEmpty, "\(label): the occurrence on \(day(offset)) was changed")
+            }
+            #expect(graph.created.isEmpty && rows.isEmpty, "\(label): rows \(reasons(rows))")
         }
     }
 }
