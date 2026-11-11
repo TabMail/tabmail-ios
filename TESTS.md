@@ -266,9 +266,10 @@ every item outside the scope is untouched: CalDAV (every VEVENT: series, changed
 split's new part and the occurrences it carries, a one-occurrence edit by the series id), Google
 and Outlook (the item the write reads, the server carrying the series' change; `FakeGoogleCalendar`
 and `FakeGraphCalendar` model the measured difference), plus pins that held before the fix. Case 3
-runs, on all three providers (and case 19 on a CalDAV split), the four shapes where the difference
+runs, on all three providers (and case 19 on a CalDAV split), the five shapes where the difference
 is not the change itself: `"*"`, `"*"` with a guest added back, an add of a guest the series holds
-that an occurrence dropped, and a remove and re-add of such a guest; each also checks weeks 4 and 5
+that an occurrence dropped, a remove and re-add of such a guest, and a removal of a guest only a
+changed occurrence holds (the series does not, so the occurrence keeps them); each also checks weeks 4 and 5
 against addresses worked out by hand. The Google and Outlook whole-series cases check that the app
 writes no occurrence. `AttendeeChangeTests` covers the function itself (order, `"*"` and
 `mailto:*`, letter case, `mailto:` prefixes, a guest with no address, re-adding, an add or removal

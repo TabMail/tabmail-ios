@@ -254,9 +254,12 @@ address; an add keeps the change's new entry, a guest with no address is in neit
 top of the occurrence's own guests. Measured on Google AND Outlook, organizer side, 2026-11-11:
 series [X] -> [] left an occurrence holding [X, Y] (its own extra Y) as [Y]; series [X, Y] written
 back unchanged left an occurrence that had dropped Y on its own as [X]. It differs from applying
-the change itself only for `"*"` and for an add of a guest the series already holds (or a remove
-and re-add of one): "remove everyone" leaves an occurrence the guests it added on its own, and
-"add B" does not invite B back to an occurrence that dropped B, when the series held B.
+the change itself only for `"*"`, for an add of a guest the series already holds (or a remove
+and re-add of one), and for a removal of a guest the series does not hold (an occurrence's own
+guest stays): "remove everyone" leaves an occurrence the guests it added on its own, "add B" does
+not invite B back to an occurrence that dropped B, when the series held B, and "remove C" leaves C
+on an occurrence that invited C on its own when the series never held C (as Google does; one
+`this_only` removal on that occurrence takes C off).
 - **CalDAV** (`mergePatchIntoICS` → `CalDAVProvider.applyAttendeeChange`): the series VEVENT gets
   the change itself; every override VEVENT in the same resource gets the series' difference. A
   one-item write keeps the change itself: a `this_only` override is merged on its own as the
@@ -313,8 +316,8 @@ and re-add of one): "remove everyone" leaves an occurrence the guests it added o
   (any letter case) is one add (`init(adds:removes:)` dedupes), so the card never repeats a line
   (its rows are keyed by text).
 - **Where the add-on differs:** only the whole-series rule. The add-on applies the change itself
-  to each exception (`applyGuestChangeToSeries`); the app follows Google, the difference (a
-  Thunderbird twin is to be filed in that repo). A cancelled occurrence and `mailto:*` now match
+  to each exception (`applyGuestChangeToSeries`); the app follows Google, the difference (the
+  Thunderbird twin is tabmail-thunderbird#379; the card twin is tabmail-thunderbird#378). A cancelled occurrence and `mailto:*` now match
   the add-on: the cancelled one is changed, and `mailto:*` names nobody (only a trimmed `"*"` is
   "everyone": `AttendeeChange.init` and `parseAttendeeRemoves`). (Until review round 2 the app
   left a cancelled CalDAV occurrence as stored and read `mailto:*` as everyone.)

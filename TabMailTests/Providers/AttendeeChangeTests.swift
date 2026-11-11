@@ -220,4 +220,13 @@ struct AttendeeChangeSeriesDifferenceTests {
         #expect(Self.occurrence(change, series: [T.alice, T.frontDesk], occurrence: [T.alice, Self.erin])
                 == [Self.erin, T.stored("dave@example.com", "new dave@example.com (Dave)")])
     }
+
+    @Test("a removal of a guest the series does not hold is no change for an occurrence: its own guest stays")
+    func removalOfAGuestTheSeriesLacksIsNoChange() {
+        let change = AttendeeChange(removes: ["erin@example.com"])
+        let difference = change.seriesDifference(before: [T.alice, T.bob], after: T.apply(change, to: [T.alice, T.bob]),
+                                                 address: \.address)
+        #expect(difference == AttendeeChange())
+        #expect(Self.occurrence(change, series: [T.alice, T.bob], occurrence: [T.alice, Self.erin]) == [T.alice, Self.erin])
+    }
 }

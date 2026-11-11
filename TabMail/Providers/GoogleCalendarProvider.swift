@@ -1988,7 +1988,8 @@ struct GCalEventInput: Sendable {
     var endDateTime: String?
     var endDate: String?
     var endTimeZone: String?
-    /// A new event's guests (a create). An edit never carries a list: it carries `attendeeChange`.
+    /// A new event's guests (a create). An edit carries `attendeeChange`; an edit's stray
+    /// `attendees` is ignored.
     var attendees: [(email: String, name: String?)]?
     var transparency: String?
     var recurrence: [String]?

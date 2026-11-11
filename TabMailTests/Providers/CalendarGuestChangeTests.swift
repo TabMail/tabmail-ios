@@ -37,7 +37,9 @@ import GRDB
 // for a series list written back unchanged (an occurrence that had dropped a guest on its own
 // stayed without them); modelled by `FakeGoogleCalendar` and `FakeGraphCalendar`. Google is the
 // reference, so CalDAV gives its changed occurrences the same difference. It differs from the
-// change itself only for `"*"` and for an add of a guest the series already holds (case 3).
+// change itself only for `"*"`, for an add of a guest the series already holds (or a remove and
+// re-add of one), and for a removal of a guest the series does not hold (an occurrence's own guest
+// stays) (case 3).
 //
 // It is checked on what the fake SERVER holds after the real calendar queue drains the edit
 // (`drainEdit`), never on the request the app built. On Google and Outlook the app writes the
@@ -257,12 +259,15 @@ enum GuestFixture {
 
 /// The whole-series changes whose difference for a changed occurrence is not the change itself
 /// (case 3), on the series every provider's suite uses: the series holds the organizer (when the
-/// provider lists them as a guest), A and B; week 4 holds C as well, week 5 dropped B.
+/// provider lists them as a guest), A and B; week 4 holds C as well, week 5 dropped B. The fifth,
+/// a removal of C, whom the series does not hold, leaves the series as it was and is no change for
+/// an occurrence: week 4 keeps its own C.
 enum SeriesDifferenceShape: String, CaseIterable, Sendable, CustomTestStringConvertible {
     case removeEveryone = "removes everyone with *"
     case removeEveryoneAddBack = "removes everyone with * and adds B back"
     case addHeldGuest = "adds B, whom the series holds and week 5 dropped"
     case removeAndAddBack = "removes B and adds B back, where week 5 lacks B"
+    case removeOccurrenceOnlyGuest = "removes C, whom only week 4 holds"
 
     var testDescription: String { rawValue }
 
@@ -273,6 +278,7 @@ enum SeriesDifferenceShape: String, CaseIterable, Sendable, CustomTestStringConv
         case .removeEveryoneAddBack: return .init(adds: [b], removes: ["*"])
         case .addHeldGuest: return .init(adds: [b])
         case .removeAndAddBack: return .init(adds: [b], removes: [GuestFixture.guestB])
+        case .removeOccurrenceOnlyGuest: return .init(removes: [GuestFixture.guestC])
         }
     }
 
@@ -283,7 +289,8 @@ enum SeriesDifferenceShape: String, CaseIterable, Sendable, CustomTestStringConv
         switch self {
         case .removeEveryone: return [F.guestC]
         case .removeEveryoneAddBack: return [F.guestB, F.guestC]
-        case .addHeldGuest, .removeAndAddBack: return Set(organizer + [F.guestA, F.guestB, F.guestC])
+        case .addHeldGuest, .removeAndAddBack, .removeOccurrenceOnlyGuest:
+            return Set(organizer + [F.guestA, F.guestB, F.guestC])
         }
     }
 
@@ -292,7 +299,8 @@ enum SeriesDifferenceShape: String, CaseIterable, Sendable, CustomTestStringConv
     func week5(organizer: [String]) -> Set<String> {
         switch self {
         case .removeEveryone, .removeEveryoneAddBack: return []
-        case .addHeldGuest, .removeAndAddBack: return Set(organizer + [GuestFixture.guestA])
+        case .addHeldGuest, .removeAndAddBack, .removeOccurrenceOnlyGuest:
+            return Set(organizer + [GuestFixture.guestA])
         }
     }
 }

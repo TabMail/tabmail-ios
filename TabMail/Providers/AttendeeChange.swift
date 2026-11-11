@@ -21,8 +21,9 @@ import Foundation
 /// is the reference, so every provider ends the same (CalDAV in
 /// `CalDAVProvider.applyAttendeeChange`; Google and Outlook write the series alone and the server
 /// carries it). The add-on applies the change itself to each changed occurrence instead
-/// (`applyGuestChangeToSeries`); the two differ only for `"*"` and for an add of a guest the series
-/// already holds.
+/// (`applyGuestChangeToSeries`); the two differ only for `"*"`, for an add of a guest the series
+/// already holds (or a remove and re-add of one), and for a removal of a guest the series does not
+/// hold (an occurrence's own guest stays).
 ///
 /// Nothing here is persisted: the queue stores the tool's arguments, and the change is built from
 /// them when the edit is written (`CalendarToolHelpers.buildGCalEventInput`).
