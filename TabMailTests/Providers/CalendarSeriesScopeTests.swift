@@ -556,14 +556,25 @@ struct ExchangeCalendarSeriesScopeTests {
 
 // MARK: - Outlook: an all-day occurrence is named by its date
 
-/// An Outlook all-day series kept in `zone` (its range's `recurrenceTimeZone`, an IANA name, which
-/// Graph accepts), daily or weekly from `day(0)`, with its occurrences around `day(7)`: each starts at
-/// midnight of its date in that zone and has that instant as its place (`originalStart`, measured).
-/// Graph returns each all-day start in the zone a read names (`allDayTimesFollowPrefer`, assumed).
+/// An Outlook all-day series, daily or weekly from `day(0)`, kept in `zone` (its range's
+/// `recurrenceTimeZone`), with its occurrences around `day(named)`: each stored at midnight of its
+/// date in that zone, with that instant as its place (`originalStart`, measured). Every read returns
+/// an all-day start as midnight of its own date, labelled with the zone the read names
+/// (`FakeGraphCalendar`, measured).
+///
+/// The zones are chosen from the device's, so every row crosses a date boundary on any host: the
+/// series' zone is east of the device's (an occurrence's midnight there is the day before on the
+/// device), and the edit names either the device's zone or one west of it (the device's midnight
+/// is the day before there).
 private enum GraphAllDaySeries {
     static let id = "ser-ad-zoned"
     /// The date every test names.
     static let named = 7
+    /// How many hours the series' zone is east of the device's, and the west zone west of it.
+    static let hoursAcross = 5
+    /// The offsets, in hours, the `Etc/GMT` zones span.
+    static let eastmost = 14
+    static let westmost = -12
 
     static func occurrence(_ offset: Int) -> String { "\(id)-\(day(offset))" }
 
@@ -571,7 +582,31 @@ private enum GraphAllDaySeries {
     /// weekly one none there.
     static func offsets(daily: Bool) -> [Int] { daily ? [named - 1, named, named + 1] : [named - 7, named, named + 7] }
 
-    static func calendar(zone: String, daily: Bool) -> FakeGraphCalendar {
+    /// The device's offset from UTC, in hours, on the named date.
+    static var deviceHours: Double {
+        let at = EKEventStoreHelper.parseNaiveISO(day(named), timeZone: utc) ?? Date()
+        return Double(TimeZone.current.secondsFromGMT(for: at)) / 3_600
+    }
+
+    /// The `Etc/GMT` zone `hours` from UTC: whole hours, no daylight saving time, and named with the
+    /// POSIX sign, the reverse of the offset's.
+    static func etcZone(_ hours: Int) -> String { hours == 0 ? "Etc/GMT" : "Etc/GMT\(hours > 0 ? "-" : "+")\(abs(hours))" }
+
+    static var seriesHours: Int { min(Int(deviceHours.rounded(.down)) + hoursAcross, eastmost) }
+    static var westHours: Int { max(Int(deviceHours.rounded(.up)) - hoursAcross, westmost) }
+
+    /// The series' zone, east of the device's.
+    static var seriesZone: String { etcZone(seriesHours) }
+
+    /// The zones an edit or read names: the device's, and one west of it.
+    static var editZones: [String] { [TimeZone.current.identifier, etcZone(westHours)] }
+
+    /// Whether this host's zone leaves room for both crossings (every zone but the two ends of the
+    /// world's offsets).
+    static var crossesOnThisHost: Bool { Double(seriesHours) > deviceHours && Double(westHours) < deviceHours }
+
+    static func calendar(daily: Bool) -> FakeGraphCalendar {
+        let zone = seriesZone
         func atMidnight(_ e: inout [String: Any], _ offset: Int) {
             e["start"] = ["dateTime": "\(day(offset))T00:00:00.0000000", "timeZone": zone]
             e["end"] = ["dateTime": "\(day(offset + 1))T00:00:00.0000000", "timeZone": zone]
@@ -594,57 +629,66 @@ private enum GraphAllDaySeries {
             e["originalStart"] = GraphFixture.allDayPlace(day(offset), in: zone)
             return e
         }
-        return FakeGraphCalendar([series] + occurrences, allDayTimesFollowPrefer: true)
+        return FakeGraphCalendar([series] + occurrences)
     }
 
-    /// The series' zone and the edit's: London's dates begin before New York's (the series east
-    /// of the edit's zone), and New York's after London's (west of it).
-    static let zones = [(series: "Europe/London", edit: "America/New_York"),
-                        (series: "America/New_York", edit: "Europe/London")]
-
-    /// The two ways an edit names `day(named)`: its date, and its start as the read tools show an
-    /// all-day start (`allDayNaiveISO`).
+    /// The two ways an edit names `day(named)` directly: its date, and its start as the read tools
+    /// show an all-day start (`allDayNaiveISO`).
     static var names: [String] { [day(named), CalendarToolHelpers.allDayNaiveISO(day(named))] }
+
+    /// Every (daily, edit zone) pair.
+    static var rows: [(daily: Bool, zone: String)] { [true, false].flatMap { daily in editZones.map { (daily, $0) } } }
+
+    static func label(_ daily: Bool, _ zone: String, _ rest: String) -> String {
+        "series \(seriesZone), device \(TimeZone.current.identifier), edit \(zone), \(daily ? "daily" : "weekly"), \(rest)"
+    }
 }
 
-@Suite("An Outlook all-day occurrence is named by its date in the series' own zone (#647)", .serialized, .processGlobalState)
+/// The occurrence on `day(shown)` was the only thing written: renamed by one PATCH, its
+/// neighbours and the series untouched, nothing created, no row left.
+private func onlyOccurrencePatched(_ shown: Int, daily: Bool, graph: FakeGraphCalendar, rows: [PendingCalendarOperation], _ label: String) {
+    let named = GraphAllDaySeries.occurrence(shown)
+    #expect(graph.patches(named).count == 1 && graph.event(named)?["subject"] as? String == "Holiday (renamed)",
+            "\(label): the occurrence shown on \(day(shown)) was not changed; rows \(reasons(rows))")
+    for offset in GraphAllDaySeries.offsets(daily: daily) where offset != shown {
+        #expect(graph.patches(GraphAllDaySeries.occurrence(offset)).isEmpty, "\(label): the occurrence on \(day(offset)) was changed")
+    }
+    #expect(graph.patches(GraphAllDaySeries.id).isEmpty && graph.created.isEmpty, "\(label): the series was written")
+    #expect(rows.isEmpty, "\(label): rows \(reasons(rows))")
+}
+
+@Suite("An Outlook all-day occurrence is named by its date (#647)", .serialized, .processGlobalState)
 struct ExchangeAllDayOccurrenceDateTests {
 
     @Test("a this_only edit naming a date changes that date's occurrence and no other, whatever zone the edit names")
     func thisOnlyEditChangesTheNamedDate() async throws {
-        for (row, (zones, daily)) in GraphAllDaySeries.zones.flatMap({ z in [true, false].map { (z, $0) } }).enumerated() {
+        #expect(GraphAllDaySeries.crossesOnThisHost, "device offset \(GraphAllDaySeries.deviceHours)h")
+        for (index, row) in GraphAllDaySeries.rows.enumerated() {
             for (form, rid) in GraphAllDaySeries.names.enumerated() {
-                let label = "\(zones.series) series, \(zones.edit) edit, \(daily ? "daily" : "weekly"), \(rid)"
-                let graph = GraphAllDaySeries.calendar(zone: zones.series, daily: daily)
+                let label = GraphAllDaySeries.label(row.daily, row.zone, rid)
+                let graph = GraphAllDaySeries.calendar(daily: row.daily)
                 let rows = try await outlook(graph, eventId: GraphAllDaySeries.id, [
                     "edit_scope": .string("this_only"), "recurrence_id": .string(rid),
-                    "title": .string("Holiday (renamed)"), "timezone": .string(zones.edit),
-                ], account: "allday-zone-\(row)-\(form)")
-                let named = GraphAllDaySeries.occurrence(GraphAllDaySeries.named)
-                #expect(graph.patches(named).count == 1 && graph.event(named)?["subject"] as? String == "Holiday (renamed)",
-                        "\(label): the named date's occurrence was not changed; rows \(reasons(rows))")
-                for offset in GraphAllDaySeries.offsets(daily: daily) where offset != GraphAllDaySeries.named {
-                    #expect(graph.patches(GraphAllDaySeries.occurrence(offset)).isEmpty,
-                            "\(label): the occurrence on \(day(offset)) was changed")
-                }
-                #expect(graph.patches(GraphAllDaySeries.id).isEmpty && graph.created.isEmpty, "\(label): the series was written")
-                #expect(rows.isEmpty, "\(label): rows \(reasons(rows))")
+                    "title": .string("Holiday (renamed)"), "timezone": .string(row.zone),
+                ], account: "allday-date-\(index)-\(form)")
+                onlyOccurrencePatched(GraphAllDaySeries.named, daily: row.daily, graph: graph, rows: rows, label)
             }
         }
     }
 
     @Test("the occurrence read naming a date gives that date's occurrence, whatever zone the read names")
     func occurrenceReadGivesTheNamedDate() async throws {
-        for (zones, daily) in GraphAllDaySeries.zones.flatMap({ z in [true, false].map { (z, $0) } }) {
+        #expect(GraphAllDaySeries.crossesOnThisHost, "device offset \(GraphAllDaySeries.deviceHours)h")
+        for row in GraphAllDaySeries.rows {
             for rid in GraphAllDaySeries.names {
-                let label = "\(zones.series) series, \(zones.edit) read, \(daily ? "daily" : "weekly"), \(rid)"
-                let graph = GraphAllDaySeries.calendar(zone: zones.series, daily: daily)
+                let label = GraphAllDaySeries.label(row.daily, row.zone, rid)
+                let graph = GraphAllDaySeries.calendar(daily: row.daily)
                 let http = FakeHTTP.Scenario()
                 defer { http.close() }
                 graph.install(on: http)
                 let provider = ExchangeCalendarProvider(mailbox: "calendar@example.com", accessToken: { _ in "test-token" },
                                                         session: http.session)
-                let zone = try #require(TimeZone(identifier: zones.edit))
+                let zone = try #require(TimeZone(identifier: row.zone))
                 do {
                     let found = try await provider.occurrence(
                         calendarId: "primary", eventId: GraphAllDaySeries.id, recurrenceId: rid, recurrenceIdZone: zone)
@@ -655,6 +699,66 @@ struct ExchangeAllDayOccurrenceDateTests {
                 }
                 #expect(graph.patches(GraphAllDaySeries.id).isEmpty && graph.created.isEmpty, "\(label): written")
             }
+        }
+    }
+
+    /// Where the read tools show an occurrence: the listing (`listEvents`) or a read by its id
+    /// (`getEvent`), rendered as the tools render it (`formatDetailedEvent`) in the edit's zone.
+    private enum Shown: CaseIterable { case listing, read }
+
+    private func shownStart(_ shown: Shown, graph: FakeGraphCalendar, zone: TimeZone) async throws -> String? {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        graph.install(on: http)
+        let provider = ExchangeCalendarProvider(mailbox: "calendar@example.com", accessToken: { _ in "test-token" },
+                                                session: http.session)
+        let id = GraphAllDaySeries.occurrence(GraphAllDaySeries.named)
+        let event: GCalEvent?
+        switch shown {
+        case .listing: event = try await provider.listEvents().first { $0.id == id }
+        case .read: event = try await provider.getEvent(eventId: id)
+        }
+        let text = event.map { CalendarToolHelpers.formatDetailedEvent($0, timeZone: zone) } ?? ""
+        return text.split(separator: "\n").first { $0.hasPrefix("start_iso: ") }.map { String($0.dropFirst("start_iso: ".count)) }
+    }
+
+    @Test("an edit naming an occurrence by the start the read tools show for it, with the series' id or its own, changes that occurrence and no other")
+    func startTheReadToolsShowNamesThatOccurrence() async throws {
+        #expect(GraphAllDaySeries.crossesOnThisHost, "device offset \(GraphAllDaySeries.deviceHours)h")
+        let named = GraphAllDaySeries.occurrence(GraphAllDaySeries.named)
+        var account = 0
+        for row in GraphAllDaySeries.rows {
+            for shown in Shown.allCases {
+                for eventId in [GraphAllDaySeries.id, named] {
+                    account += 1
+                    let graph = GraphAllDaySeries.calendar(daily: row.daily)
+                    let zone = try #require(TimeZone(identifier: row.zone))
+                    let start = try await shownStart(shown, graph: graph, zone: zone)
+                    let label = GraphAllDaySeries.label(row.daily, row.zone, "\(shown) shows \(start ?? "no start"), event \(eventId)")
+                    guard let start else {
+                        Issue.record("\(label): the read tools show no start")
+                        continue
+                    }
+                    let rows = try await outlook(graph, eventId: eventId, [
+                        "edit_scope": .string("this_only"), "recurrence_id": .string(start),
+                        "title": .string("Holiday (renamed)"), "timezone": .string(row.zone),
+                    ], account: "allday-shown-\(account)")
+                    onlyOccurrencePatched(GraphAllDaySeries.named, daily: row.daily, graph: graph, rows: rows, label)
+                }
+            }
+        }
+    }
+
+    @Test("an edit naming an occurrence by its own id with no recurrence_id changes that occurrence and no other")
+    func occurrenceIdAloneNamesThatOccurrence() async throws {
+        #expect(GraphAllDaySeries.crossesOnThisHost, "device offset \(GraphAllDaySeries.deviceHours)h")
+        for (index, row) in GraphAllDaySeries.rows.enumerated() {
+            let label = GraphAllDaySeries.label(row.daily, row.zone, "own id, no recurrence_id")
+            let graph = GraphAllDaySeries.calendar(daily: row.daily)
+            let rows = try await outlook(graph, eventId: GraphAllDaySeries.occurrence(GraphAllDaySeries.named), [
+                "edit_scope": .string("this_only"), "title": .string("Holiday (renamed)"), "timezone": .string(row.zone),
+            ], account: "allday-own-\(index)")
+            onlyOccurrencePatched(GraphAllDaySeries.named, daily: row.daily, graph: graph, rows: rows, label)
         }
     }
 }

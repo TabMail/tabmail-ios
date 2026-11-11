@@ -163,27 +163,41 @@ no zone at all is refused by the lookup, nothing written: Graph has named one on
 far (a range written without one is read back as UTC, measured 2026-11-07), so this is not expected to
 be reached.
 
-**An all-day occurrence is named by its date, read in the series' zone (#647).** `resolveInstanceId`
-read every candidate as an instant from `start` under `Prefer` naming the device's zone, with
-`dateOnly` nil even for all-day instances, so the resolver's Rule 3 (an all-day candidate answers only
-to its literal date) never applied on Outlook, and a date was matched by Rule 2 in the edit's zone. If
-Graph converts an all-day `start` as it converts `originalStart`, a London daily all-day series edited
-from New York with "D" resolved to D+1's occurrence (a weekly one: not found), and the read tools'
-`DT00:00:00` form (`allDayNaiveISO`) matched nothing unless the edit's zone was the series'. With
-#694's `exdates_add` the same lookup picks which occurrence is DELETED. Now, for an all-day series,
-`/instances` is read with `Prefer` naming the series' zone through the same rule as
-`allDayOccurrence` (`allDayZoneName`: `recurrenceTimeZoneName` as Graph gave it, refused when absent),
-and each start's date is read as every all-day start is (`toGCalDateTime(_:isAllDay: true)`, its first
-ten characters), so each candidate is a DATE and Rule 3 applies. Every caller gets it: `updateOccurrence`
+**An all-day occurrence is named by its date (#647).** `resolveInstanceId` read every candidate as an
+instant from `start` under `Prefer` naming the device's zone, with `dateOnly` nil even for all-day
+instances, so the resolver's Rule 3 (an all-day candidate answers only to its literal date) never applied
+on Outlook. Graph returns an all-day start as midnight of its own date labelled with the read's zone (see
+the measurement below), so the candidate was midnight of that date ON THE DEVICE. An edit whose `timezone`
+differs from the device's matched it in another frame: from a zone west of the device's, a date named the
+next day's occurrence of a daily series (a weekly one: not found), and the read tools' `DT00:00:00` form
+(`allDayNaiveISO`), and an occurrence id given alone (`shownStart`), matched nothing. With #694's
+`exdates_add` the same lookup picks which occurrence is DELETED. Now, for an all-day series, each start
+is read as its date the way every all-day start is (`toGCalDateTime(_:isAllDay: true)`, its first ten
+characters), so each candidate is a DATE and Rule 3 applies, whatever zone the edit names. `/instances`
+is read with `Prefer` naming the series' zone through the same rule as `allDayOccurrence`
+(`allDayZoneName`: `recurrenceTimeZoneName` as Graph gave it); since Graph only relabels an all-day start,
+that zone does not change the dates, and it makes the lookup refuse a series whose range names no zone,
+as the occurrence read already did (unreachable, see above). Every caller gets it: `updateOccurrence`
 (this_only), `occurrence(...)` (the edit tool's and the queue's `read`, #694's delete lookup) and
 `splitSeries` (through `occurrence`). Timed series are unchanged; Google and CalDAV were already by date.
-**Assumed, not measured:** how Graph writes an all-day `start` under `Prefer`. Read in the series' zone
-its date is the occurrence's date either way (converted: midnight there; written as stored midnight in
-any zone: midnight), which is why the read names that zone. `FakeGraphCalendar(allDayTimesFollowPrefer:)`
-models the converted case; `ExchangeAllDayOccurrenceDateTests` (London series and New York edit, and the
-reverse; daily and weekly; a date and the `DT00:00:00` form; a this_only edit and the occurrence read)
-pins that a date names exactly its own date's occurrence. Also assumed (unchanged): `/instances`'
-`startDateTime`/`endDateTime`, sent without an offset, are read as UTC whatever `Prefer` names.
+
+**Measured (2026-11-11, work account): Graph RELABELS an all-day start, it does not convert it.** An
+all-day series kept in a zone east of the reading zone, read through `/me/calendarView`,
+`/me/events/{id}` and `/me/events/{id}/instances`, with `Prefer: outlook.timezone` naming the series'
+zone, a zone west of it, and no `Prefer` at all: every read gave `start` (and `end`) as midnight of the
+occurrence's own date, and only `timeZone` changed (the zone `Prefer` named; `UTC` with none). Its
+`originalStart` IS converted as an instant (above). So the read tools (device zone) and the lookup show
+the same date. `FakeGraphCalendar` renders all-day starts and ends that way on every read.
+`ExchangeAllDayOccurrenceDateTests` pins the invariant with zones chosen from the device's, so every row
+crosses a date boundary on any host (the series east of the device; the edit naming the device's zone or
+one west of it), daily and weekly: a date, and the `DT00:00:00` form, name exactly their own date's
+occurrence (this_only edit and the occurrence read); the start the read tools show (the listing and a read
+by id, through `formatDetailedEvent`), given with the series' id or the occurrence's own, changes exactly
+that occurrence; and an occurrence id with no `recurrence_id` changes itself. Still assumed (unchanged):
+`/instances`' `startDateTime`/`endDateTime`, sent without an offset, are read as UTC whatever `Prefer`
+names. [Superseded the same day: the first version of this paragraph assumed Graph converts an all-day
+`start` like `originalStart`, named a London series edited from New York as the failing case, and had the
+fake convert it (`allDayTimesFollowPrefer`, deleted).]
 
 Also measured: on Outlook a PATCH of the whole series' start or end resets its changed occurrences,
 even with no recurrence sent. #560 makes an "all" time edit named by an occurrence id reach the series,
