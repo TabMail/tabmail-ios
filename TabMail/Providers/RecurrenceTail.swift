@@ -206,7 +206,11 @@ enum RecurrenceTail {
         /// Outlook's `recurrenceRange.startDate`: "the date to start applying the recurrence
         /// pattern. The first occurrence of the meeting may be this date or later, depending on the
         /// recurrence pattern" (Graph's `recurrenceRange`). That day is an occurrence only when the
-        /// pattern names it.
+        /// pattern names it (measured on Outlook: a numbered series of four whose `startDate` was a
+        /// day the pattern does not name had four occurrences, all on pattern days). Graph also
+        /// normalizes such a series when it is created, moving the event's start and the range's
+        /// `startDate` forward to the first pattern day (measured), so a series made by Outlook
+        /// usually starts on one; the anchor still holds for one that does not.
         case patternStart
     }
 

@@ -121,7 +121,11 @@ response was lost, the series it reads is already capped.
 - **How Outlook is counted** (`occurrencesLeft`): from the range's `startDate`, which Graph
   documents as "the date to start applying the recurrence pattern", the first occurrence being that
   date or later (`RecurrenceTail.Anchor.patternStart`: the start day counts only when the pattern
-  names it, where RFC 5545's DTSTART always counts); the split occurrence's day in the series' zone
+  names it, where RFC 5545's DTSTART always counts). Measured 2026-11-11: a weekly Tuesday and
+  Thursday series of four created with its `startDate` and start on a Monday had four occurrences,
+  all on Tuesdays and Thursdays, so the Monday did not count; Graph had also moved the event's start
+  and the range's `startDate` to the Tuesday on create, so a stored series normally starts on a
+  pattern day. Then: the split occurrence's day in the series' zone
   (`GCalEvent.seriesZone`; an all-day split's date as given); weeks starting on the pattern's
   `firstDayOfWeek`, sent as the counted rule's WKST. An unrecognized range zone or an uncountable
   pattern is refused before the cap. The cap's own date is still worked out in the operation's

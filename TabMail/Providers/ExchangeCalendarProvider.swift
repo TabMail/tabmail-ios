@@ -800,7 +800,10 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// them since; the instances list is not read for this.
     ///
     /// Counted as Graph applies the pattern: from the range's `startDate`, a date in the range's
-    /// zone that is an occurrence only when the pattern names it (`.patternStart`); the split
+    /// zone that is an occurrence only when the pattern names it (`.patternStart`; measured: a
+    /// `startDate` the pattern does not name does not count toward the number, and Graph moves
+    /// such a `startDate`, with the event's start, forward to the first pattern day when the series
+    /// is created); the split
     /// occurrence's day in the same zone (`GCalEvent.seriesZone`; an all-day split is a date); and
     /// weeks starting on the pattern's `firstDayOfWeek` (the rule's `WKST`), which decides which
     /// weeks a series repeating every few weeks falls in.
