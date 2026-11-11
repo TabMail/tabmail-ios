@@ -75,6 +75,10 @@ struct InboxErrorBannerTests {
             TimeoutError(duration: 30),
             CancellationError(),
             UnknownError(),
+            ReauthenticationError.accountChanged,
+            ReauthenticationError.signInMethodMismatch,
+            CalDAVError.authFailed,
+            CalDAVError.discoveryFailed(m),
         ]
         for reason in loginReasons {
             errors.append(IMAPError.loginFailed(reason))
@@ -100,7 +104,8 @@ struct InboxErrorBannerTests {
     @Test("for every error, the re-authentication alert shows a fixed line or nothing")
     func reauthAlertIsAlwaysAFixedLine() {
         let allowed: Set<String> = [AccountReauthAlert.passwordLine, AccountReauthAlert.setupLine,
-                                    AccountReauthAlert.oauthLine, AccountReauthAlert.tlsLine(host: Self.host)]
+                                    AccountReauthAlert.oauthLine, AccountReauthAlert.tlsLine(host: Self.host),
+                                    AccountReauthAlert.accountChangedLine]
         for error in Self.everyError {
             let lines = [AccountReauthAlert.passwordUpdateLine(for: error, host: Self.host),
                          AccountReauthAlert.oauthLine(for: error)].compactMap { $0 }
@@ -113,7 +118,7 @@ struct InboxErrorBannerTests {
 
     @Test("the password-update alert picks its line by what failed")
     func reauthAlertLineByPhase() {
-        // The server refused the new password (as `updateIMAPPassword` reports it).
+        // The server refused the new password (as `updatePassword` reports it).
         #expect(AccountReauthAlert.passwordUpdateLine(for: ProviderError.authenticationFailed, host: Self.host)
                 == AccountReauthAlert.passwordLine)
         // The server cannot meet the TLS minimum: main's sentence, for the account's host.
@@ -130,7 +135,11 @@ struct InboxErrorBannerTests {
         }
         // Offline keeps the alert closed, as before.
         #expect(AccountReauthAlert.passwordUpdateLine(for: URLError(.notConnectedToInternet), host: Self.host) == nil)
-        #expect(Set([AccountReauthAlert.passwordLine, AccountReauthAlert.setupLine, tls ?? ""]).count == 3)
+        // The account was removed or changed while the prompt was open: said so.
+        #expect(AccountReauthAlert.passwordUpdateLine(for: ReauthenticationError.accountChanged, host: Self.host)
+                == AccountReauthAlert.accountChangedLine)
+        #expect(Set([AccountReauthAlert.passwordLine, AccountReauthAlert.setupLine, tls ?? "",
+                     AccountReauthAlert.accountChangedLine]).count == 4)
     }
 
     /// Non-vacuity: the decision can say yes, and says no where it must.

@@ -742,54 +742,180 @@ extension AccountManager {
         }
     }
 
-    /// Update IMAP password and reconnect.
-    func updateIMAPPassword(_ newPassword: String, for account: Account) async throws {
-        guard account.provider == .imap else { return }
-        guard !isRuntimeRemoved(account.id) else { throw ProviderError.notConnected }
+    /// What a password update works from, read once as its first step.
+    private struct PasswordUpdatePlan: Sendable {
+        /// The account row as stored when the update started.
+        let account: Account
+        /// The account has mail: the mail server must accept the new password.
+        let updatesMail: Bool
+        /// The calendar the new password is checked against, if any.
+        let calendar: CalDAVConfig?
+        /// Whether a calendar refusal fails the whole update (`true`), or leaves
+        /// the calendar as it is while the mail update goes ahead (`false`).
+        let calendarMustAccept: Bool
+    }
 
-        // Test connection with new password before saving. The probe reports only
-        // to a local flag, never to the account: a mistyped password must not
-        // mark a working account. A refused password reaches the caller as
-        // `ProviderError.authenticationFailed`.
-        let testProvider = try createIMAPProvider(for: account, passwordOverride: newPassword)
-        let probe = PasswordProbeOutcome()
-        testProvider.attachSignInOutcomeReporter { outcome in
-            if outcome == .credentialsRefused { probe.refused.withLock { $0 = true } }
+    /// Snapshot the account and its calendar for a password update.
+    ///
+    /// `promptAccount` is the account as it was when the password prompt opened.
+    /// If it was removed since, or now signs in differently, the update stops here.
+    private func passwordUpdatePlan(for promptAccount: Account, newPassword: String) async throws -> PasswordUpdatePlan {
+        guard promptAccount.provider.signInMethod == .password else {
+            throw ReauthenticationError.signInMethodMismatch
         }
+        let accountId = promptAccount.id
+        let (stored, calendar) = try await dbPool.read { db in
+            (try Account.fetchOne(db, key: accountId),
+             try CalDAVConfig.filter(Column("accountId") == accountId).fetchOne(db))
+        }
+        guard let stored, stored.signsInLike(promptAccount) else {
+            throw ReauthenticationError.accountChanged
+        }
+
+        // A calendar-only account is its calendar: the calendar step alone.
+        if stored.calendarOnly {
+            guard let calendar else { throw ReauthenticationError.accountChanged }
+            return PasswordUpdatePlan(account: stored, updatesMail: false, calendar: calendar, calendarMustAccept: true)
+        }
+        guard let calendar else {
+            return PasswordUpdatePlan(account: stored, updatesMail: true, calendar: nil, calendarMustAccept: false)
+        }
+        if stored.provider.mailAndCalendarShareOnePassword {
+            return PasswordUpdatePlan(account: stored, updatesMail: true, calendar: calendar, calendarMustAccept: true)
+        }
+        // A calendar added to a mail account follows the new mail password only
+        // when it had the same password, or already has the new one (an earlier
+        // update saved the calendar and then failed to save the mail). Compared
+        // here in memory; no value is kept or logged.
+        let mailPassword = KeychainHelper.loadString(key: KeychainHelper.passwordKey(accountId: accountId))
+        let calendarPassword = KeychainHelper.loadString(key: "caldav_password_\(calendar.id)")
+        let calendarFollowsMail = calendarPassword != nil
+            && (calendarPassword == mailPassword || calendarPassword == newPassword)
+        return PasswordUpdatePlan(
+            account: stored,
+            updatesMail: true,
+            calendar: calendarFollowsMail ? calendar : nil,
+            calendarMustAccept: false
+        )
+    }
+
+    /// A calendar provider for `config` signing in with `password`, built only
+    /// once the server accepted it (the discovery `setupCalDAV` runs).
+    private func acceptedCalDAVProvider(config: CalDAVConfig, password: String) async throws -> CalDAVProvider {
+        guard let serverURL = URL(string: config.serverURL) else {
+            throw CalDAVError.discoveryFailed("Invalid server URL: \(config.serverURL)")
+        }
+        let client = makeCalDAVClient(username: config.username, password: password)
+        let discovery = try await CalDAVDiscovery.discover(serverURL: serverURL, client: client)
+        return CalDAVProvider(client: client, calendarHomeURL: discovery.calendarHomeURL, serverBaseURL: serverURL)
+    }
+
+    /// Check a new password with what it signs in to, then save it and make it
+    /// live. The one entry point for every account that signs in with a password:
+    /// - Mail and calendar on one password (iCloud): both must accept it, then
+    ///   both are saved. Any failure saves nothing.
+    /// - Mail with a calendar that had the same password, or already has the new
+    ///   one: the mail must accept it; the calendar follows only if it accepts
+    ///   too, and is otherwise left as it was. A calendar with a different
+    ///   password is left as it is.
+    /// - Calendar only: the calendar must accept it.
+    ///
+    /// `promptAccount` is the account as it was when the password prompt opened;
+    /// if it was removed or its sign-in changed since, nothing is saved and
+    /// `ReauthenticationError.accountChanged` is thrown. A refused password is
+    /// thrown as `ProviderError.authenticationFailed`. The checks never mark the
+    /// account for signing in again; the mail provider made live reports.
+    func updatePassword(_ newPassword: String, for promptAccount: Account) async throws {
+        let plan = try await passwordUpdatePlan(for: promptAccount, newPassword: newPassword)
+        let account = plan.account
+
+        // Test the mail connection with the new password before saving. The probe
+        // reports only to a local flag, never to the account: a mistyped password
+        // must not mark a working account.
+        var mailProbe: IMAPProvider?
+        if plan.updatesMail {
+            let testProvider = try createIMAPProvider(for: account, passwordOverride: newPassword)
+            let probe = PasswordProbeOutcome()
+            testProvider.attachSignInOutcomeReporter { outcome in
+                if outcome == .credentialsRefused { probe.refused.withLock { $0 = true } }
+            }
+            do {
+                try await testProvider.connect()
+            } catch {
+                if probe.refused.withLock({ $0 }) { throw ProviderError.authenticationFailed }
+                throw error
+            }
+            mailProbe = testProvider
+        }
+
+        // Then the calendar, with the same password.
+        var acceptedCalendar: (config: CalDAVConfig, provider: CalDAVProvider)?
+        if let config = plan.calendar {
+            do {
+                acceptedCalendar = (config, try await acceptedCalDAVProvider(config: config, password: newPassword))
+            } catch {
+                let refused = Self.isCalDAVAuthError(error)
+                if refused, !plan.calendarMustAccept {
+                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Reauth] Calendar did not accept the new password; it keeps its own (account \(account.id.prefix(8)))") }
+                } else {
+                    try? await mailProbe?.disconnect()
+                    if refused { throw ProviderError.authenticationFailed }
+                    throw error
+                }
+            }
+        }
+
+        guard !isRuntimeRemoved(account.id) else {
+            try? await mailProbe?.disconnect()
+            throw ReauthenticationError.accountChanged
+        }
+
+        // Save. The calendar goes first: if the mail save then fails, the next
+        // attempt still finds what it needs to finish (iCloud saves both again; a
+        // calendar that follows the mail password already has it).
         do {
-            try await testProvider.connect()
+            if let acceptedCalendar {
+                try KeychainHelper.save(newPassword, for: "caldav_password_\(acceptedCalendar.config.id)")
+            }
+            if mailProbe != nil {
+                try KeychainHelper.save(newPassword, for: KeychainHelper.passwordKey(accountId: account.id))
+            }
         } catch {
-            if probe.refused.withLock({ $0 }) { throw ProviderError.authenticationFailed }
+            try? await mailProbe?.disconnect()
             throw error
         }
-        guard !isRuntimeRemoved(account.id) else {
-            try? await testProvider.disconnect()
-            throw ProviderError.notConnected
-        }
 
-        // Save new password to Keychain
-        try KeychainHelper.save(newPassword, for: KeychainHelper.passwordKey(accountId: account.id))
-
-        // Replace active provider; it reports sign-in outcomes from here on.
-        installAcceptedPasswordProbeAsLive(testProvider, accountId: account.id)
-        let concurrency: Int
-        switch account.provider {
-        case .gmail: concurrency = SyncConfig.gmailWorkQueueConcurrency
-        case .outlook: concurrency = SyncConfig.exchangeWorkQueueConcurrency
-        default: concurrency = SyncConfig.imapMaxConnectionCeiling
+        if let acceptedCalendar {
+            calendarProviders[account.id] = acceptedCalendar.provider
         }
-        let queue = ProviderWorkQueue(provider: testProvider, maxConcurrency: concurrency)
-        workQueues[account.id] = queue
-        await syncEngine.register(accountId: account.id, provider: testProvider, workQueue: queue)
-        if isRuntimeRemoved(account.id) {
-            providers.removeValue(forKey: account.id)
-            workQueues.removeValue(forKey: account.id)
-            await queue.invalidate()
-            await syncEngine.remove(accountId: account.id)
-            try? await testProvider.disconnect()
-            throw ProviderError.notConnected
+        if let mailProbe {
+            // Replace the active provider; it reports sign-in outcomes from here on.
+            installAcceptedPasswordProbeAsLive(mailProbe, accountId: account.id)
+            let queue = ProviderWorkQueue(provider: mailProbe, maxConcurrency: SyncConfig.imapMaxConnectionCeiling)
+            workQueues[account.id] = queue
+            await syncEngine.register(accountId: account.id, provider: mailProbe, workQueue: queue)
+            if isRuntimeRemoved(account.id) {
+                providers.removeValue(forKey: account.id)
+                workQueues.removeValue(forKey: account.id)
+                calendarProviders.removeValue(forKey: account.id)
+                await queue.invalidate()
+                await syncEngine.remove(accountId: account.id)
+                try? await mailProbe.disconnect()
+                throw ReauthenticationError.accountChanged
+            }
         }
         authFailedAccounts.remove(account.id)
+    }
+
+    /// Re-authenticate an account that signs in with OAuth and reconnect it.
+    /// Throws `ReauthenticationError.signInMethodMismatch` for an account that
+    /// signs in with a password (`updatePassword` is its path).
+    func reauthenticateOAuth(for account: Account) async throws {
+        switch account.provider {
+        case .gmail: try await reauthenticateGmail(for: account)
+        case .outlook: try await reauthenticateMicrosoft(for: account)
+        case .imap, .icloud, .caldav: throw ReauthenticationError.signInMethodMismatch
+        }
     }
 
     /// Re-authenticate Gmail via OAuth and reconnect.
@@ -849,8 +975,18 @@ extension AccountManager {
     }
 }
 
+/// Why a re-authentication stopped without saving anything.
+enum ReauthenticationError: Error, Equatable {
+    /// The account does not sign in the way the call expects (a password
+    /// update for an OAuth account, or an OAuth sign-in for a password account).
+    case signInMethodMismatch
+    /// The account was removed, or now signs in differently, since the password
+    /// prompt opened.
+    case accountChanged
+}
+
 /// What a password probe's own sign-in reporter recorded. Local to one
-/// `updateIMAPPassword` call; never reaches `authFailedAccounts`.
+/// `updatePassword` call; never reaches `authFailedAccounts`.
 private final class PasswordProbeOutcome: Sendable {
     let refused = Mutex(false)
 }

@@ -6,12 +6,18 @@ import Foundation
 import Testing
 
 /// The IMAP TLS override lets tests reach a plain-TCP fake server through the real
-/// provider factory. It must never exist in a release build: both of its names
-/// may appear in app source only inside the `#if DEBUG` branch of a conditional.
-@Suite("IMAP TLS test override is fenced to DEBUG builds")
+/// provider factory, and the CalDAV session override lets them reach a
+/// `URLProtocol` fake through `makeCalDAVClient`, and the Keychain save fault
+/// lets them fail one save. None may exist in a release build: their names may
+/// appear in app source only inside the `#if DEBUG` branch of a conditional.
+@Suite("IMAP TLS, CalDAV session and Keychain save test overrides are fenced to DEBUG builds")
 struct TLSOverrideDebugFenceTests {
 
-    private static let fencedNames = ["setIMAPUseTLSOverrideForTesting", "imapUseTLSOverrideBox"]
+    private static let fencedNames = [
+        "setIMAPUseTLSOverrideForTesting", "imapUseTLSOverrideBox",
+        "setCalDAVSessionOverrideForTesting", "calDAVSessionOverrideBox",
+        "failNextSaveForTesting", "failNextSaveKeyForTesting",
+    ]
 
     private static var appSourceRoot: URL {
         URL(fileURLWithPath: #filePath)
@@ -67,15 +73,20 @@ struct TLSOverrideDebugFenceTests {
         let enumerator = try #require(FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil))
         var appearances = 0
         var violations: [String] = []
+        var sources: [String] = []
         for case let url as URL in enumerator where url.pathExtension == "swift" {
             let source = try String(contentsOf: url, encoding: .utf8)
             guard Self.fencedNames.contains(where: { source.contains($0) }) else { continue }
+            sources.append(source)
             appearances += 1
             for line in Self.unfencedLines(in: source) {
                 violations.append("\(url.lastPathComponent):\(line)")
             }
         }
         #expect(appearances > 0, "the fence scanned no file that defines the override; the check is vacuous")
-        #expect(violations.isEmpty, "TLS test override outside #if DEBUG: \(violations)")
+        for name in Self.fencedNames {
+            #expect(sources.contains { $0.contains(name) }, "no app source names \(name); the check is vacuous for it")
+        }
+        #expect(violations.isEmpty, "test override outside #if DEBUG: \(violations)")
     }
 }
