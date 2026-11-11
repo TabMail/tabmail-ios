@@ -66,6 +66,21 @@ dropped silently, and the card did not list the days.
 - Outlook names `byMonthDay: -1` plainly ("on the last day of the month"); other negative days keep
   "on a day counted from the end of the month".
 
+## The delete card names a series' rule too (#639, 2026-11-10)
+
+`calendar_event_delete`'s card says "Repeating event: every occurrence will be deleted"
+(`CalendarToolHelpers.seriesDeleteNote`, Google Calendar's question) and `Repeats: <rule>` when the
+event it read is a series itself: a repeat rule and no `recurringEventId` (`seriesDeleteLines`). An
+occurrence names its series in `recurringEventId` on every provider (a CalDAV occurrence also
+carries the series' rule), so its card gets no such line. The stored rule is worded by
+`storedRecurrenceSummary`, which shares `recurrenceText` with `recurrenceSummary`, so a stored and
+a given rule read the same; a stored UTC `UNTIL` is shown as its day in the device's zone. A stored
+`BYMONTH` out of range is left out (`recurrenceDaysText` used to index past the month list, which
+validated arguments never reached). The chat popover's `MarkdownChatText.describeRecurrence` is a
+separate, shorter wording (frequency and interval only). Pinned by `CalendarSeriesDeleteCardTests`
+and `CalDAVOccurrenceDeleteToolToWireTests` (the CalDAV series card before its DELETE; the
+occurrence card without the line).
+
 ## Pinned by
 
 `TabMailTests/Tools/CalendarRecurrenceDaysTests.swift`: the writer and the card per field and

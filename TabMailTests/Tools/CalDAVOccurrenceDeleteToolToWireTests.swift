@@ -188,6 +188,10 @@ struct CalDAVOccurrenceDeleteToolToWireTests {
         guard cardFailures.count == 1 else { return }
         #expect(cardFailures[0]?.contains("not supported yet") == true,
                 "the confirmed card does not show the refusal: \(cardFailures[0] ?? "nil")")
+        // The card shows one occurrence, so it does not say every occurrence goes (#639).
+        let cardLines = await MainActor.run { sink.confirmations.flatMap { $0.calendarEvents.flatMap(\.changes) } }
+        #expect(!cardLines.contains(CalendarToolHelpers.seriesDeleteNote),
+                "the card for one occurrence says the whole series will be deleted: \(cardLines)")
 
         // No queued delete succeeded or is left to succeed later.
         let ops = try await harness.pool.read { db in try PendingCalendarOperation.fetchAll(db) }
@@ -209,7 +213,7 @@ struct CalDAVOccurrenceDeleteToolToWireTests {
         let mapped = await translator.toRealId(seriesNumber)
         #expect(mapped == seriesCompound)
 
-        let sink = ConfirmingSink()
+        let sink = ConfirmingSink(http: harness.http)
         let output = try await CalendarEventDeleteTool(context: ToolContext(db: harness.pool, translator: translator)).execute(
             arguments: ["event_id": .string(String(seriesNumber))],
             invocation: ToolInvocation(uiSink: sink, sessionKey: "caldav-series-delete-control"))
@@ -217,6 +221,18 @@ struct CalDAVOccurrenceDeleteToolToWireTests {
         #expect(H.deletes(harness.http).count == 1,
                 "the harness must be able to send a DELETE, or the refusal's absence proves nothing: \(output)")
         #expect(harness.store.storedICS(path: W.seriesPath) == nil, "deleting by the series id left the series on the server")
+
+        // The card the user confirmed, before the DELETE was sent, said the event repeats and
+        // that every occurrence goes, with its rule (#639).
+        let (cardLines, requestsAtConfirmation) = await MainActor.run {
+            (sink.confirmations.flatMap { $0.calendarEvents.flatMap(\.changes) }, sink.requestsAtConfirmation)
+        }
+        #expect(cardLines == [CalendarToolHelpers.seriesDeleteNote, "Repeats: weekly"],
+                "the card for deleting the series does not say it repeats: \(cardLines)")
+        #expect(requestsAtConfirmation.count == 1, "expected one confirmation card, got \(requestsAtConfirmation.count)")
+        guard requestsAtConfirmation.count == 1 else { return }
+        let sentBeforeConfirming = harness.http.recordedCalls().prefix(requestsAtConfirmation[0])
+        #expect(!sentBeforeConfirming.contains { $0.method == "DELETE" }, "the DELETE was sent before the user confirmed the card")
     }
 }
 
