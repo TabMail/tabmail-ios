@@ -70,6 +70,15 @@ private func instant(_ value: Any?) -> Date? {
 /// `yyyy-MM-ddTHH:mm:ss` in UTC as an instant.
 private func utcAt(_ naive: String) -> Date? { Date.fromISO8601(naive + "Z") }
 
+/// The wall time `yyyy-MM-ddTHH:mm:ss` the UTC wall time `naive` is at in `zone`.
+private func wallTime(_ naive: String, in zone: String) -> String {
+    let fmt = DateFormatter()
+    fmt.locale = Locale(identifier: "en_US_POSIX")
+    fmt.timeZone = CalendarTimeZoneResolver.zone(named: zone, in: .none)
+    fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+    return utcAt(naive).map(fmt.string(from:)) ?? naive
+}
+
 private func reasons(_ rows: [PendingCalendarOperation]) -> [String] { rows.map { "\($0.status) \($0.failureReason ?? "")" } }
 
 /// The RFC 5545 weekday code (`MO`) of a `yyyy-MM-dd` date, in UTC.
@@ -142,6 +151,19 @@ private enum GoogleSeries {
     }
 
     static var calendar: [[String: Any]] { calendar(rule: weekly) }
+
+    /// `events` with every start, end and place labelled `zone`, at the same instants.
+    static func rezoned(_ events: [[String: Any]], _ zone: String) -> [[String: Any]] {
+        events.map { event in
+            var e = event
+            for key in ["start", "end", "originalStartTime"] {
+                guard var time = e[key] as? [String: Any] else { continue }
+                time["timeZone"] = zone
+                e[key] = time
+            }
+            return e
+        }
+    }
 
     static func calendar(rule: String) -> [[String: Any]] { [series(rule: rule), instance(day(0)), instance(day(7))] }
 }
@@ -1042,19 +1064,64 @@ struct CalendarSeriesScopeResetNoteTests {
         #expect(r.calendar.event(GoogleSeries.id)?["summary"] as? String == "Team standup", "\(r.run.out)")
     }
 
-    @Test("Google: a later occurrence's own time given back in another zone at the same instant moves the zone: the note, and the series is reset")
-    func googleSameInstantInAnotherZoneWarnsAndResets() async throws {
-        // Atlantic/Reykjavik is UTC+0 all year: the same clock digits are the same instant in a zone
-        // that is not the series' UTC.
+    @Test("Google: a series kept in Etc/UTC, its later occurrence's own time given back in UTC, moves nothing: no note, no reset")
+    func googleEtcUTCEchoInUTCIsQuiet() async throws {
+        // Etc/UTC and UTC are two zones Foundation tells apart; neither changes its clocks and both
+        // are at UTC+0, so every occurrence repeats at the same instant in either.
         let r = try await googleTool([
             "start_iso": .string("\(day(7))T09:00:00"), "end_iso": .string("\(day(7))T09:30:00"),
-            "title": .string("Team standup"), "timezone": .string("Atlantic/Reykjavik"),
-        ], eventId: GoogleSeries.later, account: "series-note-g-zone")
+            "title": .string("Team standup"), "timezone": .string("UTC"),
+        ], eventId: GoogleSeries.later, account: "series-note-g-etc-utc",
+           seed: GoogleSeries.rezoned(GoogleSeries.calendar, "Etc/UTC"))
+        #expect(r.run.cards.first?.changes.contains(CalendarToolHelpers.ruleChangeResetNote) == false,
+                "card: \(r.run.cards.first?.changes ?? [])")
+        #expect(r.calendar.seriesResets == 0, "the series was reset: \(r.calendar.writes)")
+        #expect(r.calendar.event(GoogleSeries.id)?["summary"] as? String == "Team standup", "\(r.run.out)")
+    }
+
+    /// An edit of every occurrence named from the occurrence `eventId` at `start`-`end` in `zone`
+    /// warns on the card, resets the series, and leaves it in `zone`.
+    private func expectZoneMove(_ start: String, _ end: String, zone: String, eventId: String,
+                                account: String, seed: [[String: Any]]? = nil) async throws {
+        let r = try await googleTool([
+            "start_iso": .string(start), "end_iso": .string(end),
+            "title": .string("Team standup"), "timezone": .string(zone),
+        ], eventId: eventId, account: account, seed: seed)
         #expect(r.run.cards.first?.changes.contains(CalendarToolHelpers.ruleChangeResetNote) == true,
                 "card: \(r.run.cards.first?.changes ?? [])")
         #expect(r.calendar.seriesResets == 1, "the write did not reset the series: \(r.calendar.writes)")
-        let start = r.calendar.event(GoogleSeries.id)?["start"] as? [String: Any]
-        #expect(start?["timeZone"] as? String == "Atlantic/Reykjavik", "start: \(String(describing: start))")
+        let stored = r.calendar.event(GoogleSeries.id)?["start"] as? [String: Any]
+        #expect(stored?["timeZone"] as? String == zone, "start: \(String(describing: stored))")
+    }
+
+    @Test("Google: a later occurrence's own clock time given in a zone at another offset is a move: the note, and the series is reset")
+    func googleSameDigitsInAnotherOffsetWarnsAndResets() async throws {
+        try await expectZoneMove("\(day(7))T09:00:00", "\(day(7))T09:30:00", zone: "Asia/Kolkata",
+                                 eventId: GoogleSeries.later, account: "series-note-g-digits")
+    }
+
+    @Test("Google: a later occurrence's own instant given in a zone with no clock changes at another offset is a move: the note, and the series is reset")
+    func googleSameInstantAtAnotherFixedOffsetWarnsAndResets() async throws {
+        // Asia/Kolkata (UTC+5:30) changes no clocks, as UTC does not; the offsets differ.
+        try await expectZoneMove(wallTime("\(day(7))T09:00:00", in: "Asia/Kolkata"),
+                                 wallTime("\(day(7))T09:30:00", in: "Asia/Kolkata"), zone: "Asia/Kolkata",
+                                 eventId: GoogleSeries.later, account: "series-note-g-fixed-offset")
+    }
+
+    @Test("Google: a series kept in a zone that changes its clocks, its first occurrence's own time given in another such zone at the same offset, is a move")
+    func googleSameOffsetInAnotherClockChangingZoneWarnsAndResets() async throws {
+        // America/New_York and America/Toronto are at one offset now and change their clocks:
+        // their rules may part later, so the series would repeat at other instants.
+        let seed = GoogleSeries.rezoned(GoogleSeries.calendar, "America/New_York")
+        let zone = try #require(CalendarTimeZoneResolver.zone(named: "America/Toronto", in: .none))
+        let newYork = try #require(CalendarTimeZoneResolver.zone(named: "America/New_York", in: .none))
+        let at = try #require(utcAt("\(day(0))T09:00:00"))
+        try #require(zone.secondsFromGMT(for: at) == newYork.secondsFromGMT(for: at)
+                     && zone.nextDaylightSavingTimeTransition(after: at) != nil,
+                     "setup: the two zones are not at one offset that day, or Toronto changes no clocks")
+        try await expectZoneMove(wallTime("\(day(0))T09:00:00", in: "America/Toronto"),
+                                 wallTime("\(day(0))T09:30:00", in: "America/Toronto"), zone: "America/Toronto",
+                                 eventId: GoogleSeries.first, account: "series-note-g-clock-pair", seed: seed)
     }
 
     @Test("Outlook: a new time of every occurrence named from a later occurrence warns on the card, and the series is reset")

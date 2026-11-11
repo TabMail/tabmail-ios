@@ -117,11 +117,13 @@ whether it is an occurrence.
   (`queuedEventId`). The card's reset note (`editResetsChangedOccurrences`, #423) is asked of
   `named.series` with the ROUTED arguments (PROOF P2): asked of the occurrence (no rule on Google and
   Outlook) with the edit as given, the card would show no note while the write resets. Google's check
-  (`GoogleCalendarProvider.googleTimes`) compares zones as `CalendarTimeZoneResolver` resolves them,
-  so an edit's "UTC", which the write names "GMT", is the series' own "UTC"; a same-instant change to
-  another zone (Atlantic/Reykjavik) is a move. "Etc/UTC" resolves to another zone than "UTC". The
-  Google fake resets on the same model; whether Google itself resets a series whose zone is only
-  renamed "UTC" to "GMT" is unmeasured.
+  (`GoogleCalendarProvider.googleTimes`) keys each zone with `googleZone` at that time's instant: two
+  zones are the same when `CalendarTimeZoneResolver` resolves them to one zone (an edit's "UTC", which
+  the write names "GMT", is the series' own "UTC"), or when neither changes its clocks after that
+  instant and both are at the same offset there ("Etc/UTC" and "UTC"; Atlantic/Reykjavik too). Two
+  clock-changing zones at one offset today (America/New_York, America/Toronto) are never the same:
+  their rules may part. No alias list. The Google fake resets on the same key; whether Google itself
+  resets a series whose zone is only renamed to an equal one at the same instant is unmeasured.
 - `AccountManagerCalendarQueue`, `.edit`: the same `read` and `route` again, writing `writeId`. An "all"
   edit that `route` sends to a later occurrence is refused (`laterOccurrenceRefusal`): it reaches the
   queue as "all" only when the series changed after the card, and the user confirmed every occurrence.

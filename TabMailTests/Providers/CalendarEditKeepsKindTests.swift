@@ -194,16 +194,14 @@ final class FakeGoogleCalendar: Sendable {
     }
 
     /// Whether a written start or end is the stored one as Google reads it: the same date, or the
-    /// same instant, and the same zone. Zones are compared as the zones their names resolve to
-    /// (`CalendarTimeZoneResolver`, so "UTC" and "GMT" are one), a name that resolves to none as
-    /// written: the model `GoogleCalendarProvider.googleTimes` holds. Unmeasured on Google: whether
-    /// a series whose zone is renamed "UTC" to "GMT" at the same instant is reset.
+    /// same instant, and the same zone as `GoogleCalendarProvider.googleZone` keys it (the model the
+    /// card's reset note holds). Unmeasured on Google: whether a series whose zone is only renamed
+    /// to one that is the same there ("UTC" to "GMT", "Etc/UTC" to "GMT") at the same instant is reset.
     private static func sameTime(_ written: Any, _ stored: Any?) -> Bool {
         guard let written = written as? [String: Any], let stored = stored as? [String: Any] else { return false }
         func instant(_ value: [String: Any]) -> Date? { (value["dateTime"] as? String).flatMap { Date.fromISO8601($0) } }
-        func zone(_ value: [String: Any]) -> AnyHashable? {
-            guard let name = value["timeZone"] as? String else { return nil }
-            return CalendarTimeZoneResolver.zone(named: name, in: .none).map(AnyHashable.init) ?? AnyHashable(name)
+        func zone(_ value: [String: Any]) -> String? {
+            (value["timeZone"] as? String).map { GoogleCalendarProvider.googleZone($0, at: instant(value)) }
         }
         return written["date"] as? String == stored["date"] as? String
             && instant(written) == instant(stored)

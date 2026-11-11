@@ -1437,23 +1437,36 @@ actor GoogleCalendarProvider: CalendarProvider {
     /// series' own times spelled otherwise are its own, and the same instant in another zone,
     /// which Google stores and repeats the series in, is a move.
     ///
-    /// The zone is the one its name resolves to (`CalendarTimeZoneResolver`), compared as a zone:
-    /// an edit's "UTC", which the write names "GMT" (`buildGCalEventInput` writes the resolved
-    /// zone's identifier), is the series' own "UTC". Only names that resolve to one zone are one
-    /// zone ("UTC" and "GMT"; "Etc/UTC" is another). A name it does not resolve is compared as
-    /// written, as before: a zone that can't be told is the same only under its own name.
+    /// Each zone is compared as `googleZone` keys it at that time's own instant.
     nonisolated static func googleTimes(_ merged: GCalEventInput) -> NSDictionary {
         func time(_ date: String?, _ dateTime: String?, _ zone: String?) -> [String: Any] {
             var value: [String: Any] = [:]
+            let instant = dateTime.flatMap { Date.fromISO8601($0) }
             if let date { value["date"] = date }
-            if let dateTime { value["dateTime"] = Date.fromISO8601(dateTime).map { "\($0.timeIntervalSince1970)" } ?? dateTime }
-            if let zone { value["timeZone"] = CalendarTimeZoneResolver.zone(named: zone, in: .none).map { $0 as NSTimeZone as Any } ?? zone }
+            if let dateTime { value["dateTime"] = instant.map { "\($0.timeIntervalSince1970)" } ?? dateTime }
+            if let zone { value["timeZone"] = googleZone(zone, at: instant) }
             return value
         }
         return NSDictionary(dictionary: [
             "start": time(merged.startDate, merged.startDateTime, merged.startTimeZone),
             "end": time(merged.endDate, merged.endDateTime, merged.endTimeZone),
         ])
+    }
+
+    /// The zone `name` names, as a key that is equal exactly for the zones a Google time at
+    /// `instant` repeats in alike: two zones are the same when they resolve to one zone
+    /// (`CalendarTimeZoneResolver`: an edit's "UTC", which the write names "GMT", is the series'
+    /// own "UTC"), or when neither changes its clocks after `instant` and both are at the same
+    /// offset there ("Etc/UTC" and "UTC"). Two zones that change their clocks are never the same
+    /// for an offset they share at `instant`: their rules may part later. A name that resolves to
+    /// no zone is the same only as itself, as written. A time with no instant (an all-day date)
+    /// compares resolved zones alone. The Google test fake resets a series on this same key.
+    nonisolated static func googleZone(_ name: String, at instant: Date?) -> String {
+        guard let zone = CalendarTimeZoneResolver.zone(named: name, in: .none) else { return "name:\(name)" }
+        if let instant, zone.nextDaylightSavingTimeTransition(after: instant) == nil {
+            return "offset:\(zone.secondsFromGMT(for: instant))"
+        }
+        return "zone:\(zone.identifier)"
     }
 
     /// Whether two `recurrence` arrays differ in meaning, as sets of lines: an RRULE line as
