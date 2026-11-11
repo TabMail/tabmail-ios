@@ -22,7 +22,9 @@ import GRDB
 // - a date-only value on a timed series names the one occurrence that day; on an Outlook all-day
 //   series a date names that date's occurrence whatever zone the call names (#647's lookup);
 // - a date that names no occurrence, an already deleted one, an ambiguous or a malformed one
-//   refuses the WHOLE call: no card, nothing queued, nothing written;
+//   refuses the WHOLE call: no card, nothing queued, nothing written; so do an unrecognised
+//   `timezone`, a malformed exdates_add (not a list, a non-string or blank entry), and a lookup
+//   answering with the series' own id (a delete by it would remove every occurrence);
 // - exdates_add with any other argument (every schema change field, and keys outside the schema)
 //   is refused by name, telling the assistant to send the other change FIRST and exdates_add after
 //   a fresh read; a one-off event is refused; a declined card deletes nothing;
@@ -397,6 +399,35 @@ struct CalendarEditExdatesGoogleTests {
         expectOtherChangeFirst(g.run.out)
     }
 
+    @Test("an unrecognised timezone refuses the call, naming the zone, before anything is read or queued")
+    func unrecognisedZoneIsRefused() async throws {
+        let g = try await google([
+            "exdates_add": .array([.string("\(day(7))T09:00:00")]), "timezone": .string("Mars/Olympus"),
+        ], account: "exdates-g-bad-zone")
+        expectRefused(g.run, writes: g.calendar.writes, naming: ["Mars/Olympus", "did not delete any occurrence"])
+    }
+
+    /// The malformed shapes of exdates_add, each with a valid date beside it where it can carry one.
+    static var malformed: [(name: String, value: JSONValue)] { [
+        ("not a list", .string("\(day(7))T09:00:00")),
+        ("a non-string entry", .array([.string("\(day(7))T09:00:00"), .int(42)])),
+        ("a blank entry", .array([.string("\(day(7))T09:00:00"), .string("   ")])),
+    ] }
+    static let malformedCount = 3
+
+    @Test("a malformed exdates_add refuses the whole call: nothing queued or written, the valid date beside it not deleted",
+          arguments: 0..<malformedCount)
+    func malformedDatesRefuseTheWholeCall(index: Int) async throws {
+        #expect(Self.malformed.count == Self.malformedCount)
+        let bad = Self.malformed[index]
+        let g = try await google([
+            "exdates_add": bad.value, "timezone": .string("UTC"),
+        ], account: "exdates-g-malformed-\(index)")
+        expectRefused(g.run, writes: g.calendar.writes, naming: ["exdates_add"])
+        #expect(g.calendar.event(GoogleWeekly.instanceId(day(7)))?["status"] as? String == "confirmed",
+                "\(bad.name): the valid date was deleted")
+    }
+
     @Test("the deletes are queued all or none: when the second row can't be written, nothing is queued and nothing deleted")
     func deletesAreQueuedAllOrNone() async throws {
         let g = try await google([
@@ -574,6 +605,38 @@ struct CalendarEditExdatesOutlookTests {
         ], account: "exdates-o-combined")
         expectRefused(o.run, writes: o.calendar.deleted + o.calendar.patches("ser-1").map { "\($0)" }, naming: ["title"])
         expectOtherChangeFirst(o.run.out)
+    }
+}
+
+// MARK: - A lookup that names the series
+
+@Suite("calendar_event_edit exdates_add: a lookup answering with the series' own id", .serialized, .processGlobalState)
+struct CalendarEditExdatesSeriesIdTests {
+
+    @Test("an occurrence lookup that answers with the series' own id is refused before the card: a delete by that id would remove every occurrence")
+    func lookupNamingTheSeriesIsRefused() async throws {
+        let seriesId = "ser-stub"
+        let mock = MockCalendarProvider()
+        await mock.setGetEventResult(GCalEvent(
+            id: seriesId, summary: "Standup", location: nil, description: nil,
+            start: GCalDateTime(dateTime: "\(day(0))T09:00:00Z", date: nil, timeZone: "UTC"),
+            end: GCalDateTime(dateTime: "\(day(0))T09:30:00Z", date: nil, timeZone: "UTC"),
+            attendees: nil, organizer: nil, recurrence: ["RRULE:FREQ=WEEKLY"],
+            transparency: nil, status: "confirmed", htmlLink: nil, created: nil, updated: nil,
+            recurringEventId: nil))
+        // The lookup answers with the series' id itself, as no provider does today.
+        await mock.setOccurrenceResult(GCalEvent(
+            id: seriesId, summary: "Standup", location: nil, description: nil,
+            start: GCalDateTime(dateTime: "\(day(7))T09:00:00Z", date: nil, timeZone: "UTC"),
+            end: GCalDateTime(dateTime: "\(day(7))T09:30:00Z", date: nil, timeZone: "UTC"),
+            attendees: nil, organizer: nil, recurrence: nil,
+            transparency: nil, status: "confirmed", htmlLink: nil, created: nil, updated: nil,
+            recurringEventId: seriesId))
+        let r = try await run([
+            "exdates_add": .array([.string("\(day(7))T09:00:00")]), "timezone": .string("UTC"),
+        ], eventId: seriesId, account: "exdates-stub-series-id", provider: mock)
+        let deleted = await mock.deletedEvents.map(\.eventId)
+        expectRefused(r, writes: deleted, naming: ["no id of its own"])
     }
 }
 
