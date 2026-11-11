@@ -313,10 +313,23 @@ extension AccountManager {
             calendarId: calendarId,
             arguments: arguments
         )
-        try await dbPool.write { db in try op.insert(db) }
-        BackgroundSyncLogger.logDebug("[CalendarQueue] Queued \(type.rawValue) for account \(accountId) (id: \(op.id))")
-        Task { await drainCalendarQueue() }
+        try await queueCalendarOperations([op])
         return op
+    }
+
+    /// Queue several calendar mutations in ONE write: every row is persisted, or none is (the
+    /// write is one transaction, so a failure rolls back the rows already inserted). One
+    /// confirmation that asks for several writes (`calendar_event_edit`'s `exdates_add`, one
+    /// delete per occurrence) is never left half queued. Each row then drains as an ordinary
+    /// operation of its own.
+    func queueCalendarOperations(_ ops: [PendingCalendarOperation]) async throws {
+        try await dbPool.write { db in
+            for op in ops { try op.insert(db) }
+        }
+        for op in ops {
+            BackgroundSyncLogger.logDebug("[CalendarQueue] Queued \(op.operationType) for account \(op.accountId) (id: \(op.id))")
+        }
+        Task { await drainCalendarQueue() }
     }
 
     /// Drain all queued calendar operations in FIFO order.
@@ -1150,12 +1163,12 @@ extension AccountManager {
     /// wedge, and the wedge corollary sits in the same non-recoverable set as a
     /// dropped intention — it never recovers via sync.
     static func isCalendarUnsupportedError(_ error: Error) -> Bool {
-        if case CalendarProviderError.notSupported = error { return true }
-        return false
+        // Every case is a final refusal: `notSupported`, and a series not in this calendar (#729).
+        error is CalendarProviderError
     }
 
     private func unsupportedReason(_ error: Error) -> String {
-        if case CalendarProviderError.notSupported(let msg) = error { return msg }
+        if let refused = error as? CalendarProviderError { return refused.reason }
         return "operation not supported on this calendar provider"
     }
 

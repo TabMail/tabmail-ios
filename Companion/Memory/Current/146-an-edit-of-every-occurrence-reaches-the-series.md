@@ -141,6 +141,12 @@ transient: an empty 2xx body is indeterminate, `CalendarBadRequestClassification
   this calendar, so it can't be changed as a whole or split; one of its occurrences can be changed with
   `this_only`, by the id listed for it and its `start_iso`. `scopedEdit`'s no-series branch (the resource's
   own id, or a split) throws the same reason. A resource with no VEVENT at all stays `parseError`.
+  **Since #694 (2026-11-11; the lines above are kept as history):** the refusal is the neutral case
+  `CalendarProviderError.seriesNotInThisCalendar`, thrown at the same two places, so no caller above
+  `CalendarProvider` names a CalDAV constant. An edit words it with
+  `CalendarProviderError.seriesNotInThisCalendarReason` (the text above, unchanged for the user, read
+  through `CalendarProviderError.reason`); the queue's unsupported arm takes every `CalendarProviderError`
+  and retires with that `reason`; `exdates_add` words it for removing dates (memory 144).
 - So "all" (or no scope and no `recurrence_id`) and `this_and_following` named by such an occurrence are
   refused before the card, and a row that reaches the drain (the resource rewritten between the card and
   the drain) is retired by the unsupported arm in that drain; never requeued.

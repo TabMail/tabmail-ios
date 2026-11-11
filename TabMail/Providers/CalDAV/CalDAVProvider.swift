@@ -242,7 +242,7 @@ actor CalDAVProvider: CalendarProvider {
     ///
     /// A resource that holds only changed occurrences, with no series VEVENT (an invitation to
     /// single occurrences of someone else's series), has no series to read by its own id: that
-    /// is the final answer `notSupported(CalDAVOccurrences.seriesNotInThisCalendar)`, the same
+    /// is the final answer `CalendarProviderError.seriesNotInThisCalendar`, the same
     /// on every read, never a parse error (#720). A resource with no VEVENT at all stays a
     /// `parseError`.
     func getEvent(calendarId: String, eventId: String) async throws -> GCalEvent {
@@ -268,7 +268,7 @@ actor CalDAVProvider: CalendarProvider {
         let events = ICSParser.parse(icsText: icsText, resourceHref: seriesHref, etag: etag)
         guard let event = events.first else {
             if CalDAVOccurrences.holdsOnlyChangedOccurrences(icsText: icsText, href: seriesHref) {
-                throw CalendarProviderError.notSupported(CalDAVOccurrences.seriesNotInThisCalendar)
+                throw CalendarProviderError.seriesNotInThisCalendar
             }
             throw CalDAVError.parseError("No VEVENT found in \(eventId)")
         }

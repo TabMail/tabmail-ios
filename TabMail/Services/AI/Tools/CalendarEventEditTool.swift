@@ -80,6 +80,16 @@ struct CalendarEventEditTool: AgentTool, Sendable {
             provider = await CalendarProviderDispatch.resolve(db: ctx.db)?.provider
         }
 
+        // `exdates_add` deletes occurrences, in a call of its own (#694): its own checks come
+        // first, and once the event is read it goes its own way (`CalendarEventEditExdates`).
+        var exdates: (dates: [String], zone: TimeZone)?
+        if CalendarEventEditExdates.isRequested(arguments) {
+            switch CalendarEventEditExdates.check(arguments, compoundId: compoundId) {
+            case .refused(let output): return output
+            case .dates(let dates, let zone): exdates = (dates, zone)
+            }
+        }
+
         // Build change descriptions for confirmation card from arguments alone
         var changes: [String] = []
         if let v = CalendarToolHelpers.stringArgOpt(arguments, "title") {
@@ -199,6 +209,16 @@ struct CalendarEventEditTool: AgentTool, Sendable {
             ] as [String: Any])
         }
 
+        if let exdates {
+            return try await CalendarEventEditExdates.execute(
+                dates: exdates.dates, zone: exdates.zone,
+                target: .init(
+                    event: fetchedEvent, eventId: eventId, compoundId: compoundId,
+                    accountId: resolvedAccountId, lookupCalendarId: lookupCalId,
+                    calendarId: calendarId, calendarName: calendarName),
+                provider: provider, translator: ctx.translator, invocation: invocation)
+        }
+
         // The occurrence the edit names, found by the provider's own lookup (the one its write
         // makes), and refused here, before the card, when none starts there, it was deleted, the
         // event id and recurrence_id name different ones, or the provider's write would refuse it.
@@ -207,10 +227,12 @@ struct CalendarEventEditTool: AgentTool, Sendable {
             named = try await CalendarSeriesScope.read(
                 event: fetchedEvent, eventId: eventId, recurrenceId: recurrenceIdArg, scope: resolvedScope,
                 calendarId: lookupCalId, zone: tz, splitting: false, provider: provider)
-        } catch CalendarProviderError.notSupported(let reason) {
+        } catch let refused as CalendarProviderError {
+            // A provider's refusal, worded for an edit (`reason`): `notSupported`'s own, and the
+            // edit's words for a neutral case (a series not in this calendar, #729).
             return ToolJSON.string(from: [
                 "ok": false,
-                "error": "calendar_event_edit failed: \(reason). The event was NOT changed.",
+                "error": "calendar_event_edit failed: \(refused.reason). The event was NOT changed.",
                 "event_id": compoundId,
             ] as [String: Any])
         } catch where AccountManager.isCalendarNotFoundError(error) {
