@@ -665,7 +665,7 @@ struct CalendarEditExdatesCalDAVTests {
         #expect(harness.store.storedICS(path: W.seriesPath) == fixture.ics, "the series changed")
     }
 
-    @Test("a resource holding only changed occurrences is refused before the card, nothing PUT or deleted")
+    @Test("a resource holding only changed occurrences is refused before the card, nothing PUT or deleted, saying plainly why and never steering to a one-occurrence edit")
     func changedOnlyResourceIsRefused() async throws {
         let harness = try await H.makeHarness(accountId: "exdates-caldav-changed-only")
         defer { H.tearDown(harness) }
@@ -690,7 +690,11 @@ struct CalendarEditExdatesCalDAVTests {
         let r = try await run(harness, eventId: occurrenceId, [
             "exdates_add": .array([.string(OccurrenceFixture.naive(start, fixture.zone))]), "timezone": .string("America/New_York"),
         ])
-        expectRefused(r, writes: harness.store.recordedPuts().map(\.path) + H.deletes(harness.http))
+        expectRefused(r, writes: harness.store.recordedPuts().map(\.path) + H.deletes(harness.http),
+                      naming: ["only changed occurrences of this repeating event are on the server", "calendar app"])
+        // The edit path's refusal advises a one-occurrence edit, which no exdates call can use.
+        #expect(!r.out.contains("this_only") && !r.out.contains("edit_scope") && !r.out.contains("recurrence_id"),
+                "the answer steers to a one-occurrence edit: \(r.out)")
         #expect(harness.store.storedICS(path: path) == ics, "the resource is not on the server as it was")
     }
 }

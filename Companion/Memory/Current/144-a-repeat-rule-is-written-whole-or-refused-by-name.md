@@ -115,7 +115,9 @@ write (`AccountManager.queueCalendarOperations`, all or none; the executor is un
 notified as every delete notifies them and CalDAV goes through #661's `EXDATE` write); the answer names
 each date beside the start of the occurrence it named (so a date that resolved to another occurrence
 shows), deleted, queued or NOT deleted with its reason, never "updated". A CalDAV resource holding
-only changed occurrences is refused by the lookup before the card; a one-off event, and an occurrence
+only changed occurrences is refused by the lookup before the card, in the exdates path's own words
+(`CalendarEventEditExdates.seriesNotHere`: only changed occurrences are on the server, nothing deleted,
+change it in the calendar app), never #729's edit advice to use `edit_scope` this_only; a one-off event, and an occurrence
 id equal to the series' own, are refused locally. Two dates naming one occurrence delete it once (one
 card row, one delete, both dates named). On an Outlook all-day series a date names that date's
 occurrence whatever zone the call names, through #647's date lookup (before it, a call zone west of the

@@ -29,6 +29,11 @@ enum CalendarEventEditExdates {
     /// done: the wait every calendar tool gives one write (`awaitCalendarOpOutcome`).
     static let outcomeWaitSeconds: Double = 10
 
+    /// The answer when the event's series is not on the server, only changed occurrences of it (a
+    /// calendar entry holding no series, #729): no date of it can be removed here.
+    static let seriesNotHere =
+        "only changed occurrences of this repeating event are on the server, not the event itself, so its dates can't be removed here. Nothing was deleted. The user can change it in their calendar app"
+
     /// The only arguments an `exdates_add` call may carry. Any other key, in the schema or not, is a
     /// change this path would not make, so it is refused by name (fails closed). `edit_scope` is
     /// allowed only when it is "all" (`isAllScope`).
@@ -163,6 +168,10 @@ enum CalendarEventEditExdates {
             do {
                 occurrence = try await provider.occurrence(
                     calendarId: target.lookupCalendarId, eventId: seriesId, recurrenceId: date, recurrenceIdZone: zone)
+            } catch CalendarProviderError.notSupported(let reason) where reason == CalDAVOccurrences.seriesNotInThisCalendar {
+                // That refusal advises the edit path's one-occurrence edit, which no exdates call
+                // can use: say what is true for removing dates instead.
+                return refusal(Self.seriesNotHere, compoundId: target.compoundId)
             } catch CalendarProviderError.notSupported(let reason) {
                 let reason = reason.trimmingCharacters(in: CharacterSet(charactersIn: ". "))
                 return refusal(
