@@ -124,12 +124,12 @@ extension CalDAVProvider {
         var handledMaster = false
         var i = 0
         while i < lines.count {
-            guard lines[i] == "BEGIN:VEVENT" else {
+            guard isMarker(lines[i], "BEGIN:VEVENT") else {
                 output.append(lines[i]); i += 1; continue
             }
             var block: [String] = [lines[i]]
             i += 1
-            while i < lines.count && lines[i] != "END:VEVENT" {
+            while i < lines.count && !isMarker(lines[i], "END:VEVENT") {
                 block.append(lines[i])
                 i += 1
             }

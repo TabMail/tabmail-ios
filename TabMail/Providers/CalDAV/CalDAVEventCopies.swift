@@ -490,12 +490,19 @@ extension CalDAVProvider {
         var physical: [String]
         var text: String
 
-        /// True when this is the line `marker` (`BEGIN:VEVENT`, `END:VEVENT`), whitespace around it
-        /// ignored, so a server's trailing space after either line does not hide the VEVENT from
-        /// the reader (`ICSParser`) or the writer.
+        /// True when this is the line `marker` (`isMarker(_:_:)`).
         func isMarker(_ marker: String) -> Bool {
-            text.trimmingCharacters(in: .whitespacesAndNewlines) == marker
+            CalDAVProvider.isMarker(text, marker)
         }
+    }
+
+    /// True when `line` is the component line `marker` (`BEGIN:VEVENT`, `END:VEVENT`,
+    /// `END:VCALENDAR`) with any trailing whitespace, so a server's trailing space after such a
+    /// line does not hide the VEVENT from the reader (`ICSParser`) or from any writer. The one rule
+    /// for every match of these lines in the CalDAV path. Leading whitespace is not ignored: on a
+    /// physical line it makes a folded continuation, never a component line.
+    static func isMarker(_ line: String, _ marker: String) -> Bool {
+        line.hasPrefix(marker) && line.dropFirst(marker.count).allSatisfy(\.isWhitespace)
     }
 
     static func icsUnits(_ ics: String) -> [ICSUnit] {
@@ -632,7 +639,7 @@ extension CalDAVProvider {
         let units = lines.map { ICSUnit(physical: [$0], text: $0) }
         let at = block.indices.dropFirst().first { idx in
             let upper = block[idx].text.uppercased()
-            return upper.hasPrefix("BEGIN:") || upper.trimmingCharacters(in: .whitespacesAndNewlines) == "END:VEVENT"
+            return upper.hasPrefix("BEGIN:") || isMarker(upper, "END:VEVENT")
         } ?? block.endIndex
         var out = block
         out.insert(contentsOf: units, at: at)

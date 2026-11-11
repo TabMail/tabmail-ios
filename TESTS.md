@@ -189,7 +189,9 @@ These tests read what each provider sent, or what the fake server ends up holdin
   - Pins of how a VEVENT is read, kept green across the move of `ICSParser` onto the writer's
     helpers: trailing whitespace, CRLF and bare-LF folding, the series read when a changed
     occurrence comes first, a lower-case nested component, a `BEGIN:VEVENT`/`END:VEVENT` line with
-    trailing whitespace (read by `ICSParserTests`, read and written by `CalDAVMergePatchTests`),
+    trailing whitespace (read by `ICSParserTests`; read and written by `CalDAVMergePatchTests`,
+    through the merge, `replaceRRule`, a moved start's `shiftSeriesAnchoredValues`, and a new or
+    repeated one-occurrence change's `spliceOrReplaceOverride`),
     the master readers (`extractUID` … `masterStartWallTime`) across frames and layouts
     (`CalDAVRecurringHelpersTests`), and `ICSParserOutputPinTests`, a field-by-field pin of
     `ICSParser.parse` for alarm-free resources.

@@ -824,7 +824,7 @@ actor CalDAVProvider: CalendarProvider {
         var replaced = false
         var i = 0
         while i < lines.count {
-            guard lines[i] == "BEGIN:VEVENT", !replaced else {
+            guard Self.isMarker(lines[i], "BEGIN:VEVENT"), !replaced else {
                 output.append(lines[i]); i += 1; continue
             }
             // Buffer the whole VEVENT block — we can't tell master from
@@ -832,7 +832,7 @@ actor CalDAVProvider: CalendarProvider {
             var block: [String] = [lines[i]]
             var hasRecurrenceId = false
             i += 1
-            while i < lines.count && lines[i] != "END:VEVENT" {
+            while i < lines.count && !Self.isMarker(lines[i], "END:VEVENT") {
                 if lines[i].hasPrefix("RECURRENCE-ID") { hasRecurrenceId = true }
                 block.append(lines[i])
                 i += 1
@@ -1243,12 +1243,12 @@ actor CalDAVProvider: CalendarProvider {
 
         while i < lines.count {
             let line = lines[i]
-            if line == "BEGIN:VEVENT" {
+            if Self.isMarker(line, "BEGIN:VEVENT") {
                 // Collect this VEVENT into `block` so we can decide whether to keep it.
                 var block: [String] = [line]
                 var blockRecurId: String? = nil
                 i += 1
-                while i < lines.count && lines[i] != "END:VEVENT" {
+                while i < lines.count && !Self.isMarker(lines[i], "END:VEVENT") {
                     block.append(lines[i])
                     if lines[i].hasPrefix("RECURRENCE-ID") {
                         // Normalize RECURRENCE-ID value (strip params + parse).
@@ -1269,7 +1269,7 @@ actor CalDAVProvider: CalendarProvider {
                 }
                 continue
             }
-            if line == "END:VCALENDAR" && !spliced {
+            if Self.isMarker(line, "END:VCALENDAR") && !spliced {
                 // No matching override existed — append ours before END:VCALENDAR.
                 output.append(newOverrideBlock)
                 spliced = true

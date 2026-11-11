@@ -160,10 +160,16 @@ alert's recipient as an attendee; notes "added to" overwrote the event's own wit
   `masterDTStartDay`, `icsIsAllDay`, `masterDTStartKind`, `recurrenceIdKind` and
   `masterStartWallTime` read `masterTopLevelLines`. An alarm's own `UID` (RFC 9074) placed before
   the event's no longer answers `successorIsOurs`.
-- `ICSUnit.isMarker` matches `BEGIN:VEVENT`/`END:VEVENT` with surrounding whitespace ignored, so a
-  VEVENT whose marker line has trailing whitespace is read and written. `replaceRRule`,
-  `spliceOrReplaceOverride` and `shiftSeriesAnchoredValues` still match those lines exactly on
-  physical lines.
+- `CalDAVProvider.isMarker` (and `ICSUnit.isMarker`) is the one rule for matching `BEGIN:VEVENT`,
+  `END:VEVENT` and `END:VCALENDAR` in the CalDAV path: trailing whitespace ignored, leading not (on
+  a physical line it makes a folded continuation). The shared helpers, `replaceRRule`,
+  `spliceOrReplaceOverride` and `shiftSeriesAnchoredValues` all use it. Before, a padded line hid
+  the VEVENT from those three: a new rule or a moved start was not written, and
+  `spliceOrReplaceOverride` lost a new one-occurrence change, wrote a second override for a changed
+  one, or (padded `END:VEVENT` on the series) replaced the whole resource with the override.
+- Not moved, each with its own rule outside the CalDAV path: `ICSBuilder.parseIncoming` and
+  `ICSSanitizer` (Shared, trimmed and case-insensitive already), and the diagnostic VEVENT count
+  in `ICSCalendarImporter`'s debug log line.
 - Tests: `CalDAVAlarmIsNotTheEventTests`; `TESTS.md`, "Repeating events — copies keep the series'
   properties".
 

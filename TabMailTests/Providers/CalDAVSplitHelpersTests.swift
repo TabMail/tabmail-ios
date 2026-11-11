@@ -857,6 +857,123 @@ struct CalDAVMergePatchTests {
         #expect(lines.filter { !$0.hasPrefix("SUMMARY") && !$0.hasPrefix("DESCRIPTION") }
                 == ics.components(separatedBy: "\r\n").filter { !$0.hasPrefix("SUMMARY") }, text)
     }
+
+    /// A weekly series from 09:00 UTC ten days from today, one excluded date a week in, and a changed
+    /// occurrence at two weeks; every `BEGIN:VEVENT` (`.begin`) or every `END:VEVENT` (`.end`) line
+    /// carries trailing whitespace.
+    private struct PaddedSeries {
+        let padded: PaddedMarker
+        let start: Date
+        let fmt: DateFormatter
+
+        init(_ padded: PaddedMarker) {
+            self.padded = padded
+            var utc = Calendar(identifier: .gregorian)
+            utc.timeZone = TimeZone(identifier: "UTC") ?? .current
+            start = utc.startOfDay(for: Date().addingTimeInterval(10 * 86_400)).addingTimeInterval(9 * 3_600)
+            fmt = DateFormatter()
+            fmt.locale = Locale(identifier: "en_US_POSIX")
+            fmt.timeZone = utc.timeZone
+            fmt.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+        }
+
+        func stamp(days: Int, hours: Int = 0) -> String {
+            fmt.string(from: start.addingTimeInterval(TimeInterval(days * 86_400 + hours * 3_600)))
+        }
+
+        func naive(days: Int) -> String {
+            let naive = DateFormatter()
+            naive.locale = Locale(identifier: "en_US_POSIX")
+            naive.timeZone = fmt.timeZone
+            naive.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+            return naive.string(from: start.addingTimeInterval(TimeInterval(days * 86_400)))
+        }
+
+        var begin: String { padded == .end ? "BEGIN:VEVENT" : "BEGIN:VEVENT " }
+        var end: String { padded == .begin ? "END:VEVENT" : "END:VEVENT\t" }
+
+        var ics: String {
+            [
+                "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Example//Test//EN",
+                begin, "UID:padded-series-603", "DTSTAMP:\(stamp(days: 0))", "DTSTART:\(stamp(days: 0))",
+                "DURATION:PT1H", "RRULE:FREQ=WEEKLY", "EXDATE:\(stamp(days: 7))", "SUMMARY:Planning", end,
+                begin, "UID:padded-series-603", "DTSTAMP:\(stamp(days: 0))", "RECURRENCE-ID:\(stamp(days: 14))",
+                "DTSTART:\(stamp(days: 14, hours: 1))", "DURATION:PT1H", "SUMMARY:Planning (moved)", end,
+                "END:VCALENDAR",
+            ].joined(separator: "\r\n") + "\r\n"
+        }
+
+        /// The resource's VEVENTs, each as its logical lines without the BEGIN and END lines.
+        static func vevents(_ ics: String) -> [[String]] {
+            var out: [[String]] = []
+            var current: [String]?
+            for line in ics.components(separatedBy: "\r\n") {
+                let marker = line.replacingOccurrences(of: #"\s+$"#, with: "", options: .regularExpression)
+                if marker == "BEGIN:VEVENT" { current = []; continue }
+                if marker == "END:VEVENT", let block = current { out.append(block); current = nil; continue }
+                current?.append(line)
+            }
+            return out
+        }
+    }
+
+    @Test("a padded VEVENT line does not stop a new rule replacing the series' rule",
+          arguments: [PaddedMarker.begin, .end])
+    func paddedVEventMarkersRuleReplaced(_ padded: PaddedMarker) {
+        let series = PaddedSeries(padded)
+        let replaced = CalDAVProvider.replaceRRule(in: series.ics, newRRule: "RRULE:FREQ=DAILY;COUNT=5")
+        let text = Comment(rawValue: replaced)
+        let before = series.ics.components(separatedBy: "\r\n")
+        let after = replaced.components(separatedBy: "\r\n")
+        // Only the series' rule line changed; every other line is kept byte for byte.
+        #expect(after.filter { $0.hasPrefix("RRULE") } == ["RRULE:FREQ=DAILY;COUNT=5"], text)
+        #expect(after.filter { !$0.hasPrefix("RRULE") } == before.filter { !$0.hasPrefix("RRULE") }, text)
+    }
+
+    @Test("a padded VEVENT line does not stop a moved start moving the excluded date and the changed occurrence",
+          arguments: [PaddedMarker.begin, .end])
+    func paddedVEventMarkersStartShifted(_ padded: PaddedMarker) throws {
+        let series = PaddedSeries(padded)
+        var patch = GCalEventInput()
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime]
+        patch.startDateTime = iso.string(from: series.start.addingTimeInterval(3_600))
+        let merged = try CalDAVProvider.mergePatchIntoICS(series.ics, patch: patch)
+        let text = Comment(rawValue: merged)
+        let events = PaddedSeries.vevents(merged)
+        #expect(events.count == 2, text)
+        guard events.count == 2 else { return }
+        #expect(events[0].filter { $0.hasPrefix("DTSTART") } == ["DTSTART:\(series.stamp(days: 0, hours: 1))"], text)
+        #expect(events[0].filter { $0.hasPrefix("EXDATE") } == ["EXDATE:\(series.stamp(days: 7, hours: 1))"], text)
+        #expect(events[1].filter { $0.hasPrefix("RECURRENCE-ID") } == ["RECURRENCE-ID:\(series.stamp(days: 14, hours: 1))"], text)
+        // The changed occurrence keeps its own time.
+        #expect(events[1].filter { $0.hasPrefix("DTSTART") } == ["DTSTART:\(series.stamp(days: 14, hours: 1))"], text)
+    }
+
+    /// Which occurrence a one-occurrence edit changes: one with no change of its own yet, or the one
+    /// the resource already holds a change for.
+    enum OccurrenceEdited: String, CaseIterable, Sendable {
+        case new = "an occurrence not changed before"
+        case existing = "the occurrence changed before"
+    }
+
+    @Test("a padded VEVENT line does not lose or duplicate a one-occurrence change",
+          arguments: [PaddedMarker.begin, .end], OccurrenceEdited.allCases)
+    func paddedVEventMarkersOccurrenceChanged(_ padded: PaddedMarker, _ edited: OccurrenceEdited) throws {
+        let series = PaddedSeries(padded)
+        let days = edited == .new ? 21 : 14
+        let written = try CalDAVProvider.occurrenceOverrideResource(
+            storedICS: series.ics, recurrenceIdNaive: series.naive(days: days),
+            patch: { var p = GCalEventInput(); p.summary = "Planning (changed)"; return p }(), now: Date())
+        let text = Comment(rawValue: written)
+        let events = PaddedSeries.vevents(written)
+        // The series, the occurrence changed before, and the new change when it is a new one.
+        #expect(events.count == (edited == .new ? 3 : 2), text)
+        let changed = events.filter { $0.contains("RECURRENCE-ID:\(series.stamp(days: days))") }
+        #expect(changed.count == 1, text)
+        #expect(changed.first?.filter { $0.hasPrefix("SUMMARY") } == ["SUMMARY:Planning (changed)"], text)
+        #expect(written.components(separatedBy: "\r\n").last { !$0.isEmpty } == "END:VCALENDAR", text)
+    }
 }
 
 // MARK: - splitSeries over the wire
