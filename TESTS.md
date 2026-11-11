@@ -591,7 +591,8 @@ two parts to the series through the fake's own range expansion (`rangeDays`): th
 occurrences followed by the new part's are exactly the series', with an occurrence before the split
 deleted, moved, or both (as measured, they still count), the split at the last occurrence, a range
 starting the day before its first occurrence, every-other-week series whose weeks start on Sunday
-and on Monday, and an all-day series ahead of UTC. A split with nothing left, or in a range zone
+and on Monday, a `relativeMonthly` series on the second Tuesday (plain, and with its range starting
+the day before, a day the pattern does not name), and an all-day series ahead of UTC. A split with nothing left, or in a range zone
 TabMail does not recognize, sends only GETs and creates nothing. A Google split asked to send the user's invitations sends them
 only with the new series' create; the cap of the original goes out with `sendUpdates=none`.
 

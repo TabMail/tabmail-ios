@@ -1017,20 +1017,38 @@ private enum NumberedSplitFixture {
         return base
     }
 
+    /// The first second Tuesday of a month on or after `base`, at 10:00 on the device.
+    static func firstSecondTuesday() throws -> Date {
+        let cal = Calendar(identifier: .gregorian)
+        for offset in 0..<62 {
+            let day = try adding(days: offset, to: base)
+            if weekday(day) == "tuesday", (8...14).contains(cal.component(.day, from: day)) { return day }
+        }
+        Issue.record("no second Tuesday in two months")
+        return base
+    }
+
+    /// A Graph pattern for the second Tuesday of every month.
+    static var secondTuesdayMonthly: [String: Any] {
+        ["type": "relativeMonthly", "interval": 1, "month": 0, "dayOfMonth": 0, "daysOfWeek": ["tuesday"],
+         "firstDayOfWeek": "sunday", "index": "second"]
+    }
+
     /// 10:00 on the device on `day` (`yyyy-MM-dd`, a device date).
     static func tenOClock(_ day: String) throws -> Date {
         try #require(EKEventStoreHelper.parseNaiveISO(day + "T10:00:00", timeZone: .current))
     }
 
-    /// A weekly series of `count` whose range starts on `rangeStart`'s date, as Graph stores it.
+    /// A weekly series of `count` whose range starts on `rangeStart`'s date, as Graph stores it;
+    /// `pattern`, when given, replaces the weekly pattern.
     static func series(rangeStart: Date, daysOfWeek: [String], interval: Int, firstDayOfWeek: String,
-                       count: Int, rangeZone: String = zone) -> [String: Any] {
+                       count: Int, rangeZone: String = zone, pattern: [String: Any]? = nil) -> [String: Any] {
         var e = GraphFixture.event(id: "ser-1", start: rangeStart, online: false, recurring: true)
         e["start"] = ["dateTime": GraphFixture.wall(rangeStart, in: zone) + ".0000000", "timeZone": zone]
         e["end"] = ["dateTime": GraphFixture.wall(rangeStart.addingTimeInterval(1_800), in: zone) + ".0000000", "timeZone": zone]
         e["recurrence"] = [
-            "pattern": ["type": "weekly", "interval": interval, "month": 0, "dayOfMonth": 0, "daysOfWeek": daysOfWeek,
-                        "firstDayOfWeek": firstDayOfWeek, "index": "first"],
+            "pattern": pattern ?? ["type": "weekly", "interval": interval, "month": 0, "dayOfMonth": 0, "daysOfWeek": daysOfWeek,
+                                   "firstDayOfWeek": firstDayOfWeek, "index": "first"],
             // A numbered range reads `endDate` as "0001-01-01" (measured).
             "range": ["type": "numbered", "startDate": GraphFixture.deviceDay(rangeStart), "endDate": "0001-01-01",
                       "recurrenceTimeZone": rangeZone, "numberOfOccurrences": count],
@@ -1074,6 +1092,8 @@ struct ExchangeNumberedSplitTests {
         /// A series on Tuesday and Sunday every other week from a Tuesday, its weeks starting on
         /// this day; nil: a series every week on the first occurrence's day.
         var everyOtherWeekFrom: String?
+        /// A series on the second Tuesday of every month (`relativeMonthly`).
+        var secondTuesdayMonthly = false
         var testDescription: String { name }
     }
 
@@ -1086,18 +1106,23 @@ struct ExchangeNumberedSplitTests {
         Case(name: "a range that starts the day before its first occurrence", rangeStartsTheDayBefore: true),
         Case(name: "every other week, weeks starting on Sunday", everyOtherWeekFrom: "sunday"),
         Case(name: "every other week, weeks starting on Monday", everyOtherWeekFrom: "monday"),
+        Case(name: "the second Tuesday of every month", secondTuesdayMonthly: true),
+        Case(name: "the second Tuesday of every month, its range starting the day before",
+             rangeStartsTheDayBefore: true, secondTuesdayMonthly: true),
     ]
 
     @Test("the two parts hold the series' occurrences between them, the new part numbered with what is left", arguments: cases)
     func partsHoldTheSeries(_ c: Case) async throws {
-        let first = try c.everyOtherWeekFrom == nil ? NumberedSplitFixture.base : NumberedSplitFixture.firstTuesday()
+        let first = try c.secondTuesdayMonthly ? NumberedSplitFixture.firstSecondTuesday()
+            : c.everyOtherWeekFrom == nil ? NumberedSplitFixture.base : NumberedSplitFixture.firstTuesday()
         let rangeStart = try c.rangeStartsTheDayBefore ? NumberedSplitFixture.adding(days: -1, to: first) : first
         let series = NumberedSplitFixture.series(
             rangeStart: rangeStart,
             daysOfWeek: c.everyOtherWeekFrom == nil ? [NumberedSplitFixture.weekday(first)] : ["tuesday", "sunday"],
             interval: c.everyOtherWeekFrom == nil ? 1 : 2,
             firstDayOfWeek: c.everyOtherWeekFrom ?? "sunday",
-            count: c.count)
+            count: c.count,
+            pattern: c.secondTuesdayMonthly ? NumberedSplitFixture.secondTuesdayMonthly : nil)
         let original = try #require(FakeGraphCalendar.rangeDays(series))
         #expect(original.count == c.count, "\(c.name): setup: \(original)")
         guard original.count == c.count, original.first == GraphFixture.deviceDay(first) else {

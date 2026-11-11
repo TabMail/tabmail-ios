@@ -159,7 +159,8 @@ final class FakeGraphCalendar: Sendable {
     ///
     /// Patterns: `daily` every `interval` days from `startDate`; `weekly` on `daysOfWeek` in every
     /// `interval`-th week, counted from the week holding `startDate`, weeks starting on
-    /// `firstDayOfWeek`. Worked out here day by day, apart from the app's counter, so a test can
+    /// `firstDayOfWeek`; `relativeMonthly` on one weekday at its `index` in the month, in every
+    /// `interval`-th month counted from the month holding `startDate`. Worked out here day by day, apart from the app's counter, so a test can
     /// hold the app's split to it. nil for a `noEnd` range (it has no last day), another pattern
     /// type, or a range this can't read.
     static func rangeDays(_ event: [String: Any]) -> [String]? {
@@ -196,6 +197,26 @@ final class FakeGraphCalendar: Sendable {
             isOccurrence = { date in
                 let week = (dayNumber(date) - weekFirst) / 7
                 return wanted.contains(name(date)) && week % interval == 0
+            }
+        case "relativeMonthly":
+            // One weekday at its `index` in the month ("the second Tuesday"), in every
+            // `interval`-th month counted from the month holding `startDate`. A pattern naming
+            // more than one weekday ("the first day that satisfies the pattern") is not modelled.
+            let places = ["first": 1, "second": 2, "third": 3, "fourth": 4, "last": -1]
+            guard let days = pattern["daysOfWeek"] as? [String], days.count == 1,
+                  let place = (pattern["index"] as? String).flatMap({ places[$0.lowercased()] })
+            else { return nil }
+            let wanted = days[0].lowercased()
+            func month(_ date: Date) -> Int { cal.component(.year, from: date) * 12 + cal.component(.month, from: date) }
+            let startMonth = month(start)
+            isOccurrence = { date in
+                guard name(date) == wanted, (month(date) - startMonth) % interval == 0 else { return false }
+                let dayOfMonth = cal.component(.day, from: date)
+                guard place > 0 else {
+                    let monthLength = cal.range(of: .day, in: .month, for: date)?.count ?? 0
+                    return dayOfMonth + 7 > monthLength
+                }
+                return (dayOfMonth - 1) / 7 + 1 == place
             }
         default:
             return nil
