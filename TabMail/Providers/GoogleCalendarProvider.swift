@@ -112,6 +112,26 @@ enum CalendarProviderError: Error {
     /// split on Exchange/CalDAV/Demo before those implementations land).
     case notSupported(String)
 
+    /// The calendar entry holds only changed occurrences of a repeating event, with no series (an
+    /// invitation to single occurrences of someone else's series, RFC 4791 §4.1; CalDAV, #720): it
+    /// can't be changed as a whole, split, or read by its own id. A final answer, the same on every
+    /// read. Neutral, so each caller words it for what it was asked: an edit with
+    /// `seriesNotInThisCalendarReason` (`reason`), `exdates_add` with its own words (#694).
+    case seriesNotInThisCalendar
+
+    /// What an edit is told for `seriesNotInThisCalendar` (#729's wording).
+    static let seriesNotInThisCalendarReason =
+        "The series of this repeating event is not in this calendar, which holds only changed occurrences of it (an invitation to single occurrences of someone else's series), so it can't be changed as a whole or split here. One of those occurrences can be changed on its own: edit_scope this_only, with the event_id listed for it and its start_iso as recurrence_id"
+
+    /// The refusal as an edit words it: `notSupported`'s own reason, or the edit wording of a
+    /// neutral case.
+    var reason: String {
+        switch self {
+        case .notSupported(let reason): return reason
+        case .seriesNotInThisCalendar: return Self.seriesNotInThisCalendarReason
+        }
+    }
+
     /// The refusal for a write that needs a time zone `CalendarTimeZoneResolver` does not
     /// recognize. The one wording for every such refusal; `consequence` says what TabMail
     /// therefore did not do ("it did not change the event"), and `remedy` what the user can do

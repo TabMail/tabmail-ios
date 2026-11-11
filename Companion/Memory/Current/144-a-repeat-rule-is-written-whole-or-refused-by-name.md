@@ -117,7 +117,9 @@ each date beside the start of the occurrence it named (so a date that resolved t
 shows), deleted, queued or NOT deleted with its reason, never "updated". A CalDAV resource holding
 only changed occurrences is refused by the lookup before the card, in the exdates path's own words
 (`CalendarEventEditExdates.seriesNotHere`: only changed occurrences are on the server, nothing deleted,
-change it in the calendar app), never #729's edit advice to use `edit_scope` this_only; a one-off event, and an occurrence
+change it in the calendar app), never #729's edit advice to use `edit_scope` this_only. It matches the
+neutral `CalendarProviderError.seriesNotInThisCalendar`, never a CalDAV constant (the provider boundary);
+a one-off event, and an occurrence
 id equal to the series' own, are refused locally. Two dates naming one occurrence delete it once (one
 card row, one delete, both dates named). On an Outlook all-day series a date names that date's
 occurrence whatever zone the call names, through #647's date lookup (before it, a call zone west of the

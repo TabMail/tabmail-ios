@@ -97,7 +97,9 @@ of the resource, which holds every occurrence (irreversible wire operation #5, n
      another VEVENT of the resource names. Such a resource never gets the account's own address,
      which would forge the meeting's identity (ADR-IOS-052).
      **Amended 2026-11-11 (#720).** The series is not in this calendar, and that is the final rule,
-     refused in one reason (`CalDAVOccurrences.seriesNotInThisCalendar`, which names `this_only` by the
+     refused in one reason (`CalDAVOccurrences.seriesNotInThisCalendar`; since #694 the neutral
+     `CalendarProviderError.seriesNotInThisCalendar`, whose edit wording is
+     `CalendarProviderError.seriesNotInThisCalendarReason`, the same text; which names `this_only` by the
      listed id and its `start_iso` as what can be changed): `getEvent` of the resource's own id throws
      it as `notSupported` (was `CalDAVError.parseError("No VEVENT found")`, which the calendar queue
      requeued forever, holding the account's later operations); `scopedEdit`'s own-id and split

@@ -194,15 +194,15 @@ enum CalDAVOccurrences {
         }
     }
 
-    /// Why a resource that holds only changed occurrences, with no series VEVENT (an invitation
-    /// to single occurrences of someone else's series, RFC 4791 §4.1), is not changed as a whole
-    /// or split: the series is not in this calendar. A final answer, the same on every read, never
-    /// a failure to read; one of its occurrences can be changed on its own, by the id listed for
-    /// it. Refused with it: a read of the resource's own id (`CalDAVProvider.getEvent`, which an
-    /// edit of every occurrence and a split make before the card), and a one-occurrence edit by
-    /// that id or a split at the write (`scopedEdit`).
-    static let seriesNotInThisCalendar =
-        "The series of this repeating event is not in this calendar, which holds only changed occurrences of it (an invitation to single occurrences of someone else's series), so it can't be changed as a whole or split here. One of those occurrences can be changed on its own: edit_scope this_only, with the event_id listed for it and its start_iso as recurrence_id"
+    // A resource that holds only changed occurrences, with no series VEVENT (an invitation to
+    // single occurrences of someone else's series, RFC 4791 §4.1), is not changed as a whole or
+    // split: the series is not in this calendar. A final answer, the same on every read, never a
+    // failure to read; one of its occurrences can be changed on its own, by the id listed for it.
+    // Refused with it: a read of the resource's own id (`CalDAVProvider.getEvent`, which an edit of
+    // every occurrence and a split make before the card), and a one-occurrence edit by that id or a
+    // split at the write (`scopedEdit`). Thrown as the neutral
+    // `CalendarProviderError.seriesNotInThisCalendar`, so each caller words it for what it was
+    // asked (#694); an edit's words are `CalendarProviderError.seriesNotInThisCalendarReason`.
 
     /// Whether `icsText` holds changed occurrences (VEVENTs with a RECURRENCE-ID) and no series
     /// VEVENT.
@@ -314,7 +314,7 @@ enum CalDAVOccurrences {
             rows = found
         } else {
             guard key != nil, !forSplit else {
-                throw CalendarProviderError.notSupported(seriesNotInThisCalendar)
+                throw CalendarProviderError.seriesNotInThisCalendar
             }
             rows = standaloneRows(overrides, href: href, timeMin: timeMin, timeMax: timeMax)
         }

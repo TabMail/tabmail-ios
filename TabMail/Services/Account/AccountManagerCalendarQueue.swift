@@ -1163,12 +1163,12 @@ extension AccountManager {
     /// wedge, and the wedge corollary sits in the same non-recoverable set as a
     /// dropped intention — it never recovers via sync.
     static func isCalendarUnsupportedError(_ error: Error) -> Bool {
-        if case CalendarProviderError.notSupported = error { return true }
-        return false
+        // Every case is a final refusal: `notSupported`, and a series not in this calendar (#729).
+        error is CalendarProviderError
     }
 
     private func unsupportedReason(_ error: Error) -> String {
-        if case CalendarProviderError.notSupported(let msg) = error { return msg }
+        if let refused = error as? CalendarProviderError { return refused.reason }
         return "operation not supported on this calendar provider"
     }
 

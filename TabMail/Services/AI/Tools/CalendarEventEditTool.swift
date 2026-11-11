@@ -227,10 +227,12 @@ struct CalendarEventEditTool: AgentTool, Sendable {
             named = try await CalendarSeriesScope.read(
                 event: fetchedEvent, eventId: eventId, recurrenceId: recurrenceIdArg, scope: resolvedScope,
                 calendarId: lookupCalId, zone: tz, splitting: false, provider: provider)
-        } catch CalendarProviderError.notSupported(let reason) {
+        } catch let refused as CalendarProviderError {
+            // A provider's refusal, worded for an edit (`reason`): `notSupported`'s own, and the
+            // edit's words for a neutral case (a series not in this calendar, #729).
             return ToolJSON.string(from: [
                 "ok": false,
-                "error": "calendar_event_edit failed: \(reason). The event was NOT changed.",
+                "error": "calendar_event_edit failed: \(refused.reason). The event was NOT changed.",
                 "event_id": compoundId,
             ] as [String: Any])
         } catch where AccountManager.isCalendarNotFoundError(error) {

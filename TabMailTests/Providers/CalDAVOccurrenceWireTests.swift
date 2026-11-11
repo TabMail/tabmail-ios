@@ -210,10 +210,11 @@ struct CalDAVOccurrenceWireTests {
         ics.split(whereSeparator: \.isNewline).map(String.init).filter { $0.hasPrefix(name) }
     }
 
-    /// A provider refusal (`notSupported`) whose reason contains `phrase`.
+    /// A provider refusal whose reason, as an edit is told it (`CalendarProviderError.reason`:
+    /// `notSupported`'s own, or a neutral case's edit wording), contains `phrase`.
     private static func isRefusal(_ error: any Error, saying phrase: String) -> Bool {
-        guard case CalendarProviderError.notSupported(let reason) = error else { return false }
-        return reason.contains(phrase)
+        guard let refused = error as? CalendarProviderError else { return false }
+        return refused.reason.contains(phrase)
     }
 
     /// The authoritative absence Google and Outlook report for an occurrence that isn't
@@ -986,7 +987,9 @@ struct CalDAVOccurrenceWireTests {
             await #expect("read \(attempt) of the resource's own id was not refused as holding no series") {
                 _ = try await provider.getEvent(calendarId: W.calendarId, eventId: path)
             } throws: { error in
-                Self.isRefusal(error, saying: "is not in this calendar")
+                // The neutral case, which each caller words for what it was asked (#694).
+                guard case CalendarProviderError.seriesNotInThisCalendar = error else { return false }
+                return Self.isRefusal(error, saying: "is not in this calendar")
             }
         }
         #expect(store.recordedPuts().isEmpty, "a refused edit wrote: \(store.recordedPuts().map(\.path))")

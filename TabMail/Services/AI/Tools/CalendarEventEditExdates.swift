@@ -168,9 +168,9 @@ enum CalendarEventEditExdates {
             do {
                 occurrence = try await provider.occurrence(
                     calendarId: target.lookupCalendarId, eventId: seriesId, recurrenceId: date, recurrenceIdZone: zone)
-            } catch CalendarProviderError.notSupported(let reason) where reason == CalDAVOccurrences.seriesNotInThisCalendar {
-                // That refusal advises the edit path's one-occurrence edit, which no exdates call
-                // can use: say what is true for removing dates instead.
+            } catch CalendarProviderError.seriesNotInThisCalendar {
+                // An edit is told to change one occurrence on its own (`reason`), which no exdates
+                // call can use: say what is true for removing dates instead.
                 return refusal(Self.seriesNotHere, compoundId: target.compoundId)
             } catch CalendarProviderError.notSupported(let reason) {
                 let reason = reason.trimmingCharacters(in: CharacterSet(charactersIn: ". "))
