@@ -931,12 +931,15 @@ struct CalDAVCalendarEditKeepsKindTests {
     // A stated all_day that differs from the stored kind: the event changes kind, or the edit is
     // refused with nothing written. It never reports success with the event as it was.
 
+    /// A timed event at 09:00 UTC on `start`, ending at `end` (a DTEND or DURATION line). Written in
+    /// UTC with no `TZID` its start names no zone (#679); with `tzid` it names that zone.
     private static func timedICS(uid: String, day start: String, end: String, recurring: Bool = false,
-                                 extra: [String] = []) -> String {
+                                 extra: [String] = [], tzid: String? = nil) -> String {
         var lines = [
             "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//TabMail//Test//EN", "BEGIN:VEVENT",
             "UID:\(uid)", "DTSTAMP:\(compact(day(-14)))T000000Z",
-            "DTSTART:\(compact(start))T090000Z", end, "SUMMARY:Planning",
+            tzid.map { "DTSTART;TZID=\($0):\(compact(start))T090000" } ?? "DTSTART:\(compact(start))T090000Z", end,
+            "SUMMARY:Planning",
         ]
         if recurring { lines.append("RRULE:FREQ=WEEKLY") }
         lines += extra
@@ -1001,18 +1004,26 @@ struct CalDAVCalendarEditKeepsKindTests {
     }
 
     /// A timed weekly series made all-day, or an all-day weekly series made timed at times of one day.
+    /// An edit of every occurrence keeps the series' own date: one that moves it to another date
+    /// names no occurrence, which is a question for the user (`CalendarSeriesScopeTests`), and so
+    /// does any new date of a series kept in UTC with no zone named (#679).
     @Test("a change of kind on a repeating event is refused with nothing written, on every edit_scope, both ways",
           arguments: ["all", "this_only", "this_and_following"], [true, false])
     func kindChangeOnASeriesIsRefused(_ scope: String, _ toAllDay: Bool) async throws {
         let store = FakeCalDAVStore(servesETags: true)
+        let every = scope == "all"
         let stored = toAllDay
-            ? Self.timedICS(uid: "cv-4", day: day(0), end: "DTEND:\(compact(day(0)))T100000Z", recurring: true)
+            ? (every
+                ? Self.timedICS(uid: "cv-4", day: day(0), end: "DTEND;TZID=Etc/UTC:\(compact(day(0)))T100000",
+                                recurring: true, tzid: "Etc/UTC")
+                : Self.timedICS(uid: "cv-4", day: day(0), end: "DTEND:\(compact(day(0)))T100000Z", recurring: true))
             : Self.allDayICS(uid: "cv-4", start: day(0), end: day(1), recurring: true)
         store.seed(path: "/cal/cv-4.ics", ics: stored)
+        let on = every ? 0 : 7
         var arguments: [String: JSONValue] = toAllDay
-            ? ["all_day": .bool(true), "start_iso": .string(day(7)), "end_iso": .string(day(8))]
-            : ["all_day": .bool(false), "start_iso": .string("\(day(7))T09:00:00"),
-               "end_iso": .string("\(day(7))T10:00:00")]
+            ? ["all_day": .bool(true), "start_iso": .string(day(on)), "end_iso": .string(day(on + 1))]
+            : ["all_day": .bool(false), "start_iso": .string("\(day(on))T09:00:00"),
+               "end_iso": .string("\(day(on))T10:00:00")]
         arguments["edit_scope"] = .string(scope)
         arguments["timezone"] = .string("UTC")
         if scope != "all" {
@@ -1035,8 +1046,10 @@ struct CalDAVCalendarEditKeepsKindTests {
         let store = FakeCalDAVStore(servesETags: true)
         let stored: String
         if fixture == "rdate" {
-            stored = Self.timedICS(uid: "cv-5", day: day(0), end: "DTEND:\(compact(day(0)))T100000Z",
-                                   extra: ["RDATE:\(compact(day(7)))T090000Z"])
+            // Its zone named, and the edit on its own date: an edit of every occurrence to another
+            // date, or of a series kept in UTC with no zone named (#679), is a question for the user.
+            stored = Self.timedICS(uid: "cv-5", day: day(0), end: "DTEND;TZID=Etc/UTC:\(compact(day(0)))T100000",
+                                   extra: ["RDATE:\(compact(day(7)))T090000Z"], tzid: "Etc/UTC")
         } else {
             stored = [
                 "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//TabMail//Test//EN",
@@ -1051,7 +1064,7 @@ struct CalDAVCalendarEditKeepsKindTests {
         }
         store.seed(path: "/cal/cv-5.ics", ics: stored)
         let rows = try await run(store, eventId: "/cal/cv-5.ics", [
-            "all_day": .bool(true), "start_iso": .string(day(7)), "end_iso": .string(day(8)), "edit_scope": .string("all"),
+            "all_day": .bool(true), "start_iso": .string(day(0)), "end_iso": .string(day(1)), "edit_scope": .string("all"),
         ], account: "kind-c-repeats-\(fixture)")
         #expect(store.recordedPuts().isEmpty, "\(fixture): wrote \(store.recordedPuts().map(\.path))")
         #expect(store.storedICS(path: "/cal/cv-5.ics") == stored, "\(fixture): the event changed")
@@ -1178,7 +1191,7 @@ struct CalendarQueueEditKindTests {
         if let e = times.end { args["end_iso"] = .string(e) }
         if scope != "all" { args["recurrence_id"] = .string("\(day(7))T00:00:00") }
         let label = "\(scope) \(times.start ?? "-") \(times.end ?? "-")"
-        let r = try await drain(args, account: "kind-q-time-\(scope)-\(pair)", resource: allDayResource())
+        let r = try await drain(args, account: "kind-q-time-\(scope)-\(pair)", resource: allDayResource(recurring: scope != "all"))
         #expect(r.writes == 0, "\(label): \(r.writes) write(s) reached the provider")
         #expect(r.rows.count == 1 && r.rows.first?.status == PendingStatus.failed.rawValue,
                 "\(label): not retired: \(r.rows.map { "\($0.status) \($0.failureReason ?? "")" })")
@@ -1194,7 +1207,7 @@ struct CalendarQueueEditKindTests {
             "start_iso": .string("\(day(7))T00:00:00"), "end_iso": .string(day(7)),
         ]
         if scope != "all" { args["recurrence_id"] = .string("\(day(7))T00:00:00") }
-        let r = try await drain(args, account: "kind-q-refuse-\(scope)", resource: allDayResource())
+        let r = try await drain(args, account: "kind-q-refuse-\(scope)", resource: allDayResource(recurring: scope != "all"))
         #expect(r.writes == 0, "\(scope): \(r.writes) write(s) reached the provider")
         #expect(r.rows.count == 1 && r.rows.first?.status == PendingStatus.failed.rawValue,
                 "\(scope): not retired: \(r.rows.map { "\($0.status) \($0.failureReason ?? "")" })")
@@ -1228,7 +1241,7 @@ struct CalendarQueueEditKindTests {
     func explicitEndOnlyOnStoredStartDayIsRefused() async throws {
         let r = try await drain([
             "all_day": .bool(true), "end_iso": .string(day(0)),
-        ], account: "kind-q-endonly", resource: allDayResource())
+        ], account: "kind-q-endonly", resource: allDayResource(recurring: false))
         #expect(r.writes == 0, "a zero-length all-day event was written")
         #expect(r.rows.first?.failureReason?.contains(allDayEndHint) == true,
                 "reason \(r.rows.first?.failureReason ?? "<none>")")
@@ -1355,7 +1368,7 @@ struct CalendarQueueEditKindTests {
         ], account: "kind-q-noread-split", resource: allDayResource(), occurrenceStartDay: day(20))
         #expect(split.occurrenceReads == 0 && split.writes == 1, "a split starts on recurrence_id's own day")
         let series = try await drain(["end_iso": .string(day(3))],
-                                     account: "kind-q-noread-all", resource: allDayResource(), occurrenceStartDay: day(20))
+                                     account: "kind-q-noread-all", resource: allDayResource(recurring: false), occurrenceStartDay: day(20))
         #expect(series.occurrenceReads == 0 && series.writes == 1)
         let timed = try await drain([
             "edit_scope": .string("this_only"), "recurrence_id": .string("\(day(7))T09:00:00"),

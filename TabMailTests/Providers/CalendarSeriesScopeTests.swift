@@ -534,12 +534,15 @@ struct ExchangeCalendarSeriesScopeTests {
 
 // MARK: - The queue: a series on named days
 
-/// A timed CalDAV series at 09:00 UTC from day 0, repeating by `rule`.
-private func calDAVSeries(uid: String, rule: String) -> String {
-    [
+/// A timed CalDAV series at 09:00 UTC from day 0, repeating by `rule`. Written in UTC with no
+/// `TZID` it names no zone (#679); with `tzid` its times name that zone.
+private func calDAVSeries(uid: String, rule: String, tzid: String? = nil) -> String {
+    let (start, end) = tzid.map { ("DTSTART;TZID=\($0):\(compact(day(0)))T090000", "DTEND;TZID=\($0):\(compact(day(0)))T093000") }
+        ?? ("DTSTART:\(compact(day(0)))T090000Z", "DTEND:\(compact(day(0)))T093000Z")
+    return [
         "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//TabMail//Test//EN", "BEGIN:VEVENT",
         "UID:\(uid)", "DTSTAMP:\(compact(day(-14)))T000000Z",
-        "DTSTART:\(compact(day(0)))T090000Z", "DTEND:\(compact(day(0)))T093000Z",
+        start, end,
         rule, "SUMMARY:Standup", "END:VEVENT", "END:VCALENDAR",
     ].joined(separator: "\r\n")
 }
@@ -689,7 +692,8 @@ struct CalendarSeriesDayMoveTests {
     @Test("CalDAV: a series whose rule names no days moves to another time on its date (control)")
     func calDAVWithoutNamedDaysMoves() async throws {
         let store = FakeCalDAVStore(servesETags: true)
-        store.seed(path: "/cal/wk-2.ics", ics: calDAVSeries(uid: "wk-2", rule: "RRULE:FREQ=WEEKLY"))
+        // Its zone named: a series kept in UTC names none (#679), so its dates can't be told.
+        store.seed(path: "/cal/wk-2.ics", ics: calDAVSeries(uid: "wk-2", rule: "RRULE:FREQ=WEEKLY", tzid: "Etc/UTC"))
         let rows = try await calDAV(store, eventId: "/cal/wk-2.ics", [
             "edit_scope": .string("all"),
             "start_iso": .string("\(day(0))T10:00:00"), "timezone": .string("UTC"),
@@ -1097,10 +1101,15 @@ struct CalendarSeriesScopeRouteTests {
         let routed = try CalendarSeriesScope.route(args, scope: scope, named: named, zone: zone)
         #expect(CalendarToolHelpers.stringArgOpt(routed.args, "edit_scope") ?? scope == routed.scope,
                 "the arguments' edit_scope is not the scope written")
-        // Routed again, it routes to itself: the queue decides what the card said.
-        let again = try CalendarSeriesScope.route(routed.args, scope: routed.scope,
-                                                  named: routed.eventId == named.eventId ? named : Self.named(named.series),
-                                                  zone: zone)
+        // Routed again, it routes to itself: the queue decides what the card said. The queue reads
+        // what the routed edit names: the series' own id with no `recurrence_id` names no occurrence.
+        let reread: CalendarSeriesScope.Named
+        if routed.eventId == named.eventId, !(routed.recurrenceId == nil && routed.eventId == named.seriesId) {
+            reread = named
+        } else {
+            reread = Self.named(named.series)
+        }
+        let again = try CalendarSeriesScope.route(routed.args, scope: routed.scope, named: reread, zone: zone)
         #expect(again.scope == routed.scope && again.args == routed.args, "routed again: \(again.scope), not \(routed.scope)")
         return Went(scope: routed.scope, recurrenceId: routed.recurrenceId,
                     start: CalendarToolHelpers.stringArgOpt(routed.args, "start_iso"),
@@ -1640,7 +1649,9 @@ struct CalDAVSeriesScopeTests {
             arguments: arguments, invocation: ToolInvocation(uiSink: sink, sessionKey: session))
         let cards = await MainActor.run { sink.confirmations.count }
         #expect(cards == 0, "a card was shown: \(output)")
-        #expect(output.contains("NOT changed") && output.contains("Not/AZone") && output.contains("which TabMail does not recognize"),
+        // The output is JSON, which may write the zone's slash escaped (`Not\/AZone`): read the error.
+        let error = (try? JSONSerialization.jsonObject(with: Data(output.utf8)) as? [String: Any])?["error"] as? String ?? ""
+        #expect(error.contains("NOT changed") && error.contains("Not/AZone") && error.contains("which TabMail does not recognize"),
                 "not refused by the stored zone's check: \(output)")
         let sent = harness.http.recordedCalls().dropFirst(before).map(\.method)
         #expect(sent.allSatisfy { $0 == "GET" || $0 == "REPORT" || $0 == "PROPFIND" }, "written: \(sent)")

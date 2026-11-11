@@ -60,7 +60,7 @@ actor MockCalendarProvider: CalendarProvider {
     var splitSeriesResult: GCalEvent?
     var splitSeriesThrows: Error?
     /// What `occurrence` returns; nil gives an occurrence that starts at `recurrenceId` and was
-    /// never moved (`syntheticOccurrence`).
+    /// never moved (`syntheticOccurrence`), all-day when the event `getEvent` returns is.
     var occurrenceResult: GCalEvent?
     var occurrenceThrows: Error?
     var occurrenceCalls: [(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone)] = []
@@ -147,14 +147,17 @@ actor MockCalendarProvider: CalendarProvider {
         callLog.append("occurrence(calendarId:\(calendarId),eventId:\(eventId),recurrenceId:\(recurrenceId),recurrenceIdZone:\(recurrenceIdZone.identifier))")
         occurrenceCalls.append((calendarId: calendarId, eventId: eventId, recurrenceId: recurrenceId, recurrenceIdZone: recurrenceIdZone))
         if let error = occurrenceThrows { throw error }
-        return occurrenceResult ?? Self.syntheticOccurrence(of: eventId, at: recurrenceId, in: recurrenceIdZone)
+        return occurrenceResult ?? Self.syntheticOccurrence(
+            of: eventId, at: recurrenceId, in: recurrenceIdZone, allDay: getEventResult?.isAllDay == true)
     }
 
     /// An occurrence of `seriesId` that starts at `recurrenceId` (read in `zone`) and was never
-    /// moved: its start and its place in the series are the same.
-    static func syntheticOccurrence(of seriesId: String, at recurrenceId: String, in zone: TimeZone) -> GCalEvent {
+    /// moved: its start and its place in the series are the same. An occurrence of an all-day
+    /// series is on `recurrenceId`'s date, as every provider gives one.
+    static func syntheticOccurrence(of seriesId: String, at recurrenceId: String, in zone: TimeZone,
+                                    allDay: Bool = false) -> GCalEvent {
         let start: GCalDateTime
-        if recurrenceId.count < 19 {
+        if allDay || recurrenceId.count < 19 {
             start = GCalDateTime(dateTime: nil, date: String(recurrenceId.prefix(10)), timeZone: nil)
         } else {
             let instant = EKEventStoreHelper.parseNaiveISO(String(recurrenceId.prefix(19)), timeZone: zone)

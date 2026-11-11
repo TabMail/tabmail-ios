@@ -748,7 +748,9 @@ struct ExchangeSeriesSplitCopyTests {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
         let series = GraphSplitFixture.series(range: GraphSplitFixture.noEnd)
-        let graph = FakeGraphCalendar([series])
+        // With its occurrence listed, so the split's lookup finds it on that date and the new part's
+        // start is what refuses it.
+        let graph = GraphSplitFixture.calendar(series)
         graph.install(on: http)
         // A timed series given only a date for the occurrence: the new part's start can't be read.
         let dateOnly = String(GraphSplitFixture.recurrenceId.prefix(10))
@@ -836,8 +838,9 @@ struct ExchangeSeriesSplitCopyTests {
             occurrence["originalStart"] = GraphFixture.allDayPlace(date, in: zone)
             let graph = FakeGraphCalendar([series, occurrence])
             graph.install(on: http)
+            // In UTC, where `GraphFixture.event` renders an all-day occurrence's start.
             _ = try await GraphSplitFixture.provider(http).splitSeries(
-                eventId: "ser-1", recurrenceId: date + "T00:00:00", recurrenceIdZone: .current, patch: GCalEventInput())
+                eventId: "ser-1", recurrenceId: date + "T00:00:00", recurrenceIdZone: .gmt, patch: GCalEventInput())
             #expect(graph.created.count == 1, "\(zone): no new part: \(http.servedCallSequence())")
         }
     }

@@ -446,6 +446,8 @@ struct CalendarQueueRecurrenceFrameTests {
         let accountId = "cal-r18c-occ"
         let (pool, dir, previous) = try makeTestDB(accountId: accountId)
         let mock = MockCalendarProvider()
+        // Every edit reads the event first, to find its series and the occurrence it names (#560).
+        await mock.setGetEventResult(anyEvent())
         await mock.setUpdateOccurrenceResult(anyEvent())
         await AccountManager.shared.registerCalendarProviderForTesting(accountId: accountId, provider: mock)
         defer {
