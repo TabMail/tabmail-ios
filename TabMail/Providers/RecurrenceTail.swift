@@ -147,19 +147,7 @@ enum RecurrenceTail {
                 throw CalendarProviderError.notSupported(
                     "Can't split this series: its repeat rule has an invalid COUNT (\(counts[0])).")
             }
-            guard let seriesStart, let split else {
-                throw CalendarProviderError.notSupported(
-                    "Can't split this series: it ends after \(count) occurrences, and the dates of its first occurrence or of \(splitText) can't be read, so the new series' length can't be worked out. Edit the whole series instead.")
-            }
-            guard let before = occurrences(of: rrule, seriesStart: seriesStart, before: split) else {
-                throw CalendarProviderError.notSupported(
-                    "Can't split this series: it ends after \(count) occurrences, and its repeat rule (\(body)) is not one TabMail can count, so the new series' length can't be worked out. Edit the whole series instead.")
-            }
-            guard before < count else {
-                throw CalendarProviderError.notSupported(
-                    "Can't split this series at \(splitText): the series ends after \(count) occurrences, all before it, so there are no occurrences from that point on to change.")
-            }
-            let remaining = count - before
+            let remaining = try newSeriesEnd(count: count, of: rrule, seriesStart: seriesStart, split: split)
             return prefix + parts
                 .map { $0.uppercased().hasPrefix("COUNT=") ? "COUNT=\(remaining)" : $0 }
                 .joined(separator: ";")
@@ -168,6 +156,58 @@ enum RecurrenceTail {
             throw CalendarProviderError.notSupported(
                 "Can't split this series: its repeat rule (\(body)) has more than one end (UNTIL/COUNT).")
         }
+    }
+
+    /// The number of occurrences the new series of a split gets when the original series ends after
+    /// `count` of them: `count` less the occurrences the original keeps before the split. The one
+    /// rule for every provider: Google and CalDAV write it as the new RRULE's `COUNT`
+    /// (`newSeriesRule`), Outlook as the new range's `numberOfOccurrences`.
+    ///
+    /// The occurrences before the split are the ones the rule generates (`occurrences`), so one that
+    /// was deleted or moved still counts: RFC 5545 counts an EXDATE'd occurrence toward COUNT, and on
+    /// Outlook a deleted and a moved occurrence still count toward `numberOfOccurrences` (measured).
+    ///
+    /// - `rrule`: the original rule (its COUNT and UNTIL are not read here).
+    /// - `seriesStart`: the day the count starts on, as `anchor` reads it; `split`: the split
+    ///   occurrence's day. Both in the frame the rule repeats in.
+    ///
+    /// Throws `CalendarProviderError.notSupported` when either day is unknown, when the rule is not
+    /// one `occurrences` counts, or when no occurrence is left from the split on.
+    static func newSeriesEnd(
+        count: Int,
+        of rrule: String,
+        seriesStart: Day?,
+        split: Day?,
+        anchor: Anchor = .dtstart
+    ) throws -> Int {
+        let prefix = "RRULE:"
+        let body = rrule.hasPrefix(prefix) ? String(rrule.dropFirst(prefix.count)) : rrule
+        let splitText = split.map { "the occurrence on \($0)" } ?? "the chosen occurrence"
+        guard let seriesStart, let split else {
+            throw CalendarProviderError.notSupported(
+                "Can't split this series: it ends after \(count) occurrences, and the dates of its first occurrence or of \(splitText) can't be read, so the new series' length can't be worked out. Edit the whole series instead.")
+        }
+        guard let before = occurrences(of: rrule, seriesStart: seriesStart, before: split, anchor: anchor) else {
+            throw CalendarProviderError.notSupported(
+                "Can't split this series: it ends after \(count) occurrences, and its repeat rule (\(body)) is not one TabMail can count, so the new series' length can't be worked out. Edit the whole series instead.")
+        }
+        guard before < count else {
+            throw CalendarProviderError.notSupported(
+                "Can't split this series at \(splitText): the series ends after \(count) occurrences, all before it, so there are no occurrences from that point on to change.")
+        }
+        return count - before
+    }
+
+    /// Where a series' occurrences are counted from.
+    enum Anchor: Sendable {
+        /// RFC 5545 §3.3.10: DTSTART is the first occurrence, whether or not the rule's parts name
+        /// its day.
+        case dtstart
+        /// Outlook's `recurrenceRange.startDate`: "the date to start applying the recurrence
+        /// pattern. The first occurrence of the meeting may be this date or later, depending on the
+        /// recurrence pattern" (Graph's `recurrenceRange`). That day is an occurrence only when the
+        /// pattern names it.
+        case patternStart
     }
 
     /// Whether `rrule`'s `UNTIL` is `capUntil`: this split's own cap, written by an earlier attempt
@@ -197,7 +237,9 @@ enum RecurrenceTail {
     // MARK: - Counting
 
     /// The number of occurrences the rule generates on days from `seriesStart`
-    /// up to, but not including, `before`. DTSTART counts as the first.
+    /// up to, but not including, `before`. With `anchor` `.dtstart` (RFC 5545)
+    /// `seriesStart` counts as the first; with `.patternStart` (Outlook's range
+    /// `startDate`) it counts only when the rule's parts name its day.
     /// COUNT and UNTIL are ignored: this counts what the pattern generates.
     ///
     /// Returns nil for a rule outside the supported subset:
@@ -207,13 +249,18 @@ enum RecurrenceTail {
     /// DAILY and unknown parts are not supported, nor are BYMONTHDAY with
     /// WEEKLY, a numbered BYDAY with DAILY or WEEKLY or alongside BYMONTHDAY,
     /// and any other BYSETPOS.
-    static func occurrences(of rrule: String, seriesStart: Day, before split: Day) -> Int? {
+    static func occurrences(of rrule: String, seriesStart: Day, before split: Day, anchor: Anchor = .dtstart) -> Int? {
         guard let rule = Rule(rrule) else { return nil }
         guard seriesStart < split else { return 0 }
         let first = seriesStart.ordinal
         let end = split.ordinal
-        var count = 1  // DTSTART
-        for days in rule.periods(from: seriesStart, before: split) {
+        let periods = rule.periods(from: seriesStart, before: split)
+        var count: Int
+        switch anchor {
+        case .dtstart: count = 1
+        case .patternStart: count = periods.contains { $0.contains(first) } ? 1 : 0
+        }
+        for days in periods {
             count += days.filter { $0 > first && $0 < end }.count
         }
         return count

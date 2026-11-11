@@ -602,6 +602,14 @@ struct ExchangeSeriesSplitCopyTests {
         case "endDate":
             #expect(newRange["type"] as? String == "endDate" && newRange["endDate"] as? String == range["endDate"] as? String,
                     "the new part lost the series' end date: \(canonical(newRange))")
+        case "numbered":
+            // What is left of the count; the exact number is held to the series in
+            // `ExchangeNumberedSplitTests` (this fixture's pattern day is the UTC one, so how many
+            // occurrences come before the split in the range's Pacific zone depends on the host's).
+            let left = newRange["numberOfOccurrences"] as? Int ?? 0
+            #expect(newRange["type"] as? String == "numbered" && newRange["endDate"] == nil
+                    && (1...(range["numberOfOccurrences"] as? Int ?? 0)).contains(left),
+                    "the new part does not end with the series: \(canonical(newRange))")
         default:
             #expect(newRange["type"] as? String == "noEnd" && newRange["endDate"] == nil && newRange["numberOfOccurrences"] == nil,
                     "\(rangeType): \(canonical(newRange))")
@@ -968,5 +976,222 @@ struct ExchangeSeriesSplitCopyTests {
         recurrence["range"] = range
         series["recurrence"] = recurrence
         return series
+    }
+}
+
+// MARK: - Outlook: a series that ends after a number of occurrences
+
+/// A weekly Outlook series dated on the device: its start, its range (`startDate` and
+/// `recurrenceTimeZone`, the device's IANA name, which Graph accepts for a range, measured) and the
+/// split, so every date here is the same date in every frame whatever the host's zone.
+private enum NumberedSplitFixture {
+    static let zone = TimeZone.current.identifier
+
+    /// 10:00 on the device eight days ahead: the first occurrence.
+    static let base = GraphFixture.onDevice(days: 0, hour: 10)
+
+    static func provider(_ http: FakeHTTP.Scenario) -> ExchangeCalendarProvider {
+        ExchangeCalendarProvider(mailbox: "calendar@example.com", accessToken: { _ in "test-token" }, session: http.session)
+    }
+
+    /// `date`'s day of the week on the device, as Graph names it.
+    static func weekday(_ date: Date) -> String {
+        let names = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
+        return names[Calendar(identifier: .gregorian).component(.weekday, from: date) - 1]
+    }
+
+    /// `date` moved by `days` calendar days on the device, its time of day kept.
+    static func adding(days: Int, to date: Date) throws -> Date {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = .current
+        return try #require(cal.date(byAdding: .day, value: days, to: date))
+    }
+
+    /// The first Tuesday on or after `base`, at 10:00 on the device.
+    static func firstTuesday() throws -> Date {
+        for offset in 0..<7 {
+            let day = try adding(days: offset, to: base)
+            if weekday(day) == "tuesday" { return day }
+        }
+        Issue.record("no Tuesday in a week")
+        return base
+    }
+
+    /// 10:00 on the device on `day` (`yyyy-MM-dd`, a device date).
+    static func tenOClock(_ day: String) throws -> Date {
+        try #require(EKEventStoreHelper.parseNaiveISO(day + "T10:00:00", timeZone: .current))
+    }
+
+    /// A weekly series of `count` whose range starts on `rangeStart`'s date, as Graph stores it.
+    static func series(rangeStart: Date, daysOfWeek: [String], interval: Int, firstDayOfWeek: String,
+                       count: Int, rangeZone: String = zone) -> [String: Any] {
+        var e = GraphFixture.event(id: "ser-1", start: rangeStart, online: false, recurring: true)
+        e["start"] = ["dateTime": GraphFixture.wall(rangeStart, in: zone) + ".0000000", "timeZone": zone]
+        e["end"] = ["dateTime": GraphFixture.wall(rangeStart.addingTimeInterval(1_800), in: zone) + ".0000000", "timeZone": zone]
+        e["recurrence"] = [
+            "pattern": ["type": "weekly", "interval": interval, "month": 0, "dayOfMonth": 0, "daysOfWeek": daysOfWeek,
+                        "firstDayOfWeek": firstDayOfWeek, "index": "first"],
+            // A numbered range reads `endDate` as "0001-01-01" (measured).
+            "range": ["type": "numbered", "startDate": GraphFixture.deviceDay(rangeStart), "endDate": "0001-01-01",
+                      "recurrenceTimeZone": rangeZone, "numberOfOccurrences": count],
+        ]
+        return e
+    }
+
+    /// The series' occurrence on `day`, as Graph lists it; `movedADay`: moved on its own to the
+    /// next day, its place in the series (`originalStart`) kept.
+    static func occurrence(_ index: Int, on day: String, movedADay: Bool = false) throws -> [String: Any] {
+        let at = try tenOClock(day)
+        var e = GraphFixture.event(id: "ser-1-occ-\(index)", start: at, online: false, seriesMasterId: "ser-1")
+        if movedADay {
+            let now = at.addingTimeInterval(86_400)
+            e["start"] = ["dateTime": GraphFixture.naive(now), "timeZone": "UTC"]
+            e["end"] = ["dateTime": GraphFixture.naive(now.addingTimeInterval(1_800)), "timeZone": "UTC"]
+        }
+        return e
+    }
+}
+
+/// #474: an Outlook series that ends after a number of occurrences (a `numbered` range) is split
+/// into two parts that hold exactly the series' occurrences: the capped series those before the
+/// split, the new part (numbered with what is left) the rest, ending on the series' last occurrence.
+/// Each test holds the parts to the series through `FakeGraphCalendar.rangeDays`, which applies a
+/// range as Graph does, apart from the app's counter. Deleted and moved occurrences still count
+/// toward the number (measured on Outlook), so a split after them leaves the same number.
+@Suite("Outlook split of a numbered series", .serialized)
+struct ExchangeNumberedSplitTests {
+
+    struct Case: CustomTestStringConvertible, Sendable {
+        let name: String
+        var count = 6
+        /// The occurrence the split is at, by its place in the series (0 is the first).
+        var split = 3
+        var deleted: Set<Int> = []
+        var moved: Set<Int> = []
+        /// The range starts the day before its first occurrence (Graph: "the first occurrence of the
+        /// meeting may be this date or later").
+        var rangeStartsTheDayBefore = false
+        /// A series on Tuesday and Sunday every other week from a Tuesday, its weeks starting on
+        /// this day; nil: a series every week on the first occurrence's day.
+        var everyOtherWeekFrom: String?
+        var testDescription: String { name }
+    }
+
+    static let cases: [Case] = [
+        Case(name: "a plain series"),
+        Case(name: "an occurrence before the split deleted", split: 4, deleted: [2]),
+        Case(name: "an occurrence before the split moved a day", split: 4, moved: [3]),
+        Case(name: "one deleted and the next moved, as measured on Outlook", split: 4, deleted: [2], moved: [3]),
+        Case(name: "the split at the last occurrence", split: 5),
+        Case(name: "a range that starts the day before its first occurrence", rangeStartsTheDayBefore: true),
+        Case(name: "every other week, weeks starting on Sunday", everyOtherWeekFrom: "sunday"),
+        Case(name: "every other week, weeks starting on Monday", everyOtherWeekFrom: "monday"),
+    ]
+
+    @Test("the two parts hold the series' occurrences between them, the new part numbered with what is left", arguments: cases)
+    func partsHoldTheSeries(_ c: Case) async throws {
+        let first = try c.everyOtherWeekFrom == nil ? NumberedSplitFixture.base : NumberedSplitFixture.firstTuesday()
+        let rangeStart = try c.rangeStartsTheDayBefore ? NumberedSplitFixture.adding(days: -1, to: first) : first
+        let series = NumberedSplitFixture.series(
+            rangeStart: rangeStart,
+            daysOfWeek: c.everyOtherWeekFrom == nil ? [NumberedSplitFixture.weekday(first)] : ["tuesday", "sunday"],
+            interval: c.everyOtherWeekFrom == nil ? 1 : 2,
+            firstDayOfWeek: c.everyOtherWeekFrom ?? "sunday",
+            count: c.count)
+        let original = try #require(FakeGraphCalendar.rangeDays(series))
+        #expect(original.count == c.count, "\(c.name): setup: \(original)")
+        guard original.count == c.count, original.first == GraphFixture.deviceDay(first) else {
+            Issue.record("\(c.name): setup: the series does not start on its first occurrence: \(original)")
+            return
+        }
+        var seed = [series]
+        for (index, day) in original.enumerated() where !c.deleted.contains(index) {
+            seed.append(try NumberedSplitFixture.occurrence(index, on: day, movedADay: c.moved.contains(index)))
+        }
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = FakeGraphCalendar(seed)
+        graph.install(on: http)
+        let recurrenceId = GraphFixture.wall(try NumberedSplitFixture.tenOClock(original[c.split]), in: NumberedSplitFixture.zone)
+        _ = try await NumberedSplitFixture.provider(http).splitSeries(
+            eventId: "ser-1", recurrenceId: recurrenceId, recurrenceIdZone: .current, patch: GCalEventInput())
+
+        let created = try #require(graph.created.first, "\(c.name): no new part: \(http.servedCallSequence())")
+        let range = (created["recurrence"] as? [String: Any])?["range"] as? [String: Any]
+        let newPart = try #require(FakeGraphCalendar.rangeDays(created), "\(c.name): the new part has no end: \(canonical(range))")
+        let capped = try #require(graph.rangeDays(of: "ser-1"), "\(c.name): the series was not capped: \(canonical(graph.event("ser-1")?["recurrence"]))")
+        #expect(capped.count + newPart.count == c.count,
+                "\(c.name): \(capped.count) + \(newPart.count) occurrences, not the series' \(c.count)")
+        #expect(capped + newPart == original, "\(c.name): capped \(capped) and new \(newPart), not the series' \(original)")
+        #expect(range?["type"] as? String == "numbered" && range?["endDate"] == nil, "\(c.name): \(canonical(range))")
+    }
+
+    @Test("an all-day series in a zone ahead of UTC is split the same way, its split day a date")
+    func allDaySeries() async throws {
+        let first = GraphFixture.utcDay(GraphFixture.start)
+        let midnight = try #require(EKEventStoreHelper.parseNaiveISO(first, timeZone: .gmt))
+        var series = GraphFixture.event(id: "ser-1", start: midnight, online: false, recurring: true, allDay: true)
+        series["recurrence"] = [
+            "pattern": ["type": "daily", "interval": 2, "month": 0, "dayOfMonth": 0, "firstDayOfWeek": "sunday", "index": "first"],
+            "range": ["type": "numbered", "startDate": first, "endDate": "0001-01-01",
+                      "recurrenceTimeZone": "Tokyo Standard Time", "numberOfOccurrences": 6],
+        ]
+        let original = try #require(FakeGraphCalendar.rangeDays(series))
+        #expect(original.count == 6, "setup: \(original)")
+        guard original.count == 6 else { return }
+        let day = original[2]
+        var occurrence = GraphFixture.event(id: "ser-1-occ", start: try #require(EKEventStoreHelper.parseNaiveISO(day, timeZone: .gmt)),
+                                            online: false, seriesMasterId: "ser-1", allDay: true)
+        occurrence["originalStart"] = GraphFixture.allDayPlace(day, in: "Asia/Tokyo")
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = FakeGraphCalendar([series, occurrence])
+        graph.install(on: http)
+        _ = try await NumberedSplitFixture.provider(http).splitSeries(
+            eventId: "ser-1", recurrenceId: day + "T00:00:00", recurrenceIdZone: .gmt, patch: GCalEventInput())
+
+        let created = try #require(graph.created.first, "no new part: \(http.servedCallSequence())")
+        let range = (created["recurrence"] as? [String: Any])?["range"] as? [String: Any]
+        let newPart = try #require(FakeGraphCalendar.rangeDays(created), "the new part has no end: \(canonical(range))")
+        let capped = try #require(graph.rangeDays(of: "ser-1"))
+        #expect(capped + newPart == original, "capped \(capped) and new \(newPart), not the series' \(original)")
+    }
+
+    @Test("a split that leaves no occurrence of the number, or can't count them, writes nothing", arguments: [
+        "no occurrence left", "a range zone TabMail does not recognize",
+    ])
+    func refusedWithNothingWritten(_ label: String) async throws {
+        let first = NumberedSplitFixture.base
+        let weekday = NumberedSplitFixture.weekday(first)
+        var series = NumberedSplitFixture.series(rangeStart: first, daysOfWeek: [weekday], interval: 1, firstDayOfWeek: "sunday", count: 3)
+        // The occurrences as listed: one past the series' three when nothing is left, which stands
+        // for a count that disagrees with the listing; the split must then write nothing rather
+        // than a part that runs on.
+        let listed = try #require(FakeGraphCalendar.rangeDays(
+            NumberedSplitFixture.series(rangeStart: first, daysOfWeek: [weekday], interval: 1, firstDayOfWeek: "sunday", count: 4)))
+        var split = 3
+        if label == "a range zone TabMail does not recognize" {
+            series = NumberedSplitFixture.series(rangeStart: first, daysOfWeek: [weekday], interval: 1, firstDayOfWeek: "sunday",
+                                                 count: 3, rangeZone: "Not A Zone Standard Time")
+            split = 1
+        }
+        var seed = [series]
+        for (index, day) in listed.enumerated() { seed.append(try NumberedSplitFixture.occurrence(index, on: day)) }
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = FakeGraphCalendar(seed)
+        graph.install(on: http)
+        let recurrenceId = GraphFixture.wall(try NumberedSplitFixture.tenOClock(listed[split]), in: NumberedSplitFixture.zone)
+        var reason: String?
+        do {
+            _ = try await NumberedSplitFixture.provider(http).splitSeries(
+                eventId: "ser-1", recurrenceId: recurrenceId, recurrenceIdZone: .current, patch: GCalEventInput())
+        } catch CalendarProviderError.notSupported(let message) {
+            reason = message
+        }
+        #expect(reason?.isEmpty == false, "\(label): not refused: \(http.servedCallSequence())")
+        #expect(http.recordedCalls().allSatisfy { $0.method == "GET" }, "\(label): written: \(http.servedCallSequence())")
+        #expect(graph.created.isEmpty, "\(label): a new part was created")
+        #expect(canonical(graph.event("ser-1")?["recurrence"]) == canonical(series["recurrence"]), "\(label): the series was changed")
     }
 }

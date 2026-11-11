@@ -57,6 +57,10 @@ import Synchronization
 ///   notes kept the meeting and its join link;
 /// - a create (`POST /me/events`) stores the event it is sent under a new id,
 ///   with the same recurrence rules as a PATCH;
+/// - the days a stored series repeats on (`rangeDays`): its pattern applied from the range's
+///   `startDate` for its count or through its end date, deleted and moved occurrences included
+///   (measured: they still count toward a numbered range), so a split's two parts can be held to
+///   the series they came from;
 /// - a PATCH whose `attendees` holds any entry without a `status` is refused
 ///   with 405 `UnknownError` and an empty message, and changes nothing.
 ///   Measured on an Outlook.com account (#622): a list with every entry
@@ -141,6 +145,81 @@ final class FakeGraphCalendar: Sendable {
     }
 
     private static let createdPrefix = "created-"
+
+    /// The days the stored series `id` repeats on (`rangeDays(_:)`).
+    func rangeDays(of id: String) -> [String]? { event(id).flatMap(Self.rangeDays) }
+
+    /// The days a series' recurrence repeats on, `yyyy-MM-dd` in its range's zone, as Graph applies
+    /// it (`recurrencePattern`, `recurrenceRange`): from the range's `startDate` ("the first
+    /// occurrence of the meeting may be this date or later, depending on the recurrence pattern"),
+    /// every day the pattern names, for `numberOfOccurrences` of them (`numbered`) or through
+    /// `endDate` (`endDate`). A deleted or moved occurrence is still one of them: measured on
+    /// Outlook, a weekly series of six with its third occurrence deleted and its fourth moved still
+    /// read `numbered` six and still ended on its sixth week.
+    ///
+    /// Patterns: `daily` every `interval` days from `startDate`; `weekly` on `daysOfWeek` in every
+    /// `interval`-th week, counted from the week holding `startDate`, weeks starting on
+    /// `firstDayOfWeek`. Worked out here day by day, apart from the app's counter, so a test can
+    /// hold the app's split to it. nil for a `noEnd` range (it has no last day), another pattern
+    /// type, or a range this can't read.
+    static func rangeDays(_ event: [String: Any]) -> [String]? {
+        guard let recurrence = event["recurrence"] as? [String: Any],
+              let pattern = recurrence["pattern"] as? [String: Any],
+              let range = recurrence["range"] as? [String: Any],
+              let startText = range["startDate"] as? String else { return nil }
+        let names = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
+        let cal: Calendar = {
+            var cal = Calendar(identifier: .gregorian)
+            cal.timeZone = TimeZone(identifier: "UTC")!
+            return cal
+        }()
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.calendar = cal
+        fmt.timeZone = cal.timeZone
+        fmt.dateFormat = "yyyy-MM-dd"
+        guard let start = fmt.date(from: startText) else { return nil }
+        let interval = max(pattern["interval"] as? Int ?? 1, 1)
+        func dayNumber(_ date: Date) -> Int { cal.dateComponents([.day], from: start, to: date).day ?? 0 }
+        func name(_ date: Date) -> String { names[cal.component(.weekday, from: date) - 1] }
+        let isOccurrence: (Date) -> Bool
+        switch pattern["type"] as? String {
+        case "daily":
+            isOccurrence = { dayNumber($0) % interval == 0 }
+        case "weekly":
+            guard let days = pattern["daysOfWeek"] as? [String], !days.isEmpty,
+                  let firstDay = (pattern["firstDayOfWeek"] as? String).flatMap({ names.firstIndex(of: $0.lowercased()) })
+            else { return nil }
+            let wanted = Set(days.map { $0.lowercased() })
+            // The first day of the week holding `startDate`, as a day number from it (0 or less).
+            let weekFirst = -((cal.component(.weekday, from: start) - 1 - firstDay + 7) % 7)
+            isOccurrence = { date in
+                let week = (dayNumber(date) - weekFirst) / 7
+                return wanted.contains(name(date)) && week % interval == 0
+            }
+        default:
+            return nil
+        }
+        let last: (_ day: Date, _ found: Int) -> Bool
+        switch range["type"] as? String {
+        case "numbered":
+            guard let count = range["numberOfOccurrences"] as? Int, count >= 1 else { return nil }
+            last = { _, found in found == count }
+        case "endDate":
+            guard let endText = range["endDate"] as? String, let end = fmt.date(from: endText) else { return nil }
+            last = { day, _ in day > end }
+        default:
+            return nil
+        }
+        let maxDays = 3_660
+        var out: [String] = []
+        for offset in 0..<maxDays {
+            guard let day = cal.date(byAdding: .day, value: offset, to: start) else { return nil }
+            if last(day, out.count) { return out }
+            if isOccurrence(day) { out.append(fmt.string(from: day)) }
+        }
+        return nil
+    }
 
     func install(on http: FakeHTTP.Scenario) {
         http.register(path: "/v1.0/me/events/", method: "GET") { [self] request in

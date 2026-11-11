@@ -4,6 +4,8 @@
 `seriesSplitResources`, `occurrenceOverrideResource`, `CalDAVEventCopies`, `splitNewPartJSON`,
 `serverOwnedEventKeys`, `splitCopiedKeys`, `splitSelect`, `splitReschedules`, `applyAttendeeRule`, `insertEventJSON`,
 `conferenceDataVersion`, `supportsAttachments`, `splitRecurrence`, `keptAttendeesJSON`, `editJSON`, `filterDateList`, `RecurrenceTail`,
+`newSeriesEnd`, `occurrencesLeft`, `numberOfOccurrences`, numbered range, `Anchor`, `patternStart`, WKST, `firstDayOfWeek`,
+`rangeDays`, #474, #562,
 EXDATE, RDATE, COUNT, recurrenceTimeZone, attendee answers, `needsAction`, write order,
 create first cap last, lost cap response, retry, own cap, `successorIsOurs`, `capEndDate`,
 RFC 6638 §3.2.8, PARTSTAT reset, `this_only` move asks again, Thunderbird add-on split only,
@@ -48,8 +50,9 @@ attachments, conferences, extended and X-properties, attendee roles and paramete
     `ExchangeSeriesSplitCopyTests.cappedSeriesKeepsItsPattern`: a live cap that sent a range with no
     zone and `firstDayOfWeek` "sunday" moved a Pacific series to UTC, in the shape the split wrote
     before #610). The new part's range starts on
-    its own date; a numbered range becomes `noEnd`, and `endDate` is kept only for an `endDate`
-    range.
+    its own date; a numbered range stays numbered with what is left of its number
+    (`occurrencesLeft`, #474), and `endDate` is kept verbatim only for an `endDate` range. (Before
+    #474 a numbered range became `noEnd`.)
   - The create body is built **before** the cap is written, so a series that can't be copied is
     refused while nothing has changed.
   - The revert after a failed create writes the stored recurrence back exactly.
@@ -86,7 +89,9 @@ response was lost, the series it reads is already capped.
   guard far more often. A retry after a lost cap response reads a range that already ends on this
   split's cap (`capEndDate`); kept, the new part would end before it starts, so `splitNewPartJSON`
   writes it as `noEnd`, the own-cap rule `RecurrenceTail.newSeriesRule` applies. Such a new part
-  repeats with no end where the series had an end date; editing its end repairs it.
+  repeats with no end where the series had an end date; editing its end repairs it. The same holds
+  for a numbered series (#474): its number is gone once the cap is written, so such a retry's new
+  part has no end either, until #601 moves Outlook to create first.
 - **A rule from the edit replaces only the RRULE line on every provider** (#513): Google's
   `GoogleCalendarProvider.recurrence(_:withRuleFrom:)` keeps the excluded and added dates after the
   split (and on a whole-series edit, the series' own), as CalDAV does. Before #513 Google wrote the
@@ -101,8 +106,26 @@ response was lost, the series it reads is already capped.
   or what is left of its COUNT (`RecurrenceTail.newSeriesRule`, computed before any write); the
   copy builders take that rule as given. On Outlook the end lives only in the range, which
   `ExchangeCalendarProvider.splitNewPartJSON` rewrites from the stored one: an `endDate` range
-  keeps its end date and a numbered range becomes `noEnd`, because the number left after the split
-  is not known there yet. A rule in the edit replaces the stored recurrence instead.
+  keeps its end date verbatim, and a numbered range stays numbered with what is left of its
+  number (#474, `occurrencesLeft`). A rule in the edit replaces the stored recurrence instead.
+  (Superseded text, kept for the record: "a numbered range becomes `noEnd`, because the number
+  left after the split is not known there yet.")
+- **What is left of a number is one rule for every provider** (`RecurrenceTail.newSeriesEnd`):
+  the number less the occurrences the rule generates before the split, refused with nothing
+  written when none is left or it can't be counted. Google and CalDAV write it as COUNT, Outlook
+  as `numberOfOccurrences`. Occurrences that were deleted or moved still count: RFC 5545 counts
+  an EXDATE'd occurrence, and on Outlook a weekly series of six with its third occurrence deleted
+  and its fourth moved still read `numbered` six and still ended on its sixth week (measured
+  2026-11-10). A numbered range reads `endDate` as the placeholder "0001-01-01" (measured), so
+  that value is never an end.
+- **How Outlook is counted** (`occurrencesLeft`): from the range's `startDate`, which Graph
+  documents as "the date to start applying the recurrence pattern", the first occurrence being that
+  date or later (`RecurrenceTail.Anchor.patternStart`: the start day counts only when the pattern
+  names it, where RFC 5545's DTSTART always counts); the split occurrence's day in the series' zone
+  (`GCalEvent.seriesZone`; an all-day split's date as given); weeks starting on the pattern's
+  `firstDayOfWeek`, sent as the counted rule's WKST. An unrecognized range zone or an uncountable
+  pattern is refused before the cap. The cap's own date is still worked out in the operation's
+  zone (#681).
 - **A split that moves the start (CalDAV):** the edit lands on the new part through
   `CalDAVProvider.mergePatchIntoICS`, the same merge as a whole-series edit, so its start shift
   (`shiftSeriesAnchoredValues`, #558) also moves the new part's EXDATE and RDATE, its UNTIL (unless
@@ -209,6 +232,12 @@ sends no attendee list. Tests: `GoogleAttendeeEditTests`.
 (in `CalDAVSplitHelpersTests`, against `FakeCalDAVStore`; the write order, the partition of
 changed occurrences and dates, and the retry after a lost cap response), `SeriesSplitCopyTests` (Google and Outlook, against
 `FakeGraphCalendar`; the Outlook create body is checked as sent).
+`ExchangeNumberedSplitTests` (#474, in `SeriesSplitCopyTests.swift`): an Outlook numbered series'
+two parts hold exactly the series' occurrences (`FakeGraphCalendar.rangeDays`, the fake's own
+range expansion), with deleted and moved occurrences before the split, a range starting before its
+first occurrence, every-other-week series with either first day of the week, and an all-day series
+ahead of UTC; nothing left, or an unrecognized range zone, writes nothing.
+`RecurrenceTailNewSeriesEndTests` pins the two anchors.
 `CalDAVOccurrenceOverrideTests.changedOccurrenceKeepsItsOwnProperties` (#604): an occurrence
 changed on its own keeps its status, alert, categories, link, revision, `X-` line and attendees
 through a rename, an attendee added and a move.

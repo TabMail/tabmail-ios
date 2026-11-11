@@ -315,3 +315,57 @@ struct RecurrenceTailNewSeriesRuleTests {
         #expect(refuses("RRULE:FREQ=DAILY;COUNT=10;COUNT=12"))
     }
 }
+
+/// `RecurrenceTail.newSeriesEnd` and its two anchors: RFC 5545's DTSTART, always the first
+/// occurrence, and Outlook's range `startDate`, an occurrence only when the pattern names its day.
+/// Dates are in 2099 so no clock can make them stale: 2099-03-02 is a Monday, 2099-03-03 and
+/// 2099-03-31 are Tuesdays.
+@Suite("RecurrenceTail — what is left of a numbered series")
+struct RecurrenceTailNewSeriesEndTests {
+
+    private static let monday = RecurrenceTail.Day(iso: "2099-03-02")
+    private static let tuesday = RecurrenceTail.Day(iso: "2099-03-03")
+    /// Four Tuesdays after `tuesday`'s: the 3rd, 10th, 17th and 24th come before it.
+    private static let split = RecurrenceTail.Day(iso: "2099-03-31")
+    private static let tuesdays = "RRULE:FREQ=WEEKLY;BYDAY=TU;COUNT=6"
+
+    @Test("A range starting before the pattern's first day does not count that day; DTSTART always counts")
+    func anchorsCountTheStartDayDifferently() throws {
+        let monday = try #require(Self.monday)
+        let tuesday = try #require(Self.tuesday)
+        let split = try #require(Self.split)
+        #expect(RecurrenceTail.occurrences(of: Self.tuesdays, seriesStart: monday, before: split, anchor: .patternStart) == 4,
+                "the Monday the range starts on is no occurrence of a Tuesday series")
+        #expect(RecurrenceTail.occurrences(of: Self.tuesdays, seriesStart: monday, before: split, anchor: .dtstart) == 5,
+                "RFC 5545: DTSTART is the first occurrence whatever the rule names")
+        #expect(RecurrenceTail.occurrences(of: Self.tuesdays, seriesStart: tuesday, before: split, anchor: .patternStart) == 4)
+        #expect(RecurrenceTail.occurrences(of: Self.tuesdays, seriesStart: tuesday, before: split, anchor: .dtstart) == 4)
+    }
+
+    @Test("The new series gets the count less the occurrences before the split, so the two hold the count between them")
+    func whatIsLeft() throws {
+        #expect(try RecurrenceTail.newSeriesEnd(count: 6, of: Self.tuesdays, seriesStart: Self.monday, split: Self.split, anchor: .patternStart) == 2)
+        #expect(try RecurrenceTail.newSeriesEnd(count: 6, of: Self.tuesdays, seriesStart: Self.tuesday, split: Self.split, anchor: .patternStart) == 2)
+        #expect(try RecurrenceTail.newSeriesEnd(count: 5, of: Self.tuesdays, seriesStart: Self.tuesday, split: Self.split) == 1,
+                "the split occurrence itself is the last one")
+    }
+
+    @Test("Nothing left from the split on, or a count that can't be worked out, is refused")
+    func refusals() {
+        func refuses(_ count: Int, start: RecurrenceTail.Day?, split: RecurrenceTail.Day?, rule: String = Self.tuesdays) -> Bool {
+            do {
+                _ = try RecurrenceTail.newSeriesEnd(count: count, of: rule, seriesStart: start, split: split, anchor: .patternStart)
+                return false
+            } catch CalendarProviderError.notSupported(let message) {
+                return !message.isEmpty
+            } catch {
+                return false
+            }
+        }
+        #expect(refuses(4, start: Self.monday, split: Self.split), "the 3rd, 10th, 17th and 24th are all four")
+        #expect(refuses(3, start: Self.monday, split: Self.split))
+        #expect(refuses(6, start: nil, split: Self.split))
+        #expect(refuses(6, start: Self.monday, split: nil))
+        #expect(refuses(6, start: Self.monday, split: Self.split, rule: "RRULE:FREQ=YEARLY;BYYEARDAY=1;COUNT=6"))
+    }
+}
