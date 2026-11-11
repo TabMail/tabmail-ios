@@ -191,8 +191,10 @@ build**. The error's text stays in the debug-gated logs only.
   count, for raising or clearing, decided by error KIND with no account lookup
   (`InboxErrorBanner.isSignInError`: `ProviderError.authenticationFailed`, `AuthError.refreshFailed`, and a
   provider error whose `ProviderClassifiedError.isSignInRefusal` is true, which for IMAP is a non-temporary
-  `loginFailed`); the sign-in mark and its banner carry them. For polls, accounts in `authFailedAccounts`
-  also never count. A refresh judges the one error it sees, with no per-account attribution. Seeing only the first error and the connect
+  `loginFailed`); the sign-in mark and its banner carry them. The marked-account exclusion
+  applies to polls only, which know each failing account: there, any failure of an account in
+  `authFailedAccounts` never counts. A refresh judges the one error it sees, with no per-account attribution,
+  so a marked account's other (non-sign-in) error on a refresh still raises (intended). Seeing only the first error and the connect
   loop stopping other accounts are filed separately. A poll that cannot load its accounts counts as failed.
   An all-failed foreground poll does not advance `lastSyncCompletedAt`. Superseded rules, kept for history:
   "only a full run with NO failure at all clears", then "a full refresh whose first error came from a marked

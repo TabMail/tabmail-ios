@@ -131,9 +131,11 @@ final class AccountManagerState {
     /// active account and had no counted failure; scheduler and background polls
     /// clear it this way too, so recovery heals it without a gesture, and they
     /// never raise it. Sign-in errors (a refused credential, a failed token
-    /// refresh) never count, for raising or for clearing, and neither does any
-    /// failure of an account marked sign-in-needed: the sign-in mark and its own
-    /// "Sign in again" banner carry them.
+    /// refresh) never count, for raising or for clearing: the sign-in mark and
+    /// its own "Sign in again" banner carry them. Polls, which know each failing
+    /// account, also do not count any failure of an account marked
+    /// sign-in-needed; a refresh judges only the error it sees, so a marked
+    /// account's other (non-sign-in) error on a refresh still raises.
     ///
     /// A run that did not fail as a whole (every poll, and a refresh that
     /// succeeded) ends here. It never raises.

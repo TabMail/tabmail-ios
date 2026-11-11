@@ -291,4 +291,41 @@ struct SyncRunBannerEntryPointTests {
             #expect(banner == InboxErrorBanner.genericMessage, "a poll that loaded no accounts cleared the banner")
         }
     }
+
+    // MARK: - What a failed refresh raises
+
+    @Test("an offline refresh shows no banner")
+    func offlineRefreshShowsNoBanner() async throws {
+        try await withWorld { world in
+            let offline = URLError(.notConnectedToInternet)
+            await world.providerA.setConnectThrows(offline)
+            await world.providerA.setFetchMessagesThrows(offline)
+            await InboxViewModel(folders: [world.inboxA, world.inboxB]).refreshSync()
+            #expect(banner == nil, "an offline refresh raised the banner")
+        }
+    }
+
+    @Test("a refresh failing only with a temporary refusal leaves a raised banner up")
+    func temporaryRefusalRefreshKeepsBanner() async throws {
+        try await withWorld { world in
+            await raiseThroughRefresh(world)
+            #expect(banner == InboxErrorBanner.genericMessage)
+            let refusal = ProviderTemporaryRefusal(underlying: NSError(domain: "com.example.test", code: 9))
+            await world.providerA.setConnectThrows(refusal)
+            await world.providerA.setFetchMessagesThrows(refusal)
+            await InboxViewModel(folders: [world.inboxA, world.inboxB]).refreshSync()
+            #expect(banner == InboxErrorBanner.genericMessage, "a temporary refusal cleared the banner")
+        }
+    }
+
+    @Test("a marked account's non-sign-in failure on a refresh raises the generic banner")
+    func markedAccountOtherFailureOnRefreshRaises() async throws {
+        try await withWorld { world in
+            await AccountManager.shared.markAuthFailed(world.accountA.id)
+            await world.setFailing(true)
+            await InboxViewModel(folders: [world.inboxA, world.inboxB]).refreshSync()
+            #expect(banner == InboxErrorBanner.genericMessage,
+                    "a refresh cannot attribute its error, so a marked account's other failure must raise")
+        }
+    }
 }
