@@ -16,7 +16,9 @@ occurrence, `RecurrenceTail.isCapped`, `isOwnSplitCap`, `splitCapUntil`, `afterO
 own split cap, interrupted split, `routeSeriesTimeChange`, Google Calendar behaviour, retry, lost
 response, not found, Graph series start before the first occurrence,
 `queuedEventId`, `ruleChangeResetNote`, reset note, invariant property, #559, #560, #563, #613, #679,
-#680, #683, #687.
+#680, #683, #687, #720, `usesSeries`, `readSeries`, `seriesNotRead`, `seriesNotInThisCalendar`,
+`holdsOnlyChangedOccurrences`, override-only, changed occurrences only, invitation to single
+occurrences, series not in this calendar, `parseError`, No VEVENT found, wedge, `failedAccounts`.
 
 ## The rule
 
@@ -104,11 +106,61 @@ the provider layer asks which provider it is (ADR-IOS-060).
 The lookup takes no scope: it is made as the one-occurrence edit makes it (CalDAV:
 `scopedEdit(forSplit: false)`), for every scope. `forSplit` stays only on CalDAV's own check, which its
 `splitSeries` makes with `true` (the rule read without its end, a moved occurrence refused, a resource
-holding only changed occurrences refused). So a split of a resource holding only changed occurrences (an
-invitation to single occurrences) is refused at the drain, after its card, as on `main` before #560.
+holding only changed occurrences refused).
+[Superseded 2026-11-11 (#720): "So a split of a resource holding only changed occurrences (an
+invitation to single occurrences) is refused at the drain, after its card, as on `main` before #560."
+It is now refused before the card; see "A series that is not in this calendar" below.]
 
 `read` runs for every scope (one extra read per edit; a rename included), since only the event says
-whether it is an occurrence.
+whether it is an occurrence. **Amended 2026-11-11 (#720):** the event is read for every scope; the
+SERIES of an occurrence is read only for a scope that uses it (`CalendarSeriesScope.usesSeries`: "all"
+and `this_and_following`). `read` takes the given `scope` (the tool's `resolvedScope`, the queue's
+`givenScope`); a `this_only` edit reads the event and the provider's lookup (`occurrence(...)`) only, and
+`Named.series` is nil. No `this_only` path used the series (`route` returns it as given,
+`dayMoveRefusal` passes it, the card shows the event, the queue writes `routed.eventId`).
+
+## A series that is not in this calendar (#720)
+
+A CalDAV resource can hold only changed occurrences, with no series VEVENT: an invitation to single
+occurrences of someone else's series (RFC 4791 §4.1; ADR-IOS-108). A listing gives each occurrence
+`recurringEventId` = the resource href, so `read` took it for a readable series and GET the href:
+`getEvent` threw `CalDAVError.parseError("No VEVENT found")`, which no terminal arm of the calendar queue
+claims. Through the tool it was a misleading refusal before the card (and ADR-IOS-108's `this_only` edit
+of such an occurrence, written before #560, was refused); at the drain it was requeued on every drain and
+held the account's later calendar operations through `failedAccounts` (the never-drop wedge corollary).
+
+The fix is in the read and at the address, not in the queue's classification (a `parseError` stays
+transient: an empty 2xx body is indeterminate, `CalendarBadRequestClassificationTests`):
+- `read` does not read the series for `this_only` (above), so that edit is written again, before the
+  card and at the drain, through CalDAV's own one-occurrence lookup and write.
+- `CalDAVProvider.getEvent` of such a resource's own id throws the final answer
+  `CalendarProviderError.notSupported(CalDAVOccurrences.seriesNotInThisCalendar)`: the series is not in
+  this calendar, so it can't be changed as a whole or split; one of its occurrences can be changed with
+  `this_only`, by the id listed for it and its `start_iso`. `scopedEdit`'s no-series branch (the resource's
+  own id, or a split) throws the same reason. A resource with no VEVENT at all stays `parseError`.
+- So "all" (or no scope and no `recurrence_id`) and `this_and_following` named by such an occurrence are
+  refused before the card, and a row that reaches the drain (the resource rewritten between the card and
+  the drain) is retired by the unsupported arm in that drain; never requeued.
+- **Invariant: an "all" edit never reaches `updateEvent(href)` on this shape.** `Named.series` is
+  optional; `route` gets it through `Named.readSeries()`, which throws for a scope that uses the series
+  when it was not read (`seriesNotRead`), so such an edit is never routed as given; `dayMoveRefusal`
+  refuses with the same reason; the queue's written event and the tool's card take it through
+  `readSeries()`. `series` is never filled with the occurrence.
+- The id a listing gave while the resource held its series still names the occurrence after the server
+  rewrites it to hold only that occurrence (the key is the instant, UTC, or the date, read from the
+  RECURRENCE-ID either way), so a `this_only` row drained after such a rewrite is written.
+
+Tests: `CalDAVOccurrenceEditToolToWireTests.overrideOnlyResourceWriteMatchesTheCardOrIsRefusedBeforeIt`
+(RECURRENCE-ID forms tzid, utc, date × every scope, from the tool to the wire: `this_only` written as its
+card said, every other scope no card, nothing queued, the resource byte for byte),
+`RewrittenAfterTheCardTests` (`CalendarSeriesScopeTests.swift`: the resource rewritten between the card
+and the drain, and a `this_only` row already queued against the shape, each with a second operation on
+the account: after ONE drain nothing is queued, the second operation ran, the edit written or retired),
+and `CalDAVOccurrenceWireTests.overrideOnlyResourceRefusesWhatItCannotAddress` (a read of the own id).
+
+Not measured, carried separately: whether Google or Outlook give an invitee to one occurrence an instance
+whose series that account can't read (the twin of this shape). Their own lookup and write already GET the
+series (`resolveToMaster`), so `read`'s series GET adds no new failure there.
 
 ## Where it is applied
 
@@ -237,7 +289,8 @@ stored instances. `drainEdit(..., drains:)` drains once per attempt.
 
 ## Known limits
 
-1. One extra provider read per edit.
+1. One extra provider read per edit (amended #720: for "all" and `this_and_following`; `this_only` reads
+   no series).
 2. CalDAV "all" with no occurrence named and a new date asks the user.
 3. A CalDAV series written in UTC with no `TZID` has no known zone (#679).
 4. A split at a moved occurrence is not supported: a plain error, nothing written (#563, #687).
@@ -249,9 +302,10 @@ stored instances. `drainEdit(..., drains:)` drains once per attempt.
 7. Graph's series start can fall before the series' first occurrence. First or later is judged against
    the series' start (`firstPlace`), so a date move named from the real first occurrence is taken as a
    later one and becomes a split there.
-8. A split of a CalDAV resource that holds only changed occurrences is refused after its card, at the
-   drain, as on `main` (its lookup no longer takes the split's scope): refused at the write, nothing
-   written.
+8. **Closed 2026-11-11 (#720).** Was: "A split of a CalDAV resource that holds only changed occurrences
+   is refused after its card, at the drain, as on `main` (its lookup no longer takes the split's scope):
+   refused at the write, nothing written." Now refused before the card, as is an edit of every
+   occurrence there: the series is not in this calendar (`seriesNotInThisCalendar`).
 9. An Outlook all-day series with no recurrence zone name is refused by the occurrence lookup, nothing
    written. Expected unreachable: Graph reads a range written without a zone back labelled UTC
    (measured 2026-11-07).
