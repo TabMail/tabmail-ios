@@ -124,6 +124,16 @@ struct CalendarEventCreateTool: AgentTool, Sendable {
                 "event_title": eventTitle,
             ])
         }
+        // A repeat rule the calendar can't hold is refused before the card, naming the field, so
+        // the assistant can offer one it can (#513). The calendar is the one the write goes to.
+        let backend = await CalendarProviderDispatch.resolve()
+        if let reason = try? CalendarToolHelpers.recurrenceProviderRefusal(arguments, provider: backend?.provider) {
+            return ToolJSON.string(from: [
+                "ok": false,
+                "error": "calendar_event_create failed: \(reason). The event was NOT created.",
+                "event_title": eventTitle,
+            ])
+        }
 
         // ADR-IOS-024: Show confirmation card and await user response
         let (confirmed, cardState) = await AgentToolRouter.ActionConfirmation.awaitConfirmation(
@@ -151,7 +161,7 @@ struct CalendarEventCreateTool: AgentTool, Sendable {
             ] as [String: Any]))
         }
 
-        guard let backend = await CalendarProviderDispatch.resolve() else {
+        guard let backend else {
             return CalendarProviderDispatch.notAvailableMessage
         }
         // Resolve the actual calendarId at creation time — stored in the queue and cache
@@ -246,9 +256,10 @@ struct CalendarEventCreateTool: AgentTool, Sendable {
         // render "Repeats weekly" etc. before the event drains to the provider.
         // Reuses the same builder the drain runs, so the cached value matches
         // exactly what the provider will store.
-        // `try?`: `execute` already refused any recurrence the builder would throw on, before the
-        // card was shown, and the op is queued by now; a missing cached rule only costs the pill
-        // its "Repeats" line.
+        // `try?`: `execute` already refused, before the card, any recurrence the builder would throw
+        // on, except a naive until in a DST gap of the event's zone (the card checks in UTC; the
+        // writer refuses it at the queue, nothing written); the op is queued by now, and a missing
+        // cached rule only costs the pill its "Repeats" line.
         let createdRRule: String? = {
             guard let input = try? CalendarToolHelpers.buildGCalEventInput(queuedArgs, isAllDay: isAllDay) else { return nil }
             return (input.recurrence ?? []).first(where: { $0.uppercased().hasPrefix("RRULE:") })

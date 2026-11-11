@@ -192,6 +192,8 @@ These tests read what each provider sent, or what the fake server ends up holdin
     is known by the attendee flag or by the address alone, an added attendee is asked, and a dropped
     one is removed; `splitReschedules` is also checked trigger by trigger, including timed to all day;
   - an excluded or an added date exactly at the split going to the new part only;
+  - a new rule on the new part keeping the excluded and added dates after the split (the rule
+    line alone is replaced);
   - `privateCopy` kept on the new part;
   - a refusal before any write when a date can't be read.
 - `SeriesSplitCopyTests`, Outlook, against `FakeGraphCalendar`: every property in a literal list
@@ -800,3 +802,23 @@ start, an unparsable 16-character `Z` value keeps its own date digits, and a sta
 no wall-time form leaves the `UNTIL`'s local day. `graphEndDateRoundTrips` brings the rule
 `toGCalEvent` derives from Graph's own `endDate` back to the same date in every zone. All dates are
 relative to today, read once per test.
+
+## Calendar repeat rules — every field written, or refused by name
+
+`TabMailTests/Tools/CalendarRecurrenceDaysTests.swift` pins that `calendar_event_create` and
+`calendar_event_edit` write every repeat field (`freq`, `interval`, `count`, `until`, `byDay`,
+`byMonthDay`, `byMonth`, `wkst`) on every calendar, or refuse the call before the confirmation card
+naming the field and the value, with nothing sent.
+
+- `RecurrenceDaysWriterTests`: the writer and the card per field and combination; the card's words
+  for a day counted from the month's end, the last day and a fifth weekday; every invalid token
+  (including a malformed or impossible `until`, which is refused, never dropped) refused by both.
+- `GraphRecurrenceRefusalTests`: everyday rules map to Graph patterns; rules outside Graph's pattern
+  types are refused naming the field; `byMonthDay: -1` is named "the last day of the month".
+- `GoogleRecurrenceDaysWireTests`, `ExchangeRecurrenceDaysWireTests`, `CalDAVRecurrenceDaysWireTests`:
+  create and edit through the calendar queue against the fakes write the whole rule; Google and
+  CalDAV keep EXDATE and RDATE; Outlook's create, edit and this-and-following writers each refuse a
+  rule Graph can't hold with no POST or PATCH.
+- `RecurrenceDaysToolTests`: the cards name the days; every invalid field, and an invalid `until`
+  on Google, Outlook and CalDAV, is refused before both cards with nothing sent; a rule Outlook
+  can't hold is refused before both cards.

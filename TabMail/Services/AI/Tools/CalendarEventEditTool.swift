@@ -116,6 +116,15 @@ struct CalendarEventEditTool: AgentTool, Sendable {
                 "event_id": compoundId,
             ] as [String: Any])
         }
+        // A repeat rule this event's calendar can't hold is refused before the card, naming the
+        // field, so the assistant can offer one it can (#513).
+        if let reason = try? CalendarToolHelpers.recurrenceProviderRefusal(arguments, provider: provider) {
+            return ToolJSON.string(from: [
+                "ok": false,
+                "error": "calendar_event_edit failed: \(reason). The event was NOT changed.",
+                "event_id": compoundId,
+            ] as [String: Any])
+        }
         // A `timezone` TabMail does not recognize is refused before the card, rather than read as
         // the device's zone (which would move the event to the wrong time). The queue refuses it
         // the same way (`resolveWriteTimeZone`) for an edit that reaches it.

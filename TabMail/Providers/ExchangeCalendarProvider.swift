@@ -245,6 +245,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
             calPath = "/calendars/\(encodedCalId)"
         }
 
+        try Self.refuseUnrepresentableRule(event.recurrence)
         let body = try JSONSerialization.data(withJSONObject: createEventJSON(event))
         if DebugModeManager.isLoggingEnabled() {
             if let bodyStr = String(data: body, encoding: .utf8) {
@@ -277,6 +278,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // (#423). The description was then the 255-character `bodyPreview`; it is
         // now the full notes (`notes(of:)`). Every edit wrote all of that back.
         // `graphPatchJSON` says what rides along and why.
+        try Self.refuseUnrepresentableRule(event.recurrence)
         let existing = try await fetchForEdit(eventId: eventId)
         let json = try graphPatchJSON(patch: event, existing: existing, allowRecurrence: true)
         guard !json.isEmpty else {
@@ -377,6 +379,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // don't carry the series `recurrence`; only the master does. Resolve
         // via `seriesMasterId` (mapped onto `recurringEventId` by toGCalEvent)
         // so a split aimed at an occurrence id still finds the series to cap.
+        try Self.refuseUnrepresentableRule(patch.recurrence)
         let (eventId, snapshot) = try await resolveToMaster(eventId: eventId, select: Self.splitSelect)
         let master = snapshot.event
         guard let masterRecurrence = master.recurrence, !masterRecurrence.isEmpty,
@@ -1582,6 +1585,74 @@ actor ExchangeCalendarProvider: CalendarProvider {
         return local.string(from: lastInstant)
     }
 
+    /// Why Graph cannot hold `rrule`, or nil when `parseRRULEToGraphRecurrence` maps it exactly (#513).
+    ///
+    /// Graph's `recurrencePattern` holds one shape per type: `daily`; `weekly` (`daysOfWeek`);
+    /// `absoluteMonthly` (one `dayOfMonth`, 1 to 31); `relativeMonthly` (`daysOfWeek` and one `index`,
+    /// first to fourth or last); `absoluteYearly` (one `month` and one `dayOfMonth`); `relativeYearly`
+    /// (one `month`, `daysOfWeek` and `index`). With several `daysOfWeek` a relative pattern falls on
+    /// the first of them that matches, not on each. A rule outside these shapes would be written as a
+    /// different series, so it is refused, naming the field, and the assistant can offer one Outlook
+    /// can hold. Every shape an everyday request makes maps exactly: weekly on several days, monthly
+    /// on a date or on the nth (or last) weekday, yearly on a date or on the nth weekday of a month.
+    /// A rule that leaves the day out (the start's day is implied) is not checked here.
+    nonisolated static func graphRecurrenceRefusal(_ rrule: String) -> String? {
+        var fields: [String: [String]] = [:]
+        for part in rrule.replacingOccurrences(of: "RRULE:", with: "").split(separator: ";") {
+            let kv = part.split(separator: "=", maxSplits: 1).map(String.init)
+            guard kv.count == 2 else { continue }
+            fields[kv[0].uppercased()] = kv[1].uppercased().split(separator: ",").map(String.init)
+        }
+        let freq = fields["FREQ"]?.first ?? ""
+        let byDay = fields["BYDAY"] ?? []
+        let byMonthDay = fields["BYMONTHDAY"] ?? []
+        let byMonth = fields["BYMONTH"] ?? []
+        let ordinals = byDay.map { Int($0.dropLast(2)) }
+        func refuse(_ field: String, _ values: [String], _ why: String) -> String {
+            "Outlook calendars can't repeat \(why), so recurrence.\(field) [\(values.joined(separator: ","))] can't be saved there. Offer the user a repeat Outlook can hold"
+        }
+        guard ["DAILY", "WEEKLY", "MONTHLY", "YEARLY"].contains(freq) else {
+            return "Outlook calendars can't repeat with freq \(freq). Offer the user a repeat Outlook can hold"
+        }
+        if freq != "YEARLY", !byMonth.isEmpty { return refuse("byMonth", byMonth, "in chosen months except with freq YEARLY") }
+        if byMonth.count > 1 { return refuse("byMonth", byMonth, "yearly in more than one month") }
+        if freq == "DAILY", !byDay.isEmpty { return refuse("byDay", byDay, "daily on chosen weekdays (use freq WEEKLY with these days)") }
+        if freq == "DAILY", !byMonthDay.isEmpty { return refuse("byMonthDay", byMonthDay, "daily on chosen days of the month") }
+        if freq == "MONTHLY" || freq == "YEARLY" {
+            if !byDay.isEmpty, !byMonthDay.isEmpty { return refuse("byMonthDay", byMonthDay, "on a weekday and a day of the month together") }
+            if byMonthDay.count > 1 { return refuse("byMonthDay", byMonthDay, "on more than one day of the month") }
+            if let day = byMonthDay.first.flatMap({ Int($0) }), day < 1 {
+                return refuse("byMonthDay", byMonthDay, day == -1 ? "on the last day of the month" : "on a day counted from the end of the month")
+            }
+            if freq == "YEARLY", !byMonthDay.isEmpty, byMonth.isEmpty {
+                return refuse("byMonthDay", byMonthDay, "yearly on a day of the month without the month (add byMonth)")
+            }
+            if !byDay.isEmpty {
+                if ordinals.contains(where: { $0 == nil }) {
+                    return refuse("byDay", byDay, "on every such weekday of the \(freq == "MONTHLY" ? "month" : "year") (give one position, such as 1MO or -1FR)")
+                }
+                if byDay.count > 1 { return refuse("byDay", byDay, "on more than one numbered weekday") }
+                if let n = ordinals.first ?? nil, !(1...4).contains(n), n != -1 {
+                    return refuse("byDay", byDay, "on a weekday numbered other than first to fourth or last")
+                }
+                if freq == "YEARLY", byMonth.isEmpty {
+                    return refuse("byDay", byDay, "yearly on a numbered weekday without the month (add byMonth)")
+                }
+            }
+        }
+        return nil
+    }
+
+    nonisolated func recurrenceRuleRefusal(_ rrule: String) -> String? { Self.graphRecurrenceRefusal(rrule) }
+
+    /// The writer's half of `graphRecurrenceRefusal`: a rule Graph can't hold is refused before
+    /// anything is sent, for an operation that reaches the writer without the tools' check.
+    nonisolated static func refuseUnrepresentableRule(_ recurrence: [String]?) throws {
+        guard let rrule = recurrence?.first(where: { $0.uppercased().hasPrefix("RRULE:") }),
+              let reason = graphRecurrenceRefusal(rrule) else { return }
+        throw CalendarProviderError.notSupported(reason)
+    }
+
     /// Convert an RFC 5545 `RRULE` to a Microsoft Graph `patternedRecurrence`.
     ///
     /// Graph's `recurrencePattern.type` is a CLOSED enum — `daily`, `weekly`,
@@ -1614,6 +1685,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         var byMonthDay: Int?
         var byMonth: Int?
         var bySetPos: Int?
+        var wkst: String?
 
         let abbrevToDay = ["SU": "sunday", "MO": "monday", "TU": "tuesday", "WE": "wednesday", "TH": "thursday", "FR": "friday", "SA": "saturday"]
 
@@ -1629,6 +1701,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
             case "BYMONTHDAY": byMonthDay = Int(kv[1])
             case "BYMONTH": byMonth = Int(kv[1])
             case "BYSETPOS": bySetPos = Int(kv[1])
+            case "WKST": wkst = abbrevToDay[String(kv[1]).uppercased()]
             default: break
             }
         }
@@ -1684,7 +1757,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
             // FREQ=WEEKLY with no BYDAY recurs on DTSTART's weekday.
             pattern["daysOfWeek"] = !plainDays.isEmpty ? plainDays
                 : (startWeekday.map { [$0] } ?? ["monday"])
-            pattern["firstDayOfWeek"] = "sunday"
+            pattern["firstDayOfWeek"] = wkst ?? "sunday"
 
         case "monthly":
             if !plainDays.isEmpty {
