@@ -172,7 +172,7 @@ struct ToolArgumentWholeNumberTests {
         let args: [String: JSONValue] = ["recurrence": .dictionary([
             "freq": .string("weekly"), "interval": .double(2.0), "count": .double(14.0),
         ])]
-        #expect(try CalendarToolHelpers.recurrenceSummary(args) == "every 2 weekly (14 times)")
+        #expect(try CalendarToolHelpers.recurrenceSummary(args) == "every 2 weeks (14 times)")
     }
 
     // MARK: - No other path from a JSON number to Int

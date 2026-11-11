@@ -1063,7 +1063,7 @@ enum CalendarToolHelpers {
         return until
     }
 
-    /// The confirmation-card text for a `recurrence` argument (`every 2 weekly on Monday, Wednesday
+    /// The confirmation-card text for a `recurrence` argument (`every 2 weeks on Monday, Wednesday
     /// (5 times)`), or nil when there is none. Reads every field through the builder's own readers
     /// (`recurrenceFreq`, `recurrenceNumber`, `recurrenceDayParts`), so it throws on the same values
     /// the builder refuses and a tool can refuse the call before its card is shown, and it names the
@@ -1079,16 +1079,64 @@ enum CalendarToolHelpers {
         return recurrenceText(freq: freq, interval: interval, dayParts: days, count: count, until: until)
     }
 
-    /// A rule in the confirmation card's words, from its parts: `every 2 weekly on Monday,
+    /// A rule in the confirmation card's words, from its parts: `every 2 weeks on Monday,
     /// Wednesday (5 times)`. `count` wins over `until`, as in the builder. The one wording for a
     /// rule given as arguments (`recurrenceSummary`) and a stored one (`storedRecurrenceSummary`).
+    /// The frequency and interval are the event popover's phrase (`recurrenceIntervalPhrase`); a
+    /// frequency it does not name (hourly and finer) keeps the token (`every 2 hourly`).
     private static func recurrenceText(freq: String, interval: Int?, dayParts: [String], count: Int?, until: String?) -> String {
-        var desc = freq.lowercased()
-        if let n = interval, n > 1 { desc = "every \(n) \(desc)" }
+        var desc: String
+        if let phrase = recurrenceIntervalPhrase(freq: freq, interval: interval ?? 1) {
+            desc = phrase
+        } else {
+            desc = freq.lowercased()
+            if let n = interval, n > 1 { desc = "every \(n) \(desc)" }
+        }
         if let text = recurrenceDaysText(dayParts) { desc += " \(text)" }
         if let count { desc += " (\(count) times)" }
         else if let until { desc += " (until \(until))" }
         return desc
+    }
+
+    /// A rule's frequency and interval in words: `weekly`, `every 2 weeks`; nil for a frequency
+    /// other than DAILY, WEEKLY, MONTHLY or YEARLY. The one phrase for the chat's event popover
+    /// (`popoverRecurrenceLine`) and both calendar confirmation cards (`recurrenceText`). Moved
+    /// unchanged from the popover's `describeRecurrence` (#639).
+    static func recurrenceIntervalPhrase(freq: String, interval: Int) -> String? {
+        let singular: String
+        let plural: String
+        switch freq {
+        case "DAILY": (singular, plural) = ("daily", "days")
+        case "WEEKLY": (singular, plural) = ("weekly", "weeks")
+        case "MONTHLY": (singular, plural) = ("monthly", "months")
+        case "YEARLY": (singular, plural) = ("yearly", "years")
+        default: return nil
+        }
+        if interval <= 1 { return singular }
+        return "every \(interval) \(plural)"
+    }
+
+    /// Render an `RRULE:...` as user-friendly prose ("Repeats weekly",
+    /// "Repeats every 2 months") for the event popover. Falls back to the generic
+    /// "Recurring" badge when the rule is absent or its FREQ isn't recognized.
+    /// Moved from the popover (`EventPillPopover.describeRecurrence`), output unchanged (#639).
+    static func popoverRecurrenceLine(_ rrule: String?) -> String {
+        guard let rrule, !rrule.isEmpty else { return "Recurring" }
+        let upper = rrule.uppercased()
+        let body = upper.hasPrefix("RRULE:") ? String(upper.dropFirst("RRULE:".count)) : upper
+        var freq: String?
+        var interval = 1
+        for part in body.split(separator: ";") {
+            let kv = part.split(separator: "=", maxSplits: 1)
+            guard kv.count == 2 else { continue }
+            switch kv[0] {
+            case "FREQ": freq = String(kv[1])
+            case "INTERVAL": interval = Int(kv[1]) ?? 1
+            default: break
+            }
+        }
+        guard let freq, let phrase = recurrenceIntervalPhrase(freq: freq, interval: interval) else { return "Recurring" }
+        return "Repeats \(phrase)"
     }
 
     /// A stored repeat rule (`GCalEvent.recurrence`, its `RRULE:` line) in the card's words, as
@@ -1142,7 +1190,7 @@ enum CalendarToolHelpers {
     static func seriesDeleteLines(_ event: GCalEvent) -> [String] {
         guard event.recurringEventId?.isEmpty ?? true, let recurrence = event.recurrence, !recurrence.isEmpty else { return [] }
         guard let rule = storedRecurrenceSummary(recurrence) else { return [seriesDeleteNote] }
-        return [seriesDeleteNote, "Repeats: \(rule)"]
+        return [seriesDeleteNote, "Repeats \(rule)"]
     }
 
     /// The confirmation-card line for a whole-series edit that resets the occurrences changed one

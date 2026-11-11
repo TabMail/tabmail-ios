@@ -86,7 +86,7 @@ struct CalendarSeriesDeleteCardTests {
         let series = Self.event(
             id: "series-1", recurrence: ["RRULE:FREQ=WEEKLY;BYDAY=MO,WE;COUNT=10"], recurringEventId: nil)
         let lines = try await cardLines(for: series, accountId: "series-delete-card")
-        #expect(lines == [CalendarToolHelpers.seriesDeleteNote, "Repeats: weekly on Monday, Wednesday (10 times)"],
+        #expect(lines == [CalendarToolHelpers.seriesDeleteNote, "Repeats weekly on Monday, Wednesday (10 times)"],
                 "the card for deleting a repeating series does not say it repeats: \(lines)")
     }
 
@@ -109,7 +109,7 @@ struct CalendarSeriesDeleteCardTests {
     func storedRuleInWords() throws {
         #expect(CalendarToolHelpers.storedRecurrenceSummary(["RRULE:FREQ=DAILY"]) == "daily")
         #expect(CalendarToolHelpers.storedRecurrenceSummary(["RRULE:FREQ=MONTHLY;INTERVAL=2;BYDAY=-1FR"])
-                == "every 2 monthly on the last Friday")
+                == "every 2 months on the last Friday")
         #expect(CalendarToolHelpers.storedRecurrenceSummary(["EXDATE:20990105", "RRULE:FREQ=YEARLY;BYMONTH=3;BYMONTHDAY=1"])
                 == "yearly in March on day 1")
         // A month out of range is left out, not read past the month list.
@@ -139,5 +139,32 @@ struct CalendarSeriesDeleteCardTests {
         #expect(CalendarToolHelpers.storedRecurrenceSummary(["RRULE:FREQ=FORTNIGHTLY"]) == nil)
         let rdateOnly = Self.event(id: "series-2", recurrence: ["RDATE:20990105"], recurringEventId: nil)
         #expect(CalendarToolHelpers.seriesDeleteLines(rdateOnly) == [CalendarToolHelpers.seriesDeleteNote])
+
+        // A frequency the popover's phrase does not name keeps its token on the card.
+        #expect(CalendarToolHelpers.storedRecurrenceSummary(["RRULE:FREQ=HOURLY;INTERVAL=2"]) == "every 2 hourly")
+    }
+
+    /// The event popover's line, exactly as `EventPillPopover.describeRecurrence` gave it before
+    /// it moved to `CalendarToolHelpers` (#639): the move must not change it. The old function was
+    /// private to the view, so this pin was checked against its removed source by a side-by-side
+    /// run over these same inputs before the move landed.
+    @Test("the event popover's rule line is unchanged by the move", arguments: [
+        (nil, "Recurring"),
+        ("", "Recurring"),
+        ("RRULE:FREQ=WEEKLY", "Repeats weekly"),
+        ("RRULE:FREQ=WEEKLY;INTERVAL=2", "Repeats every 2 weeks"),
+        ("rrule:freq=monthly;interval=3", "Repeats every 3 months"),
+        ("FREQ=DAILY", "Repeats daily"),
+        ("RRULE:FREQ=YEARLY;INTERVAL=1", "Repeats yearly"),
+        ("RRULE:FREQ=HOURLY;INTERVAL=2", "Recurring"),
+        ("RRULE:INTERVAL=2", "Recurring"),
+        ("RRULE:FREQ=DAILY;INTERVAL=0", "Repeats daily"),
+        ("RRULE:FREQ=DAILY;INTERVAL=x", "Repeats daily"),
+        ("RRULE:FREQ=WEEKLY;BYDAY=MO,WE;COUNT=10;INTERVAL=4", "Repeats every 4 weeks"),
+        ("RRULE:FREQ", "Recurring"),
+        ("RRULE:FREQ=MINUTELY", "Recurring"),
+    ] as [(String?, String)])
+    func popoverLineUnchanged(_ rrule: String?, _ expected: String) {
+        #expect(CalendarToolHelpers.popoverRecurrenceLine(rrule) == expected)
     }
 }

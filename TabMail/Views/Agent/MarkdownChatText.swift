@@ -1004,7 +1004,7 @@ private struct EventPillPopover: View {
             // Recurrence + Availability badges
             HStack(spacing: 6) {
                 if detail.isRecurring {
-                    Text(Self.describeRecurrence(detail.recurrenceRule))
+                    Text(CalendarToolHelpers.popoverRecurrenceLine(detail.recurrenceRule))
                         .font(.caption2)
                         .padding(.horizontal, 5)
                         .padding(.vertical, 1)
@@ -1126,37 +1126,6 @@ private struct EventPillPopover: View {
         }
         .padding(14)
         .frame(minWidth: 220, maxWidth: 300)
-    }
-
-    /// Render an `RRULE:...` as user-friendly prose ("Repeats weekly",
-    /// "Repeats every 2 months") for the popover. Falls back to the generic
-    /// "Recurring" badge when the rule is absent or its FREQ isn't recognized.
-    private static func describeRecurrence(_ rrule: String?) -> String {
-        guard let rrule, !rrule.isEmpty else { return "Recurring" }
-        let upper = rrule.uppercased()
-        let body = upper.hasPrefix("RRULE:") ? String(upper.dropFirst("RRULE:".count)) : upper
-        var freq: String?
-        var interval = 1
-        for part in body.split(separator: ";") {
-            let kv = part.split(separator: "=", maxSplits: 1)
-            guard kv.count == 2 else { continue }
-            switch kv[0] {
-            case "FREQ": freq = String(kv[1])
-            case "INTERVAL": interval = Int(kv[1]) ?? 1
-            default: break
-            }
-        }
-        let singular: String
-        let plural: String
-        switch freq {
-        case "DAILY": (singular, plural) = ("daily", "days")
-        case "WEEKLY": (singular, plural) = ("weekly", "weeks")
-        case "MONTHLY": (singular, plural) = ("monthly", "months")
-        case "YEARLY": (singular, plural) = ("yearly", "years")
-        default: return "Recurring"
-        }
-        if interval <= 1 { return "Repeats \(singular)" }
-        return "Repeats every \(interval) \(plural)"
     }
 
     private static func formatTimeRange(start: Date, end: Date) -> String {

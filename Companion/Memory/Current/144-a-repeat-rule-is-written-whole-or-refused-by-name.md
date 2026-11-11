@@ -76,10 +76,22 @@ carries the series' rule), so its card gets no such line. The stored rule is wor
 `storedRecurrenceSummary`, which shares `recurrenceText` with `recurrenceSummary`, so a stored and
 a given rule read the same; a stored UTC `UNTIL` is shown as its day in the device's zone. A stored
 `BYMONTH` out of range is left out (`recurrenceDaysText` used to index past the month list, which
-validated arguments never reached). The chat popover's `MarkdownChatText.describeRecurrence` is a
-separate, shorter wording (frequency and interval only). Pinned by `CalendarSeriesDeleteCardTests`
+validated arguments never reached).
+
+**One frequency phrase (2026-11-10, #639 follow-up):** the chat's event popover and both cards
+(edit and delete) word a rule's frequency and interval with ONE function,
+`CalendarToolHelpers.recurrenceIntervalPhrase` (`weekly`, `every 2 weeks`), moved unchanged out of
+the popover's former private `EventPillPopover.describeRecurrence`. The popover calls
+`popoverRecurrenceLine` (its output unchanged: `Repeats every 2 weeks`, else `Recurring`); the cards
+keep their days, count and end on top (`every 2 weeks on Monday, Wednesday (10 times)`; the delete
+card's line reads `Repeats every 2 weeks ...`, the edit card's `recurrence → every 2 weeks ...`).
+Hourly and finer, which the popover does not name, keep the card's old token (`every 2 hourly`).
+Do not add another rule formatter. A CalDAV resource holding only changed occurrences, deleted by
+its own id, gets no card at all: `ICSParser.parse` returns no event for it, so the delete tool's
+read fails and it refuses before the card, nothing sent. Pinned by `CalendarSeriesDeleteCardTests`
 and `CalDAVOccurrenceDeleteToolToWireTests` (the CalDAV series card before its DELETE; the
-occurrence card without the line).
+occurrence card without the line; the override-only resource by its own id refused with no DELETE;
+the popover line pinned by `popoverLineUnchanged`).
 
 ## Pinned by
 

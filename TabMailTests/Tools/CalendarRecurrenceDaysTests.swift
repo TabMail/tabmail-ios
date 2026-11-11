@@ -68,7 +68,7 @@ struct RecurrenceDaysCase: CustomTestStringConvertible, Sendable {
                        "byDay": .array([.string("TU"), .string("TH")]), "wkst": .string("MO")],
               rrule: "RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=TU,TH;WKST=MO",
               graph: ["type": "weekly", "interval": "2", "daysOfWeek": "tuesday,thursday", "firstDayOfWeek": "monday"],
-              card: "every 2 weekly on Tuesday, Thursday week starts Monday"),
+              card: "every 2 weeks on Tuesday, Thursday week starts Monday"),
     ]
 }
 
