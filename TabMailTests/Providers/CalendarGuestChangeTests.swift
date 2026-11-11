@@ -31,11 +31,11 @@ import GRDB
 // series' change to its occurrences:
 // - Google applies it on top of each occurrence's own guests, those with guest differences of
 //   their own included, moved and renamed ones too (measured for an added and a removed guest,
-//   API and web alike; modelled by `FakeGoogleCalendar`), so its whole-series cases check every
-//   occurrence with the oracle;
-// - Outlook carries it to occurrences that held the series' guests (measured for an added and a
-//   removed guest); what it does to an occurrence with guests of its own is NOT measured, so
-//   `FakeGraphCalendar` leaves those as stored and its cases check the others only.
+//   API and web alike; modelled by `FakeGoogleCalendar`);
+// - Outlook does the same: it applies it on top of each occurrence's own guests, exceptions with
+//   guest differences of their own included, moved and renamed ones too, and an exception stays
+//   an exception (measured for an added and a removed guest; modelled by `FakeGraphCalendar`).
+// So the whole-series cases of both check every occurrence with the oracle.
 //
 // RED BEFORE THE FIX, each for the reason its test names: the queue worked out ONE full list from
 // the event it read (the series) and the CalDAV write put it on the series VEVENT alone, so the
@@ -838,22 +838,31 @@ struct OutlookGuestChangeTests {
     typealias F = GuestFixture
     typealias X = GraphGuests
 
-    @Test("13. adding a guest to the whole series is one PATCH of the series, which the server carries to the occurrences that had the series' guests")
-    func seriesAddIsOnePatch() async throws {
+    /// The whole-series change `change`, by `eventId`: every item (the series and each occurrence,
+    /// weeks 4 and 5 with guests of their own included) must hold the change on its own guests, and
+    /// the app writes no occurrence (the server carries the series' change to them).
+    private func runAll(_ change: GuestChangeOracle.Change, eventId: String = X.seriesId, account: String) async throws {
         let graph = FakeGraphCalendar(X.seed())
         let before = X.guests(graph, X.everyId)
-        let rows = try await X.run(graph, eventId: X.seriesId, F.addD.arguments, account: "guests-x-series")
+        let arguments = change.arguments.merging(["edit_scope": .string("all")]) { mine, _ in mine }
+        let rows = try await X.run(graph, eventId: eventId, arguments, account: account)
         #expect(rows.isEmpty, "the edit did not land: \(rows.map { $0.failureReason ?? $0.status })")
-        #expect(graph.patchedIds == [X.seriesId], "PATCHes: \(graph.patchedIds)")
-        let after = X.guests(graph, X.everyId)
+        let occurrencePatches = graph.patchedIds.filter { $0 != X.seriesId }
+        #expect(occurrencePatches.isEmpty, "the app wrote an occurrence: \(graph.patchedIds)")
         let problems = GuestChangeOracle.problems(
-            item: X.seriesId, before: before[X.seriesId] ?? [], after: after[X.seriesId] ?? [],
-            change: F.addD, isUnanswered: X.isUnanswered)
+            before: before, after: X.guests(graph, X.everyId), inScope: Set(X.everyId),
+            change: change, isUnanswered: X.isUnanswered)
         #expect(problems.isEmpty, Comment(rawValue: problems.joined(separator: "\n")))
-        for week in [1, 2, 3, 6] {
-            #expect(after[X.instanceId(week: week)] == after[X.seriesId],
-                    "week \(week) does not hold the series' new guests: \(after[X.instanceId(week: week)] ?? [])")
-        }
+    }
+
+    @Test("13. adding a guest to the whole series reaches the series and every occurrence, each keeping its own guests, with no write to an occurrence")
+    func seriesAddReachesEveryOccurrence() async throws {
+        try await runAll(F.addD, account: "guests-x-series")
+    }
+
+    @Test("18. removing a guest from the whole series removes them from the series and every occurrence, with no write to an occurrence")
+    func seriesRemoveReachesEveryOccurrence() async throws {
+        try await runAll(GuestChangeOracle.Change(removes: [F.guestB]), account: "guests-x-series-remove")
     }
 
     @Test("14. one occurrence edited by the series id gets the guest added to its own guests (#596)")
@@ -870,25 +879,10 @@ struct OutlookGuestChangeTests {
         #expect(problems.isEmpty, Comment(rawValue: problems.joined(separator: "\n")))
     }
 
-    @Test("17. a change of every occurrence named by one changed occurrence's id is one PATCH of the series, from the series' own guests (#560)")
+    @Test("17. a change of every occurrence named by one changed occurrence's id reaches the series from its own guests, and every occurrence from its own (#560)")
     func everyOccurrenceNamedByAnOccurrenceId() async throws {
         // Week 4 holds C on its own: the series must not take C.
-        let graph = FakeGraphCalendar(X.seed())
-        let before = X.guests(graph, X.everyId)
-        let rows = try await X.run(graph, eventId: X.instanceId(week: 4),
-                                   F.addD.arguments.merging(["edit_scope": .string("all")]) { mine, _ in mine },
-                                   account: "guests-x-all-by-occurrence")
-        #expect(rows.isEmpty, "the edit did not land: \(rows.map { $0.failureReason ?? $0.status })")
-        #expect(graph.patchedIds == [X.seriesId], "PATCHes: \(graph.patchedIds)")
-        let after = X.guests(graph, X.everyId)
-        let problems = GuestChangeOracle.problems(
-            item: X.seriesId, before: before[X.seriesId] ?? [], after: after[X.seriesId] ?? [],
-            change: F.addD, isUnanswered: X.isUnanswered)
-        #expect(problems.isEmpty, Comment(rawValue: problems.joined(separator: "\n")))
-        for week in [1, 2, 3, 6] {
-            #expect(after[X.instanceId(week: week)] == after[X.seriesId],
-                    "week \(week) does not hold the series' new guests: \(after[X.instanceId(week: week)] ?? [])")
-        }
+        try await runAll(F.addD, eventId: X.instanceId(week: 4), account: "guests-x-all-by-occurrence")
     }
 
     @Test("16. a new guest is written with an unanswered status, which Graph requires")

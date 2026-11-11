@@ -67,13 +67,17 @@ import Synchronization
 ///   Measured on an Outlook.com account (#622): a list with every entry
 ///   carrying its status was accepted, and a kept attendee sent with their
 ///   stored status kept their answer;
-/// - a PATCH of a series' `attendees` gives the new list to every stored
-///   occurrence whose attendees were the series' own, as stored, before the
-///   PATCH. Measured on an Outlook.com test account (2026-11-11): a guest added
-///   to a series reached its occurrence changed on its own (renamed, still an
-///   exception) and an unchanged one. NOT measured: a guest removed, a moved
-///   occurrence, and an occurrence whose guests differ from the series'. The
-///   fake carries the first two by the same rule and leaves the third as stored.
+/// - a PATCH of a series' `attendees` is applied by the server to every stored
+///   occurrence of the series, on top of that occurrence's own guests: each
+///   guest the PATCH removes from the series (by address, any letter case)
+///   goes, each guest it adds is appended unless the occurrence holds them
+///   already, and every other guest the occurrence holds stays as stored, its
+///   own extra guests included, while a guest it dropped on its own stays
+///   dropped unless the PATCH adds them. An exception stays an exception.
+///   Measured on an Outlook.com test account (2026-11-11), for an added and a
+///   removed guest, on renamed, moved and unchanged occurrences and on
+///   exceptions with guest differences of their own (one that had dropped a
+///   series guest on its own still lacked them after the series added another).
 ///
 /// A timed event's starts and ends are returned as stored, whatever zone `Prefer` names: a
 /// fixture stores them as Graph renders them for the device. An all-day event's `start` and `end`
@@ -340,14 +344,23 @@ final class FakeGraphCalendar: Sendable {
             if changesRule || movesTime {
                 resets.withLock { $0 += 1 }
             }
-            if isSeries, let written = patch["attendees"] {
-                let seriesGuests = Self.canonicalJSON(stored["attendees"])
+            if isSeries, let written = patch["attendees"] as? [[String: Any]] {
+                func address(_ guest: [String: Any]) -> String? {
+                    ((guest["emailAddress"] as? [String: Any])?["address"] as? String)?.lowercased()
+                }
+                let was = Set((stored["attendees"] as? [[String: Any]] ?? []).compactMap(address))
+                let removed = was.subtracting(written.compactMap(address))
+                let added = written.filter { address($0).map { !was.contains($0) } ?? false }
                 events.withLock { all in
                     for (id, data) in all {
                         guard var occurrence = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-                              occurrence["seriesMasterId"] as? String == parts[0],
-                              Self.canonicalJSON(occurrence["attendees"]) == seriesGuests else { continue }
-                        occurrence["attendees"] = written
+                              occurrence["seriesMasterId"] as? String == parts[0] else { continue }
+                        let own = occurrence["attendees"] as? [[String: Any]] ?? []
+                        var guests = own.filter { address($0).map { !removed.contains($0) } ?? true }
+                        let held = Set(guests.compactMap(address))
+                        guests += added.filter { address($0).map { !held.contains($0) } ?? false }
+                        guard Self.canonicalJSON(guests) != Self.canonicalJSON(own) else { continue }
+                        occurrence["attendees"] = guests
                         // swiftlint:disable:next force_try
                         all[id] = try! JSONSerialization.data(withJSONObject: occurrence)
                     }

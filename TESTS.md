@@ -257,15 +257,12 @@ real calendar queue drains the edit, that every item in scope holds the change a
 guests (kept guests byte-identical, new ones unanswered, removed ones gone) and every item outside
 it is untouched: CalDAV (every VEVENT: series, changed occurrences, a split's new part and the
 occurrences it carries, a one-occurrence edit by the series id), Google and Outlook (the item the
-write reads), plus pins that held before the fix. On Google the server applies a series' change
-on top of each occurrence's own guests, those with guest differences of their own included
-(measured, API and web, for an added and a removed guest; `FakeGoogleCalendar` models it), so the
-Google whole-series cases (add, remove, and "all" named by an occurrence id) check every
-occurrence with the oracle and that the app writes no occurrence. On Outlook the server carries
-a series' change to occurrences that held the series' guests (measured for an added and a
-removed guest); what it does to an occurrence with guests of its own is NOT measured, so
-`FakeGraphCalendar` leaves those as stored and the Outlook cases check the series and the other
-occurrences only. `AttendeeChangeTests` covers the function itself (order, `"*"`, letter case,
+write reads), plus pins that held before the fix. On Google and on Outlook the server applies a
+series' change on top of each occurrence's own guests, those with guest differences of their own
+included (measured for an added and a removed guest: Google through the API and web, Outlook
+through Graph; `FakeGoogleCalendar` and `FakeGraphCalendar` model it), so the Google and Outlook
+whole-series cases (add, remove, and "all" named by an occurrence id) check every occurrence with
+the oracle and that the app writes no occurrence. `AttendeeChangeTests` covers the function itself (order, `"*"`, letter case,
 `mailto:` prefixes, a guest with no address, re-adding, a changed occurrence's own guests);
 `CalDAVWholeSeriesEditTests` a cancelled occurrence left as stored, a VEVENT the change leaves
 byte for byte, and a new attendee's double quote written as a single quote;

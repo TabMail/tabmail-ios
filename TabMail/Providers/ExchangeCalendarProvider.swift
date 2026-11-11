@@ -901,9 +901,12 @@ actor ExchangeCalendarProvider: CalendarProvider {
     ///   (#423, measured);
     /// - the edit's guest change applied to the stored attendees of the item read: each one kept
     ///   is written as stored, a new one `required` and unanswered (`appliedAttendeesJSON`, #622,
-    ///   #620). Graph applies a series' list to its changed occurrences itself, measured for an
-    ///   added and a removed guest on renamed and moved occurrences that held the series' guests;
-    ///   what a series change does to an occurrence with guests of its own is NOT measured on Outlook;
+    ///   #620). A series write is the only write the app makes for a change of every occurrence:
+    ///   Graph applies the series' guest change to each of its occurrences on top of that
+    ///   occurrence's own guests, those with guest differences of their own included (a guest an
+    ///   occurrence added stays, one it dropped stays dropped unless the change adds them), renamed
+    ///   and moved ones too, and an exception stays an exception. Measured on a test account for an
+    ///   added and a removed guest (2026-11-11);
     /// - a new description of an online meeting replaces only the notes in the
     ///   stored body, keeping its join section (`onlineMeetingBody`, #511); the
     ///   description the assistant read is those notes (`notes(of:)`).

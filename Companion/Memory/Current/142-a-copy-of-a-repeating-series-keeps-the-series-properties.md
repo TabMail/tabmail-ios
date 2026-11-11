@@ -264,10 +264,15 @@ address appended once and unanswered (a guest removed and added back keeps their
     guest differences of their own included, moved and renamed ones too: a guest an occurrence
     added stays, one it removed stays removed unless the change adds them. The same rule as the
     app's, so the app writes no occurrence. `FakeGoogleCalendar` models it.
-  - **Outlook** (measured 2026-11-11 for an added and a removed guest): the series' change
-    reaches renamed and moved occurrences that held the series' guests. What it does to an
-    occurrence with guests of its own is NOT measured on Outlook (pending); `FakeGraphCalendar`
-    leaves such an occurrence as stored.
+  - **Outlook** (measured 2026-11-11, test account, Graph PATCH of the series, for an added and a
+    removed guest): the same as Google. The series' change is applied on top of EVERY
+    occurrence's own guests, exceptions with guest differences of their own included, renamed
+    and moved ones too, and an exception stays an exception: an exception that had dropped a
+    series guest on its own still lacked them after the series added another guest (it took only
+    the added guest, not the series' whole new list). So the app writes no occurrence.
+    `FakeGraphCalendar` models it. (Earlier the same day only occurrences that held the series'
+    guests were measured, and an occurrence with guests of its own was recorded as NOT measured
+    and left as stored by the fake; the second measurement closed that.)
 - **Demo** (`DemoCalendarProvider.updateEvent`) applies the same function to the stored guests;
   the edit card (`CalendarEventEditTool`) shows the change itself (`AttendeeChange.cardLines`:
   the people added and removed, three of each and "and N more"), never a resulting list.
