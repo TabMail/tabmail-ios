@@ -703,6 +703,71 @@ struct CalDAVOccurrenceWireTests {
         #expect(rows.filter { $0.location == "Room 2" }.compactMap(\.id) == [movedId], "the series id at the moved occurrence's new time did not edit it")
     }
 
+    @Test("a recurrence_id given as a date alone that matches two occurrences that day is refused as ambiguous and nothing is written; a date with one occurrence resolves")
+    func dateOnlyRecurrenceIdMatchingTwoOccurrencesIsRefused() async throws {
+        // Week 3's occurrence moved onto week 2's day at 14:00: that day holds two occurrences.
+        let base = try W.make()
+        let zone = base.zone
+        let wall = { (date: Date) in OccurrenceFixture.wall(date, zone) }
+        let sharedDay = try base.occurrence(2)
+        let calendar = OccurrenceFixture.calendar(zone)
+        let moved = try #require(calendar.date(bySettingHour: 14, minute: 0, second: 0, of: sharedDay))
+        let ics = OccurrenceFixture.ics([
+            ([
+                "UID:standup-1",
+                "DTSTAMP:\(OccurrenceFixture.utcValue(base.first))",
+                "DTSTART;TZID=America/New_York:\(wall(base.first))",
+                "DTEND;TZID=America/New_York:\(wall(base.first.addingTimeInterval(30 * 60)))",
+                "SUMMARY:Standup",
+                "RRULE:FREQ=WEEKLY",
+            ]).joined(separator: "\n"),
+            """
+            UID:standup-1
+            RECURRENCE-ID;TZID=America/New_York:\(wall(try base.occurrence(3)))
+            DTSTAMP:\(OccurrenceFixture.utcValue(base.first))
+            DTSTART;TZID=America/New_York:\(wall(moved))
+            DTEND;TZID=America/New_York:\(wall(moved.addingTimeInterval(30 * 60)))
+            SUMMARY:Standup
+            """,
+        ])
+        let fixture = OccurrenceWireFixture(zone: zone, first: base.first, ics: ics)
+        let (store, http) = W.serve(fixture)
+        defer { http.close() }
+        let provider = W.makeProvider(http)
+        let sharedDate = OccurrenceFixture.isoDate(sharedDay, zone)
+        var patch = GCalEventInput()
+        patch.location = "Room 2"
+
+        await #expect("this_only at a date holding two occurrences was not refused as ambiguous") {
+            _ = try await provider.updateOccurrence(
+                calendarId: W.calendarId, eventId: W.seriesPath, recurrenceId: sharedDate,
+                recurrenceIdZone: zone, event: patch, sendUpdates: "all")
+        } throws: { error in
+            Self.isRefusal(error, saying: "matched 2 occurrences")
+        }
+        await #expect("this_and_following at a date holding two occurrences was not refused as ambiguous") {
+            _ = try await provider.splitSeries(
+                calendarId: W.calendarId, eventId: W.seriesPath, recurrenceId: sharedDate,
+                recurrenceIdZone: zone, patch: patch, sendUpdates: "all")
+        } throws: { error in
+            Self.isRefusal(error, saying: "matched 2 occurrences")
+        }
+        let writes = http.recordedCalls().filter { $0.method != "GET" && $0.method != "REPORT" }.map { "\($0.method) \($0.url)" }
+        #expect(writes.isEmpty, "an ambiguous date sent: \(writes)")
+        #expect(store.recordedPuts().isEmpty, "an ambiguous date wrote: \(store.recordedPuts().map(\.path))")
+        #expect(store.storedICS(path: W.seriesPath) == fixture.ics, "the series is not on the server as it was")
+
+        // Control: week 4's date holds one occurrence, and the same edit by that date alone writes it.
+        _ = try await provider.updateOccurrence(
+            calendarId: W.calendarId, eventId: W.seriesPath,
+            recurrenceId: OccurrenceFixture.isoDate(try base.occurrence(4), zone),
+            recurrenceIdZone: zone, event: patch, sendUpdates: "all")
+        #expect(store.recordedPuts().map(\.path) == [W.seriesPath], "a date with one occurrence did not resolve to it")
+        let rows = try await Self.listWeeks(provider, fixture, through: 4)
+        #expect(rows.filter { $0.location == "Room 2" }.compactMap(\.id) == [try fixture.occurrenceId(4)],
+                "the edit by week 4's date did not change exactly week 4's occurrence")
+    }
+
     // MARK: Where the series ends, cancelled occurrences, and what can't be addressed
 
     @Test("this_only after a COUNT series' last occurrence is not found and writes nothing; at its last occurrence it writes")
