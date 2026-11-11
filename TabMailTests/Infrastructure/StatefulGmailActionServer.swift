@@ -195,6 +195,18 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         /// spurious `nextPageToken` even though the implied next page is
         /// empty — models a dangling-pagination edge case (SPEC-B3).
         var spuriousNextPageTokenTargets: Set<String> = []
+        /// Largest page the `/messages` listing serves, the rest behind a
+        /// `nextPageToken`. Nil (the default) lists every match on one page
+        /// with no token. See `servePagedListings(pageSize:)`.
+        var listPageSize: Int?
+        /// Page tokens the paged listing handed out and still accepts, each
+        /// mapped to the offset its page starts at.
+        var livePageTokens: [String: Int] = [:]
+        var pageTokenSerial = 0
+        /// While true the paged listing refuses every request carrying a
+        /// page token, the ones it handed out included.
+        var rejectsEveryPageToken = false
+        var rejectedPageTokensServed = 0
 
         /// Record the label difference between `before` and `after` as history,
         /// as Gmail does for every label change it applies.
@@ -486,6 +498,37 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         state.value.withLock { $0.unclassified400OnGetServed }
     }
 
+    /// Heal every injected exact-ID GET `400`, leaving the served count intact.
+    func clearUnclassified400sOnGet() {
+        state.value.withLock { $0.unclassified400OnGetProviderIds.removeAll() }
+    }
+
+    /// Page the `/messages` listing as Gmail does: at most `pageSize` ids per
+    /// response (or `maxResults`, if smaller) and a `nextPageToken` while more
+    /// remain. A request whose `pageToken` this listing did not hand out, or
+    /// has since expired, gets a `400`. Gmail documents no wording for a page
+    /// token it no longer accepts, so only the status is modelled.
+    func servePagedListings(pageSize: Int) {
+        state.value.withLock { $0.listPageSize = pageSize }
+    }
+
+    /// Expire every page token handed out so far; tokens handed out later
+    /// are accepted again.
+    func expireIssuedPageTokens() {
+        state.value.withLock { $0.livePageTokens.removeAll() }
+    }
+
+    /// While `rejecting`, refuse every paged listing request that carries a
+    /// page token, including tokens handed out since.
+    func rejectEveryPageToken(_ rejecting: Bool) {
+        state.value.withLock { $0.rejectsEveryPageToken = rejecting }
+    }
+
+    /// How many listing requests were refused for their page token.
+    func rejectedPageTokenCount() -> Int {
+        state.value.withLock { $0.rejectedPageTokensServed }
+    }
+
     /// Inject Gmail's real "Invalid id value" `400` (structured,
     /// `reason == "invalidArgument"`) for the exact-ID metadata `GET
     /// /messages/{id}` naming `providerMessageId` — models Gmail rejecting a
@@ -524,6 +567,25 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                 "errors": [[
                     "domain": "global",
                     "reason": "failedPrecondition",
+                    "message": message,
+                ]],
+                "code": 400,
+                "message": message,
+            ],
+        ]
+        return (try? JSONSerialization.data(withJSONObject: object)) ?? Data()
+    }
+
+    /// Gmail's structured `400` shape for a page token it does not accept.
+    /// The wording is this fake's: Gmail documents none, and the client reads
+    /// only the status.
+    private static func invalidPageTokenBody() -> Data {
+        let message = "Invalid page token."
+        let object: [String: Any] = [
+            "error": [
+                "errors": [[
+                    "domain": "global",
+                    "reason": "invalidArgument",
                     "message": message,
                 ]],
                 "code": 400,
@@ -757,7 +819,8 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                state.value.withLock({ $0.deletedLabelIds.contains(label) }) {
                 return .bytes(Self.invalidLabelErrorBody(label), contentType: "application/json", statusCode: 400)
             }
-            let refs = state.value.withLock { model in
+            let pageToken = queryItems.first(where: { $0.name == "pageToken" })?.value
+            let matches = state.value.withLock { model in
                 model.messagesByProviderId.values
                     .filter { message in
                         // Real Gmail excludes SPAM/TRASH-labeled messages from
@@ -790,10 +853,38 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                         if lhs != rhs { return lhs > rhs }
                         return $0.providerMessageId < $1.providerMessageId
                     }
-                    .prefix(maxResults)
                     .map { ["id": $0.providerMessageId, "threadId": "thread-\($0.providerMessageId)"] }
             }
-            var responseObject: [String: Any] = ["messages": refs]
+            // Unpaged (the default): every match up to `maxResults`, no token.
+            let page = state.value.withLock { model -> (refs: [[String: String]], nextPageToken: String?)? in
+                guard let pageSize = model.listPageSize else {
+                    return (Array(matches.prefix(maxResults)), nil)
+                }
+                var start = 0
+                if let pageToken {
+                    guard !model.rejectsEveryPageToken, let resume = model.livePageTokens[pageToken] else {
+                        model.rejectedPageTokensServed += 1
+                        return nil
+                    }
+                    start = min(resume, matches.count)
+                }
+                let end = min(matches.count, start + min(pageSize, maxResults))
+                var next: String?
+                if end < matches.count {
+                    model.pageTokenSerial += 1
+                    let token = "page-token-\(model.pageTokenSerial)"
+                    model.livePageTokens[token] = end
+                    next = token
+                }
+                return (Array(matches[start..<end]), next)
+            }
+            guard let page else {
+                return .bytes(Self.invalidPageTokenBody(), contentType: "application/json", statusCode: 400)
+            }
+            var responseObject: [String: Any] = ["messages": page.refs]
+            if let next = page.nextPageToken {
+                responseObject["nextPageToken"] = next
+            }
             if let rfc822MessageId = actionRFC,
                state.value.withLock({ $0.spuriousNextPageTokenTargets.contains(rfc822MessageId) }) {
                 responseObject["nextPageToken"] = "spurious-canary-page-2"

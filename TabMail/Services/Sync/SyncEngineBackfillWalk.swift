@@ -767,6 +767,18 @@ extension SyncEngine {
         // into a network-rate spin, which is the very NB3 shape the round-9 audit
         // named elsewhere in this function. A second mismatch declines instead.
         var epochReadoptedFolderIds = Set<String>()
+        // Gmail/Exchange page walk: folders this CALL has stopped walking, so the
+        // loop's fresh re-read does not hand them straight back at network rate.
+        // Two reasons: a last page whose every fetch failed (the walk saved no
+        // token without completing), and a second rejected page token in the
+        // same call. Held in memory only and never saved: the next call walks
+        // the folder again.
+        var pageWalkSkippedFolderIds = Set<String>()
+        // Gmail/Exchange page walk: folders whose saved page token the provider
+        // rejected in this CALL, and whose walk was started over from the top.
+        // Held in memory only, so each call may restart a folder once: a token a
+        // later call finds rejected again never stalls the folder for good.
+        var pageTokenRestartedFolderIds = Set<String>()
 
         await updateBackfillProgressForAccount(account)
 
@@ -809,6 +821,7 @@ extension SyncEngine {
             let folder = remaining
                 .filter { f in
                     if epochDeclinedFolderIds.contains(f.id) { return false }
+                    if pageWalkSkippedFolderIds.contains(f.id) { return false }
                     if !fastSync && isExpensiveNetwork && !primaryRoles.contains(f.role) { return false }
                     if StorageEstimator.isOverBudget() { return false }
                     return true
@@ -1668,24 +1681,52 @@ extension SyncEngine {
                     // Gmail/Exchange: page-token cursor walk — resumes from stored position.
                     // Each call returns one page of IDs + nextPageToken. No date filter needed;
                     // the token tracks position in the listing (newest→oldest).
+                    let savedToken = folder.backfillPageToken
                     let pageResult: (ids: [String], nextPageToken: String?)
-                    if let gp = provider as? GmailProvider {
-                        pageResult = try await workQueue.execute(priority: .headerFetch) {
-                            try await gp.listMessageIdsPage(
-                                folder: folder.path,
-                                pageToken: folder.backfillPageToken,
-                                pageSize: limit
-                            )
+                    do {
+                        if let gp = provider as? GmailProvider {
+                            pageResult = try await workQueue.execute(priority: .headerFetch) {
+                                try await gp.listMessageIdsPage(
+                                    folder: folder.path,
+                                    pageToken: savedToken,
+                                    pageSize: limit
+                                )
+                            }
+                        } else {
+                            let ep = provider as! ExchangeProvider
+                            pageResult = try await workQueue.execute(priority: .headerFetch) {
+                                try await ep.listMessageIdsPage(
+                                    folder: folder.path,
+                                    pageToken: savedToken,
+                                    pageSize: limit
+                                )
+                            }
                         }
-                    } else {
-                        let ep = provider as! ExchangeProvider
-                        pageResult = try await workQueue.execute(priority: .headerFetch) {
-                            try await ep.listMessageIdsPage(
-                                folder: folder.path,
-                                pageToken: folder.backfillPageToken,
-                                pageSize: limit
-                            )
+                    } catch let error where savedToken != nil && httpStatus(of: error) == 400 {
+                        // A `400` to a request carrying the saved page token: the
+                        // provider no longer accepts it. Gmail documents no wording
+                        // for this, so the status alone decides. Retrying the same
+                        // token can never succeed, so drop it and walk this folder
+                        // again from the top; the pages already walked are
+                        // deduplicated against the database.
+                        //
+                        // Once per folder per call: a second rejection stops this
+                        // folder for the rest of the call (the folders behind it
+                        // still run), and the next call may start it over again.
+                        guard !pageTokenRestartedFolderIds.contains(folder.id) else {
+                            pageWalkSkippedFolderIds.insert(folder.id)
+                            BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) page token rejected again (HTTP 400) — skipping this folder for the rest of this cycle")
+                            continue
                         }
+                        pageTokenRestartedFolderIds.insert(folder.id)
+                        let folderId = folder.id
+                        try await AppDatabase.backgroundPool.write { db in
+                            _ = try Folder
+                                .filter(Column("id") == folderId && Column("backfillPageToken") == savedToken)
+                                .updateAll(db, Column("backfillPageToken").set(to: nil as String?))
+                        }
+                        BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) saved page token rejected (HTTP 400) — restarting this folder's walk from the top")
+                        continue
                     }
                     let (pageIds, nextToken) = pageResult
 
@@ -1889,7 +1930,18 @@ extension SyncEngine {
                 }
 
                 if headers.isEmpty {
-                    BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) fetch returned 0 headers — will retry next cycle")
+                    if isLastPage {
+                        // The last page listed messages and every fetch failed.
+                        // The walk saved no token and did not complete, so the
+                        // loop's fresh re-read would start this folder over from
+                        // the top straight away, and keep doing so for as long as
+                        // the fetches fail. Skip it for the rest of this call; the
+                        // next call walks it again.
+                        pageWalkSkippedFolderIds.insert(folder.id)
+                        BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) last page loaded nothing — skipping this folder for the rest of this cycle, retry next cycle")
+                    } else {
+                        BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) fetch returned 0 headers — will retry next cycle")
+                    }
                     continue
                 }
 

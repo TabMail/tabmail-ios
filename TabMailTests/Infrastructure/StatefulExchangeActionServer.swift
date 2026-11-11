@@ -120,6 +120,15 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         /// The `/move` counterpart of `patchLatencyByProviderId`.
         /// See `holdMove(providerMessageId:forSeconds:)`.
         var moveLatencyByProviderId: [String: TimeInterval] = [:]
+        /// Largest page an unfiltered folder listing serves, the rest behind
+        /// an `@odata.nextLink`. Nil (the default) lists every row up to `$top`
+        /// with no link. See `servePagedListings(pageSize:)`.
+        var listPageSize: Int?
+        /// `$skiptoken` values the paged listing handed out and still accepts,
+        /// each mapped to the offset its page starts at.
+        var liveSkipTokens: [String: Int] = [:]
+        var skipTokenSerial = 0
+        var rejectedSkipTokensServed = 0
     }
 
     private final class StateBox: Sendable {
@@ -356,6 +365,24 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         state.value.withLock { $0.unclassified400Served }
     }
 
+    /// Page unfiltered folder listings: at most `pageSize` rows per response
+    /// (or `$top`, if smaller) and an absolute `@odata.nextLink` carrying a
+    /// `$skiptoken` while more remain. A `$skiptoken` this listing did not
+    /// hand out, or has since expired, gets a `400`.
+    func servePagedListings(pageSize: Int) {
+        state.value.withLock { $0.listPageSize = pageSize }
+    }
+
+    /// Expire every `$skiptoken` handed out so far.
+    func expireIssuedSkipTokens() {
+        state.value.withLock { $0.liveSkipTokens.removeAll() }
+    }
+
+    /// How many listing requests were refused for their `$skiptoken`.
+    func rejectedSkipTokenCount() -> Int {
+        state.value.withLock { $0.rejectedSkipTokensServed }
+    }
+
     /// Every mutating request served, in arrival order. See `State.mutationLog`.
     func mutationLog() -> [String] {
         state.value.withLock { $0.mutationLog }
@@ -449,9 +476,10 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
                 .flatMap(Int.init) ?? Int.max
             let skip = queryItems.first(where: { $0.name == "$skip" })?.value
                 .flatMap(Int.init) ?? 0
+            let skipToken = queryItems.first(where: { $0.name == "$skiptoken" })?.value
 
-            let rows = state.value.withLock { model in
-                model.messagesByProviderId.values
+            let page = state.value.withLock { model -> (rows: [[String: Any]], nextLink: String?)? in
+                let matches = model.messagesByProviderId.values
                     .filter {
                         $0.folderId == folderId
                             && (rfc822MessageId == nil || $0.rfc822MessageId == rfc822MessageId)
@@ -462,11 +490,38 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
                         }
                         return $0.providerMessageId < $1.providerMessageId
                     }
-                    .dropFirst(skip)
-                    .prefix(top)
-                    .map(Self.graphRow)
+                // Unpaged (the default), and every `$filter` lookup: no link.
+                guard let pageSize = model.listPageSize, filter == nil else {
+                    return (matches.dropFirst(skip).prefix(top).map(Self.graphRow), nil)
+                }
+                var start = 0
+                if let skipToken {
+                    guard let resume = model.liveSkipTokens[skipToken] else {
+                        model.rejectedSkipTokensServed += 1
+                        return nil
+                    }
+                    start = min(resume, matches.count)
+                }
+                let end = min(matches.count, start + min(pageSize, top))
+                var nextLink: String?
+                if end < matches.count {
+                    model.skipTokenSerial += 1
+                    let token = "skip-token-\(model.skipTokenSerial)"
+                    model.liveSkipTokens[token] = end
+                    var link = URLComponents(string: "https://graph.microsoft.com/v1.0/me/mailFolders/\(folderId)/messages")
+                    link?.queryItems = [URLQueryItem(name: "$skiptoken", value: token)]
+                    nextLink = link?.url?.absoluteString
+                }
+                return (matches[start..<end].map(Self.graphRow), nextLink)
             }
-            let body = (try? JSONSerialization.data(withJSONObject: ["value": rows])) ?? Data()
+            guard let page else {
+                return .bytes(Self.unclassifiedBadRequestBody(), contentType: "application/json", statusCode: 400)
+            }
+            var object: [String: Any] = ["value": page.rows]
+            if let nextLink = page.nextLink {
+                object["@odata.nextLink"] = nextLink
+            }
+            let body = (try? JSONSerialization.data(withJSONObject: object)) ?? Data()
             return .bytes(body, contentType: "application/json")
         }
         // Exact resource lookup (`GET /messages/{id}?$select=…`) — the same
