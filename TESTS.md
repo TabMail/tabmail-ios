@@ -995,12 +995,16 @@ resource names one or the server advertises the user's address, and never with a
   advertised; a 408, 409, 423, 425 or 429 keeps the edit queued with nothing written; a failed
   lookup is never kept, so the retry asks again; an answer that is not XML, or a server with no
   principal, means none; a principal answered 404 is never "event not found"; a split whose capped
-  series alone needs the address looks it up before its first PUT.
+  series alone needs the address looks it up before its first PUT; a lookup answered 401 sends no
+  PUT and is retired by the auth arm with its reason (T7).
 - `CalDAVOrganizerStepTests`: the pure step (`organized`) returns a body that needs nothing byte for
-  byte, gives every VEVENT without an organizer the same one once any VEVENT needs it (one that has
+  byte (a series with its organizer and guests beside a changed occurrence with neither too),
+  gives every VEVENT without an organizer the same one once any VEVENT needs it (one that has
   its own keeps it), inserts after `UID`, copies every physical line of a folded organizer, reads only a VEVENT's
   own properties, never gives an override-only resource the own address, and is idempotent; the
-  chooser (`organizerHref`); and a source fence: one `CalDAVClient.put` call site, inside `putEvent`
-  after the organizer step.
+  chooser (`organizerHref`, the sign-in matched in any letter case and with surrounding spaces);
+  and a source fence: one `CalDAVClient.put` call site, inside `putEvent` after the organizer step
+  (the site is looked for after `putEvent`'s declaration, so a stray call fails the test instead of
+  trapping it).
 - `MultistatusParserTests.parsePropertyWithSeveralHrefs`: a property with several hrefs gives every
   one, in order (`propertyHrefs`); `properties` is unchanged.

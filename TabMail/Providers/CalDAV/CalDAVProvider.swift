@@ -679,8 +679,11 @@ actor CalDAVProvider: CalendarProvider {
             storedICS: masterICS, slotNaiveISO: masterFrameRecurrenceId,
             cappedRRule: cappedRRule, newRRule: newSeriesRRule, newUid: newUid, patch: patch, now: Date(), zones: zones)
         // Both bodies get their organizer (`withOrganizer`) before anything is written, so a lookup
-        // that fails leaves the series untouched. `putEvent` runs the same step again on each and
-        // finds nothing more to do.
+        // that fails here leaves the series untouched. `putEvent` runs the same step again on each:
+        // a body that has its organizer passes unchanged with no request, but when the server
+        // advertises no address nothing is cached, so each PUT looks it up again and one can fail
+        // between the two PUTs. The new part is then written and the series not capped yet; the
+        // retry reaches the cap through the create-only 412 and `successorIsOurs` (ADR-IOS-106).
         let newPart = try await withOrganizer(resources.newPart)
         let cappedSeries = try await withOrganizer(resources.cappedSeries)
         // The new part read the way a listing reads it, so the caller gets the

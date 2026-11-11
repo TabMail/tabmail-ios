@@ -604,6 +604,20 @@ struct CalDAVOrganizerTests {
         #expect(after == seed, Comment(rawValue: after))
     }
 
+    @Test("T7: a lookup answered 401 is the account's sign-in refused: no PUT, and the auth arm retires the edit")
+    func lookup401IsAnAuthFailure() async throws {
+        let seed = F.series()
+        let run = Self.setUp([F.path: seed], refuses: false, addressSetAnswer: .status(401))
+        defer { run.http.close() }
+        let rows = try await Self.edit(run, F.addGuest, account: "org711-lookup-401")
+        #expect(run.puts.isEmpty, "a PUT was sent after the sign-in was refused: \(run.puts.map(\.path))")
+        #expect(rows.count == 1 && rows.first?.status == PendingStatus.failed.rawValue, Self.landed(rows))
+        #expect(rows.first?.failureReason == AccountManager.calendarAuthFailureReason(CalDAVError.authFailed),
+                "reason: \(rows.first?.failureReason ?? "<none>")")
+        let after = try Self.stored(run)
+        #expect(after == seed, Comment(rawValue: after))
+    }
+
     @Test("T3: a failed lookup is never kept: the retry asks again and writes the user's address")
     func failedLookupIsNotKept() async throws {
         let run = Self.setUp([F.path: F.series()], firstAddressSetAnswer: .status(503))
@@ -840,6 +854,12 @@ struct CalDAVOrganizerStepTests {
         ["BEGIN:VEVENT", "UID:step-1", "DTSTART:20990506T170000Z", "DURATION:PT1H", "SUMMARY:Sync",
          "BEGIN:VALARM", "ACTION:EMAIL", "TRIGGER:-PT15M", "SUMMARY:Soon", "DESCRIPTION:Soon",
          "ATTENDEE:mailto:guest@example.com", "END:VALARM", "END:VEVENT"],
+        // A series with its organizer and guests, and a changed occurrence with neither: no VEVENT
+        // has an attendee without an organizer, so the occurrence gets nothing.
+        ["BEGIN:VEVENT", "UID:step-1", "DTSTART:20990506T170000Z", "DURATION:PT1H", "RRULE:FREQ=WEEKLY",
+         "SUMMARY:Sync", "ORGANIZER:mailto:other@example.com", "ATTENDEE:mailto:guest@example.com", "END:VEVENT",
+         "BEGIN:VEVENT", "UID:step-1", "RECURRENCE-ID:20990520T170000Z", "DTSTART:20990520T170000Z",
+         "DURATION:PT1H", "SUMMARY:Sync", "END:VEVENT"],
     ])
     func untouched(_ vevent: [String]) {
         let body = Self.ics(vevent)
@@ -944,6 +964,9 @@ struct CalDAVOrganizerStepTests {
         (["mailto:intruder@example.com\r\nATTENDEE:mailto:x@example.com", "mailto:alias@example.com"],
          "intruder@example.com", Optional("mailto:alias@example.com")),
         (["MAILTO:user@example.com"], "user", Optional("MAILTO:user@example.com")),
+        // The sign-in as the user typed it: any letter case, surrounding spaces.
+        (["mailto:alias@example.com", "mailto:user@example.com"], "User@Example.com", Optional("mailto:user@example.com")),
+        (["mailto:alias@example.com", "mailto:user@example.com"], "  user@example.com ", Optional("mailto:user@example.com")),
     ])
     func chooser(_ advertised: [String], _ signIn: String, _ expected: String?) {
         #expect(CalDAVProvider.organizerHref(advertised: advertised, signIn: signIn) == expected)
@@ -974,10 +997,10 @@ struct CalDAVOrganizerStepTests {
             }
         }
         #expect(scanned > 100, "the scan found the sources")
-        #expect(sites.count == 1 && sites.first?.hasPrefix("CalDAVProvider.swift:") == true, Comment(rawValue: sites.joined(separator: ", ")))
+        try #require(sites.count == 1 && sites.first?.hasPrefix("CalDAVProvider.swift:") == true, Comment(rawValue: sites.joined(separator: ", ")))
         let provider = try String(contentsOf: root.appendingPathComponent("TabMail/Providers/CalDAV/CalDAVProvider.swift"), encoding: .utf8)
         let putEvent = try #require(provider.range(of: "private func putEvent("))
-        let put = try #require(provider.range(of: "client.put("))
+        let put = try #require(provider.range(of: "client.put(", range: putEvent.upperBound..<provider.endIndex))
         let body = provider[putEvent.upperBound..<put.lowerBound]
         #expect(body.contains("withOrganizer(") && !body.contains("\n    }\n"), "client.put is called inside putEvent, after the organizer step")
     }

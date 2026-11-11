@@ -25,13 +25,18 @@ series with no organizer, and both halves of a split were all written without it
    of a split go through it. It runs `withOrganizer` on the final body: the pure
    `CalDAVProvider.organized(_:own:)` (`CalDAVOrganizer.swift`). A source fence
    (`CalDAVOrganizerStepTests.onePutCallSite`) keeps `client.put(` at one call site. The split
-   prepares both bodies before its first PUT, so a lookup that fails writes nothing.
+   prepares both bodies before its first PUT, so a lookup that fails there writes nothing. When the
+   server advertises no address, nothing is cached and `putEvent` looks it up again before each
+   PUT, so a lookup can also fail between the split's two PUTs: the new part is written and the
+   series is not capped yet, and the retry reaches the cap through ADR-IOS-106's create-only 412
+   and `successorIsOurs`.
 2. **What the step does,** reading each VEVENT's own properties only (an EMAIL alarm's attendee is
    the alarm's): when some VEVENT has an attendee and no organizer, every VEVENT of the resource
    that has no organizer gets the same one, the guest-less series too, because RFC 6638 §3.1 wants
    the organizer set in all the components; a VEVENT that has an organizer keeps its own; when no
    VEVENT has an attendee without an organizer, the body is returned byte for byte. The step is
-   idempotent, so the split's second run inside `putEvent` makes no request.
+   idempotent: a body that already has its organizer passes through `putEvent`'s run unchanged and
+   makes no request. A body that still has none (nothing advertised) asks again.
 3. **Which address, in order:**
    1. The resource's own organizer, copied byte for byte (every physical line of a folded one): the
       series VEVENT's, else the first changed occurrence's in document order. Every VEVENT that had
@@ -46,8 +51,7 @@ series with no organizer, and both halves of a split were all written without it
       bare login name, and a wrong organizer misattributes the meeting and can send the guests'
       answers elsewhere, which is worse than none.
 4. **Never the account's address on an invitations-only resource.** A resource that holds only
-   changed occurrences is an invitation to single occurrences of someone else's series (RFC 4791
-   §4.1). Writing the account's address there would forge the meeting's identity, the alternative
+   changed occurrences is an invitation to single occurrences of someone else's series. Writing the account's address there would forge the meeting's identity, the alternative
    ADR-IOS-052 rejected. It only gets an organizer another of its VEVENTs names.
 5. **The lookup** (`advertisedAddresses`) runs only when the step needs the account's address:
    some VEVENT needs an organizer, no VEVENT names one, and the resource has a series VEVENT. It
@@ -93,7 +97,9 @@ series with no organizer, and both halves of a split were all written without it
   above). RFC 6638 §3.1 requires that shape; the tests model it.
 - On a server that advertises no address, guests are still stored and not invited, as before.
 - The first write that needs the address costs up to three PROPFINDs (principal, home set, address
-  set; the `.well-known` try adds one on a non-iCloud server), once per provider.
+  set; the `.well-known` try adds one on a non-iCloud server), once per provider when an address is
+  found. On a server that advertises none, nothing is cached, so every PUT that needs the address
+  asks again: a split asks up to four times.
 - The irreversible wire operations are unchanged: the split's cap PUT gains a property, and its
   membership predicate is unaffected.
 - `MultistatusParser` keeps every href of a property in order (`propertyHrefs`); `properties` is

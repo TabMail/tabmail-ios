@@ -27,8 +27,8 @@ import Foundation
 ///    organizer misattributes the meeting and can send the guests' answers elsewhere, which is
 ///    worse than none.
 /// 4. A resource that holds only changed occurrences (an invitation to single occurrences of
-///    someone else's series, RFC 4791 §4.1) never gets the account's address: that would forge the
-///    meeting's identity (ADR-IOS-052). It only gets an organizer another of its VEVENTs names.
+///    someone else's series) never gets the account's address: that would forge the meeting's
+///    identity (ADR-IOS-052). It only gets an organizer another of its VEVENTs names.
 /// 5. When no VEVENT has an attendee without an organizer, the body is returned as it was, byte
 ///    for byte.
 extension CalDAVProvider {
