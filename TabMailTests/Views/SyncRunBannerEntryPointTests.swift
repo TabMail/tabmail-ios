@@ -17,8 +17,11 @@ import Testing
 /// | `AccountManager.backgroundPollRun(nil)`       | full                | never  | when no account failed |
 /// | `AccountManager.backgroundPollRun(email)`     | partial             | never  | never               |
 ///
-/// Two accounts: A (whose sync fails while `failing` is set) and B (healthy). Both
-/// run against `MockEmailProvider`s registered on `AccountManager.shared`.
+/// "Failed" above means counted: an account marked sign-in-needed never counts,
+/// for raising or for clearing (`AccountManagerState.finishSyncRun`).
+///
+/// Two accounts: A and B, each failing while set to, healthy otherwise. Both run
+/// against `MockEmailProvider`s registered on `AccountManager.shared`.
 @Suite("Inbox sync banner through the real run entry points", .serialized, .processGlobalState,
        .timeLimit(.minutes(2)))
 @MainActor
@@ -40,6 +43,13 @@ struct SyncRunBannerEntryPointTests {
             let error: Error? = failing ? NSError(domain: "com.example.test", code: 7) : nil
             await providerA.setConnectThrows(error)
             await providerA.setFetchMessagesThrows(error)
+        }
+
+        /// The same for account B.
+        func setBFailing(_ failing: Bool) async {
+            let error: Error? = failing ? NSError(domain: "com.example.test", code: 8) : nil
+            await providerB.setConnectThrows(error)
+            await providerB.setFetchMessagesThrows(error)
         }
     }
 
@@ -75,6 +85,8 @@ struct SyncRunBannerEntryPointTests {
     private func tearDown(_ world: World, _ saved: (String?, Date?, Bool)) async {
         await AccountManager.shared.unregisterProviderForTesting(accountId: world.accountA.id)
         await AccountManager.shared.unregisterProviderForTesting(accountId: world.accountB.id)
+        await AccountManager.shared.clearAuthFailed(world.accountA.id)
+        await AccountManager.shared.clearAuthFailed(world.accountB.id)
         let state = AccountManagerState.shared
         state.syncErrorBanner = saved.0
         state.lastSyncCompletedAt = saved.1
@@ -182,6 +194,67 @@ struct SyncRunBannerEntryPointTests {
             AccountManagerState.shared.syncErrorBanner = nil
             _ = await AccountManager.shared.backgroundPollRun(accountEmail: world.accountA.emailAddress, inboxOnly: false)
             #expect(banner == nil, "a one-account background run raised the banner")
+        }
+    }
+
+    // MARK: - Accounts marked sign-in-needed never count
+
+    @Test("A recovers while B is marked sign-in-needed and failing: the next full run clears")
+    func markedFailingAccountDoesNotHoldTheBanner() async throws {
+        try await withWorld { world in
+            await raiseThroughRefresh(world)
+            #expect(banner == InboxErrorBanner.genericMessage)
+
+            await AccountManager.shared.markAuthFailed(world.accountB.id)
+            await world.setBFailing(true)
+            await world.setFailing(false)
+            _ = await AccountManager.shared.foregroundPollRun()
+            #expect(banner == nil, "a marked account's failure kept the generic banner up")
+
+            await raiseThroughRefresh(world)
+            await world.setFailing(false)
+            await InboxViewModel(folders: [world.inboxA, world.inboxB]).refreshSync()
+            #expect(banner == nil, "a full refresh did not clear past a marked account's failure")
+        }
+    }
+
+    @Test("A recovers while B fails and is not marked: the banner stays")
+    func unmarkedFailingAccountKeepsTheBanner() async throws {
+        try await withWorld { world in
+            await raiseThroughRefresh(world)
+            await world.setBFailing(true)
+            await world.setFailing(false)
+            _ = await AccountManager.shared.foregroundPollRun()
+            #expect(banner == InboxErrorBanner.genericMessage, "an unmarked failing account let a full run clear")
+            _ = await AccountManager.shared.backgroundPollRun(accountEmail: nil, inboxOnly: false)
+            #expect(banner == InboxErrorBanner.genericMessage, "an unmarked failing account let a background run clear")
+        }
+    }
+
+    @Test("a failure from an account already marked sign-in-needed never raises")
+    func markedAccountFailureNeverRaises() async throws {
+        try await withWorld { world in
+            await AccountManager.shared.markAuthFailed(world.accountA.id)
+            await world.setFailing(true)
+            await InboxViewModel(folders: [world.inboxA]).refreshSync()
+            #expect(banner == nil, "a partial refresh raised for a marked account")
+            await InboxViewModel(folders: [world.inboxA, world.inboxB]).refreshSync()
+            #expect(banner == nil, "a full refresh raised for a marked account")
+        }
+    }
+
+    @Test("a foreground poll where every account fails neither clears nor completes")
+    func allFailedForegroundPollDoesNotClear() async throws {
+        try await withWorld { world in
+            await raiseThroughRefresh(world)
+            let completedBefore = Date(timeIntervalSinceNow: -60)
+            AccountManagerState.shared.lastSyncCompletedAt = completedBefore
+            await world.setBFailing(true)
+            _ = await AccountManager.shared.foregroundPollRun()
+            #expect(banner == InboxErrorBanner.genericMessage, "an all-failed poll cleared the banner")
+            #expect(AccountManagerState.shared.lastSyncCompletedAt == completedBefore,
+                    "an all-failed poll advanced lastSyncCompletedAt")
+            #expect(AccountManagerState.shared.lastSyncFailed)
         }
     }
 }

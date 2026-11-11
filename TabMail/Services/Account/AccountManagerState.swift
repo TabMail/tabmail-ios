@@ -122,23 +122,29 @@ final class AccountManagerState {
     /// `InboxErrorBanner`'s fixed lines; never text derived from an error.
     var syncErrorBanner: String?
 
-    /// The single place a sync run publishes its end state for the inbox.
+    /// The single place a sync run publishes its end state for the inbox, and
+    /// the single statement of what the generic banner means:
     ///
-    /// - `raised`: the banner line the run's own failure raises, or `nil`. Only a
-    ///   user-started inbox refresh passes a line; scheduler and background runs
-    ///   never raise the banner.
+    /// The generic banner means "as of the last full run, some account that is
+    /// not already marked sign-in-needed failed for a non-temporary reason". It
+    /// is raised only by foreground (user-started) runs, and cleared by a full
+    /// run in which no such account failed. Accounts marked sign-in-needed never
+    /// count, for raising or for clearing: their own "Sign in again" banner
+    /// tells the user.
+    ///
+    /// - `foreground`: a user-started refresh (only these raise).
     /// - `coverage`: whether the run covered every active account.
-    /// - `anyFailure`: whether any account in the run failed.
+    /// - `countedFailure`: an account in the run that is not marked
+    ///   sign-in-needed failed for a non-temporary reason
+    ///   (`InboxErrorBanner.countsAsFailure`).
+    /// - `raisingFailure`: such a failure is one the banner shows
+    ///   (`InboxErrorBanner.text` is not `nil`; offline is not).
     /// - `completed`: whether this run advances `lastSyncCompletedAt`.
-    ///
-    /// Only a FULL run with no failure clears the banner. A partial run (one
-    /// account, one folder) never clears it, so a healthy account's push or
-    /// pull cannot hide another account's failure, and a run where one account
-    /// keeps failing never clears it either.
-    func finishSyncRun(raised bannerText: String?, coverage: SyncRunCoverage, anyFailure: Bool, completed: Bool) {
-        if let bannerText {
-            syncErrorBanner = bannerText
-        } else if coverage == .full && !anyFailure {
+    func finishSyncRun(foreground: Bool, coverage: SyncRunCoverage, countedFailure: Bool,
+                       raisingFailure: Bool, completed: Bool) {
+        if foreground && raisingFailure {
+            syncErrorBanner = InboxErrorBanner.genericMessage
+        } else if coverage == .full && !countedFailure {
             syncErrorBanner = nil
         }
         if completed {
@@ -169,6 +175,18 @@ enum InboxErrorBanner {
 
     /// Every line the banner can show. Tests assert membership in this set.
     static let allLines: Set<String> = [genericMessage]
+
+    /// Whether an account's failure counts for the banner
+    /// (`AccountManagerState.finishSyncRun`): the account is not marked
+    /// sign-in-needed and the failure is not temporary (cancellation, a database
+    /// suspension, `SyncEngine.isTransientError`).
+    nonisolated static func countsAsFailure(_ error: Error, accountMarkedSignInNeeded: Bool) -> Bool {
+        if accountMarkedSignInNeeded { return false }
+        if error is CancellationError { return false }
+        if error.isDatabaseSuspensionAbort { return false }
+        if SyncEngine.isTransientError(error) { return false }
+        return true
+    }
 
     /// The banner line a sync or page-load failure raises, or `nil` for none.
     ///

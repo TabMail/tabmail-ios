@@ -203,4 +203,25 @@ struct IMAPLoginRefusalSignInTests {
             #expect(await !isMarked(account.id), "an accepted login did not clear the warning")
         }
     }
+
+    @Test("a late refusal from the provider Update Password replaced never marks the account")
+    func replacedProviderLateRefusalNeverMarks() async throws {
+        try await withFactoryAccount { server, account in
+            let manager = AccountManager.shared
+            let old = try await manager.createIMAPProvider(for: account)
+            await manager.registerProviderForTesting(accountId: account.id, provider: old)
+            #expect(old.hasSignInOutcomeReporter)
+
+            try await manager.updateIMAPPassword(server.password, for: account)
+            #expect(!old.hasSignInOutcomeReporter, "the replaced provider kept the account's reporter")
+
+            // The replaced provider still holds the old password; its login is refused.
+            server.failNextCommand(containing: "LOGIN", message: "[AUTHENTICATIONFAILED] Invalid credentials")
+            var thrown: (any Error)?
+            do { try await old.connect() } catch { thrown = error }
+            #expect(thrown != nil, "the replaced provider did not attempt a login")
+            #expect(await !isMarked(account.id), "a late refusal from the replaced provider marked the account")
+            try? await old.disconnect()
+        }
+    }
 }

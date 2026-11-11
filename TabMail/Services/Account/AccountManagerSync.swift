@@ -60,12 +60,12 @@ extension AccountManager {
             let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
             BackgroundSyncLogger.log("bgSync: END \(account.emailAddress): \(elapsed)ms, changes=\(changed), reason=\(reason)")
             return SyncResult(hadChanges: changed, failed: false)
-        } catch is TimeoutError {
+        } catch let error as TimeoutError {
             let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
             BackgroundSyncLogger.logDebug("[SyncScheduler:bg] Delta sync timed out for \(account.emailAddress)")
             BackgroundSyncLogger.logError("timeout", source: "bgSync:\(account.emailAddress)")
             BackgroundSyncLogger.log("bgSync: TIMEOUT \(account.emailAddress) after \(elapsed)ms")
-            return SyncResult(hadChanges: false, failed: true)
+            return .failure(error, accountMarkedSignInNeeded: authFailedAccounts.contains(account.id))
         } catch {
             let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
             BackgroundSyncLogger.logDebug("[SyncScheduler:bg] Sync failed for \(account.emailAddress): \(error)")
@@ -73,7 +73,7 @@ extension AccountManager {
                 BackgroundSyncLogger.logError("\(error)", source: "bgSync:\(account.emailAddress)")
             }
             BackgroundSyncLogger.log("bgSync: FAILED \(account.emailAddress) after \(elapsed)ms: \(error.localizedDescription)")
-            return SyncResult(hadChanges: false, failed: true)
+            return .failure(error, accountMarkedSignInNeeded: authFailedAccounts.contains(account.id))
         }
     }
 
@@ -82,13 +82,22 @@ extension AccountManager {
         let hadChanges: Bool
         /// For one account: it failed. For a run: every account failed.
         let failed: Bool
-        /// Whether any account in the run failed (for one account, `failed`).
-        let anyAccountFailed: Bool
+        /// Whether an account in the run that is not marked sign-in-needed failed
+        /// for a non-temporary reason (`InboxErrorBanner.countsAsFailure`). A run
+        /// that could not load its accounts counts too: it proved nothing.
+        let countedFailure: Bool
 
-        init(hadChanges: Bool, failed: Bool, anyAccountFailed: Bool? = nil) {
+        init(hadChanges: Bool, failed: Bool, countedFailure: Bool = false) {
             self.hadChanges = hadChanges
             self.failed = failed
-            self.anyAccountFailed = anyAccountFailed ?? failed
+            self.countedFailure = countedFailure
+        }
+
+        /// A failed account's result, counted for the banner by the one rule.
+        static func failure(_ error: any Error, accountMarkedSignInNeeded: Bool) -> SyncResult {
+            SyncResult(hadChanges: false, failed: true,
+                       countedFailure: InboxErrorBanner.countsAsFailure(
+                           error, accountMarkedSignInNeeded: accountMarkedSignInNeeded))
         }
     }
 
@@ -113,9 +122,9 @@ extension AccountManager {
                 try await self.syncEngine.sync(account: account)
             }
             return SyncResult(hadChanges: changed, failed: false)
-        } catch is TimeoutError {
+        } catch let error as TimeoutError {
             BackgroundSyncLogger.logDebug("[SyncScheduler] Sync timed out for \(account.emailAddress) after \(SyncConfig.perAccountSyncTimeoutSeconds)s")
-            return SyncResult(hadChanges: false, failed: true)
+            return .failure(error, accountMarkedSignInNeeded: authFailedAccounts.contains(account.id))
         } catch let error where SyncEngine.isTransientError(error) {
             // Transient provider blip (HTTP 5xx/429 from a reachable server) — not a
             // real sync failure. Report `failed: false` so the foreground poll doesn't
@@ -132,7 +141,7 @@ extension AccountManager {
             if !SyncEngine.isConnectionError(error) && !(error is CancellationError) {
                 BackgroundSyncLogger.logError("\(error)", source: "fgSync:\(account.emailAddress)")
             }
-            return SyncResult(hadChanges: false, failed: true)
+            return .failure(error, accountMarkedSignInNeeded: authFailedAccounts.contains(account.id))
         }
     }
 
@@ -150,7 +159,7 @@ extension AccountManager {
             }
         } catch {
             BackgroundSyncLogger.logDebug("[SyncScheduler:bg] Failed to load accounts: \(error)")
-            return SyncResult(hadChanges: false, failed: true)
+            return SyncResult(hadChanges: false, failed: true, countedFailure: true)
         }
         guard !accounts.isEmpty else { return SyncResult(hadChanges: false, failed: false) }
         let label = "bgSyncAll"
@@ -171,11 +180,11 @@ extension AccountManager {
                 accountResults.append(result)
                 if result.hadChanges { hadChanges = true }
             }
-            let anyFailed = accountResults.contains { $0.failed }
+            let countedFailure = accountResults.contains { $0.countedFailure }
             let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
             let summary = results.map { "\($0.0)=\($0.1)" }.joined(separator: ", ")
             BackgroundSyncLogger.log("\(label) END in \(elapsed)ms: [\(summary)]")
-            return SyncResult(hadChanges: hadChanges, failed: false, anyAccountFailed: anyFailed)
+            return SyncResult(hadChanges: hadChanges, failed: false, countedFailure: countedFailure)
         }
     }
 
@@ -205,7 +214,7 @@ extension AccountManager {
             }
         } catch {
             BackgroundSyncLogger.logDebug("[SyncScheduler:fg] Failed to load accounts: \(error)")
-            return SyncResult(hadChanges: false, failed: true)
+            return SyncResult(hadChanges: false, failed: true, countedFailure: true)
         }
         guard !accounts.isEmpty else { return SyncResult(hadChanges: false, failed: false) }
 
@@ -224,7 +233,7 @@ extension AccountManager {
                 if !result.failed { allFailed = false }
             }
             return SyncResult(hadChanges: hadChanges, failed: allFailed,
-                              anyAccountFailed: accountResults.contains { $0.failed })
+                              countedFailure: accountResults.contains { $0.countedFailure })
         }
     }
 
@@ -233,7 +242,8 @@ extension AccountManager {
     // Every scheduler run that advances `lastSyncCompletedAt` reports through one
     // of these, so the run's coverage and outcome reach
     // `AccountManagerState.finishSyncRun` in one place. Scheduler and background
-    // runs never raise the inbox banner; only a full run with no failure clears it.
+    // runs never raise the inbox banner; only a full run with no counted failure
+    // clears it (the rule is stated once, on `finishSyncRun`).
 
     /// The foreground poll's header sync: every active account (a full run).
     func foregroundPollRun() async -> SyncResult {
@@ -241,8 +251,8 @@ extension AccountManager {
         await MainActor.run {
             let state = AccountManagerState.shared
             state.lastSyncFailed = result.failed
-            state.finishSyncRun(raised: nil, coverage: .full,
-                                anyFailure: result.anyAccountFailed, completed: !result.failed)
+            state.finishSyncRun(foreground: false, coverage: .full, countedFailure: result.countedFailure,
+                                raisingFailure: false, completed: !result.failed)
         }
         return result
     }
@@ -259,8 +269,8 @@ extension AccountManager {
         await MainActor.run {
             let state = AccountManagerState.shared
             state.lastSyncFailed = false
-            state.finishSyncRun(raised: nil, coverage: accountEmail == nil ? .full : .partial,
-                                anyFailure: result.anyAccountFailed, completed: true)
+            state.finishSyncRun(foreground: false, coverage: accountEmail == nil ? .full : .partial,
+                                countedFailure: result.countedFailure, raisingFailure: false, completed: true)
         }
         return result
     }

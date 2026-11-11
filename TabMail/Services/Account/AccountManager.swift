@@ -1328,6 +1328,10 @@ actor AccountManager {
     /// the account's real sign-in reporter and stores the provider in ONE actor
     /// turn (no `await` between), so the live provider always reports.
     func installAcceptedPasswordProbeAsLive(_ provider: IMAPProvider, accountId: String) {
+        // The replaced provider still holds the old password; a refusal it reports
+        // late must not mark the account the user just fixed. Detach it in the
+        // same actor turn as the swap (no await between).
+        (providers[accountId] as? IMAPProvider)?.attachSignInOutcomeReporter(nil)
         provider.attachSignInOutcomeReporter(makeSignInOutcomeReporter(accountId: accountId))
         providers[accountId] = provider
     }

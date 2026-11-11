@@ -1807,45 +1807,85 @@ final class InboxViewModel {
         defer { isRefreshing = false }
         error = nil
         do {
+            // Each step is attributed to its account, so the banner decision can
+            // tell whether the failing account is already marked sign-in-needed.
             // Ensure providers are connected
             for account in uniqueAccounts {
                 if await manager.provider(for: account) == nil {
-                    try await manager.connectAccount(account)
+                    do {
+                        try await manager.connectAccount(account)
+                    } catch {
+                        throw AccountRunFailure(accountId: account.id, underlying: error)
+                    }
                 }
             }
 
             // Priority: sync ONLY the currently viewed folders first.
             // e.g. unified inbox → sync inbox folders only, not sent/trash/archive.
-            try await manager.syncFolders(folders)
+            let accountManager = self.manager
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for (accountId, accountFolders) in Dictionary(grouping: folders, by: \.accountId) {
+                    group.addTask {
+                        do {
+                            try await accountManager.syncFolders(accountFolders)
+                        } catch {
+                            throw AccountRunFailure(accountId: accountId, underlying: error)
+                        }
+                    }
+                }
+                try await group.waitForAll()
+            }
 
             AccountManagerState.shared.lastSyncFailed = false
-            AccountManagerState.shared.finishSyncRun(raised: nil, coverage: coverage, anyFailure: false, completed: true)
-        } catch is CancellationError {
-            // Task cancelled (e.g., user navigated away) — not user-facing
-        } catch let error where SyncEngine.isTransientError(error) {
-            // Transient provider blip — HTTP 5xx/429 from a reachable server (e.g. a
-            // momentary Microsoft Graph 503 during connect). NOT a real sync failure:
-            // the next poll/refresh retries. Leave lastSyncFailed unchanged and show
-            // no error banner so a single server hiccup doesn't surface to the user.
-            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Sync] Transient error (not surfaced): \(error)") }
-        } catch let error where error.isDatabaseSuspensionAbort {
-            // GRDB write aborted because the database is suspended (ADR-IOS-041).
-            // Benign and expected at a background-suspension instant — retries on
-            // the next wake — so it must NOT surface as a failed sync.
-            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Sync] Database suspended (not surfaced): \(error)") }
+            AccountManagerState.shared.finishSyncRun(foreground: true, coverage: coverage, countedFailure: false,
+                                                     raisingFailure: false, completed: true)
+        } catch let failure as AccountRunFailure {
+            await settleFailedRun(failure.underlying, accountId: failure.accountId, coverage: coverage)
         } catch {
-            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Sync] Error: \(error)") }
-            AccountManagerState.shared.lastSyncFailed = true
-            // A user-started refresh raises the banner on its own failure (fixed
-            // line only, never the error's text) and does not advance the timestamp.
-            AccountManagerState.shared.finishSyncRun(raised: InboxErrorBanner.text(for: error), coverage: coverage,
-                                                     anyFailure: true, completed: false)
+            await settleFailedRun(error, accountId: nil, coverage: coverage)
         }
 
         // Refresh loaded messages to pick up changes from sync.
         // Badge + unread counts already updated by UnreadCountManager during syncFolders.
         // With overlay, reloadMessages is always safe to call.
         await reloadMessages()
+    }
+
+    /// A sync step's failure, tagged with the account it belongs to.
+    private struct AccountRunFailure: Error {
+        let accountId: String
+        let underlying: any Error
+    }
+
+    /// Publish a failed user-started refresh. `accountId` is the failing account,
+    /// or `nil` when the failure belongs to no account.
+    private func settleFailedRun(_ error: any Error, accountId: String?, coverage: SyncRunCoverage) async {
+        if error is CancellationError {
+            // Task cancelled (e.g., user navigated away) — not user-facing
+            return
+        }
+        if SyncEngine.isTransientError(error) {
+            // Transient provider blip — HTTP 5xx/429 from a reachable server, or a
+            // temporary refusal. NOT a real sync failure: the next poll/refresh
+            // retries. Leave lastSyncFailed unchanged and show no error banner.
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Sync] Transient error (not surfaced): \(error)") }
+            return
+        }
+        if error.isDatabaseSuspensionAbort {
+            // GRDB write aborted because the database is suspended (ADR-IOS-041).
+            // Benign and expected at a background-suspension instant — retries on
+            // the next wake — so it must NOT surface as a failed sync.
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Sync] Database suspended (not surfaced): \(error)") }
+            return
+        }
+        if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Sync] Error: \(error)") }
+        AccountManagerState.shared.lastSyncFailed = true
+        var marked = false
+        if let accountId { marked = await manager.authFailedAccounts.contains(accountId) }
+        let counted = InboxErrorBanner.countsAsFailure(error, accountMarkedSignInNeeded: marked)
+        AccountManagerState.shared.finishSyncRun(
+            foreground: true, coverage: coverage, countedFailure: counted,
+            raisingFailure: counted && InboxErrorBanner.text(for: error) != nil, completed: false)
     }
 
     // MARK: - Message Actions
