@@ -129,6 +129,11 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         var liveSkipTokens: [String: Int] = [:]
         var skipTokenSerial = 0
         var rejectedSkipTokensServed = 0
+        /// An injected bare status for unfiltered folder listings. See
+        /// `failListings(status:onlyWithSkipToken:)`.
+        var listingFailureStatus: Int?
+        var listingFailureOnlyWithSkipToken = false
+        var listingFailuresServed = 0
     }
 
     private final class StateBox: Sendable {
@@ -369,8 +374,34 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
     /// (or `$top`, if smaller) and an absolute `@odata.nextLink` carrying a
     /// `$skiptoken` while more remain. A `$skiptoken` this listing did not
     /// hand out, or has since expired, gets a `400`.
+    ///
+    /// ⚠️ THE TOKEN REJECTION IS MODELLED, NOT DOCUMENTED GRAPH BEHAVIOUR. Graph's
+    /// own message-listing `@odata.nextLink` pages with `$skip=<integer>` (measured
+    /// live: a non-integer `$skip` answers `400 BadRequest`), so a saved link
+    /// cannot expire there. The `$skiptoken` and its rejection exist only so the
+    /// walk's rejected-token path can be driven through the Exchange code too.
     func servePagedListings(pageSize: Int) {
         state.value.withLock { $0.listPageSize = pageSize }
+    }
+
+    /// Answer every unfiltered folder listing (only those carrying a
+    /// `$skiptoken` when `onlyWithSkipToken`) with a bare `status` until
+    /// `clearListingFailures()`. `$filter` lookups are never failed by it.
+    func failListings(status: Int, onlyWithSkipToken: Bool = false) {
+        state.value.withLock {
+            $0.listingFailureStatus = status
+            $0.listingFailureOnlyWithSkipToken = onlyWithSkipToken
+        }
+    }
+
+    /// Stop failing listings, leaving the served count intact.
+    func clearListingFailures() {
+        state.value.withLock { $0.listingFailureStatus = nil }
+    }
+
+    /// How many listing requests were answered with an injected failure.
+    func listingFailuresServedCount() -> Int {
+        state.value.withLock { $0.listingFailuresServed }
     }
 
     /// Expire every `$skiptoken` handed out so far.
@@ -477,6 +508,13 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
             let skip = queryItems.first(where: { $0.name == "$skip" })?.value
                 .flatMap(Int.init) ?? 0
             let skipToken = queryItems.first(where: { $0.name == "$skiptoken" })?.value
+            let injectedListingStatus = state.value.withLock { model -> Int? in
+                guard filter == nil, let status = model.listingFailureStatus else { return nil }
+                if model.listingFailureOnlyWithSkipToken && skipToken == nil { return nil }
+                model.listingFailuresServed += 1
+                return status
+            }
+            if let injectedListingStatus { return .status(injectedListingStatus) }
 
             let page = state.value.withLock { model -> (rows: [[String: Any]], nextLink: String?)? in
                 let matches = model.messagesByProviderId.values

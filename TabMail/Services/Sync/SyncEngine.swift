@@ -57,6 +57,15 @@ actor SyncEngine {
     /// we see even when the query returns 0 rows.
     var recoverIncompleteExplainLogged = false
 
+    /// Gmail/Exchange backfill page walk: when each page now held for a
+    /// server-answered transient failure was FIRST held, keyed by folder and the
+    /// saved page token the page was listed with. It must outlive one
+    /// `runBackfill` call, because the hold bound
+    /// (`SyncConfig.backfillTransientPageHoldMinutes`) spans many calls. Held in
+    /// memory only and never saved: a relaunch starts the bound again. A
+    /// folder's entries are dropped whenever its saved token moves.
+    var backfillPageHoldStartedAt: [BackfillPageHoldKey: Date] = [:]
+
     /// GRDB DatabasePool for foreground SYNC — full / delta / pull-down / on-demand /
     /// pagination — at `.normal` (`AppDatabase.syncPool`), so it beats the deep
     /// background FILLING queues in `DatabaseWriteQueue` but still yields to the merge

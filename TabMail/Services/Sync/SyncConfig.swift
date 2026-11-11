@@ -253,6 +253,22 @@ enum SyncConfig {
     /// Backfill fetch+insert chunk — IMAP/Gmail backfill processes this many at a time.
     /// Used as default; overridden by BackfillProfile at runtime.
     static let backfillChunkSize = 500
+    /// Gmail/Exchange backfill page walk: how long a page stays HELD (its saved page
+    /// token neither advanced nor cleared) while some of its messages keep failing with
+    /// a server-answered transient status (5xx, 429, 403), counted from the page's first
+    /// such hold. Past it, those messages are passed over like a per-message failure and
+    /// the walk moves on.
+    ///
+    /// Why an hour: a provider incident or a rate-limit window usually clears within
+    /// minutes, and a hold must outlast that so an ordinary blip never moves the walk
+    /// past mail it could have loaded. It must still end, because one message the server
+    /// refuses for good would otherwise stop its folder from ever completing. The bound
+    /// is kept in memory only, so a relaunch starts it again. A failure that got no
+    /// answer at all (offline, connection lost) is not bounded by this: it holds until
+    /// the server answers.
+    static let backfillTransientPageHoldMinutes: Double = 60
+    /// `backfillTransientPageHoldMinutes` in seconds, for comparing against elapsed time.
+    static var backfillTransientPageHoldSeconds: TimeInterval { backfillTransientPageHoldMinutes * 60 }
     /// Pruning batch size — how many messages to process per iteration when over budget.
     static let pruneChunkSize = 50
     /// FTS bulk-index batch size — headers indexed per folder page.

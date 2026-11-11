@@ -8,79 +8,47 @@ import GRDB
 @testable import TabMail
 
 /// The Gmail and Exchange backfill page walk (`SyncEngine.runBackfill`)
-/// against the stateful provider fakes, on the two inputs that used to keep it
-/// re-walking one folder for the whole call:
+/// against the stateful provider fakes, on a saved page token the provider
+/// refuses with a `400`, which used to keep the walk re-listing one folder for
+/// the whole call.
 ///
-/// - a saved page token the provider rejects with a `400`;
-/// - a last page whose every message fetch fails.
-///
-/// Every test asserts the system properties: the call ends with a bounded
-/// number of provider requests, the folder's mail is eventually complete, and
-/// a folder behind it is still walked. Each call is given a deadline only so a
-/// regression ends at the deadline with failed assertions instead of hanging
-/// the suite; a passing walk finishes far inside it.
-@Suite("Backfill page walk — rejected page tokens and a last page that loads nothing", .serialized, .processGlobalState)
+/// Each test asserts a bounded number of listing requests and where the folder
+/// ends up (complete, or left incomplete for the next call); the test with a
+/// second folder also asserts that folder is still walked. Each call is given a
+/// deadline only so a regression ends at the deadline with failed assertions
+/// instead of hanging the suite; a passing walk finishes far inside it.
+/// Failures other than a refused token are in `BackfillPageWalkFailureTests`.
+@Suite("Backfill page walk — rejected page tokens", .serialized, .processGlobalState)
 struct BackfillPageWalkTokenTests {
+    private typealias F = BackfillPageWalkFixture
 
-    /// Safety stop for a regressed walk; a correct one needs well under a second per folder.
-    private static let safetySeconds: TimeInterval = 20
-    /// Messages per listing page, so three messages span two pages.
-    private static let pageSize = 2
     /// A token the fake never handed out: what a saved token looks like once
     /// the provider has dropped it.
     private static let staleGmailToken = "stale-page-token"
 
-    private static func deadline() -> Date { Date().addingTimeInterval(safetySeconds) }
-
-    private static func daysAgo(_ days: Double) -> Date { Date().addingTimeInterval(-days * 86_400) }
-
+    private static func deadline() -> Date { F.deadline() }
+    private static var pageSize: Int { F.pageSize }
+    private static func daysAgo(_ days: Double) -> Date { F.daysAgo(days) }
     private static func gmailSeed(_ id: String, label: String, daysAgo days: Double) -> StatefulGmailActionServer.Seed {
-        StatefulGmailActionServer.Seed(
-            rfc822MessageId: "\(id)@example.com", providerMessageId: id, labels: [label],
-            internalDate: daysAgo(days))
+        F.gmailSeed(id, label: label, daysAgo: days)
     }
-
     private static func registeredEngine(accountId: String, provider: any EmailProvider) async -> SyncEngine {
-        let engine = SyncEngine()
-        await engine.register(
-            accountId: accountId, provider: provider,
-            workQueue: ProviderWorkQueue(provider: provider, maxConcurrency: 1))
-        return engine
+        await F.registeredEngine(accountId: accountId, provider: provider)
     }
-
     private static func setSavedToken(_ token: String, accountId: String, path: String, pool: DatabasePool) throws {
-        try pool.write { db in
-            _ = try Folder.filter(Column("id") == "\(accountId):\(path)")
-                .updateAll(db, Column("backfillPageToken").set(to: token))
-        }
+        try F.setSavedToken(token, accountId: accountId, path: path, pool: pool)
     }
-
     private static func folder(_ accountId: String, _ path: String, pool: DatabasePool) throws -> Folder {
-        try #require(try FolderEpochTestFixture.readFolder(accountId: accountId, path: path, pool: pool))
+        try #require(try F.folder(accountId, path, pool: pool))
     }
-
     private static func messageIds(_ accountId: String, _ path: String, pool: DatabasePool) throws -> Set<String> {
-        try pool.read { db in
-            try String.fetchSet(db, MessageHeader
-                .select(Column("messageId"))
-                .filter(Column("folderId") == "\(accountId):\(path)"))
-        }
+        try F.messageIds(accountId, path, pool: pool)
     }
-
-    /// Gmail `messages.list` requests naming `label`, rejected ones included.
     private static func gmailListRequests(_ server: StatefulGmailActionServer, label: String) -> Int {
-        server.http.recordedCalls().filter { call in
-            guard call.method == "GET", let url = URL(string: call.url) else { return false }
-            return url.path.hasSuffix("/messages") && call.url.contains("labelIds=\(label)")
-        }.count
+        F.gmailListRequests(server, label: label)
     }
-
-    /// Graph listing requests for `folderId`'s messages, rejected ones included.
     private static func graphListRequests(_ server: StatefulExchangeActionServer, folderId: String) -> Int {
-        server.http.recordedCalls().filter { call in
-            guard call.method == "GET", let url = URL(string: call.url) else { return false }
-            return url.path.hasSuffix("/mailFolders/\(folderId)/messages")
-        }.count
+        F.graphListRequests(server, folderId: folderId)
     }
 
     // MARK: - A saved page token the provider rejects
@@ -222,47 +190,5 @@ struct BackfillPageWalkTokenTests {
         #expect(server.rejectedSkipTokenCount() == 1, "refused nextLink requests: \(server.rejectedSkipTokenCount())")
         #expect(Self.graphListRequests(server, folderId: folderId) == 3,
                 "listing requests: \(Self.graphListRequests(server, folderId: folderId))")
-    }
-
-    // MARK: - A last page whose every fetch fails
-
-    /// The last page lists one message and its fetch fails. The call leaves the
-    /// folder incomplete after ONE attempt at that page, instead of re-walking
-    /// the folder from the top until the deadline. Once the fetch succeeds,
-    /// the next call completes the folder.
-    @Test("Gmail: a last page that loads nothing is skipped for the call and the next call completes the folder")
-    func gmailLastPageThatLoadsNothingIsRetriedNextCall() async throws {
-        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
-        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
-        let accountId = "gm-last-page"
-        let server = StatefulGmailActionServer(messages: [
-            Self.gmailSeed("m1", label: "INBOX", daysAgo: 1),
-            Self.gmailSeed("m2", label: "INBOX", daysAgo: 2),
-            Self.gmailSeed("m3", label: "INBOX", daysAgo: 3),
-        ])
-        defer { server.close() }
-        server.servePagedListings(pageSize: Self.pageSize)
-        server.injectUnclassified400OnGet(providerMessageId: "m3")
-        let account = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .gmail, pool: pool)
-        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: "INBOX", role: .inbox, pool: pool)
-        let engine = await Self.registeredEngine(accountId: accountId, provider: server.provider())
-
-        _ = await engine.runBackfill(account: account, deadline: Self.deadline())
-
-        // Two pages listed once each, and the failing message asked for once.
-        #expect(Self.gmailListRequests(server, label: "INBOX") == 2,
-                "listing requests: \(Self.gmailListRequests(server, label: "INBOX"))")
-        #expect(server.unclassified400OnGetServedCount() == 1,
-                "failed fetches of the last page: \(server.unclassified400OnGetServedCount())")
-        let afterFirst = try Self.folder(accountId, "INBOX", pool: pool)
-        #expect(!afterFirst.backfillComplete, "a folder whose last page loaded nothing was marked complete")
-        #expect(try Self.messageIds(accountId, "INBOX", pool: pool) == ["m1", "m2"])
-
-        server.clearUnclassified400sOnGet()
-        _ = await engine.runBackfill(account: account, deadline: Self.deadline())
-
-        let inbox = try Self.folder(accountId, "INBOX", pool: pool)
-        #expect(inbox.backfillComplete, "the next call did not retry the last page")
-        #expect(try Self.messageIds(accountId, "INBOX", pool: pool) == ["m1", "m2", "m3"])
     }
 }
