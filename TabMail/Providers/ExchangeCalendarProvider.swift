@@ -806,7 +806,10 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// is created); the split
     /// occurrence's day in the same zone (`GCalEvent.seriesZone`; an all-day split is a date); and
     /// weeks starting on the pattern's `firstDayOfWeek` (the rule's `WKST`), which decides which
-    /// weeks a series repeating every few weeks falls in.
+    /// weeks a series repeating every few weeks falls in; and a month without the pattern's
+    /// `dayOfMonth` (`absoluteMonthly`, `absoluteYearly`) holding the occurrence on its last day,
+    /// counted (`MissingMonthDay.lastDay`; measured: monthly on the 31st, numbered 4, gave January
+    /// 31, February 28, March 31 and April 30), where RFC 5545, and so Google and CalDAV, skip it.
     ///
     /// Throws `notSupported`, before anything is written, when no occurrence is left from the split
     /// on, or the count can't be worked out (a day that can't be placed, a pattern
@@ -836,7 +839,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
                 .flatMap { RecurrenceTail.Day(iso: $0) }
         }
         return try RecurrenceTail.newSeriesEnd(
-            count: count, of: rule, seriesStart: seriesStart, split: split, anchor: .patternStart)
+            count: count, of: rule, seriesStart: seriesStart, split: split, anchor: .patternStart, missingDay: .lastDay)
     }
 
     // MARK: - Edits (#421)

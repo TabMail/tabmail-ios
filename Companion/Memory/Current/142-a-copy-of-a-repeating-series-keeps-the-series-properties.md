@@ -5,6 +5,7 @@
 `serverOwnedEventKeys`, `splitCopiedKeys`, `splitSelect`, `splitReschedules`, `applyAttendeeRule`, `insertEventJSON`,
 `conferenceDataVersion`, `supportsAttachments`, `splitRecurrence`, `keptAttendeesJSON`, `editJSON`, `filterDateList`, `RecurrenceTail`,
 `newSeriesEnd`, `occurrencesLeft`, `numberOfOccurrences`, numbered range, `Anchor`, `patternStart`, WKST, `firstDayOfWeek`,
+`MissingMonthDay`, `lastDay`, month end, 31st, February 29, leap day, `absoluteMonthly`, `absoluteYearly`,
 `rangeDays`, #474, #562,
 EXDATE, RDATE, COUNT, recurrenceTimeZone, attendee answers, `needsAction`, write order,
 create first cap last, lost cap response, retry, own cap, `successorIsOurs`, `capEndDate`,
@@ -127,8 +128,13 @@ response was lost, the series it reads is already capped.
   and the range's `startDate` to the Tuesday on create, so a stored series normally starts on a
   pattern day. Then: the split occurrence's day in the series' zone
   (`GCalEvent.seriesZone`; an all-day split's date as given); weeks starting on the pattern's
-  `firstDayOfWeek`, sent as the counted rule's WKST. An unrecognized range zone or an uncountable
-  pattern is refused before the cap. The cap's own date is still worked out in the operation's
+  `firstDayOfWeek`, sent as the counted rule's WKST; and a month without the pattern's
+  `dayOfMonth` holding the occurrence on its last day, counted (`RecurrenceTail.MissingMonthDay.lastDay`,
+  passed only by `occurrencesLeft`). Measured 2026-11-11: `absoluteMonthly` on the 31st, numbered 4,
+  gave January 31, February 28, March 31 and April 30; `absoluteYearly` on February 29, numbered 3,
+  gave the leap day, then February 28 twice. RFC 5545 skips such a month and does not count it
+  (`.skip`, the default), and Google and CalDAV keep that. An unrecognized range zone or an
+  uncountable pattern is refused before the cap. The cap's own date is still worked out in the operation's
   zone (#681).
 - **A split that moves the start (CalDAV):** the edit lands on the new part through
   `CalDAVProvider.mergePatchIntoICS`, the same merge as a whole-series edit, so its start shift
@@ -240,8 +246,10 @@ changed occurrences and dates, and the retry after a lost cap response), `Series
 two parts hold exactly the series' occurrences (`FakeGraphCalendar.rangeDays`, the fake's own
 range expansion), with deleted and moved occurrences before the split, a range starting before its
 first occurrence, every-other-week series with either first day of the week, and an all-day series
-ahead of UTC; nothing left, or an unrecognized range zone, writes nothing.
-`RecurrenceTailNewSeriesEndTests` pins the two anchors.
+ahead of UTC, and the two measured month-end shapes split after a short month (`monthEndSeries`);
+nothing left, or an unrecognized range zone, writes nothing. `RecurrenceTailNewSeriesEndTests` pins
+the two anchors; `RecurrenceTailMissingMonthDayTests` pins the measured month end against RFC 5545's
+skip.
 `CalDAVOccurrenceOverrideTests.changedOccurrenceKeepsItsOwnProperties` (#604): an occurrence
 changed on its own keeps its status, alert, categories, link, revision, `X-` line and attendees
 through a rename, an attendee added and a move.

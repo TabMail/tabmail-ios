@@ -59,7 +59,8 @@ import Synchronization
 ///   with the same recurrence rules as a PATCH;
 /// - the days a stored series repeats on (`rangeDays`): its pattern applied from the range's
 ///   `startDate` for its count or through its end date, deleted and moved occurrences included
-///   (measured: they still count toward a numbered range), so a split's two parts can be held to
+///   (measured: they still count toward a numbered range), and a monthly or yearly day a month
+///   lacks on that month's last day (measured: it counts), so a split's two parts can be held to
 ///   the series they came from;
 /// - a PATCH whose `attendees` holds any entry without a `status` is refused
 ///   with 405 `UnknownError` and an empty message, and changes nothing.
@@ -160,7 +161,9 @@ final class FakeGraphCalendar: Sendable {
     /// Patterns: `daily` every `interval` days from `startDate`; `weekly` on `daysOfWeek` in every
     /// `interval`-th week, counted from the week holding `startDate`, weeks starting on
     /// `firstDayOfWeek`; `relativeMonthly` on one weekday at its `index` in the month, in every
-    /// `interval`-th month counted from the month holding `startDate`. Worked out here day by day, apart from the app's counter, so a test can
+    /// `interval`-th month counted from the month holding `startDate`; `absoluteMonthly` and
+    /// `absoluteYearly` on `dayOfMonth`, or the month's last day when the month is shorter
+    /// (measured). Worked out here day by day, apart from the app's counter, so a test can
     /// hold the app's split to it. nil for a `noEnd` range (it has no last day), another pattern
     /// type, or a range this can't read.
     static func rangeDays(_ event: [String: Any]) -> [String]? {
@@ -217,6 +220,29 @@ final class FakeGraphCalendar: Sendable {
                     return dayOfMonth + 7 > monthLength
                 }
                 return (dayOfMonth - 1) / 7 + 1 == place
+            }
+        case "absoluteMonthly", "absoluteYearly":
+            // `dayOfMonth` in every `interval`-th month (monthly) or in `month` of every
+            // `interval`-th year (yearly), counted from `startDate`'s. A month without that day
+            // holds the occurrence on its last day, and it counts (measured: monthly on the 31st,
+            // numbered 4, gave January 31, February 28, March 31 and April 30; yearly on February 29,
+            // numbered 3, gave the leap day, then February 28 twice).
+            let yearly = pattern["type"] as? String == "absoluteYearly"
+            guard let dayOfMonth = pattern["dayOfMonth"] as? Int, (1...31).contains(dayOfMonth) else { return nil }
+            let inMonth = pattern["month"] as? Int ?? 0
+            guard !yearly || (1...12).contains(inMonth) else { return nil }
+            func month(_ date: Date) -> Int { cal.component(.year, from: date) * 12 + cal.component(.month, from: date) }
+            let startMonth = month(start)
+            let startYear = cal.component(.year, from: start)
+            isOccurrence = { date in
+                if yearly {
+                    guard cal.component(.month, from: date) == inMonth,
+                          (cal.component(.year, from: date) - startYear) % interval == 0 else { return false }
+                } else {
+                    guard (month(date) - startMonth) % interval == 0 else { return false }
+                }
+                let monthLength = cal.range(of: .day, in: .month, for: date)?.count ?? 0
+                return cal.component(.day, from: date) == min(dayOfMonth, monthLength)
             }
         default:
             return nil

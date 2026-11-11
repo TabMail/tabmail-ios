@@ -1036,6 +1036,19 @@ private enum NumberedSplitFixture {
          "firstDayOfWeek": "sunday", "index": "second"]
     }
 
+    /// The first year after this one that is a leap year (`leap`) or a common one.
+    static func nextYear(leap: Bool) -> Int {
+        func isLeap(_ year: Int) -> Bool { (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 }
+        var year = Calendar(identifier: .gregorian).component(.year, from: Date()) + 1
+        while isLeap(year) != leap { year += 1 }
+        return year
+    }
+
+    /// `yyyy-MM-dd` for `day` of `month` in `year`.
+    static func date(_ year: Int, _ month: Int, _ day: Int) -> String {
+        String(format: "%04d-%02d-%02d", year, month, day)
+    }
+
     /// 10:00 on the device on `day` (`yyyy-MM-dd`, a device date).
     static func tenOClock(_ day: String) throws -> Date {
         try #require(EKEventStoreHelper.parseNaiveISO(day + "T10:00:00", timeZone: .current))
@@ -1197,6 +1210,62 @@ struct ExchangeNumberedSplitTests {
         let newPart = try #require(FakeGraphCalendar.rangeDays(created), "\(c.name): the new part has no end: \(canonical(range))")
         let capped = try #require(graph.rangeDays(of: "ser-1"))
         #expect(capped + newPart == original, "\(c.name): capped \(capped) and new \(newPart), not the series' \(original)")
+    }
+
+    /// The two shapes measured on Outlook, where a month lacks the pattern's day.
+    enum MonthEnd: String, CaseIterable, CustomTestStringConvertible, Sendable {
+        case monthlyOn31st = "monthly on the 31st, split after February"
+        case yearlyOnLeapDay = "yearly on February 29, split at the second common year"
+        var testDescription: String { rawValue }
+    }
+
+    /// Outlook holds an occurrence a month lacks on the month's last day, and it counts toward the
+    /// number (measured), so a split after a short month leaves the new part the number less the
+    /// occurrences before it, month ends included. The fake's own expansion first reproduces the
+    /// measured shape, from the next common year (monthly) or leap year (yearly).
+    @Test("a split after a short month leaves the new part what is left, the month's last day counted", arguments: MonthEnd.allCases)
+    func monthEndSeries(_ shape: MonthEnd) async throws {
+        let measured: [String]
+        let pattern: [String: Any]
+        switch shape {
+        case .monthlyOn31st:
+            let y = NumberedSplitFixture.nextYear(leap: false)
+            measured = [NumberedSplitFixture.date(y, 1, 31), NumberedSplitFixture.date(y, 2, 28),
+                        NumberedSplitFixture.date(y, 3, 31), NumberedSplitFixture.date(y, 4, 30)]
+            pattern = ["type": "absoluteMonthly", "interval": 1, "month": 0, "dayOfMonth": 31, "daysOfWeek": [String](),
+                       "firstDayOfWeek": "sunday", "index": "first"]
+        case .yearlyOnLeapDay:
+            let leap = NumberedSplitFixture.nextYear(leap: true)
+            measured = [NumberedSplitFixture.date(leap, 2, 29), NumberedSplitFixture.date(leap + 1, 2, 28),
+                        NumberedSplitFixture.date(leap + 2, 2, 28)]
+            pattern = ["type": "absoluteYearly", "interval": 1, "month": 2, "dayOfMonth": 29, "daysOfWeek": [String](),
+                       "firstDayOfWeek": "sunday", "index": "first"]
+        }
+        // The split is at the third occurrence: two come before it, one of them a month end.
+        let split = 2
+        let series = NumberedSplitFixture.series(
+            rangeStart: try NumberedSplitFixture.tenOClock(measured[0]), daysOfWeek: [], interval: 1,
+            firstDayOfWeek: "sunday", count: measured.count, pattern: pattern)
+        let original = try #require(FakeGraphCalendar.rangeDays(series))
+        #expect(original == measured, "\(shape): setup: the fake's expansion is not the measured one: \(original)")
+        guard original == measured else { return }
+        var seed = [series]
+        for (index, day) in original.enumerated() { seed.append(try NumberedSplitFixture.occurrence(index, on: day)) }
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = FakeGraphCalendar(seed)
+        graph.install(on: http)
+        let recurrenceId = GraphFixture.wall(try NumberedSplitFixture.tenOClock(original[split]), in: NumberedSplitFixture.zone)
+        _ = try await NumberedSplitFixture.provider(http).splitSeries(
+            eventId: "ser-1", recurrenceId: recurrenceId, recurrenceIdZone: .current, patch: GCalEventInput())
+
+        let created = try #require(graph.created.first, "\(shape): no new part: \(http.servedCallSequence())")
+        let range = (created["recurrence"] as? [String: Any])?["range"] as? [String: Any]
+        #expect(range?["numberOfOccurrences"] as? Int == measured.count - split,
+                "\(shape): the new part is not numbered with what is left: \(canonical(range))")
+        let newPart = try #require(FakeGraphCalendar.rangeDays(created), "\(shape): the new part has no end: \(canonical(range))")
+        let capped = try #require(graph.rangeDays(of: "ser-1"), "\(shape): the series was not capped")
+        #expect(capped + newPart == original, "\(shape): capped \(capped) and new \(newPart), not the series' \(original)")
     }
 
     @Test("a split that leaves no occurrence of the number, or can't count them, writes nothing", arguments: [

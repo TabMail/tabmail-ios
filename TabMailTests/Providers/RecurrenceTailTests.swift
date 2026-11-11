@@ -369,3 +369,89 @@ struct RecurrenceTailNewSeriesEndTests {
         #expect(refuses(6, start: Self.monday, split: Self.split, rule: "RRULE:FREQ=YEARLY;BYYEARDAY=1;COUNT=6"))
     }
 }
+
+/// A month without the rule's day of the month (`RecurrenceTail.MissingMonthDay`): Outlook holds the
+/// occurrence on the month's last day and counts it (measured), RFC 5545, and so Google and CalDAV,
+/// skip the month. The years are worked out from today: the next common year for the 31st, the
+/// next leap year for February 29.
+@Suite("RecurrenceTail — a month without the rule's day")
+struct RecurrenceTailMissingMonthDayTests {
+
+    private static func isLeap(_ year: Int) -> Bool { (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 }
+
+    /// The first year after this one that is a leap year (`leap`) or a common one.
+    private static func nextYear(leap: Bool) -> Int {
+        var year = Calendar(identifier: .gregorian).component(.year, from: Date()) + 1
+        while isLeap(year) != leap { year += 1 }
+        return year
+    }
+
+    /// `day` of `month` in `year`.
+    private static func on(_ year: Int, _ month: Int, _ day: Int) throws -> RecurrenceTail.Day {
+        try #require(RecurrenceTail.Day(year: year, month: month, day: day))
+    }
+
+    /// Graph's `absoluteMonthly` on the 31st and `absoluteYearly` on February 29, as the app maps them.
+    private static let monthlyOn31st = "RRULE:FREQ=MONTHLY;BYMONTHDAY=31;WKST=SU"
+    private static let yearlyOnLeapDay = "RRULE:FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=29;WKST=SU"
+
+    @Test("Outlook: monthly on the 31st falls on the last day of a shorter month, as measured")
+    func outlookMonthlyOn31st() throws {
+        let y = Self.nextYear(leap: false)
+        let measured = try [Self.on(y, 1, 31), Self.on(y, 2, 28), Self.on(y, 3, 31), Self.on(y, 4, 30)]
+        let rule = try #require(RecurrenceTail.Rule(Self.monthlyOn31st, missingDay: .lastDay))
+        let days = rule.days(from: measured[0], through: measured[3], maxSteps: 12)
+        #expect(days == measured, "measured: January 31, February 28, March 31, April 30")
+    }
+
+    @Test("Outlook: yearly on February 29 falls on February 28 in a common year, as measured")
+    func outlookYearlyOnLeapDay() throws {
+        let leap = Self.nextYear(leap: true)
+        let measured = try [Self.on(leap, 2, 29), Self.on(leap + 1, 2, 28), Self.on(leap + 2, 2, 28)]
+        let rule = try #require(RecurrenceTail.Rule(Self.yearlyOnLeapDay, missingDay: .lastDay))
+        let days = rule.days(from: measured[0], through: measured[2], maxSteps: 12)
+        #expect(days == measured, "measured: the leap day, then February 28 twice")
+    }
+
+    @Test("Outlook: a month-end occurrence counts toward the number, so a split after a short month leaves N less the ones before it")
+    func outlookCountsTheMonthEnd() throws {
+        let y = Self.nextYear(leap: false)
+        let leap = Self.nextYear(leap: true)
+        let jan31 = try Self.on(y, 1, 31)
+        let mar31 = try Self.on(y, 3, 31)
+        let apr30 = try Self.on(y, 4, 30)
+        #expect(RecurrenceTail.occurrences(of: Self.monthlyOn31st, seriesStart: jan31, before: mar31,
+                                           anchor: .patternStart, missingDay: .lastDay) == 2,
+                "January 31 and February 28 come before March 31")
+        let afterFebruary = try RecurrenceTail.newSeriesEnd(
+            count: 4, of: Self.monthlyOn31st, seriesStart: jan31, split: mar31, anchor: .patternStart, missingDay: .lastDay)
+        #expect(afterFebruary == 2)
+        let afterMarch = try RecurrenceTail.newSeriesEnd(
+            count: 4, of: Self.monthlyOn31st, seriesStart: jan31, split: apr30, anchor: .patternStart, missingDay: .lastDay)
+        #expect(afterMarch == 1)
+        let leapDay = try Self.on(leap, 2, 29)
+        let secondCommon = try Self.on(leap + 2, 2, 28)
+        let yearlyLeft = try RecurrenceTail.newSeriesEnd(
+            count: 3, of: Self.yearlyOnLeapDay, seriesStart: leapDay, split: secondCommon, anchor: .patternStart, missingDay: .lastDay)
+        #expect(yearlyLeft == 1, "the leap day and the next February 28 come before it")
+    }
+
+    @Test("Google and CalDAV keep RFC 5545: a month without the day has no occurrence and is not counted")
+    func rfcSkipsTheMonth() throws {
+        let y = Self.nextYear(leap: false)
+        let leap = Self.nextYear(leap: true)
+        let monthEnds = try [Self.on(y, 1, 31), Self.on(y, 3, 31), Self.on(y, 5, 31), Self.on(y, 7, 31)]
+        let monthly = try #require(RecurrenceTail.Rule(Self.monthlyOn31st))
+        #expect(monthly.days(from: monthEnds[0], through: monthEnds[3], maxSteps: 12) == monthEnds)
+        let leapDays = try [Self.on(leap, 2, 29), Self.on(leap + 4, 2, 29)]
+        let yearly = try #require(RecurrenceTail.Rule(Self.yearlyOnLeapDay))
+        #expect(yearly.days(from: leapDays[0], through: leapDays[1], maxSteps: 12) == leapDays)
+        // The rule Google and CalDAV write: January 31 and March 31 come before May 31, so 2 are left.
+        // Counting the month ends would put four before it and refuse.
+        let written = try RecurrenceTail.newSeriesRule(
+            from: "RRULE:FREQ=MONTHLY;BYMONTHDAY=31;COUNT=4", seriesStart: monthEnds[0],
+            split: monthEnds[2], capUntil: String(format: "%04d0530T235959Z", y))
+        #expect(written == "RRULE:FREQ=MONTHLY;BYMONTHDAY=31;COUNT=2")
+        #expect(RecurrenceTail.occurrences(of: Self.monthlyOn31st, seriesStart: monthEnds[0], before: monthEnds[2]) == 2)
+    }
+}
