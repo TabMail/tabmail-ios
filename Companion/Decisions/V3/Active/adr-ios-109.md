@@ -5,14 +5,19 @@
 organizer, and nothing else did). Amends ADR-IOS-108 (a resource that holds only changed
 occurrences "adds no organizer" becomes "adds only an organizer the resource already names").
 
-**Context:** RFC 5545 §3.8.4.3 requires an ORGANIZER on a VEVENT that has attendees, and iCloud
-refuses the shape with a 403. TabMail's CalDAV writes never wrote one: a create with guests, a
-first guest added to a stored event, a changed occurrence of a series with no organizer, and both
-halves of a split all came back 403, which the calendar queue retires as permanent ("(2) the event
-has an ATTENDEE but no ORGANIZER"). On a server that does accept the shape, the event was stored
-with guests and nobody was invited, because RFC 6638 §3.1 schedules only a resource whose
-ORGANIZER is one of the owner's addresses. The one rule that did exist (an override copied the
-series' organizer) covered one of five write paths.
+**Context:** RFC 5545 §3.8.4.3 requires an ORGANIZER on a VEVENT that has attendees. TabMail's
+CalDAV writes never wrote one, except an override copying the series' organizer when the series
+had one: a create with guests, a first guest added to a stored event, a changed occurrence of a
+series with no organizer, and both halves of a split were all written without it.
+- **Measured:** iCloud refuses a changed occurrence of a series with no organizer that has
+  attendees with a 403, which the calendar queue retires as permanent ("(2) the event has an
+  ATTENDEE but no ORGANIZER").
+- **Not measured:** whether iCloud also refuses a create, a whole series or a split's parts in
+  that shape. The tests model the refusal for every VEVENT (`FakeCalDAVStore`'s
+  `refusesAttendeesWithoutOrganizer`), which is what RFC 5545 requires.
+- **From the RFCs:** on a server that accepts the shape, the event is stored with guests and nobody
+  is invited, because RFC 6638 §3.1 schedules only a resource whose ORGANIZER is one of the owner's
+  addresses.
 
 **Decision:**
 1. **One step on every PUT.** `CalDAVProvider.putEvent(url:body:precondition:)` is the only

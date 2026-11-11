@@ -210,12 +210,23 @@ final class FakeCalDAVPrincipal: Sendable {
     let advertised: [String]?
     /// The answer to the address-set `PROPFIND`, in place of the property, when set.
     let addressSetAnswer: FakeHTTP.CannedResponse?
+    /// The answer to every `current-user-principal` `PROPFIND`, in place of the principal, when set.
+    let principalAnswer: FakeHTTP.CannedResponse?
 
     private let addressSetCount = Mutex(0)
+    /// The answer to the FIRST address-set `PROPFIND` only, when set; later ones are answered as usual.
+    private let firstAddressSetAnswer: Mutex<FakeHTTP.CannedResponse?>
 
-    init(advertised: [String]?, addressSetAnswer: FakeHTTP.CannedResponse? = nil) {
+    init(
+        advertised: [String]?,
+        addressSetAnswer: FakeHTTP.CannedResponse? = nil,
+        firstAddressSetAnswer: FakeHTTP.CannedResponse? = nil,
+        principalAnswer: FakeHTTP.CannedResponse? = nil
+    ) {
         self.advertised = advertised
         self.addressSetAnswer = addressSetAnswer
+        self.firstAddressSetAnswer = Mutex(firstAddressSetAnswer)
+        self.principalAnswer = principalAnswer
     }
 
     /// How many `PROPFIND`s asked for the address set.
@@ -225,6 +236,9 @@ final class FakeCalDAVPrincipal: Sendable {
         let body = request.body.flatMap { String(data: $0, encoding: .utf8) } ?? ""
         if body.contains("calendar-user-address-set") {
             addressSetCount.withLock { $0 += 1 }
+            if let first = firstAddressSetAnswer.withLock({ answer in defer { answer = nil }; return answer }) {
+                return first
+            }
             if let addressSetAnswer { return addressSetAnswer }
             // `URL.path` drops a trailing slash; the components keep the path as sent.
             let path = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?.path
@@ -239,6 +253,7 @@ final class FakeCalDAVPrincipal: Sendable {
             return Self.multistatus(path: request.url.path, prop: "<c:calendar-home-set><d:href>/cal/</d:href></c:calendar-home-set>")
         }
         if body.contains("current-user-principal") {
+            if let principalAnswer { return principalAnswer }
             return Self.multistatus(path: request.url.path, prop: "<d:current-user-principal><d:href>\(Self.principalPath)</d:href></d:current-user-principal>")
         }
         return .status(400)
@@ -289,11 +304,15 @@ struct CalDAVOrganizerTests {
         refuses: Bool = true,
         advertised: [String]? = F.advertised,
         addressSetAnswer: FakeHTTP.CannedResponse? = nil,
+        firstAddressSetAnswer: FakeHTTP.CannedResponse? = nil,
+        principalAnswer: FakeHTTP.CannedResponse? = nil,
         put: (@Sendable (FakeCalDAVStore, FakeHTTP.Request) -> FakeHTTP.CannedResponse)? = nil
     ) -> Run {
         let store = FakeCalDAVStore(servesETags: true, refusesAttendeesWithoutOrganizer: refuses)
         for (path, ics) in seed { store.seed(path: path, ics: ics) }
-        let principal = FakeCalDAVPrincipal(advertised: advertised, addressSetAnswer: addressSetAnswer)
+        let principal = FakeCalDAVPrincipal(
+            advertised: advertised, addressSetAnswer: addressSetAnswer,
+            firstAddressSetAnswer: firstAddressSetAnswer, principalAnswer: principalAnswer)
         let http = FakeHTTP.Scenario()
         http.register(path: "/cal/", method: "GET") { store.handleGET($0) }
         http.register(path: "/cal/", method: "PUT") { request in
@@ -553,6 +572,106 @@ struct CalDAVOrganizerTests {
         let after = try Self.stored(run)
         #expect(!after.contains("ORGANIZER"), Comment(rawValue: after))
         #expect(F.masterOwn(after, "ATTENDEE").compactMap(VEventOracle.address) == [F.guest])
+    }
+
+    @Test("T1: a lookup the server refuses with another 4xx means none advertised: the write goes ahead with no organizer",
+          arguments: [403, 405, 400])
+    func lookupRefusedMeansNone(_ code: Int) async throws {
+        let run = Self.setUp([F.path: F.series()], refuses: false, addressSetAnswer: .status(code))
+        defer { run.http.close() }
+        let rows = try await Self.edit(run, F.addGuest, account: "org711-lookup-refused-\(code)")
+        #expect(rows.isEmpty, Self.landed(rows))
+        let after = try Self.stored(run)
+        #expect(!after.contains("ORGANIZER"), Comment(rawValue: after))
+        #expect(F.masterOwn(after, "ATTENDEE").compactMap(VEventOracle.address) == [F.guest])
+        #expect(run.principal.addressSetLookups == 1, "the address set was read \(run.principal.addressSetLookups) times")
+    }
+
+    @Test("T2: a lookup answered 'come back later' writes nothing and leaves the edit queued",
+          arguments: [408, 409, 423, 425, 429])
+    func lookupComeBackLaterKeepsTheEditQueued(_ code: Int) async throws {
+        let seed = F.series()
+        let run = Self.setUp([F.path: seed], refuses: false, addressSetAnswer: .status(code))
+        defer { run.http.close() }
+        let rows = try await Self.edit(run, F.addGuest, account: "org711-lookup-later-\(code)")
+        #expect(run.puts.isEmpty, "a PUT was sent without the lookup's answer: \(run.puts.map(\.path))")
+        #expect(rows.count == 1 && rows.first?.status == PendingStatus.queued.rawValue,
+                "the edit is not queued: \(rows.map { "\($0.status) \($0.failureReason ?? "")" })")
+        let after = try Self.stored(run)
+        #expect(after == seed, Comment(rawValue: after))
+    }
+
+    @Test("T3: a failed lookup is never kept: the retry asks again and writes the user's address")
+    func failedLookupIsNotKept() async throws {
+        let run = Self.setUp([F.path: F.series()], firstAddressSetAnswer: .status(503))
+        defer { run.http.close() }
+        let rows = try await Self.edit(run, F.addGuest, account: "org711-lookup-retry", drains: 2)
+        #expect(rows.isEmpty, Self.landed(rows))
+        let after = try Self.stored(run)
+        #expect(F.masterOwn(after, "ORGANIZER") == ["ORGANIZER:\(F.own)"], Comment(rawValue: after))
+        #expect(run.principal.addressSetLookups == 2, "the address set was read \(run.principal.addressSetLookups) times")
+    }
+
+    @Test("T4: an answer that can't be read, or a server with no principal, means none advertised",
+          arguments: ["parse", "discovery"])
+    func unreadableOrNoPrincipalMeansNone(_ failure: String) async throws {
+        let noPrincipal = """
+        <?xml version="1.0" encoding="utf-8"?>
+        <d:multistatus xmlns:d="DAV:"><d:response><d:href>/</d:href>\
+        <d:propstat><d:prop><d:displayname>Server</d:displayname></d:prop>\
+        <d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>
+        """
+        let run = failure == "parse"
+            ? Self.setUp([F.path: F.series()], refuses: false,
+                         addressSetAnswer: .raw(statusCode: 207, body: Data("this is not xml".utf8)))
+            : Self.setUp([F.path: F.series()], refuses: false,
+                         principalAnswer: .raw(statusCode: 207, body: Data(noPrincipal.utf8)))
+        defer { run.http.close() }
+        let rows = try await Self.edit(run, F.addGuest, account: "org711-lookup-\(failure)")
+        #expect(rows.isEmpty, Self.landed(rows))
+        let after = try Self.stored(run)
+        #expect(!after.contains("ORGANIZER"), Comment(rawValue: after))
+        #expect(F.masterOwn(after, "ATTENDEE").compactMap(VEventOracle.address) == [F.guest])
+    }
+
+    @Test("T5: a principal the server can't find is not 'event not found': the write goes ahead with no organizer")
+    func discovery404IsNotEventNotFound() async throws {
+        let run = Self.setUp([F.path: F.series()], refuses: false, principalAnswer: .status(404))
+        defer { run.http.close() }
+        let rows = try await Self.edit(run, F.addGuest, account: "org711-discovery-404")
+        #expect(rows.isEmpty, Self.landed(rows))
+        let after = try Self.stored(run)
+        #expect(!after.contains("ORGANIZER"), Comment(rawValue: after))
+        #expect(F.masterOwn(after, "ATTENDEE").compactMap(VEventOracle.address) == [F.guest])
+        #expect(run.principal.addressSetLookups == 0)
+        // Both the `.well-known` try and the direct one were answered 404.
+        #expect(run.propfinds == 2, "\(run.http.servedCallSequence())")
+    }
+
+    @Test("T6: a split whose capped series alone needs the address looks it up before its first PUT")
+    func splitLooksUpBeforeItsFirstPut() async throws {
+        // Guests on a changed occurrence BEFORE the split point: they stay with the capped series,
+        // and the new part, copied from the guest-less series, needs no organizer.
+        let earlier = F.start.addingTimeInterval(7 * 86_400)
+        let override = [
+            "BEGIN:VEVENT", "UID:\(F.uid)", "RECURRENCE-ID:\(F.icsUTC(earlier))", "DTSTAMP:\(F.icsUTC(F.start))",
+            "DTSTART:\(F.icsUTC(earlier))", "DURATION:PT1H", "SUMMARY:Planning, with a guest",
+            "ATTENDEE;CN=Guest:mailto:\(F.guest)", "END:VEVENT",
+        ]
+        var lines = F.series().components(separatedBy: "\r\n")
+        let end = try #require(lines.lastIndex(of: "END:VCALENDAR"))
+        lines.insert(contentsOf: override, at: end)
+        let seed = lines.joined(separator: "\r\n")
+        let run = Self.setUp([F.path: seed], refuses: false, addressSetAnswer: .status(503))
+        defer { run.http.close() }
+        let rows = try await Self.edit(run, F.scoped(F.rename, "this_and_following"), account: "org711-split-capped-only")
+        #expect(run.puts.isEmpty, "a PUT was sent before the lookup's answer: \(run.puts.map(\.path))")
+        #expect(rows.count == 1 && rows.first?.status == PendingStatus.queued.rawValue,
+                "the edit is not queued: \(rows.map { "\($0.status) \($0.failureReason ?? "")" })")
+        let after = try Self.stored(run)
+        #expect(after == seed, Comment(rawValue: after))
+        #expect(run.store.storedICS(path: F.newPartPath) == nil, "the new part was written")
+        #expect(run.principal.addressSetLookups == 1)
     }
 
     // MARK: 14-16: nothing to add

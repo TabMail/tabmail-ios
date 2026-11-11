@@ -990,7 +990,11 @@ resource names one or the server advertises the user's address, and never with a
   "event not found"; no guests, or only an alarm's recipient, makes no lookup; a resource of someone
   else's changed occurrences never gets the account's address; the address set is read once per
   provider; an advertised href with a line break is skipped; a replay after a lost PUT response
-  leaves the server unchanged.
+  leaves the server unchanged. The lookup's error classes (T1-T6): a 403, 405 or 400 means none
+  advertised; a 408, 409, 423, 425 or 429 keeps the edit queued with nothing written; a failed
+  lookup is never kept, so the retry asks again; an answer that is not XML, or a server with no
+  principal, means none; a principal answered 404 is never "event not found"; a split whose capped
+  series alone needs the address looks it up before its first PUT.
 - `CalDAVOrganizerStepTests`: the pure step (`organized`) returns a body that needs nothing byte for
   byte, inserts after `UID`, copies every physical line of a folded organizer, reads only a VEVENT's
   own properties, never gives an override-only resource the own address, and is idempotent; the
