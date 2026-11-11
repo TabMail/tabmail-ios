@@ -1075,6 +1075,7 @@ final class FakeCalDAVStore: Sendable {
         var nextETag = 1
         var failingPuts: [String: [Int]] = [:]
         var putHook: (@Sendable (String) -> Void)?
+        var gone: [String: Int] = [:]
     }
 
     /// The next `PUT` of `path` is answered with `status` and changes nothing.
@@ -1085,8 +1086,15 @@ final class FakeCalDAVStore: Sendable {
     /// Runs as each `PUT` arrives, with its path, before it is applied or refused.
     func beforePUT(_ hook: @escaping @Sendable (String) -> Void) { state.withLock { $0.putHook = hook } }
 
-    /// The user deletes the resource at `path` in their calendar app.
-    func userDeletes(path: String) { _ = state.withLock { $0.resources.removeValue(forKey: path) } }
+    /// The user deletes the resource at `path` in their calendar app; a GET of it then answers
+    /// `reads` (404 by default, or 410 Gone, which RFC 9110 lets a server answer for a resource
+    /// it knows was removed).
+    func userDeletes(path: String, reads: Int = 404) {
+        state.withLock {
+            $0.resources.removeValue(forKey: path)
+            if reads != 404 { $0.gone[path] = reads }
+        }
+    }
 
     private let state = Mutex(State())
 
@@ -1132,6 +1140,7 @@ final class FakeCalDAVStore: Sendable {
 
     func handleGET(_ request: FakeHTTP.Request) -> FakeHTTP.CannedResponse {
         let path = request.url.path
+        if let status = state.withLock({ $0.gone[path] }) { return .raw(statusCode: status) }
         guard let resource = state.withLock({ $0.resources[path] }) else {
             return .raw(statusCode: 404)
         }

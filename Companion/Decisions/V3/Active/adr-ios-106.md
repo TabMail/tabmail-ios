@@ -56,7 +56,7 @@ it again (CalDAV) or wrote over a cancelled event (Google): a deleted event came
 capped first, so its interrupted split lost the new part and the retry was retired "not found" with the
 series truncated.
 
-**Decision (master-agent rulings, design read 2026-11-10):**
+**Decision (ruled 2026-11-10):**
 1. **Every provider writes the new part first, then the cap.** Outlook's `splitSeries` now resolves, checks
    the occurrence, POSTs the new part, then caps (`splitCapJSON`, `writeSplitCap`). Its revert block and
    `splitRollbackError` are deleted; no provider rolls back.
@@ -89,8 +89,8 @@ series truncated.
 - **Known limit:** a create that landed whose answer was lost leaves no record. If the user deletes that
   new part before the retry, Google refuses (409 on a gone id, then the read), but Outlook and CalDAV
   create it again: the deleted part appears again. One gesture repairs it.
-- **Q2 legacy rows:** an Outlook split queued before this change and interrupted after its cap now fails
-  on retry (the occurrence is no longer listed, or the series ends before the split), never a false
+- **Rows queued before this change:** an Outlook split interrupted after its cap (Outlook capped first
+  then) now fails on retry, because the occurrence is no longer listed after the cap; never a false
   success.
 
 **Detail:** memory 142 ("Write order and retries", amendment); memory 146 (amendment to "A split retried

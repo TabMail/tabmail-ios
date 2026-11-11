@@ -871,7 +871,7 @@ A split interrupted between its writes (#601, `SplitInterruptedBetweenItsWritesT
 change queued on the same account): once the new part is written, a retry never writes it again. The new
 part there, the retry writes only the cap (`finishSplit`) and the split ends complete whether the cap
 failed or its answer was lost, named by the series or its occurrence (T2, T3); the user deleted it (Google
-read as `cancelled`, 404 or 410), the retry writes nothing, the row is failed with the ruled reason
+read as `cancelled`, 404 or 410; CalDAV 404 or 410), the retry writes nothing, the row is failed with the ruled reason
 (`SplitRecord.newPartDeleted`) and the next change drains in the same drain (T1, T7: Google's lost create
 answer); Outlook's numbered or end-dated range is kept on the new part (T4); a transient cap failure keeps
 the record on the requeued row (T5); the record is on the row when the cap arrives (T6); Outlook POSTs once,
@@ -879,9 +879,11 @@ before every PATCH (T8); a series that already ends before the split is finished
 `SplitRecordIsReservedTests` (T9): `queueCalendarOperation` drops a `_split_record` a tool call carries.
 Provider level: `SeriesSplitCopyTests.failedCreateLeavesTheSeriesUntouched` and
 `failedRecordStopsBeforeTheCap` (Outlook writes nothing to the series before its create and its record).
+`newStartPastTheEndDateIsRefused`: an Outlook split whose edit moves the new part's start past the series'
+end date is refused with nothing written.
 The fakes model it: `FakeGoogleCalendar.userDeletes(_:reads:)`/`failNext`/`beforeWrite` (a POST of a held or
 gone id is 409 `duplicate`), `FakeGraphCalendar` `transactionId` replay, `userDeletes`, `writes`,
-`beforeWrite`, `store`, `FakeCalDAVStore.failNextPUT`/`beforePUT`/`userDeletes`.
+`beforeWrite`, `store`, `FakeCalDAVStore.failNextPUT`/`beforePUT`/`userDeletes(path:reads:)` (404 or 410).
 
 History, before #601: a split interrupted after its cap ended complete on its retry (`SplitRetriedAfterItsOwnCapTests`, red before
 the queue's `read` asked `isOwnSplitCap`): Outlook, the cap applied and its response lost (so no new part),

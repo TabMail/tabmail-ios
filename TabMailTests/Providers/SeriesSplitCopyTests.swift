@@ -792,6 +792,33 @@ struct ExchangeSeriesSplitCopyTests {
         #expect(records.records.isEmpty, "a record was kept for a create that failed: \(records.records)")
     }
 
+    @Test("a split whose edit moves the new part's start past the series' end date is refused with nothing written")
+    func newStartPastTheEndDateIsRefused() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        // The series ends the day after the occurrence the split is at; the edit moves the new
+        // part three days later, past that end. The occurrence is listed, so the lookup passes.
+        let end = GraphFixture.deviceDay(GraphFixture.onDevice(days: 8, hour: 10))
+        let series = GraphSplitFixture.series(range: ["type": "endDate", "endDate": end, "numberOfOccurrences": 0])
+        let graph = GraphSplitFixture.calendar(series)
+        graph.install(on: http)
+        var patch = GCalEventInput()
+        let moved = GraphSplitFixture.occurrence.addingTimeInterval(3 * 86_400)
+        patch.startDateTime = moved.iso8601String(timeZone: .current)
+        patch.endDateTime = moved.addingTimeInterval(1_800).iso8601String(timeZone: .current)
+        var reason: String?
+        do {
+            _ = try await GraphSplitFixture.provider(http).splitSeries(
+                eventId: "ser-1", recurrenceId: GraphSplitFixture.recurrenceId, recurrenceIdZone: .current, patch: patch)
+        } catch CalendarProviderError.notSupported(let thrown) {
+            reason = thrown
+        }
+        #expect(reason?.contains("already ends before") == true, "not refused as ending before: \(reason ?? "none")")
+        #expect(http.recordedCalls().allSatisfy { $0.method == "GET" }, "written: \(http.servedCallSequence())")
+        #expect(graph.created.isEmpty)
+        #expect(canonical(graph.event("ser-1")?["recurrence"]) == canonical(series["recurrence"]), "the series was changed")
+    }
+
     @Test("a failed record stops the split before the cap: the series is not capped (#601)")
     func failedRecordStopsBeforeTheCap() async throws {
         let http = FakeHTTP.Scenario()

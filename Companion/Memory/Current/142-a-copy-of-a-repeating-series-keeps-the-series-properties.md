@@ -98,8 +98,10 @@ response was lost, the series it reads is already capped.
 - **Amendment (2026-11-11, #601, ADR-IOS-106 amendment): every provider writes the new part first, and a
   retry finds its split through a record.** The Outlook bullet above is history: Outlook now POSTs the
   new part, then caps (`splitCapJSON`, `writeSplitCap`); its revert and `splitRollbackError` are gone,
-  and `splitNewPartJSON` no longer takes `capEndDate` (an endDate range already ending before the new
-  part is refused, "already ends before"). Between the two writes `splitSeries` hands a `SplitRecord`
+  and `splitNewPartJSON` no longer takes `capEndDate`. An end-dated range is kept verbatim; a split whose
+  edit moves the new part's start past that end date is refused with nothing written ("already ends
+  before"): a new part would start after its own end. It is reached only that way, since the occurrence
+  lookup already refuses a split past the range's end. Between the two writes `splitSeries` hands a `SplitRecord`
   (`series_id`, `new_part_id`, `split_at`) to its `SplitRecorder`; the queue keeps it under
   `_split_record` (`AccountManager.recordSplit`) before the cap is sent. A retry with a record never
   creates: `eventExists` on the new part, then `finishSplit` (the cap alone, or nothing when the series

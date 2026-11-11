@@ -541,8 +541,6 @@ actor ExchangeCalendarProvider: CalendarProvider {
             return true
         } catch ExchangeCalendarError.httpError(let code, _) where code == 404 || code == 410 {
             return false
-        } catch ExchangeCalendarError.eventNotFound {
-            return false
         }
     }
 
@@ -718,9 +716,10 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// - The recurrence keeps the stored pattern exactly. Its range keeps its end date (verbatim)
     ///   and zone and starts on the new start's date; a range that ends after a number of
     ///   occurrences stays numbered with what is left of the number (`occurrencesLeft`), as on
-    ///   Google and CalDAV. A range whose end date is before the new start is refused: the series
-    ///   already ends before the split (as `RecurrenceTail.newSeriesRule` refuses it on Google and
-    ///   CalDAV). A rule in the patch replaces the stored recurrence.
+    ///   Google and CalDAV. A range whose end date is before the new start is refused, so no new
+    ///   part starts after its own end: reached by a split whose edit moves the new part's start
+    ///   past the series' end date (the occurrence lookup already refuses a split at an occurrence
+    ///   past it). A rule in the patch replaces the stored recurrence.
     /// - A new place in the patch replaces the stored places (`locations`).
     /// - New notes on an online series replace only the notes in the copied body; its join section
     ///   is kept as stored (`onlineMeetingBody`). The new part is not an online meeting of its own:

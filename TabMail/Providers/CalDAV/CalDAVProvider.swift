@@ -744,25 +744,19 @@ actor CalDAVProvider: CalendarProvider {
         return created
     }
 
-    /// Whether the resource at `eventId` (a `SplitRecord.newPartId`, the new part's path) is the
-    /// new part still: false when the server answers 404 or 410, or the resource there carries
-    /// another UID than the one its name was made from (`deterministicSplitEventId` names the
-    /// file after the UID). Any other failure is thrown.
+    /// Whether the resource at `eventId` (a `SplitRecord.newPartId`, the new part's path, which
+    /// this client chose) is still there: false when the server answers 404 or 410. Any other
+    /// failure is thrown.
     func eventExists(calendarId: String, eventId: String) async throws -> Bool {
         let url = try resolveEventURL(eventId, calendarId: calendarId)
-        let data: Data
         do {
-            (data, _) = try await client.get(url: url)
+            _ = try await client.get(url: url)
+            return true
         } catch CalDAVError.notFound {
             return false
         } catch CalDAVError.httpError(410, _) {
             return false
         }
-        guard let ics = String(data: data, encoding: .utf8), !ics.isEmpty else {
-            throw CalDAVError.parseError("Empty response for event \(eventId)")
-        }
-        let stem = url.deletingPathExtension().lastPathComponent
-        return Self.extractUID(from: ics) == stem
     }
 
     /// The cap of the split `record` names, written alone (`CalendarProvider.finishSplit`): the

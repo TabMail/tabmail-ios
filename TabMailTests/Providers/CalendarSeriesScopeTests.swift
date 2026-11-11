@@ -2610,7 +2610,7 @@ struct ExchangeSeriesScopeInvariantTests {
 // The record of the written new part (`SplitRecord`) is on the row before the cap is sent, and a
 // transient failure keeps it. Every provider writes in that order (Outlook used to cap first).
 
-/// The user-visible refusal when the new part of an unfinished split was deleted (owner ruling).
+/// The user-visible refusal when the new part of an unfinished split was deleted (as ruled).
 private let newPartDeletedReason = "This change to the repeating event wasn't finished because its new part was deleted. Check the event's later occurrences, and make the change again if you still want it."
 
 /// One calendar, faked on the wire, holding a weekly series to split, a one-off event to retitle
@@ -2757,7 +2757,7 @@ final class SplitHarness: @unchecked Sendable {
     }
 
     /// The user deletes the split's new part.
-    func deleteNewPart(googleReads: FakeGoogleCalendar.DeletedRead = .cancelled) {
+    func deleteNewPart(googleReads: FakeGoogleCalendar.DeletedRead = .cancelled, calDAVReads: Int = 404) {
         switch kind {
         case .google:
             google?.userDeletes(GoogleCalendarProvider.deterministicSplitEventId(masterId: seriesId, recurrenceId: recurrenceId),
@@ -2765,7 +2765,7 @@ final class SplitHarness: @unchecked Sendable {
         case .outlook:
             for id in newPartIds { graph?.userDeletes(id) }
         case .calDAV:
-            for path in newPartIds { store?.userDeletes(path: path) }
+            for path in newPartIds { store?.userDeletes(path: path, reads: calDAVReads) }
         }
     }
 
@@ -2910,6 +2910,20 @@ struct SplitInterruptedBetweenItsWritesTests {
         let r = try await drainSplit(harness, account: "split-t1g-\(reads)", drains: 2, between: {
             writesBeforeDelete = harness.splitWrites.count
             harness.deleteNewPart(googleReads: reads)
+        })
+        #expect(harness.splitWrites.dropFirst(writesBeforeDelete).isEmpty, "wrote after the delete: \(harness.splitWrites)")
+        #expect(r.split?.failureReason == newPartDeletedReason, "\(describe(r.split))")
+        #expect(r.next == nil && harness.nextWritten, "the next change did not drain: \(describe(r.next))")
+    }
+
+    @Test("T1: CalDAV, a deleted new part read as 404 or 410, refuses the same way", arguments: [404, 410])
+    func calDAVDeletedPartEveryAnswer(_ reads: Int) async throws {
+        let harness = SplitHarness(.calDAV)
+        harness.failCap()
+        var writesBeforeDelete = 0
+        let r = try await drainSplit(harness, account: "split-t1c-\(reads)", drains: 2, between: {
+            writesBeforeDelete = harness.splitWrites.count
+            harness.deleteNewPart(calDAVReads: reads)
         })
         #expect(harness.splitWrites.dropFirst(writesBeforeDelete).isEmpty, "wrote after the delete: \(harness.splitWrites)")
         #expect(r.split?.failureReason == newPartDeletedReason, "\(describe(r.split))")
