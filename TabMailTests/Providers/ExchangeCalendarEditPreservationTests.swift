@@ -71,6 +71,12 @@ import Synchronization
 /// outlook.timezone` names, with that zone's offset (`…T00:00:00+09:00`), and as
 /// a UTC instant (`…Z`) when the request names none. The zone is the one Graph
 /// knows by that name: `zones`, else `CalendarTimeZoneResolver`.
+///
+/// With `allDayTimesFollowPrefer`, an all-day event's `start` and `end` are returned as its
+/// `originalStart` is: the instant each names (midnight of its date in the zone it is stored in)
+/// written as the wall time in the zone `Prefer` names, labelled with that name (UTC when the request
+/// names none). Assumed, not measured: Graph documents that `Prefer: outlook.timezone` sets the zone of
+/// `start` and `end` in a response, and an all-day `originalStart` was measured converted so.
 final class FakeGraphCalendar: Sendable {
     private let events: Mutex<[String: Data]>
     private let resets = Mutex(0)
@@ -83,7 +89,11 @@ final class FakeGraphCalendar: Sendable {
     /// Zones the server knows by a name TabMail may not (`Prefer` reads them).
     private let zones: [String: TimeZone]
 
-    init(_ seed: [[String: Any]], zones: [String: TimeZone] = [:]) {
+    /// Whether an all-day event's `start` and `end` are returned in the zone `Prefer` names (see
+    /// the type's doc); otherwise as stored.
+    private let allDayTimesFollowPrefer: Bool
+
+    init(_ seed: [[String: Any]], zones: [String: TimeZone] = [:], allDayTimesFollowPrefer: Bool = false) {
         var map: [String: Data] = [:]
         for event in seed {
             // swiftlint:disable:next force_try
@@ -91,6 +101,7 @@ final class FakeGraphCalendar: Sendable {
         }
         events = Mutex(map)
         self.zones = zones
+        self.allDayTimesFollowPrefer = allDayTimesFollowPrefer
     }
 
     func event(_ id: String) -> [String: Any]? {
@@ -157,11 +168,11 @@ final class FakeGraphCalendar: Sendable {
                     .filter { $0["seriesMasterId"] as? String == parts[0] }
                     .filter { Self.starts($0, in: window) }
                     .filter { Self.isInSeries($0, master: master) }
-                return Self.json(["value": instances.map { Self.only(select, of: Self.rendered($0, in: prefer)) }])
+                return Self.json(["value": instances.map { Self.only(select, of: rendered($0, in: prefer, named: preferName)) }])
             }
             if parts.count == 1 { readLog.withLock { $0.append((id: parts[0], zone: preferName)) } }
             guard parts.count == 1, let stored = event(parts[0]) else { return .status(404) }
-            return Self.json(Self.only(select, of: Self.rendered(stored, in: prefer)))
+            return Self.json(Self.only(select, of: rendered(stored, in: prefer, named: preferName)))
         }
         http.register(path: "/v1.0/me/calendarView", method: "GET") { [self] request in
             if let status = takeFailure("GET") { return .status(status) }
@@ -241,12 +252,21 @@ final class FakeGraphCalendar: Sendable {
         return String(prefer[open.upperBound...].prefix { $0 != "\"" })
     }
 
-    /// `event` as a read in `zone` returns it: its `originalStart` written with `zone`'s offset, or
-    /// in UTC when the read names no zone.
-    private static func rendered(_ event: [String: Any], in zone: TimeZone?) -> [String: Any] {
-        guard let stored = event["originalStart"] as? String, let instant = Date.fromISO8601(stored) else { return event }
+    /// `event` as a read in `zone` (named `name` in the request) returns it: its `originalStart`
+    /// written with `zone`'s offset, or in UTC when the read names no zone; with
+    /// `allDayTimesFollowPrefer`, an all-day event's `start` and `end` written in that zone too.
+    private func rendered(_ event: [String: Any], in zone: TimeZone?, named name: String?) -> [String: Any] {
         var out = event
-        out["originalStart"] = instant.iso8601String(timeZone: zone ?? .gmt)
+        if let stored = event["originalStart"] as? String, let instant = Date.fromISO8601(stored) {
+            out["originalStart"] = instant.iso8601String(timeZone: zone ?? .gmt)
+        }
+        if allDayTimesFollowPrefer, event["isAllDay"] as? Bool == true, let readZone = name == nil ? .gmt : zone {
+            for key in ["start", "end"] {
+                guard let at = Self.instant(event[key]) else { continue }
+                out[key] = ["dateTime": EKEventStoreHelper.toNaiveISO(at, timeZone: readZone) + ".0000000",
+                            "timeZone": name ?? "UTC"]
+            }
+        }
         return out
     }
 

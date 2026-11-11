@@ -11,6 +11,7 @@ moved occurrence, current start, named where it is now, split at a moved occurre
 BYSETPOS, named days, day move, `recurringEventId`, `seriesMasterId`, `originalStartTime`,
 `originalStart`, `GCalEvent.originalStartTime`, `ExchangeCalendarProvider.originalStartTime`,
 `allDayOccurrence`, `allDayPlace`, `Prefer: outlook.timezone`, all-day place read in the series' zone,
+`allDayZoneName`, all-day occurrence named by its date in the series' zone (Rule 3 on Outlook, #647),
 `eventSelect`, first occurrence, later occurrence, time of day, this-and-following, split, phantom
 occurrence, `RecurrenceTail.isCapped`, `isOwnSplitCap`, `splitCapUntil`, `afterOwnSplitCap`, `splitting`,
 own split cap, interrupted split, `routeSeriesTimeChange`, Google Calendar behaviour, retry, lost
@@ -93,7 +94,9 @@ the provider layer asks which provider it is (ADR-IOS-060).
   `RecurrenceOccurrenceResolver.select(...naming:)` prefers the occurrence the event id names, so an
   occurrence moved onto another's time, named by its own id and that time, names itself (S3).
 - Outlook: `resolveInstanceId(...naming:)`, then `getEvent` (an all-day series: `allDayOccurrence`, read
-  in the series' zone), then `wasMoved`. `eventSelect` names `originalStart`.
+  in the series' zone), then `wasMoved`. `eventSelect` names `originalStart`. For an all-day series
+  `resolveInstanceId` reads `/instances` in the series' zone too and gives each occurrence as its DATE
+  (#647, "An all-day occurrence is named by its date" below).
 - CalDAV: `CalDAVProvider.occurrence` through `CalDAVOccurrences.scopedEdit` (returns `(key, slot)`)
   and #613's `scopedEditSlot`. That check also refuses a series whose STORED zone TabMail does not
   recognize ("which TabMail does not recognize"), so a CalDAV edit or split of such a series is refused
@@ -154,10 +157,33 @@ occurrence by its id with `Prefer` naming `recurrenceTimeZoneName` exactly as Gr
 device lookup of the zone (`allDayOccurrence`, `request(timeZoneName:)`), and takes the date part of
 `originalStart` as text (`allDayPlace`). `CalendarSeriesScope.place` and `wasMoved` then compare dates
 and need no zone, and the refusal of an all-day series whose zone TabMail does not recognize is gone.
-`/instances` (`resolveInstanceId`) selects only `id,start` and is unchanged. A series whose range names
+`/instances` (`resolveInstanceId`) selects only `id,start` and is unchanged. [Superseded 2026-11-11 by
+#647 for an all-day series, next paragraph.] A series whose range names
 no zone at all is refused by the lookup, nothing written: Graph has named one on every series read so
 far (a range written without one is read back as UTC, measured 2026-11-07), so this is not expected to
 be reached.
+
+**An all-day occurrence is named by its date, read in the series' zone (#647).** `resolveInstanceId`
+read every candidate as an instant from `start` under `Prefer` naming the device's zone, with
+`dateOnly` nil even for all-day instances, so the resolver's Rule 3 (an all-day candidate answers only
+to its literal date) never applied on Outlook, and a date was matched by Rule 2 in the edit's zone. If
+Graph converts an all-day `start` as it converts `originalStart`, a London daily all-day series edited
+from New York with "D" resolved to D+1's occurrence (a weekly one: not found), and the read tools'
+`DT00:00:00` form (`allDayNaiveISO`) matched nothing unless the edit's zone was the series'. With
+#694's `exdates_add` the same lookup picks which occurrence is DELETED. Now, for an all-day series,
+`/instances` is read with `Prefer` naming the series' zone through the same rule as
+`allDayOccurrence` (`allDayZoneName`: `recurrenceTimeZoneName` as Graph gave it, refused when absent),
+and each start's date is read as every all-day start is (`toGCalDateTime(_:isAllDay: true)`, its first
+ten characters), so each candidate is a DATE and Rule 3 applies. Every caller gets it: `updateOccurrence`
+(this_only), `occurrence(...)` (the edit tool's and the queue's `read`, #694's delete lookup) and
+`splitSeries` (through `occurrence`). Timed series are unchanged; Google and CalDAV were already by date.
+**Assumed, not measured:** how Graph writes an all-day `start` under `Prefer`. Read in the series' zone
+its date is the occurrence's date either way (converted: midnight there; written as stored midnight in
+any zone: midnight), which is why the read names that zone. `FakeGraphCalendar(allDayTimesFollowPrefer:)`
+models the converted case; `ExchangeAllDayOccurrenceDateTests` (London series and New York edit, and the
+reverse; daily and weekly; a date and the `DT00:00:00` form; a this_only edit and the occurrence read)
+pins that a date names exactly its own date's occurrence. Also assumed (unchanged): `/instances`'
+`startDateTime`/`endDateTime`, sent without an offset, are read as UTC whatever `Prefer` names.
 
 Also measured: on Outlook a PATCH of the whole series' start or end resets its changed occurrences,
 even with no recurrence sent. #560 makes an "all" time edit named by an occurrence id reach the series,
@@ -262,6 +288,11 @@ stored instances. `drainEdit(..., drains:)` drains once per attempt.
     although both writes landed; no data is lost. Whether Google answers a read of an instance past the
     new UNTIL with 404 (not found) or with the instance `cancelled` (handled: the own-cap check runs
     before the occurrence lookup) is unmeasured (#601).
+11. Outlook's occurrence lookup enumerates 25 hours either side of the named date's midnight in the
+    edit's zone. An all-day occurrence lasts from midnight in the series' zone, so when the edit's zone
+    is 25 hours or more east of the series' (Kiritimati or Tonga against Pago Pago, Niue or Baker
+    Island) the named date's occurrence is outside the window and the edit is refused as not found,
+    nothing written (#647).
 
 ## Superseded (rebuilt from main, 2026-11-10)
 

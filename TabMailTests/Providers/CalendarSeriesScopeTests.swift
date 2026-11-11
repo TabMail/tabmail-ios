@@ -554,6 +554,111 @@ struct ExchangeCalendarSeriesScopeTests {
     }
 }
 
+// MARK: - Outlook: an all-day occurrence is named by its date
+
+/// An Outlook all-day series kept in `zone` (its range's `recurrenceTimeZone`, an IANA name, which
+/// Graph accepts), daily or weekly from `day(0)`, with its occurrences around `day(7)`: each starts at
+/// midnight of its date in that zone and has that instant as its place (`originalStart`, measured).
+/// Graph returns each all-day start in the zone a read names (`allDayTimesFollowPrefer`, assumed).
+private enum GraphAllDaySeries {
+    static let id = "ser-ad-zoned"
+    /// The date every test names.
+    static let named = 7
+
+    static func occurrence(_ offset: Int) -> String { "\(id)-\(day(offset))" }
+
+    /// The offsets of the occurrences stored: a daily series has one on each neighbouring day, a
+    /// weekly one none there.
+    static func offsets(daily: Bool) -> [Int] { daily ? [named - 1, named, named + 1] : [named - 7, named, named + 7] }
+
+    static func calendar(zone: String, daily: Bool) -> FakeGraphCalendar {
+        func atMidnight(_ e: inout [String: Any], _ offset: Int) {
+            e["start"] = ["dateTime": "\(day(offset))T00:00:00.0000000", "timeZone": zone]
+            e["end"] = ["dateTime": "\(day(offset + 1))T00:00:00.0000000", "timeZone": zone]
+        }
+        var series = GraphFixture.event(id: id, online: false, recurring: true, allDay: true)
+        atMidnight(&series, 0)
+        if var recurrence = series["recurrence"] as? [String: Any], var range = recurrence["range"] as? [String: Any] {
+            range["startDate"] = day(0)
+            range["recurrenceTimeZone"] = zone
+            recurrence["range"] = range
+            if daily {
+                recurrence["pattern"] = ["type": "daily", "interval": 1, "month": 0, "dayOfMonth": 0,
+                                         "firstDayOfWeek": "monday", "index": "first"]
+            }
+            series["recurrence"] = recurrence
+        }
+        let occurrences = offsets(daily: daily).map { offset -> [String: Any] in
+            var e = GraphFixture.event(id: occurrence(offset), online: false, seriesMasterId: id, allDay: true)
+            atMidnight(&e, offset)
+            e["originalStart"] = GraphFixture.allDayPlace(day(offset), in: zone)
+            return e
+        }
+        return FakeGraphCalendar([series] + occurrences, allDayTimesFollowPrefer: true)
+    }
+
+    /// The series' zone and the edit's: London's dates begin before New York's (the series east
+    /// of the edit's zone), and New York's after London's (west of it).
+    static let zones = [(series: "Europe/London", edit: "America/New_York"),
+                        (series: "America/New_York", edit: "Europe/London")]
+
+    /// The two ways an edit names `day(named)`: its date, and its start as the read tools show an
+    /// all-day start (`allDayNaiveISO`).
+    static var names: [String] { [day(named), CalendarToolHelpers.allDayNaiveISO(day(named))] }
+}
+
+@Suite("An Outlook all-day occurrence is named by its date in the series' own zone (#647)", .serialized, .processGlobalState)
+struct ExchangeAllDayOccurrenceDateTests {
+
+    @Test("a this_only edit naming a date changes that date's occurrence and no other, whatever zone the edit names")
+    func thisOnlyEditChangesTheNamedDate() async throws {
+        for (row, (zones, daily)) in GraphAllDaySeries.zones.flatMap({ z in [true, false].map { (z, $0) } }).enumerated() {
+            for (form, rid) in GraphAllDaySeries.names.enumerated() {
+                let label = "\(zones.series) series, \(zones.edit) edit, \(daily ? "daily" : "weekly"), \(rid)"
+                let graph = GraphAllDaySeries.calendar(zone: zones.series, daily: daily)
+                let rows = try await outlook(graph, eventId: GraphAllDaySeries.id, [
+                    "edit_scope": .string("this_only"), "recurrence_id": .string(rid),
+                    "title": .string("Holiday (renamed)"), "timezone": .string(zones.edit),
+                ], account: "allday-zone-\(row)-\(form)")
+                let named = GraphAllDaySeries.occurrence(GraphAllDaySeries.named)
+                #expect(graph.patches(named).count == 1 && graph.event(named)?["subject"] as? String == "Holiday (renamed)",
+                        "\(label): the named date's occurrence was not changed; rows \(reasons(rows))")
+                for offset in GraphAllDaySeries.offsets(daily: daily) where offset != GraphAllDaySeries.named {
+                    #expect(graph.patches(GraphAllDaySeries.occurrence(offset)).isEmpty,
+                            "\(label): the occurrence on \(day(offset)) was changed")
+                }
+                #expect(graph.patches(GraphAllDaySeries.id).isEmpty && graph.created.isEmpty, "\(label): the series was written")
+                #expect(rows.isEmpty, "\(label): rows \(reasons(rows))")
+            }
+        }
+    }
+
+    @Test("the occurrence read naming a date gives that date's occurrence, whatever zone the read names")
+    func occurrenceReadGivesTheNamedDate() async throws {
+        for (zones, daily) in GraphAllDaySeries.zones.flatMap({ z in [true, false].map { (z, $0) } }) {
+            for rid in GraphAllDaySeries.names {
+                let label = "\(zones.series) series, \(zones.edit) read, \(daily ? "daily" : "weekly"), \(rid)"
+                let graph = GraphAllDaySeries.calendar(zone: zones.series, daily: daily)
+                let http = FakeHTTP.Scenario()
+                defer { http.close() }
+                graph.install(on: http)
+                let provider = ExchangeCalendarProvider(mailbox: "calendar@example.com", accessToken: { _ in "test-token" },
+                                                        session: http.session)
+                let zone = try #require(TimeZone(identifier: zones.edit))
+                do {
+                    let found = try await provider.occurrence(
+                        calendarId: "primary", eventId: GraphAllDaySeries.id, recurrenceId: rid, recurrenceIdZone: zone)
+                    #expect(found.id == GraphAllDaySeries.occurrence(GraphAllDaySeries.named) && found.start?.date == day(GraphAllDaySeries.named),
+                            "\(label): read \(found.id ?? "none") starting \(found.start?.date ?? "none")")
+                } catch {
+                    Issue.record("\(label): \(error)")
+                }
+                #expect(graph.patches(GraphAllDaySeries.id).isEmpty && graph.created.isEmpty, "\(label): written")
+            }
+        }
+    }
+}
+
 // MARK: - The queue: a series on named days
 
 /// A timed CalDAV series at 09:00 UTC from day 0, repeating by `rule`. Written in UTC with no
