@@ -34,6 +34,17 @@ dropped silently, and the card did not list the days.
   weekday, a weekday with a day of the month, BYMONTH outside YEARLY, several months, daily on
   weekdays (offer WEEKLY), yearly without the month.
 - **WKST reaches Outlook** as `firstDayOfWeek`; without it the pattern keeps `sunday` (#423 owns that).
+  After the rebase onto #423's fix: on an edit, an explicit WKST wins over the series' stored first
+  day; without WKST the stored day is kept. One comparison decides both the PATCH and the card (see
+  topic 140).
+- **Outlook's relative patterns round-trip.** The reader writes a stored `relativeMonthly`/`relativeYearly`
+  as plain BYDAY weekdays plus one BYSETPOS (Graph's `index` counts over the union of `daysOfWeek`,
+  "the second Thursday or Friday"), and the refusal accepts exactly that: MONTHLY or YEARLY (with BYMONTH),
+  plain weekdays, one BYSETPOS of 1 to 4 or -1. Every other BYSETPOS use is refused naming `recurrence.bySetPos`.
+  A missing stored `index` is read as `first` (`ExchangeCalendarProvider.storedIndex`, measured: Graph returns
+  `first`) by both the reader and `sameRule`. Pinned by `OutlookRuleRoundTripTests` (every pattern, range and
+  first day: read, accepted, encoded back the same). The tool's `recurrence` arguments have no `bySetPos` field,
+  and an unknown key is ignored, not refused (open finding).
 - **A Google rule write keeps the series' EXDATE and RDATE lines**
   (`GoogleCalendarProvider.recurrence(_:withRuleFrom:)`, applied by `updateEvent` and by a split's
   new part in `mergeMasterAndPatch`), as CalDAV's `mergePatchIntoICS` does. Google replaces the whole

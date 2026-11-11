@@ -1665,6 +1665,9 @@ struct GCalEvent: Codable, Sendable {
     /// `recurrenceTimeZone`), so a provider can read the rule as it does for a write
     /// (`CalendarProvider.editResetsChangedOccurrences`). Nil when the calendar names none; in memory only.
     var recurrenceTimeZoneName: String? = nil
+    /// The first day of the week a series' rule is kept with (Outlook's `firstDayOfWeek`), read
+    /// as `recurrenceTimeZoneName` is. Nil when the calendar names none; in memory only.
+    var recurrenceFirstDayOfWeek: String? = nil
 }
 
 // Convenience initializer that fills in `eventType`/`iCalUID`/`kind`/`visibility`

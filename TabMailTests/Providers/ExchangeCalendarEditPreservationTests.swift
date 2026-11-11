@@ -22,7 +22,9 @@ import Synchronization
 ///   `defaultRecurrenceZone`), and a rule
 ///   that differs from the stored one makes Graph restore deleted occurrences
 ///   and move moved ones back — counted in `seriesResets`. Writing the stored
-///   recurrence back exactly changed nothing;
+///   recurrence back exactly changed nothing. A recurrence that differs only in
+///   its pattern's `firstDayOfWeek` is assumed to reset the same way (not
+///   measured), so it is counted too;
 /// - writing a series' `start` or `end` (measured on a work account on
 ///   2026-11-10): a PATCH of start and end alone, with no recurrence and the
 ///   stored recurrence left as it was, brought a deleted occurrence back and
@@ -1026,6 +1028,84 @@ struct ExchangeCalendarEditPreservationTests {
         }
     }
 
+    /// The series' own rule re-sent with a first day of the week of its own (`WKST`) is a rule
+    /// change: written with that day, and the card warns of the reset (assumed, not measured,
+    /// for a change of only the first day).
+    @Test("a whole-series edit that changes only the rule's first day of the week is written and warned of")
+    func firstDayOnlyEditIsWrittenAndWarned() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = GraphFixture.calendar()
+        graph.install(on: http)
+        let provider = makeProvider(http)
+        let read = try await provider.getEvent(eventId: "ser-1")
+        let rule = try #require(read.recurrence?.first)
+        #expect(!rule.contains("WKST"), "the read rule is \(rule)")
+        var patch = GCalEventInput()
+        patch.recurrence = [rule + ";WKST=SU"]
+
+        let answer = provider.editResetsChangedOccurrences(read, edit: patch)
+        _ = try await provider.updateEvent(eventId: "ser-1", event: patch)
+
+        let sent = graph.patches("ser-1")
+        #expect(sent.count == 1, "\(sent.count) PATCHes")
+        let pattern = (sent.first?["recurrence"] as? [String: Any])?["pattern"] as? [String: Any]
+        #expect(pattern?["firstDayOfWeek"] as? String == "sunday",
+                "the PATCH's weeks start on \(pattern?["firstDayOfWeek"] as? String ?? "none")")
+        #expect(answer, "the card does not warn of a reset for the first-day change")
+        #expect(graph.seriesResets == 1, "\(graph.seriesResets) resets of the series' exceptions")
+    }
+
+    /// A rule change that names its own first day of the week is written with that day, not
+    /// the series' stored one.
+    @Test("a rule change with its own first day of the week is written with that day")
+    func ruleChangeWithFirstDayWritesIt() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = GraphFixture.calendar()
+        graph.install(on: http)
+        let provider = makeProvider(http)
+        let read = try await provider.getEvent(eventId: "ser-1")
+        var patch = GCalEventInput()
+        patch.recurrence = ["RRULE:FREQ=WEEKLY;INTERVAL=2;WKST=SU"]
+
+        let answer = provider.editResetsChangedOccurrences(read, edit: patch)
+        _ = try await provider.updateEvent(eventId: "ser-1", event: patch)
+
+        let after = try #require(graph.event("ser-1"))
+        let recurrence = try #require(after["recurrence"] as? [String: Any])
+        let pattern = recurrence["pattern"] as? [String: Any]
+        #expect(pattern?["interval"] as? Int == 2, "the new rule was not written")
+        #expect(pattern?["firstDayOfWeek"] as? String == "sunday",
+                "the series' weeks start on \(pattern?["firstDayOfWeek"] as? String ?? "none")")
+        #expect((recurrence["range"] as? [String: Any])?["recurrenceTimeZone"] as? String == "Pacific Standard Time")
+        #expect(answer, "the card does not warn of a reset for the rule change")
+    }
+
+    /// The series' own rule re-sent with no first day of the week keeps the stored one: nothing
+    /// is sent, the card does not warn, and the series' weeks still start on its stored day.
+    @Test("a re-sent rule with no first day of the week keeps the stored one and sends nothing")
+    func resentRuleWithoutFirstDayKeepsStored() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = GraphFixture.calendar()
+        graph.install(on: http)
+        let provider = makeProvider(http)
+        let read = try await provider.getEvent(eventId: "ser-1")
+        #expect(read.recurrenceFirstDayOfWeek == "monday", "the read first day is \(read.recurrenceFirstDayOfWeek ?? "none")")
+        var patch = GCalEventInput()
+        patch.recurrence = [try #require(read.recurrence?.first)]
+
+        let answer = provider.editResetsChangedOccurrences(read, edit: patch)
+        _ = try await provider.updateEvent(eventId: "ser-1", event: patch)
+
+        #expect(graph.patches("ser-1").isEmpty, "\(graph.patches("ser-1").count) PATCHes")
+        #expect(!answer, "the card warns of a reset for the series' own rule")
+        #expect(graph.seriesResets == 0)
+        let pattern = (try #require(graph.event("ser-1"))["recurrence"] as? [String: Any])?["pattern"] as? [String: Any]
+        #expect(pattern?["firstDayOfWeek"] as? String == "monday")
+    }
+
     /// #423, measured: writing a series' stored recurrence back exactly changed
     /// nothing, but writing it rebuilt from its RRULE restored deleted occurrences
     /// and moved moved ones back. The assistant re-sends the rule it read with an
@@ -1602,7 +1682,10 @@ struct ExchangeCalendarEditPreservationTests {
     /// A stored pattern that its RRULE does not say exactly (it does not come back the same
     /// through one): the card cannot tell the rule the edit re-sends is the stored one, so it
     /// answers "changed", as the write, comparing with the stored pattern, writes the rule.
-    @Test("a series whose pattern its RRULE does not say exactly answers changed, as its write writes the rule",
+    /// A relative pattern stored with no index is the exception: Graph's default index is
+    /// `first`, which the read rule says (`storedIndex`), so it is the same rule and nothing is
+    /// sent.
+    @Test("a series whose pattern its RRULE does not say exactly answers changed, as its write writes the rule; one with no index is its own rule",
           arguments: UnmappedPattern.allCases)
     func unmappedPatternAnswersChanged(_ kind: UnmappedPattern) async throws {
         let http = FakeHTTP.Scenario()
@@ -1633,7 +1716,15 @@ struct ExchangeCalendarEditPreservationTests {
         _ = try await provider.updateEvent(eventId: "ser-u", event: patch)
 
         let reset = graph.seriesResets > 0
-        #expect(answer, "\(kind): the card says the re-sent rule is the stored one")
+        switch kind {
+        case .weeklyWithNoDays:
+            #expect(answer, "\(kind): the card says the re-sent rule is the stored one")
+        case .relativeMonthlyWithNoIndex:
+            // A missing index is Graph's default `first` (measured: Graph returns it): the read rule
+            // says it, so the re-sent rule is the stored one, and nothing is sent.
+            #expect(!answer, "\(kind): the card says the re-sent rule changes the series")
+            #expect(graph.patches("ser-u").isEmpty, "\(kind): \(graph.patches("ser-u").count) PATCHes")
+        }
         #expect(answer == reset, "\(kind): the card says \(answer ? "a reset" : "no reset"), the write \(reset ? "reset" : "did not reset") the series")
     }
 

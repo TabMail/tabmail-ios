@@ -116,6 +116,14 @@ that aren't included in the request body maintain their previous values".
   (`start.timeZone` of the same PATCH; `UTC` for an all-day start, as `toGraphEventJSON` writes it).
   The changed rule is also dated in the stored zone: the stored `recurrenceTimeZone` is read through
   `CalendarTimeZoneResolver.zone(named:in: .none)` (IANA, Windows CLDR names) and passed to
+  [Superseded for the first day, #513 rebase: an RRULE now carries `WKST`. The stored
+  `firstDayOfWeek` is an encoder input (`toGraphEventJSON(_:rangeZone:firstDayOfWeek:)` →
+  `parseRRULEToGraphRecurrence`), written unless the rule names its own `WKST`, and `sameRule`
+  compares it like every other property: a rule without `WKST` matches the stored day by
+  construction, a changed `WKST` is a rule change, written and warned of on the card. The card's
+  baseline reads the stored day from `GCalEvent.recurrenceFirstDayOfWeek`. Whether Graph resets
+  exceptions on a first-day-only change is unmeasured; assumed yes (warn side), and the test fake
+  counts it.]
   `toGraphEventJSON(_:rangeZone:)`, which converts the start's wall time into that zone
   (`ExchangeCalendarProvider.wallTime(_:from:to:)`) before `parseRRULEToGraphRecurrence` /
   `graphEndDate` date an `UNTIL`; the range's `startDate` is that converted wall time's date, since Graph
