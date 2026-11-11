@@ -346,6 +346,57 @@ enum CalDAVOccurrences {
         }
     }
 
+    // MARK: - One occurrence's delete
+
+    /// The one check a delete of one occurrence (`CalDAVProvider.deleteEvent` by an occurrence
+    /// id) makes before it writes anything. The occurrence `key` names is looked up as a listing
+    /// shows it (`occurrence(key:icsText:href:)`), and that start is handed to `scopedEditSlot`,
+    /// so the delete names its occurrence through the same check a one-occurrence edit makes.
+    /// Returns what `scopedEditSlot` returns: the occurrence's place in the series as a naive
+    /// wall time in `zone`, which is where an `EXDATE` excludes it, also for an occurrence moved
+    /// away from that place. Nothing is written when it throws:
+    /// - `notSupported` for a resource that holds only changed occurrences, with no series to
+    ///   exclude one from (an invitation to single occurrences, RFC 4791 §4.1);
+    /// - `CalDAVError.notFound` when the series has no such occurrence now, or it is cancelled:
+    ///   the authoritative absence Google and Outlook report for it;
+    /// - whatever `scopedEditSlot` refuses.
+    static func deletionSlot(icsText: String, href: String, key: String, zone: TimeZone) throws -> String {
+        let components = ICSParser.components(icsText: icsText, resourceHref: href)
+        guard components.contains(where: { $0.recurrenceId == nil }) else {
+            throw CalendarProviderError.notSupported(
+                "This calendar entry holds changed occurrences without their repeating event, so TabMail can't delete one of them. Nothing was deleted. The user can delete it in their calendar app.")
+        }
+        guard let shown = occurrence(key: key, icsText: icsText, href: href),
+              shown.status?.lowercased() != "cancelled" else {
+            throw CalDAVError.notFound
+        }
+        let recurrenceId: String?
+        if let date = shown.start?.date {
+            recurrenceId = String(date.prefix(10))
+        } else {
+            recurrenceId = shown.startDate.flatMap(utcKey).flatMap { OccurrenceId.recurrenceId(ofKey: $0, in: zone) }
+        }
+        guard let recurrenceId else {
+            throw CalendarProviderError.notSupported(
+                "This occurrence has a start TabMail can't read, so it can't be deleted. Nothing was deleted.")
+        }
+        return try scopedEditSlot(icsText: icsText, href: href, key: key, recurrenceId: recurrenceId, zone: zone, forSplit: false)
+    }
+
+    /// The occurrence key a changed occurrence's `RECURRENCE-ID` (`value`, `params` without the
+    /// leading `;`) names in the series `icsText` holds, read as the listing reads it; nil when
+    /// the resource has no series this type expands. A delete removes the changed copy of the
+    /// occurrence it excludes by this key, so a RECURRENCE-ID spelled in another form or zone
+    /// than the key still matches.
+    static func seriesKey(ofRecurrenceId value: String, params: String?, icsText: String, href: String) -> String? {
+        let components = ICSParser.components(icsText: icsText, resourceHref: href)
+        guard let master = components.first(where: { $0.recurrenceId == nil }),
+              case .series(let series) = shape(of: master, overrides: components.filter { $0.recurrenceId != nil }) else {
+            return nil
+        }
+        return occurrenceKey(ofValue: value, params: params, in: series)
+    }
+
     /// Where the series puts the occurrence `key` names, as a candidate's start is given
     /// (`scopedEditSlot`): the date of an all-day key, the instant of a UTC key, and a floating
     /// key's wall time read in the series' frame, as the listing reads it. nil for a value that

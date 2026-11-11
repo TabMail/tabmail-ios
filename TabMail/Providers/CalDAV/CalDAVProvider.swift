@@ -364,18 +364,65 @@ actor CalDAVProvider: CalendarProvider {
         eventId: String,
         sendUpdates: String
     ) async throws {
-        // An occurrence id is refused before anything is sent. A WebDAV DELETE removes the
-        // whole resource, which holds every occurrence of the series, so deleting by one
-        // occurrence's id would delete them all (ADR-IOS-108). Removing one occurrence would
-        // be an EXDATE written into the series, which is not built yet.
-        if try CalDAVOccurrences.OccurrenceId.split(eventId).key != nil {
-            throw CalendarProviderError.notSupported(
-                "Deleting one occurrence of a repeating CalDAV event is not supported yet, so nothing was deleted. The user can delete it in their calendar app.")
+        // An occurrence id never reaches a WebDAV DELETE: that removes the whole resource,
+        // which holds every occurrence of the series (ADR-IOS-108). One occurrence is removed
+        // by an EXDATE written into the series (`deleteOccurrence`).
+        let (seriesHref, occurrenceKey) = try CalDAVOccurrences.OccurrenceId.split(eventId)
+        if let occurrenceKey {
+            try await deleteOccurrence(calendarId: calendarId, seriesHref: seriesHref, key: occurrenceKey)
+            return
         }
         let eventURL = try resolveEventURL(eventId, calendarId: calendarId)
         let (_, _) = try await client.delete(url: eventURL)
         etagCache.removeValue(forKey: eventId)
         BackgroundSyncLogger.logDebug("[CalDAV] Deleted event \(eventId)")
+    }
+
+    /// Delete one occurrence of a repeating event, as Google Calendar deletes one: the rest of
+    /// the series stays. GET the series' resource, find the occurrence through the check a
+    /// one-occurrence edit makes (`CalDAVOccurrences.deletionSlot`, over `scopedEditSlot`), then
+    /// ONE PUT of the resource with an EXDATE at the occurrence's place in the series and the
+    /// occurrence's changed copy removed (`occurrenceDeletedResource`), conditional on the GET's
+    /// ETag. A 412 is thrown as `preconditionFailed`, as every other conditional CalDAV write
+    /// throws it. The PUT is an irreversible wire operation (memory 102): it removes the
+    /// changed copy's content with no per-item recovery, so nothing is written unless the
+    /// occurrence is found, and unless the resource it builds no longer has that occurrence.
+    private func deleteOccurrence(calendarId: String, seriesHref: String, key: String) async throws {
+        let eventURL = try resolveEventURL(seriesHref, calendarId: calendarId)
+        let (data, getResponse) = try await client.get(url: eventURL)
+        guard let storedICS = String(data: data, encoding: .utf8), !storedICS.isEmpty else {
+            throw CalDAVError.parseError("Empty response for event \(seriesHref)")
+        }
+        let etag = getResponse.value(forHTTPHeaderField: "ETag")
+
+        // The occurrence's place is read as an instant in UTC, which has no wall time a change
+        // of UTC offset skips or repeats; `recurrenceIdInMasterFrame` writes it in the series'
+        // own frame, and leaves an all-day date or a floating wall time as it is.
+        let slotZone = TimeZone.gmt
+        let slot = try CalDAVOccurrences.deletionSlot(icsText: storedICS, href: seriesHref, key: key, zone: slotZone)
+        let zones = CalendarTimeZoneContext(calendarText: storedICS)
+        guard let slotInSeriesFrame = try Self.recurrenceIdInMasterFrame(
+            slot, declaredZone: slotZone, kind: Self.masterDTStartKind(from: storedICS), zones: zones
+        ) else {
+            throw CalendarProviderError.notSupported(
+                "This occurrence's place in the repeating event can't be written in the event's timezone, so it was not deleted. Nothing was deleted.")
+        }
+        let updatedICS = try Self.occurrenceDeletedResource(
+            storedICS: storedICS, href: seriesHref, key: key, slotNaive: slotInSeriesFrame)
+        // The write must remove the occurrence it names. One whose EXDATE the series would not
+        // read as that occurrence, written anyway, would lose its changed copy and put it back
+        // at its place in the series.
+        guard CalDAVOccurrences.occurrence(key: key, icsText: updatedICS, href: seriesHref) == nil else {
+            throw CalendarProviderError.notSupported(
+                "TabMail can't write the exclusion of this occurrence in a form the repeating event reads, so it was not deleted. Nothing was deleted.")
+        }
+        // No ETag ⇒ `.unconditional`, as every CalDAV write of a resource the GET above proved
+        // exists (see `updateEvent`).
+        _ = try await client.put(
+            url: eventURL, body: updatedICS,
+            precondition: etag.map(CalDAVPutPrecondition.ifMatch) ?? .unconditional)
+        etagCache.removeValue(forKey: seriesHref)
+        BackgroundSyncLogger.logDebug("[CalDAV] Deleted occurrence \(key) of \(seriesHref)")
     }
 
     /// The day an all-day occurrence starts on now. CalDAV addresses an occurrence by its original

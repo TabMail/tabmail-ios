@@ -12,8 +12,8 @@ import Foundation
 // event can only ever affect that occurrence. A WebDAV DELETE removes the whole
 // resource, which holds every occurrence, and a URL drops its `#` fragment from the
 // request, so on the code before ADR-IOS-108 a delete given an occurrence id would have
-// gone out as a DELETE of the series. The delete by an occurrence id is refused with no
-// request sent, and the series stays on the server exactly as it was; reads and edits
+// gone out as a DELETE of the series. The delete by an occurrence id never sends a DELETE:
+// it writes an EXDATE into the series (#661, `CalDAVOccurrenceDeleteWireTests`); reads and edits
 // by an occurrence id address that occurrence inside its series' resource.
 //
 // A second property for the edits: one occurrence's edit or a split writes only at an
@@ -260,23 +260,21 @@ struct CalDAVOccurrenceWireTests {
         }
     }
 
-    @Test("deleting by an occurrence id is refused, sends no DELETE, and leaves the series on the server unchanged")
+    @Test("deleting by an occurrence id sends no DELETE: the series stays on the server, without that occurrence only (#661)")
     func deleteByOccurrenceIdSendsNoDelete() async throws {
         let fixture = try W.make()
         let (store, http) = W.serve(fixture)
         defer { http.close() }
+        let provider = W.makeProvider(http)
         let oneDay = try fixture.occurrenceId(2)
 
-        await #expect {
-            try await W.makeProvider(http).deleteEvent(
-                calendarId: W.calendarId, eventId: oneDay, sendUpdates: "all")
-        } throws: { error in
-            guard case CalendarProviderError.notSupported(let reason) = error else { return false }
-            return reason.contains("not supported yet") && reason.contains("nothing was deleted")
-        }
+        try await provider.deleteEvent(calendarId: W.calendarId, eventId: oneDay, sendUpdates: "all")
 
         #expect(Self.deletes(http).isEmpty, "a DELETE reached the server for one occurrence: \(Self.deletes(http))")
-        #expect(store.storedICS(path: W.seriesPath) == fixture.ics, "the series is not on the server as it was")
+        #expect(store.storedICS(path: W.seriesPath) != nil, "the series is no longer on the server")
+        let rows = try await Self.listWeeks(provider, fixture, through: 3)
+        #expect(rows.compactMap(\.id) == (try [0, 1, 3].map { try fixture.occurrenceId($0) }),
+                "the series does not hold every other occurrence: \(rows.compactMap(\.id))")
     }
 
     @Test("Control: deleting by the series id still deletes the series")
