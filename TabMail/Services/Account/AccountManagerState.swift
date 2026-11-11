@@ -130,8 +130,10 @@ final class AccountManagerState {
     /// refresh never clears it. It is cleared only by a run that covered every
     /// active account and had no counted failure; scheduler and background polls
     /// clear it this way too, so recovery heals it without a gesture, and they
-    /// never raise it. Accounts marked sign-in-needed never count against a
-    /// clear: their own "Sign in again" banner tells the user.
+    /// never raise it. Sign-in errors (a refused credential, a failed token
+    /// refresh) never count, for raising or for clearing, and neither does any
+    /// failure of an account marked sign-in-needed: the sign-in mark and its own
+    /// "Sign in again" banner carry them.
     ///
     /// A run that did not fail as a whole (every poll, and a refresh that
     /// succeeded) ends here. It never raises.
@@ -181,15 +183,26 @@ enum InboxErrorBanner {
     static let allLines: Set<String> = [genericMessage]
 
     /// Whether an account's failure counts for the banner
-    /// (`AccountManagerState.finishSyncRun`): the account is not marked
-    /// sign-in-needed and the failure is not temporary (cancellation, a database
-    /// suspension, `SyncEngine.isTransientError`).
+    /// (`AccountManagerState.finishSyncRun`). It does not count when the account
+    /// is marked sign-in-needed, when it is a sign-in error, or when it is
+    /// temporary (cancellation, a database suspension, `SyncEngine.isTransientError`).
     nonisolated static func countsAsFailure(_ error: Error, accountMarkedSignInNeeded: Bool) -> Bool {
         if accountMarkedSignInNeeded { return false }
+        if isSignInError(error) { return false }
         if error is CancellationError { return false }
         if error.isDatabaseSuspensionAbort { return false }
         if SyncEngine.isTransientError(error) { return false }
         return true
+    }
+
+    /// A sign-in error: the server refused the credentials, or a token could not
+    /// be refreshed. The sign-in mark and its own banner carry these, never the
+    /// generic banner; the kind alone decides, with no account lookup.
+    nonisolated static func isSignInError(_ error: Error) -> Bool {
+        if case ProviderError.authenticationFailed = error { return true }
+        if case AuthError.refreshFailed = error { return true }
+        if let classified = error as? any ProviderClassifiedError, classified.isSignInRefusal { return true }
+        return false
     }
 
     /// The banner line a sync or page-load failure raises, or `nil` for none.

@@ -7306,3 +7306,14 @@ extension MessagePart {
         return String(data: bytes, encoding: encoding)
     }
 }
+
+/// A refused LOGIN that is not temporary is a refusal of the credentials (the
+/// temporary ones are rethrown as `ProviderTemporaryRefusal`).
+extension IMAPError: ProviderClassifiedError {
+    var isSignInRefusal: Bool {
+        if case .loginFailed(let reason) = self {
+            return !IMAPProvider.isTemporaryLoginRefusal(reason: reason)
+        }
+        return false
+    }
+}

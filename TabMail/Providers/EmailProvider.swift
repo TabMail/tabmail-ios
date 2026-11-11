@@ -1013,6 +1013,13 @@ enum SignInOutcome: Sendable, Equatable {
 /// the caller sees the result.
 typealias SignInOutcomeReporter = @Sendable (SignInOutcome) async -> Void
 
+/// An error a provider classifies itself, so callers above the provider
+/// boundary can ask what it means without knowing the provider's types.
+protocol ProviderClassifiedError: Error {
+    /// The server refused the account's credentials (not a temporary refusal).
+    var isSignInRefusal: Bool { get }
+}
+
 /// A server refused a request for now and said so (for example an IMAP login
 /// answered `NO [UNAVAILABLE]`). The next sync cycle retries; it says nothing
 /// about the user's credentials.

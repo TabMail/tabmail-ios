@@ -224,4 +224,52 @@ struct IMAPLoginRefusalSignInTests {
             try? await old.disconnect()
         }
     }
+
+    /// Run a user refresh of `inbox` and read the generic banner afterwards.
+    @MainActor
+    private static func refreshAndReadBanner(_ inbox: Folder) async -> String? {
+        await InboxViewModel(folders: [inbox]).refreshSync()
+        return AccountManagerState.shared.syncErrorBanner
+    }
+
+    @Test("a refresh whose only error is a sign-in refusal raises no generic banner, and the sign-in banner shows from the first refusal")
+    func refreshSignInRefusalShowsOnlyTheSignInBanner() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        let saved = await MainActor.run { () -> (String?, Date?, Bool) in
+            let state = AccountManagerState.shared
+            let saved = (state.syncErrorBanner, state.lastSyncCompletedAt, state.lastSyncFailed)
+            state.syncErrorBanner = nil
+            return saved
+        }
+        func restore() async {
+            await MainActor.run {
+                let state = AccountManagerState.shared
+                state.syncErrorBanner = saved.0
+                state.lastSyncCompletedAt = saved.1
+                state.lastSyncFailed = saved.2
+            }
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir)
+        }
+        do {
+            try await withFactoryAccount { server, account in
+                try await pool.write { db in try account.insert(db) }
+                try FolderEpochTestFixture.insertFolder(accountId: account.id, path: "INBOX", role: .inbox, pool: pool)
+                let inbox = try #require(try FolderEpochTestFixture.readFolder(accountId: account.id, path: "INBOX", pool: pool))
+                #expect(await !isMarked(account.id), "the account was marked before its first refusal")
+
+                server.failNextCommand(containing: "LOGIN", message: "[AUTHENTICATIONFAILED] Invalid credentials")
+                let banner = await Self.refreshAndReadBanner(inbox)
+
+                #expect(banner == nil, "a sign-in refusal raised the generic banner")
+                let failed = await AccountManager.shared.authFailedAccounts
+                let shown = await MainActor.run { SignInAgainBanner.accounts(failed: failed, in: [account]).map(\.id) }
+                #expect(shown == [account.id],
+                        "the first refusal did not show the sign-in banner")
+            }
+        } catch {
+            await restore()
+            throw error
+        }
+        await restore()
+    }
 }

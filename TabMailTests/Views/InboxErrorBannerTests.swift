@@ -158,7 +158,7 @@ struct InboxErrorBannerTests {
         #expect(!manager.isAuthError(UnknownError()))
     }
 
-    @Test("countsAsFailure: marked, cancellation, DB suspension and temporary refusals never count; timeouts and the rest do")
+    @Test("countsAsFailure: marked, sign-in errors, cancellation, DB suspension and temporary refusals never count; timeouts and the rest do")
     func countsAsFailureTable() {
         let generic = NSError(domain: "com.example.test", code: 7)
         let suspension = DatabaseError(resultCode: .SQLITE_INTERRUPT)
@@ -172,7 +172,11 @@ struct InboxErrorBannerTests {
              ProviderTemporaryRefusal(underlying: IMAPError.loginFailed("no([UNAVAILABLE] try later)")), false, false),
             ("HTTP 503", ProviderError.networkError(underlying: HTTPError.networkError(statusCode: 503)), false, false),
             ("timeout", TimeoutError(duration: 30), false, true),
-            ("credential refusal", IMAPError.loginFailed("no([AUTHENTICATIONFAILED] no)"), false, true),
+            ("credential refusal", IMAPError.loginFailed("no([AUTHENTICATIONFAILED] no)"), false, false),
+            ("uncoded login refusal", IMAPError.loginFailed("no(login failed)"), false, false),
+            ("authentication failed", ProviderError.authenticationFailed, false, false),
+            ("token refresh failed", AuthError.refreshFailed(underlying: "no"), false, false),
+            ("other IMAP error", IMAPError.fetchFailed("no"), false, true),
             ("generic", generic, false, true),
         ]
         for (name, error, marked, counts) in rows {
