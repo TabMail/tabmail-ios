@@ -66,7 +66,14 @@ import Synchronization
 ///   with 405 `UnknownError` and an empty message, and changes nothing.
 ///   Measured on an Outlook.com account (#622): a list with every entry
 ///   carrying its status was accepted, and a kept attendee sent with their
-///   stored status kept their answer.
+///   stored status kept their answer;
+/// - a PATCH of a series' `attendees` gives the new list to every stored
+///   occurrence whose attendees were the series' own, as stored, before the
+///   PATCH. Measured on an Outlook.com test account (2026-11-11): a guest added
+///   to a series reached its occurrence changed on its own (renamed, still an
+///   exception) and an unchanged one. NOT measured: a guest removed, a moved
+///   occurrence, and an occurrence whose guests differ from the series'. The
+///   fake carries the first two by the same rule and leaves the third as stored.
 ///
 /// A timed event's starts and ends are returned as stored, whatever zone `Prefer` names: a
 /// fixture stores them as Graph renders them for the device. An all-day event's `start` and `end`
@@ -135,6 +142,9 @@ final class FakeGraphCalendar: Sendable {
     /// The zone `Prefer: outlook.timezone` named on each read of `id` by its own id (nil: none),
     /// in order.
     func readZones(_ id: String) -> [String?] { readLog.withLock { $0 }.filter { $0.id == id }.map(\.zone) }
+
+    /// The id of every PATCH that was applied, in order.
+    var patchedIds: [String] { patchLog.withLock { $0.map(\.id) } }
 
     /// The PATCH bodies sent for `id`, in order.
     func patches(_ id: String) -> [[String: Any]] {
@@ -329,6 +339,19 @@ final class FakeGraphCalendar: Sendable {
             } || patch["isAllDay"].map { ($0 as? Bool) != (stored["isAllDay"] as? Bool) } ?? false)
             if changesRule || movesTime {
                 resets.withLock { $0 += 1 }
+            }
+            if isSeries, let written = patch["attendees"] {
+                let seriesGuests = Self.canonicalJSON(stored["attendees"])
+                events.withLock { all in
+                    for (id, data) in all {
+                        guard var occurrence = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                              occurrence["seriesMasterId"] as? String == parts[0],
+                              Self.canonicalJSON(occurrence["attendees"]) == seriesGuests else { continue }
+                        occurrence["attendees"] = written
+                        // swiftlint:disable:next force_try
+                        all[id] = try! JSONSerialization.data(withJSONObject: occurrence)
+                    }
+                }
             }
             Self.apply(patch, to: &stored)
             store(stored)

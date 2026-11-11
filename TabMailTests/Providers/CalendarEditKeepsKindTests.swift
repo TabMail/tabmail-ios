@@ -73,6 +73,12 @@ private let kindChangeTimesHint = "to change this event between all-day and time
 /// instant, or another zone, `sameTime`), resets the series: its stored occurrences, the ones changed one by
 /// one, are dropped, as Google did when a series was moved from 08:00 to 13:00 (measured on a
 /// personal account, 2026-11-10).
+///
+/// A PATCH of a series' `attendees` gives the new list to every stored occurrence whose attendees
+/// were the series' own, as stored, before the PATCH. Measured on a test account (2026-11-10): a
+/// guest added to a series reached its renamed occurrence and its unchanged ones. NOT measured: a
+/// guest removed, a moved occurrence, and an occurrence whose guests differ from the series'. The
+/// fake carries the first two by the same rule and leaves the third as stored.
 final class FakeGoogleCalendar: Sendable {
     private let events: Mutex<[String: Data]>
     private let writeLog = Mutex<[String]>([])
@@ -149,6 +155,19 @@ final class FakeGoogleCalendar: Sendable {
                 events.withLock { all in
                     all = all.filter { _, data in
                         ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["recurringEventId"] as? String != parts[0]
+                    }
+                }
+            }
+            if isSeries, let written = patch["attendees"] {
+                let seriesGuests = Self.canonical(stored["attendees"])
+                events.withLock { all in
+                    for (id, data) in all {
+                        guard var occurrence = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                              occurrence["recurringEventId"] as? String == parts[0],
+                              Self.canonical(occurrence["attendees"]) == seriesGuests else { continue }
+                        occurrence["attendees"] = written
+                        // swiftlint:disable:next force_try
+                        all[id] = try! JSONSerialization.data(withJSONObject: occurrence)
                     }
                 }
             }
@@ -254,6 +273,14 @@ final class FakeGoogleCalendar: Sendable {
         // swiftlint:disable:next force_try
         .raw(statusCode: 200, headers: ["Content-Type": "application/json"],
              body: try! JSONSerialization.data(withJSONObject: object))
+    }
+
+    /// A JSON value written with sorted keys, so two stored values compare as Google compares them.
+    private static func canonical(_ value: Any?) -> String {
+        guard let value, JSONSerialization.isValidJSONObject([value]),
+              let data = try? JSONSerialization.data(withJSONObject: [value], options: [.sortedKeys])
+        else { return "null" }
+        return String(decoding: data, as: UTF8.self)
     }
 
     static func allDay(id: String, start: String, end: String, recurring: Bool = false, master: String? = nil) -> [String: Any] {
