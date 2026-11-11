@@ -33,6 +33,10 @@ actor CalDAVProvider: CalendarProvider {
     /// Cached ETag per resource URL for update conflict detection.
     private var etagCache: [String: String] = [:]
 
+    /// The user's own organizer address (`ownOrganizerHref`), once a lookup has found one, for this
+    /// provider's lifetime. In memory only; a new provider (reconnect, Update Password) asks again.
+    private var advertisedOrganizer: String?
+
     init(client: CalDAVClient, calendarHomeURL: URL, serverBaseURL: URL) {
         self.client = client
         self.calendarHomeURL = calendarHomeURL
@@ -235,6 +239,12 @@ actor CalDAVProvider: CalendarProvider {
     /// A series id reads the series (its first date, with its rule); an occurrence id a
     /// listing gave (`CalDAVOccurrences.OccurrenceId`) reads that one occurrence, as a
     /// listing shows it, and throws `notFound` when the series no longer has it.
+    ///
+    /// A resource that holds only changed occurrences, with no series VEVENT (an invitation to
+    /// single occurrences of someone else's series), has no series to read by its own id: that
+    /// is the final answer `notSupported(CalDAVOccurrences.seriesNotInThisCalendar)`, the same
+    /// on every read, never a parse error (#720). A resource with no VEVENT at all stays a
+    /// `parseError`.
     func getEvent(calendarId: String, eventId: String) async throws -> GCalEvent {
         let (seriesHref, occurrenceKey) = try CalDAVOccurrences.OccurrenceId.split(eventId)
         let eventURL = try resolveEventURL(seriesHref, calendarId: calendarId)
@@ -257,6 +267,9 @@ actor CalDAVProvider: CalendarProvider {
         }
         let events = ICSParser.parse(icsText: icsText, resourceHref: seriesHref, etag: etag)
         guard let event = events.first else {
+            if CalDAVOccurrences.holdsOnlyChangedOccurrences(icsText: icsText, href: seriesHref) {
+                throw CalendarProviderError.notSupported(CalDAVOccurrences.seriesNotInThisCalendar)
+            }
             throw CalDAVError.parseError("No VEVENT found in \(eventId)")
         }
         return event
@@ -277,8 +290,7 @@ actor CalDAVProvider: CalendarProvider {
         // CREATE ONLY on purpose — see the pre-generated-id comment above: the
         // 412 from `If-None-Match: *` is what makes an idempotent retry land on
         // the same resource instead of duplicating the event.
-        let (_, _) = try await client.put(
-            url: eventURL, body: icsBody, precondition: .ifNoneMatchAny)
+        try await putEvent(url: eventURL, body: icsBody, precondition: .ifNoneMatchAny)
 
         // Fetch back the created event to return it
         let href = eventURL.path
@@ -342,7 +354,7 @@ actor CalDAVProvider: CalendarProvider {
         // arbitrary user-entered server URL — so the no-ETag branch is reachable
         // and is not an iCloud-only hypothetical. `splitSeries`' cap PUT follows
         // the same rule.
-        let (_, _) = try await client.put(
+        try await putEvent(
             url: eventURL, body: mergedICS,
             precondition: etag.map(CalDAVPutPrecondition.ifMatch) ?? .unconditional)
 
@@ -422,8 +434,9 @@ actor CalDAVProvider: CalendarProvider {
         // is, and the series must no longer read the occurrence.
         try CalDAVOccurrences.requireDeletedAlone(deletion, updatedICS: updatedICS, href: seriesHref)
         // No ETag ⇒ `.unconditional`, as every CalDAV write of a resource the GET above proved
-        // exists (see `updateEvent`).
-        _ = try await client.put(
+        // exists (see `updateEvent`). Through `putEvent`, as every CalDAV PUT: a series with guests
+        // and no organizer gets one (ADR-IOS-109), and a lookup that fails writes nothing.
+        try await putEvent(
             url: eventURL, body: updatedICS,
             precondition: etag.map(CalDAVPutPrecondition.ifMatch) ?? .unconditional)
         etagCache.removeValue(forKey: seriesHref)
@@ -553,7 +566,7 @@ actor CalDAVProvider: CalendarProvider {
         //    No ETag ⇒ `.unconditional`: step 1's GET proved this resource
         //    exists (we spliced the override into the body it returned), so
         //    `If-None-Match: *` would assert the opposite of what we observed.
-        _ = try await client.put(
+        try await putEvent(
             url: eventURL, body: updatedICS,
             precondition: etag.map(CalDAVPutPrecondition.ifMatch) ?? .unconditional)
         etagCache.removeValue(forKey: seriesHref)
@@ -675,12 +688,20 @@ actor CalDAVProvider: CalendarProvider {
         let resources = try Self.seriesSplitResources(
             storedICS: masterICS, slotNaiveISO: masterFrameRecurrenceId,
             cappedRRule: cappedRRule, newRRule: newSeriesRRule, newUid: newUid, patch: patch, now: Date(), zones: zones)
+        // Both bodies get their organizer (`withOrganizer`) before anything is written, so a lookup
+        // that fails here leaves the series untouched. `putEvent` runs the same step again on each:
+        // a body that has its organizer passes unchanged with no request, but when the server
+        // advertises no address nothing is cached, so each PUT looks it up again and one can fail
+        // between the two PUTs. The new part is then written and the series not capped yet; the
+        // retry reaches the cap through the create-only 412 and `successorIsOurs` (ADR-IOS-106).
+        let newPart = try await withOrganizer(resources.newPart)
+        let cappedSeries = try await withOrganizer(resources.cappedSeries)
         // The new part read the way a listing reads it, so the caller gets the
         // series it will see. Read BEFORE any write: a part we cannot read back
         // is refused with nothing written.
         let calURL = try resolveURL(calendarId)
         let newEventURL = calURL.appendingPathComponent("\(newUid).ics")
-        guard let created = ICSParser.parse(icsText: resources.newPart, resourceHref: newEventURL.path, etag: nil).first else {
+        guard let created = ICSParser.parse(icsText: newPart, resourceHref: newEventURL.path, etag: nil).first else {
             throw CalendarProviderError.notSupported("The new part of the repeating event could not be built, so it was not split.")
         }
 
@@ -688,8 +709,7 @@ actor CalDAVProvider: CalendarProvider {
         //    (`.ifNoneMatchAny`): a retry never overwrites a new part the user may
         //    have edited since.
         do {
-            _ = try await client.put(
-                url: newEventURL, body: resources.newPart, precondition: .ifNoneMatchAny)
+            try await putEvent(url: newEventURL, body: newPart, precondition: .ifNoneMatchAny)
         } catch CalDAVError.preconditionFailed {
             // 412: something already occupies the DETERMINISTIC new-part URL. The
             // likely cause is a retry: an earlier attempt created the new part and
@@ -718,11 +738,38 @@ actor CalDAVProvider: CalendarProvider {
         //    the split's read is lost. A change another client made to the later
         //    occurrences after that read is not on the new part and the cap removes it.
         etagCache.removeValue(forKey: seriesHref)
-        _ = try await client.put(
-            url: eventURL, body: resources.cappedSeries,
+        try await putEvent(
+            url: eventURL, body: cappedSeries,
             precondition: etag.map(CalDAVPutPrecondition.ifMatch) ?? .unconditional)
 
         return created
+    }
+
+    /// Every CalDAV event write: the final body gets its organizer (`withOrganizer`), then it is PUT.
+    /// The only caller of `client.put` (`CalDAVOrganizerStepTests.onePutCallSite`).
+    private func putEvent(url: URL, body: String, precondition: CalDAVPutPrecondition) async throws {
+        let body = try await withOrganizer(body)
+        _ = try await client.put(url: url, body: body, precondition: precondition)
+    }
+
+    /// `ics` with every VEVENT that has guests and no organizer given one (`organized`). The user's
+    /// own address is looked up only when the resource needs it (`needsOwnAddress`).
+    private func withOrganizer(_ ics: String) async throws -> String {
+        let own = Self.needsOwnAddress(ics) ? try await ownOrganizerHref() : nil
+        return Self.organized(ics, own: own)
+    }
+
+    /// The address the server advertises for the user (`organizerHref` over `advertisedAddresses`),
+    /// looked up when a write needs it. Only an address found is kept (`advertisedOrganizer`). None
+    /// advertised is not kept, nor is an error (rethrown): an answer that only reads as none (a
+    /// transient refusal, an error page served as a success) then costs one write, and the next
+    /// write that needs the address asks again.
+    private func ownOrganizerHref() async throws -> String? {
+        if let cached = advertisedOrganizer { return cached }
+        let advertised = try await Self.advertisedAddresses(client: client, serverURL: serverBaseURL)
+        let href = Self.organizerHref(advertised: advertised, signIn: client.username)
+        if let href { advertisedOrganizer = href }
+        return href
     }
 
     /// POSITIVE evidence that the resource now occupying `url` is the successor

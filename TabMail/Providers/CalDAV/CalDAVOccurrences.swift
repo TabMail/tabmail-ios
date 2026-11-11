@@ -194,6 +194,23 @@ enum CalDAVOccurrences {
         }
     }
 
+    /// Why a resource that holds only changed occurrences, with no series VEVENT (an invitation
+    /// to single occurrences of someone else's series, RFC 4791 §4.1), is not changed as a whole
+    /// or split: the series is not in this calendar. A final answer, the same on every read, never
+    /// a failure to read; one of its occurrences can be changed on its own, by the id listed for
+    /// it. Refused with it: a read of the resource's own id (`CalDAVProvider.getEvent`, which an
+    /// edit of every occurrence and a split make before the card), and a one-occurrence edit by
+    /// that id or a split at the write (`scopedEdit`).
+    static let seriesNotInThisCalendar =
+        "The series of this repeating event is not in this calendar, which holds only changed occurrences of it (an invitation to single occurrences of someone else's series), so it can't be changed as a whole or split here. One of those occurrences can be changed on its own: edit_scope this_only, with the event_id listed for it and its start_iso as recurrence_id"
+
+    /// Whether `icsText` holds changed occurrences (VEVENTs with a RECURRENCE-ID) and no series
+    /// VEVENT.
+    static func holdsOnlyChangedOccurrences(icsText: String, href: String) -> Bool {
+        let components = ICSParser.components(icsText: icsText, resourceHref: href)
+        return !components.isEmpty && components.allSatisfy { $0.recurrenceId != nil }
+    }
+
     /// The occurrence `key` names in the resource, as a listing shows it, or nil when the
     /// series has no such occurrence now (it was removed, or the series changed since the id
     /// was listed). A cancelled occurrence comes back with status `cancelled`.
@@ -297,8 +314,7 @@ enum CalDAVOccurrences {
             rows = found
         } else {
             guard key != nil, !forSplit else {
-                throw CalendarProviderError.notSupported(
-                    "This calendar entry holds changed occurrences without their repeating event, so TabMail can change one of them only through the event_id listed for it, and can't split it. Nothing was changed.")
+                throw CalendarProviderError.notSupported(seriesNotInThisCalendar)
             }
             rows = standaloneRows(overrides, href: href, timeMin: timeMin, timeMax: timeMax)
         }
@@ -455,7 +471,8 @@ enum CalDAVOccurrences {
     /// other changed occurrence, compared by what each VEVENT is (`vEventIdentities`: the
     /// series, or the occurrence key its RECURRENCE-ID names), so no other changed copy is
     /// lost with the deleted one; it does not compare their content, which the rewrite keeps
-    /// byte for byte. Second, it must no longer have the occurrence (an `EXDATE` the series
+    /// byte for byte (the PUT, through `CalDAVProvider.putEvent`, may then add ORGANIZER lines to
+    /// them, ADR-IOS-109, which changes no VEVENT's identity). Second, it must no longer have the occurrence (an `EXDATE` the series
     /// would not read as it would leave it where it is, its changed copy gone). Throws
     /// `notSupported`, nothing written, when either fails.
     static func requireDeletedAlone(_ deletion: OccurrenceDeletion, updatedICS: String, href: String) throws {

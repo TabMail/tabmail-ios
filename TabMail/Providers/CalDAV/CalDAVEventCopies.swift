@@ -279,15 +279,6 @@ extension CalDAVProvider {
             throw CalendarProviderError.notSupported("A changed occurrence of the repeating event can't be read, so it can't be changed again.")
         }
         block = insertAfterUID(block, ridUnit)
-        // RFC 5545 §3.8.4.3, enforced by iCloud with an HTTP 403: a VEVENT with attendees carries
-        // its organizer. A copy of the series already has it; an override written without one gets
-        // the series' organizer, when the resource holds the series.
-        let top = topLevel(block).compactMap { icsProperty($0.text)?.name }
-        if top.contains("ATTENDEE"), !top.contains("ORGANIZER"),
-           let masterBlock,
-           let organizer = topLevel(masterBlock).first(where: { icsProperty($0.text)?.name == "ORGANIZER" }) {
-            block = insertAfterUID(block, organizer)
-        }
         return spliceOrReplaceOverride(
             ics: storedICS, recurrenceId: recurrenceIdNaive, kind: kind,
             newOverrideBlock: block.flatMap(\.physical).joined(separator: "\r\n"))
@@ -589,7 +580,7 @@ extension CalDAVProvider {
     }
 
     /// True for an occurrence override: a VEVENT with its own `RECURRENCE-ID`.
-    private static func isOverride(_ block: [ICSUnit]) -> Bool {
+    static func isOverride(_ block: [ICSUnit]) -> Bool {
         topLevel(block).contains { icsProperty($0.text)?.name == "RECURRENCE-ID" }
     }
 
@@ -606,7 +597,7 @@ extension CalDAVProvider {
     /// Rewrite every VEVENT of a resource. `transform` gets the block (from `BEGIN:VEVENT` to
     /// `END:VEVENT` inclusive) and whether it is the series' master (no `RECURRENCE-ID`), and returns
     /// the block to write or nil to drop it. Everything outside the VEVENTs is kept as it was.
-    private static func rewriteVEvents(
+    static func rewriteVEvents(
         in ics: String,
         _ transform: ([ICSUnit], Bool) throws -> [ICSUnit]?
     ) rethrows -> String {
@@ -693,7 +684,7 @@ extension CalDAVProvider {
     }
 
     /// Insert one unit right after the VEVENT's `UID`, or right after `BEGIN:VEVENT` when it has none.
-    private static func insertAfterUID(_ block: [ICSUnit], _ unit: ICSUnit) -> [ICSUnit] {
+    static func insertAfterUID(_ block: [ICSUnit], _ unit: ICSUnit) -> [ICSUnit] {
         var depth = 0
         var at = min(1, block.count)
         for (idx, u) in block.enumerated() {

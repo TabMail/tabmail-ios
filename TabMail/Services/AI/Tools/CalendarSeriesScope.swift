@@ -45,8 +45,13 @@ enum CalendarSeriesScope {
         /// The series' id: the event's own id when it is no occurrence (a one-off event, or a series
         /// named by its own id).
         let seriesId: String
-        /// The series, or the event itself when it is no occurrence.
-        let series: GCalEvent
+        /// The series, or the event itself when it is no occurrence. Nil when the edit names an
+        /// occurrence in a scope that does not use its series (`usesSeries`, a `this_only` edit):
+        /// `read` does not read it, and a CalDAV resource holding only changed occurrences (an
+        /// invitation to single occurrences) has none (#720). Never the occurrence in its place:
+        /// an edit of every occurrence or a split gets it from `readSeries()`, which throws when it
+        /// was not read.
+        let series: GCalEvent?
         /// The occurrence the edit names, as the provider's lookup found it
         /// (`CalendarProvider.occurrence`); nil when it names none (a one-off event, or a series
         /// named by its own id with no `recurrence_id`).
@@ -57,6 +62,26 @@ enum CalendarSeriesScope {
         var afterOwnSplitCap = false
 
         var isOccurrence: Bool { seriesId != eventId }
+
+        /// The series an edit of every occurrence or a split is routed by and written to. Thrown
+        /// when it was not read, so such an edit never goes on to the event it names.
+        func readSeries() throws -> GCalEvent {
+            guard let series else { throw CalendarProviderError.notSupported(seriesNotRead) }
+            return series
+        }
+    }
+
+    /// Why an edit of every occurrence or a split is not made when the series was not read
+    /// (`Named.series`). `read` reads it for every scope that uses it, so this is not reached.
+    static let seriesNotRead =
+        "the repeating event this occurrence belongs to was not read, so it can't be changed as a whole or split from here"
+
+    /// Whether an edit in `scope` uses the series of the occurrence it names: an edit of every
+    /// occurrence ("all") and a split (`this_and_following`) are routed by it and may write it. A
+    /// `this_only` edit writes the occurrence alone, through the provider's own one-occurrence
+    /// lookup and write, and reads nothing of the series.
+    static func usesSeries(_ scope: String) -> Bool {
+        scope == "all" || scope == "this_and_following"
     }
 
     /// Read what an edit names: `eventId`, its series when it names an occurrence, and
@@ -66,6 +91,10 @@ enum CalendarSeriesScope {
     /// here, before the card, for every scope alike. A split at an occurrence moved from its place is
     /// not looked for here: `route` may make it an edit of the whole series (the first occurrence),
     /// and the split itself throws at one (#563).
+    ///
+    /// `scope`: the scope the edit is given. The series of an occurrence is read only for a scope
+    /// that uses it (`usesSeries`); a `this_only` edit reads the event and the provider's lookup
+    /// only, and its `Named.series` is nil (#720).
     ///
     /// `splitting`: the queue is about to write a split (`this_and_following`) at `recurrenceId`.
     /// When the series already ends with this split's own cap (`CalendarProvider.isOwnSplitCap`),
@@ -82,19 +111,19 @@ enum CalendarSeriesScope {
     /// start can't be read. A failed read is thrown, never replaced: the edit tool refuses, or the
     /// drain classifies it.
     static func read(
-        eventId: String, recurrenceId: String?, calendarId: String, zone: TimeZone,
+        eventId: String, recurrenceId: String?, scope: String, calendarId: String, zone: TimeZone,
         splitting: Bool, provider: any CalendarProvider
     ) async throws -> Named {
         let event = try await provider.getEvent(calendarId: calendarId, eventId: eventId)
         return try await read(
-            event: event, eventId: eventId, recurrenceId: recurrenceId,
+            event: event, eventId: eventId, recurrenceId: recurrenceId, scope: scope,
             calendarId: calendarId, zone: zone, splitting: splitting, provider: provider)
     }
 
     /// `read`, with `eventId` already read (`event`): the edit tool reads it on its own, to tell a
     /// wrong event id from an occurrence it does not name.
     static func read(
-        event: GCalEvent, eventId: String, recurrenceId: String?, calendarId: String, zone: TimeZone,
+        event: GCalEvent, eventId: String, recurrenceId: String?, scope: String, calendarId: String, zone: TimeZone,
         splitting: Bool, provider: any CalendarProvider
     ) async throws -> Named {
         if let seriesId = event.recurringEventId, !seriesId.isEmpty, seriesId != eventId {
@@ -102,6 +131,18 @@ enum CalendarSeriesScope {
                 throw CalendarProviderError.notSupported(
                     "the start of the occurrence this event_id names can't be read; pass recurrence_id (the occurrence's start_iso as calendar_event_read shows it)")
             }
+            // A `this_only` edit does not use the series: only the occurrence, by the provider's own
+            // lookup (the one its write makes), which refuses a `recurrence_id` naming another
+            // occurrence or none before the card. A CalDAV resource holding only changed
+            // occurrences has no series to read (#720).
+            guard usesSeries(scope) else {
+                let occurrence = try await provider.occurrence(
+                    calendarId: calendarId, eventId: eventId, recurrenceId: named, recurrenceIdZone: zone)
+                return Named(eventId: eventId, event: event, seriesId: seriesId, series: nil, occurrence: occurrence)
+            }
+            // The series, for an edit of every occurrence or a split. Where the calendar holds no
+            // series (a CalDAV resource holding only changed occurrences), the provider refuses this
+            // read with its final reason, before the card and at the drain alike.
             let series = try await provider.getEvent(calendarId: calendarId, eventId: seriesId)
             // Before the lookup: past this split's cap the occurrence may read as deleted.
             if splitting, provider.isOwnSplitCap(of: series, at: named, zone: zone) {
@@ -166,10 +207,12 @@ enum CalendarSeriesScope {
     ///   they mean.
     ///
     /// Refused, with nothing written: an occurrence before the series' first, one whose place in
-    /// the series can't be read, and a series whose start can't be read.
+    /// the series can't be read, a series whose start can't be read, and an edit of every
+    /// occurrence or a split whose series was not read (`Named.readSeries`): never as given.
     static func route(_ args: [String: JSONValue], scope: String, named: Named, zone: TimeZone) throws -> Routed {
         let asGiven = Routed(scope: scope, args: args, eventId: named.eventId)
-        let series = named.series
+        guard usesSeries(scope) else { return asGiven }
+        let series = try named.readSeries()
         guard !(series.recurrence ?? []).isEmpty else { return asGiven }
         switch scope {
         case "this_and_following":
@@ -179,7 +222,7 @@ enum CalendarSeriesScope {
             let slot = try slotPlace(occurrence)
             switch try order(slot, first) {
             case .orderedAscending: throw beforeFirst(shown(slot, zone: zone), first: first, zone: zone)
-            case .orderedSame: return try routeEvery(args, named: named, occurrence: occurrence, first: first, zone: zone)
+            case .orderedSame: return try routeEvery(args, named: named, series: series, occurrence: occurrence, first: first, zone: zone)
             case .orderedDescending: return asGiven
             }
         case "all":
@@ -197,17 +240,16 @@ enum CalendarSeriesScope {
                 }
                 return asGiven
             }
-            return try routeEvery(args, named: named, occurrence: occurrence, first: first, zone: zone)
+            return try routeEvery(args, named: named, series: series, occurrence: occurrence, first: first, zone: zone)
         default:
             return asGiven
         }
     }
 
-    /// An edit of every occurrence named at `occurrence` (see `route`).
+    /// An edit of every occurrence of `series` named at `occurrence` (see `route`).
     private static func routeEvery(
-        _ args: [String: JSONValue], named: Named, occurrence: GCalEvent, first: Place, zone: TimeZone
+        _ args: [String: JSONValue], named: Named, series: GCalEvent, occurrence: GCalEvent, first: Place, zone: TimeZone
     ) throws -> Routed {
-        let series = named.series
         let slot = try slotPlace(occurrence)
         let isFirst: Bool
         switch try order(slot, first) {
@@ -280,7 +322,8 @@ enum CalendarSeriesScope {
         guard scope == "all" || scope == "this_and_following",
               let start = CalendarToolHelpers.stringArgOpt(args, "start_iso"),
               !givesRule(args) else { return nil }
-        let series = named.series
+        // Both scopes read the series (`usesSeries`); one not read is refused, never passed.
+        guard let series = named.series else { return seriesNotRead }
         let days = namedDays(series)
         guard !days.isEmpty else { return nil }
         let instead = "give the new repeat rule (recurrence) with the move, or change just that date (edit_scope 'this_only' with recurrence_id)"

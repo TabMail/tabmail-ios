@@ -131,6 +131,18 @@ enum CalDAVToolWire {
     static func deletes(_ http: FakeHTTP.Scenario) -> [String] {
         http.recordedCalls().filter { $0.method == "DELETE" }.map(\.url)
     }
+
+    /// An invitation to one changed occurrence of another organizer's series (RFC 4791 §4.1),
+    /// seeded on the harness's server at `path`: a resource with a RECURRENCE-ID VEVENT and no
+    /// series VEVENT (`OccurrenceWireFixture.overrideOnly`), its RECURRENCE-ID in `form`. Returns
+    /// its path, its text and the id a listing gives its one occurrence.
+    static func seedOverrideOnly(
+        _ harness: Harness, form: String, moved: Bool = true, path: String = "/cal/invite.ics"
+    ) throws -> (path: String, ics: String, occurrenceId: String) {
+        let invite = try harness.fixture.overrideOnly(form: form, moved: moved)
+        harness.store.seed(path: path, ics: invite.ics)
+        return (path, invite.ics, CalDAVOccurrences.OccurrenceId.make(seriesHref: path, key: invite.key))
+    }
 }
 
 @Suite("calendar tools: one day of a CalDAV repeating event never deletes the series", .serialized, .processGlobalState)
@@ -250,35 +262,11 @@ struct CalDAVOccurrenceDeleteToolToWireTests {
         #expect(!sentBeforeConfirming.contains { $0.method == "DELETE" }, "the DELETE was sent before the user confirmed the card")
     }
 
-    /// An invitation to one changed occurrence of another organizer's series (RFC 4791 §4.1),
-    /// seeded on the harness's server: a resource with a RECURRENCE-ID VEVENT and no series
-    /// VEVENT. Returns its path, its text and the id a listing gives its one occurrence.
-    private static func seedChangedOnlyResource(_ harness: CalDAVToolWire.Harness) throws -> (path: String, ics: String, occurrenceId: String) {
-        let fixture = harness.fixture
-        let slot = try fixture.occurrence(2)
-        let start = slot.addingTimeInterval(60 * 60)
-        let wall = { (date: Date) in OccurrenceFixture.wall(date, fixture.zone) }
-        let path = "/cal/invite.ics"
-        let ics = OccurrenceFixture.ics([[
-            "UID:invite-1",
-            "DTSTAMP:\(OccurrenceFixture.utcValue(fixture.first))",
-            "RECURRENCE-ID;TZID=America/New_York:\(wall(slot))",
-            "DTSTART;TZID=America/New_York:\(wall(start))",
-            "DTEND;TZID=America/New_York:\(wall(start.addingTimeInterval(30 * 60)))",
-            "SUMMARY:Planning",
-            "ORGANIZER:mailto:organizer@example.com",
-            "ATTENDEE:mailto:user@example.com",
-        ].joined(separator: "\n")])
-        harness.store.seed(path: path, ics: ics)
-        let occurrenceId = CalDAVOccurrences.OccurrenceId.make(seriesHref: path, key: OccurrenceFixture.utcValue(slot))
-        return (path, ics, occurrenceId)
-    }
-
     @Test("one occurrence of a resource holding only changed occurrences: the card says the rest stays, and the delete is refused with no DELETE sent")
     func changedOnlyOccurrenceCardSaysTheRestStays() async throws {
         let harness = try await H.makeHarness(accountId: "caldav-changed-only-occurrence-delete")
         defer { H.tearDown(harness) }
-        let (path, ics, occurrenceId) = try Self.seedChangedOnlyResource(harness)
+        let (path, ics, occurrenceId) = try H.seedOverrideOnly(harness, form: "tzid")
 
         let translator = ChatIdTranslator.createIsolated()
         let compound = CompoundEventId.make(accountId: harness.accountId, eventId: occurrenceId)
@@ -308,7 +296,7 @@ struct CalDAVOccurrenceDeleteToolToWireTests {
         let harness = try await H.makeHarness(accountId: "caldav-override-only-delete")
         defer { H.tearDown(harness) }
         // Its own href names every occurrence it holds, and a WebDAV DELETE of it can't be undone.
-        let (invitePath, inviteICS, _) = try Self.seedChangedOnlyResource(harness)
+        let (invitePath, inviteICS, _) = try H.seedOverrideOnly(harness, form: "tzid")
 
         let translator = ChatIdTranslator.createIsolated()
         let inviteCompound = CompoundEventId.make(accountId: harness.accountId, eventId: invitePath)

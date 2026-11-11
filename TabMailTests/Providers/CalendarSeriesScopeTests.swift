@@ -1451,7 +1451,7 @@ struct CalendarSeriesScopeRouteTests {
         if routed.eventId == named.eventId, !(routed.recurrenceId == nil && routed.eventId == named.seriesId) {
             reread = named
         } else {
-            reread = Self.named(named.series)
+            reread = Self.named(try named.readSeries())
         }
         let again = try CalendarSeriesScope.route(routed.args, scope: routed.scope, named: reread, zone: zone)
         #expect(again.scope == routed.scope && again.args == routed.args, "routed again: \(again.scope), not \(routed.scope)")
@@ -2075,6 +2075,194 @@ struct DeletedAfterTheCardTests {
             $0.status == PendingStatus.failed.rawValue && $0.failureReason == Self.staleReason
         }, "rows: \(reasons(ops))")
         #expect(harness.store.storedICS(path: W.seriesPath) == deleted, "the series was changed")
+    }
+}
+
+// MARK: - A series rewritten to hold only changed occurrences after the card
+
+/// The card is built while the CalDAV resource holds its series; before the user confirms, the server
+/// rewrites it to hold only the one changed occurrence the user is still invited to, with no series
+/// VEVENT (a scheduling server does this when the organizer keeps the user on one occurrence and
+/// drops them from the series). A second calendar operation on the same account is queued after it.
+///
+/// PROPERTY (never-drop's wedge corollary, memory 146 invariant 4): after ONE drain nothing is left
+/// queued, the second operation ran, and the edit ended terminally: a `this_only` edit written to
+/// the occurrence the card named, any other scope retired with nothing written. Neither the error
+/// type, the reason text nor the drain arm is asserted.
+///
+/// Also the row a build before the series read existed could have left: a `this_only` edit of an
+/// occurrence in a resource that already held only changed occurrences, put straight into the queue.
+@Suite("A resource rewritten to hold only changed occurrences after the card never wedges the calendar queue", .serialized, .processGlobalState)
+struct RewrittenAfterTheCardTests {
+    typealias W = OccurrenceWireFixture
+    typealias H = CalDAVToolWire
+
+    private static let newTitle = "Retitled"
+    /// The second operation's event: a one-off on the same account, renamed.
+    private static let otherPath = "/cal/lunch.ics"
+    private static let otherTitle = "Team lunch"
+
+    /// A one-off event at `otherPath`, an hour after the fixture's first occurrence.
+    private static func oneOff(_ fixture: W) -> String {
+        let wall = { (date: Date) in OccurrenceFixture.wall(date, fixture.zone) }
+        let start = fixture.first.addingTimeInterval(3 * 60 * 60)
+        return OccurrenceFixture.ics([[
+            "UID:lunch-1",
+            "DTSTAMP:\(OccurrenceFixture.utcValue(fixture.first))",
+            "DTSTART;TZID=America/New_York:\(wall(start))",
+            "DTEND;TZID=America/New_York:\(wall(start.addingTimeInterval(60 * 60)))",
+            "SUMMARY:Lunch",
+        ].joined(separator: "\n")])
+    }
+
+    /// The second operation, put straight into the queue (no drain of its own): a rename of the
+    /// one-off event.
+    private static func queueSecondOperation(_ harness: H.Harness) async throws -> PendingCalendarOperation {
+        let op = PendingCalendarOperation(
+            operationType: .edit, accountId: harness.accountId, eventId: otherPath, calendarId: W.calendarId,
+            arguments: ["title": .string(otherTitle), "timezone": .string(harness.fixture.zone.identifier)])
+        try await harness.pool.write { db in try op.insert(db) }
+        return op
+    }
+
+    /// Waits for a drain another trigger started (the tool's own, after its card) to finish, so the
+    /// test's one drain is not skipped as "already draining".
+    private static func waitForTheRunningDrain() async {
+        for _ in 0..<400 {
+            if await !AccountManager.shared.isDrainingCalendar { return }
+            try? await Task.sleep(nanoseconds: 25_000_000)
+        }
+    }
+
+    /// The edit's state on the server after the drain, and what is left in the queue.
+    private struct Outcome {
+        let rows: [PendingCalendarOperation]
+        let second: PendingCalendarOperation
+        let stored: String?
+        let otherStored: String?
+        let puts: [String]
+        let deletes: [String]
+    }
+
+    private static func drainOnce(_ harness: H.Harness, second: PendingCalendarOperation, path: String) async throws -> Outcome {
+        await AccountManager.shared.drainCalendarQueue()
+        let rows = try await harness.pool.read { db in try PendingCalendarOperation.fetchAll(db) }
+        return Outcome(
+            rows: rows, second: second, stored: harness.store.storedICS(path: path),
+            otherStored: harness.store.storedICS(path: otherPath),
+            puts: harness.store.recordedPuts().map(\.path), deletes: H.deletes(harness.http))
+    }
+
+    /// The property, for an edit expected written (`written`) or retired.
+    private static func expectTerminal(
+        _ outcome: Outcome, label: String, written: Bool, before rewritten: String, path: String
+    ) {
+        let queued = outcome.rows.filter { $0.status != PendingStatus.failed.rawValue }
+        #expect(queued.isEmpty, "\(label): left queued after a drain: \(reasons(queued)) retry \(queued.map(\.retryCount))")
+        #expect(!outcome.rows.contains { $0.id == outcome.second.id },
+                "\(label): the next operation on the account did not run: \(reasons(outcome.rows))")
+        #expect(outcome.otherStored?.contains("SUMMARY:\(otherTitle)") == true,
+                "\(label): the next operation's write is not on the server")
+        #expect(outcome.deletes.isEmpty, "\(label): DELETE: \(outcome.deletes)")
+        let edits = outcome.rows.filter { $0.id != outcome.second.id }
+        if written {
+            #expect(edits.isEmpty, "\(label): the edit did not complete: \(reasons(edits))")
+            #expect(outcome.puts.filter { $0 == path } == [path], "\(label): not one write of the resource: \(outcome.puts)")
+            let stored = outcome.stored ?? ""
+            #expect(stored.components(separatedBy: "BEGIN:VEVENT").count - 1 == 1, "\(label): the write added a VEVENT: \(stored)")
+            #expect(stored.contains("SUMMARY:\(newTitle)"), "\(label): the occurrence was not changed: \(stored)")
+            for name in ["RECURRENCE-ID", "DTSTART", "DTEND"] {
+                #expect(lines(stored, named: name) == lines(rewritten, named: name),
+                        "\(label): the write changed the occurrence's \(name): \(lines(stored, named: name))")
+            }
+        } else {
+            #expect(edits.count == 1 && edits.allSatisfy { $0.status == PendingStatus.failed.rawValue },
+                    "\(label): the edit was not retired: \(reasons(edits))")
+            #expect(!outcome.puts.contains(path), "\(label): written: \(outcome.puts)")
+            #expect(outcome.stored == rewritten, "\(label): the resource is not on the server as it was")
+        }
+    }
+
+    private static func lines(_ ics: String, named name: String) -> [String] {
+        ics.components(separatedBy: .newlines).filter { $0.hasPrefix("\(name):") || $0.hasPrefix("\(name);") }
+    }
+
+    struct Case: CustomTestStringConvertible, Sendable {
+        let scope: String
+        let written: Bool
+        var testDescription: String { scope }
+    }
+
+    static let cases = [
+        Case(scope: "this_only", written: true),
+        Case(scope: "all", written: false),
+        Case(scope: "this_and_following", written: false),
+    ]
+
+    @Test("rewritten between the card and the drain: after one drain nothing is queued, the next operation ran, and the edit is written (this_only) or retired",
+          arguments: cases)
+    func rewrittenBetweenTheCardAndTheDrain(_ entry: Case) async throws {
+        let session = "caldav-rewritten-\(entry.scope)"
+        let harness = try await H.makeHarness(accountId: session)
+        defer { H.tearDown(harness) }
+        let fixture = harness.fixture
+        harness.store.seed(path: Self.otherPath, ics: Self.oneOff(fixture))
+        let slot = try fixture.occurrence(2)
+        let eventId = try fixture.occurrenceId(2)
+        // The same resource, holding only that occurrence where it is, as the server rewrites it.
+        let rewritten = try fixture.overrideOnly(form: "tzid", moved: false)
+        try #require(rewritten.key == OccurrenceFixture.utcValue(slot), "the rewrite names another occurrence")
+
+        let translator = ChatIdTranslator.createIsolated()
+        let compound = CompoundEventId.make(accountId: harness.accountId, eventId: eventId)
+        let forModel = await translator.processToolOutputForLLM("event_id: \(compound)")
+        let numericId = try #require(H.eventIds(in: forModel).first.flatMap { Int($0) })
+        await H.recordCalendar(of: eventId, accountId: harness.accountId, translator: translator)
+        var arguments: [String: JSONValue] = [
+            "event_id": .string(String(numericId)), "edit_scope": .string(entry.scope),
+            "title": .string(Self.newTitle), "timezone": .string(fixture.zone.identifier),
+        ]
+        if entry.scope != "all" {
+            arguments["recurrence_id"] = .string(OccurrenceFixture.naive(slot, fixture.zone))
+        }
+        let store = harness.store
+        let sink = RecordingCardSink(beforeConfirming: { store.seed(path: W.seriesPath, ics: rewritten.ics) })
+        let output = try await CalendarEventEditTool(context: ToolContext(db: harness.pool, translator: translator)).execute(
+            arguments: arguments, invocation: ToolInvocation(uiSink: sink, sessionKey: session))
+        let cards = await sink.cards
+        #expect(cards.count == 1, "\(entry.scope): no card, so the edit never reached the queue: \(output)")
+
+        // The id the listing gave at the card still names that occurrence after the rewrite.
+        let listed = try await W.makeProvider(harness.http).listEvents(
+            calendarId: W.calendarId, timeMin: slot.addingTimeInterval(-60), timeMax: slot.addingTimeInterval(60),
+            query: nil, singleEvents: true, maxResults: 250, orderBy: "startTime")
+        #expect(listed.contains { $0.id == eventId && $0.startDate == slot },
+                "\(entry.scope): after the rewrite no occurrence is listed with the card's id at its start: \(listed.map { "\($0.id ?? "nil") \($0.start?.dateTime ?? "nil")" })")
+
+        await Self.waitForTheRunningDrain()
+        let second = try await Self.queueSecondOperation(harness)
+        let outcome = try await Self.drainOnce(harness, second: second, path: W.seriesPath)
+        Self.expectTerminal(outcome, label: entry.scope, written: entry.written, before: rewritten.ics, path: W.seriesPath)
+    }
+
+    @Test("a this_only edit of an occurrence in a resource that holds only changed occurrences, already in the queue: written in one drain, and the next operation ran")
+    func queuedThisOnlyOnAnOverrideOnlyResource() async throws {
+        let harness = try await H.makeHarness(accountId: "caldav-queued-override-only")
+        defer { H.tearDown(harness) }
+        let fixture = harness.fixture
+        harness.store.seed(path: Self.otherPath, ics: Self.oneOff(fixture))
+        let (path, ics, occurrenceId) = try H.seedOverrideOnly(harness, form: "tzid", moved: false)
+        let edit = PendingCalendarOperation(
+            operationType: .edit, accountId: harness.accountId, eventId: occurrenceId, calendarId: W.calendarId,
+            arguments: [
+                "edit_scope": .string("this_only"),
+                "recurrence_id": .string(OccurrenceFixture.naive(try fixture.occurrence(2), fixture.zone)),
+                "title": .string(Self.newTitle), "timezone": .string(fixture.zone.identifier),
+            ])
+        try await harness.pool.write { db in try edit.insert(db) }
+        let second = try await Self.queueSecondOperation(harness)
+        let outcome = try await Self.drainOnce(harness, second: second, path: path)
+        Self.expectTerminal(outcome, label: "queued this_only", written: true, before: ics, path: path)
     }
 }
 

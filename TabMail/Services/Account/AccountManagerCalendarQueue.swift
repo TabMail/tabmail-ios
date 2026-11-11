@@ -842,8 +842,8 @@ extension AccountManager {
             // goes on to `splitSeries` below, which writes what the interrupted attempt did not.
             let named = try await CalendarSeriesScope.read(
                 eventId: eventId, recurrenceId: CalendarToolHelpers.stringArgOpt(args, "recurrence_id"),
-                calendarId: calId, zone: recurrenceIdZone, splitting: givenScope == "this_and_following",
-                provider: provider)
+                scope: givenScope, calendarId: calId, zone: recurrenceIdZone,
+                splitting: givenScope == "this_and_following", provider: provider)
             let routed = try CalendarSeriesScope.route(args, scope: givenScope, named: named, zone: recurrenceIdZone)
             // The tool makes an "all" edit that moves a later occurrence to another date a split before
             // its card; one that reaches the queue as "all" was confirmed as a change of every
@@ -919,7 +919,7 @@ extension AccountManager {
             // model.
             let movesTime = CalendarToolHelpers.stringArgOpt(resolvedArgs, "start_iso") != nil
                 || CalendarToolHelpers.stringArgOpt(resolvedArgs, "end_iso") != nil
-            let written = routed.scope == "all" ? named.series : named.event
+            let written = routed.scope == "all" ? try named.readSeries() : named.event
             var stored: GCalEvent? = nil
             if resolvedAllDay == nil,
                movesTime || CalendarToolHelpers.recurrenceUntilIsAtStake(resolvedArgs) {
@@ -1427,10 +1427,8 @@ extension AccountManager {
     /// drain loop's side effects.
     static func isCalendarBadRequestError(_ error: Error) -> Bool {
         // Indeterminate — "come back later", not "your payload is broken".
-        // Shared by all three arms so they cannot drift apart.
-        func isIndeterminate(_ code: Int) -> Bool {
-            code == 408 || code == 409 || code == 423 || code == 425 || code == 429
-        }
+        // Shared by all three arms, and with the CalDAV organizer lookup, so they cannot drift apart.
+        let isIndeterminate = CalendarHTTPStatus.isComeBackLater
         if case GoogleCalendarError.httpError(let code, _) = error, (400...499).contains(code), code != 401 && code != 403 && code != 404 && !isIndeterminate(code) { return true }
         if case ExchangeCalendarError.httpError(let code, _) = error, (400...499).contains(code), code != 401 && code != 403 && code != 404 && !isIndeterminate(code) { return true }
         // CalDAV: 401/404/412 already map to dedicated cases (authFailed /

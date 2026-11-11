@@ -91,6 +91,22 @@ of the resource, which holds every occurrence (irreversible wire operation #5, n
      §3.8.4.4 writes every `RECURRENCE-ID` of one event in the same value type and zone), adds no
      VEVENT, and adds no organizer, having no series to copy one from. The resource's own id, which
      names no series, and every split are refused.
+     **Amendment (2026-11-11, ADR-IOS-109, #711):** "adds no organizer" becomes "adds only an
+     organizer the resource already names". Every CalDAV PUT now runs one organizer step
+     (`CalDAVProvider.putEvent`): a changed occurrence with guests and no organizer takes one that
+     another VEVENT of the resource names. Such a resource never gets the account's own address,
+     which would forge the meeting's identity (ADR-IOS-052).
+     **Amended 2026-11-11 (#720).** The series is not in this calendar, and that is the final rule,
+     refused in one reason (`CalDAVOccurrences.seriesNotInThisCalendar`, which names `this_only` by the
+     listed id and its `start_iso` as what can be changed): `getEvent` of the resource's own id throws
+     it as `notSupported` (was `CalDAVError.parseError("No VEVENT found")`, which the calendar queue
+     requeued forever, holding the account's later operations); `scopedEdit`'s own-id and split
+     refusal throws the same reason. Since `CalendarSeriesScope.read` reads the series for an edit of
+     every occurrence and a split (memory 146), "all" (or no scope and no `recurrence_id`) and
+     `this_and_following` named by such an occurrence's id are refused BEFORE the card, nothing
+     queued; one that reaches the drain (the resource rewritten after the card) is retired in that
+     drain. `this_only` reads no series and is written, before #560's read and after it alike. A
+     resource with no VEVENT at all stays a `parseError`.
    - Delete: `deleteEvent` by an occurrence id is REFUSED before any request ("Deleting one
      occurrence of a repeating CalDAV event is not supported yet, so nothing was deleted. The user can
      delete it in their calendar app."). The queue retires it as unsupported and the card and the
@@ -147,7 +163,8 @@ of the resource, which holds every occurrence (irreversible wire operation #5, n
 - A one-occurrence edit or a split of a series the device can't expand is refused where the code
   before this ADR wrote an override or a split at the given time unchecked. A resource that holds only
   overrides takes a one-occurrence edit by the occurrence's id, where the code before this ADR could
-  not list it at all, and refuses a split.
+  not list it at all, and refuses a split. **Amended 2026-11-11 (#720):** and refuses a split or an
+  edit of every occurrence before the card, as its series not being in this calendar.
 - "This and following" at a moved occurrence is refused with nothing written; that occurrence can
   still be changed alone, and the split made in the user's calendar app.
 - The series id with a moved occurrence's new time edits that occurrence in place, and with its old
@@ -174,10 +191,13 @@ with nothing written, exactly at moved occurrences in every series frame named f
 or another; a
 `recurrence_id` that names no occurrence, one after a `COUNT` series' end or a cancelled one, not
 found with nothing written; another occurrence than the id's refused; a resource that holds only
-overrides edited in place by the occurrence's id, its own id and splits refused),
+overrides edited in place by the occurrence's id, its own id, splits and a read of its own id refused
+as its series not being in this calendar, #720),
 `CalDAVOccurrenceEditToolToWireTests` (the invariant over every scope and both id kinds, from
 `calendar_event_edit` to the wire: the write matches the card, or the edit is refused with nothing sent
-after the user confirmed, on an unmoved occurrence and on one moved past later ones; and a move whose
+after the user confirmed, on an unmoved occurrence and on one moved past later ones; on a resource
+that holds only changed occurrences, every RECURRENCE-ID form × every scope: `this_only` written,
+the rest refused before the card with the resource byte for byte, #720; and a move whose
 response is lost retired as not found on its retry, nothing written again, the queue left empty),
 `CalDAVOccurrenceDeleteToolToWireTests` (the same from `calendar_read` /
 `calendar_search` through `calendar_event_delete`) and `CalDAVOccurrenceToolOutputTests`. `ICSParserTests.skipsRecurrenceExceptions` and

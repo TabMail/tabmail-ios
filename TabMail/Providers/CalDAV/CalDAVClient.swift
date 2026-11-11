@@ -27,7 +27,7 @@ enum CalDAVPutPrecondition: Equatable, Sendable {
 /// Handles PROPFIND, REPORT, PUT, DELETE with Basic auth and correct headers.
 actor CalDAVClient {
     private let session: URLSession
-    private let username: String
+    nonisolated let username: String
     private let password: String
 
     init(username: String, password: String) {

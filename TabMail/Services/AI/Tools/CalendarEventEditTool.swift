@@ -205,7 +205,7 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         let named: CalendarSeriesScope.Named
         do {
             named = try await CalendarSeriesScope.read(
-                event: fetchedEvent, eventId: eventId, recurrenceId: recurrenceIdArg,
+                event: fetchedEvent, eventId: eventId, recurrenceId: recurrenceIdArg, scope: resolvedScope,
                 calendarId: lookupCalId, zone: tz, splitting: false, provider: provider)
         } catch CalendarProviderError.notSupported(let reason) {
             return ToolJSON.string(from: [
@@ -270,7 +270,7 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         }
         // The event the card shows and the checks below read: the series on an edit of every
         // occurrence, which is what the queue writes; otherwise the event named.
-        let shown = resolvedScope == "all" ? named.series : fetchedEvent
+        let shown = resolvedScope == "all" ? try named.readSeries() : fetchedEvent
 
         // An all-day event given a time of day without `all_day`, an all-day end on or before
         // its start, or a stated `all_day` of the other kind with no start or end, is refused
@@ -317,13 +317,13 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         // A whole-series edit may reset the occurrences the user changed one by one (#423): on
         // Outlook any change of the series' rule, start or end does. Say so on the card. The
         // series' calendar decides, as its write does, from the series the edit writes
-        // (`named.series`, read above) and the edit as routed, which is what the queue writes; a
+        // (`shown`, the series read above) and the edit as routed, which is what the queue writes; a
         // rename, or a rule equal to the stored one, which the assistant re-sends with other edits,
         // gets no line.
-        if resolvedScope == "all", named.series.recurrence?.isEmpty == false,
+        if resolvedScope == "all", shown.recurrence?.isEmpty == false,
            let edit = try? CalendarToolHelpers.buildGCalEventInput(
-               arguments, isAllDay: CalendarToolHelpers.boolArg(arguments, "all_day") ?? named.series.isAllDay),
-           provider.editResetsChangedOccurrences(named.series, edit: edit) {
+               arguments, isAllDay: CalendarToolHelpers.boolArg(arguments, "all_day") ?? shown.isAllDay),
+           provider.editResetsChangedOccurrences(shown, edit: edit) {
             changes.append(CalendarToolHelpers.ruleChangeResetNote)
         }
         let showsOccurrence = resolvedScope != "all"

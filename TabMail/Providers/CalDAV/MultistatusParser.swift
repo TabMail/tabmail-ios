@@ -11,6 +11,10 @@ enum MultistatusParser {
     struct Response {
         var href: String
         var properties: [String: String] = [:]
+        /// Every href inside a property, in the server's order, keyed by the property's name. A
+        /// property may hold several (`calendar-user-address-set`, RFC 6638 §2.4.1); `properties`
+        /// keeps only the last of them.
+        var propertyHrefs: [String: [String]] = [:]
         var calendarData: String?
         var etag: String?
         var resourceType: Set<String> = []
@@ -90,6 +94,7 @@ private final class MultistatusXMLDelegate: NSObject, XMLParserDelegate {
             // href inside a property (e.g., current-user-principal, calendar-home-set)
             if let parent = elementStack.dropLast().last {
                 currentResponse?.properties[parent] = text
+                currentResponse?.propertyHrefs[parent, default: []].append(text)
             }
         } else if localName == "calendar-data" {
             currentResponse?.calendarData = text
