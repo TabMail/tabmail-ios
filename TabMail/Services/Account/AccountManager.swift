@@ -244,14 +244,13 @@ actor AccountManager {
     }
 
     /// Check if an error is a genuine authentication failure (not a timeout or network error).
+    ///
+    /// Typed only. A refused IMAP login is classified by its response code where
+    /// it happens (`IMAPProvider.createServer`), which reports through the
+    /// injected `SignInOutcomeReporter`; matching the error's text here would let a
+    /// temporary refusal whose prose says "login failed" ask the user to sign in.
     nonisolated func isAuthError(_ error: Error) -> Bool {
         if case ProviderError.authenticationFailed = error { return true }
-        let msg = "\(error)"
-        // IMAP LOGIN failures contain "NO [AUTHENTICATIONFAILED]" or "LOGIN failed"
-        if msg.contains("AUTHENTICATIONFAILED") { return true }
-        if msg.contains("LOGIN failed") || msg.contains("login failed") { return true }
-        // Reject app-specific password errors
-        if msg.contains("Application-specific password required") { return true }
         return false
     }
 
@@ -1297,6 +1296,53 @@ actor AccountManager {
         authFailedAccounts.remove(accountId)
     }
 
+    /// Apply what a provider learned from a login the server answered: a refusal of
+    /// the credentials raises "sign in again", an accepted login clears it. An
+    /// account being removed is not marked. Clearing an unmarked account publishes
+    /// nothing, since every pooled connection reports its own login.
+    func recordSignInOutcome(_ outcome: SignInOutcome, accountId: String) {
+        switch outcome {
+        case .credentialsRefused:
+            guard !isRuntimeRemoved(accountId) else { return }
+            authFailedAccounts.insert(accountId)
+        case .accepted:
+            guard authFailedAccounts.contains(accountId) else { return }
+            authFailedAccounts.remove(accountId)
+        }
+    }
+
+    #if DEBUG
+    /// Test seam: `IMAPProvider`'s TLS override for providers this factory builds,
+    /// so the factory and `updateIMAPPassword` can be driven against the plain-TCP
+    /// `FakeIMAPServer`. `nil` (production) lets SwiftMail choose.
+    private nonisolated let imapUseTLSOverrideBox = Mutex<Bool?>(nil)
+    nonisolated func setIMAPUseTLSOverrideForTesting(_ useTLS: Bool?) {
+        imapUseTLSOverrideBox.withLock { $0 = useTLS }
+    }
+    private nonisolated var imapUseTLSOverride: Bool? { imapUseTLSOverrideBox.withLock { $0 } }
+    #else
+    private nonisolated var imapUseTLSOverride: Bool? { nil }
+    #endif
+
+    /// Make an accepted, saved password probe the account's live provider. Attaches
+    /// the account's real sign-in reporter and stores the provider in ONE actor
+    /// turn (no `await` between), so the live provider always reports.
+    func installAcceptedPasswordProbeAsLive(_ provider: IMAPProvider, accountId: String) {
+        // The replaced provider still holds the old password; a refusal it reports
+        // late must not mark the account the user just fixed. Detach it in the
+        // same actor turn as the swap (no await between).
+        (providers[accountId] as? IMAPProvider)?.attachSignInOutcomeReporter(nil)
+        provider.attachSignInOutcomeReporter(makeSignInOutcomeReporter(accountId: accountId))
+        providers[accountId] = provider
+    }
+
+    /// The reporter the provider factory injects for `accountId`.
+    nonisolated func makeSignInOutcomeReporter(accountId: String) -> SignInOutcomeReporter {
+        return { @Sendable outcome in
+            await self.recordSignInOutcome(outcome, accountId: accountId)
+        }
+    }
+
     func setFastSyncMode(_ active: Bool) {
         fastSyncModeActive = active
     }
@@ -1737,7 +1783,13 @@ actor AccountManager {
             password: password,
             senderEmail: account.emailAddress,
             smtpHost: account.smtpHost ?? host.replacingOccurrences(of: "imap", with: "smtp"),
-            smtpPort: account.smtpPort ?? 587
+            smtpPort: account.smtpPort ?? 587,
+            useTLS: imapUseTLSOverride,
+            // Only the account's live provider reports sign-in outcomes. A probe of
+            // a new password (`passwordOverride`) must never mark the account; it
+            // gets the real reporter only when it becomes live
+            // (`installAcceptedPasswordProbeAsLive`).
+            signInOutcome: passwordOverride == nil ? makeSignInOutcomeReporter(accountId: account.id) : nil
         )
     }
 }

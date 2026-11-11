@@ -165,6 +165,58 @@ which hides the condition from any walker keyed on the flag), and the register r
 > is a user-visible surface" is now TRUE — but only for non-connection errors.** State it with that
 > qualifier or it becomes the same over-broad claim the correction above was written to retract.
 
+
+### 5. REVERSED (2026-11-10) — the inbox error banner no longer has a developer (raw text) branch
+
+§4 above kept a debug-gated DETAIL: with logging unlocked the banner showed the stored
+`error.localizedDescription`. That rule is reversed; §4 stays as history. The banner and the account
+re-authentication alert now show **only fixed plain lines, never text derived from an error, in every
+build**. The error's text stays in the debug-gated logs only.
+
+- **Why.** The stored text was a library rendering, and it reached users: a temporary IMAP login refusal
+  appeared as `Login failed: no([UNAVAILABLE] …)`. Debug unlocks are used on real devices too.
+- **Where the decision lives.** `InboxErrorBanner.text(for: Error)` (in `AccountManagerState.swift`)
+  returns `genericMessage` or `nil`; `nil` for cancellation, database suspension, transient refusals
+  (`SyncEngine.isTransientError`, which now includes `ProviderTemporaryRefusal`), connection errors
+  (offline still shows no banner) and `AuthError.refreshFailed` (a refused sign-in is told by the
+  per-account `SignInAgainBanner`, which reads `authFailedAccounts`). `AccountReauthAlert.line(for:)`
+  in `AccountDetailView.swift` does the same for the alert. `text(for:loggingEnabled:)` is deleted.
+- **Sync banner state.** The rule is stated once in code, on `AccountManagerState.finishSyncRun`; its two
+  writers are `finishSyncRun(coverage:countedFailure:completed:)` and `failRefresh(countedFailure:)`. The
+  generic banner is raised only by a user-started refresh (`InboxViewModel.performSync`) that failed with
+  an error that counts (`InboxErrorBanner.countsAsFailure`, and a shown line). A failed refresh never clears
+  it: the failure path calls `failRefresh`, which has no clear branch (main's behaviour). It is cleared only by
+  a run that covered every active account with no counted failure; polls (`AccountManager.foregroundPollRun`,
+  `backgroundPollRun`) clear it this way, so recovery heals it, and never raise it. Sign-in errors never
+  count, for raising or clearing, decided by error KIND with no account lookup
+  (`InboxErrorBanner.isSignInError`: `ProviderError.authenticationFailed`, `AuthError.refreshFailed`, and a
+  provider error whose `ProviderClassifiedError.isSignInRefusal` is true, which for IMAP is a non-temporary
+  `loginFailed`); the sign-in mark and its banner carry them. The marked-account exclusion
+  applies to polls only, which know each failing account: there, any failure of an account in
+  `authFailedAccounts` never counts. A refresh judges the one error it sees, with no per-account attribution,
+  so a marked account's other (non-sign-in) error on a refresh still raises (intended). Seeing only the first error and the connect
+  loop stopping other accounts are filed separately. A poll that cannot load its accounts counts as failed.
+  An all-failed foreground poll does not advance `lastSyncCompletedAt`. Superseded rules, kept for history:
+  "only a full run with NO failure at all clears", then "a full refresh whose first error came from a marked
+  account clears" (it cleared while another account was still failing). The older-messages catch writes the
+  same fixed line to `InboxViewModel.error`.
+- **Replaced provider is detached.** `installAcceptedPasswordProbeAsLive` detaches the old live provider's
+  sign-in reporter in the same actor turn as the swap, so a late refusal of the old password cannot mark
+  the account the user just fixed.
+- **Re-auth alert by phase.** Refused password: the password line (the probe records the refusal through
+  its own local reporter, and `updateIMAPPassword` rethrows it as `ProviderError.authenticationFailed`);
+  TLS minimum not met: the existing TLS sentence for the account's host; anything after the password was
+  accepted (save, sync) or a temporary refusal: "Couldn't finish setting up the account. Try again.";
+  offline: no alert.
+- **The probe never marks the account.** `createIMAPProvider(passwordOverride:)` builds the probe with no
+  account reporter; `installAcceptedPasswordProbeAsLive` attaches the real one in the same actor turn
+  that makes the probe the live provider.
+- **The IOS-SCROLL-003 qualifier in §4 still holds**: a connection failure during pagination raises no
+  banner, as before.
+- Tests: `InboxErrorBannerTests` (fixed lines for every error; alert line by phase),
+  `SyncRunBannerEntryPointTests` (each run entry point; ten-run sequence), `IMAPLoginRefusalSignInTests`
+  (codes, factory wiring, probe never marks, live provider after Update Password reports).
+
 ---
 
 ## The residual record of `f947acb4c` was wrong, and residual records are where this keeps happening (2026-08-12)

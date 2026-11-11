@@ -2,121 +2,185 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import Foundation
+import GRDB
+import SwiftMail
 import Testing
 @testable import TabMail
 
-/// **A debug unlock must never decide whether the user is TOLD that something
-/// failed.**
+/// The inbox error banner and the account re-authentication alert show only fixed
+/// plain lines, never text derived from an error. When the banner is raised and
+/// cleared is pinned through the real run entry points in
+/// `SyncRunBannerEntryPointTests`.
 ///
-/// ## The defect this pins
-///
-/// `InboxView`'s error banner read
-/// `if let error = viewModel.error, DebugModeManager.isLoggingEnabled()`. The gate
-/// sat in the BRANCH CONDITION, so it suppressed no log — it decided whether the
-/// banner was constructed at all. `InboxView` is the ONLY render site of
-/// `InboxViewModel.error` in `TabMail/Views/` (the two `MessageCardView` hits
-/// belong to `MessageDetailViewModel`), so **in a production build the banner was
-/// unreachable**. `InboxViewModel` writes that property at exactly two sites — the
-/// infinite-scroll catch (`"Failed to load older messages: …"`) and the
-/// `performSync` catch — and both are genuine user-facing failures. A user whose
-/// pagination failed watched the list stop growing with no explanation.
-///
-/// ## Why the invariant is stated as an INDEPENDENCE, not as a list of cases
-///
-/// `bannerPresenceIsIndependentOfTheDebugFlag` is the load-bearing test. Asserting
-/// "with logging off, a non-nil error yields a banner" pins one instance; asserting
-/// that PRESENCE is the same function of `error` under both flag values pins the
-/// property, so any future re-gating **of `InboxErrorBanner.text(for:loggingEnabled:)`**
-/// fails regardless of which direction it is written in (`MIS-015` — pin the
-/// invariant, never the fix's mechanism).
-///
-/// > ⚠️ **The qualifier above is load-bearing, and without it this doc claimed reach
-/// > the suite does not have** (`MIS-019` — an absolute owes its negative case).
-/// > Every test here exercises the PURE function; **none constructs `InboxView`**.
-/// > So the last hop — from the function's return value to the view actually
-/// > rendering it — is covered by no test, and re-adding
-/// > `, DebugModeManager.isLoggingEnabled()` to the view's `if` restores the exact
-/// > original defect with all five tests GREEN. That is the same shape as the defect
-/// > this file was written to close, which is why it is stated rather than assumed
-/// > away. Closing it needs a ViewInspector-style render assertion or a snapshot
-/// > test; the repo has neither, and adding that harness for one banner is
-/// > machinery `A3`/`MIS-003` forbids. **The guard is therefore this sentence plus
-/// > the topic-105 §4 note, not a test** — if you re-gate the view, nothing will
-/// > catch you. Found by the final-train Claude audit half, 2026-08-05.
-///
-/// ## Non-vacuity is two-sided, and it was measured, not reasoned
-///
-/// Under the sanctioned inversion (restoring the pre-fix
-/// `guard let error, loggingEnabled else { return nil }` inside
-/// `InboxErrorBanner.text(for:loggingEnabled:)`) three cases go RED and
-/// `debugBuildsStillShowTheRawDetail` + `noErrorMeansNoBannerUnderEitherFlag` stay
-/// GREEN. The green half matters: a test already red after the fix is red under
-/// every inversion and proves nothing.
-///
-/// ## A1
-///
-/// Shipped `07a4bb703` and `v2final` `e28dd4edb` carry the SAME gated line, so this
-/// is authored work rather than a v3 regression — but the SHAPE is restored from
-/// `MessageCardView.bodyContent`, which is byte-identical across both of those tags
-/// and HEAD and already solves this correctly: ungated branch, debug-gated detail.
-@Suite("Inbox error banner — a debug unlock never decides whether the user is told")
+/// Earlier, the banner put `error.localizedDescription` on screen when debug
+/// logging was unlocked, and every inbox sync failure stored that text. A
+/// temporary IMAP refusal therefore reached the screen as
+/// `Login failed: no([UNAVAILABLE] …)`. The detail now lives only in the
+/// debug-gated logs.
+@Suite("Inbox error banner and re-auth alert — fixed lines only",
+       .serialized, .processGlobalState)
 struct InboxErrorBannerTests {
 
-    /// Representative of the real payload: `InboxViewModel` stores
-    /// `error.localizedDescription`, which is developer text.
-    private static let rawDeveloperText =
-        "Failed to load older messages: The operation couldn't be completed. (NIOCore.IOError error 1.)"
+    /// A marker no fixed line contains. Every error below that can carry text
+    /// carries it, so a banner derived from the error would contain it.
+    private static let marker = "raw-detail-7f3a"
 
-    /// **THE INVARIANT.** Whether the banner appears is a function of `error`
-    /// ALONE. Any re-gating changes one side and fails here.
-    @Test("banner PRESENCE is independent of the debug flag")
-    func bannerPresenceIsIndependentOfTheDebugFlag() {
-        let cases: [String?] = [
-            nil,
-            "",
-            "boom",
-            Self.rawDeveloperText,
-            "Failed to load older messages: connection reset"
+    private struct UnknownError: Error, CustomStringConvertible, LocalizedError {
+        var description: String { "UnknownError(\(InboxErrorBannerTests.marker))" }
+        var errorDescription: String? { "Unknown failure \(InboxErrorBannerTests.marker)" }
+    }
+
+    /// Every error the sync and login paths can hand the banner decision: the typed
+    /// provider, auth, OAuth, transport, IMAP-login and timeout errors, plus an
+    /// arbitrary unknown error.
+    private static var everyError: [any Error] {
+        let m = marker
+        let loginReasons = [
+            "no([UNAVAILABLE] \(m))", "no([INUSE] \(m))", "no([SERVERBUG] \(m))", "no([LIMIT] \(m))",
+            "no([AUTHENTICATIONFAILED] \(m))", "no([AUTHORIZATIONFAILED] \(m))", "no([EXPIRED] \(m))",
+            "no([CONTACTADMIN] \(m))", "no(\(m) login failed)", "bad(\(m))",
         ]
-        for error in cases {
-            let shownWithLogging = InboxErrorBanner.text(for: error, loggingEnabled: true) != nil
-            let shownWithout = InboxErrorBanner.text(for: error, loggingEnabled: false) != nil
-            #expect(
-                shownWithLogging == shownWithout,
-                "the debug flag changed whether the banner appears for \(String(describing: error))"
-            )
+        var errors: [any Error] = [
+            ProviderError.notConnected,
+            ProviderError.messageNotFound,
+            ProviderError.authenticationFailed,
+            ProviderError.networkError(underlying: HTTPError.networkError(statusCode: 503)),
+            ProviderError.networkError(underlying: HTTPError.networkError(statusCode: 429)),
+            ProviderError.networkError(underlying: HTTPError.networkError(statusCode: 400)),
+            ProviderError.networkError(underlying: NSError(domain: "Gmail", code: 403,
+                                                           userInfo: [NSLocalizedDescriptionKey: m])),
+            ProviderError.invalidURL(m),
+            ProviderError.actionIdentityResolutionFailed(m),
+            ProviderError.uidValidityChanged(folderPath: m, stored: 1, live: 2),
+            ProviderError.syntheticPlaceholderId([m]),
+            ProviderError.syntheticFolderPath(m),
+            ProviderError.addressPendingMove(m),
+            AuthError.refreshFailed(underlying: m),
+            AuthError.noRefreshToken,
+            AuthError.noToken,
+            OAuthError.tokenExchangeFailed(m),
+            OAuthError.notConfigured(m),
+            OAuthError.consentFailed(m),
+            OAuthError.cancelled,
+            OAuthError.noAuthCode,
+            IMAPTransportSecurityError.tlsFloorNotMet(host: m),
+            IMAPError.connectionFailed(m),
+            IMAPError.selectFailed(m),
+            IMAPError.fetchFailed(m),
+            URLError(.notConnectedToInternet),
+            URLError(.badServerResponse),
+            NSError(domain: "NIOCore.IOError", code: 1),
+            NSError(domain: "com.example.unknown", code: 9, userInfo: [NSLocalizedDescriptionKey: m]),
+            TimeoutError(duration: 30),
+            CancellationError(),
+            UnknownError(),
+        ]
+        for reason in loginReasons {
+            errors.append(IMAPError.loginFailed(reason))
+            errors.append(ProviderTemporaryRefusal(underlying: IMAPError.loginFailed(reason)))
+        }
+        return errors
+    }
+
+    // MARK: - The invariant
+
+    @Test("for every error, the banner shows a fixed line or nothing, never the error's text")
+    func bannerTextIsAlwaysAFixedLine() {
+        for error in Self.everyError {
+            guard let line = InboxErrorBanner.text(for: error) else { continue }
+            #expect(InboxErrorBanner.allLines.contains(line), "not a fixed line for \(error)")
+            #expect(!line.contains(Self.marker), "banner carried the error's text for \(error)")
+            #expect(line != error.localizedDescription, "banner showed the error for \(error)")
         }
     }
 
-    /// The production build is the one that matters: locked logging is what every
-    /// real user runs.
-    @Test("a non-nil error is surfaced when logging is DISABLED")
-    func nonNilErrorIsSurfacedWithLoggingDisabled() {
-        #expect(InboxErrorBanner.text(for: Self.rawDeveloperText, loggingEnabled: false) != nil)
+    private static let host = "imap.example.com"
+
+    @Test("for every error, the re-authentication alert shows a fixed line or nothing")
+    func reauthAlertIsAlwaysAFixedLine() {
+        let allowed: Set<String> = [AccountReauthAlert.passwordLine, AccountReauthAlert.setupLine,
+                                    AccountReauthAlert.oauthLine, AccountReauthAlert.tlsLine(host: Self.host)]
+        for error in Self.everyError {
+            let lines = [AccountReauthAlert.passwordUpdateLine(for: error, host: Self.host),
+                         AccountReauthAlert.oauthLine(for: error)].compactMap { $0 }
+            for line in lines {
+                #expect(allowed.contains(line), "not a fixed line for \(error)")
+                #expect(!line.contains(Self.marker), "alert carried the error's text for \(error)")
+            }
+        }
     }
 
-    /// The detail half of the shape: the user gets copy, not a domain/errno dump.
-    @Test("production copy is generic, never the raw localizedDescription")
-    func productionCopyIsGenericNotRaw() {
-        let shown = InboxErrorBanner.text(for: Self.rawDeveloperText, loggingEnabled: false)
-        #expect(shown == InboxErrorBanner.genericMessage)
-        #expect(shown != Self.rawDeveloperText)
+    @Test("the password-update alert picks its line by what failed")
+    func reauthAlertLineByPhase() {
+        // The server refused the new password (as `updateIMAPPassword` reports it).
+        #expect(AccountReauthAlert.passwordUpdateLine(for: ProviderError.authenticationFailed, host: Self.host)
+                == AccountReauthAlert.passwordLine)
+        // The server cannot meet the TLS minimum: main's sentence, for the account's host.
+        let tls = AccountReauthAlert.passwordUpdateLine(
+            for: IMAPTransportSecurityError.tlsFloorNotMet(host: Self.host), host: Self.host)
+        #expect(tls == IMAPTransportSecurityError.tlsFloorNotMet(host: Self.host).description)
+        #expect(tls != AccountReauthAlert.passwordLine)
+        // The password was accepted, then saving or the sync failed; or the server
+        // refused for now.
+        for error: any Error in [UnknownError(), NSError(domain: "com.example.keychain", code: -25299),
+                                 ProviderTemporaryRefusal(underlying: UnknownError())] {
+            #expect(AccountReauthAlert.passwordUpdateLine(for: error, host: Self.host)
+                    == AccountReauthAlert.setupLine, "\(error)")
+        }
+        // Offline keeps the alert closed, as before.
+        #expect(AccountReauthAlert.passwordUpdateLine(for: URLError(.notConnectedToInternet), host: Self.host) == nil)
+        #expect(Set([AccountReauthAlert.passwordLine, AccountReauthAlert.setupLine, tls ?? ""]).count == 3)
     }
 
-    /// Non-vacuity anchor — stays GREEN under the inversion. The gate still does
-    /// its real job: diagnostics remain available to a debug build.
-    @Test("debug builds still show the raw detail")
-    func debugBuildsStillShowTheRawDetail() {
-        #expect(InboxErrorBanner.text(for: Self.rawDeveloperText, loggingEnabled: true)
-                == Self.rawDeveloperText)
+    /// Non-vacuity: the decision can say yes, and says no where it must.
+    @Test("an unknown error raises the generic line; refresh refusals, offline and temporary refusals raise none")
+    func bannerDecisionCases() {
+        #expect(InboxErrorBanner.text(for: UnknownError()) == InboxErrorBanner.genericMessage)
+        #expect(InboxErrorBanner.text(for: IMAPError.loginFailed("no([AUTHENTICATIONFAILED] x)"))
+                == InboxErrorBanner.genericMessage)
+        #expect(InboxErrorBanner.text(for: AuthError.refreshFailed(underlying: "x")) == nil)
+        #expect(InboxErrorBanner.text(for: URLError(.notConnectedToInternet)) == nil)
+        #expect(InboxErrorBanner.text(for: CancellationError()) == nil)
+        #expect(InboxErrorBanner.text(
+            for: ProviderTemporaryRefusal(underlying: IMAPError.loginFailed("no([UNAVAILABLE] x)"))) == nil)
     }
 
-    /// Non-vacuity anchor — stays GREEN under the inversion. A presence rule driven
-    /// by `error` alone must also be able to say NO, or the first test passes
-    /// trivially by always showing a banner.
-    @Test("no error means no banner under either flag")
-    func noErrorMeansNoBannerUnderEitherFlag() {
-        #expect(InboxErrorBanner.text(for: nil, loggingEnabled: true) == nil)
-        #expect(InboxErrorBanner.text(for: nil, loggingEnabled: false) == nil)
+    // MARK: - isAuthError is typed only
+
+    @Test("isAuthError matches only the typed case, never refusal text")
+    func isAuthErrorIsTypedOnly() {
+        let manager = AccountManager.shared
+        #expect(manager.isAuthError(ProviderError.authenticationFailed))
+        #expect(!manager.isAuthError(IMAPError.loginFailed("no([UNAVAILABLE] login failed, try later)")))
+        #expect(!manager.isAuthError(IMAPError.loginFailed("no([UNAVAILABLE] LOGIN failed)")))
+        #expect(!manager.isAuthError(IMAPError.loginFailed("no([AUTHENTICATIONFAILED] x)")))
+        #expect(!manager.isAuthError(UnknownError()))
+    }
+
+    @Test("countsAsFailure: marked, sign-in errors, cancellation, DB suspension and temporary refusals never count; timeouts and the rest do")
+    func countsAsFailureTable() {
+        let generic = NSError(domain: "com.example.test", code: 7)
+        let suspension = DatabaseError(resultCode: .SQLITE_INTERRUPT)
+        #expect(suspension.isDatabaseSuspensionAbort, "the table's suspension case is not a suspension abort")
+        let rows: [(String, any Error, Bool, Bool)] = [
+            ("marked, generic", generic, true, false),
+            ("marked, timeout", TimeoutError(duration: 30), true, false),
+            ("cancellation", CancellationError(), false, false),
+            ("DB suspension", suspension, false, false),
+            ("temporary refusal",
+             ProviderTemporaryRefusal(underlying: IMAPError.loginFailed("no([UNAVAILABLE] try later)")), false, false),
+            ("HTTP 503", ProviderError.networkError(underlying: HTTPError.networkError(statusCode: 503)), false, false),
+            ("timeout", TimeoutError(duration: 30), false, true),
+            ("credential refusal", IMAPError.loginFailed("no([AUTHENTICATIONFAILED] no)"), false, false),
+            ("uncoded login refusal", IMAPError.loginFailed("no(login failed)"), false, false),
+            ("authentication failed", ProviderError.authenticationFailed, false, false),
+            ("token refresh failed", AuthError.refreshFailed(underlying: "no"), false, false),
+            ("other IMAP error", IMAPError.fetchFailed("no"), false, true),
+            ("generic", generic, false, true),
+        ]
+        for (name, error, marked, counts) in rows {
+            #expect(InboxErrorBanner.countsAsFailure(error, accountMarkedSignInNeeded: marked) == counts, "\(name)")
+        }
     }
 }

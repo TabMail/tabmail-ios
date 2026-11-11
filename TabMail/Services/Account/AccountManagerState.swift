@@ -118,5 +118,109 @@ final class AccountManagerState {
         }
     }
 
+    /// The inbox-wide sync failure banner line, or `nil`. Only ever one of
+    /// `InboxErrorBanner`'s fixed lines; never text derived from an error.
+    var syncErrorBanner: String?
+
+    /// What the generic inbox banner means, stated once for its only two writers
+    /// (`finishSyncRun` and `failRefresh`):
+    ///
+    /// The generic banner is raised only by a user-started refresh that failed
+    /// with an error that counts (`InboxErrorBanner.countsAsFailure`). A failed
+    /// refresh never clears it. It is cleared only by a run that covered every
+    /// active account and had no counted failure; scheduler and background polls
+    /// clear it this way too, so recovery heals it without a gesture, and they
+    /// never raise it. Sign-in errors (a refused credential, a failed token
+    /// refresh) never count, for raising or for clearing: the sign-in mark and
+    /// its own "Sign in again" banner carry them. Polls, which know each failing
+    /// account, also do not count any failure of an account marked
+    /// sign-in-needed; a refresh judges only the error it sees, so a marked
+    /// account's other (non-sign-in) error on a refresh still raises.
+    ///
+    /// A run that did not fail as a whole (every poll, and a refresh that
+    /// succeeded) ends here. It never raises.
+    /// - `coverage`: whether the run covered every active account.
+    /// - `countedFailure`: an account in the run failed with an error that
+    ///   counts, not being marked sign-in-needed (`InboxErrorBanner.countsAsFailure`).
+    /// - `completed`: whether this run advances `lastSyncCompletedAt`.
+    func finishSyncRun(coverage: SyncRunCoverage, countedFailure: Bool, completed: Bool) {
+        if coverage == .full && !countedFailure {
+            syncErrorBanner = nil
+        }
+        if completed {
+            lastSyncCompletedAt = Date()
+        }
+    }
+
+    /// A user-started refresh failed. It raises the banner when its error counts
+    /// and never clears it (see `finishSyncRun` for the banner's meaning).
+    func failRefresh(countedFailure: Bool) {
+        if countedFailure {
+            syncErrorBanner = InboxErrorBanner.genericMessage
+        }
+    }
+
     private init() {}
+}
+
+/// Whether a sync run covered every active account (`full`) or only some
+/// (`partial`: one account, or the folders of some accounts).
+enum SyncRunCoverage: Sendable, Equatable {
+    case full
+    case partial
+}
+
+/// The inbox error banner's copy and the decision of which errors raise it.
+///
+/// The banner shows only fixed plain lines, never text derived from an error.
+/// An error's description is developer text (library renderings, errno dumps,
+/// server prose); it stays in the debug-gated logs. This replaces the earlier
+/// rule that showed the raw text when debug logging was unlocked.
+enum InboxErrorBanner {
+    /// The one line the banner shows. Every inbox list carries `.refreshable`, so
+    /// pull-to-refresh is genuinely the recovery gesture.
+    static let genericMessage = "Unable to refresh mail. Pull to retry."
+
+    /// Every line the banner can show. Tests assert membership in this set.
+    static let allLines: Set<String> = [genericMessage]
+
+    /// Whether an account's failure counts for the banner
+    /// (`AccountManagerState.finishSyncRun`). It does not count when the account
+    /// is marked sign-in-needed, when it is a sign-in error, or when it is
+    /// temporary (cancellation, a database suspension, `SyncEngine.isTransientError`).
+    nonisolated static func countsAsFailure(_ error: Error, accountMarkedSignInNeeded: Bool) -> Bool {
+        if accountMarkedSignInNeeded { return false }
+        if isSignInError(error) { return false }
+        if error is CancellationError { return false }
+        if error.isDatabaseSuspensionAbort { return false }
+        if SyncEngine.isTransientError(error) { return false }
+        return true
+    }
+
+    /// A sign-in error: the server refused the credentials, or a token could not
+    /// be refreshed. The sign-in mark and its own banner carry these, never the
+    /// generic banner; the kind alone decides, with no account lookup.
+    nonisolated static func isSignInError(_ error: Error) -> Bool {
+        if case ProviderError.authenticationFailed = error { return true }
+        if case AuthError.refreshFailed = error { return true }
+        if let classified = error as? any ProviderClassifiedError, classified.isSignInRefusal { return true }
+        return false
+    }
+
+    /// The banner line a sync or page-load failure raises, or `nil` for none.
+    ///
+    /// - `nil` for cancellation, a database suspension, a transient refusal
+    ///   (HTTP 5xx/429, a temporary IMAP login refusal), and a connection error
+    ///   (offline shows no banner).
+    /// - `nil` for `AuthError.refreshFailed`: a refused sign-in is told by the
+    ///   per-account "sign in again" banner, which reads `authFailedAccounts`.
+    /// - `genericMessage` for every other error.
+    nonisolated static func text(for error: Error) -> String? {
+        if error is CancellationError { return nil }
+        if error.isDatabaseSuspensionAbort { return nil }
+        if case AuthError.refreshFailed = error { return nil }
+        if SyncEngine.isTransientError(error) { return nil }
+        if SyncEngine.isConnectionError(error) { return nil }
+        return genericMessage
+    }
 }

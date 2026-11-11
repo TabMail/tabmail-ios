@@ -53,6 +53,8 @@ final class InboxViewModel {
     var isRefreshing = false
     var isLoadingOlder = false
     var hasMoreMessages = true
+    /// The older-messages banner line: only ever one of `InboxErrorBanner`'s fixed
+    /// lines. Sync failures publish to `AccountManagerState.syncErrorBanner`.
     var error: String?
     var filterUnread = false
     var filterLabelIds: Set<String> = []
@@ -1354,8 +1356,9 @@ final class InboxViewModel {
                 // Task cancelled (e.g., view disappeared) — not user-facing
             } catch {
                 if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[InfiniteScroll] Error: \(error)") }
-                if !SyncEngine.isConnectionError(error) {
-                    self.error = "Failed to load older messages: \(error.localizedDescription)"
+                // Fixed line only; the error's text stays in the debug-gated log above.
+                if let line = InboxErrorBanner.text(for: error) {
+                    self.error = line
                 }
             }
         }
@@ -1778,9 +1781,15 @@ final class InboxViewModel {
         guard !accountIds.isEmpty else { return }
 
         let uniqueAccounts: [Account]
+        // Read once at the start of the run: whether this refresh covers every
+        // active account (the unified inbox) decides whether its success may clear
+        // the inbox banner (`AccountManagerState.finishSyncRun`).
+        let coverage: SyncRunCoverage
         do {
-            uniqueAccounts = try await dbPool.read { db in
-                try Account.filter(accountIds.contains(Column("id"))).fetchAll(db)
+            (uniqueAccounts, coverage) = try await dbPool.read { db in
+                let accounts = try Account.filter(accountIds.contains(Column("id"))).fetchAll(db)
+                let activeIds = try String.fetchSet(db, Account.filter(Column("isActive") == true).select(Column("id")))
+                return (accounts, activeIds.isSubset(of: Set(accountIds)) ? .full : .partial)
             }
         } catch {
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Sync] Error fetching accounts: \(error)") }
@@ -1810,14 +1819,14 @@ final class InboxViewModel {
             try await manager.syncFolders(folders)
 
             AccountManagerState.shared.lastSyncFailed = false
-            AccountManagerState.shared.lastSyncCompletedAt = Date()
+            AccountManagerState.shared.finishSyncRun(coverage: coverage, countedFailure: false, completed: true)
         } catch is CancellationError {
             // Task cancelled (e.g., user navigated away) — not user-facing
         } catch let error where SyncEngine.isTransientError(error) {
             // Transient provider blip — HTTP 5xx/429 from a reachable server (e.g. a
-            // momentary Microsoft Graph 503 during connect). NOT a real sync failure:
-            // the next poll/refresh retries. Leave lastSyncFailed unchanged and show
-            // no error banner so a single server hiccup doesn't surface to the user.
+            // momentary Microsoft Graph 503 during connect), or a temporary sign-in
+            // refusal. NOT a real sync failure: the next poll/refresh retries. Leave
+            // lastSyncFailed unchanged and show no error banner.
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Sync] Transient error (not surfaced): \(error)") }
         } catch let error where error.isDatabaseSuspensionAbort {
             // GRDB write aborted because the database is suspended (ADR-IOS-041).
@@ -1827,9 +1836,10 @@ final class InboxViewModel {
         } catch {
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Sync] Error: \(error)") }
             AccountManagerState.shared.lastSyncFailed = true
-            if !SyncEngine.isConnectionError(error) {
-                self.error = error.localizedDescription
-            }
+            // The run's outcome is the one error it sees; a failed refresh never clears.
+            AccountManagerState.shared.failRefresh(
+                countedFailure: InboxErrorBanner.countsAsFailure(error, accountMarkedSignInNeeded: false)
+                    && InboxErrorBanner.text(for: error) != nil)
         }
 
         // Refresh loaded messages to pick up changes from sync.

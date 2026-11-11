@@ -523,8 +523,9 @@ struct AccountDetailView: View {
                 try await manager.updateIMAPPassword(password, for: account)
                 try await manager.syncAccount(account)
             } catch {
-                if !SyncEngine.isConnectionError(error) {
-                    reauthError = error.localizedDescription
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Reauth] Password update failed: \(error)") }
+                if let line = AccountReauthAlert.passwordUpdateLine(for: error, host: account.imapHost ?? "") {
+                    reauthError = line
                 }
             }
             isReauthenticating = false
@@ -545,8 +546,9 @@ struct AccountDetailView: View {
                 }
                 try await manager.syncAccount(account)
             } catch {
-                if !SyncEngine.isConnectionError(error) {
-                    reauthError = error.localizedDescription
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Reauth] Re-authentication failed: \(error)") }
+                if let line = AccountReauthAlert.oauthLine(for: error) {
+                    reauthError = line
                 }
             }
             isReauthenticating = false
@@ -698,5 +700,39 @@ struct AccountDetailView: View {
         case .spam: return "xmark.bin"
         case .custom: return "folder"
         }
+    }
+}
+
+/// The re-authentication alert's copy: fixed plain lines only, never text
+/// derived from the error (which stays in the debug-gated log). The line is
+/// chosen by what failed.
+enum AccountReauthAlert {
+    /// The server refused the new password.
+    static let passwordLine = "The server did not accept the sign-in. Check the password and try again."
+    /// The password was accepted, then a later step (saving it, the sync) failed.
+    static let setupLine = "Couldn't finish setting up the account. Try again."
+    /// An OAuth re-authentication failed.
+    static let oauthLine = "Sign-in did not complete. Please try again."
+
+    /// The server cannot meet TabMail's TLS minimum: the existing fixed copy for
+    /// that case, built from the account's own host, not from the error.
+    static func tlsLine(host: String) -> String {
+        IMAPTransportSecurityError.tlsFloorNotMet(host: host).description
+    }
+
+    /// The alert line for a failed password update, or `nil` when the alert stays
+    /// closed (offline, as before).
+    static func passwordUpdateLine(for error: Error, host: String) -> String? {
+        if error is IMAPTransportSecurityError { return tlsLine(host: host) }
+        if SyncEngine.isConnectionError(error) { return nil }
+        // `updateIMAPPassword` reports a refused password as this typed case,
+        // recorded by the probe's own sign-in reporter.
+        if case ProviderError.authenticationFailed = error { return passwordLine }
+        return setupLine
+    }
+
+    /// The alert line for a failed OAuth re-authentication, or `nil` (offline).
+    static func oauthLine(for error: Error) -> String? {
+        SyncEngine.isConnectionError(error) ? nil : oauthLine
     }
 }

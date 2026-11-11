@@ -416,18 +416,34 @@ struct RevokedMailGrantSignalTests {
 
     // MARK: - Password (IMAP and iCloud) sign-ins
 
-    /// IMAP and iCloud accounts never reach the OAuth accessor; their only
-    /// sign-in warning is `connectAccount`'s `isAuthError` check. SwiftMail's
-    /// `LoginHandler` turns every tagged NO to LOGIN into
-    /// `IMAPError.loginFailed(String(describing: response.state))`, so the
-    /// strings below are what a server's answer arrives as.
+    /// IMAP and iCloud accounts never reach the OAuth accessor. Their sign-in
+    /// warning is raised by the provider's login-refusal reporter, which reads
+    /// the refusal's response code, never by matching error text. The server
+    /// answers below go over the wire to a real `IMAPProvider`.
     @Test("A temporary IMAP login refusal does not tell the user to sign in again, a refused password does")
-    func temporaryIMAPLoginRefusalIsNotAnAuthFailure() {
-        let unavailable = IMAPError.loginFailed("no([UNAVAILABLE] Service temporarily unavailable)")
-        #expect(!AccountManager.shared.isAuthError(unavailable),
-                "a server that was briefly unavailable told the user their password is wrong")
-        let refused = IMAPError.loginFailed("no([AUTHENTICATIONFAILED] Invalid credentials (Failure))")
-        #expect(AccountManager.shared.isAuthError(refused), "a refused password raised no warning")
+    func temporaryIMAPLoginRefusalIsNotAnAuthFailure() async throws {
+        let server = FakeIMAPServer(mailboxes: ["INBOX": []])
+        try server.start()
+        defer { server.stop() }
+        let accountId = "revoked-imap-\(UUID().uuidString)"
+        let provider = IMAPProvider(
+            host: "127.0.0.1", port: server.port,
+            username: server.username, password: server.password,
+            smtpHost: "127.0.0.1", smtpPort: 587, useTLS: false,
+            signInOutcome: AccountManager.shared.makeSignInOutcomeReporter(accountId: accountId))
+        func isMarked() async -> Bool { await AccountManager.shared.authFailedAccounts.contains(accountId) }
+
+        server.failNextCommand(containing: "LOGIN", message: "[UNAVAILABLE] Service temporarily unavailable")
+        do { try await provider.connect() } catch {}
+        #expect(await !isMarked(), "a server that was briefly unavailable told the user their password is wrong")
+
+        await provider.markDirty()
+        server.failNextCommand(containing: "LOGIN", message: "[AUTHENTICATIONFAILED] Invalid credentials (Failure)")
+        do { try await provider.connect() } catch {}
+        #expect(await isMarked(), "a refused password raised no warning")
+
+        try? await provider.disconnect()
+        await AccountManager.shared.clearAuthFailed(accountId)
     }
 }
 
