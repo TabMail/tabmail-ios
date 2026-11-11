@@ -300,12 +300,20 @@ actor CalDAVProvider: CalendarProvider {
     ) async throws -> GCalEvent {
         // This is the edit of the whole series (edit_scope "all"), so an occurrence id a
         // listing gave edits its SERIES, every occurrence, as the tool promises; one
-        // occurrence alone is `updateOccurrence` (this_only). How the event repeats is not
-        // changed through an occurrence id (ADR-IOS-108).
+        // occurrence alone is `updateOccurrence` (this_only).
+        //
+        // Through an occurrence id only fields that place nothing in time reach the series
+        // (title, location, description, busy status). A start, an end or guests are refused
+        // here, before any request, and so is a repeat rule (ADR-IOS-108): the assistant
+        // takes them from the occurrence it was shown, and written over the series they
+        // would move its first date to that occurrence's date (and with it every removed,
+        // added and changed occurrence) or give every occurrence one occurrence's guests.
+        // A whole-series change of time through an occurrence id returns with the series
+        // time-shift work.
         let (seriesHref, occurrenceKey) = try CalDAVOccurrences.OccurrenceId.split(eventId)
-        if occurrenceKey != nil, event.recurrence != nil {
+        if occurrenceKey != nil, Self.setsTimeGuestsOrRule(event) {
             throw CalendarProviderError.notSupported(
-                "How an event repeats belongs to the whole series, so it can't be changed through one occurrence's id. Nothing was changed. Edit the series by its series id (series_event_id in calendar_event_read)")
+                "Through one occurrence's id, a change to the whole repeating event can set its title, location, description or busy status, but not its time, end, guests or how it repeats, so nothing was changed. To change only this occurrence, edit it with edit_scope this_only. A whole-series change of time, guests or repeat can't be made from here yet; the user can make it in their calendar app.")
         }
         let eventURL = try resolveEventURL(seriesHref, calendarId: calendarId)
 
@@ -357,6 +365,14 @@ actor CalDAVProvider: CalendarProvider {
         )
     }
 
+    /// Whether an edit sets anything `updateEvent` refuses to write over a series through an
+    /// occurrence id: a start, an end or their zones, guests, or a repeat rule.
+    static func setsTimeGuestsOrRule(_ patch: GCalEventInput) -> Bool {
+        patch.startDateTime != nil || patch.startDate != nil || patch.startTimeZone != nil
+            || patch.endDateTime != nil || patch.endDate != nil || patch.endTimeZone != nil
+            || patch.attendees != nil || patch.recurrence != nil
+    }
+
     func deleteEvent(
         calendarId: String,
         eventId: String,
@@ -368,7 +384,7 @@ actor CalDAVProvider: CalendarProvider {
         // be an EXDATE written into the series, which is not built yet.
         if try CalDAVOccurrences.OccurrenceId.split(eventId).key != nil {
             throw CalendarProviderError.notSupported(
-                "Deleting one occurrence of a repeating CalDAV event is not supported yet, so nothing was deleted. The whole series can be deleted by its series id (series_event_id in calendar_event_read)")
+                "Deleting one occurrence of a repeating CalDAV event is not supported yet, so nothing was deleted. The user can delete it in their calendar app.")
         }
         let eventURL = try resolveEventURL(eventId, calendarId: calendarId)
         let (_, _) = try await client.delete(url: eventURL)
@@ -413,9 +429,8 @@ actor CalDAVProvider: CalendarProvider {
         event: GCalEventInput,
         sendUpdates: String
     ) async throws -> GCalEvent {
-        // An occurrence id addresses its series' resource; `recurrenceId` names the
-        // occurrence, as on Google (`resolveToMaster`).
-        let seriesHref = try CalDAVOccurrences.OccurrenceId.split(eventId).seriesHref
+        // An occurrence id addresses its series' resource, and its key names the occurrence.
+        let (seriesHref, occurrenceKey) = try CalDAVOccurrences.OccurrenceId.split(eventId)
         let eventURL = try resolveEventURL(seriesHref, calendarId: calendarId)
 
         // 1. GET current ICS + ETag
@@ -425,11 +440,17 @@ actor CalDAVProvider: CalendarProvider {
         }
         let etag = getResponse.value(forHTTPHeaderField: "ETag")
 
+        // The occurrence this edit changes: one the series has now, or nothing is written
+        // (`CalDAVOccurrences.scopedEditSlot`, the same check `splitSeries` makes).
+        let slot = try CalDAVOccurrences.scopedEditSlot(
+            icsText: masterICS, href: seriesHref, key: occurrenceKey,
+            recurrenceId: recurrenceId, zone: recurrenceIdZone, ignoringEnd: false)
+
         // 2. The override: a copy of the occurrence as it stands (its existing override, else the
         //    series' VEVENT) with the patch applied (`occurrenceOverrideResource`), spliced into the
         //    resource in place of any override for the same occurrence.
-        //    The caller's `recurrence_id` is a wall clock in `recurrenceIdZone` (the
-        //    operation's declared timezone, device by default). RFC 5545 requires
+        //    The slot is a wall clock in `recurrenceIdZone` (the operation's declared
+        //    timezone, device by default). RFC 5545 requires
         //    RECURRENCE-ID to be expressed in the master's own frame — convert
         //    through the absolute instant. See `recurrenceIdInMasterFrame`.
         //    The splice MUST use that SAME converted value: it decides whether an
@@ -441,7 +462,7 @@ actor CalDAVProvider: CalendarProvider {
         let zones = CalendarTimeZoneContext(calendarText: masterICS)
         let masterKind = Self.masterDTStartKind(from: masterICS)
         guard let masterFrameRecurrenceId = try Self.recurrenceIdInMasterFrame(
-            recurrenceId, declaredZone: recurrenceIdZone, kind: masterKind, zones: zones
+            slot, declaredZone: recurrenceIdZone, kind: masterKind, zones: zones
         ) else {
             throw CalendarProviderError.notSupported(
                 "Could not express recurrence_id '\(recurrenceId)' (\(recurrenceIdZone.identifier)) in this event's timezone — refusing to write an override that may name a different occurrence."
@@ -491,10 +512,11 @@ actor CalDAVProvider: CalendarProvider {
         patch: GCalEventInput,
         sendUpdates: String
     ) async throws -> GCalEvent {
-        // An occurrence id addresses its series' resource, and the split's new part is
-        // named from the series' href whichever id the edit was given, so a retry and the
-        // same split asked for through the series id land on one resource.
-        let seriesHref = try CalDAVOccurrences.OccurrenceId.split(eventId).seriesHref
+        // An occurrence id addresses its series' resource, and its key names the occurrence.
+        // The split's new part is named from the series' href and the checked slot whichever
+        // id the edit was given, so a retry and the same split asked for through the series
+        // id land on one resource.
+        let (seriesHref, occurrenceKey) = try CalDAVOccurrences.OccurrenceId.split(eventId)
         let eventURL = try resolveEventURL(seriesHref, calendarId: calendarId)
 
         // 1. GET master ICS + ETag
@@ -503,6 +525,14 @@ actor CalDAVProvider: CalendarProvider {
             throw CalDAVError.parseError("Empty response for event \(eventId)")
         }
         let etag = getResponse.value(forHTTPHeaderField: "ETag")
+
+        // The occurrence the split starts at: one the series has, or nothing is written
+        // (`CalDAVOccurrences.scopedEditSlot`, the same check `updateOccurrence` makes). Where
+        // the series ends is left to `RecurrenceTail.newSeriesRule` below, which also knows a
+        // series this split already capped.
+        let slot = try CalDAVOccurrences.scopedEditSlot(
+            icsText: masterICS, href: seriesHref, key: occurrenceKey,
+            recurrenceId: recurrenceId, zone: recurrenceIdZone, ignoringEnd: true)
 
         // 2. Parse the original RRULE so we can build the capped variant + the
         //    new-series RRULE (the original end carried over).
@@ -515,7 +545,7 @@ actor CalDAVProvider: CalendarProvider {
         // The cap is an ABSOLUTE boundary (RFC 5545 UNTIL is UTC for a timed
         // DTSTART), so it is computed from the declared frame directly — no
         // conversion, the instant is the instant.
-        guard let untilValue = GoogleCalendarProvider.googleUntilString(beforeNaiveISO: recurrenceId, allDay: masterIsAllDay, zone: recurrenceIdZone) else {
+        guard let untilValue = GoogleCalendarProvider.googleUntilString(beforeNaiveISO: slot, allDay: masterIsAllDay, zone: recurrenceIdZone) else {
             throw CalendarProviderError.notSupported("Invalid recurrence_id '\(recurrenceId)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
         }
         // The new series' DTSTART, by contrast, is a WALL CLOCK the successor
@@ -534,7 +564,7 @@ actor CalDAVProvider: CalendarProvider {
         let zones = CalendarTimeZoneContext(calendarText: masterICS)
         let masterKindForSplit = Self.masterDTStartKind(from: masterICS)
         guard let masterFrameRecurrenceId = try Self.recurrenceIdInMasterFrame(
-            recurrenceId, declaredZone: recurrenceIdZone, kind: masterKindForSplit, zones: zones
+            slot, declaredZone: recurrenceIdZone, kind: masterKindForSplit, zones: zones
         ) else {
             throw CalendarProviderError.notSupported(
                 "Could not express recurrence_id '\(recurrenceId)' (\(recurrenceIdZone.identifier)) in this event's timezone — refusing to split a series at an occurrence we cannot name."
@@ -564,7 +594,7 @@ actor CalDAVProvider: CalendarProvider {
         // recurrence_id) so a retry after a lost ACK on the successor PUT below
         // re-targets the SAME resource instead of creating a duplicate series at
         // a fresh random URL.
-        let newUid = GoogleCalendarProvider.deterministicSplitEventId(masterId: seriesHref, recurrenceId: recurrenceId)
+        let newUid = GoogleCalendarProvider.deterministicSplitEventId(masterId: seriesHref, recurrenceId: slot)
         let resources = try Self.seriesSplitResources(
             storedICS: masterICS, slotNaiveISO: masterFrameRecurrenceId,
             cappedRRule: cappedRRule, newRRule: newSeriesRRule, newUid: newUid, patch: patch, now: Date(), zones: zones)

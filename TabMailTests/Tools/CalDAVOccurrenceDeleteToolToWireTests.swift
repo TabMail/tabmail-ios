@@ -22,8 +22,8 @@ import GRDB
 // asserts what the server holds afterwards (the series, byte for byte), what the user is
 // shown (the refusal on the card and in the tool's answer), and that the queued delete
 // ends failed, so no later drain can send it. The control drives the same harness with
-// the series id the refusal points to and does delete the series, which is what makes
-// the absences here mean something.
+// the series' own id and does delete the series, which is what makes the absences here
+// mean something.
 
 @Suite("calendar tools: one day of a CalDAV repeating event never deletes the series", .serialized, .processGlobalState)
 struct CalDAVOccurrenceDeleteToolToWireTests {
@@ -104,13 +104,9 @@ struct CalDAVOccurrenceDeleteToolToWireTests {
         InstalledTestDatabaseLifetime.finish(previous: harness.previous, pool: harness.pool, directory: harness.dir)
     }
 
-    /// Every `event_id:` value in a tool's output (not `series_event_id:`).
+    /// Every `event_id:` value in a tool's output.
     private static func eventIds(in output: String) -> [String] {
         output.matches(of: /(?:^|\t)event_id:\s+(\S+)/.anchorsMatchLineEndings()).map { String($0.1) }
-    }
-
-    private static func seriesEventIds(in output: String) -> [String] {
-        output.matches(of: /series_event_id:\s+(\S+)/).map { String($0.1) }
     }
 
     /// The calendar a listed event is in, as the read tools' pill cache records it for
@@ -187,28 +183,19 @@ struct CalDAVOccurrenceDeleteToolToWireTests {
                 "the queued delete did not end failed: \(ops.map { $0.status })")
     }
 
-    @Test("Control: the series id calendar_event_read gives deletes the series through the same harness")
-    func seriesIdFromEventReadDeletesTheSeries() async throws {
+    @Test("Control: the series' own id deletes the series through the same harness")
+    func seriesOwnIdDeletesTheSeries() async throws {
         let harness = try await Self.makeHarness(accountId: "caldav-series-delete-control")
         defer { Self.tearDown(harness) }
-        let fixture = harness.fixture
-        let occurrenceId = try fixture.occurrenceId(2)
+        // The series' own id, handed to the model as an event_id, as a listing names a
+        // series it shows once. No calendar is recorded for it: the delete tool finds it as
+        // it finds any id the pill cache doesn't know.
         let translator = ChatIdTranslator.createIsolated()
-        let listed = await translator.processToolOutputForLLM(
-            "event_id: \(CompoundEventId.make(accountId: harness.accountId, eventId: occurrenceId))")
-        let occurrenceNumber = try #require(Self.eventIds(in: listed).first.flatMap { Int($0) })
-        await Self.recordCalendar(of: occurrenceId, accountId: harness.accountId, translator: translator)
-
-        // calendar_event_read on the occurrence names its series.
-        let read = try await CalendarEventReadTool(context: ToolContext(db: harness.pool, translator: translator)).execute(
-            arguments: ["event_id": .string(String(occurrenceNumber))])
         let seriesCompound = CompoundEventId.make(accountId: harness.accountId, eventId: W.seriesPath)
-        #expect(Self.seriesEventIds(in: read) == [seriesCompound], "calendar_event_read did not name the series: \(read)")
-        let forModel = await translator.processToolOutputForLLM(read)
-        let seriesNumber = try #require(Self.seriesEventIds(in: forModel).first.flatMap { Int($0) }, "no numeric series id for the model: \(forModel)")
+        let forModel = await translator.processToolOutputForLLM("event_id: \(seriesCompound)")
+        let seriesNumber = try #require(Self.eventIds(in: forModel).first.flatMap { Int($0) }, "no numeric series id for the model: \(forModel)")
         let mapped = await translator.toRealId(seriesNumber)
         #expect(mapped == seriesCompound)
-        await Self.recordCalendar(of: W.seriesPath, accountId: harness.accountId, translator: translator)
 
         let sink = ConfirmingSink()
         let output = try await CalendarEventDeleteTool(context: ToolContext(db: harness.pool, translator: translator)).execute(
@@ -258,27 +245,19 @@ struct CalDAVOccurrenceToolOutputTests {
         #expect(rendered.contains("[📅 Standup](tabmail://event/\(numericId))"), "the pill does not show the title alone: \(rendered)")
     }
 
-    @Test("an occurrence's detail names its series id, which the translator maps like an event id")
-    func occurrenceDetailNamesItsSeries() async {
+    @Test("one occurrence's detail names that occurrence's id alone, as on every provider: no series id")
+    func occurrenceDetailNamesOnlyItself() {
         let seriesHref = "/cal/standup-\(UUID().uuidString).ics"
         let occurrenceId = CalDAVOccurrences.OccurrenceId.make(seriesHref: seriesHref, key: "20990105T140000Z")
-        let row = Self.event(id: occurrenceId, recurrence: ["RRULE:FREQ=WEEKLY"], recurringEventId: seriesHref, notListed: nil)
-        let detail = CalendarToolHelpers.formatDetailedEvent(row, accountId: "acct-a", calendarId: "/cal/")
-        let seriesCompound = CompoundEventId.make(accountId: "acct-a", eventId: seriesHref)
-        #expect(detail.contains("event_id: \(CompoundEventId.make(accountId: "acct-a", eventId: occurrenceId))\n"))
-        #expect(detail.contains("series_event_id: \(seriesCompound)"), "the occurrence's detail does not name its series: \(detail)")
-
-        let translator = ChatIdTranslator.createIsolated()
-        let forModel = await translator.processToolOutputForLLM(detail)
-        let numbers = forModel.matches(of: /series_event_id:\s+(\d+)/).compactMap { Int($0.1) }
-        #expect(numbers.count == 1, "series_event_id was not translated for the model: \(forModel)")
-        guard numbers.count == 1 else { return }
-        let mapped = await translator.toRealId(numbers[0])
-        #expect(mapped == seriesCompound)
-
-        let seriesDetail = CalendarToolHelpers.formatDetailedEvent(
-            Self.event(id: seriesHref, recurrence: ["RRULE:FREQ=WEEKLY"], recurringEventId: nil, notListed: nil),
-            accountId: "acct-a", calendarId: "/cal/")
-        #expect(!seriesDetail.contains("series_event_id"), "a series' own detail names a series id: \(seriesDetail)")
+        let rows = [
+            Self.event(id: occurrenceId, recurrence: ["RRULE:FREQ=WEEKLY"], recurringEventId: seriesHref, notListed: nil),
+            Self.event(id: "series-1_20990105T140000Z", recurrence: nil, recurringEventId: "series-1", notListed: nil),
+        ]
+        for row in rows {
+            let detail = CalendarToolHelpers.formatDetailedEvent(row, accountId: "acct-a", calendarId: "/cal/")
+            let ownId = CompoundEventId.make(accountId: "acct-a", eventId: row.id ?? "")
+            #expect(detail.contains("event_id: \(ownId)\n"), "the detail does not name the occurrence: \(detail)")
+            #expect(detail.matches(of: /event_id:/).count == 1, "the detail names another id besides the occurrence's own: \(detail)")
+        }
     }
 }

@@ -128,6 +128,56 @@ struct CalDAVOccurrenceExpansionTests {
         #expect(gaps.contains { $0 != F.days(7) }, "setup: the four weeks did not cross the zone's change of UTC offset")
     }
 
+    @Test("on a day the zone's UTC offset changes, a time before the change keeps the old offset, a skipped time reads with the old offset, a repeated one is the first")
+    func wallTimesOnTheDaysTheOffsetChanges() throws {
+        let newYork = try #require(TimeZone(identifier: "America/New_York"))
+        let calendar = F.calendar(newYork)
+        let utcCalendar = F.calendar(.gmt)
+        // The next two changes, one forward and one back, whatever today's date.
+        let firstChange = try #require(newYork.nextDaylightSavingTimeTransition(after: Date()))
+        let secondChange = try #require(newYork.nextDaylightSavingTimeTransition(after: firstChange))
+        var sawSkipped = false
+        var sawRepeated = false
+
+        for change in [firstChange, secondChange] {
+            let offsetBefore = TimeInterval(newYork.secondsFromGMT(for: change.addingTimeInterval(-1)))
+            let offsetAfter = TimeInterval(newYork.secondsFromGMT(for: change))
+            let forward = offsetAfter > offsetBefore
+            let changeDay = calendar.dateComponents([.year, .month, .day], from: change)
+            let firstDay = try #require(calendar.date(byAdding: .day, value: -3, to: calendar.startOfDay(for: change)))
+            // 00:30 is before the change, 01:30 before it going forward and repeated going
+            // back, 02:30 skipped going forward and after the change going back.
+            for hour in [0, 1, 2] {
+                let first = try #require(calendar.date(bySettingHour: hour, minute: 30, second: 0, of: firstDay))
+                let ics = F.ics(["""
+                    UID:offset-change-\(hour)
+                    DTSTART;TZID=America/New_York:\(F.wall(first, newYork))
+                    DTEND;TZID=America/New_York:\(F.wall(first.addingTimeInterval(30 * 60), newYork))
+                    RRULE:FREQ=DAILY;COUNT=5
+                    """])
+                let rows = F.listing(ics, from: first.addingTimeInterval(-60), to: first.addingTimeInterval(F.days(6)))
+                    .sorted { ($0.startDate ?? .distantPast) < ($1.startDate ?? .distantPast) }
+                #expect(rows.count == 5, "\(hour):30: five daily occurrences, got \(rows.count)")
+                guard rows.count == 5 else { continue }
+
+                // The wall time read as if it were UTC, less the offset RFC 5545 §3.3.5 picks.
+                var wall = changeDay
+                wall.hour = hour
+                wall.minute = 30
+                let wallAsUTC = try #require(utcCalendar.date(from: wall))
+                let afterTheChange = !forward && hour == 2
+                let expected = wallAsUTC.addingTimeInterval(-(afterTheChange ? offsetAfter : offsetBefore))
+                let onTheDay = rows[3]
+                #expect(onTheDay.startDate == expected,
+                        "\(forward ? "forward" : "back") \(hour):30 on the day of the change: got \(onTheDay.start?.dateTime ?? "nil"), expected \(expected)")
+                #expect(onTheDay.id == F.occurrenceId(F.utcValue(expected)), "the occurrence's id is not its own instant's")
+                if forward, hour == 2 { sawSkipped = true }
+                if !forward, hour == 1 { sawRepeated = true }
+            }
+        }
+        #expect(sawSkipped && sawRepeated, "setup: the two changes were not one forward and one back")
+    }
+
     @Test("an all-day series lists plain dates, with no time and no zone")
     func allDaySeriesListsPlainDates() throws {
         let device = TimeZone.current
@@ -251,6 +301,71 @@ struct CalDAVOccurrenceExpansionTests {
         let hour: TimeInterval = 60 * 60
         let expectedLengths: [TimeInterval] = [hour, hour, 2 * hour, hour]
         #expect(lengths == expectedLengths)
+    }
+
+    @Test("an RDATE after the rule's last occurrence is still an occurrence, whether COUNT or UNTIL ends the rule")
+    func rdateAfterTheRuleEndsIsAnOccurrence() {
+        let first = F.topOfHour(hoursFromNow: 20)
+        let extra = first.addingTimeInterval(F.days(10))
+        let ends = ["COUNT=2", "UNTIL=\(F.utcValue(first.addingTimeInterval(F.days(1))))"]
+
+        for end in ends {
+            let ics = F.ics(["""
+                UID:rdate-after-end
+                DTSTART:\(F.utcValue(first))
+                DTEND:\(F.utcValue(first.addingTimeInterval(60 * 60)))
+                RRULE:FREQ=DAILY;\(end)
+                RDATE:\(F.utcValue(extra))
+                """])
+            let rows = F.listing(ics, from: first.addingTimeInterval(-60), to: first.addingTimeInterval(F.days(20)))
+                .sorted { ($0.startDate ?? .distantPast) < ($1.startDate ?? .distantPast) }
+
+            #expect(rows.compactMap(\.startDate) == [first, first.addingTimeInterval(F.days(1)), extra],
+                    "\(end): the rule's two occurrences and the extra date after them: \(rows.map { $0.start?.dateTime ?? "nil" })")
+            let read = CalDAVOccurrences.occurrence(key: F.utcValue(extra), icsText: ics, href: F.href)
+            #expect(read?.startDate == extra, "\(end): the extra date after the rule's end does not read back by its id")
+        }
+    }
+
+    @Test("an occurrence already under way when the range starts is listed: a three-day all-day one from its third day, a 56-hour one from 50 hours in")
+    func occurrenceUnderWayAtTheRangeStartIsListed() throws {
+        let device = TimeZone.current
+        let calendar = F.calendar(device)
+        let firstDay = try #require(calendar.date(byAdding: .day, value: 2, to: calendar.startOfDay(for: Date())))
+        func day(_ n: Int) throws -> Date {
+            try #require(calendar.date(byAdding: .day, value: n, to: firstDay))
+        }
+        let firstEnd = try day(3)
+        let allDay = F.ics(["""
+            UID:three-days
+            DTSTART;VALUE=DATE:\(F.dateValue(firstDay, device))
+            DTEND;VALUE=DATE:\(F.dateValue(firstEnd, device))
+            SUMMARY:Conference
+            RRULE:FREQ=WEEKLY;COUNT=3
+            """])
+        // From noon on the second week's third day, to noon the next day.
+        let secondWeek = try day(7)
+        let secondWeekThirdDay = try day(9)
+        let thirdDayNoon = try #require(calendar.date(bySettingHour: 12, minute: 0, second: 0, of: secondWeekThirdDay))
+        let allDayRows = F.listing(allDay, from: thirdDayNoon, to: thirdDayNoon.addingTimeInterval(F.days(1)))
+        #expect(allDayRows.compactMap(\.id) == [F.occurrenceId(F.dateValue(secondWeek, device))],
+                "the all-day occurrence under way when the range starts is not the one row listed: \(allDayRows.compactMap(\.id))")
+
+        let first = F.topOfHour(hoursFromNow: 30)
+        let length: TimeInterval = 56 * 60 * 60
+        let timed = F.ics(["""
+            UID:fifty-six-hours
+            DTSTART:\(F.utcValue(first))
+            DTEND:\(F.utcValue(first.addingTimeInterval(length)))
+            SUMMARY:Shift
+            RRULE:FREQ=WEEKLY;COUNT=3
+            """])
+        let second = first.addingTimeInterval(F.days(7))
+        let inside = second.addingTimeInterval(50 * 60 * 60)
+        let timedRows = F.listing(timed, from: inside, to: inside.addingTimeInterval(60 * 60))
+        #expect(timedRows.compactMap(\.id) == [F.occurrenceId(F.utcValue(second))],
+                "the 56-hour occurrence under way when the range starts is not the one row listed: \(timedRows.compactMap(\.id))")
+        #expect(timedRows.first?.startDate == second && timedRows.first?.endDate == second.addingTimeInterval(length))
     }
 
     @Test("a changed occurrence is listed where it now is: moved out of the range it is gone, moved into it it shows")
@@ -524,6 +639,37 @@ struct CalDAVOccurrenceLookupTests {
         #expect(nearbyRead?.id == nil, "a key no occurrence has must not read back as a nearby occurrence")
     }
 
+    @Test("an occurrence whose date in UTC is not its local date reads back by its id: an evening one in New York, a morning one in Tokyo")
+    func occurrencesOnAnotherUTCDateReadBack() throws {
+        let cases: [(zone: String, hour: Int)] = [("America/New_York", 20), ("Asia/Tokyo", 8)]
+        for entry in cases {
+            let zone = try #require(TimeZone(identifier: entry.zone))
+            let calendar = F.calendar(zone)
+            let tomorrow = try #require(calendar.date(byAdding: .day, value: 1, to: Date()))
+            let first = try #require(calendar.date(bySettingHour: entry.hour, minute: 0, second: 0, of: tomorrow))
+            let ics = F.ics(["""
+                UID:other-utc-date
+                DTSTART;TZID=\(entry.zone):\(F.wall(first, zone))
+                DTEND;TZID=\(entry.zone):\(F.wall(first.addingTimeInterval(30 * 60), zone))
+                SUMMARY:Call
+                RRULE:FREQ=WEEKLY;COUNT=3
+                """])
+
+            let rows = F.listing(ics, from: first.addingTimeInterval(-60), to: first.addingTimeInterval(F.days(20)))
+            #expect(rows.count == 3, "\(entry.zone): three weekly occurrences, got \(rows.count)")
+            for row in rows {
+                let start = try #require(row.startDate)
+                #expect(F.dateValue(start, zone) != F.dateValue(start, .gmt),
+                        "setup: \(entry.zone) \(entry.hour):00 has the same date in UTC")
+                let id = try #require(row.id)
+                let split = try CalDAVOccurrences.OccurrenceId.split(id)
+                let key = try #require(split.key, "\(id) is not an occurrence id")
+                let read = CalDAVOccurrences.occurrence(key: key, icsText: ics, href: F.href)
+                #expect(read?.id == row.id && read?.startDate == start, "\(entry.zone): \(id) does not read back as listed")
+            }
+        }
+    }
+
     @Test("occurrence ids: a series id has no key, a damaged one is refused, and each key names its recurrence_id")
     func occurrenceIdShapes() throws {
         let instant = F.topOfHour(hoursFromNow: 5)
@@ -538,13 +684,14 @@ struct CalDAVOccurrenceLookupTests {
             }
         }
 
-        let utcRid = try #require(CalDAVOccurrences.OccurrenceId.recurrenceId(ofKey: utcKey))
-        #expect(utcRid.naive == F.naive(instant, .gmt) && utcRid.zone.secondsFromGMT(for: instant) == 0)
+        // Each key as the recurrence_id a tool gives, a naive wall time in the operation's zone.
+        let tokyo = try #require(TimeZone(identifier: "Asia/Tokyo"))
+        #expect(CalDAVOccurrences.OccurrenceId.recurrenceId(ofKey: utcKey, in: tokyo) == F.naive(instant, tokyo),
+                "an instant's key is not that instant's wall time in the operation's zone")
         let wallKey = F.wall(instant, .current)
-        let wallRid = try #require(CalDAVOccurrences.OccurrenceId.recurrenceId(ofKey: wallKey))
-        #expect(wallRid.naive == F.naive(instant, .current) && wallRid.zone.identifier == TimeZone.current.identifier)
+        #expect(CalDAVOccurrences.OccurrenceId.recurrenceId(ofKey: wallKey, in: tokyo) == F.naive(instant, .current),
+                "a floating key's wall time was moved to another zone")
         let dateKey = F.dateValue(instant, .current)
-        let dateRid = try #require(CalDAVOccurrences.OccurrenceId.recurrenceId(ofKey: dateKey))
-        #expect(dateRid.naive == F.isoDate(instant, .current) + "T00:00:00")
+        #expect(CalDAVOccurrences.OccurrenceId.recurrenceId(ofKey: dateKey, in: tokyo) == F.isoDate(instant, .current) + "T00:00:00")
     }
 }

@@ -40,25 +40,56 @@ of the resource, which holds every occurrence (irreversible wire operation #5, n
    fragment and address the whole series, so `resolveEventURL` refuses any id that carries it.
    - Read: `getEvent` by an occurrence id returns that occurrence as the listing shows it (`notFound`
      when the series no longer has it); by the series id, the series.
-   - Edit: `updateEvent` is the edit of the whole series (edit_scope `all`), so by an occurrence id
-     it edits the SERIES, every occurrence, as the tool promises; a change of the rule through an
-     occurrence id is refused with nothing written. `updateOccurrence` (this_only) by an occurrence
-     id changes that occurrence alone; it and `splitSeries` (this_and_following) address its series'
-     resource exactly as given the series id. The Google and Outlook paths are unchanged.
+   - Edit, whole series: `updateEvent` is the edit of the whole series (edit_scope `all`). By an
+     occurrence id it may set only fields that place nothing in time (title, location, description,
+     busy status), which it writes into the SERIES, every occurrence. A start, an end (or their
+     zones), guests or a repeat rule given with an occurrence id is REFUSED before any request
+     (`CalDAVProvider.setsTimeGuestsOrRule`), nothing written: the assistant takes those values from
+     the occurrence it was shown, and written over the series they would move its first date to that
+     occurrence's date (and every removed, added and changed occurrence with it) or give every
+     occurrence one occurrence's guests. The refusal says to edit just the occurrence with this_only.
+     An `all` edit by an occurrence id that changes the time returns with the series time-shift work,
+     which reads a new time relative to the occurrence named.
+   - Edit, one occurrence or a split: `updateOccurrence` (this_only) and `splitSeries`
+     (this_and_following) address the series' resource and make ONE check before they write
+     anything, `CalDAVOccurrences.scopedEditSlot`: `recurrence_id` must name an occurrence the series
+     has now. With the series id, it must be a place the series puts an occurrence (a rule or `RDATE`
+     date not removed by `EXDATE`, or an override's `RECURRENCE-ID`); a moved occurrence's new time is
+     not one. With an occurrence id, the key names the occurrence and `recurrence_id` must name the
+     same one, by its place in the series or by where it now is (the start the listing showed); the
+     write uses the key's place, so an override is changed in place and a split starts where the
+     series puts that occurrence, never at where it was moved to. An event that does not repeat, a
+     series marked not listed, a resource holding only overrides and a cancelled occurrence are
+     refused too, as on Google and Outlook. The check runs after the GET and before any PUT,
+     including the split's create and its cap (irreversible wire operation #6). For a split it reads the rule
+     without its `COUNT`/`UNTIL`: where the series ends stays `RecurrenceTail.newSeriesRule`'s check,
+     which also knows a series this same split already capped (a retry).
    - Delete: `deleteEvent` by an occurrence id is REFUSED before any request ("Deleting one
-     occurrence of a repeating CalDAV event is not supported yet … by its series id"). The queue
-     retires it as unsupported and the card and the tool say the event was not deleted. Deleting by
-     the series id is unchanged.
-   - `calendar_event_read` shows `series_event_id` for an occurrence of a series (any provider) so the
-     refusal's way out can be taken; `ChatIdTranslator` maps it like `event_id`.
+     occurrence of a repeating CalDAV event is not supported yet, so nothing was deleted. The user can
+     delete it in their calendar app."). The queue retires it as unsupported and the card and the
+     tool say the event was not deleted. Deleting by the series id is unchanged.
+   - No series id is added to the tools' output. `calendar_event_read` shows `event_id` only, on every
+     provider, exactly as before this ADR (a `series_event_id` line was tried and pulled back: on
+     Google and Outlook it handed the assistant a series id it would edit with an occurrence's date,
+     moving the whole series). What still names a CalDAV series itself: the row of a series marked
+     not listed, and a split's `new_series_event_id`.
 
 **Consequences:**
 - A day asked about lists that day's occurrence with its own id, as on Google and Outlook; changed
   occurrences show where they now are.
 - One occurrence of a CalDAV series can't be deleted yet; that is an `EXDATE` written into the series
-  (a later change). The whole series still can be.
-- Edit scope `all` given an occurrence id edits the whole series on CalDAV. The Google and Outlook
-  paths, which edit only the instance there, are left as they are.
+  (a later change). The whole series still can be, by its own id.
+- Edit scope `all` given an occurrence id sets the whole series' title, location, description and busy
+  status on CalDAV, and refuses a time, an end, guests or a rule. The Google and Outlook paths, which
+  edit only the instance there, are left as they are.
+- For a series the listing expands, no tool output carries the series' own id, so a change of the
+  whole series' time, guests or rule, and a delete of the whole series, can't be asked for from one of
+  its occurrences; the refusals say the user can make them in their calendar app.
+- A one-occurrence edit or a split of a series the device can't expand, or of a resource that holds
+  only overrides, is refused where the code before this ADR wrote an override or a split at the given
+  time unchecked.
+- A retry after a lost response can be refused, with nothing written, when the first attempt changed
+  the time of a moved occurrence named by its new time, or capped the series at it.
 - Nothing new is stored: the occurrences are worked out per listing from the resource the server
   returns (ADR-004 untouched). `maxResults` trims after the expansion.
 
@@ -68,8 +99,10 @@ keeping the device expansion for servers that don't expand would be a second rou
 
 **Detail:** `CalDAVOccurrences.swift`; tests `CalDAVOccurrenceExpansionTests`,
 `CalDAVOccurrenceNotListedTests`, `CalDAVOccurrenceLookupTests`, `CalDAVOccurrenceWireTests`
-(no DELETE for an occurrence id, series unchanged; an `all` edit by an occurrence id changes every
-occurrence), `CalDAVOccurrenceDeleteToolToWireTests` (the
+(no DELETE for an occurrence id, series unchanged; an `all` edit by an occurrence id sets the fields
+that place nothing in time and refuses the rest with no request; a moved occurrence listed with its
+own id, edited in place and split at its place in the series; a `recurrence_id` that names no
+occurrence, or another occurrence than the id's, writes nothing), `CalDAVOccurrenceDeleteToolToWireTests` (the
 same from `calendar_read` / `calendar_search` through `calendar_event_delete`) and
 `CalDAVOccurrenceToolOutputTests`. `ICSParserTests.skipsRecurrenceExceptions` and
 `ICSParserTests.multipleVEventsReturnsFirst` now pin only the series view; the listing contract they

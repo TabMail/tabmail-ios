@@ -686,10 +686,8 @@ actor ChatIdTranslator {
         // `new_series_event_id` is emitted by `calendar_event_edit` after a
         // `this_and_following` split — the freshly-created series's id, which
         // the LLM needs to address occurrences past the split point. Treated
-        // identically to `event_id` for translation. `series_event_id` is the
-        // whole series of an occurrence `calendar_event_read` returned (the id
-        // to delete or edit every occurrence by), translated the same way.
-        let pattern = /(event_id|new_series_event_id|series_event_id|calendar_id|contact_id|addressbook_id):\s+([^\n]+?)(?=\n|$)/
+        // identically to `event_id` for translation.
+        let pattern = /(event_id|new_series_event_id|calendar_id|contact_id|addressbook_id):\s+([^\n]+?)(?=\n|$)/
         let matches = Array(output.matches(of: pattern))
         guard !matches.isEmpty else { return output }
 

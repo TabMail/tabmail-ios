@@ -286,7 +286,7 @@ enum CalendarToolHelpers {
     /// is the whole series, shown at its first date, and its occurrences are missing
     /// from the listing. Must not contain ")" (see the recurrence marker).
     static let occurrencesNotListedNote =
-        "repeating event, its occurrences are not listed: TabMail can't work out this rule, so the series is shown once, on its first date"
+        "repeating event, its occurrences are not listed: TabMail couldn't work them out, so the series is shown once, on its first date"
 
     /// Cleanup helper for the free/busy "Source: …" label. Email-style
     /// calendar ids ("alice@example.com") get reduced to the local-part.
@@ -523,13 +523,6 @@ enum CalendarToolHelpers {
         var lines: [String] = []
         let eventIdOutput = accountId.isEmpty ? (event.id ?? "") : CompoundEventId.make(accountId: accountId, eventId: event.id ?? "")
         lines.append("event_id: \(eventIdOutput)")
-        // One occurrence of a repeating event names its whole series too, so an
-        // action meant for every occurrence (deleting the series, where a provider
-        // can't delete one occurrence) has an id to act on.
-        if let seriesId = event.recurringEventId, !seriesId.isEmpty, seriesId != event.id {
-            let seriesIdOutput = accountId.isEmpty ? seriesId : CompoundEventId.make(accountId: accountId, eventId: seriesId)
-            lines.append("series_event_id: \(seriesIdOutput)")
-        }
         let isFreeBusy = (accessRole == Self.freeBusyAccessRole)
         if isFreeBusy {
             let display = Self.freeBusyDisplayName(calendarName: calendarName, calendarId: calendarId)

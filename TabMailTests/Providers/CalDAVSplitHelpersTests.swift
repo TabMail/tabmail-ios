@@ -899,10 +899,19 @@ enum CalDAVWireFixture {
         let recurrenceId: String
     }
 
+    /// The series starts on a Wednesday (in UTC, its frame) a week or more from now, and the
+    /// `recurrence_id` is the Wednesday two weeks later: an occurrence the series has, as
+    /// `updateOccurrence` and `splitSeries` require.
     static func make() -> Fixture {
-        let start = Date().addingTimeInterval(7 * 24 * 60 * 60)
+        var utcCalendar = Calendar(identifier: .gregorian)
+        utcCalendar.timeZone = TimeZone(identifier: "UTC")!
+        let wednesday = 4
+        var start = Date().addingTimeInterval(7 * 24 * 60 * 60)
+        while utcCalendar.component(.weekday, from: start) != wednesday {
+            start = start.addingTimeInterval(24 * 60 * 60)
+        }
         let end = start.addingTimeInterval(45 * 60)
-        let splitAt = Date().addingTimeInterval(21 * 24 * 60 * 60)
+        let splitAt = start.addingTimeInterval(14 * 24 * 60 * 60)
         let ics = """
         BEGIN:VCALENDAR
         VERSION:2.0
