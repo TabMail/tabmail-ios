@@ -461,6 +461,82 @@ struct CalDAVTimeZoneWireTests {
         #expect(store.storedICS(path: Self.path) == seed)
     }
 
+    enum OccurrenceCall: String, CaseIterable, CustomTestStringConvertible {
+        case override = "a one-occurrence edit"
+        case split = "a split"
+        case startDay = "the read of the day an occurrence starts on"
+        var testDescription: String { rawValue }
+    }
+
+    @Test("a timed series in an unrecognized zone is refused by name before its occurrences are worked out, with nothing written",
+          arguments: OccurrenceCall.allCases)
+    func timedSeriesInUnrecognizedZoneIsRefusedByName(call: OccurrenceCall) async throws {
+        let tzid = TimeZoneFixture.unmatchedTZID
+        let seed = TimeZoneFixture.series(tzid: tzid, vtimezone: TimeZoneFixture.unmatched)
+        let (http, store) = Self.serve(seed)
+        defer { http.close() }
+        let provider = CalDAVWireFixture.makeProvider(http)
+        let utc = try #require(TimeZone(identifier: "UTC"))
+        // 2099-03-09 10:00 at the zone's -05:00: the series' second occurrence, so a device-zone
+        // expansion would report it not found rather than name the zone.
+        let rid = "2099-03-09T15:00:00"
+        await #expect {
+            switch call {
+            case .override:
+                var patch = GCalEventInput()
+                patch.summary = "Renamed"
+                _ = try await provider.updateOccurrence(
+                    calendarId: Self.calendarId, eventId: Self.path, recurrenceId: rid,
+                    recurrenceIdZone: utc, event: patch, sendUpdates: "none")
+            case .split:
+                _ = try await provider.splitSeries(
+                    calendarId: Self.calendarId, eventId: Self.path, recurrenceId: rid,
+                    recurrenceIdZone: utc, patch: GCalEventInput(), sendUpdates: "none")
+            case .startDay:
+                _ = try await provider.occurrenceStartDay(
+                    calendarId: Self.calendarId, eventId: Self.path, recurrenceId: rid, recurrenceIdZone: utc)
+            }
+        } throws: { error in
+            TimeZoneFixture.namesZone(error, tzid)
+        }
+        #expect(store.recordedPuts().isEmpty, "a PUT was sent: \(store.recordedPuts().map(\.path))")
+        #expect(store.storedICS(path: Self.path) == seed)
+    }
+
+    /// A weekly all-day series from 2099-03-02 whose DTSTART carries a TZID TabMail does not
+    /// recognize next to VALUE=DATE: a date has no zone, so the TZID is never read.
+    private static func allDaySeriesWithUnrecognizedTZID() -> String {
+        let tzid = TimeZoneFixture.unmatchedTZID
+        return TimeZoneFixture.resource(TimeZoneFixture.unmatched, [[
+            "BEGIN:VEVENT", "UID:allday-tz", "DTSTAMP:20990101T000000Z",
+            "DTSTART;VALUE=DATE;TZID=\(tzid):20990302", "DTEND;VALUE=DATE;TZID=\(tzid):20990303",
+            "RRULE:FREQ=WEEKLY;COUNT=5", "SUMMARY:Offsite", "END:VEVENT",
+        ]])
+    }
+
+    @Test("an all-day series whose date start carries an unrecognized TZID stays editable: its start day is read and one occurrence is written")
+    func allDaySeriesWithUnrecognizedTZIDStaysEditable() async throws {
+        let (http, store) = Self.serve(Self.allDaySeriesWithUnrecognizedTZID())
+        defer { http.close() }
+        let provider = CalDAVWireFixture.makeProvider(http)
+        let utc = try #require(TimeZone(identifier: "UTC"))
+
+        let day = try await provider.occurrenceStartDay(
+            calendarId: Self.calendarId, eventId: Self.path, recurrenceId: "2099-03-09T00:00:00", recurrenceIdZone: utc)
+        #expect(day == "2099-03-09")
+
+        var patch = GCalEventInput()
+        patch.summary = "Offsite (renamed)"
+        _ = try await provider.updateOccurrence(
+            calendarId: Self.calendarId, eventId: Self.path, recurrenceId: "2099-03-09T00:00:00",
+            recurrenceIdZone: utc, event: patch, sendUpdates: "none")
+        let stored = try #require(store.storedICS(path: Self.path))
+        #expect(store.recordedPuts().count == 1)
+        #expect(stored.contains("RECURRENCE-ID;VALUE=DATE"), "stored:\n\(stored)")
+        #expect(stored.contains("20990309"))
+        #expect(stored.contains("SUMMARY:Offsite (renamed)"))
+    }
+
     @Test("an edit that needs no instant of an event in an unrecognized zone still lands")
     func titleEditOfUnrecognizedZoneLands() async throws {
         let seed = TimeZoneFixture.series(tzid: TimeZoneFixture.unmatchedTZID, vtimezone: TimeZoneFixture.unmatched)

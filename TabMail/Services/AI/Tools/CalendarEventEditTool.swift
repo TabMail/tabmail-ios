@@ -247,7 +247,8 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         // misleadingly displays the wrong date (e.g. the master on the 14th when the user is
         // editing the occurrence on the 21st). Keyed off `resolvedScope`, NOT raw recurrence_id
         // presence, so an `all`-scope edit that happens to carry a stale recurrence_id still
-        // shows the master.
+        // shows the event its event_id names (the master for a series id, the occurrence for
+        // an occurrence id).
         let tz = CalendarToolHelpers.resolveTimeZone(arguments)
         // A whole-series edit may reset the occurrences the user changed one by one (#423): on
         // Outlook any change of the series' rule, start or end does. Say so on the card. The

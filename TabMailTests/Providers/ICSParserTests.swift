@@ -135,6 +135,11 @@ struct ICSParserTests {
         #expect(events[0].end != nil)
     }
 
+    // SERIES VIEW ONLY (ADR-IOS-108). `ICSParser.parse` is what a read by a series id
+    // returns: the series, without its changed occurrences. A LISTING no longer reads
+    // through this: it lists each occurrence, changed ones where they now are, via
+    // `CalDAVOccurrences.listing`, pinned by `CalDAVOccurrenceExpansionTests`
+    // (`movedOverridesAreListedWhereTheyNowAre`, `cancelledOccurrenceIsMarkedCancelled`).
     @Test("Skips RECURRENCE-ID events (exceptions)")
     func skipsRecurrenceExceptions() {
         let ics = """
@@ -242,6 +247,10 @@ struct ICSParserTests {
 
     // MARK: - Coverage gap tests
 
+    // SERIES VIEW ONLY (ADR-IOS-108). A read by a series id takes the resource's first
+    // VEVENT. A LISTING no longer returns one row per resource: it returns one row per
+    // occurrence in the range, pinned by `CalDAVOccurrenceExpansionTests`
+    // (`weeklyZonedSeriesKeepsItsWallTimeAcrossDST` and its siblings).
     @Test("Multiple master VEVENTs returns only first")
     func multipleVEventsReturnsFirst() {
         let ics = """
