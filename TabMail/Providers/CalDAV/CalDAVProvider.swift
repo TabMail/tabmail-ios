@@ -455,6 +455,34 @@ actor CalDAVProvider: CalendarProvider {
         return Self.occurrenceStartDay(storedICS: ics, recurrenceIdNaive: rid)
     }
 
+    /// The occurrence an edit names (`CalendarProvider.occurrence`), read with nothing written:
+    /// the one `updateOccurrence` would change and `splitSeries` would split at, by their own
+    /// check (`CalDAVOccurrences.scopedEdit`, with what it refuses: a stored zone TabMail does not
+    /// recognize, an occurrence id whose key names another occurrence, with `forSplit` a moved
+    /// occurrence, and the rest), as a listing shows it, with its place in the series
+    /// (`originalStartTime`, from its key).
+    func occurrence(
+        calendarId: String,
+        eventId: String,
+        recurrenceId: String,
+        recurrenceIdZone: TimeZone,
+        forSplit: Bool
+    ) async throws -> GCalEvent {
+        let (seriesHref, occurrenceKey) = try CalDAVOccurrences.OccurrenceId.split(eventId)
+        let eventURL = try resolveEventURL(seriesHref, calendarId: calendarId)
+        let (data, _) = try await client.get(url: eventURL)
+        guard let ics = String(data: data, encoding: .utf8), !ics.isEmpty else {
+            throw CalDAVError.parseError("Empty response for event \(eventId)")
+        }
+        let named = try CalDAVOccurrences.scopedEdit(
+            icsText: ics, href: seriesHref, key: occurrenceKey,
+            recurrenceId: recurrenceId, zone: recurrenceIdZone, forSplit: forSplit)
+        guard let found = CalDAVOccurrences.occurrence(key: named.key, icsText: ics, href: seriesHref) else {
+            throw CalDAVError.notFound
+        }
+        return found
+    }
+
     /// Single-occurrence override (this_only). CalDAV represents overrides as
     /// additional VEVENT blocks in the SAME .ics resource sharing the master's
     /// UID, distinguished by a RECURRENCE-ID property. We GET the resource,

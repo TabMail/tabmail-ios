@@ -63,7 +63,10 @@ private let kindChangeTimesHint = "to change this event between all-day and time
 
 // MARK: - A stateful Google calendar
 
-/// An in-memory Google calendar: `GET` returns the stored event (or a series' instances), `PATCH`
+/// An in-memory Google calendar: `GET` returns the stored event (or a series' instances: the
+/// occurrences stored with its `recurringEventId` that overlap, where they are now, the window the
+/// request names, as Google filters them; a deleted one, kept with `status` "cancelled", is left out
+/// of the list while GET by its id still returns it), `PATCH`
 /// replaces each top-level property the body names (Google's patch semantics: a supplied `start`
 /// replaces the stored `start` whole), and `POST` stores a new event under the `id` it carries.
 /// A PATCH of a series that changes its `recurrence`, or its start or end (another date or
@@ -102,9 +105,12 @@ final class FakeGoogleCalendar: Sendable {
         http.register(path: prefix + "/", method: "GET") { [self] request in
             let parts = Self.pathParts(request.url)
             if parts.count == 2, parts[1] == "instances" {
+                let window = Self.window(request.url)
                 let items = events.withLock { Array($0.values) }
                     .compactMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
                     .filter { $0["recurringEventId"] as? String == parts[0] }
+                    .filter { $0["status"] as? String != "cancelled" }
+                    .filter { Self.overlaps($0, window) }
                 return Self.json(["items": items])
             }
             guard parts.count == 1, let stored = event(parts[0]) else { return .status(404) }
@@ -149,6 +155,29 @@ final class FakeGoogleCalendar: Sendable {
         events.withLock { $0[event["id"] as! String] = data }
     }
 
+    /// The instances window a request names (`timeMin`, `timeMax`), nil when it names none.
+    private static func window(_ url: URL) -> (from: Date, to: Date)? {
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        func value(_ name: String) -> Date? { items.first { $0.name == name }?.value.flatMap { Date.fromISO8601($0) } }
+        guard let from = value("timeMin"), let to = value("timeMax") else { return nil }
+        return (from, to)
+    }
+
+    /// Whether `event`, where it is NOW (its `start` and `end`, not its place in the series),
+    /// overlaps `window`, as Google's instances list filters; every event when there is no window.
+    /// An all-day date is read from UTC midnight.
+    private static func overlaps(_ event: [String: Any], _ window: (from: Date, to: Date)?) -> Bool {
+        guard let window else { return true }
+        func instant(_ value: Any?) -> Date? {
+            guard let value = value as? [String: Any] else { return nil }
+            if let dateTime = value["dateTime"] as? String { return Date.fromISO8601(dateTime) }
+            return (value["date"] as? String).flatMap { EKEventStoreHelper.parseNaiveISO($0, timeZone: .gmt) }
+        }
+        guard let start = instant(event["start"]) else { return false }
+        let end = instant(event["end"]) ?? start
+        return start < window.to && (end > window.from || start >= window.from)
+    }
+
     /// Whether a written start or end is the stored one as Google reads it: the same date, or the
     /// same instant, and the same zone.
     private static func sameTime(_ written: Any, _ stored: Any?) -> Bool {
@@ -178,7 +207,11 @@ final class FakeGoogleCalendar: Sendable {
             "start": ["date": start], "end": ["date": end],
         ]
         if recurring { e["recurrence"] = ["RRULE:FREQ=WEEKLY"] }
-        if let master { e["recurringEventId"] = master }
+        if let master {
+            e["recurringEventId"] = master
+            // Its place in the series, as `events.instances` gives every occurrence.
+            e["originalStartTime"] = ["date": start]
+        }
         return e
     }
 
@@ -194,7 +227,7 @@ final class FakeGoogleCalendar: Sendable {
 // MARK: - Driving the real queue
 
 /// One edit drained through `AccountManager.drainCalendarQueue` against `provider`, and the durable
-/// row afterwards. Shared with `CalDAVAlarmIsNotTheEventWriteTests`.
+/// row afterwards. Shared with `CalDAVAlarmIsNotTheEventWriteTests` and `CalendarSeriesScopeTests`.
 func drainEdit(
     accountId: String,
     eventId: String,
@@ -349,7 +382,8 @@ struct GoogleCalendarEditKeepsKindTests {
     @Test("splitting an all-day series with a move starts the new series all-day on the given date")
     func allDaySplitStartsOnTheGivenDate() async throws {
         let rid = "\(day(7))T00:00:00"
-        let r = try await run([FakeGoogleCalendar.allDay(id: "ser-sp", start: day(0), end: day(1), recurring: true)],
+        let r = try await run([FakeGoogleCalendar.allDay(id: "ser-sp", start: day(0), end: day(1), recurring: true),
+                               FakeGoogleCalendar.allDay(id: "ser-sp_occ", start: day(7), end: day(8), master: "ser-sp")],
                               eventId: "ser-sp", [
             "edit_scope": .string("this_and_following"), "recurrence_id": .string(rid),
             "start_iso": .string("\(day(9))T00:00:00"), "end_iso": .string("\(day(10))T00:00:00"),
@@ -1042,12 +1076,16 @@ struct CalDAVCalendarEditKeepsKindTests {
 @Suite("A calendar edit without all_day keeps the event's kind: the queue", .serialized, .processGlobalState)
 struct CalendarQueueEditKindTests {
 
-    private func allDayResource(start: String = day(0), end: String = day(1)) -> GCalEvent {
+    /// A weekly all-day series, or with `recurring: false` a one-off all-day event: an edit of every
+    /// occurrence of a series that moves it to another date with no occurrence named is a question
+    /// for the user (`CalendarSeriesScopeTests`), so the moves of every occurrence here move a
+    /// one-off event.
+    private func allDayResource(start: String = day(0), end: String = day(1), recurring: Bool = true) -> GCalEvent {
         GCalEvent(
             id: "ev-1", summary: "Offsite", location: nil, description: nil,
             start: GCalDateTime(dateTime: nil, date: start, timeZone: nil),
             end: GCalDateTime(dateTime: nil, date: end, timeZone: nil),
-            attendees: nil, organizer: nil, recurrence: ["RRULE:FREQ=WEEKLY"],
+            attendees: nil, organizer: nil, recurrence: recurring ? ["RRULE:FREQ=WEEKLY"] : nil,
             transparency: nil, status: nil, htmlLink: nil, created: nil, updated: nil)
     }
 
@@ -1095,7 +1133,7 @@ struct CalendarQueueEditKindTests {
     func moveLearnsTheKind() async throws {
         let r = try await drain([
             "start_iso": .string("\(day(7))T00:00:00"), "end_iso": .string("\(day(8))T00:00:00"),
-        ], account: "kind-q-learn", resource: allDayResource())
+        ], account: "kind-q-learn", resource: allDayResource(recurring: false))
         #expect(r.getEventCalls == 1, "the kind was assumed, not learned from the event")
         guard r.updates.count == 1 else { Issue.record("updates: \(r.updates.count)"); return }
         #expect(r.updates[0].event.startDate == day(7) && r.updates[0].event.endDate == day(8),
@@ -1148,12 +1186,12 @@ struct CalendarQueueEditKindTests {
     func statedKindIsNotAsked() async throws {
         let kept = try await drain([
             "all_day": .bool(true), "start_iso": .string("\(day(7))T15:00:00"), "end_iso": .string("\(day(8))T15:00:00"),
-        ], account: "kind-q-stated-true", resource: allDayResource())
+        ], account: "kind-q-stated-true", resource: allDayResource(recurring: false))
         #expect(kept.rows.isEmpty && kept.updates.first?.event.startDate == day(7),
                 "rows: \(kept.rows.map { $0.failureReason ?? $0.status })")
         let timed = try await drain([
             "all_day": .bool(false), "start_iso": .string("\(day(7))T15:00:00"), "end_iso": .string("\(day(7))T16:00:00"),
-        ], account: "kind-q-stated-false", resource: allDayResource())
+        ], account: "kind-q-stated-false", resource: allDayResource(recurring: false))
         #expect(timed.rows.isEmpty && timed.updates.first?.event.startDateTime != nil,
                 "rows: \(timed.rows.map { $0.failureReason ?? $0.status })")
     }
@@ -1178,7 +1216,7 @@ struct CalendarQueueEditKindTests {
 
     @Test("an all-day event given only a new end after its start is written (control)")
     func endOnlyAfterTheStartIsWritten() async throws {
-        let r = try await drain(["end_iso": .string(day(3))], account: "kind-q-endok", resource: allDayResource())
+        let r = try await drain(["end_iso": .string(day(3))], account: "kind-q-endok", resource: allDayResource(recurring: false))
         #expect(r.updates.count == 1 && r.rows.isEmpty, "rows: \(r.rows.map { $0.failureReason ?? $0.status })")
         #expect(r.updates.first?.event.endDate == day(3))
         #expect(r.getEventCalls == 1, "the event was read \(r.getEventCalls) times; the kind's read also gives the start")
@@ -1222,12 +1260,14 @@ struct CalendarQueueEditKindTests {
                 "\(scope): a valid move was refused: \(earlier.rows.map { $0.failureReason ?? $0.status })")
     }
 
-    @Test("all_day: true with a start and an end reads nothing: the kind and the start are both given (control)")
+    @Test("all_day: true with a start and an end reads only what finds the series: the kind and the start are both given (control)")
     func statedKindAndStartReadNothing() async throws {
         let r = try await drain([
             "all_day": .bool(true), "start_iso": .string(day(7)), "end_iso": .string(day(8)),
-        ], account: "kind-q-stated", resource: allDayResource())
-        #expect(r.getEventCalls == 0, "an edit that states its kind and start read the event \(r.getEventCalls) time(s)")
+        ], account: "kind-q-stated", resource: allDayResource(recurring: false))
+        // An edit of every occurrence reads the event once, to find whether it is an occurrence
+        // and so which event to write (#560); the kind and the start are not read again.
+        #expect(r.getEventCalls == 1, "an edit that states its kind and start read the event \(r.getEventCalls) time(s)")
         #expect(r.updates.count == 1 && r.rows.isEmpty, "rows: \(r.rows.map { $0.failureReason ?? $0.status })")
     }
 
@@ -1241,12 +1281,13 @@ struct CalendarQueueEditKindTests {
                 "reason \(r.rows.first?.failureReason ?? "<none>")")
     }
 
-    @Test("an edit that moves nothing and sets no UNTIL makes no getEvent call (control)")
+    @Test("an edit that moves nothing and sets no UNTIL reads the event only to find its series (control)")
     func noFetchWhenNothingMoves() async throws {
         let r = try await drain([
             "title": .string("Renamed"), "description": .string("Notes"), "location": .string("Room 2"),
         ], account: "kind-q-nofetch", resource: allDayResource())
-        #expect(r.getEventCalls == 0, "an edit that moves nothing paid a round trip")
+        // One read, which tells an occurrence from its series (#560); none for the kind.
+        #expect(r.getEventCalls == 1, "an edit that moves nothing paid \(r.getEventCalls) round trip(s)")
         #expect(r.updates.count == 1)
     }
 

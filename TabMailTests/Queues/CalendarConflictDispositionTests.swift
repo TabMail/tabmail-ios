@@ -380,6 +380,32 @@ struct CalendarSplitConflictDispositionTests {
      "recurrence":["RRULE:FREQ=WEEKLY;BYDAY=WE"]}
     """.utf8)
 
+    /// The series' instances list: its occurrence at `recurrenceId`, read in the device's zone as the
+    /// edit (which gives no `timezone`) reads it, never moved.
+    private static var instancesJSON: Data {
+        let at = EKEventStoreHelper.parseNaiveISO(recurrenceId, timeZone: .current)?.iso8601String() ?? ""
+        let place = ["dateTime": at]
+        // swiftlint:disable:next force_try
+        return try! JSONSerialization.data(withJSONObject: ["items": [[
+            "id": "master-1_occ", "status": "confirmed", "recurringEventId": masterId,
+            "start": place, "originalStartTime": place,
+        ]]])
+    }
+
+    /// What reaches the wire before the successor's create: the queue reads the series and the
+    /// occurrence the edit names (`CalendarSeriesScope.read`: the event, then `occurrence`'s
+    /// `resolveToMaster` and instances), then the split reads the series (`resolveToMaster`) and
+    /// checks the occurrence it splits at (its instances).
+    private static var readsBeforeCreate: [String] {
+        [
+            "GET \(masterPath)",
+            "GET \(masterPath)",
+            "GET \(masterPath)/instances",
+            "GET \(masterPath)",
+            "GET \(masterPath)/instances",
+        ]
+    }
+
     private static func googleErrorBody(code: Int, reason: String) -> Data {
         Data("""
         {"error":{"code":\(code),"message":"\(reason)","errors":[{"reason":"\(reason)","message":"\(reason)"}]}}
@@ -410,6 +436,8 @@ struct CalendarSplitConflictDispositionTests {
         // is registered for POST only.
         http.register(path: Self.masterPath, method: "GET",
                       response: .raw(statusCode: 200, headers: ok, body: Self.masterJSON))
+        http.register(path: Self.masterPath + "/instances", method: "GET",
+                      response: .raw(statusCode: 200, headers: ok, body: Self.instancesJSON))
         http.register(path: Self.masterPath, method: "PATCH",
                       response: .raw(statusCode: 200, headers: ok, body: Self.masterJSON))
         http.register(path: Self.createPath, method: "POST", response: createResponse)
@@ -485,8 +513,7 @@ struct CalendarSplitConflictDispositionTests {
                 statusCode: 404, headers: ["Content-Type": "application/json"],
                 body: Self.googleErrorBody(code: 404, reason: "notFound")))
 
-        #expect(result.wire == [
-            "GET \(Self.masterPath)",     // resolveToMaster
+        #expect(result.wire == Self.readsBeforeCreate + [
             "POST \(Self.createPath)",    // the successor create → 409
         ], "got \(result.wire)")
 
@@ -516,8 +543,7 @@ struct CalendarSplitConflictDispositionTests {
                 statusCode: 404, headers: ["Content-Type": "application/json"],
                 body: Self.googleErrorBody(code: 404, reason: "notFound")))
 
-        #expect(result.wire == [
-            "GET \(Self.masterPath)",
+        #expect(result.wire == Self.readsBeforeCreate + [
             "POST \(Self.createPath)",
             "GET \(Self.successorPath)"
         ], "got \(result.wire)")
@@ -546,8 +572,7 @@ struct CalendarSplitConflictDispositionTests {
                  "recurrence":["RRULE:FREQ=WEEKLY;BYDAY=WE"]}
                 """.utf8)))
 
-        #expect(result.wire == [
-            "GET \(Self.masterPath)",
+        #expect(result.wire == Self.readsBeforeCreate + [
             "POST \(Self.createPath)",
             "GET \(Self.successorPath)",
             "GET \(Self.masterPath)",     // updateEvent's GET-then-PATCH (cap)

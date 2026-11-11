@@ -288,6 +288,17 @@ struct RecurrenceTailNewSeriesRuleTests {
         #expect(try rule("RRULE:FREQ=DAILY;UNTIL=20990305", cap: Self.allDayCap) == "RRULE:FREQ=DAILY")
     }
 
+    @Test("A rule is capped at this split only when its UNTIL is this split's own cap")
+    func isCappedOnlyAtItsOwnCap() {
+        #expect(RecurrenceTail.isCapped("RRULE:FREQ=DAILY;UNTIL=20990306T165959Z", at: Self.timedCap))
+        #expect(RecurrenceTail.isCapped("rrule:freq=daily;until=20990306t165959z", at: Self.timedCap))
+        #expect(RecurrenceTail.isCapped("FREQ=WEEKLY;UNTIL=20990305;BYDAY=MO", at: Self.allDayCap))
+        #expect(!RecurrenceTail.isCapped("RRULE:FREQ=DAILY", at: Self.timedCap))
+        #expect(!RecurrenceTail.isCapped("RRULE:FREQ=DAILY;UNTIL=20990306T165958Z", at: Self.timedCap), "one second before the cap")
+        #expect(!RecurrenceTail.isCapped("RRULE:FREQ=DAILY;UNTIL=20991231T235959Z", at: Self.timedCap))
+        #expect(!RecurrenceTail.isCapped("RRULE:FREQ=DAILY;COUNT=20990305", at: Self.allDayCap), "a COUNT is no UNTIL")
+    }
+
     @Test("A DATE UNTIL covers its whole day")
     func dateUntilIsInclusive() throws {
         #expect(try rule("RRULE:FREQ=DAILY;UNTIL=20990306") == "RRULE:FREQ=DAILY;UNTIL=20990306",

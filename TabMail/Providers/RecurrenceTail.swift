@@ -170,6 +170,14 @@ enum RecurrenceTail {
         }
     }
 
+    /// Whether `rrule`'s `UNTIL` is `capUntil`: this split's own cap, written by an earlier attempt
+    /// (see `newSeriesRule`).
+    static func isCapped(_ rrule: String, at capUntil: String) -> Bool {
+        let prefix = "RRULE:"
+        let body = rrule.uppercased().hasPrefix(prefix) ? String(rrule.dropFirst(prefix.count)) : rrule
+        return body.split(separator: ";").contains { $0.uppercased() == "UNTIL=" + capUntil.uppercased() }
+    }
+
     /// Whether an `UNTIL` value ends the series before the split occurrence.
     /// nil when it cannot be decided.
     ///

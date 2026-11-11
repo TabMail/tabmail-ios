@@ -679,7 +679,7 @@ even with `all_day: true`, reads nothing; in the tool a rename goes through thou
 failed read in transport keeps the edit queued (queue) or shows no card (tool). The tool reads it on the
 calendar it knows for a numeric event id, in the edit's zone. An edit that gives no times
 still saves an all-day event stored with its end on its start. The queue suite counts
-`getEvent` calls: an edit that moves nothing and sets no UNTIL makes none, and a failed read on a move writes
+`getEvent` calls: an edit that moves nothing and sets no UNTIL makes only the one that finds the series, and a failed read on a move writes
 nothing and stays queued. `calendar_event_edit` applies the same rule (`allDayEditRefusal`, one function for
 the tool and the queue) to the event it reads before its confirmation card: an all-day event given a time of
 day without `all_day`, and a stated `all_day: true` with a same-day end, are refused there with nothing
@@ -705,6 +705,104 @@ the shared rule refuses it, in both directions and on every scope, and refuses n
 the stored one, when the edit gives times, or when the event was not read. Through `calendar_event_edit`, for
 the event as Google's, Outlook's and CalDAV's own `getEvent` read it from their fakes, it is refused before the
 card, reported as not changed, and nothing is queued.
+
+## An edit of every occurrence reaches the series
+
+`CalendarSeriesScopeTests.swift` pins the system properties of a series edit (`CalendarSeriesScope`). An
+edit of every occurrence changes the series, whichever occurrence the event id names (#560). A time change of
+every occurrence goes where Google Calendar takes it (#559):
+- named from the first occurrence, the whole series moves;
+- named from a later one, a new time of day on the date it is on now is the whole series' new time (moved to
+  the first occurrence's date); a new date changes that occurrence and the ones after it, through the split;
+- with no occurrence named and a new date other than the series' own, nothing is written and the assistant
+  is told to ask the user (`askWhichOccurrences`);
+- an explicit `this_and_following` at the first occurrence is the whole series, a plain move.
+
+An occurrence is named where it is now (its current start, the #613 contract), found by the provider's own
+lookup (`CalendarProvider.occurrence`) before the card. A split at an occurrence moved from its place in the
+series is not supported (#563, #687): a plain error with nothing written, wherever it is thrown. Whether a new start keeps an occurrence's date
+is judged in the series' own zone (`GCalEvent.seriesZone`); a series whose zone is not known takes the
+refusing side.
+
+**The property** (`GoogleSeriesScopeInvariantTests`, `ExchangeSeriesScopeInvariantTests`): for every
+(event_id, start_iso) pair the listing shows, `calendar_event_edit` is either refused before its card (no
+card, nothing queued, nothing written) or, after the drain, the calendar holds what the card said, and the
+output never carries a refusal after confirmation. Table-driven over occurrence states (unmoved; moved more
+than a day; moved onto another occurrence's time, Google only since Graph refuses that move; the first
+moved; deleted), naming forms (own id; own id and current start; series id and current start), scopes
+(all, `this_and_following`, `this_only`) and changes (rename; a new time of day; another date on a named-day
+rule; another date on a rule naming no days; another date with a new rule). The oracle is Google Calendar's
+behaviour; the card's scope line is the extent checked (whole series, one occurrence, from here on). One
+exception: a split at an occurrence moved from its place (`this_and_following` at any moved occurrence, the
+moved first one included, and an "all" new date from a moved later one) is not supported (#563, #687); its
+rows expect an error with nothing written and no write left queued, wherever it is thrown.
+
+The Google and Outlook queue suites (`GoogleCalendarSeriesScopeTests`, `ExchangeCalendarSeriesScopeTests`)
+drain real `.edit` rows against `FakeGoogleCalendar` and `FakeGraphCalendar`, whose occurrences carry their
+own ids, their series' id and their place (`originalStartTime` / `originalStart`; the Graph fake returns only
+the `$select`ed fields; both fakes list `/instances` by where an occurrence is NOW; the Google fake leaves a
+cancelled instance out of the list; the Graph fake refuses a PATCH moving an occurrence onto another,
+`ErrorOccurrenceCrossingBoundary`). They assert on what the fake stores:
+- a rename given an occurrence's id renames the series and not that occurrence;
+- the first occurrence's id moves the series, on its own date and to another;
+- a later occurrence's id moved to another date writes nothing and is retired, telling the assistant to use
+  `this_and_following` at that occurrence; given a new time of day on its date it moves the series to that
+  time (one `PATCH` of the series), moved occurrence included;
+- `this_and_following` at the first occurrence moves the series; before the first, between two occurrences
+  or off the series' days it is refused as not found, with nothing written;
+- a moved occurrence's split, named by its id and current start, writes nothing and leaves no write queued
+  (the one test of the `this_and_following` path);
+- an occurrence moved onto another's time, named by its own id and that time, is the one changed; the
+  series' id with that time is refused (ambiguous); an occurrence id with a time that is its place, or
+  another occurrence's start, is refused (not found / `namesAnotherOccurrence`);
+- a new date with no occurrence named is refused with the question; the series' own date moves it
+  (control); a `recurrence_id` under "all" is honoured;
+- Outlook all-day: an occurrence named by its id is dated where its `originalStart` instant begins in the
+  series' range zone (`recurrenceTimeZone`: Tokyo, Pacific); an unrecognized zone is refused.
+
+`CalendarSeriesDayMoveTests` drains real `.edit` rows of series on named days: Google (`BYDAY`) moves to
+another date refused, another time on the date moves (rule kept) or splits, a new rule moves it, the dates
+are the series' own (Asia/Tokyo); Outlook weekly refused; CalDAV `BYDAY` refused with no `PUT`, a rule naming
+no days moves (control).
+
+`CalendarEditToolSeriesScopeTests` runs `calendar_event_edit` against the real providers: a later occurrence
+to another date becomes a split on Google and Outlook; a new time of day on its date moves the whole series;
+`this_and_following` at the first occurrence moves the series; the question and named-day refusals come
+before any card with nothing queued; the card names an occurrence by one time, where it is now (no
+"originally"); an "all" new date named at a later occurrence moved from its place (a split there, #563)
+writes nothing on Outlook and leaves no write queued (the one test of that path).
+
+`CalendarSeriesScopeResetNoteTests` (PROOF P2, red-first against asking the occurrence with the edit as
+given): an "all" time edit named by a later occurrence's id, or a shift from the first occurrence's id, shows
+`ruleChangeResetNote` on the card and the fake counts one series reset (Google and Outlook); an occurrence's
+own time given back with a rename shows no note and resets nothing.
+
+`CalendarSeriesScopeRouteTests` and `CalendarSeriesScopeDayMoveRefusalTests` cover `route` and
+`dayMoveRefusal` alone with `Named` values: as-given cases; a later occurrence's split at its current start
+in the edit's zone; the first occurrence is the series; a new time
+of day moved to the first date (calendar days across DST); the series' zone decides the date (Tokyo near
+midnight), Outlook's recurrence zone wins, an unknown zone takes the refusing side; all-day by date and
+Outlook's all-day place dated in the series' zone; date-only `recurrence_id`; end-only edits; starts without
+seconds; refusals for no place, an unreadable start and before the first; each named rule part, given rules,
+`this_and_following` compared with its occurrence's current start.
+
+`ExchangeOriginalStartTests` maps Graph's `originalStart` (an instant whatever its offset; all-day the
+instant Graph gives), the series' zone from its range's `recurrenceTimeZone`, and a read selecting
+`originalStart`. `CalDAVSeriesScopeTests` pins that a CalDAV occurrence carries its place
+(`originalStartTime` from its key: a moved one at its place, `start` where it is), and that every naming form
+and scope of an edit of a series whose stored zone TabMail does not recognize is refused before the card by
+#613's `scopedEditSlot` (no card, nothing `PUT`, nothing queued), while the listing still shows it (#649).
+
+A split starts at one of the series' own occurrences (`GoogleSeriesSplitCopyTests`,
+`ExchangeSeriesSplitCopyTests`): a `recurrence_id` between two occurrences, off the series' days, at a
+deleted occurrence or at a moved occurrence's place is refused with only `GET`s on the wire (not found). A
+retry after this split's own
+cap is not checked again (`RecurrenceTail.isCapped`, pinned in `RecurrenceTailTests`).
+`CalDAVOccurrenceEditToolToWireTests`: "all" and no `edit_scope` by a CalDAV occurrence id write the series
+(#560); a moved occurrence's `this_and_following` writes nothing and leaves no write queued (#563).
+
+The queue suite's `getEvent` counts are one per edit: that read tells an occurrence from its series. A
+Google or Outlook occurrence edit or split adds one instances read.
 
 ## ICS value types — `VALUE=DATE-TIME` is timed
 

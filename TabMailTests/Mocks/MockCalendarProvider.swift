@@ -59,6 +59,11 @@ actor MockCalendarProvider: CalendarProvider {
     var updateOccurrenceThrows: Error?
     var splitSeriesResult: GCalEvent?
     var splitSeriesThrows: Error?
+    /// What `occurrence` returns; nil gives an occurrence that starts at `recurrenceId` and was
+    /// never moved (`syntheticOccurrence`).
+    var occurrenceResult: GCalEvent?
+    var occurrenceThrows: Error?
+    var occurrenceCalls: [(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, forSplit: Bool)] = []
 
     // MARK: - CalendarProvider Protocol
 
@@ -133,6 +138,35 @@ actor MockCalendarProvider: CalendarProvider {
             throw NSError(domain: "MockCalendarProvider", code: 500, userInfo: [NSLocalizedDescriptionKey: "No mock result configured"])
         }
         return result
+    }
+
+    func setOccurrenceResult(_ event: GCalEvent?) { occurrenceResult = event }
+    func setOccurrenceThrows(_ error: Error?) { occurrenceThrows = error }
+
+    func occurrence(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, forSplit: Bool) async throws -> GCalEvent {
+        callLog.append("occurrence(calendarId:\(calendarId),eventId:\(eventId),recurrenceId:\(recurrenceId),recurrenceIdZone:\(recurrenceIdZone.identifier),forSplit:\(forSplit))")
+        occurrenceCalls.append((calendarId: calendarId, eventId: eventId, recurrenceId: recurrenceId, recurrenceIdZone: recurrenceIdZone, forSplit: forSplit))
+        if let error = occurrenceThrows { throw error }
+        return occurrenceResult ?? Self.syntheticOccurrence(of: eventId, at: recurrenceId, in: recurrenceIdZone)
+    }
+
+    /// An occurrence of `seriesId` that starts at `recurrenceId` (read in `zone`) and was never
+    /// moved: its start and its place in the series are the same.
+    static func syntheticOccurrence(of seriesId: String, at recurrenceId: String, in zone: TimeZone) -> GCalEvent {
+        let start: GCalDateTime
+        if recurrenceId.count < 19 {
+            start = GCalDateTime(dateTime: nil, date: String(recurrenceId.prefix(10)), timeZone: nil)
+        } else {
+            let instant = EKEventStoreHelper.parseNaiveISO(String(recurrenceId.prefix(19)), timeZone: zone)
+            start = GCalDateTime(dateTime: instant?.iso8601String(), date: nil, timeZone: zone.identifier)
+        }
+        var event = GCalEvent(
+            id: "\(seriesId)_occurrence", summary: nil, location: nil, description: nil,
+            start: start, end: nil, attendees: nil, organizer: nil, recurrence: nil,
+            transparency: nil, status: "confirmed", htmlLink: nil, created: nil, updated: nil,
+            recurringEventId: seriesId)
+        event.originalStartTime = start
+        return event
     }
 
     func splitSeries(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, patch: GCalEventInput, sendUpdates: String) async throws -> GCalEvent {

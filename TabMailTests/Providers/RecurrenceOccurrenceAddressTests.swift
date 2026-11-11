@@ -479,6 +479,8 @@ struct CalendarQueueRecurrenceFrameTests {
         let accountId = "cal-r18c-occ-default"
         let (pool, dir, previous) = try makeTestDB(accountId: accountId)
         let mock = MockCalendarProvider()
+        // A split reads the event first, to compare the occurrence with the series' first (#559).
+        await mock.setGetEventResult(anyEvent())
         await mock.setSplitSeriesResult(anyEvent())
         await AccountManager.shared.registerCalendarProviderForTesting(accountId: accountId, provider: mock)
         defer {
@@ -869,12 +871,14 @@ struct CalendarQueueUntilValueTypeTests {
 
     @Test("no extra fetch on an edit that emits no UNTIL")
     func noExtraFetchWhenNoUntilIsAtStake() async throws {
+        // An edit of every occurrence reads the event once, to tell an occurrence from its series
+        // (#560); the UNTIL's value type needs no read of its own, so one read is the whole count.
         // A title change: no recurrence at all.
         let title = try await drainOneEdit(
             accountId: "cal-until-none",
             arguments: ["title": .string("Renamed")],
             resource: allDayResource())
-        #expect(title.getEventCalls == 0, "an edit with no recurrence paid a round trip")
+        #expect(title.getEventCalls == 1, "an edit with no recurrence paid \(title.getEventCalls) round trips")
         #expect(title.updates.count == 1)
 
         // A recurrence whose COUNT wins over UNTIL in buildGCalEventInput — the rule emits no UNTIL,
@@ -887,12 +891,12 @@ struct CalendarQueueUntilValueTypeTests {
                 "until": .string("2027-01-01"),
             ])],
             resource: allDayResource())
-        #expect(counted.getEventCalls == 0, "COUNT suppresses the UNTIL, so no fetch is warranted")
+        #expect(counted.getEventCalls == 1, "COUNT suppresses the UNTIL, so no fetch beyond the series' is warranted")
         #expect(untilOf(counted.updates.first?.event) == nil,
                 "setup: the producer emitted an UNTIL alongside COUNT, so the predicate's COUNT case is wrong")
     }
 
-    @Test("an explicitly stated all_day is still honoured, and costs no fetch")
+    @Test("an explicitly stated all_day is still honoured, and costs no fetch of its own")
     func explicitAllDayIsStillHonoured() async throws {
         // The agent converting a timed series to all-day states `all_day` AND a date. Overriding it
         // from the (still timed) resource would break the conversion.
@@ -907,7 +911,8 @@ struct CalendarQueueUntilValueTypeTests {
                 ]),
             ],
             resource: timedResource())
-        #expect(r.getEventCalls == 0, "the model stated the type; asking the server is both wasteful and wrong")
+        // The one read finds the series (#560); the stated type is not asked of the server.
+        #expect(r.getEventCalls == 1, "the model stated the type; asking the server is both wasteful and wrong")
         #expect(r.updates.count == 1)
         guard r.updates.count == 1 else { return }
         #expect(untilOf(r.updates[0].event) == "20270101")

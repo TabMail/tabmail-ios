@@ -20,16 +20,14 @@ import Synchronization
 //
 // It is checked for every scope the tool takes (all, none given, none given with a
 // recurrence_id, this_only, this_and_following) and both ids a listing hands out (the
-// series' own, one occurrence's). An edit of the whole event given ONE occurrence's id is
-// the case the card cannot describe on CalDAV, where the whole event is every occurrence:
-// it must be refused, and the test pins that it is, so the property can't be met by
-// refusing everything.
+// series' own, one occurrence's). An edit of the whole event given ONE occurrence's id
+// changes the whole series, and its card shows the series (#560).
 //
 // The same matrix runs on a MOVED occurrence (week 2's moved past weeks 3 and 4 into week 5),
 // named by where the listing shows it. There the card's "this and all future occurrences"
 // would start at the occurrence's place in the series (week 2), a wider write than the card
-// shows, so that split is refused by name with nothing written, by either id; this_only
-// changes exactly the moved occurrence where it is.
+// shows, so that split is not supported (#563): an error, with nothing written, by either id;
+// this_only changes exactly the moved occurrence where it is.
 //
 // The chain is a user's: the model passes the number the chat translator gave it, the user
 // confirms the card, and the queued edit drains through the real `CalDAVProvider` onto a
@@ -72,16 +70,17 @@ struct CalDAVOccurrenceEditToolToWireTests {
         let editScope: String?
         let givesRecurrenceId: Bool
         let refused: Bool
-        /// Refused only once the event was read: the refusal may follow a GET, never a write.
-        var refusedAfterReading = false
+        /// Not supported (a split at a moved occurrence, #563): an error, with nothing written and
+        /// no write left queued, wherever it is thrown.
+        var errorNothingWritten = false
     }
 
-    /// Every scope the tool takes, by each id kind. Refused: the whole event by one
-    /// occurrence's id, with edit_scope all or with no scope and no recurrence_id.
+    /// Every scope the tool takes, by each id kind. None is refused: the whole event by one
+    /// occurrence's id is an edit of the series (#560).
     static let cases: [Case] = [false, true].flatMap { byOccurrence in
         [
-            Case(label: "edit_scope all", occurrenceId: byOccurrence, editScope: "all", givesRecurrenceId: false, refused: byOccurrence),
-            Case(label: "no edit_scope", occurrenceId: byOccurrence, editScope: nil, givesRecurrenceId: false, refused: byOccurrence),
+            Case(label: "edit_scope all", occurrenceId: byOccurrence, editScope: "all", givesRecurrenceId: false, refused: false),
+            Case(label: "no edit_scope", occurrenceId: byOccurrence, editScope: nil, givesRecurrenceId: false, refused: false),
             Case(label: "no edit_scope, a recurrence_id", occurrenceId: byOccurrence, editScope: nil, givesRecurrenceId: true, refused: false),
             Case(label: "edit_scope this_only", occurrenceId: byOccurrence, editScope: "this_only", givesRecurrenceId: true, refused: false),
             Case(label: "edit_scope this_and_following", occurrenceId: byOccurrence, editScope: "this_and_following", givesRecurrenceId: true, refused: false),
@@ -96,15 +95,15 @@ struct CalDAVOccurrenceEditToolToWireTests {
         try W.makeMoved(week: movedFromWeek, toWeek: movedToWeek)
     }
 
-    /// Every scope by each id kind, on the moved occurrence. Refused: the whole event by one
-    /// occurrence's id (as above), and a split at it by either id.
+    /// Every scope by each id kind, on the moved occurrence. An error with nothing written: a
+    /// split at it by either id.
     static let movedCases: [Case] = [false, true].flatMap { byOccurrence in
         [
-            Case(label: "edit_scope all", occurrenceId: byOccurrence, editScope: "all", givesRecurrenceId: false, refused: byOccurrence),
-            Case(label: "no edit_scope", occurrenceId: byOccurrence, editScope: nil, givesRecurrenceId: false, refused: byOccurrence),
+            Case(label: "edit_scope all", occurrenceId: byOccurrence, editScope: "all", givesRecurrenceId: false, refused: false),
+            Case(label: "no edit_scope", occurrenceId: byOccurrence, editScope: nil, givesRecurrenceId: false, refused: false),
             Case(label: "no edit_scope, a recurrence_id", occurrenceId: byOccurrence, editScope: nil, givesRecurrenceId: true, refused: false),
             Case(label: "edit_scope this_only", occurrenceId: byOccurrence, editScope: "this_only", givesRecurrenceId: true, refused: false),
-            Case(label: "edit_scope this_and_following", occurrenceId: byOccurrence, editScope: "this_and_following", givesRecurrenceId: true, refused: true, refusedAfterReading: true),
+            Case(label: "edit_scope this_and_following", occurrenceId: byOccurrence, editScope: "this_and_following", givesRecurrenceId: true, refused: true, errorNothingWritten: true),
         ]
     }
 
@@ -170,6 +169,14 @@ struct CalDAVOccurrenceEditToolToWireTests {
         let (cards, confirmedAt) = await MainActor.run {
             (sink.confirmations.flatMap(\.calendarEvents), sink.requestsAtConfirmation)
         }
+        if entry.errorNothingWritten {
+            #expect(harness.store.recordedPuts().isEmpty, "\(label): written: \(harness.store.recordedPuts().map(\.path))")
+            #expect(H.deletes(harness.http).isEmpty, "\(label): deleted: \(H.deletes(harness.http))")
+            #expect(harness.store.storedICS(path: W.seriesPath) == fixture.ics, "\(label): the series is not on the server as it was")
+            let ops = try await harness.pool.read { db in try PendingCalendarOperation.fetchAll(db) }
+            #expect(ops.allSatisfy { $0.status == PendingStatus.failed.rawValue }, "\(label): a write is still queued: \(ops.map { $0.status })")
+            return
+        }
         #expect(cards.count == 1 && confirmedAt.count == 1, "\(label): expected one confirmed card, got \(cards.count): \(output)")
         guard cards.count == 1, confirmedAt.count == 1 else { return }
         let card = cards[0]
@@ -177,12 +184,7 @@ struct CalDAVOccurrenceEditToolToWireTests {
         let refused = output.contains("NOT changed")
         #expect(refused == entry.refused, "\(label): \(entry.refused ? "was not refused" : "was refused"): \(output)")
 
-        if refused, entry.refusedAfterReading {
-            let sent = harness.http.recordedCalls().dropFirst(confirmedAt[0]).map(\.method)
-            #expect(sent.allSatisfy { $0 == "GET" }, "\(label): a refused split sent more than a read after the user confirmed: \(sent)")
-            #expect(output.contains("was moved from its place in the series") && output.contains("this_only"),
-                    "\(label): the refusal does not name the moved occurrence and what works instead: \(output)")
-        } else if refused {
+        if refused {
             #expect(sentAfterConfirming == 0, "\(label): a refused edit sent \(sentAfterConfirming) request(s) after the user confirmed: \(harness.http.servedCallSequence())")
         }
         if refused {

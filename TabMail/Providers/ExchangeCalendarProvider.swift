@@ -155,7 +155,8 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// What an event read selects (`listEvents`, `getEvent`, and an edit's
     /// `fetchForEdit`). `body` and `onlineMeeting` give the description and the
     /// join link (`notes(of:)`), and the stored body an edit keeps (#511).
-    private static let eventSelect = "id,subject,location,body,bodyPreview,onlineMeeting,start,end,attendees,organizer,recurrence,showAs,isCancelled,webLink,createdDateTime,lastModifiedDateTime,isAllDay,seriesMasterId"
+    /// `originalStart` gives an occurrence's place in its series (`originalStartTime`).
+    private static let eventSelect = "id,subject,location,body,bodyPreview,onlineMeeting,start,end,attendees,organizer,recurrence,showAs,isCancelled,webLink,createdDateTime,lastModifiedDateTime,isAllDay,seriesMasterId,originalStart"
 
     /// What a split reads from the stored series: what `getEvent` reads, and every property the
     /// new part copies (`splitCopiedKeys`).
@@ -332,8 +333,10 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // their parent's id in `seriesMasterId`). Graph's
         // `/events/{id}/instances` endpoint requires the master id — resolve
         // via seriesMasterId before the instance lookup.
+        let named = eventId
         let (eventId, _) = try await resolveToMaster(eventId: eventId)
-        let instanceId = try await resolveInstanceId(masterId: eventId, recurrenceId: recurrenceId, zone: recurrenceIdZone)
+        let instanceId = try await resolveInstanceId(
+            masterId: eventId, recurrenceId: recurrenceId, zone: recurrenceIdZone, naming: named == eventId ? nil : named)
         let encodedInstanceId = try Self.encodedGraphPathSegment(instanceId, context: "Graph event instance id")
         // Only the properties the user changed, as in `updateEvent` (#421), and
         // never `recurrence`: an instance cannot carry a series rule and Graph
@@ -360,6 +363,40 @@ actor ExchangeCalendarProvider: CalendarProvider {
         return toGCalEvent(updated)
     }
 
+    /// The occurrence of `eventId`'s series that starts at `recurrenceId` now
+    /// (`CalendarProvider.occurrence`): the one `updateOccurrence` would change, found by the same
+    /// lookup (`resolveInstanceId`), read as `getEvent` reads it (with its `originalStart`).
+    /// Nothing is written.
+    func occurrence(
+        calendarId: String = "primary",
+        eventId: String,
+        recurrenceId: String,
+        recurrenceIdZone: TimeZone,
+        forSplit: Bool
+    ) async throws -> GCalEvent {
+        let (masterId, master) = try await resolveToMaster(eventId: eventId)
+        return try await occurrence(
+            named: eventId, masterId: masterId, master: master.event,
+            recurrenceId: recurrenceId, zone: recurrenceIdZone, forSplit: forSplit)
+    }
+
+    /// `occurrence`, with the series already read (`resolveToMaster`): `named` is the id the edit
+    /// gave, `masterId` and `master` its series. Also the split's own check (`splitSeries`).
+    private func occurrence(
+        named: String, masterId: String, master: GCalEvent,
+        recurrenceId: String, zone: TimeZone, forSplit: Bool
+    ) async throws -> GCalEvent {
+        let instanceId = try await resolveInstanceId(
+            masterId: masterId, recurrenceId: recurrenceId, zone: zone, naming: named == masterId ? nil : named)
+        let found = try await getEvent(eventId: instanceId)
+        if forSplit, RecurrenceOccurrenceResolver.wasMoved(found, seriesZone: master.seriesZone) {
+            // A split at an occurrence moved from its place is not supported (#563): a plain error,
+            // nothing written.
+            throw CalendarProviderError.notSupported("split at a moved occurrence")
+        }
+        return found
+    }
+
     /// Series split (this_and_following). For Graph:
     /// 1. PATCH the master's recurrence.range to {type: "endDate", endDate: splitDate - 1 day}
     ///    — Graph's `endDate` is inclusive and date-only, so we set the day before splitDate. The
@@ -380,6 +417,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // via `seriesMasterId` (mapped onto `recurringEventId` by toGCalEvent)
         // so a split aimed at an occurrence id still finds the series to cap.
         try Self.refuseUnrepresentableRule(patch.recurrence)
+        let named = eventId
         let (eventId, snapshot) = try await resolveToMaster(eventId: eventId, select: Self.splitSelect)
         let master = snapshot.event
         guard let masterRecurrence = master.recurrence, !masterRecurrence.isEmpty,
@@ -402,6 +440,16 @@ actor ExchangeCalendarProvider: CalendarProvider {
         //    Graph requires, and its zone) are written back as they are.
         guard let capEndDate = Self.graphEndDateBefore(naiveISO: recurrenceId, allDay: master.isAllDay, zone: recurrenceIdZone) else {
             throw CalendarProviderError.notSupported("Invalid recurrence_id '\(recurrenceId)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
+        }
+        // The split is at an occurrence that starts at `recurrenceId` now and was not moved from
+        // its place in the series, the one `occurrence(forSplit:)` finds; otherwise it throws with
+        // nothing written. Not asked on a retry after this split's own cap, which ended the series
+        // before that occurrence.
+        let ownCap = storedRange["type"] as? String == "endDate" && storedRange["endDate"] as? String == capEndDate
+        if !ownCap {
+            _ = try await occurrence(
+                named: named, masterId: eventId, master: master,
+                recurrenceId: recurrenceId, zone: recurrenceIdZone, forSplit: true)
         }
         var capRange = storedRange
         capRange["type"] = "endDate"
@@ -1044,7 +1092,12 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// "Pacific Standard Time"), we do not guess: an unplaceable candidate could
     /// be the one being addressed, and defaulting it to UTC would compute a wrong
     /// instant, which is how a wrong occurrence gets PATCHed.
-    private func resolveInstanceId(masterId: String, recurrenceId: String, zone: TimeZone) async throws -> String {
+    ///
+    /// `named` is the occurrence id the edit gave, when it gave one (nil for the series' own id):
+    /// that occurrence answers to `recurrenceId` before any other
+    /// (`RecurrenceOccurrenceResolver.select(_:recurrenceId:zone:naming:)`), and another one is
+    /// refused (`namesAnotherOccurrence`).
+    private func resolveInstanceId(masterId: String, recurrenceId: String, zone: TimeZone, naming named: String?) async throws -> String {
         guard let centerDate = RecurrenceOccurrenceResolver.windowCenter(recurrenceId: recurrenceId, zone: zone) else {
             throw CalendarProviderError.notSupported(
                 "Invalid recurrence_id '\(recurrenceId)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00') or a date (e.g. '2026-05-20')."
@@ -1087,8 +1140,11 @@ actor ExchangeCalendarProvider: CalendarProvider {
             candidates.append(OccurrenceCandidate(id: id, instant: instant, dateOnly: nil))
         }
 
-        switch RecurrenceOccurrenceResolver.select(candidates, recurrenceId: recurrenceId, zone: zone) {
+        switch RecurrenceOccurrenceResolver.select(candidates, recurrenceId: recurrenceId, zone: zone, naming: named) {
         case .resolved(let id):
+            if let named, id != named {
+                throw CalendarProviderError.notSupported(RecurrenceOccurrenceResolver.namesAnotherOccurrence(recurrenceId))
+            }
             return id
         case .absent:
             throw ExchangeCalendarError.eventNotFound
@@ -1330,7 +1386,20 @@ actor ExchangeCalendarProvider: CalendarProvider {
         )
         event.recurrenceTimeZoneName = e.recurrence?.range?.recurrenceTimeZone.flatMap { $0.isEmpty ? nil : $0 }
         event.recurrenceFirstDayOfWeek = e.recurrence?.pattern?.firstDayOfWeek.flatMap { $0.isEmpty ? nil : $0 }
+        event.originalStartTime = Self.originalStartTime(e.originalStart)
         return event
+    }
+
+    /// An occurrence's `originalStart` as `GCalEvent.originalStartTime`: the start the series gave
+    /// it, which a moved one keeps, as the instant it names. Graph gives it as an ISO 8601 date-time
+    /// in UTC (`…T17:00:00Z`), or with an offset when the read asks for a zone, both measured; an
+    /// all-day occurrence's is the instant its date begins in the series' zone, which an occurrence
+    /// does not carry, so it is dated from the series (`CalendarSeriesScope`,
+    /// `RecurrenceOccurrenceResolver.wasMoved`). Nil when there is none (a series, a one-off event)
+    /// or it is no ISO 8601 date-time; a listing or read shows the event all the same.
+    nonisolated static func originalStartTime(_ originalStart: String?) -> GCalDateTime? {
+        guard let originalStart, let instant = Date.fromISO8601(originalStart) else { return nil }
+        return GCalDateTime(dateTime: instant.iso8601String(), date: nil, timeZone: "UTC")
     }
 
     /// An event's description: the notes in its stored body as text, at full
@@ -1924,6 +1993,9 @@ struct MSEvent: Decodable {
     /// We map it onto `GCalEvent.recurringEventId` so the calendar_search
     /// enrichment (`resolveMasterRecurrence`) can fetch the master's rule.
     let seriesMasterId: String?
+    /// Set on `occurrence`/`exception` rows: the start the series gives the occurrence, which a
+    /// moved one keeps (`ExchangeCalendarProvider.originalStartTime`).
+    let originalStart: String?
 }
 
 struct MSLocation: Decodable {
