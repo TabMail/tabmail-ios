@@ -381,20 +381,28 @@ actor CalDAVProvider: CalendarProvider {
     /// The day an all-day occurrence starts on now. CalDAV addresses an occurrence by its original
     /// slot (`RECURRENCE-ID`), so one moved on its own is read from the resource: its override's own
     /// `DTSTART` (`CalDAVProvider.occurrenceStartDay(storedICS:recurrenceIdNaive:)`).
+    ///
+    /// An occurrence id a listing gave addresses its series' resource, and the occurrence is the
+    /// one `updateOccurrence` would change: the same `CalDAVOccurrences.scopedEditSlot` check,
+    /// in the same frame (`recurrenceIdKind`), so the day checked is the day that edit writes.
     func occurrenceStartDay(
         calendarId: String,
         eventId: String,
         recurrenceId: String,
         recurrenceIdZone: TimeZone
     ) async throws -> String? {
-        let eventURL = try resolveEventURL(eventId, calendarId: calendarId)
+        let (seriesHref, occurrenceKey) = try CalDAVOccurrences.OccurrenceId.split(eventId)
+        let eventURL = try resolveEventURL(seriesHref, calendarId: calendarId)
         let (data, _) = try await client.get(url: eventURL)
         guard let ics = String(data: data, encoding: .utf8), !ics.isEmpty else {
             throw CalDAVError.parseError("Empty response for event \(eventId)")
         }
-        let kind = Self.masterDTStartKind(from: ics)
+        let slot = try CalDAVOccurrences.scopedEditSlot(
+            icsText: ics, href: seriesHref, key: occurrenceKey,
+            recurrenceId: recurrenceId, zone: recurrenceIdZone, forSplit: false)
+        let kind = Self.recurrenceIdKind(from: ics)
         guard let rid = try Self.recurrenceIdInMasterFrame(
-            recurrenceId, declaredZone: recurrenceIdZone, kind: kind, zones: CalendarTimeZoneContext(calendarText: ics)
+            slot, declaredZone: recurrenceIdZone, kind: kind, zones: CalendarTimeZoneContext(calendarText: ics)
         ) else {
             throw CalendarProviderError.notSupported(
                 "Could not express recurrence_id '\(recurrenceId)' (\(recurrenceIdZone.identifier)) in this event's timezone."

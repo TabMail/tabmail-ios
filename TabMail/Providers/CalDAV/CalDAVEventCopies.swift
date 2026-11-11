@@ -156,7 +156,7 @@ extension CalDAVProvider {
     /// when the occurrence was changed on its own, else its slot (`recurrenceIdNaive`, already in
     /// the series' frame). Nil when the occurrence is timed.
     static func occurrenceStartDay(storedICS: String, recurrenceIdNaive: String) -> String? {
-        let kind = masterDTStartKind(from: storedICS)
+        let kind = recurrenceIdKind(from: storedICS)
         let override = existingOverride(in: icsUnits(storedICS), recurrenceIdNaive: recurrenceIdNaive, kind: kind)
         guard let override else {
             guard case .allDay = kind else { return nil }

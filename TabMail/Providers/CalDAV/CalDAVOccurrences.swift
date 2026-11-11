@@ -267,6 +267,13 @@ enum CalDAVOccurrences {
         let rows: [(key: String, row: GCalEvent)]
         var seriesFrame: Frame?
         if let master = components.first(where: { $0.recurrenceId == nil }) {
+            // A series zone TabMail does not recognize is refused by name before any expansion:
+            // the expansion would read it in the device's zone and could report the occurrence
+            // not found, or pick another one. Same refusal every CalDAV write gives such a zone.
+            if let dtstart = master.dtstart, !dtstart.value.uppercased().hasSuffix("Z"),
+               let tzid = dtstart.params.flatMap(ICSParser.extractTZID) {
+                _ = try CalDAVProvider.zone(forTZID: tzid, zones: master.zones)
+            }
             var series: Series
             switch shape(of: master, overrides: overrides) {
             case .single:

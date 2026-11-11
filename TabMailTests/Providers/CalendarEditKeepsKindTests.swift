@@ -777,7 +777,7 @@ struct CalDAVCalendarEditKeepsKindTests {
         let series = Self.seriesWithMovedOccurrence(uid: "mv-\(endOffset)")
         store.seed(path: "/cal/mv.ics", ics: series)
         var arguments: [String: JSONValue] = [
-            "edit_scope": .string("this_only"), "recurrence_id": .string("\(day(7))T00:00:00"),
+            "edit_scope": .string("this_only"), "recurrence_id": .string("\(day(9))T00:00:00"),
             "end_iso": .string(day(endOffset)), "timezone": .string("UTC"),
         ]
         if statesAllDay { arguments["all_day"] = .bool(true) }
@@ -789,12 +789,40 @@ struct CalDAVCalendarEditKeepsKindTests {
                 "rows: \(rows.map { "\($0.status) \($0.failureReason ?? "")" })")
     }
 
+    @Test("by the occurrence id a listing gave, an end alone on a moved occurrence is checked against the day it starts on now: refused on it, written after it",
+          arguments: [9, 12])
+    func endAloneByOccurrenceIdIsCheckedAgainstTheMovedStart(_ endOffset: Int) async throws {
+        // The occurrence of day 7 now starts on day 9. The edit names it by its occurrence id
+        // (series href + its slot's date key), so the read of the day it starts on goes to the
+        // series' resource for that same occurrence.
+        let store = FakeCalDAVStore(servesETags: true)
+        let series = Self.seriesWithMovedOccurrence(uid: "mv-occ-\(endOffset)")
+        store.seed(path: "/cal/mv.ics", ics: series)
+        let eventId = CalDAVOccurrences.OccurrenceId.make(seriesHref: "/cal/mv.ics", key: compact(day(7)))
+        let rows = try await run(store, eventId: eventId, [
+            "edit_scope": .string("this_only"), "recurrence_id": .string("\(day(9))T00:00:00"),
+            "end_iso": .string(day(endOffset)), "timezone": .string("UTC"),
+        ], account: "kind-c-moved-occ-\(endOffset)")
+        if endOffset <= 9 {
+            #expect(store.recordedPuts().isEmpty, "an occurrence ending on or before its start was written")
+            #expect(store.storedICS(path: "/cal/mv.ics") == series, "the series changed")
+            #expect(rows.count == 1 && rows.first?.failureReason?.contains(allDayEndHint) == true,
+                    "rows: \(rows.map { "\($0.status) \($0.failureReason ?? "")" })")
+        } else {
+            #expect(rows.isEmpty, "the change was refused: \(rows.first?.failureReason ?? "<none>")")
+            let blocks = (store.storedICS(path: "/cal/mv.ics") ?? "").components(separatedBy: "BEGIN:VEVENT")
+            let override = blocks.first { $0.contains("RECURRENCE-ID") }
+            #expect(line(override, "DTSTART") == "DTSTART;VALUE=DATE:\(compact(day(9)))")
+            #expect(line(override, "DTEND") == "DTEND;VALUE=DATE:\(compact(day(12)))")
+        }
+    }
+
     @Test("an end alone after a moved occurrence's start is written, and the occurrence keeps that start")
     func endAfterTheMovedStartIsWritten() async throws {
         let store = FakeCalDAVStore(servesETags: true)
         store.seed(path: "/cal/mv.ics", ics: Self.seriesWithMovedOccurrence(uid: "mv-ok"))
         let rows = try await run(store, eventId: "/cal/mv.ics", [
-            "edit_scope": .string("this_only"), "recurrence_id": .string("\(day(7))T00:00:00"),
+            "edit_scope": .string("this_only"), "recurrence_id": .string("\(day(9))T00:00:00"),
             "end_iso": .string(day(12)), "timezone": .string("UTC"),
         ], account: "kind-c-moved-ok")
         #expect(rows.isEmpty, "the change was refused: \(rows.first?.failureReason ?? "<none>")")
@@ -818,7 +846,7 @@ struct CalDAVCalendarEditKeepsKindTests {
             .replacingOccurrences(of: "DTEND;VALUE=DATE:\(compact(day(10)))", with: "DTEND;VALUE=DATE:\(compact(day(6)))")
         store.seed(path: "/cal/mv.ics", ics: series)
         var arguments: [String: JSONValue] = [
-            "edit_scope": .string("this_only"), "recurrence_id": .string("\(day(7))T00:00:00"),
+            "edit_scope": .string("this_only"), "recurrence_id": .string("\(day(5))T00:00:00"),
             "end_iso": .string(day(7)), "timezone": .string("UTC"),
         ]
         if statesAllDay { arguments["all_day"] = .bool(true) }
