@@ -117,7 +117,10 @@ each date beside the start of the occurrence it named (so a date that resolved t
 shows), deleted, queued or NOT deleted with its reason, never "updated". A CalDAV resource holding
 only changed occurrences is refused by the lookup before the card; a one-off event, and an occurrence
 id equal to the series' own, are refused locally. Two dates naming one occurrence delete it once (one
-card row, one delete, both dates named). Pinned by `CalendarEditExdatesTests` (Google, Outlook, CalDAV
+card row, one delete, both dates named). On an Outlook all-day series a date names that date's
+occurrence whatever zone the call names, through #647's date lookup (before it, a call zone west of the
+series' could name, and now delete, the next day's occurrence; pinned with #647's `GraphAllDaySeries`).
+Pinned by `CalendarEditExdatesTests` (Google, Outlook, CalDAV
 fakes; the refused keys are pinned against a copy of the published schema's properties).
 
 ## Pinned by

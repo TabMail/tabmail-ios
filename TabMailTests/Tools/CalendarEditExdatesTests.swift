@@ -19,7 +19,8 @@ import GRDB
 // The rules pinned, per provider, from the tool down to the fake server (Google, Graph, CalDAV):
 // - every date is looked up against the SERIES, before the card, read in the call's `timezone`,
 //   also when `event_id` names one of its occurrences;
-// - a date-only value on a timed series names the one occurrence that day;
+// - a date-only value on a timed series names the one occurrence that day; on an Outlook all-day
+//   series a date names that date's occurrence whatever zone the call names (#647's lookup);
 // - a date that names no occurrence, an already deleted one, an ambiguous or a malformed one
 //   refuses the WHOLE call: no card, nothing queued, nothing written;
 // - exdates_add with any other argument (every schema change field, and keys outside the schema)
@@ -491,6 +492,34 @@ struct CalendarEditExdatesOutlookTests {
         #expect(o.calendar.patches("ser-1").isEmpty, "the series was written: \(o.calendar.patches("ser-1"))")
         expectDeleted(o.run, ids: [GraphWeekly.first, GraphWeekly.later], dates: dates,
                       starts: [GraphWeekly.first: GraphFixture.start, GraphWeekly.later: GraphFixture.occurrenceStart])
+    }
+
+    @Test("an all-day series' date names that date's occurrence and deletes it alone, whatever zone the call names (#647's date lookup)")
+    func allDayDateDeletesThatDatesOccurrence() async throws {
+        // #647's series and zones (`GraphAllDaySeries`): the series' zone east of the device's, the
+        // call's zone the device's or one west of it, so every row crosses a date boundary on any
+        // host. The instant-based lookup named the next day's occurrence here, now a delete.
+        #expect(GraphAllDaySeries.crossesOnThisHost, "device offset \(GraphAllDaySeries.deviceHours)h")
+        let named = GraphAllDaySeries.occurrence(GraphAllDaySeries.named)
+        let shownStart = GraphAllDaySeries.names[1]
+        for (index, row) in GraphAllDaySeries.rows.enumerated() {
+            for (form, date) in GraphAllDaySeries.names.enumerated() {
+                let label = GraphAllDaySeries.label(row.daily, row.zone, date)
+                let o = try await outlook([
+                    "exdates_add": .array([.string(date)]), "timezone": .string(row.zone),
+                ], eventId: GraphAllDaySeries.id, account: "exdates-o-allday-\(index)-\(form)",
+                   graph: GraphAllDaySeries.calendar(daily: row.daily))
+                #expect(o.calendar.deleted == [named], "\(label): deleted \(o.calendar.deleted); \(o.run.out)")
+                for offset in GraphAllDaySeries.offsets(daily: row.daily) where offset != GraphAllDaySeries.named {
+                    #expect(o.calendar.event(GraphAllDaySeries.occurrence(offset)) != nil, "\(label): another occurrence was deleted")
+                }
+                #expect(o.calendar.event(GraphAllDaySeries.id) != nil && o.calendar.patches(GraphAllDaySeries.id).isEmpty,
+                        "\(label): the series was written")
+                expectDeleted(o.run, ids: [named], dates: [date])
+                #expect(answerLine(o.run.out, date: date) == "- \(date) (occurrence starting \(shownStart)): deleted",
+                        "\(label): \(o.run.out)")
+            }
+        }
     }
 
     @Test("a one-off event is refused: it has no occurrences to delete, no card, nothing deleted")

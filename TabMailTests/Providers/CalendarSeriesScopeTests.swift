@@ -566,7 +566,10 @@ struct ExchangeCalendarSeriesScopeTests {
 /// series' zone is east of the device's (an occurrence's midnight there is the day before on the
 /// device), and the edit names either the device's zone or one west of it (the device's midnight
 /// is the day before there).
-private enum GraphAllDaySeries {
+///
+/// Internal, not private: `calendar_event_edit`'s `exdates_add` tests delete through the same lookup
+/// with the same series (`CalendarEditExdatesOutlookTests`).
+enum GraphAllDaySeries {
     static let id = "ser-ad-zoned"
     /// The date every test names.
     static let named = 7
