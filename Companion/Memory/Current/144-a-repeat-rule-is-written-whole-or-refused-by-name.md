@@ -72,7 +72,11 @@ dropped silently, and the card did not list the days.
 (`CalendarToolHelpers.seriesDeleteNote`, Google Calendar's question) and `Repeats: <rule>` when the
 event it read is a series itself: a repeat rule and no `recurringEventId` (`seriesDeleteLines`). An
 occurrence names its series in `recurringEventId` on every provider (a CalDAV occurrence also
-carries the series' rule), so its card gets no such line. The stored rule is worded by
+carries the series' rule), so its card gets no such line. **Since the #639 follow-up (2026-11-10)**
+an occurrence's card says "One occurrence of a repeating event; the rest of the series stays."
+(`occurrenceDeleteNote`), keyed on `recurringEventId` alone: true on every provider (Google and
+Outlook delete only it; CalDAV refuses, ADR-IOS-108), including a CalDAV row of a resource holding
+only changed occurrences, which carries no rule. Do not key it on the rule being absent. The stored rule is worded by
 `storedRecurrenceSummary`, which shares `recurrenceText` with `recurrenceSummary`, so a stored and
 a given rule read the same; a stored UTC `UNTIL` is shown as its day in the device's zone. A stored
 `BYMONTH` out of range is left out (`recurrenceDaysText` used to index past the month list, which

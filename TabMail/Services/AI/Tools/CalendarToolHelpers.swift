@@ -1182,13 +1182,19 @@ enum CalendarToolHelpers {
     /// of it, in Google Calendar's words (#639).
     static let seriesDeleteNote = "Repeating event: every occurrence will be deleted"
 
-    /// The delete card's lines for `event`, read before the card: for a repeating series itself
-    /// (it has a repeat rule and names no series it belongs to), `seriesDeleteNote` and its rule in
-    /// words (`storedRecurrenceSummary`); for anything else, none. An occurrence names its series in
-    /// `recurringEventId` on every provider (a CalDAV occurrence also carries the series' rule), and
-    /// deleting it by its own id does not delete the series.
+    /// The delete card's line for one occurrence of a repeating event (#639). True on every
+    /// provider: Google and Outlook delete only that occurrence, and CalDAV refuses the delete
+    /// (ADR-IOS-108), so either way the rest of the series stays.
+    static let occurrenceDeleteNote = "One occurrence of a repeating event; the rest of the series stays."
+
+    /// The delete card's lines for `event`, read before the card. An occurrence names its series in
+    /// `recurringEventId` on every provider (a CalDAV occurrence may also carry the series' rule),
+    /// and deleting it by its own id does not delete the series: `occurrenceDeleteNote`. A repeating
+    /// series itself (a repeat rule and no series it belongs to): `seriesDeleteNote` and its rule in
+    /// words (`storedRecurrenceSummary`). Anything else: none.
     static func seriesDeleteLines(_ event: GCalEvent) -> [String] {
-        guard event.recurringEventId?.isEmpty ?? true, let recurrence = event.recurrence, !recurrence.isEmpty else { return [] }
+        if event.recurringEventId?.isEmpty == false { return [occurrenceDeleteNote] }
+        guard let recurrence = event.recurrence, !recurrence.isEmpty else { return [] }
         guard let rule = storedRecurrenceSummary(recurrence) else { return [seriesDeleteNote] }
         return [seriesDeleteNote, "Repeats \(rule)"]
     }

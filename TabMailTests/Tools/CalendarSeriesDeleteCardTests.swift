@@ -11,12 +11,14 @@ import GRDB
 //
 // INVARIANT (system property): the confirmation card for a delete that removes a repeating
 // series says so, and names its rule, before any delete request is sent; a card for one
-// occurrence, or for an event that does not repeat, does not. Google Calendar asks the same
-// question in its delete dialog. The event the card is built from is the one the tool reads,
-// so the shapes below are the ones each provider reads back: a series (a rule, no series it
-// belongs to), a Google or Outlook occurrence (no rule, its series named), a CalDAV
-// occurrence (its series' rule AND its series named), and a single event. The CalDAV series,
-// end to end on a fake server, is pinned in `CalDAVOccurrenceDeleteToolToWireTests`.
+// occurrence says the rest of the series stays instead, true on every provider (Google and
+// Outlook delete only it, CalDAV refuses); an event that does not repeat gets no line. Google
+// Calendar asks the same question in its delete dialog. The event the card is built from is
+// the one the tool reads, so the shapes below are the ones each provider reads back: a series
+// (a rule, no series it belongs to), a Google or Outlook occurrence (no rule, its series
+// named), a CalDAV occurrence (its series' rule AND its series named, or no rule on a row of a
+// resource holding only changed occurrences), and a single event. The CalDAV cases, end to end
+// on a fake server, are pinned in `CalDAVOccurrenceDeleteToolToWireTests`.
 
 @Suite("calendar_event_delete: the card says when a repeating series is deleted", .serialized, .processGlobalState)
 struct CalendarSeriesDeleteCardTests {
@@ -90,19 +92,32 @@ struct CalendarSeriesDeleteCardTests {
                 "the card for deleting a repeating series does not say it repeats: \(lines)")
     }
 
-    @Test("one occurrence, on Google or Outlook (no rule) and on CalDAV (its series' rule), and a single event: no series line")
-    func occurrenceAndSingleCardsDoNotSayTheSeriesGoes() async throws {
+    /// The occurrence card's line, written out so this suite also compiles, and fails, on the code
+    /// before the line existed (the red-first run for #639).
+    static let occurrenceLine = "One occurrence of a repeating event; the rest of the series stays."
+
+    @Test("one occurrence, on Google or Outlook (no rule) and on CalDAV (its series' rule, or none on a changed-only row): the card says the rest of the series stays")
+    func occurrenceCardsSayTheRestStays() async throws {
         let shapes = [
             ("google-outlook-occurrence", Self.event(id: "series-1_occurrence", recurrence: nil, recurringEventId: "series-1")),
             ("caldav-occurrence", Self.event(
                 id: CalDAVOccurrences.OccurrenceId.make(seriesHref: "/cal/standup.ics", key: "20990105T140000Z"),
                 recurrence: ["RRULE:FREQ=WEEKLY"], recurringEventId: "/cal/standup.ics")),
-            ("single", Self.event(id: "single-1", recurrence: nil, recurringEventId: nil)),
+            ("caldav-changed-only-row", Self.event(
+                id: CalDAVOccurrences.OccurrenceId.make(seriesHref: "/cal/invite.ics", key: "20990105T140000Z"),
+                recurrence: nil, recurringEventId: "/cal/invite.ics")),
         ]
         for (name, event) in shapes {
             let lines = try await cardLines(for: event, accountId: "occurrence-delete-card-\(name)")
-            #expect(lines.isEmpty, "the \(name) card says the series will be deleted: \(lines)")
+            #expect(lines == [Self.occurrenceLine], "the \(name) card does not say only one occurrence is meant: \(lines)")
         }
+    }
+
+    @Test("an event that does not repeat: no line")
+    func singleEventCardHasNoLine() async throws {
+        let single = Self.event(id: "single-1", recurrence: nil, recurringEventId: nil)
+        let lines = try await cardLines(for: single, accountId: "single-delete-card")
+        #expect(lines.isEmpty, "the card for an event that does not repeat has a line: \(lines)")
     }
 
     @Test("a stored rule in the card's words: interval, days, months, count, until; an unreadable rule is still a series")

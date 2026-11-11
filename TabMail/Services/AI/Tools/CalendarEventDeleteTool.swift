@@ -145,7 +145,8 @@ struct CalendarEventDeleteTool: AgentTool, Sendable {
         let confirmIsAllDay = resolvedEvent.isAllDay
         let confirmNotes = resolvedEvent.description
         // A repeating series is deleted with every occurrence, so its card says so and names the
-        // rule, as Google Calendar does (#639). The event read above decides, on every provider.
+        // rule, as Google Calendar does; one occurrence's card says the rest of the series stays (#639).
+        // The event read above decides, on every provider.
         let seriesLines = CalendarToolHelpers.seriesDeleteLines(resolvedEvent)
 
         // ADR-IOS-024: Show confirmation card and await user response

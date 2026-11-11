@@ -188,10 +188,11 @@ struct CalDAVOccurrenceDeleteToolToWireTests {
         guard cardFailures.count == 1 else { return }
         #expect(cardFailures[0]?.contains("not supported yet") == true,
                 "the confirmed card does not show the refusal: \(cardFailures[0] ?? "nil")")
-        // The card shows one occurrence, so it does not say every occurrence goes (#639).
+        // The card shows one occurrence and says the rest of the series stays, which the refusal
+        // keeps true; it never says every occurrence goes (#639).
         let cardLines = await MainActor.run { sink.confirmations.flatMap { $0.calendarEvents.flatMap(\.changes) } }
-        #expect(!cardLines.contains(CalendarToolHelpers.seriesDeleteNote),
-                "the card for one occurrence says the whole series will be deleted: \(cardLines)")
+        #expect(cardLines == [CalendarSeriesDeleteCardTests.occurrenceLine],
+                "the card for one occurrence does not say only it is meant: \(cardLines)")
 
         // No queued delete succeeded or is left to succeed later.
         let ops = try await harness.pool.read { db in try PendingCalendarOperation.fetchAll(db) }
@@ -235,19 +236,16 @@ struct CalDAVOccurrenceDeleteToolToWireTests {
         #expect(!sentBeforeConfirming.contains { $0.method == "DELETE" }, "the DELETE was sent before the user confirmed the card")
     }
 
-    @Test("a resource holding only changed occurrences, deleted by its own id, is refused before the card and no DELETE is sent")
-    func overrideOnlyResourceByItsOwnIdIsNeverDeleted() async throws {
-        let harness = try await H.makeHarness(accountId: "caldav-override-only-delete")
-        defer { H.tearDown(harness) }
-        // An invitation to one changed occurrence of another organizer's series (RFC 4791 §4.1):
-        // a resource with a RECURRENCE-ID VEVENT and no series VEVENT. Its own href names every
-        // occurrence it holds, and a WebDAV DELETE of it can't be undone.
+    /// An invitation to one changed occurrence of another organizer's series (RFC 4791 §4.1),
+    /// seeded on the harness's server: a resource with a RECURRENCE-ID VEVENT and no series
+    /// VEVENT. Returns its path, its text and the id a listing gives its one occurrence.
+    private static func seedChangedOnlyResource(_ harness: CalDAVToolWire.Harness) throws -> (path: String, ics: String, occurrenceId: String) {
         let fixture = harness.fixture
         let slot = try fixture.occurrence(2)
         let start = slot.addingTimeInterval(60 * 60)
         let wall = { (date: Date) in OccurrenceFixture.wall(date, fixture.zone) }
-        let invitePath = "/cal/invite.ics"
-        let inviteICS = OccurrenceFixture.ics([[
+        let path = "/cal/invite.ics"
+        let ics = OccurrenceFixture.ics([[
             "UID:invite-1",
             "DTSTAMP:\(OccurrenceFixture.utcValue(fixture.first))",
             "RECURRENCE-ID;TZID=America/New_York:\(wall(slot))",
@@ -257,7 +255,46 @@ struct CalDAVOccurrenceDeleteToolToWireTests {
             "ORGANIZER:mailto:organizer@example.com",
             "ATTENDEE:mailto:user@example.com",
         ].joined(separator: "\n")])
-        harness.store.seed(path: invitePath, ics: inviteICS)
+        harness.store.seed(path: path, ics: ics)
+        let occurrenceId = CalDAVOccurrences.OccurrenceId.make(seriesHref: path, key: OccurrenceFixture.utcValue(slot))
+        return (path, ics, occurrenceId)
+    }
+
+    @Test("one occurrence of a resource holding only changed occurrences: the card says the rest stays, and the delete is refused with no DELETE sent")
+    func changedOnlyOccurrenceCardSaysTheRestStays() async throws {
+        let harness = try await H.makeHarness(accountId: "caldav-changed-only-occurrence-delete")
+        defer { H.tearDown(harness) }
+        let (path, ics, occurrenceId) = try Self.seedChangedOnlyResource(harness)
+
+        let translator = ChatIdTranslator.createIsolated()
+        let compound = CompoundEventId.make(accountId: harness.accountId, eventId: occurrenceId)
+        let forModel = await translator.processToolOutputForLLM("event_id: \(compound)")
+        let number = try #require(H.eventIds(in: forModel).first.flatMap { Int($0) }, "no numeric id for the model: \(forModel)")
+        await H.recordCalendar(of: occurrenceId, accountId: harness.accountId, translator: translator)
+
+        let sink = ConfirmingSink()
+        let output = try await CalendarEventDeleteTool(context: ToolContext(db: harness.pool, translator: translator)).execute(
+            arguments: ["event_id": .string(String(number))],
+            invocation: ToolInvocation(uiSink: sink, sessionKey: "caldav-changed-only-occurrence-delete"))
+        await AccountManager.shared.drainCalendarQueue()
+
+        let (cardLines, titles) = await MainActor.run {
+            (sink.confirmations.flatMap { $0.calendarEvents.flatMap(\.changes) }, sink.confirmations.flatMap { $0.calendarEvents.map(\.title) })
+        }
+        #expect(titles == ["Planning"], "the card was not for the changed occurrence: \(titles)")
+        #expect(cardLines == [CalendarSeriesDeleteCardTests.occurrenceLine],
+                "the card for one changed occurrence does not say only it is meant: \(cardLines)")
+        #expect(H.deletes(harness.http).isEmpty, "a DELETE reached the server: \(H.deletes(harness.http))")
+        #expect(harness.store.storedICS(path: path) == ics, "the resource is not on the server as it was")
+        #expect(output.contains("NOT deleted"), "the tool's answer does not say the event was not deleted: \(output)")
+    }
+
+    @Test("a resource holding only changed occurrences, deleted by its own id, is refused before the card and no DELETE is sent")
+    func overrideOnlyResourceByItsOwnIdIsNeverDeleted() async throws {
+        let harness = try await H.makeHarness(accountId: "caldav-override-only-delete")
+        defer { H.tearDown(harness) }
+        // Its own href names every occurrence it holds, and a WebDAV DELETE of it can't be undone.
+        let (invitePath, inviteICS, _) = try Self.seedChangedOnlyResource(harness)
 
         let translator = ChatIdTranslator.createIsolated()
         let inviteCompound = CompoundEventId.make(accountId: harness.accountId, eventId: invitePath)
