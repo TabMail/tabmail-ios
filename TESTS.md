@@ -757,8 +757,9 @@ cancelled instance out of the list; the Graph fake refuses a PATCH moving an occ
   another occurrence's start, is refused (not found / `namesAnotherOccurrence`);
 - a new date with no occurrence named is refused with the question; the series' own date moves it
   (control); a `recurrence_id` under "all" is honoured;
-- Outlook all-day: an occurrence named by its id is dated where its `originalStart` instant begins in the
-  series' range zone (`recurrenceTimeZone`: Tokyo, Pacific); an unrecognized zone is refused.
+- Outlook all-day: an occurrence named by its id is dated by its `originalStart` read in the series' range
+  zone, named as Graph gives it (`recurrenceTimeZone`: Tokyo, Kathmandu, Pacific, and a zone the server
+  knows by a name TabMail does not), and is read with that `Prefer` zone.
 
 `CalendarSeriesDayMoveTests` drains real `.edit` rows of series on named days: Google (`BYDAY`) moves to
 another date refused, another time on the date moves (rule kept) or splits, a new rule moves it, the dates
@@ -783,13 +784,15 @@ own time given back with a rename shows no note and resets nothing.
 `dayMoveRefusal` alone with `Named` values: as-given cases; a later occurrence's split at its current start
 in the edit's zone; the first occurrence is the series; a new time
 of day moved to the first date (calendar days across DST); the series' zone decides the date (Tokyo near
-midnight), Outlook's recurrence zone wins, an unknown zone takes the refusing side; all-day by date and
-Outlook's all-day place dated in the series' zone; date-only `recurrence_id`; end-only edits; starts without
+midnight), Outlook's recurrence zone wins, an unknown zone takes the refusing side; all-day by date, needing
+no zone (a series in a zone TabMail does not recognize routes as any other; a time given as an all-day
+place is refused as not comparable); date-only `recurrence_id`; end-only edits; starts without
 seconds; refusals for no place, an unreadable start and before the first; each named rule part, given rules,
 `this_and_following` compared with its occurrence's current start.
 
-`ExchangeOriginalStartTests` maps Graph's `originalStart` (an instant whatever its offset; all-day the
-instant Graph gives), the series' zone from its range's `recurrenceTimeZone`, and a read selecting
+`ExchangeOriginalStartTests` maps Graph's `originalStart` on an ordinary read (an instant whatever its
+offset; all-day the instant Graph gives; the all-day place as a date comes only from the lookup's read in
+the series' zone), the series' zone from its range's `recurrenceTimeZone`, and a read selecting
 `originalStart`. `CalDAVSeriesScopeTests` pins that a CalDAV occurrence carries its place
 (`originalStartTime` from its key: a moved one at its place, `start` where it is), and that every naming form
 and scope of an edit of a series whose stored zone TabMail does not recognize is refused before the card by
@@ -798,8 +801,14 @@ and scope of an edit of a series whose stored zone TabMail does not recognize is
 A split starts at one of the series' own occurrences (`GoogleSeriesSplitCopyTests`,
 `ExchangeSeriesSplitCopyTests`): a `recurrence_id` between two occurrences, off the series' days, at a
 deleted occurrence or at a moved occurrence's place is refused with only `GET`s on the wire (not found). An
-Outlook all-day series whose zone is not known is not split: its occurrence is found, and the split's own
-check counts its undatable place as moved (`allDaySeriesWithoutAZoneIsNotSplit`). A retry after this split's
+Outlook all-day series' occurrence is read in the series' own zone as Graph names it
+(`allDayOccurrenceIsReadInTheSeriesZone`, from the measured values: Tokyo Standard Time, Asia/Kathmandu and
+Pacific Standard Time, each with a plain occurrence, split at, and one moved a day earlier, a plain error
+with nothing written; red for the zones ahead of UTC when the read does not name the series' zone), and a
+series in a zone TabMail does not recognize is split like any other
+(`allDaySeriesInAZoneTabMailDoesNotRecognizeIsSplit`). `FakeGraphCalendar` returns `originalStart` in the
+zone `Prefer: outlook.timezone` names (its `zones`, else the resolver), as a UTC instant when none is
+named, and records the zone of each read by id (`readZones`). A retry after this split's
 own cap is not checked again (`CalendarProvider.isOwnSplitCap`, over `RecurrenceTail.isCapped`, pinned in
 `RecurrenceTailTests`; on Outlook `ownCapRetryDoesNotLookTheOccurrenceUp`: no instances read, and an
 occurrence moved there does not stop it).

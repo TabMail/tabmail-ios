@@ -10,6 +10,7 @@ moved occurrence, current start, named where it is now, split at a moved occurre
 `toolInstant`, start without seconds, series zone, BYDAY, BYMONTHDAY, BYYEARDAY, BYWEEKNO, BYMONTH,
 BYSETPOS, named days, day move, `recurringEventId`, `seriesMasterId`, `originalStartTime`,
 `originalStart`, `GCalEvent.originalStartTime`, `ExchangeCalendarProvider.originalStartTime`,
+`allDayOccurrence`, `allDayPlace`, `Prefer: outlook.timezone`, all-day place read in the series' zone,
 `eventSelect`, first occurrence, later occurrence, time of day, this-and-following, split, phantom
 occurrence, `RecurrenceTail.isCapped`, `isOwnSplitCap`, `splitCapUntil`, `afterOwnSplitCap`, `splitting`,
 own split cap, interrupted split, `routeSeriesTimeChange`, Google Calendar behaviour, retry, lost
@@ -62,9 +63,9 @@ refusal: no dedicated wording and no work to order it before the card (coordinat
   written and the row left failed;
 - `this_and_following` at a moved FIRST occurrence is routed to "all" (from the first occurrence on is
   every occurrence) and is written as an edit of the whole series; no split is written.
-`wasMoved(_:seriesZone:)` compares the occurrence's `start` with its `originalStartTime` (all-day: by
-date in the series' zone; an all-day place given as an instant, whose series' zone is not known, counts
-as moved, so such a series is not split).
+`wasMoved(_:)` compares the occurrence's `start` with its `originalStartTime`: a timed one by instant, an
+all-day one by date, as text (every provider gives an all-day place as a date, see "Outlook's
+`originalStart`"); an all-day place that is no date counts as moved. No zone is needed (option B, 2026-11-11).
 
 **Dates are the series' own, in its zone** (`GCalEvent.seriesZone` = `recurrenceTimeZoneName ??
 start.timeZone`, resolved by `CalendarTimeZoneResolver` alone; ONE source for every caller). Outlook
@@ -72,7 +73,8 @@ names its zone on the series' range (`recurrenceTimeZone`, mapped to `recurrence
 names its IANA zone on `start`; CalDAV its TZID. When the zone is not known (an unrecognized name; a
 CalDAV floating time; a CalDAV time written in UTC with no `TZID`, #679), a timed series' new start is
 taken to be on another date: the side that splits, asks or refuses, never a wrong write. An all-day
-series whose zone is not known is refused when an Outlook all-day place (an instant) has to be dated.
+series needs no zone: its places are dates on every provider (`CalendarSeriesScope.place`), so one in a
+zone TabMail does not recognize is edited and split like any other.
 
 Also refused, with nothing written: an occurrence whose place or start can't be read; a series whose
 start can't be read; a deleted (`cancelled`) occurrence; an occurrence id with a `recurrence_id`
@@ -89,8 +91,8 @@ the provider layer asks which provider it is (ADR-IOS-060).
 - Google: `resolveInstance` (returns `(id, instance)`) over `events.instances`, by current start;
   `RecurrenceOccurrenceResolver.select(...naming:)` prefers the occurrence the event id names, so an
   occurrence moved onto another's time, named by its own id and that time, names itself (S3).
-- Outlook: `resolveInstanceId(...naming:)`, then `getEvent`, then `wasMoved`. `eventSelect` names
-  `originalStart`.
+- Outlook: `resolveInstanceId(...naming:)`, then `getEvent` (an all-day series: `allDayOccurrence`, read
+  in the series' zone), then `wasMoved`. `eventSelect` names `originalStart`.
 - CalDAV: `CalDAVProvider.occurrence` through `CalDAVOccurrences.scopedEdit` (returns `(key, slot)`)
   and #613's `scopedEditSlot`. That check also refuses a series whose STORED zone TabMail does not
   recognize ("which TabMail does not recognize"), so a CalDAV edit or split of such a series is refused
@@ -125,8 +127,26 @@ Graph's documentation calls it a `DateTimeOffset` in UTC. Measured live (2026-11
 exception shows its original slot there while `start` shows the moved time. An all-day instance's
 `originalStart` is a UTC instant at local midnight in the series' zone (Tokyo's December 1 is
 `…-11-30T15:00:00Z`). `ExchangeCalendarProvider.originalStartTime` maps every occurrence to the instant
-(nil when no ISO 8601 date-time with a zone designator); an all-day place is dated only in
-`CalendarSeriesScope`, in the series' zone.
+(nil when no ISO 8601 date-time with a zone designator) on every ordinary read.
+
+**An all-day occurrence's place is read in the series' own zone, as Graph names it** (option B,
+coordinator ruling 2026-11-11, on the measurement of that day). Measured on a work account (all-day
+series every two days in Pacific Standard Time, Tokyo Standard Time and Asia/Kathmandu, +5:45; a plain
+occurrence and one moved a day earlier each; read by id and through `/instances`, identical): with
+`Prefer: outlook.timezone` naming the series' zone, `originalStart` is local midnight with that zone's
+offset (`2026-11-20T00:00:00+09:00`), and its date is the original day, for a plain occurrence equal to
+its start's date. With no `Prefer` or `Prefer` UTC it is the UTC instant (`2026-11-19T15:00:00Z`), the day
+before for a zone ahead of UTC. Graph accepted an IANA name for a series' zone (and gave it back as
+given) and refused a made-up one (400 `TimeZoneNotSupportedException`). So the provider's occurrence
+lookup (`occurrence`, which `CalendarSeriesScope.read` and `splitSeries` use) reads an all-day series'
+occurrence by its id with `Prefer` naming `recurrenceTimeZoneName` exactly as Graph gave it, with no
+device lookup of the zone (`allDayOccurrence`, `request(timeZoneName:)`), and takes the date part of
+`originalStart` as text (`allDayPlace`). `CalendarSeriesScope.place` and `wasMoved` then compare dates
+and need no zone, and the refusal of an all-day series whose zone TabMail does not recognize is gone.
+`/instances` (`resolveInstanceId`) selects only `id,start` and is unchanged. A series whose range names
+no zone at all is refused by the lookup, nothing written: Graph has named one on every series read so
+far (a range written without one is read back as UTC, measured 2026-11-07), so this is not expected to
+be reached.
 
 Also measured: on Outlook a PATCH of the whole series' start or end resets its changed occurrences,
 even with no recurrence sent. #560 makes an "all" time edit named by an occurrence id reach the series,
@@ -248,6 +268,11 @@ rule above when #613 settled that an occurrence is named where it is now.
   moved FIRST occurrence, before the card. Replaced (round-2 ruling, 2026-11-11): `forSplit` deleted
   from the protocol and from `read` (and `read`'s `scope`); CalDAV's split refuses at the write, like
   Google's and Outlook's, and a moved first occurrence is a whole-series edit on all three.
+- An Outlook all-day place, an instant, was dated in the series' zone (`seriesZone`) by
+  `CalendarSeriesScope.place` and `wasMoved(_:seriesZone:)`, and an all-day series whose zone TabMail did
+  not recognize was refused before the card and not split (`allDaySeriesWithoutAZoneIsNotSplit`).
+  Replaced (option B, 2026-11-11): the provider reads the place in the series' zone as Graph names it and
+  gives a date.
 - The superseded items of the first build's own review (a later occurrence's new time of day split; the
   place compared in the edit's zone; Outlook's all-day `originalStart` read as a date) stay superseded.
 

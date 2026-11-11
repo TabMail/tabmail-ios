@@ -64,7 +64,13 @@ import Synchronization
 ///   stored status kept their answer.
 ///
 /// Starts and ends are returned as stored, whatever zone `Prefer` names: a
-/// fixture stores them as Graph renders them for the device.
+/// fixture stores them as Graph renders them for the device. An occurrence's
+/// `originalStart` (stored as any ISO 8601 date-time) is returned as Graph returns
+/// it (measured 2026-11-11 on all-day series in Pacific Standard Time, Tokyo
+/// Standard Time and Asia/Kathmandu): written in the zone `Prefer:
+/// outlook.timezone` names, with that zone's offset (`…T00:00:00+09:00`), and as
+/// a UTC instant (`…Z`) when the request names none. The zone is the one Graph
+/// knows by that name: `zones`, else `CalendarTimeZoneResolver`.
 final class FakeGraphCalendar: Sendable {
     private let events: Mutex<[String: Data]>
     private let resets = Mutex(0)
@@ -72,14 +78,19 @@ final class FakeGraphCalendar: Sendable {
     private let patchAuthorizationLog = Mutex<[String]>([])
     private let failingRequests = Mutex<[String: [Int]]>([:])
     private let lostResponses = Mutex<[String: Int]>([:])
+    private let readLog = Mutex<[(id: String, zone: String?)]>([])
 
-    init(_ seed: [[String: Any]]) {
+    /// Zones the server knows by a name TabMail may not (`Prefer` reads them).
+    private let zones: [String: TimeZone]
+
+    init(_ seed: [[String: Any]], zones: [String: TimeZone] = [:]) {
         var map: [String: Data] = [:]
         for event in seed {
             // swiftlint:disable:next force_try
             map[event["id"] as! String] = try! JSONSerialization.data(withJSONObject: event)
         }
         events = Mutex(map)
+        self.zones = zones
     }
 
     func event(_ id: String) -> [String: Any]? {
@@ -111,6 +122,10 @@ final class FakeGraphCalendar: Sendable {
         }
     }
 
+    /// The zone `Prefer: outlook.timezone` named on each read of `id` by its own id (nil: none),
+    /// in order.
+    func readZones(_ id: String) -> [String?] { readLog.withLock { $0 }.filter { $0.id == id }.map(\.zone) }
+
     /// The PATCH bodies sent for `id`, in order.
     func patches(_ id: String) -> [[String: Any]] {
         patchLog.withLock { $0 }.filter { $0.id == id }
@@ -132,6 +147,8 @@ final class FakeGraphCalendar: Sendable {
             if let status = takeFailure("GET") { return .status(status) }
             let parts = Self.pathParts(request.url)
             let select = Self.selected(request.url)
+            let preferName = Self.preferredZoneName(request)
+            let prefer = preferName.flatMap { zones[$0] ?? CalendarTimeZoneResolver.zone(named: $0, in: .none) }
             if parts.count == 2, parts[1] == "instances" {
                 let window = Self.window(request.url)
                 let master = event(parts[0])
@@ -140,10 +157,11 @@ final class FakeGraphCalendar: Sendable {
                     .filter { $0["seriesMasterId"] as? String == parts[0] }
                     .filter { Self.starts($0, in: window) }
                     .filter { Self.isInSeries($0, master: master) }
-                return Self.json(["value": instances.map { Self.only(select, of: $0) }])
+                return Self.json(["value": instances.map { Self.only(select, of: Self.rendered($0, in: prefer)) }])
             }
+            if parts.count == 1 { readLog.withLock { $0.append((id: parts[0], zone: preferName)) } }
             guard parts.count == 1, let stored = event(parts[0]) else { return .status(404) }
-            return Self.json(Self.only(select, of: stored))
+            return Self.json(Self.only(select, of: Self.rendered(stored, in: prefer)))
         }
         http.register(path: "/v1.0/me/calendarView", method: "GET") { [self] request in
             if let status = takeFailure("GET") { return .status(status) }
@@ -215,6 +233,21 @@ final class FakeGraphCalendar: Sendable {
         guard let window else { return true }
         guard let at = instant(event["start"]) else { return false }
         return at >= window.from && at < window.to
+    }
+
+    /// The zone name a request's `Prefer: outlook.timezone="…"` gives; nil when it gives none.
+    private static func preferredZoneName(_ request: FakeHTTP.Request) -> String? {
+        guard let prefer = request.header("Prefer"), let open = prefer.range(of: "outlook.timezone=\"") else { return nil }
+        return String(prefer[open.upperBound...].prefix { $0 != "\"" })
+    }
+
+    /// `event` as a read in `zone` returns it: its `originalStart` written with `zone`'s offset, or
+    /// in UTC when the read names no zone.
+    private static func rendered(_ event: [String: Any], in zone: TimeZone?) -> [String: Any] {
+        guard let stored = event["originalStart"] as? String, let instant = Date.fromISO8601(stored) else { return event }
+        var out = event
+        out["originalStart"] = instant.iso8601String(timeZone: zone ?? .gmt)
+        return out
     }
 
     /// Whether `occurrence`'s place in the series (`originalStart`, else its start) is on or before

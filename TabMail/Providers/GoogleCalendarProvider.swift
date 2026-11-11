@@ -300,16 +300,15 @@ enum RecurrenceOccurrenceResolver {
     }
 
     /// Whether `occurrence` starts somewhere other than its place in the series
-    /// (`originalStartTime`). A timed one compares instants, an all-day one dates; an all-day start
-    /// whose place is given as an instant (Outlook: the start of its date in the series' zone) is
-    /// dated in `seriesZone`. True when it can't be told (no place, a time that can't be read, no
-    /// zone), the side that refuses a split.
-    static func wasMoved(_ occurrence: GCalEvent, seriesZone: TimeZone?) -> Bool {
+    /// (`originalStartTime`). A timed one compares instants, an all-day one dates, as text (every
+    /// provider gives an all-day occurrence's place as a date: Outlook's read in the series' zone,
+    /// `ExchangeCalendarProvider.allDayOccurrence`). True when it can't be told (no place, a time
+    /// that can't be read, an all-day start whose place is no date), the side that refuses a split.
+    static func wasMoved(_ occurrence: GCalEvent) -> Bool {
         guard let place = occurrence.originalStartTime, let start = occurrence.start else { return true }
         if let date = start.date {
-            if let placeDate = place.date { return String(date.prefix(10)) != String(placeDate.prefix(10)) }
-            guard let seriesZone, let placeTime = place.dateTime, let instant = Date.fromISO8601(placeTime) else { return true }
-            return EKEventStoreHelper.dayKey(instant, timeZone: seriesZone) != String(date.prefix(10))
+            guard let placeDate = place.date else { return true }
+            return String(date.prefix(10)) != String(placeDate.prefix(10))
         }
         guard let startTime = start.dateTime, let placeTime = place.dateTime,
               let now = Date.fromISO8601(startTime), let original = Date.fromISO8601(placeTime) else { return true }
@@ -803,7 +802,7 @@ actor GoogleCalendarProvider: CalendarProvider {
             let found = try await occurrence(
                 calendarId: calendarId, named: named, masterId: eventId,
                 recurrenceId: recurrenceId, zone: recurrenceIdZone)
-            if RecurrenceOccurrenceResolver.wasMoved(found, seriesZone: master.seriesZone) {
+            if RecurrenceOccurrenceResolver.wasMoved(found) {
                 // A split at an occurrence moved from its place is not supported (#563): a plain
                 // error, nothing written.
                 throw CalendarProviderError.notSupported("split at a moved occurrence")

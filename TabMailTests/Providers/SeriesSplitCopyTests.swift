@@ -823,8 +823,9 @@ struct ExchangeSeriesSplitCopyTests {
     @Test("an all-day series' occurrence is found at the date its place begins in the series' own zone")
     func allDayPlaceIsDatedInTheSeriesZone() async throws {
         // Measured: Graph gives an all-day occurrence's place as the instant its date begins in the
-        // series' zone, which it names on the series only (its range's `recurrenceTimeZone`). Tokyo's
-        // date begins the day before in UTC; Los Angeles' the same day.
+        // series' zone, which it names on the series only (its range's `recurrenceTimeZone`); read
+        // in that zone, its date is the place. Tokyo's date begins the day before in UTC; Los
+        // Angeles' the same day.
         for (zone, windows) in [("Asia/Tokyo", "Tokyo Standard Time"), ("America/Los_Angeles", "Pacific Standard Time")] {
             let http = FakeHTTP.Scenario()
             defer { http.close() }
@@ -841,30 +842,90 @@ struct ExchangeSeriesSplitCopyTests {
         }
     }
 
-    @Test("an all-day series whose own zone is not known is not split: its occurrence's place can't be dated, so the split's own check counts it as moved")
-    func allDaySeriesWithoutAZoneIsNotSplit() async throws {
+    @Test("an all-day series in a zone TabMail does not recognize is split like any other: its occurrence's place is read in that zone as Graph names it, and needs no zone of TabMail's")
+    func allDaySeriesInAZoneTabMailDoesNotRecognizeIsSplit() async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
         let date = GraphFixture.utcDay(GraphSplitFixture.occurrence)
-        // The occurrence is where its place puts it (`GraphFixture.event` gives it that place); only the
-        // series' zone, which Graph's all-day place is dated in, is not one TabMail recognizes.
-        let graph = FakeGraphCalendar([Self.allDaySeries(zone: "Not a zone"),
-                                       GraphFixture.event(id: "ser-1-occ", start: GraphSplitFixture.occurrence,
-                                                          online: false, seriesMasterId: "ser-1", allDay: true)])
+        // A zone the server knows by a name TabMail does not (here Kathmandu's, 5:45 ahead of UTC);
+        // the occurrence is where its place puts it.
+        let serverZone = "Custom Server Zone"
+        let kathmandu = try #require(TimeZone(identifier: "Asia/Kathmandu"))
+        #expect(CalendarTimeZoneResolver.zone(named: serverZone, in: .none) == nil, "TabMail recognizes the zone")
+        var occurrence = GraphFixture.event(id: "ser-1-occ", start: GraphSplitFixture.occurrence, online: false,
+                                            seriesMasterId: "ser-1", allDay: true)
+        occurrence["originalStart"] = GraphFixture.allDayPlace(date, in: kathmandu.identifier)
+        let graph = FakeGraphCalendar([Self.allDaySeries(zone: serverZone), occurrence], zones: [serverZone: kathmandu])
         graph.install(on: http)
-        var reason: String?
-        do {
-            _ = try await GraphSplitFixture.provider(http).splitSeries(
-                eventId: "ser-1", recurrenceId: date + "T00:00:00", recurrenceIdZone: .current, patch: GCalEventInput())
-        } catch CalendarProviderError.notSupported(let thrown) {
-            reason = thrown
+        _ = try await GraphSplitFixture.provider(http).splitSeries(
+            eventId: "ser-1", recurrenceId: date + "T00:00:00", recurrenceIdZone: .gmt, patch: GCalEventInput())
+        #expect(graph.readZones("ser-1-occ") == [serverZone], "the occurrence was not read in the series' zone: \(graph.readZones("ser-1-occ"))")
+        #expect(graph.created.count == 1, "no new part: \(http.servedCallSequence())")
+    }
+
+    @Test("an all-day series' occurrence is read in the series' own zone, as Graph names it: split at a plain one, a plain error with nothing written at a moved one, in zones ahead of UTC and behind it")
+    func allDayOccurrenceIsReadInTheSeriesZone() async throws {
+        // Measured on Graph: an all-day series every two days; a plain occurrence, and one moved a
+        // day earlier. Read in the series' zone, `originalStart` is midnight there with its offset,
+        // and its date is the occurrence's place; read in UTC it is the instant, the day before in
+        // Tokyo and Kathmandu.
+        let first = GraphFixture.utcDay(GraphSplitFixture.start)
+        for (name, iana) in [("Tokyo Standard Time", "Asia/Tokyo"), ("Asia/Kathmandu", "Asia/Kathmandu"),
+                             ("Pacific Standard Time", "America/Los_Angeles")] {
+            for moved in [false, true] {
+                let label = "\(name), \(moved ? "moved" : "plain")"
+                let http = FakeHTTP.Scenario()
+                defer { http.close() }
+                // The plain one is on its place, the third date; the moved one's place is the fifth
+                // date, and it is on the fourth.
+                let place = try Self.date(first, plus: moved ? 4 : 2)
+                let now = try Self.date(first, plus: moved ? 3 : 2)
+                var occurrence = GraphFixture.event(id: "ser-1-occ", start: try Self.midnight(now), online: false,
+                                                    seriesMasterId: "ser-1", allDay: true)
+                occurrence["originalStart"] = GraphFixture.allDayPlace(place, in: iana)
+                let graph = FakeGraphCalendar([try Self.everyTwoDays(from: first, zone: name), occurrence])
+                graph.install(on: http)
+                var reason: String?
+                do {
+                    _ = try await GraphSplitFixture.provider(http).splitSeries(
+                        eventId: "ser-1", recurrenceId: now + "T00:00:00", recurrenceIdZone: .gmt, patch: GCalEventInput())
+                } catch CalendarProviderError.notSupported(let thrown) {
+                    reason = thrown
+                }
+                #expect(graph.readZones("ser-1-occ") == [name], "\(label): the occurrence was not read in the series' zone: \(graph.readZones("ser-1-occ"))")
+                if moved {
+                    #expect(reason == "split at a moved occurrence", "\(label): \(reason ?? "not refused")")
+                    #expect(graph.created.isEmpty && graph.patches("ser-1").isEmpty, "\(label): written: \(http.servedCallSequence())")
+                } else {
+                    #expect(reason == nil, "\(label): refused: \(reason ?? "")")
+                    #expect(graph.created.count == 1, "\(label): no new part: \(http.servedCallSequence())")
+                }
+            }
         }
-        // The occurrence was found (read by its id), and the split's own check refused it there.
-        #expect(http.recordedCalls().contains { $0.method == "GET" && $0.url.contains("/events/ser-1-occ") },
-                "the occurrence was not found: \(http.servedCallSequence())")
-        #expect(reason == "split at a moved occurrence", "\(reason ?? "not refused")")
-        #expect(http.recordedCalls().allSatisfy { $0.method == "GET" }, "written: \(http.servedCallSequence())")
-        #expect(graph.created.isEmpty && graph.patches("ser-1").isEmpty, "the series was split")
+    }
+
+    /// `date` (`yyyy-MM-dd`) `days` later.
+    private static func date(_ date: String, plus days: Int) throws -> String {
+        GraphFixture.utcDay(try midnight(date).addingTimeInterval(Double(days) * 86_400))
+    }
+
+    /// UTC midnight of `date`, where `GraphFixture.event` puts an all-day event on that date.
+    private static func midnight(_ date: String) throws -> Date {
+        try #require(EKEventStoreHelper.parseNaiveISO(date, timeZone: .gmt))
+    }
+
+    /// An all-day series every two days from `first`, repeating in `zone` (the name Graph gives).
+    private static func everyTwoDays(from first: String, zone: String) throws -> [String: Any] {
+        var series = GraphFixture.event(id: "ser-1", start: try midnight(first), online: false, recurring: true, allDay: true)
+        var recurrence = series["recurrence"] as? [String: Any] ?? [:]
+        recurrence["pattern"] = ["type": "daily", "interval": 2, "month": 0, "dayOfMonth": 0,
+                                 "firstDayOfWeek": "sunday", "index": "first"]
+        var range = recurrence["range"] as? [String: Any] ?? [:]
+        range["recurrenceTimeZone"] = zone
+        range["startDate"] = first
+        recurrence["range"] = range
+        series["recurrence"] = recurrence
+        return series
     }
 
     /// A weekly all-day series repeating in `zone` (a Windows zone name, as Graph's range gives it).

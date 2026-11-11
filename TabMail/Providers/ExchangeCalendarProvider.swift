@@ -374,20 +374,63 @@ actor ExchangeCalendarProvider: CalendarProvider {
         recurrenceId: String,
         recurrenceIdZone: TimeZone
     ) async throws -> GCalEvent {
-        let (masterId, _) = try await resolveToMaster(eventId: eventId)
+        let (masterId, master) = try await resolveToMaster(eventId: eventId)
         return try await occurrence(
-            named: eventId, masterId: masterId,
+            named: eventId, masterId: masterId, series: master.event,
             recurrenceId: recurrenceId, zone: recurrenceIdZone)
     }
 
     /// `occurrence`, with the series already read (`resolveToMaster`): `named` is the id the edit
-    /// gave, `masterId` its series. Also the split's own lookup (`splitSeries`).
+    /// gave, `masterId` its series, `series` the series as read. Also the split's own lookup
+    /// (`splitSeries`).
+    ///
+    /// An occurrence of an all-day series is read in the series' own zone (`allDayOccurrence`), so
+    /// its place in the series is a date.
     private func occurrence(
-        named: String, masterId: String, recurrenceId: String, zone: TimeZone
+        named: String, masterId: String, series: GCalEvent, recurrenceId: String, zone: TimeZone
     ) async throws -> GCalEvent {
         let instanceId = try await resolveInstanceId(
             masterId: masterId, recurrenceId: recurrenceId, zone: zone, naming: named == masterId ? nil : named)
-        return try await getEvent(eventId: instanceId)
+        guard series.isAllDay else { return try await getEvent(eventId: instanceId) }
+        return try await allDayOccurrence(instanceId: instanceId, series: series)
+    }
+
+    /// The all-day occurrence `instanceId` of `series`, its place in the series
+    /// (`originalStartTime`) given as a date: the date of Graph's `originalStart`, read in the
+    /// series' own zone.
+    ///
+    /// Measured (2026-11-11, all-day series in Pacific Standard Time, Tokyo Standard Time and
+    /// Asia/Kathmandu, a plain and a moved occurrence each, read by id and in `/instances`): an
+    /// all-day occurrence's `originalStart` is the instant its original date begins in the series'
+    /// zone. Read with `Prefer: outlook.timezone` naming that zone, it is written as that local
+    /// midnight with the zone's offset (`…-11-20T00:00:00+09:00`), so its date text is the original
+    /// date. Read in UTC (no `Prefer`, or `Prefer` UTC) it is the UTC instant, the day before for a
+    /// zone ahead of UTC. So the read names the series' zone exactly as Graph gave it
+    /// (`recurrence.range.recurrenceTimeZone`, a Windows or an IANA name) and the date is taken as
+    /// text: no zone is looked up on the device, so a zone TabMail does not recognize is read the
+    /// same way. A series whose range names no zone is refused, with nothing written: the date of
+    /// its occurrences' places is not known (Graph names one on every series read so far; a range
+    /// written without one is read back as UTC, measured 2026-11-07).
+    private func allDayOccurrence(instanceId: String, series: GCalEvent) async throws -> GCalEvent {
+        guard let seriesZone = series.recurrenceTimeZoneName else {
+            throw CalendarProviderError.notSupported(
+                "Outlook gives no time zone for this all-day repeating event, so the date of the occurrence named can't be read; change it in your calendar app instead")
+        }
+        let encodedInstanceId = try Self.encodedGraphPathSegment(instanceId, context: "Graph event id")
+        let data = try await request(
+            path: "/events/\(encodedInstanceId)?$select=\(Self.eventSelect)", timeZoneName: seriesZone)
+        let read = try JSONDecoder().decode(MSEvent.self, from: data)
+        var occurrence = toGCalEvent(read)
+        occurrence.originalStartTime = Self.allDayPlace(read.originalStart)
+        return occurrence
+    }
+
+    /// An all-day occurrence's `originalStart`, read in its series' zone (`allDayOccurrence`), as
+    /// its place in the series: the date it names, as written. Nil when it is no ISO 8601
+    /// date-time.
+    nonisolated static func allDayPlace(_ originalStart: String?) -> GCalDateTime? {
+        guard let originalStart, Date.fromISO8601(originalStart) != nil else { return nil }
+        return GCalDateTime(dateTime: nil, date: String(originalStart.prefix(10)), timeZone: nil)
     }
 
     /// Series split (this_and_following). For Graph:
@@ -440,11 +483,10 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // that occurrence.
         if !isOwnSplitCap(of: master, at: recurrenceId, zone: recurrenceIdZone) {
             let found = try await occurrence(
-                named: named, masterId: eventId, recurrenceId: recurrenceId, zone: recurrenceIdZone)
-            if RecurrenceOccurrenceResolver.wasMoved(found, seriesZone: master.seriesZone) {
+                named: named, masterId: eventId, series: master, recurrenceId: recurrenceId, zone: recurrenceIdZone)
+            if RecurrenceOccurrenceResolver.wasMoved(found) {
                 // A split at an occurrence moved from its place is not supported (#563): a plain
-                // error, nothing written. An all-day place whose series' zone is not known can't be
-                // dated, so it counts as moved.
+                // error, nothing written.
                 throw CalendarProviderError.notSupported("split at a moved occurrence")
             }
         }
@@ -1202,7 +1244,9 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// bytes in `errorBody`, so `httpError(_, result.data)` could only ever carry
     /// `nil`. Every reason string `badRequestReason` / `parseHttpReason` surfaced
     /// to the user and to the LLM was therefore the code-only fallback.
-    private func request(path: String, method: String = "GET", body: Data? = nil) async throws -> Data {
+    /// `timeZoneName`: the zone `Prefer: outlook.timezone` names, exactly as given; the device's
+    /// when nil (see below).
+    private func request(path: String, method: String = "GET", body: Data? = nil, timeZoneName: String? = nil) async throws -> Data {
         let token = try await accessToken(false)
         // `Prefer: outlook.timezone` controls the timezone Graph uses in the
         // response's `start.timeZone` / `end.timeZone`. Without it Graph
@@ -1215,7 +1259,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // post-split occurrence by the user's UTC offset (e.g. 16:00 PDT →
         // 16:00 UTC = 09:00 PDT visible). Use the device's IANA zone so the
         // round-trip preserves the user's intended wall time.
-        let prefTz = TimeZone.current.identifier
+        let prefTz = timeZoneName ?? TimeZone.current.identifier
         let headers = ["Prefer": "outlook.timezone=\"\(prefTz)\""]
         // Throttling (429) and 503 are retried after Graph's `Retry-After`, like the
         // mail provider's requests (#426).
@@ -1398,10 +1442,10 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// An occurrence's `originalStart` as `GCalEvent.originalStartTime`: the start the series gave
     /// it, which a moved one keeps, as the instant it names. Graph gives it as an ISO 8601 date-time
     /// in UTC (`…T17:00:00Z`), or with an offset when the read asks for a zone, both measured; an
-    /// all-day occurrence's is the instant its date begins in the series' zone, which an occurrence
-    /// does not carry, so it is dated from the series (`CalendarSeriesScope`,
-    /// `RecurrenceOccurrenceResolver.wasMoved`). Nil when there is none (a series, a one-off event)
-    /// or it is no ISO 8601 date-time; a listing or read shows the event all the same.
+    /// all-day occurrence's is the instant its date begins in the series' zone, so its date is read
+    /// only where the read names that zone (`allDayOccurrence`, `allDayPlace`). Nil when there is
+    /// none (a series, a one-off event) or it is no ISO 8601 date-time; a listing or read shows the
+    /// event all the same.
     nonisolated static func originalStartTime(_ originalStart: String?) -> GCalDateTime? {
         guard let originalStart, let instant = Date.fromISO8601(originalStart) else { return nil }
         return GCalDateTime(dateTime: instant.iso8601String(), date: nil, timeZone: "UTC")

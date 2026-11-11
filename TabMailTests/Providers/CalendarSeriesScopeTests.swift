@@ -498,36 +498,36 @@ struct ExchangeCalendarSeriesScopeTests {
         }
     }
 
-    @Test("an all-day occurrence named by its id is placed on the date its place begins in the series' own zone")
+    @Test("an all-day occurrence named by its id is placed on the date its place begins in the series' own zone, read there as Graph names it, a zone TabMail does not recognize included")
     func allDayOccurrenceIsPlacedInTheSeriesZone() async throws {
-        // Measured: Graph gives an all-day occurrence's place as the UTC instant its date begins in
+        // Measured: Graph gives an all-day occurrence's place as the instant its date begins in
         // the series' zone, and names that zone on the series only (its range's
-        // `recurrenceTimeZone`). Tokyo's date begins on the day before in UTC; Los Angeles' on the
-        // same day.
+        // `recurrenceTimeZone`); read in that zone, its date is the place. Tokyo's and Kathmandu's
+        // date begins on the day before in UTC; Los Angeles' on the same day. A zone the server
+        // knows by a name TabMail does not is read the same way.
         let date = GraphFixture.utcDay(GraphFixture.occurrenceStart)
         let moved = GraphFixture.utcDay(GraphFixture.occurrenceStart.addingTimeInterval(2 * 86_400))
-        for (zone, windows) in [("Asia/Tokyo", "Tokyo Standard Time"), ("America/Los_Angeles", "Pacific Standard Time"), ("none", "Not a zone")] {
+        let kathmandu = try #require(TimeZone(identifier: "Asia/Kathmandu"))
+        for (zone, name) in [("Asia/Tokyo", "Tokyo Standard Time"), ("Asia/Kathmandu", "Asia/Kathmandu"),
+                             ("America/Los_Angeles", "Pacific Standard Time"), ("Asia/Kathmandu", "Custom Server Zone")] {
             var series = GraphFixture.event(id: "ser-ad", online: false, recurring: true, allDay: true)
             if var recurrence = series["recurrence"] as? [String: Any], var range = recurrence["range"] as? [String: Any] {
-                range["recurrenceTimeZone"] = windows
+                range["recurrenceTimeZone"] = name
                 recurrence["range"] = range
                 series["recurrence"] = recurrence
             }
             var occurrence = GraphFixture.event(id: "ser-ad-occ", start: GraphFixture.occurrenceStart, online: false,
                                                 seriesMasterId: "ser-ad", allDay: true)
-            occurrence["originalStart"] = GraphFixture.allDayPlace(date, in: TimeZone(identifier: zone)?.identifier ?? "UTC")
-            let graph = FakeGraphCalendar([series, occurrence])
+            occurrence["originalStart"] = GraphFixture.allDayPlace(date, in: zone)
+            let graph = FakeGraphCalendar([series, occurrence], zones: ["Custom Server Zone": kathmandu])
             let rows = try await outlook(graph, eventId: "ser-ad-occ", [
                 "start_iso": .string("\(moved)T00:00:00"), "timezone": .string("UTC"),
-            ], account: "series-x-all-day-\(zone)")
+            ], account: "series-x-all-day-\(name)")
             #expect(graph.patches("ser-ad").isEmpty && graph.patches("ser-ad-occ").isEmpty && graph.created.isEmpty,
-                    "\(zone): written")
+                    "\(name): written")
             let reason = rows.first?.failureReason ?? "<none>"
-            if zone == "none" {
-                #expect(reason.contains("the time zone of this all-day repeating event"), "\(zone): \(reason)")
-            } else {
-                #expect(reason.contains(CalendarSeriesScope.laterOccurrenceRefusal("\(date)T00:00:00")), "\(zone): \(reason)")
-            }
+            #expect(reason.contains(CalendarSeriesScope.laterOccurrenceRefusal("\(date)T00:00:00")), "\(name): \(reason)")
+            #expect(graph.readZones("ser-ad-occ").contains(name), "\(name): the occurrence was not read in the series' zone: \(graph.readZones("ser-ad-occ"))")
         }
     }
 }
@@ -1240,28 +1240,22 @@ struct CalendarSeriesScopeRouteTests {
                 == Went(scope: "all", start: "\(day(0))T00:00:00", end: "\(day(2))T00:00:00"))
     }
 
-    @Test("Outlook's all-day place, an instant, is dated in the series' own zone, which the series names")
-    func outlookAllDayPlaceIsDatedInTheSeriesZone() throws {
-        // Measured: Graph gives an all-day occurrence's place as the UTC instant its date begins in
-        // the series' zone (its recurrence zone, on the series only). Tokyo's day 7 begins at 15:00
-        // UTC on day 6.
-        for (zone, windows) in [("Asia/Tokyo", "Tokyo Standard Time"), ("America/Los_Angeles", "Pacific Standard Time")] {
+    @Test("an all-day series' place is a date and needs no zone: a series in a zone TabMail does not recognize routes as any other; a time given as its place can't be compared, and is refused")
+    func allDayPlaceNeedsNoZone() throws {
+        // Every provider gives an all-day occurrence's place as a date (Outlook's read in the
+        // series' own zone, `ExchangeCalendarProvider.allDayOccurrence`).
+        let now = GCalDateTime(dateTime: nil, date: day(7), timeZone: nil)
+        for name in ["Tokyo Standard Time", "Custom Server Zone"] {
             var series = Self.allDaySeries
-            series.recurrenceTimeZoneName = windows
-            let tz = try #require(TimeZone(identifier: zone))
-            let begins = try #require(EKEventStoreHelper.parseNaiveISO(day(7), timeZone: tz))
-            let place = GCalDateTime(dateTime: begins.iso8601String(timeZone: .gmt), date: nil, timeZone: "UTC")
-            let now = GCalDateTime(dateTime: nil, date: day(7), timeZone: nil)
-            #expect(try route(["start_iso": .string("\(day(9))T00:00:00")], Self.named(series, occurrence: Self.occurrence(place, now: now)))
+            series.recurrenceTimeZoneName = name
+            #expect(try route(["start_iso": .string("\(day(9))T00:00:00")], Self.named(series, occurrence: Self.occurrence(now)))
                     == Went(scope: "this_and_following", recurrenceId: "\(day(7))T00:00:00", start: "\(day(9))T00:00:00", eventId: "ser_occ"),
-                    "\(zone)")
+                    "\(name)")
         }
-        var unknown = Self.allDaySeries
-        unknown.recurrenceTimeZoneName = "Not a zone"
-        let place = GCalDateTime(dateTime: "\(day(6))T15:00:00Z", date: nil, timeZone: "UTC")
+        let instant = GCalDateTime(dateTime: "\(day(6))T15:00:00Z", date: nil, timeZone: "UTC")
         #expect(refusal(["start_iso": .string("\(day(9))T00:00:00")],
-                        Self.named(unknown, occurrence: Self.occurrence(place, now: GCalDateTime(dateTime: nil, date: day(7), timeZone: nil))))?
-            .contains("the time zone of this all-day repeating event") == true)
+                        Self.named(Self.allDaySeries, occurrence: Self.occurrence(instant, now: now)))?
+            .contains("can't be compared") == true)
     }
 
     @Test("a recurrence_id given as a date names the occurrence on that date")

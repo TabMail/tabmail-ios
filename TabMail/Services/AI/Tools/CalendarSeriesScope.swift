@@ -30,9 +30,10 @@ import Foundation
 ///
 /// First or later is judged on the occurrence's place in the series (`originalStartTime`); a
 /// date or a time change, and the move back to the first occurrence's date, on where it is now
-/// (`start`). Dates are read in the series' own zone (`GCalEvent.seriesZone`), the zone its rule
-/// repeats in; a timed series whose zone is not known is taken to move to another date, the side
-/// that splits or asks, never a wrong write.
+/// (`start`). A timed series' dates are read in its own zone (`GCalEvent.seriesZone`), the zone its
+/// rule repeats in; a timed series whose zone is not known is taken to move to another date, the
+/// side that splits or asks, never a wrong write. An all-day series' places are dates, as every
+/// provider gives them, and need no zone.
 enum CalendarSeriesScope {
 
     /// The event an edit names, the series it belongs to, and the occurrence it names.
@@ -176,7 +177,7 @@ enum CalendarSeriesScope {
             // A missing `recurrence_id` is refused by the caller's scope switch.
             guard let occurrence = named.occurrence else { return asGiven }
             let first = try firstPlace(series)
-            let slot = try slotPlace(occurrence, series: series)
+            let slot = try slotPlace(occurrence)
             switch try order(slot, first) {
             case .orderedAscending: throw beforeFirst(shown(slot, zone: zone), first: first, zone: zone)
             case .orderedSame: return try routeEvery(args, named: named, occurrence: occurrence, first: first, zone: zone)
@@ -190,7 +191,7 @@ enum CalendarSeriesScope {
                 // the series' own date is a move of the series; another date is a question for the user.
                 let start = CalendarToolHelpers.stringArgOpt(args, "start_iso")
                 let given = start ?? CalendarToolHelpers.stringArgOpt(args, "end_iso") ?? ""
-                guard let own = try place(start != nil ? series.start : series.end, series: series),
+                guard let own = place(start != nil ? series.start : series.end),
                       sameDate(given, as: own, series: series, zone: zone) else {
                     throw CalendarProviderError.notSupported(
                         "the new time of this repeating event is on another date than its first occurrence (\(shown(first, zone: zone))); " + askWhichOccurrences)
@@ -208,14 +209,14 @@ enum CalendarSeriesScope {
         _ args: [String: JSONValue], named: Named, occurrence: GCalEvent, first: Place, zone: TimeZone
     ) throws -> Routed {
         let series = named.series
-        let slot = try slotPlace(occurrence, series: series)
+        let slot = try slotPlace(occurrence)
         let isFirst: Bool
         switch try order(slot, first) {
         case .orderedAscending: throw beforeFirst(shown(slot, zone: zone), first: first, zone: zone)
         case .orderedSame: isFirst = true
         case .orderedDescending: isFirst = false
         }
-        let now = try currentPlace(occurrence, series: series)
+        let now = try currentPlace(occurrence)
         let recurrenceId = CalendarToolHelpers.stringArgOpt(args, "recurrence_id") ?? shown(now, zone: zone)
         guard movesTime(args) else {
             return routed(args, scope: "all", recurrenceId: recurrenceId, eventId: named.eventId)
@@ -285,7 +286,7 @@ enum CalendarSeriesScope {
         guard !days.isEmpty else { return nil }
         let instead = "give the new repeat rule (recurrence) with the move, or change just that date (edit_scope 'this_only' with recurrence_id)"
         let moved = scope == "this_and_following" ? named.occurrence?.start : series.start
-        guard let from = try? place(moved, series: series),
+        guard let from = place(moved),
               let dates = dates(of: start, and: from, series: series, zone: zone) else {
             return "this repeating event repeats on named days (\(days.joined(separator: ";"))), and it can't be told whether the new start (\(start)) keeps its date, as its own time zone is not known; \(instead)"
         }
@@ -307,7 +308,7 @@ enum CalendarSeriesScope {
 
     /// The series' first occurrence: its start.
     private static func firstPlace(_ series: GCalEvent) throws -> Place {
-        guard let first = try place(series.start, series: series) else {
+        guard let first = place(series.start) else {
             throw CalendarProviderError.notSupported(
                 "the start of this repeating event can't be read, so it is not known which of its occurrences the new time is for")
         }
@@ -315,8 +316,8 @@ enum CalendarSeriesScope {
     }
 
     /// The occurrence's place in the series (`originalStartTime`).
-    private static func slotPlace(_ occurrence: GCalEvent, series: GCalEvent) throws -> Place {
-        guard let slot = try place(occurrence.originalStartTime, series: series) else {
+    private static func slotPlace(_ occurrence: GCalEvent) throws -> Place {
+        guard let slot = place(occurrence.originalStartTime) else {
             throw CalendarProviderError.notSupported(
                 "the place in its series of the occurrence named can't be read, so it is not known whether it is the series' first; pass recurrence_id as the start_iso of the occurrence calendar_event_read shows")
         }
@@ -324,27 +325,22 @@ enum CalendarSeriesScope {
     }
 
     /// Where the occurrence is now (`start`).
-    private static func currentPlace(_ occurrence: GCalEvent, series: GCalEvent) throws -> Place {
-        guard let now = try place(occurrence.start, series: series) else {
+    private static func currentPlace(_ occurrence: GCalEvent) throws -> Place {
+        guard let now = place(occurrence.start) else {
             throw CalendarProviderError.notSupported(
                 "the start of the occurrence named can't be read; pass recurrence_id as the start_iso of the occurrence calendar_event_read shows")
         }
         return now
     }
 
-    /// A start, or an occurrence's `originalStartTime`, as a place in `series`; nil when there is
-    /// none or it can't be read. Outlook gives an all-day occurrence's place as the instant its date
-    /// begins in the series' zone (measured), so it is dated there; a series whose zone is not known
-    /// is refused, as the date would be a guess.
-    private static func place(_ value: GCalDateTime?, series: GCalEvent) throws -> Place? {
+    /// A start, or an occurrence's `originalStartTime`, as a place; nil when there is none or it
+    /// can't be read. An all-day one is a date, as every provider gives it (Outlook's place read in
+    /// the series' own zone, `ExchangeCalendarProvider.allDayOccurrence`), so no zone is needed to
+    /// date it. A time given where the series is all-day can't be compared with its dates (`order`).
+    private static func place(_ value: GCalDateTime?) -> Place? {
         if let date = value?.date { return .date(String(date.prefix(10))) }
         guard let dateTime = value?.dateTime, let instant = Date.fromISO8601(dateTime) else { return nil }
-        guard series.start?.date != nil else { return .instant(instant) }
-        guard let own = series.seriesZone else {
-            throw CalendarProviderError.notSupported(
-                "the time zone of this all-day repeating event (\(series.recurrenceTimeZoneName ?? series.start?.timeZone ?? "none")) is not one TabMail recognizes, so the date of the occurrence named can't be read; change it in your calendar app instead")
-        }
-        return .date(EKEventStoreHelper.dayKey(instant, timeZone: own))
+        return .instant(instant)
     }
 
     /// Whether `place` is before, at or after `first`. Thrown when the two can't be compared (one a
