@@ -1142,21 +1142,25 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// defect existed because the selection logic was duplicated, so the fix is
     /// one implementation, not two).
     ///
-    /// Graph-specific note: `request` sends `Prefer: outlook.timezone="<device zone>"`,
+    /// Graph-specific note, for a TIMED series: `request` sends `Prefer: outlook.timezone="<device zone>"`,
     /// so instance starts come back as a naive `dateTime` plus the IANA `timeZone`
     /// we asked for. That pairing is what makes the instant computable at all —
     /// unlike Google, the wire value carries NO offset. If Graph ever answers with
     /// a zone identifier Foundation cannot resolve (a Windows-style name such as
     /// "Pacific Standard Time"), we do not guess: an unplaceable candidate could
     /// be the one being addressed, and defaulting it to UTC would compute a wrong
-    /// instant, which is how a wrong occurrence gets PATCHed.
+    /// instant, which is how a wrong occurrence gets PATCHed. An all-day series is
+    /// read differently (next paragraph).
     ///
-    /// An occurrence of an ALL-DAY `series` is a date, not an instant (the resolver's Rule 3): the
-    /// instances are read in the series' own zone (`allDayZoneName`, as `allDayOccurrence` reads
-    /// one), and each start is taken as its date, as every all-day start is read
-    /// (`toGCalDateTime(_:isAllDay: true)`). Read in the device's zone, an all-day occurrence of a
-    /// series kept east of the edit's zone fell on the day before there, so a date named the next
-    /// day's occurrence (#647).
+    /// An occurrence of an ALL-DAY `series` is a date, not an instant (the resolver's Rule 3): each
+    /// start is taken as its date, as every all-day start is read (`toGCalDateTime(_:isAllDay:
+    /// true)`), and the instances are read with `Prefer` naming the series' own zone
+    /// (`allDayZoneName`, as `allDayOccurrence` reads one). Graph RELABELS an all-day start, it
+    /// does not convert it (measured): every read gives midnight of the occurrence's own date,
+    /// labelled with the zone `Prefer` names. Read as an instant, that was midnight on the DEVICE, so
+    /// an edit whose zone differs from the device's matched it in another frame: from a zone west of
+    /// the device's, a date named the next day's occurrence, and the start the read tools show
+    /// named none (#647).
     ///
     /// `named` is the occurrence id the edit gave, when it gave one (nil for the series' own id):
     /// that occurrence answers to `recurrenceId` before any other
