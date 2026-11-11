@@ -11,7 +11,7 @@ moved occurrence, current start, named where it is now, split at a moved occurre
 BYSETPOS, named days, day move, `recurringEventId`, `seriesMasterId`, `originalStartTime`,
 `originalStart`, `GCalEvent.originalStartTime`, `ExchangeCalendarProvider.originalStartTime`,
 `allDayOccurrence`, `allDayPlace`, `Prefer: outlook.timezone`, all-day place read in the series' zone,
-`allDayZoneName`, all-day occurrence named by its date in the series' zone (Rule 3 on Outlook, #647),
+all-day occurrence named by its date in the series' zone (Rule 3 on Outlook, #647),
 `eventSelect`, first occurrence, later occurrence, time of day, this-and-following, split, phantom
 occurrence, `RecurrenceTail.isCapped`, `isOwnSplitCap`, `splitCapUntil`, `afterOwnSplitCap`, `splitting`,
 own split cap, interrupted split, `routeSeriesTimeChange`, Google Calendar behaviour, retry, lost
@@ -174,10 +174,10 @@ next day's occurrence of a daily series (a weekly one: not found), and the read 
 `exdates_add` the same lookup picks which occurrence is DELETED. Now, for an all-day series, each start
 is read as its date the way every all-day start is (`toGCalDateTime(_:isAllDay: true)`, its first ten
 characters), so each candidate is a DATE and Rule 3 applies, whatever zone the edit names. `/instances`
-is read with `Prefer` naming the series' zone through the same rule as `allDayOccurrence`
-(`allDayZoneName`: `recurrenceTimeZoneName` as Graph gave it); since Graph only relabels an all-day start,
-that zone does not change the dates, and it makes the lookup refuse a series whose range names no zone,
-as the occurrence read already did (unreachable, see above). Every caller gets it: `updateOccurrence`
+is read in the device's zone, as before: Graph only relabels an all-day start, so the zone changes no date.
+[Superseded the same day: the first build also read `/instances` with `Prefer` naming the series' zone
+(`allDayZoneName`); its mutants survived, since no date depends on that zone, so it was deleted and
+`allDayOccurrence` keeps its own no-zone refusal.] Every caller gets it: `updateOccurrence`
 (this_only), `occurrence(...)` (the edit tool's and the queue's `read`, #694's delete lookup) and
 `splitSeries` (through `occurrence`). Timed series are unchanged; Google and CalDAV were already by date.
 

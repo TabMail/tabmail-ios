@@ -409,9 +409,14 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// zone ahead of UTC. So the read names the series' zone exactly as Graph gave it
     /// (`recurrence.range.recurrenceTimeZone`, a Windows or an IANA name) and the date is taken as
     /// text: no zone is looked up on the device, so a zone TabMail does not recognize is read the
-    /// same way (`allDayZoneName`).
+    /// same way. A series whose range names no zone is refused, with nothing written: the date of
+    /// its occurrences' places is not known (Graph names one on every series read so far; a range
+    /// written without one is read back as UTC, measured 2026-11-07).
     private func allDayOccurrence(instanceId: String, series: GCalEvent) async throws -> GCalEvent {
-        let seriesZone = try Self.allDayZoneName(of: series)
+        guard let seriesZone = series.recurrenceTimeZoneName else {
+            throw CalendarProviderError.notSupported(
+                "Outlook gives no time zone for this all-day repeating event, so the date of the occurrence named can't be read; change it in your calendar app instead")
+        }
         let encodedInstanceId = try Self.encodedGraphPathSegment(instanceId, context: "Graph event id")
         let data = try await request(
             path: "/events/\(encodedInstanceId)?$select=\(Self.eventSelect)", timeZoneName: seriesZone)
@@ -419,21 +424,6 @@ actor ExchangeCalendarProvider: CalendarProvider {
         var occurrence = toGCalEvent(read)
         occurrence.originalStartTime = Self.allDayPlace(read.originalStart)
         return occurrence
-    }
-
-    /// The zone an all-day series' occurrences are read in (`Prefer: outlook.timezone`), so their
-    /// dates are the series' own: its range's zone exactly as Graph gave it
-    /// (`recurrence.range.recurrenceTimeZone`). Both the occurrence read (`allDayOccurrence`) and the
-    /// occurrence lookup (`resolveInstanceId`) read in it. A series whose range names no zone is
-    /// refused, with nothing written: the dates of its occurrences are not known (Graph names one
-    /// on every series read so far; a range written without one is read back as UTC, measured
-    /// 2026-11-07).
-    private static func allDayZoneName(of series: GCalEvent) throws -> String {
-        guard let seriesZone = series.recurrenceTimeZoneName else {
-            throw CalendarProviderError.notSupported(
-                "Outlook gives no time zone for this all-day repeating event, so the date of the occurrence named can't be read; change it in your calendar app instead")
-        }
-        return seriesZone
     }
 
     /// An all-day occurrence's `originalStart`, read in its series' zone (`allDayOccurrence`), as
@@ -1142,8 +1132,8 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// defect existed because the selection logic was duplicated, so the fix is
     /// one implementation, not two).
     ///
-    /// Graph-specific note, for a TIMED series: `request` sends `Prefer: outlook.timezone="<device zone>"`,
-    /// so instance starts come back as a naive `dateTime` plus the IANA `timeZone`
+    /// Graph-specific note: `request` sends `Prefer: outlook.timezone="<device zone>"`,
+    /// so a timed instance start comes back as a naive `dateTime` plus the IANA `timeZone`
     /// we asked for. That pairing is what makes the instant computable at all —
     /// unlike Google, the wire value carries NO offset. If Graph ever answers with
     /// a zone identifier Foundation cannot resolve (a Windows-style name such as
@@ -1154,10 +1144,9 @@ actor ExchangeCalendarProvider: CalendarProvider {
     ///
     /// An occurrence of an ALL-DAY `series` is a date, not an instant (the resolver's Rule 3): each
     /// start is taken as its date, as every all-day start is read (`toGCalDateTime(_:isAllDay:
-    /// true)`), and the instances are read with `Prefer` naming the series' own zone
-    /// (`allDayZoneName`, as `allDayOccurrence` reads one). Graph RELABELS an all-day start, it
-    /// does not convert it (measured): every read gives midnight of the occurrence's own date,
-    /// labelled with the zone `Prefer` names. Read as an instant, that was midnight on the DEVICE, so
+    /// true)`). Graph RELABELS an all-day start, it does not convert it (measured): every read gives
+    /// midnight of the occurrence's own date, labelled with the zone `Prefer` names, so the zone the
+    /// instances are read in changes no date. Read as an instant, that was midnight on the DEVICE, so
     /// an edit whose zone differs from the device's matched it in another frame: from a zone west of
     /// the device's, a date named the next day's occurrence, and the start the read tools show
     /// named none (#647).
@@ -1186,10 +1175,8 @@ actor ExchangeCalendarProvider: CalendarProvider {
         let encodedMaster = try Self.encodedGraphPathSegment(masterId, context: "Graph series master id")
         let encodedStart = startQS.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? startQS
         let encodedEnd = endQS.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? endQS
-        let allDayZone = series.isAllDay ? try Self.allDayZoneName(of: series) : nil
         let data = try await request(
-            path: "/events/\(encodedMaster)/instances?startDateTime=\(encodedStart)&endDateTime=\(encodedEnd)&$select=id,start",
-            timeZoneName: allDayZone)
+            path: "/events/\(encodedMaster)/instances?startDateTime=\(encodedStart)&endDateTime=\(encodedEnd)&$select=id,start")
 
         struct InstancesResponse: Decodable { let value: [MSEvent] }
         let resp = try JSONDecoder().decode(InstancesResponse.self, from: data)
@@ -1197,7 +1184,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         var candidates: [OccurrenceCandidate] = []
         for ev in resp.value {
             guard let id = ev.id, let start = ev.start, let dt = start.dateTime else { continue }
-            if allDayZone != nil {
+            if series.isAllDay {
                 candidates.append(OccurrenceCandidate(id: id, instant: nil, dateOnly: toGCalDateTime(start, isAllDay: true)?.date))
                 continue
             }
