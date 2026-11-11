@@ -74,8 +74,11 @@ private func expectOtherChangeFirst(_ out: String, sourceLocation: SourceLocatio
 }
 
 /// The answer's line for `date`: the date, the start of the occurrence it named, and what happened.
+/// A failed call answers in JSON, its lines in the `error` text; a successful one in plain lines.
 private func answerLine(_ out: String, date: String) -> String? {
-    out.components(separatedBy: "\n").first { $0.hasPrefix("- \(date) (occurrence starting ") }
+    let object = (try? JSONSerialization.jsonObject(with: Data(out.utf8))) as? [String: Any]
+    let text = object?["error"] as? String ?? out
+    return text.components(separatedBy: "\n").first { $0.hasPrefix("- \(date) (occurrence starting ") }
 }
 
 // MARK: - Running the tool
@@ -402,9 +405,9 @@ struct CalendarEditExdatesGoogleTests {
     @Test("an unrecognised timezone refuses the call, naming the zone, before anything is read or queued")
     func unrecognisedZoneIsRefused() async throws {
         let g = try await google([
-            "exdates_add": .array([.string("\(day(7))T09:00:00")]), "timezone": .string("Mars/Olympus"),
+            "exdates_add": .array([.string("\(day(7))T09:00:00")]), "timezone": .string("Olympus_Mons"),
         ], account: "exdates-g-bad-zone")
-        expectRefused(g.run, writes: g.calendar.writes, naming: ["Mars/Olympus", "did not delete any occurrence"])
+        expectRefused(g.run, writes: g.calendar.writes, naming: ["Olympus_Mons", "did not delete any occurrence"])
     }
 
     /// The malformed shapes of exdates_add, each with a valid date beside it where it can carry one.
