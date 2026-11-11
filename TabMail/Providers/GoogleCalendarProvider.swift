@@ -1341,8 +1341,9 @@ actor GoogleCalendarProvider: CalendarProvider {
     ///
     /// Attendees keep their entries (role, optional flag, answer). When the edit moves the new part
     /// (its start, end, all-day form, rule or place differs from the plain re-anchored copy, or that
-    /// can't be told) every attendee but the organizer is asked again. An attendee the patch adds is
-    /// asked; one it leaves out is removed.
+    /// can't be told) every attendee but the organizer is asked again. The edit's guest change is
+    /// applied to the series' stored guests (`AttendeeChange.apply`): an attendee it adds is asked,
+    /// one it removes goes.
     static func splitNewPartJSON(
         masterJSON: [String: Any],
         master: GCalEvent,
@@ -1370,10 +1371,10 @@ actor GoogleCalendarProvider: CalendarProvider {
         json["recurrence"] = edited.recurrence
 
         let stored = masterJSON["attendees"] as? [[String: Any]] ?? []
-        guard !stored.isEmpty || patch.attendees != nil else { return json }
+        guard !stored.isEmpty || patch.attendeeChange != nil else { return json }
         func email(_ attendee: [String: Any]) -> String? { (attendee["email"] as? String)?.lowercased() }
         let organizerEmail = master.organizer?.email?.lowercased()
-        let attendees = patch.attendees.map { keptAttendeesJSON(stored: stored, wanted: $0) } ?? stored
+        let attendees = patch.attendeeChange.map { applied($0, to: stored) } ?? stored
         let askAgain = splitReschedules(unchanged, edited)
         json["attendees"] = attendees.map { attendee -> [String: Any] in
             let isOrganizer = (attendee["organizer"] as? Bool) == true
@@ -1387,27 +1388,26 @@ actor GoogleCalendarProvider: CalendarProvider {
         return json
     }
 
-    /// The attendee list an edit writes when it changes who attends: each attendee it keeps, as the
-    /// stored event holds them (optional flag, answer, comment, additional guests, resource); each
-    /// one it adds by address and name. Google replaces the whole list with what it is sent, so an
-    /// attendee sent by address alone loses the rest.
-    static func keptAttendeesJSON(stored: [[String: Any]], wanted: [(email: String, name: String?)]) -> [[String: Any]] {
-        wanted.map { want in
-            if let kept = stored.first(where: { ($0["email"] as? String)?.lowercased() == want.email.lowercased() }) {
-                return kept
-            }
-            var added: [String: Any] = ["email": want.email]
-            if let name = want.name { added["displayName"] = name }
+    /// The attendee list an edit writes when it changes who attends: `change` applied to the item's
+    /// own stored list (`AttendeeChange.apply`). Each attendee it keeps goes back as the item holds
+    /// them (optional flag, answer, comment, additional guests, resource, and one with no address);
+    /// each one it adds by address and name, unanswered. Google replaces the whole list with what it
+    /// is sent, so an attendee sent by address alone loses the rest.
+    static func applied(_ change: AttendeeChange, to stored: [[String: Any]]) -> [[String: Any]] {
+        change.apply(to: stored, address: { ($0["email"] as? String)?.lowercased() }) { add in
+            var added: [String: Any] = ["email": add.email]
+            if let name = add.name { added["displayName"] = name }
             return added
         }
     }
 
-    /// The PATCH body of an edit: `merged` as JSON, with the attendees it names as the stored event
-    /// `stored` holds them (`keptAttendeesJSON`).
+    /// The PATCH body of an edit: `merged` as JSON, with its guest change applied to the attendees
+    /// of the item it writes, `stored` as read for the write. Google applies a series' guest list to
+    /// the occurrences it holds on their own.
     static func editJSON(_ merged: GCalEventInput, stored: [String: Any]) -> [String: Any] {
         var json = merged.toJSON()
-        if let wanted = merged.attendees {
-            json["attendees"] = keptAttendeesJSON(stored: stored["attendees"] as? [[String: Any]] ?? [], wanted: wanted)
+        if let change = merged.attendeeChange {
+            json["attendees"] = applied(change, to: stored["attendees"] as? [[String: Any]] ?? [])
         }
         return json
     }
@@ -1547,11 +1547,10 @@ actor GoogleCalendarProvider: CalendarProvider {
     ///
     /// Attendees are deliberately NOT inherited from `existing`: re-sending
     /// them by address and name alone would reset what the server holds for
-    /// them (their answer, optional flag, comment). We only include
-    /// attendees when `patch` explicitly changes them; the
-    /// caller is responsible for delta-resolving against the existing list
-    /// (see `AccountManager.resolveAttendeeDelta`), and `editJSON` writes
-    /// each attendee the list keeps as the stored event holds them.
+    /// them (their answer, optional flag, comment). Only the patch's guest
+    /// change is carried (`attendeeChange`); each write applies it to the
+    /// stored guests of the item it writes (`editJSON`, Outlook's
+    /// `graphPatchJSON`), so each attendee it keeps stays as stored.
     static func mergeExistingEventWithPatch(existing: GCalEvent, patch: GCalEventInput) -> GCalEventInput {
         var merged = GCalEventInput()
         merged.summary = patch.summary ?? existing.summary
@@ -1644,8 +1643,8 @@ actor GoogleCalendarProvider: CalendarProvider {
         // carry a series rule and providers will 400.)
         merged.recurrence = patch.recurrence ?? existing.recurrence
 
-        // Attendees: only set when the patch is changing them. See doc.
-        merged.attendees = patch.attendees
+        // Attendees: only the patch's guest change. See doc.
+        merged.attendeeChange = patch.attendeeChange
 
         return merged
     }
@@ -1744,15 +1743,8 @@ actor GoogleCalendarProvider: CalendarProvider {
             }
         }
 
-        // Attendees: prefer patch's resolved list, else inherit master's.
-        if let patchAttendees = patch.attendees {
-            out.attendees = patchAttendees
-        } else {
-            out.attendees = (master.attendees ?? []).compactMap { att in
-                guard let email = att.email, !email.isEmpty else { return nil }
-                return (email: email, name: att.displayName)
-            }
-        }
+        // No attendees: each split writes the new part's guests from the series' stored list and the
+        // patch's guest change itself (`splitNewPartJSON`, Google's and Outlook's).
 
         // Recurrence: caller-supplied `newRecurrence` is the default (the
         // master's RRULE as the split rewrites it). If `patch.recurrence` is non-nil, the
@@ -1982,9 +1974,13 @@ struct GCalEventInput: Sendable {
     var endDateTime: String?
     var endDate: String?
     var endTimeZone: String?
+    /// A new event's guests (a create). An edit never carries a list: it carries `attendeeChange`.
     var attendees: [(email: String, name: String?)]?
     var transparency: String?
     var recurrence: [String]?
+    /// An edit's guest change, which each provider's write applies to the stored guests of every
+    /// item it covers (#620). Nil when the edit names nobody: no guest list is written.
+    var attendeeChange: AttendeeChange?
 
     func toJSON() -> [String: Any] {
         var json: [String: Any] = [:]

@@ -243,11 +243,26 @@ the PATCH body the fake calendar received:
 - adding an attendee sends every other attendee exactly as stored (organizer, optional, resource,
   additional guests) and the new one by address and name;
 - removing one drops only that attendee;
-- an address in another letter case still matches its stored entry, on either side, and the list
-  keeps the order the edit asks for;
+- an address in another letter case still matches its stored entry, on either side; a guest
+  removed and added back in one change keeps their stored entry, at the end of the list;
 - adding the first attendee to an event with none sends just that attendee;
 - an edit that names no attendee change sends no attendee list;
 - an occurrence edit keeps that occurrence's own stored attendees.
+
+## A guest change reaches every item it covers, each from its own guests (#620)
+
+An edit carries the guest change itself (`AttendeeChange`), and each write applies it to the stored
+guests of every item it covers. `CalendarGuestChangeTests` checks, on each fake server after the
+real calendar queue drains the edit, that every item in scope holds the change applied to its OWN
+guests (kept guests byte-identical, new ones unanswered, removed ones gone) and every item outside
+it is untouched: CalDAV (every VEVENT: series, changed occurrences, a split's new part and the
+occurrences it carries, a one-occurrence edit by the series id), Google and Outlook (the item the
+write reads; the server carries a series' list to its changed occurrences), plus pins that held
+before the fix. `AttendeeChangeTests` covers the function itself (order, `"*"`, letter case,
+`mailto:` prefixes, a guest with no address, re-adding, both changed-occurrence rules);
+`CalDAVWholeSeriesEditTests` a cancelled occurrence left as stored and a VEVENT the change leaves
+byte for byte; `DemoGuestChangeTests` the demo calendar; `CalendarToolResolvedAccountTests` the
+edit card, which names the people added and removed and shows no list.
 
 ## Inbox list — layered test architecture
 

@@ -4,6 +4,7 @@
 
 import Testing
 import Foundation
+import GRDB
 @testable import TabMail
 
 // MARK: - A guest change reaches every item it covers, each from its own guest list (#620)
@@ -30,15 +31,15 @@ import Foundation
 // (measured for an added guest, modelled by `FakeGoogleCalendar` and `FakeGraphCalendar`), so
 // there the app writes the item it read, once.
 //
-// RED ON MAIN, each for the reason its test names: the queue works out ONE full list from the
-// event it reads (the series) and the CalDAV write puts it on the series VEVENT alone, so the
-// changed occurrences keep their old guests; and a one-occurrence edit given the series id is
-// handed the series' list, which drops the occurrence's own guests (#596). The pins at the end
-// hold on main and must keep holding through the fix.
+// RED BEFORE THE FIX, each for the reason its test names: the queue worked out ONE full list from
+// the event it read (the series) and the CalDAV write put it on the series VEVENT alone, so the
+// changed occurrences kept their old guests; and a one-occurrence edit given the series id was
+// handed the series' list, which dropped the occurrence's own guests (#596). The fix carries the
+// change itself to each write (`AttendeeChange`). The pins at the end held before the fix and must
+// keep holding.
 //
-// Pending, not written here: an "all" edit given one occurrence's instance id on Google and
-// Outlook (it needs the series resolution of #560 first), and a unit suite for the shared function
-// the fix adds.
+// Case 17 is an "all" edit named by one changed occurrence's own id (#560 writes it to the series):
+// the series takes the change on its own guests, never the guests that occurrence holds on its own.
 
 // MARK: - The oracle
 
@@ -435,8 +436,10 @@ struct CalDAVGuestChangeTests {
         #expect(problems.isEmpty, Comment(rawValue: problems.joined(separator: "\n")))
     }
 
-    @Test("8. a changed occurrence that gains its first guest also gets the series' organizer, which iCloud requires")
-    func firstGuestOnAnOccurrenceBringsTheOrganizer() async throws {
+    @Test("8. a changed occurrence with no guests and no organizer gains the guest, on a server that refuses guests without an organizer")
+    func firstGuestOnAnOccurrenceLands() async throws {
+        // The organizer the occurrence then needs is the PUT's own step (`putEvent`, ADR-IOS-109,
+        // pinned by `CalDAVOrganizerTests`); this asserts the guests.
         let seed = C.resource([
             C.series([]),
             C.occurrence(week: 2, summary: "Planning review", [], organizer: false),
@@ -448,9 +451,20 @@ struct CalDAVGuestChangeTests {
         let after = run.store.storedICS(path: C.seriesPath)
         let problems = C.problems(before: seed, after: after, inScope: [C.seriesKey, C.key(week: 2)], F.addD)
         #expect(problems.isEmpty, Comment(rawValue: problems.joined(separator: "\n")))
-        let occurrence = C.vevents(after)[C.key(week: 2)] ?? []
-        #expect(VEventOracle.own(occurrence, "ORGANIZER") == [C.organizerLine],
-                "the occurrence's organizer is \(VEventOracle.own(occurrence, "ORGANIZER")):\n\(occurrence.joined(separator: "\n"))")
+    }
+
+    @Test("17. a change of every occurrence named by one changed occurrence's id reaches every VEVENT from its own guests, and the series does not take that occurrence's own guests")
+    func everyOccurrenceNamedByAnOccurrenceId() async throws {
+        let seed = C.changedSeries()
+        let run = C.serve(seed)
+        defer { run.http.close() }
+        let occurrenceId = CalDAVOccurrences.OccurrenceId.make(seriesHref: C.seriesPath, key: C.key(week: 4))
+        let rows = try await C.drain(run, eventId: occurrenceId,
+                                     F.addD.arguments.merging(["edit_scope": .string("all")]) { mine, _ in mine },
+                                     account: "guests-c-all-by-occurrence")
+        #expect(rows.isEmpty, "the edit did not land: \(rows.map { $0.failureReason ?? $0.status })")
+        let problems = C.problems(before: seed, after: run.store.storedICS(path: C.seriesPath), inScope: Self.everyItem, F.addD)
+        #expect(problems.isEmpty, Comment(rawValue: problems.joined(separator: "\n")))
     }
 
     @Test("11. an attendee whose address is not mailto: is kept on every VEVENT through an unrelated add (#607)")
@@ -681,6 +695,27 @@ struct GoogleGuestChangeTests {
         #expect(problems.isEmpty, Comment(rawValue: problems.joined(separator: "\n")))
     }
 
+    @Test("17. a change of every occurrence named by one changed occurrence's id is one PATCH of the series, from the series' own guests (#560)")
+    func everyOccurrenceNamedByAnOccurrenceId() async throws {
+        // Week 4 holds C on its own: the series must not take C.
+        let seed = G.seed()
+        let before = G.guests(FakeGoogleCalendar(seed), G.everyId)
+        let r = try await G.run(seed, eventId: G.instanceId(week: 4),
+                                F.addD.arguments.merging(["edit_scope": .string("all")]) { mine, _ in mine },
+                                account: "guests-g-all-by-occurrence")
+        #expect(r.rows.isEmpty, "the edit did not land: \(r.rows.map { $0.failureReason ?? $0.status })")
+        #expect(r.calendar.writes == ["PATCH \(G.seriesId)"], "writes: \(r.calendar.writes)")
+        let after = G.guests(r.calendar, G.everyId)
+        let problems = GuestChangeOracle.problems(
+            item: G.seriesId, before: before[G.seriesId] ?? [], after: after[G.seriesId] ?? [],
+            change: F.addD, isUnanswered: G.isUnanswered)
+        #expect(problems.isEmpty, Comment(rawValue: problems.joined(separator: "\n")))
+        for week in [1, 2, 3, 6] {
+            #expect(after[G.instanceId(week: week)] == after[G.seriesId],
+                    "week \(week) does not hold the series' new guests: \(after[G.instanceId(week: week)] ?? [])")
+        }
+    }
+
     @Test("15. a guest stored with no address is kept through an add (#597)")
     func guestWithoutAddressSurvives() async throws {
         let noAddress: [String: Any] = ["id": "guest-without-address", "displayName": "Front desk",
@@ -833,6 +868,27 @@ struct OutlookGuestChangeTests {
             before: before, after: X.guests(graph, X.everyId), inScope: [X.instanceId(week: 4)],
             change: F.addD, isUnanswered: X.isUnanswered)
         #expect(problems.isEmpty, Comment(rawValue: problems.joined(separator: "\n")))
+    }
+
+    @Test("17. a change of every occurrence named by one changed occurrence's id is one PATCH of the series, from the series' own guests (#560)")
+    func everyOccurrenceNamedByAnOccurrenceId() async throws {
+        // Week 4 holds C on its own: the series must not take C.
+        let graph = FakeGraphCalendar(X.seed())
+        let before = X.guests(graph, X.everyId)
+        let rows = try await X.run(graph, eventId: X.instanceId(week: 4),
+                                   F.addD.arguments.merging(["edit_scope": .string("all")]) { mine, _ in mine },
+                                   account: "guests-x-all-by-occurrence")
+        #expect(rows.isEmpty, "the edit did not land: \(rows.map { $0.failureReason ?? $0.status })")
+        #expect(graph.patchedIds == [X.seriesId], "PATCHes: \(graph.patchedIds)")
+        let after = X.guests(graph, X.everyId)
+        let problems = GuestChangeOracle.problems(
+            item: X.seriesId, before: before[X.seriesId] ?? [], after: after[X.seriesId] ?? [],
+            change: F.addD, isUnanswered: X.isUnanswered)
+        #expect(problems.isEmpty, Comment(rawValue: problems.joined(separator: "\n")))
+        for week in [1, 2, 3, 6] {
+            #expect(after[X.instanceId(week: week)] == after[X.seriesId],
+                    "week \(week) does not hold the series' new guests: \(after[X.instanceId(week: week)] ?? [])")
+        }
     }
 
     @Test("16. a new guest is written with an unanswered status, which Graph requires")
@@ -992,5 +1048,55 @@ struct DemoGuestChangePinTests {
         #expect(rows.count == 1 && rows.first?.status == PendingStatus.failed.rawValue
                     && rows.first?.failureReason == "event not found on server",
                 "rows: \(rows.map { "\($0.status) \($0.failureReason ?? "")" })")
+    }
+}
+
+@Suite("A guest change to a demo event", .serialized, .processGlobalState)
+struct DemoGuestChangeTests {
+    private static func storedGuests(_ pool: DatabasePool, _ id: String?) async throws -> [[String: String]] {
+        let json = try await pool.read { db in
+            try String.fetchOne(db, sql: "SELECT attendeesJSON FROM demoCalendarEvent WHERE id = ?", arguments: [id])
+        }
+        return try json.map { try JSONDecoder().decode([[String: String]].self, from: Data($0.utf8)) } ?? []
+    }
+
+    @Test("is applied to the guests the event stores, and an edit naming nobody keeps them")
+    func changeIsAppliedToTheStoredGuests() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("demo-guests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let pool = try DatabasePool(path: directory.appendingPathComponent("test.sqlite").path, configuration: configuration)
+        let appDatabase = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let saved = current
+            current = appDatabase
+            return saved
+        }
+        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
+
+        let provider = DemoCalendarProvider(accountId: "demo-guests")
+        let start = Date().addingTimeInterval(7 * 86_400)
+        var create = GCalEventInput()
+        create.summary = "Planning"
+        create.startDateTime = start.iso8601String()
+        create.endDateTime = start.addingTimeInterval(3_600).iso8601String()
+        create.attendees = [(email: "alice@example.com", name: "Alice"), (email: "bob@example.com", name: nil)]
+        let created = try await provider.createEvent(calendarId: "primary", event: create, sendUpdates: "none")
+
+        var edit = create
+        edit.attendees = nil
+        edit.attendeeChange = AttendeeChange(adds: [.init(email: "carol@example.com", name: "Carol")], removes: ["BOB@example.com"])
+        _ = try await provider.updateEvent(calendarId: "primary", eventId: created.id ?? "", event: edit, sendUpdates: "none")
+        #expect(try await Self.storedGuests(pool, created.id)
+                == [["email": "alice@example.com", "name": "Alice"], ["email": "carol@example.com", "name": "Carol"]])
+
+        var rename = create
+        rename.attendees = nil
+        rename.summary = "Planning (renamed)"
+        _ = try await provider.updateEvent(calendarId: "primary", eventId: created.id ?? "", event: rename, sendUpdates: "none")
+        #expect(try await Self.storedGuests(pool, created.id)
+                == [["email": "alice@example.com", "name": "Alice"], ["email": "carol@example.com", "name": "Carol"]],
+                "an edit that names nobody changed the guests")
     }
 }

@@ -354,7 +354,7 @@ struct CalDAVOccurrenceWireTests {
         var allDayEnd = GCalEventInput()
         allDayEnd.endDate = day(shown.addingTimeInterval(OccurrenceFixture.days(2)), fixture.zone)
         var guests = GCalEventInput()
-        guests.attendees = [(email: "guest@example.com", name: nil)]
+        guests.attendeeChange = AttendeeChange(adds: [.init(email: "guest@example.com", name: nil)])
         var rule = GCalEventInput()
         rule.recurrence = ["RRULE:FREQ=DAILY"]
         let patches: [(label: String, patch: GCalEventInput)] = [

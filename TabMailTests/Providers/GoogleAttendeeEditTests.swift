@@ -37,16 +37,6 @@ private enum AttendeeEditFixture {
         return event
     }
 
-    /// The attendee list an edit asks for: every stored attendee by address and name, as the edit
-    /// queue resolves an add or remove, with `adding` appended and `removing` left out.
-    static func wanted(adding: [(email: String, name: String?)] = [], removing: Set<String> = [],
-                       from stored: [[String: Any]] = attendees) -> [(email: String, name: String?)] {
-        stored.compactMap { attendee -> (email: String, name: String?)? in
-            guard let email = attendee["email"] as? String, !removing.contains(email) else { return nil }
-            return (email: email, name: attendee["displayName"] as? String)
-        } + adding
-    }
-
     static func data(_ object: [String: Any]) -> Data {
         // swiftlint:disable:next force_try
         try! JSONSerialization.data(withJSONObject: object)
@@ -117,7 +107,7 @@ struct GoogleAttendeeEditTests {
     @Test("adding an attendee keeps everyone else as stored and invites only the new one")
     func addKeepsTheOthers() async throws {
         var patch = GCalEventInput()
-        patch.attendees = F.wanted(adding: [(email: "carol@example.com", name: "Carol")])
+        patch.attendeeChange = AttendeeChange(adds: [.init(email: "carol@example.com", name: "Carol")])
 
         let patches = try await F.editEvent(F.event(id: "evt-1"), patch: patch)
 
@@ -135,7 +125,7 @@ struct GoogleAttendeeEditTests {
     @Test("removing an attendee drops only that one and keeps everyone else as stored")
     func removeKeepsTheOthers() async throws {
         var patch = GCalEventInput()
-        patch.attendees = F.wanted(removing: ["bob@example.com"])
+        patch.attendeeChange = AttendeeChange(removes: ["bob@example.com"])
 
         let patches = try await F.editEvent(F.event(id: "evt-1"), patch: patch)
 
@@ -152,14 +142,14 @@ struct GoogleAttendeeEditTests {
     @Test("an attendee named in another letter case is still matched to their stored entry")
     func addressCaseIsIgnored() async throws {
         var patch = GCalEventInput()
-        patch.attendees = F.wanted(removing: ["alice@example.com"]) + [(email: "Alice@Example.com", name: nil)]
+        patch.attendeeChange = AttendeeChange(adds: [.init(email: "Alice@Example.com", name: nil)], removes: ["alice@example.com"])
 
         let patches = try await F.editEvent(F.event(id: "evt-1"), patch: patch)
 
         #expect(patches.count == 1)
         guard patches.count == 1 else { return }
         #expect(F.canonical(F.sent(patches[0], "alice@example.com")) == F.canonical(F.stored("alice@example.com")))
-        // The list goes out in the order the edit asks for, not the stored order.
+        // A guest removed and added back in one change goes to the end, as stored.
         let sentOrder = (patches[0]["attendees"] as? [[String: Any]])?.compactMap { $0["email"] as? String }
         #expect(sentOrder == ["olivia@example.com", "room-1@example.com", "bob@example.com", "alice@example.com"])
     }
@@ -169,8 +159,7 @@ struct GoogleAttendeeEditTests {
         var stored = F.attendees
         stored[3]["email"] = "Bob@Example.com"
         var patch = GCalEventInput()
-        // The queue builds the wanted list from the stored entries, so Bob keeps his capitals here.
-        patch.attendees = F.wanted(adding: [(email: "carol@example.com", name: nil)], from: stored)
+        patch.attendeeChange = AttendeeChange(adds: [.init(email: "carol@example.com", name: nil)])
 
         let patches = try await F.editEvent(F.event(id: "evt-1", attendees: stored), patch: patch)
 
@@ -185,7 +174,7 @@ struct GoogleAttendeeEditTests {
         var event = F.event(id: "evt-1")
         event.removeValue(forKey: "attendees")
         var patch = GCalEventInput()
-        patch.attendees = [(email: "carol@example.com", name: "Carol")]
+        patch.attendeeChange = AttendeeChange(adds: [.init(email: "carol@example.com", name: "Carol")])
 
         let patches = try await F.editEvent(event, patch: patch)
 
@@ -222,7 +211,7 @@ struct GoogleAttendeeEditTests {
             "originalStartTime": ["dateTime": "2099-05-20T17:00:00Z", "timeZone": "UTC"],
         ])
         var patch = GCalEventInput()
-        patch.attendees = F.wanted(adding: [(email: "carol@example.com", name: nil)], from: own)
+        patch.attendeeChange = AttendeeChange(adds: [.init(email: "carol@example.com", name: nil)])
 
         let patches = try await F.editOccurrence(instance, patch: patch)
 

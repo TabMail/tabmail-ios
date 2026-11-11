@@ -3,10 +3,11 @@
 **Keywords:** `splitSeries`, this-and-following, new part, capped series, occurrence override,
 `seriesSplitResources`, `occurrenceOverrideResource`, `CalDAVEventCopies`, `splitNewPartJSON`,
 `serverOwnedEventKeys`, `splitCopiedKeys`, `splitSelect`, `splitReschedules`, `applyAttendeeRule`, `insertEventJSON`,
-`conferenceDataVersion`, `supportsAttachments`, `splitRecurrence`, `keptAttendeesJSON`, `editJSON`, `filterDateList`, `RecurrenceTail`,
+`conferenceDataVersion`, `supportsAttachments`, `splitRecurrence`, `keptAttendeesJSON` (retired), `editJSON`, `filterDateList`, `RecurrenceTail`,
 `newSeriesEnd`, `occurrencesLeft`, `numberOfOccurrences`, numbered range, `Anchor`, `patternStart`, WKST, `firstDayOfWeek`,
 `MissingMonthDay`, `lastDay`, month end, 31st, February 29, leap day, `absoluteMonthly`, `absoluteYearly`,
 `rangeDays`, #474, #562,
+`AttendeeChange`, `attendeeChange`, `applyAttendeeChange`, guest change, `resolveAttendeeDelta` (retired), #620,
 EXDATE, RDATE, COUNT, recurrenceTimeZone, attendee answers, `needsAction`, write order,
 create first cap last, lost cap response, retry, own cap, `successorIsOurs`, `capEndDate`,
 RFC 6638 §3.2.8, PARTSTAT reset, `this_only` move asks again, Thunderbird add-on split only,
@@ -235,6 +236,33 @@ each attendee it keeps as the stored event holds them (`keptAttendeesJSON`, via 
 matched by address in any letter case, and only a new one by address and name. An occurrence edit
 matches against that occurrence's own stored attendees. An edit that names no attendee change
 sends no attendee list. Tests: `GoogleAttendeeEditTests`.
+
+**Since #620 (2026-11-11) an edit carries the guest change, never a list.** `add_attendees` /
+`remove_attendees` (`"*"` for everyone) become `GCalEventInput.attendeeChange`
+(`AttendeeChange(arguments:)`, in `buildGCalEventInput`); the queue no longer reads one item and
+works out one full list (`resolveAttendeeDelta` is deleted). Each write applies the change with the
+one function `AttendeeChange.apply` to the stored guests of every item it covers, read for that
+write: removals first, every other stored guest kept as stored (one with no address too), each new
+address appended once and unanswered (a guest removed and added back keeps their stored entry).
+- **CalDAV** (`mergePatchIntoICS` → `CalDAVProvider.applyAttendeeChange`): every VEVENT of the
+  resource the write covers: the series and each changed occurrence, a split's new part and the
+  changed occurrences it carries, a one-occurrence override (#596). A changed occurrence takes the
+  change on its OWN guests (`AttendeeChange.changedOccurrenceGuests`, `.ownGuestsChanged`, the
+  Thunderbird add-on's rule; `.seriesGuests` is the one switchable alternative). A
+  `STATUS:CANCELLED` occurrence is left as stored, and a VEVENT the change leaves as it was goes
+  back byte for byte. A new line is `ATTENDEE;CN="…";ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE`.
+  No ORGANIZER is written there: `putEvent` adds it (ADR-IOS-109).
+- **Google and Outlook:** the change is applied to the event or occurrence the write reads
+  (`GoogleCalendarProvider.applied` via `editJSON` and `splitNewPartJSON`;
+  `ExchangeCalendarProvider.appliedAttendeesJSON` and the split's `splitNewPartJSON`). A series'
+  new list reaches its changed occurrences on the server (measured for an added guest); a removal
+  and a moved occurrence are not measured.
+- **Demo** (`DemoCalendarProvider.updateEvent`) applies the same function to the stored guests;
+  the edit card (`CalendarEventEditTool`) shows the change itself (`AttendeeChange.cardLines`:
+  the people added and removed, three of each and "and N more"), never a resulting list.
+Tests: `CalendarGuestChangeTests` (on each fake server after the real queue drains),
+`AttendeeChangeTests` (the function), `DemoGuestChangeTests`, the card test in
+`CalendarToolResolvedAccountTests`.
 
 ## Tests
 

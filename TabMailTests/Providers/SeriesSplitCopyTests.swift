@@ -343,10 +343,11 @@ struct GoogleSeriesSplitCopyTests {
         #expect(GoogleCalendarProvider.splitReschedules(allDay, moved), "all day, another date")
     }
 
-    @Test("an attendee the edit adds is asked; one it leaves out is removed; the others keep their entries")
+    @Test("an attendee the edit adds is asked; ones it removes go; the others keep their entries")
     func attendeeChange() async throws {
         var patch = GCalEventInput()
-        patch.attendees = [("olivia@example.com", nil), ("alice@example.com", "Alice"), ("carol@example.com", "Carol")]
+        patch.attendeeChange = AttendeeChange(adds: [.init(email: "carol@example.com", name: "Carol")],
+                                              removes: ["room-1@example.com", "bob@example.com"])
         let wire = try await GoogleSplitFixture.split(GoogleSplitFixture.master(), patch: patch)
         let attendees = try #require(wire.created?["attendees"] as? [[String: Any]])
         #expect(attendees.compactMap { $0["email"] as? String } == ["olivia@example.com", "alice@example.com", "carol@example.com"])
@@ -671,7 +672,7 @@ struct ExchangeSeriesSplitCopyTests {
         #expect(names == ["Ana", "Bo", "Room 1"])
 
         var patch = GCalEventInput()
-        patch.attendees = [("ana@example.com", "Ana"), ("bo@example.com", "Bo"), ("cy@example.com", "Cy")]
+        patch.attendeeChange = AttendeeChange(adds: [.init(email: "cy@example.com", name: "Cy")], removes: ["room-1@example.com"])
         let (_, changed) = try await split(series, patch: patch)
         #expect(types(changed) == ["ana@example.com": "required", "bo@example.com": "optional", "cy@example.com": "required"],
                 "got \(types(changed))")

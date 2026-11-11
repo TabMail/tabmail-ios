@@ -766,10 +766,10 @@ struct CalDAVMergePatchTests {
         #expect(merged.contains("alice@example.com"))
     }
 
-    @Test("replacing attendees removes the old set and inserts the new")
+    @Test("a change removing everyone and adding one leaves just that one")
     func replaceAttendees() throws {
         var patch = GCalEventInput()
-        patch.attendees = [(email: "bob@example.com", name: "Bob")]
+        patch.attendeeChange = AttendeeChange(adds: [.init(email: "bob@example.com", name: "Bob")], removes: ["*"])
         let merged = try CalDAVProvider.mergePatchIntoICS(masterICS, patch: patch)
         #expect(merged.contains("bob@example.com"))
         #expect(!merged.contains("alice@example.com"))
@@ -2054,7 +2054,7 @@ struct CalDAVSplitBoundaryInstantTests {
 /// alone left this class open: `toICS` covers create, while `updateOccurrence` builds its VEVENT in
 /// `CalDAVProvider.occurrenceOverrideResource` and `updateEvent` and the split build it in
 /// `CalDAVProvider.mergePatchIntoICS` (via `replaceOrAppendInMasterVEvent`, `replaceRRule` and
-/// `replaceAttendeesInMasterVEvent`). Every one of those interpolates model-supplied tool arguments,
+/// `applyAttendeeChange`). Every one of those interpolates model-supplied tool arguments,
 /// so each is asserted here directly rather than through the create path.
 ///
 /// The oracle is LINE-level and splits on ANY newline: sanitizing strips the separators rather than
@@ -2111,8 +2111,9 @@ struct CalDAVICSInjectionTests {
     @Test("occurrenceOverrideResource: a poisoned attendee name cannot forge an occurrence")
     func overrideAttendeeCannotForgeOccurrence() throws {
         var patch = GCalEventInput()
-        patch.attendees = [(email: "real@example.com",
-                            name: "Bob\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nRECURRENCE-ID:20260520T170000Z\r\nSTATUS:CANCELLED")]
+        patch.attendeeChange = AttendeeChange(adds: [.init(
+            email: "real@example.com",
+            name: "Bob\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nRECURRENCE-ID:20260520T170000Z\r\nSTATUS:CANCELLED")])
         let block = try CalDAVProvider.occurrenceOverrideResource(
             storedICS: seriesICS, recurrenceIdNaive: "2026-05-13T17:00:00", patch: patch, now: Date()
         )
@@ -2127,12 +2128,13 @@ struct CalDAVICSInjectionTests {
         #expect(lines.contains { $0.hasPrefix("ATTENDEE") && $0.contains("real@example.com") })
     }
 
-    @Test("replaceAttendeesInMasterVEvent: a poisoned attendee name cannot add a property")
+    @Test("applyAttendeeChange: a poisoned attendee name cannot add a property")
     func replaceAttendeesCannotInject() {
-        let out = CalDAVProvider.replaceAttendeesInMasterVEvent(
-            in: masterICS,
-            attendees: [(email: "real@example.com",
-                         name: "Bob\r\nATTENDEE;ROLE=REQ-PARTICIPANT:mailto:attacker@evil.example")]
+        let out = CalDAVProvider.applyAttendeeChange(
+            AttendeeChange(adds: [.init(email: "real@example.com",
+                                        name: "Bob\r\nATTENDEE;ROLE=REQ-PARTICIPANT:mailto:attacker@evil.example")],
+                           removes: ["*"]),
+            in: masterICS
         )
         let lines = propertyLines(out)
         let attendeeLines = lines.filter { $0.hasPrefix("ATTENDEE") }
@@ -2143,9 +2145,9 @@ struct CalDAVICSInjectionTests {
         // sits inside the CN parameter and is always followed by `";ROLE=` — so it held pre-fix too and
         // merely LOOKED like coverage. Comparing against a clean run of the same helper catches an
         // injected property of ANY name, not just ATTENDEE, and needs no hardcoded baseline.
-        let clean = CalDAVProvider.replaceAttendeesInMasterVEvent(
-            in: masterICS,
-            attendees: [(email: "real@example.com", name: "Bob")]
+        let clean = CalDAVProvider.applyAttendeeChange(
+            AttendeeChange(adds: [.init(email: "real@example.com", name: "Bob")], removes: ["*"]),
+            in: masterICS
         )
         #expect(lines.count == propertyLines(clean).count,
                 "the poisoned name changed the number of property lines:\n\(out)")
@@ -2155,8 +2157,8 @@ struct CalDAVICSInjectionTests {
     @Test("mergePatchIntoICS: end to end, a poisoned attendee name cannot add a property")
     func mergePatchAttendeeCannotInject() throws {
         var patch = GCalEventInput()
-        patch.attendees = [(email: "real@example.com",
-                            name: "Bob\u{2028}ORGANIZER:mailto:attacker@evil.example")]
+        patch.attendeeChange = AttendeeChange(adds: [.init(email: "real@example.com",
+                                                           name: "Bob\u{2028}ORGANIZER:mailto:attacker@evil.example")])
         let merged = try CalDAVProvider.mergePatchIntoICS(masterICS, patch: patch)
         let lines = propertyLines(merged)
         #expect(!lines.contains { $0.hasPrefix("ORGANIZER:mailto:attacker") }, "injected ORGANIZER:\n\(merged)")

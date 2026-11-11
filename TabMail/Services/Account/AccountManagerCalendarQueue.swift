@@ -868,13 +868,11 @@ extension AccountManager {
             // An edit of every occurrence writes the series (#560), whichever of its occurrences the
             // edit names.
             let writeId = routed.scope == "all" ? named.seriesId : routed.eventId
-            // calendar_event_edit-v1.5.21+: attendees are delta-based. If args carries
-            // add_attendees or remove_attendees, fetch the current event and resolve the
-            // delta against its attendee list before building the update input — so the
-            // existing attendees are preserved instead of being overwritten.
-            let resolvedArgs = try await resolveAttendeeDelta(
-                args: routed.args, eventId: writeId, calendarId: calId, provider: provider
-            )
+            // A guest change (`add_attendees` / `remove_attendees`) stays a change: it is never
+            // resolved here against one item's list. `buildGCalEventInput` carries it as
+            // `GCalEventInput.attendeeChange`, and the provider's write applies it to the stored
+            // guests of every item the write covers, each from its own (#620).
+            let resolvedArgs = routed.args
             if !named.afterOwnSplitCap, let reason = CalendarSeriesScope.dayMoveRefusal(
                 resolvedArgs, named: named, scope: routed.scope, zone: recurrenceIdZone) {
                 throw CalendarProviderError.notSupported(reason)
@@ -1060,60 +1058,6 @@ extension AccountManager {
             BackgroundSyncLogger.logDebug("[CalendarQueue] Deleted event id=\(eventId)")
         }
         return (nil, nil)
-    }
-
-    // MARK: - Attendee Delta Resolution (calendar_event_edit-v1.5.21)
-
-    /// When `args` carries `add_attendees` / `remove_attendees`, fetch the current event
-    /// and resolve the delta against its attendee list. Returns a copy of `args` with a
-    /// flat `attendees` array — which is what `buildGCalEventInput` consumes.
-    /// If neither delta key is present, returns `args` unchanged. If the fetch fails
-    /// (offline, transient), throws — the caller's retry path keeps the op queued.
-    private func resolveAttendeeDelta(
-        args: [String: JSONValue],
-        eventId: String,
-        calendarId: String,
-        provider: any CalendarProvider
-    ) async throws -> [String: JSONValue] {
-        let hasAdds = args["add_attendees"] != nil
-        let hasRemoves = args["remove_attendees"] != nil
-        guard hasAdds || hasRemoves else { return args }
-
-        let adds = CalendarToolHelpers.parseAttendeeAdds(args["add_attendees"])
-        let removes = CalendarToolHelpers.parseAttendeeRemoves(args["remove_attendees"])
-
-        // If the LLM emitted the delta keys but they're empty after parsing
-        // (e.g. `add_attendees: []`, or all entries filtered out for missing
-        // email), there's no change to apply. Strip the keys without fetching
-        // the event — otherwise we'd needlessly re-write the same attendee
-        // list, which under sendUpdates="all" re-notifies every existing
-        // attendee.
-        if adds.isEmpty && removes.isEmpty {
-            var out = args
-            out.removeValue(forKey: "add_attendees")
-            out.removeValue(forKey: "remove_attendees")
-            return out
-        }
-
-        let current = try await provider.getEvent(calendarId: calendarId, eventId: eventId)
-        let base: [(email: String, name: String?)] = (current.attendees ?? []).compactMap { att in
-            guard let raw = att.email, !raw.isEmpty else { return nil }
-            return (email: CalendarToolHelpers.stripMailto(raw), name: att.displayName)
-        }
-        let merged = CalendarToolHelpers.applyAttendeeDelta(base: base, adds: adds, removes: removes)
-
-        let mergedJSON: [JSONValue] = merged.map { entry in
-            var dict: [String: JSONValue] = ["email": .string(entry.email)]
-            if let name = entry.name, !name.isEmpty { dict["name"] = .string(name) }
-            return .dictionary(dict)
-        }
-        var out = args
-        out["attendees"] = .array(mergedJSON)
-        // Strip the delta keys so downstream code only sees the resolved list.
-        out.removeValue(forKey: "add_attendees")
-        out.removeValue(forKey: "remove_attendees")
-        BackgroundSyncLogger.logDebug("[CalendarQueue] Resolved attendee delta: base=\(base.count) +\(adds.count) -\(removes.count) → \(merged.count)")
-        return out
     }
 
     // MARK: - Error Classification

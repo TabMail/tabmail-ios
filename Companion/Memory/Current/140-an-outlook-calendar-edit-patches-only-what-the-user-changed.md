@@ -230,6 +230,8 @@ that aren't included in the request body maintain their previous values".
   the read holds them: type, answer (`status`) and name, matched by lowercased address
   (`editAttendeesJSON`). A new one is `required` and unanswered:
   `status {"response": "none", "time": "0001-01-01T00:00:00Z"}`.
+  Since #620 the function is `appliedAttendeesJSON`: the edit's guest change (`AttendeeChange`)
+  applied to the read's own stored list, never a list the queue worked out from another item.
 - Measured on an Outlook.com account (2026-11-10, #622):
   - Graph refuses with **405 `UnknownError`, empty message**, an attendee PATCH in which any entry
     has no `status`. The earlier `{emailAddress, type}` shape failed on every guest change there.

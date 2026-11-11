@@ -125,14 +125,14 @@ private enum Fixture {
 
     static func patch(summary: String? = nil, description: String? = nil, location: String? = nil,
                       start: String? = nil, end: String? = nil,
-                      attendees: [(email: String, name: String?)]? = nil) -> GCalEventInput {
+                      attendeeChange: AttendeeChange? = nil) -> GCalEventInput {
         var p = GCalEventInput()
         p.summary = summary
         p.description = description
         p.location = location
         p.startDateTime = start
         p.endDateTime = end
-        p.attendees = attendees
+        p.attendeeChange = attendeeChange
         return p
     }
 
@@ -264,11 +264,8 @@ struct CalDAVEventCopiesTests {
 
     @Test("an attendee the edit adds is asked; the others keep their lines", arguments: CopyKind.allCases)
     func addedAttendeeIsAsked(_ kind: CopyKind) throws {
-        let attendees: [(email: String, name: String?)] = [
-            ("olivia@example.com", "Olivia"), ("alice@example.com", "Doe, Alice"),
-            ("bob@example.com", "Bob"), ("carol@example.com", "Carol"),
-        ]
-        let (block, _) = try kind.copy(of: Fixture.richSeries, patch: Fixture.patch(attendees: attendees))
+        let change = AttendeeChange(adds: [.init(email: "carol@example.com", name: "Carol")])
+        let (block, _) = try kind.copy(of: Fixture.richSeries, patch: Fixture.patch(attendeeChange: change))
         let carol = try #require(Fixture.attendee(block, "carol@example.com"))
         #expect(carol.contains("ROLE=REQ-PARTICIPANT") && carol.contains("PARTSTAT=NEEDS-ACTION") && carol.contains("RSVP=TRUE"), Comment(rawValue: carol))
         for address in ["alice@example.com", "bob@example.com"] {
@@ -463,10 +460,7 @@ enum ChangedOccurrenceEdit: String, CaseIterable, CustomTestStringConvertible, S
         case .rename:
             return Fixture.patch(summary: "Planning, offsite")
         case .attendeeAdded:
-            return Fixture.patch(attendees: [
-                ("olivia@example.com", "Olivia"), ("alice@example.com", "Alice"),
-                ("room-4@example.com", "Room 4"), ("carol@example.com", "Carol"),
-            ])
+            return Fixture.patch(attendeeChange: AttendeeChange(adds: [.init(email: "carol@example.com", name: "Carol")]))
         case .move:
             let start = ChangedOccurrenceFixture.slot.addingTimeInterval(3_600)
             return Fixture.patch(start: ChangedOccurrenceFixture.isoUTC(start),
@@ -854,15 +848,67 @@ struct CalDAVWholeSeriesEditTests {
     @Test("an attendee change keeps every staying attendee's role and answer")
     func attendeeChangeKeepsOthers() throws {
         var patch = GCalEventInput()
-        patch.attendees = [("olivia@example.com", "Olivia"), ("alice@example.com", "Doe, Alice"), ("carol@example.com", "Carol")]
+        patch.attendeeChange = AttendeeChange(adds: [.init(email: "carol@example.com", name: "Carol")], removes: ["bob@example.com"])
         let out = try CalDAVProvider.mergePatchIntoICS(Fixture.richSeries, patch: patch)
         let block = Fixture.master(out)
         #expect(Fixture.attendee(block, "olivia@example.com") == "ATTENDEE;CN=Olivia;PARTSTAT=ACCEPTED;ROLE=CHAIR:mailto:olivia@example.com")
         #expect(Fixture.attendee(block, "alice@example.com") == "ATTENDEE;CN=\"Doe, Alice\";ROLE=OPT-PARTICIPANT;PARTSTAT=ACCEPTED;RSVP=FALSE:mailto:alice@example.com")
         #expect(Fixture.attendee(block, "bob@example.com") == nil, "a removed attendee stayed")
-        #expect(Fixture.attendee(block, "carol@example.com") == "ATTENDEE;CN=\"Carol\";ROLE=REQ-PARTICIPANT:mailto:carol@example.com")
+        #expect(Fixture.attendee(block, "carol@example.com") == "ATTENDEE;CN=\"Carol\";ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:carol@example.com")
         let alarm = block.firstIndex(of: "BEGIN:VALARM") ?? block.endIndex
         #expect(block[..<alarm].filter { $0.hasPrefix("ATTENDEE") }.count == 3, "an attendee was written after the alarm")
+    }
+
+    /// A series with a cancelled occurrence and a changed one that dropped Bob on its own (#620).
+    static let seriesWithOverrides = Fixture.series([
+        "BEGIN:VEVENT", "UID:series-20", "DTSTART:20990506T170000Z", "DTEND:20990506T174500Z", "RRULE:FREQ=WEEKLY",
+        "SUMMARY:Sync",
+        "ATTENDEE;CN=Alice;PARTSTAT=ACCEPTED:mailto:alice@example.com",
+        "ATTENDEE;CN=Bob;PARTSTAT=TENTATIVE:mailto:bob@example.com",
+        "END:VEVENT",
+        "BEGIN:VEVENT", "UID:series-20", "RECURRENCE-ID:20990513T170000Z",
+        "DTSTART:20990513T170000Z", "DTEND:20990513T174500Z", "SUMMARY:Sync", "STATUS:CANCELLED",
+        "ATTENDEE;CN=Alice;PARTSTAT=ACCEPTED:mailto:alice@example.com",
+        "ATTENDEE;CN=Bob;PARTSTAT=TENTATIVE:mailto:bob@example.com",
+        "END:VEVENT",
+        "BEGIN:VEVENT", "UID:series-20", "RECURRENCE-ID:20990520T170000Z",
+        "DTSTART:20990520T180000Z", "DTEND:20990520T184500Z", "SUMMARY:Sync",
+        "ATTENDEE;CN=Alice;PARTSTAT=DECLINED:mailto:alice@example.com",
+        "END:VEVENT",
+    ])
+
+    @Test("a guest change of the series reaches each changed occurrence from its own guests, and leaves a cancelled one as stored")
+    func guestChangeReachesOverridesButNotCancelledOnes() throws {
+        var patch = GCalEventInput()
+        patch.attendeeChange = AttendeeChange(adds: [.init(email: "carol@example.com", name: "Carol")])
+        let out = try CalDAVProvider.mergePatchIntoICS(Self.seriesWithOverrides, patch: patch)
+        let overrides = Fixture.overrides(out)
+        let storedOverrides = Fixture.overrides(Self.seriesWithOverrides)
+        #expect(overrides.count == 2 && storedOverrides.count == 2, Comment(rawValue: out))
+        guard overrides.count == 2, storedOverrides.count == 2 else { return }
+        #expect(overrides[0] == storedOverrides[0], "the cancelled occurrence changed:\n\(overrides[0].joined(separator: "\n"))")
+        let moved = overrides[1]
+        #expect(Fixture.attendee(moved, "alice@example.com") == "ATTENDEE;CN=Alice;PARTSTAT=DECLINED:mailto:alice@example.com")
+        #expect(Fixture.attendee(moved, "bob@example.com") == nil, "the series' guest was copied to the occurrence that dropped him")
+        #expect(Fixture.attendee(moved, "carol@example.com")
+                == "ATTENDEE;CN=\"Carol\";ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:carol@example.com")
+        let series = Fixture.master(out)
+        #expect(Fixture.attendee(series, "bob@example.com") == "ATTENDEE;CN=Bob;PARTSTAT=TENTATIVE:mailto:bob@example.com")
+        #expect(Fixture.attendee(series, "carol@example.com") != nil)
+        #expect(!out.contains("ORGANIZER"), "the merge wrote an organizer; `putEvent` writes it")
+    }
+
+    @Test("a VEVENT the guest change leaves as it was goes back byte for byte")
+    func unchangedVEventIsUntouched() throws {
+        var patch = GCalEventInput()
+        patch.attendeeChange = AttendeeChange(removes: ["bob@example.com"])
+        let out = try CalDAVProvider.mergePatchIntoICS(Self.seriesWithOverrides, patch: patch)
+        let overrides = Fixture.overrides(out)
+        let storedOverrides = Fixture.overrides(Self.seriesWithOverrides)
+        #expect(overrides.count == 2 && storedOverrides.count == 2, Comment(rawValue: out))
+        guard overrides.count == 2, storedOverrides.count == 2 else { return }
+        #expect(overrides[1] == storedOverrides[1], "an occurrence without Bob was rewritten")
+        #expect(Fixture.attendee(Fixture.master(out), "bob@example.com") == nil)
     }
 
     @Test("adding the first attendee writes it among the event's properties, not the alarm's")
@@ -873,7 +919,7 @@ struct CalDAVWholeSeriesEditTests {
             "ATTENDEE:mailto:olivia@example.com", "END:VALARM", "END:VEVENT",
         ])
         var patch = GCalEventInput()
-        patch.attendees = [("carol@example.com", nil)]
+        patch.attendeeChange = AttendeeChange(adds: [.init(email: "carol@example.com", name: nil)])
         let block = Fixture.master(try CalDAVProvider.mergePatchIntoICS(ics, patch: patch))
         let alarm = block.firstIndex(of: "BEGIN:VALARM") ?? block.endIndex
         #expect(block[..<alarm].contains { $0.hasSuffix("mailto:carol@example.com") }, Comment(rawValue: block.joined(separator: "\n")))

@@ -368,7 +368,7 @@ struct CalendarToolResolvedAccountTests {
 
     /// A weekly series a week from today at 10:00 UTC, on that day's weekday; a one-off
     /// event at the same time when `recurring` is false.
-    private static func series(recurring: Bool = true) -> GCalEvent {
+    private static func series(recurring: Bool = true, attendees: [GCalAttendee]? = nil) -> GCalEvent {
         let start = isoDay(7, hour: 10)
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = TimeZone(identifier: "UTC") ?? .gmt
@@ -381,19 +381,20 @@ struct CalendarToolResolvedAccountTests {
             id: "evt-bare", summary: "Weekly sync", location: nil, description: nil,
             start: GCalDateTime(dateTime: start + "Z", date: nil, timeZone: "UTC"),
             end: GCalDateTime(dateTime: isoDay(7, hour: 11) + "Z", date: nil, timeZone: "UTC"),
-            attendees: nil, organizer: nil, recurrence: recurring ? ["RRULE:FREQ=WEEKLY;BYDAY=\(weekday)"] : nil,
+            attendees: attendees, organizer: nil, recurrence: recurring ? ["RRULE:FREQ=WEEKLY;BYDAY=\(weekday)"] : nil,
             transparency: nil, status: "confirmed", htmlLink: nil, created: nil, updated: nil
         )
     }
 
     /// The lines of the card an edit of `series` with `arguments` presents, with the series'
-    /// calendar answering `answer` to whether the edit resets changed occurrences, and the
-    /// edits it was asked about.
+    /// calendar answering `answer` to whether the edit resets changed occurrences, the edits it
+    /// was asked about, and the guest list the card shows.
     private func cardLines(
         series: GCalEvent, arguments: [String: JSONValue], answer: Bool
-    ) async throws -> (lines: [String], asked: [GCalEventInput]) {
+    ) async throws -> (lines: [String], asked: [GCalEventInput], attendees: [String]) {
         var lines: [String] = []
         var asked: [GCalEventInput] = []
+        var attendees: [String] = []
         try await withCalendars(registered: [.a], preferred: .a) { f in
             await f.mockA.setGetEventResult(series)
             f.mockA.resetsAnswer.withLock { $0 = answer }
@@ -403,9 +404,38 @@ struct CalendarToolResolvedAccountTests {
                 invocation: ToolInvocation(uiSink: sink, sessionKey: "cal-tool-rule-card"))
             #expect(sink.calendarEvents.count == 1, "setup: the edit card was not shown; tool said: \(output)")
             lines = sink.calendarEvents.first?.changes ?? []
+            attendees = sink.calendarEvents.first?.attendees ?? []
             asked = f.mockA.resetsAsked.withLock { $0 }
         }
-        return (lines, asked)
+        return (lines, asked, attendees)
+    }
+
+    /// The card of a guest change names the guests added and removed, as the Thunderbird add-on's
+    /// does, and never a resulting list: the write applies the change to each item the edit
+    /// covers, whose guests can differ (#620).
+    @Test("A guest change's card names the guests added and removed, never a resulting list")
+    func guestChangeCardNamesTheChange() async throws {
+        let stored = ["alice@example.com", "bob@example.com"].map {
+            GCalAttendee(email: $0, displayName: nil, responseStatus: "accepted", organizer: nil, self: nil)
+        }
+        let adds: [JSONValue] = [
+            .dictionary(["email": .string("carol@example.com"), "name": .string("Carol")]),
+            .string("dave@example.com"),
+            .string("erin@example.com"),
+            .string("frank@example.com"),
+            .string("grace@example.com"),
+        ]
+        let card = try await cardLines(
+            series: Self.series(attendees: stored),
+            arguments: ["add_attendees": .array(adds),
+                        "remove_attendees": .array([.string("mailto:Bob@Example.com"), .string("*")])],
+            answer: false)
+        #expect(card.lines == [
+            "attendees + Carol", "attendees + dave@example.com", "attendees + erin@example.com",
+            "attendees + and 2 more",
+            "attendees − all attendees", "attendees − bob@example.com",
+        ], "the card shows \(card.lines)")
+        #expect(card.attendees.isEmpty, "the card shows a guest list: \(card.attendees)")
     }
 
     /// Outlook resets a series' deleted and moved occurrences when a whole-series edit

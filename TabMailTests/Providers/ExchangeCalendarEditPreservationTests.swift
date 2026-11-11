@@ -875,19 +875,11 @@ enum UserCalendarEdit: String, CaseIterable, CustomTestStringConvertible, Sendab
         case .moveRoom:
             p.location = Self.newRoom
         case .addAttendee:
-            // What `resolveAttendeeDelta` hands the provider: the whole resolved list.
-            p.attendees = [
-                (email: "ana@example.com", name: "Ana"),
-                (email: "bo@example.com", name: "Bo"),
-                (email: "room-1@example.com", name: "Room 1"),
-                (email: "cy@example.com", name: "Cy"),
-            ]
+            // "add Cy": the change, which the write applies to the stored attendees (#620).
+            p.attendeeChange = AttendeeChange(adds: [.init(email: "cy@example.com", name: "Cy")])
         case .removeAttendee:
-            // "take Bo off it": the whole resolved list, without Bo.
-            p.attendees = [
-                (email: "ana@example.com", name: "Ana"),
-                (email: "room-1@example.com", name: "Room 1"),
-            ]
+            // "take Bo off it".
+            p.attendeeChange = AttendeeChange(removes: [Self.removedAttendee])
         case .markBusy:
             p.transparency = "opaque"
         case .newDescription:
@@ -2492,7 +2484,8 @@ struct ExchangeCalendarEditPreservationTests {
         graph.install(on: http)
         var patch = UserCalendarEdit.addAttendee.patch(start: GraphFixture.start)
         // Asked for in another letter case than Graph stores.
-        patch.attendees?.append((email: "optional.person@example.com", name: "Optional Person"))
+        patch.attendeeChange = AttendeeChange(
+            adds: (patch.attendeeChange?.adds ?? []) + [.init(email: "optional.person@example.com", name: "Optional Person")])
 
         _ = try await makeProvider(http).updateEvent(eventId: "ev-case", event: patch)
 
