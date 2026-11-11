@@ -1427,10 +1427,8 @@ extension AccountManager {
     /// drain loop's side effects.
     static func isCalendarBadRequestError(_ error: Error) -> Bool {
         // Indeterminate — "come back later", not "your payload is broken".
-        // Shared by all three arms so they cannot drift apart.
-        func isIndeterminate(_ code: Int) -> Bool {
-            code == 408 || code == 409 || code == 423 || code == 425 || code == 429
-        }
+        // Shared by all three arms, and with the CalDAV organizer lookup, so they cannot drift apart.
+        let isIndeterminate = CalendarHTTPStatus.isComeBackLater
         if case GoogleCalendarError.httpError(let code, _) = error, (400...499).contains(code), code != 401 && code != 403 && code != 404 && !isIndeterminate(code) { return true }
         if case ExchangeCalendarError.httpError(let code, _) = error, (400...499).contains(code), code != 401 && code != 403 && code != 404 && !isIndeterminate(code) { return true }
         // CalDAV: 401/404/412 already map to dedicated cases (authFailed /

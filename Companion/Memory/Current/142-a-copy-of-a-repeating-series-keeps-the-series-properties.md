@@ -185,8 +185,9 @@ alert's recipient as an attendee; notes "added to" overwrote the event's own wit
 PUT.** `occurrenceOverrideResource` used to give an override with guests and no organizer the
 series' organizer, and nothing else wrote one. That rule is deleted. Every CalDAV PUT (create,
 whole-event edit, one-occurrence edit, both PUTs of a split) now goes through
-`CalDAVProvider.putEvent`, which runs `organized(_:own:)` on the final body: a VEVENT with its own
-ATTENDEE and no ORGANIZER takes the resource's own organizer (the series', else the first
+`CalDAVProvider.putEvent`, which runs `organized(_:own:)` on the final body: once a VEVENT has its own
+ATTENDEE and no ORGANIZER, every VEVENT without an ORGANIZER (a guest-less series too, RFC 6638
+§3.1) takes the resource's own organizer (the series', else the first
 override's, copied byte for byte), else the address the server advertises in
 `calendar-user-address-set` (only for a resource with a series VEVENT), else none. The copies above
 are unchanged otherwise. Tests: `CalDAVOrganizerTests`, `CalDAVOrganizerStepTests`; the old pin

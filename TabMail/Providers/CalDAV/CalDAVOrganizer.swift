@@ -8,28 +8,33 @@ import Foundation
 /// carries its organizer; iCloud refuses the write with a 403 without one).
 ///
 /// One step, `organized(_:own:)`, runs on the final body of every CalDAV `PUT`
-/// (`CalDAVProvider.putEvent`). For each VEVENT, looking at its own properties only (an EMAIL
+/// (`CalDAVProvider.putEvent`). Each VEVENT is read through its own properties only (an EMAIL
 /// alarm's `ATTENDEE` is the alarm's, not the event's):
-/// 1. A VEVENT with an attendee and no organizer gets one. A VEVENT that has an organizer, or no
-///    attendee, is never changed.
+/// 1. When some VEVENT has an attendee and no organizer, every VEVENT of the resource that has no
+///    organizer gets the same one, a guest-less series too: RFC 6638 §3.1 wants the organizer set
+///    in all the components. A VEVENT that has an organizer keeps its own.
 /// 2. The organizer is the resource's own, copied byte for byte: the series VEVENT's, else the first
-///    changed occurrence's in document order. So every VEVENT of the resource names the same
+///    changed occurrence's in document order. So every VEVENT that had none names the same
 ///    organizer (RFC 6638 §3.2.4.2).
 /// 3. Only when no VEVENT names one, and the resource is the user's own event (it has a series
 ///    VEVENT, as every create does), the user's own address: one the server itself advertises in
-///    the principal's `calendar-user-address-set` (RFC 6638 §2.4.1), so RFC 6638 §3.1 makes the
-///    resource the user's organizer object and the server invites the guests. The sign-in when it
-///    is advertised, written as the server spells it; else the first advertised `mailto:`. When
-///    nothing is advertised, no organizer is written and the server decides. The sign-in is never
-///    written unchecked: a wrong organizer misattributes the meeting and can send the guests'
-///    answers elsewhere, which is worse than none.
+///    the principal's `calendar-user-address-set` (RFC 6638 §2.4.1), which RFC 6638 §3.1 needs to
+///    treat the resource as the user's organizer object and invite the guests. Whether iCloud
+///    schedules every shape this writes (a series given the organizer only because one of its
+///    changed occurrences has guests) is not measured. The sign-in when it is advertised, written
+///    as the server spells it; else the first advertised `mailto:`. When nothing is advertised, no
+///    organizer is written and the server decides. The sign-in is never written unchecked: a wrong
+///    organizer misattributes the meeting and can send the guests' answers elsewhere, which is
+///    worse than none.
 /// 4. A resource that holds only changed occurrences (an invitation to single occurrences of
 ///    someone else's series, RFC 4791 §4.1) never gets the account's address: that would forge the
 ///    meeting's identity (ADR-IOS-052). It only gets an organizer another of its VEVENTs names.
-/// 5. When nothing needs an organizer, the body is returned as it was, byte for byte.
+/// 5. When no VEVENT has an attendee without an organizer, the body is returned as it was, byte
+///    for byte.
 extension CalDAVProvider {
 
-    /// `ics` with every VEVENT that has an attendee and no organizer given one (rules 1 to 5 above).
+    /// `ics` with every VEVENT that has no organizer given one, when some VEVENT has an attendee and
+    /// no organizer (rules 1 to 5 above).
     /// `own` is the user's advertised address (`organizerHref`), or nil when there is none.
     static func organized(_ ics: String, own: String?) -> String {
         let blocks = veventBlocks(icsUnits(ics))
@@ -44,7 +49,7 @@ extension CalDAVProvider {
             return ics
         }
         return rewriteVEvents(in: ics) { block, _ in
-            needsOrganizer(block) ? insertAfterUID(block, organizer) : block
+            ownOrganizer(of: block) == nil ? insertAfterUID(block, organizer) : block
         }
     }
 
@@ -100,8 +105,7 @@ extension CalDAVProvider {
              CalDAVError.discoveryFailed, CalDAVError.parseError:
             return true
         case CalDAVError.httpError(let code, _):
-            let comeBackLater: Set<Int> = [408, 409, 423, 425, 429]
-            return (400...499).contains(code) && !comeBackLater.contains(code)
+            return (400...499).contains(code) && !CalendarHTTPStatus.isComeBackLater(code)
         default:
             return false
         }
@@ -115,13 +119,15 @@ extension CalDAVProvider {
         return names.contains("ATTENDEE") && !names.contains("ORGANIZER")
     }
 
+    /// A VEVENT's own organizer.
+    private static func ownOrganizer(of block: [ICSUnit]) -> ICSUnit? {
+        topLevel(block).first { icsProperty($0.text)?.name == "ORGANIZER" }
+    }
+
     /// The resource's own organizer: the series VEVENT's, else the first changed occurrence's in
     /// document order.
     private static func resourceOrganizer(_ blocks: [[ICSUnit]]) -> ICSUnit? {
-        func organizer(_ block: [ICSUnit]) -> ICSUnit? {
-            topLevel(block).first { icsProperty($0.text)?.name == "ORGANIZER" }
-        }
-        if let series = blocks.first(where: { !isOverride($0) }), let found = organizer(series) { return found }
-        return blocks.lazy.compactMap(organizer).first
+        if let series = blocks.first(where: { !isOverride($0) }), let found = ownOrganizer(of: series) { return found }
+        return blocks.lazy.compactMap { ownOrganizer(of: $0) }.first
     }
 }

@@ -374,7 +374,7 @@ struct CalDAVOrganizerTests {
         F.expectInvariant(before: seed, after: after, advertised: F.advertised)
     }
 
-    @Test("3: the first guest of one occurrence of a series with no organizer gives the changed occurrence the user's address")
+    @Test("3: the first guest of one occurrence of a series with no organizer gives the changed occurrence, and the series, the user's address")
     func thisOnlyFirstGuest() async throws {
         let seed = F.series()
         let run = Self.setUp([F.path: seed])
@@ -385,6 +385,9 @@ struct CalDAVOrganizerTests {
         let override = try #require(VEventOracle.overrides(after).first, Comment(rawValue: after))
         #expect(VEventOracle.own(override, "ORGANIZER") == ["ORGANIZER:\(F.own)"], Comment(rawValue: after))
         #expect(VEventOracle.own(override, "ATTENDEE").compactMap(VEventOracle.address) == [F.guest])
+        // RFC 6638 §3.1: the organizer is set in every component, the guest-less series too.
+        #expect(F.masterOwn(after, "ORGANIZER") == ["ORGANIZER:\(F.own)"], Comment(rawValue: after))
+        #expect(F.masterOwn(after, "ATTENDEE").isEmpty, Comment(rawValue: after))
         F.expectInvariant(before: seed, after: after, advertised: F.advertised)
     }
 
@@ -733,6 +736,22 @@ struct CalDAVOrganizerTests {
         #expect(run.principal.addressSetLookups == 1, "the address set was read \(run.principal.addressSetLookups) times")
     }
 
+    @Test("17b: an answer read as none is not kept: the next guest write on the provider asks again")
+    func noneIsNotKept() async throws {
+        let other = "/cal/org-711-b.ics"
+        let run = Self.setUp([F.path: F.series(), other: F.series(uid: "org-711-b")], refuses: false,
+                             firstAddressSetAnswer: .status(403))
+        defer { run.http.close() }
+        let first = try await Self.edit(run, F.addGuest, account: "org711-none-once-a")
+        let second = try await Self.edit(run, F.addGuest, account: "org711-none-once-b", eventId: other)
+        #expect(first.isEmpty && second.isEmpty, Self.landed(first + second))
+        let firstResource = try Self.stored(run)
+        #expect(!firstResource.contains("ORGANIZER"), Comment(rawValue: firstResource))
+        let secondResource = try Self.stored(run, other)
+        #expect(F.masterOwn(secondResource, "ORGANIZER") == ["ORGANIZER:\(F.own)"], Comment(rawValue: secondResource))
+        #expect(run.principal.addressSetLookups == 2, "the address set was read \(run.principal.addressSetLookups) times")
+    }
+
     @Test("18: an advertised href with a line break in it is skipped, and never adds a property")
     func hrefWithLineBreakIsSkipped() async throws {
         let advertised = ["mailto:user@example.com\r\nATTENDEE:mailto:intruder@example.com", "mailto:alias@example.com"]
@@ -871,6 +890,33 @@ struct CalDAVOrganizerStepTests {
         let out = CalDAVProvider.organized(body, own: "mailto:user@example.com")
         #expect(Self.lines(out).filter { $0 == "ORGANIZER:mailto:other@example.com" }.count == 2)
         #expect(!out.contains("user@example.com"))
+    }
+
+    @Test("once one VEVENT needs an organizer, every VEVENT without one gets the same one; one that has its own keeps it")
+    func everyComponentGetsTheOrganizer() {
+        let guestless = ["BEGIN:VEVENT", "UID:step-1", "DTSTART:20990506T170000Z", "DURATION:PT1H",
+                         "RRULE:FREQ=WEEKLY", "SUMMARY:Sync", "END:VEVENT"]
+        let other = ["BEGIN:VEVENT", "UID:step-1", "RECURRENCE-ID:20990513T170000Z",
+                     "DTSTART:20990513T180000Z", "DURATION:PT1H", "SUMMARY:Sync", "END:VEVENT"]
+        // The account's address: the series and both changed occurrences.
+        let body = Self.ics(guestless + other + Self.override(["ATTENDEE:mailto:guest@example.com"]))
+        #expect(CalDAVProvider.needsOwnAddress(body))
+        let out = Self.lines(CalDAVProvider.organized(body, own: "mailto:user@example.com"))
+        #expect(out.filter { $0 == "ORGANIZER:mailto:user@example.com" }.count == 3, Comment(rawValue: out.joined(separator: "\n")))
+        // A copied organizer: the occurrence that names one keeps it; the one given a guest and the
+        // guest-less series take it.
+        var otherWithGuest = other
+        otherWithGuest.insert("ATTENDEE:mailto:guest@example.com", at: otherWithGuest.count - 1)
+        let named = Self.ics(guestless + otherWithGuest + Self.override([
+            "ORGANIZER;CN=Other:mailto:other@example.com", "ATTENDEE:mailto:guest@example.com",
+        ]))
+        let copied = Self.lines(CalDAVProvider.organized(named, own: "mailto:user@example.com"))
+        #expect(copied.filter { $0 == "ORGANIZER;CN=Other:mailto:other@example.com" }.count == 3,
+                Comment(rawValue: copied.joined(separator: "\n")))
+        #expect(!copied.contains { $0.contains("user@example.com") })
+        // Nothing needs one: a VEVENT without an organizer is left alone.
+        let quiet = Self.ics(guestless + Self.override(["ORGANIZER:mailto:other@example.com"]))
+        #expect(CalDAVProvider.organized(quiet, own: "mailto:user@example.com") == quiet)
     }
 
     @Test("a resource of changed occurrences only never gets the account's address")

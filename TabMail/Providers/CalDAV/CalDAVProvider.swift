@@ -33,10 +33,9 @@ actor CalDAVProvider: CalendarProvider {
     /// Cached ETag per resource URL for update conflict detection.
     private var etagCache: [String: String] = [:]
 
-    /// The user's own organizer address (`ownOrganizerHref`): nil until a write first needs it, then
-    /// the server's definite answer, an address or none (`.some(nil)`), for this provider's lifetime.
-    /// In memory only; a new provider (reconnect, Update Password) asks again.
-    private var advertisedOrganizer: String??
+    /// The user's own organizer address (`ownOrganizerHref`), once a lookup has found one, for this
+    /// provider's lifetime. In memory only; a new provider (reconnect, Update Password) asks again.
+    private var advertisedOrganizer: String?
 
     init(client: CalDAVClient, calendarHomeURL: URL, serverBaseURL: URL) {
         self.client = client
@@ -748,13 +747,15 @@ actor CalDAVProvider: CalendarProvider {
     }
 
     /// The address the server advertises for the user (`organizerHref` over `advertisedAddresses`),
-    /// looked up the first time a write needs it. A definite answer is kept (`advertisedOrganizer`);
-    /// an error is rethrown and never kept, so the next write asks again.
+    /// looked up when a write needs it. Only an address found is kept (`advertisedOrganizer`). None
+    /// advertised is not kept, nor is an error (rethrown): an answer that only reads as none (a
+    /// transient refusal, an error page served as a success) then costs one write, and the next
+    /// write that needs the address asks again.
     private func ownOrganizerHref() async throws -> String? {
         if let cached = advertisedOrganizer { return cached }
         let advertised = try await Self.advertisedAddresses(client: client, serverURL: serverBaseURL)
         let href = Self.organizerHref(advertised: advertised, signIn: client.username)
-        advertisedOrganizer = .some(href)
+        if let href { advertisedOrganizer = href }
         return href
     }
 

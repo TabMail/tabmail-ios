@@ -16,8 +16,8 @@ series with no organizer, and both halves of a split were all written without it
   that shape. The tests model the refusal for every VEVENT (`FakeCalDAVStore`'s
   `refusesAttendeesWithoutOrganizer`), which is what RFC 5545 requires.
 - **From the RFCs:** on a server that accepts the shape, the event is stored with guests and nobody
-  is invited, because RFC 6638 §3.1 schedules only a resource whose ORGANIZER is one of the owner's
-  addresses.
+  is invited, because RFC 6638 §3.1 schedules only a resource whose ORGANIZER is one of the calendar
+  owner's addresses.
 
 **Decision:**
 1. **One step on every PUT.** `CalDAVProvider.putEvent(url:body:precondition:)` is the only
@@ -26,14 +26,16 @@ series with no organizer, and both halves of a split were all written without it
    `CalDAVProvider.organized(_:own:)` (`CalDAVOrganizer.swift`). A source fence
    (`CalDAVOrganizerStepTests.onePutCallSite`) keeps `client.put(` at one call site. The split
    prepares both bodies before its first PUT, so a lookup that fails writes nothing.
-2. **What the step does,** per VEVENT and only on its own properties (an EMAIL alarm's attendee is
-   the alarm's): a VEVENT with an attendee and no organizer gets one; a VEVENT that has an organizer
-   or no attendee is never changed; when nothing needs one, the body is returned byte for byte. The
-   step is idempotent, so the split's second run inside `putEvent` makes no request.
+2. **What the step does,** reading each VEVENT's own properties only (an EMAIL alarm's attendee is
+   the alarm's): when some VEVENT has an attendee and no organizer, every VEVENT of the resource
+   that has no organizer gets the same one, the guest-less series too, because RFC 6638 §3.1 wants
+   the organizer set in all the components; a VEVENT that has an organizer keeps its own; when no
+   VEVENT has an attendee without an organizer, the body is returned byte for byte. The step is
+   idempotent, so the split's second run inside `putEvent` makes no request.
 3. **Which address, in order:**
    1. The resource's own organizer, copied byte for byte (every physical line of a folded one): the
-      series VEVENT's, else the first changed occurrence's in document order. Every VEVENT of the
-      resource then names the same organizer (RFC 6638 §3.2.4.2).
+      series VEVENT's, else the first changed occurrence's in document order. Every VEVENT that had
+      none then names the same organizer (RFC 6638 §3.2.4.2).
    2. Otherwise, and only for a resource with a series VEVENT (every create has one): an address the
       server advertises in the principal's `calendar-user-address-set` (RFC 6638 §2.4.1). The
       sign-in address when it is advertised, written as the server spells it; else the first
@@ -51,16 +53,20 @@ series with no organizer, and both halves of a split were all written without it
    some VEVENT needs an organizer, no VEVENT names one, and the resource has a series VEVENT. It
    reuses `CalDAVDiscovery.discover` for the principal, then PROPFINDs the principal (Depth 0) for
    `calendar-user-address-set` (`CalDAVDiscovery.calendarUserAddresses`), reading every href
-   (`MultistatusParser.Response.propertyHrefs`). A definite answer (an address, or none advertised)
-   is cached for the provider's lifetime, in memory only: no column, nothing persisted (ADR-004
-   untouched), not a setting (the snapshot rule does not apply). A new provider, built on reconnect
-   and on Update Password, asks again. An error is never cached.
+   (`MultistatusParser.Response.propertyHrefs`). An address found is cached for the provider's
+   lifetime, in memory only: no column, nothing persisted (ADR-004 untouched), not a setting (the
+   snapshot rule does not apply). A new provider, built on reconnect and on Update Password, asks
+   again. "None advertised" and errors are never cached: an answer that only reads as none (a
+   transient refusal, an error page served as a success) then costs one write, and the next write
+   that needs the address asks again.
 6. **Lookup errors keep the queue's meaning.** A 404, 403 or other 4xx, a missing principal or
    property, or an answer that can't be read means "none advertised" and the write goes ahead
    without an organizer. A lookup 404 never surfaces as `CalDAVError.notFound`, which the queue
    reads as "the event is gone" and retires. A 401 is rethrown (the auth arm handles it); a
    transport error, a 5xx, a 408, 409, 423, 425 or 429 is rethrown and the edit stays queued with
-   nothing written (never-drop clause 2).
+   nothing written (never-drop clause 2). The "come back later" codes are one predicate,
+   `CalendarHTTPStatus.isComeBackLater`, shared with the calendar queue's retirement rule
+   (`AccountManager.isCalendarBadRequestError`), so the two cannot drift apart.
 
 **Alternatives rejected:**
 - *Write the sign-in address unchecked* (no request): wrong whenever the sign-in is not a scheduling
@@ -76,10 +82,15 @@ series with no organizer, and both halves of a split were all written without it
 - Guests are invited on CalDAV for the first time: on iCloud, guest writes that 403'd now land, and
   an RFC 6638 server sends the invitations, consistent with `sendUpdates: "all"` and with Google and
   Outlook.
-- An unrelated edit of a stored event that has guests and no organizer (almost always one TabMail
-  wrote before this ADR, on a server that accepted it) now adds the organizer, and the server then
-  invites those guests, possibly long after they were added. Accepted: the guests were added to be
-  invited, and on iCloud such a resource can't be written back without an organizer anyway.
+- Late invitations: any later write of a stored event that has guests and no organizer (almost
+  always one TabMail wrote before this ADR, on a server that accepted it), such as a title edit,
+  a one-occurrence edit or a split, adds the organizer. RFC 6638 §3.2.3.1 makes that PUT a
+  scheduling "Create", so the server invites those guests then, possibly long after they were
+  added. Those guests were added to be invited, and on iCloud such a resource can't be written back
+  without an organizer.
+- Not measured on iCloud: whether it accepts and schedules a resource whose series VEVENT was given
+  the organizer only because one of its changed occurrences has guests (the all-components rule
+  above). RFC 6638 §3.1 requires that shape; the tests model it.
 - On a server that advertises no address, guests are still stored and not invited, as before.
 - The first write that needs the address costs up to three PROPFINDs (principal, home set, address
   set; the `.well-known` try adds one on a non-iCloud server), once per provider.
