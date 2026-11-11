@@ -961,8 +961,8 @@ final class SyncScheduler {
         // Syncs and reports the run (`AccountManager.backgroundPollRun`): it stamps
         // the sync-status timestamp so the "Updated N min ago" subtitle reflects
         // background / push / startup (NSE-coalesce) delta syncs too, never raises
-        // the inbox banner, and clears it only when every account was synced
-        // without a failure.
+        // the inbox banner, and clears it only when a run of every account had
+        // no counted failure.
         let anyChanges = await manager.backgroundPollRun(accountEmail: accountEmail, inboxOnly: inboxOnly).hadChanges
 
         lastPollTime = Date()
@@ -1026,7 +1026,7 @@ final class SyncScheduler {
             // Header sync — phase updates published per-account by foregroundSyncOne.
             // Syncs every account and reports the run
             // (`AccountManager.foregroundPollRun`): never raises the inbox banner,
-            // clears it only when no account failed.
+            // clears it only when the run had no counted failure.
             let result = await manager.foregroundPollRun()
             anyChanges = result.hadChanges
             // Clear phases after a short delay so the terminal per-account phase

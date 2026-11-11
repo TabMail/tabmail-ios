@@ -302,6 +302,14 @@ struct SyncRunBannerEntryPointTests {
             await world.providerA.setFetchMessagesThrows(offline)
             await InboxViewModel(folders: [world.inboxA, world.inboxB]).refreshSync()
             #expect(banner == nil, "an offline refresh raised the banner")
+
+            // Offline is a failed refresh that does not count: it must not clear either.
+            await raiseThroughRefresh(world)
+            #expect(banner == InboxErrorBanner.genericMessage)
+            await world.providerA.setConnectThrows(offline)
+            await world.providerA.setFetchMessagesThrows(offline)
+            await InboxViewModel(folders: [world.inboxA, world.inboxB]).refreshSync()
+            #expect(banner == InboxErrorBanner.genericMessage, "an offline refresh cleared the banner")
         }
     }
 

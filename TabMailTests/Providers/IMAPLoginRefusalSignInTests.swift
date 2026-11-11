@@ -225,6 +225,12 @@ struct IMAPLoginRefusalSignInTests {
         }
     }
 
+    /// Set the generic banner, as an earlier failed refresh would have.
+    @MainActor
+    private static func raiseBanner() {
+        AccountManagerState.shared.syncErrorBanner = InboxErrorBanner.genericMessage
+    }
+
     /// Run a user refresh of `inbox` and read the generic banner afterwards.
     @MainActor
     private static func refreshAndReadBanner(_ inbox: Folder) async -> String? {
@@ -262,6 +268,13 @@ struct IMAPLoginRefusalSignInTests {
 
                 #expect(banner == nil, "a sign-in refusal raised the generic banner")
                 let failed = await AccountManager.shared.authFailedAccounts
+
+                // A failed refresh never clears: with the banner already up, a second
+                // sign-in refusal leaves it there.
+                await Self.raiseBanner()
+                server.failNextCommand(containing: "LOGIN", message: "[AUTHENTICATIONFAILED] Invalid credentials")
+                let after = await Self.refreshAndReadBanner(inbox)
+                #expect(after == InboxErrorBanner.genericMessage, "a failed sign-in refresh cleared the banner")
                 let shown = await MainActor.run { SignInAgainBanner.accounts(failed: failed, in: [account]).map(\.id) }
                 #expect(shown == [account.id],
                         "the first refusal did not show the sign-in banner")
