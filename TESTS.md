@@ -612,8 +612,9 @@ refuses, including INTERVAL above `RecurrenceTail.maxInterval` and BY values of 
 otherwise overflow or trap. `RecurrenceTailNewSeriesRuleTests` covers the rule a split's new series
 gets: COUNT reduced in place, a used-up or uncountable COUNT refused (the message names unreadable
 dates or the uncountable rule, whichever it was), an UNTIL at or after the split kept, one before it
-refused, a DATE UNTIL covering its whole day, and an UNTIL equal to the split's own cap read as a
-retry. `GoogleSplitSeriesTailTests` and `CalDAVSplitSeriesTailTests` drive the real providers on
+refused, a DATE UNTIL covering its whole day, and an UNTIL equal to the split's own cap refused like
+any UNTIL before the split (#601: a retry finds its split through `SplitRecord`, never through the
+series' end; until then the own cap was read as a retry). `GoogleSplitSeriesTailTests` and `CalDAVSplitSeriesTailTests` drive the real providers on
 `FakeHTTP` with a series zoned to Pacific/Auckland at 07:00 and the split declared in UTC, so a rule
 read in the wrong frame counts other weekdays. A refused split sends no write: Google sends only the
 master GET, and CalDAV sends no PUT. `RecurrenceTailNewSeriesEndTests` pins the count's two anchors:
@@ -859,12 +860,30 @@ with nothing written; red for the zones ahead of UTC when the read does not name
 series in a zone TabMail does not recognize is split like any other
 (`allDaySeriesInAZoneTabMailDoesNotRecognizeIsSplit`). `FakeGraphCalendar` returns `originalStart` in the
 zone `Prefer: outlook.timezone` names (its `zones`, else the resolver), as a UTC instant when none is
-named, and records the zone of each read by id (`readZones`). A retry after this split's
-own cap is not checked again (`CalendarProvider.isOwnSplitCap`, over `RecurrenceTail.isCapped`, pinned in
-`RecurrenceTailTests`; on Outlook `ownCapRetryDoesNotLookTheOccurrenceUp`: no instances read, and an
-occurrence moved there does not stop it).
+named, and records the zone of each read by id (`readZones`). A series that already ends on this
+split's cap is not split again on any provider (#601; `ownCapIsNotSplitAgain` on Outlook, `ownCapIsRefused`
+on Google, CalDAV and in `RecurrenceTailTests`): refused with nothing written. Before #601 a retry after
+this split's own cap was not checked again (`CalendarProvider.isOwnSplitCap`, over `RecurrenceTail.isCapped`;
+on Outlook `ownCapRetryDoesNotLookTheOccurrenceUp`); both are gone.
 
-A split interrupted after its cap ends complete on its retry (`SplitRetriedAfterItsOwnCapTests`, red before
+A split interrupted between its writes (#601, `SplitInterruptedBetweenItsWritesTests` in
+`CalendarSeriesScopeTests.swift`, through the real queue on all three providers' wire fakes, with a later
+change queued on the same account): once the new part is written, a retry never writes it again. The new
+part there, the retry writes only the cap (`finishSplit`) and the split ends complete whether the cap
+failed or its answer was lost, named by the series or its occurrence (T2, T3); the user deleted it (Google
+read as `cancelled`, 404 or 410), the retry writes nothing, the row is failed with the ruled reason
+(`SplitRecord.newPartDeleted`) and the next change drains in the same drain (T1, T7: Google's lost create
+answer); Outlook's numbered or end-dated range is kept on the new part (T4); a transient cap failure keeps
+the record on the requeued row (T5); the record is on the row when the cap arrives (T6); Outlook POSTs once,
+before every PATCH (T8); a series that already ends before the split is finished with no write (T10).
+`SplitRecordIsReservedTests` (T9): `queueCalendarOperation` drops a `_split_record` a tool call carries.
+Provider level: `SeriesSplitCopyTests.failedCreateLeavesTheSeriesUntouched` and
+`failedRecordStopsBeforeTheCap` (Outlook writes nothing to the series before its create and its record).
+The fakes model it: `FakeGoogleCalendar.userDeletes(_:reads:)`/`failNext`/`beforeWrite` (a POST of a held or
+gone id is 409 `duplicate`), `FakeGraphCalendar` `transactionId` replay, `userDeletes`, `writes`,
+`beforeWrite`, `store`, `FakeCalDAVStore.failNextPUT`/`beforePUT`/`userDeletes`.
+
+History, before #601: a split interrupted after its cap ended complete on its retry (`SplitRetriedAfterItsOwnCapTests`, red before
 the queue's `read` asked `isOwnSplitCap`): Outlook, the cap applied and its response lost (so no new part),
 then retried: one new part at the split with the edit, the series ending before it, no row left; Google, the
 cap's response lost on a series on its weekday given a new time on the split's date (the retry does not ask

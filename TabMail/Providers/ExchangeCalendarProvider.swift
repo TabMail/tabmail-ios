@@ -434,21 +434,26 @@ actor ExchangeCalendarProvider: CalendarProvider {
         return GCalDateTime(dateTime: nil, date: String(originalStart.prefix(10)), timeZone: nil)
     }
 
-    /// Series split (this_and_following). For Graph:
-    /// 1. PATCH the master's recurrence.range to {type: "endDate", endDate: splitDate - 1 day}
-    ///    — Graph's `endDate` is inclusive and date-only, so we set the day before splitDate. The
-    ///    stored pattern is written back exactly.
-    /// 2. POST the new part: a copy of the stored series (`splitNewPartJSON`) starting at
+    /// Series split (this_and_following). For Graph, create first, then cap (#601, the order
+    /// Google and CalDAV use, ADR-IOS-106):
+    /// 1. POST the new part: a copy of the stored series (`splitNewPartJSON`) starting at
     ///    recurrenceId, ending where the series did (a numbered series: what is left of its
-    ///    number, `occurrencesLeft`), with `patch` applied.
-    /// On step-2 failure, attempt a best-effort revert of step 1 to the stored recurrence.
+    ///    number, `occurrencesLeft`), with `patch` applied, under a DETERMINISTIC
+    ///    `transactionId`, so Graph answers a retried POST with the part it already made.
+    /// 2. `record` keeps the `SplitRecord` (the new part's Graph id).
+    /// 3. PATCH the master's recurrence.range to {type: "endDate", endDate: splitDate - 1 day}
+    ///    (`splitCapJSON`). The stored pattern is written back exactly.
+    /// Nothing is rolled back: a failed cap is rethrown, and the retry finds the record and
+    /// writes the cap alone (`finishSplit`). Until then both parts show the occurrences after
+    /// the split.
     func splitSeries(
         calendarId: String = "primary",
         eventId: String,
         recurrenceId: String,
         recurrenceIdZone: TimeZone,
         patch: GCalEventInput,
-        sendUpdates: String = "all"
+        sendUpdates: String = "all",
+        record: SplitRecorder
     ) async throws -> GCalEvent {
         // The agent may have passed an INSTANCE id — Graph instance events
         // don't carry the series `recurrence`; only the master does. Resolve
@@ -460,46 +465,26 @@ actor ExchangeCalendarProvider: CalendarProvider {
         let master = snapshot.event
         guard let masterRecurrence = master.recurrence, !masterRecurrence.isEmpty,
               masterRecurrence.contains(where: { $0.uppercased().hasPrefix("RRULE:") }),
-              let storedRecurrence = snapshot.raw["recurrence"] as? [String: Any],
-              let storedRange = storedRecurrence["range"] as? [String: Any]
+              let storedRecurrence = snapshot.raw["recurrence"] as? [String: Any]
         else {
             throw CalendarProviderError.notSupported("Event \(eventId) is not recurring; can't split.")
         }
-
-        // 1. Cap the master via PATCH.
-        //    IMPORTANT: Graph's recurrenceRange uses a DATE-inclusive `endDate`
-        //    ("occurrences ... between startDate and endDate inclusive"). We
-        //    therefore can NOT round-trip through an RRULE `UNTIL` instant —
-        //    its precision is lost when collapsed to a whole date, and the
-        //    naive date-part of (split − 1s) is still the split day, which
-        //    Graph would keep on the master. So compute the cap directly:
-        //    endDate = local date of (split occurrence − 1 day). The stored
-        //    pattern and the rest of the stored range (its `startDate`, which
-        //    Graph requires, and its zone) are written back as they are.
-        guard let capEndDate = Self.graphEndDateBefore(naiveISO: recurrenceId, allDay: master.isAllDay, zone: recurrenceIdZone) else {
+        guard let capEndDate = Self.graphEndDateBefore(naiveISO: recurrenceId, allDay: master.isAllDay, zone: recurrenceIdZone),
+              let cappedJSON = Self.splitCapJSON(master: master, storedRecurrence: storedRecurrence, capEndDate: capEndDate) else {
             throw CalendarProviderError.notSupported("Invalid recurrence_id '\(recurrenceId)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
         }
         // The split is at an occurrence that starts at `recurrenceId` now, the one `occurrence`
         // finds, and was not moved from its place in the series; otherwise it throws with nothing
-        // written. Not asked on a retry after this split's own cap, which ended the series before
-        // that occurrence.
-        if !isOwnSplitCap(of: master, at: recurrenceId, zone: recurrenceIdZone) {
-            let found = try await occurrence(
-                named: named, masterId: eventId, series: master, recurrenceId: recurrenceId, zone: recurrenceIdZone)
-            if RecurrenceOccurrenceResolver.wasMoved(found) {
-                // A split at an occurrence moved from its place is not supported (#563): a plain
-                // error, nothing written.
-                throw CalendarProviderError.notSupported("split at a moved occurrence")
-            }
+        // written.
+        let found = try await occurrence(
+            named: named, masterId: eventId, series: master, recurrenceId: recurrenceId, zone: recurrenceIdZone)
+        if RecurrenceOccurrenceResolver.wasMoved(found) {
+            // A split at an occurrence moved from its place is not supported (#563): a plain
+            // error, nothing written.
+            throw CalendarProviderError.notSupported("split at a moved occurrence")
         }
-        var capRange = storedRange
-        capRange["type"] = "endDate"
-        capRange["endDate"] = capEndDate
-        capRange.removeValue(forKey: "numberOfOccurrences")
-        var cappedRecurrence = storedRecurrence
-        cappedRecurrence["range"] = capRange
-        // Built before the cap is written, so a series that can't be copied is
-        // refused while nothing has changed.
+        // Built before anything is written, so a series that can't be copied is refused while
+        // nothing has changed.
         let transactionId = GoogleCalendarProvider.deterministicSplitEventId(
             masterId: eventId, recurrenceId: recurrenceId
         )
@@ -508,38 +493,163 @@ actor ExchangeCalendarProvider: CalendarProvider {
             patch: patch,
             newStartNaiveISO: recurrenceId,
             newStartZone: recurrenceIdZone,
-            capEndDate: capEndDate,
             transactionId: transactionId
         )
-        // CRITICAL: include the master's existing start/end on the cap PATCH.
-        // If we send ONLY `recurrence`, Graph silently rewrites the master's
-        // `start.dateTime`/`start.timeZone` to UTC midnight at the
-        // recurrence range's `startDate` — shifting the master's first
-        // occurrence by the device's UTC offset (17:00 Vancouver → 00:00 UTC,
-        // i.e. the previous day in PDT). Re-sending the existing wall time
-        // pins the master in place. `graphNaiveDateTime` strips the offset so
-        // the `dateTime` is naive in `timeZone`, per Graph's spec.
+        let cappedBody = try JSONSerialization.data(withJSONObject: cappedJSON)
+
+        // 1. Create the new part. Graph defines `transactionId` as a value "for the server to
+        // avoid redundant POST operations in case of client retries": a retried POST receives
+        // the original success response, so a retry after a lost answer gets the same part
+        // back. A 409 is a store-level save conflict, not proof of anything: it is rethrown,
+        // nothing has been capped, and the drain retries it.
+        let calPath: String
+        if calendarId == "primary" {
+            calPath = ""
+        } else {
+            let encodedCalId = try Self.encodedGraphPathSegment(calendarId, context: "Graph calendar id")
+            calPath = "/calendars/\(encodedCalId)"
+        }
+        let createBody = try JSONSerialization.data(withJSONObject: createJSON)
+        if DebugModeManager.isLoggingEnabled() {
+            if let bodyStr = String(data: createBody, encoding: .utf8) {
+                BackgroundSyncLogger.logDebug("[ExchangeCalendar] splitSeries new-series POST body=\(bodyStr.prefix(4000))")
+            }
+        }
+        let data = try await request(path: "\(calPath)/events", method: "POST", body: createBody)
+        if DebugModeManager.isLoggingEnabled() {
+            if let respStr = String(data: data, encoding: .utf8) {
+                BackgroundSyncLogger.logDebug("[ExchangeCalendar] splitSeries new-series response=\(respStr.prefix(4000))")
+            }
+        }
+        let created = toGCalEvent(try JSONDecoder().decode(MSEvent.self, from: data))
+        guard let createdId = created.id, !createdId.isEmpty else {
+            throw CalendarProviderError.notSupported("Outlook gave no id for the new part of the repeating event, so the change can't be finished. Check the event's later occurrences in your calendar app.")
+        }
+
+        // 2. Keep the record before the cap: a retry after this point writes the cap alone.
+        try await record(SplitRecord(seriesId: eventId, newPartId: createdId, splitAt: recurrenceId))
+
+        // 3. Cap the master. A failure is rethrown; the record is kept.
+        try await writeSplitCap(seriesId: eventId, body: cappedBody)
+        return created
+    }
+
+    func eventExists(calendarId: String = "primary", eventId: String) async throws -> Bool {
+        let encodedId = try Self.encodedGraphPathSegment(eventId, context: "Graph event id")
+        do {
+            _ = try await request(path: "/events/\(encodedId)?$select=id")
+            return true
+        } catch ExchangeCalendarError.httpError(let code, _) where code == 404 || code == 410 {
+            return false
+        } catch ExchangeCalendarError.eventNotFound {
+            return false
+        }
+    }
+
+    /// The cap of the split `record` names, written alone (`CalendarProvider.finishSplit`): the
+    /// cap `splitSeries` writes, worked out from the series as it is now, and nothing when the
+    /// series already ends before the split (`splitAlreadyEnded`).
+    func finishSplit(calendarId: String = "primary", record: SplitRecord, zone: TimeZone) async throws {
+        let stored = try await fetchForEdit(eventId: record.seriesId, select: Self.splitSelect)
+        guard let storedRecurrence = stored.raw["recurrence"] as? [String: Any],
+              let storedRange = storedRecurrence["range"] as? [String: Any] else {
+            throw CalendarProviderError.notSupported("Can't finish this change to the repeating event: it no longer repeats. Check the event in your calendar app.")
+        }
+        guard let capEndDate = Self.graphEndDateBefore(naiveISO: record.splitAt, allDay: stored.event.isAllDay, zone: zone),
+              let cappedJSON = Self.splitCapJSON(master: stored.event, storedRecurrence: storedRecurrence, capEndDate: capEndDate) else {
+            throw CalendarProviderError.notSupported("Invalid recurrence_id '\(record.splitAt)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
+        }
+        if try Self.splitAlreadyEnded(
+            stored: stored, storedRange: storedRange, capEndDate: capEndDate, splitNaiveISO: record.splitAt, splitZone: zone) {
+            if DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[ExchangeCalendar] finishSplit: series \(record.seriesId) already ends before \(record.splitAt) — nothing to write")
+            }
+            return
+        }
+        try await writeSplitCap(seriesId: record.seriesId, body: try JSONSerialization.data(withJSONObject: cappedJSON))
+    }
+
+    /// Whether the stored series already ends before the split, so `finishSplit` writes no cap:
+    /// an `endDate` range ending on or before the cap's `capEndDate` (this split's own cap among
+    /// them), or a numbered range whose occurrences are all before the split, counted as
+    /// `occurrencesLeft` counts them. A range with no end does not. Throws `notSupported` when a
+    /// numbered range can't be counted.
+    nonisolated static func splitAlreadyEnded(
+        stored: EditSnapshot,
+        storedRange: [String: Any],
+        capEndDate: String,
+        splitNaiveISO: String,
+        splitZone: TimeZone
+    ) throws -> Bool {
+        switch storedRange["type"] as? String {
+        case "endDate":
+            guard let endDate = storedRange["endDate"] as? String, RecurrenceTail.Day(iso: endDate) != nil else {
+                throw CalendarProviderError.notSupported("Can't finish this change to the repeating event: Outlook gives no end date for it. Check the event's later occurrences in your calendar app.")
+            }
+            return endDate <= capEndDate
+        case "numbered":
+            let counted = try numberedRange(stored: stored, storedRange: storedRange, splitNaiveISO: splitNaiveISO, splitZone: splitZone)
+            guard let seriesStart = counted.seriesStart, let split = counted.split,
+                  let before = RecurrenceTail.occurrences(
+                      of: counted.rule, seriesStart: seriesStart, before: split, anchor: .patternStart, missingDay: .lastDay)
+            else {
+                throw CalendarProviderError.notSupported("Can't finish this change to the repeating event: its occurrences can't be counted. Check the event's later occurrences in your calendar app.")
+            }
+            return before >= counted.count
+        default:
+            return false
+        }
+    }
+
+    /// The PATCH that caps the master at `capEndDate`, or nil when the stored recurrence has no
+    /// range.
+    ///
+    /// IMPORTANT: Graph's recurrenceRange uses a DATE-inclusive `endDate` ("occurrences ...
+    /// between startDate and endDate inclusive"). We therefore can NOT round-trip through an
+    /// RRULE `UNTIL` instant — its precision is lost when collapsed to a whole date, and the
+    /// naive date-part of (split − 1s) is still the split day, which Graph would keep on the
+    /// master. So the cap is computed directly: endDate = local date of (split occurrence − 1
+    /// day) (`graphEndDateBefore`). The stored pattern and the rest of the stored range (its
+    /// `startDate`, which Graph requires, and its zone) are written back as they are.
+    ///
+    /// CRITICAL: the master's existing start/end go on the cap PATCH. If we send ONLY
+    /// `recurrence`, Graph silently rewrites the master's `start.dateTime`/`start.timeZone` to
+    /// UTC midnight at the recurrence range's `startDate` — shifting the master's first
+    /// occurrence by the device's UTC offset (17:00 Vancouver → 00:00 UTC, i.e. the previous day
+    /// in PDT). Re-sending the existing wall time pins the master in place. `graphNaiveDateTime`
+    /// strips the offset so the `dateTime` is naive in `timeZone`, per Graph's spec.
+    nonisolated static func splitCapJSON(master: GCalEvent, storedRecurrence: [String: Any], capEndDate: String) -> [String: Any]? {
+        guard var capRange = storedRecurrence["range"] as? [String: Any] else { return nil }
+        capRange["type"] = "endDate"
+        capRange["endDate"] = capEndDate
+        capRange.removeValue(forKey: "numberOfOccurrences")
+        var cappedRecurrence = storedRecurrence
+        cappedRecurrence["range"] = capRange
         var cappedJSON: [String: Any] = ["recurrence": cappedRecurrence]
         if let startISO = master.start?.dateTime, let startTz = master.start?.timeZone {
             cappedJSON["start"] = [
-                "dateTime": Self.graphNaiveDateTime(startISO),
+                "dateTime": graphNaiveDateTime(startISO),
                 "timeZone": startTz,
             ]
         }
         if let endISO = master.end?.dateTime, let endTz = master.end?.timeZone {
             cappedJSON["end"] = [
-                "dateTime": Self.graphNaiveDateTime(endISO),
+                "dateTime": graphNaiveDateTime(endISO),
                 "timeZone": endTz,
             ]
         }
-        let cappedBody = try JSONSerialization.data(withJSONObject: cappedJSON)
+        return cappedJSON
+    }
+
+    /// The silent cap PATCH of a split (`splitCapJSON`'s body) on the series `seriesId`.
+    private func writeSplitCap(seriesId: String, body: Data) async throws {
         if DebugModeManager.isLoggingEnabled() {
-            if let bodyStr = String(data: cappedBody, encoding: .utf8) {
+            if let bodyStr = String(data: body, encoding: .utf8) {
                 BackgroundSyncLogger.logDebug("[ExchangeCalendar] splitSeries cap PATCH body=\(bodyStr.prefix(4000))")
             }
         }
-        let encodedMasterId = try Self.encodedGraphPathSegment(eventId, context: "Graph series master id")
-        let capRespData = try await request(path: "/events/\(encodedMasterId)", method: "PATCH", body: cappedBody)
+        let encodedMasterId = try Self.encodedGraphPathSegment(seriesId, context: "Graph series master id")
+        let capRespData = try await request(path: "/events/\(encodedMasterId)", method: "PATCH", body: body)
         // Log the response so we can see what Graph stored — particularly the
         // master's start/end/recurrence after capping, to diagnose visible
         // "occurrence moved to earlier day" symptoms after a split.
@@ -548,108 +658,6 @@ actor ExchangeCalendarProvider: CalendarProvider {
                 BackgroundSyncLogger.logDebug("[ExchangeCalendar] splitSeries cap PATCH response=\(capRespStr.prefix(4000))")
             }
         }
-
-        // 2. Create the new part (`createJSON`, built above). Its DETERMINISTIC
-        // `transactionId` (derived from master id + recurrence_id) lets Graph
-        // dedupe POSTs — so a retry after a lost ACK on the create below won't
-        // produce a duplicate series. The two-step cap-then-create is
-        // otherwise not idempotent (the PATCH is, the POST isn't).
-        let calPath: String
-        if calendarId == "primary" {
-            calPath = ""
-        } else {
-            let encodedCalId = try Self.encodedGraphPathSegment(calendarId, context: "Graph calendar id")
-            calPath = "/calendars/\(encodedCalId)"
-        }
-        do {
-            let createBody = try JSONSerialization.data(withJSONObject: createJSON)
-            if DebugModeManager.isLoggingEnabled() {
-                if let bodyStr = String(data: createBody, encoding: .utf8) {
-                    BackgroundSyncLogger.logDebug("[ExchangeCalendar] splitSeries new-series POST body=\(bodyStr.prefix(4000))")
-                }
-            }
-            let data = try await request(path: "\(calPath)/events", method: "POST", body: createBody)
-            if DebugModeManager.isLoggingEnabled() {
-                if let respStr = String(data: data, encoding: .utf8) {
-                    BackgroundSyncLogger.logDebug("[ExchangeCalendar] splitSeries new-series response=\(respStr.prefix(4000))")
-                }
-            }
-            let created = try JSONDecoder().decode(MSEvent.self, from: data)
-            return toGCalEvent(created)
-        } catch {
-            // ⚠️ THERE IS DELIBERATELY NO `catch ExchangeCalendarError.httpError(409, _)`
-            // AHEAD OF THIS (R13-U3). Until 2026-08-06 a 409 here returned a
-            // FABRICATED `GCalEvent(id: "")` — a synthetic success with no id, no
-            // start and no end, built entirely from the request we had just failed
-            // to send. The queue then reported the split done and deleted the
-            // durable op, leaving a truncated master with no successor series.
-            //
-            // Its premise — "Graph rejected the POST as a duplicate transactionId"
-            // — is not what Microsoft documents. The `event` resource defines
-            // `transactionId` as a value *"for the server to AVOID REDUNDANT POST
-            // operations in case of client retries"*: a deduped retry receives the
-            // ORIGINAL success response, so a 409 is evidence AGAINST the dedup
-            // reading, not for it. Graph's observed calendar-POST 409s are
-            // store-level save conflicts (`ConcurrentItemSave`,
-            // `IrresolvableConflict`) which say nothing about whether the item
-            // exists. A 409 therefore takes this arm now: the master cap is
-            // reverted and the error is rethrown for the drain to classify as
-            // indeterminate-and-retryable, and the retry re-runs the whole split
-            // against an uncapped master.
-            //
-            // 🚨 R13-U4 — A FAILED ROLLBACK IS NOT THE SAME OUTCOME AS A SUCCESSFUL
-            // ONE, and this used to report them identically via `try?`. If the
-            // create failed with a 400/415/422, `isCalendarBadRequestError` claims
-            // the rethrown error and the drain DELETES the durable row — so when
-            // the revert had also failed, the master was left permanently capped,
-            // with no successor and no queued work to make one. Later sync imports
-            // the truncated master and cannot reconstruct the original recurrence.
-            //
-            // On a revert failure this now raises `CalDAVError.inconsistentState`,
-            // which the drain claims at its own dedicated arm with exactly this
-            // rationale already written there (*"retrying would re-cap an
-            // already-capped master and create duplicate successor series"*). That
-            // arm is terminal-with-a-reason and surfaces the message to the user —
-            // NOT transient: this is deliberately not "make every rollback failure
-            // retryable", which would put a two-step write that has already half
-            // landed into an unbounded retry.
-            // The stored recurrence exactly as it was. SAME Graph quirk as the
-            // cap PATCH above — sending ONLY `recurrence` causes Graph to
-            // silently rewrite the master's start/end to UTC midnight at
-            // `range.startDate` — so the master's existing start/end, which the
-            // cap carried, go with it and its first occurrence stays put.
-            var revertJSON = cappedJSON
-            revertJSON["recurrence"] = storedRecurrence
-            var revertFailure: Error?
-            if let revertBody = try? JSONSerialization.data(withJSONObject: revertJSON) {
-                if DebugModeManager.isLoggingEnabled() {
-                    if let bodyStr = String(data: revertBody, encoding: .utf8) {
-                        BackgroundSyncLogger.logDebug("[ExchangeCalendar] splitSeries revert PATCH body=\(bodyStr.prefix(4000))")
-                    }
-                }
-                do {
-                    _ = try await request(path: "/events/\(encodedMasterId)", method: "PATCH", body: revertBody)
-                } catch let revertError {
-                    revertFailure = revertError
-                    BackgroundSyncLogger.logDebug("[ExchangeCalendar] splitSeries revert PATCH FAILED: \(revertError)")
-                }
-            } else {
-                // The revert request could not even be built, so the master is
-                // still capped — the same end state as a failed PATCH, and it must
-                // not be reported as a successful rollback.
-                revertFailure = CalendarProviderError.notSupported("the revert payload could not be encoded")
-                BackgroundSyncLogger.logDebug("[ExchangeCalendar] splitSeries revert PATCH body could not be encoded — master left capped")
-            }
-            throw GoogleCalendarProvider.splitRollbackError(original: error, revertFailure: revertFailure)
-        }
-    }
-
-    /// The cap `splitSeries` writes, as the series' RRULE reads it: Graph's range `endDate`
-    /// (`graphEndDateBefore`), which the mapping to `GCalEvent.recurrence` gives as an `UNTIL` of
-    /// that date without its dashes when the range type is `endDate`.
-    nonisolated func splitCapUntil(beforeNaiveISO recurrenceId: String, allDay: Bool, zone: TimeZone) -> String? {
-        Self.graphEndDateBefore(naiveISO: recurrenceId, allDay: allDay, zone: zone)?
-            .replacingOccurrences(of: "-", with: "")
     }
 
     /// Graph `recurrenceRange.endDate` for capping a series so the occurrence
@@ -710,24 +718,22 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// - The recurrence keeps the stored pattern exactly. Its range keeps its end date (verbatim)
     ///   and zone and starts on the new start's date; a range that ends after a number of
     ///   occurrences stays numbered with what is left of the number (`occurrencesLeft`), as on
-    ///   Google and CalDAV. A range that already ends on this split's cap (`capEndDate`) has no
-    ///   end: it is a retry after the cap was written and the create was not, and that end is the
-    ///   cap, not the series' own (the rule `RecurrenceTail.newSeriesRule` applies on Google and
+    ///   Google and CalDAV. A range whose end date is before the new start is refused: the series
+    ///   already ends before the split (as `RecurrenceTail.newSeriesRule` refuses it on Google and
     ///   CalDAV). A rule in the patch replaces the stored recurrence.
     /// - A new place in the patch replaces the stored places (`locations`).
     /// - New notes on an online series replace only the notes in the copied body; its join section
     ///   is kept as stored (`onlineMeetingBody`). The new part is not an online meeting of its own:
     ///   its body carries the series' join link.
     ///
-    /// Throws `notSupported` when the new start can't be dated, or when a numbered series has no
-    /// occurrence left from the split on or can't be counted (`occurrencesLeft`); nothing has been
-    /// written then.
+    /// Throws `notSupported` when the new start can't be dated, when the series ends before the
+    /// split, or when a numbered series has no occurrence left from the split on or can't be
+    /// counted (`occurrencesLeft`); nothing has been written then.
     nonisolated func splitNewPartJSON(
         stored: EditSnapshot,
         patch: GCalEventInput,
         newStartNaiveISO: String,
         newStartZone: TimeZone,
-        capEndDate: String,
         transactionId: String
     ) throws -> [String: Any] {
         // The recurrence comes from the stored series' range below, or from the patch's rule.
@@ -776,11 +782,11 @@ actor ExchangeCalendarProvider: CalendarProvider {
                 range["numberOfOccurrences"] = try Self.occurrencesLeft(
                     stored: stored, storedRange: storedRange, splitNaiveISO: newStartNaiveISO, splitZone: newStartZone)
                 range.removeValue(forKey: "endDate")
-            case "endDate" where range["endDate"] as? String == capEndDate:
-                range["type"] = "noEnd"
-                range.removeValue(forKey: "endDate")
-                range.removeValue(forKey: "numberOfOccurrences")
             case "endDate":
+                if let endDate = range["endDate"] as? String, endDate < newDay {
+                    throw CalendarProviderError.notSupported(
+                        "Can't split this series at the occurrence on \(newDay): the series already ends before it (on \(endDate)), so there are no occurrences from that point on to change.")
+                }
                 range.removeValue(forKey: "numberOfOccurrences")
             default:
                 range.removeValue(forKey: "endDate")
@@ -825,6 +831,22 @@ actor ExchangeCalendarProvider: CalendarProvider {
         splitNaiveISO: String,
         splitZone: TimeZone
     ) throws -> Int {
+        let counted = try numberedRange(stored: stored, storedRange: storedRange, splitNaiveISO: splitNaiveISO, splitZone: splitZone)
+        return try RecurrenceTail.newSeriesEnd(
+            count: counted.count, of: counted.rule, seriesStart: counted.seriesStart, split: counted.split,
+            anchor: .patternStart, missingDay: .lastDay)
+    }
+
+    /// A numbered range as `occurrencesLeft` and `splitAlreadyEnded` count it: the stored count,
+    /// the series' rule with the pattern's `firstDayOfWeek` as its `WKST`, the range's
+    /// `startDate`, and the split occurrence's day in the series' zone (nil when one can't be
+    /// placed). Throws `notSupported` when the range gives no count.
+    nonisolated static func numberedRange(
+        stored: EditSnapshot,
+        storedRange: [String: Any],
+        splitNaiveISO: String,
+        splitZone: TimeZone
+    ) throws -> (count: Int, rule: String, seriesStart: RecurrenceTail.Day?, split: RecurrenceTail.Day?) {
         guard let count = storedRange["numberOfOccurrences"] as? Int, count >= 1,
               let rrule = stored.event.recurrence?.first(where: { $0.uppercased().hasPrefix("RRULE:") }) else {
             throw CalendarProviderError.notSupported(
@@ -843,8 +865,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
                 .flatMap { RecurrenceOccurrenceResolver.renderNaive(splitNaiveISO, from: splitZone, to: $0) }
                 .flatMap { RecurrenceTail.Day(iso: $0) }
         }
-        return try RecurrenceTail.newSeriesEnd(
-            count: count, of: rule, seriesStart: seriesStart, split: split, anchor: .patternStart, missingDay: .lastDay)
+        return (count, rule, seriesStart, split)
     }
 
     // MARK: - Edits (#421)

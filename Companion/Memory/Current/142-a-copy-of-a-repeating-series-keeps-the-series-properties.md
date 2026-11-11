@@ -95,6 +95,19 @@ response was lost, the series it reads is already capped.
   repeats with no end where the series had an end date; editing its end repairs it. The same holds
   for a numbered series (#474): its number is gone once the cap is written, so such a retry's new
   part has no end either, until #601 moves Outlook to create first.
+- **Amendment (2026-11-11, #601, ADR-IOS-106 amendment): every provider writes the new part first, and a
+  retry finds its split through a record.** The Outlook bullet above is history: Outlook now POSTs the
+  new part, then caps (`splitCapJSON`, `writeSplitCap`); its revert and `splitRollbackError` are gone,
+  and `splitNewPartJSON` no longer takes `capEndDate` (an endDate range already ending before the new
+  part is refused, "already ends before"). Between the two writes `splitSeries` hands a `SplitRecord`
+  (`series_id`, `new_part_id`, `split_at`) to its `SplitRecorder`; the queue keeps it under
+  `_split_record` (`AccountManager.recordSplit`) before the cap is sent. A retry with a record never
+  creates: `eventExists` on the new part, then `finishSplit` (the cap alone, or nothing when the series
+  already ends before the split), or, the new part deleted, a refusal with `SplitRecord.newPartDeleted`
+  and nothing written. The address-based guards (`successorIsOurs`, Google's 409 `duplicate`) still run
+  on a retry WITHOUT a record (the create's answer was lost); Google then reads the event, and a gone or
+  `cancelled` one is refused. Limit: on Outlook and CalDAV a create that landed with its answer lost,
+  then deleted by the user, is created again on the retry.
 - **A rule from the edit replaces only the RRULE line on every provider** (#513): Google's
   `GoogleCalendarProvider.recurrence(_:withRuleFrom:)` keeps the excluded and added dates after the
   split (and on a whole-series edit, the series' own), as CalDAV does. Before #513 Google wrote the

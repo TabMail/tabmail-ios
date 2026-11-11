@@ -301,6 +301,17 @@ No provider's write order changed (#601 owns moving Outlook to create first). Ou
 interrupted split had lost the new part: the retry was retired "not found" with the series truncated.
 Google and CalDAV write the cap last, so theirs had lost only the row's success.
 
+**Amendment (2026-11-11, #601): superseded by the split record.** The own-cap rule above is gone:
+`isOwnSplitCap`, `RecurrenceTail.isCapped`, `splitCapUntil`, `afterOwnSplitCap` and the queue `read`'s
+`splitting` are deleted. Every provider writes the new part first and keeps a `SplitRecord` on the queued
+row before the cap (memory 142, amendment; ADR-IOS-106, amendment). A retry with a record skips `read` and
+`route` entirely: `eventExists` on the new part, then `finishSplit`, or the refusal
+`SplitRecord.newPartDeleted` when the user deleted it. A retry without a record reads and looks the
+occurrence up like any edit, and a series that already ends on this split's cap is refused, not finished
+(`RecurrenceTail.newSeriesRule`, Outlook "already ends before"). An Outlook split named by an OCCURRENCE id
+and interrupted after its create now ends complete on its retry: the record names the series and the new
+part, so the occurrence Graph no longer lists after the cap is never read again.
+
 The queue's `read` is still made on every retry and still looks the occurrence up where it starts now
 for every other edit. So a retried first-occurrence date shift whose first response was lost can report
 "not found" though the calendar holds the change (the series no longer starts where the edit named it;
@@ -326,6 +337,9 @@ series with one PUT) and the unrecognized-zone row. The fakes filter `/instances
 cancelled Google instance out of the list, and Graph refuses a PATCH moving an occurrence onto another
 (`ErrorOccurrenceCrossingBoundary`).
 
+Since #601 (2026-11-11): `SplitInterruptedBetweenItsWritesTests` (a split interrupted between its writes:
+finished by its record while the new part is there, by series or occurrence id; refused with nothing written
+once the user deleted it; the next queued change drains) replaces the suite named below. History:
 A split interrupted after its cap ends complete on its retry (`SplitRetriedAfterItsOwnCapTests`: Outlook,
 cap applied and its response lost, so no new part, then retried: the new part exists and the row is not
 retired; Google, the cap's response lost on a series on named days given a new time; and
@@ -363,6 +377,9 @@ stored instances. `drainEdit(..., drains:)` drains once per attempt.
     although both writes landed; no data is lost. Whether Google answers a read of an instance past the
     new UNTIL with 404 (not found) or with the instance `cancelled` (handled: the own-cap check runs
     before the occurrence lookup) is unmeasured (#601).
+    **Amendment (2026-11-11, #601): closed.** A split interrupted after its create keeps a `SplitRecord`
+    naming the series and the new part; its retry never reads the occurrence again, by either id, and
+    ends complete (`SplitInterruptedBetweenItsWritesTests` T3). Limit 6's own-cap clause is gone with it.
 11. Outlook's occurrence lookup enumerates 25 hours either side of the named date's midnight in the
     edit's zone. An all-day occurrence lasts from midnight in the series' zone, so when the edit's zone
     is 25 hours or more east of the series' (Kiritimati or Tonga against Pago Pago, Niue or Baker

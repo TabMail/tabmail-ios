@@ -85,12 +85,53 @@ private let kindChangeTimesHint = "to change this event between all-day and time
 /// removed guest, a series emptied of its guests and a series list written back unchanged, on
 /// renamed, moved and unchanged occurrences and on occurrences with guest differences of their
 /// own.
+///
+/// A `POST` of an id the calendar already holds, a deleted one included, is refused with 409
+/// `duplicate` (measured 2026-11-10: Google keeps a deleted event's id, reads it as 200 `cancelled`,
+/// and refuses to insert it again). `userDeletes` deletes an event as the user does in Google
+/// Calendar; `failNext` makes the next write of a method fail; `beforeWrite` runs as a write
+/// arrives, before it is applied.
 final class FakeGoogleCalendar: Sendable {
     private let events: Mutex<[String: Data]>
     private let writeLog = Mutex<[String]>([])
     private let patchLog = Mutex<[(id: String, body: Data)]>([])
     private let resets = Mutex(0)
     private let lostResponses = Mutex<[String: Int]>([:])
+    private let failingRequests = Mutex<[String: [Int]]>([:])
+    private let gone = Mutex<[String: Int]>([:])
+    private let writeHook = Mutex<(@Sendable (_ method: String, _ id: String) -> Void)?>(nil)
+
+    /// What a GET of an event the user deleted answers: Google's measured 200 `cancelled`, or a
+    /// 404 or 410 (unmeasured, so both are held to the same outcome).
+    enum DeletedRead: Sendable { case cancelled, status(Int) }
+
+    /// The user deletes `id` in their calendar app.
+    func userDeletes(_ id: String, reads: DeletedRead = .cancelled) {
+        switch reads {
+        case .cancelled:
+            guard var stored = event(id) else { return }
+            stored["status"] = "cancelled"
+            store(stored)
+        case .status(let code):
+            events.withLock { $0[id] = nil }
+            gone.withLock { $0[id] = code }
+        }
+    }
+
+    /// The next `method` write (`PATCH` or `POST`) is answered with `status` and changes nothing.
+    func failNext(_ method: String, with status: Int) { failingRequests.withLock { $0[method, default: []].append(status) } }
+
+    private func takeFailure(_ method: String) -> Int? {
+        failingRequests.withLock { $0[method]?.isEmpty == false ? $0[method]?.removeFirst() : nil }
+    }
+
+    /// Runs as each write (`PATCH`, `POST`) arrives, before it is applied or refused.
+    func beforeWrite(_ hook: @escaping @Sendable (_ method: String, _ id: String) -> Void) { writeHook.withLock { $0 = hook } }
+
+    private func runWriteHook(_ method: String, _ id: String) {
+        let hook = writeHook.withLock { $0 }
+        hook?(method, id)
+    }
 
     /// The next `method` write (`PATCH` or `POST`) is applied, and its response is lost: the
     /// connection drops before it arrives.
@@ -145,11 +186,14 @@ final class FakeGoogleCalendar: Sendable {
                     .filter { Self.overlaps($0, window) }
                 return Self.json(["items": items])
             }
+            if parts.count == 1, let code = gone.withLock({ $0[parts[0]] }) { return .status(code) }
             guard parts.count == 1, let stored = event(parts[0]) else { return .status(404) }
             return Self.json(stored)
         }
         http.register(path: prefix + "/", method: "PATCH") { [self] request in
             let parts = Self.pathParts(request.url)
+            runWriteHook("PATCH", parts.first ?? "")
+            if let status = takeFailure("PATCH") { return .status(status) }
             guard parts.count == 1, var stored = event(parts[0]), let body = request.body,
                   let patch = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any]
             else { return .status(400) }
@@ -196,6 +240,12 @@ final class FakeGoogleCalendar: Sendable {
                   let created = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any],
                   let id = created["id"] as? String
             else { return .status(400) }
+            runWriteHook("POST", id)
+            if let status = takeFailure("POST") { return .status(status) }
+            if event(id) != nil || gone.withLock({ $0[id] }) != nil {
+                return .json(raw: #"{"error":{"code":409,"message":"The requested identifier already exists.","errors":[{"domain":"global","reason":"duplicate","message":"The requested identifier already exists."}]}}"#,
+                             statusCode: 409)
+            }
             store(created)
             writeLog.withLock { $0.append("POST \(id)") }
             if takeLoss("POST") { return .transportError(.networkConnectionLost) }

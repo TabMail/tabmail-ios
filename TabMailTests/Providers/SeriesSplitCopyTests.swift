@@ -631,41 +631,26 @@ struct ExchangeSeriesSplitCopyTests {
         }
     }
 
-    @Test("a series that already ends on this split's cap is a retry: the new part has no end")
-    func ownCapIsARetry() async throws {
-        // The state a retry reads when the cap was written and the create was not.
-        let cap = try #require(ExchangeCalendarProvider.graphEndDateBefore(
-            naiveISO: GraphSplitFixture.recurrenceId, allDay: false, zone: .current))
-        let series = GraphSplitFixture.series(range: ["type": "endDate", "endDate": cap, "numberOfOccurrences": 0])
-        // The cap ended the series before the occurrence, so the series no longer lists it: this
-        // split's own cap is not asked again.
-        let (_, _, sent) = try await splitOnTheWire(series, listed: false, patch: GCalEventInput())
-
-        let recurrence = try #require(sent["recurrence"] as? [String: Any])
-        let range = try #require(recurrence["range"] as? [String: Any])
-        #expect(range["type"] as? String == "noEnd" && range["endDate"] == nil,
-                "the new part would end before it starts: \(canonical(range))")
-        #expect(range["startDate"] as? String == String(GraphSplitFixture.recurrenceId.prefix(10)), "\(canonical(range))")
-    }
-
-    @Test("a retry after this split's own cap does not look its occurrence up again: no instances read, and an occurrence moved there does not stop it")
-    func ownCapRetryDoesNotLookTheOccurrenceUp() async throws {
+    @Test("a series that already ends on this split's cap is not split again: refused with nothing written, an occurrence listed there or not (#601)",
+          arguments: [false, true])
+    func ownCapIsNotSplitAgain(_ listed: Bool) async throws {
+        // What a row queued before #601 reads when its cap was written and its create was not:
+        // Outlook capped first then. A retry now finds a split only through its record, and a
+        // series that already ends before the split has nothing to split.
         let http = FakeHTTP.Scenario()
         defer { http.close() }
         let cap = try #require(ExchangeCalendarProvider.graphEndDateBefore(
             naiveISO: GraphSplitFixture.recurrenceId, allDay: false, zone: .current))
         let series = GraphSplitFixture.series(range: ["type": "endDate", "endDate": cap, "numberOfOccurrences": 0])
-        // An occurrence at the split's place, moved on its own an hour later: looked up, it would stop
-        // the split (nothing starts at the place now, and the one there was moved).
-        var moved = GraphFixture.event(id: "ser-1-occ", start: GraphSplitFixture.occurrence, online: false, seriesMasterId: "ser-1")
-        moved["start"] = ["dateTime": GraphFixture.naive(GraphSplitFixture.occurrence.addingTimeInterval(3_600)), "timeZone": "UTC"]
-        let graph = FakeGraphCalendar([series, moved])
+        let graph = GraphSplitFixture.calendar(series, listed: listed)
         graph.install(on: http)
-        _ = try await GraphSplitFixture.provider(http).splitSeries(
-            eventId: "ser-1", recurrenceId: GraphSplitFixture.recurrenceId, recurrenceIdZone: .current, patch: GCalEventInput())
-        #expect(!http.recordedCalls().contains { $0.url.contains("/instances") },
-                "the occurrence was looked up on a retry: \(http.servedCallSequence())")
-        #expect(graph.created.count == 1, "no new part: \(http.servedCallSequence())")
+        await #expect(throws: (any Error).self) {
+            _ = try await GraphSplitFixture.provider(http).splitSeries(
+                eventId: "ser-1", recurrenceId: GraphSplitFixture.recurrenceId, recurrenceIdZone: .current, patch: GCalEventInput())
+        }
+        #expect(http.recordedCalls().allSatisfy { $0.method == "GET" }, "written: \(http.servedCallSequence())")
+        #expect(graph.created.isEmpty)
+        #expect(canonical(graph.event("ser-1")?["recurrence"]) == canonical(series["recurrence"]), "the series was changed")
     }
 
     @Test("attendees keep their name and type; one the edit adds is required")
@@ -786,22 +771,42 @@ struct ExchangeSeriesSplitCopyTests {
         #expect(canonical(graph.event("ser-1")?["recurrence"]) == canonical(series["recurrence"]), "the series was changed")
     }
 
-    @Test("a failed create puts the stored recurrence back exactly")
-    func failedCreateRestoresTheRecurrence() async throws {
+    @Test("a failed create leaves the series untouched: the new part is written before the cap (#601)")
+    func failedCreateLeavesTheSeriesUntouched() async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
         let series = GraphSplitFixture.series(range: GraphSplitFixture.numbered)
         let graph = GraphSplitFixture.calendar(series)
         graph.install(on: http)
         graph.failNext("POST", with: 400)
+        let records = SplitRecordBox()
         await #expect(throws: (any Error).self) {
             _ = try await GraphSplitFixture.provider(http).splitSeries(
-                eventId: "ser-1", recurrenceId: GraphSplitFixture.recurrenceId, recurrenceIdZone: .current, patch: GCalEventInput())
+                calendarId: "primary", eventId: "ser-1", recurrenceId: GraphSplitFixture.recurrenceId,
+                recurrenceIdZone: .current, patch: GCalEventInput(), sendUpdates: "all", record: records.recorder)
         }
-        #expect(graph.patches("ser-1").count == 2, "expected the cap and the revert")
+        #expect(graph.patches("ser-1").isEmpty, "the series was written: \(graph.writes)")
         #expect(canonical(graph.event("ser-1")?["recurrence"]) == canonical(series["recurrence"]),
-                "the series' recurrence was not restored: \(canonical(graph.event("ser-1")?["recurrence"]))")
+                "the series' recurrence changed: \(canonical(graph.event("ser-1")?["recurrence"]))")
         #expect(graph.created.isEmpty)
+        #expect(records.records.isEmpty, "a record was kept for a create that failed: \(records.records)")
+    }
+
+    @Test("a failed record stops the split before the cap: the series is not capped (#601)")
+    func failedRecordStopsBeforeTheCap() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let series = GraphSplitFixture.series(range: GraphSplitFixture.numbered)
+        let graph = GraphSplitFixture.calendar(series)
+        graph.install(on: http)
+        let records = SplitRecordBox(failWith: SplitRecord.OperationGone())
+        await #expect(throws: SplitRecord.OperationGone.self) {
+            _ = try await GraphSplitFixture.provider(http).splitSeries(
+                calendarId: "primary", eventId: "ser-1", recurrenceId: GraphSplitFixture.recurrenceId,
+                recurrenceIdZone: .current, patch: GCalEventInput(), sendUpdates: "all", record: records.recorder)
+        }
+        #expect(graph.patches("ser-1").isEmpty, "the series was capped without a kept record: \(graph.writes)")
+        #expect(graph.writes == ["POST"], "\(graph.writes)")
     }
 
     @Test("a split at a recurrence_id at which no occurrence starts now writes nothing, and is the provider's absence", arguments: [

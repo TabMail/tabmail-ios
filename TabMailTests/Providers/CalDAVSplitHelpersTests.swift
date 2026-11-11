@@ -1073,7 +1073,20 @@ final class FakeCalDAVStore: Sendable {
         var resources: [String: Resource] = [:]
         var puts: [RecordedPut] = []
         var nextETag = 1
+        var failingPuts: [String: [Int]] = [:]
+        var putHook: (@Sendable (String) -> Void)?
     }
+
+    /// The next `PUT` of `path` is answered with `status` and changes nothing.
+    func failNextPUT(path: String, with status: Int) {
+        state.withLock { $0.failingPuts[path, default: []].append(status) }
+    }
+
+    /// Runs as each `PUT` arrives, with its path, before it is applied or refused.
+    func beforePUT(_ hook: @escaping @Sendable (String) -> Void) { state.withLock { $0.putHook = hook } }
+
+    /// The user deletes the resource at `path` in their calendar app.
+    func userDeletes(path: String) { _ = state.withLock { $0.resources.removeValue(forKey: path) } }
 
     private let state = Mutex(State())
 
@@ -1142,12 +1155,18 @@ final class FakeCalDAVStore: Sendable {
         let refused = refusesAttendeesWithoutOrganizer && VEventOracle.vevents(body).contains {
             !VEventOracle.own($0, "ATTENDEE").isEmpty && VEventOracle.own($0, "ORGANIZER").isEmpty
         }
+        let hook = state.withLock { $0.putHook }
+        hook?(path)
 
         return state.withLock { value -> FakeHTTP.CannedResponse in
             func record(_ returnedETag: String?) {
                 value.puts.append(RecordedPut(
                     path: path, ifMatch: ifMatch, ifNoneMatch: ifNoneMatch,
                     returnedETag: returnedETag))
+            }
+            if value.failingPuts[path]?.isEmpty == false, let status = value.failingPuts[path]?.removeFirst() {
+                record(nil)
+                return .raw(statusCode: status)
             }
             if refused {
                 record(nil)
@@ -1668,7 +1687,7 @@ struct CalDAVSplitRollbackTests {
 /// `AccountManager.isCalendarBadRequestError` — which matches
 /// `CalDAVError.httpError`, and whose own comment says "401/404/412 already map
 /// to dedicated cases" — returns false for it. It is not `notFound`,
-/// `missingScope`, `authFailed`, `unsupported` or `inconsistentState` either.
+/// `missingScope`, `authFailed` or `unsupported` either.
 /// So it falls to the generic arm ("Transient errors — always retry. NEVER drop
 /// on age alone"), is requeued with `retryCount += 1`, re-sends the identical
 /// `If-None-Match: *`, and 412s again forever. The drain then skips every later
@@ -2360,18 +2379,19 @@ struct CalDAVSplitSeriesTailTests {
         #expect(out.successorRRule == rule, "the new series must end where the original did. got \(String(describing: out.successorRRule))")
     }
 
-    @Test("A master already carrying this split's cap is a retry: the new series is written without an end")
-    func ownCapIsARetry() async throws {
+    @Test("A master already carrying this split's cap is not split again: refused with nothing written (#601)")
+    func ownCapIsRefused() async throws {
+        // A retry finds its own split through the operation's record (`SplitRecord`), never
+        // through the series' end: a series that already ends before the split has nothing left
+        // to split.
         let start = try Self.mondayInAuckland()
         let recurrenceId = Self.format(try Self.aucklandDays(7, after: start), "yyyy-MM-dd'T'HH:mm:ss", Self.utc)
         let cap = try #require(GoogleCalendarProvider.googleUntilString(beforeNaiveISO: recurrenceId, allDay: false, zone: Self.utc))
         let out = try await split(rrule: "RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR;UNTIL=\(cap)")
         #expect(out.recurrenceId == recurrenceId, "setup: the cap must be the one this split computes")
-        #expect(out.error == nil, """
-            refusing here retires the operation while the master stays capped with no new \
-            series. got \(String(describing: out.error))
-            """)
-        #expect(out.successorRRule == "RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR", "got \(String(describing: out.successorRRule))")
+        #expect(isRefusal(out.error), "got \(String(describing: out.error))")
+        #expect(out.puts.isEmpty, "got \(out.puts.map(\.path))")
+        #expect(out.master == out.originalMaster, "the master must be untouched")
     }
 
     @Test("A DAILY COUNT series' new half gets the occurrences the original had left")

@@ -94,8 +94,34 @@ import Synchronization
 /// outlook.timezone` names, with that zone's offset (`…T00:00:00+09:00`), and as
 /// a UTC instant (`…Z`) when the request names none. The zone is the one Graph
 /// knows by that name: `zones`, else `CalendarTimeZoneResolver`.
+///
+/// A `POST` carrying a `transactionId` an earlier `POST` carried is answered with the event that one
+/// made while it is still there, and makes a new event once it was deleted (measured 2026-11-10).
+/// `userDeletes` deletes an event as the user does in Outlook: a GET of it is then 404 (measured).
+/// `writes` is every write that arrived, in order; `beforeWrite` runs as one arrives.
 final class FakeGraphCalendar: Sendable {
     private let events: Mutex<[String: Data]>
+    private let transactions = Mutex<[String: String]>([:])
+    /// How many events a POST made; the next one's id is numbered after them, so a deleted
+    /// event's id is never given again.
+    private let creations = Mutex(0)
+    private let writeLog = Mutex<[String]>([])
+    private let writeHook = Mutex<(@Sendable (_ method: String, _ id: String) -> Void)?>(nil)
+
+    /// The user deletes `id` in their calendar app.
+    func userDeletes(_ id: String) { events.withLock { $0[id] = nil } }
+
+    /// `"PATCH <id>"` / `"POST"` for every write that arrived, refused ones included, in order.
+    var writes: [String] { writeLog.withLock { $0 } }
+
+    /// Runs as each write (`PATCH`, `POST`) arrives, before it is applied or refused.
+    func beforeWrite(_ hook: @escaping @Sendable (_ method: String, _ id: String) -> Void) { writeHook.withLock { $0 = hook } }
+
+    private func arrived(_ method: String, _ id: String) {
+        writeLog.withLock { $0.append(id.isEmpty ? method : "\(method) \(id)") }
+        let hook = writeHook.withLock { $0 }
+        hook?(method, id)
+    }
     private let resets = Mutex(0)
     private let patchLog = Mutex<[(id: String, body: Data)]>([])
     private let patchAuthorizationLog = Mutex<[String]>([])
@@ -322,8 +348,9 @@ final class FakeGraphCalendar: Sendable {
         }
         http.register(path: "/v1.0/me/events/", method: "PATCH") { [self] request in
             patchAuthorizationLog.withLock { $0.append(request.header("Authorization") ?? "none") }
-            if let status = takeFailure("PATCH") { return .status(status) }
             let parts = Self.pathParts(request.url)
+            arrived("PATCH", parts.first ?? "")
+            if let status = takeFailure("PATCH") { return .status(status) }
             guard parts.count == 1, var stored = event(parts[0]),
                   let body = request.body,
                   let patch = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any],
@@ -374,12 +401,19 @@ final class FakeGraphCalendar: Sendable {
             return Self.json(stored)
         }
         http.register(path: "/v1.0/me/events", method: "POST") { [self] request in
+            arrived("POST", "")
             if let status = takeFailure("POST") { return .status(status) }
             guard let body = request.body,
                   var created = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any],
                   Self.rangeHasStart(created)
             else { return .status(400) }
-            created["id"] = Self.createdPrefix + String(ids.filter { $0.hasPrefix(Self.createdPrefix) }.count + 1)
+            let transactionId = created["transactionId"] as? String
+            if let transactionId, let madeId = transactions.withLock({ $0[transactionId] }), let made = event(madeId) {
+                if takeLoss("POST") { return .transportError(.networkConnectionLost) }
+                return Self.json(made)
+            }
+            created["id"] = Self.createdPrefix + String(creations.withLock { n in n += 1; return n })
+            if let transactionId, let id = created["id"] as? String { transactions.withLock { $0[transactionId] = id } }
             Self.defaultRecurrenceZone(in: &created)
             store(created)
             if takeLoss("POST") { return .transportError(.networkConnectionLost) }
@@ -479,7 +513,8 @@ final class FakeGraphCalendar: Sendable {
         return wall(written) == wall(stored) && written["timeZone"] as? String == stored["timeZone"] as? String
     }
 
-    private func store(_ event: [String: Any]) {
+    /// Puts `event` in the calendar, replacing the one with its id: a write, or another client's change.
+    func store(_ event: [String: Any]) {
         // swiftlint:disable:next force_try
         let data = try! JSONSerialization.data(withJSONObject: event)
         // swiftlint:disable:next force_cast

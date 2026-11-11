@@ -188,20 +188,19 @@ struct GoogleSplitSeriesTailTests {
                 "the cap told every attendee the series changed: \(caps[0].url)")
     }
 
-    @Test("A master already carrying this split's cap is a retry: the new series is written without an end")
-    func ownCapIsARetry() async throws {
+    @Test("A master already carrying this split's cap is not split again: refused with nothing written (#601)")
+    func ownCapIsRefused() async throws {
+        // A retry finds its own split through the operation's record (`SplitRecord`), never
+        // through the series' end: a series that already ends before the split has nothing left
+        // to split.
         let start = try Self.mondayInAuckland()
         let recurrenceId = Self.format(try Self.aucklandDays(7, after: start), "yyyy-MM-dd'T'HH:mm:ss", Self.utc)
         let cap = try #require(GoogleCalendarProvider.googleUntilString(beforeNaiveISO: recurrenceId, allDay: false, zone: Self.utc))
-        // The cap ended the series before the occurrence, so the series no longer lists it: this
-        // split's own cap is not asked again.
-        let out = try await split(rrule: "RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR;UNTIL=\(cap)", listed: false)
+        let out = try await split(rrule: "RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR;UNTIL=\(cap)")
         #expect(out.recurrenceId == recurrenceId, "setup: the cap must be the one this split computes")
-        #expect(out.error == nil, """
-            refusing here retires the operation while the master stays capped with no new \
-            series. got \(String(describing: out.error))
-            """)
-        #expect(out.created == ["RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR"], "got \(String(describing: out.created))")
+        #expect(isRefusal(out.error), "got \(String(describing: out.error))")
+        #expect(!out.calls.contains { $0.method != "GET" }, "got \(out.wire)")
+        #expect(out.created == nil, "got \(String(describing: out.created))")
     }
 
     @Test("A DAILY COUNT series' new half gets the occurrences the original had left")

@@ -99,12 +99,10 @@ enum RecurrenceTail {
     /// - `split`: the split occurrence's day, in the same frame.
     /// - `capUntil`: the `UNTIL` value this split caps the original series with.
     ///
-    /// An `UNTIL` equal to `capUntil` is this split's own cap: the master was
-    /// capped by an earlier attempt whose new series may or may not exist. The
-    /// caller's duplicate check returns an existing new series; otherwise the new
-    /// series gets no end, because the original end can no longer be read and
-    /// refusing would retire the operation with the master capped and no
-    /// successor.
+    /// An `UNTIL` equal to `capUntil` (the series already carries this split's own
+    /// cap) ends the series before the split like any earlier one, and is refused:
+    /// a split whose cap was written is finished from its `SplitRecord`
+    /// (`CalendarProvider.finishSplit`), never by running the split again (#601).
     ///
     /// Throws `CalendarProviderError.notSupported` when the original series ends
     /// before the split, or when its end cannot be carried over (a COUNT this
@@ -131,7 +129,6 @@ enum RecurrenceTail {
 
         case (1, 0):
             let until = String(untils[0].dropFirst("UNTIL=".count)).uppercased()
-            if until == capUntil.uppercased() { return openEnded }
             guard let endsBefore = untilIsBeforeSplit(until, split: split, capUntil: capUntil) else {
                 throw CalendarProviderError.notSupported(
                     "Can't split this series: its repeat rule ends on \(until), which can't be compared with \(splitText). Edit the whole series instead.")
@@ -230,26 +227,59 @@ enum RecurrenceTail {
         case lastDay
     }
 
-    /// Whether `rrule`'s `UNTIL` is `capUntil`: this split's own cap, written by an earlier attempt
-    /// (see `newSeriesRule`).
-    static func isCapped(_ rrule: String, at capUntil: String) -> Bool {
+    /// Whether the series whose rule is `rrule` already ends before the split: the split's
+    /// `finishSplit` writes no cap then (#601), as the cap landed already or the series was ended
+    /// earlier. A rule with no end does not. An `UNTIL` is compared as `untilIsBeforeSplit` does;
+    /// a `COUNT` ends before the split when the occurrences the rule generates before it
+    /// (`occurrences`, read with `anchor` and `missingDay`) are at least the count.
+    ///
+    /// Throws `CalendarProviderError.notSupported` when it cannot be told: an `UNTIL` that
+    /// can't be compared, a `COUNT` that is invalid or can't be counted, or both ends at once.
+    static func endsBeforeSplit(
+        _ rrule: String,
+        seriesStart: Day?,
+        split: Day?,
+        capUntil: String,
+        anchor: Anchor = .dtstart,
+        missingDay: MissingMonthDay = .skip
+    ) throws -> Bool {
         let prefix = "RRULE:"
         let body = rrule.uppercased().hasPrefix(prefix) ? String(rrule.dropFirst(prefix.count)) : rrule
-        return body.split(separator: ";").contains { $0.uppercased() == "UNTIL=" + capUntil.uppercased() }
+        let parts = body.split(separator: ";").map(String.init)
+        let untils = parts.filter { $0.uppercased().hasPrefix("UNTIL=") }
+        let counts = parts.filter { $0.uppercased().hasPrefix("COUNT=") }
+        let refusal = CalendarProviderError.notSupported(
+            "Can't finish this change to the repeating event: its repeat rule (\(body)) can't be compared with the occurrence the change starts at. Check the event's later occurrences in your calendar app.")
+        switch (untils.count, counts.count) {
+        case (0, 0):
+            return false
+        case (1, 0):
+            let until = String(untils[0].dropFirst("UNTIL=".count))
+            guard let before = untilIsBeforeSplit(until, split: split, capUntil: capUntil) else { throw refusal }
+            return before
+        case (0, 1):
+            guard let count = Int(counts[0].dropFirst("COUNT=".count)), count >= 1,
+                  let seriesStart, let split,
+                  let before = occurrences(of: rrule, seriesStart: seriesStart, before: split, anchor: anchor, missingDay: missingDay)
+            else { throw refusal }
+            return before >= count
+        default:
+            throw refusal
+        }
     }
 
     /// Whether an `UNTIL` value ends the series before the split occurrence.
     /// nil when it cannot be decided.
     ///
     /// Two UTC date-times compare exactly: the cap is one second before the
-    /// split instant, so an `UNTIL` earlier than the cap is earlier than the
-    /// split. Any other pairing compares whole days, and a DATE `UNTIL` is
-    /// inclusive of its whole day, so it is before the split only when its day
-    /// is earlier than the split's.
+    /// split instant, so an `UNTIL` at or before the cap (this split's own cap
+    /// among them) is before the split. Any other pairing compares whole days,
+    /// and a DATE `UNTIL` is inclusive of its whole day, so it is before the
+    /// split only when its day is earlier than the split's.
     static func untilIsBeforeSplit(_ until: String, split: Day?, capUntil: String) -> Bool? {
         let until = until.uppercased()
         let cap = capUntil.uppercased()
-        if isUTCDateTime(until), isUTCDateTime(cap) { return until < cap }
+        if isUTCDateTime(until), isUTCDateTime(cap) { return until <= cap }
         guard let untilDay = Day(ical: until), let split else { return nil }
         return untilDay < split
     }

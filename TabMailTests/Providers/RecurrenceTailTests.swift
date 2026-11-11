@@ -281,22 +281,49 @@ struct RecurrenceTailNewSeriesRuleTests {
         #expect(refuses("RRULE:FREQ=DAILY;UNTIL=20990304T170000Z"))
     }
 
-    @Test("An UNTIL equal to this split's own cap gives the new series no end")
-    func ownCapIsARetry() throws {
-        #expect(try rule("RRULE:FREQ=DAILY;UNTIL=20990306T165959Z") == "RRULE:FREQ=DAILY")
-        #expect(try rule("RRULE:FREQ=DAILY;until=20990306t165959z") == "RRULE:FREQ=DAILY")
-        #expect(try rule("RRULE:FREQ=DAILY;UNTIL=20990305", cap: Self.allDayCap) == "RRULE:FREQ=DAILY")
+    @Test("An UNTIL equal to this split's own cap ends the series before the split: refused, never an open end (#601)")
+    func ownCapIsRefused() {
+        // A series that already carries the split's cap is finished from the split's record
+        // (`finishSplit`), never by running the split again; a new part with no end would be a
+        // series the user never had.
+        #expect(refuses("RRULE:FREQ=DAILY;UNTIL=20990306T165959Z"))
+        #expect(refuses("RRULE:FREQ=DAILY;until=20990306t165959z"))
+        #expect(refuses("RRULE:FREQ=DAILY;UNTIL=20990305", cap: Self.allDayCap))
     }
 
-    @Test("A rule is capped at this split only when its UNTIL is this split's own cap")
-    func isCappedOnlyAtItsOwnCap() {
-        #expect(RecurrenceTail.isCapped("RRULE:FREQ=DAILY;UNTIL=20990306T165959Z", at: Self.timedCap))
-        #expect(RecurrenceTail.isCapped("rrule:freq=daily;until=20990306t165959z", at: Self.timedCap))
-        #expect(RecurrenceTail.isCapped("FREQ=WEEKLY;UNTIL=20990305;BYDAY=MO", at: Self.allDayCap))
-        #expect(!RecurrenceTail.isCapped("RRULE:FREQ=DAILY", at: Self.timedCap))
-        #expect(!RecurrenceTail.isCapped("RRULE:FREQ=DAILY;UNTIL=20990306T165958Z", at: Self.timedCap), "one second before the cap")
-        #expect(!RecurrenceTail.isCapped("RRULE:FREQ=DAILY;UNTIL=20991231T235959Z", at: Self.timedCap))
-        #expect(!RecurrenceTail.isCapped("RRULE:FREQ=DAILY;COUNT=20990305", at: Self.allDayCap), "a COUNT is no UNTIL")
+    @Test("endsBeforeSplit: a series already ending at or before the split's cap ends before it (#601)")
+    func endsBeforeSplitReadsEveryEnd() throws {
+        func ends(_ rrule: String, start: RecurrenceTail.Day? = Self.start, cap: String = Self.timedCap,
+                  anchor: RecurrenceTail.Anchor = .dtstart, missingDay: RecurrenceTail.MissingMonthDay = .skip) throws -> Bool {
+            try RecurrenceTail.endsBeforeSplit(
+                rrule, seriesStart: start, split: Self.split, capUntil: cap, anchor: anchor, missingDay: missingDay)
+        }
+        // No end: never.
+        #expect(try ends("RRULE:FREQ=DAILY") == false)
+        // UNTIL: its own cap, and anything before it, ends before; the split instant and later do not.
+        #expect(try ends("RRULE:FREQ=DAILY;UNTIL=20990306T165959Z"))
+        #expect(try ends("RRULE:FREQ=DAILY;UNTIL=20990306T165958Z"))
+        #expect(try ends("RRULE:FREQ=DAILY;UNTIL=20990306T170000Z") == false)
+        #expect(try ends("RRULE:FREQ=DAILY;UNTIL=20991231T235959Z") == false)
+        // A DATE UNTIL covers its whole day.
+        #expect(try ends("RRULE:FREQ=DAILY;UNTIL=20990305", cap: Self.allDayCap))
+        #expect(try ends("RRULE:FREQ=DAILY;UNTIL=20990306", cap: Self.allDayCap) == false)
+        // COUNT: 2, 3, 4 and 5 March are before the split, so four ends before it and five does not.
+        #expect(try ends("RRULE:FREQ=DAILY;COUNT=4"))
+        #expect(try ends("RRULE:FREQ=DAILY;COUNT=3"))
+        #expect(try ends("RRULE:FREQ=DAILY;COUNT=5") == false)
+    }
+
+    @Test("endsBeforeSplit refuses what it can't tell, rather than guessing either way")
+    func endsBeforeSplitRefusesTheUndecidable() {
+        for (rrule, start) in [("RRULE:FREQ=DAILY;COUNT=4", nil as RecurrenceTail.Day?),
+                               ("RRULE:FREQ=YEARLY;BYYEARDAY=1;COUNT=4", Self.start),
+                               ("RRULE:FREQ=DAILY;COUNT=0", Self.start),
+                               ("RRULE:FREQ=DAILY;COUNT=4;UNTIL=20990310", Self.start)] {
+            #expect(throws: CalendarProviderError.self, "\(rrule)") {
+                try RecurrenceTail.endsBeforeSplit(rrule, seriesStart: start, split: Self.split, capUntil: Self.timedCap)
+            }
+        }
     }
 
     @Test("A DATE UNTIL covers its whole day")
