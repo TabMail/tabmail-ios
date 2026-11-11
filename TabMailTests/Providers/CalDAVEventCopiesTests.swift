@@ -43,7 +43,7 @@ private enum Fixture {
         "ORGANIZER;CN=Olivia:mailto:olivia@example.com",
         "ATTENDEE;CN=Olivia;PARTSTAT=ACCEPTED;ROLE=CHAIR:mailto:olivia@example.com",
         "ATTENDEE;CN=\"Doe, Alice\";ROLE=OPT-PARTICIPANT;PARTSTAT=ACCEPTED;RSVP=FALSE:mailto:alice@example.com",
-        "ATTENDEE;CN=Bob;ROLE=REQ-PARTICIPANT;PARTSTAT=DECLINED:mailto:bob@example.com",
+        "ATTENDEE;CN=Bob;CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;PARTSTAT=DECLINED:mailto:bob@example.com",
         "BEGIN:VALARM",
         "ACTION:DISPLAY",
         "DESCRIPTION:Reminder",
@@ -67,13 +67,17 @@ private enum Fixture {
         "ORGANIZER;CN=Olivia:mailto:olivia@example.com",
         "ATTENDEE;CN=Olivia;PARTSTAT=ACCEPTED;ROLE=CHAIR:mailto:olivia@example.com",
         "ATTENDEE;CN=\"Doe, Alice\";ROLE=OPT-PARTICIPANT;PARTSTAT=ACCEPTED;RSVP=FALSE:mailto:alice@example.com",
-        "ATTENDEE;CN=Bob;ROLE=REQ-PARTICIPANT;PARTSTAT=DECLINED:mailto:bob@example.com",
+        "ATTENDEE;CN=Bob;CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;PARTSTAT=DECLINED:mailto:bob@example.com",
         "BEGIN:VALARM",
         "ACTION:DISPLAY",
         "DESCRIPTION:Reminder",
         "TRIGGER:-PT15M",
         "END:VALARM",
     ]
+
+    /// The series' revision. A one-occurrence override keeps it; a split's new part is a new event
+    /// and starts without one (`newPartIdentity`).
+    static let sequence = "SEQUENCE:3"
 
     /// The folded DESCRIPTION exactly as the server wrote it (two physical lines).
     static let foldedDescription = "DESCRIPTION:A long description that the server folded across two physical l\r\n ines\\, with an escaped comma"
@@ -175,7 +179,8 @@ struct CalDAVEventCopiesTests {
     @Test("a copy keeps every property of the series that the edit does not change", arguments: CopyKind.allCases)
     func copyKeepsUnchangedProperties(_ kind: CopyKind) throws {
         let (block, resource) = try kind.copy(of: Fixture.richSeries, patch: Fixture.patch(summary: "Next phase"))
-        for line in Fixture.keptLines {
+        let kept = Fixture.keptLines + (kind == .occurrenceOverride ? [Fixture.sequence] : [])
+        for line in kept {
             #expect(block.contains(line), "the \(kind.rawValue) lost '\(line)':\n\(block.joined(separator: "\n"))")
         }
         #expect(block.contains("SUMMARY:Next phase"))
@@ -227,6 +232,7 @@ struct CalDAVEventCopiesTests {
         #expect(alice.contains("ROLE=OPT-PARTICIPANT") && alice.contains("CN=\"Doe, Alice\""), Comment(rawValue: alice))
         let bob = try #require(Fixture.attendee(block, "bob@example.com"))
         #expect(bob.contains("PARTSTAT=NEEDS-ACTION") && !bob.contains("DECLINED"), Comment(rawValue: bob))
+        #expect(bob.contains("CUTYPE=INDIVIDUAL") && bob.contains("ROLE=REQ-PARTICIPANT"), Comment(rawValue: bob))
     }
 
     @Test("an all-day series with no end: restating its date keeps the answers, moving it asks again")
@@ -312,6 +318,104 @@ struct CalDAVEventCopiesTests {
 }
 
 // MARK: - One-occurrence override
+
+/// A weekly series whose occurrence two weeks in was changed on its own, as another client may
+/// leave it: cancelled, with its own alert, categories, link, revision, `X-` line, and attendees
+/// who answered it differently from the series and are listed with other parameters. Every one of
+/// these lines differs from the series'. Dates are relative to today.
+private enum ChangedOccurrenceFixture {
+    static let utc = TimeZone(identifier: "UTC") ?? .current
+
+    /// The series' first start: 17:00 UTC, a week from today.
+    static let seriesStart: Date = {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = utc
+        return calendar.startOfDay(for: Date()).addingTimeInterval(7 * 86_400 + 17 * 3_600)
+    }()
+
+    /// The changed occurrence's original start (its `RECURRENCE-ID`), two weeks after the first.
+    static let slot = seriesStart.addingTimeInterval(14 * 86_400)
+    static let length: TimeInterval = 45 * 60
+
+    /// `20990520T170000Z`
+    static func icsUTC(_ date: Date) -> String { format(date, "yyyyMMdd'T'HHmmss'Z'") }
+    /// `2099-05-20T17:00:00`, the form `recurrence_id` takes in the series' frame.
+    static func naive(_ date: Date) -> String { format(date, "yyyy-MM-dd'T'HH:mm:ss") }
+    /// `2099-05-20T17:00:00Z`, the form a patch's start and end take.
+    static func isoUTC(_ date: Date) -> String { format(date, "yyyy-MM-dd'T'HH:mm:ss'Z'") }
+
+    private static func format(_ date: Date, _ pattern: String) -> String {
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.calendar = Calendar(identifier: .gregorian)
+        fmt.timeZone = utc
+        fmt.dateFormat = pattern
+        return fmt.string(from: date)
+    }
+
+    static let organizerAttendee = "ATTENDEE;CN=Olivia;PARTSTAT=ACCEPTED;ROLE=CHAIR:mailto:olivia@example.com"
+    static let alice = "ATTENDEE;CN=Alice;CUTYPE=GROUP;ROLE=OPT-PARTICIPANT;PARTSTAT=TENTATIVE;RSVP=FALSE:mailto:alice@example.com"
+    static let room = "ATTENDEE;CN=Room 4;CUTYPE=ROOM;ROLE=NON-PARTICIPANT;PARTSTAT=DECLINED:mailto:room-4@example.com"
+
+    /// The occurrence's own properties that no edit below names.
+    static let ownProperties = [
+        "STATUS:CANCELLED",
+        "CATEGORIES:Offsite,Travel",
+        "URL:https://example.com/occurrence",
+        "SEQUENCE:5",
+        "X-EXAMPLE-OCCURRENCE:kept",
+        "ORGANIZER;CN=Olivia:mailto:olivia@example.com",
+    ]
+
+    /// The occurrence's own alert, which is not the series'.
+    static let ownAlarm = [
+        "BEGIN:VALARM", "ACTION:DISPLAY", "DESCRIPTION:Occurrence reminder", "TRIGGER:-PT1H", "END:VALARM",
+    ]
+
+    static var resource: String {
+        let start = icsUTC(seriesStart)
+        return Fixture.series([
+            "BEGIN:VEVENT", "UID:series-10", "DTSTAMP:\(start)", "SEQUENCE:1",
+            "DTSTART:\(start)", "DTEND:\(icsUTC(seriesStart.addingTimeInterval(length)))", "RRULE:FREQ=WEEKLY",
+            "SUMMARY:Planning", "STATUS:CONFIRMED", "CATEGORIES:Work",
+            "ORGANIZER;CN=Olivia:mailto:olivia@example.com", organizerAttendee,
+            "ATTENDEE;CN=Alice;CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;PARTSTAT=ACCEPTED:mailto:alice@example.com",
+            "ATTENDEE;CN=Room 4;CUTYPE=ROOM;ROLE=NON-PARTICIPANT;PARTSTAT=ACCEPTED:mailto:room-4@example.com",
+            "BEGIN:VALARM", "ACTION:DISPLAY", "DESCRIPTION:Series reminder", "TRIGGER:-PT15M", "END:VALARM",
+            "END:VEVENT",
+            "BEGIN:VEVENT", "UID:series-10", "RECURRENCE-ID:\(icsUTC(slot))", "DTSTAMP:\(start)",
+            "DTSTART:\(icsUTC(slot))", "DTEND:\(icsUTC(slot.addingTimeInterval(length)))", "SUMMARY:Planning",
+        ] + ownProperties + [organizerAttendee, alice, room] + ownAlarm + [
+            "END:VEVENT",
+        ])
+    }
+}
+
+/// The edits made to the changed occurrence: none names its status, alert, categories, link,
+/// revision or `X-` line.
+enum ChangedOccurrenceEdit: String, CaseIterable, CustomTestStringConvertible, Sendable {
+    case rename = "a rename"
+    case attendeeAdded = "an attendee added"
+    case move = "a move"
+
+    var testDescription: String { rawValue }
+
+    var patch: GCalEventInput {
+        switch self {
+        case .rename:
+            return Fixture.patch(summary: "Planning, offsite")
+        case .attendeeAdded:
+            return Fixture.patch(attendees: [
+                ("olivia@example.com", "Olivia"), ("alice@example.com", "Alice"),
+                ("room-4@example.com", "Room 4"), ("carol@example.com", "Carol"),
+            ])
+        case .move:
+            let start = ChangedOccurrenceFixture.slot.addingTimeInterval(3_600)
+            return Fixture.patch(start: ChangedOccurrenceFixture.isoUTC(start),
+                                 end: ChangedOccurrenceFixture.isoUTC(start.addingTimeInterval(ChangedOccurrenceFixture.length)))
+        }
+    }
+}
 
 @Suite("CalDAV one-occurrence edit")
 struct CalDAVOccurrenceOverrideTests {
@@ -417,6 +521,53 @@ struct CalDAVOccurrenceOverrideTests {
             #expect(block.contains(line), "lost '\(line)':\n\(block.joined(separator: "\n"))")
         }
         #expect(block.filter { $0.hasPrefix("RECURRENCE-ID") } == ["RECURRENCE-ID;TZID=Europe/Paris:20990520T090000"])
+    }
+
+    @Test("an occurrence changed on its own keeps its status, alert, categories, link, revision and attendees through an edit",
+          arguments: ChangedOccurrenceEdit.allCases)
+    func changedOccurrenceKeepsItsOwnProperties(_ edit: ChangedOccurrenceEdit) throws {
+        typealias Stored = ChangedOccurrenceFixture
+        let stored = Stored.resource
+        let out = try Fixture.overrideEdit(stored, recurrenceId: Stored.naive(Stored.slot), patch: edit.patch)
+        let blocks = Fixture.overrides(out)
+        #expect(blocks.count == 1, "the occurrence has \(blocks.count) overrides:\n\(out)")
+        let block = try #require(blocks.first)
+        let text = Comment(rawValue: block.joined(separator: "\n"))
+
+        #expect(block.filter { $0.hasPrefix("RECURRENCE-ID") } == ["RECURRENCE-ID:\(Stored.icsUTC(Stored.slot))"], text)
+        for line in Stored.ownProperties {
+            #expect(block.contains(line), "lost '\(line)':\n\(block.joined(separator: "\n"))")
+        }
+        // The occurrence's own alert, whole and after its properties; never the series' alert.
+        let alarm = try #require(block.firstIndex(of: "BEGIN:VALARM"), text)
+        #expect(Array(block[alarm..<min(alarm + Stored.ownAlarm.count, block.count)]) == Stored.ownAlarm, text)
+        #expect(!block.contains("DESCRIPTION:Series reminder"), text)
+        // The series is untouched.
+        #expect(Fixture.master(out) == Fixture.master(stored))
+
+        let organizer = try #require(Fixture.attendee(block, "olivia@example.com"), text)
+        let alice = try #require(Fixture.attendee(block, "alice@example.com"), text)
+        let room = try #require(Fixture.attendee(block, "room-4@example.com"), text)
+        #expect(organizer == Stored.organizerAttendee)
+        switch edit {
+        case .rename:
+            #expect(block.contains("SUMMARY:Planning\\, offsite"), text)
+            #expect(alice == Stored.alice && room == Stored.room, text)
+        case .attendeeAdded:
+            #expect(alice == Stored.alice && room == Stored.room, text)
+            let carol = try #require(Fixture.attendee(block, "carol@example.com"), text)
+            #expect(carol.contains("PARTSTAT=NEEDS-ACTION") && carol.contains("RSVP=TRUE"), Comment(rawValue: carol))
+        case .move:
+            let start = Stored.slot.addingTimeInterval(3_600)
+            #expect(block.contains("DTSTART:\(Stored.icsUTC(start))"), text)
+            #expect(block.contains("DTEND:\(Stored.icsUTC(start.addingTimeInterval(Stored.length)))"), text)
+            // Asked again for the new time, each keeping how they are listed.
+            #expect(alice.contains("PARTSTAT=NEEDS-ACTION") && alice.contains("RSVP=TRUE"), Comment(rawValue: alice))
+            #expect(!alice.contains("TENTATIVE") && !alice.contains("RSVP=FALSE"), Comment(rawValue: alice))
+            #expect(alice.contains("CUTYPE=GROUP") && alice.contains("ROLE=OPT-PARTICIPANT") && alice.contains("CN=Alice"), Comment(rawValue: alice))
+            #expect(room.contains("PARTSTAT=NEEDS-ACTION") && !room.contains("DECLINED"), Comment(rawValue: room))
+            #expect(room.contains("CUTYPE=ROOM") && room.contains("ROLE=NON-PARTICIPANT") && room.contains("CN=Room 4"), Comment(rawValue: room))
+        }
     }
 
     @Test("an override with attendees but no organizer gets the series' organizer ahead of them")
