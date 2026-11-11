@@ -892,18 +892,30 @@ struct CalDAVCalendarEditKeepsKindTests {
         #expect(rows.isEmpty)
     }
 
-    @Test("a change of kind that gives only a start is refused with nothing written")
-    func kindChangeWithoutAnEndIsRefused() async throws {
+    /// Both directions, each with only a start or only an end. A timed event made all-day with only an
+    /// end gives an end after the stored start, so the queue's own end check passes it to the provider.
+    @Test("a change of kind that gives only a start or only an end is refused with nothing written, both ways",
+          arguments: [true, false], ["start", "end"])
+    func kindChangeWithoutAnEndIsRefused(_ toAllDay: Bool, _ given: String) async throws {
         let store = FakeCalDAVStore(servesETags: true)
-        let stored = Self.allDayICS(uid: "cv-3", start: day(0), end: day(1), recurring: false)
+        let stored = toAllDay
+            ? Self.timedICS(uid: "cv-3", day: day(0), end: "DTEND:\(compact(day(0)))T100000Z")
+            : Self.allDayICS(uid: "cv-3", start: day(0), end: day(1), recurring: false)
         store.seed(path: "/cal/cv-3.ics", ics: stored)
-        let rows = try await run(store, eventId: "/cal/cv-3.ics", [
-            "all_day": .bool(false), "start_iso": .string("\(day(7))T09:00:00"), "timezone": .string("UTC"),
-        ], account: "kind-c-one-end")
-        #expect(store.recordedPuts().isEmpty, "wrote \(store.recordedPuts().map(\.path))")
-        #expect(store.storedICS(path: "/cal/cv-3.ics") == stored)
+        var arguments: [String: JSONValue] = ["all_day": .bool(toAllDay), "timezone": .string("UTC")]
+        switch (toAllDay, given) {
+        case (true, "start"): arguments["start_iso"] = .string(day(7))
+        case (true, _): arguments["end_iso"] = .string(day(8))
+        case (false, "start"): arguments["start_iso"] = .string("\(day(7))T09:00:00")
+        default: arguments["end_iso"] = .string("\(day(7))T10:00:00")
+        }
+        let label = "\(toAllDay ? "to all-day" : "to timed"), \(given) only"
+        let rows = try await run(store, eventId: "/cal/cv-3.ics", arguments,
+                                 account: "kind-c-one-end-\(toAllDay)-\(given)")
+        #expect(store.recordedPuts().isEmpty, "\(label): wrote \(store.recordedPuts().map(\.path))")
+        #expect(store.storedICS(path: "/cal/cv-3.ics") == stored, "\(label): the event changed")
         #expect(rows.first?.failureReason?.contains(CalDAVProvider.kindChangeNeedsBothMessage) == true,
-                "reason: \(rows.first?.failureReason ?? "<none>")")
+                "\(label): reason: \(rows.first?.failureReason ?? "<none>")")
     }
 
     /// A timed weekly series made all-day, or an all-day weekly series made timed at times of one day.
@@ -933,19 +945,36 @@ struct CalDAVCalendarEditKeepsKindTests {
                 "\(label): reason: \(rows.first?.failureReason ?? "<none>")")
     }
 
-    @Test("a change of kind on an event that repeats only by added dates (RDATE) is refused with nothing written")
-    func kindChangeOnAnRDateSeriesIsRefused() async throws {
+    /// A timed event that repeats only by added dates (RDATE), or whose master has no rule or dates
+    /// at all but whose resource holds a changed occurrence (a second VEVENT with RECURRENCE-ID).
+    @Test("a change of kind on an event that repeats only by added dates, or only by a changed occurrence, is refused with nothing written",
+          arguments: ["rdate", "changed occurrence"])
+    func kindChangeOnAnRDateSeriesIsRefused(_ fixture: String) async throws {
         let store = FakeCalDAVStore(servesETags: true)
-        let stored = Self.timedICS(uid: "cv-5", day: day(0), end: "DTEND:\(compact(day(0)))T100000Z",
+        let stored: String
+        if fixture == "rdate" {
+            stored = Self.timedICS(uid: "cv-5", day: day(0), end: "DTEND:\(compact(day(0)))T100000Z",
                                    extra: ["RDATE:\(compact(day(7)))T090000Z"])
+        } else {
+            stored = [
+                "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//TabMail//Test//EN",
+                "BEGIN:VEVENT", "UID:cv-5", "DTSTAMP:\(compact(day(-14)))T000000Z",
+                "DTSTART:\(compact(day(0)))T090000Z", "DTEND:\(compact(day(0)))T100000Z", "SUMMARY:Planning",
+                "END:VEVENT",
+                "BEGIN:VEVENT", "UID:cv-5", "DTSTAMP:\(compact(day(-14)))T000000Z",
+                "RECURRENCE-ID:\(compact(day(0)))T090000Z",
+                "DTSTART:\(compact(day(0)))T110000Z", "DTEND:\(compact(day(0)))T120000Z", "SUMMARY:Planning",
+                "END:VEVENT", "END:VCALENDAR",
+            ].joined(separator: "\r\n")
+        }
         store.seed(path: "/cal/cv-5.ics", ics: stored)
         let rows = try await run(store, eventId: "/cal/cv-5.ics", [
             "all_day": .bool(true), "start_iso": .string(day(7)), "end_iso": .string(day(8)), "edit_scope": .string("all"),
-        ], account: "kind-c-rdate")
-        #expect(store.recordedPuts().isEmpty, "wrote \(store.recordedPuts().map(\.path))")
-        #expect(store.storedICS(path: "/cal/cv-5.ics") == stored, "the event changed")
+        ], account: "kind-c-repeats-\(fixture)")
+        #expect(store.recordedPuts().isEmpty, "\(fixture): wrote \(store.recordedPuts().map(\.path))")
+        #expect(store.storedICS(path: "/cal/cv-5.ics") == stored, "\(fixture): the event changed")
         #expect(rows.first?.failureReason?.contains(CalDAVProvider.kindChangeOnRepeatingMessage) == true,
-                "reason: \(rows.first?.failureReason ?? "<none>")")
+                "\(fixture): reason: \(rows.first?.failureReason ?? "<none>")")
     }
 
     @Test("a zoned event that does not repeat, stored with a VTIMEZONE whose rules repeat, becomes all-day")

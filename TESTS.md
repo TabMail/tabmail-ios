@@ -663,8 +663,10 @@ A stated `all_day` that differs from the stored kind, on CalDAV (`CalDAVCalendar
 start and an end, an all-day event becomes timed at those times and a timed one (stored with `DTEND` or with
 `DURATION`) becomes all-day on those dates, with the rest of the event kept, and a zoned event stored with a
 VTIMEZONE whose own rules repeat converts with the VTIMEZONE kept byte for byte. A change that gives only a
-start, a change on a repeating event on every `edit_scope` in both directions (a timed series made all-day,
-an all-day series given times of one day), and a change on an event that repeats only by `RDATE`, are refused
+start or only an end, in both directions, a change on a repeating event on every `edit_scope` in both
+directions (a timed series made all-day, an all-day series given times of one day), and a change on an event
+that repeats only by `RDATE` or only by a changed occurrence (a master with no rule plus a VEVENT with
+`RECURRENCE-ID`, on `all`), are refused
 with nothing written and the stored event byte-identical. `CalDAVOccurrenceOverrideTests` refuses times on an
 all-day occurrence rather than writing their dates.
 
