@@ -76,6 +76,7 @@ private let kindChangeTimesHint = "to change this event between all-day and time
 final class FakeGoogleCalendar: Sendable {
     private let events: Mutex<[String: Data]>
     private let writeLog = Mutex<[String]>([])
+    private let patchLog = Mutex<[(id: String, body: Data)]>([])
     private let resets = Mutex(0)
     private let lostResponses = Mutex<[String: Int]>([:])
 
@@ -113,6 +114,12 @@ final class FakeGoogleCalendar: Sendable {
 
     var ids: Set<String> { events.withLock { Set($0.keys) } }
 
+    /// The bodies of the PATCHes of `id` that landed, in order.
+    func patchBodies(_ id: String) -> [[String: Any]] {
+        patchLog.withLock { $0 }.filter { $0.id == id }
+            .compactMap { (try? JSONSerialization.jsonObject(with: $0.body)) as? [String: Any] }
+    }
+
     func install(on http: FakeHTTP.Scenario) {
         let prefix = "/calendar/v3/calendars/primary/events"
         http.register(path: prefix + "/", method: "GET") { [self] request in
@@ -148,6 +155,7 @@ final class FakeGoogleCalendar: Sendable {
             for (key, value) in patch { stored[key] = value }
             store(stored)
             writeLog.withLock { $0.append("PATCH \(parts[0])") }
+            patchLog.withLock { $0.append((parts[0], body)) }
             if takeLoss("PATCH") { return .transportError(.networkConnectionLost) }
             return Self.json(stored)
         }

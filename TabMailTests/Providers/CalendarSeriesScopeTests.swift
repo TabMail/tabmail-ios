@@ -1132,6 +1132,39 @@ struct CalendarSeriesScopeResetNoteTests {
                                  eventId: GoogleSeries.first, account: "series-note-g-clock-pair", seed: seed)
     }
 
+    @Test("Google: a Tokyo series given its own instants in Asia/Seoul with a new title PATCHes no start or end, and the card shows no reset")
+    func googleSameZoneUnderAnotherNameSendsNoTimes() async throws {
+        // Asia/Tokyo and Asia/Seoul are both UTC+9 with no clock changes: one zone (`googleZone`).
+        let seed = GoogleSeries.rezoned(GoogleSeries.calendar, "Asia/Tokyo")
+        let r = try await googleTool([
+            "start_iso": .string(wallTime("\(day(7))T09:00:00", in: "Asia/Seoul")),
+            "end_iso": .string(wallTime("\(day(7))T09:30:00", in: "Asia/Seoul")),
+            "title": .string("Team standup"), "timezone": .string("Asia/Seoul"),
+        ], eventId: GoogleSeries.later, account: "series-note-g-seoul", seed: seed)
+        #expect(r.run.cards.first?.changes.contains(CalendarToolHelpers.ruleChangeResetNote) == false,
+                "card: \(r.run.cards.first?.changes ?? [])")
+        let bodies = r.calendar.patchBodies(GoogleSeries.id)
+        #expect(bodies.count == 1, "writes: \(r.calendar.writes)")
+        #expect(bodies.first?["summary"] as? String == "Team standup", "body: \(bodies)")
+        #expect(bodies.first?["start"] == nil && bodies.first?["end"] == nil, "a start or end was sent: \(bodies)")
+        #expect(r.calendar.seriesResets == 0, "the series was reset: \(r.calendar.writes)")
+        let start = r.calendar.event(GoogleSeries.id)?["start"] as? [String: Any]
+        #expect(start?["timeZone"] as? String == "Asia/Tokyo", "start: \(String(describing: start))")
+    }
+
+    @Test("Google: a new time of every occurrence PATCHes the series' start and end together")
+    func googleMoveSendsStartAndEnd() async throws {
+        let r = try await googleTool([
+            "start_iso": .string("\(day(7))T11:00:00"), "timezone": .string("UTC"),
+        ], eventId: GoogleSeries.later, account: "series-note-g-move-body")
+        let bodies = r.calendar.patchBodies(GoogleSeries.id)
+        #expect(bodies.count == 1, "writes: \(r.calendar.writes)")
+        let start = bodies.first?["start"] as? [String: Any], end = bodies.first?["end"] as? [String: Any]
+        #expect(instant(start) == utcAt("\(day(0))T11:00:00") && instant(end) == utcAt("\(day(0))T11:30:00"),
+                "start \(String(describing: start)), end \(String(describing: end))")
+        #expect(r.calendar.seriesResets == 1, "the write did not reset the series: \(r.calendar.writes)")
+    }
+
     @Test("Outlook: a new time of every occurrence named from a later occurrence warns on the card, and the series is reset")
     func outlookLaterOccurrenceTimeWarnsAndResets() async throws {
         let graph = GraphSeries.calendar()

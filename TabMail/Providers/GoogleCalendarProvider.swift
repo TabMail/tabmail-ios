@@ -612,7 +612,20 @@ actor GoogleCalendarProvider: CalendarProvider {
         let merged = Self.mergeExistingEventWithPatch(existing: existing, patch: edit)
         let encodedCalId = try Self.encodedPathSegment(calendarId, "Google calendar id")
         let encodedEventId = try Self.encodedPathSegment(eventId, "Google event id")
-        let body = try JSONSerialization.data(withJSONObject: Self.editJSON(merged, stored: existingJSON))
+        var json = Self.editJSON(merged, stored: existingJSON)
+        // A series edit whose start and end are the series' own as Google reads them (`googleTimes`,
+        // through `movesSeriesTime`: the one decision the card's reset note takes too) sends neither,
+        // so Google keeps the stored pair and its zone, and resets nothing. The pair is decided
+        // together: when either differs, both are sent, as merged (`mergeExistingEventWithPatch`
+        // derives a side the edit does not give from the stored duration), so Google never gets a
+        // start without its end, or one side changed against the other's stored zone. Omitting both
+        // is safe because PATCH keeps what it is not sent: the stored pair, already consistent.
+        if keepStoredDates, existing.recurrence?.isEmpty == false,
+           !Self.movesSeriesTime(edit, existing: existing, as: Self.googleTimes) {
+            json["start"] = nil
+            json["end"] = nil
+        }
+        let body = try JSONSerialization.data(withJSONObject: json)
         let data = try await request(
             path: "/calendars/\(encodedCalId)/events/\(encodedEventId)?sendUpdates=\(sendUpdates)",
             method: "PATCH",

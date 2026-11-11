@@ -122,8 +122,11 @@ whether it is an occurrence.
   the write names "GMT", is the series' own "UTC"), or when neither changes its clocks after that
   instant and both are at the same offset there ("Etc/UTC" and "UTC"; Atlantic/Reykjavik too). Two
   clock-changing zones at one offset today (America/New_York, America/Toronto) are never the same:
-  their rules may part. No alias list. The Google fake resets on the same key; whether Google itself
-  resets a series whose zone is only renamed to an equal one at the same instant is unmeasured.
+  their rules may part. No alias list. The Google fake resets on the same key. When the times are the
+  series' own under that comparison, the write sends no start or end (`patchEvent`, 2026-11-11), so the
+  stored zone stays and nothing resets; when either differs, both are sent.
+  [Superseded 2026-11-11: "whether Google itself resets a series whose zone is only renamed to an equal
+  one at the same instant is unmeasured" — the write no longer sends that rename.]
 - `AccountManagerCalendarQueue`, `.edit`: the same `read` and `route` again, writing `writeId`. An "all"
   edit that `route` sends to a later occurrence is refused (`laterOccurrenceRefusal`): it reaches the
   queue as "all" only when the series changed after the card, and the user confirmed every occurrence.
