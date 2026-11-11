@@ -764,7 +764,6 @@ extension AccountManager {
             throw ReauthenticationError.signInMethodMismatch
         }
         let accountId = promptAccount.id
-        guard !isRuntimeRemoved(accountId) else { throw ReauthenticationError.accountChanged }
         let (stored, calendar) = try await dbPool.read { db in
             (try Account.fetchOne(db, key: accountId),
              try CalDAVConfig.filter(Column("accountId") == accountId).fetchOne(db))

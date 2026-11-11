@@ -15,6 +15,9 @@ had an empty `.imap, .icloud, .caldav` arm, so the button did nothing.
   prompt's account (id, provider, calendar-only, address, IMAP user, host, port), stops the update
   before any server is asked: `ReauthenticationError.accountChanged`, alert line
   `AccountReauthAlert.accountChangedLine`. A runtime removal during the checks ends the same way.
+  There is no separate removal-fence check at plan time: removal commits the row delete before
+  `disconnectAccount(_:deletingCredentials:)` sets the fence, so the stored-row check already stops
+  a removed account (an early fence check was deleted as redundant; its mutant could not be killed).
 - **What is checked and saved, by kind** (model properties, no provider switch in the account layer):
   - Mail and calendar on one password (`mailAndCalendarShareOnePassword`, iCloud): the mail probe
     and the calendar (CalDAV discovery with the new password) must both accept; then both are
