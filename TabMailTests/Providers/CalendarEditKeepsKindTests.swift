@@ -194,8 +194,8 @@ final class FakeGoogleCalendar: Sendable {
 // MARK: - Driving the real queue
 
 /// One edit drained through `AccountManager.drainCalendarQueue` against `provider`, and the durable
-/// row afterwards.
-private func drainEdit(
+/// row afterwards. Shared with `CalDAVAlarmIsNotTheEventWriteTests`.
+func drainEdit(
     accountId: String,
     eventId: String,
     calendarId: String,

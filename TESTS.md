@@ -176,6 +176,27 @@ These tests read what each provider sent, or what the fake server ends up holdin
     changed occurrences' RECURRENCE-IDs with it (a changed occurrence's own time stays); the capped
     series keeps its own.
   - A whole-series edit keeps attendees and alarms.
+  - A series with an alert and no notes, renamed or moved, gives a copy of one occurrence or a
+    split's new part with no notes and the alert as stored (`alertOnlySeriesCopyHasNoNotes`, #603).
+- `CalDAVAlarmIsNotTheEventTests` (#603): an alarm's properties are never the event's.
+  - Reading: `ICSParser.parse`, `getEvent` and `listEvents` (no range, and a range that expands the
+    series into occurrences) give the event's own title, notes, attendees and length, with a
+    DISPLAY, EMAIL, repeating or UID-carrying alarm placed after or before the event's properties;
+    `extractUID` gives the event's UID when an alarm with its own comes first.
+  - Writing, through the real calendar queue on `all`, `this_only` and `this_and_following`: adding
+    an attendee never writes the alarm's recipient as one, adding to the notes builds on the
+    event's own notes, and a rename leaves every alarm byte for byte.
+  - Pins of how a VEVENT is read, kept green across the move of `ICSParser` onto the writer's
+    helpers: trailing whitespace, CRLF and bare-LF folding, the series read when a changed
+    occurrence comes first, a lower-case nested component, a `BEGIN:VEVENT`/`END:VEVENT` line with
+    trailing whitespace (read by `ICSParserTests`; read and written by `CalDAVMergePatchTests`,
+    through the merge, `replaceRRule`, a moved start's `shiftSeriesAnchoredValues`, a new or
+    repeated one-occurrence change's `spliceOrReplaceOverride` (also with a padded `END:VCALENDAR`)
+    and a split's `seriesSplitResources`; a folded continuation reading ` END:VEVENT` is not a
+    component line), a lower-case EMAIL alarm after the event's properties (`ICSParserTests`),
+    the master readers (`extractUID` … `masterStartWallTime`) across frames and layouts
+    (`CalDAVRecurringHelpersTests`), and `ICSParserOutputPinTests`, a field-by-field pin of
+    `ICSParser.parse` for alarm-free resources.
 - `CalDAVSplitRefusedBeforeWriteTests` (`CalDAVSplitHelpersTests`, against `FakeCalDAVStore`): a
   series whose excluded dates can't be read is refused with no PUT and the resource unchanged.
 - `CalDAVSplitRollbackTests` (same file): the new part is written before the cap. A failed new

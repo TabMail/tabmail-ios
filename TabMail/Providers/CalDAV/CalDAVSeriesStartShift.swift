@@ -96,7 +96,7 @@ extension CalDAVProvider {
     /// Throws when it is present but is not a DATE or DATE-TIME RFC 5545
     /// allows: nothing tied to the start could then be moved correctly.
     static func masterStartWallTime(in ics: String) throws -> ICSWallTime? {
-        guard let line = masterVEventLines(from: ics).first(where: { $0.uppercased().hasPrefix("DTSTART") }) else {
+        guard let line = masterTopLevelLines(ics).first(where: { $0.uppercased().hasPrefix("DTSTART") }) else {
             return nil
         }
         guard let property = ICSProperty(line),
@@ -124,12 +124,12 @@ extension CalDAVProvider {
         var handledMaster = false
         var i = 0
         while i < lines.count {
-            guard lines[i] == "BEGIN:VEVENT" else {
+            guard isMarker(lines[i], "BEGIN:VEVENT") else {
                 output.append(lines[i]); i += 1; continue
             }
             var block: [String] = [lines[i]]
             i += 1
-            while i < lines.count && lines[i] != "END:VEVENT" {
+            while i < lines.count && !isMarker(lines[i], "END:VEVENT") {
                 block.append(lines[i])
                 i += 1
             }

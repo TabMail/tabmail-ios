@@ -489,6 +489,20 @@ extension CalDAVProvider {
     struct ICSUnit {
         var physical: [String]
         var text: String
+
+        /// True when this is the line `marker` (`isMarker(_:_:)`).
+        func isMarker(_ marker: String) -> Bool {
+            CalDAVProvider.isMarker(text, marker)
+        }
+    }
+
+    /// True when `line` is the component line `marker` (`BEGIN:VEVENT`, `END:VEVENT`,
+    /// `END:VCALENDAR`) with any trailing whitespace, so a server's trailing space after such a
+    /// line does not hide the VEVENT from the reader (`ICSParser`) or from any writer. The one rule
+    /// for every match of these lines in the CalDAV path. Leading whitespace is not ignored: on a
+    /// physical line it makes a folded continuation, never a component line.
+    static func isMarker(_ line: String, _ marker: String) -> Bool {
+        line.hasPrefix(marker) && line.dropFirst(marker.count).allSatisfy(\.isWhitespace)
     }
 
     static func icsUnits(_ ics: String) -> [ICSUnit] {
@@ -511,16 +525,18 @@ extension CalDAVProvider {
         while i < units.count {
             block.append(units[i])
             i += 1
-            if block.last?.text == "END:VEVENT" { break }
+            if block.last?.isMarker("END:VEVENT") == true { break }
         }
         return block
     }
 
-    private static func veventBlocks(_ units: [ICSUnit]) -> [[ICSUnit]] {
+    /// Every VEVENT of a resource, `BEGIN:VEVENT` through `END:VEVENT` inclusive, in document order.
+    /// `ICSParser` reads each one through `topLevel`, as the writer does.
+    static func veventBlocks(_ units: [ICSUnit]) -> [[ICSUnit]] {
         var blocks: [[ICSUnit]] = []
         var i = 0
         while i < units.count {
-            guard units[i].text == "BEGIN:VEVENT" else { i += 1; continue }
+            guard units[i].isMarker("BEGIN:VEVENT") else { i += 1; continue }
             blocks.append(takeVEvent(units, at: &i))
         }
         return blocks
@@ -532,6 +548,10 @@ extension CalDAVProvider {
     }
 
     /// The series VEVENT's own properties (not those of its alarms), as logical lines.
+    ///
+    /// Every reader of the series' properties goes through this, so it never sees a VTIMEZONE's
+    /// `STANDARD`/`DAYLIGHT` `DTSTART` and `RRULE` (a split capped by the zone's DST rule), an
+    /// override's lines, or a nested component's (an alarm's `UID`, RFC 9074).
     static func masterTopLevelLines(_ ics: String) -> [String] {
         guard let block = veventBlocks(icsUnits(ics)).first(where: { !isOverride($0) }) else { return [] }
         return topLevel(block).map(\.text)
@@ -548,7 +568,7 @@ extension CalDAVProvider {
         var out: [ICSUnit] = []
         var i = 0
         while i < units.count {
-            guard units[i].text == "BEGIN:VEVENT" else { out.append(units[i]); i += 1; continue }
+            guard units[i].isMarker("BEGIN:VEVENT") else { out.append(units[i]); i += 1; continue }
             let block = takeVEvent(units, at: &i)
             if let rewritten = try transform(block, !isOverride(block)) { out.append(contentsOf: rewritten) }
         }
@@ -563,7 +583,7 @@ extension CalDAVProvider {
         var i = 0
         var done = false
         while i < units.count {
-            guard !done, units[i].text == "BEGIN:VEVENT" else { out.append(units[i]); i += 1; continue }
+            guard !done, units[i].isMarker("BEGIN:VEVENT") else { out.append(units[i]); i += 1; continue }
             let block = takeVEvent(units, at: &i)
             if isOverride(block) {
                 out.append(contentsOf: block)
@@ -619,7 +639,7 @@ extension CalDAVProvider {
         let units = lines.map { ICSUnit(physical: [$0], text: $0) }
         let at = block.indices.dropFirst().first { idx in
             let upper = block[idx].text.uppercased()
-            return upper.hasPrefix("BEGIN:") || upper == "END:VEVENT"
+            return upper.hasPrefix("BEGIN:") || isMarker(upper, "END:VEVENT")
         } ?? block.endIndex
         var out = block
         out.insert(contentsOf: units, at: at)
