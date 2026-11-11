@@ -7,7 +7,8 @@
 EXDATE, RDATE, COUNT, recurrenceTimeZone, attendee answers, `needsAction`, write order,
 create first cap last, lost cap response, retry, own cap, `successorIsOurs`, `capEndDate`,
 RFC 6638 §3.2.8, PARTSTAT reset, `this_only` move asks again, Thunderbird add-on split only,
-LOCATION, `changedOccurrenceKeepsItsOwnProperties`, #604.
+LOCATION, `changedOccurrenceKeepsItsOwnProperties`, #604, VALARM, alarm, `ICSParser`, `topLevel`,
+`masterTopLevelLines`, `masterVEventLines` (retired), trailing whitespace, #603.
 
 ## The rule
 
@@ -143,6 +144,28 @@ amendment; that was true of the split only.
 - #604 (an occurrence edit that reset every answer and dropped the occurrence's alerts and status)
   described the override builder before #610; the copy above already fixed it.
   `changedOccurrenceKeepsItsOwnProperties` pins it.
+
+**Amendment (2026-11-10, #603): the reader sees a VEVENT through `topLevel`, as the writer does.**
+The copies above already kept an alarm inside its VALARM. The leak that remained was on the read
+side: `ICSParser` took every line between `BEGIN:VEVENT` and `END:VEVENT`, last value winning, and
+RFC 5545 puts alarms last. So a DISPLAY alert's text was read as the event's notes, an EMAIL
+alert's subject and recipient as its title and an attendee, and a repeating alert's `DURATION` as
+its length. Those values then went back to the server through edits (an attendee added wrote the
+alert's recipient as an attendee; notes "added to" overwrote the event's own with the alert text).
+
+- `ICSParser.components` reads each VEVENT through `CalDAVProvider.icsUnits`, `veventBlocks` and
+  `topLevel`: one depth rule shared by reader and writer, for masters and overrides alike, so the
+  occurrence listing (`CalDAVOccurrences`) reads the same way.
+- `masterVEventLines` (a whole-block reader) is gone; `extractUID`, `extractRRule`,
+  `masterDTStartDay`, `icsIsAllDay`, `masterDTStartKind`, `recurrenceIdKind` and
+  `masterStartWallTime` read `masterTopLevelLines`. An alarm's own `UID` (RFC 9074) placed before
+  the event's no longer answers `successorIsOurs`.
+- `ICSUnit.isMarker` matches `BEGIN:VEVENT`/`END:VEVENT` with surrounding whitespace ignored, so a
+  VEVENT whose marker line has trailing whitespace is read and written. `replaceRRule`,
+  `spliceOrReplaceOverride` and `shiftSeriesAnchoredValues` still match those lines exactly on
+  physical lines.
+- Tests: `CalDAVAlarmIsNotTheEventTests`; `TESTS.md`, "Repeating events — copies keep the series'
+  properties".
 
 ## Google attendee edits (#564)
 

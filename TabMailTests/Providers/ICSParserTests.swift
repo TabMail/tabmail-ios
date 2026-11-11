@@ -603,4 +603,20 @@ struct ICSParserTests {
         #expect(events[0].start?.dateTime == Self.pinStart.iso)
         #expect(events[0].end != nil)
     }
+
+    @Test("a VEVENT whose BEGIN or END line ends in whitespace is read",
+          arguments: ["BEGIN:VEVENT ", "BEGIN:VEVENT\t", "BEGIN:VEVENT"], ["END:VEVENT ", "END:VEVENT\t", "END:VEVENT"])
+    func paddedVEventMarkersAreRead(_ begin: String, _ end: String) {
+        let ics = [
+            "BEGIN:VCALENDAR", begin, "UID:series-1", "SUMMARY:Planning", "DESCRIPTION:Agenda",
+            "DTSTART:\(Self.pinStart.ics)", "DURATION:PT1H", end, "END:VCALENDAR",
+        ].joined(separator: "\r\n")
+        let events = ICSParser.parse(icsText: ics, resourceHref: "/cal/x.ics", etag: nil)
+        #expect(events.count == 1)
+        guard events.count == 1 else { return }
+        #expect(events[0].summary == "Planning")
+        #expect(events[0].description == "Agenda")
+        #expect(events[0].start?.dateTime == Self.pinStart.iso)
+        #expect(events[0].end != nil)
+    }
 }

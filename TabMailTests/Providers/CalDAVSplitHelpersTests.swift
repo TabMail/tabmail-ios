@@ -460,8 +460,8 @@ struct CalDAVRecurringHelpersTests {
         #expect(try CalDAVProvider.extractMasterDuration(from: ics) == TimeInterval(45 * 60))
     }
 
-    @Test("masterVEventLines picks the VEVENT with no RECURRENCE-ID, skipping override blocks")
-    func masterVEventLinesSkipsOverrides() {
+    @Test("masterTopLevelLines picks the VEVENT with no RECURRENCE-ID, skipping override blocks")
+    func masterTopLevelLinesSkipsOverrides() {
         // Master + an existing override in the same resource. The extractors
         // must read the MASTER (no RECURRENCE-ID), not the override.
         let ics = [
@@ -480,7 +480,7 @@ struct CalDAVRecurringHelpersTests {
             "END:VEVENT",
             "END:VCALENDAR",
         ].joined(separator: "\r\n") + "\r\n"
-        let masterLines = CalDAVProvider.masterVEventLines(from: ics)
+        let masterLines = CalDAVProvider.masterTopLevelLines(ics)
         #expect(masterLines.contains("RRULE:FREQ=WEEKLY"))
         #expect(masterLines.contains("SUMMARY:Master title"))
         #expect(!masterLines.contains("SUMMARY:Override title"))
@@ -810,6 +810,52 @@ struct CalDAVMergePatchTests {
         let rruleIdx = lines.firstIndex { $0.hasPrefix("RRULE:") }
         let endIdx = lines.firstIndex(of: "END:VEVENT")
         if let r = rruleIdx, let e = endIdx { #expect(r < e) }
+    }
+
+    /// Which of the VEVENT's own `BEGIN`/`END` lines a server wrote with trailing whitespace.
+    enum PaddedMarker: String, CaseIterable, Sendable {
+        case begin = "BEGIN:VEVENT"
+        case end = "END:VEVENT"
+        case both = "BEGIN:VEVENT and END:VEVENT"
+    }
+
+    @Test("a VEVENT whose BEGIN or END line ends in whitespace is still read and written",
+          arguments: PaddedMarker.allCases, [" ", "\t"])
+    func paddedVEventMarkersAreReadAndWritten(_ padded: PaddedMarker, _ pad: String) throws {
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = TimeZone(identifier: "UTC") ?? .current
+        let start = utc.startOfDay(for: Date().addingTimeInterval(10 * 86_400)).addingTimeInterval(9 * 3_600)
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.timeZone = utc.timeZone
+        fmt.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+        let begin = "BEGIN:VEVENT" + (padded == .end ? "" : pad)
+        let end = "END:VEVENT" + (padded == .begin ? "" : pad)
+        let ics = [
+            "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Example//Test//EN", begin,
+            "UID:padded-603", "DTSTAMP:\(fmt.string(from: Date()))", "DTSTART:\(fmt.string(from: start))",
+            "DURATION:PT1H", "SUMMARY:Planning", end, "END:VCALENDAR",
+        ].joined(separator: "\r\n") + "\r\n"
+
+        // Read as the writer reads it.
+        #expect(CalDAVProvider.extractUID(from: ics) == "padded-603")
+        #expect(CalDAVProvider.masterTopLevelLines(ics).contains("SUMMARY:Planning"))
+
+        // Written: a rename replaces the title and new notes go inside the VEVENT.
+        var patch = GCalEventInput()
+        patch.summary = "Planning review"
+        patch.description = "Agenda"
+        let merged = try CalDAVProvider.mergePatchIntoICS(ics, patch: patch)
+        let lines = merged.components(separatedBy: "\r\n")
+        let text = Comment(rawValue: merged)
+        #expect(lines.filter { $0.hasPrefix("SUMMARY") } == ["SUMMARY:Planning review"], text)
+        let beginAt = try #require(lines.firstIndex(of: begin), text)
+        let endAt = try #require(lines.firstIndex(of: end), text)
+        let notesAt = try #require(lines.firstIndex(of: "DESCRIPTION:Agenda"), text)
+        #expect(beginAt < notesAt && notesAt < endAt, text)
+        // Every line not changed is kept byte for byte, the padded ones included.
+        #expect(lines.filter { !$0.hasPrefix("SUMMARY") && !$0.hasPrefix("DESCRIPTION") }
+                == ics.components(separatedBy: "\r\n").filter { !$0.hasPrefix("SUMMARY") }, text)
     }
 }
 

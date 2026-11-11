@@ -676,42 +676,10 @@ actor CalDAVProvider: CalendarProvider {
 
     // MARK: - ICS Helpers (recurring edits)
 
-    /// Return the lines of the MASTER VEVENT in a CalDAV `.ics` resource — the
-    /// first `BEGIN:VEVENT…END:VEVENT` block that has NO `RECURRENCE-ID` line
-    /// (override VEVENTs carry one; the series master does not).
-    ///
-    /// CRITICAL: a CalDAV resource typically leads with a `VTIMEZONE` block
-    /// whose nested `STANDARD`/`DAYLIGHT` subcomponents have their OWN
-    /// `DTSTART` and `RRULE` lines (the timezone's DST rule). A naive
-    /// whole-resource scan for the "first RRULE/DTSTART" would pick up the
-    /// timezone's rule — catastrophic for `splitSeries` (it would cap the
-    /// series using `FREQ=YEARLY;BYMONTH=…`). Every VEVENT-scoped extractor
-    /// MUST go through this so it only ever sees the master event's lines.
-    static func masterVEventLines(from ics: String) -> [String] {
-        let all = Self.icsLines(ics)
-        var i = 0
-        while i < all.count {
-            guard all[i] == "BEGIN:VEVENT" else { i += 1; continue }
-            var block: [String] = []
-            var hasRecurrenceId = false
-            i += 1
-            while i < all.count && all[i] != "END:VEVENT" {
-                if all[i].hasPrefix("RECURRENCE-ID") { hasRecurrenceId = true }
-                block.append(all[i])
-                i += 1
-            }
-            i += 1  // step past END:VEVENT
-            // The master is the VEVENT with no RECURRENCE-ID. Override blocks
-            // (which carry one) are skipped — keep scanning.
-            if !hasRecurrenceId { return block }
-        }
-        return []
-    }
-
-    /// Pull the UID line from the MASTER VEVENT. Scoped via `masterVEventLines`
-    /// so a VTIMEZONE or override block can't shadow it.
+    /// Pull the UID line from the MASTER VEVENT. Scoped via `masterTopLevelLines`
+    /// so a VTIMEZONE, an override block or an alarm's own UID (RFC 9074) can't shadow it.
     static func extractUID(from ics: String) -> String? {
-        for line in Self.masterVEventLines(from: ics) {
+        for line in Self.masterTopLevelLines(ics) {
             if line.hasPrefix("UID:") {
                 return String(line.dropFirst("UID:".count)).trimmingCharacters(in: .whitespaces)
             }
@@ -722,7 +690,7 @@ actor CalDAVProvider: CalendarProvider {
     /// Pull the RRULE line (full text, incl. the `RRULE:` prefix) from the
     /// MASTER VEVENT. Scoped so a VTIMEZONE's DST RRULE can't be returned.
     static func extractRRule(from ics: String) -> String? {
-        for line in Self.masterVEventLines(from: ics) {
+        for line in Self.masterTopLevelLines(ics) {
             if line.hasPrefix("RRULE:") { return line }
         }
         return nil
@@ -732,7 +700,7 @@ actor CalDAVProvider: CalendarProvider {
     /// frame its RRULE expands in (its TZID, UTC for a `Z` value, or floating).
     /// Scoped like `icsIsAllDay` so a VTIMEZONE's DTSTART can't stand in for it.
     static func masterDTStartDay(from ics: String) -> RecurrenceTail.Day? {
-        for line in Self.masterVEventLines(from: ics) {
+        for line in Self.masterTopLevelLines(ics) {
             guard line.uppercased().hasPrefix("DTSTART"), let colonIdx = line.firstIndex(of: ":") else { continue }
             let value = String(line[line.index(after: colonIdx)...]).trimmingCharacters(in: .whitespaces)
             return RecurrenceTail.Day(ical: value)
@@ -745,7 +713,7 @@ actor CalDAVProvider: CalendarProvider {
     /// `T`. Scoped to the master VEVENT so a VTIMEZONE's `DTSTART:…T020000`
     /// can't mislead the check.
     static func icsIsAllDay(_ ics: String) -> Bool {
-        for line in Self.masterVEventLines(from: ics) {
+        for line in Self.masterTopLevelLines(ics) {
             guard line.hasPrefix("DTSTART") else { continue }
             guard let colonIdx = line.firstIndex(of: ":") else { return false }
             if ICSValueType.statesDate(line[..<colonIdx]) { return true }
@@ -767,10 +735,10 @@ actor CalDAVProvider: CalendarProvider {
         case zoned(String)       // DTSTART;TZID=America/Vancouver:20260520T170000
     }
 
-    /// Classify the master VEVENT's DTSTART. Scoped via `masterVEventLines` so
+    /// Classify the master VEVENT's DTSTART. Scoped via `masterTopLevelLines` so
     /// a leading VTIMEZONE's own DTSTART can't be mistaken for the event's.
     static func masterDTStartKind(from ics: String) -> MasterDTStartKind {
-        for line in Self.masterVEventLines(from: ics) where line.uppercased().hasPrefix("DTSTART") {
+        for line in Self.masterTopLevelLines(ics) where line.uppercased().hasPrefix("DTSTART") {
             return valueKind(ofLine: line)
         }
         return .floating
@@ -784,7 +752,7 @@ actor CalDAVProvider: CalendarProvider {
     /// breaks that rule fails closed: the converted value names none of its overrides, and with no
     /// series to copy a new one from, `occurrenceOverrideResource` writes nothing.
     static func recurrenceIdKind(from ics: String) -> MasterDTStartKind {
-        guard Self.masterVEventLines(from: ics).isEmpty,
+        guard Self.masterTopLevelLines(ics).isEmpty,
               let recurrenceId = Self.icsLines(ics).first(where: { $0.uppercased().hasPrefix("RECURRENCE-ID") }) else {
             return masterDTStartKind(from: ics)
         }

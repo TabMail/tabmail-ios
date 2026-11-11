@@ -52,33 +52,18 @@ enum ICSParser {
     }
 
     /// Every VEVENT in the resource, masters and overrides, in document order.
+    ///
+    /// Each VEVENT is read as the writer reads it (`CalDAVProvider.icsUnits`, `veventBlocks`,
+    /// `topLevel`): its own properties only. A nested component's lines belong to that component,
+    /// so a VALARM's `DESCRIPTION`, `SUMMARY`, `ATTENDEE` or `DURATION` is never read as the
+    /// event's notes, title, attendee or length (#603).
     static func components(icsText: String, resourceHref: String) -> [VEventComponent] {
         // What the resource's VTIMEZONE components say about its zone names, read once for all its events.
         let zones = CalendarTimeZoneContext(calendarText: icsText)
-        let unfolded = unfold(icsText)
-        let lines = unfolded.components(separatedBy: .newlines)
-
-        var components: [VEventComponent] = []
-        var inEvent = false
-        var eventLines: [String] = []
-
-        for line in lines {
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed == "BEGIN:VEVENT" {
-                inEvent = true
-                eventLines = []
-                continue
-            }
-            if trimmed == "END:VEVENT" {
-                inEvent = false
-                components.append(parseVEvent(lines: eventLines, resourceHref: resourceHref, zones: zones))
-                continue
-            }
-            if inEvent {
-                eventLines.append(trimmed)
-            }
+        return CalDAVProvider.veventBlocks(CalDAVProvider.icsUnits(icsText)).map { block in
+            let lines = CalDAVProvider.topLevel(block).map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }
+            return parseVEvent(lines: lines, resourceHref: resourceHref, zones: zones)
         }
-        return components
     }
 
     // MARK: - Private
@@ -258,13 +243,6 @@ enum ICSParser {
     }
 
     // MARK: - ICS Helpers (reuse ICSBuilder patterns)
-
-    private static func unfold(_ text: String) -> String {
-        text.replacingOccurrences(of: "\r\n ", with: "")
-            .replacingOccurrences(of: "\r\n\t", with: "")
-            .replacingOccurrences(of: "\n ", with: "")
-            .replacingOccurrences(of: "\n\t", with: "")
-    }
 
     private static func extractValue(_ line: String) -> String {
         // Find the colon separating property+params from value

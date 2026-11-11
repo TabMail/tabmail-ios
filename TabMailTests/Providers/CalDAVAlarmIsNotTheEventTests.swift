@@ -295,19 +295,35 @@ struct CalDAVAlarmIsNotTheEventReadTests {
         AlarmFixture.expectTheEventsOwnValues(event, shape, via: "getEvent")
     }
 
+    /// The listing's range. With no range the series is listed once, at its first date; with a
+    /// range it is expanded into its occurrences (`CalDAVOccurrences.listing`). The range here holds
+    /// only the first occurrence.
+    enum ListingRange: String, CaseIterable, Sendable {
+        case none = "no range"
+        case firstOccurrence = "a range holding the first occurrence"
+
+        var bounds: (min: Date?, max: Date?) {
+            switch self {
+            case .none: return (nil, nil)
+            case .firstOccurrence:
+                return (AlarmFixture.start.addingTimeInterval(-3_600), AlarmFixture.start.addingTimeInterval(86_400))
+            }
+        }
+    }
+
     @Test("CalDAVProvider.listEvents gives the event's own notes, title, attendees and length",
-          arguments: AlarmFixture.Shape.all)
-    func listEventsReadsTheEventsOwnValues(_ shape: AlarmFixture.Shape) async throws {
+          arguments: AlarmFixture.Shape.all, ListingRange.allCases)
+    func listEventsReadsTheEventsOwnValues(_ shape: AlarmFixture.Shape, _ range: ListingRange) async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
         http.register(path: "/cal/", method: "REPORT", response: .raw(
             statusCode: 207, headers: ["Content-Type": "application/xml; charset=utf-8"],
             body: AlarmFixture.multistatus(AlarmFixture.resource(shape))))
         let events = try await AlarmFixture.provider(http).listEvents(
-            calendarId: "/cal/", timeMin: nil, timeMax: nil, query: nil,
+            calendarId: "/cal/", timeMin: range.bounds.min, timeMax: range.bounds.max, query: nil,
             singleEvents: false, maxResults: 50, orderBy: "startTime")
         #expect(events.count == 1, "listEvents gave \(events.count) events")
-        AlarmFixture.expectTheEventsOwnValues(events.first, shape, via: "listEvents")
+        AlarmFixture.expectTheEventsOwnValues(events.first, shape, via: "listEvents (\(range.rawValue))")
     }
 
     @Test("CalDAVProvider.extractUID gives the event's UID, not its alarm's",
