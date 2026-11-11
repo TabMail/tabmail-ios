@@ -17,7 +17,9 @@ import GRDB
 //   - the provider's new opaque state, in the SAME transaction as the flag updates
 //     and removals, so a crash resumes from the last write.
 // It changes or removes only rows the device already holds. It never inserts: new
-// mail is the ordinary sync's job and older mail is the backfill's.
+// mail is the ordinary sync's job and older mail is the backfill's. When the
+// provider reports mail inside the folder's local range that no row holds (an old
+// message moved in), the same transaction re-arms the folder's backfill walk.
 // No provider is named here: the step does the same thing for every provider, and a
 // provider without catch-up returns nothing.
 
@@ -92,6 +94,23 @@ struct SyncEngineCatchUpRowReader: CatchUpLocalRowReader {
                 """, arguments: [folderId, afterId, afterId, limit]).map(Self.localRow)
         }
     }
+
+    /// Served by the v91 `(folderId, providerDate)` index. `providerDate` is NOT
+    /// NULL, so no row falls out of a bound by SQL's three-valued logic.
+    func rows(folderId: String, orderDatesFrom lower: Date?, before upper: Date?, limit: Int?) async throws -> [CatchUpLocalRow] {
+        try await pool.read { db in
+            // SQLite reads a negative LIMIT as no limit.
+            try Row.fetchAll(db, sql: """
+                SELECT \(Self.columns), providerDate FROM messageHeader
+                WHERE folderId = ? AND (? IS NULL OR providerDate >= ?) AND (? IS NULL OR providerDate < ?)
+                ORDER BY providerDate, messageId LIMIT ?
+                """, arguments: [folderId, lower, lower, upper, upper, limit ?? -1]).map { row in
+                    var local = Self.localRow(row)
+                    local.orderDate = row["providerDate"]
+                    return local
+                }
+        }
+    }
 }
 
 extension SyncEngine {
@@ -157,6 +176,19 @@ extension SyncEngine {
         return outcome
     }
 
+    /// A delta-cursor lapse, inside the caller's write transaction: the account's
+    /// cursor (`Account.lastHistoryId`) becomes `newCursor` (nil clears it) and every
+    /// one of the account's folders loses its catch-up state. Both or neither: the
+    /// changes the lost history held reach no delta, and the cleared state makes
+    /// each folder's next catch-up a full listing, which is what finds them. Used
+    /// wherever a cursor is cleared or replaced by one the delta did not reach.
+    /// Provider-blind: the cursor column and the state are the same for every
+    /// provider that has a delta cursor.
+    nonisolated static func lapseDeltaCursor(accountId: String, newCursor: String?, db: Database) throws {
+        try db.execute(sql: "UPDATE account SET lastHistoryId = ? WHERE id = ?", arguments: [newCursor, accountId])
+        try db.execute(sql: "UPDATE folder SET catchUpState = NULL WHERE accountId = ?", arguments: [accountId])
+    }
+
     /// The transaction itself. Everything it decides on is read INSIDE it: the folder
     /// row (quarantine, epoch), the pending operations and the recent completions.
     nonisolated static func applyCatchUpTransaction(
@@ -206,9 +238,27 @@ extension SyncEngine {
             folderRole: folder.role, ids: result.removedIds,
             recentlyCompleted: recentlyCompleted, db: db)
 
+        // Mail the server lists inside the folder's local range that no row holds:
+        // the existing, insert-only backfill walk loads it from the top. Only a
+        // COMPLETE walk is re-armed, as read in this transaction (`folder` above):
+        // restarting an unfinished walk would throw its position away, and a walk
+        // can complete or be reset between the provider's listing and this write.
+        // A declined re-arm loses nothing: the walk goes on and loads everything
+        // below its position, and the next check asks again for what is still
+        // missing.
+        let rearm = result.rearmBackfill && folder.backfillComplete
         try db.execute(
             sql: "UPDATE folder SET catchUpState = ? WHERE id = ?",
             arguments: [result.newState, folder.id])
+        if rearm {
+            // Written with the state of the check that asked, so a crash cannot
+            // leave one without the other. The page hold time belongs to the token
+            // being cleared, so it is cleared in the same write, like every
+            // other write that moves or clears `backfillPageToken`.
+            try db.execute(
+                sql: "UPDATE folder SET backfillComplete = 0, backfillPageToken = NULL, backfillPageHeldSince = NULL WHERE id = ?",
+                arguments: [folder.id])
+        }
         return .applied(updatedFlags: updatedFlags, removedIds: removedIds)
     }
 }

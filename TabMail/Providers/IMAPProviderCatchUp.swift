@@ -79,15 +79,10 @@ extension IMAPProvider {
             guard let stamp = state?.completionStamp, let freshModSeq else { return false }
             return freshModSeq != stamp
         }()
-        let fullCheckDue: Bool = {
-            guard let last = state?.lastCompletedAt else { return true }
-            return now.timeIntervalSince(last) >= SyncConfig.catchUpFullCheckIntervalSeconds
-        }()
-        let waitedTooLong: Bool = {
-            guard let state else { return false }
-            guard let since = state.lastCompletedAt ?? state.createdAt else { return true }
-            return now.timeIntervalSince(since) >= SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds
-        }()
+        let fullCheckDue = CatchUpSchedule.fullCheckDue(
+            lastCompletedAt: state?.lastCompletedAt, now: now, interval: SyncConfig.catchUpFullCheckIntervalSeconds)
+        let waitedTooLong = CatchUpSchedule.waitedTooLong(
+            hasState: state != nil, lastCompletedAt: state?.lastCompletedAt, createdAt: state?.createdAt, now: now)
         if isExpensiveNetwork && !modSeqChanged && !waitedTooLong { return .none }
         if let listing = state?.listing { return .list(listing) }
         if modSeqChanged || fullCheckDue {
@@ -110,13 +105,9 @@ extension IMAPProvider {
         // (a completion is a try). A folder whose requests keep failing
         // therefore goes behind the others. The sort is stable on the caller's order
         // for ties.
-        func lastAttempt(_ folder: Folder) -> Date {
-            IMAPCatchUpState.decode(folder.catchUpState)?.lastAttemptAt ?? .distantPast
+        let ordered = CatchUpSchedule.leastRecentlyAttemptedFirst(folders) {
+            IMAPCatchUpState.decode($0.catchUpState)?.lastAttemptAt
         }
-        let ordered = folders.enumerated().sorted { lhs, rhs in
-            let l = lastAttempt(lhs.element), r = lastAttempt(rhs.element)
-            return l == r ? lhs.offset < rhs.offset : l < r
-        }.map(\.element)
 
         var results: [CatchUpFolderResult] = []
         for folder in ordered {

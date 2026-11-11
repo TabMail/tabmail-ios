@@ -45,12 +45,14 @@ extension SyncEngine {
             // History expired (404), or longer than one delta can apply before
             // the sync deadline (over `GmailAPI.historyMaxChanges` records or
             // changed messages, or `GmailAPI.historyMaxPages` pages) — clear
-            // the cursor so the full sync takes over when it is next due
+            // the cursor so the full sync takes over when it is next due. The
+            // changes in the gap reach no delta, so this is a lapse: every
+            // folder's catch-up lists in full at that full sync (ADR-IOS-107).
             BackgroundSyncLogger.logDebug("[Sync] Gmail delta: history expired or too long for \(account.emailAddress) — clearing cursor")
             BackgroundSyncLogger.log("gmailDelta: \(account.emailAddress) historyExpiredOrTooLong")
+            let accountId = account.id
             try await dbPool.write { db in
-                _ = try Account.filter(Column("id") == account.id)
-                    .updateAll(db, Column("lastHistoryId").set(to: nil as String?))
+                try Self.lapseDeltaCursor(accountId: accountId, newCursor: nil, db: db)
             }
             return (false, false)
         }
@@ -1332,16 +1334,28 @@ extension SyncEngine {
     }
 
     /// Capture sync cursors after a full sync so delta sync can detect changes next time.
-    /// For Gmail: only advances historyId forward (never overwrites a newer cursor from delta sync).
-    func captureSyncCursors(account: Account, provider: any EmailProvider) async {
+    /// `deltaReachedCursor`: this pass's delta succeeded, so the stored cursor is
+    /// the one it reached.
+    /// For Gmail: a cursor this pass's delta reached is kept, so the next delta
+    /// reads every change made since, including those made during this full sync.
+    /// Any other cursor (the delta failed, or found none) is replaced by the
+    /// profile's current one, only forward, and that replacement is a lapse
+    /// (`lapseDeltaCursor`): the changes the skipped history held reach no delta,
+    /// so every folder's catch-up lists in full at the next full sync.
+    func captureSyncCursors(account: Account, provider: any EmailProvider, deltaReachedCursor: Bool) async {
         if account.provider == .gmail, let gmailProvider = provider as? GmailProvider {
+            guard !deltaReachedCursor else {
+                BackgroundSyncLogger.logDebug("[Sync] Gmail historyId: keeping the cursor this pass's delta reached")
+                return
+            }
             do {
                 let newHistoryId = try await gmailProvider.getCurrentHistoryId()
+                let accountId = account.id
                 try await dbPool.write { db in
                     // Only advance — never go backwards. Delta sync may have set a
                     // more recent historyId that this profile API call must not overwrite.
                     if let newId = newHistoryId,
-                       let current = try Account.fetchOne(db, key: account.id)?.lastHistoryId,
+                       let current = try Account.fetchOne(db, key: accountId)?.lastHistoryId,
                        let newVal = UInt64(newId),
                        let curVal = UInt64(current),
                        newVal <= curVal {
@@ -1350,8 +1364,7 @@ extension SyncEngine {
                         }
                         return
                     }
-                    _ = try Account.filter(Column("id") == account.id)
-                        .updateAll(db, Column("lastHistoryId").set(to: newHistoryId))
+                    try Self.lapseDeltaCursor(accountId: accountId, newCursor: newHistoryId, db: db)
                 }
                 BackgroundSyncLogger.logDebug("[Sync] Captured Gmail historyId: \(newHistoryId ?? "nil")")
             } catch {

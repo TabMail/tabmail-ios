@@ -2,6 +2,19 @@
 
 **Status:** Active (2026-11-10). Issue #540. This ADR covers the generic seam and IMAP. The Outlook
 and Gmail catch-ups plug into the same seam later and will amend this ADR with their own sections.
+**Amended 2026-11-10: Gmail** (decision 8 below: the Gmail catch-up, the delta-cursor lapse, the
+re-armed backfill for moved-in mail, and the order-date reader accessor).
+**Amended 2026-11-11: Gmail re-arm record** (decisions 1 and 8: the record of missing ids expires
+after `catchUpRearmRetryIntervalSeconds`, and a folder whose walk is complete is listed from the epoch).
+The record itself was removed later the same day (see the rebase amendment below); the epoch listing stays.
+**Amended 2026-11-11: Gmail weekly full check** (decision 8, owner ruling: once the Gmail history
+delta follows All Mail (#731), the Gmail full check is a weekly safety check plus the catch-up after
+every lapse; IMAP keeps its daily check).
+**Amended 2026-11-11: rebase onto the bounded page walk (#713, #723)** (decisions 5 and 8: the
+backfill version migration is renumbered `v100_addFolderBackfillVersion`; a re-arm also clears
+`backfillPageHeldSince`; the membership list asks for Spam and Trash mail only in those two folders;
+a fetch the walk passed over is a named trigger; the re-arm record is removed, because it holds
+nothing back on the weekly schedule).
 
 **Context.** Every sync path windows its work, and changes to older mail fall outside every window:
 
@@ -37,10 +50,20 @@ The owner's rulings of 2026-11-09:
    - **The catch-up is not the backfill (owner 2026-11-10).** It changes or removes only rows the
      device already holds. The result has no field for a message without a local row, so no
      provider's catch-up can insert: new mail is the ordinary sync's job and older mail is the
-     backfill's. No request names an id outside the range the device holds; a folder with a partial
-     backfill is never listed below its lowest local id or above its highest.
+     backfill's. A folder with a partial backfill is never listed below its lowest local id or above
+     its highest.
+     - *Amended 2026-11-11 (Gmail):* a folder whose backfill walk is complete when a Gmail listing
+       starts is listed from the epoch up to its newest local row, not from its oldest local row. A
+       message older than every local row that moves into such a folder is then found missing and
+       the folder's walk re-armed (decision 8). Without it that message never appears: no walk is
+       running to reach it, and the delta does not cover All Mail. The catch-up still inserts
+       nothing and still never lists above the newest local row.
+       *Note (2026-11-11, after #731):* the Gmail delta now follows All Mail too, so while its
+       cursor is valid it inserts such a message itself. The epoch listing still covers a move the
+       delta never applied (a lapse, or a change whose GET failed, #464).
+     - *Superseded (2026-11-10):* "No request names an id outside the range the device holds."
    - The do-nothing default returns `[]`. Gmail, Exchange and Demo use it until their own
-     catch-up lands.
+     catch-up lands. (Gmail's landed with decision 8; Exchange and Demo still use the default.)
    - No cast, switch or knob names a provider above the boundary (ADR-IOS-060). The only generic
      input is `staleWindowMode`, which already exists.
 2. **Placement.** The step runs at the very end of `SyncEngine.fullSync`, after the IMAP
@@ -71,10 +94,16 @@ The owner's rulings of 2026-11-09:
       `ids: [String]` (approved), with its pending, recent and outbox protections.
    5. The new state is written in the SAME transaction. After the commit come FTS removal and an
       unread recount.
-5. **Persistence.** There is one nullable `Folder.catchUpState TEXT` column, added by
-   `v98_addFolderCatchUpState`. NULL is the correct start for every existing folder. The UIDVALIDITY
+5. **Persistence.** The catch-up's own state is one nullable `Folder.catchUpState TEXT` column, added
+   by `v98_addFolderCatchUpState`. NULL is the correct start for every existing folder. The UIDVALIDITY
    purge transaction (`AccountManager.uidValidityResetPurgeTxn`) clears it with the folder's other
-   sync cursors.
+   sync cursors. *Correction (2026-11-11):* this was first worded "There is one nullable
+   `Folder.catchUpState TEXT` column", but it is not the only column the catch-up added.
+   `v100_addFolderBackfillVersion` adds `Folder.backfillVersion` (INTEGER NOT NULL DEFAULT 0), the
+   backfill bookkeeping's row version, so that the backfill walk never overwrites a catch-up re-arm
+   (decision 8). *Renumbered (2026-11-11):* this migration was first `v99_addFolderBackfillVersion`;
+   main shipped `v99_addFolderBackfillPageHeldSince` (#713) first, so it is v100. It never reached a
+   release under the old name.
 6. **IMAP** (`IMAPProviderCatchUp.swift`; the wire request `IMAPProvider.listFlagsInUIDRange`).
    - **Eligibility.** A folder is handled only if its stored epoch is known, it is not quarantined,
      and its path is non-empty. The state carries its epoch (`IMAPCatchUpState.epoch`); a state from
@@ -134,6 +163,238 @@ The owner's rulings of 2026-11-09:
    The catch-up does not adopt the walk's count-based circuit breaker, because this population has
    no count evidence. Its removal needs two independent server statements instead: absence from the
    range FETCH and absence from `UID SEARCH`, both under the folder's epoch.
+8. **Gmail** (amendment 2026-11-10; `GmailProviderCatchUp.swift`, `GmailCatchUpState`). The IMAP
+   plan without a MODSEQ signal, keyed by order date instead of UID.
+   - **Why Gmail needs it.** The history delta reaches every change only while its cursor is valid.
+     When the history expires (404) or is too long for one delta, or when the full sync's capture
+     replaces a cursor this pass's delta did not reach (a delta whose message GET failed, #464), the
+     changes in the gap reach no delta. A change to older mail in that gap, and an All Mail read
+     change beyond the window at any time, then never reached the device.
+     *Amended 2026-11-11 (#731):* the delta now follows All Mail like every other folder
+     (`GmailProvider.folder(_:containsMessageWithLabels:)`, built on `allMailExcludedLabelIds`, the
+     one All Mail membership rule; the catch-up's removal proof asks the same rule). So while the
+     cursor is valid every change reaches the device through the delta, All Mail included, and the
+     catch-up is the safety net for the gaps above.
+   - **Schedule.** `CatchUpSchedule` (shared with IMAP): a full check every
+     `gmailCatchUpFullCheckIntervalSeconds` (WEEKLY, amended 2026-11-11), and at once after a lapse,
+     which clears the folder's state; on an expensive network at most
+     `catchUpExpensiveNetworkMaxWaitSeconds` of waiting (first sight writes `createdAt` and makes no
+     request); least recently attempted folder first; the pass budget before every request and
+     `catchUpRequestTimeoutSeconds` on each.
+     - **Each provider chooses its own interval, below the boundary.**
+       `CatchUpSchedule.fullCheckDue(lastCompletedAt:now:interval:)` takes the interval as an
+       argument; `GmailProvider.catchUpPlan` passes `gmailCatchUpFullCheckIntervalSeconds` (7 days)
+       and `IMAPProvider.catchUpPlan` passes `catchUpFullCheckIntervalSeconds` (one day, unchanged).
+       Nothing above `EmailProvider` names a provider or an interval.
+     - **Why weekly (owner 2026-11-11).** With #731 the delta reaches every change while its cursor
+       is valid, and a lapse clears the catch-up state, so every folder is listed in full at the
+       next full sync anyway. The regular check only backs up what no delta and no lapse reveals
+       (for example a change whose delta GET failed while the capture kept the cursor). The owner
+       accepted that such mail may take up to a week to appear.
+     - **Consequences of the week.** The expensive-network wait is counted from the last completed
+       listing and is as long as the week, so a due weekly check has already waited as long as the
+       wait allows and runs on any network; only a folder with no completed listing (new, or cleared
+       by a lapse) waits for a non-expensive network. And while an id stays missing, each weekly
+       check re-arms the folder once (one ids-only re-walk per week, the bound below). *Note
+       (2026-11-11):* this week is why the re-arm record was removed; it held back no re-arm here.
+     - *Superseded (2026-11-10):* "a full check every `catchUpFullCheckIntervalSeconds` (daily)".
+     Every number is in `SyncConfig`
+     (`catchUpGmailRangeRowLimit`, `catchUpGmailRangeMaxSpanSeconds`, `catchUpGmailRangeSlackSeconds`,
+     `catchUpGmailListPageSize`, `gmailCatchUpFullCheckIntervalSeconds`; `catchUpMissingIdsRecordLimit`
+     was removed with the re-arm record, 2026-11-11).
+     The network state comes only from the `CatchUpContext` snapshot.
+   - **Ranges by order date.** Ranges are cut from the LOCAL rows' `providerDate` (Gmail's
+     `internalDate`) through the reader's new order-date accessor
+     (`rows(folderId:orderDatesFrom:before:limit:)`, index `(folderId, providerDate)`): at most
+     `catchUpGmailRangeRowLimit` rows (unless more share the first second), whole seconds, at most
+     `catchUpGmailRangeMaxSpanSeconds` from the range's first local row. Ranges tile the local range
+     without gaps; the cursor (`listing.nextFromSecond`) resumes across passes. Every list carries
+     `after:`/`before:` bounds widened by `catchUpGmailRangeSlackSeconds` only. A listing that starts
+     while the folder's walk is complete starts its first range at 0 (decision 1, amended
+     2026-11-11), so that range's membership list also covers mail older than every local row; its
+     `after:` bound is never below 0. The flag lists still start at the range's first local row, and
+     no list reaches above the newest local row. *Superseded (2026-11-10):* "so no request reaches
+     outside the local range."
+   - **Per range.** The folder's membership list (`listMessageIdsPage` with a date window, extended),
+     then the account-wide `is:unread` and `is:starred` lists over the same dates
+     (`listAccountMessageIdsPage`). Flags come only for local rows the membership list names, and
+     account-wide lists make them immune to a move between requests. A range counts only when all of
+     its lists finished. Each list resumes at its saved page token (`listing.range`), so a budget stop
+     or failure loses no page and a range whose lists need more requests than one pass allows still
+     completes over several passes. The saved range keeps only what concerns its own local rows (the
+     rows the membership list named, with their flags when it completed, and which of them the unread
+     and starred lists named), so its size is bounded by the range's row count. A named row whose
+     local flags changed after the membership list completed (a later delta, the user) gets no update
+     from the range: its pages may be older than that change.
+   - **Spam and Trash only where they belong** (amendment 2026-11-11). Gmail leaves Spam and Trash
+     mail out of a list that does not send `includeSpamTrash` (Google's `users.messages.list`
+     reference: "Include messages from SPAM and TRASH in the results", unsent = false). The
+     membership list sends it only for the Spam and Trash folders' own lists
+     (`GmailProvider.spamTrashFolderIds`, `messageListPath`); the account-wide unread and starred
+     lists always send it, so a Spam or Trash row's flags still arrive. Every other folder's check
+     therefore lists what its walk lists: a message in a label that is also in Trash or Spam is not
+     missing there and re-arms nothing. *Superseded (2026-11-10):* every windowed list sent
+     `includeSpamTrash`, so such a message re-armed its label's walk at every check for nothing. A
+     live check on a test account found no labelled message in Trash to decide it, so this rests on
+     Google's documented behaviour; if the live API included that mail anyway, the outcome is the
+     earlier behaviour (a wasted re-arm), never worse.
+   - **A refused page token restarts its list once per pass** (amendment 2026-11-11). Gmail documents
+     no wording for a page token it no longer accepts (an invalid value is a `400`, `badRequest`), so
+     any `400` to one of the catch-up's own list requests (membership, unread, starred) that carried a
+     saved token drops the token and starts that list again from the range's start, its pages so far
+     dropped. The bound is once per list per pass and is held in memory inside `catchUpFolder`; it is
+     never saved in the state. A second `400` in the same pass stops the pass like any other failure,
+     and the next pass resumes the list where it stopped, and may start it over once again. A saved
+     bound would stall a list for good once a later pass found its fresh token refused too. The
+     catch-up's own lists keep a `400`'s body (`requestPreservingBadRequestBody`) only so that the
+     debug-gated log line can name the structured reason (`GmailProvider.badRequestReason`).
+   - **Removal needs proof.** A local row the membership list leaves out is only a candidate. Its own
+     `GET format=minimal` decides: 404/410 removes; labels without the folder's label remove; for All
+     Mail, labels carrying INBOX, SENT, TRASH, SPAM or DRAFT (what All Mail's query excludes) remove;
+     any other answer, including an unreadable one for that message, keeps the row. A failure that is
+     no answer (a dropped connection, a timeout) ends the folder's pass. Removals go only through
+     `deleteConfirmedGhostHeaders`.
+   - **Candidates carried across passes.** A range's candidates are saved in the state
+     (`listing.pendingCandidates`) and verified before the next range, so a range whose GETs run past
+     the budget is never listed again for them (liveness on a slow link).
+   - **Never inserts; placeholders.** Results carry no new rows. A synthetic placeholder id
+     (`isSyntheticPlaceholderId`) is never named in a request, never removed, and never counted as
+     missing. Results carry `epoch: nil`; Gmail folders have no known epoch, so the gate passes and the
+     `.date` window mode applies.
+   - **Moved-in mail re-arms the backfill** (amended 2026-11-11: the re-arm record is removed). When
+     a check's listing completes, the server ids it listed that no local row in the folder holds (an
+     old message moved or archived into the folder) are missing.
+     - **When a check asks.** The result sets `rearmBackfill` when the completed listing found a
+       missing id (`listing.foundMissing`). Nothing about earlier re-arms is kept.
+     - **The re-arm.** The apply writes `backfillComplete = 0, backfillPageToken = NULL,
+       backfillPageHeldSince = NULL` in the SAME transaction as the state (the page hold time belongs
+       to the token it clears, like every other write of `backfillPageToken`; added 2026-11-11 with
+       #713's column). A declined re-arm (next bullet) writes the same state.
+     - **What leaves an id missing** (named 2026-11-11). Mail moved in from elsewhere below every
+       window; a lapse (the state is cleared); and a fetch that failed during the
+       walk: the walk passes over a message whose `format=full` GET fails about that message (a
+       per-message failure) or keeps failing past the page hold bound (#713), completes without it,
+       and the next check finds it missing and re-arms. Test:
+       `GmailCatchUpTests.idPassedOverByTheWalkLoadsAtTheNextCheck`.
+     - **Bounds.** Ids that stay missing cost at most one re-arm per completed check per folder: one
+       per week on the weekly schedule, plus the check after each lapse. Each try is a fresh chance
+       to load, so an id whose cause passed (a queued op removed, a server error over) loads at the
+       next check. One re-arm costs one ids-only re-walk of the folder (about one list request per
+       500 messages) and one `format=full` GET per id still missing.
+     - The catch-up itself still never inserts: the existing insert-only backfill walk loads the
+       mail.
+     - *Superseded (2026-11-11): the re-arm record, removed.* It held back no re-arm on the shipped
+       weekly schedule: every completed check comes at least `catchUpRearmRetryIntervalSeconds` after
+       the last re-arm, and a lapse clears the record with the rest of the state, so it only added
+       state, config and tests. Removed with it: `GmailCatchUpState.recordedMissingIds` and
+       `rearmedAt`, `Listing.missingIds` and `foundUnrecordedMissing`, `CatchUpBackfillRearm`
+       (`stateIfWalkUnfinished`), `SyncConfig.catchUpMissingIdsRecordLimit` and
+       `catchUpRearmRetryIntervalSeconds`. It was JSON inside `catchUpState`, so no column or
+       migration changes. Its wording before removal:
+     - **Moved-in mail re-arms the backfill** (amended 2026-11-11: the record expires). When a check's
+       listing completes, the server ids it listed that no local row in the folder holds (an old message
+       moved or archived into the folder) are the missing set. The state keeps the ids the last re-arm
+       was for (`recordedMissingIds`, the first `catchUpMissingIdsRecordLimit` in listing order) and when
+       that re-arm was made (`rearmedAt`, optional, so a state saved without it still decodes).
+       - **When a check asks.** The result sets `rearmBackfill` when the missing set is not empty and
+         either the last re-arm is at least `catchUpRearmRetryIntervalSeconds` (7 days) old or there was
+         none, or a missing id is not in the record while the record has room.
+       - **The record changes with the re-arm.** The apply writes `backfillComplete = 0,
+         backfillPageToken = NULL, backfillPageHeldSince = NULL` in the SAME transaction as the state
+         (the page hold time belongs to the token it clears, like every other write of
+         `backfillPageToken`; added 2026-11-11 with #713's column), and that state carries the new
+         record and `rearmedAt`. A declined re-arm (next bullet) changes neither. A check that asks for
+         nothing and finds no missing id outside the record shrinks the record to the missing set, so
+         an id loaded since leaves it at the next such check.
+       - **Why the record expires.** Whether an id can load is only known by trying, and it changes: a
+         destructive op queued for it in that folder is removed later, or its `format=full` GET failed
+         once and the walk moved on past it. A record without an expiry kept such an id out of every
+         later re-arm, and so did one holding an id that loaded and then moved out and back with no
+         check in between: the message never appeared. With the expiry the record only delays another
+         try, by at most the interval.
+       - **Why the record is kept** (2026-11-11, corrected). It bounds the re-arms of a check that
+         completes sooner than `catchUpRearmRetryIntervalSeconds` after the last re-arm. On today's
+         schedule none does: the weekly check comes no sooner, and a lapse clears the record together
+         with the rest of the state, so the post-lapse check re-arms whatever is missing (the "plus one
+         after each lapse" in the bounds). What it still bounds is a check run off that schedule, or a
+         device clock set back. It is kept by ruling (2026-11-11), and it is used only by the Gmail
+         catch-up, not by IMAP.
+       - **Bounds.** Ids that stay missing cost at most one re-arm per interval per folder, plus one
+         after each lapse (which clears the record), however many there are. Past the record limit a
+         newly missing id also waits for the interval, so a folder with more unloadable ids than the
+         limit does not re-walk at every daily check. One re-arm costs one ids-only re-walk of the
+         folder (about one list request per 500 messages) and one `format=full` GET per id still
+         missing. *Note (2026-11-11, weekly check):* the regular check now comes no sooner than the
+         interval, so these bounds are met by the schedule itself and the record holds nothing back
+         (Schedule, above); it would matter again only if a Gmail check ran more often than
+         `catchUpRearmRetryIntervalSeconds`.
+     - *Superseded wording (2026-11-10):* "If it holds an id not recorded at the previous completed
+       check, the result sets `rearmBackfill` [...] The state records the missing set
+       (`recordedMissingIds`, the first `catchUpMissingIdsRecordLimit` in listing order), replaced at
+       every completed check. So an id the backfill cannot load (a destructive op queued for it in
+       that folder) re-arms once and then stays recorded; a later move re-arms once more; an id loaded
+       and later missing again counts as new. Over the limit, the unrecorded id re-arms at most once
+       per daily check, and only a completed walk (next bullet). A lapse clears the record (at worst
+       one extra re-arm)."
+   - **Only a completed walk is re-armed** (amendment 2026-11-11). The apply re-arms only when the
+     folder's `backfillComplete` is 1, read from the folder row inside the SAME transaction as the
+     re-arm and the state write (`applyCatchUpTransaction`), not from the folder the provider listed:
+     the walk can complete, or a reset can unfinish it, between the listing and the apply, and the
+     write transaction is the only read that no walk write can overtake. Why: the re-arm writes
+     `backfillPageToken = NULL`, so re-arming an unfinished walk throws its position away. A folder
+     whose local range reaches below the walk's position (an old message moved in) lists every
+     not-yet-walked id as missing; such checks would keep asking for a re-arm, and a folder too large
+     to walk between two of them could then restart from the top each time and never complete.
+     Declining loses nothing: the walk goes on and loads everything below its position, and the
+     first check after the walk completes asks again for whatever is still missing; that walk then
+     loads anything above the old position. *Superseded (2026-11-11, record removed):* "A declined
+     re-arm writes the result's `CatchUpBackfillRearm.stateIfWalkUnfinished`, which is the new state
+     without the record change (the previous record and `rearmedAt` kept), so the first check after
+     the walk completes asks again for whatever is still missing outside that record, or for anything
+     missing once the record is old enough; that walk then loads anything above the old position." Cost: mail moved in above an unfinished walk's position loads up to one
+     check interval after the walk completes. The backfill-version compare-and-set below is
+     unchanged: two walks are not serialized, so a second walk can complete a folder and a re-arm
+     land while the first walk's iteration is in flight.
+   - **The backfill walk never overwrites a re-arm** (amendment 2026-11-11). The re-arm can land
+     while a page-token walk iteration (Gmail and Exchange, `SyncEngine.runBackfill`) is waiting on
+     its page; no serial gate covers both (`oneSyncAtATime` serializes the sync passes, and the walk
+     does not take it). Since only a completed walk is re-armed, that takes a second walk (the
+     foreground loop and a background run are not serialized either) completing the folder while the
+     first walk's iteration is in flight. The walk's two bookkeeping writes, the next page token and the folder's
+     completion (`SyncEngine.advanceBackfillPageWalk`), are therefore compare-and-set on
+     `Folder.backfillVersion` (v100; first numbered v99), read with the folder at the start of the iteration. The trigger
+     `folder_bumpBackfillVersion` bumps it on every UPDATE that writes `backfillPageToken` or
+     `backfillComplete`, even when the value is unchanged, and never on an insert (a new folder
+     starts at 0). Every writer bumps it without naming it: the re-arm, the walk's own writes, the
+     IMAP walk's completions, the fast-sync and Settings resets, the startup resets and the
+     UIDVALIDITY reaction's whole-record folder updates. The check is the version ALONE, not the
+     token and completion it read: a re-arm of a folder whose walk is at its top (no token, not
+     complete) writes exactly that state, so a value comparison still matches and the walk would
+     move on from a page answered before the move, past the moved-in message. A write that matches
+     no row stops that folder's iteration; the next iteration re-reads the folder and walks it from
+     the top. It never retries the stale write. SQLite's change count excludes the trigger's own
+     update, so it reports the walk's statement alone.
+   - **The delta-cursor lapse** (`SyncEngine.lapseDeltaCursor`). One provider-blind helper writes the
+     account's new cursor (nil clears it) AND clears `catchUpState` for every folder of the account, in
+     the caller's transaction. It is used by the Gmail delta's clear arm (history expired or too long)
+     and by `captureSyncCursors` when it replaces a cursor this pass's delta did not reach. A cursor the
+     pass's delta DID reach is now kept (`deltaReachedCursor`), so the next delta reads every change
+     made since, including those made during the full sync. Cleared state makes the next full sync's
+     catch-up list every folder in full, which is what finds the changes the lost history held. The
+     lapse survives a relaunch because it is persisted with the cursor.
+   - **Costs.** A delta failure in a pass with a due full sync clears the catch-up state that pass's
+     full sync just wrote, so the next full sync lists again (one extra listing). More generally
+     (amendment 2026-11-11), every lapse clears ALL listing progress, saved pages included, so
+     repeated lapses can keep restarting the listing of a folder too large to list within the passes
+     between two lapses: more than one extra listing. It is bounded: the listing completes once
+     deltas succeed and no lapse interrupts it. The slack of
+     `catchUpGmailRangeSlackSeconds` may count a message within one second outside the local range as
+     missing (at worst one extra re-arm). A row whose stored `providerDate` differs from Gmail's
+     `internalDate` is not known to exist: `providerDate` is Gmail's `internalDate` on every write
+     path (parse, every sync, backfill and delta insert or refresh, NSE staging, copies), and rows
+     from before v91 hold it too, because Gmail's `date` was `internalDate` until v91 copied it into
+     `providerDate`. Such a row would fall outside its range's list, become a candidate and be kept by
+     its GET: one cheap `format=minimal` GET per check (weekly since 2026-11-11; daily before).
 
 **Consequences.**
 

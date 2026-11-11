@@ -44,6 +44,9 @@ enum GmailAPI {
     /// `metadataQuery`.
     static let fullQuery = "?format=full"
 
+    /// `?format=minimal` query: id, thread and label ids only, no headers or body.
+    static let minimalQuery = "?format=minimal"
+
     /// Records per `users.history.list` page: Gmail's documented maximum (the
     /// default is 100), to keep the number of round trips low.
     static let historyPageSize = 500

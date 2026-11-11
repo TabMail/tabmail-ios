@@ -23,6 +23,9 @@ struct CatchUpLocalRow: Sendable, Equatable {
     let messageId: String
     let isRead: Bool
     let isFlagged: Bool
+    /// `MessageHeader.providerDate`, the key the provider orders and windows by.
+    /// Set only by the order-date accessor; nil from the others.
+    var orderDate: Date? = nil
 }
 
 /// Read access to a folder's local rows, by range, so a provider can compare a
@@ -38,6 +41,11 @@ protocol CatchUpLocalRowReader: Sendable {
     /// Up to `limit` rows in ascending provider-id order, after `afterId`
     /// (nil starts at the beginning) — an ordered scan of the whole folder.
     func rows(folderId: String, after afterId: String?, limit: Int) async throws -> [CatchUpLocalRow]
+    /// Rows whose provider order date (`MessageHeader.providerDate`) is at or after
+    /// `lower` (nil: no lower bound) and before `upper` (nil: no upper bound),
+    /// ascending by that date and then by id, at most `limit` of them (nil: all).
+    /// Each row carries its `orderDate`. For a provider that windows by date.
+    func rows(folderId: String, orderDatesFrom lower: Date?, before upper: Date?, limit: Int?) async throws -> [CatchUpLocalRow]
 }
 
 /// What one catch-up call may spend and on what kind of network. A value snapshot
@@ -90,12 +98,53 @@ struct CatchUpFolderResult: Sendable {
     /// The folder's new opaque state, written in the same transaction as the
     /// results. Nil clears it.
     var newState: String?
+    /// Re-arm the folder's existing backfill walk (`backfillComplete = false`,
+    /// `backfillPageToken = NULL`) in the same transaction: the server lists a
+    /// message in the folder that the device holds no row for (an old message
+    /// moved into the folder). The catch-up itself never inserts; the
+    /// backfill, which only inserts, loads it. The apply re-arms only a folder
+    /// whose walk is COMPLETE, read inside its own transaction: a check never
+    /// restarts an unfinished walk, which would throw away its position.
+    var rearmBackfill = false
+}
+
+/// The time rules every provider's catch-up shares: when a folder's full check is
+/// due, and whether an expensive network may still hold it back.
+enum CatchUpSchedule {
+    /// True when the folder has never completed a listing, or its last one
+    /// completed at least `interval` ago. Each provider passes its own interval
+    /// from `SyncConfig`, below the provider boundary.
+    static func fullCheckDue(lastCompletedAt: Date?, now: Date, interval: TimeInterval) -> Bool {
+        guard let lastCompletedAt else { return true }
+        return now.timeIntervalSince(lastCompletedAt) >= interval
+    }
+
+    /// True when a folder WITH a state has waited for a non-expensive network for
+    /// at least `SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds`, counted from its
+    /// last completed listing or, before the first, from `createdAt`. A folder with
+    /// no state has not started waiting.
+    static func waitedTooLong(hasState: Bool, lastCompletedAt: Date?, createdAt: Date?, now: Date) -> Bool {
+        guard hasState else { return false }
+        guard let since = lastCompletedAt ?? createdAt else { return true }
+        return now.timeIntervalSince(since) >= SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds
+    }
+
+    /// `folders` in the order a pass works them: never-tried first, then by the
+    /// last try (a completion is a try), so a folder whose requests keep failing
+    /// goes behind the others and cannot hold their catch-up past its bound.
+    /// Stable on the caller's order for ties.
+    static func leastRecentlyAttemptedFirst(_ folders: [Folder], lastAttemptAt: (Folder) -> Date?) -> [Folder] {
+        folders.enumerated().sorted { lhs, rhs in
+            let l = lastAttemptAt(lhs.element) ?? .distantPast, r = lastAttemptAt(rhs.element) ?? .distantPast
+            return l == r ? lhs.offset < rhs.offset : l < r
+        }.map(\.element)
+    }
 }
 
 extension EmailProvider {
-    /// Default: no catch-up. A provider without support (Gmail, Exchange and Demo
-    /// until their own catch-up lands) returns nothing, and the full sync then
-    /// writes nothing.
+    /// Default: no catch-up. A provider without support (Exchange and Demo until
+    /// their own catch-up lands) returns nothing, and the full sync then writes
+    /// nothing.
     func catchUp(
         folders: [Folder], localRows: any CatchUpLocalRowReader, context: CatchUpContext
     ) async -> [CatchUpFolderResult] {

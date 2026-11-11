@@ -827,6 +827,37 @@ extension SyncEngine {
         }
     }
 
+    /// The page walk's bookkeeping write for one folder (Gmail and Exchange),
+    /// compare-and-set on the bookkeeping's row version alone: it lands only while
+    /// the folder still holds `readVersion`, the `Folder.backfillVersion` the
+    /// iteration read with the folder. Every write of the bookkeeping bumps that
+    /// version (the `folder_bumpBackfillVersion` trigger), including a catch-up
+    /// re-arm (ADR-IOS-107) that writes the very state the iteration read, so a
+    /// re-arm landing while the iteration is on the network makes this match
+    /// nothing and return false: the caller stops the folder's iteration, never
+    /// retries the stale write, and the next iteration re-reads the folder and
+    /// walks it from the top. `complete` marks the folder crawled and clears its
+    /// token; otherwise the token moves to `nextToken`. Either way the page's
+    /// hold time (`backfillPageHeldSince`) is cleared in the same write, because
+    /// it belongs to the token being replaced. SQLite's change count excludes
+    /// the trigger's own update, so it reports this statement alone.
+    nonisolated static func advanceBackfillPageWalk(
+        folderId: String, readVersion: Int, nextToken: String?, complete: Bool, db: Database
+    ) throws -> Bool {
+        if complete {
+            try db.execute(sql: """
+                UPDATE folder SET backfillComplete = 1, backfillPageToken = NULL, backfillPageHeldSince = NULL
+                WHERE id = ? AND backfillVersion = ?
+                """, arguments: [folderId, readVersion])
+        } else {
+            try db.execute(sql: """
+                UPDATE folder SET backfillPageToken = ?, backfillPageHeldSince = NULL
+                WHERE id = ? AND backfillVersion = ?
+                """, arguments: [nextToken, folderId, readVersion])
+        }
+        return db.changesCount > 0
+    }
+
     // MARK: - Unified Backfill Walk
 
     /// Crawl folders for this account, inserting headers AND indexing bodies in the same walk.
@@ -1884,16 +1915,21 @@ extension SyncEngine {
                         continue
                     }
                     let (pageIds, nextToken) = pageResult
+                    // Every bookkeeping write below is compare-and-set on the row
+                    // version read with the folder at this iteration's start
+                    // (`advanceBackfillPageWalk`), so a catch-up re-arm landing
+                    // mid-iteration is never overwritten.
+                    let readVersion = folder.backfillVersion
 
                     if pageIds.isEmpty && nextToken == nil {
                         // No more pages — folder fully crawled
-                        try? await AppDatabase.backgroundPool.write { db in
-                            _ = try Folder.filter(Column("id") == folder.id)
-                                .updateAll(db,
-                                    Column("backfillComplete").set(to: true),
-                                    Column("backfillPageToken").set(to: nil as String?),
-                                    Column("backfillPageHeldSince").set(to: nil as Date?)
-                                )
+                        let advanced = try? await AppDatabase.backgroundPool.write { db in
+                            try Self.advanceBackfillPageWalk(
+                                folderId: folder.id, readVersion: readVersion, nextToken: nil, complete: true, db: db)
+                        }
+                        if advanced == false {
+                            BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) state changed during the iteration (re-armed) — re-reading it")
+                            continue
                         }
                         BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) fully crawled (no more pages)")
                         BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress)/\(folder.name) fully crawled (no more pages)")
@@ -1943,22 +1979,18 @@ extension SyncEngine {
                                     .updateAll(db, Column("oldestSyncedDate").set(to: d))
                             }
                         }
-                        // Safe to advance — all IDs on this page already exist in GRDB
-                        try await AppDatabase.backgroundPool.write { db in
-                            _ = try Folder.filter(Column("id") == folder.id)
-                                .updateAll(db,
-                                    Column("backfillPageToken").set(to: nextToken),
-                                    Column("backfillPageHeldSince").set(to: nil as Date?))
+                        // Safe to advance — all IDs on this page already exist in GRDB.
+                        // The last page completes the folder in the same write.
+                        let advanced = try await AppDatabase.backgroundPool.write { db in
+                            try Self.advanceBackfillPageWalk(
+                                folderId: folder.id, readVersion: readVersion, nextToken: nextToken,
+                                complete: nextToken == nil, db: db)
+                        }
+                        guard advanced else {
+                            BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) state changed during the iteration (re-armed) — re-reading it")
+                            continue
                         }
                         if nextToken == nil {
-                            try? await AppDatabase.backgroundPool.write { db in
-                                _ = try Folder.filter(Column("id") == folder.id)
-                                    .updateAll(db,
-                                        Column("backfillComplete").set(to: true),
-                                        Column("backfillPageToken").set(to: nil as String?),
-                                        Column("backfillPageHeldSince").set(to: nil as Date?)
-                                    )
-                            }
                             BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) fully crawled (last page, all exist)")
                             didWork = true
                         } else {
@@ -2129,11 +2161,20 @@ extension SyncEngine {
                         case .advance, .passOverAfterHoldBound:
                             // A page passed over after the bound walks on in this cycle.
                             pageWalkSkippedFolderIds.remove(folder.id)
-                            try await AppDatabase.backgroundPool.write { db in
-                                _ = try Folder.filter(Column("id") == folder.id)
-                                    .updateAll(db,
-                                        Column("backfillPageToken").set(to: nextToken),
-                                        Column("backfillPageHeldSince").set(to: nil as Date?))
+                            // The last page completes the folder in the same
+                            // write, whether or not anything on it loaded: a
+                            // page whose messages all failed per message (or
+                            // past the hold bound) has been passed over, and
+                            // the folder is done.
+                            let advanced = try await AppDatabase.backgroundPool.write { db in
+                                try Self.advanceBackfillPageWalk(
+                                    folderId: folder.id, readVersion: readVersion, nextToken: nextToken,
+                                    complete: nextToken == nil, db: db)
+                            }
+                            guard advanced else {
+                                BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) state changed during the iteration (re-armed) — re-reading it")
+                                if insertedCount > 0 { didWork = true }
+                                continue
                             }
                             if nextToken == nil {
                                 isLastPage = true
@@ -2167,16 +2208,8 @@ extension SyncEngine {
                     }
                 }
 
-                // Gmail/Exchange: mark folder complete if this was the last page
+                // Gmail/Exchange: the last page's write above marked the folder complete
                 if isLastPage {
-                    try? await AppDatabase.backgroundPool.write { db in
-                        _ = try Folder.filter(Column("id") == folder.id)
-                            .updateAll(db,
-                                Column("backfillComplete").set(to: true),
-                                Column("backfillPageToken").set(to: nil as String?),
-                                Column("backfillPageHeldSince").set(to: nil as Date?)
-                            )
-                    }
                     BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) fully crawled (last page processed)")
                     BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress)/\(folder.name) fully crawled (last page processed)")
                 }

@@ -1,6 +1,14 @@
 
 ## ADR-IOS-051: Evidence-Triggered IMAP External-Deletion Reconcile (VANISHED + Count-Mismatch UID Walk)
 
+> **Current note (2026-11-10), correcting the Context below.** "Gmail/Exchange are immune — provider
+> deltas carry deletions of any age" holds only while the delta cursor is valid. A Gmail history that
+> expires (404) or is too long for one delta, or a full-sync capture that replaces a cursor the pass's
+> delta did not reach, loses the changes in that gap, deletions and moves of older mail included.
+> Gmail now catches those up through ADR-IOS-107 decision 8 (the delta-cursor lapse clears every
+> folder's catch-up state, so the next full sync lists every folder in full). Exchange has the same
+> exposure and still uses the seam's do-nothing default. The original text below is kept as written.
+
 **Context:** The 2026-07-02 audit (PROJECT_MEMORY "IMAP external-deletion blind spot") confirmed that raw-IMAP/iCloud accounts never remove an externally-deleted message once it falls below the newest-`syncMessageLimit`(=50)-UID stale window: `selectStaleHeaders` is windowed, backfill is insert-only, `selfHealRecentMessages` is add-only, and the complete-knowledge branch is capped to tiny folders. Ghost rows persisted in GRDB + FTS + search indefinitely (Gmail/Exchange are immune — provider deltas carry deletions of any age). Two free signals were being wasted: `imapDeltaSync` observed `status.messageCount != folder.totalCount` but only ran the windowed sync and then OVERWROTE `totalCount` (evidence consumed, ghost survived), and IDLE `VANISHED(UIDSet)` — the server literally naming the deleted UIDs — was discarded into a generic poll.
 
 **Decision:** Two evidence-triggered mechanisms (`SyncEngineDeletionReconcile.swift`), no periodic jobs, work proportional to drift, UID everywhere (never date — ADR-IOS-042):
