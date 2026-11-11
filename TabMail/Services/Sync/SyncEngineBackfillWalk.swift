@@ -2006,10 +2006,6 @@ extension SyncEngine {
                             strictestFailure = max(strictestFailure ?? kind, kind)
                             failedCount += 1
                         }
-                        if let error = result.error, case ProviderError.authenticationFailed = error {
-                            await AccountManager.shared.markAuthFailed(account.id)
-                            throw error
-                        }
                     }
 
                     if !headers.isEmpty {
