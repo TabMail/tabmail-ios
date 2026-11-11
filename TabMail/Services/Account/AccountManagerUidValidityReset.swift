@@ -718,6 +718,7 @@ extension AccountManager {
                     folder.backfillComplete = false
                     folder.backfillUidCursor = nil
                     folder.backfillPageToken = nil
+                    folder.backfillPageHeldSince = nil
                     folder.oldestSyncedDate = Date()
                     folder.unreadCount = 0
                     folder.totalCount = 0

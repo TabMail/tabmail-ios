@@ -53,6 +53,14 @@ struct Folder: Codable, FetchableRecord, PersistableRecord, Identifiable, Hashab
     var backfillUidCursor: Int?
     /// Gmail/Exchange: page token for cursor-based backfill. Resumes listing from stored position.
     var backfillPageToken: String?
+    /// Gmail/Exchange: when the page `backfillPageToken` names (nil token: the
+    /// first page) was FIRST held because some of its messages failed to load
+    /// with a failure that is not about that message alone. The page stays
+    /// held while less than `SyncConfig.backfillPageHoldMinutes` has passed
+    /// since then; past it the walk moves on. It belongs to the saved token it
+    /// was set under, so every write that moves or clears `backfillPageToken`
+    /// clears it in the same write. Nil: the current page has not been held.
+    var backfillPageHeldSince: Date?
     /// IMAP UIDVALIDITY — **the epoch the LOCAL UIDs in this folder belong to**,
     /// NOT "the epoch the server most recently reported". It is the
     /// deletion-reconcile walk's abort guard (ADR-IOS-051): the walk compares this

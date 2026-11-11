@@ -171,7 +171,8 @@ extension SyncEngine {
                     Column("backfillComplete").set(to: false),
                     Column("oldestSyncedDate").set(to: now),
                     Column("backfillUidCursor").set(to: nil as Int?),
-                    Column("backfillPageToken").set(to: nil as String?)
+                    Column("backfillPageToken").set(to: nil as String?),
+                    Column("backfillPageHeldSince").set(to: nil as Date?)
                 )
         }
         // Reset bodyEmptyConfirmed — gives previously-empty messages a fresh chance,
@@ -201,6 +202,14 @@ extension SyncEngine {
     /// Body fetching is delegated to BackfillBodyQueue (runs independently).
     /// Respects battery/idle/cellular gates. Progress is reported per cycle.
     static let backfillDisabled = false
+
+    /// How long the backfill worker sleeps after a `runBackfill` call. A call
+    /// that did no work (every remaining folder held, skipped or declined, or
+    /// nothing left to do) waits the profile's idle delay, so a page held for
+    /// minutes is not re-listed at the pace of a productive walk.
+    nonisolated static func backfillInterCycleDelay(didWork: Bool, profile: BackfillProfile) -> TimeInterval {
+        didWork ? profile.interCycleActiveDelay : profile.interCycleIdleDelay
+    }
 
     func startBackfill(account: Account) {
         if Self.backfillDisabled { BackgroundSyncLogger.logDebug("[Backfill] SKIPPED \(account.emailAddress) — backfillDisabled"); return }
@@ -265,7 +274,7 @@ extension SyncEngine {
                         BackgroundSyncLogger.logDebug("[Backfill] \(account.emailAddress) no work, walkDone=\(walkDone)")
                         BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress) cycle no work, walkDone=\(walkDone)")
                         guard walkDone else {
-                            let sleepDelay = profile.interCycleActiveDelay
+                            let sleepDelay = Self.backfillInterCycleDelay(didWork: didWork, profile: profile)
                             try? await Task.sleep(for: .seconds(sleepDelay))
                             continue
                         }
@@ -280,7 +289,7 @@ extension SyncEngine {
                         break
                     }
 
-                    let sleepSeconds = profile.interCycleActiveDelay
+                    let sleepSeconds = Self.backfillInterCycleDelay(didWork: didWork, profile: profile)
                     try? await Task.sleep(for: .seconds(sleepSeconds))
                 }
 

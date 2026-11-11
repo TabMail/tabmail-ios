@@ -620,7 +620,7 @@ struct AccountDetailView: View {
             arguments: [accountId]
         )
         try db.execute(
-            sql: "UPDATE folder SET backfillComplete = 0, oldestSyncedDate = NULL, lastKnownUidNext = NULL, backfillUidCursor = NULL, backfillPageToken = NULL WHERE accountId = ?",
+            sql: "UPDATE folder SET backfillComplete = 0, oldestSyncedDate = NULL, lastKnownUidNext = NULL, backfillUidCursor = NULL, backfillPageToken = NULL, backfillPageHeldSince = NULL WHERE accountId = ?",
             arguments: [accountId]
         )
     }

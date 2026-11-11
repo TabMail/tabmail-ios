@@ -134,6 +134,11 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         var listingFailureStatus: Int?
         var listingFailureOnlyWithSkipToken = false
         var listingFailuresServed = 0
+        /// Injected bare statuses for the exact message GET
+        /// (`GET /messages/{id}?$select=…`, the backfill fetch included), per
+        /// provider message id, served until `clearGetFailures()`.
+        var getFailureStatusByProviderId: [String: Int] = [:]
+        var getFailuresServedByProviderId: [String: Int] = [:]
     }
 
     private final class StateBox: Sendable {
@@ -404,6 +409,23 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         state.value.withLock { $0.listingFailuresServed }
     }
 
+    /// Answer every exact `GET /messages/{providerMessageId}` with a bare
+    /// `status` until `clearGetFailures()`. Attachment-collection reads are
+    /// never failed by it.
+    func injectGetFailure(providerMessageId: String, status: Int) {
+        state.value.withLock { $0.getFailureStatusByProviderId[providerMessageId] = status }
+    }
+
+    /// Heal every injected message-GET failure, leaving the served counts intact.
+    func clearGetFailures() {
+        state.value.withLock { $0.getFailureStatusByProviderId.removeAll() }
+    }
+
+    /// How many GETs of `providerMessageId` were answered with an injected failure.
+    func getFailuresServedCount(providerMessageId: String) -> Int {
+        state.value.withLock { $0.getFailuresServedByProviderId[providerMessageId] ?? 0 }
+    }
+
     /// Expire every `$skiptoken` handed out so far.
     func expireIssuedSkipTokens() {
         state.value.withLock { $0.liveSkipTokens.removeAll() }
@@ -574,6 +596,12 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
             guard let providerId = Self.messageId(from: request.url, move: false) else {
                 return .status(404)
             }
+            let injectedStatus = state.value.withLock { model -> Int? in
+                guard let status = model.getFailureStatusByProviderId[providerId] else { return nil }
+                model.getFailuresServedByProviderId[providerId, default: 0] += 1
+                return status
+            }
+            if let injectedStatus { return .status(injectedStatus) }
             let message = state.value.withLock { $0.messagesByProviderId[providerId] }
             guard let message else { return .status(404) }
             let body = (try? JSONSerialization.data(withJSONObject: Self.graphRow(message))) ?? Data()

@@ -212,6 +212,17 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         /// served until `clearGetFailures()`.
         var getFailureByProviderId: [String: GetFailure] = [:]
         var getFailuresServedByProviderId: [String: Int] = [:]
+        /// How long an injected message-GET failure is withheld before it is
+        /// answered, per provider message id. See `injectGetFailure(providerMessageId:_:answeredAfter:)`.
+        var getFailureDelayByProviderId: [String: TimeInterval] = [:]
+        /// While true, a forced token refresh (the one a `401` triggers) fails,
+        /// as when the provider refuses the refresh token or the refresh gets
+        /// no answer. The first, unforced token read still succeeds.
+        var failsTokenRefresh = false
+        var failedTokenRefreshes = 0
+        /// Called with the refused token each time the paged listing refuses a
+        /// page token, before the refusal is answered. See `onRejectedPageToken(_:)`.
+        var rejectedPageTokenHook: (@Sendable (String) -> Void)?
         /// An injected failure of the `/messages` listing (action lookups
         /// excluded). See `failListings(status:label:onlyWithPageToken:times:)`.
         var listingFailure: ListingFailure?
@@ -284,9 +295,37 @@ final class StatefulGmailActionServer: @unchecked Sendable {
     func provider() -> GmailProvider {
         GmailProvider(
             userEmail: "user@example.com",
-            accessToken: { _ in "stateful-test-token" },
+            accessToken: { [state] forceRefresh in
+                let refused = forceRefresh && state.value.withLock { model -> Bool in
+                    guard model.failsTokenRefresh else { return false }
+                    model.failedTokenRefreshes += 1
+                    return true
+                }
+                if refused { throw TokenRefreshRefused() }
+                return "stateful-test-token"
+            },
             session: http.session
         )
+    }
+
+    /// What a refused token refresh throws from the access-token closure.
+    struct TokenRefreshRefused: Error {}
+
+    /// Make every forced token refresh fail (`true`) or succeed again (`false`).
+    func failTokenRefresh(_ failing: Bool) {
+        state.value.withLock { $0.failsTokenRefresh = failing }
+    }
+
+    /// How many forced token refreshes were refused.
+    func failedTokenRefreshCount() -> Int {
+        state.value.withLock { $0.failedTokenRefreshes }
+    }
+
+    /// Run `hook` with the refused token whenever the paged listing refuses a
+    /// page token, before the refusal is answered: a stand-in for another
+    /// writer acting on the folder while the walk's request is in flight.
+    func onRejectedPageToken(_ hook: (@Sendable (String) -> Void)?) {
+        state.value.withLock { $0.rejectedPageTokenHook = hook }
     }
 
     /// Refuse the next `POST /labels` with 409 "Label name exists or
@@ -547,13 +586,23 @@ final class StatefulGmailActionServer: @unchecked Sendable {
 
     /// Fail every `GET /messages/{providerMessageId}` with `failure` until
     /// `clearGetFailures()`.
-    func injectGetFailure(providerMessageId: String, _ failure: GetFailure) {
-        state.value.withLock { $0.getFailureByProviderId[providerMessageId] = failure }
+    /// `answeredAfter` withholds each failure for that long before answering
+    /// it, so a test can order it after another message's answer.
+    func injectGetFailure(providerMessageId: String, _ failure: GetFailure, answeredAfter delay: TimeInterval = 0) {
+        state.value.withLock {
+            $0.getFailureByProviderId[providerMessageId] = failure
+            $0.getFailureDelayByProviderId[providerMessageId] = delay
+        }
     }
 
     /// Heal every injected message-GET failure, leaving the served counts intact.
     func clearGetFailures() {
         state.value.withLock { $0.getFailureByProviderId.removeAll() }
+    }
+
+    /// Heal the injected message-GET failure of one message only.
+    func clearGetFailure(providerMessageId: String) {
+        state.value.withLock { _ = $0.getFailureByProviderId.removeValue(forKey: providerMessageId) }
     }
 
     /// How many GETs of `providerMessageId` were answered with an injected failure.
@@ -563,6 +612,9 @@ final class StatefulGmailActionServer: @unchecked Sendable {
 
     struct ListingFailure: Sendable {
         let status: Int
+        /// When set, the listing gets no answer at all (this transport error)
+        /// instead of `status`.
+        var transport: URLError.Code?
         let label: String?
         let onlyWithPageToken: Bool
         var remaining: Int?
@@ -576,6 +628,18 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         state.value.withLock {
             $0.listingFailure = ListingFailure(
                 status: status, label: label, onlyWithPageToken: onlyWithPageToken, remaining: times)
+        }
+    }
+
+    /// Like `failListings(status:label:onlyWithPageToken:times:)`, but the
+    /// matching listings get no answer at all: the request fails with the
+    /// transport error `code`.
+    func failListings(transport code: URLError.Code, label: String? = nil, onlyWithPageToken: Bool = false, times: Int? = nil) {
+        state.value.withLock {
+            var failure = ListingFailure(
+                status: 0, label: label, onlyWithPageToken: onlyWithPageToken, remaining: times)
+            failure.transport = code
+            $0.listingFailure = failure
         }
     }
 
@@ -824,15 +888,22 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         }
         http.register(path: "/messages/", method: "GET") { [state] request in
             let providerId = request.url.pathComponents.last ?? ""
-            let injectedFailure = state.value.withLock { model -> GetFailure? in
+            let injected = state.value.withLock { model -> (failure: GetFailure, delay: TimeInterval)? in
                 guard let failure = model.getFailureByProviderId[providerId] else { return nil }
                 model.getFailuresServedByProviderId[providerId, default: 0] += 1
-                return failure
+                return (failure, model.getFailureDelayByProviderId[providerId] ?? 0)
             }
-            switch injectedFailure {
-            case .status(let code)?: return .status(code)
-            case .transport(let code)?: return .transportError(code)
-            case nil: break
+            if let injected {
+                let response: FakeHTTP.CannedResponse
+                switch injected.failure {
+                case .status(let code): response = .status(code)
+                case .transport(let code): response = .transportError(code)
+                }
+                guard injected.delay > 0 else { return response }
+                return .parked {
+                    Thread.sleep(forTimeInterval: injected.delay)
+                    return response
+                }
             }
             if state.value.withLock({ $0.invalidIdOnGetProviderIds.contains(providerId) }) {
                 return .bytes(Self.invalidIdErrorBody(providerId), contentType: "application/json", statusCode: 400)
@@ -890,7 +961,7 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                 return .bytes(Self.invalidLabelErrorBody(label), contentType: "application/json", statusCode: 400)
             }
             let pageToken = queryItems.first(where: { $0.name == "pageToken" })?.value
-            let listingFailureStatus = state.value.withLock { model -> Int? in
+            let listingFailure = state.value.withLock { model -> ListingFailure? in
                 guard actionRFC == nil, var failure = model.listingFailure else { return nil }
                 if let only = failure.label, only != label { return nil }
                 if failure.onlyWithPageToken && pageToken == nil { return nil }
@@ -899,9 +970,12 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                     model.listingFailure = remaining > 1 ? failure : nil
                 }
                 model.listingFailuresServed += 1
-                return failure.status
+                return failure
             }
-            if let listingFailureStatus { return .status(listingFailureStatus) }
+            if let listingFailure {
+                if let code = listingFailure.transport { return .transportError(code) }
+                return .status(listingFailure.status)
+            }
             let matches = state.value.withLock { model in
                 model.messagesByProviderId.values
                     .filter { message in
@@ -961,6 +1035,9 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                 return (Array(matches[start..<end]), next)
             }
             guard let page else {
+                if let pageToken, let hook = state.value.withLock({ $0.rejectedPageTokenHook }) {
+                    hook(pageToken)
+                }
                 return .bytes(Self.invalidPageTokenBody(), contentType: "application/json", statusCode: 400)
             }
             var responseObject: [String: Any] = ["messages": page.refs]

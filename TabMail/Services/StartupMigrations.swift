@@ -146,7 +146,8 @@ enum StartupMigrations {
                             Column("backfillComplete").set(to: false),
                             Column("oldestSyncedDate").set(to: nil as Date?),
                             Column("backfillUidCursor").set(to: nil as Int?),
-                            Column("backfillPageToken").set(to: nil as String?)
+                            Column("backfillPageToken").set(to: nil as String?),
+                            Column("backfillPageHeldSince").set(to: nil as Date?)
                         )
                     try Account.filter(imapAccountIds.contains(Column("id")))
                         .updateAll(db, Column("lastFullSyncAt").set(to: nil as Date?))
@@ -170,7 +171,8 @@ enum StartupMigrations {
                         Column("oldestSyncedDate").set(to: nil as Date?),
                         Column("lastKnownUidNext").set(to: nil as Int?),
                         Column("backfillUidCursor").set(to: nil as Int?),
-                        Column("backfillPageToken").set(to: nil as String?)
+                        Column("backfillPageToken").set(to: nil as String?),
+                        Column("backfillPageHeldSince").set(to: nil as Date?)
                     )
                     try Account.updateAll(db, Column("lastFullSyncAt").set(to: nil as Date?))
                 }

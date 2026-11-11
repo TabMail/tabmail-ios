@@ -12,10 +12,12 @@ import GRDB
 ///
 /// The properties asserted, per test: the requests a call makes are bounded;
 /// a folder is never completed while a message it could still load is
-/// missing; a message that failed with no answer, or transiently inside the
-/// hold bound, is never passed over; a page that is held costs one listing on
+/// missing; a message whose failure is not about that message alone is never
+/// passed over inside the hold bound; a page that is held costs one listing on
 /// a later call, not a re-list from the top; and the folder completes once
-/// the failure clears (or, for a failure about one message, without it).
+/// the failure clears, or past the bound, or (for a failure about one
+/// message) at once without it. The bound across token moves, relaunches and
+/// Exchange is in `BackfillPageWalkHoldBoundTests`.
 /// Each call has a deadline only so a regression ends with failed assertions
 /// instead of hanging the suite.
 @Suite("Backfill page walk — page-list failures and held pages", .serialized, .processGlobalState)
@@ -277,7 +279,7 @@ struct BackfillPageWalkFailureTests {
         server.injectGetFailure(providerMessageId: "m3", .status(503))
         let engine = await F.registeredEngine(accountId: accountId, provider: server.provider())
         let start = Date()
-        let bound = SyncConfig.backfillTransientPageHoldSeconds
+        let bound = SyncConfig.backfillPageHoldSeconds
         let margin = bound / 60
 
         Self.setHoldClock(start)
@@ -299,11 +301,14 @@ struct BackfillPageWalkFailureTests {
                 "each later call lists only the held page: \(tokens)")
     }
 
-    /// The last page's only message gets no answer at all (offline). The page
-    /// is held past the transient bound too, each later call costs one
-    /// listing of the held page, and the folder completes once it answers.
-    @Test("Gmail: a message with no answer holds its page past the bound and is never passed over")
-    func gmailNoAnswerHoldsPastTheBound() async throws {
+    /// The last page's only message gets no answer at all, call after call
+    /// (offline for that request). That is a hold like any other failure that
+    /// is not about the message alone: the page is held while the hold is
+    /// younger than the bound, each later call costs one listing of the held
+    /// page, and past the bound the message is passed over and the folder
+    /// completes without it.
+    @Test("Gmail: a message that keeps getting no answer holds its page until the bound, then is passed over")
+    func gmailRecurringNoAnswerHoldsUntilTheBound() async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         defer { Self.setHoldClock(nil) }
@@ -313,55 +318,66 @@ struct BackfillPageWalkFailureTests {
         server.injectGetFailure(providerMessageId: "m3", .transport(.notConnectedToInternet))
         let engine = await F.registeredEngine(accountId: accountId, provider: server.provider())
         let start = Date()
-        let bound = SyncConfig.backfillTransientPageHoldSeconds
+        let bound = SyncConfig.backfillPageHoldSeconds
+        let margin = bound / 60
 
         Self.setHoldClock(start)
         _ = await engine.runBackfill(account: account, deadline: F.deadline())
-        Self.setHoldClock(start.addingTimeInterval(bound * 2))
+        Self.setHoldClock(start.addingTimeInterval(bound - margin))
         _ = await engine.runBackfill(account: account, deadline: F.deadline())
 
-        #expect(try !Self.isComplete(accountId, "INBOX", pool: pool), "a message with no answer was passed over")
+        #expect(try !Self.isComplete(accountId, "INBOX", pool: pool), "a message with no answer was passed over inside the hold bound")
         #expect(try F.messageIds(accountId, "INBOX", pool: pool) == ["m1", "m2"])
-        let tokens = F.gmailListPageTokens(server, label: "INBOX")
-        #expect(tokens.count == 3, "the later call re-listed more than the held page: \(tokens)")
-        guard tokens.count == 3 else { return }
-        #expect(tokens[2] != nil && tokens[2] == tokens[1], "the held page was not listed by its saved token: \(tokens)")
+        let held = F.gmailListPageTokens(server, label: "INBOX")
+        #expect(held.count == 3, "the later call re-listed more than the held page: \(held)")
+        guard held.count == 3 else { return }
+        #expect(held[2] != nil && held[2] == held[1], "the held page was not listed by its saved token: \(held)")
 
-        server.clearGetFailures()
+        Self.setHoldClock(start.addingTimeInterval(bound + margin))
         _ = await engine.runBackfill(account: account, deadline: F.deadline())
 
-        #expect(try Self.isComplete(accountId, "INBOX", pool: pool))
-        #expect(try F.messageIds(accountId, "INBOX", pool: pool) == ["m1", "m2", "m3"])
+        #expect(try Self.isComplete(accountId, "INBOX", pool: pool), "a message with no answer held its page past the bound")
+        #expect(try F.messageIds(accountId, "INBOX", pool: pool) == ["m1", "m2"])
+        #expect(server.getFailuresServedCount(providerMessageId: "m3") == 3)
     }
 
     // MARK: - The one classification rule
 
     /// The classification is one rule over error kind and status, the same
-    /// whichever provider threw: no answer beats a transient answer, which
-    /// beats an answer about one message.
+    /// whichever provider threw. Only an answer about the one message is
+    /// per-message: a 4xx other than 401, 403 and 429, an answer that did not
+    /// decode, and an answer the provider could not read as a message (no
+    /// header, no error). Everything else holds the page, an error the rule
+    /// does not name included.
     @Test("A failed fetch is classified by error kind and status alone")
     func failureKindsFollowOneRule() {
         typealias Kind = SyncEngine.BackfillFetchFailureKind
         func status(_ code: Int) -> Error { ProviderError.networkError(underlying: HTTPError.networkError(statusCode: code)) }
         let cases: [(String, Error?, Kind)] = [
-            ("offline", URLError(.notConnectedToInternet), .noAnswer),
-            ("connection lost", URLError(.networkConnectionLost), .noAnswer),
-            ("cancelled", CancellationError(), .noAnswer),
-            ("500", status(500), .serverTransient),
-            ("503", status(503), .serverTransient),
-            ("429", status(429), .serverTransient),
-            ("403", status(403), .serverTransient),
-            ("403 status-coded NSError", ProviderError.networkError(underlying: NSError(domain: "Provider", code: 403)), .serverTransient),
+            ("offline", URLError(.notConnectedToInternet), .hold),
+            ("connection lost", URLError(.networkConnectionLost), .hold),
+            ("timed out", URLError(.timedOut), .hold),
+            ("cancelled", CancellationError(), .hold),
+            ("500", status(500), .hold),
+            ("503", status(503), .hold),
+            ("429", status(429), .hold),
+            ("403", status(403), .hold),
+            ("403 status-coded NSError", ProviderError.networkError(underlying: NSError(domain: "Provider", code: 403)), .hold),
+            ("401", status(401), .hold),
+            ("token refresh failed", AuthError.refreshFailed(underlying: "the refresh token was refused"), .hold),
+            ("unclassified provider error", ProviderError.invalidURL("not a message URL"), .hold),
+            ("unclassified error", NSError(domain: "Unclassified", code: 7), .hold),
             ("400", status(400), .perMessage),
             ("404", status(404), .perMessage),
+            ("409", status(409), .perMessage),
             ("410", status(410), .perMessage),
-            ("not found", ProviderError.messageNotFound, .perMessage),
+            ("404 status-coded NSError", ProviderError.networkError(underlying: NSError(domain: "Provider", code: 404)), .perMessage),
             ("undecodable answer", DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "bad")), .perMessage),
             ("no header, no error", nil, .perMessage),
         ]
         for (name, error, expected) in cases {
             #expect(SyncEngine.backfillFetchFailureKind(error) == expected, "\(name)")
         }
-        #expect(Kind.noAnswer > Kind.serverTransient && Kind.serverTransient > Kind.perMessage)
+        #expect(Kind.hold > Kind.perMessage)
     }
 }

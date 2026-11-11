@@ -86,7 +86,8 @@ struct StartupMigrationsTests {
             try db.execute(sql: """
                 CREATE TABLE folder (
                     id TEXT, backfillComplete INTEGER, oldestSyncedDate DOUBLE,
-                    lastKnownUidNext INTEGER, backfillUidCursor INTEGER, backfillPageToken TEXT
+                    lastKnownUidNext INTEGER, backfillUidCursor INTEGER, backfillPageToken TEXT,
+                    backfillPageHeldSince DATETIME
                 )
                 """)
             try db.execute(sql: "CREATE TABLE account (id TEXT, lastFullSyncAt DOUBLE)")
@@ -170,6 +171,10 @@ struct StartupMigrationsTests {
         try await queue.write { db in
             try db.execute(sql: "INSERT INTO messageHeader (id) VALUES ('h1')")
             try db.execute(sql: "INSERT INTO messageBody (id) VALUES ('b1')")
+            try db.execute(sql: """
+                INSERT INTO folder (id, backfillComplete, backfillPageToken, backfillPageHeldSince)
+                VALUES ('f1', 1, 'saved-page-token', '2099-01-01 00:00:00.000')
+                """)
         }
 
         var ftsResets = 0
@@ -177,6 +182,13 @@ struct StartupMigrationsTests {
 
         #expect(try await Self.count(queue, "messageHeader") == 0)
         #expect(try await Self.count(queue, "messageBody") == 0)
+        // The walk starts over, so the page its saved token named is no longer held.
+        let (token, heldSince) = try await queue.read { db -> (String?, String?) in
+            let row = try Row.fetchOne(db, sql: "SELECT backfillPageToken, backfillPageHeldSince FROM folder WHERE id = 'f1'")
+            return (row?["backfillPageToken"], row?["backfillPageHeldSince"])
+        }
+        #expect(token == nil)
+        #expect(heldSince == nil, "the reset left the cleared page's hold time behind")
         #expect(ftsResets == 1)  // FTS reset fired in lockstep with the deletes
         #expect(UserDefaults.standard.bool(forKey: "didCleanResetMessageData_v1") == true)
 
