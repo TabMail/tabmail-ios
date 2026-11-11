@@ -265,6 +265,7 @@ enum CalDAVOccurrences {
         let components = ICSParser.components(icsText: icsText, resourceHref: href)
         let overrides = components.filter { $0.recurrenceId != nil }
         let rows: [(key: String, row: GCalEvent)]
+        var seriesFrame: Frame?
         if let master = components.first(where: { $0.recurrenceId == nil }) {
             var series: Series
             switch shape(of: master, overrides: overrides) {
@@ -278,6 +279,7 @@ enum CalDAVOccurrences {
                 series = s
             }
             if forSplit { series = series.withoutEnd }
+            seriesFrame = series.frame
             guard let found = occurrenceRows(of: series, overrides: overrides, href: href, timeMin: timeMin, timeMax: timeMax) else {
                 throw CalendarProviderError.notSupported(
                     "TabMail can't work out the occurrences of this repeating event, so it can't change one of them or split the series at one. Nothing was changed.")
@@ -316,10 +318,10 @@ enum CalDAVOccurrences {
                 throw CalendarProviderError.notSupported(
                     "TabMail can't express the occurrence recurrence_id '\(recurrenceId)' names in \(zone.identifier), so nothing was changed.")
             }
-            // A moved occurrence no longer answers to its place in the series. A split there
-            // would start at that place and also change the occurrences between it and where
-            // the occurrence was moved to, a wider write than the one asked for: refuse it.
-            if forSplit, RecurrenceOccurrenceResolver.select(candidates, recurrenceId: slot, zone: zone) != .resolved(named) {
+            // A split at a moved occurrence would start at its place in the series and also
+            // change the occurrences between that place and where it was moved to, a wider
+            // write than the one asked for: refuse it.
+            if forSplit, let seriesFrame, let candidate = candidates.first(where: { $0.id == named }), isMoved(candidate, in: seriesFrame) {
                 throw CalendarProviderError.notSupported(
                     "The occurrence recurrence_id '\(recurrenceId)' names was moved from its place in the series, so TabMail can't split the series at it. Nothing was changed. Use edit_scope this_only to change just this occurrence, or ask the user to change this and the following occurrences in their calendar app.")
             }
@@ -332,6 +334,30 @@ enum CalDAVOccurrences {
         case .malformed:
             throw CalendarProviderError.notSupported(invalid)
         }
+    }
+
+    /// Where the series puts the occurrence `key` names, as a candidate's start is given
+    /// (`scopedEditSlot`): the date of an all-day key, the instant of a UTC key, and a floating
+    /// key's wall time read in the series' frame, as the listing reads it. nil for a value that
+    /// is not a key.
+    private static func seriesSlot(ofKey key: String, in frame: Frame) -> OccurrenceCandidate? {
+        guard OccurrenceId.isKey(key) else { return nil }
+        let c = Array(key)
+        guard c.count > 8 else {
+            return OccurrenceCandidate(id: key, instant: nil, dateOnly: "\(String(c[0..<4]))-\(String(c[4..<6]))-\(String(c[6..<8]))")
+        }
+        guard let wall = wallTime(key),
+              let instant = wallInstant(
+                  day: wall.day, hour: wall.hour, minute: wall.minute, second: wall.second,
+                  in: key.hasSuffix("Z") ? .gmt : frame.zone) else { return nil }
+        return OccurrenceCandidate(id: key, instant: instant, dateOnly: nil)
+    }
+
+    /// CalDAV's one notion of a moved occurrence: `candidate` (keyed as `scopedEditSlot`'s are)
+    /// no longer starts where the series puts it (`seriesSlot`), compared in the series' own
+    /// frame. A key that names no slot counts as moved, so a check on it fails closed.
+    private static func isMoved(_ candidate: OccurrenceCandidate, in frame: Frame) -> Bool {
+        seriesSlot(ofKey: candidate.id, in: frame) != candidate
     }
 
     // MARK: - Series

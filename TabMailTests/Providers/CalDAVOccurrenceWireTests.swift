@@ -508,6 +508,113 @@ struct CalDAVOccurrenceWireTests {
         }
     }
 
+    /// How a series' DTSTART is written in `splitIsRefusedExactlyAtMovedOccurrencesInEveryFrame`.
+    enum SeriesFrame: String, CaseIterable {
+        case floating, utc, zoned, allDay
+
+        /// The zone the series' wall times are in: a floating or all-day value is read in the
+        /// device's, as the listing reads it.
+        func zone() throws -> TimeZone {
+            switch self {
+            case .floating, .allDay: return .current
+            case .utc: return .gmt
+            case .zoned: return try #require(TimeZone(identifier: "America/New_York"))
+            }
+        }
+
+        /// A DTSTART, RECURRENCE-ID or DTEND line for `date`.
+        func line(_ name: String, _ date: Date) throws -> String {
+            switch self {
+            case .floating: return "\(name):\(OccurrenceFixture.wall(date, .current))"
+            case .utc: return "\(name):\(OccurrenceFixture.utcValue(date))"
+            case .zoned: return "\(name);TZID=America/New_York:\(OccurrenceFixture.wall(date, try zone()))"
+            case .allDay: return "\(name);VALUE=DATE:\(OccurrenceFixture.dateValue(date, .current))"
+            }
+        }
+    }
+
+    /// Where `splitIsRefusedExactlyAtMovedOccurrencesInEveryFrame` puts week 2's occurrence.
+    enum Move: String, CaseIterable {
+        /// No change at all, and a change that kept its start (an override at its own slot).
+        case none, retitledInPlace, sameDay, nextDay
+    }
+
+    @Test("this_and_following is refused exactly at a moved occurrence, in every series frame, from the device's zone or another, by either id",
+          arguments: SeriesFrame.allCases, Move.allCases)
+    func splitIsRefusedExactlyAtMovedOccurrencesInEveryFrame(_ frame: SeriesFrame, _ move: Move) async throws {
+        // An all-day occurrence has no time of day to move within its day.
+        if frame == .allDay, move == .sameDay { return }
+        let zone = try frame.zone()
+        let calendar = OccurrenceFixture.calendar(zone)
+        let weekAgo = try #require(calendar.date(byAdding: .day, value: -7, to: Date()))
+        let first = frame == .allDay
+            ? calendar.startOfDay(for: weekAgo)
+            : try #require(calendar.date(bySettingHour: 9, minute: 0, second: 0, of: weekAgo))
+        let slot = try #require(calendar.date(byAdding: .day, value: 14, to: first))
+        let length: TimeInterval = frame == .allDay ? 24 * 60 * 60 : 30 * 60
+        let shown: Date
+        switch move {
+        case .none, .retitledInPlace: shown = slot
+        case .sameDay: shown = slot.addingTimeInterval(2 * 60 * 60)
+        case .nextDay: shown = try #require(calendar.date(byAdding: .day, value: 1, to: slot)).addingTimeInterval(frame == .allDay ? 0 : 60 * 60)
+        }
+        var vevents = [[
+            "UID:standup-1", "DTSTAMP:\(OccurrenceFixture.utcValue(first))",
+            try frame.line("DTSTART", first), try frame.line("DTEND", first.addingTimeInterval(length)),
+            "SUMMARY:Standup", "RRULE:FREQ=WEEKLY",
+        ].joined(separator: "\n")]
+        if move != .none {
+            vevents.append([
+                "UID:standup-1", try frame.line("RECURRENCE-ID", slot), "DTSTAMP:\(OccurrenceFixture.utcValue(first))",
+                try frame.line("DTSTART", shown), try frame.line("DTEND", shown.addingTimeInterval(length)),
+                "SUMMARY:Standup (changed)",
+            ].joined(separator: "\n"))
+        }
+        let fixture = W(zone: zone, first: first, ics: OccurrenceFixture.ics(vevents))
+        let occurrenceId = CalDAVOccurrences.OccurrenceId.make(
+            seriesHref: W.seriesPath,
+            key: frame == .allDay ? OccurrenceFixture.dateValue(slot, .current)
+                : frame == .floating ? OccurrenceFixture.wall(slot, .current) : OccurrenceFixture.utcValue(slot))
+        let moved = move == .sameDay || move == .nextDay
+        // The model may name the occurrence in the device's zone or in another one.
+        let device = TimeZone.current
+        let other = try #require(TimeZone(identifier: device.identifier == "Asia/Tokyo" ? "Europe/Berlin" : "Asia/Tokyo"))
+
+        for toolZone in [device, other] {
+            for eventId in [occurrenceId, W.seriesPath] {
+                let (store, http) = W.serve(fixture)
+                defer { http.close() }
+                let recurrenceId = frame == .allDay
+                    ? OccurrenceFixture.isoDate(shown, .current)
+                    : OccurrenceFixture.naive(shown, toolZone)
+                let label = "\(frame) series, \(move), named in \(toolZone.identifier) by \(eventId)"
+                let split: () async throws -> Void = {
+                    _ = try await W.makeProvider(http).splitSeries(
+                        calendarId: W.calendarId, eventId: eventId, recurrenceId: recurrenceId,
+                        recurrenceIdZone: toolZone, patch: GCalEventInput(), sendUpdates: "all")
+                }
+                if moved {
+                    await #expect("\(label): the split was not refused by name") {
+                        try await split()
+                    } throws: { error in
+                        guard case CalendarProviderError.notSupported(let message) = error else { return false }
+                        return message.contains("was moved from its place in the series")
+                    }
+                    let writes = http.recordedCalls().filter { $0.method != "GET" }.map { "\($0.method) \($0.url)" }
+                    #expect(writes.isEmpty, "\(label): the refused split sent a write: \(writes)")
+                    #expect(store.storedICS(path: W.seriesPath) == fixture.ics, "\(label): the series is not on the server as it was")
+                } else {
+                    do {
+                        try await split()
+                    } catch {
+                        Issue.record("\(label): the split at an occurrence that was not moved failed: \(error)")
+                    }
+                    #expect(store.recordedPuts().count == 2, "\(label): the split did not write its new part and the capped series: \(store.recordedPuts().map(\.path))")
+                }
+            }
+        }
+    }
+
     @Test("a recurrence_id that names another occurrence than the event_id does is refused, one that names none is not found, and nothing is written")
     func recurrenceIdDisagreeingWithTheIdIsRefused() async throws {
         let fixture = try W.makeChanged()

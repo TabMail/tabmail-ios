@@ -69,7 +69,10 @@ of the resource, which holds every occurrence (irreversible wire operation #5, n
      names; another is refused. The write uses the named occurrence's place in the series (its key),
      so an override is changed in place, never duplicated, and a split starts where the series puts
      the occurrence; the series id and an occurrence id name a split's new part alike. A split at a
-     MOVED occurrence (an override that no longer starts at its place in the series) is REFUSED by
+     MOVED occurrence (`CalDAVOccurrences.isMoved`: its start differs from the slot its own key
+     names, compared in the series' own frame, a floating time as a wall time in the device's zone,
+     an all-day one as a date, a UTC or zoned one as an instant, whatever zone the tool names it
+     in) is REFUSED by
      name, by either id, after the GET and before any write: it would start at the occurrence's
      place and also change the occurrences between that place and where it was moved to, a wider
      write than the card shows. The refusal tells the assistant what works: `this_only` on that
@@ -134,7 +137,8 @@ keeping the device expansion for servers that don't expand would be a second rou
 overrides), `CalDAVOccurrenceWireTests` (no DELETE for an occurrence id, series unchanged; an `all`
 edit by an occurrence id, a moved occurrence's included, refused with no request whatever it sets; a
 moved occurrence listed with its own id and edited in place, and a split at it refused by either id
-with nothing written; a
+with nothing written, exactly at moved occurrences in every series frame named from the device's zone
+or another; a
 `recurrence_id` that names no occurrence, one after a `COUNT` series' end or a cancelled one, not
 found with nothing written; another occurrence than the id's refused; a resource that holds only
 overrides edited in place by the occurrence's id, its own id and splits refused),
