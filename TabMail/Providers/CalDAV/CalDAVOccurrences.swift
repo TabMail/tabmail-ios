@@ -267,7 +267,7 @@ enum CalDAVOccurrences {
         let rows: [(key: String, row: GCalEvent)]
         var seriesFrame: Frame?
         if let master = components.first(where: { $0.recurrenceId == nil }) {
-            try refuseUnknownSeriesZone(of: master)
+            try refuseUnknownSeriesZone(of: master, refusal: .change)
             var series: Series
             switch shape(of: master, overrides: overrides) {
             case .single:
@@ -341,12 +341,13 @@ enum CalDAVOccurrences {
     /// expansion would read it in the device's zone and could report the occurrence not found,
     /// or pick another one. Same refusal every CalDAV write gives such a zone. Only a start the
     /// writers read as zoned (`CalDAVProvider.valueKind`) needs its zone: an all-day start is a
-    /// plain date whatever TZID it carries, and stays editable.
-    private static func refuseUnknownSeriesZone(of master: ICSParser.VEventComponent) throws {
+    /// plain date whatever TZID it carries, and stays editable. `refusal` says what the write
+    /// therefore did not do.
+    private static func refuseUnknownSeriesZone(of master: ICSParser.VEventComponent, refusal: CalDAVProvider.ZoneRefusal) throws {
         if let dtstart = master.dtstart,
            case .zoned(let tzid) = CalDAVProvider.valueKind(
                ofLine: "DTSTART\(dtstart.params.map { ";\($0)" } ?? ""):\(dtstart.value)") {
-            _ = try CalDAVProvider.zone(forTZID: tzid, zones: master.zones)
+            _ = try CalDAVProvider.zone(forTZID: tzid, zones: master.zones, refusal: refusal)
         }
     }
 
@@ -368,6 +369,8 @@ enum CalDAVOccurrences {
         let slotInUTC: String
         /// The position of the series VEVENT, which takes the `EXDATE`.
         let seriesPosition: Int
+        /// The resource's zone context, built once by the parse (`ICSParser.components`).
+        let zones: CalendarTimeZoneContext
         /// The positions of the occurrence's changed copies (none, or more than one where
         /// another client wrote the same RECURRENCE-ID twice): every VEVENT whose RECURRENCE-ID
         /// names the occurrence's key in this series, read as the listing reads it, so one
@@ -399,7 +402,7 @@ enum CalDAVOccurrences {
                 "This calendar entry holds changed occurrences without their repeating event, so TabMail can't delete one of them. Nothing was deleted. The user can delete it in their calendar app.")
         }
         let master = components[seriesPosition]
-        try refuseUnknownSeriesZone(of: master)
+        try refuseUnknownSeriesZone(of: master, refusal: .occurrenceDelete)
         let cantExpand = "TabMail can't work out the occurrences of this repeating event, so it can't delete one of them. Nothing was deleted. The user can delete it in their calendar app."
         let series: Series
         switch shape(of: master, overrides: overrides) {
@@ -435,16 +438,18 @@ enum CalDAVOccurrences {
         let identities = { (components: [ICSParser.VEventComponent]) in vEventIdentities(components, in: series) }
         let kept = components.indices.filter { !changedCopyPositions.contains($0) }.map { components[$0] }
         return OccurrenceDeletion(
-            key: key, slotInUTC: slotInUTC, seriesPosition: seriesPosition,
+            key: key, slotInUTC: slotInUTC, seriesPosition: seriesPosition, zones: master.zones,
             changedCopyPositions: changedCopyPositions, keptVEvents: identities(kept), identities: identities)
     }
 
-    /// The check before the delete's PUT, the last before an irreversible write (memory 102):
-    /// the rebuilt resource `updatedICS` must hold exactly what the delete keeps, the series
-    /// and every other changed occurrence (a changed copy's content would otherwise be lost for
-    /// good), and must no longer have the occurrence (an `EXDATE` the series would not read as
-    /// it would leave it where it is, its changed copy gone). Throws `notSupported`, nothing
-    /// written, when either fails.
+    /// The check before the delete's PUT, the last before an irreversible write (memory 102),
+    /// in two parts. First, the rebuilt resource `updatedICS` must hold the series and every
+    /// other changed occurrence, compared by what each VEVENT is (`vEventIdentities`: the
+    /// series, or the occurrence key its RECURRENCE-ID names), so no other changed copy is
+    /// lost with the deleted one; it does not compare their content, which the rewrite keeps
+    /// byte for byte. Second, it must no longer have the occurrence (an `EXDATE` the series
+    /// would not read as it would leave it where it is, its changed copy gone). Throws
+    /// `notSupported`, nothing written, when either fails.
     static func requireDeletedAlone(_ deletion: OccurrenceDeletion, updatedICS: String, href: String) throws {
         let components = ICSParser.components(icsText: updatedICS, resourceHref: href)
         guard deletion.identities(components) == deletion.keptVEvents else {

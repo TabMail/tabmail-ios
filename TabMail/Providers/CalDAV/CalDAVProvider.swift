@@ -386,8 +386,9 @@ actor CalDAVProvider: CalendarProvider {
     /// ETag. A 412 is thrown as `preconditionFailed`, as every other conditional CalDAV write
     /// throws it. The PUT is an irreversible wire operation (memory 102): it removes the
     /// changed copy's content with no per-item recovery, so nothing is written unless the
-    /// occurrence is found, and unless the resource it builds has lost that occurrence and
-    /// nothing else (`CalDAVOccurrences.requireDeletedAlone`).
+    /// occurrence is found, and unless the resource it builds no longer has that occurrence
+    /// and still has the series and every other changed occurrence, compared by what each
+    /// VEVENT is (`CalDAVOccurrences.requireDeletedAlone`).
     private func deleteOccurrence(calendarId: String, seriesHref: String, key: String) async throws {
         let eventURL = try resolveEventURL(seriesHref, calendarId: calendarId)
         let (data, getResponse) = try await client.get(url: eventURL)
@@ -400,17 +401,17 @@ actor CalDAVProvider: CalendarProvider {
         // The occurrence's place is read as an instant in UTC, which has no wall time a change
         // of UTC offset skips or repeats; `recurrenceIdInMasterFrame` writes it in the series'
         // own frame, and leaves an all-day date or a floating wall time as it is.
-        let zones = CalendarTimeZoneContext(calendarText: storedICS)
         guard let slotInSeriesFrame = try Self.recurrenceIdInMasterFrame(
-            deletion.slotInUTC, declaredZone: .gmt, kind: Self.masterDTStartKind(from: storedICS), zones: zones
+            deletion.slotInUTC, declaredZone: .gmt, kind: Self.masterDTStartKind(from: storedICS), zones: deletion.zones,
+            zoneRefusal: .occurrenceDelete
         ) else {
             throw CalendarProviderError.notSupported(
                 "This occurrence's place in the repeating event can't be written in the event's timezone, so it was not deleted. Nothing was deleted. The user can delete it in their calendar app.")
         }
         let updatedICS = try Self.occurrenceDeletedResource(
             storedICS: storedICS, deletion: deletion, slotNaive: slotInSeriesFrame)
-        // The write must remove the occurrence it names and nothing else: the series and every
-        // other changed occurrence stay, and the series no longer reads the occurrence.
+        // The series and every other changed occurrence must still be there, by what each VEVENT
+        // is, and the series must no longer read the occurrence.
         try CalDAVOccurrences.requireDeletedAlone(deletion, updatedICS: updatedICS, href: seriesHref)
         // No ETag ⇒ `.unconditional`, as every CalDAV write of a resource the GET above proved
         // exists (see `updateEvent`).
@@ -1247,13 +1248,14 @@ actor CalDAVProvider: CalendarProvider {
     ///
     /// Returns nil when the value cannot be re-expressed; callers MUST fail closed
     /// rather than fall back to the raw digits, which is the pre-fix behaviour and
-    /// the defect itself. Throws the zone-naming refusal when the master's TZID is a
-    /// zone TabMail does not recognize; `zones` is the master resource's zone context.
+    /// the defect itself. Throws the zone-naming refusal (`zoneRefusal`) when the master's TZID
+    /// is a zone TabMail does not recognize; `zones` is the master resource's zone context.
     static func recurrenceIdInMasterFrame(
         _ recurrenceId: String,
         declaredZone: TimeZone,
         kind: MasterDTStartKind,
-        zones: CalendarTimeZoneContext
+        zones: CalendarTimeZoneContext,
+        zoneRefusal: ZoneRefusal = .change
     ) throws -> String? {
         switch kind {
         case .allDay:
@@ -1270,7 +1272,7 @@ actor CalDAVProvider: CalendarProvider {
                 recurrenceId, from: declaredZone, to: TimeZone(identifier: "UTC") ?? declaredZone
             )
         case .zoned(let tzid):
-            let masterZone = try zone(forTZID: tzid, zones: zones)
+            let masterZone = try zone(forTZID: tzid, zones: zones, refusal: zoneRefusal)
             return RecurrenceOccurrenceResolver.renderNaive(recurrenceId, from: declaredZone, to: masterZone)
         }
     }
@@ -1462,14 +1464,30 @@ actor CalDAVProvider: CalendarProvider {
         return fmt.date(from: value)
     }
 
+    /// What a refusal of a zone TabMail does not recognize tells the user
+    /// (`CalendarProviderError.unrecognizedTimeZone`): what was not done, and what to do instead.
+    struct ZoneRefusal {
+        let consequence: String
+        let remedy: String
+
+        /// Every write that changes an event.
+        static let change = ZoneRefusal(
+            consequence: "it did not change the event", remedy: "Change the time in your calendar app instead.")
+        /// The delete of one occurrence (`deleteOccurrence`), on each route that needs the zone.
+        static let occurrenceDelete = ZoneRefusal(
+            consequence: "it can't delete one occurrence of it. Nothing was deleted",
+            remedy: "The user can delete it in their calendar app.")
+    }
+
     /// The zone a TZID names in a CalDAV resource whose zone context is `zones`,
     /// through `CalendarTimeZoneResolver`. Every CalDAV write that needs a stored
     /// zone reads it here, so a zone TabMail does not recognize is refused the same
-    /// way on each: nothing is written, and the message names the zone.
-    static func zone(forTZID tzid: String, zones: CalendarTimeZoneContext) throws -> TimeZone {
+    /// way on each: nothing is written, and the message names the zone and says what
+    /// was not done (`refusal`).
+    static func zone(forTZID tzid: String, zones: CalendarTimeZoneContext, refusal: ZoneRefusal = .change) throws -> TimeZone {
         guard let zone = CalendarTimeZoneResolver.zone(named: tzid, in: zones) else {
             BackgroundSyncLogger.logDebug("[CalDAV] unrecognized TZID '\(tzid)' — refusing to guess")
-            throw CalendarProviderError.unrecognizedTimeZone(tzid, consequence: "it did not change the event")
+            throw CalendarProviderError.unrecognizedTimeZone(tzid, consequence: refusal.consequence, remedy: refusal.remedy)
         }
         return zone
     }

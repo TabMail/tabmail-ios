@@ -117,7 +117,10 @@ of the resource, which holds every occurrence (irreversible wire operation #5, n
      changed-only; a series changed into one TabMail can't expand or that no longer repeats,
      refused, not not-found; the check before the PUT refusing an EXDATE that would exclude
      nothing, and a rebuilt resource that lost the series or another changed occurrence; a padded
-     `END:VEVENT` keeping the next changed occurrence; 412; a server without ETags), `CalDAVOccurrenceDeleteToolToWireTests` (end to end from the tools).
+     `END:VEVENT` keeping the next changed occurrence; a series VEVENT after a changed copy; two
+     changed copies of one occurrence, the first deciding it and both removed; a series zone
+     TabMail does not recognize refused in the delete's own words (`CalDAVProvider.ZoneRefusal`);
+     a source fence that the check runs before the PUT; 412; a server without ETags), `CalDAVOccurrenceDeleteToolToWireTests` (end to end from the tools).
    - No series id is added to the tools' output. `calendar_event_read` shows `event_id` only, on every
      provider, exactly as before this ADR (a `series_event_id` line was tried and pulled back: on
      Google and Outlook it handed the assistant a series id it would edit with an occurrence's date,

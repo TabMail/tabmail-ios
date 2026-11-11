@@ -594,4 +594,148 @@ struct CalDAVOccurrenceDeleteWireTests {
                 && reason.contains("calendar app")
         }
     }
+
+    /// A changed occurrence of `Series(.zoned)`'s week `week`, moved an hour later, titled `title`,
+    /// with `extra` lines (a STATUS) after its title.
+    private static func changedCopy(_ series: Series, week: Int, title: String, extra: [String] = []) throws -> String {
+        let wall = { (date: Date) in OccurrenceFixture.wall(date, series.zone) }
+        let slot = try series.slot(week)
+        return ([
+            "UID:standup-1", "RECURRENCE-ID;TZID=America/New_York:\(wall(slot))",
+            "DTSTAMP:\(OccurrenceFixture.utcValue(series.first))",
+            "DTSTART;TZID=America/New_York:\(wall(slot.addingTimeInterval(60 * 60)))",
+            "DTEND;TZID=America/New_York:\(wall(slot.addingTimeInterval(90 * 60)))",
+            "SUMMARY:\(title)",
+        ] + extra).joined(separator: "\n")
+    }
+
+    /// Where the series VEVENT stands among the changed copies in `seriesAfterAChangedCopy`.
+    enum Order: String, CaseIterable {
+        /// Another changed occurrence, then the series, then the deleted occurrence's copy.
+        case otherCopyFirst
+        /// The deleted occurrence's copy, then the series, then another changed occurrence.
+        case deletedCopyFirst
+    }
+
+    @Test("a series VEVENT that comes after a changed occurrence takes the EXDATE, and only the deleted occurrence's copy is removed",
+          arguments: Order.allCases)
+    func seriesAfterAChangedCopy(_ order: Order) async throws {
+        let series = try Series(.zoned)
+        let master = try series.master()
+        let target = try Self.changedCopy(series, week: 2, title: "Standup (later)")
+        let other = try Self.changedCopy(series, week: 3, title: "Standup (retitled)")
+        let ics: String
+        let expected: String
+        let excluded = master + "\n" + (try series.exdate(2))
+        switch order {
+        case .otherCopyFirst:
+            ics = OccurrenceFixture.ics([other, master, target])
+            expected = OccurrenceFixture.ics([other, excluded])
+        case .deletedCopyFirst:
+            ics = OccurrenceFixture.ics([target, master, other])
+            expected = OccurrenceFixture.ics([excluded, other])
+        }
+        let (store, http) = W.serve(W(zone: series.zone, first: series.first, ics: ics))
+        defer { http.close() }
+        let provider = W.makeProvider(http)
+        let deleted = try series.occurrenceId(2)
+
+        let before = try await Self.listing(provider, series)
+        #expect(before.contains { $0.hasPrefix(deleted + " |") && $0.contains("Standup (later)") }, "\(order): setup: the changed occurrence is not listed: \(before)")
+        #expect(before.contains { $0.contains("Standup (retitled)") }, "\(order): setup: the other changed occurrence is not listed: \(before)")
+
+        try await provider.deleteEvent(calendarId: W.calendarId, eventId: deleted, sendUpdates: "all")
+
+        let after = try await Self.listing(provider, series)
+        #expect(after == Self.without(deleted, before), "\(order): the listing did not lose exactly that occurrence.\nbefore: \(before)\nafter: \(after)")
+        #expect(store.recordedPuts().count == 1, "\(order): expected one PUT: \(Self.writes(http))")
+        #expect(store.storedICS(path: W.seriesPath) == expected,
+                "\(order): the EXDATE is not in the series VEVENT, or more than the deleted copy went.\nsent: \(store.storedICS(path: W.seriesPath) ?? "nil")")
+    }
+
+    /// Which of two changed copies of the deleted occurrence (another client wrote its
+    /// RECURRENCE-ID twice) comes first in `twoCopiesOfOneOccurrence`.
+    enum Duplicate: String, CaseIterable {
+        case liveFirst, cancelledFirst
+    }
+
+    @Test("with two changed copies of one occurrence the first decides it, as the listing shows it: a live first copy is deleted with both copies removed; a cancelled first copy is not found and nothing is written",
+          arguments: Duplicate.allCases)
+    func twoCopiesOfOneOccurrence(_ duplicate: Duplicate) async throws {
+        let series = try Series(.zoned)
+        let master = try series.master()
+        let live = try Self.changedCopy(series, week: 2, title: "Standup (later)")
+        let cancelled = try Self.changedCopy(series, week: 2, title: "Standup (cancelled)", extra: ["STATUS:CANCELLED"])
+        let ics = OccurrenceFixture.ics(duplicate == .liveFirst ? [master, live, cancelled] : [master, cancelled, live])
+        let (store, http) = W.serve(W(zone: series.zone, first: series.first, ics: ics))
+        defer { http.close() }
+        let provider = W.makeProvider(http)
+        let deleted = try series.occurrenceId(2)
+
+        guard duplicate == .liveFirst else {
+            await #expect("cancelledFirst: not reported as not found") {
+                try await provider.deleteEvent(calendarId: W.calendarId, eventId: deleted, sendUpdates: "all")
+            } throws: { error in
+                if case CalDAVError.notFound = error { return true }
+                return false
+            }
+            #expect(Self.writes(http).isEmpty, "cancelledFirst: the refused delete wrote: \(Self.writes(http))")
+            #expect(store.storedICS(path: W.seriesPath) == ics, "cancelledFirst: the series is not on the server as it was")
+            return
+        }
+
+        let before = try await Self.listing(provider, series)
+        #expect(before.contains { $0.hasPrefix(deleted + " |") && $0.contains("Standup (later)") }, "liveFirst: setup: the live copy is not the one listed: \(before)")
+
+        try await provider.deleteEvent(calendarId: W.calendarId, eventId: deleted, sendUpdates: "all")
+
+        let after = try await Self.listing(provider, series)
+        #expect(after == Self.without(deleted, before), "liveFirst: the listing did not lose exactly that occurrence.\nbefore: \(before)\nafter: \(after)")
+        #expect(store.recordedPuts().count == 1, "liveFirst: expected one PUT: \(Self.writes(http))")
+        #expect(store.storedICS(path: W.seriesPath) == OccurrenceFixture.ics([master + "\n" + (try series.exdate(2))]),
+                "liveFirst: both copies are not gone, or the EXDATE is missing.\nsent: \(store.storedICS(path: W.seriesPath) ?? "nil")")
+    }
+
+    @Test("an occurrence of a series in a time zone TabMail does not recognize is refused with the delete's own words and nothing is written")
+    func unrecognizedZoneIsRefusedWithTheDeletesWords() async throws {
+        let series = try Series(.floating)
+        let wall = { (date: Date) in OccurrenceFixture.wall(date, series.zone) }
+        let tzid = "Customized Time Zone"
+        let ics = OccurrenceFixture.ics([[
+            "UID:standup-1", "DTSTAMP:\(OccurrenceFixture.utcValue(series.first))",
+            "DTSTART;TZID=\(tzid):\(wall(series.first))",
+            "DTEND;TZID=\(tzid):\(wall(series.first.addingTimeInterval(series.length)))",
+            "SUMMARY:Standup", "RRULE:FREQ=WEEKLY",
+        ].joined(separator: "\n")])
+        let (store, http) = W.serve(W(zone: series.zone, first: series.first, ics: ics))
+        defer { http.close() }
+        let provider = W.makeProvider(http)
+        // The listing still shows the occurrences, read in the device's zone, with their ids.
+        let listed = try await Self.listing(provider, series)
+        let row = try #require(listed.dropFirst(2).first, "setup: the series' occurrences are not listed: \(listed)")
+        let id = try #require(row.components(separatedBy: " | ").first)
+        #expect(id.contains("#"), "setup: the row has no occurrence id: \(row)")
+
+        await #expect("the delete was not refused with its own words") {
+            try await provider.deleteEvent(calendarId: W.calendarId, eventId: id, sendUpdates: "all")
+        } throws: { error in
+            guard case CalendarProviderError.notSupported(let reason) = error else { return false }
+            return reason == "This event uses the time zone \"\(tzid)\", which TabMail does not recognize, so it can't delete one occurrence of it. Nothing was deleted. The user can delete it in their calendar app."
+        }
+        #expect(Self.writes(http).isEmpty, "the refused delete wrote: \(Self.writes(http))")
+        #expect(store.storedICS(path: W.seriesPath) == ics, "the series is not on the server as it was")
+    }
+
+    @Test("source fence: deleteOccurrence runs requireDeletedAlone before its one PUT (no wire input can make the check's identity half fire)")
+    func checkRunsBeforeThePut() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let text = try String(contentsOf: root.appendingPathComponent("TabMail/Providers/CalDAV/CalDAVProvider.swift"), encoding: .utf8)
+        let start = try #require(text.range(of: "private func deleteOccurrence("))
+        let end = try #require(text[start.upperBound...].range(of: "\n    }\n"))
+        let body = text[start.upperBound..<end.lowerBound]
+        let check = try #require(body.range(of: "try CalDAVOccurrences.requireDeletedAlone(deletion, updatedICS: updatedICS"))
+        let put = try #require(body.range(of: "client.put("))
+        #expect(check.upperBound <= put.lowerBound, "the check does not come before the PUT")
+        #expect(body.components(separatedBy: "client.put(").count == 2, "deleteOccurrence has more than one PUT")
+    }
 }
