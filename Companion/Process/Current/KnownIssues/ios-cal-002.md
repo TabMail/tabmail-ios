@@ -18,6 +18,10 @@ Calendar; CalDAV; WebDAV; lost update; last-writer-wins; `CalDAVPutPrecondition`
 **The class, by symbol.** Every calendar UPDATE-path write in this tree lands without a precondition that names WHICH version it is replacing, so a concurrent edit by another client or device is silently overwritten (last-writer-wins, no error, no user signal). Three independently verified members:
 
 **(1) CalDAV `.unconditional` PUT.** Round-9 S1 introduced `enum CalDAVPutPrecondition { case ifMatch(String); case ifNoneMatchAny; case unconditional }` in `CalDAVClient`; `.unconditional` sets NEITHER `If-Match` nor `If-None-Match`. FOUR write sites reach it through `etag.map(CalDAVPutPrecondition.ifMatch) ?? .unconditional`: `CalDAVProvider.updateEvent`, `updateOccurrence`, `splitSeries`' capped-master PUT, and `revertMasterCap`. On a server that returns no ETag on PUT — RFC 4791 §5.3.4 says SHOULD, not MUST — all four are blind overwrites.
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+
+> **Amended 2026-11-11 (#661): a fifth write site.** The CalDAV one-occurrence delete, `CalDAVProvider.deleteOccurrence` (one `PUT` adding an `EXDATE` to the series and removing the occurrence's changed copy, ADR-IOS-108), reaches `.unconditional` through the same `etag.map(CalDAVPutPrecondition.ifMatch) ?? .unconditional` when the server's GET sends no ETag, and is pinned by a `FakeCalDAVStore(servesETags: false)` case in `CalDAVOccurrenceDeleteWireTests`. Same trade as the four above.
+<!-- KNOWN-ISSUES-AMENDMENT-END -->
 
 **(2) `revertMasterCap` / `mergeExistingEventWithPatch`.** `revertMasterCap`'s own doc claimed the `.ifMatch(capETag)` property of the path rather than of one branch of it; corrected in place 2026-08-06 (round-11 R11-H). `GoogleCalendarProvider.mergeExistingEventWithPatch` is the read-modify-write helper both Google (`updateEvent`, `updateOccurrence`) and Exchange (`updateEvent`, `updateOccurrence`) drive: it GETs the existing event, merges the patch over it, and PUTs/PATCHes the result back with nothing asserting that the GET's version is still current.
 

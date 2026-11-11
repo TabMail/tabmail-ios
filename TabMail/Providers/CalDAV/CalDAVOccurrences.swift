@@ -267,16 +267,7 @@ enum CalDAVOccurrences {
         let rows: [(key: String, row: GCalEvent)]
         var seriesFrame: Frame?
         if let master = components.first(where: { $0.recurrenceId == nil }) {
-            // A series zone TabMail does not recognize is refused by name before any expansion:
-            // the expansion would read it in the device's zone and could report the occurrence
-            // not found, or pick another one. Same refusal every CalDAV write gives such a zone.
-            // Only a start the writers read as zoned (`CalDAVProvider.valueKind`) needs its zone:
-            // an all-day start is a plain date whatever TZID it carries, and stays editable.
-            if let dtstart = master.dtstart,
-               case .zoned(let tzid) = CalDAVProvider.valueKind(
-                   ofLine: "DTSTART\(dtstart.params.map { ";\($0)" } ?? ""):\(dtstart.value)") {
-                _ = try CalDAVProvider.zone(forTZID: tzid, zones: master.zones)
-            }
+            try refuseUnknownSeriesZone(of: master, refusal: .change)
             var series: Series
             switch shape(of: master, overrides: overrides) {
             case .single:
@@ -344,6 +335,141 @@ enum CalDAVOccurrences {
         case .malformed:
             throw CalendarProviderError.notSupported(invalid)
         }
+    }
+
+    /// A series zone TabMail does not recognize is refused by name before any expansion: the
+    /// expansion would read it in the device's zone and could report the occurrence not found,
+    /// or pick another one. Same refusal every CalDAV write gives such a zone. Only a start the
+    /// writers read as zoned (`CalDAVProvider.valueKind`) needs its zone: an all-day start is a
+    /// plain date whatever TZID it carries, and stays editable. `refusal` says what the write
+    /// therefore did not do.
+    private static func refuseUnknownSeriesZone(of master: ICSParser.VEventComponent, refusal: CalDAVProvider.ZoneRefusal) throws {
+        if let dtstart = master.dtstart,
+           case .zoned(let tzid) = CalDAVProvider.valueKind(
+               ofLine: "DTSTART\(dtstart.params.map { ";\($0)" } ?? ""):\(dtstart.value)") {
+            _ = try CalDAVProvider.zone(forTZID: tzid, zones: master.zones, refusal: refusal)
+        }
+    }
+
+    // MARK: - One occurrence's delete
+
+    /// What a delete of one occurrence writes, read from one parse of the series' resource. A
+    /// VEVENT is named by its position among the resource's VEVENTs in document order, as
+    /// `ICSParser.components` reads them (`CalDAVProvider.veventBlocks`) and as
+    /// `CalDAVProvider.occurrenceDeletedResource` rewrites them, so the delete changes exactly
+    /// the VEVENTs this parse read: the reader and the writer share one framing and one reading
+    /// of each VEVENT's RECURRENCE-ID.
+    struct OccurrenceDeletion {
+        /// The occurrence's key.
+        let key: String
+        /// The occurrence's place in the series, its key as a naive wall time in UTC
+        /// (`OccurrenceId.recurrenceId(ofKey:in:)`): where an `EXDATE` excludes it, also for an
+        /// occurrence moved away from that place. A floating key's wall time and an all-day
+        /// key's date stay as they are.
+        let slotInUTC: String
+        /// The position of the series VEVENT, which takes the `EXDATE`.
+        let seriesPosition: Int
+        /// The resource's zone context, built once by the parse (`ICSParser.components`).
+        let zones: CalendarTimeZoneContext
+        /// The positions of the occurrence's changed copies (none, or more than one where
+        /// another client wrote the same RECURRENCE-ID twice): every VEVENT whose RECURRENCE-ID
+        /// names the occurrence's key in this series, read as the listing reads it, so one
+        /// spelled in another form or zone than the key is still the one removed.
+        let changedCopyPositions: Set<Int>
+        /// What every VEVENT the delete keeps is (`vEventIdentities`), which the rebuilt
+        /// resource must still hold (`requireDeletedAlone`).
+        let keptVEvents: [String]
+        /// `vEventIdentities` in this series.
+        let identities: ([ICSParser.VEventComponent]) -> [String]
+    }
+
+    /// The one check a delete of one occurrence (`CalDAVProvider.deleteEvent` by an occurrence
+    /// id) makes before it writes anything: the series `icsText` holds has the occurrence `key`
+    /// names now, as a listing shows it. The key names the occurrence by its place in the
+    /// series, so nothing else is matched. Nothing is written when it throws:
+    /// - `notSupported` for a resource that holds only changed occurrences, with no series to
+    ///   exclude one from (an invitation to single occurrences, RFC 4791 §4.1), for a series
+    ///   zone TabMail does not recognize, for an event that does not repeat, and for a series
+    ///   this type can't expand (the refusals `scopedEditSlot` gives an edit): "could not tell"
+    ///   is never reported as not found;
+    /// - `CalDAVError.notFound` when the series has no such occurrence now, or it is cancelled:
+    ///   the authoritative absence Google and Outlook report for it.
+    static func deletion(icsText: String, href: String, key: String) throws -> OccurrenceDeletion {
+        let components = ICSParser.components(icsText: icsText, resourceHref: href)
+        let overrides = components.filter { $0.recurrenceId != nil }
+        guard let seriesPosition = components.firstIndex(where: { $0.recurrenceId == nil }) else {
+            throw CalendarProviderError.notSupported(
+                "This calendar entry holds changed occurrences without their repeating event, so TabMail can't delete one of them. Nothing was deleted. The user can delete it in their calendar app.")
+        }
+        let master = components[seriesPosition]
+        try refuseUnknownSeriesZone(of: master, refusal: .occurrenceDelete)
+        let cantExpand = "TabMail can't work out the occurrences of this repeating event, so it can't delete one of them. Nothing was deleted. The user can delete it in their calendar app."
+        let series: Series
+        switch shape(of: master, overrides: overrides) {
+        case .single:
+            throw CalendarProviderError.notSupported(
+                "This event does not repeat, so it has no single occurrence to delete. Nothing was deleted.")
+        case .unexpandable:
+            throw CalendarProviderError.notSupported(cantExpand)
+        case .series(let s):
+            series = s
+        }
+        let changedCopyPositions = Set(components.indices.filter { position in
+            components[position].recurrenceId.flatMap { occurrenceKey(ofValue: $0.value, params: $0.params, in: series) } == key
+        })
+
+        // Where the listing shows the occurrence: its (first) changed copy, else where the
+        // series puts it.
+        if let changed = changedCopyPositions.min().map({ components[$0] }) {
+            guard changed.event.status?.lowercased() != "cancelled" else { throw CalDAVError.notFound }
+        } else {
+            // A UTC key's date is a day either side of the occurrence's date in the series' zone
+            // at most (UTC offsets stay within 14 hours).
+            guard let keyDay = RecurrenceTail.Day(ical: key) else { throw CalDAVError.notFound }
+            guard let found = expandInstances(of: series, from: keyDay.adding(days: -1), through: keyDay.adding(days: 1)) else {
+                throw CalendarProviderError.notSupported(cantExpand)
+            }
+            guard found.contains(where: { $0.key == key }) else { throw CalDAVError.notFound }
+        }
+        guard let slotInUTC = OccurrenceId.recurrenceId(ofKey: key, in: .gmt) else {
+            throw CalendarProviderError.notSupported(
+                "This occurrence's place in the repeating event can't be read, so it was not deleted. Nothing was deleted. The user can delete it in their calendar app.")
+        }
+        let identities = { (components: [ICSParser.VEventComponent]) in vEventIdentities(components, in: series) }
+        let kept = components.indices.filter { !changedCopyPositions.contains($0) }.map { components[$0] }
+        return OccurrenceDeletion(
+            key: key, slotInUTC: slotInUTC, seriesPosition: seriesPosition, zones: master.zones,
+            changedCopyPositions: changedCopyPositions, keptVEvents: identities(kept), identities: identities)
+    }
+
+    /// The check before the delete's PUT, the last before an irreversible write (memory 102),
+    /// in two parts. First, the rebuilt resource `updatedICS` must hold the series and every
+    /// other changed occurrence, compared by what each VEVENT is (`vEventIdentities`: the
+    /// series, or the occurrence key its RECURRENCE-ID names), so no other changed copy is
+    /// lost with the deleted one; it does not compare their content, which the rewrite keeps
+    /// byte for byte. Second, it must no longer have the occurrence (an `EXDATE` the series
+    /// would not read as it would leave it where it is, its changed copy gone). Throws
+    /// `notSupported`, nothing written, when either fails.
+    static func requireDeletedAlone(_ deletion: OccurrenceDeletion, updatedICS: String, href: String) throws {
+        let components = ICSParser.components(icsText: updatedICS, resourceHref: href)
+        guard deletion.identities(components) == deletion.keptVEvents else {
+            throw CalendarProviderError.notSupported(
+                "TabMail's rewrite of this repeating event would not keep the rest of it as it is, so the occurrence was not deleted. Nothing was deleted. The user can delete it in their calendar app.")
+        }
+        guard occurrence(key: deletion.key, icsText: updatedICS, href: href) == nil else {
+            throw CalendarProviderError.notSupported(
+                "TabMail can't write the exclusion of this occurrence in a form the repeating event reads, so it was not deleted. Nothing was deleted. The user can delete it in their calendar app.")
+        }
+    }
+
+    /// What each VEVENT of a resource is, read as the listing reads it, sorted: `series` for one
+    /// with no RECURRENCE-ID, else the occurrence key its RECURRENCE-ID names in `series` (its
+    /// value as written when it names none), so two resources compare by what they hold.
+    private static func vEventIdentities(_ components: [ICSParser.VEventComponent], in series: Series) -> [String] {
+        components.map { component in
+            guard let rid = component.recurrenceId else { return "series" }
+            return occurrenceKey(ofValue: rid.value, params: rid.params, in: series) ?? "unread \(rid.value)"
+        }.sorted()
     }
 
     /// Where the series puts the occurrence `key` names, as a candidate's start is given

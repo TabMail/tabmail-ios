@@ -95,6 +95,36 @@ of the resource, which holds every occurrence (irreversible wire operation #5, n
      occurrence of a repeating CalDAV event is not supported yet, so nothing was deleted. The user can
      delete it in their calendar app."). The queue retires it as unsupported and the card and the
      tool say the event was not deleted. Deleting by the series id is unchanged.
+     **Amended 2026-11-11 (#661): superseded.** `deleteEvent` by an occurrence id now deletes that
+     occurrence alone, as Google Calendar does, and still never sends a DELETE. It GETs the series'
+     resource, finds the occurrence by its key as the listing shows it, from one parse of the
+     resource (`CalDAVOccurrences.deletion`; an event that does not repeat or a series TabMail can't
+     expand is refused as `scopedEditSlot` refuses it, never reported not found), and writes ONE PUT conditional on the GET's ETag (a 412 is thrown as
+     `preconditionFailed`, as every conditional CalDAV write throws it): an `EXDATE` added to the
+     series VEVENT at the occurrence's place in the series, in the series DTSTART's value type and
+     zone (`VALUE=DATE` all-day, `TZID` wall time, UTC `Z`, floating), and the occurrence's changed
+     copy removed, matched by occurrence key in that one parse and removed by its position among
+     the VEVENTs, framed as the reader frames them (#603), never by RECURRENCE-ID text
+     (`CalDAVProvider.occurrenceDeletedResource`). A moved occurrence is excluded at its
+     original slot. A missing, excluded or cancelled occurrence is `CalDAVError.notFound` with
+     nothing written (so a retry after a lost response is retired as not found, as on Google and
+     Outlook); a resource that holds only changed occurrences is refused with nothing written; and
+     the built resource must keep the series and every other changed occurrence and no longer have
+     the occurrence (`CalDAVOccurrences.requireDeletedAlone`), or nothing is written. The PUT is an
+     irreversible wire operation (memory 102). Tests: `CalDAVOccurrenceDeleteWireTests` (every
+     series frame; a moved occurrence with another changed one kept, in every frame and with its
+     RECURRENCE-ID in the series' form, another form or another zone; missing/cancelled/repeated;
+     changed-only; a series changed into one TabMail can't expand or that no longer repeats,
+     refused, not not-found; the check before the PUT refusing an EXDATE that would exclude
+     nothing, and a rebuilt resource that lost the series or another changed occurrence; a padded
+     `END:VEVENT` keeping the next changed occurrence; a series VEVENT after a changed copy; two
+     changed copies of one occurrence, the first deciding it and both removed; a series zone
+     TabMail does not recognize refused in the delete's own words (`CalDAVProvider.ZoneRefusal`);
+     412; a server without ETags), `CalDAVTimeZoneWireTests` (the delete in a zone recognized only
+     through its VTIMEZONE, excluded under the series' own TZID; the delete's check naming an
+     unrecognized zone before it looks the occurrence up; and the edits' refusal of such a zone,
+     word for word, never in the delete's words, also for a changed occurrence held without its
+     series), `CalDAVOccurrenceDeleteToolToWireTests` (end to end from the tools).
    - No series id is added to the tools' output. `calendar_event_read` shows `event_id` only, on every
      provider, exactly as before this ADR (a `series_event_id` line was tried and pulled back: on
      Google and Outlook it handed the assistant a series id it would edit with an occurrence's date,
@@ -105,7 +135,9 @@ of the resource, which holds every occurrence (irreversible wire operation #5, n
 - A day asked about lists that day's occurrence with its own id, as on Google and Outlook; changed
   occurrences show where they now are.
 - One occurrence of a CalDAV series can't be deleted yet; that is an `EXDATE` written into the series
-  (a later change). The whole series still can be, by its own id.
+  (a later change). The whole series still can be, by its own id. **Amended 2026-11-11 (#661):** that
+  later change is made; one occurrence is deleted by an `EXDATE` written into the series (Decision 3,
+  Delete).
 - Edit scope `all`, or no scope and no `recurrence_id`, given an occurrence id is refused on CalDAV
   with nothing written, whatever it sets. The Google and Outlook paths, which edit only the instance
   there, are left as they are.
@@ -134,7 +166,8 @@ keeping the device expansion for servers that don't expand would be a second rou
 
 **Detail:** `CalDAVOccurrences.swift`; tests `CalDAVOccurrenceExpansionTests`,
 `CalDAVOccurrenceNotListedTests`, `CalDAVOccurrenceLookupTests` (with a resource that holds only
-overrides), `CalDAVOccurrenceWireTests` (no DELETE for an occurrence id, series unchanged; an `all`
+overrides), `CalDAVOccurrenceWireTests` (a delete by an occurrence id sends no DELETE and leaves every other
+occurrence of the series in place, #661; an `all`
 edit by an occurrence id, a moved occurrence's included, refused with no request whatever it sets; a
 moved occurrence listed with its own id and edited in place, and a split at it refused by either id
 with nothing written, exactly at moved occurrences in every series frame named from the device's zone

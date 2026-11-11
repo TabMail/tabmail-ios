@@ -228,11 +228,7 @@ extension CalDAVProvider {
             guard let ridValue = icsDateValue(fromNaive: recurrenceIdNaive, kind: kind) else {
                 throw CalendarProviderError.notSupported("Invalid recurrence_id '\(recurrenceIdNaive)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
             }
-            // RFC 5545 §3.8.4.4: RECURRENCE-ID takes the series DTSTART's value type and zone. A date
-            // value must say so, even where the series' own DTSTART leaves it implicit.
-            var ridParams = dtstartProperty.params
-            if case .allDay = kind, !ICSValueType.statesDate(ridParams) { ridParams += ";VALUE=DATE" }
-            let ridLine = "RECURRENCE-ID\(ridParams):\(ridValue)"
+            let ridLine = slotLine("RECURRENCE-ID", dtstartParams: dtstartProperty.params, value: ridValue, kind: kind)
             guard let ridInstant = try parseICSDateTime(ridLine, zones: zones) else {
                 throw CalendarProviderError.notSupported("The repeating event's time zone can't be read, so one occurrence of it can't be changed.")
             }
@@ -295,6 +291,56 @@ extension CalDAVProvider {
         return spliceOrReplaceOverride(
             ics: storedICS, recurrenceId: recurrenceIdNaive, kind: kind,
             newOverrideBlock: block.flatMap(\.physical).joined(separator: "\r\n"))
+    }
+
+    /// A line naming one occurrence's place in the series (`RECURRENCE-ID`, `EXDATE`): RFC 5545
+    /// §3.8.4.4 gives it the series DTSTART's value type and zone, so it carries DTSTART's
+    /// parameters, and a date value says so even where the series' own DTSTART leaves it implicit.
+    private static func slotLine(_ name: String, dtstartParams: String, value: String, kind: MasterDTStartKind) -> String {
+        var params = dtstartParams
+        if case .allDay = kind, !ICSValueType.statesDate(params) { params += ";VALUE=DATE" }
+        return "\(name)\(params):\(value)"
+    }
+
+    // MARK: - One occurrence's delete
+
+    /// The series' resource after one occurrence is deleted, as Google Calendar deletes one: an
+    /// `EXDATE` added to the series VEVENT at the occurrence's place in the series, in the series
+    /// DTSTART's value type and zone (a DATE for an all-day series), and the occurrence's changed
+    /// copy, if it has one, removed. A moved occurrence is excluded at its place in the series,
+    /// the slot its RECURRENCE-ID names, not where it was moved to. Which VEVENT is the series
+    /// and which are the changed copies comes from the delete's one parse of `storedICS`
+    /// (`CalDAVOccurrences.OccurrenceDeletion`), by position: `rewriteVEvents` takes the VEVENTs
+    /// in the order and framing `ICSParser.components` reads them (`isMarker`, `takeVEvent`),
+    /// so a changed copy is matched by its occurrence key as the listing reads it, never by
+    /// RECURRENCE-ID text read again here. Every other line goes back byte for byte.
+    ///
+    /// - Parameters:
+    ///   - storedICS: the series' resource exactly as the server returned it.
+    ///   - deletion: what the delete's check read from `storedICS`.
+    ///   - slotNaive: the occurrence's place in the series, already in the series' frame
+    ///     (`recurrenceIdInMasterFrame`).
+    static func occurrenceDeletedResource(
+        storedICS: String, deletion: CalDAVOccurrences.OccurrenceDeletion, slotNaive: String
+    ) throws -> String {
+        let kind = masterDTStartKind(from: storedICS)
+        guard let value = icsDateValue(fromNaive: slotNaive, kind: kind) else {
+            throw CalendarProviderError.notSupported("The occurrence's place in the repeating event can't be written, so it can't be deleted. Nothing was deleted. The user can delete it in their calendar app.")
+        }
+        var position = -1
+        return try rewriteVEvents(in: storedICS) { block, _ in
+            position += 1
+            if position == deletion.seriesPosition {
+                guard let dtstart = topLevel(block).first(where: { icsProperty($0.text)?.name == "DTSTART" }),
+                      let dtstartProperty = icsProperty(dtstart.text) else {
+                    throw CalendarProviderError.notSupported("The repeating event has no start, so one occurrence of it can't be deleted. Nothing was deleted. The user can delete it in their calendar app.")
+                }
+                return insertBeforeSubcomponents(block, lines: [
+                    slotLine("EXDATE", dtstartParams: dtstartProperty.params, value: value, kind: kind),
+                ])
+            }
+            return deletion.changedCopyPositions.contains(position) ? nil : block
+        }
     }
 
     // MARK: - Patch and attendee answers

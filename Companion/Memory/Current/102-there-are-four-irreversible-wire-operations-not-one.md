@@ -565,3 +565,45 @@ exists; the four `.unconditional` PUT sites listed under `IOS-CAL-002` are now t
 The predicates were not re-run for this change: it removes one `client.put` call site and adds
 none, so pattern counts can only fall. Re-run them before restating any integer.
 
+
+---
+
+## Re-derived for #661 CalDAV one-occurrence delete (2026-11-11): EIGHT
+
+The property predicate and all five lower-bound searches were re-run over `TabMail/`, `Shared/` and
+`TabMailNotificationService/` on branch `agent/ios-661-caldav-occurrence-delete` (base `13c17ebd`):
+
+| pattern | hits | disposition |
+|---|---:|---|
+| A — `method\s*:\s*"DELETE"` | 8 | unchanged adjudications |
+| B — `httpMethod\s*=\s*"DELETE"` | 3 | unchanged adjudications |
+| C — `expunge\s*\(` | 5 | unchanged |
+| D — `httpMethod\s*=\s*"PUT"` | 3 | unchanged: the new operation goes through `CalDAVClient.put`, the existing line |
+| E — `method\s*:\s*"PUT"` | 2 | unchanged adjudications |
+| action names (`permanentDelete\|batchDelete\|DeleteType\|HardDelete\|SoftDelete\|/purges?/`) | 2 | both prose, zero call sites, as before |
+
+The greps cannot see this member: it is a new CALLER of the existing `CalDAVClient.put` line
+(`client.put(` call sites in `CalDAVProvider.swift`: 5 at `13c17ebd`, 6 with #661), the
+grep-hit-versus-caller blindness recorded above (round-13 U9). It is counted by the property.
+
+**(8) `CalDAVProvider.deleteEvent` by an occurrence id (`deleteOccurrence`) — IN the set.** One
+`PUT` of the series resource adds an `EXDATE` at the occurrence's place in the series and removes the
+occurrence's changed copy (override VEVENT). The changed copy's content (its own title, time,
+notes, attendees) no longer exists on the server afterwards, and WebDAV/CalDAV define no per-item
+recovery (the same reasoning that counts (5) and (6)). Even with no changed copy, the occurrence is
+gone until someone removes the `EXDATE` by hand. Its guards: the occurrence is found by its key in
+one parse of the resource, as the listing finds it (`CalDAVOccurrences.deletion`); a
+missing, excluded or cancelled occurrence is `notFound`, and a resource holding only changed
+occurrences, an event that does not repeat or a series TabMail can't expand is refused
+(`notSupported`, never `notFound`), all with nothing written; the changed copy is matched by
+occurrence key in that one parse and removed by its position among the VEVENTs, which the rewrite
+frames as the reader does (`veventBlocks`, `isMarker`, #603), never by RECURRENCE-ID text; the built
+resource must keep the series and every other changed occurrence and must no longer have the
+occurrence (`CalDAVOccurrences.requireDeletedAlone`; else nothing is written, so a copy is never
+removed while its slot comes back, and no neighbour's changed copy is ever lost with it); and
+the `PUT` is conditional on the GET's ETag (`.unconditional` only when the server sends none, as
+every CalDAV write of a resource the GET proved exists).
+
+**Negative case.** Re-adjudicate if the delete ever writes more than one occurrence's `EXDATE` per
+`PUT`, removes an override whose key differs from the one named, writes without
+`requireDeletedAlone`, or sends the `PUT` without `If-Match` when the server gave an ETag.

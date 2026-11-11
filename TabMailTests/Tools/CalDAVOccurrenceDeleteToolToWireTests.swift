@@ -19,9 +19,10 @@ import GRDB
 // that day hand the model the occurrence's own id, the model passes the number the chat
 // translator gave it to `calendar_event_delete`, the user confirms the card, the queued
 // delete drains through the real `CalDAVProvider` onto a fake CalDAV server. The test
-// asserts what the server holds afterwards (the series, byte for byte), what the user is
-// shown (the refusal on the card and in the tool's answer), and that the queued delete
-// ends failed, so no later drain can send it. The control drives the same harness with
+// asserts what the server holds afterwards (the series, byte for byte, plus one EXDATE for
+// that day, #661), what a listing then shows (that day empty, the next week's occurrence
+// still there), what the user is shown (the one-occurrence card, and the delete reported
+// done), and that the queued delete completed. The control drives the same harness with
 // the series' own id and does delete the series, which is what makes the absences here
 // mean something.
 
@@ -138,7 +139,7 @@ struct CalDAVOccurrenceDeleteToolToWireTests {
     typealias H = CalDAVToolWire
     typealias ConfirmingSink = CalDAVToolWire.ConfirmingSink
 
-    @Test("read and search for one day name that day's occurrence, and deleting it is refused with the series left on the server")
+    @Test("read and search for one day name that day's occurrence, and deleting it removes that occurrence alone, the series staying on the server")
     func deletingOneDayNeverDeletesTheSeries() async throws {
         let harness = try await H.makeHarness(accountId: "caldav-one-day-delete")
         defer { H.tearDown(harness) }
@@ -174,30 +175,43 @@ struct CalDAVOccurrenceDeleteToolToWireTests {
         // A later drain must not send it either.
         await AccountManager.shared.drainCalendarQueue()
 
-        // The series is on the server exactly as it was.
+        // The series stays on the server: no DELETE, one PUT that adds one EXDATE for that
+        // day's occurrence, and every other line as it was (#661).
         #expect(H.deletes(harness.http).isEmpty,
                 "a DELETE reached the server for one day of the series, which deletes every occurrence: \(H.deletes(harness.http))")
-        #expect(harness.store.storedICS(path: W.seriesPath) == fixture.ics, "the series is not on the server as it was")
-        #expect(harness.store.recordedPuts().isEmpty, "the refused delete wrote to the series")
+        #expect(harness.store.recordedPuts().count == 1, "expected one write of the series: \(harness.store.recordedPuts().map(\.path))")
+        let stored = try #require(harness.store.storedICS(path: W.seriesPath), "the series is no longer on the server")
+        let exdate = "EXDATE;TZID=America/New_York:\(OccurrenceFixture.wall(try fixture.occurrence(2), fixture.zone))"
+        let storedLines = stored.components(separatedBy: "\r\n")
+        #expect(storedLines.filter { $0 == exdate }.count == 1, "the series does not exclude that day's occurrence: \(stored)")
+        #expect(storedLines.filter { $0 != exdate }.joined(separator: "\r\n") == fixture.ics,
+                "the rest of the series changed on the wire: \(stored)")
 
-        // The user is shown the refusal, on the card and in the tool's answer.
-        #expect(output.contains("NOT deleted") && output.contains("not supported yet"),
-                "the tool's answer does not say the event was not deleted and why: \(output)")
+        // That day now lists nothing; the days around it keep their occurrences.
+        let readAfter = try await CalendarReadTool().execute(arguments: oneDay)
+        #expect(H.eventIds(in: readAfter).isEmpty, "the deleted occurrence is still listed: \(readAfter)")
+        let weekAfter = OccurrenceFixture.isoDate(try fixture.occurrence(3), fixture.zone)
+        let readNext = try await CalendarReadTool().execute(arguments: [
+            "from_date": .string(weekAfter), "to_date": .string(weekAfter), "timezone": .string("America/New_York"),
+        ])
+        #expect(H.eventIds(in: readNext) == [CompoundEventId.make(accountId: harness.accountId, eventId: try fixture.occurrenceId(3))],
+                "the next occurrence of the series is not listed: \(readNext)")
+
+        // The user is told it was deleted, on the card and in the tool's answer.
+        #expect(output.contains("deleted successfully"), "the tool's answer does not say the occurrence was deleted: \(output)")
         let cardFailures = await MainActor.run { sink.confirmations.map { $0.responseState.failureReason } }
         #expect(cardFailures.count == 1, "expected one confirmation card, got \(cardFailures.count)")
         guard cardFailures.count == 1 else { return }
-        #expect(cardFailures[0]?.contains("not supported yet") == true,
-                "the confirmed card does not show the refusal: \(cardFailures[0] ?? "nil")")
-        // The card shows one occurrence and says the rest of the series stays, which the refusal
-        // keeps true; it never says every occurrence goes (#639).
+        #expect(cardFailures[0] == nil, "the confirmed card shows a failure: \(cardFailures[0] ?? "nil")")
+        // The card shows one occurrence and says the rest of the series stays, which is now what
+        // the server holds; it never says every occurrence goes (#639).
         let cardLines = await MainActor.run { sink.confirmations.flatMap { $0.calendarEvents.flatMap(\.changes) } }
         #expect(cardLines == [CalendarSeriesDeleteCardTests.occurrenceLine],
                 "the card for one occurrence does not say only it is meant: \(cardLines)")
 
-        // No queued delete succeeded or is left to succeed later.
+        // The queued delete completed; nothing is left to send again.
         let ops = try await harness.pool.read { db in try PendingCalendarOperation.fetchAll(db) }
-        #expect(ops.count == 1 && ops.allSatisfy { $0.status == PendingStatus.failed.rawValue },
-                "the queued delete did not end failed: \(ops.map { $0.status })")
+        #expect(ops.isEmpty, "the queued delete did not complete: \(ops.map { $0.status })")
     }
 
     @Test("Control: the series' own id deletes the series through the same harness")

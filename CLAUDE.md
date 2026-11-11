@@ -91,16 +91,16 @@ where being wrong cannot be undone. **Never widen its evidence.** A source copy 
 `\Deleted`-but-present is an accepted, recoverable cost; expunging without proof is a wrong-message
 deletion.
 
-> **"Never permanently deletes" is true of MAIL, not of DRAFTS OR CALENDAR EVENTS.** There are **seven**
+> **"Never permanently deletes" is true of MAIL, not of DRAFTS OR CALENDAR EVENTS.** There are **eight**
 > irreversible wire operations: (1) the `COPYUID`-gated source expunge; (2) `IMAPProvider.deleteDraftStrong`;
 > (3) `saveDraft`'s old-copy replacement; (4) Gmail `DELETE /drafts/{id}`; (5) `CalDAVProvider.deleteEvent`;
 > (6) `CalDAVProvider.splitSeries`' cap `PUT`; (7) `ExchangeProvider.replaceDraftAttachments`' attachment
-> `DELETE`. Membership is a PROPERTY (server content gone with no documented per-item recovery), not the verb
+> `DELETE`; (8) the CalDAV one-occurrence delete's `EXDATE` `PUT` (`deleteOccurrence`, #661). Membership is a PROPERTY (server content gone with no documented per-item recovery), not the verb
 > `DELETE`; do not restate the count without re-running its predicate. A fail-closed argument that leans on
 > "nothing is ever destroyed" is invalid for drafts and CalDAV events. Full text, exclusions and the census greps:
 > [`seven-irreversible-wire-operations-inline-text.md`](Companion/Rules/Active/seven-irreversible-wire-operations-inline-text.md).
 > Detail and evidence: [`Companion/Memory/Current/102-there-are-four-irreversible-wire-operations-not-one.md`](Companion/Memory/Current/102-there-are-four-irreversible-wire-operations-not-one.md)
-> (filename preserved; its count is now seven).
+> (filename preserved; its count is now eight).
 
 **Check "rare" before invoking this.** An edge that is actually the common path is not an edge.
 "Undo of an already-drained move" *sounds* rare, but the drain fires immediately after the gesture, so

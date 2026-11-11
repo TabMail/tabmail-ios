@@ -75,10 +75,13 @@ enum CalendarProviderError: Error {
     case notSupported(String)
 
     /// The refusal for a write that needs a time zone `CalendarTimeZoneResolver` does not
-    /// recognize. The one wording for every such refusal; `consequence` is the only part that
-    /// changes, and says what TabMail therefore did not do ("it did not change the event").
-    static func unrecognizedTimeZone(_ name: String, consequence: String) -> CalendarProviderError {
-        .notSupported("This event uses the time zone \"\(name)\", which TabMail does not recognize, so \(consequence). Change the time in your calendar app instead.")
+    /// recognize. The one wording for every such refusal; `consequence` says what TabMail
+    /// therefore did not do ("it did not change the event"), and `remedy` what the user can do
+    /// instead, which is to change the time unless the write was a delete.
+    static func unrecognizedTimeZone(
+        _ name: String, consequence: String, remedy: String = "Change the time in your calendar app instead."
+    ) -> CalendarProviderError {
+        .notSupported("This event uses the time zone \"\(name)\", which TabMail does not recognize, so \(consequence). \(remedy)")
     }
 }
 

@@ -1183,8 +1183,9 @@ enum CalendarToolHelpers {
     static let seriesDeleteNote = "Repeating event: every occurrence will be deleted"
 
     /// The delete card's line for one occurrence of a repeating event (#639). True on every
-    /// provider: Google and Outlook delete only that occurrence, and CalDAV refuses the delete
-    /// (ADR-IOS-108), so either way the rest of the series stays.
+    /// provider: Google, Outlook and CalDAV delete only that occurrence (CalDAV with an `EXDATE`
+    /// written into the series, ADR-IOS-108), and where CalDAV can't it refuses with nothing
+    /// deleted, so either way the rest of the series stays.
     static let occurrenceDeleteNote = "One occurrence of a repeating event; the rest of the series stays."
 
     /// The delete card's lines for `event`, read before the card. An occurrence names its series in

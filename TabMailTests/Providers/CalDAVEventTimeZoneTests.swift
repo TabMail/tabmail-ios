@@ -180,6 +180,15 @@ enum TimeZoneFixture {
         return reason.contains("This event uses the time zone \"\(tzid)\", which TabMail does not recognize")
     }
 
+    /// Whether `error` is, word for word, the refusal a write that changes an event gives for the
+    /// zone `tzid` TabMail does not recognize: what it did not do and the change's remedy, never
+    /// the words of a delete (`CalDAVProvider.ZoneRefusal.change`).
+    static func refusesTheChange(_ error: any Error, _ tzid: String) -> Bool {
+        guard case CalendarProviderError.notSupported(let reason) = error else { return false }
+        return reason == "This event uses the time zone \"\(tzid)\", which TabMail does not recognize, so it did not change the event. Change the time in your calendar app instead."
+            && !reason.contains("Nothing was deleted")
+    }
+
     /// The start an ICSParser read of `ics` shows.
     static func parsedStart(_ ics: String) throws -> Date {
         let event = try #require(ICSParser.parse(icsText: ics, resourceHref: "/cal/single.ics", etag: nil).first)
@@ -311,6 +320,7 @@ struct CalDAVTimeZoneWireTests {
         store.seed(path: path, ics: ics)
         http.register(path: "/cal/", method: "GET") { store.handleGET($0) }
         http.register(path: "/cal/", method: "PUT") { store.handlePUT($0) }
+        http.register(path: "/cal/", method: "REPORT") { store.handleREPORT($0) }
         return (http, store)
     }
 
@@ -416,6 +426,54 @@ struct CalDAVTimeZoneWireTests {
         #expect(TimeZoneFixture.undefinedZones(newPart).isEmpty, "\(TimeZoneFixture.undefinedZones(newPart))")
     }
 
+    /// The ids and starts a listing of March 2099 shows for the resource, by start.
+    private static func march(_ provider: CalDAVProvider) async throws -> [String] {
+        let rows = try await provider.listEvents(
+            calendarId: Self.calendarId, timeMin: try TimeZoneFixture.instant("20990301T000000", in: "UTC"),
+            timeMax: try TimeZoneFixture.instant("20990401T000000", in: "UTC"),
+            query: nil, singleEvents: true, maxResults: 250, orderBy: "startTime")
+        return rows.sorted { ($0.startDate ?? .distantPast) < ($1.startDate ?? .distantPast) }
+            .map { "\($0.id ?? "-") | \($0.start?.dateTime ?? "-")" }
+    }
+
+    @Test("deleting one occurrence excludes it at its wall time under the series' own TZID, in a recognized zone",
+          arguments: TimeZoneFixture.recognized)
+    func occurrenceDeleteExcludesItInTheSeriesZone(zone: TimeZoneFixture.Zone) async throws {
+        let seed = TimeZoneFixture.series(tzid: zone.tzid, vtimezone: zone.vtimezone)
+        let (http, store) = Self.serve(seed)
+        defer { http.close() }
+        let provider = CalDAVWireFixture.makeProvider(http)
+        let occurrence = try TimeZoneFixture.instant("20990309T100000", in: zone.oracle)
+        let id = CalDAVOccurrences.OccurrenceId.make(seriesHref: Self.path, key: OccurrenceFixture.utcValue(occurrence))
+        let before = try await Self.march(provider)
+        #expect(before.contains { $0.hasPrefix(id + " |") }, "setup: the occurrence is not listed: \(before)")
+
+        try await provider.deleteEvent(calendarId: Self.calendarId, eventId: id, sendUpdates: "none")
+
+        #expect(store.recordedPuts().count == 1, "expected one PUT: \(store.recordedPuts().map(\.path))")
+        let stored = try #require(store.storedICS(path: Self.path))
+        let master = try #require(TimeZoneFixture.vevents(stored).first)
+        #expect(master.contains("EXDATE;TZID=\(zone.tzid):20990309T100000"), "stored:\n\(stored)")
+        #expect(try SeriesOracle.states(TimeZoneFixture.aliased(stored, zone)) == [.shown, .deleted, .deleted, .changed, .shown],
+                Comment(rawValue: stored))
+        let after = try await Self.march(provider)
+        #expect(after == before.filter { !$0.hasPrefix(id + " |") }, "the listing did not lose exactly that occurrence.\nbefore: \(before)\nafter: \(after)")
+    }
+
+    @Test("the delete's check refuses a series in an unrecognized zone by name, in the delete's words, before it looks the occurrence up")
+    func occurrenceDeleteCheckRefusesTheZoneFirst() throws {
+        let tzid = TimeZoneFixture.unmatchedTZID
+        let seed = TimeZoneFixture.series(tzid: tzid, vtimezone: TimeZoneFixture.unmatched)
+        // A key no expansion of the series gives, in any device zone: looked up first, it would be
+        // reported not found instead of naming the zone.
+        #expect {
+            _ = try CalDAVOccurrences.deletion(icsText: seed, href: Self.path, key: "20990309T150700Z")
+        } throws: { error in
+            guard case CalendarProviderError.notSupported(let reason) = error else { return false }
+            return reason == "This event uses the time zone \"\(tzid)\", which TabMail does not recognize, so it can't delete one occurrence of it. Nothing was deleted. The user can delete it in their calendar app."
+        }
+    }
+
     // MARK: Unrecognized
 
     enum Write: String, CaseIterable, CustomTestStringConvertible, Sendable {
@@ -455,7 +513,7 @@ struct CalDAVTimeZoneWireTests {
                     recurrenceIdZone: utc, patch: GCalEventInput(), sendUpdates: "none")
             }
         } throws: { error in
-            TimeZoneFixture.namesZone(error, tzid)
+            TimeZoneFixture.namesZone(error, tzid) && TimeZoneFixture.refusesTheChange(error, tzid)
         }
         #expect(store.recordedPuts().isEmpty, "a PUT was sent: \(store.recordedPuts().map(\.path))")
         #expect(store.storedICS(path: Self.path) == seed)
@@ -497,7 +555,55 @@ struct CalDAVTimeZoneWireTests {
                     calendarId: Self.calendarId, eventId: Self.path, recurrenceId: rid, recurrenceIdZone: utc)
             }
         } throws: { error in
-            TimeZoneFixture.namesZone(error, tzid)
+            TimeZoneFixture.namesZone(error, tzid) && TimeZoneFixture.refusesTheChange(error, tzid)
+        }
+        #expect(store.recordedPuts().isEmpty, "a PUT was sent: \(store.recordedPuts().map(\.path))")
+        #expect(store.storedICS(path: Self.path) == seed)
+    }
+
+    enum OverrideOnlyCall: String, CaseIterable, CustomTestStringConvertible {
+        case override = "a one-occurrence edit"
+        case startDay = "the read of the day an occurrence starts on"
+        var testDescription: String { rawValue }
+    }
+
+    @Test("a changed occurrence held without its series, in an unrecognized zone, is refused by name in the change's words, with nothing written",
+          arguments: OverrideOnlyCall.allCases)
+    func changedOccurrenceWithoutSeriesInUnrecognizedZoneIsRefused(call: OverrideOnlyCall) async throws {
+        let tzid = TimeZoneFixture.unmatchedTZID
+        let seed = TimeZoneFixture.resource(TimeZoneFixture.unmatched, [[
+            "BEGIN:VEVENT", "UID:series-tz", "DTSTAMP:20990101T000000Z",
+            "RECURRENCE-ID;TZID=\(tzid):20990309T100000",
+            "DTSTART;TZID=\(tzid):20990309T110000", "DTEND;TZID=\(tzid):20990309T120000",
+            "SUMMARY:Weekly sync, moved", "END:VEVENT",
+        ]])
+        let (http, store) = Self.serve(seed)
+        defer { http.close() }
+        let provider = CalDAVWireFixture.makeProvider(http)
+        let utc = try #require(TimeZone(identifier: "UTC"))
+        // The occurrence as a listing names it: with no series, its frame is its RECURRENCE-ID's,
+        // the zone TabMail does not recognize.
+        let rows = try await provider.listEvents(
+            calendarId: Self.calendarId, timeMin: try TimeZoneFixture.instant("20990301T000000", in: "UTC"),
+            timeMax: try TimeZoneFixture.instant("20990401T000000", in: "UTC"),
+            query: nil, singleEvents: true, maxResults: 250, orderBy: "startTime")
+        try #require(rows.count == 1, "setup: the changed occurrence is not listed once: \(rows.map { $0.id ?? "-" })")
+        let id = try #require(rows[0].id)
+        let rid = TimeZoneFixture.naiveUTC(try #require(rows[0].startDate))
+        await #expect {
+            switch call {
+            case .override:
+                var patch = GCalEventInput()
+                patch.summary = "Renamed"
+                _ = try await provider.updateOccurrence(
+                    calendarId: Self.calendarId, eventId: id, recurrenceId: rid,
+                    recurrenceIdZone: utc, event: patch, sendUpdates: "none")
+            case .startDay:
+                _ = try await provider.occurrenceStartDay(
+                    calendarId: Self.calendarId, eventId: id, recurrenceId: rid, recurrenceIdZone: utc)
+            }
+        } throws: { error in
+            TimeZoneFixture.namesZone(error, tzid) && TimeZoneFixture.refusesTheChange(error, tzid)
         }
         #expect(store.recordedPuts().isEmpty, "a PUT was sent: \(store.recordedPuts().map(\.path))")
         #expect(store.storedICS(path: Self.path) == seed)
