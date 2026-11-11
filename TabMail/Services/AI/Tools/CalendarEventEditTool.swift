@@ -80,6 +80,16 @@ struct CalendarEventEditTool: AgentTool, Sendable {
             provider = await CalendarProviderDispatch.resolve(db: ctx.db)?.provider
         }
 
+        // `exdates_add` deletes occurrences, in a call of its own (#694): its own checks come
+        // first, and once the event is read it goes its own way (`CalendarEventEditExdates`).
+        var exdates: (dates: [String], zone: TimeZone)?
+        if CalendarEventEditExdates.isRequested(arguments) {
+            switch CalendarEventEditExdates.check(arguments, compoundId: compoundId) {
+            case .refused(let output): return output
+            case .dates(let dates, let zone): exdates = (dates, zone)
+            }
+        }
+
         // Build change descriptions for confirmation card from arguments alone
         var changes: [String] = []
         if let v = CalendarToolHelpers.stringArgOpt(arguments, "title") {
@@ -197,6 +207,16 @@ struct CalendarEventEditTool: AgentTool, Sendable {
                 "error": "calendar_event_edit failed: could not find event with id '\(compoundId)'. The id may be wrong or the event may have been deleted. Call calendar_event_read or calendar_search to look up the correct event, then retry.",
                 "event_id": compoundId,
             ] as [String: Any])
+        }
+
+        if let exdates {
+            return try await CalendarEventEditExdates.execute(
+                dates: exdates.dates, zone: exdates.zone,
+                target: .init(
+                    event: fetchedEvent, eventId: eventId, compoundId: compoundId,
+                    accountId: resolvedAccountId, lookupCalendarId: lookupCalId,
+                    calendarId: calendarId, calendarName: calendarName),
+                provider: provider, translator: ctx.translator, invocation: invocation)
         }
 
         // The occurrence the edit names, found by the provider's own lookup (the one its write

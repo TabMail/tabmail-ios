@@ -347,7 +347,21 @@ final class FakeGraphCalendar: Sendable {
             if takeLoss("POST") { return .transportError(.networkConnectionLost) }
             return Self.json(created)
         }
+        // DELETE removes the event: an occurrence leaves its series' instances list and is not
+        // found by its id afterwards. An event that is not there is 404.
+        http.register(path: "/v1.0/me/events/", method: "DELETE") { [self] request in
+            if let status = takeFailure("DELETE") { return .status(status) }
+            let parts = Self.pathParts(request.url)
+            guard parts.count == 1, event(parts[0]) != nil else { return .status(404) }
+            events.withLock { _ = $0.removeValue(forKey: parts[0]) }
+            deleteLog.withLock { $0.append(parts[0]) }
+            return .status(204)
+        }
     }
+
+    /// The ids every DELETE that landed removed, in order.
+    var deleted: [String] { deleteLog.withLock { $0 } }
+    private let deleteLog = Mutex<[String]>([])
 
     /// The instances window a request names (`startDateTime`, `endDateTime`: naive UTC wall times),
     /// nil when it names none.

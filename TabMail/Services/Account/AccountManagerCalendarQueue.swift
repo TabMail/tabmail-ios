@@ -313,10 +313,23 @@ extension AccountManager {
             calendarId: calendarId,
             arguments: arguments
         )
-        try await dbPool.write { db in try op.insert(db) }
-        BackgroundSyncLogger.logDebug("[CalendarQueue] Queued \(type.rawValue) for account \(accountId) (id: \(op.id))")
-        Task { await drainCalendarQueue() }
+        try await queueCalendarOperations([op])
         return op
+    }
+
+    /// Queue several calendar mutations in ONE write: every row is persisted, or none is (the
+    /// write is one transaction, so a failure rolls back the rows already inserted). One
+    /// confirmation that asks for several writes (`calendar_event_edit`'s `exdates_add`, one
+    /// delete per occurrence) is never left half queued. Each row then drains as an ordinary
+    /// operation of its own.
+    func queueCalendarOperations(_ ops: [PendingCalendarOperation]) async throws {
+        try await dbPool.write { db in
+            for op in ops { try op.insert(db) }
+        }
+        for op in ops {
+            BackgroundSyncLogger.logDebug("[CalendarQueue] Queued \(op.operationType) for account \(op.accountId) (id: \(op.id))")
+        }
+        Task { await drainCalendarQueue() }
     }
 
     /// Drain all queued calendar operations in FIFO order.

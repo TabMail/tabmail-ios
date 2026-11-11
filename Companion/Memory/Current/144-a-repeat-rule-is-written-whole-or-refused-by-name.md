@@ -97,6 +97,21 @@ and `CalDAVOccurrenceDeleteToolToWireTests` (the CalDAV series card before its D
 occurrence card without the line; the override-only resource by its own id refused with no DELETE;
 the popover line pinned by `popoverLineUnchanged`).
 
+**The delete card also serves `calendar_event_edit`'s `exdates_add` (#694, 2026-11-11).** Before
+#694 no iOS code read `exdates_add`: the edit wrote an unchanged series (or nothing) and answered
+"updated successfully". Now (`CalendarEventEditExdates`) it is a call of its own (any other change in
+the call, or an `edit_scope` other than "all", is refused by name, telling the assistant to send that
+change as a second call); every date is looked up before the card against the SERIES (also when
+`event_id` names an occurrence) in the call's `timezone`, through `CalendarProvider.occurrence` only (a
+date alone on a timed series names the one occurrence that day; none there, already deleted, ambiguous
+or malformed refuses the whole call, nothing queued); the card is the delete card, one row per
+occurrence with `occurrenceDeleteNote`; the same occurrences are queued as ordinary `.delete` ops in ONE
+write (`AccountManager.queueCalendarOperations`, all or none; the executor is unchanged, so guests are
+notified as every delete notifies them and CalDAV goes through #661's `EXDATE` write); the answer names
+each date deleted, queued or NOT deleted with its reason, never "updated". A CalDAV resource holding
+only changed occurrences is refused by the lookup before the card. Two dates naming one occurrence
+delete it once. Pinned by `CalendarEditExdatesTests` (Google, Outlook, CalDAV fakes).
+
 ## Pinned by
 
 `TabMailTests/Tools/CalendarRecurrenceDaysTests.swift`: the writer and the card per field and

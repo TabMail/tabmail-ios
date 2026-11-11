@@ -169,7 +169,33 @@ final class FakeGoogleCalendar: Sendable {
             if takeLoss("POST") { return .transportError(.networkConnectionLost) }
             return Self.json(created)
         }
+        // DELETE of an instance keeps it as a cancelled instance (left out of the instances list,
+        // GET by its id still returns it), as Google does; of any other event removes it. An event
+        // that is not there is 404, an instance already cancelled 410 ("Resource has been deleted").
+        http.register(path: prefix + "/", method: "DELETE") { [self] request in
+            let parts = Self.pathParts(request.url)
+            guard parts.count == 1, var stored = event(parts[0]) else { return .status(404) }
+            if stored["status"] as? String == "cancelled" { return .status(410) }
+            let sendUpdates = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?
+                .queryItems?.first { $0.name == "sendUpdates" }?.value ?? "none given"
+            deleteNotices.withLock { $0.append(sendUpdates) }
+            if stored["recurringEventId"] is String {
+                stored["status"] = "cancelled"
+                store(stored)
+            } else {
+                events.withLock { _ = $0.removeValue(forKey: parts[0]) }
+            }
+            writeLog.withLock { $0.append("DELETE \(parts[0])") }
+            return .status(204)
+        }
     }
+
+    /// The `sendUpdates` each DELETE that landed was sent with, in order.
+    var deleteSendUpdates: [String] { deleteNotices.withLock { $0 } }
+    private let deleteNotices = Mutex<[String]>([])
+
+    /// Takes `id` out of the calendar: another client's delete, which leaves nothing behind.
+    func remove(_ id: String) { events.withLock { _ = $0.removeValue(forKey: id) } }
 
     /// Puts `event` in the calendar, replacing the one with its id: a write, or another client's change.
     func store(_ event: [String: Any]) {
