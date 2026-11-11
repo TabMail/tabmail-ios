@@ -122,23 +122,23 @@ final class AccountManagerState {
     /// `InboxErrorBanner`'s fixed lines; never text derived from an error.
     var syncErrorBanner: String?
 
-    /// The single place a sync run (pull-to-refresh, foreground poll, background
-    /// poll) publishes its end state.
+    /// The single place a sync run publishes its end state for the inbox.
     ///
-    /// - `bannerText`: what the run's own failures say (`InboxErrorBanner.text`
-    ///   aggregated over the run's accounts), or `nil` when nothing in the run
-    ///   raises the banner.
+    /// - `raised`: the banner line the run's own failure raises, or `nil`. Only a
+    ///   user-started inbox refresh passes a line; scheduler and background runs
+    ///   never raise the banner.
+    /// - `coverage`: whether the run covered every active account.
+    /// - `anyFailure`: whether any account in the run failed.
     /// - `completed`: whether this run advances `lastSyncCompletedAt`.
     ///
-    /// The banner may be cleared only by a run that itself raised no banner, so a
-    /// run in which one account fails and another succeeds keeps the banner up:
-    /// the run's own error wins over its own timestamp advance. That keeps the
-    /// banner steady (never cleared and re-raised per poll) while one account
-    /// keeps failing, and clears it on the first completed run that raises none.
-    func finishSyncRun(bannerText: String?, completed: Bool) {
+    /// Only a FULL run with no failure clears the banner. A partial run (one
+    /// account, one folder) never clears it, so a healthy account's push or
+    /// pull cannot hide another account's failure, and a run where one account
+    /// keeps failing never clears it either.
+    func finishSyncRun(raised bannerText: String?, coverage: SyncRunCoverage, anyFailure: Bool, completed: Bool) {
         if let bannerText {
             syncErrorBanner = bannerText
-        } else if completed {
+        } else if coverage == .full && !anyFailure {
             syncErrorBanner = nil
         }
         if completed {
@@ -147,6 +147,13 @@ final class AccountManagerState {
     }
 
     private init() {}
+}
+
+/// Whether a sync run covered every active account (`full`) or only some
+/// (`partial`: one account, or the folders of some accounts).
+enum SyncRunCoverage: Sendable, Equatable {
+    case full
+    case partial
 }
 
 /// The inbox error banner's copy and the decision of which errors raise it.

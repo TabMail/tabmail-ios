@@ -8,15 +8,16 @@ import Testing
 @testable import TabMail
 
 /// The inbox error banner and the account re-authentication alert show only fixed
-/// plain lines, never text derived from an error; and the inbox banner is cleared
-/// only by a completed sync run that itself raised no banner.
+/// plain lines, never text derived from an error. When the banner is raised and
+/// cleared is pinned through the real run entry points in
+/// `SyncRunBannerEntryPointTests`.
 ///
 /// Earlier, the banner put `error.localizedDescription` on screen when debug
 /// logging was unlocked, and every inbox sync failure stored that text. A
 /// temporary IMAP refusal therefore reached the screen as
 /// `Login failed: no([UNAVAILABLE] …)`. The detail now lives only in the
 /// debug-gated logs.
-@Suite("Inbox error banner — fixed lines only, cleared only by a clean run",
+@Suite("Inbox error banner and re-auth alert — fixed lines only",
        .serialized, .processGlobalState)
 struct InboxErrorBannerTests {
 
@@ -93,15 +94,42 @@ struct InboxErrorBannerTests {
         }
     }
 
+    private static let host = "imap.example.com"
+
     @Test("for every error, the re-authentication alert shows a fixed line or nothing")
     func reauthAlertIsAlwaysAFixedLine() {
+        let allowed: Set<String> = [AccountReauthAlert.passwordLine, AccountReauthAlert.setupLine,
+                                    AccountReauthAlert.oauthLine, AccountReauthAlert.tlsLine(host: Self.host)]
         for error in Self.everyError {
-            for isPassword in [true, false] {
-                guard let line = AccountReauthAlert.line(for: error, isPassword: isPassword) else { continue }
-                #expect(AccountReauthAlert.allLines.contains(line), "not a fixed line for \(error)")
+            let lines = [AccountReauthAlert.passwordUpdateLine(for: error, host: Self.host),
+                         AccountReauthAlert.oauthLine(for: error)].compactMap { $0 }
+            for line in lines {
+                #expect(allowed.contains(line), "not a fixed line for \(error)")
                 #expect(!line.contains(Self.marker), "alert carried the error's text for \(error)")
             }
         }
+    }
+
+    @Test("the password-update alert picks its line by what failed")
+    func reauthAlertLineByPhase() {
+        // The server refused the new password (as `updateIMAPPassword` reports it).
+        #expect(AccountReauthAlert.passwordUpdateLine(for: ProviderError.authenticationFailed, host: Self.host)
+                == AccountReauthAlert.passwordLine)
+        // The server cannot meet the TLS minimum: main's sentence, for the account's host.
+        let tls = AccountReauthAlert.passwordUpdateLine(
+            for: IMAPTransportSecurityError.tlsFloorNotMet(host: Self.host), host: Self.host)
+        #expect(tls == IMAPTransportSecurityError.tlsFloorNotMet(host: Self.host).description)
+        #expect(tls != AccountReauthAlert.passwordLine)
+        // The password was accepted, then saving or the sync failed; or the server
+        // refused for now.
+        for error: any Error in [UnknownError(), NSError(domain: "com.example.keychain", code: -25299),
+                                 ProviderTemporaryRefusal(underlying: UnknownError())] {
+            #expect(AccountReauthAlert.passwordUpdateLine(for: error, host: Self.host)
+                    == AccountReauthAlert.setupLine, "\(error)")
+        }
+        // Offline keeps the alert closed, as before.
+        #expect(AccountReauthAlert.passwordUpdateLine(for: URLError(.notConnectedToInternet), host: Self.host) == nil)
+        #expect(Set([AccountReauthAlert.passwordLine, AccountReauthAlert.setupLine, tls ?? ""]).count == 3)
     }
 
     /// Non-vacuity: the decision can say yes, and says no where it must.
@@ -115,74 +143,6 @@ struct InboxErrorBannerTests {
         #expect(InboxErrorBanner.text(for: CancellationError()) == nil)
         #expect(InboxErrorBanner.text(
             for: ProviderTemporaryRefusal(underlying: IMAPError.loginFailed("no([UNAVAILABLE] x)"))) == nil)
-    }
-
-    // MARK: - Clearing: only a completed run that raised nothing clears it
-
-    /// Runs `body` with the shared banner state saved and restored.
-    @MainActor
-    private func withCleanState(_ body: (AccountManagerState) throws -> Void) rethrows {
-        let state = AccountManagerState.shared
-        let savedBanner = state.syncErrorBanner
-        let savedCompleted = state.lastSyncCompletedAt
-        state.syncErrorBanner = nil
-        defer {
-            state.syncErrorBanner = savedBanner
-            state.lastSyncCompletedAt = savedCompleted
-        }
-        try body(state)
-    }
-
-    private static func failing() -> AccountManager.SyncResult {
-        AccountManager.SyncResult(hadChanges: false, failed: true,
-                                  bannerText: InboxErrorBanner.text(for: UnknownError()))
-    }
-
-    private static func succeeding() -> AccountManager.SyncResult {
-        AccountManager.SyncResult(hadChanges: true, failed: false)
-    }
-
-    @Test("one account failing every run beside one succeeding: the banner stays up for ten runs, then clears once it recovers")
-    @MainActor
-    func bannerStaysSteadyWhileOneAccountKeepsFailing() {
-        withCleanState { state in
-            for run in 1...10 {
-                let results = [Self.failing(), Self.succeeding()]
-                // A mixed run still completes (the foreground poll's aggregate is
-                // "not every account failed"; the background poll always stamps).
-                state.finishSyncRun(bannerText: AccountManager.SyncResult.runBannerText(results),
-                                    completed: true)
-                #expect(state.syncErrorBanner == InboxErrorBanner.genericMessage, "banner gone after run \(run)")
-            }
-            let recovered = [Self.succeeding(), Self.succeeding()]
-            state.finishSyncRun(bannerText: AccountManager.SyncResult.runBannerText(recovered), completed: true)
-            #expect(state.syncErrorBanner == nil)
-        }
-    }
-
-    @Test("a completed background or scheduler run clears the banner and advances the timestamp")
-    @MainActor
-    func backgroundCompletionClearsBanner() {
-        withCleanState { state in
-            state.finishSyncRun(bannerText: InboxErrorBanner.genericMessage, completed: false)
-            #expect(state.syncErrorBanner == InboxErrorBanner.genericMessage)
-            let before = state.lastSyncCompletedAt
-            state.finishSyncRun(bannerText: AccountManager.SyncResult.runBannerText([Self.succeeding()]),
-                                completed: true)
-            #expect(state.syncErrorBanner == nil)
-            #expect(state.lastSyncCompletedAt != nil)
-            #expect(state.lastSyncCompletedAt != before)
-        }
-    }
-
-    @Test("a run that does not complete never clears the banner")
-    @MainActor
-    func incompleteRunDoesNotClear() {
-        withCleanState { state in
-            state.finishSyncRun(bannerText: InboxErrorBanner.genericMessage, completed: false)
-            state.finishSyncRun(bannerText: nil, completed: false)
-            #expect(state.syncErrorBanner == InboxErrorBanner.genericMessage)
-        }
     }
 
     // MARK: - isAuthError is typed only

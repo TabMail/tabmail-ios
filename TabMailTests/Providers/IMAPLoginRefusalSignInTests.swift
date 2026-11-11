@@ -114,4 +114,93 @@ struct IMAPLoginRefusalSignInTests {
         #expect(!IMAPProvider.isTemporaryLoginRefusal(reason: "no(Server UNAVAILABLE, see [UNAVAILABLE])"))
         #expect(!IMAPProvider.isTemporaryLoginRefusal(reason: "no(login failed)"))
     }
+
+    // MARK: - Factory wiring and Update Password
+
+    /// An IMAP account pointing at `server`, with its stored password in the
+    /// Keychain, built through the real factory. Cleans up the Keychain entry,
+    /// the registered provider and the warning.
+    private func withFactoryAccount(
+        _ body: (FakeIMAPServer, Account) async throws -> Void
+    ) async throws {
+        let server = FakeIMAPServer(mailboxes: ["INBOX": []])
+        try server.start()
+        defer { server.stop() }
+        var account = Account(emailAddress: "factory-\(UUID().uuidString.prefix(8))@example.com",
+                              displayName: "Factory", provider: .imap)
+        account.imapHost = "127.0.0.1"
+        account.imapPort = server.port
+        account.imapUsername = server.username
+        let manager = AccountManager.shared
+        manager.setIMAPUseTLSOverrideForTesting(false)
+        try KeychainHelper.save(server.password, for: KeychainHelper.passwordKey(accountId: account.id))
+        func finish() async {
+            if let live = await manager.provider(for: account) { try? await live.disconnect() }
+            await manager.unregisterProviderForTesting(accountId: account.id)
+            await manager.syncEngine.remove(accountId: account.id)
+            await manager.clearAuthFailed(account.id)
+            KeychainHelper.delete(key: KeychainHelper.passwordKey(accountId: account.id))
+            manager.setIMAPUseTLSOverrideForTesting(nil)
+        }
+        do {
+            try await body(server, account)
+        } catch {
+            await finish()
+            throw error
+        }
+        await finish()
+    }
+
+    @Test("the factory injects the reporter into the live provider, and not into a password probe")
+    func factoryInjectsReporterIntoLiveProviderOnly() async throws {
+        try await withFactoryAccount { server, account in
+            let manager = AccountManager.shared
+            let live = try await manager.createIMAPProvider(for: account)
+            #expect(live.hasSignInOutcomeReporter, "the live provider was built without the sign-in reporter")
+            let probe = try await manager.createIMAPProvider(for: account, passwordOverride: "probe-password")
+            #expect(!probe.hasSignInOutcomeReporter, "a password probe was built with the account's reporter")
+
+            // And the live provider's reporter is the account's: a refusal marks it.
+            server.failNextCommand(containing: "LOGIN", message: "[AUTHENTICATIONFAILED] Invalid credentials")
+            var thrown: (any Error)?
+            do { try await live.connect() } catch { thrown = error }
+            #expect(thrown != nil)
+            #expect(await isMarked(account.id))
+            try? await live.disconnect()
+        }
+    }
+
+    @Test("Update Password with a refused password never marks the account")
+    func refusedProbeNeverMarks() async throws {
+        try await withFactoryAccount { server, account in
+            let manager = AccountManager.shared
+            server.failNextCommand(containing: "LOGIN", message: "[AUTHENTICATIONFAILED] Invalid credentials")
+            var thrown: (any Error)?
+            do { try await manager.updateIMAPPassword("mistyped", for: account) } catch { thrown = error }
+            let error = try #require(thrown, "the refused probe did not reach the caller")
+            #expect(AccountReauthAlert.passwordUpdateLine(for: error, host: "127.0.0.1") == AccountReauthAlert.passwordLine,
+                    "a refused password did not get the password line: \(error)")
+            #expect(await !isMarked(account.id), "a refused password probe marked a working account")
+        }
+    }
+
+    @Test("after Update Password the live provider reports: a refusal marks, a later login clears")
+    func updatedPasswordProviderReportsWithoutRelaunch() async throws {
+        try await withFactoryAccount { server, account in
+            let manager = AccountManager.shared
+            try await manager.updateIMAPPassword(server.password, for: account)
+            let live = try #require(await manager.provider(for: account) as? IMAPProvider)
+            #expect(live.hasSignInOutcomeReporter)
+
+            await live.markDirty()
+            server.failNextCommand(containing: "LOGIN", message: "[AUTHENTICATIONFAILED] Invalid credentials")
+            var thrown: (any Error)?
+            do { try await live.connect() } catch { thrown = error }
+            #expect(thrown != nil)
+            #expect(await isMarked(account.id), "the provider made live by Update Password did not report a refusal")
+
+            try await live.connect()
+            #expect(await !isMarked(account.id), "an accepted login did not clear the warning")
+        }
+    }
 }

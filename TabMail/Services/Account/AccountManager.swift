@@ -1311,6 +1311,27 @@ actor AccountManager {
         }
     }
 
+    #if DEBUG
+    /// Test seam: `IMAPProvider`'s TLS override for providers this factory builds,
+    /// so the factory and `updateIMAPPassword` can be driven against the plain-TCP
+    /// `FakeIMAPServer`. `nil` (production) lets SwiftMail choose.
+    private nonisolated let imapUseTLSOverrideBox = Mutex<Bool?>(nil)
+    nonisolated func setIMAPUseTLSOverrideForTesting(_ useTLS: Bool?) {
+        imapUseTLSOverrideBox.withLock { $0 = useTLS }
+    }
+    private nonisolated var imapUseTLSOverride: Bool? { imapUseTLSOverrideBox.withLock { $0 } }
+    #else
+    private nonisolated var imapUseTLSOverride: Bool? { nil }
+    #endif
+
+    /// Make an accepted, saved password probe the account's live provider. Attaches
+    /// the account's real sign-in reporter and stores the provider in ONE actor
+    /// turn (no `await` between), so the live provider always reports.
+    func installAcceptedPasswordProbeAsLive(_ provider: IMAPProvider, accountId: String) {
+        provider.attachSignInOutcomeReporter(makeSignInOutcomeReporter(accountId: accountId))
+        providers[accountId] = provider
+    }
+
     /// The reporter the provider factory injects for `accountId`.
     nonisolated func makeSignInOutcomeReporter(accountId: String) -> SignInOutcomeReporter {
         return { @Sendable outcome in
@@ -1759,7 +1780,12 @@ actor AccountManager {
             senderEmail: account.emailAddress,
             smtpHost: account.smtpHost ?? host.replacingOccurrences(of: "imap", with: "smtp"),
             smtpPort: account.smtpPort ?? 587,
-            signInOutcome: makeSignInOutcomeReporter(accountId: account.id)
+            useTLS: imapUseTLSOverride,
+            // Only the account's live provider reports sign-in outcomes. A probe of
+            // a new password (`passwordOverride`) must never mark the account; it
+            // gets the real reporter only when it becomes live
+            // (`installAcceptedPasswordProbeAsLive`).
+            signInOutcome: passwordOverride == nil ? makeSignInOutcomeReporter(accountId: account.id) : nil
         )
     }
 }

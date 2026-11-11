@@ -1781,9 +1781,15 @@ final class InboxViewModel {
         guard !accountIds.isEmpty else { return }
 
         let uniqueAccounts: [Account]
+        // Read once at the start of the run: whether this refresh covers every
+        // active account (the unified inbox) decides whether its success may clear
+        // the inbox banner (`AccountManagerState.finishSyncRun`).
+        let coverage: SyncRunCoverage
         do {
-            uniqueAccounts = try await dbPool.read { db in
-                try Account.filter(accountIds.contains(Column("id"))).fetchAll(db)
+            (uniqueAccounts, coverage) = try await dbPool.read { db in
+                let accounts = try Account.filter(accountIds.contains(Column("id"))).fetchAll(db)
+                let activeIds = try String.fetchSet(db, Account.filter(Column("isActive") == true).select(Column("id")))
+                return (accounts, activeIds.isSubset(of: Set(accountIds)) ? .full : .partial)
             }
         } catch {
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Sync] Error fetching accounts: \(error)") }
@@ -1813,7 +1819,7 @@ final class InboxViewModel {
             try await manager.syncFolders(folders)
 
             AccountManagerState.shared.lastSyncFailed = false
-            AccountManagerState.shared.finishSyncRun(bannerText: nil, completed: true)
+            AccountManagerState.shared.finishSyncRun(raised: nil, coverage: coverage, anyFailure: false, completed: true)
         } catch is CancellationError {
             // Task cancelled (e.g., user navigated away) — not user-facing
         } catch let error where SyncEngine.isTransientError(error) {
@@ -1830,9 +1836,10 @@ final class InboxViewModel {
         } catch {
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Sync] Error: \(error)") }
             AccountManagerState.shared.lastSyncFailed = true
-            // Fixed line only (never the error's text). The run raised it, so the
-            // run does not advance the timestamp either.
-            AccountManagerState.shared.finishSyncRun(bannerText: InboxErrorBanner.text(for: error), completed: false)
+            // A user-started refresh raises the banner on its own failure (fixed
+            // line only, never the error's text) and does not advance the timestamp.
+            AccountManagerState.shared.finishSyncRun(raised: InboxErrorBanner.text(for: error), coverage: coverage,
+                                                     anyFailure: true, completed: false)
         }
 
         // Refresh loaded messages to pick up changes from sync.

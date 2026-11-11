@@ -133,8 +133,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// IMAPProvider at an in-process plain-TCP fake on an ephemeral port.
     private let useTLS: Bool?
     /// Reports what a login the server answered says about the account's
-    /// sign-in. Injected by the account layer; `nil` reports nothing.
-    private let signInOutcome: SignInOutcomeReporter?
+    /// sign-in. Injected by the account layer; `nil` reports nothing. Stored in a
+    /// `Mutex` so the account layer can attach it synchronously, in the same actor
+    /// turn that makes a probe provider live.
+    private nonisolated let signInOutcomeBox: Mutex<SignInOutcomeReporter?>
 
     // MARK: - UIDVALIDITY epoch observation (T1.2b)
 
@@ -847,7 +849,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         self.smtpHost = smtpHost
         self.smtpPort = smtpPort
         self.useTLS = useTLS
-        self.signInOutcome = signInOutcome
+        self.signInOutcomeBox = Mutex(signInOutcome)
         // Start from the persisted server limit (learned from a prior
         // max_userip_connections rejection) so backfill's parallel walk never
         // re-oversubscribes a server whose cap we already know.
@@ -937,6 +939,17 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         deadDropTestHook.withLock { $0 }?(server)
     }
 
+    /// Replace the sign-in reporter. Synchronous, so the caller can do it in the
+    /// same actor turn as the step that depends on it.
+    nonisolated func attachSignInOutcomeReporter(_ reporter: SignInOutcomeReporter?) {
+        signInOutcomeBox.withLock { $0 = reporter }
+    }
+
+    /// Whether a sign-in reporter is attached. Read by tests of the wiring.
+    nonisolated var hasSignInOutcomeReporter: Bool {
+        signInOutcomeBox.withLock { $0 != nil }
+    }
+
     // MARK: - Connection Creation
 
     /// Create a fresh logged-in IMAP connection.
@@ -969,10 +982,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 throw ProviderTemporaryRefusal(underlying: IMAPError.loginFailed(reason))
             }
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] \(senderEmail) login refused (credentials): \(reason)") }
-            await signInOutcome?(.credentialsRefused)
+            await signInOutcomeBox.withLock { $0 }?(.credentialsRefused)
             throw IMAPError.loginFailed(reason)
         }
-        await signInOutcome?(.accepted)
+        await signInOutcomeBox.withLock { $0 }?(.accepted)
         // The oracle's birth mark — see `serverCreatedTestHook`.
         serverCreatedTestHook.withLock { $0 }?(server, diagSite)
         return server

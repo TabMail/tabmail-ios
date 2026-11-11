@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import Synchronization
 
 enum AccountRemovalError: LocalizedError {
     case searchIndexCleanupFailed(String)
@@ -746,9 +747,21 @@ extension AccountManager {
         guard account.provider == .imap else { return }
         guard !isRuntimeRemoved(account.id) else { throw ProviderError.notConnected }
 
-        // Test connection with new password before saving
+        // Test connection with new password before saving. The probe reports only
+        // to a local flag, never to the account: a mistyped password must not
+        // mark a working account. A refused password reaches the caller as
+        // `ProviderError.authenticationFailed`.
         let testProvider = try createIMAPProvider(for: account, passwordOverride: newPassword)
-        try await testProvider.connect()
+        let probe = PasswordProbeOutcome()
+        testProvider.attachSignInOutcomeReporter { outcome in
+            if outcome == .credentialsRefused { probe.refused.withLock { $0 = true } }
+        }
+        do {
+            try await testProvider.connect()
+        } catch {
+            if probe.refused.withLock({ $0 }) { throw ProviderError.authenticationFailed }
+            throw error
+        }
         guard !isRuntimeRemoved(account.id) else {
             try? await testProvider.disconnect()
             throw ProviderError.notConnected
@@ -757,8 +770,8 @@ extension AccountManager {
         // Save new password to Keychain
         try KeychainHelper.save(newPassword, for: KeychainHelper.passwordKey(accountId: account.id))
 
-        // Replace active provider
-        providers[account.id] = testProvider
+        // Replace active provider; it reports sign-in outcomes from here on.
+        installAcceptedPasswordProbeAsLive(testProvider, accountId: account.id)
         let concurrency: Int
         switch account.provider {
         case .gmail: concurrency = SyncConfig.gmailWorkQueueConcurrency
@@ -834,4 +847,10 @@ extension AccountManager {
             try await connectAccount(account)
         }
     }
+}
+
+/// What a password probe's own sign-in reporter recorded. Local to one
+/// `updateIMAPPassword` call; never reaches `authFailedAccounts`.
+private final class PasswordProbeOutcome: Sendable {
+    let refused = Mutex(false)
 }

@@ -524,7 +524,7 @@ struct AccountDetailView: View {
                 try await manager.syncAccount(account)
             } catch {
                 if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Reauth] Password update failed: \(error)") }
-                if let line = AccountReauthAlert.line(for: error, isPassword: true) {
+                if let line = AccountReauthAlert.passwordUpdateLine(for: error, host: account.imapHost ?? "") {
                     reauthError = line
                 }
             }
@@ -547,7 +547,7 @@ struct AccountDetailView: View {
                 try await manager.syncAccount(account)
             } catch {
                 if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Reauth] Re-authentication failed: \(error)") }
-                if let line = AccountReauthAlert.line(for: error, isPassword: false) {
+                if let line = AccountReauthAlert.oauthLine(for: error) {
                     reauthError = line
                 }
             }
@@ -704,18 +704,35 @@ struct AccountDetailView: View {
 }
 
 /// The re-authentication alert's copy: fixed plain lines only, never text
-/// derived from the error (which stays in the debug-gated log).
+/// derived from the error (which stays in the debug-gated log). The line is
+/// chosen by what failed.
 enum AccountReauthAlert {
+    /// The server refused the new password.
     static let passwordLine = "The server did not accept the sign-in. Check the password and try again."
+    /// The password was accepted, then a later step (saving it, the sync) failed.
+    static let setupLine = "Couldn't finish setting up the account. Try again."
+    /// An OAuth re-authentication failed.
     static let oauthLine = "Sign-in did not complete. Please try again."
 
-    /// Every line the alert can show. Tests assert membership in this set.
-    static let allLines: Set<String> = [passwordLine, oauthLine]
+    /// The server cannot meet TabMail's TLS minimum: the existing fixed copy for
+    /// that case, built from the account's own host, not from the error.
+    static func tlsLine(host: String) -> String {
+        IMAPTransportSecurityError.tlsFloorNotMet(host: host).description
+    }
 
-    /// The alert line for `error`, or `nil` when the alert stays closed (offline,
-    /// as before).
-    static func line(for error: Error, isPassword: Bool) -> String? {
+    /// The alert line for a failed password update, or `nil` when the alert stays
+    /// closed (offline, as before).
+    static func passwordUpdateLine(for error: Error, host: String) -> String? {
+        if error is IMAPTransportSecurityError { return tlsLine(host: host) }
         if SyncEngine.isConnectionError(error) { return nil }
-        return isPassword ? passwordLine : oauthLine
+        // `updateIMAPPassword` reports a refused password as this typed case,
+        // recorded by the probe's own sign-in reporter.
+        if case ProviderError.authenticationFailed = error { return passwordLine }
+        return setupLine
+    }
+
+    /// The alert line for a failed OAuth re-authentication, or `nil` (offline).
+    static func oauthLine(for error: Error) -> String? {
+        SyncEngine.isConnectionError(error) ? nil : oauthLine
     }
 }

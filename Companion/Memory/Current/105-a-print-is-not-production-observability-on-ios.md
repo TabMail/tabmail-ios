@@ -182,15 +182,25 @@ build**. The error's text stays in the debug-gated logs only.
   per-account `SignInAgainBanner`, which reads `authFailedAccounts`). `AccountReauthAlert.line(for:)`
   in `AccountDetailView.swift` does the same for the alert. `text(for:loggingEnabled:)` is deleted.
 - **Sync banner state.** Sync failures publish to `AccountManagerState.syncErrorBanner` through one call,
-  `finishSyncRun(bannerText:completed:)`, from all three paths that advance `lastSyncCompletedAt`
-  (`InboxViewModel.performSync`, `SyncScheduler.poll`, `SyncScheduler.backgroundPoll`). A run's own
-  banner line wins over its own timestamp advance, so the banner is cleared only by a completed run that
-  raised nothing and stays steady while one account keeps failing. The older-messages catch writes the
-  same fixed line to `InboxViewModel.error`.
+  `finishSyncRun(raised:coverage:anyFailure:completed:)`. Only a user-started inbox refresh
+  (`InboxViewModel.performSync`) raises it, on its own failure. Scheduler and background runs never raise
+  it (`AccountManager.foregroundPollRun`, `backgroundPollRun`). Only a FULL run (every active account; the
+  unified-inbox refresh counts) with no failure clears it; a partial run (one account, one folder) never
+  clears it, so a healthy account's push or pull cannot hide another account's failure. The
+  older-messages catch writes the same fixed line to `InboxViewModel.error`.
+- **Re-auth alert by phase.** Refused password: the password line (the probe records the refusal through
+  its own local reporter, and `updateIMAPPassword` rethrows it as `ProviderError.authenticationFailed`);
+  TLS minimum not met: the existing TLS sentence for the account's host; anything after the password was
+  accepted (save, sync) or a temporary refusal: "Couldn't finish setting up the account. Try again.";
+  offline: no alert.
+- **The probe never marks the account.** `createIMAPProvider(passwordOverride:)` builds the probe with no
+  account reporter; `installAcceptedPasswordProbeAsLive` attaches the real one in the same actor turn
+  that makes the probe the live provider.
 - **The IOS-SCROLL-003 qualifier in §4 still holds**: a connection failure during pagination raises no
   banner, as before.
-- Tests: `InboxErrorBannerTests` (every typed error plus an unknown one maps to a fixed line or nothing;
-  ten-run steady banner; clearing on a completed background run), `IMAPLoginRefusalSignInTests`.
+- Tests: `InboxErrorBannerTests` (fixed lines for every error; alert line by phase),
+  `SyncRunBannerEntryPointTests` (each run entry point; ten-run sequence), `IMAPLoginRefusalSignInTests`
+  (codes, factory wiring, probe never marks, live provider after Update Password reports).
 
 ---
 

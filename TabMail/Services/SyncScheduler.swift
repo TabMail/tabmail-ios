@@ -958,13 +958,12 @@ final class SyncScheduler {
         }
 
         let t0 = CFAbsoluteTimeGetCurrent()
-        let runResult: AccountManager.SyncResult
-        if let email = accountEmail {
-            runResult = await manager.backgroundSyncForAccount(email: email)
-        } else {
-            runResult = await manager.backgroundSyncAll(inboxOnly: inboxOnly)
-        }
-        let anyChanges = runResult.hadChanges
+        // Syncs and reports the run (`AccountManager.backgroundPollRun`): it stamps
+        // the sync-status timestamp so the "Updated N min ago" subtitle reflects
+        // background / push / startup (NSE-coalesce) delta syncs too, never raises
+        // the inbox banner, and clears it only when every account was synced
+        // without a failure.
+        let anyChanges = await manager.backgroundPollRun(accountEmail: accountEmail, inboxOnly: inboxOnly).hadChanges
 
         lastPollTime = Date()
 
@@ -992,18 +991,9 @@ final class SyncScheduler {
         // Revalidate AI subscription gate if closed
         await Self.revalidateAISubscriptionGate()
 
-        // Stamp the sync-status timestamp so the "Updated N min ago" subtitle
-        // reflects background / push / startup (NSE-coalesce) delta syncs too —
-        // not just pull-to-refresh (InboxViewModel.performSync) and the
-        // foreground poll tier (poll()). This is the only sync tier that never
-        // stamped, which left the subtitle stale after a silent-push / NSE wake.
-        // Stamp on completion-with-connectivity even when nothing changed (the
-        // no-network case returns false earlier and is correctly skipped).
-        // The run's own banner line wins over its own timestamp advance: a run
-        // where one account failed keeps the inbox banner up
-        // (`AccountManagerState.finishSyncRun`).
-        AccountManagerState.shared.lastSyncFailed = false
-        AccountManagerState.shared.finishSyncRun(bannerText: runResult.bannerText, completed: true)
+        // The timestamp was stamped by `backgroundPollRun` above, on completion
+        // with connectivity even when nothing changed (the no-network case
+        // returns false earlier and is correctly skipped).
 
         return true
     }
@@ -1034,12 +1024,11 @@ final class SyncScheduler {
         var anyChanges = false
         if !AccountManagerState.shared.fastSyncModeActive {
             // Header sync — phase updates published per-account by foregroundSyncOne.
-            let result = await manager.foregroundSyncAll()
+            // Syncs every account and reports the run
+            // (`AccountManager.foregroundPollRun`): never raises the inbox banner,
+            // clears it only when no account failed.
+            let result = await manager.foregroundPollRun()
             anyChanges = result.hadChanges
-            AccountManagerState.shared.lastSyncFailed = result.failed
-            // One call publishes both: the run's own banner line wins over its
-            // own timestamp advance (`AccountManagerState.finishSyncRun`).
-            AccountManagerState.shared.finishSyncRun(bannerText: result.bannerText, completed: !result.failed)
             // Clear phases after a short delay so the terminal per-account phase
             // emission has a chance to render through the subtitle's throttle
             // before being wiped. Without this the phase lifetime is sub-ms.
