@@ -28,6 +28,13 @@ struct SplitRecord: Sendable, Equatable {
     /// operation is queued.
     static let argumentKey = "_split_record"
 
+    /// The reserved key in `PendingCalendarOperation.argumentsJSON` for when the calendar first
+    /// answered "not found" for a new part it had reported as already created
+    /// (`SplitRecorder.partNotFound`), in seconds since 1970. Only the queue writes it
+    /// (`AccountManager.noteSplitPartNotFound`); a tool call that carries it has it removed when
+    /// the operation is queued.
+    static let partNotFoundSinceKey = "_split_part_not_found_since"
+
     private static let seriesKey = "series_id"
     private static let newPartKey = "new_part_id"
     private static let splitAtKey = "split_at"
@@ -59,6 +66,20 @@ struct SplitRecord: Sendable, Equatable {
     }
 }
 
-/// Keeps a `SplitRecord` with the operation that is splitting. A throw stops the split before
-/// the cap: the cap is written only once the record is kept.
-typealias SplitRecorder = @Sendable (SplitRecord) async throws -> Void
+/// What a split keeps on the queued operation that is splitting (#601).
+struct SplitRecorder: Sendable {
+    /// Keeps a `SplitRecord` with the operation. A throw stops the split before the cap: the
+    /// cap is written only once the record is kept.
+    let keep: @Sendable (SplitRecord) async throws -> Void
+
+    /// Notes that the calendar answered "not found" for a new part it had reported as already
+    /// created, and returns how long ago, in seconds, it first answered so for this operation
+    /// (zero the first time). The first time is kept on the operation, so the answer counts
+    /// from the first attempt that got it, across retries and launches.
+    let partNotFound: @Sendable () async throws -> TimeInterval
+
+    /// Keeps `record` (`keep`).
+    func callAsFunction(_ record: SplitRecord) async throws {
+        try await keep(record)
+    }
+}

@@ -406,8 +406,7 @@ struct GoogleSeriesSplitCopyTests {
             }
         }
         http.register(path: GoogleSplitFixture.masterPath + "/instances", method: "GET") { _ in
-            // The series lists the occurrence at the split until the cap ends it before it, so the
-            // retry finds none there: it is this split's own cap, and is not asked again.
+            // The series lists the occurrence at the split until the cap ends it before it.
             let capped = server.withLock { state in
                 (state.master["recurrence"] as? [String] ?? []).contains { $0.contains("UNTIL=20990520T165959Z") }
             }
@@ -420,16 +419,23 @@ struct GoogleSeriesSplitCopyTests {
             return .raw(statusCode: 200, headers: ok, body: event)
         }
         let provider = GoogleCalendarProvider(accessToken: { _ in "test-token" }, session: http.session)
-        func split() async throws {
-            _ = try await provider.splitSeries(
-                eventId: "master-1", recurrenceId: GoogleSplitFixture.recurrenceId,
-                recurrenceIdZone: GoogleSplitFixture.utc, patch: GCalEventInput())
-        }
+        let records = SplitRecordBox()
 
-        await #expect(throws: (any Error).self) { try await split() }
+        await #expect(throws: (any Error).self) {
+            _ = try await provider.splitSeries(
+                calendarId: "primary", eventId: "master-1", recurrenceId: GoogleSplitFixture.recurrenceId,
+                recurrenceIdZone: GoogleSplitFixture.utc, patch: GCalEventInput(), sendUpdates: "all",
+                record: records.recorder)
+        }
         let writes = http.recordedCalls().map(\.method).filter { $0 != "GET" }
         #expect(writes == ["POST", "PATCH"], "the new part must be created before the cap: \(writes)")
-        try await split()
+        // The retry, as the queue runs it once the split's record is kept: the new part is still
+        // there, so only the cap is finished.
+        let record = try #require(records.records.first, "the split kept no record before its cap")
+        #expect(try await provider.eventExists(calendarId: "primary", eventId: record.newPartId))
+        try await provider.finishSplit(calendarId: "primary", record: record, zone: GoogleSplitFixture.utc)
+        let retryWrites = http.recordedCalls().map(\.method).filter { $0 != "GET" }.dropFirst(writes.count)
+        #expect(!retryWrites.contains("POST"), "the retry wrote the new part again: \(Array(retryWrites))")
 
         let (count, newPart, capped) = server.withLock { state in
             (state.created.count,

@@ -78,7 +78,9 @@ protocol CalendarProvider: Sendable {
     /// `eventExists` + `finishSplit` instead of here, so a new part the user deleted between
     /// the two writes is never created again. A create the calendar reports as already made
     /// (the deterministic id) counts as confirmed only while that part is still there; when
-    /// it is gone the split is refused with `SplitRecord.newPartDeleted`.
+    /// it is gone the split is refused with `SplitRecord.newPartDeleted`. A "not found" answer
+    /// for it is passed to `record.partNotFound`, which says how long ago this operation first
+    /// got one, so a provider can tell read-after-write lag from a deletion.
     func splitSeries(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, patch: GCalEventInput, sendUpdates: String, record: SplitRecorder) async throws -> GCalEvent
 
     /// Whether the event `eventId` (a `SplitRecord.newPartId`) is on the calendar now: false
@@ -794,7 +796,10 @@ actor GoogleCalendarProvider: CalendarProvider {
     /// the new part again (#601). A retry that runs the split again (the record was not kept) and
     /// is told the deterministic id already exists keeps that new part only while it is there: a
     /// part the user deleted is not created again, and the split is refused
-    /// (`SplitRecord.newPartDeleted`). A failed cap is rethrown; until the retry writes it, both
+    /// (`SplitRecord.newPartDeleted`) — at once when it reads as `cancelled`, and when it reads as
+    /// not found only once `SyncConfig.splitPartNotFoundGraceMinutes` have passed since the first
+    /// such answer (until then it may be read-after-write lag, and the operation stays queued).
+    /// A failed cap is rethrown; until the retry writes it, both
     /// parts show the occurrences after the split.
     func splitSeries(
         calendarId: String = "primary",
@@ -895,11 +900,19 @@ actor GoogleCalendarProvider: CalendarProvider {
             // The proof read's own failure may not masquerade as anything else.
             // Until 2026-08-06 this arm caught ANY 409, assumed the create had
             // landed, and a 404 from this GET escaped to `isCalendarNotFoundError`,
-            // which deletes the `PendingCalendarOperation` (R14-F2). `liveEvent`
-            // answers a 404 as "gone" itself, so it never escapes.
-            let existing: GCalEvent?
+            // which deletes the `PendingCalendarOperation` (R14-F2). `readPart`
+            // answers a 404 or 410 itself, so it never escapes.
+            //
+            // A 404 or 410 right after Google said the id exists may be read-after-write
+            // lag, so it is not yet "deleted": the operation stays queued (the original
+            // 409 is rethrown, which no terminal arm claims) until
+            // `SyncConfig.splitPartNotFoundGraceMinutes` have passed since the first
+            // such answer for this operation (`SplitRecorder.partNotFound`, kept on the
+            // operation), and only then is the split refused. `cancelled` is Google's
+            // own answer that the part was deleted, so it is refused at once.
+            let existing: PartRead
             do {
-                existing = try await liveEvent(calendarId: calendarId, eventId: newSeriesId)
+                existing = try await readPart(calendarId: calendarId, eventId: newSeriesId)
             } catch {
                 // We could not read it back. Rethrowing the ORIGINAL 409 says "we
                 // could not determine the outcome"; no terminal arm claims a 409
@@ -911,13 +924,28 @@ actor GoogleCalendarProvider: CalendarProvider {
                 }
                 throw GoogleCalendarError.httpError(409, conflictBody)
             }
-            guard let existing else {
+            switch existing {
+            case .live(let event):
+                created = event
+            case .cancelled:
                 if DebugModeManager.isLoggingEnabled() {
                     BackgroundSyncLogger.logDebug("[GoogleCalendar] splitSeries: new series \(newSeriesId) was deleted — refusing the split")
                 }
                 throw CalendarProviderError.notSupported(SplitRecord.newPartDeleted)
+            case .notFound:
+                let waited = try await record.partNotFound()
+                let grace = TimeInterval(SyncConfig.splitPartNotFoundGraceMinutes * 60)
+                guard waited >= grace else {
+                    if DebugModeManager.isLoggingEnabled() {
+                        BackgroundSyncLogger.logDebug("[GoogleCalendar] splitSeries: new series \(newSeriesId) not found \(Int(waited))s after the first such answer — keeping the operation queued")
+                    }
+                    throw GoogleCalendarError.httpError(409, conflictBody)
+                }
+                if DebugModeManager.isLoggingEnabled() {
+                    BackgroundSyncLogger.logDebug("[GoogleCalendar] splitSeries: new series \(newSeriesId) still not found \(Int(waited))s after the first such answer — refusing the split")
+                }
+                throw CalendarProviderError.notSupported(SplitRecord.newPartDeleted)
             }
-            created = existing
             if DebugModeManager.isLoggingEnabled() {
                 BackgroundSyncLogger.logDebug("[GoogleCalendar] splitSeries: new series \(newSeriesId) already exists — going on to the cap")
             }
@@ -960,23 +988,33 @@ actor GoogleCalendarProvider: CalendarProvider {
         return input
     }
 
-    /// The event as Google has it now, or nil when it is gone: Google answers 404 or 410, or the
-    /// event reads as `cancelled` (a deleted event Google still keeps under its id). Any other
-    /// failure is thrown.
-    private func liveEvent(calendarId: String, eventId: String) async throws -> GCalEvent? {
+    /// What Google answers for an event read by id.
+    private enum PartRead {
+        /// The event, there now.
+        case live(GCalEvent)
+        /// The event reads as `cancelled`: deleted, with Google still keeping its id.
+        case cancelled
+        /// Google answers 404 or 410.
+        case notFound
+    }
+
+    /// The event as Google has it now. Any failure other than a 404 or 410 is thrown.
+    private func readPart(calendarId: String, eventId: String) async throws -> PartRead {
         let event: GCalEvent
         do {
             event = try await getEvent(calendarId: calendarId, eventId: eventId)
         } catch GoogleCalendarError.httpError(let code, _) where code == 404 || code == 410 {
-            return nil
+            return .notFound
         } catch GoogleCalendarError.eventNotFound {
-            return nil
+            return .notFound
         }
-        return event.status == "cancelled" ? nil : event
+        return event.status == "cancelled" ? .cancelled : .live(event)
     }
 
+    /// False when Google answers 404 or 410, or the event reads as `cancelled`.
     func eventExists(calendarId: String = "primary", eventId: String) async throws -> Bool {
-        try await liveEvent(calendarId: calendarId, eventId: eventId) != nil
+        if case .live = try await readPart(calendarId: calendarId, eventId: eventId) { return true }
+        return false
     }
 
     /// The cap of the split `record` names, written alone (`CalendarProvider.finishSplit`): the

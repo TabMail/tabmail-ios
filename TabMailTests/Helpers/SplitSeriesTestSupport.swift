@@ -14,7 +14,7 @@ extension CalendarProvider {
     ) async throws -> GCalEvent {
         try await splitSeries(
             calendarId: calendarId, eventId: eventId, recurrenceId: recurrenceId,
-            recurrenceIdZone: recurrenceIdZone, patch: patch, sendUpdates: sendUpdates, record: { _ in })
+            recurrenceIdZone: recurrenceIdZone, patch: patch, sendUpdates: sendUpdates, record: .unused)
     }
 }
 
@@ -25,7 +25,7 @@ extension GoogleCalendarProvider {
     ) async throws -> GCalEvent {
         try await splitSeries(
             calendarId: calendarId, eventId: eventId, recurrenceId: recurrenceId,
-            recurrenceIdZone: recurrenceIdZone, patch: patch, sendUpdates: sendUpdates, record: { _ in })
+            recurrenceIdZone: recurrenceIdZone, patch: patch, sendUpdates: sendUpdates, record: .unused)
     }
 }
 
@@ -36,7 +36,7 @@ extension ExchangeCalendarProvider {
     ) async throws -> GCalEvent {
         try await splitSeries(
             calendarId: calendarId, eventId: eventId, recurrenceId: recurrenceId,
-            recurrenceIdZone: recurrenceIdZone, patch: patch, sendUpdates: sendUpdates, record: { _ in })
+            recurrenceIdZone: recurrenceIdZone, patch: patch, sendUpdates: sendUpdates, record: .unused)
     }
 }
 
@@ -55,11 +55,18 @@ final class SplitRecordBox: @unchecked Sendable {
     }
 
     var recorder: SplitRecorder {
-        { [self] record in
+        SplitRecorder(keep: { [self] record in
             try lock.withLock {
                 if let failure { throw failure }
                 kept.append(record)
             }
-        }
+        }, partNotFound: { 0 })
+    }
+}
+
+extension SplitRecorder {
+    /// Keeps nothing, and answers every "not found" for a new part as the first one.
+    static var unused: SplitRecorder {
+        SplitRecorder(keep: { _ in }, partNotFound: { 0 })
     }
 }

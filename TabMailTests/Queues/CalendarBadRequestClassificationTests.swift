@@ -354,6 +354,15 @@ struct CalendarBadRequestClassificationTests {
             ("Demo database not up", DemoError.notInDemo, false),
             // — Cross-provider —
             ("provider cannot perform this edit scope", CalendarProviderError.notSupported("this_and_following"), true),
+            // — A split interrupted between its writes (#601). No split rolls back any more, so
+            //   CalDAV's half-landed `inconsistentState` is gone from the call graph; these are
+            //   what a split can throw instead —
+            ("a split's new part was deleted", CalendarProviderError.notSupported(SplitRecord.newPartDeleted), true),
+            // The split's row was gone when its record was to be kept: nothing is left to retry.
+            ("a split's queued row is gone before its cap", SplitRecord.OperationGone(), false),
+            // Google said the new part's id exists, then reads it as not found: until the grace
+            // has passed this may be read-after-write lag, and the split is retried.
+            ("Google duplicate 409 rethrown while the new part is not yet visible", GoogleCalendarError.httpError(409, nil), false),
             // — THE R14-F4 CLASS: raised before any request is issued —
             ("OAuth grant revoked (invalid_grant)", OAuthError.tokenExchangeFailed("invalid_grant"), true),
             ("OAuth client rejected (invalid_client)", OAuthError.tokenExchangeFailed("invalid_client"), true),
@@ -375,7 +384,7 @@ struct CalendarBadRequestClassificationTests {
         // MIS-030: anchor the roster's own cardinality, so a future edit that
         // silently empties or truncates it cannot make every assertion below
         // pass over nothing.
-        #expect(roster.count == 32, "the roster lost or gained entries — re-derive it from the call graph")
+        #expect(roster.count == 34,"the roster lost or gained entries — re-derive it from the call graph")
         for (label, error, terminal) in roster {
             #expect(
                 claimedByATerminalArm(error) == terminal,

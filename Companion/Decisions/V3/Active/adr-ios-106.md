@@ -78,7 +78,14 @@ series truncated.
    as a retry (`isOwnSplitCap`, `RecurrenceTail.isCapped`, `splitCapUntil`, `afterOwnSplitCap`, the
    queue's `splitting` are deleted); without a record it is refused like any series that ends before the
    split. Google's 409 `duplicate` on a create without a record reads the event: live, the split goes on
-   to record and cap; gone or `cancelled`, refused with the same reason.
+   to record and cap; `cancelled`, refused with the same reason at once. A 404 or 410 there may be
+   read-after-write lag right after Google said the id exists, so the operation stays queued until
+   `SyncConfig.splitPartNotFoundGraceMinutes` (10) have passed since the first such answer, and only then
+   is refused. The first answer's time is kept on the row under the reserved
+   `_split_part_not_found_since` (`SplitRecorder.partNotFound`, `AccountManager.noteSplitPartNotFound`),
+   stripped at queue time like the record. Ruled 2026-11-11: elapsed time, not a retry count, bounds it;
+   while it waits, the account's later calendar changes wait behind it. A refusal on a retry reaches the
+   user only as the failed row and the error log (no chat turn is waiting): open issue #600.
 
 **Trade-offs:**
 - The record is the only durable state added: two ids and a naive split time per in-flight split, gone

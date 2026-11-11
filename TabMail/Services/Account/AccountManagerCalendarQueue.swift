@@ -303,6 +303,41 @@ extension AccountManager {
     /// or can't be written, so the cap is not written: a retry runs the split again, and the
     /// calendar's own answer for the new part it already made decides it there.
     func recordSplit(opId: String, _ record: SplitRecord) async throws {
+        try await updateSplitArguments(opId: opId) { object in
+            object[SplitRecord.argumentKey] = record.jsonObject
+        }
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[CalendarQueue] Recorded split of \(record.seriesId) at \(record.splitAt) on op \(opId)")
+        }
+    }
+
+    /// The split's `SplitRecorder.partNotFound` (#601): the calendar answered "not found" for a
+    /// new part it had reported as already created. Keeps the time of the first such answer on
+    /// the operation (`SplitRecord.partNotFoundSinceKey`, written the first time only) and
+    /// returns how long ago it was. Throws as `recordSplit` does when the row is gone or can't
+    /// be written.
+    func noteSplitPartNotFound(opId: String) async throws -> TimeInterval {
+        let now = Date()
+        let first = try await updateSplitArguments(opId: opId) { object -> Date in
+            if let since = object[SplitRecord.partNotFoundSinceKey] as? Double {
+                return Date(timeIntervalSince1970: since)
+            }
+            object[SplitRecord.partNotFoundSinceKey] = now.timeIntervalSince1970
+            return now
+        }
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[CalendarQueue] Split's new part not found on op \(opId), first at \(first)")
+        }
+        return now.timeIntervalSince(first)
+    }
+
+    /// Reads the queued operation `opId` again, applies `change` to its arguments, and writes
+    /// back only its `argumentsJSON`, every other argument as stored. Throws when the row is
+    /// gone or its arguments can't be read or written.
+    private func updateSplitArguments<T: Sendable>(
+        opId: String,
+        _ change: @escaping @Sendable (inout [String: Any]) -> T
+    ) async throws -> T {
         try await retryWrite(dbPool, label: "CalendarQueue") { db in
             // A row that is gone fails the split before its cap with an error no terminal arm
             // claims; the requeue then finds no row and writes nothing.
@@ -313,16 +348,14 @@ extension AccountManager {
                   var object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 throw CalendarProviderError.notSupported("the queued calendar edit's arguments can't be read, so its split was not finished")
             }
-            object[SplitRecord.argumentKey] = record.jsonObject
+            let result = change(&object)
             let merged = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
             guard let text = String(data: merged, encoding: .utf8) else {
                 throw CalendarProviderError.notSupported("the queued calendar edit's arguments can't be written, so its split was not finished")
             }
             row.argumentsJSON = text
             try row.update(db, columns: ["argumentsJSON"])
-        }
-        if DebugModeManager.isLoggingEnabled() {
-            BackgroundSyncLogger.logDebug("[CalendarQueue] Recorded split of \(record.seriesId) at \(record.splitAt) on op \(opId)")
+            return result
         }
     }
 
@@ -330,8 +363,9 @@ extension AccountManager {
 
     /// Queue a calendar mutation for async execution.
     /// Persists the operation to GRDB before returning — survives crashes/kills.
-    /// `SplitRecord.argumentKey` is reserved for the queue (`recordSplit`); a tool call that
-    /// carries it has it removed here.
+    /// `SplitRecord.argumentKey` and `SplitRecord.partNotFoundSinceKey` are reserved for the
+    /// queue (`recordSplit`, `noteSplitPartNotFound`); a tool call that carries them has them
+    /// removed here.
     func queueCalendarOperation(
         type: CalendarOperationType,
         accountId: String,
@@ -341,6 +375,7 @@ extension AccountManager {
     ) async throws -> PendingCalendarOperation {
         var arguments = arguments
         arguments.removeValue(forKey: SplitRecord.argumentKey)
+        arguments.removeValue(forKey: SplitRecord.partNotFoundSinceKey)
         let op = PendingCalendarOperation(
             operationType: type,
             accountId: accountId,
@@ -1071,7 +1106,9 @@ extension AccountManager {
                     calendarId: calId, eventId: writeId, recurrenceId: rid,
                     recurrenceIdZone: recurrenceIdZone,
                     patch: input, sendUpdates: "all",
-                    record: { record in try await self.recordSplit(opId: opId, record) }
+                    record: SplitRecorder(
+                        keep: { record in try await self.recordSplit(opId: opId, record) },
+                        partNotFound: { try await self.noteSplitPartNotFound(opId: opId) })
                 )
                 BackgroundSyncLogger.logDebug("[CalendarQueue] Updated event id=\(eventId) scope=this_and_following at \(rid) (\(recurrenceIdZone.identifier)) — new series id=\(created.id ?? "?")")
                 // Surface the new series id so `awaitCalendarOpOutcome` can hand

@@ -2818,6 +2818,38 @@ private final class KeptAtCap: @unchecked Sendable {
     var values: [Bool] { lock.withLock { kept } }
 }
 
+/// The split's row, as `drainSplit` hands it to `watch`, for a change between two drains.
+private final class WatchedRow: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pool: DatabasePool?
+    private var id: String?
+    func set(_ pool: DatabasePool, _ id: String) { lock.withLock { self.pool = pool; self.id = id } }
+
+    /// Keeps on the row that the calendar first answered "not found" for the split's new part
+    /// `seconds` ago, as the queue keeps it.
+    func backdatePartNotFound(by seconds: TimeInterval) {
+        let (pool, id) = lock.withLock { (self.pool, self.id) }
+        guard let pool, let id else {
+            Issue.record("the split's row was not watched")
+            return
+        }
+        do {
+            try pool.write { db in
+                guard var row = try PendingCalendarOperation.fetchOne(db, key: id) else {
+                    Issue.record("the split's row is gone")
+                    return
+                }
+                var arguments = row.arguments
+                arguments[SplitRecord.partNotFoundSinceKey] = .double(Date().addingTimeInterval(-seconds).timeIntervalSince1970)
+                row.argumentsJSON = String(decoding: try JSONEncoder().encode(arguments), as: UTF8.self)
+                try row.update(db)
+            }
+        } catch {
+            Issue.record("could not change the split's row: \(error)")
+        }
+    }
+}
+
 /// What a drain of a split left: its row (nil once it completed) and the next change's.
 private struct SplitDrain {
     let split: PendingCalendarOperation?
@@ -3010,16 +3042,49 @@ struct SplitInterruptedBetweenItsWritesTests {
         #expect(seen.values == [true], "\(kind): the cap was sent before the record was kept: \(seen.values)")
     }
 
-    @Test("T7: Google, the create's answer is lost and the user deletes the new part: the retry is refused, with no cap and no wedge",
-          arguments: [FakeGoogleCalendar.DeletedRead.cancelled, .status(404), .status(410)])
-    func googleCreateAnswerLostThenDeleted(_ reads: FakeGoogleCalendar.DeletedRead) async throws {
+    @Test("T7: Google, the create's answer is lost and the user deletes the new part (read as cancelled): the retry is refused at once, with no cap and no wedge")
+    func googleCreateAnswerLostThenDeleted() async throws {
         let harness = SplitHarness(.google)
         harness.google?.loseNextResponse("POST")
-        let r = try await drainSplit(harness, account: "split-t7-\(reads)", drains: 2, between: {
-            harness.deleteNewPart(googleReads: reads)
+        let r = try await drainSplit(harness, account: "split-t7-cancelled", drains: 2, between: {
+            harness.deleteNewPart(googleReads: .cancelled)
         })
         #expect(!harness.splitWrites.contains(where: harness.isCap), "the series was capped: \(harness.splitWrites)")
+        #expect(harness.newPartIds.isEmpty, "the deleted new part was made again: \(harness.newPartIds)")
         #expect(r.split?.failureReason == newPartDeletedReason, "\(describe(r.split))")
+        #expect(r.next == nil && harness.nextWritten, "the next change did not drain: \(describe(r.next))")
+    }
+
+    @Test("T7: Google, the create's answer is lost and the new part then reads as not found: within the grace the change stays queued, with no cap",
+          arguments: [404, 410])
+    func googleCreateAnswerLostThenNotFoundWithinTheGrace(_ code: Int) async throws {
+        let harness = SplitHarness(.google)
+        harness.google?.loseNextResponse("POST")
+        let r = try await drainSplit(harness, account: "split-t7-grace-\(code)", drains: 2, between: {
+            harness.deleteNewPart(googleReads: .status(code))
+        })
+        #expect(!harness.splitWrites.contains(where: harness.isCap), "the series was capped: \(harness.splitWrites)")
+        #expect(harness.newPartIds.isEmpty, "the new part was made again: \(harness.newPartIds)")
+        #expect(r.split?.status == PendingStatus.queued.rawValue,
+                "a not-found answer just after Google said the id exists may be lag: the change stays queued. \(describe(r.split))")
+    }
+
+    @Test("T7: Google, the new part still reads as not found past the grace: the change is refused, with no cap, and the next change drains",
+          arguments: [404, 410])
+    func googleCreateAnswerLostThenNotFoundPastTheGrace(_ code: Int) async throws {
+        let harness = SplitHarness(.google)
+        harness.google?.loseNextResponse("POST")
+        let watched = WatchedRow()
+        let grace = TimeInterval(SyncConfig.splitPartNotFoundGraceMinutes * 60)
+        let r = try await drainSplit(harness, account: "split-t7-past-\(code)", drains: 2, between: {
+            harness.deleteNewPart(googleReads: .status(code))
+            // The first not-found answer for this operation came longer ago than the grace.
+            watched.backdatePartNotFound(by: grace + 60)
+        }, watch: { pool, id in watched.set(pool, id) })
+        #expect(!harness.splitWrites.contains(where: harness.isCap), "the series was capped: \(harness.splitWrites)")
+        #expect(harness.newPartIds.isEmpty, "the new part was made again: \(harness.newPartIds)")
+        #expect(r.split?.status == PendingStatus.failed.rawValue && r.split?.failureReason == newPartDeletedReason,
+                "\(describe(r.split))")
         #expect(r.next == nil && harness.nextWritten, "the next change did not drain: \(describe(r.next))")
     }
 
@@ -3073,7 +3138,7 @@ struct SplitInterruptedBetweenItsWritesTests {
 @Suite("The split record is reserved for the queue (#601)", .serialized, .processGlobalState)
 struct SplitRecordIsReservedTests {
 
-    @Test("T9: a split record in a tool call's arguments is dropped when the change is queued")
+    @Test("T9: a split record or first not-found time in a tool call's arguments is dropped when the change is queued")
     func forgedRecordIsDropped() async throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -3094,9 +3159,14 @@ struct SplitRecordIsReservedTests {
             type: .edit, accountId: account, eventId: "ser-g", calendarId: "primary",
             arguments: ["edit_scope": .string("this_and_following"), "recurrence_id": .string(forged.splitAt),
                         "title": .string("Retitled"),
-                        SplitRecord.argumentKey: .dictionary(forged.jsonObject.mapValues { .string($0) })])
+                        SplitRecord.argumentKey: .dictionary(forged.jsonObject.mapValues { .string($0) }),
+                        // A forged "first not found long ago" would refuse the split on its first
+                        // not-found answer, with no grace.
+                        SplitRecord.partNotFoundSinceKey: .double(Date().addingTimeInterval(-86_400).timeIntervalSince1970)])
         let stored = try #require(try await pool.read { db in try PendingCalendarOperation.fetchOne(db, key: op.id) })
         #expect(SplitRecord(stored.arguments) == nil, "the forged record was queued: \(stored.argumentsJSON)")
+        #expect(stored.arguments[SplitRecord.partNotFoundSinceKey] == nil,
+                "the forged first not-found time was queued: \(stored.argumentsJSON)")
         #expect(stored.arguments["title"] != nil, "the rest of the arguments were not kept: \(stored.argumentsJSON)")
     }
 

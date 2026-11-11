@@ -1627,13 +1627,25 @@ struct CalDAVSplitRollbackTests {
             return dropNext.withLock { drop in defer { drop = false }; return drop } ? .raw(statusCode: 500) : response
         }
         let provider = Self.makeProvider(http)
+        let records = SplitRecordBox()
 
-        await #expect(throws: (any Error).self) { try await Self.split(provider, fixture) }
+        await #expect(throws: (any Error).self) {
+            _ = try await provider.splitSeries(
+                calendarId: Self.calendarId, eventId: Self.masterEventId, recurrenceId: fixture.recurrenceId,
+                recurrenceIdZone: .current, patch: GCalEventInput(), sendUpdates: "none", record: records.recorder)
+        }
         #expect(store.storedICS(path: Self.masterPath)?.contains("UNTIL=") == true,
                 "setup: the first cap did not land")
-        try await Self.split(provider, fixture)
+        // The retry, as the queue runs it once the split's record is kept: the new part is
+        // still there, so only the cap is finished.
+        let record = try #require(records.records.first, "the split kept no record before its cap")
+        let writesBeforeRetry = store.recordedPuts().count
+        #expect(try await provider.eventExists(calendarId: Self.calendarId, eventId: record.newPartId))
+        try await provider.finishSplit(calendarId: Self.calendarId, record: record, zone: .current)
 
         try Self.expectPartition(store, fixture, dated)
+        #expect(!store.recordedPuts().dropFirst(writesBeforeRetry).contains { $0.path == Self.newPartPath(fixture) },
+                "the retry wrote the new part again: \(store.recordedPuts().map(\.path))")
     }
 
     @Test("""

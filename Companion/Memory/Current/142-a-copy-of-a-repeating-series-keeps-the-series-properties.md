@@ -107,8 +107,10 @@ response was lost, the series it reads is already capped.
   creates: `eventExists` on the new part, then `finishSplit` (the cap alone, or nothing when the series
   already ends before the split), or, the new part deleted, a refusal with `SplitRecord.newPartDeleted`
   and nothing written. The address-based guards (`successorIsOurs`, Google's 409 `duplicate`) still run
-  on a retry WITHOUT a record (the create's answer was lost); Google then reads the event, and a gone or
-  `cancelled` one is refused. Limit: on Outlook and CalDAV a create that landed with its answer lost,
+  on a retry WITHOUT a record (the create's answer was lost); Google then reads the event, and a
+  `cancelled` one is refused at once, a 404 or 410 one only once `SyncConfig.splitPartNotFoundGraceMinutes`
+  have passed since the first such answer (kept on the row as `_split_part_not_found_since`; until then
+  it may be read-after-write lag and the operation stays queued). Limit: on Outlook and CalDAV a create that landed with its answer lost,
   then deleted by the user, is created again on the retry.
 - **A rule from the edit replaces only the RRULE line on every provider** (#513): Google's
   `GoogleCalendarProvider.recurrence(_:withRuleFrom:)` keeps the excluded and added dates after the
