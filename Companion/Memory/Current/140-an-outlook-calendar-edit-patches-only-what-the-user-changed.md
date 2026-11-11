@@ -53,6 +53,15 @@ that aren't included in the request body maintain their previous values".
   in review: dating it as written misdated a seconds-less start labelled with another zone). A string in
   none of these forms (no wall time, or a one-digit hour) is dated as written. The tools still pass unknown start
   spellings through unparsed; reading them once at the tool boundary is #543.
+  **Superseded by #543 (2026-11-10):** the tool boundary now reads every start and end one way
+  (`CalendarToolHelpers.toolInstant`, used by `toRFC3339` and the create tool): a wall time without an offset
+  (with or without seconds) is the wall time in the edit's zone, and a time with a UTC offset or `Z` is the
+  instant it spells, as Google Calendar reads it. Either is handed on spelled with the label's own offset, so
+  `graphNaiveDateTime`'s dropped offset always matches the label, the start-only end derivation and the weekly
+  BYDAY fill read the same instant, and the seconds-less padding in `graphNaiveDateTime` was deleted as
+  unreachable. An all-day value is a plain calendar date taken as spelled (its first ten characters,
+  `toolAllDayDate`), never the day its instant falls on in the label's zone. The paragraph above records the
+  earlier reading.
   `day` reads the device's zone while the stored range keeps its `recurrenceTimeZone`; where the two
   disagree on the date, the range start can be a day off (#463).
 - A rule the edit gives is written as before (rebuilt from the RRULE by `toGraphEventJSON`). It still

@@ -186,6 +186,115 @@ struct CalendarToolResolvedAccountTests {
         }
     }
 
+    /// A start and end the assistant spells with an offset name the instants they spell, so the
+    /// card shows them and the calendar gets them, never the current time in their place.
+    @Test("A create with a start and end spelled with or without an offset is shown and created at those times",
+          arguments: StartSpelling.allCases)
+    func createAtSpelledTimes(_ spelling: StartSpelling) async throws {
+        let zone = "America/Los_Angeles"
+        let start = GraphFixture.onDevice(days: 0, hour: 23).addingTimeInterval(1_800)
+        try await withCalendars(registered: [.a], preferred: .a) { f in
+            await f.mockA.setCreateEventResult(Self.event(id: "evt-spelled", summary: "Planning review"))
+
+            let sink = RecordingConfirmSink()
+            let tool = CalendarEventCreateTool(context: ToolContext(db: f.pool, translator: MockChatIdTranslator()))
+            let output = try await tool.execute(
+                arguments: [
+                    "title": .string("Planning review"),
+                    "start_iso": .string(spelling.spell(start, label: zone)),
+                    "end_iso": .string(spelling.spell(start.addingTimeInterval(3_600), label: zone)),
+                    "timezone": .string(zone),
+                ],
+                invocation: ToolInvocation(uiSink: sink, sessionKey: "cal-tool-create-spelled"))
+
+            #expect(sink.calendarEvents.count == 1, "setup: no create card — got \(sink.calendarEvents.count)")
+            guard sink.calendarEvents.count == 1 else { return }
+            #expect(sink.calendarEvents[0].startDate == start, "the card shows \(sink.calendarEvents[0].startDate)")
+            #expect(sink.calendarEvents[0].endDate == start.addingTimeInterval(3_600), "the card shows \(sink.calendarEvents[0].endDate)")
+            let created = await f.mockA.createdEvents
+            #expect(created.count == 1, "tool said: \(output)")
+            guard created.count == 1 else { return }
+            #expect(created[0].event.startDateTime.flatMap(Date.fromISO8601) == start, "\(created[0].event.startDateTime ?? "nil")")
+            #expect(created[0].event.endDateTime.flatMap(Date.fromISO8601) == start.addingTimeInterval(3_600), "\(created[0].event.endDateTime ?? "nil")")
+        }
+    }
+
+    /// An all-day create is dated as spelled: the card and the created event show the spelled
+    /// date, never the day an offset's instant falls on in the event's zone.
+    @Test("An all-day create spelled with a time and an offset is shown and created on the spelled dates",
+          arguments: AllDaySpelling.allCases)
+    func createAllDayOnSpelledDates(_ spelling: AllDaySpelling) async throws {
+        let zone = AllDaySpelling.label
+        try await withCalendars(registered: [.a], preferred: .a) { f in
+            await f.mockA.setCreateEventResult(Self.event(id: "evt-all-day", summary: "Offsite"))
+
+            let sink = RecordingConfirmSink()
+            let tool = CalendarEventCreateTool(context: ToolContext(db: f.pool, translator: MockChatIdTranslator()))
+            let output = try await tool.execute(
+                arguments: [
+                    "title": .string("Offsite"),
+                    "start_iso": .string(spelling.spell(AllDaySpelling.day)),
+                    "end_iso": .string(spelling.spell(AllDaySpelling.nextDay)),
+                    "all_day": .bool(true),
+                    "timezone": .string(zone),
+                ],
+                invocation: ToolInvocation(uiSink: sink, sessionKey: "cal-tool-create-all-day"))
+
+            let fmt = DateFormatter()
+            fmt.locale = Locale(identifier: "en_US_POSIX")
+            fmt.timeZone = TimeZone(identifier: zone)
+            fmt.dateFormat = "yyyy-MM-dd"
+            #expect(sink.calendarEvents.count == 1, "setup: no create card — got \(sink.calendarEvents.count)")
+            guard sink.calendarEvents.count == 1 else { return }
+            #expect(fmt.string(from: sink.calendarEvents[0].startDate) == AllDaySpelling.day, "the card shows \(sink.calendarEvents[0].startDate)")
+            #expect(fmt.string(from: sink.calendarEvents[0].endDate) == AllDaySpelling.nextDay, "the card shows \(sink.calendarEvents[0].endDate)")
+            let created = await f.mockA.createdEvents
+            #expect(created.count == 1, "tool said: \(output)")
+            guard created.count == 1 else { return }
+            #expect(created[0].event.startDate == AllDaySpelling.day, "\(created[0].event.startDate ?? "nil")")
+            #expect(created[0].event.endDate == AllDaySpelling.nextDay, "\(created[0].event.endDate ?? "nil")")
+        }
+    }
+
+    /// A timed create spelled as a bare date starts at midnight in the event's zone: the card
+    /// shows that instant and the created event carries it spelled with the zone's own offset.
+    @Test("A timed create spelled as a bare date starts at midnight in the event's zone")
+    func createTimedFromBareDate() async throws {
+        let zone = "America/Los_Angeles"
+        let tz = try #require(TimeZone(identifier: zone))
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = tz
+        let start = try #require(cal.date(from: DateComponents(year: 2099, month: 3, day: 2)))
+        let end = try #require(cal.date(from: DateComponents(year: 2099, month: 3, day: 3)))
+        try await withCalendars(registered: [.a], preferred: .a) { f in
+            await f.mockA.setCreateEventResult(Self.event(id: "evt-bare-date", summary: "Planning review"))
+
+            let sink = RecordingConfirmSink()
+            let tool = CalendarEventCreateTool(context: ToolContext(db: f.pool, translator: MockChatIdTranslator()))
+            let output = try await tool.execute(
+                arguments: [
+                    "title": .string("Planning review"),
+                    "start_iso": .string("2099-03-02"),
+                    "end_iso": .string("2099-03-03"),
+                    "all_day": .bool(false),
+                    "timezone": .string(zone),
+                ],
+                invocation: ToolInvocation(uiSink: sink, sessionKey: "cal-tool-create-bare-date"))
+
+            #expect(sink.calendarEvents.count == 1, "setup: no create card — got \(sink.calendarEvents.count)")
+            guard sink.calendarEvents.count == 1 else { return }
+            #expect(sink.calendarEvents[0].startDate == start, "the card shows \(sink.calendarEvents[0].startDate)")
+            #expect(sink.calendarEvents[0].endDate == end, "the card shows \(sink.calendarEvents[0].endDate)")
+            let created = await f.mockA.createdEvents
+            #expect(created.count == 1, "tool said: \(output)")
+            guard created.count == 1 else { return }
+            let startDateTime = created[0].event.startDateTime ?? "nil"
+            #expect(Date.fromISO8601(startDateTime) == start, "\(startDateTime)")
+            #expect(startDateTime.hasSuffix("-08:00"), "\(startDateTime)")
+            #expect(created[0].event.endDateTime.flatMap(Date.fromISO8601) == end, "\(created[0].event.endDateTime ?? "nil")")
+        }
+    }
+
     @Test("A confirmed create with no resolvable calendar says so and queues nothing")
     func confirmedCreateWithNoCalendarQueuesNothing() async throws {
         try await withCalendars(registered: [], preferred: .a) { f in

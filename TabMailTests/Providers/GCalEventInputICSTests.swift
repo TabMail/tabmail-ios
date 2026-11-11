@@ -20,6 +20,25 @@ struct GCalEventInputICSTests {
         #expect(ics.contains("UID:test-uid"))
     }
 
+    /// However the assistant spells a start and end, the CalDAV lines name the instants they name
+    /// (an offset spelling the instant it spells, one without the wall time in the edit's zone),
+    /// as wall times in the edit's zone.
+    @Test("toICS writes a start and end spelled with or without an offset at the instants they name",
+          arguments: StartSpelling.allCases)
+    func spelledStartLines(_ spelling: StartSpelling) throws {
+        let zone = "America/Los_Angeles"
+        let start = try #require(Date.fromISO8601("2099-03-02T07:30:00Z"))
+        let input = try CalendarToolHelpers.buildGCalEventInput([
+            "title": .string("Late sync"),
+            "start_iso": .string(spelling.spell(start, label: zone)),
+            "end_iso": .string(spelling.spell(start.addingTimeInterval(1_800), label: zone)),
+            "timezone": .string(zone),
+        ], isAllDay: false)
+        let lines = input.toICS(uid: "uid-spelled").components(separatedBy: "\r\n")
+        #expect(lines.contains("DTSTART;TZID=\(zone):20990301T233000"), "\(lines)")
+        #expect(lines.contains("DTEND;TZID=\(zone):20990302T000000"), "\(lines)")
+    }
+
     @Test("toICS does NOT include METHOD (CalDAV PUT, not email invitation)")
     func noMethodLine() {
         let input = GCalEventInput(summary: "Meeting", startDateTime: "2024-03-15T10:00:00Z")

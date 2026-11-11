@@ -818,12 +818,9 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// time `toGraphEventJSON` writes (`graphNaiveDateTime`, which drops an
     /// offset or `Z` without converting) in the zone the start is labelled with
     /// (`timeZone`, the device's when nil, as `toGraphEventJSON` labels it).
-    /// So `…T00:30:00Z` labelled with the device's zone is 00:30 on the device,
-    /// and a start whose offset matches its label (`Z` with `UTC`) is the instant
-    /// it spells. A wall time without seconds (`…T10:00`), which the tools pass
-    /// through as given, is read the same way: `graphNaiveDateTime` writes it with
-    /// `:00`. A string in none of these forms (no wall time, or a one-digit
-    /// hour such as `…T9:00`) is dated as written.
+    /// The tools spell a start with its label's offset, so that wall time is the
+    /// instant the start names. A string in no `yyyy-MM-ddTHH:mm:ss` form (no
+    /// wall time, or a one-digit hour such as `…T9:00`) is dated as written.
     nonisolated static func day(_ date: String?, _ dateTime: String?, in timeZone: String?) -> String? {
         if let date { return String(date.prefix(10)) }
         guard let dateTime else { return nil }
@@ -1186,20 +1183,14 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// `end.dateTime`. Searches AFTER the `T` so the date's `-` separators
     /// aren't mistaken for an offset.
     ///
-    /// A wall time without seconds (`…T10:00`, which the tools pass through as
-    /// given) gets `:00`, the form Graph's example and responses use, and `day`
-    /// reads this same string, so the date an edit is judged by is the date of
-    /// the start Graph stores.
+    /// The tools hand every start and end over with the offset of the zone it is
+    /// labelled with (`CalendarToolHelpers.toRFC3339`), so the wall time kept here
+    /// is the instant's wall time in that label.
     nonisolated static func graphNaiveDateTime(_ iso: String) -> String {
         guard let tIdx = iso.firstIndex(of: "T") else { return iso }
-        let afterT = iso.index(after: tIdx)
-        let timePart = iso[afterT...]
-        let naive = timePart.firstIndex(where: { $0 == "Z" || $0 == "+" || $0 == "-" }).map { iso[..<$0] } ?? iso[...]
-        let time = Array(naive[afterT...])
-        if time.count == 5, time[2] == ":", [0, 1, 3, 4].allSatisfy({ time[$0].isASCII && time[$0].isNumber }) {
-            return String(naive) + ":00"
-        }
-        return String(naive)
+        let timePart = iso[iso.index(after: tIdx)...]
+        guard let offsetIdx = timePart.firstIndex(where: { $0 == "Z" || $0 == "+" || $0 == "-" }) else { return iso }
+        return String(iso[..<offsetIdx])
     }
 
     /// `attendeeTypes` (lowercased address → Graph type) keeps an existing

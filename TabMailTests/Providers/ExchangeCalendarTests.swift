@@ -400,8 +400,7 @@ struct ExchangeCalendarRecurringTests {
         #expect(range?["endDate"] as? String == lastDay, "UNTIL \(rule) in \(zoneId)")
     }
 
-    /// A start written without seconds (`…T10:00`, which the tools pass through as given) is the
-    /// same 10:00 start: Graph stores it as `graphNaiveDateTime` pads it, so an end at 05:00 still
+    /// A start written without seconds (`…T10:00`) is the same 10:00 start, so an end at 05:00 still
     /// ends the series the day before.
     @Test("A seconds-less start still ends the series before an unreached start time")
     func secondsLessStartKeepsTheStartTimeRule() throws {
@@ -418,10 +417,38 @@ struct ExchangeCalendarRecurringTests {
                                        "until": .string("\(relativeDay(30, "yyyy-MM-dd", in: zone, from: now))T05:00:00")]),
         ]
         let input = try CalendarToolHelpers.buildGCalEventInput(args, isAllDay: false)
-        #expect(input.startDateTime?.count == 16, "premise: the start reaches the writer without seconds (\(input.startDateTime ?? "nil"))")
         let json = makeProvider().toGraphEventJSON(input)
+        #expect((json["start"] as? [String: Any])?["dateTime"] as? String == "\(firstDay)T10:00:00")
         let range = (json["recurrence"] as? [String: Any])?["range"] as? [String: Any]
         #expect(range?["endDate"] as? String == relativeDay(29, "yyyy-MM-dd", in: zone, from: now))
+    }
+
+    /// A weekly series created at 23:30 on the device, its start spelled with or without an offset:
+    /// Graph stores that instant, the end is the one given, and the rule's weekday and range start
+    /// are the stored start's device day, which near midnight is not the UTC day.
+    @Test("A weekly series created near midnight by a start spelled with an offset meets on the stored start's weekday",
+          arguments: StartSpelling.allCases)
+    func weeklySeriesBySpelledStartNearMidnight(_ spelling: StartSpelling) throws {
+        let device = TimeZone.current.identifier
+        let start = GraphFixture.onDevice(days: 0, hour: 23).addingTimeInterval(1_800)
+        let args: [String: JSONValue] = [
+            "title": .string("Late sync"),
+            "start_iso": .string(spelling.spell(start, label: device)),
+            "end_iso": .string(spelling.spell(start.addingTimeInterval(1_800), label: device)),
+            "recurrence": .dictionary(["freq": .string("weekly")]),
+        ]
+        let json = makeProvider().toGraphEventJSON(try CalendarToolHelpers.buildGCalEventInput(args, isAllDay: false))
+
+        let stored = try #require(GraphFixture.instant(json["start"] as? [String: Any]), "no start in \(json)")
+        #expect(stored == start, "Graph stores \(String(describing: json["start"])), the user asked for \(start)")
+        #expect(GraphFixture.instant(json["end"] as? [String: Any]) == start.addingTimeInterval(1_800), "\(String(describing: json["end"]))")
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = .current
+        let names = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
+        let recurrence = json["recurrence"] as? [String: Any]
+        #expect((recurrence?["pattern"] as? [String: Any])?["daysOfWeek"] as? [String] == [names[cal.component(.weekday, from: stored) - 1]],
+                "\(String(describing: recurrence))")
+        #expect((recurrence?["range"] as? [String: Any])?["startDate"] as? String == GraphFixture.deviceDay(stored))
     }
 
     /// An all-day series' `UNTIL` is a bare date and stays the day the user named. The input
@@ -743,11 +770,10 @@ struct ExchangeCalendarRecurringTests {
         #expect(ExchangeCalendarProvider.graphNaiveDateTime("2026-05-15T20:00:00") == "2026-05-15T20:00:00")
         // The `-` in the date portion must NOT be mistaken for an offset.
         #expect(ExchangeCalendarProvider.graphNaiveDateTime("2026-05-15T20:00:00.123-0700") == "2026-05-15T20:00:00.123")
-        // A wall time without seconds gets `:00`, with or without an offset; one
-        // that is no wall time keeps its form.
-        #expect(ExchangeCalendarProvider.graphNaiveDateTime("2099-05-15T20:00") == "2099-05-15T20:00:00")
-        #expect(ExchangeCalendarProvider.graphNaiveDateTime("2099-05-15T20:00Z") == "2099-05-15T20:00:00")
-        #expect(ExchangeCalendarProvider.graphNaiveDateTime("2099-05-15T20:00-07:00") == "2099-05-15T20:00:00")
+        // Any other form keeps its wall time as written: the tools hand every time they
+        // read over with seconds and its label's offset.
+        #expect(ExchangeCalendarProvider.graphNaiveDateTime("2099-05-15T20:00") == "2099-05-15T20:00")
+        #expect(ExchangeCalendarProvider.graphNaiveDateTime("2099-05-15T20:00Z") == "2099-05-15T20:00")
         #expect(ExchangeCalendarProvider.graphNaiveDateTime("2099-05-15T2000") == "2099-05-15T2000")
         #expect(ExchangeCalendarProvider.graphNaiveDateTime("2099-05-15T20") == "2099-05-15T20")
     }
