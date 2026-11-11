@@ -943,7 +943,7 @@ actor CalDAVProvider: CalendarProvider {
     static let kindChangeNeedsBothMessage =
         "To change this event between all-day and timed, give both its new start and its new end, each as a date or a date and time. Nothing was changed."
     static let kindChangeOnRepeatingMessage =
-        "TabMail can't change a repeating event between all-day and timed on this calendar. Nothing was changed. Change it in your calendar app instead."
+        "This edit gives the start or end as all-day where this event or occurrence is timed, or the other way round, and on this calendar TabMail can't change that for an event that repeats. Nothing was changed. If the user did not ask to change between all-day and timed, retry with all_day matching how this occurrence is shown; otherwise the user can change it in their calendar app."
 
     /// The value type the merge writes `DTSTART` / `DTEND` in. It is the stored
     /// event's, unless the patch gives a start or end of the other kind: a time

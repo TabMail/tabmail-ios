@@ -1525,6 +1525,8 @@ struct CalendarEditToolAllDayEndTests {
             ("true, the event not read", ["all_day": .bool(true)], nil, "all", false),
             ("false, the event not read", ["all_day": .bool(false)], nil, "all", false),
             ("true with dates on a timed event", ["all_day": .bool(true), "start_iso": .string(day(7)), "end_iso": .string(day(8))], timed, "all", false),
+            ("false with only a start on an all-day event", ["all_day": .bool(false), "start_iso": .string("\(day(7))T09:00:00")], allDay, "all", false),
+            ("true with only a start on a timed event", ["all_day": .bool(true), "start_iso": .string(day(7))], timed, "all", false),
         ]
         for c in cases {
             let reason = CalendarToolHelpers.allDayEditRefusal(
