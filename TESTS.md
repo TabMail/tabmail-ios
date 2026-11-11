@@ -874,7 +874,8 @@ failed or its answer was lost, named by the series or its occurrence (T2, T3); t
 read as `cancelled`, 404 or 410; CalDAV 404 or 410), the retry writes nothing, the row is failed with the ruled reason
 (`SplitRecord.newPartDeleted`) and the next change drains in the same drain (T1; T7, Google's lost create
 answer: `cancelled` refused at once; 404 or 410 keeps the row queued within
-`SyncConfig.splitPartNotFoundGraceMinutes` and is refused past it, with the next change draining); Outlook's numbered or end-dated range is kept on the new part (T4); a transient cap failure keeps
+`SyncConfig.splitPartNotFoundGraceMinutes` and is refused past it, with the next change draining; the
+first not-found answer's time is kept on the row and a later one within the grace does not move it); Outlook's numbered or end-dated range is kept on the new part (T4); a transient cap failure keeps
 the record on the requeued row (T5); the record is on the row when the cap arrives (T6); Outlook POSTs once,
 before every PATCH (T8); a series that already ends before the split is finished with no write (T10).
 `SplitRecordIsReservedTests` (T9): `queueCalendarOperation` drops a `_split_record` a tool call carries.

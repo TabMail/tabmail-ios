@@ -2825,6 +2825,20 @@ private final class WatchedRow: @unchecked Sendable {
     private var id: String?
     func set(_ pool: DatabasePool, _ id: String) { lock.withLock { self.pool = pool; self.id = id } }
 
+    /// The split's row now, or nil when it is gone or was not watched.
+    var row: PendingCalendarOperation? {
+        let (pool, id) = lock.withLock { (self.pool, self.id) }
+        guard let pool, let id else { return nil }
+        return (try? pool.read { db in try PendingCalendarOperation.fetchOne(db, key: id) }) ?? nil
+    }
+
+    /// When the row says the calendar first answered "not found" for the split's new part.
+    var partNotFoundSince: Double? {
+        guard let data = row?.argumentsJSON.data(using: .utf8),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+        return (object[SplitRecord.partNotFoundSinceKey] as? NSNumber)?.doubleValue
+    }
+
     /// Keeps on the row that the calendar first answered "not found" for the split's new part
     /// `seconds` ago, as the queue keeps it.
     func backdatePartNotFound(by seconds: TimeInterval) {
@@ -3085,6 +3099,50 @@ struct SplitInterruptedBetweenItsWritesTests {
         #expect(harness.newPartIds.isEmpty, "the new part was made again: \(harness.newPartIds)")
         #expect(r.split?.status == PendingStatus.failed.rawValue && r.split?.failureReason == newPartDeletedReason,
                 "\(describe(r.split))")
+        #expect(r.next == nil && harness.nextWritten, "the next change did not drain: \(describe(r.next))")
+    }
+
+    @Test("T7: Google, the first not-found answer is kept on the row, later ones within the grace do not move it, and once the grace has passed since it the change is refused")
+    func googleFirstNotFoundIsKeptAndCounted() async throws {
+        let harness = SplitHarness(.google)
+        harness.google?.loseNextResponse("POST")
+        let watched = WatchedRow()
+        let grace = TimeInterval(SyncConfig.splitPartNotFoundGraceMinutes * 60)
+        var statusAfterFirst: String?
+        var sinceAfterFirst: Double?
+        var statusAfterSecond: String?
+        var sinceAfterSecond: Double?
+        var drain = 0
+        let between: () -> Void = {
+            drain += 1
+            if drain == 1 {
+                // The create landed with its answer lost; the user deletes the new part.
+                harness.deleteNewPart(googleReads: .status(404))
+            } else if drain == 2 {
+                // After the first drain that got a not-found answer, with no time kept before it.
+                statusAfterFirst = watched.row?.status
+                sinceAfterFirst = watched.partNotFoundSince
+            } else {
+                // After a second not-found answer within the grace; then the first one is moved
+                // back past the grace.
+                statusAfterSecond = watched.row?.status
+                sinceAfterSecond = watched.partNotFoundSince
+                watched.backdatePartNotFound(by: grace + 60)
+            }
+        }
+        let watch: (DatabasePool, String) -> Void = { pool, id in watched.set(pool, id) }
+        let r = try await drainSplit(harness, account: "split-t7-first", drains: 4, between: between, watch: watch)
+
+        #expect(statusAfterFirst == PendingStatus.queued.rawValue, "the first not-found answer did not keep the row queued: \(statusAfterFirst ?? "gone")")
+        let first = try #require(sinceAfterFirst, "the first not-found answer was not kept on the row")
+        #expect(statusAfterSecond == PendingStatus.queued.rawValue, "a not-found answer within the grace did not keep the row queued: \(statusAfterSecond ?? "gone")")
+        #expect(sinceAfterSecond == first,
+                "a later not-found answer moved the first one's time, so the grace would never end: \(first) then \(String(describing: sinceAfterSecond))")
+        #expect(r.split?.status == PendingStatus.failed.rawValue && r.split?.failureReason == newPartDeletedReason,
+                "past the grace since the first not-found answer the change was not refused: \(describe(r.split))")
+        #expect(!harness.seriesCapped && !harness.splitWrites.contains(where: harness.isCap),
+                "the series was capped: \(harness.splitWrites)")
+        #expect(harness.newPartIds.isEmpty, "the new part was made again: \(harness.newPartIds)")
         #expect(r.next == nil && harness.nextWritten, "the next change did not drain: \(describe(r.next))")
     }
 
