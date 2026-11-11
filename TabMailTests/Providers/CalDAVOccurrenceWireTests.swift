@@ -74,6 +74,29 @@ struct OccurrenceWireFixture {
         return OccurrenceWireFixture(zone: zone, first: base.first, ics: ics)
     }
 
+    /// The series with week `week`'s occurrence moved to the day after week `toWeek`'s, at
+    /// 10:00 (`movedStart(toWeek:)`), title unchanged: an occurrence whose place in the
+    /// series is weeks before where it now is.
+    static func makeMoved(week: Int, toWeek: Int) throws -> OccurrenceWireFixture {
+        let base = try make()
+        let zone = base.zone
+        let wall = { (date: Date) in OccurrenceFixture.wall(date, zone) }
+        let slot = try base.occurrence(week)
+        let moved = try base.movedStart(toWeek: toWeek)
+        let ics = OccurrenceFixture.ics([
+            seriesVEvent(first: base.first, zone: zone, extra: []),
+            """
+            UID:standup-1
+            RECURRENCE-ID;TZID=America/New_York:\(wall(slot))
+            DTSTAMP:\(OccurrenceFixture.utcValue(base.first))
+            DTSTART;TZID=America/New_York:\(wall(moved))
+            DTEND;TZID=America/New_York:\(wall(moved.addingTimeInterval(30 * 60)))
+            SUMMARY:Standup
+            """,
+        ])
+        return OccurrenceWireFixture(zone: zone, first: base.first, ics: ics)
+    }
+
     /// The series' VEVENT, with `extra` lines after its rule.
     private static func seriesVEvent(first: Date, zone: TimeZone, extra: [String]) -> String {
         let wall = { (date: Date) in OccurrenceFixture.wall(date, zone) }
@@ -92,10 +115,11 @@ struct OccurrenceWireFixture {
         try #require(OccurrenceFixture.calendar(zone).date(byAdding: .day, value: 7 * weeks, to: first))
     }
 
-    /// Where `makeChanged()` moved week `movedWeek`'s occurrence: the next day, 10:00 New York time.
-    func movedStart() throws -> Date {
+    /// Where `makeChanged()` moved week `movedWeek`'s occurrence (or `makeMoved` moved one to
+    /// week `toWeek`): the day after that week's occurrence, 10:00 New York time.
+    func movedStart(toWeek: Int = movedWeek) throws -> Date {
         let calendar = OccurrenceFixture.calendar(zone)
-        let slot = try occurrence(Self.movedWeek)
+        let slot = try occurrence(toWeek)
         let nextDay = try #require(calendar.date(byAdding: .day, value: 1, to: slot))
         return try #require(calendar.date(bySettingHour: 10, minute: 0, second: 0, of: nextDay))
     }
@@ -452,38 +476,36 @@ struct CalDAVOccurrenceWireTests {
                 "the edit did not land on the moved occurrence alone: \(after.map { [$0.id, $0.location] })")
     }
 
-    @Test("this_and_following from a moved occurrence's id, with the start the listing showed, keeps the later occurrences' day and time")
-    func splitFromMovedOccurrenceKeepsLaterTimes() async throws {
-        let fixture = try W.makeChanged()
-        let (store, http) = W.serve(fixture)
-        defer { http.close() }
-        let provider = W.makeProvider(http)
-        let moved = try fixture.movedStart()
-        let movedId = try fixture.occurrenceId(W.movedWeek)
-        let slot = OccurrenceFixture.naive(try fixture.occurrence(W.movedWeek), fixture.zone)
-        let expectedStarts = [try fixture.occurrence(0), try fixture.occurrence(2), moved,
-                              try fixture.occurrence(4), try fixture.occurrence(5), try fixture.occurrence(6)]
-
-        _ = try await provider.splitSeries(
-            calendarId: W.calendarId, eventId: movedId,
-            recurrenceId: OccurrenceFixture.naive(moved, fixture.zone), recurrenceIdZone: fixture.zone,
-            patch: GCalEventInput(), sendUpdates: "all")
-
-        let newPart = "/cal/\(GoogleCalendarProvider.deterministicSplitEventId(masterId: W.seriesPath, recurrenceId: slot)).ics"
-        #expect(store.recordedPuts().map(\.path) == [newPart, W.seriesPath],
-                "the split did not start its new part at the moved occurrence's place in the series")
-        let rows = try await Self.listWeeks(provider, fixture, through: 6)
-        #expect(rows.compactMap(\.startDate) == expectedStarts,
-                "after the split the occurrences are not where they were: \(rows.map { $0.start?.dateTime ?? "nil" })")
-        let calendar = OccurrenceFixture.calendar(fixture.zone)
-        let weekday = calendar.component(.weekday, from: fixture.first)
-        let unmoved = rows.filter { $0.startDate != moved }
-        #expect(unmoved.allSatisfy { row in
-            guard let start = row.startDate else { return false }
-            let wall = calendar.dateComponents([.weekday, .hour, .minute], from: start)
-            return wall.weekday == weekday && wall.hour == 9 && wall.minute == 0
-        }, "an occurrence after the split left its weekday at 09:00")
-        #expect(rows.filter { $0.startDate == moved }.map(\.summary) == ["Standup (moved)"], "the moved occurrence is not listed once, as it was")
+    @Test("this_and_following at a moved occurrence, by its id or the series id with the start the listing showed, is refused by name and nothing is written")
+    func splitAtMovedOccurrenceIsRefused() async throws {
+        // A split there would start at the occurrence's place in the series, and change the
+        // occurrences between that place and where the occurrence now is: week 2's moved into
+        // week 5 (weeks 3 and 4 between), and week 3's moved to the next day (none between).
+        let movedFar = try W.makeMoved(week: 2, toWeek: 5)
+        let movedNear = try W.makeChanged()
+        let fixtures: [(label: String, fixture: W, week: Int, shown: Date)] = [
+            ("week 2's moved into week 5", movedFar, 2, try movedFar.movedStart(toWeek: 5)),
+            ("week 3's moved to the next day", movedNear, W.movedWeek, try movedNear.movedStart()),
+        ]
+        for entry in fixtures {
+            for eventId in [try entry.fixture.occurrenceId(entry.week), W.seriesPath] {
+                let (store, http) = W.serve(entry.fixture)
+                defer { http.close() }
+                let label = "\(entry.label), by \(eventId)"
+                await #expect("this_and_following, \(label), was not refused by name") {
+                    _ = try await W.makeProvider(http).splitSeries(
+                        calendarId: W.calendarId, eventId: eventId,
+                        recurrenceId: OccurrenceFixture.naive(entry.shown, entry.fixture.zone),
+                        recurrenceIdZone: entry.fixture.zone, patch: GCalEventInput(), sendUpdates: "all")
+                } throws: { error in
+                    guard case CalendarProviderError.notSupported(let message) = error else { return false }
+                    return message.contains("was moved from its place in the series") && message.contains("this_only")
+                }
+                let writes = http.recordedCalls().filter { $0.method != "GET" }.map { "\($0.method) \($0.url)" }
+                #expect(writes.isEmpty, "\(label): the refused split sent a write: \(writes)")
+                #expect(store.storedICS(path: W.seriesPath) == entry.fixture.ics, "\(label): the series is not on the server as it was")
+            }
+        }
     }
 
     @Test("a recurrence_id that names another occurrence than the event_id does is refused, one that names none is not found, and nothing is written")

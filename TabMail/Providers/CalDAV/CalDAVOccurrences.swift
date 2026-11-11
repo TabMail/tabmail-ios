@@ -244,7 +244,8 @@ enum CalDAVOccurrences {
     /// - `CalDAVError.notFound` when no occurrence starts there, the authoritative absence
     ///   Google and Outlook report for it;
     /// - `notSupported` for a malformed or ambiguous `recurrence_id`, for an occurrence id whose
-    ///   key names another occurrence than `recurrenceId` does, for an event that does not repeat
+    ///   key names another occurrence than `recurrenceId` does, for a split at a moved occurrence
+    ///   (one that no longer starts at its place in the series), for an event that does not repeat
     ///   and for a series this type can't expand.
     ///
     /// A resource that holds only changed occurrences (an invitation to single occurrences,
@@ -314,6 +315,13 @@ enum CalDAVOccurrences {
             guard let slot = OccurrenceId.recurrenceId(ofKey: named, in: zone) else {
                 throw CalendarProviderError.notSupported(
                     "TabMail can't express the occurrence recurrence_id '\(recurrenceId)' names in \(zone.identifier), so nothing was changed.")
+            }
+            // A moved occurrence no longer answers to its place in the series. A split there
+            // would start at that place and also change the occurrences between it and where
+            // the occurrence was moved to, a wider write than the one asked for: refuse it.
+            if forSplit, RecurrenceOccurrenceResolver.select(candidates, recurrenceId: slot, zone: zone) != .resolved(named) {
+                throw CalendarProviderError.notSupported(
+                    "The occurrence recurrence_id '\(recurrenceId)' names was moved from its place in the series, so TabMail can't split the series at it. Nothing was changed. Use edit_scope this_only to change just this occurrence, or ask the user to change this and the following occurrences in their calendar app.")
             }
             return slot
         case .absent:

@@ -68,8 +68,13 @@ of the resource, which holds every occurrence (irreversible wire operation #5, n
      occurrence's old place). With an occurrence id, `recurrence_id` must name the occurrence its key
      names; another is refused. The write uses the named occurrence's place in the series (its key),
      so an override is changed in place, never duplicated, and a split starts where the series puts
-     the occurrence, never where it was moved to; the series id and an occurrence id name a split's
-     new part alike. An event that does not repeat and a series marked not listed are refused. The
+     the occurrence; the series id and an occurrence id name a split's new part alike. A split at a
+     MOVED occurrence (an override that no longer starts at its place in the series) is REFUSED by
+     name, by either id, after the GET and before any write: it would start at the occurrence's
+     place and also change the occurrences between that place and where it was moved to, a wider
+     write than the card shows. The refusal tells the assistant what works: `this_only` on that
+     occurrence, or the split in the user's calendar app. The refusal follows the card, since only
+     the resource says the occurrence was moved. An event that does not repeat and a series marked not listed are refused. The
      check runs after the GET and before any PUT, including the split's create and its cap
      (irreversible wire operation #6). For a split it reads the rule without its `COUNT`/`UNTIL`: where
      the series ends stays `RecurrenceTail.newSeriesRule`'s check, which also knows a series this same
@@ -108,6 +113,8 @@ of the resource, which holds every occurrence (irreversible wire operation #5, n
   before this ADR wrote an override or a split at the given time unchecked. A resource that holds only
   overrides takes a one-occurrence edit by the occurrence's id, where the code before this ADR could
   not list it at all, and refuses a split.
+- "This and following" at a moved occurrence is refused with nothing written; that occurrence can
+  still be changed alone, and the split made in the user's calendar app.
 - The series id with a moved occurrence's new time edits that occurrence in place, and with its old
   place is not found, the same as on Google, whose resolver finds no instance there.
 - A retry after a lost response is reported not found, with nothing written, when the first attempt
@@ -126,13 +133,16 @@ keeping the device expansion for servers that don't expand would be a second rou
 `CalDAVOccurrenceNotListedTests`, `CalDAVOccurrenceLookupTests` (with a resource that holds only
 overrides), `CalDAVOccurrenceWireTests` (no DELETE for an occurrence id, series unchanged; an `all`
 edit by an occurrence id, a moved occurrence's included, refused with no request whatever it sets; a
-moved occurrence listed with its own id, edited in place and split at its place in the series; a
+moved occurrence listed with its own id and edited in place, and a split at it refused by either id
+with nothing written; a
 `recurrence_id` that names no occurrence, one after a `COUNT` series' end or a cancelled one, not
 found with nothing written; another occurrence than the id's refused; a resource that holds only
 overrides edited in place by the occurrence's id, its own id and splits refused),
 `CalDAVOccurrenceEditToolToWireTests` (the invariant over every scope and both id kinds, from
 `calendar_event_edit` to the wire: the write matches the card, or the edit is refused with nothing sent
-after the user confirmed), `CalDAVOccurrenceDeleteToolToWireTests` (the same from `calendar_read` /
+after the user confirmed, on an unmoved occurrence and on one moved past later ones; and a move whose
+response is lost retired as not found on its retry, nothing written again, the queue left empty),
+`CalDAVOccurrenceDeleteToolToWireTests` (the same from `calendar_read` /
 `calendar_search` through `calendar_event_delete`) and `CalDAVOccurrenceToolOutputTests`. `ICSParserTests.skipsRecurrenceExceptions` and
 `ICSParserTests.multipleVEventsReturnsFirst` now pin only the series view; the listing contract they
 stood in for is pinned by `movedOverridesAreListedWhereTheyNowAre`,

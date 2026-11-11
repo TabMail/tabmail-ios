@@ -70,8 +70,8 @@ enum CalDAVToolWire {
     }
 
     /// A test database holding one active CalDAV account, and the real `CalDAVProvider`
-    /// for it over a fake server holding one weekly series.
-    static func makeHarness(accountId: String) async throws -> Harness {
+    /// for it over a fake server holding one weekly series (`fixture`, else `W.make()`).
+    static func makeHarness(accountId: String, fixture given: OccurrenceWireFixture? = nil) async throws -> Harness {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         var config = Configuration()
@@ -87,7 +87,7 @@ enum CalDAVToolWire {
             try account.insert(db)
         }
 
-        let fixture = try W.make()
+        let fixture = try given ?? W.make()
         let (store, http) = W.serve(fixture)
         http.register(
             path: "/cal/", method: "PROPFIND",
