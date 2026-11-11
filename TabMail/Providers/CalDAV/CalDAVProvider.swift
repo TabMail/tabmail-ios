@@ -18,6 +18,14 @@ actor CalDAVProvider: CalendarProvider {
         return edited != rule(event.recurrence)
     }
 
+    /// The cap `splitSeries` writes: the master's RRULE `UNTIL`, as Google's
+    /// (`GoogleCalendarProvider.googleUntilString`). The split computes it from the occurrence's
+    /// slot, which is `recurrenceId` for every occurrence it splits at (one moved from its place is
+    /// refused there).
+    nonisolated func splitCapUntil(beforeNaiveISO recurrenceId: String, allDay: Bool, zone: TimeZone) -> String? {
+        GoogleCalendarProvider.googleUntilString(beforeNaiveISO: recurrenceId, allDay: allDay, zone: zone)
+    }
+
     private let client: CalDAVClient
     private let calendarHomeURL: URL
     private let serverBaseURL: URL

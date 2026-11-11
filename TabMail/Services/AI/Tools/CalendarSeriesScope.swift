@@ -50,6 +50,10 @@ enum CalendarSeriesScope {
         /// (`CalendarProvider.occurrence`); nil when it names none (a one-off event, or a series
         /// named by its own id with no `recurrence_id`).
         let occurrence: GCalEvent?
+        /// The series already ends with the cap a split at the edit's `recurrence_id` writes
+        /// (`CalendarProvider.isOwnSplitCap`): the queue's retry of a split interrupted after its
+        /// cap. `occurrence` is nil then, as the cap ended the series before it.
+        var afterOwnSplitCap = false
 
         var isOccurrence: Bool { seriesId != eventId }
     }
@@ -62,6 +66,14 @@ enum CalendarSeriesScope {
     /// not looked for here: `route` may make it an edit of the whole series (the first occurrence),
     /// and the split itself throws at one (#563).
     ///
+    /// `splitting`: the queue is about to write a split (`this_and_following`) at `recurrenceId`.
+    /// When the series already ends with this split's own cap (`CalendarProvider.isOwnSplitCap`),
+    /// an earlier attempt wrote the cap and was interrupted before the rest, and the occurrence is
+    /// not looked for: the cap ended the series before it, so the lookup would report it not found
+    /// and the drain would retire the split half done. `Named.afterOwnSplitCap` says so, with no
+    /// occurrence, and the queue goes on to `splitSeries`, which finishes it. The edit tool passes
+    /// false: a split asked for at a series that already ends there has nothing to split.
+    ///
     /// Throws, with nothing written: what the provider throws (its not-found error when no
     /// occurrence starts at `recurrence_id`, `notSupported` for an occurrence id that names another
     /// occurrence than `recurrence_id`, an ambiguous or malformed one, and what CalDAV's own check
@@ -69,36 +81,43 @@ enum CalendarSeriesScope {
     /// failed read is thrown, never replaced: the edit tool refuses, or the drain classifies it.
     static func read(
         eventId: String, recurrenceId: String?, calendarId: String, zone: TimeZone,
-        provider: any CalendarProvider
+        splitting: Bool, provider: any CalendarProvider
     ) async throws -> Named {
         let event = try await provider.getEvent(calendarId: calendarId, eventId: eventId)
         return try await read(
             event: event, eventId: eventId, recurrenceId: recurrenceId,
-            calendarId: calendarId, zone: zone, provider: provider)
+            calendarId: calendarId, zone: zone, splitting: splitting, provider: provider)
     }
 
     /// `read`, with `eventId` already read (`event`): the edit tool reads it on its own, to tell a
     /// wrong event id from an occurrence it does not name.
     static func read(
         event: GCalEvent, eventId: String, recurrenceId: String?, calendarId: String, zone: TimeZone,
-        provider: any CalendarProvider
+        splitting: Bool, provider: any CalendarProvider
     ) async throws -> Named {
         if let seriesId = event.recurringEventId, !seriesId.isEmpty, seriesId != eventId {
             guard let named = recurrenceId ?? shownStart(of: event, zone: zone) else {
                 throw CalendarProviderError.notSupported(
                     "the start of the occurrence this event_id names can't be read; pass recurrence_id (the occurrence's start_iso as calendar_event_read shows it)")
             }
+            let series = try await provider.getEvent(calendarId: calendarId, eventId: seriesId)
+            // Before the occurrence's own status: past this split's cap it may read as deleted.
+            if splitting, provider.isOwnSplitCap(of: series, at: named, zone: zone) {
+                return Named(eventId: eventId, event: event, seriesId: seriesId, series: series, occurrence: nil, afterOwnSplitCap: true)
+            }
             // Google reads a deleted occurrence as an event with status `cancelled`; CalDAV does too.
             guard event.status?.lowercased() != "cancelled" else {
                 throw CalendarProviderError.notSupported(namesNoOccurrence(named))
             }
-            let series = try await provider.getEvent(calendarId: calendarId, eventId: seriesId)
             let occurrence = try await provider.occurrence(
                 calendarId: calendarId, eventId: eventId, recurrenceId: named, recurrenceIdZone: zone)
             return Named(eventId: eventId, event: event, seriesId: seriesId, series: series, occurrence: occurrence)
         }
         guard let recurrenceId, !(event.recurrence ?? []).isEmpty else {
             return Named(eventId: eventId, event: event, seriesId: eventId, series: event, occurrence: nil)
+        }
+        if splitting, provider.isOwnSplitCap(of: event, at: recurrenceId, zone: zone) {
+            return Named(eventId: eventId, event: event, seriesId: eventId, series: event, occurrence: nil, afterOwnSplitCap: true)
         }
         let occurrence = try await provider.occurrence(
             calendarId: calendarId, eventId: eventId, recurrenceId: recurrenceId, recurrenceIdZone: zone)
@@ -254,7 +273,9 @@ enum CalendarSeriesScope {
     ///
     /// Called before the confirmation card (`CalendarEventEditTool`) and again before the write
     /// (`AccountManagerCalendarQueue`), on every provider, with what `read` returns and the edit as
-    /// `route` sent it.
+    /// `route` sent it. Not on the queue's retry of a split after its own cap
+    /// (`Named.afterOwnSplitCap`): the attempt that wrote the cap passed it, and the occurrence it
+    /// compares is past the cap.
     static func dayMoveRefusal(_ args: [String: JSONValue], named: Named, scope: String, zone: TimeZone) -> String? {
         guard scope == "all" || scope == "this_and_following",
               let start = CalendarToolHelpers.stringArgOpt(args, "start_iso"),

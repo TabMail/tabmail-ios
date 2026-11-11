@@ -146,15 +146,18 @@ private enum GoogleSeries {
     static func calendar(rule: String) -> [[String: Any]] { [series(rule: rule), instance(day(0)), instance(day(7))] }
 }
 
-private func google(_ seed: [[String: Any]], eventId: String, _ arguments: [String: JSONValue], account: String)
+/// `loseNext`: the first write of that method (`PATCH`, `POST`) is applied and its response lost.
+private func google(_ seed: [[String: Any]], eventId: String, _ arguments: [String: JSONValue], account: String,
+                    loseNext: String? = nil, drains: Int = 1)
     async throws -> (calendar: FakeGoogleCalendar, rows: [PendingCalendarOperation]) {
     let http = FakeHTTP.Scenario()
     defer { http.close() }
     let calendar = FakeGoogleCalendar(seed)
     calendar.install(on: http)
+    if let loseNext { calendar.loseNextResponse(loseNext) }
     let provider = GoogleCalendarProvider(accessToken: { _ in "test-token" }, session: http.session)
     let rows = try await drainEdit(accountId: account, eventId: eventId, calendarId: "primary",
-                                   arguments: arguments, provider: provider)
+                                   arguments: arguments, provider: provider, drains: drains)
     return (calendar, rows)
 }
 
@@ -215,7 +218,8 @@ private enum GraphSeries {
     }
 }
 
-private func outlook(_ graph: FakeGraphCalendar, eventId: String, _ arguments: [String: JSONValue], account: String)
+private func outlook(_ graph: FakeGraphCalendar, eventId: String, _ arguments: [String: JSONValue], account: String,
+                     drains: Int = 1)
     async throws -> [PendingCalendarOperation] {
     let http = FakeHTTP.Scenario()
     defer { http.close() }
@@ -223,7 +227,7 @@ private func outlook(_ graph: FakeGraphCalendar, eventId: String, _ arguments: [
     let provider = ExchangeCalendarProvider(mailbox: "calendar@example.com", accessToken: { _ in "test-token" },
                                             session: http.session)
     return try await drainEdit(accountId: account, eventId: eventId, calendarId: "primary",
-                               arguments: arguments, provider: provider)
+                               arguments: arguments, provider: provider, drains: drains)
 }
 
 /// What the queue's drain records for an edit the provider says names no occurrence there now.
@@ -1968,5 +1972,68 @@ struct ExchangeSeriesScopeInvariantTests {
         case .refused, .error:
             break
         }
+    }
+}
+
+// MARK: - A split retried after its own cap
+
+// INVARIANT (system property): a split (`this_and_following`) that the queue started and that was
+// interrupted after it capped the series ends complete on its retry: the series ends before the
+// split, the new part holds the occurrences from it on, and no row is left queued or failed. The
+// cap ended the series before the occurrence the split starts at, so the retry does not look that
+// occurrence up again (`CalendarProvider.isOwnSplitCap`); looked up, it is not found, and the split
+// was retired half done. Outlook writes the cap first, so its interruption lost the new part; Google
+// and CalDAV write it last, so theirs lost only the row's success.
+
+@Suite("A split interrupted after its cap ends complete on its retry", .serialized, .processGlobalState)
+struct SplitRetriedAfterItsOwnCapTests {
+
+    @Test("Outlook: a split whose cap was written and whose new part was not is written whole on its retry, and the row is not retired")
+    func outlookSplitInterruptedAfterItsCapIsFinished() async throws {
+        let graph = GraphSeries.calendar(daily: true)
+        // Named in the series' own zone, where Graph dates the cap's end.
+        let zone = "America/Los_Angeles"
+        let rid = GraphFixture.wall(GraphFixture.occurrenceStart, in: zone)
+        // The cap is written, then the connection drops before its response arrives: no new part.
+        graph.loseNextResponse("PATCH")
+        let rows = try await outlook(graph, eventId: "ser-1", [
+            "edit_scope": .string("this_and_following"), "recurrence_id": .string(rid),
+            "title": .string("Retitled"), "timezone": .string(zone),
+        ], account: "own-cap-x", drains: 2)
+
+        #expect(rows.isEmpty, "the split did not end complete: \(reasons(rows))")
+        #expect(graph.created.count == 1, "the new part was not written: \(graph.created.count)")
+        let created = graph.created.first
+        #expect(instant(created?["start"]) == GraphFixture.occurrenceStart,
+                "the new part does not start at the split: \(created?["start"] ?? "none")")
+        #expect(created?["subject"] as? String == "Retitled", "the new part is not the edit: \(created?["subject"] ?? "none")")
+        let cap = try #require(ExchangeCalendarProvider.graphEndDateBefore(
+            naiveISO: rid, allDay: false, zone: TimeZone(identifier: zone)!))
+        let range = (graph.event("ser-1")?["recurrence"] as? [String: Any])?["range"] as? [String: Any]
+        #expect(range?["type"] as? String == "endDate" && range?["endDate"] as? String == cap,
+                "the series does not end before the split: \(range ?? [:])")
+        #expect(graph.event("ser-1")?["subject"] as? String == "Planning", "the series' own occurrences were changed")
+    }
+
+    @Test("Google: a split whose cap's response was lost ends complete on its retry, its new time on a series on named days included")
+    func googleSplitWhoseCapResponseWasLostEndsComplete() async throws {
+        let rid = "\(day(7))T09:00:00"
+        // The new part is written, then the cap, whose response is lost. A series on its weekday,
+        // given a new time on the same date: the retry's own-cap read names no occurrence to date it.
+        let r = try await google(GoogleSeries.calendar(rule: GoogleSeries.onItsWeekday), eventId: GoogleSeries.id, [
+            "edit_scope": .string("this_and_following"), "recurrence_id": .string(rid),
+            "start_iso": .string("\(day(7))T11:00:00"), "timezone": .string("UTC"),
+        ], account: "own-cap-g", loseNext: "PATCH", drains: 2)
+
+        #expect(r.rows.isEmpty, "the split did not end complete: \(reasons(r.rows)); writes: \(r.calendar.writes)")
+        let successor = r.calendar.event(
+            GoogleCalendarProvider.deterministicSplitEventId(masterId: GoogleSeries.id, recurrenceId: rid))
+        #expect(instant(successor?["start"]) == utcAt("\(day(7))T11:00:00"),
+                "no following part at the new time: \(successor?["start"] ?? "none")")
+        let cap = try #require(GoogleCalendarProvider.googleUntilString(beforeNaiveISO: rid, allDay: false, zone: utc))
+        let master = r.calendar.event(GoogleSeries.id)
+        let rule = (master?["recurrence"] as? [String])?.first { $0.uppercased().hasPrefix("RRULE:") }
+        #expect(rule.map { RecurrenceTail.isCapped($0, at: cap) } == true, "the series does not end before the split: \(rule ?? "none")")
+        #expect(instant(master?["start"]) == utcAt("\(day(0))T09:00:00"), "the series moved: \(master?["start"] ?? "none")")
     }
 }

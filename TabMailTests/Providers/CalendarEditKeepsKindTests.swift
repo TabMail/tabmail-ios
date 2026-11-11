@@ -77,6 +77,19 @@ final class FakeGoogleCalendar: Sendable {
     private let events: Mutex<[String: Data]>
     private let writeLog = Mutex<[String]>([])
     private let resets = Mutex(0)
+    private let lostResponses = Mutex<[String: Int]>([:])
+
+    /// The next `method` write (`PATCH` or `POST`) is applied, and its response is lost: the
+    /// connection drops before it arrives.
+    func loseNextResponse(_ method: String) { lostResponses.withLock { $0[method, default: 0] += 1 } }
+
+    private func takeLoss(_ method: String) -> Bool {
+        lostResponses.withLock { lost in
+            guard let count = lost[method], count > 0 else { return false }
+            lost[method] = count - 1
+            return true
+        }
+    }
 
     /// How many PATCHes reset a series' changed occurrences.
     var seriesResets: Int { resets.withLock { $0 } }
@@ -135,6 +148,7 @@ final class FakeGoogleCalendar: Sendable {
             for (key, value) in patch { stored[key] = value }
             store(stored)
             writeLog.withLock { $0.append("PATCH \(parts[0])") }
+            if takeLoss("PATCH") { return .transportError(.networkConnectionLost) }
             return Self.json(stored)
         }
         http.register(path: prefix, method: "POST") { [self] request in
@@ -144,6 +158,7 @@ final class FakeGoogleCalendar: Sendable {
             else { return .status(400) }
             store(created)
             writeLog.withLock { $0.append("POST \(id)") }
+            if takeLoss("POST") { return .transportError(.networkConnectionLost) }
             return Self.json(created)
         }
     }
@@ -226,14 +241,16 @@ final class FakeGoogleCalendar: Sendable {
 
 // MARK: - Driving the real queue
 
-/// One edit drained through `AccountManager.drainCalendarQueue` against `provider`, and the durable
-/// row afterwards. Shared with `CalDAVAlarmIsNotTheEventWriteTests` and `CalendarSeriesScopeTests`.
+/// One edit drained through `AccountManager.drainCalendarQueue` against `provider` (`drains` times),
+/// and the durable row afterwards. Shared with `CalDAVAlarmIsNotTheEventWriteTests` and
+/// `CalendarSeriesScopeTests`.
 func drainEdit(
     accountId: String,
     eventId: String,
     calendarId: String,
     arguments: [String: JSONValue],
-    provider: any CalendarProvider
+    provider: any CalendarProvider,
+    drains: Int = 1
 ) async throws -> [PendingCalendarOperation] {
     let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -260,7 +277,10 @@ func drainEdit(
         calendarId: calendarId, arguments: arguments)
     try await pool.write { db in try op.insert(db) }
 
-    await AccountManager.shared.drainCalendarQueue()
+    // One drain per attempt: a write whose response was lost stays queued for the next.
+    for _ in 0..<drains {
+        await AccountManager.shared.drainCalendarQueue()
+    }
 
     return try await pool.read { db in try PendingCalendarOperation.fetchAll(db) }
 }

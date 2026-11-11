@@ -336,3 +336,63 @@ struct CalDAVOccurrenceEditToolToWireTests {
         #expect(ops[0].failureReason?.contains("not found") == true, "the retried edit did not end as not found: \(ops[0].failureReason ?? "nil")")
     }
 }
+
+extension CalDAVOccurrenceEditToolToWireTests {
+
+    // MARK: A split whose cap's response was lost
+
+    @Test("a change of an occurrence and the following ones, whose cap's response is lost, ends complete on its retry: the edit from that occurrence on, every occurrence once, nothing queued or failed")
+    func splitWhoseCapResponseWasLostEndsComplete() async throws {
+        let session = "caldav-split-cap-lost"
+        let harness = try await H.makeHarness(accountId: session)
+        defer { H.tearDown(harness) }
+        let fixture = harness.fixture
+        let slot = try fixture.occurrence(2)
+        let before = try await Self.listing(fixture, http: harness.http)
+
+        // The new part is written first; the cap, written last to the series, is applied and the
+        // connection drops before its response arrives. Every later write is answered.
+        let store = harness.store
+        let lostOnce = Mutex(true)
+        harness.http.register(path: W.seriesPath, method: "PUT") { request in
+            let response = store.handlePUT(request)
+            let lose = lostOnce.withLock { lose in defer { lose = false }; return lose }
+            return lose ? .transportError(.networkConnectionLost) : response
+        }
+
+        let translator = ChatIdTranslator.createIsolated()
+        let compound = CompoundEventId.make(accountId: harness.accountId, eventId: W.seriesPath)
+        let forModel = await translator.processToolOutputForLLM("event_id: \(compound)")
+        let numericId = try #require(H.eventIds(in: forModel).first.flatMap { Int($0) }, "no numeric event id for the model: \(forModel)")
+        await H.recordCalendar(of: W.seriesPath, accountId: harness.accountId, translator: translator)
+
+        let arguments: [String: JSONValue] = [
+            "event_id": .string(String(numericId)),
+            "edit_scope": .string("this_and_following"),
+            "recurrence_id": .string(OccurrenceFixture.naive(slot, fixture.zone)),
+            "title": .string(Self.newTitle),
+            "timezone": .string(fixture.zone.identifier),
+        ]
+        let sink = H.ConfirmingSink(http: harness.http)
+        let output = try await CalendarEventEditTool(context: ToolContext(db: harness.pool, translator: translator)).execute(
+            arguments: arguments, invocation: ToolInvocation(uiSink: sink, sessionKey: session))
+        // The first attempt's cap response is lost, so the split is retried by a later drain.
+        await AccountManager.shared.drainCalendarQueue()
+        await AccountManager.shared.drainCalendarQueue()
+
+        let ops = try await harness.pool.read { db in try PendingCalendarOperation.fetchAll(db) }
+        #expect(ops.isEmpty, "the split did not end complete: \(ops.map { "\($0.status) \($0.failureReason ?? "")" }), tool said: \(output)")
+        #expect(lostOnce.withLock { !$0 }, "the cap was never written")
+
+        // Every occurrence is listed once, where it was, and the edit is on exactly those from the
+        // split on.
+        let after = try await Self.listing(fixture, http: harness.http)
+        #expect(after.compactMap(\.startDate) == before.compactMap(\.startDate),
+                "the split moved, added or removed an occurrence: \(after.map { $0.start?.dateTime ?? "nil" })")
+        for row in after {
+            guard let start = row.startDate else { continue }
+            #expect(row.summary == (start >= slot ? Self.newTitle : "Standup"),
+                    "the occurrence at \(row.start?.dateTime ?? "nil") \(start >= slot ? "does not show" : "shows") the edit")
+        }
+    }
+}

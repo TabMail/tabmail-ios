@@ -438,8 +438,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // finds, and was not moved from its place in the series; otherwise it throws with nothing
         // written. Not asked on a retry after this split's own cap, which ended the series before
         // that occurrence.
-        let ownCap = storedRange["type"] as? String == "endDate" && storedRange["endDate"] as? String == capEndDate
-        if !ownCap {
+        if !isOwnSplitCap(of: master, at: recurrenceId, zone: recurrenceIdZone) {
             let found = try await occurrence(
                 named: named, masterId: eventId, recurrenceId: recurrenceId, zone: recurrenceIdZone)
             if RecurrenceOccurrenceResolver.wasMoved(found, seriesZone: master.seriesZone) {
@@ -599,6 +598,14 @@ actor ExchangeCalendarProvider: CalendarProvider {
             }
             throw GoogleCalendarProvider.splitRollbackError(original: error, revertFailure: revertFailure)
         }
+    }
+
+    /// The cap `splitSeries` writes, as the series' RRULE reads it: Graph's range `endDate`
+    /// (`graphEndDateBefore`), which the mapping to `GCalEvent.recurrence` gives as an `UNTIL` of
+    /// that date without its dashes when the range type is `endDate`.
+    nonisolated func splitCapUntil(beforeNaiveISO recurrenceId: String, allDay: Bool, zone: TimeZone) -> String? {
+        Self.graphEndDateBefore(naiveISO: recurrenceId, allDay: allDay, zone: zone)?
+            .replacingOccurrences(of: "-", with: "")
     }
 
     /// Graph `recurrenceRange.endDate` for capping a series so the occurrence

@@ -800,8 +800,20 @@ A split starts at one of the series' own occurrences (`GoogleSeriesSplitCopyTest
 deleted occurrence or at a moved occurrence's place is refused with only `GET`s on the wire (not found). An
 Outlook all-day series whose zone is not known is not split: its occurrence is found, and the split's own
 check counts its undatable place as moved (`allDaySeriesWithoutAZoneIsNotSplit`). A retry after this split's
-own cap is not checked again (`RecurrenceTail.isCapped`, pinned in `RecurrenceTailTests`; on Outlook
-`ownCapRetryDoesNotLookTheOccurrenceUp`: no instances read, and an occurrence moved there does not stop it).
+own cap is not checked again (`CalendarProvider.isOwnSplitCap`, over `RecurrenceTail.isCapped`, pinned in
+`RecurrenceTailTests`; on Outlook `ownCapRetryDoesNotLookTheOccurrenceUp`: no instances read, and an
+occurrence moved there does not stop it).
+
+A split interrupted after its cap ends complete on its retry (`SplitRetriedAfterItsOwnCapTests`, red before
+the queue's `read` asked `isOwnSplitCap`): Outlook, the cap applied and its response lost (so no new part),
+then retried: one new part at the split with the edit, the series ending before it, no row left; Google, the
+cap's response lost on a series on its weekday given a new time on the split's date (the retry does not ask
+`dayMoveRefusal`): the new part at the new time, the series capped, no row left; CalDAV
+(`splitWhoseCapResponseWasLostEndsComplete`): every occurrence listed once where it was, the edit on those
+from the split on, nothing queued or failed. `FakeGraphCalendar` and `FakeGoogleCalendar` take
+`loseNextResponse` (the write applied, its response dropped); the Graph fake's `/instances` leaves out the
+occurrences past a range's `endDate` in its `recurrenceTimeZone` (measured); `drainEdit(..., drains:)` drains
+once per attempt.
 `CalDAVOccurrenceEditToolToWireTests`: "all" and no `edit_scope` by a CalDAV occurrence id write the series
 (#560); a moved later occurrence's `this_and_following`, by either id, shows the split's card, then errors at
 the write with nothing `PUT` or deleted and the row left failed (#563; CalDAV's #613 check in its

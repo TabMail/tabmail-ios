@@ -72,6 +72,14 @@ protocol CalendarProvider: Sendable {
     /// declared frame in only one of them would make one argument mean two
     /// different instants depending on `edit_scope`.
     func splitSeries(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, patch: GCalEventInput, sendUpdates: String) async throws -> GCalEvent
+
+    /// The `UNTIL` this calendar's `splitSeries` ends a series with when it splits it at
+    /// `recurrenceId` (read in `zone`; `allDay`: the series is all-day), as the series' RRULE
+    /// (`GCalEvent.recurrence`) reads once that cap is written. Pure, no request. Nil for a
+    /// `recurrenceId` that can't be read, and on a calendar that does not split (the default).
+    /// Read only through `isOwnSplitCap`.
+    func splitCapUntil(beforeNaiveISO recurrenceId: String, allDay: Bool, zone: TimeZone) -> String?
+
     /// Whether the whole-series edit `edit` (the input the write is given) resets the
     /// occurrences of `event` changed one by one, as this calendar's write treats them: on
     /// Outlook and Google, any change of the series' rule, start or end; on CalDAV, a change of
@@ -121,6 +129,20 @@ extension CalendarProvider {
     }
     func splitSeries(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, patch: GCalEventInput, sendUpdates: String) async throws -> GCalEvent {
         throw CalendarProviderError.notSupported("Splitting a recurring series at a given occurrence is not yet supported on this calendar provider. Edit the whole series or use the Thunderbird add-on for this-and-following edits.")
+    }
+    func splitCapUntil(beforeNaiveISO recurrenceId: String, allDay: Bool, zone: TimeZone) -> String? { nil }
+
+    /// 🚨 THE ONE TEST FOR "THIS SPLIT ALREADY CAPPED THE SERIES": whether `series` (as read)
+    /// ends with the cap `splitSeries` writes when it splits it at `recurrenceId` (read in `zone`).
+    /// Only then do the series' occurrences end just before the split, and a split of it there is
+    /// a retry after its own cap. The providers' `splitSeries` asks it before looking for the
+    /// occurrence the split starts at, and the calendar queue (`CalendarSeriesScope.read`) before
+    /// its own lookup; neither looks for that occurrence then, as the cap ended the series before
+    /// it, and the split goes on to the write it did not finish.
+    func isOwnSplitCap(of series: GCalEvent, at recurrenceId: String, zone: TimeZone) -> Bool {
+        guard let cap = splitCapUntil(beforeNaiveISO: recurrenceId, allDay: series.isAllDay, zone: zone),
+              let rule = series.recurrence?.first(where: { $0.uppercased().hasPrefix("RRULE:") }) else { return false }
+        return RecurrenceTail.isCapped(rule, at: cap)
     }
 }
 
@@ -705,6 +727,11 @@ actor GoogleCalendarProvider: CalendarProvider {
         return found.instance
     }
 
+    /// The cap `splitSeries` writes: the master's RRULE `UNTIL` (`googleUntilString`).
+    nonisolated func splitCapUntil(beforeNaiveISO recurrenceId: String, allDay: Bool, zone: TimeZone) -> String? {
+        Self.googleUntilString(beforeNaiveISO: recurrenceId, allDay: allDay, zone: zone)
+    }
+
     /// Split a recurring series at `recurrenceId`:
     /// 1. POST the new part: a copy of the stored series (`splitNewPartJSON`) starting at
     ///    recurrenceId, with the master's RRULE ending where the original series ended
@@ -772,7 +799,7 @@ actor GoogleCalendarProvider: CalendarProvider {
         // `occurrence` finds, and was not moved from its place in the series; otherwise the split
         // throws with nothing written. Not asked on a retry after this split's own cap, which
         // ended the series before that occurrence.
-        if !RecurrenceTail.isCapped(originalRRule, at: untilValue) {
+        if !isOwnSplitCap(of: master, at: recurrenceId, zone: recurrenceIdZone) {
             let found = try await occurrence(
                 calendarId: calendarId, named: named, masterId: eventId,
                 recurrenceId: recurrenceId, zone: recurrenceIdZone)

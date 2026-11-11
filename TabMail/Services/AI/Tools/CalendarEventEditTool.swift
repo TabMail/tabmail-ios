@@ -206,7 +206,7 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         do {
             named = try await CalendarSeriesScope.read(
                 event: fetchedEvent, eventId: eventId, recurrenceId: recurrenceIdArg,
-                calendarId: lookupCalId, zone: tz, provider: provider)
+                calendarId: lookupCalId, zone: tz, splitting: false, provider: provider)
         } catch CalendarProviderError.notSupported(let reason) {
             return ToolJSON.string(from: [
                 "ok": false,

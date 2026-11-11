@@ -11,7 +11,8 @@ moved occurrence, current start, named where it is now, split at a moved occurre
 BYSETPOS, named days, day move, `recurringEventId`, `seriesMasterId`, `originalStartTime`,
 `originalStart`, `GCalEvent.originalStartTime`, `ExchangeCalendarProvider.originalStartTime`,
 `eventSelect`, first occurrence, later occurrence, time of day, this-and-following, split, phantom
-occurrence, `RecurrenceTail.isCapped`, `routeSeriesTimeChange`, Google Calendar behaviour, retry, lost
+occurrence, `RecurrenceTail.isCapped`, `isOwnSplitCap`, `splitCapUntil`, `afterOwnSplitCap`, `splitting`,
+own split cap, interrupted split, `routeSeriesTimeChange`, Google Calendar behaviour, retry, lost
 response, not found, Graph series start before the first occurrence,
 `queuedEventId`, `ruleChangeResetNote`, reset note, invariant property, #559, #560, #563, #613, #679,
 #680, #683, #687.
@@ -145,16 +146,38 @@ name days, so on Outlook only a daily series moves to another date without a new
 
 Google's and Outlook's `splitSeries` find the occurrence among the series' instances by its current
 start (the same lookup as `occurrence`), and refuse with nothing written when none is there (a time
-between two, a date off its days, a deleted occurrence), so no phantom part is written. A retry after
-the split's own cap is not checked again (Google: `RecurrenceTail.isCapped`; Outlook: the stored range
-ends on the cap). CalDAV's split is checked by #613.
+between two, a date off its days, a deleted occurrence), so no phantom part is written. CalDAV's split is
+checked by #613.
 
-The queue's `read` before the write, though, IS made on every retry, and it looks the occurrence up
-where it starts now. So a retry after a write that already took effect can report "not found" though
-the calendar holds the change (the #683 class): a retried first-occurrence date shift whose first
-response was lost (the series no longer starts where the edit named it), and a retried split whose last
-step's response was lost (Google and CalDAV write the new part first and the cap last; once capped, the
-occurrence is no longer listed).
+**A split retried after its own cap is finished, not looked up again** (coordinator ruling, option X,
+2026-11-11). Once the cap is written the series ends before the occurrence the split starts at, so a
+lookup of it reports it not found. ONE predicate says "this split already capped the series":
+`CalendarProvider.isOwnSplitCap(of:at:zone:)` (a protocol extension): the series' RRULE ends with the
+`UNTIL` this provider's split writes at that `recurrence_id`, `RecurrenceTail.isCapped` over
+`splitCapUntil(beforeNaiveISO:allDay:zone:)`, a pure protocol requirement (Google and CalDAV:
+`googleUntilString`; Outlook: `graphEndDateBefore` without its dashes, the `UNTIL` its rule mapping
+writes for a range ending on that date; default nil, no split). Called from both places:
+- Google's and Outlook's `splitSeries` skip their occurrence lookup on it (Outlook's raw-range check is
+  replaced by this equivalent one on the mapped rule). CalDAV's split has no such skip:
+  `scopedEditSlot(forSplit: true)` reads the rule without its end, and `RecurrenceTail.newSeriesRule`
+  knows its own cap.
+- The queue's `read` (`splitting: true`, set for a given `this_and_following`) asks it right after the
+  series is read, before the occurrence's own status and lookup, and returns `Named` with no occurrence
+  and `afterOwnSplitCap`. `route` sends a split with no occurrence as given; `dayMoveRefusal` is not asked
+  (the attempt that wrote the cap passed it, and the occurrence it would date is past the cap); the queue
+  goes on to `splitSeries`, which writes what was not written. The edit tool passes `splitting: false`: a
+  split asked for at a series that already ends there has nothing to split.
+No provider's write order changed (#601 owns moving Outlook to create first). Outlook caps first, so its
+interrupted split had lost the new part: the retry was retired "not found" with the series truncated.
+Google and CalDAV write the cap last, so theirs had lost only the row's success.
+
+The queue's `read` is still made on every retry and still looks the occurrence up where it starts now
+for every other edit. So a retried first-occurrence date shift whose first response was lost can report
+"not found" though the calendar holds the change (the series no longer starts where the edit named it;
+the #683 class). An Outlook split queued with an OCCURRENCE id is not finished by its retry either: after
+the cap Graph no longer has the occurrences from the split on, so the retry's first read of that id is
+not found (as on `main`, where `splitSeries` read it through `resolveToMaster`); the tool queues a split
+with the id it was given.
 
 ## The invariant property (tests)
 
@@ -173,6 +196,14 @@ series with one PUT) and the unrecognized-zone row. The fakes filter `/instances
 cancelled Google instance out of the list, and Graph refuses a PATCH moving an occurrence onto another
 (`ErrorOccurrenceCrossingBoundary`).
 
+A split interrupted after its cap ends complete on its retry (`SplitRetriedAfterItsOwnCapTests`: Outlook,
+cap applied and its response lost, so no new part, then retried: the new part exists and the row is not
+retired; Google, the cap's response lost on a series on named days given a new time; and
+`CalDAVOccurrenceEditToolToWireTests.splitWhoseCapResponseWasLostEndsComplete`). The fakes model it:
+`loseNextResponse` applies a write and drops its response; Graph's `/instances` leaves out occurrences
+past a range's `endDate` in its `recurrenceTimeZone` (measured), Google's rule-changing PATCH drops the
+stored instances. `drainEdit(..., drains:)` drains once per attempt.
+
 ## Known limits
 
 1. One extra provider read per edit.
@@ -181,12 +212,15 @@ cancelled Google instance out of the list, and Graph refuses a PATCH moving an o
 4. A split at a moved occurrence is not supported: a plain error, nothing written (#563, #687).
 5. An Outlook "all" time edit resets the series' changed occurrences; the card warns (#680).
 6. A retried edit whose first response was lost can report "not found" after the change applied (the
-   #683 class): a first-occurrence date shift, and a split whose cap's response was lost.
+   #683 class): a first-occurrence date shift. A split interrupted after its cap is finished by its retry
+   (`isOwnSplitCap`), except an Outlook split queued with an occurrence id, whose id Graph no longer has
+   after the cap (as on `main`).
 7. Graph's series start can fall before the series' first occurrence. First or later is judged against
    the series' start (`firstPlace`), so a date move named from the real first occurrence is taken as a
    later one and becomes a split there.
 8. A split of a CalDAV resource that holds only changed occurrences is refused after its card, at the
-   drain, as on `main` (its lookup no longer takes the split's scope).
+   drain, as on `main` (its lookup no longer takes the split's scope): refused at the write, nothing
+   written.
 
 ## Superseded (rebuilt from main, 2026-11-10)
 

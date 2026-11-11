@@ -39,7 +39,11 @@ import Synchronization
 ///   (`recurrenceRange`: "Required");
 /// - `$select` returns only the properties it names (`event-get`);
 /// - a series' instances list (`/events/{id}/instances`) holds the occurrences stored with its
-///   `seriesMasterId` that START, where they are now, inside the window the request names;
+///   `seriesMasterId` that START, where they are now, inside the window the request names; of a
+///   series whose range ends on a date (`type` `endDate`), only those whose place in the series
+///   (`originalStart`) is on or before that date in the range's `recurrenceTimeZone`: Graph lists
+///   none after a series' end (measured: a series capped by a split no longer listed the
+///   occurrences from the split on);
 /// - an occurrence moved onto the time another occurrence of its series starts at is refused with
 ///   a 400 (`ErrorOccurrenceCrossingBoundary`), and nothing changes;
 /// - `calendarView` lists single events and occurrences, never a series master
@@ -67,6 +71,7 @@ final class FakeGraphCalendar: Sendable {
     private let patchLog = Mutex<[(id: String, body: Data)]>([])
     private let patchAuthorizationLog = Mutex<[String]>([])
     private let failingRequests = Mutex<[String: [Int]]>([:])
+    private let lostResponses = Mutex<[String: Int]>([:])
 
     init(_ seed: [[String: Any]]) {
         var map: [String: Data] = [:]
@@ -94,6 +99,18 @@ final class FakeGraphCalendar: Sendable {
         failingRequests.withLock { $0[method]?.isEmpty == false ? $0[method]?.removeFirst() : nil }
     }
 
+    /// The next `method` write is applied, and its response is lost: the connection drops before
+    /// it arrives (`PATCH` and `POST`).
+    func loseNextResponse(_ method: String) { lostResponses.withLock { $0[method, default: 0] += 1 } }
+
+    private func takeLoss(_ method: String) -> Bool {
+        lostResponses.withLock { lost in
+            guard let count = lost[method], count > 0 else { return false }
+            lost[method] = count - 1
+            return true
+        }
+    }
+
     /// The PATCH bodies sent for `id`, in order.
     func patches(_ id: String) -> [[String: Any]] {
         patchLog.withLock { $0 }.filter { $0.id == id }
@@ -117,10 +134,12 @@ final class FakeGraphCalendar: Sendable {
             let select = Self.selected(request.url)
             if parts.count == 2, parts[1] == "instances" {
                 let window = Self.window(request.url)
+                let master = event(parts[0])
                 let instances = events.withLock { Array($0.values) }
                     .compactMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
                     .filter { $0["seriesMasterId"] as? String == parts[0] }
                     .filter { Self.starts($0, in: window) }
+                    .filter { Self.isInSeries($0, master: master) }
                 return Self.json(["value": instances.map { Self.only(select, of: $0) }])
             }
             guard parts.count == 1, let stored = event(parts[0]) else { return .status(404) }
@@ -162,6 +181,7 @@ final class FakeGraphCalendar: Sendable {
             }
             Self.apply(patch, to: &stored)
             store(stored)
+            if takeLoss("PATCH") { return .transportError(.networkConnectionLost) }
             return Self.json(stored)
         }
         http.register(path: "/v1.0/me/events", method: "POST") { [self] request in
@@ -173,6 +193,7 @@ final class FakeGraphCalendar: Sendable {
             created["id"] = Self.createdPrefix + String(ids.filter { $0.hasPrefix(Self.createdPrefix) }.count + 1)
             Self.defaultRecurrenceZone(in: &created)
             store(created)
+            if takeLoss("POST") { return .transportError(.networkConnectionLost) }
             return Self.json(created)
         }
     }
@@ -194,6 +215,18 @@ final class FakeGraphCalendar: Sendable {
         guard let window else { return true }
         guard let at = instant(event["start"]) else { return false }
         return at >= window.from && at < window.to
+    }
+
+    /// Whether `occurrence`'s place in the series (`originalStart`, else its start) is on or before
+    /// the end of `master`'s range when it ends on a date, that date read in the range's zone.
+    private static func isInSeries(_ occurrence: [String: Any], master: [String: Any]?) -> Bool {
+        guard let range = (master?["recurrence"] as? [String: Any])?["range"] as? [String: Any],
+              range["type"] as? String == "endDate", let end = range["endDate"] as? String,
+              let zoneName = range["recurrenceTimeZone"] as? String,
+              let zone = CalendarTimeZoneResolver.zone(named: zoneName, in: .none),
+              let place = (occurrence["originalStart"] as? String).flatMap({ Date.fromISO8601($0) }) ?? instant(occurrence["start"])
+        else { return true }
+        return EKEventStoreHelper.dayKey(place, timeZone: zone) <= end
     }
 
     /// The instant a stored or written start names: its wall time read in the zone it is labelled

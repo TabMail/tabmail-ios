@@ -838,9 +838,12 @@ extension AccountManager {
             // (an occurrence that no longer starts there is the provider's not-found).
             let givenScope = CalendarToolHelpers.stringArgOpt(args, "edit_scope")?.lowercased()
                 ?? (CalendarToolHelpers.stringArgOpt(args, "recurrence_id") != nil ? "this_only" : "all")
+            // A split's retry after its own cap is not looked up again (`read`'s `splitting`): it
+            // goes on to `splitSeries` below, which writes what the interrupted attempt did not.
             let named = try await CalendarSeriesScope.read(
                 eventId: eventId, recurrenceId: CalendarToolHelpers.stringArgOpt(args, "recurrence_id"),
-                calendarId: calId, zone: recurrenceIdZone, provider: provider)
+                calendarId: calId, zone: recurrenceIdZone, splitting: givenScope == "this_and_following",
+                provider: provider)
             let routed = try CalendarSeriesScope.route(args, scope: givenScope, named: named, zone: recurrenceIdZone)
             // The tool makes an "all" edit that moves a later occurrence to another date a split before
             // its card; one that reaches the queue as "all" was confirmed as a change of every
@@ -859,7 +862,7 @@ extension AccountManager {
             let resolvedArgs = try await resolveAttendeeDelta(
                 args: routed.args, eventId: writeId, calendarId: calId, provider: provider
             )
-            if let reason = CalendarSeriesScope.dayMoveRefusal(
+            if !named.afterOwnSplitCap, let reason = CalendarSeriesScope.dayMoveRefusal(
                 resolvedArgs, named: named, scope: routed.scope, zone: recurrenceIdZone) {
                 throw CalendarProviderError.notSupported(reason)
             }
