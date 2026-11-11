@@ -4,12 +4,13 @@
 
 import Foundation
 import GRDB
+import SwiftMail
 import Synchronization
 import Testing
 @testable import TabMail
 
 /// A Google or Microsoft sign-in the provider has revoked (password change,
-/// revocation, admin policy), as the user and the mail queues see it (#534):
+/// revocation, admin revocation), as the user and the mail queues see it (#534):
 ///
 /// - the account shows the same "sign in again" warning the calendar already
 ///   raised (`authFailedAccounts`, which `RootView`, `SettingsView` and
@@ -238,6 +239,8 @@ struct RevokedMailGrantSignalTests {
             #expect(held.sentAt == nil)
             #expect(held.to == draft.to && held.subject == draft.subject && held.body == draft.body,
                     "\(kind): the kept send lost its content")
+            #expect(held.outboxStatus == .failed,
+                    "\(kind): the send did not become failed (visible, with Retry) after three refused drains")
             #expect(reachedTheServer(routes.actionPath) == 0, "\(kind): an action went out without a token")
             #expect(reachedTheServer(routes.sendPath) == 0, "\(kind): a send went out without a token")
 
@@ -261,9 +264,9 @@ struct RevokedMailGrantSignalTests {
 
                 // A send that used up its automatic retries waits for the Outbox's Retry.
                 let current = try await f.pool.read { db in try OutboxMessage.fetchOne(db, key: seeded.id) }
-                if current?.outboxStatus == .failed {
-                    #expect(AccountManager.shared.retryOutboxMessage(seeded.id))
-                }
+                #expect(current?.outboxStatus == .failed,
+                        "\(kind): the failed send changed state before the user pressed Retry")
+                #expect(AccountManager.shared.retryOutboxMessage(seeded.id))
                 await AccountManager.shared.drainOutbox()
                 let sent = try await f.pool.read { db in try OutboxMessage.fetchOne(db, key: seeded.id) }
                 #expect(sent == nil, "\(kind): the kept send did not go out after signing in")
@@ -299,7 +302,7 @@ struct RevokedMailGrantSignalTests {
 
     private func refreshThroughTheAccessor(
         _ failure: @escaping @Sendable () -> any Error
-    ) async throws -> (accountId: String, threw: Bool) {
+    ) async throws -> (accountId: String, error: (any Error)?) {
         let harness = CredentialTestHarness(), store = harness.provider
         let accountId = "revoked-signal-" + UUID().uuidString
         try store.install(accountId: accountId, tokens: CredentialTestHarness.tokens())
@@ -307,20 +310,28 @@ struct RevokedMailGrantSignalTests {
             accountId: accountId, email: "user@example.com",
             store: store, refreshCoordinator: OAuthRefreshCoordinator(store: store)
         ) { _ in throw failure() }
-        let threw: Bool
         do {
             _ = try await accessor(true)
-            threw = false
+            return (accountId, nil)
         } catch {
-            threw = true
+            return (accountId, error)
         }
-        return (accountId, threw)
+    }
+
+    /// The OAuth code a caught error carries, if it is the token endpoint's refusal.
+    private static func tokenExchangeCode(_ error: (any Error)?) -> String? {
+        guard case OAuthError.tokenExchangeFailed(let code)? = error else { return nil }
+        return code
     }
 
     @Test("A token endpoint that could not answer does not tell the user to sign in again", arguments: indeterminate)
     func indeterminateFailureRaisesNoWarning(_ failure: RefreshFailure) async throws {
-        let (accountId, threw) = try await refreshThroughTheAccessor(failure.make)
-        #expect(threw, "the failed refresh returned a token")
+        let (accountId, error) = try await refreshThroughTheAccessor(failure.make)
+        #expect(error != nil, "the failed refresh returned a token")
+        // The caller receives the refresher's own error, unchanged: this also
+        // proves the refresher ran and its failure reached the accessor.
+        #expect(error.map { String(reflecting: $0) } == String(reflecting: failure.make()),
+                "\(failure.testDescription): the accessor did not rethrow the refresher's error unchanged")
         #expect(await warningReaches(false, for: accountId),
                 "\(failure.testDescription): a transient failure told the user their sign-in is broken")
         await AccountManager.shared.clearAuthFailed(accountId)
@@ -328,8 +339,14 @@ struct RevokedMailGrantSignalTests {
 
     @Test("A grant the token endpoint refuses tells the user to sign in again", arguments: refused)
     func refusedGrantRaisesTheWarning(_ code: String) async throws {
-        let (accountId, threw) = try await refreshThroughTheAccessor { OAuthError.tokenExchangeFailed(code) }
-        #expect(threw, "the refused refresh returned a token")
+        let (accountId, error) = try await refreshThroughTheAccessor { OAuthError.tokenExchangeFailed(code) }
+        #expect(error != nil, "the refused refresh returned a token")
+        #expect(Self.tokenExchangeCode(error) == code,
+                "\(code): the accessor did not rethrow the refusal unchanged")
+        // The warning is raised before the refusal is rethrown, so it is already
+        // set when the caller sees the error.
+        #expect(await AccountManager.shared.authFailedAccounts.contains(accountId),
+                "\(code): the warning was not raised before the refusal reached the caller")
         #expect(await warningReaches(true, for: accountId), "\(code): the user was not told to sign in again")
         await AccountManager.shared.clearAuthFailed(accountId)
     }
@@ -354,10 +371,69 @@ struct RevokedMailGrantSignalTests {
         try store.install(accountId: accountId, tokens: .init(
             accessToken: "new-access", refreshToken: "new-refresh", expiresAt: Date().addingTimeInterval(3600)))
         await release.signal()
-        await #expect(throws: (any Error).self) { try await refresh.value }
+        let result = await refresh.result
+        #expect(Self.tokenExchangeCode(result.failure) == "invalid_grant",
+                "the old sign-in's refusal did not reach the caller unchanged")
 
         #expect(await warningReaches(false, for: accountId),
                 "the old sign-in's refusal told the user to sign in again after they had")
         await AccountManager.shared.clearAuthFailed(accountId)
+    }
+
+    @Test("A refusal that lands after the account was removed does not warn")
+    func refusalAfterRemovalRaisesNoWarning() async throws {
+        let harness = CredentialTestHarness(), store = harness.provider
+        var account = Account(
+            emailAddress: "removed-\(UUID().uuidString)@example.com", displayName: "Removed", provider: .gmail)
+        account.id = "revoked-removed-" + UUID().uuidString
+        let accountId = account.id
+        try store.install(accountId: accountId, tokens: CredentialTestHarness.tokens())
+        let started = CredentialTestLatch(), release = CredentialTestLatch()
+        let accessor = await AccountManager.shared.makeOAuthAccessor(
+            accountId: accountId, email: account.emailAddress,
+            store: store, refreshCoordinator: OAuthRefreshCoordinator(store: store)
+        ) { _ in
+            await started.signal()
+            await release.wait()
+            throw OAuthError.tokenExchangeFailed("invalid_grant")
+        }
+        let refresh = Task { try await accessor(true) }
+        await started.wait()
+        // The user removes the account while the refresh is on the wire. The
+        // credential in this store stays, so only the removal can stop the warning.
+        await AccountManager.shared.disconnectAccount(account, deletingCredentials: [])
+        #expect(AccountManager.shared.isRuntimeRemoved(accountId))
+        #expect(store.activation(accountId: accountId) != nil, "the credential the test relies on is gone")
+        await release.signal()
+        let result = await refresh.result
+        #expect(Self.tokenExchangeCode(result.failure) == "invalid_grant",
+                "the removed account's refusal did not reach the caller unchanged")
+
+        #expect(await warningReaches(false, for: accountId),
+                "a removed account was told to sign in again")
+        await AccountManager.shared.clearAuthFailed(accountId)
+    }
+
+    // MARK: - Password (IMAP and iCloud) sign-ins
+
+    /// IMAP and iCloud accounts never reach the OAuth accessor; their only
+    /// sign-in warning is `connectAccount`'s `isAuthError` check. SwiftMail's
+    /// `LoginHandler` turns every tagged NO to LOGIN into
+    /// `IMAPError.loginFailed(String(describing: response.state))`, so the
+    /// strings below are what a server's answer arrives as.
+    @Test("A temporary IMAP login refusal does not tell the user to sign in again, a refused password does")
+    func temporaryIMAPLoginRefusalIsNotAnAuthFailure() {
+        let unavailable = IMAPError.loginFailed("no([UNAVAILABLE] Service temporarily unavailable)")
+        #expect(!AccountManager.shared.isAuthError(unavailable),
+                "a server that was briefly unavailable told the user their password is wrong")
+        let refused = IMAPError.loginFailed("no([AUTHENTICATIONFAILED] Invalid credentials (Failure))")
+        #expect(AccountManager.shared.isAuthError(refused), "a refused password raised no warning")
+    }
+}
+
+private extension Result {
+    var failure: Failure? {
+        if case .failure(let error) = self { return error }
+        return nil
     }
 }

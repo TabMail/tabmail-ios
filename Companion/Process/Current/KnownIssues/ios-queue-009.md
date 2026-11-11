@@ -27,8 +27,11 @@
 > `unauthorized_client`). That is the narrow shape the row demanded: `temporarily_unavailable`,
 > `server_error`, the `"unknown"` fallback, `invalid_scope`, an offline device, a timeout and an
 > undecodable body raise nothing. The signal is skipped when the account was removed or the user
-> has already installed a new sign-in (the stored generation moved), so a late refusal of the old
-> grant cannot re-raise the prompt after re-authentication. The user sees the existing warning
+> has already installed a new sign-in (the stored generation moved), so the accessor itself does not
+> re-raise the prompt on a late refusal of the old grant after re-authentication. The calendar drain's
+> own raise (`isCalendarOAuthReauthRequired`) has no generation guard, so a calendar op whose refresh
+> with the old grant was in flight during re-authentication can still re-raise it; the warning then
+> stays until the next successful `connectAccount` (at the latest, the next cold launch). The user sees the existing warning
 > (`RootView` opens Settings after a launch connect, the `SettingsView` row icon, the
 > `AccountDetailView` banner), and it clears as before when `connectAccount` succeeds after
 > re-authentication.
@@ -42,7 +45,10 @@
 > separate process with its own token path and no banner), and `AccountManager.freshAccessToken`
 > (push subscription), which calls the refresh coordinator directly. IMAP and iCloud accounts sign
 > in with a password and have no grant; their connect-time refusal was already signalled through
-> `AccountManager.isAuthError`. Tests: `RevokedMailGrantSignalTests`.
+> `AccountManager.isAuthError`. The body's statement that `isAuthError` is the ONLY writer of
+> `authFailedAccounts` was already untrue before this change (the calendar drain and
+> `SyncEngineBackfillWalk` also write it), and the accessor is now a further writer. Tests:
+> `RevokedMailGrantSignalTests`.
 <!-- KNOWN-ISSUES-AMENDMENT-END -->
 # IOS-QUEUE-009
 
