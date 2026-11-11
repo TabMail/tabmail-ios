@@ -1089,8 +1089,13 @@ final class FakeCalDAVStore: Sendable {
     /// recurring.
     private let servesETags: Bool
 
-    init(servesETags: Bool) {
+    /// Whether a `PUT` holding a VEVENT that has attendees and no organizer is refused with 403
+    /// and changes nothing, as iCloud does (RFC 5545 §3.8.4.3; measured for a changed occurrence).
+    private let refusesAttendeesWithoutOrganizer: Bool
+
+    init(servesETags: Bool, refusesAttendeesWithoutOrganizer: Bool = false) {
         self.servesETags = servesETags
+        self.refusesAttendeesWithoutOrganizer = refusesAttendeesWithoutOrganizer
     }
 
     func seed(path: String, ics: String) {
@@ -1134,12 +1139,19 @@ final class FakeCalDAVStore: Sendable {
         let ifMatch = request.header("If-Match")
         let ifNoneMatch = request.header("If-None-Match")
         let body = request.body.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        let refused = refusesAttendeesWithoutOrganizer && VEventOracle.vevents(body).contains {
+            !VEventOracle.own($0, "ATTENDEE").isEmpty && VEventOracle.own($0, "ORGANIZER").isEmpty
+        }
 
         return state.withLock { value -> FakeHTTP.CannedResponse in
             func record(_ returnedETag: String?) {
                 value.puts.append(RecordedPut(
                     path: path, ifMatch: ifMatch, ifNoneMatch: ifNoneMatch,
                     returnedETag: returnedETag))
+            }
+            if refused {
+                record(nil)
+                return .raw(statusCode: 403)
             }
             let existing = value.resources[path]
             if ifNoneMatch == "*", existing != nil {
