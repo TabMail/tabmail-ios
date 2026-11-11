@@ -66,6 +66,37 @@ dropped silently, and the card did not list the days.
 - Outlook names `byMonthDay: -1` plainly ("on the last day of the month"); other negative days keep
   "on a day counted from the end of the month".
 
+## The delete card names a series' rule too (#639, 2026-11-10)
+
+`calendar_event_delete`'s card says "Repeating event: every occurrence will be deleted"
+(`CalendarToolHelpers.seriesDeleteNote`, Google Calendar's question) and `Repeats: <rule>` when the
+event it read is a series itself: a repeat rule and no `recurringEventId` (`seriesDeleteLines`). An
+occurrence names its series in `recurringEventId` on every provider (a CalDAV occurrence also
+carries the series' rule), so its card gets no such line. **Since the #639 follow-up (2026-11-10)**
+an occurrence's card says "One occurrence of a repeating event; the rest of the series stays."
+(`occurrenceDeleteNote`), keyed on `recurringEventId` alone: true on every provider (Google and
+Outlook delete only it; CalDAV refuses, ADR-IOS-108), including a CalDAV row of a resource holding
+only changed occurrences, which carries no rule. Do not key it on the rule being absent. The stored rule is worded by
+`storedRecurrenceSummary`, which shares `recurrenceText` with `recurrenceSummary`, so a stored and
+a given rule read the same; a stored UTC `UNTIL` is shown as its day in the device's zone. A stored
+`BYMONTH` out of range is left out (`recurrenceDaysText` used to index past the month list, which
+validated arguments never reached).
+
+**One frequency phrase (2026-11-10, #639 follow-up):** the chat's event popover and both cards
+(edit and delete) word a rule's frequency and interval with ONE function,
+`CalendarToolHelpers.recurrenceIntervalPhrase` (`weekly`, `every 2 weeks`), moved unchanged out of
+the popover's former private `EventPillPopover.describeRecurrence`. The popover calls
+`popoverRecurrenceLine` (its output unchanged: `Repeats every 2 weeks`, else `Recurring`); the cards
+keep their days, count and end on top (`every 2 weeks on Monday, Wednesday (10 times)`; the delete
+card's line reads `Repeats every 2 weeks ...`, the edit card's `recurrence → every 2 weeks ...`).
+Hourly and finer, which the popover does not name, keep the card's old token (`every 2 hourly`).
+Do not add another rule formatter. A CalDAV resource holding only changed occurrences, deleted by
+its own id, gets no card at all: `ICSParser.parse` returns no event for it, so the delete tool's
+read fails and it refuses before the card, nothing sent. Pinned by `CalendarSeriesDeleteCardTests`
+and `CalDAVOccurrenceDeleteToolToWireTests` (the CalDAV series card before its DELETE; the
+occurrence card without the line; the override-only resource by its own id refused with no DELETE;
+the popover line pinned by `popoverLineUnchanged`).
+
 ## Pinned by
 
 `TabMailTests/Tools/CalendarRecurrenceDaysTests.swift`: the writer and the card per field and

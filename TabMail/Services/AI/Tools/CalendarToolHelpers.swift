@@ -1063,21 +1063,140 @@ enum CalendarToolHelpers {
         return until
     }
 
-    /// The confirmation-card text for a `recurrence` argument (`every 2 weekly on Monday, Wednesday
+    /// The confirmation-card text for a `recurrence` argument (`every 2 weeks on Monday, Wednesday
     /// (5 times)`), or nil when there is none. Reads every field through the builder's own readers
     /// (`recurrenceFreq`, `recurrenceNumber`, `recurrenceDayParts`), so it throws on the same values
     /// the builder refuses and a tool can refuse the call before its card is shown, and it names the
     /// days the builder writes.
     static func recurrenceSummary(_ arguments: [String: JSONValue]) throws -> String? {
         guard case .dictionary(let rec) = arguments["recurrence"], let freq = try recurrenceFreq(rec) else { return nil }
-        var desc = freq.lowercased()
-        if let n = try recurrenceNumber(rec, "interval"), n > 1 { desc = "every \(n) \(desc)" }
+        let interval = try recurrenceNumber(rec, "interval")
         let days = try recurrenceDayParts(rec, freq: freq)
-        if let text = recurrenceDaysText(days) { desc += " \(text)" }
-        if let count = try recurrenceNumber(rec, "count") { desc += " (\(count) times)" }
-        else if try recurrenceUntil(rec, allDay: false, zone: TimeZone(identifier: "UTC") ?? .gmt) != nil,
-                case .string(let until) = rec["until"] { desc += " (until \(until))" }
+        let count = try recurrenceNumber(rec, "count")
+        var until: String?
+        if count == nil, try recurrenceUntil(rec, allDay: false, zone: TimeZone(identifier: "UTC") ?? .gmt) != nil,
+           case .string(let given) = rec["until"] { until = given }
+        return recurrenceText(freq: freq, interval: interval, dayParts: days, count: count, until: until)
+    }
+
+    /// A rule in the confirmation card's words, from its parts: `every 2 weeks on Monday,
+    /// Wednesday (5 times)`. `count` wins over `until`, as in the builder. The one wording for a
+    /// rule given as arguments (`recurrenceSummary`) and a stored one (`storedRecurrenceSummary`).
+    /// The frequency and interval are the event popover's phrase (`recurrenceIntervalPhrase`); a
+    /// frequency it does not name (hourly and finer) keeps the token (`every 2 hourly`).
+    private static func recurrenceText(freq: String, interval: Int?, dayParts: [String], count: Int?, until: String?) -> String {
+        var desc: String
+        if let phrase = recurrenceIntervalPhrase(freq: freq, interval: interval ?? 1) {
+            desc = phrase
+        } else {
+            desc = freq.lowercased()
+            if let n = interval, n > 1 { desc = "every \(n) \(desc)" }
+        }
+        if let text = recurrenceDaysText(dayParts) { desc += " \(text)" }
+        if let count { desc += " (\(count) times)" }
+        else if let until { desc += " (until \(until))" }
         return desc
+    }
+
+    /// A rule's frequency and interval in words: `weekly`, `every 2 weeks`; nil for a frequency
+    /// other than DAILY, WEEKLY, MONTHLY or YEARLY. The one phrase for the chat's event popover
+    /// (`popoverRecurrenceLine`) and both calendar confirmation cards (`recurrenceText`). Moved
+    /// unchanged from the popover's `describeRecurrence` (#639).
+    static func recurrenceIntervalPhrase(freq: String, interval: Int) -> String? {
+        let singular: String
+        let plural: String
+        switch freq {
+        case "DAILY": (singular, plural) = ("daily", "days")
+        case "WEEKLY": (singular, plural) = ("weekly", "weeks")
+        case "MONTHLY": (singular, plural) = ("monthly", "months")
+        case "YEARLY": (singular, plural) = ("yearly", "years")
+        default: return nil
+        }
+        if interval <= 1 { return singular }
+        return "every \(interval) \(plural)"
+    }
+
+    /// Render an `RRULE:...` as user-friendly prose ("Repeats weekly",
+    /// "Repeats every 2 months") for the event popover. Falls back to the generic
+    /// "Recurring" badge when the rule is absent or its FREQ isn't recognized.
+    /// Moved from the popover (`EventPillPopover.describeRecurrence`), output unchanged (#639).
+    static func popoverRecurrenceLine(_ rrule: String?) -> String {
+        guard let rrule, !rrule.isEmpty else { return "Recurring" }
+        let upper = rrule.uppercased()
+        let body = upper.hasPrefix("RRULE:") ? String(upper.dropFirst("RRULE:".count)) : upper
+        var freq: String?
+        var interval = 1
+        for part in body.split(separator: ";") {
+            let kv = part.split(separator: "=", maxSplits: 1)
+            guard kv.count == 2 else { continue }
+            switch kv[0] {
+            case "FREQ": freq = String(kv[1])
+            case "INTERVAL": interval = Int(kv[1]) ?? 1
+            default: break
+            }
+        }
+        guard let freq, let phrase = recurrenceIntervalPhrase(freq: freq, interval: interval) else { return "Recurring" }
+        return "Repeats \(phrase)"
+    }
+
+    /// A stored repeat rule (`GCalEvent.recurrence`, its `RRULE:` line) in the card's words, as
+    /// `recurrenceSummary` words a rule given as arguments; nil when there is no `RRULE:` line or its
+    /// `FREQ` is not one RFC 5545 names. A stored `UNTIL` is shown as the day it ends on: a UTC
+    /// date-time in the device's zone, as the card shows the event's dates; a date, or a floating
+    /// date-time, as its own date.
+    static func storedRecurrenceSummary(_ recurrence: [String]) -> String? {
+        guard let line = recurrence.first(where: { $0.uppercased().hasPrefix("RRULE:") }) else { return nil }
+        var fields: [String: String] = [:]
+        var dayParts: [String] = []
+        for part in line.dropFirst("RRULE:".count).split(separator: ";") {
+            let pair = part.split(separator: "=", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces).uppercased() }
+            guard pair.count == 2 else { continue }
+            fields[pair[0]] = pair[1]
+            if ["BYDAY", "BYMONTHDAY", "BYMONTH", "WKST"].contains(pair[0]) { dayParts.append("\(pair[0])=\(pair[1])") }
+        }
+        guard let freq = fields["FREQ"].flatMap(validatedRRuleFreq) else { return nil }
+        return recurrenceText(
+            freq: freq, interval: fields["INTERVAL"].flatMap { Int($0) }, dayParts: dayParts,
+            count: fields["COUNT"].flatMap { Int($0) }, until: fields["UNTIL"].map(storedUntilDay))
+    }
+
+    /// A stored `UNTIL` as a `yyyy-MM-dd` day (see `storedRecurrenceSummary`); the value as stored
+    /// when it is neither form.
+    private static func storedUntilDay(_ until: String) -> String {
+        func formatter(_ format: String, _ zone: TimeZone?) -> DateFormatter {
+            let f = DateFormatter()
+            f.locale = Locale(identifier: "en_US_POSIX")
+            f.timeZone = zone
+            f.dateFormat = format
+            return f
+        }
+        let utcZone = TimeZone(identifier: "UTC")
+        if let instant = formatter("yyyyMMdd'T'HHmmss'Z'", utcZone).date(from: until) {
+            return formatter("yyyy-MM-dd", .current).string(from: instant)
+        }
+        guard let date = formatter("yyyyMMdd", utcZone).date(from: String(until.prefix(8))) else { return until }
+        return formatter("yyyy-MM-dd", utcZone).string(from: date)
+    }
+
+    /// The confirmation card's line for a delete that removes a repeating series, every occurrence
+    /// of it, in Google Calendar's words (#639).
+    static let seriesDeleteNote = "Repeating event: every occurrence will be deleted"
+
+    /// The delete card's line for one occurrence of a repeating event (#639). True on every
+    /// provider: Google and Outlook delete only that occurrence, and CalDAV refuses the delete
+    /// (ADR-IOS-108), so either way the rest of the series stays.
+    static let occurrenceDeleteNote = "One occurrence of a repeating event; the rest of the series stays."
+
+    /// The delete card's lines for `event`, read before the card. An occurrence names its series in
+    /// `recurringEventId` on every provider (a CalDAV occurrence may also carry the series' rule),
+    /// and deleting it by its own id does not delete the series: `occurrenceDeleteNote`. A repeating
+    /// series itself (a repeat rule and no series it belongs to): `seriesDeleteNote` and its rule in
+    /// words (`storedRecurrenceSummary`). Anything else: none.
+    static func seriesDeleteLines(_ event: GCalEvent) -> [String] {
+        if event.recurringEventId?.isEmpty == false { return [occurrenceDeleteNote] }
+        guard let recurrence = event.recurrence, !recurrence.isEmpty else { return [] }
+        guard let rule = storedRecurrenceSummary(recurrence) else { return [seriesDeleteNote] }
+        return [seriesDeleteNote, "Repeats \(rule)"]
     }
 
     /// The confirmation-card line for a whole-series edit that resets the occurrences changed one
@@ -1113,7 +1232,10 @@ enum CalendarToolHelpers {
                 let days = values.compactMap(Int.init).map { $0 < 0 ? "the \(position($0)) day" : "day \($0)" }
                 phrases.append("on \(days.joined(separator: ", "))")
             case "BYMONTH":
-                phrases.append("in \(values.compactMap(Int.init).map { months[$0 - 1] }.joined(separator: ", "))")
+                // A stored rule is not validated as the arguments are, so a month out of range is
+                // left out rather than read past the list.
+                let named = values.compactMap(Int.init).filter { months.indices.contains($0 - 1) }.map { months[$0 - 1] }
+                if !named.isEmpty { phrases.append("in \(named.joined(separator: ", "))") }
             case "WKST":
                 phrases.append("week starts \(names[kv[1]] ?? kv[1])")
             default:
