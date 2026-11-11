@@ -1009,7 +1009,10 @@ actor CalDAVProvider: CalendarProvider {
     /// RDATE, an UNTIL the patch did not write, each override's
     /// RECURRENCE-ID, and the DTEND when the patch gives no end; see
     /// `shiftSeriesAnchoredValues`). Throws, before any
-    /// write, when one of those values cannot be moved correctly.
+    /// write, when one of those values cannot be moved correctly. The
+    /// patch's guest change is the exception to "master only": it reaches
+    /// every VEVENT of the resource, each from its own attendees, a changed
+    /// occurrence as the series' difference (`applyAttendeeChange`, #620).
     ///
     /// Also applied to the copies a split and a one-occurrence edit make
     /// (`seriesSplitResources`, `occurrenceOverrideResource`), so the patch
@@ -1112,8 +1115,8 @@ actor CalDAVProvider: CalendarProvider {
         if let dtend = patchedEnd {
             result = replaceOrAppendInMasterVEvent(in: result, propertyKey: "DTEND", newLine: dtend)
         }
-        if let attendees = patch.attendees {
-            result = replaceAttendeesInMasterVEvent(in: result, attendees: attendees)
+        if let change = patch.attendeeChange {
+            result = applyAttendeeChange(change, in: result)
         }
         return result
     }
@@ -1194,58 +1197,91 @@ actor CalDAVProvider: CalendarProvider {
         }
     }
 
-    /// Replace the MASTER VEVENT's attendees with the supplied list.
-    /// The queue resolves attendee deltas (add_attendees / remove_attendees)
-    /// against the existing attendee list BEFORE calling updateEvent, so by
-    /// the time we get here `attendees` is the desired final list.
+    /// The resource with an edit's guest change applied to every VEVENT in it, each from its own
+    /// attendees (#620). The series VEVENT gets the change itself. Each changed occurrence gets the
+    /// series' resulting difference (`AttendeeChange.seriesDifference`) on its own guests, as Google
+    /// Calendar and Outlook carry a series' guest change to its changed occurrences (measured; see
+    /// `AttendeeChange`): a guest an occurrence added on its own stays, and one it dropped on its
+    /// own is invited back only when the series gains them. A cancelled occurrence is changed like
+    /// any other, as the Thunderbird add-on changes it. A resource with no series VEVENT (only
+    /// changed occurrences) has no series to take a difference from: each VEVENT gets the change
+    /// itself. A VEVENT the change leaves as it was goes back byte for byte.
+    ///
+    /// Every caller that writes one item merges it on its own, as the series VEVENT of a resource
+    /// of one (`occurrenceOverrideResource`), so it gets the change itself. A whole-series write
+    /// (`updateEvent`) and a split's new part (`seriesSplitResources`, a whole-series write for the
+    /// changed occurrences it carries, as on Google) give the changed occurrences the difference.
     ///
     /// An attendee who stays keeps their own line: role, answer, RSVP and every other parameter the
-    /// server holds. Rewriting it would reset all of them for everyone each time one attendee is added
-    /// or removed. A new attendee is written where the attendees were, or else ahead of any nested
-    /// component (RFC 5545 puts a VEVENT's properties before its alarms).
-    static func replaceAttendeesInMasterVEvent(in ics: String, attendees: [(email: String, name: String?)]) -> String {
-        rewriteMasterVEvent(in: ics) { block in
-            var kept: [String: ICSUnit] = [:]
-            var rest: [ICSUnit] = []
-            var insertAt: Int?
-            var depth = 0
-            for unit in block {
-                let upper = unit.text.uppercased()
-                if upper.hasPrefix("BEGIN:") { depth += 1 } else if upper.hasPrefix("END:") { depth -= 1 }
-                if depth == 1, let p = icsProperty(unit.text), p.name == "ATTENDEE" {
-                    if let address = mailtoAddress(p.value), kept[address] == nil { kept[address] = unit }
-                    if insertAt == nil { insertAt = rest.count }
-                    continue
-                }
-                rest.append(unit)
-            }
-            // Sanitized for the same reason as `GCalEventInput.toICS`: `cn` and `a.email` are
-            // model-supplied (an attendee name or address from tool arguments) and are
-            // interpolated with only a quote swap, so a CRLF in either would split this into an
-            // extra ICS property the CalDAV server honours — an injected ATTENDEE has the server
-            // mail the invitation to an address the user never typed.
-            //
-            // Only the lines generated HERE are sanitized. The surrounding lines came from the
-            // server's own ICS via `physicalICSLines`, which has already split on real line
-            // breaks, so there is nothing left in them to strip and rewriting them would risk
-            // altering a value the server round-trips.
-            let attendeeUnits = attendees.map { a -> ICSUnit in
-                if let existing = kept[a.email.lowercased()] { return existing }
-                let cn = (a.name ?? a.email).replacingOccurrences(of: "\"", with: "'")
-                let line = GCalEventInput.sanitizeICSLine(
-                    "ATTENDEE;CN=\"\(cn)\";ROLE=REQ-PARTICIPANT:mailto:\(a.email)"
-                )
-                return ICSUnit(physical: [line], text: line)
-            }
-            // No attendees before: every line is new (a single physical line), and goes ahead of any
-            // nested component.
-            guard let insertAt else {
-                return insertBeforeSubcomponents(rest, lines: attendeeUnits.map(\.text))
-            }
-            var out = rest
-            out.insert(contentsOf: attendeeUnits, at: insertAt)
-            return out
+    /// server holds, and so does one whose address is not `mailto:` (#607). Rewriting it would reset
+    /// all of them for everyone each time one attendee is added or removed. A new attendee is asked
+    /// (`PARTSTAT=NEEDS-ACTION;RSVP=TRUE`) and is written where the attendees were, or else ahead of
+    /// any nested component (RFC 5545 puts a VEVENT's properties before its alarms). No ORGANIZER is
+    /// written here: `putEvent` adds the one a VEVENT with attendees needs (ADR-IOS-109).
+    static func applyAttendeeChange(_ change: AttendeeChange, in ics: String) -> String {
+        let address: (ICSUnit) -> String? = { icsProperty($0.text).flatMap { mailtoAddress($0.value) } }
+        // Sanitized for the same reason as `GCalEventInput.toICS`: `cn` and the address are
+        // model-supplied (an attendee name or address from tool arguments) and are interpolated
+        // with only a quote swap, so a CRLF in either would split this into an extra ICS property
+        // the CalDAV server honours — an injected ATTENDEE has the server mail the invitation to
+        // an address the user never typed.
+        //
+        // Only the lines generated HERE are sanitized. The surrounding lines came from the server's
+        // own ICS via `physicalICSLines`, which has already split on real line breaks, so there is
+        // nothing left in them to strip and rewriting them would risk altering a value the server
+        // round-trips.
+        let make: (AttendeeChange.Add) -> ICSUnit = { add in
+            let cn = (add.name ?? add.email).replacingOccurrences(of: "\"", with: "'")
+            let line = GCalEventInput.sanitizeICSLine(
+                "ATTENDEE;CN=\"\(cn)\";ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:\(add.email)")
+            return ICSUnit(physical: [line], text: line)
         }
+        let occurrenceChange = veventBlocks(icsUnits(ics)).first(where: { !isOverride($0) }).map { series -> AttendeeChange in
+            let own = ownAttendees(series)
+            return change.seriesDifference(before: own, after: change.apply(to: own, address: address, make: make),
+                                           address: address)
+        } ?? change
+        var counts: [String] = []
+        let result = rewriteVEvents(in: ics) { block, isSeries in
+            let own = ownAttendees(block)
+            let after = (isSeries ? change : occurrenceChange).apply(to: own, address: address, make: make)
+            counts.append("\(own.count)->\(after.count)")
+            guard after.map(\.text) != own.map(\.text) else { return block }
+            return replacingAttendees(in: block, with: after)
+        }
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[CalDAV] applyAttendeeChange: \(counts.count) VEVENTs, guests before->after \(counts.joined(separator: ", "))")
+        }
+        return result
+    }
+
+    /// The VEVENT's own `ATTENDEE` lines (not an alarm's), in order.
+    private static func ownAttendees(_ block: [ICSUnit]) -> [ICSUnit] {
+        topLevel(block).filter { icsProperty($0.text)?.name == "ATTENDEE" }
+    }
+
+    /// The VEVENT with its own attendee lines replaced by `attendees`, written where the first one
+    /// was, or ahead of any nested component when it had none.
+    private static func replacingAttendees(in block: [ICSUnit], with attendees: [ICSUnit]) -> [ICSUnit] {
+        var rest: [ICSUnit] = []
+        var insertAt: Int?
+        var depth = 0
+        for unit in block {
+            let upper = unit.text.uppercased()
+            if upper.hasPrefix("BEGIN:") { depth += 1 } else if upper.hasPrefix("END:") { depth -= 1 }
+            if depth == 1, icsProperty(unit.text)?.name == "ATTENDEE" {
+                if insertAt == nil { insertAt = rest.count }
+                continue
+            }
+            rest.append(unit)
+        }
+        // No attendees before: every line is new (a single physical line), and goes ahead of any
+        // nested component.
+        guard let insertAt else {
+            return insertBeforeSubcomponents(rest, lines: attendees.map(\.text))
+        }
+        rest.insert(contentsOf: attendees, at: insertAt)
+        return rest
     }
 
     /// Build a DTSTART / DTEND line for the merge path, re-using the master's

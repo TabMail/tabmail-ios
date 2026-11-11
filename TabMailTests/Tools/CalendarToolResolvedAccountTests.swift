@@ -368,7 +368,7 @@ struct CalendarToolResolvedAccountTests {
 
     /// A weekly series a week from today at 10:00 UTC, on that day's weekday; a one-off
     /// event at the same time when `recurring` is false.
-    private static func series(recurring: Bool = true) -> GCalEvent {
+    private static func series(recurring: Bool = true, attendees: [GCalAttendee]? = nil) -> GCalEvent {
         let start = isoDay(7, hour: 10)
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = TimeZone(identifier: "UTC") ?? .gmt
@@ -381,19 +381,20 @@ struct CalendarToolResolvedAccountTests {
             id: "evt-bare", summary: "Weekly sync", location: nil, description: nil,
             start: GCalDateTime(dateTime: start + "Z", date: nil, timeZone: "UTC"),
             end: GCalDateTime(dateTime: isoDay(7, hour: 11) + "Z", date: nil, timeZone: "UTC"),
-            attendees: nil, organizer: nil, recurrence: recurring ? ["RRULE:FREQ=WEEKLY;BYDAY=\(weekday)"] : nil,
+            attendees: attendees, organizer: nil, recurrence: recurring ? ["RRULE:FREQ=WEEKLY;BYDAY=\(weekday)"] : nil,
             transparency: nil, status: "confirmed", htmlLink: nil, created: nil, updated: nil
         )
     }
 
     /// The lines of the card an edit of `series` with `arguments` presents, with the series'
-    /// calendar answering `answer` to whether the edit resets changed occurrences, and the
-    /// edits it was asked about.
+    /// calendar answering `answer` to whether the edit resets changed occurrences, the edits it
+    /// was asked about, and the guest list the card shows.
     private func cardLines(
         series: GCalEvent, arguments: [String: JSONValue], answer: Bool
-    ) async throws -> (lines: [String], asked: [GCalEventInput]) {
+    ) async throws -> (lines: [String], asked: [GCalEventInput], attendees: [String]) {
         var lines: [String] = []
         var asked: [GCalEventInput] = []
+        var attendees: [String] = []
         try await withCalendars(registered: [.a], preferred: .a) { f in
             await f.mockA.setGetEventResult(series)
             f.mockA.resetsAnswer.withLock { $0 = answer }
@@ -403,9 +404,65 @@ struct CalendarToolResolvedAccountTests {
                 invocation: ToolInvocation(uiSink: sink, sessionKey: "cal-tool-rule-card"))
             #expect(sink.calendarEvents.count == 1, "setup: the edit card was not shown; tool said: \(output)")
             lines = sink.calendarEvents.first?.changes ?? []
+            attendees = sink.calendarEvents.first?.attendees ?? []
             asked = f.mockA.resetsAsked.withLock { $0 }
         }
-        return (lines, asked)
+        return (lines, asked, attendees)
+    }
+
+    /// The card of a guest change names the guests added and removed, as the Thunderbird add-on's
+    /// does, and never a resulting list: the write applies the change to each item the edit
+    /// covers, whose guests can differ (#620). Each added guest shows the address the invitation
+    /// goes to, after the name when one is given, so a wrong address is caught before the user
+    /// confirms (ADR-IOS-024).
+    @Test("A guest change's card names the guests added, with their addresses, and removed, never a resulting list")
+    func guestChangeCardNamesTheChange() async throws {
+        let stored = ["alice@example.com", "bob@example.com"].map {
+            GCalAttendee(email: $0, displayName: nil, responseStatus: "accepted", organizer: nil, self: nil)
+        }
+        let adds: [JSONValue] = [
+            .dictionary(["email": .string("carol@example.com"), "name": .string("Carol")]),
+            .string("dave@example.com"),
+            .string("erin@example.com"),
+            .string("frank@example.com"),
+            .string("grace@example.com"),
+        ]
+        let card = try await cardLines(
+            series: Self.series(attendees: stored),
+            arguments: ["add_attendees": .array(adds),
+                        "remove_attendees": .array([.string("mailto:Bob@Example.com"), .string("*")])],
+            answer: false)
+        #expect(card.lines == [
+            "attendees + Carol <carol@example.com>", "attendees + dave@example.com", "attendees + erin@example.com",
+            "attendees + and 2 more",
+            "attendees − all attendees", "attendees − bob@example.com",
+        ], "the card shows \(card.lines)")
+        #expect(card.attendees.isEmpty, "the card shows a guest list: \(card.attendees)")
+    }
+
+    /// A guest named twice (the same address in another letter case, under another name) is one
+    /// added guest and one card line, and so is an address removed twice: the card's rows are keyed
+    /// by their text, so a repeated line could drop a row. Four guests added show three and
+    /// "and 1 more".
+    @Test("A guest change's card names a guest added or removed twice once, and four added as three and 1 more")
+    func guestChangeCardNamesEachGuestOnce() async throws {
+        let adds: [JSONValue] = [
+            .dictionary(["email": .string("carol@example.com"), "name": .string("Carol")]),
+            .dictionary(["email": .string("Carol@Example.com"), "name": .string("Carol Two")]),
+            .string("dave@example.com"),
+            .string("erin@example.com"),
+            .string("frank@example.com"),
+        ]
+        let card = try await cardLines(
+            series: Self.series(attendees: []),
+            arguments: ["add_attendees": .array(adds),
+                        "remove_attendees": .array([.string("bob@example.com"), .string("Bob@Example.com")])],
+            answer: false)
+        #expect(card.lines == [
+            "attendees + Carol <carol@example.com>", "attendees + dave@example.com", "attendees + erin@example.com",
+            "attendees + and 1 more",
+            "attendees − bob@example.com",
+        ], "the card shows \(card.lines)")
     }
 
     /// Outlook resets a series' deleted and moved occurrences when a whole-series edit

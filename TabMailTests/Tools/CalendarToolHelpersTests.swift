@@ -1577,80 +1577,8 @@ struct CalendarToolHelpersTimezoneTests {
     }
 }
 
-// MARK: - applyAttendeeDelta (calendar_event_edit-v1.5.21)
-
-@Suite("CalendarToolHelpers applyAttendeeDelta")
-struct CalendarToolHelpersAttendeeDeltaTests {
-
-    private let alice: (email: String, name: String?) = ("alice@example.com", "Alice")
-    private let bob: (email: String, name: String?) = ("bob@example.com", "Bob")
-    private let carol: (email: String, name: String?) = ("carol@example.com", "Carol")
-
-    @Test("returns base unchanged when adds and removes are empty")
-    func emptyDelta() {
-        let result = CalendarToolHelpers.applyAttendeeDelta(base: [alice, bob], adds: [], removes: [])
-        #expect(result.count == 2)
-        guard result.count == 2 else { return }
-        #expect(result[0].email == "alice@example.com")
-        #expect(result[1].email == "bob@example.com")
-    }
-
-    @Test("adds a new attendee on top of existing list")
-    func addsNewAttendee() {
-        let result = CalendarToolHelpers.applyAttendeeDelta(base: [alice], adds: [bob], removes: [])
-        #expect(result.count == 2)
-        guard result.count == 2 else { return }
-        #expect(result.map(\.email) == ["alice@example.com", "bob@example.com"])
-    }
-
-    @Test("removes a specific attendee case-insensitively")
-    func removesOneCaseInsensitive() {
-        let result = CalendarToolHelpers.applyAttendeeDelta(base: [alice, bob], adds: [], removes: ["BOB@EXAMPLE.COM"])
-        #expect(result.count == 1)
-        guard result.count == 1 else { return }
-        #expect(result[0].email == "alice@example.com")
-    }
-
-    @Test("preserves existing attendees when only adding — the original bug")
-    func preservesExistingOnAdd() {
-        // Before delta: passing `attendees: [carol]` whole-list-replaced alice+bob with just carol.
-        // With delta: alice+bob survive.
-        let result = CalendarToolHelpers.applyAttendeeDelta(base: [alice, bob], adds: [carol], removes: [])
-        #expect(result.count == 3)
-        #expect(Set(result.map(\.email)) == ["alice@example.com", "bob@example.com", "carol@example.com"])
-    }
-
-    @Test("dedupes adds that already exist in base — base entry wins")
-    func dedupesAddAgainstBase() {
-        let dupeAlice: (email: String, name: String?) = ("ALICE@example.com", "Different Alice")
-        let result = CalendarToolHelpers.applyAttendeeDelta(base: [alice], adds: [dupeAlice], removes: [])
-        #expect(result.count == 1)
-        guard result.count == 1 else { return }
-        #expect(result[0].name == "Alice")
-    }
-
-    @Test("clears all attendees when remove list contains '*'")
-    func starClearsAll() {
-        let result = CalendarToolHelpers.applyAttendeeDelta(base: [alice, bob, carol], adds: [], removes: ["*"])
-        #expect(result.isEmpty)
-    }
-
-    @Test("clear-all then add — adds replace the whole list")
-    func clearThenAdd() {
-        let result = CalendarToolHelpers.applyAttendeeDelta(base: [alice, bob], adds: [carol], removes: ["*"])
-        #expect(result.count == 1)
-        guard result.count == 1 else { return }
-        #expect(result[0].email == "carol@example.com")
-    }
-
-    @Test("silently ignores removes that don't match anything in base")
-    func ignoresMissingRemoves() {
-        let result = CalendarToolHelpers.applyAttendeeDelta(base: [alice], adds: [], removes: ["nonexistent@example.com"])
-        #expect(result.count == 1)
-        guard result.count == 1 else { return }
-        #expect(result[0].email == "alice@example.com")
-    }
-}
+// The add/remove rule itself (`AttendeeChange.apply`) is covered in
+// `TabMailTests/Providers/AttendeeChangeTests.swift`.
 
 @Suite("CalendarToolHelpers attendee delta parsers")
 struct CalendarToolHelpersAttendeeParsersTests {
@@ -1715,6 +1643,14 @@ struct CalendarToolHelpersAttendeeParsersTests {
         #expect(result == ["alice@example.com"])
     }
 
+    @Test("every repeated or spaced mailto: prefix is stripped, adds and removes alike")
+    func repeatedMailtoIsStripped() {
+        #expect(CalendarToolHelpers.stripMailto(" mailto:MAILTO: mailto:alice@example.com ") == "alice@example.com")
+        let value: JSONValue = .array([.string("mailto:mailto:alice@example.com")])
+        #expect(CalendarToolHelpers.parseAttendeeAdds(value).map(\.email) == ["alice@example.com"])
+        #expect(CalendarToolHelpers.parseAttendeeRemoves(value) == ["alice@example.com"])
+    }
+
     @Test("parseAttendeeAdds returns empty for non-array JSONValue")
     func parseAddsNonArray() {
         #expect(CalendarToolHelpers.parseAttendeeAdds(.string("not an array")).isEmpty)
@@ -1724,8 +1660,8 @@ struct CalendarToolHelpersAttendeeParsersTests {
     @Test("parseAttendeeAdds returns empty for an explicit empty array")
     func parseAddsEmptyArray() {
         // LLM might emit `add_attendees: []` instead of omitting the key —
-        // resolveAttendeeDelta short-circuits in that case, so the parser must
-        // distinguish "absent" from "empty after parse" cleanly.
+        // `AttendeeChange(arguments:)` then gives no change, so no guest list
+        // is written and nobody is notified again.
         #expect(CalendarToolHelpers.parseAttendeeAdds(.array([])).isEmpty)
     }
 

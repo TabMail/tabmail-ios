@@ -73,6 +73,18 @@ private let kindChangeTimesHint = "to change this event between all-day and time
 /// instant, or another zone, `sameTime`), resets the series: its stored occurrences, the ones changed one by
 /// one, are dropped, as Google did when a series was moved from 08:00 to 13:00 (measured on a
 /// personal account, 2026-11-10).
+///
+/// A PATCH of a series' `attendees` reaches every stored occurrence of the series as the
+/// difference between the series' stored list and the written one, applied on top of that
+/// occurrence's own guests: each guest the written list drops from the stored one (by address,
+/// any letter case) goes, each guest it holds that the stored one did not is appended unless the
+/// occurrence holds them already, and every other guest the occurrence holds stays as stored. So
+/// an occurrence's own extra guest stays even when the series is emptied, and a guest it dropped
+/// on its own stays dropped when the series' list is written back unchanged. Measured on a test
+/// account (2026-11-11), through the API and Google Calendar web alike, for an added and a
+/// removed guest, a series emptied of its guests and a series list written back unchanged, on
+/// renamed, moved and unchanged occurrences and on occurrences with guest differences of their
+/// own.
 final class FakeGoogleCalendar: Sendable {
     private let events: Mutex<[String: Data]>
     private let writeLog = Mutex<[String]>([])
@@ -149,6 +161,26 @@ final class FakeGoogleCalendar: Sendable {
                 events.withLock { all in
                     all = all.filter { _, data in
                         ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["recurringEventId"] as? String != parts[0]
+                    }
+                }
+            }
+            if isSeries, let written = patch["attendees"] as? [[String: Any]] {
+                func address(_ guest: [String: Any]) -> String? { (guest["email"] as? String)?.lowercased() }
+                let was = Set((stored["attendees"] as? [[String: Any]] ?? []).compactMap(address))
+                let removed = was.subtracting(written.compactMap(address))
+                let added = written.filter { address($0).map { !was.contains($0) } ?? false }
+                events.withLock { all in
+                    for (id, data) in all {
+                        guard var occurrence = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                              occurrence["recurringEventId"] as? String == parts[0] else { continue }
+                        let own = occurrence["attendees"] as? [[String: Any]] ?? []
+                        var guests = own.filter { address($0).map { !removed.contains($0) } ?? true }
+                        let held = Set(guests.compactMap(address))
+                        guests += added.filter { address($0).map { !held.contains($0) } ?? false }
+                        guard Self.canonical(guests) != Self.canonical(own) else { continue }
+                        occurrence["attendees"] = guests
+                        // swiftlint:disable:next force_try
+                        all[id] = try! JSONSerialization.data(withJSONObject: occurrence)
                     }
                 }
             }
@@ -254,6 +286,14 @@ final class FakeGoogleCalendar: Sendable {
         // swiftlint:disable:next force_try
         .raw(statusCode: 200, headers: ["Content-Type": "application/json"],
              body: try! JSONSerialization.data(withJSONObject: object))
+    }
+
+    /// A JSON value written with sorted keys, so two stored values compare as Google compares them.
+    private static func canonical(_ value: Any?) -> String {
+        guard let value, JSONSerialization.isValidJSONObject([value]),
+              let data = try? JSONSerialization.data(withJSONObject: [value], options: [.sortedKeys])
+        else { return "null" }
+        return String(decoding: data, as: UTF8.self)
     }
 
     static func allDay(id: String, start: String, end: String, recurring: Bool = false, master: String? = nil) -> [String: Any] {

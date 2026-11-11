@@ -473,9 +473,9 @@ struct CalendarBadRequestClassificationTests {
     ///
     /// The reachable sequence: an edit tool reads a Demo event and awaits user
     /// confirmation, another chat deletes it, the user confirms. `updateEvent`'s
-    /// UPDATE matches zero rows and its confirming `getEvent` finds none — and for an
-    /// edit carrying attendee deltas, `resolveAttendeeDelta` reaches `getEvent`
-    /// before any update is attempted. Until R15-FIX-4 that was
+    /// UPDATE matches zero rows and its confirming `getEvent` finds none — and every
+    /// edit reaches `getEvent` through `CalendarSeriesScope.read` before any update
+    /// is attempted. Until R15-FIX-4 that was
     /// `DemoError.startFailed("event not found")`, claimed by NO terminal arm, so it
     /// fell to the transient arm: requeue, `retryCount += 1` (this file has no retry
     /// cap — one increment, zero comparisons) and `failedAccounts.insert`. The next

@@ -66,7 +66,20 @@ import Synchronization
 ///   with 405 `UnknownError` and an empty message, and changes nothing.
 ///   Measured on an Outlook.com account (#622): a list with every entry
 ///   carrying its status was accepted, and a kept attendee sent with their
-///   stored status kept their answer.
+///   stored status kept their answer;
+/// - a PATCH of a series' `attendees` reaches every stored occurrence of the
+///   series as the difference between the series' stored list and the written
+///   one, applied on top of that occurrence's own guests: each guest the
+///   written list drops from the stored one (by address, any letter case)
+///   goes, each guest it holds that the stored one did not is appended unless
+///   the occurrence holds them already, and every other guest the occurrence
+///   holds stays as stored. So an exception's own extra guest stays even when
+///   the series is emptied, and a guest it dropped on its own stays dropped
+///   when the series' list is written back unchanged. An exception stays an
+///   exception. Measured on an Outlook.com test account (2026-11-11), for an
+///   added and a removed guest, a series emptied of its guests and a series
+///   list written back unchanged, on renamed, moved and unchanged occurrences
+///   and on exceptions with guest differences of their own.
 ///
 /// A timed event's starts and ends are returned as stored, whatever zone `Prefer` names: a
 /// fixture stores them as Graph renders them for the device. An all-day event's `start` and `end`
@@ -135,6 +148,9 @@ final class FakeGraphCalendar: Sendable {
     /// The zone `Prefer: outlook.timezone` named on each read of `id` by its own id (nil: none),
     /// in order.
     func readZones(_ id: String) -> [String?] { readLog.withLock { $0 }.filter { $0.id == id }.map(\.zone) }
+
+    /// The id of every PATCH that was applied, in order.
+    var patchedIds: [String] { patchLog.withLock { $0.map(\.id) } }
 
     /// The PATCH bodies sent for `id`, in order.
     func patches(_ id: String) -> [[String: Any]] {
@@ -329,6 +345,28 @@ final class FakeGraphCalendar: Sendable {
             } || patch["isAllDay"].map { ($0 as? Bool) != (stored["isAllDay"] as? Bool) } ?? false)
             if changesRule || movesTime {
                 resets.withLock { $0 += 1 }
+            }
+            if isSeries, let written = patch["attendees"] as? [[String: Any]] {
+                func address(_ guest: [String: Any]) -> String? {
+                    ((guest["emailAddress"] as? [String: Any])?["address"] as? String)?.lowercased()
+                }
+                let was = Set((stored["attendees"] as? [[String: Any]] ?? []).compactMap(address))
+                let removed = was.subtracting(written.compactMap(address))
+                let added = written.filter { address($0).map { !was.contains($0) } ?? false }
+                events.withLock { all in
+                    for (id, data) in all {
+                        guard var occurrence = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                              occurrence["seriesMasterId"] as? String == parts[0] else { continue }
+                        let own = occurrence["attendees"] as? [[String: Any]] ?? []
+                        var guests = own.filter { address($0).map { !removed.contains($0) } ?? true }
+                        let held = Set(guests.compactMap(address))
+                        guests += added.filter { address($0).map { !held.contains($0) } ?? false }
+                        guard Self.canonicalJSON(guests) != Self.canonicalJSON(own) else { continue }
+                        occurrence["attendees"] = guests
+                        // swiftlint:disable:next force_try
+                        all[id] = try! JSONSerialization.data(withJSONObject: occurrence)
+                    }
+                }
             }
             Self.apply(patch, to: &stored)
             store(stored)
@@ -852,19 +890,11 @@ enum UserCalendarEdit: String, CaseIterable, CustomTestStringConvertible, Sendab
         case .moveRoom:
             p.location = Self.newRoom
         case .addAttendee:
-            // What `resolveAttendeeDelta` hands the provider: the whole resolved list.
-            p.attendees = [
-                (email: "ana@example.com", name: "Ana"),
-                (email: "bo@example.com", name: "Bo"),
-                (email: "room-1@example.com", name: "Room 1"),
-                (email: "cy@example.com", name: "Cy"),
-            ]
+            // "add Cy": the change, which the write applies to the stored attendees (#620).
+            p.attendeeChange = AttendeeChange(adds: [.init(email: "cy@example.com", name: "Cy")])
         case .removeAttendee:
-            // "take Bo off it": the whole resolved list, without Bo.
-            p.attendees = [
-                (email: "ana@example.com", name: "Ana"),
-                (email: "room-1@example.com", name: "Room 1"),
-            ]
+            // "take Bo off it".
+            p.attendeeChange = AttendeeChange(removes: [Self.removedAttendee])
         case .markBusy:
             p.transparency = "opaque"
         case .newDescription:
@@ -2469,7 +2499,8 @@ struct ExchangeCalendarEditPreservationTests {
         graph.install(on: http)
         var patch = UserCalendarEdit.addAttendee.patch(start: GraphFixture.start)
         // Asked for in another letter case than Graph stores.
-        patch.attendees?.append((email: "optional.person@example.com", name: "Optional Person"))
+        patch.attendeeChange = AttendeeChange(
+            adds: (patch.attendeeChange?.adds ?? []) + [.init(email: "optional.person@example.com", name: "Optional Person")])
 
         _ = try await makeProvider(http).updateEvent(eventId: "ev-case", event: patch)
 

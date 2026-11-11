@@ -866,6 +866,9 @@ enum CalendarToolHelpers {
                 return nil
             }
         }
+        // An edit's guest change (`add_attendees` / `remove_attendees`), carried as a change for
+        // each provider's write to apply to the guests of every item it covers (#620).
+        input.attendeeChange = AttendeeChange(arguments: arguments)
 
         // Recurrence
         //
@@ -1678,60 +1681,32 @@ enum CalendarToolHelpers {
     }
 
     /// Parse a `remove_attendees`-shaped argument into a list of emails (or `"*"` literal
-    /// for clear-all). Accepts `[{ "email": "..." }]` or `["bare@email.com"]`.
+    /// for clear-all). Accepts `[{ "email": "..." }]` or `["bare@email.com"]`. Only `"*"` itself
+    /// is clear-all: `mailto:*` names nobody and is dropped, as the Thunderbird add-on reads it.
     static func parseAttendeeRemoves(_ value: JSONValue?) -> [String] {
         guard case .array(let arr) = value else { return [] }
         return arr.compactMap { item -> String? in
-            if case .dictionary(let dict) = item,
-               case .string(let raw) = dict["email"] {
-                let trimmed = stripMailto(raw).trimmingCharacters(in: .whitespaces)
-                return trimmed.isEmpty ? nil : trimmed
+            let raw: String
+            if case .dictionary(let dict) = item, case .string(let email) = dict["email"] {
+                raw = email
+            } else if case .string(let email) = item {
+                raw = email
+            } else {
+                return nil
             }
-            if case .string(let raw) = item {
-                let trimmed = stripMailto(raw).trimmingCharacters(in: .whitespaces)
-                return trimmed.isEmpty ? nil : trimmed
-            }
-            return nil
+            if raw.trimmingCharacters(in: .whitespacesAndNewlines) == "*" { return "*" }
+            let address = stripMailto(raw).trimmingCharacters(in: .whitespaces)
+            return address.isEmpty || address == "*" ? nil : address
         }
     }
 
-    /// Apply an add/remove delta on top of `base`. Matching for removals is case-insensitive
-    /// on the email address. A remove list containing `"*"` (literal) means "clear all — drop
-    /// everything in `base`". Adds are appended after removes, de-duped case-insensitively
-    /// against whatever's left. When the same email appears in `base` and `adds` with a
-    /// different name, the base entry's name is kept (the existing record wins).
-    /// Mirrors `EmailReplyTool.applyRecipientDelta`.
-    static func applyAttendeeDelta(
-        base: [(email: String, name: String?)],
-        adds: [(email: String, name: String?)],
-        removes: [String]
-    ) -> [(email: String, name: String?)] {
-        let clearAll = removes.contains { $0.trimmingCharacters(in: .whitespaces) == "*" }
-        var result: [(email: String, name: String?)]
-        if clearAll {
-            result = []
-        } else {
-            let removeSet = Set(removes
-                .filter { $0.trimmingCharacters(in: .whitespaces) != "*" }
-                .map { $0.lowercased() })
-            result = base.filter { !removeSet.contains($0.email.lowercased()) }
-        }
-        var seen = Set(result.map { $0.email.lowercased() })
-        for add in adds {
-            let key = add.email.lowercased()
-            if seen.insert(key).inserted {
-                result.append(add)
-            }
-        }
-        return result
-    }
-
-    /// Strip an optional `mailto:` prefix from an email-shaped string (case-insensitive).
-    /// Provider attendee lists (especially TB / CalDAV) sometimes carry the URI form.
+    /// Strip every `mailto:` prefix from an email-shaped string (in any letter case, repeated or
+    /// spaced as in `mailto: mailto:a@example.com`). Provider attendee lists (especially TB /
+    /// CalDAV) sometimes carry the URI form, and a model can copy it more than once.
     static func stripMailto(_ raw: String) -> String {
-        let trimmed = raw.trimmingCharacters(in: .whitespaces)
-        if trimmed.lowercased().hasPrefix("mailto:") {
-            return String(trimmed.dropFirst("mailto:".count))
+        var trimmed = raw.trimmingCharacters(in: .whitespaces)
+        while trimmed.lowercased().hasPrefix("mailto:") {
+            trimmed = String(trimmed.dropFirst("mailto:".count)).trimmingCharacters(in: .whitespaces)
         }
         return trimmed
     }

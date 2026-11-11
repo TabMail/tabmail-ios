@@ -868,15 +868,13 @@ extension AccountManager {
             // An edit of every occurrence writes the series (#560), whichever of its occurrences the
             // edit names.
             let writeId = routed.scope == "all" ? named.seriesId : routed.eventId
-            // calendar_event_edit-v1.5.21+: attendees are delta-based. If args carries
-            // add_attendees or remove_attendees, fetch the current event and resolve the
-            // delta against its attendee list before building the update input — so the
-            // existing attendees are preserved instead of being overwritten.
-            let resolvedArgs = try await resolveAttendeeDelta(
-                args: routed.args, eventId: writeId, calendarId: calId, provider: provider
-            )
+            // A guest change (`add_attendees` / `remove_attendees`) stays a change: it is never
+            // resolved here against one item's list. `buildGCalEventInput` carries it as
+            // `GCalEventInput.attendeeChange`, and the provider's write applies it to the stored
+            // guests of the item it writes; a whole-series write reaches each changed occurrence as
+            // the series' difference, on that occurrence's own guests (`AttendeeChange`, #620).
             if !named.afterOwnSplitCap, let reason = CalendarSeriesScope.dayMoveRefusal(
-                resolvedArgs, named: named, scope: routed.scope, zone: recurrenceIdZone) {
+                routed.args, named: named, scope: routed.scope, zone: recurrenceIdZone) {
                 throw CalendarProviderError.notSupported(reason)
             }
             // 🚨 AN RRULE `UNTIL`'S VALUE TYPE BELONGS TO THE DTSTART, AND ON AN EDIT THE DTSTART
@@ -930,12 +928,12 @@ extension AccountManager {
             // transient ⇒ retried, permanent ⇒ retired with a reason. Fail closed, per THE MANTRA; a
             // defaulted value here would be the same wrong-kind write, chosen by us instead of the
             // model.
-            let movesTime = CalendarToolHelpers.stringArgOpt(resolvedArgs, "start_iso") != nil
-                || CalendarToolHelpers.stringArgOpt(resolvedArgs, "end_iso") != nil
+            let movesTime = CalendarToolHelpers.stringArgOpt(routed.args, "start_iso") != nil
+                || CalendarToolHelpers.stringArgOpt(routed.args, "end_iso") != nil
             let written = routed.scope == "all" ? try named.readSeries() : named.event
             var stored: GCalEvent? = nil
             if resolvedAllDay == nil,
-               movesTime || CalendarToolHelpers.recurrenceUntilIsAtStake(resolvedArgs) {
+               movesTime || CalendarToolHelpers.recurrenceUntilIsAtStake(routed.args) {
                 stored = written
                 // `GCalDateTime.date` is populated only for an all-day event, on every provider:
                 // `ICSParser.makeGCalDateTime` (CalDAV), `ExchangeCalendarProvider.toGCalDateTime`,
@@ -965,8 +963,8 @@ extension AccountManager {
             // the refusal below needs it (an explicit `all_day: true` skipped the kind above and the
             // edit gives an end but no start); otherwise the value stays nil. The KIND still comes from
             // the stored event above, on every scope: an occurrence has its series' kind.
-            let movesEndOnly = CalendarToolHelpers.stringArgOpt(resolvedArgs, "end_iso") != nil
-                && CalendarToolHelpers.stringArgOpt(resolvedArgs, "start_iso") == nil
+            let movesEndOnly = CalendarToolHelpers.stringArgOpt(routed.args, "end_iso") != nil
+                && CalendarToolHelpers.stringArgOpt(routed.args, "start_iso") == nil
             var target = stored
             if scope == "all", target == nil, resolvedAllDay == true, movesEndOnly {
                 target = written
@@ -999,16 +997,16 @@ extension AccountManager {
             // (the event is gone) retire it with a reason.
             var occurrenceStartDay: String? = nil
             if let rid = recurrenceId,
-               CalendarToolHelpers.needsOccurrenceStartDay(resolvedArgs, storedStart: stored?.start, scope: scope) {
+               CalendarToolHelpers.needsOccurrenceStartDay(routed.args, storedStart: stored?.start, scope: scope) {
                 occurrenceStartDay = try await provider.occurrenceStartDay(
                     calendarId: calId, eventId: writeId, recurrenceId: rid, recurrenceIdZone: recurrenceIdZone)
             }
             if let reason = CalendarToolHelpers.allDayEditRefusal(
-                resolvedArgs, storedStart: target?.start, scope: scope, recurrenceId: recurrenceId,
+                routed.args, storedStart: target?.start, scope: scope, recurrenceId: recurrenceId,
                 occurrenceStartDay: occurrenceStartDay) {
                 throw CalendarProviderError.notSupported(reason)
             }
-            let input = try CalendarToolHelpers.buildGCalEventInput(resolvedArgs, isAllDay: resolvedAllDay)
+            let input = try CalendarToolHelpers.buildGCalEventInput(routed.args, isAllDay: resolvedAllDay)
 
             switch scope {
             case "this_only":
@@ -1060,60 +1058,6 @@ extension AccountManager {
             BackgroundSyncLogger.logDebug("[CalendarQueue] Deleted event id=\(eventId)")
         }
         return (nil, nil)
-    }
-
-    // MARK: - Attendee Delta Resolution (calendar_event_edit-v1.5.21)
-
-    /// When `args` carries `add_attendees` / `remove_attendees`, fetch the current event
-    /// and resolve the delta against its attendee list. Returns a copy of `args` with a
-    /// flat `attendees` array — which is what `buildGCalEventInput` consumes.
-    /// If neither delta key is present, returns `args` unchanged. If the fetch fails
-    /// (offline, transient), throws — the caller's retry path keeps the op queued.
-    private func resolveAttendeeDelta(
-        args: [String: JSONValue],
-        eventId: String,
-        calendarId: String,
-        provider: any CalendarProvider
-    ) async throws -> [String: JSONValue] {
-        let hasAdds = args["add_attendees"] != nil
-        let hasRemoves = args["remove_attendees"] != nil
-        guard hasAdds || hasRemoves else { return args }
-
-        let adds = CalendarToolHelpers.parseAttendeeAdds(args["add_attendees"])
-        let removes = CalendarToolHelpers.parseAttendeeRemoves(args["remove_attendees"])
-
-        // If the LLM emitted the delta keys but they're empty after parsing
-        // (e.g. `add_attendees: []`, or all entries filtered out for missing
-        // email), there's no change to apply. Strip the keys without fetching
-        // the event — otherwise we'd needlessly re-write the same attendee
-        // list, which under sendUpdates="all" re-notifies every existing
-        // attendee.
-        if adds.isEmpty && removes.isEmpty {
-            var out = args
-            out.removeValue(forKey: "add_attendees")
-            out.removeValue(forKey: "remove_attendees")
-            return out
-        }
-
-        let current = try await provider.getEvent(calendarId: calendarId, eventId: eventId)
-        let base: [(email: String, name: String?)] = (current.attendees ?? []).compactMap { att in
-            guard let raw = att.email, !raw.isEmpty else { return nil }
-            return (email: CalendarToolHelpers.stripMailto(raw), name: att.displayName)
-        }
-        let merged = CalendarToolHelpers.applyAttendeeDelta(base: base, adds: adds, removes: removes)
-
-        let mergedJSON: [JSONValue] = merged.map { entry in
-            var dict: [String: JSONValue] = ["email": .string(entry.email)]
-            if let name = entry.name, !name.isEmpty { dict["name"] = .string(name) }
-            return .dictionary(dict)
-        }
-        var out = args
-        out["attendees"] = .array(mergedJSON)
-        // Strip the delta keys so downstream code only sees the resolved list.
-        out.removeValue(forKey: "add_attendees")
-        out.removeValue(forKey: "remove_attendees")
-        BackgroundSyncLogger.logDebug("[CalendarQueue] Resolved attendee delta: base=\(base.count) +\(adds.count) -\(removes.count) → \(merged.count)")
-        return out
     }
 
     // MARK: - Error Classification

@@ -703,7 +703,8 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// re-anchored at the split (`mergeMasterAndPatch`) with the patch applied, under
     /// `transactionId`.
     ///
-    /// - Attendees keep their address, name and type; one the patch adds is `required`. Their
+    /// - Attendees are the series' with the edit's guest change applied (`AttendeeChange.apply`), and
+    ///   keep their address, name and type; one the change adds is `required`. Their
     ///   answers are not copied: Graph lets only the attendee write a response, so the new part's
     ///   attendees start unanswered, as they do when Outlook splits a series itself.
     /// - The recurrence keeps the stored pattern exactly. Its range keeps its end date (verbatim)
@@ -748,10 +749,13 @@ actor ExchangeCalendarProvider: CalendarProvider {
         written.endDateTime = edited.endDateTime
         written.endTimeZone = edited.endTimeZone
         written.recurrence = edited.recurrence
-        written.attendees = patch.attendees ?? (stored.event.attendees ?? []).compactMap { attendee in
+        let storedAttendees: [(email: String, name: String?)] = (stored.event.attendees ?? []).compactMap { attendee in
             guard let email = attendee.email, !email.isEmpty else { return nil }
             return (email: email, name: attendee.displayName)
         }
+        written.attendees = patch.attendeeChange.map { change in
+            change.apply(to: storedAttendees, address: { $0.email.lowercased() }) { (email: $0.email, name: $0.name) }
+        } ?? storedAttendees
 
         var json = stored.raw.filter { Self.splitCopiedKeys.contains($0.key) }
         if patch.location != nil { json.removeValue(forKey: "locations") }
@@ -895,8 +899,18 @@ actor ExchangeCalendarProvider: CalendarProvider {
     ///   A series edit that keeps its date writes no recurrence: any recurrence
     ///   write that differs from the stored one resets the series' exceptions
     ///   (#423, measured);
-    /// - attendees the edit keeps are written as stored, a new one `required` and unanswered
-    ///   (`editAttendeesJSON`, #622);
+    /// - the edit's guest change applied to the stored attendees of the item read: each one kept
+    ///   is written as stored, a new one `required` and unanswered (`appliedAttendeesJSON`, #622,
+    ///   #620). A series write is the only write the app makes for a change of every occurrence:
+    ///   Graph carries the series' resulting difference to each of its occurrences, on top of that
+    ///   occurrence's own guests: each guest the written list drops from the series' stored list is
+    ///   removed, each guest it holds that the stored list did not is added, and every other guest
+    ///   the occurrence holds stays (a guest it added on its own stays; one it dropped on its own
+    ///   comes back only when the series gains them), renamed and moved ones too, and an exception
+    ///   stays an exception. Measured on a test account (2026-11-11) for an added and a removed
+    ///   guest, for a series emptied of its guests (an exception kept the guest it held on its
+    ///   own) and for a series list written back unchanged (an exception that had dropped a guest
+    ///   stayed without them), as on Google (`AttendeeChange.seriesDifference`);
     /// - a new description of an online meeting replaces only the notes in the
     ///   stored body, keeping its join section (`onlineMeetingBody`, #511); the
     ///   description the assistant read is those notes (`notes(of:)`).
@@ -919,7 +933,6 @@ actor ExchangeCalendarProvider: CalendarProvider {
         sparse.location = patch.location
         sparse.description = patch.description
         sparse.transparency = patch.transparency
-        sparse.attendees = patch.attendees
         // The series' own zone (#423): a rule the edit gives is dated and labelled in it.
         let storedRecurrence = existing.raw["recurrence"] as? [String: Any]
         let storedZoneName = ((storedRecurrence?["range"] as? [String: Any])?["recurrenceTimeZone"] as? String)
@@ -957,8 +970,13 @@ actor ExchangeCalendarProvider: CalendarProvider {
             rule["range"] = range
             json["recurrence"] = rule
         }
-        if let wanted = sparse.attendees {
-            json["attendees"] = Self.editAttendeesJSON(stored: existing.raw["attendees"] as? [[String: Any]] ?? [], wanted: wanted)
+        if let change = patch.attendeeChange {
+            let own = existing.raw["attendees"] as? [[String: Any]] ?? []
+            let after = Self.appliedAttendeesJSON(change, to: own)
+            json["attendees"] = after
+            if DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[ExchangeCalendar] graphPatchJSON: guest change applied to 1 item, guests \(own.count)->\(after.count)")
+            }
         }
         if allowRecurrence, sparse.recurrence == nil, movesTime,
            var stored = existing.raw["recurrence"] as? [String: Any],
@@ -1124,21 +1142,18 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// measured accepted on an Outlook.com account, #622).
     nonisolated static var unansweredAttendeeStatus: [String: Any] { ["response": "none", "time": "0001-01-01T00:00:00Z"] }
 
-    /// The attendee list an edit writes when it changes who attends (#622): each attendee it
-    /// keeps exactly as the edit's read holds them (type, answer and name, matched by address in
-    /// any letter case), in the order the edit asks for; each one it adds as `required` and
-    /// unanswered. Measured on an Outlook.com account: Graph refuses with 405 an attendee list
-    /// in which any entry has no `status`, and an attendee sent with their stored status keeps
-    /// their answer.
-    nonisolated static func editAttendeesJSON(stored: [[String: Any]], wanted: [(email: String, name: String?)]) -> [[String: Any]] {
-        wanted.map { want in
-            if let kept = stored.first(where: {
-                (($0["emailAddress"] as? [String: Any])?["address"] as? String)?.lowercased() == want.email.lowercased()
-            }) {
-                return kept
-            }
-            var address: [String: Any] = ["address": want.email]
-            if let name = want.name { address["name"] = name }
+    /// The attendee list an edit writes when it changes who attends (#622): `change` applied to the
+    /// edit's read of the item (`AttendeeChange.apply`, #620). Each attendee it keeps goes back
+    /// exactly as the read holds them (type, answer and name, matched by address in any letter
+    /// case); each one it adds as `required` and unanswered. Measured on an Outlook.com account:
+    /// Graph refuses with 405 an attendee list in which any entry has no `status`, and an attendee
+    /// sent with their stored status keeps their answer.
+    nonisolated static func appliedAttendeesJSON(_ change: AttendeeChange, to stored: [[String: Any]]) -> [[String: Any]] {
+        change.apply(to: stored, address: {
+            (($0["emailAddress"] as? [String: Any])?["address"] as? String)?.lowercased()
+        }) { add in
+            var address: [String: Any] = ["address": add.email]
+            if let name = add.name { address["name"] = name }
             return ["emailAddress": address, "type": "required", "status": unansweredAttendeeStatus]
         }
     }

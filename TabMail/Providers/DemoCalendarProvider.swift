@@ -99,13 +99,11 @@ actor DemoCalendarProvider: CalendarProvider {
             // wedged one is reached first every time. A wedge sits in the same
             // non-recoverable set as a dropped intention.
             //
-            // ⚠️ THIS READ IS THE AUTHORITY FOR BOTH STALE-EDIT PATHS, which is why
-            // the signal is raised here rather than from `updateEvent`'s affected-row
-            // count. An `.edit` op carrying `add_attendees`/`remove_attendees`
-            // reaches `resolveAttendeeDelta` → `getEvent` BEFORE any update is
-            // attempted; every other `.edit` reaches `updateEvent`, whose UPDATE
-            // matches zero rows and which then confirms through this same `getEvent`.
-            // An affected-row check alone would have covered only the second.
+            // ⚠️ THIS READ IS THE AUTHORITY FOR THE STALE EDIT, which is why the
+            // signal is raised here rather than from `updateEvent`'s affected-row
+            // count. Every `.edit` op reaches `CalendarSeriesScope.read` → `getEvent`
+            // BEFORE any update is attempted, and `updateEvent`, whose UPDATE would
+            // match zero rows, confirms through this same `getEvent`.
             //
             // `createEvent`'s trailing confirmation read shares this throw, and the
             // disposition is right there too: reaching it means the row we just
@@ -150,6 +148,11 @@ actor DemoCalendarProvider: CalendarProvider {
         }
         let (startMs, endMs, allDay) = Self.parseDateInput(event)
         try await db.dbPool.write { conn in
+            // The edit's guest change applied to the stored guests, read in the same write (#620);
+            // an edit that names nobody keeps them as stored.
+            let stored = try String.fetchOne(
+                conn, sql: "SELECT attendeesJSON FROM demoCalendarEvent WHERE id = ?", arguments: [eventId])
+            let attendeesJSON = try event.attendeeChange.map { try Self.applied($0, to: stored) } ?? stored
             try conn.execute(sql: """
                 UPDATE demoCalendarEvent
                 SET title = ?, location = ?, description = ?, startMs = ?, endMs = ?, allDay = ?, attendeesJSON = ?
@@ -161,11 +164,24 @@ actor DemoCalendarProvider: CalendarProvider {
                 startMs,
                 endMs,
                 allDay ? 1 : 0,
-                Self.encodeAttendees(event.attendees),
+                attendeesJSON,
                 eventId,
             ])
         }
         return try await getEvent(calendarId: "primary", eventId: eventId)
+    }
+
+    /// `change` applied to the stored guests (`attendeesJSON`, as `encodeAttendees` writes them):
+    /// each one kept as stored, each one added by address and name.
+    private static func applied(_ change: AttendeeChange, to storedJSON: String?) throws -> String? {
+        let stored = try storedJSON.map { try JSONDecoder().decode([[String: String]].self, from: Data($0.utf8)) } ?? []
+        let after = change.apply(to: stored, address: { $0["email"]?.lowercased() }) { add in
+            var entry = ["email": add.email]
+            if let name = add.name { entry["name"] = name }
+            return entry
+        }
+        guard !after.isEmpty else { return nil }
+        return String(decoding: try JSONEncoder().encode(after), as: UTF8.self)
     }
 
     /// The demo calendar stores no rule (`updateEvent` writes none), so an edit never changes one.

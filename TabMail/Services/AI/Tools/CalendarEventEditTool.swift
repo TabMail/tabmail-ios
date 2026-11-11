@@ -384,33 +384,11 @@ struct CalendarEventEditTool: AgentTool, Sendable {
             ?? shown.summary
             ?? "(Event)"
 
-        // Attendees are delta-based (v1.5.21+): parse add_attendees / remove_attendees,
-        // merge against the freshly-fetched event's attendees for the projected final list
-        // shown on the confirmation card. The queue path re-resolves the delta at execute
-        // time against the latest provider state — the card here is best-effort preview.
-        let addAttendees = CalendarToolHelpers.parseAttendeeAdds(arguments["add_attendees"])
-        let removeAttendees = CalendarToolHelpers.parseAttendeeRemoves(arguments["remove_attendees"])
-        var attendeeNames: [String] = []
-        let baseAttendees: [(email: String, name: String?)] = (shown.attendees ?? []).compactMap { att in
-            guard let raw = att.email, !raw.isEmpty else { return nil }
-            let email = CalendarToolHelpers.stripMailto(raw)
-            return (email: email, name: att.displayName)
-        }
-        if !addAttendees.isEmpty || !removeAttendees.isEmpty {
-            let merged = CalendarToolHelpers.applyAttendeeDelta(
-                base: baseAttendees, adds: addAttendees, removes: removeAttendees
-            )
-            attendeeNames = merged.map { entry in
-                if let n = entry.name, !n.isEmpty { return "\(n) <\(entry.email)>" }
-                return entry.email
-            }
-            let deltaSummary = [
-                addAttendees.isEmpty ? nil : "+\(addAttendees.count)",
-                removeAttendees.isEmpty ? nil : "-\(removeAttendees.count)"
-            ].compactMap { $0 }.joined(separator: " / ")
-            if !deltaSummary.isEmpty {
-                changes.append("attendees → \(deltaSummary)")
-            }
+        // The guest change, as the people added and removed (`AttendeeChange.cardLines`), never a
+        // resulting list: the write applies the change to each item the edit covers, whose guests
+        // can differ (#620), as the Thunderbird add-on's card shows it.
+        if let change = AttendeeChange(arguments: arguments) {
+            changes.append(contentsOf: change.cardLines)
         }
 
         // ADR-IOS-024: Show confirmation card. Title/start/end/all-day
@@ -429,7 +407,7 @@ struct CalendarEventEditTool: AgentTool, Sendable {
                 endDate: cardEnd ?? Date(),
                 isAllDay: shown.isAllDay,
                 changes: changes,
-                attendees: attendeeNames,
+                attendees: [],
                 timeZoneId: CalendarToolHelpers.stringArgOpt(arguments, "timezone"),
                 notes: CalendarToolHelpers.stringArgOpt(arguments, "description")
             )],

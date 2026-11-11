@@ -243,11 +243,43 @@ the PATCH body the fake calendar received:
 - adding an attendee sends every other attendee exactly as stored (organizer, optional, resource,
   additional guests) and the new one by address and name;
 - removing one drops only that attendee;
-- an address in another letter case still matches its stored entry, on either side, and the list
-  keeps the order the edit asks for;
+- an address in another letter case still matches its stored entry, on either side; a guest
+  removed and added back in one change keeps their stored entry, at the end of the list;
 - adding the first attendee to an event with none sends just that attendee;
 - an edit that names no attendee change sends no attendee list;
 - an occurrence edit keeps that occurrence's own stored attendees.
+
+## A guest change reaches every item it covers, each from its own guests (#620)
+
+An edit carries the guest change itself (`AttendeeChange`), and each write applies it to the stored
+guests of the item it writes; a whole-series change reaches each changed occurrence as the series'
+resulting difference (`AttendeeChange.seriesDifference`: the guests the series lost removed, the
+guests it gained added, on the occurrence's own guests). That is Google's rule and Outlook's,
+measured on both (2026-11-11) for an added and a removed guest, a series emptied of its guests (an
+occurrence kept the extra guest it held on its own) and a series list written back unchanged (an
+occurrence that had dropped a guest stayed without them); Google is the reference, so CalDAV gives
+its changed occurrences the same difference. `CalendarGuestChangeTests` checks, on each fake server
+after the real calendar queue drains the edit, that the item written holds the change applied to
+its OWN guests, every changed occurrence of a whole-series edit the series' difference on its own
+(kept guests byte-identical, new ones unanswered, removed ones gone; `GuestChangeOracle`), and
+every item outside the scope is untouched: CalDAV (every VEVENT: series, changed occurrences, a
+split's new part and the occurrences it carries, a one-occurrence edit by the series id), Google
+and Outlook (the item the write reads, the server carrying the series' change; `FakeGoogleCalendar`
+and `FakeGraphCalendar` model the measured difference), plus pins that held before the fix. Case 3
+runs, on all three providers (and case 19 on a CalDAV split), the five shapes where the difference
+is not the change itself: `"*"`, `"*"` with a guest added back, an add of a guest the series holds
+that an occurrence dropped, a remove and re-add of such a guest, and a removal of a guest only a
+changed occurrence holds (the series does not, so the occurrence keeps them); each also checks weeks 4 and 5
+against addresses worked out by hand. The Google and Outlook whole-series cases check that the app
+writes no occurrence. `AttendeeChangeTests` covers the function itself (order, `"*"` and
+`mailto:*`, letter case, `mailto:` prefixes, a guest with no address, re-adding, an add or removal
+given twice, a changed occurrence's own guests, the series' difference);
+`CalDAVWholeSeriesEditTests` a cancelled occurrence changed like any other, a VEVENT the change
+leaves byte for byte (attendee lines between other properties too), and a new attendee's double
+quote written as a single quote; `GoogleSeriesSplitCopyTests` the first guest a split adds to a
+series with none; `DemoGuestChangeTests` the demo calendar (an event left with no guests stores no
+list); `CalendarToolResolvedAccountTests` the edit card, which names the people added ("Name
+<address>") and removed, each once, three and "and N more", and shows no list.
 
 ## Inbox list — layered test architecture
 
