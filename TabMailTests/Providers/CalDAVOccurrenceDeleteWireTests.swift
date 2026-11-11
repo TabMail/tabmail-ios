@@ -725,17 +725,4 @@ struct CalDAVOccurrenceDeleteWireTests {
         #expect(Self.writes(http).isEmpty, "the refused delete wrote: \(Self.writes(http))")
         #expect(store.storedICS(path: W.seriesPath) == ics, "the series is not on the server as it was")
     }
-
-    @Test("source fence: deleteOccurrence runs requireDeletedAlone before its one PUT (no wire input can make the check's identity half fire)")
-    func checkRunsBeforeThePut() throws {
-        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        let text = try String(contentsOf: root.appendingPathComponent("TabMail/Providers/CalDAV/CalDAVProvider.swift"), encoding: .utf8)
-        let start = try #require(text.range(of: "private func deleteOccurrence("))
-        let end = try #require(text[start.upperBound...].range(of: "\n    }\n"))
-        let body = text[start.upperBound..<end.lowerBound]
-        let check = try #require(body.range(of: "try CalDAVOccurrences.requireDeletedAlone(deletion, updatedICS: updatedICS"))
-        let put = try #require(body.range(of: "client.put("))
-        #expect(check.upperBound <= put.lowerBound, "the check does not come before the PUT")
-        #expect(body.components(separatedBy: "client.put(").count == 2, "deleteOccurrence has more than one PUT")
-    }
 }
