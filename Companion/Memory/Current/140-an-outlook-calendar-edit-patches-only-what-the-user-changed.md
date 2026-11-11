@@ -193,7 +193,9 @@ that aren't included in the request body maintain their previous values".
   Google measurement above, true when the edit moves the series' start or end
   (`GoogleCalendarProvider.movesSeriesTime` with `googleTimes`, the date or instant and the zone Google
   reads, so its own times spelled otherwise are no move and the same instant in another zone is one;
-  Outlook shared this function until a consult gave it its own comparison, now by instant, above). Google's write sends the merged start and end every time, unchanged; CalDAV replaces
+  Outlook shared this function until a consult gave it its own comparison, now by instant, above). (SUPERSEDED: "Google's write sends the merged start and end every time, unchanged".)
+  Current: a Google whole-series edit whose times compare equal (`googleTimes`) now omits start and end;
+  a same-instant re-zone between equal fixed-offset zones is not written, the same limit Outlook has (#667). CalDAV replaces
   only the RRULE line, so it answers by that line alone; the demo calendar stores no rule. Replaced in
   review: a card-side normaliser (`CalendarToolHelpers.ruleChanges` over a `RuleMeaning` of the two
   RRULEs) that could disagree with the write, deleted. Creates and the split's new
