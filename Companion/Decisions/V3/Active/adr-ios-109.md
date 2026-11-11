@@ -21,8 +21,9 @@ series with no organizer, and both halves of a split were all written without it
 
 **Decision:**
 1. **One step on every PUT.** `CalDAVProvider.putEvent(url:body:precondition:)` is the only
-   caller of `client.put`; the create, the whole-event edit, the one-occurrence edit and both PUTs
-   of a split go through it. It runs `withOrganizer` on the final body: the pure
+   caller of `client.put`; all six writes go through it: the create, the whole-event edit, the
+   one-occurrence edit, the one-occurrence delete's `EXDATE` PUT (`deleteOccurrence`) and both PUTs
+   of a split. It runs `withOrganizer` on the final body: the pure
    `CalDAVProvider.organized(_:own:)` (`CalDAVOrganizer.swift`). A source fence
    (`CalDAVOrganizerStepTests.onePutCallSite`) keeps `client.put(` at one call site. The split
    prepares both bodies before its first PUT, so a lookup that fails there writes nothing. When the
@@ -88,7 +89,9 @@ series with no organizer, and both halves of a split were all written without it
   Outlook.
 - Late invitations: any later write of a stored event that has guests and no organizer (almost
   always one TabMail wrote before this ADR, on a server that accepted it), such as a title edit,
-  a one-occurrence edit or a split, adds the organizer. RFC 6638 §3.2.3.1 makes that PUT a
+  a one-occurrence edit, a split or the delete of one occurrence, adds the organizer. For a delete,
+  the remaining guests then get their first invitation, to the rest of the series, when one
+  occurrence is deleted. RFC 6638 §3.2.3.1 makes that PUT a
   scheduling "Create", so the server invites those guests then, possibly long after they were
   added. Those guests were added to be invited, and on iCloud such a resource can't be written back
   without an organizer.
@@ -100,8 +103,10 @@ series with no organizer, and both halves of a split were all written without it
   set; the `.well-known` try adds one on a non-iCloud server), once per provider when an address is
   found. On a server that advertises none, nothing is cached, so every PUT that needs the address
   asks again: a split asks up to four times.
-- The irreversible wire operations are unchanged: the split's cap PUT gains a property, and its
-  membership predicate is unaffected.
+- The irreversible wire operations are unchanged: the split's cap PUT and the one-occurrence
+  delete's `EXDATE` PUT may gain ORGANIZER lines, and their membership predicate is unaffected. The
+  delete's check (`CalDAVOccurrences.requireDeletedAlone`) compares what each VEVENT is, not its
+  content, so the added lines cannot trip it, and a lookup that fails throws before the PUT.
 - `MultistatusParser` keeps every href of a property in order (`propertyHrefs`); `properties` is
   unchanged (the last href, as before) for its existing readers.
 

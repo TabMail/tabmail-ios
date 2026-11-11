@@ -996,7 +996,8 @@ resource names one or the server advertises the user's address, and never with a
   lookup is never kept, so the retry asks again; an answer that is not XML, or a server with no
   principal, means none; a principal answered 404 is never "event not found"; a split whose capped
   series alone needs the address looks it up before its first PUT; a lookup answered 401 sends no
-  PUT and is retired by the auth arm with its reason (T7).
+  PUT and is retired by the auth arm with its reason (T7). Deleting one occurrence of a series whose
+  guests have no organizer writes its `EXDATE` PUT with the advertised address (test 20).
 - `CalDAVOrganizerStepTests`: the pure step (`organized`) returns a body that needs nothing byte for
   byte (a series with its organizer and guests beside a changed occurrence with neither too),
   gives every VEVENT without an organizer the same one once any VEVENT needs it (one that has

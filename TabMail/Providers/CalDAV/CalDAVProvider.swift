@@ -425,8 +425,9 @@ actor CalDAVProvider: CalendarProvider {
         // is, and the series must no longer read the occurrence.
         try CalDAVOccurrences.requireDeletedAlone(deletion, updatedICS: updatedICS, href: seriesHref)
         // No ETag ⇒ `.unconditional`, as every CalDAV write of a resource the GET above proved
-        // exists (see `updateEvent`).
-        _ = try await client.put(
+        // exists (see `updateEvent`). Through `putEvent`, as every CalDAV PUT: a series with guests
+        // and no organizer gets one (ADR-IOS-109), and a lookup that fails writes nothing.
+        try await putEvent(
             url: eventURL, body: updatedICS,
             precondition: etag.map(CalDAVPutPrecondition.ifMatch) ?? .unconditional)
         etagCache.removeValue(forKey: seriesHref)

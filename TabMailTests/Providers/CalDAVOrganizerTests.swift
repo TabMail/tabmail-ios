@@ -723,9 +723,14 @@ struct CalDAVOrganizerTests {
         let run = Self.setUp([F.path: seed], refuses: false)
         defer { run.http.close() }
         let occurrenceId = "\(F.path)#\(F.icsUTC(F.occurrence))"
-        let rows = try await Self.edit(run, F.scoped(F.rename, "this_only"), account: "org711-overrides-only",
-                                       eventId: occurrenceId)
-        #expect(rows.isEmpty, Self.landed(rows))
+        // Through the provider's one-occurrence edit, as `CalDAVOccurrenceWireTests` edits such a
+        // resource: the queue's series read (`CalendarSeriesScope.read`) reads its series first.
+        var patch = GCalEventInput()
+        patch.summary = "Planning, new agenda"
+        _ = try await run.provider.updateOccurrence(
+            calendarId: F.calendarId, eventId: occurrenceId, recurrenceId: F.naiveUTC(F.occurrence),
+            recurrenceIdZone: try #require(TimeZone(identifier: "UTC")), event: patch, sendUpdates: "all")
+        #expect(run.puts.map(\.path) == [F.path], "PUTs: \(run.puts.map(\.path))")
         let after = try Self.stored(run)
         #expect(after.contains("SUMMARY:Planning\\, new agenda"), Comment(rawValue: after))
         #expect(!after.contains("ORGANIZER"), Comment(rawValue: after))
@@ -798,6 +803,27 @@ struct CalDAVOrganizerTests {
         let after = try Self.stored(run)
         #expect(after == first, "the replay changed the server:\n\(after)")
         #expect(run.puts.count == 2, "PUTs: \(run.puts.map(\.path))")
+    }
+
+    // MARK: 20: the delete of one occurrence
+
+    @Test("20: deleting one occurrence of a series whose guests have no organizer writes its EXDATE with the user's address")
+    func occurrenceDeleteGetsTheOrganizer() async throws {
+        let seed = F.series(["ATTENDEE;CN=Guest:mailto:\(F.guest)"])
+        let run = Self.setUp([F.path: seed])
+        defer { run.http.close() }
+        let occurrence = CalDAVOccurrences.OccurrenceId.make(seriesHref: F.path, key: F.icsUTC(F.occurrence))
+        let rows = try await drainCalendarOperation(
+            type: .delete, accountId: "org711-occurrence-delete", eventId: occurrence, calendarId: F.calendarId,
+            arguments: [:], provider: run.provider)
+        #expect(rows.isEmpty, Self.landed(rows))
+        let after = try Self.stored(run)
+        #expect(F.masterOwn(after, "ORGANIZER") == ["ORGANIZER:\(F.own)"], Comment(rawValue: after))
+        #expect(F.masterOwn(after, "ATTENDEE").compactMap(VEventOracle.address) == [F.guest])
+        let exdates = F.masterOwn(after, "EXDATE")
+        #expect(exdates.count == 1 && exdates.first?.hasSuffix(":\(F.icsUTC(F.occurrence))") == true, Comment(rawValue: after))
+        #expect(run.puts.count == 1, "PUTs: \(run.puts.map(\.path))")
+        F.expectInvariant(before: seed, after: after, advertised: F.advertised)
     }
 }
 

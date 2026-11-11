@@ -455,7 +455,8 @@ enum CalDAVOccurrences {
     /// other changed occurrence, compared by what each VEVENT is (`vEventIdentities`: the
     /// series, or the occurrence key its RECURRENCE-ID names), so no other changed copy is
     /// lost with the deleted one; it does not compare their content, which the rewrite keeps
-    /// byte for byte. Second, it must no longer have the occurrence (an `EXDATE` the series
+    /// byte for byte (the PUT, through `CalDAVProvider.putEvent`, may then add ORGANIZER lines to
+    /// them, ADR-IOS-109, which changes no VEVENT's identity). Second, it must no longer have the occurrence (an `EXDATE` the series
     /// would not read as it would leave it where it is, its changed copy gone). Throws
     /// `notSupported`, nothing written, when either fails.
     static func requireDeletedAlone(_ deletion: OccurrenceDeletion, updatedICS: String, href: String) throws {
