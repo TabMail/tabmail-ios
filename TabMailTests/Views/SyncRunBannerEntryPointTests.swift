@@ -11,14 +11,15 @@ import Testing
 ///
 /// | Entry point                                   | Coverage            | Raises | Clears              |
 /// |-----------------------------------------------|---------------------|--------|---------------------|
-/// | `InboxViewModel.refreshSync` (unified inbox)  | full                | yes    | on success          |
-/// | `InboxViewModel.refreshSync` (some accounts)  | partial             | yes    | never               |
+/// | `InboxViewModel.refreshSync` (unified inbox)  | full                | on a counted failure | on success; never when it failed |
+/// | `InboxViewModel.refreshSync` (some accounts)  | partial             | on a counted failure | never               |
 /// | `AccountManager.foregroundPollRun`            | full                | never  | when no account failed |
 /// | `AccountManager.backgroundPollRun(nil)`       | full                | never  | when no account failed |
 /// | `AccountManager.backgroundPollRun(email)`     | partial             | never  | never               |
 ///
-/// "Failed" above means counted: an account marked sign-in-needed never counts,
-/// for raising or for clearing (`AccountManagerState.finishSyncRun`).
+/// "Failed" above means counted (`InboxErrorBanner.countsAsFailure`): for a poll,
+/// an account marked sign-in-needed never counts. A refresh judges the one error
+/// it sees (`AccountManagerState.finishSyncRun`).
 ///
 /// Two accounts: A and B, each failing while set to, healthy otherwise. Both run
 /// against `MockEmailProvider`s registered on `AccountManager.shared`.
@@ -210,11 +211,8 @@ struct SyncRunBannerEntryPointTests {
             await world.setFailing(false)
             _ = await AccountManager.shared.foregroundPollRun()
             #expect(banner == nil, "a marked account's failure kept the generic banner up")
-
-            await raiseThroughRefresh(world)
-            await world.setFailing(false)
-            await InboxViewModel(folders: [world.inboxA, world.inboxB]).refreshSync()
-            #expect(banner == nil, "a full refresh did not clear past a marked account's failure")
+            _ = await AccountManager.shared.backgroundPollRun(accountEmail: nil, inboxOnly: false)
+            #expect(banner == nil)
         }
     }
 
@@ -231,18 +229,6 @@ struct SyncRunBannerEntryPointTests {
         }
     }
 
-    @Test("a failure from an account already marked sign-in-needed never raises")
-    func markedAccountFailureNeverRaises() async throws {
-        try await withWorld { world in
-            await AccountManager.shared.markAuthFailed(world.accountA.id)
-            await world.setFailing(true)
-            await InboxViewModel(folders: [world.inboxA]).refreshSync()
-            #expect(banner == nil, "a partial refresh raised for a marked account")
-            await InboxViewModel(folders: [world.inboxA, world.inboxB]).refreshSync()
-            #expect(banner == nil, "a full refresh raised for a marked account")
-        }
-    }
-
     @Test("a foreground poll where every account fails neither clears nor completes")
     func allFailedForegroundPollDoesNotClear() async throws {
         try await withWorld { world in
@@ -255,6 +241,54 @@ struct SyncRunBannerEntryPointTests {
             #expect(AccountManagerState.shared.lastSyncCompletedAt == completedBefore,
                     "an all-failed poll advanced lastSyncCompletedAt")
             #expect(AccountManagerState.shared.lastSyncFailed)
+        }
+    }
+
+    // MARK: - A failed refresh never clears
+
+    @Test("a full refresh where a marked and an unmarked account both fail never clears, in either order")
+    func failedRefreshWithMarkedAndUnmarkedNeverClears() async throws {
+        for markA in [true, false] {
+            for foldersFirstA in [true, false] {
+                try await withWorld { world in
+                    await raiseThroughRefresh(world)
+                    #expect(banner == InboxErrorBanner.genericMessage)
+                    await world.setBFailing(true)
+                    await AccountManager.shared.markAuthFailed(markA ? world.accountA.id : world.accountB.id)
+                    let folders = foldersFirstA ? [world.inboxA, world.inboxB] : [world.inboxB, world.inboxA]
+                    for refresh in 1...3 {
+                        await InboxViewModel(folders: folders).refreshSync()
+                        #expect(banner == InboxErrorBanner.genericMessage,
+                                "a failed refresh cleared (marked \(markA ? "A" : "B"), A first: \(foldersFirstA), refresh \(refresh))")
+                    }
+                }
+            }
+        }
+    }
+
+    @Test("a background poll where an account is temporarily refused still clears")
+    func temporaryRefusalLetsBackgroundPollClear() async throws {
+        try await withWorld { world in
+            await raiseThroughRefresh(world)
+            let refusal = ProviderTemporaryRefusal(underlying: NSError(domain: "com.example.test", code: 9))
+            await world.providerA.setConnectThrows(refusal)
+            await world.providerA.setFetchMessagesThrows(refusal)
+            _ = await AccountManager.shared.backgroundPollRun(accountEmail: nil, inboxOnly: false)
+            #expect(banner == nil, "a temporary refusal blocked the clear")
+        }
+    }
+
+    @Test("a poll that cannot load its accounts counts as failed and cannot clear")
+    func accountLoadFailureCannotClear() async throws {
+        try await withWorld { world in
+            await raiseThroughRefresh(world)
+            await world.setFailing(false)
+            try await world.pool.write { db in try db.execute(sql: "ALTER TABLE account RENAME TO account_hidden") }
+            let background = await AccountManager.shared.backgroundPollRun(accountEmail: nil, inboxOnly: false)
+            let foreground = await AccountManager.shared.foregroundPollRun()
+            try await world.pool.write { db in try db.execute(sql: "ALTER TABLE account_hidden RENAME TO account") }
+            #expect(background.countedFailure && foreground.countedFailure)
+            #expect(banner == InboxErrorBanner.genericMessage, "a poll that loaded no accounts cleared the banner")
         }
     }
 }

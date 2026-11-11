@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import GRDB
 import SwiftMail
 import Testing
 @testable import TabMail
@@ -155,5 +156,27 @@ struct InboxErrorBannerTests {
         #expect(!manager.isAuthError(IMAPError.loginFailed("no([UNAVAILABLE] LOGIN failed)")))
         #expect(!manager.isAuthError(IMAPError.loginFailed("no([AUTHENTICATIONFAILED] x)")))
         #expect(!manager.isAuthError(UnknownError()))
+    }
+
+    @Test("countsAsFailure: marked, cancellation, DB suspension and temporary refusals never count; timeouts and the rest do")
+    func countsAsFailureTable() {
+        let generic = NSError(domain: "com.example.test", code: 7)
+        let suspension = DatabaseError(resultCode: .SQLITE_INTERRUPT)
+        #expect(suspension.isDatabaseSuspensionAbort, "the table's suspension case is not a suspension abort")
+        let rows: [(String, any Error, Bool, Bool)] = [
+            ("marked, generic", generic, true, false),
+            ("marked, timeout", TimeoutError(duration: 30), true, false),
+            ("cancellation", CancellationError(), false, false),
+            ("DB suspension", suspension, false, false),
+            ("temporary refusal",
+             ProviderTemporaryRefusal(underlying: IMAPError.loginFailed("no([UNAVAILABLE] try later)")), false, false),
+            ("HTTP 503", ProviderError.networkError(underlying: HTTPError.networkError(statusCode: 503)), false, false),
+            ("timeout", TimeoutError(duration: 30), false, true),
+            ("credential refusal", IMAPError.loginFailed("no([AUTHENTICATIONFAILED] no)"), false, true),
+            ("generic", generic, false, true),
+        ]
+        for (name, error, marked, counts) in rows {
+            #expect(InboxErrorBanner.countsAsFailure(error, accountMarkedSignInNeeded: marked) == counts, "\(name)")
+        }
     }
 }

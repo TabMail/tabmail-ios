@@ -181,19 +181,20 @@ build**. The error's text stays in the debug-gated logs only.
   (offline still shows no banner) and `AuthError.refreshFailed` (a refused sign-in is told by the
   per-account `SignInAgainBanner`, which reads `authFailedAccounts`). `AccountReauthAlert.line(for:)`
   in `AccountDetailView.swift` does the same for the alert. `text(for:loggingEnabled:)` is deleted.
-- **Sync banner state.** The generic banner means "as of the last full run, some account that is not
-  already marked sign-in-needed failed for a non-temporary reason". That one rule is stated in code once,
-  on `AccountManagerState.finishSyncRun(foreground:coverage:countedFailure:raisingFailure:completed:)`, the
-  single place every run publishes to `syncErrorBanner`. Only a user-started inbox refresh
-  (`InboxViewModel.performSync`) raises it, on its own counted failure; scheduler and background runs
-  (`AccountManager.foregroundPollRun`, `backgroundPollRun`) never raise it. A FULL run (every active
-  account; the unified-inbox refresh counts) with no counted failure clears it; a partial run never clears,
-  so a healthy account's push or pull cannot hide another account's failure. Accounts in
-  `authFailedAccounts` never count, for raising or for clearing (`InboxErrorBanner.countsAsFailure`): their
-  own "Sign in again" banner tells the user, and counting them would hold a stale generic banner up after
-  the failing account recovered (superseded rule, kept for history: "only a full run with NO failure at all
-  clears"). An all-failed foreground poll does not advance `lastSyncCompletedAt`. The older-messages catch
-  writes the same fixed line to `InboxViewModel.error`.
+- **Sync banner state.** The rule is stated once in code, on `AccountManagerState.finishSyncRun`; its two
+  writers are `finishSyncRun(coverage:countedFailure:completed:)` and `failRefresh(countedFailure:)`. The
+  generic banner is raised only by a user-started refresh (`InboxViewModel.performSync`) that failed with
+  an error that counts (`InboxErrorBanner.countsAsFailure`, and a shown line). A failed refresh never clears
+  it: the failure path calls `failRefresh`, which has no clear branch (main's behaviour). It is cleared only by
+  a run that covered every active account with no counted failure; polls (`AccountManager.foregroundPollRun`,
+  `backgroundPollRun`) clear it this way, so recovery heals it, and never raise it. For polls, accounts in
+  `authFailedAccounts` never count. A refresh judges the one error it sees: it has no per-account
+  attribution, so it cannot tell a marked account's error apart. Seeing only the first error and the connect
+  loop stopping other accounts are filed separately. A poll that cannot load its accounts counts as failed.
+  An all-failed foreground poll does not advance `lastSyncCompletedAt`. Superseded rules, kept for history:
+  "only a full run with NO failure at all clears", then "a full refresh whose first error came from a marked
+  account clears" (it cleared while another account was still failing). The older-messages catch writes the
+  same fixed line to `InboxViewModel.error`.
 - **Replaced provider is detached.** `installAcceptedPasswordProbeAsLive` detaches the old live provider's
   sign-in reporter in the same actor turn as the swap, so a late refusal of the old password cannot mark
   the account the user just fixed.

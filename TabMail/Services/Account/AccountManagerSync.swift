@@ -251,8 +251,8 @@ extension AccountManager {
         await MainActor.run {
             let state = AccountManagerState.shared
             state.lastSyncFailed = result.failed
-            state.finishSyncRun(foreground: false, coverage: .full, countedFailure: result.countedFailure,
-                                raisingFailure: false, completed: !result.failed)
+            state.finishSyncRun(coverage: .full, countedFailure: result.countedFailure,
+                                completed: !result.failed)
         }
         return result
     }
@@ -269,8 +269,8 @@ extension AccountManager {
         await MainActor.run {
             let state = AccountManagerState.shared
             state.lastSyncFailed = false
-            state.finishSyncRun(foreground: false, coverage: accountEmail == nil ? .full : .partial,
-                                countedFailure: result.countedFailure, raisingFailure: false, completed: true)
+            state.finishSyncRun(coverage: accountEmail == nil ? .full : .partial,
+                                countedFailure: result.countedFailure, completed: true)
         }
         return result
     }

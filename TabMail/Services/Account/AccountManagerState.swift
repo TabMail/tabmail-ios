@@ -122,33 +122,37 @@ final class AccountManagerState {
     /// `InboxErrorBanner`'s fixed lines; never text derived from an error.
     var syncErrorBanner: String?
 
-    /// The single place a sync run publishes its end state for the inbox, and
-    /// the single statement of what the generic banner means:
+    /// What the generic inbox banner means, stated once for its only two writers
+    /// (`finishSyncRun` and `failRefresh`):
     ///
-    /// The generic banner means "as of the last full run, some account that is
-    /// not already marked sign-in-needed failed for a non-temporary reason". It
-    /// is raised only by foreground (user-started) runs, and cleared by a full
-    /// run in which no such account failed. Accounts marked sign-in-needed never
-    /// count, for raising or for clearing: their own "Sign in again" banner
-    /// tells the user.
+    /// The generic banner is raised only by a user-started refresh that failed
+    /// with an error that counts (`InboxErrorBanner.countsAsFailure`). A failed
+    /// refresh never clears it. It is cleared only by a run that covered every
+    /// active account and had no counted failure; scheduler and background polls
+    /// clear it this way too, so recovery heals it without a gesture, and they
+    /// never raise it. Accounts marked sign-in-needed never count against a
+    /// clear: their own "Sign in again" banner tells the user.
     ///
-    /// - `foreground`: a user-started refresh (only these raise).
+    /// A run that did not fail as a whole (every poll, and a refresh that
+    /// succeeded) ends here. It never raises.
     /// - `coverage`: whether the run covered every active account.
-    /// - `countedFailure`: an account in the run that is not marked
-    ///   sign-in-needed failed for a non-temporary reason
-    ///   (`InboxErrorBanner.countsAsFailure`).
-    /// - `raisingFailure`: such a failure is one the banner shows
-    ///   (`InboxErrorBanner.text` is not `nil`; offline is not).
+    /// - `countedFailure`: an account in the run failed with an error that
+    ///   counts, not being marked sign-in-needed (`InboxErrorBanner.countsAsFailure`).
     /// - `completed`: whether this run advances `lastSyncCompletedAt`.
-    func finishSyncRun(foreground: Bool, coverage: SyncRunCoverage, countedFailure: Bool,
-                       raisingFailure: Bool, completed: Bool) {
-        if foreground && raisingFailure {
-            syncErrorBanner = InboxErrorBanner.genericMessage
-        } else if coverage == .full && !countedFailure {
+    func finishSyncRun(coverage: SyncRunCoverage, countedFailure: Bool, completed: Bool) {
+        if coverage == .full && !countedFailure {
             syncErrorBanner = nil
         }
         if completed {
             lastSyncCompletedAt = Date()
+        }
+    }
+
+    /// A user-started refresh failed. It raises the banner when its error counts
+    /// and never clears it (see `finishSyncRun` for the banner's meaning).
+    func failRefresh(countedFailure: Bool) {
+        if countedFailure {
+            syncErrorBanner = InboxErrorBanner.genericMessage
         }
     }
 
