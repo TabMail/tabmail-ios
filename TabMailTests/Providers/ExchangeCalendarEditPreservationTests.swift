@@ -79,7 +79,12 @@ import Synchronization
 ///   exception. Measured on an Outlook.com test account (2026-11-11), for an
 ///   added and a removed guest, a series emptied of its guests and a series
 ///   list written back unchanged, on renamed, moved and unchanged occurrences
-///   and on exceptions with guest differences of their own.
+///   and on exceptions with guest differences of their own;
+/// - a PATCH of a series whose timed `start` is labelled with a zone other than the series'
+///   stored zone is refused with 400 `ErrorPropertyValidationFailure`, and changes nothing
+///   (`seriesStartZoneRefusal`: measured on a work account 2026-11-11 for another zone and for a
+///   name whose rules now differ; an end alone, one occurrence and an all-day `UTC` date are
+///   measured accepted; a stored zone TabMail does not recognize is not checked, unmeasured).
 ///
 /// A timed event's starts and ends are returned as stored, whatever zone `Prefer` names: a
 /// fixture stores them as Graph renders them for the device. An all-day event's `start` and `end`
@@ -364,6 +369,7 @@ final class FakeGraphCalendar: Sendable {
                 return .json(raw: #"{"error":{"code":"ErrorOccurrenceCrossingBoundary","message":"An occurrence can't be moved onto another occurrence of its series."}}"#,
                              statusCode: 400)
             }
+            if let refusal = Self.seriesStartZoneRefusal(patch, stored: stored) { return refusal }
             patchLog.withLock { $0.append((id: parts[0], body: body)) }
             let changesRule = patch["recurrence"].map { Self.canonicalJSON($0) != Self.canonicalJSON(stored["recurrence"]) } ?? false
             let isSeries = stored["recurrence"] != nil && !(stored["recurrence"] is NSNull)
@@ -503,6 +509,36 @@ final class FakeGraphCalendar: Sendable {
         events.withLock { Array($0.values) }
             .compactMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
             .contains { $0["seriesMasterId"] as? String == master && $0["id"] as? String != other && Self.instant($0["start"]) == at }
+    }
+
+    /// The refusal of a series PATCH whose timed `start` is labelled with a zone other than the
+    /// one the series is kept in; nil when the PATCH is not refused for that. Measured on a work
+    /// account (2026-11-11), on a weekly series kept in `Pacific Standard Time`: a start labelled
+    /// `America/Vancouver` (British Columbia, on UTC-7 all year since 2026-11-01) or
+    /// `America/New_York` is refused with 400 `ErrorPropertyValidationFailure` and nothing
+    /// changes; Exchange checks the start's IANA name against the zone stored with the series
+    /// (`IanaTimeZoneConstraint`, "the rules ... do not match"). The stored name and
+    /// `America/Los_Angeles` are accepted. Also measured, and not refused: an end alone, a PATCH of
+    /// one occurrence (an exception), and an all-day series' date written with `UTC`.
+    ///
+    /// "Another zone" is a name `CalendarTimeZoneResolver` resolves to a different zone from the
+    /// range's `recurrenceTimeZone`, which Graph keeps beside the series' start zone. A stored zone
+    /// that does not resolve (`Customized Time Zone`) is not checked: what Exchange does there is
+    /// not measured.
+    private static func seriesStartZoneRefusal(_ patch: [String: Any], stored: [String: Any]) -> FakeHTTP.CannedResponse? {
+        guard stored["seriesMasterId"] == nil,
+              let range = (stored["recurrence"] as? [String: Any])?["range"] as? [String: Any],
+              let storedName = range["recurrenceTimeZone"] as? String,
+              let storedZone = CalendarTimeZoneResolver.zone(named: storedName, in: .none),
+              let start = patch["start"] as? [String: Any],
+              let label = start["timeZone"] as? String,
+              (patch["isAllDay"] as? Bool ?? stored["isAllDay"] as? Bool ?? false) == false,
+              CalendarTimeZoneResolver.zone(named: label, in: .none)?.identifier != storedZone.identifier
+        else { return nil }
+        let message = "Validation of IANA time zone property StartTimeZoneIanaName failed because the rules for "
+            + "'\(label)' (from IANA time zone name '\(label)') and '\(storedName)' (from the Windows time zone "
+            + "stored in TimeZoneDefinitionStart) do not match."
+        return .json(raw: #"{"error":{"code":"ErrorPropertyValidationFailure","message":"\#(message)"}}"#, statusCode: 400)
     }
 
     /// Whether a written start or end names the stored one: the same wall time to the
