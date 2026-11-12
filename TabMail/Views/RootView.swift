@@ -1127,6 +1127,11 @@ extension Notification.Name {
     /// Posted when undo restores dismissed messages.
     /// Object is [String] array of message IDs to un-dismiss.
     static let messagesUndone = Notification.Name("messagesUndone")
+    /// Posted by `AccountManager.move` when requested members were NOT moved
+    /// and nothing still outstanding will move them (admission refused, row
+    /// vanished, write rolled back). Object is `[String]` header ids; a list
+    /// that hid those rows at gesture time shows them again.
+    static let messageMovesRefused = Notification.Name("messageMovesRefused")
     /// Posted after a provider move or sync UID remap has atomically re-keyed a
     /// local row. Object is `[HeaderRekeyRecord]`; active lists follow the new
     /// primary key immediately instead of waiting for their debounced reload.
