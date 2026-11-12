@@ -59,6 +59,15 @@
 > conditions (α)–(δ) changes: the report only READS the admission outcome. Pins:
 > `InboxRefusedMoveVisibilityTests` (visible set + `IntentionLedger` REPORTED-REFUSED, with an
 > admitted-move positive control) and the report assertion in `IdResetDispositionMatrixTests`.
+> Two further facts, same date: (1) each reported id is also reported under the id a
+> provider-proven re-key has since handed it to (`MessageHeaderRekey.currentHeaderId(afterHandoffFrom:)`),
+> because `HeaderRekeyReceiver` moves the View's hide to the new id while `move` re-resolves by the
+> exact id the gesture named; (2) a deferred successor dropped later
+> (`dropDeferredMoveSuccessors`, or a group `materializeDeferredMoveSuccessors` cannot address)
+> posts the same report. The design is announce-based rather than a "queued set" returned to
+> the gesture because gestures queue after they return and deferred successors are decided
+> later. The role-folder path (`moveToRoleFolderPerAccount`) is not reported: only
+> `performCoordinatedRoleMove` reaches it, and that path never touches the View's hide sets.
 <!-- KNOWN-ISSUES-AMENDMENT-END -->
 # IOS-MOVE-002
 

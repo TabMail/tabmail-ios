@@ -375,13 +375,24 @@ extension AccountManager {
     /// hid those rows at gesture time shows them again in the same step that
     /// settles the action (#441).
     private static func announceMovesRefused(_ ids: Set<String>) async {
-        guard !ids.isEmpty else { return }
-        let payload = ids.sorted()
-        BackgroundSyncLogger.logInbox(
-            "[RoleActionTrace] manager.move phase=refusedAnnounced ids=[\(payload.joined(separator: ","))]")
+        guard let payload = movesRefusedPayload(ids) else { return }
         await MainActor.run {
             NotificationCenter.default.post(name: .messageMovesRefused, object: payload)
         }
+    }
+
+    /// The `.messageMovesRefused` payload for `ids`: each id the gesture named
+    /// plus the id a provider-proven re-key has since handed it to. A list
+    /// follows such a re-key with its own hide set (`HeaderRekeyReceiver`),
+    /// so after one it is hiding the NEW id; naming both settles the hide
+    /// whichever of the two notifications reaches the list first.
+    private nonisolated static func movesRefusedPayload(_ ids: Set<String>) -> [String]? {
+        guard !ids.isEmpty else { return nil }
+        let followed = ids.map { MessageHeaderRekey.currentHeaderId(afterHandoffFrom: $0) }
+        let payload = ids.union(followed).sorted()
+        BackgroundSyncLogger.logInbox(
+            "[RoleActionTrace] manager.move phase=refusedAnnounced ids=[\(payload.joined(separator: ","))]")
+        return payload
     }
 
     // MARK: - T1.3 — an unknown folder epoch fails CLOSED for new gestures
@@ -1066,9 +1077,14 @@ extension AccountManager {
             deferredMoveSuccessors.removeValue(forKey: oldHeaderId)
             releaseOverlayEntry(id: oldHeaderId)
         }
+        // The dropped successor will never move: settle the hide its gesture
+        // took, as `move` does for a member it refuses.
+        let refusedPayload = Self.movesRefusedPayload(Set(oldHeaderIds)) ?? []
         Task { @MainActor in
             NotificationCenter.default.post(
                 name: .inboxDataDidChange, object: oldHeaderIds)
+            NotificationCenter.default.post(
+                name: .messageMovesRefused, object: refusedPayload)
         }
     }
 
@@ -1130,6 +1146,10 @@ extension AccountManager {
                         + "predecessor=\(predecessor.id.prefix(8)) "
                         + "destination=\(destinationPath) "
                         + "resolved=\(rows.count)/\(successors.count)")
+                // These successors will never move: settle the hide their
+                // gesture took. A group that does reach `move` below is
+                // settled by `move` itself.
+                await Self.announceMovesRefused(Set(successors.map(\.oldHeaderId)))
                 continue
             }
             let admission = await move(rows, to: destinationPath)
