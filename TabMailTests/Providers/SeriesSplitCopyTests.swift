@@ -711,7 +711,7 @@ struct ExchangeSplitCarryTests {
         #expect(Self.instant(r.graph.event("created-1-w3")?["start"]) == Self.week(1, plusDays: 1), "the kept occurrence moved")
     }
 
-    @Test("an occurrence edited where it is moves once: a retry after a failed cap (finishSplit) leaves it where the first attempt put it (T4)")
+    @Test("an occurrence edited where it is moves once: a retry after a failed cap (finishSplit) leaves it where the first attempt put it")
     func movedSplitRetryMovesEditedOnce() async throws {
         let named = Self.exception(1, at: Self.week(1, plusDays: 2))
         let movedOut = Self.exception(0, at: Self.week(1, plusDays: 3))   // earlier place, shown after
@@ -758,7 +758,7 @@ struct ExchangeSplitCarryTests {
         GraphSplitFixture.series(range: ["type": "numbered", "endDate": "0001-01-01", "numberOfOccurrences": 2])
     }
 
-    @Test("an edit past the series' end that fails part way keeps its targets: the retry moves nothing twice and finds every one (R1)")
+    @Test("an edit past the series' end that fails part way keeps its targets: the retry moves nothing twice and finds every one")
     func pastEndRetryMovesOnce() async throws {
         let named = Self.exception(1, at: Self.week(2, plusDays: 2))
         let other = Self.exception(0, at: Self.week(2, plusDays: 3))
@@ -788,7 +788,7 @@ struct ExchangeSplitCarryTests {
         #expect(r.graph.event("ser-1-occ-0")?["subject"] as? String == "Renamed" && r.graph.event("ser-1-occ-1")?["subject"] as? String == "Renamed")
     }
 
-    @Test("occurrences edited where they are move in the order Graph takes, none onto a day another still holds (C2)")
+    @Test("occurrences edited where they are move in the order Graph takes, none onto a day another still holds")
     func shownEditsAreOrderedOffHeldDays() async throws {
         // The edit moves both a day earlier: the named one onto a free day, the other onto the named one's day.
         let named = Self.exception(1, at: Self.week(2, plusDays: 2))
@@ -807,7 +807,7 @@ struct ExchangeSplitCarryTests {
                 "not both moved: \(r.http.servedCallSequence())")
     }
 
-    @Test("an occurrence shown before the named one is kept whole: the edit's guest change does not reach its own guests (T8)")
+    @Test("an occurrence shown before the named one is kept whole: the edit's guest change does not reach its own guests")
     func movedSplitKeptItemKeepsItsGuests() async throws {
         let extra: [String: Any] = ["emailAddress": ["address": "extra@example.com", "name": "Extra"], "type": "required",
                                     "status": ["response": "accepted", "time": "0001-01-01T00:00:00Z"]]
@@ -851,7 +851,7 @@ struct ExchangeSplitCarryTests {
         #expect(!r.graph.patches("ser-1").isEmpty, "the series was not capped: \(r.http.servedCallSequence())")
     }
 
-    @Test("a changed occurrence is carried WHOLE: its own importance, categories and reminder survive a rename (C1)")
+    @Test("a changed occurrence is carried WHOLE: its own importance, categories and reminder survive a rename")
     func carryCopiesTheWholeException() async throws {
         let r = try await split(exceptions: [Self.exception(2) { e in
             e["importance"] = "low"
@@ -868,7 +868,7 @@ struct ExchangeSplitCarryTests {
         #expect(r.graph.patches("created-1-w2").allSatisfy { $0["subject"] == nil }, "the carry wrote the old title: \(r.graph.patches("created-1-w2"))")
     }
 
-    @Test("an exception listed past the first page of the new part's occurrences is still carried (C2)")
+    @Test("an exception listed past the first page of the new part's occurrences is still carried")
     func carryReadsEveryPage() async throws {
         let r = try await split(exceptions: [Self.exception(2) { $0["location"] = ["displayName": "Room 9"] }],
                                 parts: [2], patch: Self.rename) { graph, http in

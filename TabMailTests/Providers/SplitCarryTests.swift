@@ -285,6 +285,29 @@ struct SplitCarryTests {
         #expect(retry.first?.end?.dateTime.flatMap(Date.fromISO8601) == Date.fromISO8601(Self.at(30, "10:00:00")))
     }
 
+    @Test("a record whose kept length is not a number is not read, so a retry never ends an occurrence at a guessed length")
+    func malformedEditLengthIsNotRead() throws {
+        let named = try Self.occurrence(place: 7, start: Self.at(30), end: Self.at(30, "09:30:00"))
+        var edit = GCalEventInput()
+        edit.endDateTime = Self.at(30, "10:00:00")
+        let first = try #require(SplitCarry.shownEdits(exceptions: [.changed(named)], named: named, seriesId: "s", patch: edit))
+        guard case .dictionary(var stored) = first.record.argument else { Issue.record("the record is not a dictionary"); return }
+        stored["edit_length"] = .string("an hour")
+        #expect(SplitRecord([SplitRecord.argumentKey: .dictionary(stored)]) == nil)
+    }
+
+    @Test("Outlook orders moves without dating an occurrence that does not move, so a series with no readable zone still writes it")
+    func moveOrderNeedsNoZoneForStays() throws {
+        let time = GCalDateTime(dateTime: Self.at(30), date: nil, timeZone: nil)
+        let stays: [(at: GCalDateTime, to: GCalDateTime?)] = [(time, nil), (time, nil)]
+        let ordered = try ExchangeCalendarProvider.moveOrder(stays, at: \.at, to: \.to, zone: nil)
+        #expect(ordered.count == 2)
+        // A move is dated: with no zone to date it in, it is refused before anything is written.
+        #expect(throws: CalendarProviderError.self) {
+            try ExchangeCalendarProvider.moveOrder([(at: time, to: Optional(time))], at: \.at, to: \.to, zone: nil)
+        }
+    }
+
     // MARK: partition
 
     @Test("exceptions sort into four groups by place against the cut and start against the named one; a deleted one goes by its place")
