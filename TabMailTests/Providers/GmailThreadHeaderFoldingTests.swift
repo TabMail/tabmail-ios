@@ -138,6 +138,24 @@ struct GmailThreadHeaderFoldingTests {
         #expect(metadata.references == [parent])
     }
 
+    /// The soft limit is inclusive: a field line of exactly 78 octets is within it,
+    /// so it is written on one line.
+    @Test("A thread header line of exactly 78 octets stays on one line", arguments: Serializer.allCases)
+    func exactlySoftLimitUnfolded(_ serializer: Serializer) {
+        let first = String(repeating: "f", count: 78 - "References: <".utf8.count - "@example.com> <b@example.com>".utf8.count) + "@example.com"
+        let referencesLine = "References: <\(first)> <b@example.com>"
+        #expect(referencesLine.utf8.count == 78)
+        let parent = String(repeating: "i", count: 78 - "In-Reply-To: <".utf8.count - "@example.com>".utf8.count) + "@example.com"
+        let inReplyToLine = "In-Reply-To: <\(parent)>"
+        #expect(inReplyToLine.utf8.count == 78)
+        let draft = DraftMessage(
+            to: ["you@example.com"], subject: "Re: thread", body: "reply",
+            inReplyTo: parent, references: [first, "b@example.com"])
+        let lines = headerLines(raw(draft, serializer))
+        #expect(lines.contains(referencesLine), "\(lines)")
+        #expect(lines.contains(inReplyToLine), "\(lines)")
+    }
+
     @Test("Short thread headers stay on one line each", arguments: Serializer.allCases)
     func shortHeadersUnfolded(_ serializer: Serializer) {
         let draft = DraftMessage(
@@ -244,6 +262,21 @@ struct GmailThreadHeaderFoldingTests {
         let fieldLines = [lines[fieldStart]] + lines[(fieldStart + 1)...].prefix { $0.hasPrefix(" ") }
         #expect(fieldLines.allSatisfy { $0.utf8.count <= 78 }, "\(fieldLines)")
         #expect(field.recipients(try readBack(message)).map(\.email) == [first, "b@example.com"])
+    }
+
+    /// The soft limit is inclusive: a recipient line of exactly 78 octets, its comma
+    /// counted, is within it, so it is written on one line.
+    @Test("A recipient line of exactly 78 octets stays on one line",
+          arguments: Serializer.allCases, Field.allCases)
+    func recipientLineAtTheSoftLimit(_ serializer: Serializer, field: Field) throws {
+        let prefix = "\(field.rawValue): "
+        let second = "b@example.com"
+        let first = String(repeating: "s", count: 78 - prefix.utf8.count - ", ".utf8.count - second.utf8.count - "@example.com".utf8.count) + "@example.com"
+        let line = prefix + first + ", " + second
+        #expect(line.utf8.count == 78)
+        let message = raw(field.draft([first, second]), serializer)
+        #expect(headerLines(message).contains(line), "\(headerLines(message))")
+        #expect(field.recipients(try readBack(message)).map(\.email) == [first, second])
     }
 
     /// A reply can copy a UTF-8 address from a received header (RFC 6532), and one

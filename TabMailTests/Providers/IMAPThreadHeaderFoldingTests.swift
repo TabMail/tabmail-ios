@@ -169,6 +169,24 @@ struct IMAPThreadHeaderFoldingTests {
         #expect(metadata.references == [parent])
     }
 
+    /// The soft limit is inclusive: a field line of exactly 78 octets is within it,
+    /// so it is written on one line.
+    @Test("A thread header line of exactly 78 octets stays on one line", arguments: Copy.allCases)
+    func exactlySoftLimitUnfolded(_ copy: Copy) async throws {
+        let first = String(repeating: "f", count: 78 - "References: <".utf8.count - "@example.com> <b@example.com>".utf8.count) + "@example.com"
+        let referencesLine = "References: <\(first)> <b@example.com>"
+        #expect(referencesLine.utf8.count == 78)
+        let parent = String(repeating: "i", count: 78 - "In-Reply-To: <".utf8.count - "@example.com>".utf8.count) + "@example.com"
+        let inReplyToLine = "In-Reply-To: <\(parent)>"
+        #expect(inReplyToLine.utf8.count == 78)
+        let draft = DraftMessage(
+            to: ["you@example.com"], subject: "Re: thread", body: "reply",
+            inReplyTo: parent, references: [first, "b@example.com"])
+        let lines = headerLines(try await raw(draft, copy))
+        #expect(lines.contains(referencesLine), "\(lines)")
+        #expect(lines.contains(inReplyToLine), "\(lines)")
+    }
+
     @Test("Short thread headers stay on one line each", arguments: Copy.allCases)
     func shortHeadersUnfolded(_ copy: Copy) async throws {
         let draft = DraftMessage(
