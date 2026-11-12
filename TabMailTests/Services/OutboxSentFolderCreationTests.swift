@@ -189,6 +189,28 @@ struct OutboxSentFolderCreationTests {
         #expect(try outboxRow(fixture, outboxId) == nil)
     }
 
+    /// RED-FIRST: the account has no Sent row and the server has two folders
+    /// with Sent names and no attributes. The server check gives the role to
+    /// one of them, as folder sync does (dedup: `Sent` before
+    /// `Sent Messages`), so the copy lands only in `Sent` and no CREATE is
+    /// sent.
+    @Test("Two Sent-named server folders: the copy lands only in the canonical one; no CREATE")
+    func twoSentNamedFoldersCopyLandsOnlyInCanonical() async throws {
+        let fixture = try makeFixture(customFolderPaths: ["Sent", "Sent Messages"])
+        defer { finish(fixture) }
+        let (outboxId, messageId) = try seedSentAwaitingCopy(fixture)
+        let server = Self.strictServer(mailboxes: ["INBOX": [], "Sent": [], "Sent Messages": []])
+        try server.start()
+        defer { server.stop() }
+
+        try await drainOutbox(fixture, against: server)
+
+        #expect(Self.createCommands(server).isEmpty, "a CREATE was sent although the server has a Sent folder")
+        #expect(Self.holdsOnly(server, "Sent", messageId), "the copy is not in the canonical Sent folder")
+        #expect(server.messageIDs(in: "Sent Messages").isEmpty, "the copy went into the non-canonical Sent folder")
+        #expect(try outboxRow(fixture, outboxId) == nil)
+    }
+
     /// RED-FIRST: an existing account on a server that keeps folders under
     /// INBOX and sends no special-use attributes. Its Sent folder
     /// `INBOX.Sent Items` was stored as an ordinary folder before such names

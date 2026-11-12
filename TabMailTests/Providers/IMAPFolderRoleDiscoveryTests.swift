@@ -196,4 +196,47 @@ struct IMAPFolderRoleDiscoveryTests {
         #expect(roles.values.filter { $0 == .sent }.count == 1, "exactly one Sent folder")
         #expect(roles.values.filter { $0 == .trash }.count == 1, "exactly one Trash folder")
     }
+
+    /// A server whose personal namespace is NOT under INBOX (`Mail/`, delimiter
+    /// `/`) and that sends no attributes: a role name directly under the
+    /// namespace prefix is the role folder; one nested deeper is not.
+    @Test("A role name directly under a non-INBOX namespace prefix gets the role")
+    func roleNameUnderNonInboxNamespacePrefix() async throws {
+        let server = FakeIMAPServer(
+            username: Self.uniqueUsername(),
+            mailboxes: ["INBOX": [], "Mail/Sent": [], "Mail/Trash": [], "Mail/Clients/Sent": [], "Mail/Projects": []])
+        server.setHierarchy(delimiter: "/", personalNamespacePrefix: "Mail/")
+        try server.start()
+        defer { server.stop() }
+
+        let roles = try await Self.roles(on: server)
+
+        #expect(roles["Mail/Sent"] == .sent, "the Sent folder under the namespace prefix must carry the Sent role")
+        #expect(roles["Mail/Trash"] == .trash)
+        #expect(roles["Mail/Clients/Sent"] == .custom)
+        #expect(roles["Mail/Projects"] == .custom)
+        #expect(roles["INBOX"] == .inbox)
+    }
+
+    /// Two top-level folders that match the same role by name: folder sync
+    /// keeps exactly one per role, the canonical name (`Sent` before
+    /// `Sent Messages`, `Trash` before `Deleted Messages`), so the Sent copy
+    /// and deletes have one deterministic target.
+    @Test("Two folders matching one role by name: exactly one keeps it, the canonical name")
+    func duplicateRoleNamesKeepOneCanonical() async throws {
+        let server = FakeIMAPServer(
+            username: Self.uniqueUsername(),
+            mailboxes: ["INBOX": [], "Sent": [], "Sent Messages": [], "Trash": [], "Deleted Messages": []])
+        try server.start()
+        defer { server.stop() }
+
+        let roles = try await Self.roles(on: server)
+
+        #expect(roles.values.filter { $0 == .sent }.count == 1, "exactly one Sent folder")
+        #expect(roles.values.filter { $0 == .trash }.count == 1, "exactly one Trash folder")
+        #expect(roles["Sent"] == .sent)
+        #expect(roles["Sent Messages"] == .custom)
+        #expect(roles["Trash"] == .trash)
+        #expect(roles["Deleted Messages"] == .custom)
+    }
 }
