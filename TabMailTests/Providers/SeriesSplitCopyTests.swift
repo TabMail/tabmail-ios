@@ -886,16 +886,25 @@ struct ExchangeSplitCarryTests {
         return e
     }
 
-    @Test("a rename of a series with no zone it can date in still carries a deleted and a changed later occurrence: only a move needs the zone")
+    @Test("a rename of a series with no zone it can date in still carries a changed later occurrence: only a move needs the zone")
     func zonelessRenameCarries() async throws {
         let series = Self.zoneless(GraphSplitFixture.series(range: GraphSplitFixture.noEnd))
         #expect(CalendarTimeZoneResolver.zone(named: "Customized Time Zone", in: .none) == nil, "non-vacuity: the zone is recognized")
         let r = try await split(exceptions: [Self.exception(2) { $0["location"] = ["displayName": "Room 9"] }],
-                                cancelled: [3], parts: [2, 3], patch: Self.rename, series: series)
+                                parts: [2], patch: Self.rename, series: series)
         defer { r.http.close() }
         #expect(r.error == nil, "\(String(describing: r.error)); \(r.http.servedCallSequence())")
-        #expect(r.graph.event("created-1-w3") == nil, "the deleted occurrence came back: \(r.http.servedCallSequence())")
         #expect(Self.displayName(r.graph.event("created-1-w2")?["location"]) == "Room 9", "\(r.http.servedCallSequence())")
+        #expect(!r.graph.patches("ser-1").isEmpty, "the series was not capped: \(r.http.servedCallSequence())")
+    }
+
+    @Test("a deleted occurrence of a series with no zone it can date in can't be placed (Graph names it by date only), so the split is refused with nothing written")
+    func zonelessDeletionIsRefusedBeforeThePart() async throws {
+        let r = try await split(exceptions: [], cancelled: [3], parts: [2, 3], patch: Self.rename,
+                                series: Self.zoneless(GraphSplitFixture.series(range: GraphSplitFixture.noEnd)))
+        defer { r.http.close() }
+        #expect(r.error != nil, "the split went on: \(r.http.servedCallSequence())")
+        #expect(r.http.recordedCalls().allSatisfy { $0.method == "GET" }, "something was written: \(r.http.servedCallSequence())")
     }
 
     @Test("a new start for a series with no zone it can date in, that would move a changed occurrence, is refused before the new part is made")
@@ -905,37 +914,20 @@ struct ExchangeSplitCarryTests {
         patch.startDateTime = GraphSplitFixture.occurrence.addingTimeInterval(3_600).iso8601String()
         patch.startTimeZone = "UTC"
         let r = try await split(exceptions: [Self.exception(2) { $0["location"] = ["displayName": "Room 9"] }],
-                                cancelled: [3], parts: [2, 3], patch: patch, series: series)
+                                parts: [2], patch: patch, series: series)
         defer { r.http.close() }
         #expect(r.error != nil, "the move was written: \(r.http.servedCallSequence())")
         #expect(r.http.recordedCalls().allSatisfy { $0.method == "GET" }, "something was written: \(r.http.servedCallSequence())")
     }
 
-    @Test("a rename past the end of a series with no zone it can date in edits the occurrences shown, a deleted one staying deleted")
-    func zonelessPastEndRenameEdits() async throws {
+    @Test("past the end of a series with no zone it can date in, a moved occurrence can't be placed, so a rename is refused with nothing written")
+    func zonelessPastEndRenameIsRefused() async throws {
         let named = Self.exception(1, at: Self.week(2, plusDays: 2))
-        let series = Self.zoneless(Self.pastEndSeries)
         let r = try await split(named: "ser-1-occ-1", start: Self.week(2, plusDays: 2), exceptions: [named], parts: [],
-                                patch: Self.rename, series: series)
+                                patch: Self.rename, series: Self.zoneless(Self.pastEndSeries))
         defer { r.http.close() }
-        #expect(r.error == nil, "\(String(describing: r.error)); \(r.http.servedCallSequence())")
-        #expect(r.graph.event("ser-1-occ-1")?["subject"] as? String == "Renamed")
-        #expect(r.graph.created.isEmpty && r.graph.patches("ser-1").isEmpty)
-    }
-
-    @Test("a new start past the end of a series with no zone it can date in is refused with no record kept and nothing written")
-    func zonelessPastEndMoveKeepsNoRecord() async throws {
-        let named = Self.exception(1, at: Self.week(2, plusDays: 2))
-        let other = Self.exception(0, at: Self.week(2, plusDays: 3))
-        var patch = GCalEventInput()
-        patch.startDateTime = Self.week(2, plusDays: 2).addingTimeInterval(3_600).iso8601String()
-        patch.startTimeZone = "UTC"
-        let r = try await split(named: "ser-1-occ-1", start: Self.week(2, plusDays: 2), exceptions: [named, other], parts: [],
-                                patch: patch, series: Self.zoneless(Self.pastEndSeries))
-        defer { r.http.close() }
-        #expect(r.error != nil, "the move was written: \(r.http.servedCallSequence())")
-        #expect(r.records.records.isEmpty, "a record was kept for an edit that can't be ordered")
-        #expect(r.http.recordedCalls().allSatisfy { $0.method == "GET" }, "\(r.http.servedCallSequence())")
+        #expect(r.error != nil, "the edit went on: \(r.http.servedCallSequence())")
+        #expect(r.records.records.isEmpty && r.http.recordedCalls().allSatisfy { $0.method == "GET" }, "\(r.http.servedCallSequence())")
     }
 
     @Test("a changed occurrence is carried WHOLE: its own importance, categories and reminder survive a rename")
