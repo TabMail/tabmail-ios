@@ -335,6 +335,32 @@ extension AccountManager {
             folderPath: message.folderPath, section: section, encoding: encoding)
     }
 
+    /// The files inside the attached email at `section` of `message`, for an
+    /// attachment whose `AttachmentInfo.filesListedOnOpen` is set; called when the
+    /// user opens that attached email. Throws when they could not be listed in
+    /// full, so the caller shows the failure; opening the email again retries.
+    /// Same address check as `fetchAttachment(for:)`: the list belongs to the
+    /// message at `(folderPath, messageId)`.
+    func fetchAttachedEmailAttachments(for message: MessageHeader, section: String) async throws -> [AttachmentInfo] {
+        guard await !attachmentFetchIsBlockedByPendingAddress(for: message) else {
+            throw ProviderError.addressPendingMove(message.id)
+        }
+        if providers[message.accountId] == nil {
+            guard let account = try? await dbPool.read({ db in try Account.fetchOne(db, key: message.accountId) }) else {
+                throw ProviderError.notConnected
+            }
+            try await connectAccount(account)
+        }
+        guard let queue = workQueues[message.accountId] else {
+            throw ProviderError.notConnected
+        }
+        let provider = queue.provider
+        let messageId = message.messageId
+        return try await queue.execute(priority: .userAction) {
+            try await provider.fetchAttachedEmailAttachments(messageId: messageId, section: section)
+        }
+    }
+
     /// Download one attachment by its provider coordinates. The caller owns the
     /// address: a synced header goes through `fetchAttachment(for:)` and its
     /// pending-move check; #217 adoption passes the coordinates of the server copy

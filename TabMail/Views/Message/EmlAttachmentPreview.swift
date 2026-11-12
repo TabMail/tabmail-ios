@@ -18,12 +18,30 @@ import QuickLook
 /// user sees each attachment in the context of the message that actually carries
 /// it. Tapping a nested attachment uses the same fetchAttachment + QuickLook flow
 /// that `AttachmentListView` uses for regular attachments.
+///
+/// When the attached email's files are not in the message's list
+/// (`AttachmentInfo.filesListedOnOpen`), `listFiles` lists them once each time
+/// the sheet opens; a failure is shown in the strip, and opening the email
+/// again lists them again.
 struct EmlAttachmentPreview: View {
     let html: String
     let filename: String
     let nestedAttachments: [AttachmentInfo]
+    /// Lists the attached email's files when they are listed on open; `nil`
+    /// when they are `nestedAttachments`.
+    let listFiles: (() async throws -> [AttachmentInfo])?
     let parentMessage: MessageHeader
     let onDismiss: () -> Void
+
+    /// What listing the files on open produced.
+    enum FilesOnOpen {
+        case listed([AttachmentInfo])
+        /// The message shown to the user.
+        case failed(String)
+    }
+
+    static let filesFailedMessage = "Couldn't load this email's attachments. Open it again to retry."
+    static let filesFailedOfflineMessage = "Couldn't load this email's attachments. Check your connection, then open it again."
 
     /// Parsed once on init — envelope metadata carried on the marker div.
     private let metadata: EmailFilter.EmlSectionMetadata?
@@ -32,6 +50,9 @@ struct EmlAttachmentPreview: View {
     @State private var downloadedFiles: [String: URL] = [:]
     @State private var previewURL: URL?
     @State private var error: String?
+    @State private var listedFiles: [AttachmentInfo] = []
+    @State private var listingFiles = false
+    @State private var filesError: String?
 
     private let manager = AccountManager.shared
 
@@ -39,12 +60,14 @@ struct EmlAttachmentPreview: View {
         html: String,
         filename: String,
         nestedAttachments: [AttachmentInfo] = [],
+        listFiles: (() async throws -> [AttachmentInfo])? = nil,
         parentMessage: MessageHeader,
         onDismiss: @escaping () -> Void
     ) {
         self.html = html
         self.filename = filename
         self.nestedAttachments = nestedAttachments
+        self.listFiles = listFiles
         self.parentMessage = parentMessage
         self.onDismiss = onDismiss
         self.metadata = EmailFilter.parseEmlSectionMetadata(html: html, filename: filename)
@@ -82,7 +105,7 @@ struct EmlAttachmentPreview: View {
                     // the standing "no behaviour changes, just security" directive puts
                     // out of scope for this commit.
                     AutoSizingHTMLView(html: html, previewFilename: filename)
-                    if !nestedAttachments.isEmpty {
+                    if !shownFiles.isEmpty || listingFiles || filesError != nil {
                         nestedAttachmentStrip
                             .padding(.horizontal)
                             .padding(.top, 12)
@@ -108,6 +131,32 @@ struct EmlAttachmentPreview: View {
         .presentationDetents([.large])
         .presentationDragIndicator(.visible)
         .quickLookPreview($previewURL)
+        .task { await listFilesOnOpen() }
+    }
+
+    private var shownFiles: [AttachmentInfo] { nestedAttachments + listedFiles }
+
+    private func listFilesOnOpen() async {
+        guard let listFiles else { return }
+        listingFiles = true
+        switch await Self.filesOnOpen(listFiles) {
+        case .listed(let files): listedFiles = files
+        case .failed(let message): filesError = message
+        }
+        listingFiles = false
+    }
+
+    /// Lists the attached email's files with `list`; a failure becomes the
+    /// message the strip shows, never an empty list.
+    static func filesOnOpen(_ list: () async throws -> [AttachmentInfo]) async -> FilesOnOpen {
+        do {
+            return .listed(try await list())
+        } catch {
+            if DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[EmlNestedAttachment] Listing failed: \(DebugModeManager.escapedForLogLine(String(describing: error)))")
+            }
+            return .failed(SyncEngine.isConnectionError(error) ? filesFailedOfflineMessage : filesFailedMessage)
+        }
     }
 
     // MARK: - Native header (mirrors MessageCardView.expandedHeaderDetails)
@@ -159,7 +208,15 @@ struct EmlAttachmentPreview: View {
                 .font(.caption)
                 .fontWeight(.semibold)
                 .foregroundStyle(Theme.textSecondary)
-            ForEach(nestedAttachments, id: \.section) { attachment in
+            if listingFiles {
+                ProgressView().controlSize(.small)
+            }
+            if let filesError {
+                Text(filesError)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+            ForEach(shownFiles, id: \.section) { attachment in
                 HStack(spacing: 10) {
                     Image(systemName: iconName(for: attachment.contentType))
                         .font(.body)

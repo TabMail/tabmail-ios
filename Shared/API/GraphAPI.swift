@@ -95,8 +95,7 @@ enum GraphAPI {
     /// derived `fileAttachment` type, and Graph refuses it unqualified in a
     /// `$select` on the base attachment type (400), so an inline image's content
     /// id comes with its bytes from that attachment's own GET. Used by main-app
-    /// `fetchMessage` (also for an attached email's own list) and NSE
-    /// `messageFull`.
+    /// `fetchMessage` and NSE `messageFull`.
     static let attachmentMetadataQuery = "$select=id,name,contentType,size,isInline"
 
     /// Pages of one message's attachment list read before giving up. Graph caps a

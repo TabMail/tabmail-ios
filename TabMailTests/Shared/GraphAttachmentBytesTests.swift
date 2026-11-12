@@ -14,11 +14,10 @@ import Synchronization
 /// serves while a message is read are inline images' (`isInline`, `image/*`),
 /// each once, only when the HTML has a `cid:` reference, and at most the
 /// inline-image cap of them; no other file's, the files of an attached email
-/// included (still open: see `attachedEmailIsListedWithoutBytes`). Every
-/// attachment is still listed or shown inline (except an inline image whose
-/// content id the body does not reference, #550, and an attached email's
-/// files, #549), and every
-/// referenced image still resolves.* The list does not carry a content id, so
+/// included. Every attachment is still listed or shown inline (except an
+/// inline image whose content id the body does not reference, #550), an
+/// attached email's files when the user opens it, and every referenced image
+/// still resolves.* The list does not carry a content id, so
 /// which image a `cid:` names is known only from the image's own GET. Both
 /// readers are held to it: the notification service extension
 /// (`GraphAPI.messageFull`) and the main app (`ExchangeProvider.fetchMessage`).
@@ -316,39 +315,129 @@ struct GraphAttachmentBytesTests {
         #expect(server.bytesServed() == expectedServed)
     }
 
-    /// An attached email expanded in full carries its files' bytes (Graph
-    /// attachment-get, Example 4), so a read that expands it without leaving
-    /// them out downloads every one of them.
-    ///
-    /// Two expectations are known issues today and fail this test the moment
-    /// they are fixed, so the markers come off with the fix: the expansion still
-    /// downloads the attached email's files (#434), and its own list is a 400 on
-    /// Graph v1.0, so none of them is listed (#549).
-    @Test("Main app: an attached email shows its preview and lists its files, without their bytes")
-    func attachedEmailIsListedWithoutBytes() async throws {
+    // MARK: - An attached email (an Outlook itemAttachment)
+
+    private static let forwarded = GraphAttachmentServer.File(
+        id: "fwd", name: "Fwd: plan.eml", contentType: "message/rfc822", isInline: false,
+        contentId: nil, bytes: Data(), isAttachedEmail: true)
+
+    private static func attachedEmailServer(
+        dated: Bool = true, failingOpens: Int = 0, listContinues: Bool = false
+    ) -> GraphAttachmentServer {
+        GraphAttachmentServer(
+            messageId: messageId, html: "<p>See the attached mail</p>",
+            files: [forwarded], pageSize: 10, attachedEmailFiles: [report, notes],
+            attachedEmailDated: dated, failingAttachedEmailOpens: failingOpens,
+            attachedEmailListContinues: listContinues)
+    }
+
+    /// The attached email's files, as `EmlAttachmentPreview` lists them when the
+    /// user opens it.
+    @MainActor
+    private static func open(_ provider: ExchangeProvider) async -> EmlAttachmentPreview.FilesOnOpen {
+        await EmlAttachmentPreview.filesOnOpen {
+            try await provider.fetchAttachedEmailAttachments(messageId: messageId, section: forwarded.id)
+        }
+    }
+
+    @Test("Main app: reading a message previews its attached email and downloads none of its files' bytes")
+    func readingAnAttachedEmailDownloadsNoFileBytes() async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
-        let forwarded = GraphAttachmentServer.File(
-            id: "fwd", name: "Fwd: plan.eml", contentType: "message/rfc822", isInline: false,
-            contentId: nil, bytes: Data(), isAttachedEmail: true)
-        let server = GraphAttachmentServer(
-            messageId: Self.messageId, html: "<p>See the attached mail</p>",
-            files: [forwarded], pageSize: 10, attachedEmailFiles: [Self.report, Self.notes])
+        let server = Self.attachedEmailServer()
         server.install(on: http)
 
         let info = try await Self.mainApp(http).fetchMessage(id: Self.messageId, folder: "inbox-id")
 
+        #expect(server.bytesServed().isEmpty, "no file of the attached email is downloaded")
         let html = info.htmlBody ?? ""
         #expect(html.contains("class=\"tm-eml-section\""), "the attached email is previewed")
         #expect(html.contains(GraphAttachmentServer.attachedEmailBody))
         #expect(html.contains("data-subject=\"Plan\""))
-        #expect(info.attachments.contains { $0.section == forwarded.id && $0.parentEmlSection == nil })
-        withKnownIssue("#434: expanding an attached email downloads its files' bytes") {
-            #expect(server.bytesServed().isEmpty, "no file of the attached email is downloaded")
+        #expect(html.contains("data-date="))
+        let chip = info.attachments.first { $0.section == Self.forwarded.id }
+        #expect(chip?.parentEmlSection == nil)
+        #expect(chip?.filesListedOnOpen == true, "its files are listed when the user opens it")
+        #expect(!info.attachments.contains { $0.parentEmlSection != nil })
+    }
+
+    @Test("Main app: an attached email Graph returns without a date has no date in its preview")
+    func attachedEmailWithoutDateHasNone() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        Self.attachedEmailServer(dated: false).install(on: http)
+
+        let info = try await Self.mainApp(http).fetchMessage(id: Self.messageId, folder: "inbox-id")
+
+        let html = info.htmlBody ?? ""
+        #expect(html.contains("data-subject=\"Plan\""))
+        #expect(!html.contains("data-date="), "no date is made up")
+        #expect(!html.contains("<b>Date:</b>"))
+    }
+
+    @Test("Main app: opening an attached email lists every one of its files")
+    @MainActor
+    func openingAnAttachedEmailListsItsFiles() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        Self.attachedEmailServer().install(on: http)
+
+        guard case .listed(let files) = await Self.open(Self.mainApp(http)) else {
+            Issue.record("the attached email's files are listed")
+            return
         }
-        withKnownIssue("#549: an attached email's own list is a 400 on Graph v1.0") {
-            let nested = info.attachments.filter { $0.parentEmlSection == forwarded.id }
-            #expect(Set(nested.map(\.filename)) == ["report.pdf", "notes.txt"], "the attached email's files are listed")
+        #expect(Set(files.map(\.filename)) == ["report.pdf", "notes.txt"])
+        #expect(files.allSatisfy { $0.parentEmlSection == Self.forwarded.id })
+    }
+
+    @Test("Main app: an attached email whose files cannot be listed shows the failure, and opening it again lists them")
+    @MainActor
+    func failedOpenIsShownAndRetried() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        Self.attachedEmailServer(failingOpens: 1).install(on: http)
+        let provider = Self.mainApp(http)
+
+        guard case .failed(let message) = await Self.open(provider) else {
+            Issue.record("a list that failed is shown as a failure, not as no files")
+            return
+        }
+        #expect([EmlAttachmentPreview.filesFailedMessage, EmlAttachmentPreview.filesFailedOfflineMessage].contains(message))
+        guard case .listed(let files) = await Self.open(provider) else {
+            Issue.record("opening the attached email again lists its files")
+            return
+        }
+        #expect(Set(files.map(\.filename)) == ["report.pdf", "notes.txt"])
+    }
+
+    @Test("Main app: an attached email whose file list continues on another page is shown as a failure, never in part")
+    @MainActor
+    func continuedListIsAFailure() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        Self.attachedEmailServer(listContinues: true).install(on: http)
+
+        guard case .failed = await Self.open(Self.mainApp(http)) else {
+            Issue.record("a list that cannot be read in full is not shown")
+            return
+        }
+    }
+
+    @Test("Main app: opening a file of an attached email returns its bytes")
+    func openingAFileOfAnAttachedEmailGetsItsBytes() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        Self.attachedEmailServer().install(on: http)
+        let provider = Self.mainApp(http)
+
+        let section = "\(Self.forwarded.id)\(ExchangeProvider.nestedSeparator)\(Self.notes.id)"
+        let bytes = try await provider.fetchAttachment(messageId: Self.messageId, attachmentId: section)
+
+        #expect(bytes == Self.notes.bytes)
+        await #expect(throws: (any Error).self) {
+            _ = try await provider.fetchAttachment(
+                messageId: Self.messageId,
+                attachmentId: "\(Self.forwarded.id)\(ExchangeProvider.nestedSeparator)missing")
         }
     }
 
@@ -415,15 +504,20 @@ struct GraphPageLinkTests {
 ///   with 400; pages are joined by `@odata.nextLink`;
 /// - an attachment GET returns that file with its `contentId` and bytes
 ///   (attachment-get);
-/// - an attached email's GET with `$expand=microsoft.graph.itemattachment/item`
-///   returns the item with its own attachments, each file with its bytes
-///   (attachment-get, Example 4: documented, unmeasured, because a test draft
-///   cannot hold one: Graph accepts a POSTed attached email that carries a file
-///   with 201 and drops the file, measured); a `$select` of message properties
-///   inside that `$expand` is a 400, and so is the attached email's own list,
-///   `.../microsoft.graph.itemattachment/item/attachments` (both measured).
-/// The list shapes, the 400s and the unqualified-`contentId` 400 were measured
-/// on a test mailbox.
+/// - an attached email's GET with the plain
+///   `$expand=microsoft.graph.itemattachment/item` returns the item with its
+///   own attachments, each file with its bytes (no `attachments` key when it has
+///   none); with `item($select=...)` casting each property to
+///   `microsoft.graph.message/`, only those properties, no attachments and no
+///   bytes, and a nested `;$expand=microsoft.graph.message/attachments(...)`
+///   is accepted and dropped from the answer; an uncast message property in
+///   that `$select`, or an uncast nested `$expand=attachments`, is a 400;
+/// - anything below an attachment, such as the attached email's own list
+///   `.../microsoft.graph.itemattachment/item/attachments` or one of its files by
+///   id, plain or cast through `microsoft.graph.message`, is a 400.
+/// All of these were measured on a test mailbox. Not measured, and modelled so a
+/// reader cannot show part of a list: `attachedEmailListContinues` adds an
+/// `attachments@odata.nextLink` to the expanded item.
 final class GraphAttachmentServer: Sendable {
     struct File: Sendable {
         let id: String
@@ -458,13 +552,20 @@ final class GraphAttachmentServer: Sendable {
     let endless: Bool
     /// The files of the attached email in `files`, if there is one.
     let attachedEmailFiles: [File]
+    /// Whether the attached email has a `receivedDateTime`.
+    let attachedEmailDated: Bool
+    /// Whether its expanded file list says it continues.
+    let attachedEmailListContinues: Bool
+    /// Plain expansions of the attached email still to answer with 500.
+    private let failingAttachedEmailOpens: Mutex<Int>
     /// File id -> times its bytes were served.
     private let served = Mutex<[String: Int]>([:])
 
     init(
         messageId: String, html: String, files: [File], pageSize: Int,
         listStatus: Int? = nil, nextLinkHost: String? = nil, endless: Bool = false,
-        attachedEmailFiles: [File] = []
+        attachedEmailFiles: [File] = [], attachedEmailDated: Bool = true,
+        failingAttachedEmailOpens: Int = 0, attachedEmailListContinues: Bool = false
     ) {
         self.messageId = messageId
         self.html = html
@@ -474,6 +575,9 @@ final class GraphAttachmentServer: Sendable {
         self.nextLinkHost = nextLinkHost
         self.endless = endless
         self.attachedEmailFiles = attachedEmailFiles
+        self.attachedEmailDated = attachedEmailDated
+        self.failingAttachedEmailOpens = Mutex(failingAttachedEmailOpens)
+        self.attachedEmailListContinues = attachedEmailListContinues
     }
 
     func bytesServed() -> [String: Int] { served.withLock { $0 } }
@@ -483,13 +587,16 @@ final class GraphAttachmentServer: Sendable {
             message(request)
         }
         http.register(path: "/messages/\(messageId)/attachments", method: "GET") { [self] request in
-            // An attached email's own list: Graph v1.0 answers 400 "Resource not
-            // found for the segment 'attachments'", with or without `$select`
-            // (measured).
-            if request.url.path.lowercased().contains("/microsoft.graph.itemattachment/item/attachments") {
-                return .status(400)
+            let components = request.url.pathComponents
+            guard let index = components.firstIndex(of: "attachments") else { return .status(404) }
+            switch components.count - index - 1 {
+            case 0: return list(request, of: files)
+            case 1: return attachment(request)
+            // Below an attachment: an attached email's own list, or one of its
+            // files by id, plain or cast. Graph v1.0 answers 400 "Resource not
+            // found for the segment ...", with or without `$select` (measured).
+            default: return .status(400)
             }
-            return request.url.lastPathComponent == "attachments" ? list(request, of: files) : attachment(request)
         }
     }
 
@@ -558,36 +665,85 @@ final class GraphAttachmentServer: Sendable {
                 return Self.json(json)
             }
         }
-        // `$expand=microsoft.graph.itemattachment/item`: the attached email with
-        // its own attachments, every file with its `contentBytes`
-        // (attachment-get, Example 4: documented, unmeasured); no `attachments`
-        // key when it has none (measured). A `$select` of a message property
-        // inside the `$expand` is a 400, `subject` not being on `outlookItem`
-        // (measured); a type-cast `$select` or a nested `$expand` has not been
-        // run, so it is not modelled.
+        var json = metadata(file)
         let expand = Self.query(request, "$expand") ?? ""
-        guard expand == "microsoft.graph.itemattachment/item" else {
-            let selected = expand.range(of: "($select=").map { start in
-                expand[start.upperBound...].prefix { $0 != ")" && $0 != ";" }
-                    .split(separator: ",").map(String.init)
-            } ?? []
-            let notOnOutlookItem = selected.contains { !$0.contains("/") && !Self.outlookItemProperties.contains($0) }
-            return .status(notOnOutlookItem ? 400 : Self.notModelled)
+        if expand == Self.plainExpand {
+            // The attached email with its own attachments, every file with its
+            // `contentBytes`; no `attachments` key when it has none (measured).
+            let failed = failingAttachedEmailOpens.withLock { remaining in
+                guard remaining > 0 else { return false }
+                remaining -= 1
+                return true
+            }
+            if failed { return .status(500) }
+            var item = attachedEmailItem()
+            if !attachedEmailFiles.isEmpty {
+                item["attachments"] = attachedEmailFiles.map { serve($0) }
+                if attachedEmailListContinues {
+                    item["attachments@odata.nextLink"] =
+                        "https://graph.microsoft.com/v1.0/me/messages/\(messageId)/attachments/\(file.id)?$skiptoken=1"
+                }
+            }
+            json["item"] = item
+            return Self.json(json)
         }
+        guard expand.hasPrefix(Self.plainExpand + "("), expand.hasSuffix(")") else {
+            return .status(Self.notModelled)
+        }
+        var selected: [String]?
+        let options = Self.splitOutsideParentheses(
+            String(expand.dropFirst(Self.plainExpand.count + 1).dropLast()), on: ";")
+        for option in options {
+            if option.hasPrefix("$select=") {
+                var names: [String] = []
+                for property in option.dropFirst("$select=".count).split(separator: ",").map(String.init) {
+                    if property.hasPrefix(Self.messageCast) {
+                        names.append(String(property.dropFirst(Self.messageCast.count)))
+                    } else if Self.outlookItemProperties.contains(property) {
+                        names.append(property)
+                    } else {
+                        // "Could not find a property named 'subject' on type
+                        // 'microsoft.graph.outlookItem'" (measured).
+                        return .status(400)
+                    }
+                }
+                selected = names
+            } else if option.hasPrefix("$expand=attachments") {
+                // An uncast nested expansion of the item's attachments (measured).
+                return .status(400)
+            } else if !option.hasPrefix("$expand=" + Self.messageCast + "attachments") {
+                return .status(Self.notModelled)
+            }
+            // A cast nested expansion of the item's attachments is accepted and
+            // dropped from the answer (measured).
+        }
+        guard let selected else { return .status(Self.notModelled) }
+        let full = attachedEmailItem()
+        var item: [String: Any] = ["@odata.type": "#microsoft.graph.message", "id": "\(file.id)-item"]
+        for name in selected {
+            if let value = full[name] { item[name] = value }
+        }
+        json["item"] = item
+        return Self.json(json)
+    }
+
+    /// The attached email's own properties, without its attachments.
+    private func attachedEmailItem() -> [String: Any] {
         var item: [String: Any] = [
-            "subject": "Plan", "receivedDateTime": ISO8601DateFormatter().string(from: Date()),
+            "@odata.type": "#microsoft.graph.message", "subject": "Plan",
             "from": ["emailAddress": ["name": "Sender", "address": "sender@example.com"]],
             "toRecipients": [["emailAddress": ["address": "owner@example.com"]]],
             "body": ["contentType": "html", "content": Self.attachedEmailBody],
             "hasAttachments": !attachedEmailFiles.isEmpty,
         ]
-        if !attachedEmailFiles.isEmpty {
-            item["attachments"] = attachedEmailFiles.map { serve($0) }
+        if attachedEmailDated {
+            item["receivedDateTime"] = ISO8601DateFormatter().string(from: Date())
         }
-        var json = metadata(file)
-        json["item"] = item
-        return Self.json(json)
+        return item
     }
+
+    private static let plainExpand = "microsoft.graph.itemattachment/item"
+    private static let messageCast = "microsoft.graph.message/"
 
     /// The status for a request shape this fake does not model, so a reader
     /// that starts sending one fails loudly instead of meeting a guess.
@@ -599,6 +755,25 @@ final class GraphAttachmentServer: Sendable {
     static let outlookItemProperties: Set<String> = [
         "id", "categories", "changeKey", "createdDateTime", "lastModifiedDateTime",
     ]
+
+    /// `text` split on `separator` where it is not inside parentheses.
+    private static func splitOutsideParentheses(_ text: String, on separator: Character) -> [String] {
+        var parts: [String] = []
+        var current = ""
+        var depth = 0
+        for character in text {
+            if character == "(" { depth += 1 }
+            if character == ")" { depth -= 1 }
+            if character == separator, depth == 0 {
+                parts.append(current)
+                current = ""
+            } else {
+                current.append(character)
+            }
+        }
+        parts.append(current)
+        return parts
+    }
 
     /// The body of the attached email in `files`.
     static let attachedEmailBody = "<p>The attached plan</p>"
