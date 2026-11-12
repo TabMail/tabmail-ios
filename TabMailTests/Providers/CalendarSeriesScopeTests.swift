@@ -1062,7 +1062,10 @@ private func runTool(_ arguments: [String: JSONValue], eventId: String, account:
     let out: String
     var declined = false
     do {
-        out = try await CalendarEventEditTool(context: ToolContext(db: db, translator: MockChatIdTranslator()))
+        // The recurrence_ids these tests give are printed as the read tools print them, in the
+        // device's zone (#794): the zone each edit names, so the device is in that zone here.
+        let printedZone = CalendarToolHelpers.stringArgOpt(args, "timezone").flatMap { CalendarTimeZoneResolver.zone(named: $0, in: .none) }
+        out = try await CalendarEventEditTool(context: ToolContext(db: db, translator: MockChatIdTranslator(), deviceZone: printedZone))
             .execute(arguments: args, invocation: ToolInvocation(uiSink: sink, sessionKey: "series-tool-\(account)"))
     } catch let error as ToolDeclinedError {
         out = error.output
@@ -1879,7 +1882,7 @@ struct CalendarSeriesScopeRouteTests {
 
     private func route(_ args: [String: JSONValue], _ named: CalendarSeriesScope.Named, scope: String = "all",
                        zone: TimeZone = utc) throws -> Went {
-        let routed = try CalendarSeriesScope.route(args, scope: scope, named: named, zone: zone)
+        let routed = try CalendarSeriesScope.route(args, scope: scope, named: named, zone: zone, recurrenceIdZone: zone)
         #expect(CalendarToolHelpers.stringArgOpt(routed.args, "edit_scope") ?? scope == routed.scope,
                 "the arguments' edit_scope is not the scope written")
         // Routed again, it routes to itself: the queue decides what the card said. The queue reads
@@ -1890,7 +1893,7 @@ struct CalendarSeriesScopeRouteTests {
         } else {
             reread = Self.named(try named.readSeries())
         }
-        let again = try CalendarSeriesScope.route(routed.args, scope: routed.scope, named: reread, zone: zone)
+        let again = try CalendarSeriesScope.route(routed.args, scope: routed.scope, named: reread, zone: zone, recurrenceIdZone: zone)
         #expect(again.scope == routed.scope && again.args == routed.args, "routed again: \(again.scope), not \(routed.scope)")
         return Went(scope: routed.scope, recurrenceId: routed.recurrenceId,
                     start: CalendarToolHelpers.stringArgOpt(routed.args, "start_iso"),
@@ -1900,7 +1903,7 @@ struct CalendarSeriesScopeRouteTests {
     private func refusal(_ args: [String: JSONValue], _ named: CalendarSeriesScope.Named, scope: String = "all",
                          zone: TimeZone = utc) -> String? {
         do {
-            _ = try CalendarSeriesScope.route(args, scope: scope, named: named, zone: zone)
+            _ = try CalendarSeriesScope.route(args, scope: scope, named: named, zone: zone, recurrenceIdZone: zone)
             return nil
         } catch CalendarProviderError.notSupported(let reason) {
             return reason
@@ -1929,6 +1932,16 @@ struct CalendarSeriesScopeRouteTests {
         let tokyo = try #require(TimeZone(identifier: "Asia/Tokyo"))
         #expect(try route(moved, later, zone: tokyo)
                 == Went(scope: "this_and_following", recurrenceId: "\(day(7))T18:00:00", start: "\(day(8))T09:00:00", eventId: "ser_occ"))
+    }
+
+    @Test("a recurrence_id route names for a later occurrence is in the recurrence_id's zone, not the edit's (#794)")
+    func mintedRecurrenceIdIsInTheRecurrenceIdZone() throws {
+        let later = Self.named(Self.timedSeries, occurrence: Self.occurrence(timed(day(7))))
+        let tokyo = try #require(TimeZone(identifier: "Asia/Tokyo"))
+        let routed = try CalendarSeriesScope.route(
+            ["start_iso": .string("\(day(8))T09:00:00")], scope: "all", named: later, zone: utc, recurrenceIdZone: tokyo)
+        #expect(routed.scope == "this_and_following" && routed.recurrenceId == "\(day(7))T18:00:00",
+                "\(routed.scope) at \(routed.recurrenceId ?? "-")")
     }
 
     @Test("the first occurrence named by its id is the whole series, a plain move, at the first occurrence")
@@ -2452,7 +2465,7 @@ struct CalDAVSeriesScopeTests {
         }
         let before = harness.http.recordedCalls().count
         let sink = H.ConfirmingSink(http: harness.http)
-        let output = try await CalendarEventEditTool(context: ToolContext(db: harness.pool, translator: translator)).execute(
+        let output = try await CalendarEventEditTool(context: ToolContext(db: harness.pool, translator: translator, deviceZone: fixture.zone)).execute(
             arguments: arguments, invocation: ToolInvocation(uiSink: sink, sessionKey: session))
         let cards = await MainActor.run { sink.confirmations.count }
         #expect(cards == 0, "a card was shown: \(output)")
@@ -2517,7 +2530,7 @@ struct DeletedAfterTheCardTests {
         await H.recordCalendar(of: eventId, accountId: harness.accountId, translator: translator)
         let store = harness.store
         let sink = RecordingCardSink(beforeConfirming: { store.seed(path: W.seriesPath, ics: deleted) })
-        let output = try await CalendarEventEditTool(context: ToolContext(db: harness.pool, translator: translator)).execute(
+        let output = try await CalendarEventEditTool(context: ToolContext(db: harness.pool, translator: translator, deviceZone: fixture.zone)).execute(
             arguments: [
                 "event_id": .string(String(numericId)), "edit_scope": .string("this_only"),
                 "recurrence_id": .string(OccurrenceFixture.naive(occurrence, fixture.zone)),
@@ -2685,7 +2698,7 @@ struct RewrittenAfterTheCardTests {
         }
         let store = harness.store
         let sink = RecordingCardSink(beforeConfirming: { store.seed(path: W.seriesPath, ics: rewritten.ics) })
-        let output = try await CalendarEventEditTool(context: ToolContext(db: harness.pool, translator: translator)).execute(
+        let output = try await CalendarEventEditTool(context: ToolContext(db: harness.pool, translator: translator, deviceZone: fixture.zone)).execute(
             arguments: arguments, invocation: ToolInvocation(uiSink: sink, sessionKey: session))
         let cards = await sink.cards
         #expect(cards.count == 1, "\(entry.scope): no card, so the edit never reached the queue: \(output)")

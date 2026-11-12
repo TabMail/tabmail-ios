@@ -164,7 +164,7 @@ struct CalDAVOccurrenceEditToolToWireTests {
         }
 
         let sink = H.ConfirmingSink(http: harness.http)
-        let output = try await CalendarEventEditTool(context: ToolContext(db: harness.pool, translator: translator)).execute(
+        let output = try await CalendarEventEditTool(context: ToolContext(db: harness.pool, translator: translator, deviceZone: fixture.zone)).execute(
             arguments: arguments, invocation: ToolInvocation(uiSink: sink, sessionKey: session))
         await AccountManager.shared.drainCalendarQueue()
 
@@ -250,7 +250,7 @@ struct CalDAVOccurrenceEditToolToWireTests {
                 "timezone": .string(fixture.zone.identifier),
             ]
             let sink = H.ConfirmingSink(http: harness.http)
-            let output = try await CalendarEventEditTool(context: ToolContext(db: harness.pool, translator: translator)).execute(
+            let output = try await CalendarEventEditTool(context: ToolContext(db: harness.pool, translator: translator, deviceZone: fixture.zone)).execute(
                 arguments: arguments, invocation: ToolInvocation(uiSink: sink, sessionKey: session))
             await AccountManager.shared.drainCalendarQueue()
 
@@ -312,7 +312,7 @@ struct CalDAVOccurrenceEditToolToWireTests {
             "timezone": .string(fixture.zone.identifier),
         ]
         let sink = H.ConfirmingSink(http: harness.http)
-        let output = try await CalendarEventEditTool(context: ToolContext(db: harness.pool, translator: translator)).execute(
+        let output = try await CalendarEventEditTool(context: ToolContext(db: harness.pool, translator: translator, deviceZone: fixture.zone)).execute(
             arguments: arguments, invocation: ToolInvocation(uiSink: sink, sessionKey: session))
         // The first attempt's response is lost, so the edit is retried by a later drain.
         await AccountManager.shared.drainCalendarQueue()
@@ -374,7 +374,7 @@ extension CalDAVOccurrenceEditToolToWireTests {
             "timezone": .string(fixture.zone.identifier),
         ]
         let sink = H.ConfirmingSink(http: harness.http)
-        let output = try await CalendarEventEditTool(context: ToolContext(db: harness.pool, translator: translator)).execute(
+        let output = try await CalendarEventEditTool(context: ToolContext(db: harness.pool, translator: translator, deviceZone: fixture.zone)).execute(
             arguments: arguments, invocation: ToolInvocation(uiSink: sink, sessionKey: session))
         // The first attempt's cap response is lost, so the split is retried by a later drain.
         await AccountManager.shared.drainCalendarQueue()
@@ -470,7 +470,7 @@ extension CalDAVOccurrenceEditToolToWireTests {
         }
 
         let sink = H.ConfirmingSink(http: harness.http)
-        let output = try await CalendarEventEditTool(context: ToolContext(db: harness.pool, translator: translator)).execute(
+        let output = try await CalendarEventEditTool(context: ToolContext(db: harness.pool, translator: translator, deviceZone: fixture.zone)).execute(
             arguments: arguments, invocation: ToolInvocation(uiSink: sink, sessionKey: session))
         await AccountManager.shared.drainCalendarQueue()
 

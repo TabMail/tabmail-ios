@@ -55,6 +55,30 @@ enum CalendarToolHelpers {
         return stamped
     }
 
+    /// The queued argument naming the zone an edit's `recurrence_id` is read in (#794).
+    static let recurrenceIdZoneKey = "recurrence_id_timezone"
+
+    /// `arguments` naming the zone their `recurrence_id` is read in: `deviceZone`, the zone the read
+    /// tools print an occurrence's start in, whatever `timezone` the edit names for its new times.
+    /// `recurrence_id` is an identifier copied from read output, so it is read where it was
+    /// printed, as the Thunderbird add-on reads it (`occurrenceNamedBy`, in the user's zone). Set
+    /// by the edit tool, so the drain reads the `recurrence_id` in the zone its card did (#753).
+    static func stampingRecurrenceIdZone(_ arguments: [String: JSONValue], _ deviceZone: TimeZone) -> [String: JSONValue] {
+        var stamped = arguments
+        stamped[recurrenceIdZoneKey] = .string(deviceZone.identifier)
+        return stamped
+    }
+
+    /// The zone a queued edit's `recurrence_id` is read in (`stampingRecurrenceIdZone`). A row
+    /// queued before that stamp existed has none, and is read in `editZone`, as it was queued.
+    static func recurrenceIdZone(_ arguments: [String: JSONValue], editZone: TimeZone) throws -> TimeZone {
+        guard let id = stringArgOpt(arguments, recurrenceIdZoneKey), !id.isEmpty else { return editZone }
+        guard let zone = CalendarTimeZoneResolver.zone(named: id, in: .none) else {
+            throw CalendarProviderError.unrecognizedTimeZone(id, consequence: "it did not change the event")
+        }
+        return zone
+    }
+
     // MARK: - Date Range Resolution (matching TB's resolveDateRange)
 
     /// Resolve from_date/to_date arguments into a (startDate, endDate) tuple.

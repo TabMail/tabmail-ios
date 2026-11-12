@@ -202,7 +202,10 @@ enum CalendarSeriesScope {
     /// Refused, with nothing written: an occurrence before the series' first, one whose place in
     /// the series can't be read, a series whose start can't be read, and an edit of every
     /// occurrence or a split whose series was not read (`Named.readSeries`): never as given.
-    static func route(_ args: [String: JSONValue], scope: String, named: Named, zone: TimeZone) throws -> Routed {
+    ///
+    /// `recurrenceIdZone`: the zone the edit's `recurrence_id` is read in, the device's, where the read
+    /// tools print it, whatever `zone` is (#794); a `recurrence_id` `route` names is shown in it.
+    static func route(_ args: [String: JSONValue], scope: String, named: Named, zone: TimeZone, recurrenceIdZone: TimeZone) throws -> Routed {
         let asGiven = Routed(scope: scope, args: args, eventId: named.eventId)
         guard usesSeries(scope) else { return asGiven }
         let series = try named.readSeries()
@@ -215,7 +218,7 @@ enum CalendarSeriesScope {
             let slot = try slotPlace(occurrence)
             switch try order(slot, first) {
             case .orderedAscending: throw beforeFirst(shown(slot, zone: zone), first: first, zone: zone)
-            case .orderedSame: return try routeEvery(args, named: named, series: series, occurrence: occurrence, first: first, zone: zone)
+            case .orderedSame: return try routeEvery(args, named: named, series: series, occurrence: occurrence, first: first, zone: zone, recurrenceIdZone: recurrenceIdZone)
             case .orderedDescending: return asGiven
             }
         case "all":
@@ -233,7 +236,7 @@ enum CalendarSeriesScope {
                 }
                 return asGiven
             }
-            return try routeEvery(args, named: named, series: series, occurrence: occurrence, first: first, zone: zone)
+            return try routeEvery(args, named: named, series: series, occurrence: occurrence, first: first, zone: zone, recurrenceIdZone: recurrenceIdZone)
         default:
             return asGiven
         }
@@ -241,7 +244,8 @@ enum CalendarSeriesScope {
 
     /// An edit of every occurrence of `series` named at `occurrence` (see `route`).
     private static func routeEvery(
-        _ args: [String: JSONValue], named: Named, series: GCalEvent, occurrence: GCalEvent, first: Place, zone: TimeZone
+        _ args: [String: JSONValue], named: Named, series: GCalEvent, occurrence: GCalEvent, first: Place, zone: TimeZone,
+        recurrenceIdZone: TimeZone
     ) throws -> Routed {
         let slot = try slotPlace(occurrence)
         let isFirst: Bool
@@ -251,7 +255,7 @@ enum CalendarSeriesScope {
         case .orderedDescending: isFirst = false
         }
         let now = try currentPlace(occurrence)
-        let recurrenceId = CalendarToolHelpers.stringArgOpt(args, "recurrence_id") ?? shown(now, zone: zone)
+        let recurrenceId = CalendarToolHelpers.stringArgOpt(args, "recurrence_id") ?? shown(now, zone: recurrenceIdZone)
         guard movesTime(args) else {
             return routed(args, scope: "all", recurrenceId: recurrenceId, eventId: named.eventId)
         }

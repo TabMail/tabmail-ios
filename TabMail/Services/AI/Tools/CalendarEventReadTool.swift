@@ -65,8 +65,10 @@ struct CalendarEventReadTool: AgentTool, Sendable {
 
         // Path 1: Direct lookup by event_id
         if !compoundId.isEmpty {
-            let tz = CalendarToolHelpers.resolveTimeZone(arguments)
-            return await directLookup(compoundId: compoundId, numericId: numericId, timeZone: tz)
+            // Printed in the device's zone whatever `timezone` is given, as the Thunderbird add-on's
+            // read by id prints it: an occurrence's start is what `calendar_event_edit` takes back as
+            // `recurrence_id`, and it reads that in the device's zone (#794).
+            return await directLookup(compoundId: compoundId, numericId: numericId, timeZone: ctx.deviceZone)
         }
 
         // Path 2: Search by start_iso across all calendars
