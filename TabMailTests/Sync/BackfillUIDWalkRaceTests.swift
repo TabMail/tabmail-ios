@@ -410,14 +410,14 @@ struct BackfillUIDWalkRaceTests {
     /// Bound, in 10 ms polls, on waiting for the walk to send that SEARCH.
     private static let commandWaitPolls = 1_000
 
-    /// Walk the folder of `walk` (resumed at `resumedCursor`) once, with
-    /// `reset` landing while the server holds the SEARCH of the walk's top
-    /// range, before that range's empty answer is confirmed. Returns the
-    /// call's result and whether the reset finished inside the hold.
+    /// Walk the folder of `walk` (resumed at `cursor`) once, with `reset`
+    /// landing while the server holds the SEARCH of the walk's top range,
+    /// before that range's empty answer is confirmed. Returns the call's
+    /// result and whether the reset finished inside the hold.
     private static func resetDuringTopRangeSearch(
-        _ walk: Walk, _ reset: UserReset
+        _ walk: Walk, _ reset: UserReset, cursor: Int = resumedCursor
     ) async -> (didWork: Bool, resetInsideHold: Bool) {
-        let topRange = ":\(resumedCursor)"
+        let topRange = ":\(cursor)"
         walk.server.stallNextCommand(containing: topRange, seconds: searchStallSeconds)
         let call = Task { await walk.call() }
         var sent = false
@@ -536,6 +536,54 @@ struct BackfillUIDWalkRaceTests {
         #expect(try walk.row().backfillComplete, "\(reset): the folder's walk never completed again after the reset")
         let missing = Set(walk.serverUIDs()).subtracting(try walk.local())
         #expect(missing.isEmpty, "\(reset): backfill never loaded UIDs \(missing.sorted()) again after the reset")
+    }
+
+    /// A resumed walk's cursor far down a large folder: every range below it
+    /// is empty, and there are many times more of them than the walk has
+    /// workers whatever the profile's chunk.
+    private static let farCursor = 100_000
+    /// The one message the large folder holds, above `farCursor`.
+    private static let aboveFarCursor = 101_000
+
+    /// The walker resumes far down a large folder whose ranges below the
+    /// cursor are all empty. The reset lands while the server holds the
+    /// SEARCH of the top range, so that range's progress write finds the
+    /// walk's position moved. From then on the walk stops: its workers finish
+    /// the ranges they already hold and search no other (the folder's commands
+    /// share one connection, so none was sent during the hold), and the next
+    /// call walks from what the reset left.
+    @Test("Once a walk's position moved under it, the walk searches no further ranges in that call")
+    func lostPositionStopsTheWalk() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        defer { F.clearWalkCheckpoints() }
+
+        let walk = try await Self.makeWalk(
+            accountId: "uid-race-lost-position-stops", serverUIDs: [Self.aboveFarCursor],
+            cursor: Self.farCursor, localUIDs: [Self.aboveFarCursor], pool: pool)
+        defer { Self.tearDown(walk) }
+
+        let workers = await walk.imap.poolMaxConnections()
+        let largestChunk = [BackfillProfile.low, .normal, .aggressive, .turbo].map(\.backfillChunkSize).max() ?? 1
+        let fewestRanges = Self.farCursor / largestChunk
+        #expect(fewestRanges > 4 * workers,
+                "precondition: the folder has many more ranges (at least \(fewestRanges)) than the walk has workers (\(workers))")
+        let commandsBefore = walk.server.recordedCommands().count
+
+        let (_, resetInsideHold) = await Self.resetDuringTopRangeSearch(walk, .accountReset, cursor: Self.farCursor)
+
+        #expect(resetInsideHold, "precondition: the reset landed while the top range's SEARCH was held")
+        let searches = walk.server.recordedCommands().dropFirst(commandsBefore)
+            .filter { $0.uppercased().hasPrefix("UID SEARCH") }.count
+        #expect(searches < fewestRanges / 2,
+                "after its position moved, the walk searched \(searches) of the folder's \(fewestRanges) or more ranges with \(workers) workers: it walked on over a position it no longer owned")
+        let claim = try walk.claim()
+        #expect(claim == nil, "after the walker's call, \(claim ?? "")")
+
+        try await walk.callUntilComplete()
+        #expect(try walk.row().backfillComplete, "the folder's walk never completed again after the reset")
+        let missing = Set(walk.serverUIDs()).subtracting(try walk.local())
+        #expect(missing.isEmpty, "backfill never loaded UIDs \(missing.sorted()) again after the reset")
     }
 
     /// The walker resumes at cursor 4000 (UID 5000 above it already loaded)

@@ -132,6 +132,18 @@ struct BackfillInsertFailureTests {
         try pool.write { db in try db.execute(sql: "DROP TRIGGER test_failInsert") }
     }
 
+    /// Whether `command` (as `FakeIMAPServer` records it, without its tag) is
+    /// a `UID FETCH` whose UID set names `uid`.
+    private static func isUIDFetch(_ command: String, naming uid: Int) -> Bool {
+        let words = command.split(separator: " ")
+        guard words.count >= 3, words[0].uppercased() == "UID", words[1].uppercased() == "FETCH" else { return false }
+        return words[2].split(separator: ",").contains { item in
+            let bounds = item.split(separator: ":").compactMap { Int($0) }
+            guard let low = bounds.min(), let high = bounds.max() else { return false }
+            return (low...high).contains(uid)
+        }
+    }
+
     // MARK: - The IMAP UID walk
 
     @Test("A failed write chunk on the IMAP walk keeps the walk's cursor above it, and the next call loads the messages")
@@ -147,6 +159,17 @@ struct BackfillInsertFailureTests {
         try Self.failInserts(of: Self.failingUID, pool: pool)
 
         _ = await world.engine.runBackfill(account: world.account, deadline: F.deadline())
+
+        // The call leaves the failed range to the next call: each of its
+        // workers may take the range once (a failed range is served to the
+        // next worker that asks), and then the folder is declined for the rest
+        // of the call. Walking it again would retry the failing write at
+        // network rate until the deadline.
+        let workers = await world.imap.poolMaxConnections()
+        let fetchesOfFailedRange = world.server.recordedCommands()
+            .filter { Self.isUIDFetch($0, naming: Self.failingUID) }.count
+        #expect(fetchesOfFailedRange >= 1 && fetchesOfFailedRange <= workers,
+                "the call fetched the failed range \(fetchesOfFailedRange) times with \(workers) workers: it walked the range again instead of leaving it for the next call")
 
         let afterFailure = try world.row()
         let claim = F.uidPositionClaimsMissingMail(afterFailure, local: try world.local(), server: Self.serverUIDs)
