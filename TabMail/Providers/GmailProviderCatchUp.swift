@@ -8,7 +8,8 @@ import Foundation
 /// `Folder.catchUpState`. Only `GmailProvider` reads or writes it. Gmail ids carry
 /// no epoch, so unlike IMAP's there is none here.
 struct GmailCatchUpState: Codable, Equatable, Sendable {
-    /// When the last listing completed. Drives the full-check interval.
+    /// When the last listing completed. Until one has, the folder's first
+    /// listing is due; after it, the expensive-network wait counts from here.
     var lastCompletedAt: Date?
     /// The listing in progress, if any.
     var listing: Listing?
@@ -104,18 +105,20 @@ extension GmailProvider {
 
     /// What a folder needs this pass. Pure, so the decision is testable on its own.
     enum CatchUpPlan: Equatable {
-        /// Nothing: the full check is not due, or an expensive network holds it back.
+        /// Nothing: no listing is due, or an expensive network holds it back.
         case none
         /// List the folder by provider-date ranges, starting at or continuing `listing`.
         case list(GmailCatchUpState.Listing)
     }
 
-    /// The per-folder decision: IMAP's without the HIGHESTMODSEQ signal (Gmail has
-    /// none). A folder continues a listing in progress (a lapse never interrupts
-    /// one), or starts one when its full check is due (weekly,
-    /// `SyncConfig.gmailCatchUpFullCheckIntervalSeconds`; no state at all is due),
-    /// or when a lapse came after its last completed listing started
-    /// (`GmailCatchUpState.lapsedSinceLastListing`). On an expensive network only
+    /// The per-folder decision. A Gmail folder is listed in exactly three cases:
+    /// it continues a listing in progress (a lapse never interrupts one); it
+    /// starts its first listing (no listing has completed yet, no state at all
+    /// included); or it starts one when a lapse came after its last completed
+    /// listing started (`GmailCatchUpState.lapsedSinceLastListing`). There is no
+    /// periodic re-check: while the history cursor is valid the delta follows
+    /// every folder, All Mail included, and a lapse is what loses changes. On an
+    /// expensive network only
     /// once it has waited `SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds` since
     /// its last completed listing (a lapse does not restart the wait). A folder
     /// with no state on an expensive network gets `.none`; the caller writes a
@@ -125,8 +128,7 @@ extension GmailProvider {
             hasState: state != nil, lastCompletedAt: state?.lastCompletedAt, createdAt: state?.createdAt, now: now)
         if isExpensiveNetwork && !waitedTooLong { return .none }
         if let listing = state?.listing { return .list(listing) }
-        if state?.lapsedSinceLastListing == true || CatchUpSchedule.fullCheckDue(
-            lastCompletedAt: state?.lastCompletedAt, now: now, interval: SyncConfig.gmailCatchUpFullCheckIntervalSeconds) {
+        if state?.lastCompletedAt == nil || state?.lapsedSinceLastListing == true {
             return .list(GmailCatchUpState.Listing(lapseCountAtStart: state?.lapseCount))
         }
         return .none
@@ -189,8 +191,8 @@ extension GmailProvider {
         folder.backfillComplete && !context.storageLimitInForce
     }
 
-    /// `EmailProvider.catchUp` for Gmail (ADR-IOS-107). For each folder whose full
-    /// check is due (weekly, or after a lapse) or whose listing is in progress: a listing by
+    /// `EmailProvider.catchUp` for Gmail (ADR-IOS-107). For each folder whose
+    /// listing is due (its first, or after a lapse) or in progress: a listing by
     /// provider-date ranges taken from the local rows, newest first, resuming across passes.
     /// Per range, the folder's membership list, then the account-wide `is:unread`
     /// and `is:starred` lists over the same dates (so a message moved between two
@@ -318,7 +320,7 @@ extension GmailProvider {
                         // while the folder's walk is unfinished or a storage limit
                         // is in force. One completed listing asks at most once, so
                         // an id that cannot load costs one ids-only re-walk per
-                        // listing (weekly, plus the listing after each lapse), and
+                        // listing (the first, plus the listing after each lapse), and
                         // is tried again at each. What leaves an id missing, and so
                         // asks: mail moved in from elsewhere (older than the newest
                         // rows, which no window reaches) that no delta brought (a

@@ -20,6 +20,10 @@ folder's state instead of clearing it, so a listing in progress keeps its place 
 starts once it completes; listings run newest first; while a storage limit is in force no catch-up
 re-arms a walk or lists below the oldest local row; the writer list and the Spam/Trash sentence are
 corrected).
+**Amended 2026-11-12: no periodic Gmail check** (decision 8, owner ruling: the weekly Gmail full check
+is dropped. A Gmail folder is listed in exactly three cases: its first listing, a listing in progress,
+and after a lapse. `SyncConfig.gmailCatchUpFullCheckIntervalSeconds` is deleted; the expensive-network
+wait stays; IMAP keeps its daily check).
 
 **Context.** Every sync path windows its work, and changes to older mail fall outside every window:
 
@@ -182,18 +186,42 @@ The owner's rulings of 2026-11-09:
      one All Mail membership rule; the catch-up's removal proof asks the same rule). So while the
      cursor is valid every change reaches the device through the delta, All Mail included, and the
      catch-up is the safety net for the gaps above.
-   - **Schedule.** `CatchUpSchedule` (shared with IMAP): a full check every
-     `gmailCatchUpFullCheckIntervalSeconds` (WEEKLY, amended 2026-11-11), and a new listing after
+   - **Schedule** (amended 2026-11-12: no periodic check). `GmailProvider.catchUpPlan` lists a
+     folder in exactly three cases: it continues a listing in progress (a lapse never interrupts
+     one); it starts the folder's FIRST listing (no listing has completed yet: no state at all, or
+     the state first sight wrote on an expensive network); and it starts a new listing after a lapse
+     as soon as the listing in progress (if any) completes (the lapse marker, below). There is no
+     periodic re-check: a tracked folder whose listing completed and that no lapse touched is never
+     listed again. Shared with IMAP (`CatchUpSchedule`): on an expensive network at most
+     `catchUpExpensiveNetworkMaxWaitSeconds` of waiting (`CatchUpSchedule.waitedTooLong`, kept); least
+     recently attempted folder first; the pass budget before every request and
+     `catchUpRequestTimeoutSeconds` on each.
+     - **Why no periodic check (owner 2026-11-12).** While the history cursor is valid the delta
+       follows every folder, All Mail included (#731), and every lapse lists every folder again, so
+       the weekly check only backed up what neither reveals: a change whose delta GET failed while
+       the capture kept the cursor (#464). The owner dropped it. Cost accepted: such a change waits
+       for the next lapse. Test: `GmailCatchUpTests.gmailHasNoPeriodicCheckAndIMAPIsDaily` (a tracked,
+       completed folder with no lapse makes no request 8 days later; a lapse lists it).
+     - *Superseded (2026-11-12, the weekly schedule):* "`CatchUpSchedule` (shared with IMAP): a full
+     check every `gmailCatchUpFullCheckIntervalSeconds` (WEEKLY, amended 2026-11-11), and a new listing after
      a lapse as soon as the listing in progress (if any) completes (the lapse marker, below); on an
      expensive network at most `catchUpExpensiveNetworkMaxWaitSeconds` of waiting (first sight writes
      `createdAt` and makes no request); least recently attempted folder first; the pass budget before
-     every request and `catchUpRequestTimeoutSeconds` on each. *Superseded (2026-11-11, before the
+     every request and `catchUpRequestTimeoutSeconds` on each." *Superseded (2026-11-11, before the
      lapse marker):* "and at once after a lapse, which clears the folder's state".
+     - **Only IMAP has an interval** (amended 2026-11-12). `CatchUpSchedule.fullCheckDue` is called
+       by `IMAPProvider.catchUpPlan` alone, with `catchUpFullCheckIntervalSeconds` (one day). Nothing
+       above `EmailProvider` names a provider or an interval. *Superseded (2026-11-12):* the bullet
+       below.
      - **Each provider chooses its own interval, below the boundary.**
        `CatchUpSchedule.fullCheckDue(lastCompletedAt:now:interval:)` takes the interval as an
        argument; `GmailProvider.catchUpPlan` passes `gmailCatchUpFullCheckIntervalSeconds` (7 days)
        and `IMAPProvider.catchUpPlan` passes `catchUpFullCheckIntervalSeconds` (one day, unchanged).
        Nothing above `EmailProvider` names a provider or an interval.
+     - *Superseded (2026-11-12, no periodic check):* the two bullets below ("Why weekly",
+       "Consequences of the week"). Their point about the length of a listing still holds: a
+       listing spans many full syncs, so the repair after a lapse takes, newest first, one full sync
+       for this week's mail and up to one listing for mail of any age.
      - **Why weekly (owner 2026-11-11).** With #731 the delta reaches every change while its cursor
        is valid, and after a lapse every folder is listed again, newest first, as soon as its
        listing in progress completes. The regular check only backs up what no delta and no lapse
@@ -222,8 +250,8 @@ The owner's rulings of 2026-11-09:
      - *Superseded (2026-11-10):* "a full check every `catchUpFullCheckIntervalSeconds` (daily)".
      Every number is in `SyncConfig`
      (`catchUpGmailRangeRowLimit`, `catchUpGmailRangeMaxSpanSeconds`, `catchUpGmailRangeSlackSeconds`,
-     `catchUpGmailListPageSize`, `gmailCatchUpFullCheckIntervalSeconds`; `catchUpMissingIdsRecordLimit`
-     was removed with the re-arm record, 2026-11-11).
+     `catchUpGmailListPageSize`; `catchUpMissingIdsRecordLimit` was removed with the re-arm record,
+     2026-11-11, and `gmailCatchUpFullCheckIntervalSeconds` with the weekly check, 2026-11-12).
      The network state comes only from the `CatchUpContext` snapshot.
    - **Ranges by order date, newest first** (amended 2026-11-11). The reader's order-date accessors
      (index `(folderId, providerDate)`) are `newestRows(folderId:orderDatesBefore:limit:)` (the
@@ -342,10 +370,12 @@ The owner's rulings of 2026-11-09:
        walk: the walk passes over a message whose `format=full` GET fails about that message (a
        per-message failure) or keeps failing past the page hold bound (#713), completes without it,
        and the next check finds it missing and re-arms. Test:
-       `GmailCatchUpTests.idPassedOverByTheWalkLoadsAtTheNextCheck`.
+       `GmailCatchUpTests.idPassedOverByTheWalkLoadsAtTheNextCheck`. *Note (2026-11-12, no periodic
+       check):* the next check of a tracked folder is the listing after the next lapse.
      - **Bounds.** Ids that stay missing cost at most one re-arm per completed listing per folder:
-       one per week on the weekly schedule, plus the listing after each lapse (*superseded:* "plus
-       the check after each lapse"); none while a storage limit is in force. Each try is a fresh chance
+       the first listing, plus the listing after each lapse (*superseded 2026-11-12:* "one per week
+       on the weekly schedule, plus the listing after each lapse"; *superseded:* "plus the check
+       after each lapse"); none while a storage limit is in force. Each try is a fresh chance
        to load, so an id whose cause passed (a queued op removed, a server error over) loads at the
        next check. One re-arm costs one ids-only re-walk of the folder (about one list request per
        500 messages) and one `format=full` GET per id still missing.
@@ -494,7 +524,8 @@ The owner's rulings of 2026-11-09:
      path (parse, every sync, backfill and delta insert or refresh, NSE staging, copies), and rows
      from before v91 hold it too, because Gmail's `date` was `internalDate` until v91 copied it into
      `providerDate`. Such a row would fall outside its range's list, become a candidate and be kept by
-     its GET: one cheap `format=minimal` GET per check (weekly since 2026-11-11; daily before).
+     its GET: one cheap `format=minimal` GET per listing (the first and one after each lapse since
+     2026-11-12; weekly from 2026-11-11; daily before).
 
 **Consequences.**
 

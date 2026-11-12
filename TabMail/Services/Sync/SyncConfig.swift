@@ -721,14 +721,10 @@ enum SyncConfig {
     static let catchUpRequestTimeoutSeconds: TimeInterval = 3
     /// How often an IMAP folder gets a full listing even when nothing signals a
     /// change (seconds). Runs only on a non-expensive network, oldest folder first.
+    /// Gmail has no such interval: the history delta follows every folder while
+    /// its cursor is valid, so a Gmail folder is listed only the first time and
+    /// after a lapse of the cursor (`GmailProvider.catchUpPlan`).
     static let catchUpFullCheckIntervalSeconds: TimeInterval = 86_400
-    /// How often a Gmail folder gets a full listing (seconds): weekly. The Gmail
-    /// history delta follows every folder, All Mail included, while its cursor is
-    /// valid, so the full check is a safety net. A lapse of the cursor marks every
-    /// folder's catch-up state, and each folder is listed again as soon as its
-    /// listing in progress completes; a large folder's listing can take many full
-    /// syncs, because each gets `catchUpPassBudgetSeconds`.
-    static let gmailCatchUpFullCheckIntervalSeconds: TimeInterval = 7 * 86_400
     /// The longest a folder's full listing waits for a non-expensive network
     /// (seconds), counted from its last completed listing, or from the catch-up's
     /// first sight of the folder. After that it runs on any network, inside the

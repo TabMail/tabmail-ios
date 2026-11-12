@@ -140,8 +140,9 @@ enum CatchUpLapse {
 /// due, and whether an expensive network may still hold it back.
 enum CatchUpSchedule {
     /// True when the folder has never completed a listing, or its last one
-    /// completed at least `interval` ago. Each provider passes its own interval
-    /// from `SyncConfig`, below the provider boundary.
+    /// completed at least `interval` ago. A provider with a periodic check passes
+    /// its own interval from `SyncConfig`, below the provider boundary (IMAP:
+    /// daily). Gmail has no periodic check (`GmailProvider.catchUpPlan`).
     static func fullCheckDue(lastCompletedAt: Date?, now: Date, interval: TimeInterval) -> Bool {
         guard let lastCompletedAt else { return true }
         return now.timeIntervalSince(lastCompletedAt) >= interval

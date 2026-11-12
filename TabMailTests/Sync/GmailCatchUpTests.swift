@@ -913,36 +913,39 @@ struct GmailCatchUpTests {
         }
     }
 
-    /// The Gmail full check is weekly, and the expensive-network wait is counted
-    /// from the last completed listing and is as long as that week: a due weekly
-    /// check has already waited as long as the wait allows, so it runs on any
-    /// network. Only a folder with no completed listing yet (a new folder, or one
-    /// whose state was reset) still waits for a non-expensive network. A lapse
-    /// after the last completed listing started makes a new listing due at once,
-    /// but never interrupts one in progress and never restarts the wait.
+    /// A Gmail folder is listed in exactly three cases: its first listing (no
+    /// listing completed yet), a listing in progress, and a lapse after the last
+    /// completed listing started. There is no periodic re-check, however long ago
+    /// the last listing completed. A lapse makes a new listing due at once, but
+    /// never interrupts one in progress and never restarts or skips the
+    /// expensive-network wait, which is counted from the last completed listing
+    /// (before the first, from `createdAt`).
     @Test("The per-folder plan")
     func catchUpPlan() {
         let now = Clock().now
-        let week = SyncConfig.gmailCatchUpFullCheckIntervalSeconds
+        let maxWait = SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds
         let fresh = GmailCatchUpState(lastCompletedAt: now.addingTimeInterval(-60))
-        let stale = GmailCatchUpState(lastCompletedAt: now.addingTimeInterval(-week - 1))
+        let old = GmailCatchUpState(lastCompletedAt: now.addingTimeInterval(-4 * maxWait))
         let running = GmailCatchUpState(lastCompletedAt: now.addingTimeInterval(-60), listing: .init(nextBeforeSecond: 42))
         let lapsed = GmailCatchUpState(lastCompletedAt: now.addingTimeInterval(-60), lapseCount: 3, listedLapseCount: 2)
+        let lapsedLongAgo = GmailCatchUpState(lastCompletedAt: now.addingTimeInterval(-maxWait - 1), lapseCount: 3, listedLapseCount: 2)
         let lapseListed = GmailCatchUpState(lastCompletedAt: now.addingTimeInterval(-60), lapseCount: 3, listedLapseCount: 3)
         let lapsedNeverListed = GmailCatchUpState(createdAt: now.addingTimeInterval(-60), lapseCount: 1)
         let lapsedWhileRunning = GmailCatchUpState(
             lastCompletedAt: now.addingTimeInterval(-60), listing: .init(nextBeforeSecond: 42, lapseCountAtStart: 3),
             lapseCount: 4, listedLapseCount: 2)
         let waiting = GmailCatchUpState(createdAt: now.addingTimeInterval(-60))
-        let longWait = GmailCatchUpState(createdAt: now.addingTimeInterval(-SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds - 1))
+        let longWait = GmailCatchUpState(createdAt: now.addingTimeInterval(-maxWait - 1))
 
-        #expect(week >= SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds, "precondition: the wait is no longer than the week")
         #expect(GmailProvider.catchUpPlan(state: nil, isExpensiveNetwork: false, now: now) == .list(.init()))
         #expect(GmailProvider.catchUpPlan(state: nil, isExpensiveNetwork: true, now: now) == .none)
-        #expect(GmailProvider.catchUpPlan(state: fresh, isExpensiveNetwork: false, now: now) == .none, "weekly, not every pass")
-        #expect(GmailProvider.catchUpPlan(state: stale, isExpensiveNetwork: false, now: now) == .list(.init()))
-        #expect(GmailProvider.catchUpPlan(state: stale, isExpensiveNetwork: true, now: now) == .list(.init()),
-                "a due weekly check has waited as long as the wait allows")
+        #expect(GmailProvider.catchUpPlan(state: waiting, isExpensiveNetwork: false, now: now) == .list(.init()),
+                "a folder whose first listing waited for the network is listed once it may be")
+        #expect(GmailProvider.catchUpPlan(state: fresh, isExpensiveNetwork: false, now: now) == .none, "not every pass")
+        #expect(GmailProvider.catchUpPlan(state: old, isExpensiveNetwork: false, now: now) == .none,
+                "no periodic re-check, however long ago the last listing completed")
+        #expect(GmailProvider.catchUpPlan(state: old, isExpensiveNetwork: true, now: now) == .none,
+                "the expensive-network wait being over makes nothing due")
         #expect(GmailProvider.catchUpPlan(state: waiting, isExpensiveNetwork: true, now: now) == .none,
                 "a folder with no completed listing waits for a non-expensive network")
         #expect(GmailProvider.catchUpPlan(state: running, isExpensiveNetwork: false, now: now) == .list(.init(nextBeforeSecond: 42)))
@@ -956,42 +959,45 @@ struct GmailCatchUpTests {
                 == .list(.init(nextBeforeSecond: 42, lapseCountAtStart: 3)), "a lapse never interrupts a listing in progress")
         #expect(GmailProvider.catchUpPlan(state: lapsed, isExpensiveNetwork: true, now: now) == .none,
                 "a lapse does not restart the expensive-network wait, and does not skip it")
+        #expect(GmailProvider.catchUpPlan(state: lapsedLongAgo, isExpensiveNetwork: true, now: now) == .list(.init(lapseCountAtStart: 3)),
+                "a lapsed folder that has waited as long as the wait allows is listed on any network")
         #expect(GmailProvider.catchUpPlan(state: lapsedNeverListed, isExpensiveNetwork: true, now: now) == .none)
     }
 
-    /// The schedule: a Gmail folder's full check runs weekly (plus a new listing
-    /// once a lapse came after the last one started), while IMAP keeps its daily check. Pinned
-    /// end to end for Gmail (no request before the week is over, the listing at
-    /// it) and through the plan for IMAP.
-    @Test("A Gmail folder is checked again only after 7 days; an IMAP folder still daily",
+    /// The schedule end to end: a tracked Gmail folder whose listing completed
+    /// and that no lapse touched is never listed again, 8 days later included
+    /// (no request, a change made elsewhere stays unapplied); a lapse makes the
+    /// next pass list it. IMAP keeps its daily check, pinned through its plan.
+    @Test("A tracked, completed Gmail folder with no lapse runs no check 8 days later; a lapse lists it; an IMAP folder is still checked daily",
           .enabled(if: !NetworkMonitor.checkExpensive()))
-    func gmailFullCheckIsWeeklyAndIMAPDaily() async throws {
+    func gmailHasNoPeriodicCheckAndIMAPIsDaily() async throws {
         let day: TimeInterval = 86_400
-        #expect(SyncConfig.gmailCatchUpFullCheckIntervalSeconds == 7 * day, "Gmail: weekly")
         #expect(SyncConfig.catchUpFullCheckIntervalSeconds == day, "IMAP: daily")
 
         let clock = Clock()
         let seeds = [Self.seed("i1", clock.daysAgo(30), [inboxPath])]
         let local = [Local(id: "i1", path: inboxPath, date: clock.daysAgo(30))]
-        try await Self.withWorld("gcu-weekly", seeds: seeds, local: local) { world async throws in
+        try await Self.withWorld("gcu-no-periodic", seeds: seeds, local: local) { world async throws in
             let start = clock.now
             await Self.pass(world, [inboxPath], context: Self.unlimited(at: { start }))
             #expect(try Self.state(world, inboxPath)?.lastCompletedAt == start, "precondition: the first check completed")
 
             // Read elsewhere; no delta in this test, so only a check can bring it.
             world.server.applyLabelChange(providerMessageId: "i1", add: ["UNREAD"])
-            for offset in [day + 3_600, 7 * day - 1] {
+            for offset in [day + 3_600, 7 * day, 8 * day] {
                 let at = start.addingTimeInterval(offset)
                 let before = world.server.http.recordedCalls().count
                 await Self.pass(world, [inboxPath], context: Self.unlimited(at: { at }))
                 #expect(world.server.http.recordedCalls().count == before, "no request \(offset) s after the last check")
                 #expect(try Self.rows(world, inboxPath)["i1"]?.isRead == true, "nothing applied \(offset) s after the last check")
             }
+            #expect(try Self.state(world, inboxPath)?.lastCompletedAt == start, "no listing ran")
 
-            let dueAt = start.addingTimeInterval(7 * day)
-            await Self.pass(world, [inboxPath], context: Self.unlimited(at: { dueAt }))
-            #expect(try Self.rows(world, inboxPath)["i1"]?.isRead == false, "the check 7 days after the last one applies the change")
-            #expect(try Self.state(world, inboxPath)?.lastCompletedAt == dueAt)
+            try await Self.lapse(world)
+            let lapsedAt = start.addingTimeInterval(8 * day + 60)
+            await Self.pass(world, [inboxPath], context: Self.unlimited(at: { lapsedAt }))
+            #expect(try Self.rows(world, inboxPath)["i1"]?.isRead == false, "the listing after the lapse applies the change")
+            #expect(try Self.state(world, inboxPath)?.lastCompletedAt == lapsedAt)
         }
 
         // IMAP keeps its daily full check (nothing else signals a change: the stamp is unchanged).
@@ -1448,7 +1454,7 @@ struct GmailCatchUpTests {
     /// - P2: every re-arm comes with a completed check; re-arms never outnumber
     ///   completed checks.
     /// Then, with the server and the faults at rest, `rearmPropertyRestRounds`
-    /// weekly rounds of "check to completion, walk to completion":
+    /// rounds of "lapse, check to completion, walk to completion":
     /// - P1: every id the folder's walk lists, dated up to the newest local row
     ///   and protected by no queued action, has a row.
     @Test("Seeded: re-arms stay bounded, never move an unfinished walk, are never lost, and every loadable missing id loads",
@@ -1530,8 +1536,9 @@ struct GmailCatchUpTests {
                     case .walk:
                         _ = await stepper.step(engine: engine, account: account)
                     case .check:
-                        // 0 to 2 full-check intervals, so about half the checks are due.
-                        now = now.addingTimeInterval(TimeInterval(rng.pick(Int(2 * SyncConfig.gmailCatchUpFullCheckIntervalSeconds) + 1)))
+                        // 0 to 2 expensive-network waits. A check lists a folder only
+                        // on its first listing, a listing in progress, or after a lapse.
+                        now = now.addingTimeInterval(TimeInterval(rng.pick(Int(2 * SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds) + 1)))
                         let budget = Self.rearmPropertyMinCheckBudget + rng.pick(Self.rearmPropertyCheckBudgetSpread)
                         await engine.runCatchUp(
                             provider: world.provider, folderIds: paths.map(world.folderId),
@@ -1599,10 +1606,11 @@ struct GmailCatchUpTests {
                     }
                 }
 
-                // P1: the server and the faults at rest, weekly rounds.
+                // P1: the server and the faults at rest, rounds each started by a lapse.
                 await stepper.stop()
                 world.server.clearGetFailures()
                 for _ in 0..<Self.rearmPropertyRestRounds {
+                    try await Self.lapse(world)
                     now = now.addingTimeInterval(Self.checkSpacing)
                     let at = now
                     for _ in 0..<Self.rearmPropertyMaxCheckPasses {
@@ -1798,25 +1806,28 @@ struct GmailCatchUpTests {
         }
     }
 
-    /// Weekly checks a week and an hour apart, so each is due even when its listing
-    /// completed a few (request-count) seconds after the check began.
-    private static let checkSpacing = SyncConfig.gmailCatchUpFullCheckIntervalSeconds + 3_600
+    /// Checks an expensive-network wait and an hour apart. Each check is started
+    /// by a lapse; the spacing keeps every check past the previous one's page
+    /// hold bound.
+    private static let checkSpacing = SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds + 3_600
 
-    /// The clock of weekly check `check`.
+    /// The clock of check `check`.
     private static func checkDay(_ clock: Clock, _ check: Int) -> Date {
         clock.now.addingTimeInterval(Double(check) * checkSpacing)
     }
 
-    /// One weekly check of the label with an unlimited budget; when it re-armed the
+    /// One check of the label, started by a lapse (a Gmail folder has no
+    /// periodic check), with an unlimited budget; when it re-armed the
     /// walk, the walk runs to completion. True when it re-armed. With
     /// `pastPageHolds`, the walk's first call runs at the check's time on the
     /// page hold clock (`SyncEngine.backfillPageHoldNowForTesting`) and the rest
-    /// past the hold bound, as a week later would: a page held by a failing
+    /// past the hold bound, as the next check later would: a page held by a failing
     /// fetch is passed over instead of holding the walk. The caller resets the
     /// hold clock.
-    private static func weeklyLabelCheck(
+    private static func labelCheckAfterLapse(
         _ world: World, _ clock: Clock, _ check: Int, pastPageHolds: Bool = false
     ) async throws -> Bool {
+        try await lapse(world)
         let at = checkDay(clock, check)
         let completedBefore = try state(world, labelPath)?.lastCompletedAt
         await pass(world, [labelPath], context: unlimited(at: { at }))
@@ -1841,11 +1852,11 @@ struct GmailCatchUpTests {
         case failingGet
     }
 
-    /// A missing id the backfill cannot load re-arms the backfill once per weekly
+    /// A missing id the backfill cannot load re-arms the backfill once per
     /// check, never more; the walk still loads everything else, and a message moved in later
     /// loads at the next check. Once the cause passes (the queued archive is
     /// removed, the GET answers again) the id loads at the next check.
-    @Test("A missing id the backfill cannot load re-arms once per weekly check; a message moved in later loads; once it can load it loads at the next check",
+    @Test("A missing id the backfill cannot load re-arms once per check; a message moved in later loads; once it can load it loads at the next check",
           .enabled(if: !NetworkMonitor.checkExpensive()),
           arguments: LoadBlock.allCases)
     func unloadableMissingIdRearmsOncePerCheck(block: LoadBlock) async throws {
@@ -1870,14 +1881,14 @@ struct GmailCatchUpTests {
             }
             defer { SyncEngine.backfillPageHoldNowForTesting.withLock { $0 = nil } }
             var rearmChecks: [Int] = []
-            func weeklyCheck(_ check: Int) async throws {
-                if try await Self.weeklyLabelCheck(world, clock, check, pastPageHolds: block == .failingGet) {
+            func check(_ check: Int) async throws {
+                if try await Self.labelCheckAfterLapse(world, clock, check, pastPageHolds: block == .failingGet) {
                     rearmChecks.append(check)
                 }
             }
 
-            for check in 0..<2 { try await weeklyCheck(check) }
-            #expect(rearmChecks == [0, 1], "an id the backfill cannot load re-armed it at checks \(rearmChecks) of 2 weekly checks")
+            for index in 0..<2 { try await check(index) }
+            #expect(rearmChecks == [0, 1], "an id the backfill cannot load re-armed it at checks \(rearmChecks) of 2 checks")
             #expect(try Self.rows(world, labelPath)["m"] == nil, "precondition: the backfill could not load it")
             #expect(try Self.rows(world, labelPath)["k"] != nil, "precondition: the walk loaded the rest")
             if block == .failingGet {
@@ -1885,7 +1896,7 @@ struct GmailCatchUpTests {
             }
 
             world.server.applyLabelChange(providerMessageId: "n", add: [labelPath], remove: [inboxPath])
-            try await weeklyCheck(2)
+            try await check(2)
             #expect(rearmChecks == [0, 1, 2], "the check after a message moved in re-arms once: \(rearmChecks)")
             #expect(try Self.rows(world, labelPath)["n"] != nil, "and the backfill loads it")
 
@@ -1898,7 +1909,7 @@ struct GmailCatchUpTests {
             case .failingGet:
                 world.server.clearGetFailures()
             }
-            try await weeklyCheck(3)
+            try await check(3)
             #expect(rearmChecks == [0, 1, 2, 3], "once m can load, the next check re-arms: \(rearmChecks)")
             #expect(try Self.rows(world, labelPath)["m"] != nil, "m loads")
         }
@@ -1965,7 +1976,7 @@ struct GmailCatchUpTests {
                 world.server.clearGetFailures()
             }
 
-            #expect(try await Self.weeklyLabelCheck(world, clock, 1), "the next check re-arms the walk for m")
+            #expect(try await Self.labelCheckAfterLapse(world, clock, 1), "the next check re-arms the walk for m")
             #expect(try Self.rows(world, labelPath)["m"] != nil, "m loads")
         }
     }
@@ -2016,16 +2027,17 @@ struct GmailCatchUpTests {
             let walkToken = "2"
             try Self.setPartialWalk(world, labelPath, pageToken: walkToken)
             world.server.applyLabelChange(providerMessageId: "m", add: [labelPath], remove: [inboxPath])
-            let interval = SyncConfig.gmailCatchUpFullCheckIntervalSeconds + 1
-            func weeklyCheck(_ check: Int) async throws {
-                let at = clock.now.addingTimeInterval(Double(check) * interval)
+            func check(_ check: Int) async throws {
+                // A Gmail folder has no periodic check: a lapse starts each one.
+                try await Self.lapse(world)
+                let at = Self.checkDay(clock, check)
                 let completedBefore = try Self.state(world, labelPath)?.lastCompletedAt
                 await Self.pass(world, [labelPath], context: Self.unlimited(at: { at }))
                 #expect(try Self.state(world, labelPath)?.lastCompletedAt != completedBefore,
                         "precondition: check \(check) completed")
             }
 
-            try await weeklyCheck(0)
+            try await check(0)
             let during = try Self.folder(world, labelPath)
             #expect(!during.backfillComplete && during.backfillPageToken == walkToken,
                     "the check leaves the unfinished walk where it was")
@@ -2034,22 +2046,22 @@ struct GmailCatchUpTests {
             #expect(try Self.rows(world, labelPath)["m"] == nil,
                     "precondition: the walk went on from its position and never reached m")
 
-            try await weeklyCheck(1)
+            try await check(1)
             let after = try Self.folder(world, labelPath)
             #expect(!after.backfillComplete && after.backfillPageToken == nil,
                     "the first check after the walk completes re-arms it")
             try await Self.backfillUntilComplete(world)
             #expect(try Self.rows(world, labelPath)["m"] != nil, "the re-armed walk loads m")
 
-            try await weeklyCheck(2)
+            try await check(2)
             #expect(try Self.folder(world, labelPath).backfillComplete, "the next check re-arms nothing")
         }
     }
 
     /// The huge-folder case: many not-yet-walked ids are missing (an old message
-    /// gave the folder a local row far below the walk's position). No weekly
-    /// check moves the walk's position backwards.
-    @Test("No weekly check moves an unfinished walk's position backwards, even with many missing ids",
+    /// gave the folder a local row far below the walk's position). No check
+    /// moves the walk's position backwards.
+    @Test("No check moves an unfinished walk's position backwards, even with many missing ids",
           .enabled(if: !NetworkMonitor.checkExpensive()))
     func checksNeverMoveAnUnfinishedWalkBack() async throws {
         let clock = Clock()
@@ -2069,13 +2081,14 @@ struct GmailCatchUpTests {
             Local(id: "old", path: labelPath, date: clock.daysAgo(60)),
         ]
         try await Self.withWorld("gcu-walk-never-back", seeds: seeds, local: local) { world async throws in
-            let interval = SyncConfig.gmailCatchUpFullCheckIntervalSeconds + 1
             let checks = 3
             for check in 0..<checks {
                 // The walk has moved on since the last check.
                 let position = String(check + 1)
                 try Self.setPartialWalk(world, labelPath, pageToken: position)
-                let at = clock.now.addingTimeInterval(Double(check) * interval)
+                // A Gmail folder has no periodic check: a lapse starts each one.
+                try await Self.lapse(world)
+                let at = Self.checkDay(clock, check)
                 let completedBefore = try Self.state(world, labelPath)?.lastCompletedAt
                 await Self.pass(world, [labelPath], context: Self.unlimited(at: { at }))
                 #expect(try Self.state(world, labelPath)?.lastCompletedAt != completedBefore,
@@ -2471,31 +2484,6 @@ struct GmailCatchUpTests {
         await Self.pass(world, [inboxPath, allMailPath], context: Self.unlimited(at: { at }))
         for path in [inboxPath, allMailPath] {
             #expect(try Self.state(world, path)?.lastCompletedAt != nil, "precondition: \(path)'s catch-up completed")
-        }
-    }
-
-    @Test("G1: an All Mail read change beyond the window that no delta reads arrives at the weekly check while the cursor stays valid",
-          .enabled(if: !NetworkMonitor.checkExpensive()))
-    func weeklyCheckWithValidCursor() async throws {
-        let clock = Clock()
-        let (seeds, local) = Self.syncWorld(clock)
-        try await Self.withWorld("gcu-g1", seeds: seeds, local: local, folders: Self.syncFolders, userLabels: [:]) { world async throws in
-            world.server.serveProfile()
-            let lastWeek = clock.now.addingTimeInterval(-SyncConfig.gmailCatchUpFullCheckIntervalSeconds - 1)
-            try await Self.completeCatchUp(world, at: lastWeek)
-
-            // Read elsewhere, in history the delta will never be asked for.
-            world.server.applyLabelChange(providerMessageId: "ao0", remove: ["UNREAD"])
-            let reached = world.server.currentHistoryId()
-            try Self.setAccount(world, cursor: reached, lastFullSyncAt: nil)
-            world.server.setProfileAhead(5)
-
-            try await Self.syncPass(world)
-
-            #expect(try Self.rows(world, allMailPath)["ao0"]?.isRead == true, "the weekly check applied the change")
-            #expect(try Self.cursor(world) == reached, "the cursor this pass's delta reached is kept")
-            let state = try #require(try Self.state(world, allMailPath))
-            #expect((state.lastCompletedAt ?? .distantPast) > lastWeek, "the check's state persists past the capture")
         }
     }
 
