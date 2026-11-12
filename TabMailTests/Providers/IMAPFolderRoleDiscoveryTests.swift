@@ -215,7 +215,9 @@ struct IMAPFolderRoleDiscoveryTests {
         #expect(roles["Mail/Trash"] == .trash)
         #expect(roles["Mail/Clients/Sent"] == .custom)
         #expect(roles["Mail/Projects"] == .custom)
-        #expect(roles["INBOX"] == .inbox)
+        // No INBOX expectation here: with a non-empty personal prefix the
+        // library lists only that namespace (`Mail/*`, `Mail`), so INBOX is not
+        // in this listing. That listing rule is the library's, not this test's.
     }
 
     /// Two top-level folders that match the same role by name: folder sync
