@@ -430,7 +430,7 @@ and the queue's past-end retry answers nil, so the tool prints no `new_series_ev
 dated in `GCalEvent.seriesZone` (range zone, else the start's); a past-end edit is ordered before its
 record; the carry's listing window is dated in UTC; a timed series with no readable zone is refused
 before the POST only when `movesAnOccurrence` (a time-setting edit, or a changed occurrence away from
-its place), so a deletion or a rename still works. `MockCalendarProvider.splitCut` cuts at
+its place), so a rename still works. A zone-less timed series is still refused, with nothing written, when it has a deleted occurrence (Graph's `cancelledOccurrences` names it by date only, so placing it needs the zone) or when the occurrence named was moved (its cut is placed in the zone). `MockCalendarProvider.splitCut` cuts at
 `recurrenceId` unless set. Tests: card and answer past the end on Google, Outlook and CalDAV;
 `movedSplitCardShowsTheWrittenRule`; Google `pastEndKeepsItsRecordFirstAndRetryNotifies`; queue
 `pastEndRetryWritesOnlyItsEdits`; `ExchangeSplitCarryTests` `zoneless*`, `splitEditsAreOrderedOffHeldDays`;
