@@ -79,10 +79,26 @@ import Synchronization
 ///   exception. Measured on an Outlook.com test account (2026-11-11), for an
 ///   added and a removed guest, a series emptied of its guests and a series
 ///   list written back unchanged, on renamed, moved and unchanged occurrences
-///   and on exceptions with guest differences of their own.
+///   and on exceptions with guest differences of their own;
+/// - a PATCH of a series whose timed `start` is labelled with a zone other than the series'
+///   stored zone is refused with 400 `ErrorPropertyValidationFailure`, and changes nothing
+///   (`seriesStartZoneRefusal`: measured on a work account 2026-11-11 for another zone and for a
+///   name whose rules now differ; an end alone, one occurrence and an all-day `UTC` date are
+///   measured accepted; a stored zone TabMail does not recognize is not checked, unmeasured);
+/// - an all-day series' `start` or `end` written labelled with a zone other than its range's
+///   `recurrenceTimeZone` (a PATCH of the series, or a POST carrying a `recurrence`) is accepted
+///   and stored two days longer than written (`allDaySeriesLengthened`, measured on a work
+///   account 2026-11-11 on series kept in `Pacific Standard Time`): with a `recurrence` in the
+///   same write, or on a create, the start lands where written; without one the start stays and
+///   the length grows. Another name for the same zone (`America/Los_Angeles`) is the same zone.
+///   One occurrence, a single event and a range kept in `UTC` are measured unaffected.
 ///
 /// A timed event's starts and ends are returned as stored, whatever zone `Prefer` names: a
-/// fixture stores them as Graph renders them for the device. An all-day event's `start` and `end`
+/// fixture stores them as Graph renders them for the device. The one exception is a series' start
+/// and end stored labelled with the series' own zone (its range's `recurrenceTimeZone`, as the app
+/// writes them since #719): those are returned in the zone `Prefer` names, labelled with that name,
+/// at the stored instant (Graph's documented `outlook.timezone`), as Graph renders them for the
+/// device. An all-day event's `start` and `end`
 /// are returned on every read (`/calendarView`, `/events/{id}`, `/instances`) as Graph returns them
 /// (measured on a work account: an all-day series kept east of the reading zone, read with `Prefer`
 /// naming the series' zone, a zone west of it, and none): midnight of the event's own date, whatever
@@ -364,6 +380,9 @@ final class FakeGraphCalendar: Sendable {
                 return .json(raw: #"{"error":{"code":"ErrorOccurrenceCrossingBoundary","message":"An occurrence can't be moved onto another occurrence of its series."}}"#,
                              statusCode: 400)
             }
+            if let refusal = Self.seriesStartZoneRefusal(patch, stored: stored) { return refusal }
+            let lengthened = stored["seriesMasterId"] == nil && Self.allDaySeriesLengthened(patch, stored: stored)
+            let storedStart = stored["start"]
             patchLog.withLock { $0.append((id: parts[0], body: body)) }
             let changesRule = patch["recurrence"].map { Self.canonicalJSON($0) != Self.canonicalJSON(stored["recurrence"]) } ?? false
             let isSeries = stored["recurrence"] != nil && !(stored["recurrence"] is NSNull)
@@ -396,6 +415,7 @@ final class FakeGraphCalendar: Sendable {
                 }
             }
             Self.apply(patch, to: &stored)
+            if lengthened { Self.lengthen(&stored, written: patch, storedStart: storedStart) }
             store(stored)
             if takeLoss("PATCH") { return .transportError(.networkConnectionLost) }
             return Self.json(stored)
@@ -414,6 +434,7 @@ final class FakeGraphCalendar: Sendable {
             }
             created["id"] = Self.createdPrefix + String(creations.withLock { n in n += 1; return n })
             if let transactionId, let id = created["id"] as? String { transactions.withLock { $0[transactionId] = id } }
+            if Self.allDaySeriesLengthened(created, stored: [:]) { Self.lengthen(&created, written: created, storedStart: nil) }
             Self.defaultRecurrenceZone(in: &created)
             store(created)
             if takeLoss("POST") { return .transportError(.networkConnectionLost) }
@@ -473,6 +494,19 @@ final class FakeGraphCalendar: Sendable {
                 guard let side = event[key] as? [String: Any], let dateTime = side["dateTime"] as? String else { continue }
                 out[key] = ["dateTime": String(dateTime.prefix(10)) + "T00:00:00.0000000", "timeZone": name ?? "UTC"]
             }
+        } else if let zone, let name,
+                  let seriesZone = ((event["recurrence"] as? [String: Any])?["range"] as? [String: Any])?["recurrenceTimeZone"] as? String {
+            for key in ["start", "end"] {
+                guard let side = event[key] as? [String: Any], let label = side["timeZone"] as? String, label == seriesZone,
+                      let storedZone = CalendarTimeZoneResolver.zone(named: label, in: .none),
+                      storedZone.identifier != zone.identifier, let at = instant(side) else { continue }
+                let fmt = DateFormatter()
+                fmt.locale = Locale(identifier: "en_US_POSIX")
+                fmt.calendar = Calendar(identifier: .gregorian)
+                fmt.timeZone = zone
+                fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+                out[key] = ["dateTime": fmt.string(from: at) + ".0000000", "timeZone": name]
+            }
         }
         return out
     }
@@ -505,6 +539,83 @@ final class FakeGraphCalendar: Sendable {
             .contains { $0["seriesMasterId"] as? String == master && $0["id"] as? String != other && Self.instant($0["start"]) == at }
     }
 
+    /// The refusal of a series PATCH whose timed `start` is labelled with a zone other than the
+    /// one the series is kept in; nil when the PATCH is not refused for that. Measured on a work
+    /// account (2026-11-11), on a weekly series kept in `Pacific Standard Time`: a start labelled
+    /// `America/Vancouver` (British Columbia, on UTC-7 all year since 2026-11-01) or
+    /// `America/New_York` is refused with 400 `ErrorPropertyValidationFailure` and nothing
+    /// changes; Exchange checks the start's IANA name against the zone stored with the series
+    /// (`IanaTimeZoneConstraint`, "the rules ... do not match"). The stored name and
+    /// `America/Los_Angeles` are accepted. Also measured, and not refused: an end alone, a PATCH of
+    /// one occurrence (an exception), and an all-day series' date written with `UTC`.
+    ///
+    /// "Another zone" is a name `CalendarTimeZoneResolver` resolves to a different zone from the
+    /// range's `recurrenceTimeZone`, which Graph keeps beside the series' start zone. A stored zone
+    /// that does not resolve (`Customized Time Zone`) is not checked: what Exchange does there is
+    /// not measured.
+    private static func seriesStartZoneRefusal(_ patch: [String: Any], stored: [String: Any]) -> FakeHTTP.CannedResponse? {
+        guard stored["seriesMasterId"] == nil,
+              let range = (stored["recurrence"] as? [String: Any])?["range"] as? [String: Any],
+              let storedName = range["recurrenceTimeZone"] as? String,
+              let storedZone = CalendarTimeZoneResolver.zone(named: storedName, in: .none),
+              let start = patch["start"] as? [String: Any],
+              let label = start["timeZone"] as? String,
+              (patch["isAllDay"] as? Bool ?? stored["isAllDay"] as? Bool ?? false) == false,
+              CalendarTimeZoneResolver.zone(named: label, in: .none)?.identifier != storedZone.identifier
+        else { return nil }
+        let message = "Validation of IANA time zone property StartTimeZoneIanaName failed because the rules for "
+            + "'\(label)' (from IANA time zone name '\(label)') and '\(storedName)' (from the Windows time zone "
+            + "stored in TimeZoneDefinitionStart) do not match."
+        return .json(raw: #"{"error":{"code":"ErrorPropertyValidationFailure","message":"\#(message)"}}"#, statusCode: 400)
+    }
+
+    /// Whether Graph stores an all-day series write two days longer than written: the write is to
+    /// a series (`stored` has a recurrence, or `written` carries one, as a create does), the result
+    /// is all day, and its written `start` or `end` is labelled with a zone other than the range's
+    /// `recurrenceTimeZone` (the written range's when it has one, else the stored one; `UTC` when
+    /// neither names a zone, as Graph stores a range written without one). Two names for the same
+    /// zone are the same zone. Measured on a work account (2026-11-11) on all-day weekly series kept
+    /// in `Pacific Standard Time`, written with the app's `UTC` label: a move with the stored
+    /// recurrence beside it (1 day became 3), the start and end alone (not moved, 1 became 3), a
+    /// length edit (2 became 4) and a create carrying the range (3 from creation). Labelled with
+    /// the range's own name or `America/Los_Angeles`, the length was kept. East of UTC (`Tokyo
+    /// Standard Time`) the same write lengthened by a day and moved the series a day early; this
+    /// fake models the measured Pacific effect for any other zone, so neither case can pass.
+    private static func allDaySeriesLengthened(_ written: [String: Any], stored: [String: Any]) -> Bool {
+        let writtenRecurrence = written["recurrence"] as? [String: Any]
+        let storedRecurrence = stored["recurrence"] as? [String: Any]
+        guard writtenRecurrence != nil || storedRecurrence != nil,
+              (written["isAllDay"] as? Bool ?? stored["isAllDay"] as? Bool ?? false) else { return false }
+        let rangeName = (writtenRecurrence?["range"] as? [String: Any])?["recurrenceTimeZone"] as? String
+            ?? (storedRecurrence?["range"] as? [String: Any])?["recurrenceTimeZone"] as? String
+            ?? "UTC"
+        func sameZone(_ label: String) -> Bool {
+            guard label != rangeName else { return true }
+            guard let a = CalendarTimeZoneResolver.zone(named: label, in: .none),
+                  let b = CalendarTimeZoneResolver.zone(named: rangeName, in: .none) else { return false }
+            return a.identifier == b.identifier
+        }
+        return ["start", "end"].contains { key in
+            ((written[key] as? [String: Any])?["timeZone"] as? String).map { !sameZone($0) } ?? false
+        }
+    }
+
+    /// `event` (all day) as Graph stores the write `allDaySeriesLengthened` names: two days longer
+    /// than written; without a `recurrence` in the write, from the start it had (`storedStart`).
+    private static func lengthen(_ event: inout [String: Any], written: [String: Any], storedStart: Any?) {
+        func day(_ value: Any?) -> Date? {
+            ((value as? [String: Any])?["dateTime"] as? String).flatMap {
+                EKEventStoreHelper.parseNaiveISO(String($0.prefix(10)) + "T00:00:00", timeZone: .gmt)
+            }
+        }
+        guard let start = day(event["start"]), let end = day(event["end"]) else { return }
+        let startSide = written["recurrence"] == nil ? (storedStart ?? event["start"]) : event["start"]
+        guard let from = day(startSide), let label = (event["end"] as? [String: Any])?["timeZone"] as? String else { return }
+        let lengthened = from.addingTimeInterval(end.timeIntervalSince(start) + 2 * 86_400)
+        event["start"] = startSide
+        event["end"] = ["dateTime": String(GraphFixture.naive(lengthened).prefix(10)) + "T00:00:00.0000000", "timeZone": label]
+    }
+
     /// Whether a written start or end names the stored one: the same wall time to the
     /// second and the same zone label.
     private static func sameTime(_ written: Any, _ stored: Any?) -> Bool {
@@ -522,8 +633,15 @@ final class FakeGraphCalendar: Sendable {
     }
 
     private static func apply(_ patch: [String: Any], to stored: inout [String: Any]) {
+        // An all-day series written a `recurrence` alone that keeps its range's `startDate` keeps
+        // its start and end (measured 2026-11-11: the all-day split cap, `endDate` moved only).
+        func rangeStart(_ event: [String: Any]) -> String? {
+            ((event["recurrence"] as? [String: Any])?["range"] as? [String: Any])?["startDate"] as? String
+        }
+        let keepsAllDayDates = stored["isAllDay"] as? Bool == true && patch["isAllDay"] == nil
+            && rangeStart(stored) != nil && rangeStart(stored) == rangeStart(patch)
         for (key, value) in patch { stored[key] = value }
-        if patch["recurrence"] != nil, patch["start"] == nil,
+        if patch["recurrence"] != nil, patch["start"] == nil, !keepsAllDayDates,
            let startDate = ((stored["recurrence"] as? [String: Any])?["range"] as? [String: Any])?["startDate"] as? String {
             let midnight: [String: Any] = ["dateTime": startDate + "T00:00:00.0000000", "timeZone": "UTC"]
             stored["start"] = midnight
@@ -719,7 +837,7 @@ enum GraphFixture {
     /// The device's date of the start Graph stores as `wall` in `zone`, written
     /// with or without seconds.
     static func deviceDay(wall: String, in zone: String) -> String? {
-        guard let tz = TimeZone(identifier: zone) else { return nil }
+        guard let tz = CalendarTimeZoneResolver.zone(named: zone, in: .none) else { return nil }
         let fmt = DateFormatter()
         fmt.locale = Locale(identifier: "en_US_POSIX")
         fmt.timeZone = tz
@@ -732,7 +850,7 @@ enum GraphFixture {
     /// The instant a stored Graph `start` or `end` names: its wall time read in its label.
     static func instant(_ side: [String: Any]?) -> Date? {
         guard let wall = side?["dateTime"] as? String, let zone = side?["timeZone"] as? String,
-              let tz = TimeZone(identifier: zone) else { return nil }
+              let tz = CalendarTimeZoneResolver.zone(named: zone, in: .none) else { return nil }
         let fmt = DateFormatter()
         fmt.locale = Locale(identifier: "en_US_POSIX")
         fmt.timeZone = tz
@@ -1066,6 +1184,16 @@ private let watchedProperties = [
     "locations", "attendees", "start", "end", "isAllDay", "recurrence",
 ]
 
+/// Whether a watched property is as it was: a timed `start` or `end` names the same instant (a
+/// series write is labelled with the series' stored zone, #719), anything else is equal.
+private func unchanged(_ property: String, _ after: Any?, _ before: Any?) -> Bool {
+    if ["start", "end"].contains(property),
+       let was = GraphFixture.instant(before as? [String: Any]), let now = GraphFixture.instant(after as? [String: Any]) {
+        return was == now
+    }
+    return canonical(after) == canonical(before)
+}
+
 private func canonical(_ value: Any?) -> String {
     guard let value, !(value is NSNull) else { return "null" }
     guard JSONSerialization.isValidJSONObject([value]),
@@ -1123,7 +1251,7 @@ private func expectOnlyEdited(
     _ edit: UserCalendarEdit?, before: [String: Any], after: [String: Any], start: Date? = nil, label: String
 ) {
     for property in watchedProperties where !(edit?.changes.contains(property) ?? false) {
-        #expect(canonical(after[property]) == canonical(before[property]),
+        #expect(unchanged(property, after[property], before[property]),
                 "\(label): \(edit?.rawValue ?? "no edit") changed \(property), which it did not edit")
     }
     switch edit {
@@ -1133,21 +1261,21 @@ private func expectOnlyEdited(
         #expect(after["showAs"] as? String == "busy", "\(label): the event was not marked busy")
     case .moveOneHour:
         if let start {
-            let newStart = (after["start"] as? [String: Any])?["dateTime"] as? String
-            let newEnd = (after["end"] as? [String: Any])?["dateTime"] as? String
-            #expect(newStart?.hasPrefix(GraphFixture.naive(start.addingTimeInterval(3_600))) == true,
-                    "\(label): the start did not move an hour, is \(newStart ?? "none")")
-            #expect(newEnd?.hasPrefix(GraphFixture.naive(start.addingTimeInterval(1_800 + 3_600))) == true,
-                    "\(label): the end did not move with the start, is \(newEnd ?? "none")")
+            let newStart = GraphFixture.instant(after["start"] as? [String: Any])
+            let newEnd = GraphFixture.instant(after["end"] as? [String: Any])
+            #expect(newStart == start.addingTimeInterval(3_600),
+                    "\(label): the start did not move an hour, is \(canonical(after["start"]))")
+            #expect(newEnd == start.addingTimeInterval(1_800 + 3_600),
+                    "\(label): the end did not move with the start, is \(canonical(after["end"]))")
         }
     case .endLater:
         if let start {
-            let newStart = (after["start"] as? [String: Any])?["dateTime"] as? String
-            let newEnd = (after["end"] as? [String: Any])?["dateTime"] as? String
-            #expect(newStart?.hasPrefix(GraphFixture.naive(start)) == true,
-                    "\(label): moving the end moved the start, is \(newStart ?? "none")")
-            #expect(newEnd?.hasPrefix(GraphFixture.naive(start.addingTimeInterval(1_800 + 3_600))) == true,
-                    "\(label): the end did not move an hour later, is \(newEnd ?? "none")")
+            let newStart = GraphFixture.instant(after["start"] as? [String: Any])
+            let newEnd = GraphFixture.instant(after["end"] as? [String: Any])
+            #expect(newStart == start,
+                    "\(label): moving the end moved the start, is \(canonical(after["start"]))")
+            #expect(newEnd == start.addingTimeInterval(1_800 + 3_600),
+                    "\(label): the end did not move an hour later, is \(canonical(after["end"]))")
         }
     case .moveRoom:
         let room: [String: Any] = ["displayName": UserCalendarEdit.newRoom]
@@ -1308,7 +1436,7 @@ struct ExchangeCalendarEditPreservationTests {
         range["startDate"] = (was["range"] as? [String: Any])?["startDate"]
         #expect(canonical(range) == canonical(was["range"]), "the move changed the range beyond its start date")
         let start = try #require(after["start"] as? [String: Any])
-        #expect((start["dateTime"] as? String)?.hasPrefix(GraphFixture.naive(newStart)) == true, "the series did not move")
+        #expect(GraphFixture.instant(start) == newStart, "the series did not move: \(canonical(start))")
         for property in watchedProperties where !["start", "end", "recurrence"].contains(property) {
             #expect(canonical(after[property]) == canonical(before[property]), "the move changed \(property)")
         }
@@ -1335,7 +1463,7 @@ struct ExchangeCalendarEditPreservationTests {
         let range = recurrence["range"] as? [String: Any]
         #expect(range?["type"] as? String == "numbered" && (range?["numberOfOccurrences"] as? Int) == 5)
         #expect(range?["startDate"] as? String == GraphFixture.utcDay(newStart))
-        #expect(((after["start"] as? [String: Any])?["dateTime"] as? String)?.hasPrefix(GraphFixture.naive(newStart)) == true)
+        #expect(GraphFixture.instant(after["start"] as? [String: Any]) == newStart)
     }
 
     /// #423, measured: a rule written without the series' zone is stored as UTC (a
@@ -1369,7 +1497,7 @@ struct ExchangeCalendarEditPreservationTests {
         #expect(pattern?["firstDayOfWeek"] as? String == wasFirstDay,
                 "the series' weeks start on \(pattern?["firstDayOfWeek"] as? String ?? "none"), did on \(wasFirstDay ?? "none")")
         for property in watchedProperties where property != "recurrence" {
-            #expect(canonical(after[property]) == canonical(before[property]), "the rule change changed \(property)")
+            #expect(unchanged(property, after[property], before[property]), "the rule change changed \(property)")
         }
     }
 
@@ -1800,6 +1928,16 @@ struct ExchangeCalendarEditPreservationTests {
         patch.endTimeZone = zone.label
 
         let answer = provider.editResetsChangedOccurrences(read, edit: patch)
+        // A label no zone is known by can't be written in the series' zone (#719): the app sends it
+        // as given and Graph refuses it (the fake's measured 400 for another zone; a made-up name is
+        // measured refused too), so nothing changes. The tools never give one: an unrecognized
+        // `timezone` is refused before the card (`resolveWriteTimeZone`).
+        if zone == .unresolvable {
+            await #expect(throws: (any Error).self) { _ = try await provider.updateEvent(eventId: "ser-w", event: patch) }
+            #expect(answer, "\(zone): the card says no reset")
+            #expect(graph.patches("ser-w").isEmpty && graph.seriesResets == 0, "\(zone): written")
+            return
+        }
         _ = try await provider.updateEvent(eventId: "ser-w", event: patch)
 
         let sent = graph.patches("ser-w")
@@ -2164,7 +2302,7 @@ struct ExchangeCalendarEditPreservationTests {
         let sent = graph.patches("ser-x")
         #expect(sent.count == 1 && sent.allSatisfy { $0["recurrence"] == nil }, "a move within the device's day wrote a recurrence")
         #expect(graph.seriesResets == 1, "a start move did not reset the series' exceptions, as Graph does")
-        #expect(((graph.event("ser-x")?["start"] as? [String: Any])?["dateTime"] as? String)?.hasPrefix(GraphFixture.naive(to)) == true)
+        #expect(GraphFixture.instant(graph.event("ser-x")?["start"] as? [String: Any]) == to)
     }
 
     /// The other side: a move across the device's midnight within one UTC date is a
@@ -2309,6 +2447,9 @@ struct ExchangeCalendarEditPreservationTests {
         #expect(((after["end"] as? [String: Any])?["dateTime"] as? String)?.hasPrefix(newEndDay) == true,
                 "the end did not move with the start, is \((after["end"] as? [String: Any])?["dateTime"] as? String ?? "none")")
         #expect(after["isAllDay"] as? Bool == true, "the series stopped being all day")
+        // #747: every occurrence keeps its one-day length and the series keeps its zone.
+        #expect((now["range"] as? [String: Any])?["recurrenceTimeZone"] as? String
+                    == (was["range"] as? [String: Any])?["recurrenceTimeZone"] as? String, "the move changed the series' zone")
     }
 
     /// An all-day edit is dated as spelled, never by the day an offset's instant falls on in

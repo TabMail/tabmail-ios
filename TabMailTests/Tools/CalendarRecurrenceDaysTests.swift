@@ -615,6 +615,23 @@ struct RecurrenceDaysToolTests {
         }
     }
 
+    @Test("an edit whose start or end names no time is refused before the card, naming it, with nothing sent (#719)",
+          arguments: ["start_iso", "end_iso"])
+    func unreadableTimeRefusedBeforeTheCard(_ key: String) async throws {
+        let mock = MockCalendarProvider()
+        await mock.setGetEventResult(Self.event(id: "evt-series"))
+        try await withCalendar(mock) { pool in
+            let sink = RecordingConfirmSink()
+            let output = try await CalendarEventEditTool(context: ToolContext(db: pool, translator: MockChatIdTranslator())).execute(
+                arguments: ["event_id": .string("evt-series"), key: .string("next Tuesday T9"), "timezone": .string("America/New_York")],
+                invocation: ToolInvocation(uiSink: sink, sessionKey: "rd-edit-time"))
+            #expect(output.contains(key) && output.contains("next Tuesday T9") && output.contains("NOT changed"), "tool said: \(output)")
+            #expect(sink.calendarEvents.isEmpty, "a card was shown for a time that names no instant")
+            let updated = await mock.updatedEvents
+            #expect(updated.isEmpty)
+        }
+    }
+
     @Test("an invalid until is refused before the create and edit cards on Google, Outlook and CalDAV, with nothing sent",
           arguments: ["google", "outlook", "caldav"])
     func invalidUntilRefusedOnEveryCalendar(_ calendar: String) async throws {
@@ -684,5 +701,60 @@ struct RecurrenceDaysToolTests {
             let created = await mock.createdEvents
             #expect(created.first?.event.recurrence == ["RRULE:FREQ=MONTHLY;BYMONTHDAY=1,15"])
         }
+    }
+
+    /// A time a clock change skips (02:30 on the US spring-forward Sunday, in New York) is read as
+    /// the instant an hour on, by the tools and by the Outlook write alike, so the series gets the
+    /// time the tools read. A series kept in `Eastern Standard Time`, moved on its first day.
+    @Test("a series moved to a time a clock change skips is written at the instant the tools read it as (#719)")
+    func skippedHourCardIsTheWrite() async throws {
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = TimeZone(identifier: "UTC")!
+        let year = utc.component(.year, from: Date()) + 1
+        let changeDay = try #require(utc.date(from: DateComponents(year: year, month: 3, weekday: 1, weekdayOrdinal: 2)))
+        let day = String(GraphFixture.naive(changeDay).prefix(10))
+        let newYork = try #require(TimeZone(identifier: "America/New_York"))
+        let seriesStart = try #require(EKEventStoreHelper.parseNaiveISO("\(day)T10:00:00", timeZone: newYork))
+        var series = GraphFixture.event(id: "ser-dst", start: seriesStart, online: false, recurring: true)
+        series["start"] = ["dateTime": "\(day)T10:00:00.0000000", "timeZone": "America/New_York"]
+        series["end"] = ["dateTime": "\(day)T11:00:00.0000000", "timeZone": "America/New_York"]
+        series["recurrence"] = [
+            "pattern": ["type": "weekly", "interval": 1, "month": 0, "dayOfMonth": 0, "daysOfWeek": ["sunday"],
+                        "firstDayOfWeek": "sunday", "index": "first"],
+            "range": ["type": "noEnd", "startDate": day, "endDate": "0001-01-01",
+                      "recurrenceTimeZone": "Eastern Standard Time", "numberOfOccurrences": 0],
+        ]
+        let arguments: [String: JSONValue] = [
+            "event_id": .string("ser-dst"), "edit_scope": .string("all"),
+            "start_iso": .string("\(day)T02:30:00"), "end_iso": .string("\(day)T04:00:00"),
+            "timezone": .string("America/New_York"),
+        ]
+        // Non-vacuity: 02:30 is skipped that day, and the tools read it an hour on.
+        let read = try #require(CalendarToolHelpers.toolInstant("\(day)T02:30:00", timeZone: newYork))
+        #expect(GraphFixture.wall(read, in: "America/New_York") == "\(day)T03:30:00", "02:30 is not skipped on \(day)")
+
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = FakeGraphCalendar([series])
+        graph.install(on: http)
+        let provider = ExchangeCalendarProvider(mailbox: "calendar@example.com", accessToken: { _ in "test-token" }, session: http.session)
+        try await withCalendar(provider) { pool in
+            let sink = RecordingConfirmSink()
+            let output = try await CalendarEventEditTool(context: ToolContext(db: pool, translator: MockChatIdTranslator())).execute(
+                arguments: arguments, invocation: ToolInvocation(uiSink: sink, sessionKey: "rd-edit-dst"))
+            #expect(sink.calendarEvents.count == 1, "no card: \(output)")
+        }
+        // The queued edit, drained as the queue drains it.
+        var queued = arguments
+        queued.removeValue(forKey: "event_id")
+        let rows = try await drainEdit(accountId: "dst-skipped-hour", eventId: "ser-dst", calendarId: "primary",
+                                       arguments: queued, provider: provider)
+
+        #expect(rows.isEmpty, "the edit was not written: \(rows.map { $0.failureReason ?? $0.status })")
+        let sent = graph.patches("ser-dst").last
+        let start = sent?["start"] as? [String: Any]
+        #expect(start?["timeZone"] as? String == "Eastern Standard Time", "the write is labelled \(start ?? [:])")
+        #expect(GraphFixture.instant(start) == read, "the tools read \(read), the write is \(start ?? [:])")
+        #expect(GraphFixture.instant(graph.event("ser-dst")?["start"] as? [String: Any]) == read, "the series starts \(String(describing: graph.event("ser-dst")?["start"]))")
     }
 }

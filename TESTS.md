@@ -37,7 +37,24 @@ stored event, not on our payload: every property the edit did not set (body, `sh
 unchanged, and the edited property holds what was asked (a removed attendee is gone, each kept attendee's whole stored entry, type, answer and its time,
 is unchanged, and an added one is `required` and unanswered). The fake refuses with 405, as measured
 on Outlook.com for #622, an attendee PATCH in which any entry has no `status`
-(`fakeRefusesAttendeeWithoutStatus`). The fake also models the recurrence
+(`fakeRefusesAttendeeWithoutStatus`). It refuses with 400 `ErrorPropertyValidationFailure`, as
+measured on a work account for #719, a series PATCH whose timed start is labelled with a zone that
+resolves to another zone than the series' stored `recurrenceTimeZone` (`seriesStartZoneRefusal`; an
+end alone, one occurrence, an all-day `UTC` date and an unrecognized stored zone are not checked).
+`ExchangeSeriesZoneLabelTests` drives series edits through the queue against it: a time change of
+every occurrence from a Vancouver device and named in New York, a split from the device's zone, and a
+split whose new part fails (the revert is accepted) are written at the card's instant under the
+series' stored zone name; a rename and the same instant under another name send no start; an
+unrecognized stored zone keeps the write's earlier label (#746). The fake also stores an all-day
+series write whose start or end is labelled with a zone other than the range's two days longer, as
+measured for #747 (`allDaySeriesLengthened`); `ExchangeAllDaySeriesLengthTests` holds a whole-series
+move, a length edit and a split of an all-day series kept in Pacific, Tokyo or an IANA zone to the
+series' length and zone. `ExchangeSeriesDayTests` holds a series kept in Tokyo, moved or split
+across midnight in only one of the series' and the device's zones, to a range `startDate` on the
+written start's day in the series' zone.
+`ExchangeSeriesZoneHelperTests` pins `inSeriesZone` (the British Columbia change, DST edges, the date
+line, fractional offsets, a stored IANA name, an unknown zone, an all-day relabel, and the instant property).
+The fake also models the recurrence
 behaviour measured live for #423 (a range written without a zone is stored as UTC; a written rule
 that differs from the stored one resets the series' exceptions; a `recurrence` PATCHed without
 `start` moves the series to UTC midnight; a range without `startDate` is refused with a 400) and the

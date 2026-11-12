@@ -1654,6 +1654,20 @@ enum CalendarToolHelpers {
     static func toolAllDayDate(_ iso: String) -> String { String(iso.prefix(10)) }
 
     /// The offset-free forms `toolInstant` reads in the label's zone, longest first.
+    /// Why a timed `start_iso` or `end_iso` can't be written: it names no instant in `zone`
+    /// (`toolInstant` reads none of the forms the tools take); nil when each one given names an
+    /// instant, or the edit is stated all-day (a date has no time). A wall time a clock change
+    /// skips is read (Foundation reads it as the instant an hour on), so it is not refused here.
+    static func unreadableWallTime(_ arguments: [String: JSONValue], in zone: TimeZone) -> String? {
+        if case .bool(true) = arguments["all_day"] { return nil }
+        for key in ["start_iso", "end_iso"] {
+            guard let value = stringArgOpt(arguments, key), value.contains("T"),
+                  toolInstant(value, timeZone: zone) == nil else { continue }
+            return "\(key) '\(value)' is not a time TabMail can read (give it as yyyy-MM-ddTHH:mm:ss)."
+        }
+        return nil
+    }
+
     private static let toolWallTimeFormats = ["yyyy-MM-dd'T'HH:mm:ss", "yyyy-MM-dd'T'HH:mm", "yyyy-MM-dd"]
 
     // MARK: - Attendee Delta (calendar_event_edit-v1.5.21)
