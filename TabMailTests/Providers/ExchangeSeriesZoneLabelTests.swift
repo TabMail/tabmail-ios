@@ -526,6 +526,31 @@ struct ExchangeSeriesDayTests {
         #expect(label(created["end"]) == Self.tokyo, "the new part's end is labelled \(canonical(created["end"]))")
     }
 
+    @Test("a retried split's cap, written alone, labels the series' start and end with the series' zone at the same instants")
+    func retriedSplitCapIsInTheSeriesZone() async throws {
+        // A Tokyo series read in the device's zone; the split's new part was made and recorded,
+        // and the cap is written by the retry (`finishSplit`).
+        let first = Self.intoTheNextDeviceDay.0
+        let graph = ZoneSeries.calendar(start: first, label: Self.device, stored: Self.tokyo)
+        let split = ZoneSeries.place(first, week: 1, stored: Self.tokyo)
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        graph.install(on: http)
+        let provider = ExchangeCalendarProvider(mailbox: "calendar@example.com", accessToken: { _ in "test-token" },
+                                                session: http.session)
+        let record = SplitRecord(seriesId: ZoneSeries.id, newPartId: "zs-new", splitAt: wall(split, in: Self.device))
+        await #expect(throws: Never.self, "the retry's cap was refused") {
+            try await provider.finishSplit(calendarId: "primary", record: record, zone: .current)
+        }
+
+        let cap = graph.patches(ZoneSeries.id).last
+        #expect(rangeOf(cap)?["type"] as? String == "endDate", "no cap was written: \(canonical(cap?["recurrence"]))")
+        #expect(label(cap?["start"]) == Self.tokyo && label(cap?["end"]) == Self.tokyo,
+                "the cap is labelled \(canonical(cap?["start"])) to \(canonical(cap?["end"]))")
+        #expect(instant(cap?["start"]) == first && instant(cap?["end"]) == first.addingTimeInterval(3_600),
+                "the cap moved the series: \(canonical(cap?["start"])) to \(canonical(cap?["end"]))")
+    }
+
     @Test("a split's new part given a new rule starts its range on the day of the start it is written with",
           .enabled(if: deviceDayIsNotTokyos), arguments: [false, true])
     func splitWithANewRuleStartsOnTheWrittenDay(_ moved: Bool) async throws {
