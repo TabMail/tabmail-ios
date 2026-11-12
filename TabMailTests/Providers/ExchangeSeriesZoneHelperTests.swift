@@ -148,11 +148,14 @@ struct ExchangeSeriesZoneHelperTests {
         #expect(out["timeZone"] as? String == "Pacific Standard Time", "kept \(out)")
         #expect(instant(out) == read, "\(given) became \(out), not the instant the tools read")
         #expect(CalendarToolHelpers.unreadableWallTime(["start_iso": .string(wallText)], in: zone("America/New_York")) == nil,
-                "a skipped wall time is refused")
+                "a skipped wall time was refused")
         #expect(CalendarToolHelpers.unreadableWallTime(["start_iso": .string("soon")], in: zone("America/New_York")) == nil,
-                "a value with no time part is the date check's")
+                "a value with no time part was refused here, not by the date check")
         #expect(CalendarToolHelpers.unreadableWallTime(["end_iso": .string("\(wallText.prefix(10))T25:99")], in: zone("America/New_York")) != nil,
-                "an unreadable time is not refused")
+                "an unreadable time was not refused")
+        #expect(CalendarToolHelpers.unreadableWallTime(["all_day": .bool(true), "start_iso": .string("\(wallText.prefix(10))T25:99")],
+                                                       in: zone("America/New_York")) == nil,
+                "an all-day edit's start was refused as a time")
     }
 
     @Test("U9: a start's day in the series' zone is the date of the start written there; a series with no zone known keeps the device's day")

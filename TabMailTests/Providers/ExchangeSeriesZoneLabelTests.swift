@@ -525,4 +525,32 @@ struct ExchangeSeriesDayTests {
                 "the new part's range starts \(canonical(rangeOf(created))), on \(Self.dayIn(newStart, "Asia/Tokyo")) in the series' zone")
         #expect(label(created["end"]) == Self.tokyo, "the new part's end is labelled \(canonical(created["end"]))")
     }
+
+    @Test("a split's new part given a new rule starts its range on the day of the start it is written with",
+          .enabled(if: deviceDayIsNotTokyos), arguments: [false, true])
+    func splitWithANewRuleStartsOnTheWrittenDay(_ moved: Bool) async throws {
+        // The new part's rule is the edit's, so it is not dated in the stored range's zone: its
+        // range starts on the day of the start as written, whatever day that is in Tokyo.
+        let first = moved ? Self.intoTheNextDeviceDay.1 : Self.intoTheNextDeviceDay.0
+        let graph = ZoneSeries.calendar(start: first, label: Self.device, stored: Self.tokyo)
+        let split = ZoneSeries.place(first, week: 1, stored: Self.tokyo)
+        let newStart = moved ? split.addingTimeInterval(-12 * 3_600) : split
+        var arguments: [String: JSONValue] = [
+            "edit_scope": .string("this_and_following"), "recurrence_id": .string(wall(split, in: Self.device)),
+            "recurrence": .dictionary(["freq": .string("DAILY")]), "timezone": .string(Self.device),
+        ]
+        if moved {
+            arguments["start_iso"] = .string(wall(newStart, in: Self.device))
+            arguments["end_iso"] = .string(wall(newStart.addingTimeInterval(3_600), in: Self.device))
+        }
+        let rows = try await outlook(graph, arguments, account: "seriesday-split-rule-\(moved)")
+
+        #expect(rows.isEmpty, "the split was not written: \(reasons(rows))")
+        #expect(graph.created.count == 1, "\(graph.created.count) new parts")
+        guard graph.created.count == 1 else { return }
+        let created = graph.created[0]
+        #expect(instant(created["start"]) == newStart, "the new part starts \(canonical(created["start"]))")
+        #expect(rangeOf(created)?["startDate"] as? String == dateOf(created["start"]),
+                "the new part's range starts \(canonical(rangeOf(created))), its start \(canonical(created["start"]))")
+    }
 }
