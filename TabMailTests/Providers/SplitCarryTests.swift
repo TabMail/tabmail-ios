@@ -149,6 +149,142 @@ struct SplitCarryTests {
         #expect(SplitCarry.cut(named: moved, series: series) == .at(GCalDateTime(dateTime: nil, date: day(14), timeZone: nil)))
     }
 
+    /// `at(days, time)` as an iCalendar UTC value (`20990101T090000Z`).
+    private static func ical(_ days: Int, _ time: String = "09:00:00") -> String {
+        at(days, time).replacingOccurrences(of: "-", with: "").replacingOccurrences(of: ":", with: "")
+    }
+
+    @Test("an added date (RDATE) before the rule's next place is the cut")
+    func cutAtAddedDate() throws {
+        let moved = try Self.occurrence(place: 7, start: Self.at(9), end: Self.at(9, "09:30:00"))
+        let cut = SplitCarry.cut(named: moved, series: try Self.weekly(), rdates: ["RDATE:\(Self.ical(10))"])
+        #expect(cut == .at(Self.instant(Self.at(10))))
+        // One after the rule's next place leaves the cut there.
+        let later = SplitCarry.cut(named: moved, series: try Self.weekly(), rdates: ["RDATE:\(Self.ical(16))"])
+        #expect(later == .at(Self.instant(Self.at(14))))
+    }
+
+    @Test("a UTC UNTIL before the next place leaves no cut; one at it keeps the place")
+    func cutPastUTCUntil() throws {
+        let moved = try Self.occurrence(place: 7, start: Self.at(9), end: Self.at(9, "09:30:00"))
+        #expect(SplitCarry.cut(named: moved, series: try Self.weekly(";UNTIL=\(Self.ical(13))")) == .pastEnd)
+        #expect(SplitCarry.cut(named: moved, series: try Self.weekly(";UNTIL=\(Self.ical(14))")) == .at(Self.instant(Self.at(14))))
+    }
+
+    @Test("a date UNTIL is the series' own date: an evening place in a zone behind UTC on that date is kept")
+    func cutDateUntilInSeriesZone() throws {
+        let pacific = try #require(TimeZone(identifier: "America/Los_Angeles"))
+        // 23:00 UTC is the afternoon of the same date in Pacific time, and 02:00 UTC is the evening before.
+        let series = try Self.event([
+            "id": "s", "start": Self.time(Self.at(0, "02:00:00")), "end": Self.time(Self.at(0, "03:00:00")),
+            "recurrence": ["RRULE:FREQ=WEEKLY;UNTIL=\(String(Self.ical(13).prefix(8)))"],
+        ])
+        let moved = try Self.occurrence(place: 7, start: Self.at(9), end: Self.at(9, "10:00:00"))
+        // The place on day 14 at 02:00 UTC is day 13 in Pacific time, on the UNTIL date.
+        #expect(SplitCarry.cut(named: moved, series: series, zone: pacific) == .at(Self.instant(Self.at(14, "02:00:00"))))
+        // Read in UTC it is day 14, after the UNTIL date.
+        #expect(SplitCarry.cut(named: moved, series: series, zone: .gmt) == .pastEnd)
+    }
+
+    @Test("a local date-time UNTIL compares by wall clock in the series' zone")
+    func cutLocalUntilInSeriesZone() throws {
+        let pacific = try #require(TimeZone(identifier: "America/Los_Angeles"))
+        let moved = try Self.occurrence(place: 7, start: Self.at(9), end: Self.at(9, "10:00:00"))
+        func series(_ until: String) throws -> GCalEvent {
+            try Self.event([
+                "id": "s", "start": Self.time(Self.at(0, "02:00:00")), "end": Self.time(Self.at(0, "03:00:00")),
+                "recurrence": ["RRULE:FREQ=WEEKLY;UNTIL=\(until)"],
+            ])
+        }
+        let day13 = String(Self.ical(13).prefix(8))
+        // The day-14 place is 18:00 or 19:00 Pacific on day 13 (with or without daylight time).
+        #expect(SplitCarry.cut(named: moved, series: try series("\(day13)T230000"), zone: pacific) == .at(Self.instant(Self.at(14, "02:00:00"))))
+        #expect(SplitCarry.cut(named: moved, series: try series("\(day13)T170000"), zone: pacific) == .pastEnd)
+    }
+
+    // MARK: CalDAV's split point
+
+    /// A weekly CalDAV series from today at 09:00 with `start` (`DTSTART` params and value
+    /// suffix), its day-7 occurrence moved to day 9, and `extra` top-level lines.
+    private static func caldavSeries(floating: Bool, extra: [String] = []) -> String {
+        let z = floating ? "" : "Z"
+        func v(_ days: Int, _ time: String = "09:00:00") -> String { String(ical(days, time).dropLast()) + z }
+        return ([
+            "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Example//EN",
+            "BEGIN:VEVENT", "UID:split-point@example.com", "DTSTAMP:\(ical(0))",
+            "DTSTART:\(v(0))", "DTEND:\(v(0, "09:30:00"))", "RRULE:FREQ=WEEKLY", "SUMMARY:Standup",
+        ] + extra + [
+            "END:VEVENT",
+            "BEGIN:VEVENT", "UID:split-point@example.com", "DTSTAMP:\(ical(0))", "RECURRENCE-ID:\(v(7))",
+            "DTSTART:\(v(9))", "DTEND:\(v(9, "09:30:00"))", "SUMMARY:Standup",
+            "END:VEVENT", "END:VCALENDAR",
+        ]).joined(separator: "\r\n")
+    }
+
+    @Test("CalDAV cuts at an added date (RDATE) the series holds, as the card shows it")
+    func caldavSplitPointAtAddedDate() throws {
+        let ics = Self.caldavSeries(floating: false, extra: ["RDATE:\(Self.ical(10))"])
+        let point = try CalDAVProvider.splitPoint(
+            masterICS: ics, href: "/cal/split-point.ics", key: nil, recurrenceId: String(Self.at(9).dropLast()), zone: .gmt)
+        #expect(point.cut == .at(Self.instant(Self.at(10))))
+        #expect(point.slot == String(Self.at(10).dropLast()))
+    }
+
+    @Test("CalDAV reads a floating series in the operation's zone, not the device's")
+    func caldavSplitPointFloatingInOperationZone() throws {
+        let candidates = ["Pacific/Kiritimati", "Pacific/Pago_Pago"].compactMap(TimeZone.init(identifier:))
+        let zone = try #require(candidates.first { $0.secondsFromGMT() != TimeZone.current.secondsFromGMT() })
+        let ics = Self.caldavSeries(floating: true)
+        let point = try CalDAVProvider.splitPoint(
+            masterICS: ics, href: "/cal/split-point.ics", key: nil, recurrenceId: String(Self.at(9).dropLast()), zone: zone)
+        #expect(point.slot == String(Self.at(14).dropLast()))
+        // The occurrence named starts at its wall clock in that zone.
+        #expect(point.namedInstants.start == GoogleCalendarProvider.naiveInstant(String(Self.at(9).dropLast()), zone: zone))
+    }
+
+    // MARK: an edit past the series' end
+
+    @Test("an edit past the end keeps absolute targets: a retry after a partial write never moves an occurrence twice")
+    func shownEditsRetryMovesOnce() throws {
+        // Named: placed day 7, now day 30; another shown after it at day 31. The edit moves it an hour later.
+        let named = try Self.occurrence(place: 7, start: Self.at(30), end: Self.at(30, "09:30:00"))
+        let other = try Self.occurrence(place: 0, start: Self.at(31), end: Self.at(31, "09:30:00"))
+        var edit = GCalEventInput()
+        edit.startDateTime = Self.at(30, "10:00:00")
+        edit.endDateTime = Self.at(30, "10:30:00")
+        let first = try #require(SplitCarry.shownEdits(exceptions: [.changed(named), .changed(other)], named: named, seriesId: "s", patch: edit))
+        #expect(first.record.isPastEnd && first.record.newPartId == "s_7")
+        #expect(first.edits.map(\.exception.id) == ["s_0", "s_7"])
+        // The first write landed, the named one's did not. The record survives the queue's round trip.
+        let kept = try #require(SplitRecord([SplitRecord.argumentKey: first.record.argument]))
+        #expect(kept == first.record)
+        let written = try Self.occurrence(place: 0, start: Self.at(31, "10:00:00"), end: Self.at(31, "10:30:00"))
+        let retry = try #require(SplitCarry.shownEdits(exceptions: [.changed(named), .changed(written)], record: kept))
+        #expect(retry.map(\.exception.id) == ["s_0", "s_7"])
+        func start(_ edit: SplitCarry.Edit?) -> Date? { edit?.start?.dateTime.flatMap(Date.fromISO8601) }
+        // The one written stays where the first attempt put it; the named one goes where it was to.
+        #expect(start(retry.first) == Date.fromISO8601(Self.at(31, "10:00:00")), "moved twice: \(String(describing: retry.first?.start))")
+        #expect(start(retry.last) == Date.fromISO8601(Self.at(30, "10:00:00")))
+        // Both landed: nothing moves again, and the named one is still found by its place.
+        let namedWritten = try Self.occurrence(place: 7, start: Self.at(30, "10:00:00"), end: Self.at(30, "10:30:00"))
+        let done = try #require(SplitCarry.shownEdits(exceptions: [.changed(namedWritten), .changed(written)], record: kept))
+        #expect(done.count == 2)
+        #expect(start(done.first) == Date.fromISO8601(Self.at(31, "10:00:00")) && start(done.last) == Date.fromISO8601(Self.at(30, "10:00:00")))
+    }
+
+    @Test("an edit past the end that sets the end keeps its length on the record")
+    func shownEditsKeepLength() throws {
+        let named = try Self.occurrence(place: 7, start: Self.at(30), end: Self.at(30, "09:30:00"))
+        var edit = GCalEventInput()
+        edit.endDateTime = Self.at(30, "10:00:00")
+        let first = try #require(SplitCarry.shownEdits(exceptions: [.changed(named)], named: named, seriesId: "s", patch: edit))
+        #expect(first.record.editLength == 3600)
+        let kept = try #require(SplitRecord([SplitRecord.argumentKey: first.record.argument]))
+        #expect(kept.editLength == 3600)
+        let retry = try #require(SplitCarry.shownEdits(exceptions: [.changed(named)], record: kept))
+        #expect(retry.first?.end?.dateTime.flatMap(Date.fromISO8601) == Date.fromISO8601(Self.at(30, "10:00:00")))
+    }
+
     // MARK: partition
 
     @Test("exceptions sort into four groups by place against the cut and start against the named one; a deleted one goes by its place")
@@ -432,6 +568,46 @@ struct SplitCarryTests {
         #expect(kept.contains("DTSTART:20990113T090000Z") && kept.contains("SUMMARY:Standup"), "kept: \(kept)")
         #expect(Self.override("20990202T090000Z", in: r.newPart).isEmpty && Self.override("20990202T100000Z", in: r.newPart).isEmpty,
                 "the reset kept a later change")
+    }
+
+    @Test("CalDAV: (d) on a reset, an occurrence deleted between the named one's place and the cut stays deleted on the capped series")
+    func calDAVResetKeepsDeletedBeforeTheCut() throws {
+        let ics = """
+        BEGIN:VCALENDAR
+        VERSION:2.0
+        PRODID:-//Test//EN
+        BEGIN:VEVENT
+        UID:moved-1
+        DTSTAMP:20990101T000000Z
+        DTSTART:20990105T090000Z
+        DTEND:20990105T093000Z
+        RRULE:FREQ=WEEKLY
+        EXDATE:20990119T090000Z
+        SUMMARY:Standup
+        END:VEVENT
+        BEGIN:VEVENT
+        UID:moved-1
+        RECURRENCE-ID:20990112T090000Z
+        DTSTAMP:20990101T000000Z
+        DTSTART:20990121T090000Z
+        DTEND:20990121T093000Z
+        SUMMARY:Standup
+        END:VEVENT
+        END:VCALENDAR
+        """.replacingOccurrences(of: "\n", with: "\r\n")
+        var patch = GCalEventInput()
+        // The new part's start as the provider gives it (`partEdit`): the cut (26th), an hour on.
+        patch.startDateTime = "2099-01-26T10:00:00Z"
+        patch.startTimeZone = "UTC"
+        let named = (start: try #require(Date.fromISO8601("2099-01-21T09:00:00Z")), place: try #require(Date.fromISO8601("2099-01-12T09:00:00Z")))
+        let r = try CalDAVProvider.seriesSplitResources(
+            storedICS: ics, slotNaiveISO: "2099-01-26T09:00:00", cappedRRule: "RRULE:FREQ=WEEKLY;UNTIL=20990126T085959Z",
+            newRRule: "RRULE:FREQ=WEEKLY", newUid: "moved-2", patch: patch, now: Date(),
+            zones: CalendarTimeZoneContext(calendarText: ics), named: named)
+        #expect(r.mode == .reset)
+        #expect(r.cappedSeries.contains("EXDATE:20990119T090000Z"), "the deleted occurrence came back: \(r.cappedSeries)")
+        #expect(!r.newPart.contains("EXDATE"), "the new part kept an excluded date on a reset: \(r.newPart)")
+        #expect(Self.override("20990112T090000Z", in: r.cappedSeries).contains("DTSTART:20990121T100000Z"), "\(r.cappedSeries)")
     }
 
     @Test("CalDAV: an occurrence moved past the series' last place: the edit reaches what is shown from it on, and nothing else (owner rule e)")

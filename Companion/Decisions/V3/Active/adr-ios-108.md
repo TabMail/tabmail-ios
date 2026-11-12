@@ -189,6 +189,14 @@ of the resource, which holds every occurrence (irreversible wire operation #5, n
   leaves those shown before it alone, and deletions between its old and new place stay deleted. Moved
   past the series' last occurrence, no new part is made: only it is edited, and a rule change there is
   refused. Memory 142, "Split at a moved occurrence".
+  **Amended again 2026-11-12 (review of #687):** each calendar works the cut out in ONE provider
+  function (`splitPoint`), which both its `splitSeries` and its `dayMovedRules` (the card's repeat
+  line) call, so the card can never cut where the write does not (CalDAV reads the resource's
+  `RDATE` lines there; Outlook places a pattern from its range start and a missing month day on the
+  month's last). A floating CalDAV series is read in the zone the operation was queued with
+  (`CalendarTimeZoneContext.readingFloating(in:)`), never the device's at the drain. Past the end,
+  Google and Outlook keep a record (`SplitRecord.pastEnd`) with absolute targets before the first
+  write, and a retry finishes from it (`finishShownEdit`), so no occurrence moves twice.
 - The series id with a moved occurrence's new time edits that occurrence in place, and with its old
   place is not found, the same as on Google, whose resolver finds no instance there.
 - A retry after a lost response is reported not found, with nothing written, when the first attempt

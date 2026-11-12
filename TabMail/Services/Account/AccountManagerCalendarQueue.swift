@@ -921,6 +921,16 @@ extension AccountManager {
             // change read again from the arguments (#563). A
             // new part the user deleted since is not written again, and nor is the cap: the
             // change is refused with the reason, and the user decides.
+            // An edit past the series' last place that an earlier attempt began writes the rest
+            // of its edits to the targets it kept, without looking for the occurrence named where
+            // it was (the first attempt may have moved it).
+            if let record = SplitRecord(args), record.isPastEnd {
+                try await provider.finishShownEdit(
+                    calendarId: calId, record: record,
+                    edit: try CalendarToolHelpers.buildGCalEventInput(args, isAllDay: nil), guests: AttendeeChange(arguments: args))
+                BackgroundSyncLogger.logDebug("[CalendarQueue] Finished the edit past the end of \(record.seriesId)")
+                return (record.newPartId, nil)
+            }
             if let record = SplitRecord(args) {
                 guard try await provider.eventExists(calendarId: calId, eventId: record.newPartId) else {
                     throw CalendarProviderError.notSupported(SplitRecord.newPartDeleted)

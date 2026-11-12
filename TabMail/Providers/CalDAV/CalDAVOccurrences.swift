@@ -222,15 +222,16 @@ enum CalDAVOccurrences {
 
     /// The occurrence `key` names in the resource, as a listing shows it, or nil when the
     /// series has no such occurrence now (it was removed, or the series changed since the id
-    /// was listed). A cancelled occurrence comes back with status `cancelled`.
-    static func occurrence(key wanted: String, icsText: String, href: String) -> GCalEvent? {
-        let components = ICSParser.components(icsText: icsText, resourceHref: href)
+    /// was listed). A cancelled occurrence comes back with status `cancelled`. Floating times are
+    /// read in `floatingZone` (the device's unless given).
+    static func occurrence(key wanted: String, icsText: String, href: String, floatingZone: TimeZone = .current) -> GCalEvent? {
+        let components = ICSParser.components(icsText: icsText, resourceHref: href, floatingZone: floatingZone)
         let overrides = components.filter { $0.recurrenceId != nil }
         guard let master = components.first(where: { $0.recurrenceId == nil }) else {
             return overrides.first { override in override.recurrenceId.flatMap { standaloneKey(of: $0, zones: override.zones) } == wanted }
-                .map { occurrenceRow($0.event, href: href, key: wanted, recurrence: nil, frame: .floating(.current)) }
+                .map { occurrenceRow($0.event, href: href, key: wanted, recurrence: nil, frame: .floating(floatingZone)) }
         }
-        guard case .series(let series) = shape(of: master, overrides: overrides) else { return nil }
+        guard case .series(let series) = shape(of: master, overrides: overrides, floatingZone: floatingZone) else { return nil }
         return occurrence(key: wanted, in: series, overrides: overrides, href: href)
     }
 
@@ -297,7 +298,7 @@ enum CalDAVOccurrences {
         }
         let timeMin = center.addingTimeInterval(-Config.resolverWindow)
         let timeMax = center.addingTimeInterval(Config.resolverWindow)
-        let components = ICSParser.components(icsText: icsText, resourceHref: href)
+        let components = ICSParser.components(icsText: icsText, resourceHref: href, floatingZone: zone)
         let overrides = components.filter { $0.recurrenceId != nil }
         let rows: [(key: String, row: GCalEvent)]
         if let master = components.first(where: { $0.recurrenceId == nil }) {

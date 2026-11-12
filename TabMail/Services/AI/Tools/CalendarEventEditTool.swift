@@ -308,19 +308,11 @@ struct CalendarEventEditTool: AgentTool, Sendable {
             // refused here, with nothing queued.
             if let move = try CalendarSeriesScope.dayMove(arguments, named: named, scope: resolvedScope, zone: tz) {
                 let series = try named.readSeries()
-                // A split starts at its cut (`SplitCarry.cut`), the first place of the series at or
-                // after where the occurrence named starts now, as its write does.
-                let splitAt = recurrenceIdArg.map { rid in
-                    named.occurrence.flatMap { occurrence in
-                        SplitCarry.cut(named: occurrence, series: series).flatMap { cut -> String? in
-                            guard case .at(let at) = cut else { return nil }
-                            return SplitCarry.splitAt(at, named: occurrence, recurrenceId: rid, zone: ridZone)
-                        }
-                    } ?? rid
-                }
+                // A split's rule starts at its cut, which the calendar works out as its write does
+                // (`dayMovedRules`, from the occurrence named at `recurrenceIdArg`).
                 let rules = try await provider.dayMovedRules(
                     calendarId: lookupCalId, eventId: queuedEventId, series: series,
-                    scope: resolvedScope, recurrenceId: splitAt, zone: ridZone, move: move)
+                    scope: resolvedScope, recurrenceId: recurrenceIdArg, zone: ridZone, move: move)
                 // A move that leaves the rule as it is (one named by position) changes nothing the
                 // card should name, and resets no exception. One that turns it resets them on every
                 // calendar, for the whole series or the split's new part.

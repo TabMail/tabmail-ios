@@ -9,13 +9,16 @@ import Foundation
 /// provider-neutral: each calendar reads its own exceptions, hands them here as `GCalEvent`
 /// values, and writes what comes back in its own terms.
 ///
-/// The rule, Google Calendar's (measured on a test calendar):
-/// - A split is an edit of every occurrence of its new part, which starts at the PLACE of the
-///   occurrence named (`originalStartTime`), not where that occurrence was moved to. The series
-///   is capped before that place, and an occurrence moved from its place is carried like any
-///   other changed occurrence.
+/// The rule (where to cut: calendar order; what to carry: Google Calendar's, measured on a test calendar):
+/// - A split changes the occurrence named and every one shown after it, by where each is now
+///   (`cut`): the new part starts at the first place of the series at or after where the
+///   occurrence named starts now, and the series is capped before it. An occurrence shown after
+///   the named one but placed before the cut is edited where it is (`Parts.edited`); one placed
+///   after the cut but shown before the named one is carried whole, unchanged (`Parts.kept`).
+///   Past the series' last place nothing is cut and only the occurrences shown are edited
+///   (`Cut.pastEnd`).
 /// - **Reset** (`Mode.reset`) when the edit moves the new part's start (another instant or day
-///   than the place, or the same instant in another time zone) or changes its rule: nothing is carried; deleted occurrences come back and
+///   than the cut, or the same instant in another time zone) or changes its rule: nothing is carried; deleted occurrences come back and
 ///   changed ones lose their change, and the new part's excluded dates go.
 /// - **Carry** (`Mode.carry`) otherwise: a deleted occurrence stays deleted; a changed one is
 ///   carried WHOLE (everything it holds that the calendar lets the organizer write, its guests'
@@ -239,6 +242,10 @@ enum SplitCarry {
 
     // MARK: - Calendar order (a split named at a moved occurrence)
 
+    /// Why a split past the series' last place (`Cut.pastEnd`) can't change the repeat: no new
+    /// part is left to take it. The write and the card refuse it in the same words.
+    static let pastEndRuleRefusal = "the occurrence named is after the series' last one, so its repeat can't be changed from it"
+
     /// Where a split cuts its series.
     enum Cut: Equatable {
         /// The old series keeps every place before this one; the new part starts here.
@@ -374,7 +381,7 @@ enum SplitCarry {
                     if before >= count { return .pastEnd }
                 }
                 if let until {
-                    guard let ends = endsBefore(at, until: until) else { return nil }
+                    guard let ends = endsBefore(at, until: until, zone: pattern.zone) else { return nil }
                     if ends { return .pastEnd }
                 }
                 return .at(at)
@@ -383,8 +390,10 @@ enum SplitCarry {
     }
 
     /// Whether an `UNTIL` value ends the series before `place`: a UTC date-time compares by
-    /// instant, any other by date (a date `UNTIL` takes in its whole day). Nil when unreadable.
-    private static func endsBefore(_ place: GCalDateTime, until: String) -> Bool? {
+    /// instant; any other is a wall clock in the series' zone (`zone`, nil for an all-day series),
+    /// so `place` is read in that zone: a local date-time compares by wall clock, a date by date (a
+    /// date `UNTIL` takes in its whole day). Nil when unreadable.
+    private static func endsBefore(_ place: GCalDateTime, until: String, zone: TimeZone?) -> Bool? {
         if until.hasSuffix("Z"), until.count == 16, let instant = place.dateTime.flatMap(Date.fromISO8601) {
             let formatter = DateFormatter()
             formatter.locale = Locale(identifier: "en_US_POSIX")
@@ -395,14 +404,17 @@ enum SplitCarry {
             return end < instant
         }
         guard let untilDay = RecurrenceTail.Day(ical: until) else { return nil }
-        let placeDay: RecurrenceTail.Day?
         if let date = place.date {
-            placeDay = RecurrenceTail.Day(iso: date)
-        } else {
-            placeDay = place.dateTime.flatMap(Date.fromISO8601).flatMap { RecurrenceTail.Day(iso: naive($0, in: .gmt)) }
+            guard let placeDay = RecurrenceTail.Day(iso: date) else { return nil }
+            return untilDay < placeDay
         }
-        guard let placeDay else { return nil }
-        return untilDay < placeDay
+        guard let zone, let instant = place.dateTime.flatMap(Date.fromISO8601) else { return nil }
+        let wall = naive(instant, in: zone)
+        guard let placeDay = RecurrenceTail.Day(iso: wall) else { return nil }
+        guard until.count == 15, until.dropFirst(8).first == "T" else { return untilDay < placeDay }
+        // A local date-time: the same wall clock form, compared as text.
+        let untilWall = "\(untilDay)T\(until.dropFirst(9).prefix(2)):\(until.dropFirst(11).prefix(2)):\(until.dropFirst(13).prefix(2))"
+        return untilWall < wall
     }
 
     /// The exceptions of a series sorted by calendar order around a split (`partition`).
@@ -600,6 +612,37 @@ enum SplitCarry {
         guard let place else { return occurrences }
         let isNamed = { (event: GCalEvent) in event.originalStartTime.map(key) == key(place) }
         return occurrences.filter { !isNamed($0) } + occurrences.filter(isNamed)
+    }
+
+    /// An edit past the series' last place (`Cut.pastEnd`) named at `named` of the series
+    /// `seriesId`, whose exceptions are `exceptions`: the edits of every occurrence shown from the
+    /// one named on (`Parts.edited`), the one named last, each to an absolute target worked out
+    /// once, and the record (`SplitRecord.pastEnd`) that keeps those targets for a retry
+    /// (`shownEdits(exceptions:record:)`). Nil when a time can't be read.
+    static func shownEdits(
+        exceptions: [Exception], named: GCalEvent, seriesId: String, patch: GCalEventInput
+    ) -> (record: SplitRecord, edits: [Edit])? {
+        let fields = fields(of: patch)
+        guard let namedId = named.id, let namedStart = named.start, let namedPlace = named.originalStartTime,
+              let parts = partition(exceptions, cut: .pastEnd, namedStart: namedStart),
+              let moved = moved(by: patch, start: namedStart),
+              let edits = edits(of: namedLast(parts.edited, place: namedPlace), shift: moved.shift, length: moved.length, fields: fields)
+        else { return nil }
+        let record = SplitRecord.pastEnd(
+            seriesId: seriesId, namedId: namedId, fields: fields, namedPlace: key(namedPlace), namedStart: key(namedStart),
+            edits: targets(of: edits), editLength: fields.contains(.end) ? moved.length : nil)
+        return (record, edits)
+    }
+
+    /// The edits a retry of an edit past the series' last place writes (`record`, kept by
+    /// `shownEdits(exceptions:named:seriesId:patch:)`): each occurrence still shown from where the
+    /// one named started then, to the target the record keeps for its place, the one named last.
+    /// One already written is written to where it is. Nil when a time can't be read.
+    static func shownEdits(exceptions: [Exception], record: SplitRecord) -> [Edit]? {
+        guard let namedStart = record.namedStart.flatMap(time),
+              let parts = partition(exceptions, cut: .pastEnd, namedStart: namedStart) else { return nil }
+        let ordered = namedLast(parts.edited, place: record.namedPlace.flatMap(time))
+        return edits(of: ordered, targets: record.edits, length: record.editLength, fields: record.fields)
     }
 
     /// The occurrence named, when the split places it in the new part (`Parts.tail`): found by

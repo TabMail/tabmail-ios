@@ -97,10 +97,18 @@ protocol CalendarProvider: Sendable {
     /// lost, or the user ended it earlier). Default: refused, as `splitSeries` is.
     func finishSplit(calendarId: String, record: SplitRecord, zone: TimeZone, guests: AttendeeChange?) async throws
 
+    /// Finishes an edit past the series' last place that an earlier attempt began
+    /// (`SplitRecord.isPastEnd`): each occurrence the record keeps a target for that is still shown
+    /// from the one named on is written to that target, with `edit`'s values of the record's fields
+    /// and the guests' change `guests`. Absolute, so one already written changes nothing. Default:
+    /// refused (only calendars that write such an edit one occurrence at a time keep its record).
+    func finishShownEdit(calendarId: String, record: SplitRecord, edit: GCalEventInput, guests: AttendeeChange?) async throws
+
     /// Every repeat rule, as an RRULE, that this calendar writes when a move to another day turns
     /// the days of `series` (`GCalEventInput.ruleDayMove`): the whole series' rules for scope "all",
-    /// the new part's for a split (`this_and_following` at `recurrenceId`, read in `zone`), its end
-    /// carried as the split carries it. `eventId` is the id the edit is written to. The
+    /// the new part's for a split (`this_and_following` named at the occurrence that starts at
+    /// `recurrenceId`, read in `zone`, cut where `splitSeries` cuts it), its end carried as the
+    /// split carries it. `eventId` is the id the edit is written to. The
     /// confirmation card shows them; each calendar's write is built by the same functions from
     /// what it reads. Throws `notSupported` when the move or the split can't be carried, or the
     /// rule written can't be told: nothing is shown or written then.
@@ -191,6 +199,9 @@ extension CalendarProvider {
         throw CalendarProviderError.notSupported(Self.splitNotSupported)
     }
     func finishSplit(calendarId: String, record: SplitRecord, zone: TimeZone, guests: AttendeeChange?) async throws {
+        throw CalendarProviderError.notSupported(Self.splitNotSupported)
+    }
+    func finishShownEdit(calendarId: String, record: SplitRecord, edit: GCalEventInput, guests: AttendeeChange?) async throws {
         throw CalendarProviderError.notSupported(Self.splitNotSupported)
     }
     func dayMovedRules(calendarId: String, eventId: String, series: GCalEvent, scope: String, recurrenceId: String?,
@@ -792,16 +803,38 @@ actor GoogleCalendarProvider: CalendarProvider {
     /// Google's rules for a move to another day (`CalendarProvider.dayMovedRules`): every RRULE of
     /// the series turned (`turned`) for an edit of every occurrence, or the new part's
     /// (`splitTailRule`, the end the split carries over) turned for a split.
-    nonisolated func dayMovedRules(calendarId: String, eventId: String, series: GCalEvent, scope: String, recurrenceId: String?,
-                                   zone: TimeZone, move: RecurrenceDayShift.Move) async throws -> [String] {
+    func dayMovedRules(calendarId: String, eventId: String, series: GCalEvent, scope: String, recurrenceId: String?,
+                       zone: TimeZone, move: RecurrenceDayShift.Move) async throws -> [String] {
         let rules = (series.recurrence ?? []).filter { $0.uppercased().hasPrefix("RRULE:") }
         guard scope == "this_and_following" else { return try Self.turned(rules, by: move) }
-        guard let rule = rules.first, let recurrenceId,
-              let cap = Self.googleUntilString(beforeNaiveISO: recurrenceId, allDay: series.isAllDay, zone: zone) else {
-            throw CalendarProviderError.notSupported("the occurrence the series would be split at can't be told, so its days can't be moved with it")
-        }
+        let untold = CalendarProviderError.notSupported("the occurrence the series would be split at can't be told, so its days can't be moved with it")
+        guard let recurrenceId else { throw untold }
+        // The split point the write cuts at (`splitPoint`), from the series as `splitSeries` reads it.
+        let (masterId, master, _) = try await resolveToMaster(calendarId: calendarId, eventId: eventId)
+        guard let rule = (master.recurrence ?? []).first(where: { $0.uppercased().hasPrefix("RRULE:") }) else { throw untold }
+        let point = try await splitPoint(
+            calendarId: calendarId, named: eventId, masterId: masterId, master: master, recurrenceId: recurrenceId, zone: zone)
+        guard let place = point.place else { throw CalendarProviderError.notSupported(SplitCarry.pastEndRuleRefusal) }
+        guard let cap = Self.googleUntilString(beforeNaiveISO: place, allDay: master.isAllDay, zone: zone) else { throw untold }
         return [try RecurrenceDayShift.shifted(
-            Self.splitTailRule(master: series, rule: rule, recurrenceId: recurrenceId, recurrenceIdZone: zone, capUntil: cap), by: move)]
+            Self.splitTailRule(master: master, rule: rule, recurrenceId: place, recurrenceIdZone: zone, capUntil: cap), by: move)]
+    }
+
+    /// Where a split of `master` named at `recurrenceId` (read in `zone`) cuts it: the occurrence
+    /// named is the one that starts at `recurrenceId` now (`occurrence`), and the cut the first
+    /// place of the series at or after where it starts (`SplitCarry.cut`). `place` is the cut as a
+    /// naive wall clock in `zone` (`SplitCarry.splitAt`), nil past the series' end. The one
+    /// computation `splitSeries` writes and the card shows (`dayMovedRules`).
+    private func splitPoint(
+        calendarId: String, named: String, masterId: String, master: GCalEvent, recurrenceId: String, zone: TimeZone
+    ) async throws -> (found: GCalEvent, namedStart: GCalDateTime, namedPlace: GCalDateTime, cut: SplitCarry.Cut, place: String?) {
+        let found = try await occurrence(calendarId: calendarId, named: named, masterId: masterId, recurrenceId: recurrenceId, zone: zone)
+        let unreadable = CalendarProviderError.notSupported("where the occurrence named falls in its series can't be read, so the series can't be split at it")
+        guard let namedStart = found.start, let namedPlace = found.originalStartTime,
+              let cut = SplitCarry.cut(named: found, series: master) else { throw unreadable }
+        guard case .at(let at) = cut else { return (found, namedStart, namedPlace, cut, nil) }
+        guard let place = SplitCarry.splitAt(at, named: found, recurrenceId: recurrenceId, zone: zone) else { throw unreadable }
+        return (found, namedStart, namedPlace, cut, place)
     }
 
     /// Split a recurring series at `recurrenceId`:
@@ -853,19 +886,16 @@ actor GoogleCalendarProvider: CalendarProvider {
         //    it and every occurrence shown after it change, and none shown before it does. Each
         //    time the edit gives moves the new part as far from the cut as it moves the
         //    occurrence named (`SplitCarry.partEdit`).
-        let found = try await occurrence(
-            calendarId: calendarId, named: named, masterId: eventId,
+        let point = try await splitPoint(
+            calendarId: calendarId, named: named, masterId: eventId, master: master,
             recurrenceId: recurrenceId, zone: recurrenceIdZone)
-        guard let namedStart = found.start, let namedPlace = found.originalStartTime,
-              let cut = SplitCarry.cut(named: found, series: master) else {
-            throw CalendarProviderError.notSupported("where the occurrence named falls in its series can't be read, so the series can't be split at it")
-        }
-        guard case .at(let splitPlace) = cut else {
+        let found = point.found, namedStart = point.namedStart, namedPlace = point.namedPlace
+        guard let place = point.place, case .at(let splitPlace) = point.cut else {
             return try await editShown(
-                calendarId: calendarId, master: master, masterId: eventId, named: found, patch: patch, sendUpdates: sendUpdates)
+                calendarId: calendarId, master: master, masterId: eventId, named: found, patch: patch, sendUpdates: sendUpdates,
+                record: record)
         }
-        guard let place = SplitCarry.splitAt(splitPlace, named: found, recurrenceId: recurrenceId, zone: recurrenceIdZone),
-              let partPatch = SplitCarry.partEdit(patch, namedStart: namedStart, cut: splitPlace) else {
+        guard let partPatch = SplitCarry.partEdit(patch, namedStart: namedStart, cut: splitPlace) else {
             throw CalendarProviderError.notSupported("where the occurrence named falls in its series can't be read, so the series can't be split at it")
         }
         let mode = SplitCarry.mode(edit: partPatch, place: splitPlace, storedRules: masterRecurrence, seriesZone: master.isAllDay ? nil : master.seriesZone)
@@ -908,7 +938,7 @@ actor GoogleCalendarProvider: CalendarProvider {
         //    is kept. In either mode, those shown before the one named keep what they show, and
         //    those shown after it but placed before the cut get the edit where they are.
         let exceptions = try await seriesExceptions(calendarId: calendarId, master: master, masterId: eventId)
-        guard let parts = SplitCarry.partition(exceptions.map(\.carried), cut: cut, namedStart: namedStart) else {
+        guard let parts = SplitCarry.partition(exceptions.map(\.carried), cut: point.cut, namedStart: namedStart) else {
             throw CalendarProviderError.notSupported("a changed occurrence of this repeating event has a time TabMail can't read, so it was not split")
         }
         switch mode {
@@ -1169,30 +1199,53 @@ actor GoogleCalendarProvider: CalendarProvider {
 
     /// A "this and following" edit at an occurrence moved past the series' last place
     /// (`SplitCarry.Cut.pastEnd`): no new part and no cap; the edit is written onto every
-    /// occurrence shown from the one named on, each as a "this occurrence" edit, the one named
-    /// last, so a retry after a failure finds it where it was. An edit of the rule is refused:
-    /// no part is left to take it.
+    /// occurrence shown from the one named on, each as a "this occurrence" edit, to an absolute
+    /// target worked out once and kept on the operation's record before the first write
+    /// (`SplitCarry.shownEdits`), so a retry (`finishShownEdit`) never moves one twice. An edit
+    /// of the rule is refused: no part is left to take it.
     private func editShown(
-        calendarId: String, master: GCalEvent, masterId: String, named: GCalEvent, patch: GCalEventInput, sendUpdates: String
+        calendarId: String, master: GCalEvent, masterId: String, named: GCalEvent, patch: GCalEventInput, sendUpdates: String,
+        record: SplitRecorder
     ) async throws -> GCalEvent {
         guard patch.recurrence == nil, patch.ruleDayMove == nil else {
-            throw CalendarProviderError.notSupported("the occurrence named is after the series' last one, so its repeat can't be changed from it")
+            throw CalendarProviderError.notSupported(SplitCarry.pastEndRuleRefusal)
         }
         let exceptions = try await seriesExceptions(calendarId: calendarId, master: master, masterId: masterId)
-        guard let namedStart = named.start,
-              let parts = SplitCarry.partition(exceptions.map(\.carried), cut: .pastEnd, namedStart: namedStart),
-              let moved = SplitCarry.moved(by: patch, start: namedStart),
-              let edits = SplitCarry.edits(of: SplitCarry.namedLast(parts.edited, place: named.originalStartTime), shift: moved.shift, length: moved.length, fields: SplitCarry.fields(of: patch)) else {
-            throw CalendarProviderError.notSupported("a changed occurrence of this repeating event has a time TabMail can't read, so it was not changed")
+        guard let shown = SplitCarry.shownEdits(exceptions: exceptions.map(\.carried), named: named, seriesId: masterId, patch: patch) else {
+            throw CalendarProviderError.notSupported(Self.shownEditUnreadable)
         }
-        let values = SplitCarry.values(of: patch, fields: SplitCarry.fields(of: patch))
-        var last = named
+        try await record(shown.record)
+        return try await writeShownEdits(
+            calendarId: calendarId, edits: shown.edits, values: SplitCarry.values(of: patch, fields: shown.record.fields),
+            guests: patch.attendeeChange, sendUpdates: sendUpdates) ?? named
+    }
+
+    /// `CalendarProvider.finishShownEdit`: the edits of `record` still to write, from the series'
+    /// exceptions as they are now (`SplitCarry.shownEdits(exceptions:record:)`).
+    func finishShownEdit(calendarId: String = "primary", record: SplitRecord, edit: GCalEventInput, guests: AttendeeChange?) async throws {
+        let (masterId, master, _) = try await resolveToMaster(calendarId: calendarId, eventId: record.seriesId)
+        let exceptions = try await seriesExceptions(calendarId: calendarId, master: master, masterId: masterId)
+        guard let edits = SplitCarry.shownEdits(exceptions: exceptions.map(\.carried), record: record) else {
+            throw CalendarProviderError.notSupported(Self.shownEditUnreadable)
+        }
+        _ = try await writeShownEdits(
+            calendarId: calendarId, edits: edits, values: SplitCarry.values(of: edit, fields: record.fields),
+            guests: guests, sendUpdates: "all")
+    }
+
+    private static let shownEditUnreadable = "a changed occurrence of this repeating event has a time TabMail can't read, so it was not changed"
+
+    /// Writes `edits` in order, each as a "this occurrence" edit; the last one written, nil when none.
+    private func writeShownEdits(
+        calendarId: String, edits: [SplitCarry.Edit], values: GCalEventInput, guests: AttendeeChange?, sendUpdates: String
+    ) async throws -> GCalEvent? {
+        var last: GCalEvent?
         for edit in edits {
             guard let id = edit.exception.id else {
                 throw CalendarProviderError.notSupported("a changed occurrence of this repeating event can't be addressed, so it was not changed")
             }
             last = try await patchOccurrence(
-                calendarId: calendarId, instanceId: id, event: SplitCarry.input(for: edit, values: values, guests: patch.attendeeChange),
+                calendarId: calendarId, instanceId: id, event: SplitCarry.input(for: edit, values: values, guests: guests),
                 sendUpdates: sendUpdates)
         }
         return last

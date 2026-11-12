@@ -31,10 +31,11 @@ actor CalDAVProvider: CalendarProvider {
         }
         guard scope == "this_and_following" else { return [try RecurrenceDayShift.shifted(stored, by: move)] }
         guard let recurrenceId else { throw CalendarProviderError.notSupported(CalendarSeriesScope.seriesNotRead) }
-        let slot = try CalDAVOccurrences.scopedEditSlot(
-            icsText: masterICS, href: seriesHref, key: occurrenceKey, recurrenceId: recurrenceId, zone: zone, forSplit: true)
+        let point = try Self.splitPoint(
+            masterICS: masterICS, href: seriesHref, key: occurrenceKey, recurrenceId: recurrenceId, zone: zone)
+        guard let slot = point.slot else { throw CalendarProviderError.notSupported(SplitCarry.pastEndRuleRefusal) }
         let rules = try Self.splitRules(masterICS: masterICS, slot: slot, recurrenceId: recurrenceId, recurrenceIdZone: zone,
-                                        zones: CalendarTimeZoneContext(calendarText: masterICS))
+                                        zones: point.zones)
         return [try RecurrenceDayShift.shifted(rules.newRule, by: move)]
     }
 
@@ -641,32 +642,18 @@ actor CalDAVProvider: CalendarProvider {
         // occurrence shown after it change, and none shown before it does. Each time the edit
         // gives moves the new part as far from the cut as it moves the occurrence named
         // (`SplitCarry.partEdit`).
-        let (namedKey, placeSlot) = try CalDAVOccurrences.scopedEdit(
-            icsText: masterICS, href: seriesHref, key: occurrenceKey,
-            recurrenceId: recurrenceId, zone: recurrenceIdZone, forSplit: true)
-        let zones = CalendarTimeZoneContext(calendarText: masterICS)
-        let unreadable = CalendarProviderError.notSupported("where the occurrence named falls in its series can't be read, so the series can't be split at it")
-        guard let named = CalDAVOccurrences.occurrence(key: namedKey, icsText: masterICS, href: seriesHref),
-              let namedStart = named.start, let namedPlace = named.originalStartTime ?? named.start,
-              let series = ICSParser.components(icsText: masterICS, resourceHref: seriesHref).first(where: { $0.recurrenceId == nil }),
-              let startLine = Self.masterTopLevelLines(masterICS).first(where: { Self.icsProperty($0)?.name == "DTSTART" }) else {
-            throw unreadable
-        }
-        // A floating series has no zone: its wall clocks are read in the device's (#761), so its cut
-        // is turned back into one there too.
-        let wallZone = Self.masterDTStartKind(from: masterICS) == .floating ? TimeZone.current : recurrenceIdZone
-        let seriesZone = try Self.seriesStartZone(startLine, zones: zones) ?? wallZone
-        let rdates = Self.masterTopLevelLines(masterICS).filter { Self.icsProperty($0)?.name == "RDATE" }
-        guard let cut = SplitCarry.cut(named: named, series: series.event, rdates: rdates, zone: seriesZone, zones: zones),
-              let namedInstants = Self.instants(start: namedStart, place: namedPlace, zone: recurrenceIdZone) else { throw unreadable }
-        guard case .at(let cutTime) = cut else {
+        let point = try Self.splitPoint(
+            masterICS: masterICS, href: seriesHref, key: occurrenceKey, recurrenceId: recurrenceId, zone: recurrenceIdZone)
+        let zones = point.zones
+        guard let slot = point.slot, case .at(let cutTime) = point.cut else {
             return try await editShown(
                 url: eventURL, storedICS: masterICS, etag: etag, href: seriesHref, patch: patch,
-                namedStart: namedStart, shownFrom: namedInstants.start, zones: zones)
+                namedStart: point.namedStart, shownFrom: point.shownFrom, zones: zones)
         }
-        let moved = RecurrenceOccurrenceResolver.wasMoved(named)
-        guard let slot = moved ? SplitCarry.naive(of: cutTime, recurrenceId: recurrenceId, zone: wallZone) : placeSlot,
-              let patch = SplitCarry.partEdit(patch, namedStart: namedStart, cut: cutTime) else { throw unreadable }
+        let namedStart = point.namedStart, namedPlace = point.namedPlace, namedInstants = point.namedInstants
+        guard let patch = SplitCarry.partEdit(patch, namedStart: namedStart, cut: cutTime) else {
+            throw CalendarProviderError.notSupported(Self.splitPointUnreadable)
+        }
 
         // 2. The capped series' rule and the new part's (`splitRules`), worked out before the cap
         //    PUT in step 3, so a split the series cannot take is refused with nothing written.
@@ -754,6 +741,54 @@ actor CalDAVProvider: CalendarProvider {
         return created
     }
 
+    static let splitPointUnreadable = "where the occurrence named falls in its series can't be read, so the series can't be split at it"
+
+    /// Where a split of the stored series `masterICS` named at `recurrenceId` (read in `zone`)
+    /// cuts it: the one computation `splitSeries` writes and the card shows (`dayMovedRules`).
+    struct SplitPoint {
+        /// The resource's zone context, its floating times read in the operation's zone.
+        let zones: CalendarTimeZoneContext
+        let namedStart: GCalDateTime
+        let namedPlace: GCalDateTime
+        /// The occurrence named's start and place as instants (`instants`).
+        let namedInstants: (start: Date, place: Date)
+        var shownFrom: Date { namedInstants.start }
+        let cut: SplitCarry.Cut
+        /// The split's slot, a naive wall clock in `zone` (nil past the series' end).
+        let slot: String?
+    }
+
+    /// The split point (`SplitPoint`) of `masterICS`: the occurrence named is the one
+    /// `CalDAVOccurrences.scopedEdit` checks, and the cut is the first place of the series at or
+    /// after where it starts now (`SplitCarry.cut`, the series' RDATE lines included). Floating
+    /// times are read in `zone`, the zone the operation runs in, not the device's at the drain.
+    static func splitPoint(
+        masterICS: String, href: String, key: String?, recurrenceId: String, zone: TimeZone
+    ) throws -> SplitPoint {
+        let (namedKey, placeSlot) = try CalDAVOccurrences.scopedEdit(
+            icsText: masterICS, href: href, key: key, recurrenceId: recurrenceId, zone: zone, forSplit: true)
+        let zones = CalendarTimeZoneContext(calendarText: masterICS).readingFloating(in: zone)
+        let unreadable = CalendarProviderError.notSupported(splitPointUnreadable)
+        guard let named = CalDAVOccurrences.occurrence(key: namedKey, icsText: masterICS, href: href, floatingZone: zone),
+              let namedStart = named.start, let namedPlace = named.originalStartTime ?? named.start,
+              let series = ICSParser.components(icsText: masterICS, resourceHref: href, floatingZone: zone)
+                  .first(where: { $0.recurrenceId == nil }),
+              let startLine = masterTopLevelLines(masterICS).first(where: { icsProperty($0)?.name == "DTSTART" }) else {
+            throw unreadable
+        }
+        let seriesZone = try seriesStartZone(startLine, zones: zones) ?? zone
+        let rdates = masterTopLevelLines(masterICS).filter { icsProperty($0)?.name == "RDATE" }
+        guard let cut = SplitCarry.cut(named: named, series: series.event, rdates: rdates, zone: seriesZone, zones: zones),
+              let namedInstants = instants(start: namedStart, place: namedPlace, zone: zone) else { throw unreadable }
+        var slot: String?
+        if case .at(let cutTime) = cut {
+            guard let at = RecurrenceOccurrenceResolver.wasMoved(named)
+                ? SplitCarry.naive(of: cutTime, recurrenceId: recurrenceId, zone: zone) : placeSlot else { throw unreadable }
+            slot = at
+        }
+        return SplitPoint(zones: zones, namedStart: namedStart, namedPlace: namedPlace, namedInstants: namedInstants, cut: cut, slot: slot)
+    }
+
     /// The instants `start` and `place` name, as `parseICSDateTime` reads a resource's times: a
     /// date as its UTC midnight, a time as its instant. Nil when either can't be read.
     static func instants(start: GCalDateTime, place: GCalDateTime, zone: TimeZone) -> (start: Date, place: Date)? {
@@ -774,7 +809,7 @@ actor CalDAVProvider: CalendarProvider {
         namedStart: GCalDateTime, shownFrom: Date, zones: CalendarTimeZoneContext
     ) async throws -> GCalEvent {
         guard patch.recurrence == nil, patch.ruleDayMove == nil else {
-            throw CalendarProviderError.notSupported("the occurrence named is after the series' last one, so its repeat can't be changed from it")
+            throw CalendarProviderError.notSupported(SplitCarry.pastEndRuleRefusal)
         }
         guard let moved = SplitCarry.moved(by: patch, start: namedStart) else {
             throw CalendarProviderError.notSupported("the new time can't be read, so the occurrences were not changed")
@@ -1764,8 +1799,9 @@ actor CalDAVProvider: CalendarProvider {
             // by the timezone offset) and every value written from it.
             resolvedZone = try zone(forTZID: tzid, zones: zones)
         } else {
-            // No TZID → RFC 5545 "floating time": interpret in device-local.
-            resolvedZone = .current
+            // No TZID → RFC 5545 "floating time": read in the zone the context gives (the
+            // device's unless the operation gives its own).
+            resolvedZone = zones.floating
         }
         let fmt = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss", timeZone: resolvedZone)
         return fmt.date(from: value)

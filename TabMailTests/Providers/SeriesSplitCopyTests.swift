@@ -631,16 +631,22 @@ struct ExchangeSplitCarryTests {
     /// now.
     private func split(
         named: String, start: Date, exceptions: [[String: Any]], parts: [Int], patch: GCalEventInput,
-        series: [String: Any] = GraphSplitFixture.series(range: GraphSplitFixture.noEnd)
+        series: [String: Any] = GraphSplitFixture.series(range: GraphSplitFixture.noEnd), graph given: FakeGraphCalendar? = nil
     ) async throws -> Run {
-        let graph = FakeGraphCalendar([series] + exceptions + parts.map(Self.part))
+        let graph = given ?? FakeGraphCalendar([series] + exceptions + parts.map(Self.part))
         let http = FakeHTTP.Scenario()
         graph.install(on: http)
         let ok = ["Content-Type": "application/json"]
-        var expanded = series
-        expanded["exceptionOccurrences"] = exceptions
-        http.register(path: "/v1.0/me/events/ser-1?$expand=exceptionOccurrences", method: "GET",
-                      response: .raw(statusCode: 200, headers: ok, body: try JSONSerialization.data(withJSONObject: expanded)))
+        // The exceptions as the calendar holds them at each read, so a retry reads what was written.
+        let ids = exceptions.compactMap { $0["id"] as? String }
+        let stored = try JSONSerialization.data(withJSONObject: series)
+        http.register(path: "/v1.0/me/events/ser-1?$expand=exceptionOccurrences", method: "GET") { _ in
+            // swiftlint:disable:next force_cast force_try
+            var expanded = try! JSONSerialization.jsonObject(with: stored) as! [String: Any]
+            expanded["exceptionOccurrences"] = ids.compactMap(graph.event)
+            // swiftlint:disable:next force_try
+            return .raw(statusCode: 200, headers: ok, body: try! JSONSerialization.data(withJSONObject: expanded))
+        }
         http.register(path: "/v1.0/me/events/ser-1?$select=cancelledOccurrences", method: "GET",
                       response: .raw(statusCode: 200, headers: ok, body: try JSONSerialization.data(withJSONObject: ["cancelledOccurrences": [String]()])))
         let provider = GraphSplitFixture.provider(http)
@@ -705,6 +711,35 @@ struct ExchangeSplitCarryTests {
         #expect(Self.instant(r.graph.event("created-1-w3")?["start"]) == Self.week(1, plusDays: 1), "the kept occurrence moved")
     }
 
+    @Test("an occurrence edited where it is moves once: a retry after a failed cap (finishSplit) leaves it where the first attempt put it (T4)")
+    func movedSplitRetryMovesEditedOnce() async throws {
+        let named = Self.exception(1, at: Self.week(1, plusDays: 2))
+        let movedOut = Self.exception(0, at: Self.week(1, plusDays: 3))   // earlier place, shown after
+        var patch = GCalEventInput()
+        patch.startDateTime = Self.week(1, plusDays: 2).addingTimeInterval(3_600).iso8601String()
+        patch.startTimeZone = "UTC"
+        let graph = FakeGraphCalendar([GraphSplitFixture.series(range: GraphSplitFixture.noEnd), named, movedOut] + [2].map(Self.part))
+        let failed = Mutex(false)
+        // The cap is refused once, after the occurrences were edited.
+        graph.beforeWrite { method, id in
+            guard method == "PATCH", id == "ser-1", !failed.withLock({ $0 }) else { return }
+            failed.withLock { $0 = true }
+            graph.failNext("PATCH", with: 400)
+        }
+        let r = try await split(named: "ser-1-occ-1", start: Self.week(1, plusDays: 2), exceptions: [named, movedOut],
+                                parts: [2], patch: patch, graph: graph)
+        defer { r.http.close() }
+        #expect(r.error != nil, "the refused cap did not stop the split")
+        let moved = Self.week(1, plusDays: 3).addingTimeInterval(3_600)
+        #expect(Self.instant(r.graph.event("ser-1-occ-0")?["start"]) == moved, "\(r.graph.event("ser-1-occ-0") ?? [:])")
+        let record = try #require(r.records.records.first, "no record was kept before the cap")
+        try await r.provider.finishSplit(record: record, zone: .current, guests: nil)
+        #expect(Self.instant(r.graph.event("ser-1-occ-0")?["start"]) == moved,
+                "the retry moved an edited occurrence again: \(r.graph.event("ser-1-occ-0") ?? [:])")
+        #expect(Self.instant(r.graph.event("ser-1-occ-1")?["start"]) == Self.week(1, plusDays: 2).addingTimeInterval(3_600))
+        #expect(!r.graph.patches("ser-1").isEmpty, "the retry did not cap")
+    }
+
     @Test("a split named at an occurrence moved past the series' last place makes no new part and edits it where it is (owner rule e)")
     func movedPastTheEndEditsWhereItIs() async throws {
         let named = Self.exception(1, at: Self.week(2, plusDays: 2))
@@ -715,6 +750,83 @@ struct ExchangeSplitCarryTests {
         #expect(r.error == nil, "\(String(describing: r.error)); \(r.http.servedCallSequence())")
         #expect(r.graph.created.isEmpty && r.graph.patches("ser-1").isEmpty, "a part was made or the series capped: \(r.http.servedCallSequence())")
         #expect(r.graph.event("ser-1-occ-1")?["subject"] as? String == "Renamed")
+    }
+
+    /// A series of two weeks, past whose end week 1's occurrence (`ser-1-occ-1`) was moved, to
+    /// week 2 plus two days, and week 0's (`ser-1-occ-0`) to week 2 plus three days.
+    private static var pastEndSeries: [String: Any] {
+        GraphSplitFixture.series(range: ["type": "numbered", "endDate": "0001-01-01", "numberOfOccurrences": 2])
+    }
+
+    @Test("an edit past the series' end that fails part way keeps its targets: the retry moves nothing twice and finds every one (R1)")
+    func pastEndRetryMovesOnce() async throws {
+        let named = Self.exception(1, at: Self.week(2, plusDays: 2))
+        let other = Self.exception(0, at: Self.week(2, plusDays: 3))
+        var patch = Self.rename
+        patch.startDateTime = Self.week(2, plusDays: 2).addingTimeInterval(3_600).iso8601String()
+        patch.startTimeZone = "UTC"
+        let graph = FakeGraphCalendar([Self.pastEndSeries, named, other])
+        let failed = Mutex(false)
+        // The named occurrence's write is refused once, after the other one's landed.
+        graph.beforeWrite { method, id in
+            guard method == "PATCH", id == "ser-1-occ-1", !failed.withLock({ $0 }) else { return }
+            failed.withLock { $0 = true }
+            graph.failNext("PATCH", with: 400)
+        }
+        let r = try await split(named: "ser-1-occ-1", start: Self.week(2, plusDays: 2), exceptions: [named, other], parts: [],
+                                patch: patch, series: Self.pastEndSeries, graph: graph)
+        defer { r.http.close() }
+        #expect(r.error != nil, "the refused write did not stop the edit")
+        let record = try #require(r.records.records.first, "no record was kept before the first write")
+        #expect(record.isPastEnd)
+        #expect(Self.instant(r.graph.event("ser-1-occ-0")?["start"]) == Self.week(2, plusDays: 3).addingTimeInterval(3_600))
+        try await r.provider.finishShownEdit(record: record, edit: patch, guests: nil)
+        #expect(Self.instant(r.graph.event("ser-1-occ-0")?["start"]) == Self.week(2, plusDays: 3).addingTimeInterval(3_600),
+                "the retry moved an occurrence twice: \(r.graph.event("ser-1-occ-0") ?? [:])")
+        #expect(Self.instant(r.graph.event("ser-1-occ-1")?["start"]) == Self.week(2, plusDays: 2).addingTimeInterval(3_600),
+                "the retry did not move the named occurrence: \(r.http.servedCallSequence())")
+        #expect(r.graph.event("ser-1-occ-0")?["subject"] as? String == "Renamed" && r.graph.event("ser-1-occ-1")?["subject"] as? String == "Renamed")
+    }
+
+    @Test("occurrences edited where they are move in the order Graph takes, none onto a day another still holds (C2)")
+    func shownEditsAreOrderedOffHeldDays() async throws {
+        // The edit moves both a day earlier: the named one onto a free day, the other onto the named one's day.
+        let named = Self.exception(1, at: Self.week(2, plusDays: 2))
+        let other = Self.exception(0, at: Self.week(2, plusDays: 3))
+        var patch = GCalEventInput()
+        patch.startDateTime = Self.week(2, plusDays: 1).iso8601String()
+        patch.startTimeZone = "UTC"
+        let graph = FakeGraphCalendar([Self.pastEndSeries, named, other])
+        graph.refusesSameDayMoves.withLock { $0 = true }
+        let r = try await split(named: "ser-1-occ-1", start: Self.week(2, plusDays: 2), exceptions: [named, other], parts: [],
+                                patch: patch, series: Self.pastEndSeries, graph: graph)
+        defer { r.http.close() }
+        #expect(r.error == nil, "a move landed on a held day: \(String(describing: r.error)); \(r.http.servedCallSequence())")
+        #expect(Self.instant(r.graph.event("ser-1-occ-1")?["start"]) == Self.week(2, plusDays: 1)
+                    && Self.instant(r.graph.event("ser-1-occ-0")?["start"]) == Self.week(2, plusDays: 2),
+                "not both moved: \(r.http.servedCallSequence())")
+    }
+
+    @Test("an occurrence shown before the named one is kept whole: the edit's guest change does not reach its own guests (T8)")
+    func movedSplitKeptItemKeepsItsGuests() async throws {
+        let extra: [String: Any] = ["emailAddress": ["address": "extra@example.com", "name": "Extra"], "type": "required",
+                                    "status": ["response": "accepted", "time": "0001-01-01T00:00:00Z"]]
+        let named = Self.exception(1, at: Self.week(1, plusDays: 2))
+        let movedIn = Self.exception(3, at: Self.week(1, plusDays: 1)) { e in
+            e["attendees"] = (e["attendees"] as? [[String: Any]] ?? []) + [extra]
+        }
+        var patch = Self.rename
+        patch.attendeeChange = AttendeeChange(adds: [.init(email: "new@example.com", name: nil)])
+        let r = try await split(named: "ser-1-occ-1", start: Self.week(1, plusDays: 2), exceptions: [named, movedIn],
+                                parts: [2, 3], patch: patch)
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error)); \(r.http.servedCallSequence())")
+        let guests = Set((r.graph.event("created-1-w3")?["attendees"] as? [[String: Any]] ?? []).compactMap {
+            ($0["emailAddress"] as? [String: Any])?["address"] as? String
+        })
+        #expect(guests.contains("extra@example.com") && !guests.contains("new@example.com"),
+                "the kept occurrence's guests changed: \(guests)")
+        #expect(r.graph.event("created-1-w3")?["subject"] as? String != "Renamed", "the kept occurrence was renamed")
     }
 
     private static var rename: GCalEventInput {

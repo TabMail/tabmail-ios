@@ -404,6 +404,23 @@ parse without them and are read as named at the cut. Tests: `SplitCarryTests` cu
 `movedSplit*` in `CalendarEditToolSeriesScopeTests` and `ExchangeSplitCarryTests`,
 `SplitCarryTests.calDAVMovedSplit*`/`calDAVPastEnd`.
 
+**One split point per calendar (amended 2026-11-12, review of #687):** the card's repeat line
+(`dayMovedRules`) and the write (`splitSeries`) both call the calendar's own `splitPoint`, so the cut
+the card shows is the cut written (CalDAV with the resource's `RDATE` lines; Outlook from the range
+start, a missing month day on the month's last). A date or local `UNTIL` is read in the series' zone
+(`SplitCarry.endsBefore`). A floating CalDAV series is read in the operation's zone
+(`CalendarTimeZoneContext.readingFloating(in:)`, `ICSParser.components(floatingZone:)`,
+`CalDAVOccurrences.occurrence(floatingZone:)`). Outlook writes the edits of occurrences where they
+are in Graph's move order (`editOrder`, the same `moveOrder` as `carryOrder`). Past the end (e),
+Google and Outlook keep `SplitRecord.pastEnd` (`split_at` "", `new_part_id` the named occurrence,
+absolute `edits`, `edit_length`) before the first write; the queue finishes such a record with
+`finishShownEdit` without looking for the named occurrence again. Unmeasured: whether Graph keeps an
+exception moved past the capped range's new `endDate` (measure: split a weekly series at a moved
+occurrence whose earlier-placed neighbour is shown after the cut, then GET the capped series'
+`/instances` and `exceptionOccurrences`). Tests: `SplitCarryTests` (RDATE, UNTIL, floating,
+`shownEdits*`, reset keeps deleted), `ExchangeSplitCarryTests` (`pastEndRetryMovesOnce`,
+`shownEditsAreOrderedOffHeldDays`, `movedSplitRetryMovesEditedOnce`, `movedSplitKeptItemKeepsItsGuests`).
+
 Tests: `SplitCarryTests`, `ExchangeSplitCarryTests` (whole copy, every page, failure before the cap
 and `finishSplit`, `carryOrder` against the fake's opt-in same-day refusal, deletes before moves,
 guests, end only), `CalendarEditToolSeriesScopeTests.renameSplitCarriesLaterExceptions` /

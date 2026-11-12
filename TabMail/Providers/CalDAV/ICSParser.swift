@@ -57,9 +57,10 @@ enum ICSParser {
     /// `topLevel`): its own properties only. A nested component's lines belong to that component,
     /// so a VALARM's `DESCRIPTION`, `SUMMARY`, `ATTENDEE` or `DURATION` is never read as the
     /// event's notes, title, attendee or length (#603).
-    static func components(icsText: String, resourceHref: String) -> [VEventComponent] {
+    /// `floatingZone` is the zone its floating date-times are read in (the device's unless given).
+    static func components(icsText: String, resourceHref: String, floatingZone: TimeZone = .current) -> [VEventComponent] {
         // What the resource's VTIMEZONE components say about its zone names, read once for all its events.
-        let zones = CalendarTimeZoneContext(calendarText: icsText)
+        let zones = CalendarTimeZoneContext(calendarText: icsText).readingFloating(in: floatingZone)
         return CalDAVProvider.veventBlocks(CalDAVProvider.icsUnits(icsText)).map { block in
             let lines = CalDAVProvider.topLevel(block).map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }
             return parseVEvent(lines: lines, resourceHref: resourceHref, zones: zones)
@@ -319,7 +320,8 @@ enum ICSParser {
 
     /// The zone this parser reads a DATE-TIME's wall time in: the zone the TZID
     /// the parameters name resolves to (`CalendarTimeZoneResolver`, in the
-    /// resource's context `zones`), else the device's (a floating time). The
+    /// resource's context `zones`), else the context's floating zone (`zones.floating`, the device's
+    /// unless the operation gives its own). The
     /// recurrence expansion reads its wall times in the same zone, so a series'
     /// occurrences line up with its first date.
     ///
@@ -328,7 +330,7 @@ enum ICSParser {
     /// reading is wrong whenever the two zones differ. Writes of such an event are refused
     /// instead (`CalDAVProvider.zone(forTZID:zones:)`).
     static func wallTimeZone(params: String?, zones: CalendarTimeZoneContext) -> TimeZone {
-        guard let params, let tzid = extractTZID(params) else { return .current }
+        guard let params, let tzid = extractTZID(params) else { return zones.floating }
         return CalendarTimeZoneResolver.zone(named: tzid, in: zones) ?? .current
     }
 
