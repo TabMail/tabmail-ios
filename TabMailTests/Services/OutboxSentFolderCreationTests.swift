@@ -225,7 +225,7 @@ struct OutboxSentFolderCreationTests {
         let (outboxId, messageId) = try seedSentAwaitingCopy(fixture)
         let server = Self.strictServer(
             mailboxes: ["INBOX": [], "Envoyes": []],
-            capabilities: FakeIMAPServer.defaultCapabilities + ["SPECIAL-USE"])
+            capabilities: FakeIMAPServer.defaultCapabilities + ["SPECIAL-USE", "LIST-EXTENDED"])
         server.setSpecialUse("\\Sent", for: "Envoyes", onPlainList: false)
         try server.start()
         defer { server.stop() }

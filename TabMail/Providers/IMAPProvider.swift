@@ -3475,17 +3475,24 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// advertises `SPECIAL-USE`, the fork's `listSpecialUseMailboxes()` sends
     /// that LIST and its attributes are merged onto the plain listing by name.
     ///
-    /// Without the capability the plain listing is returned untouched.
-    /// `listSpecialUseMailboxes()` must NOT be called then: on such a server it
-    /// invents attributes from substrings of folder names (any name containing
-    /// "sent", "draft", "all" + "mail" …), which would hand roles to ordinary
-    /// folders. The capability test below is the fork's own test
-    /// (`capabilities.contains(Capability("SPECIAL-USE"))`, an exact-token
+    /// The RETURN option belongs to the extended LIST (RFC 5258); RFC 6154
+    /// does not say that `SPECIAL-USE` implies it (erratum 5581). So it is sent
+    /// only when the server advertises BOTH `SPECIAL-USE` and `LIST-EXTENDED`;
+    /// a server that rejected it would otherwise fail every folder sync.
+    /// Otherwise the plain listing is returned untouched, carrying whatever
+    /// special-use attributes the server puts on a plain LIST.
+    ///
+    /// `listSpecialUseMailboxes()` must NOT be called without `SPECIAL-USE`: on
+    /// such a server it invents attributes from substrings of folder names (any
+    /// name containing "sent", "draft", "all" + "mail" …), which would hand
+    /// roles to ordinary folders. The `SPECIAL-USE` test below is the fork's own
+    /// test (`capabilities.contains(Capability("SPECIAL-USE"))`, an exact-token
     /// match), so the fork always takes its SPECIAL-USE branch when called here.
     static func listMailboxesWithSpecialUse(_ server: IMAPServer) async throws -> [Mailbox.Info] {
         let mailboxes = try await server.listMailboxes()
         let capabilities = try await server.fetchCapabilities()
-        guard capabilities.contains(where: { $0.name == "SPECIAL-USE" && $0.value == nil }) else {
+        let advertised = { (name: String) in capabilities.contains(where: { $0.name == name && $0.value == nil }) }
+        guard advertised("SPECIAL-USE"), advertised("LIST-EXTENDED") else {
             return mailboxes
         }
         let special = try await server.listSpecialUseMailboxes()

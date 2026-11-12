@@ -826,7 +826,8 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// Gives `mailbox` an RFC 6154 special-use attribute such as `\Sent`.
     /// With `onPlainList == false` only `LIST ... RETURN (SPECIAL-USE)` reports
     /// it, which RFC 6154 §2 allows: the plain-LIST copy is a MAY. Advertising
-    /// `SPECIAL-USE` is the caller's choice of `capabilities`.
+    /// `SPECIAL-USE` (and `LIST-EXTENDED`, without which a RETURN option is
+    /// answered BAD) is the caller's choice of `capabilities`.
     func setSpecialUse(_ attribute: String, for mailbox: String, onPlainList: Bool) {
         withState { $0.specialUseAttributes[mailbox] = (attribute, onPlainList) }
     }
@@ -1844,8 +1845,13 @@ final class FakeIMAPServer: @unchecked Sendable {
             //
             // RFC 5258 return options (`LIST "" "*" RETURN (SPECIAL-USE)`)
             // follow the pattern; they are cut off before the pattern is read.
+            // A server that does not advertise LIST-EXTENDED rejects them, as
+            // a real one that only parses the plain LIST does.
             let upperArgs = args.uppercased()
             let returnRange = upperArgs.range(of: " RETURN ")
+            if returnRange != nil, !capabilities.contains("LIST-EXTENDED") {
+                return "\(tag) BAD Could not parse command\r\n"
+            }
             let patternArgs = returnRange.map { String(args[..<$0.lowerBound]) } ?? args
             let wantsSpecialUse = returnRange.map {
                 upperArgs[$0.upperBound...].contains("SPECIAL-USE")

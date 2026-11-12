@@ -81,7 +81,7 @@ struct IMAPFolderRoleDiscoveryTests {
     func sentOnlyOnSpecialUseReturn() async throws {
         let server = FakeIMAPServer(
             username: Self.uniqueUsername(),
-            capabilities: FakeIMAPServer.defaultCapabilities + ["SPECIAL-USE"],
+            capabilities: FakeIMAPServer.defaultCapabilities + ["SPECIAL-USE", "LIST-EXTENDED"],
             mailboxes: ["INBOX": [], "Envoyes": [], "Projects": []])
         server.setSpecialUse("\\Sent", for: "Envoyes", onPlainList: false)
         try server.start()
@@ -93,6 +93,35 @@ struct IMAPFolderRoleDiscoveryTests {
         #expect(roles.values.filter { $0 == .sent }.count == 1, "exactly one Sent folder")
         #expect(roles["INBOX"] == .inbox)
         #expect(roles["Projects"] == .custom)
+    }
+
+    /// A server that advertises SPECIAL-USE but not LIST-EXTENDED. The RETURN
+    /// option belongs to the extended LIST (RFC 5258), and RFC 6154 does not
+    /// say SPECIAL-USE implies it, so such a server may answer it BAD (this
+    /// fake does). It must get a plain LIST only, the folder sync must
+    /// complete, and the special-use attributes the server puts on the plain
+    /// LIST reply (RFC 6154 §2 "MAY include") must still give the roles.
+    @Test("SPECIAL-USE without LIST-EXTENDED: plain LIST only, roles read from it")
+    func specialUseWithoutListExtendedUsesPlainList() async throws {
+        let server = FakeIMAPServer(
+            username: Self.uniqueUsername(),
+            capabilities: FakeIMAPServer.defaultCapabilities + ["SPECIAL-USE"],
+            mailboxes: ["INBOX": [], "Envoyes": [], "Corbeille": [], "Projects": []])
+        server.setSpecialUse("\\Sent", for: "Envoyes", onPlainList: true)
+        server.setSpecialUse("\\Trash", for: "Corbeille", onPlainList: true)
+        try server.start()
+        defer { server.stop() }
+
+        let roles = try await Self.roles(on: server)
+
+        #expect(roles["Envoyes"] == .sent, "the \\Sent on the plain LIST reply must give the Sent role")
+        #expect(roles["Corbeille"] == .trash, "the \\Trash on the plain LIST reply must give the Trash role")
+        #expect(roles["INBOX"] == .inbox)
+        #expect(roles["Projects"] == .custom)
+        let listCommands = server.recordedCommands().filter { $0.uppercased().hasPrefix("LIST") }
+        #expect(!listCommands.isEmpty, "precondition: the folder list came from LIST")
+        #expect(listCommands.allSatisfy { !$0.uppercased().contains("RETURN") },
+                "a server without LIST-EXTENDED must never be sent a RETURN option: \(listCommands)")
     }
 
     /// A server WITHOUT the SPECIAL-USE capability must not be sent the
