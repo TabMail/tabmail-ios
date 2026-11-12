@@ -707,8 +707,9 @@ struct CalendarTimeZoneResolverFenceTests {
         #expect(offenders.isEmpty, "zone names read outside CalendarTimeZoneResolver:\n\(offenders.joined(separator: "\n"))")
         // `ICSParser.parse`, `ICSBuilder.parseIncoming`, CalDAV's four write operations (update,
         // occurrence update, split, and the cap that finishes a split, `finishSplit`), and its
-        // read of the day a moved all-day occurrence starts on (`occurrenceStartDay`). Each is one
+        // read of the day a moved all-day occurrence starts on (`occurrenceStartDay`), and its read
+        // of the stored series for a move to another day (`dayMovedRules`). Each is one
         // resource's entry point: a context is built once per resource read, never per value.
-        #expect(contexts == ["ICSParser.swift": 1, "ICSBuilder.swift": 1, "CalDAVProvider.swift": 5], "\(contexts)")
+        #expect(contexts == ["ICSParser.swift": 1, "ICSBuilder.swift": 1, "CalDAVProvider.swift": 6], "\(contexts)")
     }
 }

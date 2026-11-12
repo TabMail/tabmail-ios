@@ -956,8 +956,8 @@ resource's own VTIMEZONE. Fixtures name every zone and use dates in 2099.
   14-name map reads the same; an unrecognised zone is still shown). `CalDAVTimeZoneWireTests`, against the
   fake CalDAV server: a time edit, series move, override and split land at the right instants and keep the
   stored TZID; an unrecognised zone is refused on each write, naming the zone, while a title-only edit lands.
-  `CalendarTimeZoneResolverFenceTests` fails on any zone lookup outside the resolver and pins the five
-  context construction sites.
+  `CalendarTimeZoneResolverFenceTests` fails on any zone lookup outside the resolver and pins every
+  context construction site (one per resource entry point).
 - Changed: `CalDAVRecurringHelpersTests` (`parseICSDateTimeUnknownTZID`, `extractMasterDurationUnknownTZID`)
   and `CalDAVOccurrenceFrameTests` (`unknownMasterZoneFailsClosed`) expect the named refusal;
   `windowsMasterZoneIsRecognized` re-expresses a Windows master zone. Added: Exchange and Google Windows-zone
