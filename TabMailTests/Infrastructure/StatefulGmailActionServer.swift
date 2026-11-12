@@ -207,10 +207,15 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         /// `nextPageToken`. Nil (the default): `maxResults` alone decides the
         /// page size. See `servePagedListings(pageSize:)`.
         var listPageSize: Int?
-        /// The generation page tokens are minted in. A token is the offset its
-        /// page starts at, `<offset>` in generation 0 and `<offset>~<generation>`
-        /// after; one from an older generation (`expireIssuedPageTokens()`), or
-        /// not in this form at all, is refused.
+        /// The generation page tokens are minted in. A minted token is
+        /// `<offset>~<generation>~<signature>`: the offset its page starts at,
+        /// and a signature of the list it came from (`pageTokenSignature`). One
+        /// from an older generation (`expireIssuedPageTokens()`), one sent with a
+        /// different list (`labelIds`, `q` or `includeSpamTrash`), or one not in
+        /// this form at all, is refused. A token with no signature (`<offset>`,
+        /// generation 0, or `<offset>~<generation>`) is one a test wrote into a
+        /// folder by hand; the app only replays tokens this fake minted, so it is
+        /// accepted on any list, as before.
         var pageTokenGeneration = 0
         /// The page tokens the listing refused, in order.
         var rejectedPageTokens: [String] = []
@@ -257,9 +262,6 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         /// with a `400` whose wording says nothing about the page token.
         var tokenedListBadRequestsRemaining = 0
         var badRequestedPageTokens: [String] = []
-        /// How far `/profile`'s history id runs ahead of the last record: changes
-        /// no record here models (made while a full sync ran) moved it on.
-        var profileAhead = 0
         /// `/history` answers `404` (expired) for any `startHistoryId` below this.
         var historyFloor = 0
         /// `/history` answers with more records than one delta takes on.
@@ -499,12 +501,12 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         state.value.withLock { $0.historyTooLong = on }
     }
 
-    /// Serve `/profile` with the mailbox's history id (plus `setProfileAhead`).
+    /// Serve `/profile` with the mailbox's history id.
     /// Opt-in, so a full sync in a suite that never asked for it still captures
     /// no cursor, as before. `/history` is always served.
     func serveProfile() {
         http.register(path: "/profile", method: "GET") { [state] _ in
-            let (historyId, total) = state.value.withLock { ($0.historyId + $0.profileAhead, $0.messagesByProviderId.count) }
+            let (historyId, total) = state.value.withLock { ($0.historyId, $0.messagesByProviderId.count) }
             return .json(raw: #"{ "emailAddress": "user@example.com", "historyId": "\#(historyId)", "messagesTotal": \#(total) }"#)
         }
     }
@@ -567,12 +569,6 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         state.value.withLock { $0.searchListPageLimit = ids }
     }
 
-    /// `/profile` answers `ahead` past the last history record, as when changes
-    /// land between a delta and the full sync's capture.
-    func setProfileAhead(_ ahead: Int) {
-        state.value.withLock { $0.profileAhead = ahead }
-    }
-
     /// One `GET /messages` list request as the fake received it.
     struct ListRequest: Sendable, Equatable {
         let labelId: String?
@@ -601,7 +597,6 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         }
     }
 
-    /// The provider ids of every `GET /messages/{id}` received so far, in order.
     /// The ids of the `format=full` message GETs (the backfill's fetch), in order.
     func fullMessageGets() -> [String] {
         http.recordedCalls().compactMap { call in
@@ -613,6 +608,7 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         }
     }
 
+    /// The provider ids of every `GET /messages/{id}` received so far, in order.
     func messageGets() -> [String] {
         http.recordedCalls().compactMap { call in
             guard call.method == "GET", let components = URLComponents(string: call.url),
@@ -881,6 +877,35 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                 "errors": [[
                     "domain": "global",
                     "reason": "failedPrecondition",
+                    "message": message,
+                ]],
+                "code": 400,
+                "message": message,
+            ],
+        ]
+        return (try? JSONSerialization.data(withJSONObject: object)) ?? Data()
+    }
+
+    /// A short signature of one list request (`labelIds`, `q`,
+    /// `includeSpamTrash`): FNV-1a over the three, 8 hex digits. Stable across
+    /// runs, so a minted token reads the same in every log.
+    private static func pageTokenSignature(label: String?, query: String, includeSpamTrash: Bool) -> String {
+        var hash: UInt32 = 2_166_136_261
+        for byte in "\(label ?? "")|\(query)|\(includeSpamTrash)".utf8 {
+            hash = (hash ^ UInt32(byte)) &* 16_777_619
+        }
+        return String(format: "%08x", hash)
+    }
+
+    /// The `400` a label list answers for a `q` term this fake cannot apply.
+    /// Test-only: see the `/messages` route.
+    private static func unsupportedLabelQueryBody(_ remainder: String) -> Data {
+        let message = "Unsupported query term for a label list in this fake: \(remainder)"
+        let object: [String: Any] = [
+            "error": [
+                "errors": [[
+                    "domain": "global",
+                    "reason": "invalidArgument",
                     "message": message,
                 ]],
                 "code": 400,
@@ -1169,12 +1194,17 @@ final class StatefulGmailActionServer: @unchecked Sendable {
             // strictly above (the stricter reading of an undocumented edge).
             // `is:unread` / `is:starred` test the UNREAD / STARRED labels. These
             // tokens are removed so the remaining query compares as before.
-            let beforeEpoch = tokens.first { $0.hasPrefix("before:") }.flatMap { Double($0.dropFirst("before:".count)) }
-            let afterEpoch = tokens.first { $0.hasPrefix("after:") }.flatMap { Double($0.dropFirst("after:".count)) }
+            // A bound whose value is not a number is not removed: it stays in
+            // the remaining query, where a label list refuses it (below).
+            func epoch(_ token: String, _ name: String) -> Double? {
+                token.hasPrefix(name) ? Double(token.dropFirst(name.count)) : nil
+            }
+            let beforeEpoch = tokens.lazy.compactMap { epoch($0, "before:") }.first
+            let afterEpoch = tokens.lazy.compactMap { epoch($0, "after:") }.first
             let wantsUnread = tokens.contains("is:unread")
             let wantsStarred = tokens.contains("is:starred")
             let query = tokens
-                .filter { !$0.hasPrefix("before:") && !$0.hasPrefix("after:") && $0 != "is:unread" && $0 != "is:starred" }
+                .filter { epoch($0, "before:") == nil && epoch($0, "after:") == nil && $0 != "is:unread" && $0 != "is:starred" }
                 .joined(separator: " ")
             let pageToken = queryItems.first(where: { $0.name == "pageToken" })?.value
             let label = queryItems.first(where: { $0.name == "labelIds" })?.value
@@ -1195,6 +1225,17 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                 return .bytes(Self.unrelatedBadRequestErrorBody(), contentType: "application/json", statusCode: 400)
             }
             let actionRFC = Self.rfcIdentity(fromSearchQuery: query)
+            // Deliberate test-only strictness, NOT Gmail's behaviour: real Gmail
+            // treats a `q` term it does not know as search text. A label list
+            // here applies only `before:` / `after:` (numeric epochs) and
+            // `is:unread` / `is:starred`, so any other term left in `q` (a
+            // malformed bound, a stray word) would otherwise be ignored and the
+            // whole label listed. Refusing it makes such a request fail loudly in
+            // a test instead of passing on a list it never asked for. Action
+            // lookups (`rfc822msgid:`) keep their own matching below.
+            if label != nil, actionRFC == nil, !query.isEmpty {
+                return .bytes(Self.unsupportedLabelQueryBody(query), contentType: "application/json", statusCode: 400)
+            }
             if actionRFC != nil {
                 let lookupFailed = state.value.withLock { model -> Bool in
                     guard model.lookupFailuresRemaining > 0 else { return false }
@@ -1269,16 +1310,21 @@ final class StatefulGmailActionServer: @unchecked Sendable {
             // Pages as Gmail serves them: at most `maxResults` ids (or a smaller
             // page this fake was told to serve) and a `nextPageToken` while more
             // remain. A token is the offset its page starts at, in the current
-            // generation (`pageTokenGeneration`); any other token gets a `400`.
+            // generation (`pageTokenGeneration`), signed with the list it came
+            // from (`pageTokenSignature`), as Gmail ties a token to its request;
+            // any other token gets a `400`. See `State.pageTokenGeneration`.
+            let signature = Self.pageTokenSignature(label: label, query: rawQuery, includeSpamTrash: includeSpamTrash)
             let page = state.value.withLock { model -> (refs: [[String: String]], nextPageToken: String?)? in
                 let pageSize = min(maxResults, model.listPageSize ?? Int.max)
                 var start = 0
                 if let pageToken {
                     let parts = pageToken.split(separator: "~", omittingEmptySubsequences: false)
-                    let generation = parts.count == 2 ? Int(parts[1]) : (parts.count == 1 ? 0 : nil)
-                    guard !model.rejectsEveryPageToken,
+                    let generation = parts.count >= 2 ? Int(parts[1]) : 0
+                    let signed = parts.count == 3 ? String(parts[2]) : nil
+                    guard !model.rejectsEveryPageToken, parts.count <= 3,
                           let offset = parts.first.flatMap({ Int($0) }), offset >= 0,
-                          generation == model.pageTokenGeneration else {
+                          generation == model.pageTokenGeneration,
+                          signed == nil || signed == signature else {
                         model.rejectedPageTokens.append(pageToken)
                         return nil
                     }
@@ -1287,7 +1333,7 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                 let end = pageSize >= matches.count - start ? matches.count : start + pageSize
                 var next: String?
                 if end < matches.count {
-                    next = model.pageTokenGeneration == 0 ? "\(end)" : "\(end)~\(model.pageTokenGeneration)"
+                    next = "\(end)~\(model.pageTokenGeneration)~\(signature)"
                 }
                 return (Array(matches[start..<end]), next)
             }

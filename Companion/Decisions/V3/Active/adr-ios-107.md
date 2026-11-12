@@ -29,11 +29,11 @@ loads a missing id itself, through the backfill page walk's own insert tail, bou
 first; a membership page's token moves on only once its missing ids have loaded or been classified
 done; the backfill re-arm, its storage-limit decline and `CatchUpFolderResult.rearmBackfill` are
 removed; a missing id that keeps failing holds its range for at most the page walk's hold bound).
-**Amended 2026-11-12: loads that did not land** (decisions 4 and 8, review round 5: a load that does
+**Amended 2026-11-12: loads that did not land** (decisions 4 and 8: a load that does
 not land writes no catch-up state and the page walk keeps its page token; an id loaded earlier in the
 same pass counts as held; a duplicate id in one insert chunk is skipped as the same message instead
 of rolling back the chunk; the load hold clock is per page, cleared whenever the page moves on).
-**Amended 2026-11-12: the hold bound under the pass budget** (decision 8, review round 6: loads that
+**Amended 2026-11-12: the hold bound under the pass budget** (decision 8: loads that
 stop on the pass budget with nothing loaded hold the page like a held load, so the hold bound also
 ends a page a slow link never finishes; loads that stop on the budget after loading some clear the
 page's hold clock).
@@ -441,7 +441,7 @@ The owner's rulings of 2026-11-09:
        bound after an earlier page's hold passed its ids over on their first failure. A batch whose
        timeout fires holds every id it has no answer for (the bound above still applies; on a
        persistently slow link those ids count as done after it, the trade-off already stated).
-       *Amended 2026-11-12 (the hold bound under the pass budget, review round 6):* the bound
+       *Amended 2026-11-12 (the hold bound under the pass budget):* the bound
        applies wherever the loads stop. When they stop on the pass budget, the page is held if this
        pass loaded none of its ids (every id asked for was held, or the budget ran out before any
        was asked for, as when the membership list alone spends it): the clock starts or is kept,

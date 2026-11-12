@@ -2174,6 +2174,68 @@ struct GmailCatchUpTests {
         }
     }
 
+    /// Settings' Delete All Email Index Data (`SettingsView.localIndexWipeTxn`)
+    /// lands while a backfill walk iteration is in flight: the iteration has
+    /// read the folder (its page token and row version) and is held at its page
+    /// request, before its page-outcome write. The wipe deletes every header row,
+    /// `l1` (on the page before the held one) among them, and resets the walk to
+    /// the top. Once released, the iteration's stale write must not land over the
+    /// reset: the walk starts again from the top, so `l1` comes back. A stale
+    /// token written over the reset would walk on from the page after the held
+    /// one and never list `l1` again. (ADR-IOS-107: the walk's page-outcome
+    /// writes are compare-and-set on `Folder.backfillVersion`.)
+    @Test("A Settings reset landing during a walk iteration is not overwritten: the walk restarts from the top and reloads the deleted rows",
+          .enabled(if: !NetworkMonitor.checkExpensive()))
+    func settingsResetDuringWalkIterationRestartsTheWalk() async throws {
+        let clock = Clock()
+        // The walk lists newest first, one id per page: l1, l2, l3.
+        let seeds = [
+            Self.seed("l1", clock.daysAgo(10), [labelPath]),
+            Self.seed("l2", clock.daysAgo(20), [labelPath]),
+            Self.seed("l3", clock.daysAgo(30), [labelPath]),
+        ]
+        let local = seeds.map { Local(id: $0.providerMessageId, path: labelPath, date: $0.internalDate!) }
+        try await Self.withWorld("gcu-walk-settings-reset", seeds: seeds, local: local) { world async throws in
+            world.server.limitWalkListPages(to: 1)
+            // The iteration reads the page after l1's.
+            let readToken = "1"
+            let labelId = world.folderId(labelPath)
+            try await world.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET backfillComplete = 0, backfillPageToken = ? WHERE id = ?",
+                               arguments: [readToken, labelId])
+            }
+            let accountId = world.accountId
+            let account = try #require(try await world.pool.read { db in try Account.fetchOne(db, key: accountId) })
+
+            let hold = world.server.holdNextWalkList()
+            defer { hold.release.signal() }
+            let walk = Task { await world.engine.runBackfill(account: account) }
+            let arrived = await Task.detached { hold.waitUntilReached(seconds: Self.holdArrivalSeconds) }.value
+            try #require(arrived, "precondition: the walk's page request is held")
+
+            // Meanwhile: the Settings reset.
+            let before = try Self.folder(world, labelPath)
+            try await world.pool.write { db in try SettingsView.localIndexWipeTxn(db) }
+            let reset = try Self.folder(world, labelPath)
+            #expect(try Self.rows(world, labelPath)["l1"] == nil, "precondition: the reset deleted l1's row")
+            #expect(reset.backfillPageToken == nil && !reset.backfillComplete, "precondition: the reset put the walk at the top")
+            #expect(reset.backfillVersion != before.backfillVersion, "precondition: the reset moved the row version")
+
+            hold.release.signal()
+            _ = await walk.value
+            try await Self.backfillUntilComplete(world)
+
+            let walkLists = world.server.listRequests().filter { $0.labelId == labelPath && $0.bound("after") == nil }
+            #expect(walkLists.first?.pageToken == readToken, "precondition: the held page was the iteration's")
+            #expect(walkLists.dropFirst().first?.pageToken == nil,
+                    "the walk restarts from the top after the reset, its stale token not written: \(walkLists.map { $0.pageToken ?? "top" })")
+            #expect(try Self.folder(world, labelPath).backfillComplete, "the walk completes")
+            let rows = try Self.rows(world, labelPath)
+            #expect(rows["l1"] != nil, "the row the reset deleted comes back on the walk's next pass")
+            #expect(rows["l2"] != nil && rows["l3"] != nil)
+        }
+    }
+
     // MARK: - Under a storage limit (ADR-IOS-107 decision 8, ADR-IOS-006)
 
     /// A folder the storage prune thinned: three kept Inbox rows within one
@@ -2669,6 +2731,62 @@ struct GmailCatchUpTests {
             holdClock(later + 60)
             await Self.pass(world, [inboxPath], context: Self.unlimited(at: { at }))
             #expect(try Self.rows(world, inboxPath)["b"] != nil, "page B's id loads once it answers")
+            #expect(try Self.state(world, inboxPath)?.lastCompletedAt == at)
+        }
+    }
+
+    /// The hold clock belongs to the page token: a held page whose saved token
+    /// then gets a `400` starts its list over, and the clock goes with the token.
+    /// Page B holds at T. More than the bound later, a new message `c` arrives
+    /// on the first page and its GET fails too, and the saved token gets a `400`.
+    /// The list starts over, and the first page's hold is held from its own
+    /// first hold, not passed over on page B's old clock; once `c` answers it
+    /// loads.
+    @Test("A held page whose saved token gets a 400 clears its hold clock; the restarted list's hold starts its own bound",
+          .enabled(if: !NetworkMonitor.checkExpensive()))
+    func badRequestRestartOfAHeldPageClearsItsHoldClock() async throws {
+        let clock = Clock()
+        let dates = (l0: clock.daysAgo(1), c: clock.daysAgo(1.5), a: clock.daysAgo(2), b: clock.daysAgo(3), l1: clock.daysAgo(4))
+        let seeds = [Self.seed("l0", dates.l0, [inboxPath]), Self.seed("a", dates.a, [inboxPath]),
+                     Self.seed("b", dates.b, [inboxPath]), Self.seed("l1", dates.l1, [inboxPath])]
+        let local = [Local(id: "l0", path: inboxPath, date: dates.l0), Local(id: "l1", path: inboxPath, date: dates.l1)]
+        try await Self.withWorld("gcu-400-held-page", seeds: seeds, local: local) { world async throws in
+            defer { SyncEngine.backfillPageHoldNowForTesting.withLock { $0 = nil } }
+            // Page A is [l0, a], page B is [b, l1].
+            world.server.servePagedListings(pageSize: 2)
+            let at = clock.now
+            func holdClock(_ offset: TimeInterval) {
+                SyncEngine.backfillPageHoldNowForTesting.withLock { $0 = at.addingTimeInterval(offset) }
+            }
+
+            world.server.injectGetFailure(providerMessageId: "b", .status(503))
+            holdClock(0)
+            await Self.pass(world, [inboxPath], context: Self.unlimited(at: { at }))
+            let held = try Self.state(world, inboxPath)?.listing?.range
+            #expect(held?.loadHeldSince == at && held?.pageToken != nil, "precondition: page B, on a saved token, holds at T")
+            #expect(try Self.rows(world, inboxPath)["a"] != nil, "precondition: page A loaded")
+
+            // Past the bound: b answers, c arrives on the first page (now
+            // [l0, c]) and fails, and the saved token gets a 400.
+            world.server.clearGetFailure(providerMessageId: "b")
+            world.server.addMessage(Self.seed("c", dates.c, [inboxPath]))
+            world.server.injectGetFailure(providerMessageId: "c", .status(503))
+            world.server.answerTokenedListsWithUnrelatedBadRequest(count: 1)
+            let later = SyncConfig.backfillPageHoldSeconds + 60
+            holdClock(later)
+            await Self.pass(world, [inboxPath], context: Self.unlimited(at: { at }))
+
+            #expect(world.server.badRequestedPageTokens().count == 1, "precondition: the saved token got the 400")
+            #expect(world.server.getFailuresServedCount(providerMessageId: "c") == 1, "precondition: c's GET failed")
+            #expect(try Self.state(world, inboxPath)?.lastCompletedAt == nil, "c is held, not passed over")
+            #expect(try Self.state(world, inboxPath)?.listing?.range?.loadHeldSince == at.addingTimeInterval(later),
+                    "the restarted list's hold starts its own bound")
+
+            world.server.clearGetFailures()
+            holdClock(later + 60)
+            await Self.pass(world, [inboxPath], context: Self.unlimited(at: { at }))
+            let inbox = try Self.rows(world, inboxPath)
+            #expect(inbox["c"] != nil && inbox["b"] != nil, "c and b load once they answer")
             #expect(try Self.state(world, inboxPath)?.lastCompletedAt == at)
         }
     }

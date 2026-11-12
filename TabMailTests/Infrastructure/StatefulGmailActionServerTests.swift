@@ -1063,4 +1063,77 @@ struct StatefulGmailActionServerTests {
             "a RESOURCE 404 must not trigger a contained-MESSAGE trash request: \(server.http.servedCallSequence())"
         )
     }
+
+    /// The fake's own list contract, which the catch-up and walk tests rely on:
+    /// a page token is tied to the list it came from (`labelIds`, `q`,
+    /// `includeSpamTrash`) and to its generation, a malformed or negative token
+    /// is refused, and a label list refuses a `q` term it cannot apply instead
+    /// of listing the whole label. Each refusal is a `400`.
+    @Test("the fake's list refuses a token from another list, a bad or old token, and a q term it cannot apply")
+    func listContractRefusesForeignTokensAndUnknownQueryTerms() async throws {
+        let now = Date()
+        let seeds = (0..<3).map { index in
+            StatefulGmailActionServer.Seed(
+                rfc822MessageId: "gmail-contract-\(index)@example.com", providerMessageId: "gmail-contract-\(index)",
+                labels: ["INBOX", "Label_1", "UNREAD"], internalDate: now.addingTimeInterval(-3_600 * Double(index + 1)))
+        }
+        let server = StatefulGmailActionServer(messages: seeds)
+        defer { server.close() }
+
+        func list(_ items: [URLQueryItem]) async throws -> (status: Int, ids: [String], next: String?) {
+            var components = try #require(URLComponents(string: "https://gmail.googleapis.com/gmail/v1/users/me/messages"))
+            components.queryItems = items
+            let url = try #require(components.url)
+            let (data, response) = try await server.http.session.data(from: url)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+            let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+            let ids = (object["messages"] as? [[String: String]] ?? []).compactMap { $0["id"] }
+            return (status, ids, object["nextPageToken"] as? String)
+        }
+        let inbox = [URLQueryItem(name: "labelIds", value: "INBOX"), URLQueryItem(name: "maxResults", value: "1")]
+        func with(_ token: String, _ items: [URLQueryItem] = inbox) -> [URLQueryItem] {
+            items + [URLQueryItem(name: "pageToken", value: token)]
+        }
+
+        let first = try await list(inbox)
+        #expect(first.status == 200 && first.ids == ["gmail-contract-0"])
+        let token = try #require(first.next, "precondition: the first page hands out a token")
+        let second = try await list(with(token))
+        #expect(second.status == 200 && second.ids == ["gmail-contract-1"], "the token pages its own list")
+
+        // The same token on another list.
+        let window = "after:\(Int(now.timeIntervalSince1970) - 86_400) before:\(Int(now.timeIntervalSince1970))"
+        let foreign: [(String, [URLQueryItem])] = [
+            ("another label", [URLQueryItem(name: "labelIds", value: "Label_1"), URLQueryItem(name: "maxResults", value: "1")]),
+            ("the same label with a window", inbox + [URLQueryItem(name: "q", value: window)]),
+            ("the same label with Spam and Trash", inbox + [URLQueryItem(name: "includeSpamTrash", value: "true")]),
+            ("an account-wide search", [URLQueryItem(name: "q", value: "is:unread"), URLQueryItem(name: "maxResults", value: "1")]),
+        ]
+        for (name, items) in foreign {
+            let answer = try await list(with(token, items))
+            #expect(answer.status == 400, "a token from the INBOX list is refused on \(name): \(answer.status) \(answer.ids)")
+        }
+
+        // Malformed and negative tokens.
+        for bad in ["not-a-token", "-1", "1~0~\(token.split(separator: "~").last ?? "")~extra", "1~x"] {
+            let answer = try await list(with(bad))
+            #expect(answer.status == 400, "token \(bad) is refused: \(answer.status) \(answer.ids)")
+        }
+
+        // A token from an older generation.
+        server.expireIssuedPageTokens()
+        let expired = try await list(with(token))
+        #expect(expired.status == 400, "an expired token is refused: \(expired.status)")
+        let fresh = try await list(inbox)
+        let freshToken = try #require(fresh.next)
+        #expect(try await list(with(freshToken)).status == 200, "a token minted after the expiry is accepted")
+
+        // A label list with a `q` term the fake cannot apply.
+        #expect(try await list(inbox + [URLQueryItem(name: "q", value: window)]).status == 200,
+                "precondition: a numeric window is applied")
+        for term in ["after:soon", "stray", "\(window) stray"] {
+            let answer = try await list(inbox + [URLQueryItem(name: "q", value: term)])
+            #expect(answer.status == 400, "a label list refuses q=\(term) rather than listing the whole label: \(answer.status) \(answer.ids)")
+        }
+    }
 }
