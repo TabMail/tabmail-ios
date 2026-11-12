@@ -928,6 +928,48 @@ struct CalendarRecurrenceIdZoneTests {
         }
     }
 
+    // MARK: Read by id, then edit (#794, option B)
+
+    @Test("Google: an occurrence read by its id with any timezone, then edited with the recurrence_id read printed, is the one edited")
+    func readByIdThenEditNamesTheSameOccurrence() async throws {
+        let slot = try #require(LateSeries.at(day(7)))
+        let (device, edit) = try fixedZones(at: slot)
+        let read = try #require(TimeZone(identifier: "Pacific/Chatham"))
+        try #require(read.secondsFromGMT(for: slot) != TimeZone.current.secondsFromGMT(for: slot), "the host is in the read zone")
+        try await withGoogle("rid-g-read", seed: LateSeries.calendar(rule: "RRULE:FREQ=WEEKLY")) { calendar, pool in
+            let account = "rid-g-read"
+            let instance = LateSeries.instanceId(day(7))
+            let translator = ChatIdTranslator.createIsolated()
+            let compound = CompoundEventId.make(accountId: account, eventId: instance)
+            let forModel = await translator.processToolOutputForLLM("event_id: \(compound)")
+            let numericId = try #require(CalDAVToolWire.eventIds(in: forModel).first, "no numeric id: \(forModel)")
+            await translator.cacheEventDetail(
+                realId: instance, accountId: account, calendarId: "primary", calendarName: "Work",
+                title: "Standup", startDate: nil, endDate: nil, isAllDay: false,
+                location: nil, notes: nil, attendees: [], isRecurring: true, recurrenceRule: nil,
+                availability: "busy", htmlLink: nil, eventTimeZone: nil)
+            for zone in [device, edit, read] {
+                let printed = try await CalendarEventReadTool(context: ToolContext(db: pool, translator: translator, deviceZone: device))
+                    .execute(arguments: ["event_id": .string(numericId), "timezone": .string(zone.identifier)])
+                let line = try #require(printed.split(separator: "\n").first { $0.hasPrefix("start_iso: ") },
+                                        "read \(zone.identifier) printed no start_iso: \(printed)")
+                let rid = String(line.dropFirst("start_iso: ".count).prefix(19))
+                let sink = ConfirmingCards()
+                let out = try await CalendarEventEditTool(context: ToolContext(db: pool, translator: translator, deviceZone: device))
+                    .execute(arguments: [
+                        "event_id": .string(numericId), "edit_scope": .string("this_only"), "recurrence_id": .string(rid),
+                        "timezone": .string(edit.identifier), "title": .string("Standup \(zone.identifier)"),
+                    ], invocation: ToolInvocation(uiSink: sink, sessionKey: "rid-read-\(zone.identifier)"))
+                await AccountManager.shared.drainCalendarQueue()
+                let cards = await sink.cards
+                #expect(cards.count == 1 && cards.first?.startDate == slot,
+                        "read in \(zone.identifier) printed \(rid): \(cards.map(\.startDate)); \(out)")
+                #expect(calendar.event(instance)?["summary"] as? String == "Standup \(zone.identifier)",
+                        "read in \(zone.identifier): the occurrence was not edited; \(calendar.writes); \(out)")
+            }
+        }
+    }
+
     // MARK: Each place the recurrence_id's zone and the edit's zone part (#794 review)
 
     @Test("a queued edit with no recurrence_id zone (queued before it was) reads its recurrence_id in the edit's zone")

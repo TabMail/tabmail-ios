@@ -475,3 +475,17 @@ Every provider call that takes `recurrenceIdZone` (lookup, one-occurrence write,
 stay in the edit's zone. A CalDAV floating series is matched by wall clock in this zone, so it is
 unaffected. Matches the Thunderbird add-on (`occurrenceNamedBy`, user's zone). Pinned by
 `CalendarRecurrenceIdZoneTests` (device, edit and drain zones all different).
+
+**Read by id prints in the device's zone (#794, option B, owner/coordinator decision 2026-11-12).**
+`calendar_event_read` by `event_id` prints the event's times, and so the `start_iso` the model copies
+as `recurrence_id`, in the device's zone (`ToolContext.deviceZone`) whatever `timezone` it is given,
+as the Thunderbird add-on's read by id does (`calendar_event_read.js`: the argument is read and
+never used on the direct lookup). Read by `start_iso`, `calendar_read` and `calendar_search` keep
+`timezone` (Thunderbird's `calendar_search` also prints in it). The backend's iOS edit text must say
+`recurrence_id` is read in the device's zone, as `calendar_event_read` prints it (option A); `exdates_add`
+is still read in `timezone` (parity gap with Thunderbird, to be filed). Pinned by
+`CalendarRecurrenceIdZoneTests.readByIdThenEditNamesTheSameOccurrence` (device, edit and read zones
+all different). The review's mutants on the device-zone / edit-zone split are pinned in the same suite
+and `CalendarSeriesScopeRouteTests.mintedRecurrenceIdIsInTheRecurrenceIdZone`; giving
+`occurrenceStartDay` the edit's zone is an equivalent mutant (that path runs only for an all-day
+`this_only` edit, whose `recurrence_id` is a date every provider matches by date).
