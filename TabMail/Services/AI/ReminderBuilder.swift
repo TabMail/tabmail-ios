@@ -295,7 +295,7 @@ enum ReminderBuilder {
         comps.year = year
         comps.month = month
         comps.day = day
-        let calendar = Calendar.current
+        let calendar = Calendar(identifier: .gregorian) // the due date is a Gregorian `yyyy-MM-dd`
         let today = calendar.startOfDay(for: Date())
         guard let dueDate = calendar.date(from: comps) else { return false }
         let dueMidnight = calendar.startOfDay(for: dueDate)
@@ -323,7 +323,7 @@ enum ReminderBuilder {
         let allReminders = await buildReminderList()
         guard !allReminders.isEmpty else { return [] }
 
-        let calendar = Calendar.current
+        let calendar = Calendar(identifier: .gregorian) // due dates are Gregorian `yyyy-MM-dd`
         let today = calendar.startOfDay(for: Date())
         let tomorrow = calendar.date(byAdding: .day, value: 1, to: today)!
 
@@ -400,7 +400,7 @@ enum ReminderBuilder {
         guard !defaults.bool(forKey: didAutoDisableKey) else { return false }
         guard let firstLaunchDate = defaults.object(forKey: "firstLaunchDate") as? Date else { return false }
 
-        let calendar = Calendar.current
+        let calendar = Calendar(identifier: .gregorian) // due dates are Gregorian `yyyy-MM-dd`
         let cutoff = calendar.startOfDay(for: firstLaunchDate)
         var hashesToDisable: [String] = []
 

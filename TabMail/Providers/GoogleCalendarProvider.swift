@@ -292,16 +292,10 @@ enum RecurrenceOccurrenceResolver {
     ) -> OccurrenceMatch {
         let targetDay = String(recurrenceId.prefix(10))
 
-        let dayFmt = DateFormatter()
-        dayFmt.locale = Locale(identifier: "en_US_POSIX")
-        dayFmt.dateFormat = "yyyy-MM-dd"
-        dayFmt.timeZone = zone
+        let dayFmt = FixedDateFormat.formatter("yyyy-MM-dd", timeZone: zone)
         guard dayFmt.date(from: targetDay) != nil else { return .malformed }
 
-        let dtFmt = DateFormatter()
-        dtFmt.locale = Locale(identifier: "en_US_POSIX")
-        dtFmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        dtFmt.timeZone = zone
+        let dtFmt = FixedDateFormat.formatter("yyyy-MM-dd'T'HH:mm:ss", timeZone: zone)
 
         // A time component is only present when there are at least 19 characters
         // (`yyyy-MM-ddTHH:mm:ss`). `prefix(19)` is the same normalization
@@ -374,17 +368,11 @@ enum RecurrenceOccurrenceResolver {
     /// Returns nil when the address is unusable — callers MUST fail closed
     /// rather than substituting `Date()`, which would enumerate the wrong week.
     static func windowCenter(recurrenceId: String, zone: TimeZone) -> Date? {
-        let dtFmt = DateFormatter()
-        dtFmt.locale = Locale(identifier: "en_US_POSIX")
-        dtFmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        dtFmt.timeZone = zone
+        let dtFmt = FixedDateFormat.formatter("yyyy-MM-dd'T'HH:mm:ss", timeZone: zone)
         if recurrenceId.count >= 19, let d = dtFmt.date(from: String(recurrenceId.prefix(19))) {
             return d
         }
-        let dayFmt = DateFormatter()
-        dayFmt.locale = Locale(identifier: "en_US_POSIX")
-        dayFmt.dateFormat = "yyyy-MM-dd"
-        dayFmt.timeZone = zone
+        let dayFmt = FixedDateFormat.formatter("yyyy-MM-dd", timeZone: zone)
         return dayFmt.date(from: String(recurrenceId.prefix(10)))
     }
 
@@ -396,15 +384,9 @@ enum RecurrenceOccurrenceResolver {
     static func renderNaive(_ naive: String, from source: TimeZone, to target: TimeZone) -> String? {
         guard naive.count >= 19 else { return naive }
         if source == target { return naive }
-        let inFmt = DateFormatter()
-        inFmt.locale = Locale(identifier: "en_US_POSIX")
-        inFmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        inFmt.timeZone = source
+        let inFmt = FixedDateFormat.formatter("yyyy-MM-dd'T'HH:mm:ss", timeZone: source)
         guard let instant = inFmt.date(from: String(naive.prefix(19))) else { return nil }
-        let outFmt = DateFormatter()
-        outFmt.locale = Locale(identifier: "en_US_POSIX")
-        outFmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        outFmt.timeZone = target
+        let outFmt = FixedDateFormat.formatter("yyyy-MM-dd'T'HH:mm:ss", timeZone: target)
         return outFmt.string(from: instant)
     }
 }
@@ -1318,16 +1300,12 @@ actor GoogleCalendarProvider: CalendarProvider {
             var cal = Calendar(identifier: .gregorian)
             cal.timeZone = zone
             guard let dayBefore = cal.date(byAdding: .day, value: -1, to: date) else { return nil }
-            let out = DateFormatter()
-            out.dateFormat = "yyyyMMdd"
-            out.timeZone = zone
+            let out = FixedDateFormat.formatter("yyyyMMdd", timeZone: zone)
             return out.string(from: dayBefore)
         }
         // One second before, UTC date-time form.
         let untilDate = date.addingTimeInterval(-1)
-        let out = DateFormatter()
-        out.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
-        out.timeZone = TimeZone(identifier: "UTC")
+        let out = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss'Z'", timeZone: .gmt)
         return out.string(from: untilDate)
     }
 
@@ -1357,10 +1335,7 @@ actor GoogleCalendarProvider: CalendarProvider {
         }
         guard let tzid = master.start?.timeZone,
               let masterZone = CalendarTimeZoneResolver.zone(named: tzid, in: .none) else { return (nil, nil) }
-        let dayFormatter = DateFormatter()
-        dayFormatter.locale = Locale(identifier: "en_US_POSIX")
-        dayFormatter.dateFormat = "yyyy-MM-dd"
-        dayFormatter.timeZone = masterZone
+        let dayFormatter = FixedDateFormat.formatter("yyyy-MM-dd", timeZone: masterZone)
         let seriesStart = master.start?.dateTime
             .flatMap { Date.fromISO8601($0) }
             .flatMap { RecurrenceTail.Day(iso: dayFormatter.string(from: $0)) }
@@ -1386,12 +1361,8 @@ actor GoogleCalendarProvider: CalendarProvider {
     /// A naive ISO wall clock read in `zone`: the full `2026-05-20T17:00:00` form, or a date
     /// (`2026-05-20`) read as its midnight.
     static func naiveInstant(_ naive: String, zone: TimeZone) -> Date? {
-        let dtFmt = DateFormatter()
-        dtFmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        dtFmt.timeZone = zone
-        let dateFmt = DateFormatter()
-        dateFmt.dateFormat = "yyyy-MM-dd"
-        dateFmt.timeZone = zone
+        let dtFmt = FixedDateFormat.formatter("yyyy-MM-dd'T'HH:mm:ss", timeZone: zone)
+        let dateFmt = FixedDateFormat.formatter("yyyy-MM-dd", timeZone: zone)
         return dtFmt.date(from: naive) ?? dateFmt.date(from: String(naive.prefix(10)))
     }
 
@@ -1746,7 +1717,7 @@ actor GoogleCalendarProvider: CalendarProvider {
             if existing.isAllDay, let sd = patch.startDate {
                 // For all-day, work in whole days using a calendar so DST
                 // boundaries roll correctly.
-                let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd"; df.timeZone = .current
+                let df = FixedDateFormat.formatter("yyyy-MM-dd", timeZone: .current)
                 if let startDate = df.date(from: String(sd.prefix(10))) {
                     var cal = Calendar(identifier: .gregorian); cal.timeZone = .current
                     let days = max(1, Int((duration / 86400).rounded()))
@@ -1767,7 +1738,7 @@ actor GoogleCalendarProvider: CalendarProvider {
         } else if hasPatchEnd, let duration = masterDuration {
             // Symmetric case: patch moves END only — derive start = newEnd - masterDuration.
             if existing.isAllDay, let ed = patch.endDate {
-                let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd"; df.timeZone = .current
+                let df = FixedDateFormat.formatter("yyyy-MM-dd", timeZone: .current)
                 if let endDate = df.date(from: String(ed.prefix(10))) {
                     var cal = Calendar(identifier: .gregorian); cal.timeZone = .current
                     let days = max(1, Int((duration / 86400).rounded()))
@@ -1835,12 +1806,8 @@ actor GoogleCalendarProvider: CalendarProvider {
             // EXCLUSIVE, so a 1-day event is start=D, end=D+1 (durationSec≈86400).
             var cal = Calendar(identifier: .gregorian)
             cal.timeZone = newStartZone
-            let dateOnlyFmt = DateFormatter()
-            dateOnlyFmt.dateFormat = "yyyy-MM-dd"
-            dateOnlyFmt.timeZone = newStartZone
-            let parseFmt = DateFormatter()
-            parseFmt.dateFormat = "yyyy-MM-dd"
-            parseFmt.timeZone = newStartZone
+            let dateOnlyFmt = FixedDateFormat.formatter("yyyy-MM-dd", timeZone: newStartZone)
+            let parseFmt = FixedDateFormat.formatter("yyyy-MM-dd", timeZone: newStartZone)
             // Prefer the patch's explicit new date when the LLM is moving the
             // series with the split. `recurrence_id` only identifies WHICH
             // occurrence the split anchors at — `start_iso` is the user's
@@ -1860,9 +1827,7 @@ actor GoogleCalendarProvider: CalendarProvider {
                 }
             }
         } else {
-            let fmt = DateFormatter()
-            fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-            fmt.timeZone = newStartZone
+            let fmt = FixedDateFormat.formatter("yyyy-MM-dd'T'HH:mm:ss", timeZone: newStartZone)
             // Prefer the patch's explicit new datetime — same rationale as
             // above. The recurrence_id is the "WHICH occurrence" anchor; the
             // patch's start_iso/end_iso is the "WHAT TIME" the new series
@@ -2203,9 +2168,7 @@ extension GCalEvent {
     }
 
     private func parseDateOnly(_ str: String) -> Date? {
-        let fmt = DateFormatter()
-        fmt.dateFormat = "yyyy-MM-dd"
-        fmt.timeZone = .current
+        let fmt = FixedDateFormat.formatter("yyyy-MM-dd", timeZone: .current)
         return fmt.date(from: str)
     }
 }

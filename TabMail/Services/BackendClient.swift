@@ -667,11 +667,7 @@ struct BYOKSmokeFixture: Sendable {
         let weekdayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
         let weekdayIdx = cal.component(.weekday, from: start) - 1 // Calendar: 1=Sun…7=Sat
         let result = cal.date(byAdding: .day, value: deltaDays, to: start)!
-        let fmt = DateFormatter()
-        fmt.calendar = cal
-        fmt.timeZone = cal.timeZone
-        fmt.locale = Locale(identifier: "en_US_POSIX")
-        fmt.dateFormat = "yyyy-MM-dd"
+        let fmt = FixedDateFormat.formatter("yyyy-MM-dd", timeZone: cal.timeZone)
         return BYOKSmokeFixture(
             date: fmt.string(from: start),
             dayName: weekdayNames[weekdayIdx],

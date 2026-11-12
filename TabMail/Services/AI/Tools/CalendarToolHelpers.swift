@@ -487,10 +487,7 @@ enum CalendarToolHelpers {
     /// `timezone:` header still governs it); the parenthetical exists because
     /// the LLM has misread bare 24-hour ranges as the wrong half of the day.
     static func formatHourWithCue(_ date: Date, timeZone: TimeZone) -> String {
-        let fmt = DateFormatter()
-        fmt.locale = Locale(identifier: "en_US_POSIX")
-        fmt.dateFormat = "HH:mm"
-        fmt.timeZone = timeZone
+        let fmt = FixedDateFormat.formatter("HH:mm", timeZone: timeZone)
         return "\(fmt.string(from: date)) (\(twelveHourCue(date, timeZone: timeZone)))"
     }
 
@@ -1187,19 +1184,11 @@ enum CalendarToolHelpers {
     /// A stored `UNTIL` as a `yyyy-MM-dd` day (see `storedRecurrenceSummary`); the value as stored
     /// when it is neither form.
     private static func storedUntilDay(_ until: String) -> String {
-        func formatter(_ format: String, _ zone: TimeZone?) -> DateFormatter {
-            let f = DateFormatter()
-            f.locale = Locale(identifier: "en_US_POSIX")
-            f.timeZone = zone
-            f.dateFormat = format
-            return f
+        if let instant = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss'Z'", timeZone: .gmt).date(from: until) {
+            return FixedDateFormat.formatter("yyyy-MM-dd", timeZone: .current).string(from: instant)
         }
-        let utcZone = TimeZone(identifier: "UTC")
-        if let instant = formatter("yyyyMMdd'T'HHmmss'Z'", utcZone).date(from: until) {
-            return formatter("yyyy-MM-dd", .current).string(from: instant)
-        }
-        guard let date = formatter("yyyyMMdd", utcZone).date(from: String(until.prefix(8))) else { return until }
-        return formatter("yyyy-MM-dd", utcZone).string(from: date)
+        guard let date = FixedDateFormat.formatter("yyyyMMdd", timeZone: .gmt).date(from: String(until.prefix(8))) else { return until }
+        return FixedDateFormat.formatter("yyyy-MM-dd", timeZone: .gmt).string(from: date)
     }
 
     /// The confirmation card's line for a delete that removes a repeating series, every occurrence
@@ -1559,17 +1548,9 @@ enum CalendarToolHelpers {
         // tzdata on the build host sits at UTC−7 year-round (see `untilIsValidated`). Do not reinstate
         // the ordering claim, and do not treat this ordering as a guard.
         let naive = timePart.map { "\(datePart)T\($0)" } ?? "\(datePart)T235959"
-        let inFmt = DateFormatter()
-        inFmt.locale = Locale(identifier: "en_US_POSIX")
-        inFmt.calendar = Calendar(identifier: .gregorian)
-        inFmt.dateFormat = "yyyyMMdd'T'HHmmss"
-        inFmt.timeZone = zone
+        let inFmt = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss", timeZone: zone)
         guard let instant = inFmt.date(from: naive) else { return nil }
-        let outFmt = DateFormatter()
-        outFmt.locale = Locale(identifier: "en_US_POSIX")
-        outFmt.calendar = Calendar(identifier: .gregorian)
-        outFmt.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
-        outFmt.timeZone = TimeZone(identifier: "UTC")
+        let outFmt = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss'Z'", timeZone: .gmt)
         return outFmt.string(from: instant)
     }
 
@@ -1655,21 +1636,14 @@ enum CalendarToolHelpers {
     /// spelled (`toolAllDayDate`), at midnight in `timeZone`, never the day an offset's instant
     /// falls on there.
     static func toolInstant(_ iso: String, timeZone: TimeZone, allDay: Bool = false) -> Date? {
-        let fmt = DateFormatter()
-        fmt.locale = Locale(identifier: "en_US_POSIX")
-        fmt.calendar = Calendar(identifier: .gregorian)
-        fmt.timeZone = timeZone
         if allDay {
-            fmt.dateFormat = "yyyy-MM-dd"
-            return fmt.date(from: toolAllDayDate(iso))
+            return FixedDateFormat.formatter("yyyy-MM-dd", timeZone: timeZone).date(from: toolAllDayDate(iso))
         }
         for format in toolWallTimeFormats {
-            fmt.dateFormat = format
-            if let date = fmt.date(from: iso) { return date }
+            if let date = FixedDateFormat.formatter(format, timeZone: timeZone).date(from: iso) { return date }
         }
         if let date = Date.fromISO8601(iso) { return date }
-        fmt.dateFormat = "yyyy-MM-dd'T'HH:mmXXXXX"
-        return fmt.date(from: iso)
+        return FixedDateFormat.formatter("yyyy-MM-dd'T'HH:mmXXXXX", timeZone: timeZone).date(from: iso)
     }
 
     /// The calendar date an all-day `start_iso` or `end_iso` spells: the date itself, or the first

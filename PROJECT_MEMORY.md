@@ -12,6 +12,7 @@ Root [`../CLAUDE.md`](../CLAUDE.md) is normative; the [full pre-pass iOS routing
 
 ## Current topics
 
+- [Fixed-format dates: Gregorian, `en_US_POSIX`, explicit zone, built only by `FixedDateFormat` (no `dateFormat` set anywhere else, any target; fence test); a non-Gregorian phone calendar wrote events 543 years late (#586); calendar locale DateFormatter Buddhist Japanese Islamic](Companion/Rules/Active/gregorian-fixed-format-dates.md).
 - [Slow email rendering: lazy-attribute regex quadratic whitespace retries, premature empty-view reveal, native/WebKit timing diagnostics](Companion/Memory/Current/render-timing-diagnostics.md).
 
 - [HTML-to-text Markdown links, href destinations in FTS and agent reads (#100); `snippetLinkScanChars`, linear `unwrapMarkdownLinks` (#162), draft `keepingSpacing` (#217), `HTMLText`/`HTMLTextStyle` (#251)](Companion/Memory/Current/125-html-links-in-converted-text.md).

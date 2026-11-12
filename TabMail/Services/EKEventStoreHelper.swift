@@ -149,32 +149,25 @@ enum EKEventStoreHelper {
 
     /// Format an event's time range as "HH:mm - HH:mm" (matching TB output).
     static func formatTimeRange(_ event: EKEvent) -> String {
-        let fmt = DateFormatter()
-        fmt.dateFormat = "HH:mm"
+        let fmt = FixedDateFormat.formatter("HH:mm", timeZone: .current)
         return "\(fmt.string(from: event.startDate)) - \(fmt.string(from: event.endDate))"
     }
 
     /// Format a date as naive ISO (no timezone offset), matching TB's `toNaiveIso()`.
     static func toNaiveISO(_ date: Date) -> String {
-        let fmt = DateFormatter()
-        fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        fmt.timeZone = .current
+        let fmt = FixedDateFormat.formatter("yyyy-MM-dd'T'HH:mm:ss", timeZone: .current)
         return fmt.string(from: date)
     }
 
     /// Format a date as naive ISO (no timezone offset) in the specified timezone.
     static func toNaiveISO(_ date: Date, timeZone: TimeZone) -> String {
-        let fmt = DateFormatter()
-        fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        fmt.timeZone = timeZone
+        let fmt = FixedDateFormat.formatter("yyyy-MM-dd'T'HH:mm:ss", timeZone: timeZone)
         return fmt.string(from: date)
     }
 
     /// Format a date as a day key "YYYY-MM-DD" in local timezone.
     static func dayKey(_ date: Date) -> String {
-        let fmt = DateFormatter()
-        fmt.dateFormat = "yyyy-MM-dd"
-        fmt.timeZone = .current
+        let fmt = FixedDateFormat.formatter("yyyy-MM-dd", timeZone: .current)
         return fmt.string(from: date)
     }
 
@@ -183,11 +176,7 @@ enum EKEventStoreHelper {
     /// keyed from a provider DATE and rows keyed from an instant coalesce on
     /// every device locale (#166).
     static func dayKey(_ date: Date, timeZone: TimeZone) -> String {
-        let fmt = DateFormatter()
-        fmt.locale = Locale(identifier: "en_US_POSIX")
-        fmt.calendar = Calendar(identifier: .gregorian)
-        fmt.dateFormat = "yyyy-MM-dd"
-        fmt.timeZone = timeZone
+        let fmt = FixedDateFormat.formatter("yyyy-MM-dd", timeZone: timeZone)
         return fmt.string(from: date)
     }
 
@@ -209,24 +198,18 @@ enum EKEventStoreHelper {
 
     /// Parse a naive ISO date string (no timezone) into a Date in the user's local timezone.
     static func parseNaiveISO(_ iso: String) -> Date? {
-        let fmt = DateFormatter()
-        fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        fmt.timeZone = .current
+        let fmt = FixedDateFormat.formatter("yyyy-MM-dd'T'HH:mm:ss", timeZone: .current)
         if let date = fmt.date(from: iso) { return date }
         // Try date-only format
-        fmt.dateFormat = "yyyy-MM-dd"
-        return fmt.date(from: iso)
+        return FixedDateFormat.formatter("yyyy-MM-dd", timeZone: .current).date(from: iso)
     }
 
     /// Parse a naive ISO date string (no timezone) into a Date in the specified timezone.
     static func parseNaiveISO(_ iso: String, timeZone: TimeZone) -> Date? {
-        let fmt = DateFormatter()
-        fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        fmt.timeZone = timeZone
+        let fmt = FixedDateFormat.formatter("yyyy-MM-dd'T'HH:mm:ss", timeZone: timeZone)
         if let date = fmt.date(from: iso) { return date }
         // Try date-only format
-        fmt.dateFormat = "yyyy-MM-dd"
-        return fmt.date(from: iso)
+        return FixedDateFormat.formatter("yyyy-MM-dd", timeZone: timeZone).date(from: iso)
     }
 
     // MARK: - Calendar Enumeration

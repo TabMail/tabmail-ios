@@ -19,13 +19,8 @@ enum MessageViewHelpers {
         } else if calendar.isDateInYesterday(date) {
             return "Yesterday"
         } else {
-            let formatter = DateFormatter()
-            if !calendar.isDate(date, equalTo: Date(), toGranularity: .year) {
-                formatter.dateFormat = "MMM d, yyyy"
-            } else {
-                formatter.dateFormat = "MMM d"
-            }
-            return formatter.string(from: date)
+            let format = calendar.isDate(date, equalTo: Date(), toGranularity: .year) ? "MMM d" : "MMM d, yyyy"
+            return FixedDateFormat.formatter(format, timeZone: .current).string(from: date)
         }
     }
 

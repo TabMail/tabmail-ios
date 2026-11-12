@@ -401,10 +401,7 @@ enum DemoSeed {
             // demo always shows fresh-looking due dates.
             if let daysAhead = m.reminderDaysAhead, m.reminderContent != nil {
                 let due = Calendar.current.date(byAdding: .day, value: daysAhead, to: now) ?? now
-                let formatter = DateFormatter()
-                formatter.dateFormat = "yyyy-MM-dd"
-                formatter.calendar = Calendar(identifier: .gregorian)
-                formatter.locale = Locale(identifier: "en_US_POSIX")
+                let formatter = FixedDateFormat.formatter("yyyy-MM-dd", timeZone: .current)
                 header.reminderDate = formatter.string(from: due)
                 header.reminderTime = m.reminderTime
                 header.reminderContent = m.reminderContent

@@ -193,9 +193,7 @@ struct CalendarEventCreateTool: AgentTool, Sendable {
         // They are written in the zone the card showed (`resolvedTz`, from the snapshot), and that
         // zone is queued with them (`stampingZone`), so the drain reads them where they were meant.
         var queuedArgs = CalendarToolHelpers.stampingZone(arguments, resolvedTz)
-        let isoFmt = DateFormatter()
-        isoFmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        isoFmt.timeZone = resolvedTz
+        let isoFmt = FixedDateFormat.formatter("yyyy-MM-dd'T'HH:mm:ss", timeZone: resolvedTz)
         if isAllDay {
             queuedArgs["start_iso"] = .string(String(isoFmt.string(from: startDate).prefix(10)))
             queuedArgs["end_iso"] = .string(String(isoFmt.string(from: endDate).prefix(10)))
@@ -295,9 +293,7 @@ struct CalendarEventCreateTool: AgentTool, Sendable {
         // Calendar setting (`defaultEventDurationMinutes`, typically 30 min) —
         // but the tool's return previously hid that, and the LLM would tell
         // the user "Created for 1 hour" assuming a fictitious default.
-        let echoIsoFmt = DateFormatter()
-        echoIsoFmt.dateFormat = isAllDay ? "yyyy-MM-dd" : "yyyy-MM-dd'T'HH:mm:ss"
-        echoIsoFmt.timeZone = resolvedTz
+        let echoIsoFmt = FixedDateFormat.formatter(isAllDay ? "yyyy-MM-dd" : "yyyy-MM-dd'T'HH:mm:ss", timeZone: resolvedTz)
         let startIsoLine = "start_iso: \(echoIsoFmt.string(from: startDate))"
         let endIsoLine = "end_iso: \(echoIsoFmt.string(from: endDate))"
 

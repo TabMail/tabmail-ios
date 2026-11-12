@@ -125,17 +125,13 @@ enum ICSBuilder {
 
     /// UTC timestamp: `YYYYMMDDTHHMMSSZ`
     private static func formatUTC(_ date: Date) -> String {
-        let fmt = DateFormatter()
-        fmt.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
-        fmt.timeZone = TimeZone(identifier: "UTC")
+        let fmt = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss'Z'", timeZone: .gmt)
         return fmt.string(from: date)
     }
 
     /// Date-only: `YYYYMMDD`
     private static func formatDateOnly(_ date: Date) -> String {
-        let fmt = DateFormatter()
-        fmt.dateFormat = "yyyyMMdd"
-        fmt.timeZone = TimeZone.current
+        let fmt = FixedDateFormat.formatter("yyyyMMdd", timeZone: .current)
         return fmt.string(from: date)
     }
 
@@ -472,32 +468,25 @@ enum ICSBuilder {
     private static func parseICSDate(_ value: String, params: String?, zones: CalendarTimeZoneContext) -> Date? {
         let cleaned = value.trimmingCharacters(in: .whitespaces)
 
-        let fmt = DateFormatter()
-        fmt.locale = Locale(identifier: "en_US_POSIX")
-
         if cleaned.hasSuffix("Z") {
-            fmt.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
-            fmt.timeZone = TimeZone(identifier: "UTC")
-            return fmt.date(from: cleaned)
+            return FixedDateFormat.formatter("yyyyMMdd'T'HHmmss'Z'", timeZone: .gmt).date(from: cleaned)
         }
 
         if cleaned.count == 8 {
             // Date-only (all-day)
-            fmt.dateFormat = "yyyyMMdd"
-            fmt.timeZone = .current
-            return fmt.date(from: cleaned)
+            return FixedDateFormat.formatter("yyyyMMdd", timeZone: .current).date(from: cleaned)
         }
 
         // Date-time with optional timezone
-        fmt.dateFormat = "yyyyMMdd'T'HHmmss"
+        let wallZone: TimeZone
         if let params, let tzid = extractTZID(params) {
             // A zone the resolver does not recognize is read in the device's zone: this is a
             // read-only summary of an incoming invite, never written anywhere.
-            fmt.timeZone = CalendarTimeZoneResolver.zone(named: tzid, in: zones) ?? .current
+            wallZone = CalendarTimeZoneResolver.zone(named: tzid, in: zones) ?? .current
         } else {
-            fmt.timeZone = .current
+            wallZone = .current
         }
-        return fmt.date(from: cleaned)
+        return FixedDateFormat.formatter("yyyyMMdd'T'HHmmss", timeZone: wallZone).date(from: cleaned)
     }
 
     /// Extract TZID from property parameters.

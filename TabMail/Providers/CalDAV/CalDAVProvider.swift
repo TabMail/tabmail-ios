@@ -1420,14 +1420,10 @@ actor CalDAVProvider: CalendarProvider {
             let sameZone = chosenTz != masterTz
                 && CalendarTimeZoneResolver.zone(named: masterTz, in: zones)?.identifier == lineZone.identifier
             let writtenTz = sameZone ? masterTz : chosenTz
-            let fmt = DateFormatter()
-            fmt.dateFormat = "yyyyMMdd'T'HHmmss"
-            fmt.timeZone = lineZone
+            let fmt = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss", timeZone: lineZone)
             return "\(name);TZID=\(writtenTz):\(fmt.string(from: date))"
         case .utc:
-            let fmt = DateFormatter()
-            fmt.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
-            fmt.timeZone = TimeZone(identifier: "UTC")
+            let fmt = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss'Z'", timeZone: .gmt)
             return "\(name):\(fmt.string(from: date))"
         case .floating:
             // A floating time is a wall clock with no zone: it is written as the wall clock the
@@ -1437,9 +1433,7 @@ actor CalDAVProvider: CalendarProvider {
             guard let tzid, !tzid.isEmpty else {
                 throw CalendarProviderError.notSupported(Self.floatingWriteNeedsZoneMessage)
             }
-            let fmt = DateFormatter()
-            fmt.dateFormat = "yyyyMMdd'T'HHmmss"
-            fmt.timeZone = try zone(forTZID: tzid, zones: zones)
+            let fmt = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss", timeZone: try zone(forTZID: tzid, zones: zones))
             return "\(name):\(fmt.string(from: date))"
         }
     }
@@ -1666,19 +1660,15 @@ actor CalDAVProvider: CalendarProvider {
         let isDateOnly = ICSValueType.statesDate(header)
             || (value.count == 8 && !value.contains("T"))
         if isDateOnly {
-            let fmt = DateFormatter()
-            fmt.dateFormat = "yyyyMMdd"
             // All-day events are tz-agnostic at the data layer; interpret in
             // UTC for stable duration math.
-            fmt.timeZone = TimeZone(identifier: "UTC")
+            let fmt = FixedDateFormat.formatter("yyyyMMdd", timeZone: .gmt)
             return fmt.date(from: value)
         }
 
         // UTC zulu form.
         if value.hasSuffix("Z") {
-            let fmt = DateFormatter()
-            fmt.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
-            fmt.timeZone = TimeZone(identifier: "UTC")
+            let fmt = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss'Z'", timeZone: .gmt)
             return fmt.date(from: value)
         }
 
@@ -1695,9 +1685,7 @@ actor CalDAVProvider: CalendarProvider {
             // No TZID → RFC 5545 "floating time": interpret in device-local.
             resolvedZone = .current
         }
-        let fmt = DateFormatter()
-        fmt.dateFormat = "yyyyMMdd'T'HHmmss"
-        fmt.timeZone = resolvedZone
+        let fmt = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss", timeZone: resolvedZone)
         return fmt.date(from: value)
     }
 
@@ -1842,9 +1830,7 @@ actor CalDAVProvider: CalendarProvider {
 
     /// Format date as CalDAV UTC: YYYYMMDDTHHMMSSZ
     private func formatUTCCalDAV(_ date: Date) -> String {
-        let fmt = DateFormatter()
-        fmt.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
-        fmt.timeZone = TimeZone(identifier: "UTC")
+        let fmt = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss'Z'", timeZone: .gmt)
         return fmt.string(from: date)
     }
 

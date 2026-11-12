@@ -1131,8 +1131,7 @@ private struct EventPillPopover: View {
     private static func formatTimeRange(start: Date, end: Date) -> String {
         let cal = Calendar.current
         let dateFmt = DateFormatter()
-        let timeFmt = DateFormatter()
-        timeFmt.dateFormat = "HH:mm"
+        let timeFmt = FixedDateFormat.formatter("HH:mm", timeZone: .current)
 
         if cal.isDate(start, inSameDayAs: end) {
             dateFmt.dateStyle = .medium

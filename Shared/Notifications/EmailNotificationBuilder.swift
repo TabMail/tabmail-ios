@@ -99,7 +99,7 @@ enum EmailNotificationBuilder {
 
         var comps = DateComponents()
         comps.year = year; comps.month = month; comps.day = day
-        let calendar = Calendar.current
+        let calendar = Calendar(identifier: .gregorian) // the due date is a Gregorian `yyyy-MM-dd`
         let today = calendar.startOfDay(for: Date())
         guard let dueDateObj = calendar.date(from: comps) else { return nil }
         let dueMidnight = calendar.startOfDay(for: dueDateObj)
@@ -115,8 +115,7 @@ enum EmailNotificationBuilder {
             return "Overdue (\(daysOverdue) \(dayWord))"
         }
 
-        let formatter = DateFormatter()
-        formatter.dateFormat = "EEE, MMM d"
+        let formatter = FixedDateFormat.formatter("EEE, MMM d", timeZone: .current)
         return "Due \(formatter.string(from: dueMidnight))\(timeSuffix)"
     }
 

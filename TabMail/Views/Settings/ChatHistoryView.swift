@@ -325,17 +325,9 @@ private struct ChatExchange: Identifiable {
     let assistantText: String
     let timestamp: Date
 
-    private static let timeFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "h:mm a"
-        return f
-    }()
+    private static let timeFormatter: DateFormatter = FixedDateFormat.formatter("h:mm a", timeZone: .current)
 
-    private static let dateOnlyFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "MMM d, yyyy"
-        return f
-    }()
+    private static let dateOnlyFormatter: DateFormatter = FixedDateFormat.formatter("MMM d, yyyy", timeZone: .current)
 
     var formattedDate: String {
         let calendar = Calendar.current

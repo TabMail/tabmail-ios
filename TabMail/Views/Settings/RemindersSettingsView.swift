@@ -260,7 +260,7 @@ private func dueDateLabel(for reminder: Reminder) -> (text: String, urgency: Due
         return nil
     }
 
-    let calendar = Calendar.current
+    let calendar = Calendar(identifier: .gregorian) // the due date is a Gregorian `yyyy-MM-dd`
     var comps = DateComponents()
     comps.year = year
     comps.month = month
@@ -282,8 +282,7 @@ private func dueDateLabel(for reminder: Reminder) -> (text: String, urgency: Due
     } else if dueMidnight == tomorrowMidnight {
         return ("Due Tomorrow", .tomorrow)
     } else {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "EEE, MMM d"
+        let formatter = FixedDateFormat.formatter("EEE, MMM d", timeZone: .current)
         return ("Due \(formatter.string(from: dueMidnight))", .future)
     }
 }

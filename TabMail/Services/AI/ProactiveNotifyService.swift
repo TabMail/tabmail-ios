@@ -247,7 +247,7 @@ actor ProactiveNotifyService {
         comps.year = year
         comps.month = month
         comps.day = day
-        return Calendar.current.date(from: comps)
+        return Calendar(identifier: .gregorian).date(from: comps) // a Gregorian `yyyy-MM-dd`, whatever the phone's calendar
     }
 
     /// Schedule `UNCalendarNotificationTrigger` for reminders with due dates.
@@ -526,6 +526,6 @@ actor ProactiveNotifyService {
         comps.year = year
         comps.month = month
         comps.day = day
-        return Calendar.current.date(from: comps)
+        return Calendar(identifier: .gregorian).date(from: comps) // a Gregorian `yyyy-MM-dd`, whatever the phone's calendar
     }
 }
