@@ -131,6 +131,8 @@ private enum GoogleSplitFixture {
         http.register(path: masterPath + "/instances", method: "GET",
                       response: .raw(statusCode: 200, headers: ok, body: instances(listed ?? [occurrence(recurrenceId)])))
         http.register(path: masterPath, method: "PATCH", response: .raw(statusCode: 200, headers: ok, body: stored))
+        // The series' exceptions, read by a split that carries them (#563): none.
+        http.register(path: createPath, method: "GET", response: .raw(statusCode: 200, headers: ok, body: instances([])))
         http.register(path: createPath, method: "POST") { request in
             .raw(statusCode: 200, headers: ok, body: request.body ?? Data())
         }
@@ -201,13 +203,14 @@ struct GoogleSeriesSplitCopyTests {
         ], "the new part: \(canonical(wire.created?["recurrence"]))")
     }
 
-    @Test("a new rule on the new part keeps the excluded and added dates after the split")
-    func newRuleKeepsTheTailDates() async throws {
+    @Test("a new rule on the new part resets its excluded dates and keeps its added dates after the split (#563)")
+    func newRuleResetsTheTailExcludedDates() async throws {
         var patch = GCalEventInput()
         patch.recurrence = ["RRULE:FREQ=WEEKLY;BYDAY=MO,WE"]
         let wire = try await GoogleSplitFixture.split(GoogleSplitFixture.master(), patch: patch)
+        // A new rule resets the occurrences deleted one by one, as Google Calendar does.
         #expect(wire.created?["recurrence"] as? [String] == [
-            "RRULE:FREQ=WEEKLY;BYDAY=MO,WE", "EXDATE:20990527T170000Z", "RDATE:20990529T170000Z",
+            "RRULE:FREQ=WEEKLY;BYDAY=MO,WE", "RDATE:20990529T170000Z",
         ], "the new part: \(canonical(wire.created?["recurrence"]))")
     }
 
@@ -413,6 +416,8 @@ struct GoogleSeriesSplitCopyTests {
             return .raw(statusCode: 200, headers: ok,
                         body: GoogleSplitFixture.instances(capped ? [] : [GoogleSplitFixture.occurrence(GoogleSplitFixture.recurrenceId)]))
         }
+        http.register(path: GoogleSplitFixture.createPath, method: "GET",
+                      response: .raw(statusCode: 200, headers: ok, body: GoogleSplitFixture.instances([])))
         http.register(path: GoogleSplitFixture.createPath + "/", method: "GET") { request in
             let id = String(request.url.path.split(separator: "/").last ?? "")
             guard let event = server.withLock({ state in state.created[id].map { json($0) } }) else { return .raw(statusCode: 404) }
@@ -433,7 +438,7 @@ struct GoogleSeriesSplitCopyTests {
         // there, so only the cap is finished.
         let record = try #require(records.records.first, "the split kept no record before its cap")
         #expect(try await provider.eventExists(calendarId: "primary", eventId: record.newPartId))
-        try await provider.finishSplit(calendarId: "primary", record: record, zone: GoogleSplitFixture.utc)
+        try await provider.finishSplit(calendarId: "primary", record: record, zone: GoogleSplitFixture.utc, guests: nil)
         let retryWrites = http.recordedCalls().map(\.method).filter { $0 != "GET" }.dropFirst(writes.count)
         #expect(!retryWrites.contains("POST"), "the retry wrote the new part again: \(Array(retryWrites))")
 
@@ -465,6 +470,8 @@ struct GoogleSeriesSplitCopyTests {
         // swiftlint:disable:next force_try
         let stored = try! JSONSerialization.data(withJSONObject: master)
         http.register(path: GoogleSplitFixture.masterPath, method: "GET", response: .raw(statusCode: 200, headers: ok, body: stored))
+        http.register(path: GoogleSplitFixture.masterPath + "/instances", method: "GET", response: .raw(
+            statusCode: 200, headers: ok, body: GoogleSplitFixture.instances([GoogleSplitFixture.occurrence(GoogleSplitFixture.recurrenceId)])))
         let provider = GoogleCalendarProvider(accessToken: { _ in "test-token" }, session: http.session)
         await #expect(throws: CalendarProviderError.self) {
             _ = try await provider.splitSeries(
@@ -556,6 +563,47 @@ private enum GraphSplitFixture {
     static func calendar(_ series: [String: Any], listed: Bool = true) -> FakeGraphCalendar {
         FakeGraphCalendar([series] + (listed ? [GraphFixture.event(id: "ser-1-occ", start: occurrence, online: false,
                                                                    seriesMasterId: "ser-1")] : []))
+    }
+}
+
+@Suite("Outlook split carries the occurrences after it changed or deleted one by one (#563)", .serialized)
+struct ExchangeSplitCarryTests {
+    @Test("a rename from an occurrence on keeps a deleted later occurrence deleted and a changed one's own room")
+    func renameCarriesLaterExceptions() async throws {
+        let series = GraphSplitFixture.series(range: GraphSplitFixture.noEnd)
+        let changedAt = GraphFixture.onDevice(days: 14, hour: 10)
+        let deletedAt = GraphFixture.onDevice(days: 21, hour: 10)
+        var exception = GraphFixture.event(id: "ser-1-occ-2", start: changedAt, online: false, seriesMasterId: "ser-1")
+        exception["location"] = ["displayName": "Room 9"]
+        // The new part's occurrences at the same places, as Graph lists them once it is made.
+        let partOccurrences = [("created-1-w2", changedAt), ("created-1-w3", deletedAt)].map { id, at in
+            GraphFixture.event(id: id, start: at, online: false, seriesMasterId: "created-1")
+        }
+        let graph = FakeGraphCalendar([series, GraphFixture.event(id: "ser-1-occ", start: GraphSplitFixture.occurrence, online: false,
+                                                                  seriesMasterId: "ser-1"), exception] + partOccurrences)
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        graph.install(on: http)
+        let ok = ["Content-Type": "application/json"]
+        var expanded = series
+        expanded["exceptionOccurrences"] = [exception]
+        http.register(path: "/v1.0/me/events/ser-1?$expand=exceptionOccurrences", method: "GET",
+                      response: .raw(statusCode: 200, headers: ok, body: try JSONSerialization.data(withJSONObject: expanded)))
+        let cancelled = ["cancelledOccurrences": ["OID.ser-1.\(GraphFixture.deviceDay(deletedAt))"]]
+        http.register(path: "/v1.0/me/events/ser-1?$select=cancelledOccurrences", method: "GET",
+                      response: .raw(statusCode: 200, headers: ok, body: try JSONSerialization.data(withJSONObject: cancelled)))
+
+        var patch = GCalEventInput()
+        patch.summary = "Renamed"
+        _ = try await GraphSplitFixture.provider(http).splitSeries(
+            eventId: "ser-1", recurrenceId: GraphSplitFixture.recurrenceId, recurrenceIdZone: .current, patch: patch)
+
+        #expect(http.recordedCalls().filter { $0.method == "POST" }.count == 1 && graph.event("created-1") != nil,
+                "no new part: \(http.servedCallSequence())")
+        #expect(graph.event("created-1-w3") == nil, "the deleted occurrence came back: \(http.servedCallSequence())")
+        let carried = (graph.event("created-1-w2")?["location"] as? [String: Any])?["displayName"] as? String
+        #expect(carried == "Room 9", "the changed occurrence lost its room: \(carried ?? "none"); \(http.servedCallSequence())")
+        #expect(!graph.patches("ser-1").isEmpty, "the series was not capped: \(http.servedCallSequence())")
     }
 }
 
@@ -986,13 +1034,9 @@ struct ExchangeSeriesSplitCopyTests {
                     reason = thrown
                 }
                 #expect(graph.readZones("ser-1-occ") == [name], "\(label): the occurrence was not read in the series' zone: \(graph.readZones("ser-1-occ"))")
-                if moved {
-                    #expect(reason == "split at a moved occurrence", "\(label): \(reason ?? "not refused")")
-                    #expect(graph.created.isEmpty && graph.patches("ser-1").isEmpty, "\(label): written: \(http.servedCallSequence())")
-                } else {
-                    #expect(reason == nil, "\(label): refused: \(reason ?? "")")
-                    #expect(graph.created.count == 1, "\(label): no new part: \(http.servedCallSequence())")
-                }
+                // A moved occurrence is split at its place (#687), like a plain one.
+                #expect(reason == nil, "\(label): refused: \(reason ?? "")")
+                #expect(graph.created.count == 1, "\(label): no new part: \(http.servedCallSequence())")
             }
         }
     }

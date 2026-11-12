@@ -345,6 +345,34 @@ Tests: `CalendarGuestChangeTests` (on each fake server after the real queue drai
 `AttendeeChangeTests` (the function), `DemoGuestChangeTests`, the card test in
 `CalendarToolResolvedAccountTests`.
 
+## Exceptions after the split (#563, #687)
+
+Google Calendar's rule, measured on a test calendar, now followed on Google, Outlook and CalDAV
+(`SplitCarry`, one provider-neutral source the card and every write call):
+- A split starts at the PLACE of the occurrence named (`originalStartTime`), not where it was moved
+  to; the series is capped before that place, and the moved occurrence is carried like any other
+  changed one (#687; the old "split at a moved occurrence" refusal is gone).
+- **Reset** (`SplitCarry.Mode.reset`) when the edit gives a start other than the place (another
+  instant or day) or another rule (`ruleDayMove`, or a RRULE other than the stored one): nothing is
+  carried, deleted occurrences come back, changed ones lose their change, and the new part's EXDATE
+  lines go (RDATE stays). The card shows `CalendarToolHelpers.exceptionsResetNote`.
+- **Carry** otherwise: a deleted occurrence stays deleted (Google: an EXDATE in the create; Outlook:
+  the new part's occurrence DELETEd, 404/410 = done; CalDAV: EXDATE and overrides kept); a changed one
+  keeps its own fields except those the edit sets (`SplitCarry.Field`), its own times, an end given
+  alone giving its own start plus the new part's length, and its guests take the series' difference.
+- The mode and set fields are on `SplitRecord` (`mode`, `fields`), so a retry (`finishSplit`) carries
+  as the first attempt did, before the cap. A carry write that fails for good stops before the cap
+  (owner ruling); the residual case is iOS #769.
+- Outlook writes the DELETEs first, then the moves in `carryOrder`, so none lands on a date another
+  occurrence still holds (`ErrorOccurrenceCrossingBoundary`).
+- Carry writes send the providers' usual update emails to attendees (owner ruling: accepted).
+- A numbered series keeps its remaining COUNT on the new part (Google's own 8 -> 11 is not copied).
+
+Tests: `SplitCarryTests`, `ExchangeSplitCarryTests`,
+`CalendarEditToolSeriesScopeTests.renameSplitCarriesLaterExceptions` /
+`followingAtAMovedLaterOccurrenceCarriesIt`, the Google/Outlook invariant matrices (moved states now
+split at the place), `CalDAVOccurrenceWireTests.splitIsAtThePlaceInEveryFrame`.
+
 ## Tests
 
 `CalDAVEventCopiesTests`, `CalDAVSplitRefusedBeforeWriteTests` and `CalDAVSplitRollbackTests`

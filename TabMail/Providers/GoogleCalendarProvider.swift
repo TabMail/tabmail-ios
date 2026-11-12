@@ -88,12 +88,14 @@ protocol CalendarProvider: Sendable {
     /// read that fails for another reason throws. Default: refused, as `splitSeries` is.
     func eventExists(calendarId: String, eventId: String) async throws -> Bool
 
-    /// Finish the split `record` names: write the cap `splitSeries` writes after its create,
-    /// with the series as it is now (read in `zone`, the operation's `recurrenceIdZone`), and
-    /// nothing else. Writes nothing when the series already ends before `record.splitAt` (its
-    /// cap landed and only the answer was lost, or the user ended it earlier). Default:
-    /// refused, as `splitSeries` is.
-    func finishSplit(calendarId: String, record: SplitRecord, zone: TimeZone) async throws
+    /// Finish the split `record` names: write what `splitSeries` writes after its record, the
+    /// carry of the changed occurrences (when `record.mode` carries, #563) and then the cap, with
+    /// the series as it is now (read in `zone`, the operation's `recurrenceIdZone`). `guests` is
+    /// the edit's guest change, read again from the queued operation, which a carried occurrence's
+    /// own guests get as the series' difference. Writes nothing when the series already ends
+    /// before `record.splitAt` (its cap, the split's last write, landed and only the answer was
+    /// lost, or the user ended it earlier). Default: refused, as `splitSeries` is.
+    func finishSplit(calendarId: String, record: SplitRecord, zone: TimeZone, guests: AttendeeChange?) async throws
 
     /// Every repeat rule, as an RRULE, that this calendar writes when a move to another day turns
     /// the days of `series` (`GCalEventInput.ruleDayMove`): the whole series' rules for scope "all",
@@ -188,7 +190,7 @@ extension CalendarProvider {
     func eventExists(calendarId: String, eventId: String) async throws -> Bool {
         throw CalendarProviderError.notSupported(Self.splitNotSupported)
     }
-    func finishSplit(calendarId: String, record: SplitRecord, zone: TimeZone) async throws {
+    func finishSplit(calendarId: String, record: SplitRecord, zone: TimeZone, guests: AttendeeChange?) async throws {
         throw CalendarProviderError.notSupported(Self.splitNotSupported)
     }
     func dayMovedRules(calendarId: String, eventId: String, series: GCalEvent, scope: String, recurrenceId: String?,
@@ -838,27 +840,43 @@ actor GoogleCalendarProvider: CalendarProvider {
             throw CalendarProviderError.notSupported("Event \(eventId) is not recurring; can't split.")
         }
 
-        // 2. Locate the master's RRULE line and compute the capped variant.
+        // 2. The occurrence named: the one that starts at `recurrenceId` now, as `occurrence`
+        //    finds it. The split is at its PLACE in the series (#687), where Google Calendar
+        //    splits a series at an occurrence moved from it: the series is capped before the
+        //    place, and the moved occurrence is carried into the new part like any other changed
+        //    one. An end given alone keeps, from the place, the length it gives from where the
+        //    occurrence starts now (`SplitCarry.partEdit`).
+        let found = try await occurrence(
+            calendarId: calendarId, named: named, masterId: eventId,
+            recurrenceId: recurrenceId, zone: recurrenceIdZone)
+        guard let splitPlace = found.originalStartTime,
+              let place = SplitCarry.placeNaive(of: found, recurrenceId: recurrenceId, zone: recurrenceIdZone),
+              let partPatch = SplitCarry.partEdit(patch, named: found) else {
+            throw CalendarProviderError.notSupported("the place in the series of the occurrence named can't be read, so the series can't be split at it")
+        }
+        let mode = SplitCarry.mode(edit: partPatch, place: splitPlace, storedRules: masterRecurrence)
+
+        // 3. Locate the master's RRULE line and compute the capped variant.
         guard let originalRRule = masterRecurrence.first(where: { $0.uppercased().hasPrefix("RRULE:") }) else {
             throw CalendarProviderError.notSupported("Master event has no RRULE; can't split.")
         }
-        guard let untilValue = Self.googleUntilString(beforeNaiveISO: recurrenceId, allDay: master.isAllDay, zone: recurrenceIdZone) else {
+        guard let untilValue = Self.googleUntilString(beforeNaiveISO: place, allDay: master.isAllDay, zone: recurrenceIdZone) else {
             throw CalendarProviderError.notSupported("Invalid recurrence_id '\(recurrenceId)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
         }
         let cappedRRule = Self.replaceOrAppendUntil(in: originalRRule, untilValue: untilValue)
         // The new series ends where the original one did: the same UNTIL, or
-        // what is left of its COUNT. Worked out here, before the cap PATCH in
-        // step 4, so a split the series cannot take (it already ends before the
+        // what is left of its COUNT. Worked out here, before the cap PATCH,
+        // so a split the series cannot take (it already ends before the
         // split, or its COUNT cannot be counted) is refused with nothing written.
         // A patch that brings its own recurrence is still written as given
         // (`mergeMasterAndPatch` prefers it), but the check runs all the same:
         // it is also what stops the cap from moving the end of a series that
         // already ended before the split.
         let tailRRule = try Self.splitTailRule(
-            master: master, rule: originalRRule, recurrenceId: recurrenceId, recurrenceIdZone: recurrenceIdZone, capUntil: untilValue)
+            master: master, rule: originalRRule, recurrenceId: place, recurrenceIdZone: recurrenceIdZone, capUntil: untilValue)
         // A move of the new part to another day turns the days its rule names, its end as above.
-        let newSeriesRRule = try patch.ruleDayMove.map { try RecurrenceDayShift.shifted(tailRRule, by: $0) } ?? tailRRule
-        guard let slot = Self.splitInstant(naiveISO: recurrenceId, allDay: master.isAllDay, zone: recurrenceIdZone) else {
+        let newSeriesRRule = try partPatch.ruleDayMove.map { try RecurrenceDayShift.shifted(tailRRule, by: $0) } ?? tailRRule
+        guard let slot = Self.splitInstant(naiveISO: place, allDay: master.isAllDay, zone: recurrenceIdZone) else {
             throw CalendarProviderError.notSupported("Invalid recurrence_id '\(recurrenceId)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
         }
         // Excluded and added dates go with the part they fall in. Pure, so a
@@ -866,31 +884,38 @@ actor GoogleCalendarProvider: CalendarProvider {
         var recurrenceParts = try Self.splitRecurrence(
             masterRecurrence, cappedRRule: cappedRRule,
             tailRRule: newSeriesRRule, slot: slot)
-        // A day move that changes the new part's rule drops its excluded dates, as on the whole
-        // series (`withoutExcludedDates`).
-        if newSeriesRRule != tailRRule { recurrenceParts.tail = Self.withoutExcludedDates(recurrenceParts.tail) }
 
-        // The new part starts at an occurrence that starts at `recurrenceId` now, the one
-        // `occurrence` finds, and was not moved from its place in the series; otherwise the split
-        // throws with nothing written.
-        let found = try await occurrence(
-            calendarId: calendarId, named: named, masterId: eventId,
-            recurrenceId: recurrenceId, zone: recurrenceIdZone)
-        if RecurrenceOccurrenceResolver.wasMoved(found) {
-            // A split at an occurrence moved from its place is not supported (#563): a plain
-            // error, nothing written.
-            throw CalendarProviderError.notSupported("split at a moved occurrence")
+        // 4. The occurrences after the split deleted or changed one by one (#563), read before
+        //    anything is written. A reset (`SplitCarry.mode`) carries none of them and drops the
+        //    new part's excluded dates, as Google Calendar does when "this and following" moves
+        //    the start; a carry gives each deleted place an excluded date in the create itself,
+        //    and writes each changed occurrence onto the new part once the record is kept.
+        //    A reset reads none: the cap ends the series, and its exceptions with it.
+        var exceptions: [TailException] = []
+        switch mode {
+        case .reset:
+            recurrenceParts.tail = Self.withoutExcludedDates(recurrenceParts.tail)
+        case .carry:
+            exceptions = try await tailExceptions(
+                calendarId: calendarId, master: master, masterId: eventId, split: splitPlace)
+            for exception in exceptions {
+                guard case .deleted(let deleted) = exception.carried else { continue }
+                guard let line = Self.excludedDateLine(deleted, master: master) else {
+                    throw CalendarProviderError.notSupported("an occurrence deleted after the split can't be dated, so the series can't be split")
+                }
+                if !recurrenceParts.tail.contains(line) { recurrenceParts.tail.append(line) }
+            }
         }
 
         // 3. Build the new series: a copy of the stored series, re-anchored at
         //    the split, with the patch applied. Pin a DETERMINISTIC id so a retry
         //    re-targets the same series instead of creating a duplicate.
-        let newSeriesId = Self.deterministicSplitEventId(masterId: eventId, recurrenceId: recurrenceId)
+        let newSeriesId = Self.deterministicSplitEventId(masterId: eventId, recurrenceId: place)
         let newSeriesJSON = Self.splitNewPartJSON(
             masterJSON: masterJSON,
             master: master,
-            patch: patch,
-            newStartNaiveISO: recurrenceId,
+            patch: partPatch,
+            newStartNaiveISO: place,
             newStartZone: recurrenceIdZone,
             newRecurrence: recurrenceParts.tail,
             newId: newSeriesId
@@ -971,11 +996,22 @@ actor GoogleCalendarProvider: CalendarProvider {
             }
         }
 
-        // 5. Keep the record before the cap: a retry after this point finishes the
-        //    cap alone (`finishSplit`).
-        try await record(SplitRecord(seriesId: eventId, newPartId: created.id ?? newSeriesId, splitAt: recurrenceId))
+        // 5. Keep the record before the carry and the cap: a retry after this point carries
+        //    and caps alone (`finishSplit`), from the series, untouched until the cap.
+        let partId = created.id ?? newSeriesId
+        let fields = SplitCarry.fields(of: partPatch)
+        try await record(SplitRecord(seriesId: eventId, newPartId: partId, splitAt: place, mode: mode, fields: fields))
 
-        // 6. PATCH master silently. A failure is rethrown; the record is kept, so
+        // 6. Carry the changed occurrences onto the new part. A write that fails stops the split
+        //    here, before the cap: the series is still whole, and the retry carries again.
+        if mode == .carry {
+            try await carry(
+                calendarId: calendarId, exceptions: exceptions, master: master, masterJSON: masterJSON,
+                newPart: created, newPartId: partId, fields: fields, guests: partPatch.attendeeChange,
+                sendUpdates: sendUpdates)
+        }
+
+        // 7. PATCH master silently. A failure is rethrown; the record is kept, so
         //    the retry writes the cap alone.
         let _: GCalEvent = try await patchEvent(
             calendarId: calendarId,
@@ -985,6 +1021,151 @@ actor GoogleCalendarProvider: CalendarProvider {
             keepStoredDates: false
         )
         return created
+    }
+
+    /// One exception of a series from a split on, as Google lists it: the neutral value the
+    /// carry plans with (`SplitCarry.Exception`) and the stored JSON its own values are copied from.
+    struct TailException {
+        let carried: SplitCarry.Exception
+        let json: [String: Any]
+    }
+
+    /// The exceptions of the series `masterId` whose place is at or after `split`: deleted ones
+    /// (`cancelled`) and changed ones, each with its place (`originalStartTime`). Read with
+    /// `events?iCalUID=…&singleEvents=false&showDeleted=true`, which lists the series and every
+    /// exception it holds, and nothing else (measured). Every page is read; an exception whose
+    /// place can't be read is refused, with nothing written.
+    private func tailExceptions(
+        calendarId: String, master: GCalEvent, masterId: String, split: GCalDateTime
+    ) async throws -> [TailException] {
+        guard let uid = master.iCalUID, !uid.isEmpty else {
+            throw CalendarProviderError.notSupported("Google gives no iCalUID for this repeating event, so its changed occurrences can't be read, and it was not split")
+        }
+        let encodedCalId = try Self.encodedPathSegment(calendarId, "Google calendar id")
+        var allowed = CharacterSet.urlQueryAllowed
+        allowed.remove(charactersIn: "&=+?#")
+        var found: [TailException] = []
+        var pageToken: String?
+        repeat {
+            var path = "/calendars/\(encodedCalId)/events?singleEvents=false&showDeleted=true&maxResults=2500"
+                + "&iCalUID=\(uid.addingPercentEncoding(withAllowedCharacters: allowed) ?? uid)"
+            if let pageToken { path += "&pageToken=\(pageToken.addingPercentEncoding(withAllowedCharacters: allowed) ?? pageToken)" }
+            let data = try await request(path: path)
+            guard let page = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw CalendarProviderError.notSupported("Google's list of this repeating event's occurrences can't be read, so it was not split")
+            }
+            for item in page["items"] as? [[String: Any]] ?? [] where item["recurringEventId"] as? String == masterId {
+                let event = try JSONDecoder().decode(GCalEvent.self, from: JSONSerialization.data(withJSONObject: item))
+                guard let place = event.originalStartTime, let inTail = SplitCarry.isInTail(place, split: split) else {
+                    throw CalendarProviderError.notSupported("a changed occurrence of this repeating event has a place in the series TabMail can't read, so it was not split")
+                }
+                guard inTail else { continue }
+                found.append(TailException(
+                    carried: event.status == "cancelled" ? .deleted(place: place) : .changed(event), json: item))
+            }
+            pageToken = page["nextPageToken"] as? String
+        } while pageToken != nil
+        return found
+    }
+
+    /// The `EXDATE` line that removes the occurrence at `place` from a copy of `master`: a date
+    /// for an all-day series, else the wall clock in the series' zone (`TZID`), or UTC when the
+    /// series names no zone. Nil when the place can't be read.
+    static func excludedDateLine(_ place: GCalDateTime, master: GCalEvent) -> String? {
+        if let date = place.date {
+            let digits = String(date.prefix(10)).replacingOccurrences(of: "-", with: "")
+            return digits.count == 8 ? "EXDATE;VALUE=DATE:\(digits)" : nil
+        }
+        guard let instant = place.dateTime.flatMap(Date.fromISO8601) else { return nil }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        if let tzid = master.start?.timeZone, let zone = CalendarTimeZoneResolver.zone(named: tzid, in: .none) {
+            formatter.timeZone = zone
+            formatter.dateFormat = "yyyyMMdd'T'HHmmss"
+            return "EXDATE;TZID=\(tzid):\(formatter.string(from: instant))"
+        }
+        formatter.timeZone = .gmt
+        formatter.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+        return "EXDATE:\(formatter.string(from: instant))"
+    }
+
+    /// The id Google gives the occurrence of the series `seriesId` at `place`: the series id, `_`,
+    /// and the place's UTC start (`yyyyMMdd'T'HHmmss'Z'`), or its date (`yyyyMMdd`) for an all-day
+    /// series (measured: a GET and a PATCH of it work, and the PATCH makes it a changed one).
+    static func instanceId(seriesId: String, place: GCalDateTime) -> String? {
+        if let date = place.date {
+            let digits = String(date.prefix(10)).replacingOccurrences(of: "-", with: "")
+            return digits.count == 8 ? "\(seriesId)_\(digits)" : nil
+        }
+        guard let instant = place.dateTime.flatMap(Date.fromISO8601) else { return nil }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = .gmt
+        formatter.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+        return "\(seriesId)_\(formatter.string(from: instant))"
+    }
+
+    /// Writes each changed occurrence of `exceptions` onto the new part `newPartId`
+    /// (`SplitCarry.plan`): a PATCH of its occurrence there, by id (`instanceId`), with its own
+    /// values of the fields the edit did not set, its own times, and its own guests with the
+    /// edit's change applied as the series' difference. Every value is absolute, so a write that
+    /// runs again changes nothing. Deleted places need nothing here: the create excluded them.
+    /// Invitations go as the split's create sends them (`sendUpdates`).
+    private func carry(
+        calendarId: String, exceptions: [TailException], master: GCalEvent, masterJSON: [String: Any],
+        newPart: GCalEvent, newPartId: String, fields: Set<SplitCarry.Field>, guests: AttendeeChange?,
+        sendUpdates: String
+    ) async throws {
+        guard let plan = SplitCarry.plan(exceptions: exceptions.map(\.carried), series: master, newPart: newPart, fields: fields) else {
+            throw CalendarProviderError.notSupported("a changed occurrence of this repeating event has a time TabMail can't read, so its change can't be carried")
+        }
+        let encodedCalId = try Self.encodedPathSegment(calendarId, "Google calendar id")
+        let seriesGuests = masterJSON["attendees"] as? [[String: Any]] ?? []
+        func address(_ guest: [String: Any]) -> String? { (guest["email"] as? String)?.lowercased() }
+        let difference = guests.map { $0.seriesDifference(before: seriesGuests, after: Self.applied($0, to: seriesGuests), address: address) }
+        for change in plan.changed {
+            guard let id = Self.instanceId(seriesId: newPartId, place: change.place),
+                  let own = exceptions.first(where: { $0.json["id"] as? String == change.exception.id })?.json else {
+                throw CalendarProviderError.notSupported("a changed occurrence of this repeating event can't be addressed on its new part, so its change can't be carried")
+            }
+            var json: [String: Any] = [:]
+            for field in change.own {
+                switch field {
+                case .summary, .location, .description:
+                    json[field.rawValue] = own[field.rawValue] ?? ""
+                case .transparency:
+                    json["transparency"] = own["transparency"] ?? "opaque"
+                case .attendees:
+                    let held = own["attendees"] as? [[String: Any]] ?? []
+                    json["attendees"] = difference.map { Self.applied($0, to: held) } ?? held
+                case .end:
+                    break
+                }
+            }
+            if let start = change.start, let end = change.end {
+                json["start"] = Self.timeJSON(start)
+                json["end"] = Self.timeJSON(end)
+            }
+            let encodedId = try Self.encodedPathSegment(id, "Google occurrence id")
+            _ = try await request(
+                path: "/calendars/\(encodedCalId)/events/\(encodedId)?sendUpdates=\(sendUpdates)",
+                method: "PATCH",
+                body: try JSONSerialization.data(withJSONObject: json))
+            if DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[GoogleCalendar] split carried a changed occurrence onto \(id): \(change.own.sorted().map(\.rawValue)) times=\(change.start != nil)")
+            }
+        }
+    }
+
+    /// A start or end as Google's JSON writes it.
+    private static func timeJSON(_ time: GCalDateTime) -> [String: Any] {
+        var json: [String: Any] = [:]
+        if let date = time.date { json["date"] = date }
+        if let dateTime = time.dateTime { json["dateTime"] = dateTime }
+        if let zone = time.timeZone { json["timeZone"] = zone }
+        return json
     }
 
     /// The capped-master patch a split writes. The semantic change is recurrence-only, but the
@@ -1037,11 +1218,13 @@ actor GoogleCalendarProvider: CalendarProvider {
         return false
     }
 
-    /// The cap of the split `record` names, written alone (`CalendarProvider.finishSplit`): the
-    /// cap `splitSeries` writes, worked out from the series as it is now, and nothing when the
-    /// series already ends before the split.
-    func finishSplit(calendarId: String = "primary", record: SplitRecord, zone: TimeZone) async throws {
-        let master = try await getEvent(calendarId: calendarId, eventId: record.seriesId)
+    /// The rest of the split `record` names (`CalendarProvider.finishSplit`): the carry and the
+    /// cap `splitSeries` writes after its record, worked out from the series as it is now, and
+    /// nothing when the series already ends before the split. The cap is the split's last write,
+    /// so a capped series was carried. The carry is re-planned from the series' exceptions, which
+    /// stay as they were until the cap, and the new part as it is now.
+    func finishSplit(calendarId: String = "primary", record: SplitRecord, zone: TimeZone, guests: AttendeeChange?) async throws {
+        let (_, master, masterJSON) = try await resolveToMaster(calendarId: calendarId, eventId: record.seriesId)
         guard let recurrence = master.recurrence,
               let rule = recurrence.first(where: { $0.uppercased().hasPrefix("RRULE:") }) else {
             throw CalendarProviderError.notSupported("Can't finish this change to the repeating event: it no longer repeats. Check the event in your calendar app.")
@@ -1056,6 +1239,16 @@ actor GoogleCalendarProvider: CalendarProvider {
                 BackgroundSyncLogger.logDebug("[GoogleCalendar] finishSplit: series \(record.seriesId) already ends before \(record.splitAt) — nothing to write")
             }
             return
+        }
+        if record.mode == .carry {
+            let split = master.isAllDay
+                ? GCalDateTime(dateTime: nil, date: String(record.splitAt.prefix(10)), timeZone: nil)
+                : GCalDateTime(dateTime: slot.iso8601String(), date: nil, timeZone: nil)
+            let exceptions = try await tailExceptions(calendarId: calendarId, master: master, masterId: record.seriesId, split: split)
+            let newPart = try await getEvent(calendarId: calendarId, eventId: record.newPartId)
+            try await carry(
+                calendarId: calendarId, exceptions: exceptions, master: master, masterJSON: masterJSON,
+                newPart: newPart, newPartId: record.newPartId, fields: record.fields, guests: guests, sendUpdates: "all")
         }
         // Only the series' half is written; the new part's rule is not needed here.
         let cappedRRule = Self.replaceOrAppendUntil(in: rule, untilValue: untilValue)

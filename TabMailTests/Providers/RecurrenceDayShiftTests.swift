@@ -173,7 +173,7 @@ struct RecurrenceDayShiftTests {
         func naive(_ d: Date) -> String { EKEventStoreHelper.toNaiveISO(d, timeZone: utc) }
         let masterPath = "/calendar/v3/calendars/primary/events/m"
         let master = Data("""
-        {"id":"m","summary":"Standup","status":"confirmed",
+        {"id":"m","iCalUID":"m@example.com","summary":"Standup","status":"confirmed",
          "start":{"dateTime":"\(naive(start))Z","timeZone":"UTC"},
          "end":{"dateTime":"\(naive(start.addingTimeInterval(1_800)))Z","timeZone":"UTC"},
          "recurrence":["RRULE:FREQ=WEEKLY;COUNT=10;BYDAY=MO,WE,FR"]}
@@ -189,6 +189,8 @@ struct RecurrenceDayShiftTests {
         http.register(path: masterPath, method: "GET", response: .raw(statusCode: 200, headers: json, body: master))
         http.register(path: masterPath + "/instances", method: "GET", response: .raw(statusCode: 200, headers: json, body: instances))
         http.register(path: masterPath, method: "PATCH", response: .raw(statusCode: 200, headers: json, body: master))
+        http.register(path: "/calendar/v3/calendars/primary/events", method: "GET",
+                      response: .raw(statusCode: 200, headers: json, body: Data(#"{"items":[]}"#.utf8)))
         http.register(path: "/calendar/v3/calendars/primary/events", method: "POST",
                       response: .raw(statusCode: 200, headers: json, body: Data(#"{"id":"successor","status":"confirmed"}"#.utf8)))
         let provider = GoogleCalendarProvider(accessToken: { _ in "test-token" }, session: http.session)

@@ -374,7 +374,7 @@ struct CalendarSplitConflictDispositionTests {
     }
 
     private static let masterJSON = Data("""
-    {"id":"master-1","summary":"Weekly sync","status":"confirmed",
+    {"id":"master-1","iCalUID":"master-1@example.com","summary":"Weekly sync","status":"confirmed",
      "start":{"dateTime":"2026-04-01T17:00:00Z","timeZone":"UTC"},
      "end":{"dateTime":"2026-04-01T18:00:00Z","timeZone":"UTC"},
      "recurrence":["RRULE:FREQ=WEEKLY;BYDAY=WE"]}
@@ -395,7 +395,8 @@ struct CalendarSplitConflictDispositionTests {
     /// What reaches the wire before the successor's create: the queue reads the series and the
     /// occurrence the edit names (`CalendarSeriesScope.read`: the event, then `occurrence`'s
     /// `resolveToMaster` and instances), then the split reads the series (`resolveToMaster`) and
-    /// checks the occurrence it splits at (its instances).
+    /// checks the occurrence it splits at (its instances), then reads the series' exceptions after
+    /// the split, which a rename carries (#563).
     private static var readsBeforeCreate: [String] {
         [
             "GET \(masterPath)",
@@ -403,6 +404,7 @@ struct CalendarSplitConflictDispositionTests {
             "GET \(masterPath)/instances",
             "GET \(masterPath)",
             "GET \(masterPath)/instances",
+            "GET \(createPath)",
         ]
     }
 
@@ -443,6 +445,8 @@ struct CalendarSplitConflictDispositionTests {
                       response: .raw(statusCode: 200, headers: ok, body: Self.instancesJSON))
         http.register(path: Self.masterPath, method: "PATCH",
                       response: .raw(statusCode: 200, headers: ok, body: Self.masterJSON))
+        http.register(path: Self.createPath, method: "GET",
+                      response: .raw(statusCode: 200, headers: ok, body: Data(#"{"items":[]}"#.utf8)))
         http.register(path: Self.createPath, method: "POST", response: createResponse)
         http.register(path: Self.successorPath, method: "GET", response: successorGetResponse)
 

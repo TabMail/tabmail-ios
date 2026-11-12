@@ -178,6 +178,9 @@ of the resource, which holds every occurrence (irreversible wire operation #5, n
   edit of every occurrence before the card, as its series not being in this calendar.
 - "This and following" at a moved occurrence is refused with nothing written; that occurrence can
   still be changed alone, and the split made in the user's calendar app.
+  **Amended 2026-11-12 (#563, #687):** no longer refused. The split is made at the occurrence's place
+  in the series (`CalDAVOccurrences.scopedEdit` gives the slot), and the moved occurrence is carried
+  onto the new part with its own times, as Google Calendar does (memory 142, "Exceptions after the split").
 - The series id with a moved occurrence's new time edits that occurrence in place, and with its old
   place is not found, the same as on Google, whose resolver finds no instance there.
 - A retry after a lost response is reported not found, with nothing written, when the first attempt

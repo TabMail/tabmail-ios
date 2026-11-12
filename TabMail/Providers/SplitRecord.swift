@@ -11,8 +11,14 @@ import Foundation
 /// - `seriesId`: the series the split caps;
 /// - `newPartId`: the new part the split created (Google and Outlook: the event id; CalDAV: the
 ///   resource path);
-/// - `splitAt`: the occurrence the split starts at, as the operation's `recurrence_id` names it.
-/// It holds ids and the split point only, no event content (ADR-004).
+/// - `splitAt`: the PLACE in the series of the occurrence the split starts at, a naive wall clock
+///   in the operation's zone: its `recurrence_id`, or, for an occurrence moved from its place,
+///   where the series had it (#687, `SplitCarry.placeNaive`);
+/// - `mode`: whether the split carries the later exceptions into the new part or resets them
+///   (`SplitCarry.Mode`, #563);
+/// - `fields`: the names of the fields the edit set, which overwrite a carried occurrence's own.
+/// It holds ids, the split point, the mode and field names only, no event content (ADR-004): a
+/// retry re-reads what it carries from the series, which is untouched until the cap.
 ///
 /// A retry that finds the record asks the calendar whether the new part is still there
 /// (`CalendarProvider.eventExists`). When it is, it only finishes the cap
@@ -22,6 +28,8 @@ struct SplitRecord: Sendable, Equatable {
     let seriesId: String
     let newPartId: String
     let splitAt: String
+    let mode: SplitCarry.Mode
+    let fields: Set<SplitCarry.Field>
 
     /// The reserved key in `PendingCalendarOperation.argumentsJSON`. Only the queue writes it
     /// (`AccountManager.recordSplit`); a tool call that carries it has it removed when the
@@ -38,14 +46,18 @@ struct SplitRecord: Sendable, Equatable {
     private static let seriesKey = "series_id"
     private static let newPartKey = "new_part_id"
     private static let splitAtKey = "split_at"
+    private static let modeKey = "mode"
+    private static let fieldsKey = "fields"
 
     /// The refusal when the new part of an unfinished split is gone.
     static let newPartDeleted = "This change to the repeating event wasn't finished because its new part was deleted. Check the event's later occurrences, and make the change again if you still want it."
 
-    init(seriesId: String, newPartId: String, splitAt: String) {
+    init(seriesId: String, newPartId: String, splitAt: String, mode: SplitCarry.Mode, fields: Set<SplitCarry.Field>) {
         self.seriesId = seriesId
         self.newPartId = newPartId
         self.splitAt = splitAt
+        self.mode = mode
+        self.fields = fields
     }
 
     /// The record in a queued operation's arguments, or nil when it has none.
@@ -53,16 +65,32 @@ struct SplitRecord: Sendable, Equatable {
         guard case .dictionary(let d)? = arguments[Self.argumentKey],
               case .string(let series)? = d[Self.seriesKey],
               case .string(let part)? = d[Self.newPartKey],
-              case .string(let at)? = d[Self.splitAtKey] else { return nil }
-        self.init(seriesId: series, newPartId: part, splitAt: at)
+              case .string(let at)? = d[Self.splitAtKey],
+              case .string(let modeName)? = d[Self.modeKey], let mode = SplitCarry.Mode(rawValue: modeName),
+              case .array(let names)? = d[Self.fieldsKey] else { return nil }
+        var fields = Set<SplitCarry.Field>()
+        for name in names {
+            guard case .string(let text) = name, let field = SplitCarry.Field(rawValue: text) else { return nil }
+            fields.insert(field)
+        }
+        self.init(seriesId: series, newPartId: part, splitAt: at, mode: mode, fields: fields)
     }
 
     /// The operation the record was for is no longer queued, so the record was not kept.
     struct OperationGone: Error {}
 
+    /// The record as a queued operation's argument (`argumentKey`).
+    var argument: JSONValue {
+        .dictionary([
+            Self.seriesKey: .string(seriesId), Self.newPartKey: .string(newPartId), Self.splitAtKey: .string(splitAt),
+            Self.modeKey: .string(mode.rawValue), Self.fieldsKey: .array(fields.sorted().map { .string($0.rawValue) }),
+        ])
+    }
+
     /// The record as stored under `argumentKey`.
-    var jsonObject: [String: String] {
-        [Self.seriesKey: seriesId, Self.newPartKey: newPartId, Self.splitAtKey: splitAt]
+    var jsonObject: [String: Any] {
+        [Self.seriesKey: seriesId, Self.newPartKey: newPartId, Self.splitAtKey: splitAt,
+         Self.modeKey: mode.rawValue, Self.fieldsKey: fields.sorted().map(\.rawValue)]
     }
 }
 

@@ -538,9 +538,9 @@ struct ExchangeSeriesDayTests {
         graph.install(on: http)
         let provider = ExchangeCalendarProvider(mailbox: "calendar@example.com", accessToken: { _ in "test-token" },
                                                 session: http.session)
-        let record = SplitRecord(seriesId: ZoneSeries.id, newPartId: "zs-new", splitAt: wall(split, in: Self.device))
+        let record = SplitRecord(seriesId: ZoneSeries.id, newPartId: "zs-new", splitAt: wall(split, in: Self.device), mode: .reset, fields: [])
         await #expect(throws: Never.self, "the retry's cap was refused") {
-            try await provider.finishSplit(calendarId: "primary", record: record, zone: .current)
+            try await provider.finishSplit(calendarId: "primary", record: record, zone: .current, guests: nil)
         }
 
         let cap = graph.patches(ZoneSeries.id).last

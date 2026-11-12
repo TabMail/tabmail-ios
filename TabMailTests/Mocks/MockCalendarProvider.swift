@@ -187,7 +187,7 @@ actor MockCalendarProvider: CalendarProvider {
         guard let result = splitSeriesResult else {
             throw NSError(domain: "MockCalendarProvider", code: 500, userInfo: [NSLocalizedDescriptionKey: "No mock result configured"])
         }
-        try await record(SplitRecord(seriesId: eventId, newPartId: result.id ?? "", splitAt: recurrenceId))
+        try await record(SplitRecord(seriesId: eventId, newPartId: result.id ?? "", splitAt: recurrenceId, mode: .reset, fields: []))
         if let error = splitSeriesCapThrows { throw error }
         return result
     }
@@ -198,7 +198,7 @@ actor MockCalendarProvider: CalendarProvider {
         return eventExistsResult
     }
 
-    func finishSplit(calendarId: String, record: SplitRecord, zone: TimeZone) async throws {
+    func finishSplit(calendarId: String, record: SplitRecord, zone: TimeZone, guests: AttendeeChange?) async throws {
         callLog.append("finishSplit(calendarId:\(calendarId),seriesId:\(record.seriesId),splitAt:\(record.splitAt),zone:\(zone.identifier))")
         finishSplitCalls.append(record)
         if let error = finishSplitThrows { throw error }

@@ -53,6 +53,9 @@ add-on's `routeSeriesTimeChange`, done in `CalendarSeriesScope.route`:
 First or later is judged on the occurrence's PLACE in the series (`originalStartTime`); same date or
 not, and the move back to the first date, on where it is NOW (`start`).
 
+**[Superseded 2026-11-12 by #563/#687: a split at a moved occurrence is now made at its PLACE and
+carries it like any other changed occurrence, on all three providers; the refusal below is gone. See
+memory 142, "Exceptions after the split". The paragraph is kept as history.]**
 **A split at an occurrence moved from its place in the series is not supported** (owner ruling,
 option A; #563 tracks splitting there, #687 the follow-up). It is a plain thrown error with nothing
 written (`CalendarProviderError.notSupported("split at a moved occurrence")`). It is thrown ONLY by

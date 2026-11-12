@@ -1641,7 +1641,7 @@ struct CalDAVSplitRollbackTests {
         let record = try #require(records.records.first, "the split kept no record before its cap")
         let writesBeforeRetry = store.recordedPuts().count
         #expect(try await provider.eventExists(calendarId: Self.calendarId, eventId: record.newPartId))
-        try await provider.finishSplit(calendarId: Self.calendarId, record: record, zone: .current)
+        try await provider.finishSplit(calendarId: Self.calendarId, record: record, zone: .current, guests: nil)
 
         try Self.expectPartition(store, fixture, dated)
         #expect(!store.recordedPuts().dropFirst(writesBeforeRetry).contains { $0.path == Self.newPartPath(fixture) },

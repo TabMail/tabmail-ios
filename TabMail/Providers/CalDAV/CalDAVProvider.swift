@@ -636,9 +636,16 @@ actor CalDAVProvider: CalendarProvider {
         // The occurrence the split starts at: one the series has, or nothing is written
         // (`CalDAVOccurrences.scopedEditSlot`, the same check `updateOccurrence` makes). Where
         // the series ends is left to `RecurrenceTail.newSeriesRule` below.
-        let slot = try CalDAVOccurrences.scopedEditSlot(
+        // The slot is the occurrence's PLACE in the series, also for one moved from it (#687): the
+        // split starts there, as Google Calendar's does, and an end given alone keeps, from the
+        // place, the length it gives from where the occurrence starts now (`SplitCarry.partEdit`).
+        let (namedKey, slot) = try CalDAVOccurrences.scopedEdit(
             icsText: masterICS, href: seriesHref, key: occurrenceKey,
             recurrenceId: recurrenceId, zone: recurrenceIdZone, forSplit: true)
+        guard let named = CalDAVOccurrences.occurrence(key: namedKey, icsText: masterICS, href: seriesHref),
+              let patch = SplitCarry.partEdit(patch, named: named) else {
+            throw CalendarProviderError.notSupported("the place in the series of the occurrence named can't be read, so the series can't be split at it")
+        }
 
         // 2. The capped series' rule and the new part's (`splitRules`), worked out before the cap
         //    PUT in step 3, so a split the series cannot take is refused with nothing written.
@@ -704,7 +711,11 @@ actor CalDAVProvider: CalendarProvider {
         }
 
         // 4. Keep the record before the cap: a retry after this point writes the cap alone.
-        try await record(SplitRecord(seriesId: seriesHref, newPartId: newEventURL.path, splitAt: slot))
+        // The carry was made in the create itself (`seriesSplitResources`), so the record's mode
+        // and fields are only what the other calendars keep.
+        try await record(SplitRecord(
+            seriesId: seriesHref, newPartId: newEventURL.path, splitAt: slot,
+            mode: resources.mode, fields: SplitCarry.fields(of: patch)))
 
         // 5. PUT the capped series back. No ETag ⇒ `.unconditional`: step 1's GET
         //    proved the series resource exists (its ICS is what we just capped),
@@ -741,7 +752,7 @@ actor CalDAVProvider: CalendarProvider {
     /// series as it is now and PUT under its ETag, and nothing when the series already ends
     /// before the split. `record.splitAt` is the checked slot `splitSeries` split at, read in
     /// `zone`.
-    func finishSplit(calendarId: String, record: SplitRecord, zone: TimeZone) async throws {
+    func finishSplit(calendarId: String, record: SplitRecord, zone: TimeZone, guests: AttendeeChange?) async throws {
         let eventURL = try resolveEventURL(record.seriesId, calendarId: calendarId)
         let (data, getResponse) = try await client.get(url: eventURL)
         guard let storedICS = String(data: data, encoding: .utf8), !storedICS.isEmpty else {

@@ -72,9 +72,9 @@ struct CalDAVOccurrenceEditToolToWireTests {
         let editScope: String?
         let givesRecurrenceId: Bool
         let refused: Bool
-        /// Not supported (a split at a moved occurrence, #563): the split's card, then an error at
-        /// the write, with nothing written and no write left queued.
-        var errorNothingWritten = false
+        /// A split at a moved occurrence is made at its place (#687): the following ones are
+        /// counted from the occurrence's place, not from where it is listed now.
+        var splitFromPlace = false
     }
 
     /// Every scope the tool takes, by each id kind. None is refused: the whole event by one
@@ -97,15 +97,15 @@ struct CalDAVOccurrenceEditToolToWireTests {
         try W.makeMoved(week: movedFromWeek, toWeek: movedToWeek)
     }
 
-    /// Every scope by each id kind, on the moved occurrence. The split's card, then an error at the
-    /// write with nothing written: a split at it by either id.
+    /// Every scope by each id kind, on the moved occurrence. A split at it by either id is made at
+    /// its place, as Google Calendar does.
     static let movedCases: [Case] = [false, true].flatMap { byOccurrence in
         [
             Case(label: "edit_scope all", occurrenceId: byOccurrence, editScope: "all", givesRecurrenceId: false, refused: false),
             Case(label: "no edit_scope", occurrenceId: byOccurrence, editScope: nil, givesRecurrenceId: false, refused: false),
             Case(label: "no edit_scope, a recurrence_id", occurrenceId: byOccurrence, editScope: nil, givesRecurrenceId: true, refused: false),
             Case(label: "edit_scope this_only", occurrenceId: byOccurrence, editScope: "this_only", givesRecurrenceId: true, refused: false),
-            Case(label: "edit_scope this_and_following", occurrenceId: byOccurrence, editScope: "this_and_following", givesRecurrenceId: true, refused: true, errorNothingWritten: true),
+            Case(label: "edit_scope this_and_following", occurrenceId: byOccurrence, editScope: "this_and_following", givesRecurrenceId: true, refused: false, splitFromPlace: true),
         ]
     }
 
@@ -171,17 +171,6 @@ struct CalDAVOccurrenceEditToolToWireTests {
         let (cards, confirmedAt) = await MainActor.run {
             (sink.confirmations.flatMap(\.calendarEvents), sink.requestsAtConfirmation)
         }
-        if entry.errorNothingWritten {
-            #expect(cards.count == 1 && cards.first.map { Extent(changes: $0.changes) } == .fromHereOn,
-                    "\(label): the split's card was not shown: \(cards.map(\.changes)): \(output)")
-            #expect(harness.store.recordedPuts().isEmpty, "\(label): written: \(harness.store.recordedPuts().map(\.path))")
-            #expect(H.deletes(harness.http).isEmpty, "\(label): deleted: \(H.deletes(harness.http))")
-            #expect(harness.store.storedICS(path: W.seriesPath) == fixture.ics, "\(label): the series is not on the server as it was")
-            let ops = try await harness.pool.read { db in try PendingCalendarOperation.fetchAll(db) }
-            #expect(ops.count == 1 && ops.allSatisfy { $0.status == PendingStatus.failed.rawValue },
-                    "\(label): the split did not end failed, or a write is still queued: \(ops.map { $0.status })")
-            return
-        }
         #expect(cards.count == 1 && confirmedAt.count == 1, "\(label): expected one confirmed card, got \(cards.count): \(output)")
         guard cards.count == 1, confirmedAt.count == 1 else { return }
         let card = cards[0]
@@ -214,7 +203,7 @@ struct CalDAVOccurrenceEditToolToWireTests {
             // What an edit of the whole event does to an occurrence moved on its own is not
             // this property's, so a moved occurrence is not checked for it.
             if extent == .whole, start == shown, start != (try fixture.occurrence(week)) { continue }
-            let changed = extent.covers(start, cardStart: card.startDate)
+            let changed = extent.covers(start, cardStart: entry.splitFromPlace ? try fixture.occurrence(week) : card.startDate)
             #expect(row.summary == (changed ? Self.newTitle : "Standup"),
                     "\(label): the occurrence at \(row.start?.dateTime ?? "nil") \(changed ? "does not show" : "shows") the edit; the card named \(extent) from \(card.startDate)")
         }
