@@ -464,8 +464,54 @@ struct InboxRefusedMoveVisibilityTests {
 
         #expect(result.reported.contains(newId),
                 "the report must name the id the view hides after the re-key")
+        #expect(result.reported.contains(oldId),
+                "the report must still name the id the gesture hid")
         #expect(visibleIds(result.vm, dismissed: result.dismissed).contains(newId),
                 "the re-keyed row the refused move never touched must be visible again")
+        #expect(!result.fading.contains(newId))
+    }
+
+    /// The same re-key, but the view has NOT yet moved its hide to the new id when
+    /// the refusal arrives (the re-key notification reaches it second). The refusal
+    /// must settle the hide under the old id, so the late re-key carries no hide to
+    /// the new id.
+    @Test("A refusal that reaches the view before its re-key leaves the re-keyed row visible")
+    func refusalBeforeRekeyNotificationLeavesRowVisible() async throws {
+        let fixture = try makeFixture()
+        defer { restore(fixture) }
+        MessageHeaderRekey.clearAddressHandoffsForTesting()
+        clearOverlay()
+        let oldId = try insertInboxHeader(fixture, uid: Config.uid)
+        let newId = MessageIdentity.headerId(
+            accountId: fixture.accountId, folderPath: fixture.inbox.path, messageId: Config.rekeyedUid)
+        let record = HeaderRekeyRecord(
+            oldHeaderId: oldId, newHeaderId: newId,
+            newProviderMessageId: Config.rekeyedUid,
+            newObservedUidValidity: Config.gestureEpoch)
+
+        var result = try await archiveWithHeldWrite(
+            fixture, id: oldId, watching: [newId]
+        ) { dismissed, _ in
+            let insertedId = try insertInboxHeader(fixture, uid: Config.rekeyedUid)
+            #expect(insertedId == newId, "setup: the re-keyed row must carry the expected id")
+            try fixture.pool.write { db in
+                _ = try MessageHeader.deleteOne(db, key: oldId)
+                MessageHeaderRekey.publishAddressHandoffsAfterCommit([record], in: db)
+            }
+            #expect(dismissed.contains(oldId) && !dismissed.contains(newId),
+                    "setup: the view still hides the old id")
+        }
+
+        // The re-key notification reaches the view after the refusal.
+        var selected: String?
+        var pushed: String?
+        HeaderRekeyReceiver.apply(
+            [record], dismissedMessages: &result.dismissed, swipeFadingMessages: &result.fading,
+            selectedMessageId: &selected, pushedMessageId: &pushed)
+
+        #expect(result.reported.contains(oldId), "the report must name the id the view hides")
+        #expect(visibleIds(result.vm, dismissed: result.dismissed).contains(newId),
+                "the late re-key must not carry a settled hide to the new id")
         #expect(!result.fading.contains(newId))
     }
 
