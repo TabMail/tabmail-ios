@@ -517,3 +517,18 @@ serializer that writes recipients:
   mutant. Targeted package suites and `swiftlint --strict` pass.
 - App and NSE pin `f4191156dd73d84c5266549c4569d428cb97886e` (`project.yml` and the root
   `Package.resolved`).
+
+## 2026-11-12 — upstream `17e85de` and INBOX outside the personal namespace (#782)
+
+- Upstream squash-merged #288 (`3339619`) and #289 (`17e85de`); `git diff upstream/main 9f52083` was
+  empty, so the collision check found no new upstream behaviour. Fork `main` reset to upstream
+  `17e85de` plus the one commit of [upstream PR #290](https://github.com/Cocoanetics/SwiftMail/pull/290)
+  (head `cafc29f`), our only open upstream PR. `pin/ios-main-9f52083` keeps the previous app pin fetchable.
+- #290 (tabmail-ios #782): `NamespaceResponse.listingPatterns(for:)` adds an `INBOX` pattern to a full
+  listing (`*` / `%`) unless a pattern already covers it (empty prefix `*`, or the `INBOX` root of an
+  `INBOX.` prefix), so a server whose personal prefix is e.g. `Mail/` lists INBOX, once, and the app
+  gets its inbox folder. The pattern is personal: a refused INBOX LIST fails the call.
+- Tests: SwiftMail pattern + connection cases (`IMAPTestServer` gained opt-in `matchesListPatterns`);
+  app `IMAPInboxOutsideNamespaceTests` (real `IMAPProvider` + full sync, using `FakeIMAPServer`'s
+  `setHierarchy(delimiter:personalNamespacePrefix:)` seam). The `Mail/` cases are red on the old pin.
+- App and NSE pin `cafc29fed52ba01a848268ac1036af5342f0d078` (`project.yml` and the root `Package.resolved`).
