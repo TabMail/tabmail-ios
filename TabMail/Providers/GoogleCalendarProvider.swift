@@ -58,8 +58,8 @@ protocol CalendarProvider: Sendable {
     func occurrence(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone) async throws -> GCalEvent
 
     /// Split a recurring series at `recurrenceId` (this_and_following edit_scope):
-    /// cap the original series with UNTIL = recurrenceId - 1, then create a new
-    /// series with the same RRULE starting at `recurrenceId` with `patch` applied.
+    /// create a new series with the same RRULE starting at `recurrenceId` with `patch`
+    /// applied, then cap the original series with UNTIL = recurrenceId - 1.
     /// `sendUpdates` controls invitation emails for the NEW series only — the
     /// master cap is silent so attendees see one notification, not two.
     /// Default implementation throws `CalendarProviderError.notSupported` —
@@ -71,14 +71,29 @@ protocol CalendarProvider: Sendable {
     /// `recurrence_id` string off the SAME durable operation, so honouring the
     /// declared frame in only one of them would make one argument mean two
     /// different instants depending on `edit_scope`.
-    func splitSeries(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, patch: GCalEventInput, sendUpdates: String) async throws -> GCalEvent
+    ///
+    /// 🚨 WRITE ORDER (#601): every provider creates the new part FIRST, hands `record` the
+    /// `SplitRecord` once that create is confirmed, and caps the series only after `record`
+    /// returns. A retry of the same operation then finds the record and goes to
+    /// `eventExists` + `finishSplit` instead of here, so a new part the user deleted between
+    /// the two writes is never created again. A create the calendar reports as already made
+    /// (the deterministic id) counts as confirmed only while that part is still there; when
+    /// it is gone the split is refused with `SplitRecord.newPartDeleted`. A "not found" answer
+    /// for it is passed to `record.partNotFound`, which says how long ago this operation first
+    /// got one, so a provider can tell read-after-write lag from a deletion.
+    func splitSeries(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, patch: GCalEventInput, sendUpdates: String, record: SplitRecorder) async throws -> GCalEvent
 
-    /// The `UNTIL` this calendar's `splitSeries` ends a series with when it splits it at
-    /// `recurrenceId` (read in `zone`; `allDay`: the series is all-day), as the series' RRULE
-    /// (`GCalEvent.recurrence`) reads once that cap is written. Pure, no request. Nil for a
-    /// `recurrenceId` that can't be read, and on a calendar that does not split (the default).
-    /// Read only through `isOwnSplitCap`.
-    func splitCapUntil(beforeNaiveISO recurrenceId: String, allDay: Bool, zone: TimeZone) -> String?
+    /// Whether the event `eventId` (a `SplitRecord.newPartId`) is on the calendar now: false
+    /// only on the calendar's own answer that it is gone (deleted, or cancelled on Google); a
+    /// read that fails for another reason throws. Default: refused, as `splitSeries` is.
+    func eventExists(calendarId: String, eventId: String) async throws -> Bool
+
+    /// Finish the split `record` names: write the cap `splitSeries` writes after its create,
+    /// with the series as it is now (read in `zone`, the operation's `recurrenceIdZone`), and
+    /// nothing else. Writes nothing when the series already ends before `record.splitAt` (its
+    /// cap landed and only the answer was lost, or the user ended it earlier). Default:
+    /// refused, as `splitSeries` is.
+    func finishSplit(calendarId: String, record: SplitRecord, zone: TimeZone) async throws
 
     /// Whether the whole-series edit `edit` (the input the write is given) resets the
     /// occurrences of `event` changed one by one, as this calendar's write treats them: on
@@ -157,22 +172,17 @@ extension CalendarProvider {
     func occurrence(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone) async throws -> GCalEvent {
         throw CalendarProviderError.notSupported("Changing one occurrence of a repeating event, or the occurrences from one on, is not yet supported on this calendar provider. Edit the whole series instead.")
     }
-    func splitSeries(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, patch: GCalEventInput, sendUpdates: String) async throws -> GCalEvent {
-        throw CalendarProviderError.notSupported("Splitting a recurring series at a given occurrence is not yet supported on this calendar provider. Edit the whole series or use the Thunderbird add-on for this-and-following edits.")
+    func splitSeries(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, patch: GCalEventInput, sendUpdates: String, record: SplitRecorder) async throws -> GCalEvent {
+        throw CalendarProviderError.notSupported(Self.splitNotSupported)
     }
-    func splitCapUntil(beforeNaiveISO recurrenceId: String, allDay: Bool, zone: TimeZone) -> String? { nil }
-
-    /// 🚨 THE ONE TEST FOR "THIS SPLIT ALREADY CAPPED THE SERIES": whether `series` (as read)
-    /// ends with the cap `splitSeries` writes when it splits it at `recurrenceId` (read in `zone`).
-    /// Only then do the series' occurrences end just before the split, and a split of it there is
-    /// a retry after its own cap. The providers' `splitSeries` asks it before looking for the
-    /// occurrence the split starts at, and the calendar queue (`CalendarSeriesScope.read`) before
-    /// its own lookup; neither looks for that occurrence then, as the cap ended the series before
-    /// it, and the split goes on to the write it did not finish.
-    func isOwnSplitCap(of series: GCalEvent, at recurrenceId: String, zone: TimeZone) -> Bool {
-        guard let cap = splitCapUntil(beforeNaiveISO: recurrenceId, allDay: series.isAllDay, zone: zone),
-              let rule = series.recurrence?.first(where: { $0.uppercased().hasPrefix("RRULE:") }) else { return false }
-        return RecurrenceTail.isCapped(rule, at: cap)
+    func eventExists(calendarId: String, eventId: String) async throws -> Bool {
+        throw CalendarProviderError.notSupported(Self.splitNotSupported)
+    }
+    func finishSplit(calendarId: String, record: SplitRecord, zone: TimeZone) async throws {
+        throw CalendarProviderError.notSupported(Self.splitNotSupported)
+    }
+    private static var splitNotSupported: String {
+        "Splitting a recurring series at a given occurrence is not yet supported on this calendar provider. Edit the whole series or use the Thunderbird add-on for this-and-following edits."
     }
 }
 
@@ -769,11 +779,6 @@ actor GoogleCalendarProvider: CalendarProvider {
         return found.instance
     }
 
-    /// The cap `splitSeries` writes: the master's RRULE `UNTIL` (`googleUntilString`).
-    nonisolated func splitCapUntil(beforeNaiveISO recurrenceId: String, allDay: Bool, zone: TimeZone) -> String? {
-        Self.googleUntilString(beforeNaiveISO: recurrenceId, allDay: allDay, zone: zone)
-    }
-
     /// Split a recurring series at `recurrenceId`:
     /// 1. POST the new part: a copy of the stored series (`splitNewPartJSON`) starting at
     ///    recurrenceId, with the master's RRULE ending where the original series ended
@@ -782,20 +787,28 @@ actor GoogleCalendarProvider: CalendarProvider {
     ///    keeping its excluded and added dates before the split.
     /// Invitations (`sendUpdates`) fire only on the new series.
     ///
-    /// **Create first, cap last, no rollback** (ADR-IOS-106, the order CalDAV uses). The cap
-    /// removes the excluded and added dates after the split, which the new part takes over. Written
-    /// first, a cap whose response is lost leaves a master without them, and the retry copies the
-    /// new part from that master, so they are gone for good. Written last, the new part already
-    /// holds them: a retry's insert is a proven duplicate of the deterministic id, the existing new
-    /// part is kept as it is, and the split goes on to the cap. A failed cap is rethrown; until the
-    /// retry writes it, both parts show the occurrences after the split.
+    /// **Create first, record, cap last, no rollback** (ADR-IOS-106, the order every provider
+    /// uses). The cap removes the excluded and added dates after the split, which the new part
+    /// takes over. Written first, a cap whose response is lost leaves a master without them, and
+    /// the retry copies the new part from that master, so they are gone for good. Written last,
+    /// the new part already holds them. Between the two, `record` keeps the `SplitRecord`, so a
+    /// retry after a failed or lost cap finishes the cap alone (`finishSplit`) and never writes
+    /// the new part again (#601). A retry that runs the split again (the record was not kept) and
+    /// is told the deterministic id already exists keeps that new part only while it is there: a
+    /// part the user deleted is not created again, and the split is refused
+    /// (`SplitRecord.newPartDeleted`) — at once when it reads as `cancelled`, and when it reads as
+    /// not found only once `SyncConfig.splitPartNotFoundGraceMinutes` have passed since the first
+    /// such answer (until then it may be read-after-write lag, and the operation stays queued).
+    /// A failed cap is rethrown; until the retry writes it, both
+    /// parts show the occurrences after the split.
     func splitSeries(
         calendarId: String = "primary",
         eventId: String,
         recurrenceId: String,
         recurrenceIdZone: TimeZone,
         patch: GCalEventInput,
-        sendUpdates: String = "all"
+        sendUpdates: String = "all",
+        record: SplitRecorder
     ) async throws -> GCalEvent {
         // 1. Fetch the master so we can preserve its fields and read its RRULE.
         //    The agent may have passed an INSTANCE id (Google format
@@ -839,17 +852,14 @@ actor GoogleCalendarProvider: CalendarProvider {
 
         // The new part starts at an occurrence that starts at `recurrenceId` now, the one
         // `occurrence` finds, and was not moved from its place in the series; otherwise the split
-        // throws with nothing written. Not asked on a retry after this split's own cap, which
-        // ended the series before that occurrence.
-        if !isOwnSplitCap(of: master, at: recurrenceId, zone: recurrenceIdZone) {
-            let found = try await occurrence(
-                calendarId: calendarId, named: named, masterId: eventId,
-                recurrenceId: recurrenceId, zone: recurrenceIdZone)
-            if RecurrenceOccurrenceResolver.wasMoved(found) {
-                // A split at an occurrence moved from its place is not supported (#563): a plain
-                // error, nothing written.
-                throw CalendarProviderError.notSupported("split at a moved occurrence")
-            }
+        // throws with nothing written.
+        let found = try await occurrence(
+            calendarId: calendarId, named: named, masterId: eventId,
+            recurrenceId: recurrenceId, zone: recurrenceIdZone)
+        if RecurrenceOccurrenceResolver.wasMoved(found) {
+            // A split at an occurrence moved from its place is not supported (#563): a plain
+            // error, nothing written.
+            throw CalendarProviderError.notSupported("split at a moved occurrence")
         }
 
         // 3. Build the new series: a copy of the stored series, re-anchored at
@@ -877,23 +887,34 @@ actor GoogleCalendarProvider: CalendarProvider {
         } catch GoogleCalendarError.httpError(409, let conflictBody)
                     where Self.isDuplicateIdConflict(conflictBody) {
             // A PROVEN duplicate of our deterministic id: an earlier attempt
-            // created the new series, and its response, or its cap, never
-            // completed. The existing new series is kept as it is (it was copied
-            // from the master before any cap) and the split goes on to the cap.
-            // Any other 409 (empty, unparseable, Google's `conflict`) is not
-            // proof: it is rethrown with nothing written, and the drain retries it.
+            // created the new series and its record was not kept. Google keeps a
+            // client-supplied id after the event is deleted (the event reads as
+            // `cancelled`), so the duplicate alone does not say the new series is
+            // still there: it is kept as it is only while it is (it was copied
+            // from the master before any cap), and the split goes on to record and
+            // cap. A new series the user deleted is never created again (#601): the
+            // split is refused with nothing written. Any other 409 (empty,
+            // unparseable, Google's `conflict`) is not proof: it is rethrown with
+            // nothing written, and the drain retries it.
             //
-            // The proof-GET's own failure may not masquerade as anything else.
+            // The proof read's own failure may not masquerade as anything else.
             // Until 2026-08-06 this arm caught ANY 409, assumed the create had
             // landed, and a 404 from this GET escaped to `isCalendarNotFoundError`,
-            // which deletes the `PendingCalendarOperation` (R14-F2).
+            // which deletes the `PendingCalendarOperation` (R14-F2). `readPart`
+            // answers a 404 or 410 itself, so it never escapes.
+            //
+            // A 404 or 410 right after Google said the id exists may be read-after-write
+            // lag, so it is not yet "deleted": the operation stays queued (the original
+            // 409 is rethrown, which no terminal arm claims) until
+            // `SyncConfig.splitPartNotFoundGraceMinutes` have passed since the first
+            // such answer for this operation (`SplitRecorder.partNotFound`, kept on the
+            // operation), and only then is the split refused. `cancelled` is Google's
+            // own answer that the part was deleted, so it is refused at once.
+            let existing: PartRead
             do {
-                created = try await getEvent(calendarId: calendarId, eventId: newSeriesId)
+                existing = try await readPart(calendarId: calendarId, eventId: newSeriesId)
             } catch {
-                // The new series EXISTS — Google just said so — we merely could not
-                // read it back. Letting this error escape is forbidden: a
-                // 404/`eventNotFound` here is claimed by `isCalendarNotFoundError`
-                // and deletes the durable row. Rethrowing the ORIGINAL 409 says "we
+                // We could not read it back. Rethrowing the ORIGINAL 409 says "we
                 // could not determine the outcome"; no terminal arm claims a 409
                 // (`isCalendarBadRequestError` excludes it as indeterminate), so the
                 // op stays queued and the next drain re-runs the split, re-proves
@@ -903,80 +924,129 @@ actor GoogleCalendarProvider: CalendarProvider {
                 }
                 throw GoogleCalendarError.httpError(409, conflictBody)
             }
+            switch existing {
+            case .live(let event):
+                created = event
+            case .cancelled:
+                if DebugModeManager.isLoggingEnabled() {
+                    BackgroundSyncLogger.logDebug("[GoogleCalendar] splitSeries: new series \(newSeriesId) was deleted — refusing the split")
+                }
+                throw CalendarProviderError.notSupported(SplitRecord.newPartDeleted)
+            case .notFound:
+                let waited = try await record.partNotFound()
+                let grace = TimeInterval(SyncConfig.splitPartNotFoundGraceMinutes * 60)
+                guard waited >= grace else {
+                    if DebugModeManager.isLoggingEnabled() {
+                        BackgroundSyncLogger.logDebug("[GoogleCalendar] splitSeries: new series \(newSeriesId) not found \(Int(waited))s after the first such answer — keeping the operation queued")
+                    }
+                    throw GoogleCalendarError.httpError(409, conflictBody)
+                }
+                if DebugModeManager.isLoggingEnabled() {
+                    BackgroundSyncLogger.logDebug("[GoogleCalendar] splitSeries: new series \(newSeriesId) still not found \(Int(waited))s after the first such answer — refusing the split")
+                }
+                throw CalendarProviderError.notSupported(SplitRecord.newPartDeleted)
+            }
             if DebugModeManager.isLoggingEnabled() {
                 BackgroundSyncLogger.logDebug("[GoogleCalendar] splitSeries: new series \(newSeriesId) already exists — going on to the cap")
             }
         }
 
-        // 5. Build the capped-master patch. The semantic change is recurrence-
-        //    only, but defensive-include the master's existing start/end so
-        //    the provider can't silently re-anchor them on partial PATCH.
-        //    Google's docs explicitly recommend "prefer GET + UPDATE over
-        //    PATCH" for events — sending the unchanged fields makes the
-        //    intent crystal clear and parallels the Exchange Graph fix where
-        //    omitting start/end caused the master to be rewritten to UTC
-        //    midnight at `range.startDate`.
-        var cappedMasterInput = GCalEventInput()
-        cappedMasterInput.recurrence = recurrenceParts.capped
-        if master.isAllDay {
-            if let s = master.start?.date { cappedMasterInput.startDate = s }
-            if let e = master.end?.date { cappedMasterInput.endDate = e }
-        } else {
-            if let s = master.start?.dateTime { cappedMasterInput.startDateTime = s }
-            if let tz = master.start?.timeZone { cappedMasterInput.startTimeZone = tz }
-            if let e = master.end?.dateTime { cappedMasterInput.endDateTime = e }
-            if let tz = master.end?.timeZone { cappedMasterInput.endTimeZone = tz }
-        }
+        // 5. Keep the record before the cap: a retry after this point finishes the
+        //    cap alone (`finishSplit`).
+        try await record(SplitRecord(seriesId: eventId, newPartId: created.id ?? newSeriesId, splitAt: recurrenceId))
 
-        // 6. PATCH master silently. A failure is rethrown; the new series exists,
-        //    so the retry proves the duplicate above and writes the cap again.
+        // 6. PATCH master silently. A failure is rethrown; the record is kept, so
+        //    the retry writes the cap alone.
         let _: GCalEvent = try await patchEvent(
             calendarId: calendarId,
             eventId: eventId,
-            event: cappedMasterInput,
+            event: Self.splitCapInput(master: master, cappedRecurrence: recurrenceParts.capped),
             sendUpdates: "none",
             keepStoredDates: false
         )
         return created
     }
 
-    /// 🚨 **R13-U4 — the error a half-landed split reports depends on whether its
-    /// ROLLBACK worked.** Used by `ExchangeCalendarProvider.splitSeries`, the one
-    /// split that still caps first (Google and CalDAV create first and roll nothing
-    /// back, ADR-IOS-106).
-    ///
-    /// An Outlook split is cap-then-create. If the create fails, it tries to
-    /// restore the master's original recurrence and then rethrows. Until
-    /// 2026-08-06 the restore was `_ = try? await updateEvent(…)`, which reports a
-    /// failed rollback and a successful one IDENTICALLY. That matters because the
-    /// rethrown error decides the queue's disposition: when the create failed with
-    /// a 400/415/422, `isCalendarBadRequestError` claims it and the drain DELETES
-    /// the durable row — so a rollback that had ALSO failed left the master
-    /// permanently capped, with no successor series and no queued work to make
-    /// one. Later sync imports the truncated master and cannot reconstruct the
-    /// original recurrence.
-    ///
-    /// - `revertFailure == nil` ⇒ the original error, verbatim. The master is back
-    ///   to its pre-split state, so the pre-existing disposition is still right and
-    ///   this deliberately changes nothing about it.
-    /// - `revertFailure != nil` ⇒ `CalDAVError.inconsistentState`, carrying BOTH
-    ///   causes. The drain has a dedicated arm for that case whose own comment
-    ///   already states the rationale (*"retrying would re-cap an already-capped
-    ///   master and create duplicate successor series"*): terminal, with the reason
-    ///   surfaced to the user.
-    ///
-    /// ⚠️ NOT "make every rollback failure retryable" — that is the mirror image,
-    /// and it would put a two-step write that has already half landed into an
-    /// unbounded retry against a master that is already capped. Terminal-with-a-
-    /// reason is the disposition that is neither a silent drop nor a wedge.
-    ///
-    /// The case is `CalDAVError.inconsistentState` rather than a Google- or
-    /// Graph-domain twin because that is the case the drain already claims;
-    /// inventing a third spelling of one state is how classifiers drift.
-    static func splitRollbackError(original: Error, revertFailure: Error?) -> Error {
-        guard let revertFailure else { return original }
-        return CalDAVError.inconsistentState(
-            "the recurring series was capped but its replacement series could not be created (\(original)), and restoring the original recurrence also failed (\(revertFailure)). The series now ends early on the server and needs its recurrence fixed by hand.")
+    /// The capped-master patch a split writes. The semantic change is recurrence-only, but the
+    /// master's existing start/end are included so the provider can't silently re-anchor them on
+    /// partial PATCH. Google's docs explicitly recommend "prefer GET + UPDATE over PATCH" for
+    /// events — sending the unchanged fields makes the intent crystal clear and parallels the
+    /// Exchange Graph fix where omitting start/end caused the master to be rewritten to UTC
+    /// midnight at `range.startDate`.
+    static func splitCapInput(master: GCalEvent, cappedRecurrence: [String]) -> GCalEventInput {
+        var input = GCalEventInput()
+        input.recurrence = cappedRecurrence
+        if master.isAllDay {
+            if let s = master.start?.date { input.startDate = s }
+            if let e = master.end?.date { input.endDate = e }
+        } else {
+            if let s = master.start?.dateTime { input.startDateTime = s }
+            if let tz = master.start?.timeZone { input.startTimeZone = tz }
+            if let e = master.end?.dateTime { input.endDateTime = e }
+            if let tz = master.end?.timeZone { input.endTimeZone = tz }
+        }
+        return input
+    }
+
+    /// What Google answers for an event read by id.
+    private enum PartRead {
+        /// The event, there now.
+        case live(GCalEvent)
+        /// The event reads as `cancelled`: deleted, with Google still keeping its id.
+        case cancelled
+        /// Google answers 404 or 410.
+        case notFound
+    }
+
+    /// The event as Google has it now. Any failure other than a 404 or 410 is thrown.
+    private func readPart(calendarId: String, eventId: String) async throws -> PartRead {
+        let event: GCalEvent
+        do {
+            event = try await getEvent(calendarId: calendarId, eventId: eventId)
+        } catch GoogleCalendarError.httpError(let code, _) where code == 404 || code == 410 {
+            return .notFound
+        } catch GoogleCalendarError.eventNotFound {
+            return .notFound
+        }
+        return event.status == "cancelled" ? .cancelled : .live(event)
+    }
+
+    /// False when Google answers 404 or 410, or the event reads as `cancelled`.
+    func eventExists(calendarId: String = "primary", eventId: String) async throws -> Bool {
+        if case .live = try await readPart(calendarId: calendarId, eventId: eventId) { return true }
+        return false
+    }
+
+    /// The cap of the split `record` names, written alone (`CalendarProvider.finishSplit`): the
+    /// cap `splitSeries` writes, worked out from the series as it is now, and nothing when the
+    /// series already ends before the split.
+    func finishSplit(calendarId: String = "primary", record: SplitRecord, zone: TimeZone) async throws {
+        let master = try await getEvent(calendarId: calendarId, eventId: record.seriesId)
+        guard let recurrence = master.recurrence,
+              let rule = recurrence.first(where: { $0.uppercased().hasPrefix("RRULE:") }) else {
+            throw CalendarProviderError.notSupported("Can't finish this change to the repeating event: it no longer repeats. Check the event in your calendar app.")
+        }
+        guard let untilValue = Self.googleUntilString(beforeNaiveISO: record.splitAt, allDay: master.isAllDay, zone: zone),
+              let slot = Self.splitInstant(naiveISO: record.splitAt, allDay: master.isAllDay, zone: zone) else {
+            throw CalendarProviderError.notSupported("Invalid recurrence_id '\(record.splitAt)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
+        }
+        let days = Self.splitDaysInMasterFrame(master: master, recurrenceId: record.splitAt, recurrenceIdZone: zone)
+        if try RecurrenceTail.endsBeforeSplit(rule, seriesStart: days.seriesStart, split: days.split, capUntil: untilValue) {
+            if DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[GoogleCalendar] finishSplit: series \(record.seriesId) already ends before \(record.splitAt) — nothing to write")
+            }
+            return
+        }
+        // Only the series' half is written; the new part's rule is not needed here.
+        let cappedRRule = Self.replaceOrAppendUntil(in: rule, untilValue: untilValue)
+        let capped = try Self.splitRecurrence(recurrence, cappedRRule: cappedRRule, tailRRule: cappedRRule, slot: slot).capped
+        let _: GCalEvent = try await patchEvent(
+            calendarId: calendarId,
+            eventId: record.seriesId,
+            event: Self.splitCapInput(master: master, cappedRecurrence: capped),
+            sendUpdates: "none",
+            keepStoredDates: false
+        )
     }
 
     /// Does this Google Calendar 409 body positively say *"the identifier you
@@ -1003,10 +1073,9 @@ actor GoogleCalendarProvider: CalendarProvider {
     /// 2026-08-06, and `splitSeries` — in THIS file — needs the identical
     /// question answered before it may treat a 409 as proof the successor series
     /// exists. Copying it in would have produced two spellings of one invariant,
-    /// which is precisely the drift `splitRollbackError` above was created to
-    /// prevent. Parsing a Google error payload is the Google provider's job, and
-    /// `deterministicSplitEventId` / `splitRollbackError` already establish that
-    /// a cross-provider helper lives on this type. Still `static` (hence
+    /// which is the drift a single classifier prevents. Parsing a Google error
+    /// payload is the Google provider's job, and `deterministicSplitEventId`
+    /// already establishes that a cross-provider helper lives on this type. Still `static` (hence
     /// nonisolated), so the discrimination stays table-testable against real
     /// Google error payloads exactly as before.
     static func isDuplicateIdConflict(_ body: Data?) -> Bool {

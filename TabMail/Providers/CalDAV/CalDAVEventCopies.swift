@@ -76,39 +76,14 @@ extension CalDAVProvider {
         now: Date,
         zones: CalendarTimeZoneContext
     ) throws -> SeriesSplitResources {
-        let kind = masterDTStartKind(from: storedICS)
-        guard let dtstart = masterTopLevelLines(storedICS).first(where: { icsProperty($0)?.name == "DTSTART" }),
-              let dtstartProperty = icsProperty(dtstart) else {
-            throw CalendarProviderError.notSupported("The repeating event has no start, so it can't be split.")
-        }
-        guard let slotValue = icsDateValue(fromNaive: slotNaiveISO, kind: kind) else {
-            throw CalendarProviderError.notSupported("Invalid recurrence_id '\(slotNaiveISO)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
-        }
-        let slotLine = "DTSTART\(dtstartProperty.params):\(slotValue)"
-        guard let slotInstant = try parseICSDateTime(slotLine, zones: zones) else {
-            throw CalendarProviderError.notSupported("The repeating event's time zone can't be read, so it can't be split.")
-        }
+        let (slotLine, slotInstant) = try splitSlot(storedICS: storedICS, slotNaiveISO: slotNaiveISO, zones: zones)
         guard let duration = try extractMasterDuration(from: storedICS, zones: zones) else {
             throw CalendarProviderError.notSupported("The repeating event's length can't be read, so it can't be split.")
         }
         let stamp = utcStamp(now)
 
-        // 1. The capped series: the cap, and nothing at or after the slot.
-        let capped = try rewriteVEvents(in: storedICS) { block, isMaster in
-            if !isMaster {
-                return try recurrenceInstant(of: block, zones: zones) < slotInstant ? block : nil
-            }
-            return try rewriteTopLevel(block) { unit, name in
-                switch name {
-                case "RRULE":
-                    return [cappedRRule]
-                case "EXDATE", "RDATE":
-                    return try filterDateList(unit.text, zones: zones, keep: { $0 < slotInstant })
-                default:
-                    return nil
-                }
-            }
-        }
+        // 1. The capped series.
+        let capped = try cappedSeriesResource(storedICS: storedICS, slotInstant: slotInstant, cappedRRule: cappedRRule, zones: zones)
 
         // 2. The new part, re-anchored at the slot.
         let anchored = try rewriteVEvents(in: storedICS) { block, isMaster in
@@ -148,6 +123,49 @@ extension CalDAVProvider {
         let patched = try mergePatchKeepingLength(patch, into: anchored, length: duration, zones: zones)
         let newPart = try applyAttendeeRule(before: anchored, after: patched, zones: zones)
         return SeriesSplitResources(cappedSeries: capped, newPart: newPart)
+    }
+
+    /// The split occurrence's `DTSTART` line in the series' own form (its parameters and value
+    /// type) and the instant it names. `slotNaiveISO` is already in the series' frame.
+    static func splitSlot(
+        storedICS: String, slotNaiveISO: String, zones: CalendarTimeZoneContext
+    ) throws -> (line: String, instant: Date) {
+        let kind = masterDTStartKind(from: storedICS)
+        guard let dtstart = masterTopLevelLines(storedICS).first(where: { icsProperty($0)?.name == "DTSTART" }),
+              let dtstartProperty = icsProperty(dtstart) else {
+            throw CalendarProviderError.notSupported("The repeating event has no start, so it can't be split.")
+        }
+        guard let slotValue = icsDateValue(fromNaive: slotNaiveISO, kind: kind) else {
+            throw CalendarProviderError.notSupported("Invalid recurrence_id '\(slotNaiveISO)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
+        }
+        let slotLine = "DTSTART\(dtstartProperty.params):\(slotValue)"
+        guard let slotInstant = try parseICSDateTime(slotLine, zones: zones) else {
+            throw CalendarProviderError.notSupported("The repeating event's time zone can't be read, so it can't be split.")
+        }
+        return (slotLine, slotInstant)
+    }
+
+    /// The series' half of a split (`seriesSplitResources`, and `finishSplit` on its own): the
+    /// stored series with `cappedRRule` as its rule, and nothing at or after `slotInstant` (its
+    /// changed occurrences, excluded and added dates there go to the new part).
+    static func cappedSeriesResource(
+        storedICS: String, slotInstant: Date, cappedRRule: String, zones: CalendarTimeZoneContext
+    ) throws -> String {
+        try rewriteVEvents(in: storedICS) { block, isMaster in
+            if !isMaster {
+                return try recurrenceInstant(of: block, zones: zones) < slotInstant ? block : nil
+            }
+            return try rewriteTopLevel(block) { unit, name in
+                switch name {
+                case "RRULE":
+                    return [cappedRRule]
+                case "EXDATE", "RDATE":
+                    return try filterDateList(unit.text, zones: zones, keep: { $0 < slotInstant })
+                default:
+                    return nil
+                }
+            }
+        }
     }
 
     // MARK: - One-occurrence override

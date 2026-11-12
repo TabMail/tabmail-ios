@@ -18,14 +18,6 @@ actor CalDAVProvider: CalendarProvider {
         return edited != rule(event.recurrence)
     }
 
-    /// The cap `splitSeries` writes: the master's RRULE `UNTIL`, as Google's
-    /// (`GoogleCalendarProvider.googleUntilString`). The split computes it from the occurrence's
-    /// slot, which is `recurrenceId` for every occurrence it splits at (one moved from its place is
-    /// refused there).
-    nonisolated func splitCapUntil(beforeNaiveISO recurrenceId: String, allDay: Bool, zone: TimeZone) -> String? {
-        GoogleCalendarProvider.googleUntilString(beforeNaiveISO: recurrenceId, allDay: allDay, zone: zone)
-    }
-
     private let client: CalDAVClient
     private let calendarHomeURL: URL
     private let serverBaseURL: URL
@@ -591,16 +583,21 @@ actor CalDAVProvider: CalendarProvider {
     /// series that no longer holds them, and the retry copies the new part from
     /// that series, so they are gone for good. Written last, the new part already
     /// holds them, and every interruption leaves at worst both parts showing the
-    /// later occurrences until the retry writes the cap. The retry finds its own
-    /// new part (a 412 on the create-only PUT whose resource carries our UID) and
-    /// goes on to the cap. A failed cap is rethrown and nothing is rolled back.
+    /// later occurrences until the retry writes the cap. Between the two writes
+    /// `record` keeps the `SplitRecord`, so a retry after a failed or lost cap
+    /// writes the cap alone (`finishSplit`) and never writes the new part again
+    /// (#601). A retry that runs the split again (the record was not kept) finds
+    /// its own new part (a 412 on the create-only PUT whose resource carries our
+    /// UID) and goes on to record and cap. A failed cap is rethrown and nothing
+    /// is rolled back.
     func splitSeries(
         calendarId: String,
         eventId: String,
         recurrenceId: String,
         recurrenceIdZone: TimeZone,
         patch: GCalEventInput,
-        sendUpdates: String
+        sendUpdates: String,
+        record: SplitRecorder
     ) async throws -> GCalEvent {
         // An occurrence id addresses its series' resource, and its key names the occurrence.
         // The split's new part is named from the series' href and the checked slot whichever
@@ -618,8 +615,7 @@ actor CalDAVProvider: CalendarProvider {
 
         // The occurrence the split starts at: one the series has, or nothing is written
         // (`CalDAVOccurrences.scopedEditSlot`, the same check `updateOccurrence` makes). Where
-        // the series ends is left to `RecurrenceTail.newSeriesRule` below, which also knows a
-        // series this split already capped.
+        // the series ends is left to `RecurrenceTail.newSeriesRule` below.
         let slot = try CalDAVOccurrences.scopedEditSlot(
             icsText: masterICS, href: seriesHref, key: occurrenceKey,
             recurrenceId: recurrenceId, zone: recurrenceIdZone, forSplit: true)
@@ -730,7 +726,10 @@ actor CalDAVProvider: CalendarProvider {
             }
         }
 
-        // 4. PUT the capped series back. No ETag ⇒ `.unconditional`: step 1's GET
+        // 4. Keep the record before the cap: a retry after this point writes the cap alone.
+        try await record(SplitRecord(seriesId: seriesHref, newPartId: newEventURL.path, splitAt: slot))
+
+        // 5. PUT the capped series back. No ETag ⇒ `.unconditional`: step 1's GET
         //    proved the series resource exists (its ICS is what we just capped),
         //    so `If-None-Match: *` would assert the opposite. With an ETag, a
         //    concurrent edit since the GET 412s and the retry caps the series as
@@ -743,6 +742,65 @@ actor CalDAVProvider: CalendarProvider {
             precondition: etag.map(CalDAVPutPrecondition.ifMatch) ?? .unconditional)
 
         return created
+    }
+
+    /// Whether the resource at `eventId` (a `SplitRecord.newPartId`, the new part's path, which
+    /// this client chose) is still there: false when the server answers 404 or 410. Any other
+    /// failure is thrown.
+    func eventExists(calendarId: String, eventId: String) async throws -> Bool {
+        let url = try resolveEventURL(eventId, calendarId: calendarId)
+        do {
+            _ = try await client.get(url: url)
+            return true
+        } catch CalDAVError.notFound {
+            return false
+        } catch CalDAVError.httpError(410, _) {
+            return false
+        }
+    }
+
+    /// The cap of the split `record` names, written alone (`CalendarProvider.finishSplit`): the
+    /// series' half `seriesSplitResources` builds (`cappedSeriesResource`), worked out from the
+    /// series as it is now and PUT under its ETag, and nothing when the series already ends
+    /// before the split. `record.splitAt` is the checked slot `splitSeries` split at, read in
+    /// `zone`.
+    func finishSplit(calendarId: String, record: SplitRecord, zone: TimeZone) async throws {
+        let eventURL = try resolveEventURL(record.seriesId, calendarId: calendarId)
+        let (data, getResponse) = try await client.get(url: eventURL)
+        guard let storedICS = String(data: data, encoding: .utf8), !storedICS.isEmpty else {
+            throw CalDAVError.parseError("Empty response for event \(record.seriesId)")
+        }
+        let etag = getResponse.value(forHTTPHeaderField: "ETag")
+        guard let originalRRule = Self.extractRRule(from: storedICS) else {
+            throw CalendarProviderError.notSupported("Can't finish this change to the repeating event: it no longer repeats. Check the event in your calendar app.")
+        }
+        guard let untilValue = GoogleCalendarProvider.googleUntilString(
+            beforeNaiveISO: record.splitAt, allDay: Self.icsIsAllDay(storedICS), zone: zone) else {
+            throw CalendarProviderError.notSupported("Invalid recurrence_id '\(record.splitAt)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
+        }
+        let zones = CalendarTimeZoneContext(calendarText: storedICS)
+        guard let masterFrameSlot = try Self.recurrenceIdInMasterFrame(
+            record.splitAt, declaredZone: zone, kind: Self.masterDTStartKind(from: storedICS), zones: zones
+        ) else {
+            throw CalendarProviderError.notSupported(
+                "Could not express recurrence_id '\(record.splitAt)' (\(zone.identifier)) in this event's timezone — refusing to finish a split at an occurrence we cannot name.")
+        }
+        if try RecurrenceTail.endsBeforeSplit(
+            originalRRule, seriesStart: Self.masterDTStartDay(from: storedICS),
+            split: RecurrenceTail.Day(iso: masterFrameSlot), capUntil: untilValue) {
+            if DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[CalDAV] finishSplit: series \(record.seriesId) already ends before \(record.splitAt) — nothing to write")
+            }
+            return
+        }
+        let cappedRRule = GoogleCalendarProvider.replaceOrAppendUntil(in: originalRRule, untilValue: untilValue)
+        let slotInstant = try Self.splitSlot(storedICS: storedICS, slotNaiveISO: masterFrameSlot, zones: zones).instant
+        let cappedSeries = try Self.cappedSeriesResource(
+            storedICS: storedICS, slotInstant: slotInstant, cappedRRule: cappedRRule, zones: zones)
+        etagCache.removeValue(forKey: record.seriesId)
+        try await putEvent(
+            url: eventURL, body: cappedSeries,
+            precondition: etag.map(CalDAVPutPrecondition.ifMatch) ?? .unconditional)
     }
 
     /// Every CalDAV event write: the final body gets its organizer (`withOrganizer`), then it is PUT.

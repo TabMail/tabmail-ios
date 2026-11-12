@@ -131,7 +131,6 @@ struct CalendarBadRequestClassificationTests {
         if AccountManager.isCalendarMissingScopeError(error) { return true }
         if AccountManager.isCalendarAuthError(error) { return true }
         if AccountManager.isCalendarUnsupportedError(error) { return true }
-        if case CalDAVError.inconsistentState = error { return true }
         if AccountManager.isCalendarBadRequestError(error) { return true }
         return false
     }
@@ -293,56 +292,6 @@ struct CalendarBadRequestClassificationTests {
         }
     }
 
-    @Test("R13-U4 — a split whose ROLLBACK also failed never leaves through the malformed-payload door")
-    func aFailedSplitRollbackDoesNotRetireAsABadRequest() {
-        // SYSTEM PROPERTY: a series that has been CAPPED on the server, with no
-        // successor created and no rollback, must not be retired by the arm that
-        // exists for "your payload is broken" — because that arm retires the
-        // durable row silently (`status = 'failed'`; it deleted it before R16-1),
-        // and the user is left with a recurring series that ends early, no queued
-        // work to fix it, and no way for sync to know.
-        //
-        // The pre-fix shape reported both rollback outcomes identically
-        // (`_ = try? await updateEvent(… revertInput …)` then `throw error`), so
-        // whether the master was still capped made no difference to the queue's
-        // disposition at all. This composes the real classifier the Outlook
-        // split uses (the one split that still caps first) with the drain's real
-        // terminal roster.
-        //
-        // 400 is chosen deliberately: it is exactly the code that makes the
-        // difference visible. `isCalendarBadRequestError` claims a bare 400, so
-        // pre-fix the whole half-landed split vanished through it.
-        let original = ExchangeCalendarError.httpError(400, nil)
-
-        // ROLLBACK SUCCEEDED — the master is back to its pre-split state, so the
-        // pre-existing disposition is still correct and must NOT change. Pinning
-        // this side is what stops the fix from over-reaching into "every split
-        // failure is now inconsistentState".
-        let recovered = GoogleCalendarProvider.splitRollbackError(original: original, revertFailure: nil)
-        #expect(AccountManager.isCalendarBadRequestError(recovered),
-                "a split whose rollback succeeded leaves nothing half-written; retiring the malformed 400 is right and this fix must not have changed it")
-
-        // ROLLBACK FAILED — the server is in a state no retry of this op can
-        // repair (a retry re-caps an already-capped master), and no silent
-        // retirement may claim it.
-        let stranded = GoogleCalendarProvider.splitRollbackError(
-            original: original, revertFailure: URLError(.timedOut))
-        #expect(AccountManager.isCalendarBadRequestError(stranded) == false,
-                "the half-landed split was retired as a malformed request — the durable row is retired unexecuted and the truncated master is left on the server with nothing queued to repair it")
-        #expect(claimedByATerminalArm(stranded),
-                "it must still reach SOME terminal arm — falling into the transient arm would head-of-line-block every later calendar op on the account, which is the wedge this suite's other tests guard against")
-
-        // The user has to fix this by hand, so both causes must survive into the
-        // reason string the drain surfaces.
-        guard case CalDAVError.inconsistentState(let reason) = stranded else {
-            Issue.record("expected inconsistentState, got \(stranded)")
-            return
-        }
-        #expect(reason.contains("400"), "the original create failure must survive into the reason: \(reason)")
-        #expect(reason.lowercased().contains("timed out") || reason.contains("-1001"),
-                "the rollback failure must survive into the reason too, or the user is told only half the story: \(reason)")
-    }
-
     // MARK: - R14-F4 — the credential failures that carried no HTTP status at all
 
     /// 🚨 **THE CENSUS SHAPE, not the finding, is what this section fixes
@@ -392,7 +341,6 @@ struct CalendarBadRequestClassificationTests {
             // exactly the remedy, so terminalizing it would discard a live edit.
             ("CalDAV stale-ETag precondition", CalDAVError.preconditionFailed, false),
             ("CalDAV unreadable response body", CalDAVError.parseError("Empty response for event evt-1"), false),
-            ("CalDAV half-landed split, rollback failed", CalDAVError.inconsistentState("capped, no successor"), true),
             // — Demo: a registered `CalendarProvider` like any other (R15-FIX-4).
             //   `DemoModeService` calls `AccountManager.registerDemoProviders`, which
             //   puts `DemoCalendarProvider` into `calendarProviders`, so this drain
@@ -406,6 +354,15 @@ struct CalendarBadRequestClassificationTests {
             ("Demo database not up", DemoError.notInDemo, false),
             // — Cross-provider —
             ("provider cannot perform this edit scope", CalendarProviderError.notSupported("this_and_following"), true),
+            // — A split interrupted between its writes (#601). No split rolls back any more, so
+            //   CalDAV's half-landed `inconsistentState` is gone from the call graph; these are
+            //   what a split can throw instead —
+            ("a split's new part was deleted", CalendarProviderError.notSupported(SplitRecord.newPartDeleted), true),
+            // The split's row was gone when its record was to be kept: nothing is left to retry.
+            ("a split's queued row is gone before its cap", SplitRecord.OperationGone(), false),
+            // Google said the new part's id exists, then reads it as not found: until the grace
+            // has passed this may be read-after-write lag, and the split is retried.
+            ("Google duplicate 409 rethrown while the new part is not yet visible", GoogleCalendarError.httpError(409, nil), false),
             // — THE R14-F4 CLASS: raised before any request is issued —
             ("OAuth grant revoked (invalid_grant)", OAuthError.tokenExchangeFailed("invalid_grant"), true),
             ("OAuth client rejected (invalid_client)", OAuthError.tokenExchangeFailed("invalid_client"), true),
@@ -427,7 +384,7 @@ struct CalendarBadRequestClassificationTests {
         // MIS-030: anchor the roster's own cardinality, so a future edit that
         // silently empties or truncates it cannot make every assertion below
         // pass over nothing.
-        #expect(roster.count == 32, "the roster lost or gained entries — re-derive it from the call graph")
+        #expect(roster.count == 34,"the roster lost or gained entries — re-derive it from the call graph")
         for (label, error, terminal) in roster {
             #expect(
                 claimedByATerminalArm(error) == terminal,
@@ -640,8 +597,6 @@ struct CalendarBadRequestClassificationTests {
                         "\(label) HTTP \(code) is not a client error")
             }
         }
-        #expect(AccountManager.isCalendarBadRequestError(
-            CalDAVError.inconsistentState("rollback failed")) == false)
         #expect(AccountManager.isCalendarBadRequestError(
             URLError(.networkConnectionLost)) == false)
     }

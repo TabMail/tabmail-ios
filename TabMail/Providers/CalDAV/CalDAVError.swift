@@ -12,10 +12,4 @@ enum CalDAVError: Error {
     case discoveryFailed(String)
     case parseError(String)
     case noWritableCalendar
-    /// A multi-step write (e.g. a `this_and_following` series split) failed
-    /// partway AND the best-effort revert of the already-applied step also
-    /// failed — the calendar resource is left in an inconsistent state that
-    /// needs manual attention. The associated string is a human-readable
-    /// description for the user/LLM.
-    case inconsistentState(String)
 }

@@ -59,6 +59,12 @@ actor MockCalendarProvider: CalendarProvider {
     var updateOccurrenceThrows: Error?
     var splitSeriesResult: GCalEvent?
     var splitSeriesThrows: Error?
+    /// Thrown by `splitSeries` after it handed over its record: the cap failed.
+    var splitSeriesCapThrows: Error?
+    var eventExistsResult = true
+    var eventExistsThrows: Error?
+    var finishSplitThrows: Error?
+    var finishSplitCalls: [SplitRecord] = []
     /// What `occurrence` returns; nil gives an occurrence that starts at `recurrenceId` and was
     /// never moved (`syntheticOccurrence`), all-day when the event `getEvent` returns is.
     var occurrenceResult: GCalEvent?
@@ -172,15 +178,36 @@ actor MockCalendarProvider: CalendarProvider {
         return event
     }
 
-    func splitSeries(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, patch: GCalEventInput, sendUpdates: String) async throws -> GCalEvent {
+    /// Records the split. Once `splitSeriesResult` is set (the new part is "created") the
+    /// `SplitRecord` is handed to `record`, then `splitSeriesCapThrows` stands for the cap failing.
+    func splitSeries(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, patch: GCalEventInput, sendUpdates: String, record: SplitRecorder) async throws -> GCalEvent {
         callLog.append("splitSeries(calendarId:\(calendarId),eventId:\(eventId),recurrenceId:\(recurrenceId),recurrenceIdZone:\(recurrenceIdZone.identifier),sendUpdates:\(sendUpdates))")
         splitSeriesCalls.append((calendarId: calendarId, eventId: eventId, recurrenceId: recurrenceId, recurrenceIdZone: recurrenceIdZone, patch: patch, sendUpdates: sendUpdates))
         if let error = splitSeriesThrows { throw error }
         guard let result = splitSeriesResult else {
             throw NSError(domain: "MockCalendarProvider", code: 500, userInfo: [NSLocalizedDescriptionKey: "No mock result configured"])
         }
+        try await record(SplitRecord(seriesId: eventId, newPartId: result.id ?? "", splitAt: recurrenceId))
+        if let error = splitSeriesCapThrows { throw error }
         return result
     }
+
+    func eventExists(calendarId: String, eventId: String) async throws -> Bool {
+        callLog.append("eventExists(calendarId:\(calendarId),eventId:\(eventId))")
+        if let error = eventExistsThrows { throw error }
+        return eventExistsResult
+    }
+
+    func finishSplit(calendarId: String, record: SplitRecord, zone: TimeZone) async throws {
+        callLog.append("finishSplit(calendarId:\(calendarId),seriesId:\(record.seriesId),splitAt:\(record.splitAt),zone:\(zone.identifier))")
+        finishSplitCalls.append(record)
+        if let error = finishSplitThrows { throw error }
+    }
+
+    func setSplitSeriesCapThrows(_ error: Error?) { splitSeriesCapThrows = error }
+    func setEventExistsResult(_ exists: Bool) { eventExistsResult = exists }
+    func setEventExistsThrows(_ error: Error?) { eventExistsThrows = error }
+    func setFinishSplitThrows(_ error: Error?) { finishSplitThrows = error }
 
     // MARK: - Test Helpers
 

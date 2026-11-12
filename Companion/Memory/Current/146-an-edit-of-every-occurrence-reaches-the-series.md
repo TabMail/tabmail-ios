@@ -59,7 +59,7 @@ written (`CalendarProviderError.notSupported("split at a moved occurrence")`). I
 `splitSeries`' own check, where a split is written, on all three providers, never by the occurrence
 lookup (`occurrence(...)` finds a moved occurrence like any other). On CalDAV that check is #613's
 `scopedEditSlot(forSplit: true)`, untouched, with its own words. It is deliberately NOT a finished
-refusal: no dedicated wording and no work to order it before the card (coordinator rulings,
+refusal: no dedicated wording and no work to order it before the card (ruled
 2026-11-11). So, on Google, Outlook and CalDAV alike:
 - a split at a moved LATER occurrence (`this_and_following` named there, or an "all" new date named
   there, which `route` makes a split) shows its card, then the queued split throws at the drain, nothing
@@ -201,8 +201,8 @@ exception shows its original slot there while `start` shows the moved time. An a
 `…-11-30T15:00:00Z`). `ExchangeCalendarProvider.originalStartTime` maps every occurrence to the instant
 (nil when no ISO 8601 date-time with a zone designator) on every ordinary read.
 
-**An all-day occurrence's place is read in the series' own zone, as Graph names it** (option B,
-coordinator ruling 2026-11-11, on the measurement of that day). Measured on a work account (all-day
+**An all-day occurrence's place is read in the series' own zone, as Graph names it** (ruled
+2026-11-11, on the measurement of that day). Measured on a work account (all-day
 series every two days in Pacific Standard Time, Tokyo Standard Time and Asia/Kathmandu, +5:45; a plain
 occurrence and one moved a day earlier each; read by id and through `/instances`, identical): with
 `Prefer: outlook.timezone` naming the series' zone, `originalStart` is local midnight with that zone's
@@ -279,7 +279,7 @@ start (the same lookup as `occurrence`), and refuse with nothing written when no
 between two, a date off its days, a deleted occurrence), so no phantom part is written. CalDAV's split is
 checked by #613.
 
-**A split retried after its own cap is finished, not looked up again** (coordinator ruling, option X,
+**A split retried after its own cap is finished, not looked up again** (ruled
 2026-11-11). Once the cap is written the series ends before the occurrence the split starts at, so a
 lookup of it reports it not found. ONE predicate says "this split already capped the series":
 `CalendarProvider.isOwnSplitCap(of:at:zone:)` (a protocol extension): the series' RRULE ends with the
@@ -300,6 +300,18 @@ writes for a range ending on that date; default nil, no split). Called from both
 No provider's write order changed (#601 owns moving Outlook to create first). Outlook caps first, so its
 interrupted split had lost the new part: the retry was retired "not found" with the series truncated.
 Google and CalDAV write the cap last, so theirs had lost only the row's success.
+
+**Amendment (2026-11-11, #601): superseded by the split record.** The own-cap rule above is gone:
+`isOwnSplitCap`, `RecurrenceTail.isCapped`, `splitCapUntil`, `afterOwnSplitCap` and the queue `read`'s
+`splitting` are deleted. Every provider writes the new part first and keeps a `SplitRecord` on the queued
+row before the cap (memory 142, amendment; ADR-IOS-106, amendment). A retry with a record skips `read` and
+`route` entirely: `eventExists` on the new part, then `finishSplit`, or the refusal
+`SplitRecord.newPartDeleted` when the user deleted it. A retry without a record reads and looks the
+occurrence up like any edit, and a series that already ends on this split's cap is refused, not finished
+(`RecurrenceTail.newSeriesRule` on Google and CalDAV; on Outlook the occurrence lookup, since Graph lists no
+occurrence past the range's end). An Outlook split named by an OCCURRENCE id
+and interrupted after its create now ends complete on its retry: the record names the series and the new
+part, so the occurrence Graph no longer lists after the cap is never read again.
 
 The queue's `read` is still made on every retry and still looks the occurrence up where it starts now
 for every other edit. So a retried first-occurrence date shift whose first response was lost can report
@@ -326,6 +338,9 @@ series with one PUT) and the unrecognized-zone row. The fakes filter `/instances
 cancelled Google instance out of the list, and Graph refuses a PATCH moving an occurrence onto another
 (`ErrorOccurrenceCrossingBoundary`).
 
+Since #601 (2026-11-11): `SplitInterruptedBetweenItsWritesTests` (a split interrupted between its writes:
+finished by its record while the new part is there, by series or occurrence id; refused with nothing written
+once the user deleted it; the next queued change drains) replaces the suite named below. History:
 A split interrupted after its cap ends complete on its retry (`SplitRetriedAfterItsOwnCapTests`: Outlook,
 cap applied and its response lost, so no new part, then retried: the new part exists and the row is not
 retired; Google, the cap's response lost on a series on named days given a new time; and
@@ -363,6 +378,9 @@ stored instances. `drainEdit(..., drains:)` drains once per attempt.
     although both writes landed; no data is lost. Whether Google answers a read of an instance past the
     new UNTIL with 404 (not found) or with the instance `cancelled` (handled: the own-cap check runs
     before the occurrence lookup) is unmeasured (#601).
+    **Amendment (2026-11-11, #601): closed.** A split interrupted after its create keeps a `SplitRecord`
+    naming the series and the new part; its retry never reads the occurrence again, by either id, and
+    ends complete (`SplitInterruptedBetweenItsWritesTests` T3). Limit 6's own-cap clause is gone with it.
 11. Outlook's occurrence lookup enumerates 25 hours either side of the named date's midnight in the
     edit's zone. An all-day occurrence lasts from midnight in the series' zone, so when the edit's zone
     is 25 hours or more east of the series' (Kiritimati or Tonga against Pago Pago, Niue or Baker
@@ -385,7 +403,7 @@ rule above when #613 settled that an occurrence is named where it is now.
   `.series(allDayZone:)`). Replaced: by current start; a moved occurrence's split throws a plain error.
 - A split-producing "all" at a moved later occurrence threw at the queue; then (in the rebuild's first
   commit) a dedicated `movedSplitRefusal` before the card in `route`, with a proof that CalDAV refused
-  it before the card. Replaced by the coordinator ruling (2026-11-11): a plain error, nothing written,
+  it before the card. Replaced by the ruling of 2026-11-11: a plain error, nothing written,
   no dedicated wording, no before-the-card ordering.
 - That plain error was first thrown by the Google and Outlook occurrence lookup when `forSplit` was set,
   so `read` threw it before the card, and `this_and_following` at a moved FIRST occurrence (a whole-series

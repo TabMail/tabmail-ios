@@ -318,6 +318,14 @@ enum SyncConfig {
     /// production reader, so reclaiming it can neither drop nor revive an
     /// intention.
     static let retiredCalendarOpRetentionDays = 30
+    /// How long a split keeps retrying after Google first answers "not found" (404 or 410) for
+    /// a new part it has just reported as already created (a duplicate-id 409), in minutes.
+    /// Until then the answer is read as the part not being visible yet (read-after-write lag)
+    /// and the operation stays queued; after it, the part counts as deleted and the change is
+    /// refused (`SplitRecord.newPartDeleted`). A part Google reads as `cancelled` is deleted at
+    /// once. Far above a read-after-write lag (seconds), and short enough that the account's
+    /// later calendar changes, which wait behind a queued operation, are not held for long.
+    static let splitPartNotFoundGraceMinutes = 10
     /// Max message-detail chat sessions to keep (non-inbox messages only; inbox exempt).
     static let maxMessageChatSessions = 10
     /// Max compose drafts to keep (drafts for inbox reply/forward exempt).

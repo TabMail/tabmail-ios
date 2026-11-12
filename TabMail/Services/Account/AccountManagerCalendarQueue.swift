@@ -264,7 +264,8 @@ extension AccountManager {
     /// The single terminal-announcement gate: signal `.permanentFailure` when the
     /// retirement committed, and the truthful `.stillQueued` when it did not.
     ///
-    /// 🚨 R17-2 — ALL SIX TERMINAL ARMS ROUTE THROUGH THIS, so the producer's
+    /// 🚨 R17-2 — ALL THE TERMINAL ARMS ROUTE THROUGH THIS (six at R17-2, five since #601
+    /// removed the `inconsistentState` arm), so the producer's
     /// verdict and the consumer's announcement cannot come apart again. The census
     /// property is *"every call site that announces a terminal calendar outcome"*;
     /// re-derive it with a predicate this comment cannot satisfy (`MIS-033`):
@@ -295,10 +296,76 @@ extension AccountManager {
             outcome: retired ? .permanentFailure(reason: reason) : .stillQueued)
     }
 
+    /// Keep a split's `SplitRecord` on its queued operation (#601): `splitSeries` calls it once
+    /// the new part's create is confirmed, and writes the cap only after it returns. The row is
+    /// read again and only its `argumentsJSON` is written, with the record under
+    /// `SplitRecord.argumentKey` and every other argument as stored. Throws when the row is gone
+    /// or can't be written, so the cap is not written: a retry runs the split again, and the
+    /// calendar's own answer for the new part it already made decides it there.
+    func recordSplit(opId: String, _ record: SplitRecord) async throws {
+        try await updateSplitArguments(opId: opId) { object in
+            object[SplitRecord.argumentKey] = record.jsonObject
+        }
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[CalendarQueue] Recorded split of \(record.seriesId) at \(record.splitAt) on op \(opId)")
+        }
+    }
+
+    /// The split's `SplitRecorder.partNotFound` (#601): the calendar answered "not found" for a
+    /// new part it had reported as already created. Keeps the time of the first such answer on
+    /// the operation (`SplitRecord.partNotFoundSinceKey`, written the first time only) and
+    /// returns how long ago it was. Throws as `recordSplit` does when the row is gone or can't
+    /// be written.
+    func noteSplitPartNotFound(opId: String) async throws -> TimeInterval {
+        let now = Date()
+        let first = try await updateSplitArguments(opId: opId) { object -> Date in
+            if let since = object[SplitRecord.partNotFoundSinceKey] as? Double {
+                return Date(timeIntervalSince1970: since)
+            }
+            object[SplitRecord.partNotFoundSinceKey] = now.timeIntervalSince1970
+            return now
+        }
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[CalendarQueue] Split's new part not found on op \(opId), first at \(first)")
+        }
+        return now.timeIntervalSince(first)
+    }
+
+    /// Reads the queued operation `opId` again, applies `change` to its arguments, and writes
+    /// back only its `argumentsJSON`, every other argument as stored. Throws when the row is
+    /// gone or its arguments can't be read or written.
+    private func updateSplitArguments<T: Sendable>(
+        opId: String,
+        _ change: @escaping @Sendable (inout [String: Any]) -> T
+    ) async throws -> T {
+        try await retryWrite(dbPool, label: "CalendarQueue") { db in
+            // A row that is gone fails the split before its cap with an error no terminal arm
+            // claims; the requeue then finds no row and writes nothing.
+            guard var row = try PendingCalendarOperation.fetchOne(db, key: opId) else {
+                throw SplitRecord.OperationGone()
+            }
+            guard let data = row.argumentsJSON.data(using: .utf8),
+                  var object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw CalendarProviderError.notSupported("the queued calendar edit's arguments can't be read, so its split was not finished")
+            }
+            let result = change(&object)
+            let merged = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+            guard let text = String(data: merged, encoding: .utf8) else {
+                throw CalendarProviderError.notSupported("the queued calendar edit's arguments can't be written, so its split was not finished")
+            }
+            row.argumentsJSON = text
+            try row.update(db, columns: ["argumentsJSON"])
+            return result
+        }
+    }
+
     // MARK: - Calendar Operation Queue
 
     /// Queue a calendar mutation for async execution.
     /// Persists the operation to GRDB before returning — survives crashes/kills.
+    /// `SplitRecord.argumentKey` and `SplitRecord.partNotFoundSinceKey` are reserved for the
+    /// queue (`recordSplit`, `noteSplitPartNotFound`); a tool call that carries them has them
+    /// removed here.
     func queueCalendarOperation(
         type: CalendarOperationType,
         accountId: String,
@@ -306,6 +373,9 @@ extension AccountManager {
         calendarId: String? = nil,
         arguments: [String: JSONValue]
     ) async throws -> PendingCalendarOperation {
+        var arguments = arguments
+        arguments.removeValue(forKey: SplitRecord.argumentKey)
+        arguments.removeValue(forKey: SplitRecord.partNotFoundSinceKey)
         let op = PendingCalendarOperation(
             operationType: type,
             accountId: accountId,
@@ -423,7 +493,7 @@ extension AccountManager {
                     // SERVER SEES, AND IT IS DELIBERATELY NOT GATED. (The other two:
                     // mark-in-flight is checked and `continue`s, leaving the op
                     // `queued`; the transient requeue below only delays the op to the
-                    // next launch. The six TERMINAL arms are gated on
+                    // next launch. The TERMINAL arms are gated on
                     // `retireCalendarOperation`'s Bool, R17-2.)
                     // If the delete never commits, the row stays
                     // `inFlight`; after successful recovery in `AppDatabase.init`
@@ -582,18 +652,6 @@ extension AccountManager {
                         continue
                     }
 
-                    // Permanent: a multi-step write (series split) failed AND
-                    // its rollback also failed — the calendar is in an
-                    // inconsistent state. Retrying would re-cap an already-
-                    // capped master and create duplicate successor series, so
-                    // drop the op and surface the message for manual attention.
-                    if case CalDAVError.inconsistentState(let reason) = error {
-                        BackgroundSyncLogger.logDebug("[CalendarQueue] Inconsistent calendar state for \(opType) — retiring (no retry): \(reason)")
-                        await retireAndAnnounce(currentOp, reason: reason)
-                        executedAny = true
-                        continue
-                    }
-
                     // Permanent malformed-request errors — retire terminally.
                     // Retrying the same broken payload never succeeds. The
                     // retirement is recorded at error level through
@@ -609,7 +667,7 @@ extension AccountManager {
 
                     // Transient errors — always retry. NEVER drop on age alone.
                     // Only confirmed-stale paths above (notFound, missingScope,
-                    // authError, unsupported, inconsistentState, badRequest) may
+                    // authError, unsupported, badRequest) may
                     // retire an op, and none of them DELETES it: each moves the row
                     // to `PendingStatus.failed` with a reason.
                     //
@@ -622,7 +680,8 @@ extension AccountManager {
                     // cannot satisfy it (`MIS-033`):
                     //   rg -c --pcre2 '^(?!\s*(///|//)).*retireAndAnnounce\('
                     //      TabMail/Services/Account/AccountManagerCalendarQueue.swift
-                    // → 7 at R17-2: the six arms plus the function's own definition.
+                    // → 7 at R17-2: the six arms plus the function's own definition;
+                    // 6 since #601 removed the `inconsistentState` arm (five arms).
                     // See `retireAndAnnounce`, which is now the single terminal
                     // announcement gate, and `retireCalendarOperation` beneath it.
                     BackgroundSyncLogger.logDebug("[CalendarQueue] Failed \(opType): \(error) (age \(String(format: "%.1f", ageHours))h) — will retry")
@@ -638,12 +697,17 @@ extension AccountManager {
                     // `retireCalendarOperation`'s catch and the in-flight marker
                     // above; Outbox rule 2 ("never `try?` on queue state
                     // transitions") is the stated precedent.
+                    //
+                    // The row is read again and only its status and retry count are
+                    // written (#601): the attempt may have kept a split's record in
+                    // `argumentsJSON` (`recordSplit`), and writing back the row as it was
+                    // read before the attempt would erase it.
                     do {
                         try await retryWrite(dbPool, label: "CalendarQueue") { db in
-                            var updated = currentOp
+                            guard var updated = try PendingCalendarOperation.fetchOne(db, key: currentOp.id) else { return }
                             updated.status = PendingStatus.queued.rawValue
                             updated.retryCount += 1
-                            try updated.save(db)
+                            try updated.update(db, columns: ["status", "retryCount"])
                         }
                     } catch {
                         BackgroundSyncLogger.logError(
@@ -843,6 +907,20 @@ extension AccountManager {
             // function `buildGCalEventInput` uses.
             let recurrenceIdZone = try CalendarToolHelpers.resolveWriteTimeZone(
                 args, consequence: "it did not change the event")
+            // 🚨 A SPLIT WHOSE NEW PART WAS WRITTEN IS NEVER RUN AGAIN (#601). An earlier attempt
+            // of this operation created the new part and kept its record (`recordSplit`) before
+            // the cap; its cap failed or its answer was lost. Only the cap is left: it is written
+            // alone, from the series as it is now (`finishSplit`), while the new part is there. A
+            // new part the user deleted since is not written again, and nor is the cap: the
+            // change is refused with the reason, and the user decides.
+            if let record = SplitRecord(args) {
+                guard try await provider.eventExists(calendarId: calId, eventId: record.newPartId) else {
+                    throw CalendarProviderError.notSupported(SplitRecord.newPartDeleted)
+                }
+                try await provider.finishSplit(calendarId: calId, record: record, zone: recurrenceIdZone)
+                BackgroundSyncLogger.logDebug("[CalendarQueue] Finished split of \(record.seriesId) at \(record.splitAt) — new series id=\(record.newPartId)")
+                return (record.newPartId, nil)
+            }
             // The same reading and routing the edit tool made before its card
             // (`CalendarSeriesScope`): the event, its series and the occurrence it names, by the
             // provider's own lookup, then where the edit goes. The tool queues the edit as it routed
@@ -851,12 +929,9 @@ extension AccountManager {
             // (an occurrence that no longer starts there is the provider's not-found).
             let givenScope = CalendarToolHelpers.stringArgOpt(args, "edit_scope")?.lowercased()
                 ?? (CalendarToolHelpers.stringArgOpt(args, "recurrence_id") != nil ? "this_only" : "all")
-            // A split's retry after its own cap is not looked up again (`read`'s `splitting`): it
-            // goes on to `splitSeries` below, which writes what the interrupted attempt did not.
             let named = try await CalendarSeriesScope.read(
                 eventId: eventId, recurrenceId: CalendarToolHelpers.stringArgOpt(args, "recurrence_id"),
-                scope: givenScope, calendarId: calId, zone: recurrenceIdZone,
-                splitting: givenScope == "this_and_following", provider: provider)
+                scope: givenScope, calendarId: calId, zone: recurrenceIdZone, provider: provider)
             let routed = try CalendarSeriesScope.route(args, scope: givenScope, named: named, zone: recurrenceIdZone)
             // The tool makes an "all" edit that moves a later occurrence to another date a split before
             // its card; one that reaches the queue as "all" was confirmed as a change of every
@@ -873,7 +948,7 @@ extension AccountManager {
             // `GCalEventInput.attendeeChange`, and the provider's write applies it to the stored
             // guests of the item it writes; a whole-series write reaches each changed occurrence as
             // the series' difference, on that occurrence's own guests (`AttendeeChange`, #620).
-            if !named.afterOwnSplitCap, let reason = CalendarSeriesScope.dayMoveRefusal(
+            if let reason = CalendarSeriesScope.dayMoveRefusal(
                 routed.args, named: named, scope: routed.scope, zone: recurrenceIdZone) {
                 throw CalendarProviderError.notSupported(reason)
             }
@@ -1023,10 +1098,17 @@ extension AccountManager {
                 guard let rid = recurrenceId else {
                     throw CalendarProviderError.notSupported("edit_scope='this_and_following' requires recurrence_id")
                 }
+                // The record is kept on this operation once the new part's create is
+                // confirmed and before the cap (`SplitRecord`), so a retry takes the branch
+                // above. #563 would carry what it needs between the create and the record here.
+                let opId = op.id
                 let created = try await provider.splitSeries(
                     calendarId: calId, eventId: writeId, recurrenceId: rid,
                     recurrenceIdZone: recurrenceIdZone,
-                    patch: input, sendUpdates: "all"
+                    patch: input, sendUpdates: "all",
+                    record: SplitRecorder(
+                        keep: { record in try await self.recordSplit(opId: opId, record) },
+                        partNotFound: { try await self.noteSplitPartNotFound(opId: opId) })
                 )
                 BackgroundSyncLogger.logDebug("[CalendarQueue] Updated event id=\(eventId) scope=this_and_following at \(rid) (\(recurrenceIdZone.identifier)) — new series id=\(created.id ?? "?")")
                 // Surface the new series id so `awaitCalendarOpOutcome` can hand

@@ -2597,65 +2597,646 @@ struct ExchangeSeriesScopeInvariantTests {
     }
 }
 
-// MARK: - A split retried after its own cap
+// MARK: - A split interrupted between its writes (#601)
 
-// INVARIANT (system property): a split (`this_and_following`) that the queue started and that was
-// interrupted after it capped the series ends complete on its retry: the series ends before the
-// split, the new part holds the occurrences from it on, and no row is left queued or failed. The
-// cap ended the series before the occurrence the split starts at, so the retry does not look that
-// occurrence up again (`CalendarProvider.isOwnSplitCap`); looked up, it is not found, and the split
-// was retired half done. Outlook writes the cap first, so its interruption lost the new part; Google
-// and CalDAV write it last, so theirs lost only the row's success.
+// INVARIANT (system property): a split (`this_and_following`) writes its new part, then caps the
+// series. Once the new part is written, a retry of the operation never writes it again, and:
+// - while the new part is there, the retry ends the split complete: one new part, the series ends
+//   before the split, the row is gone, whichever id (series or occurrence) the edit named;
+// - once the user deleted the new part, the retry writes nothing at all (no new part, no cap), the
+//   row is `failed` with the ruled reason, and the account's next queued change still drains in the
+//   same drain;
+// - a series that already ends before the split is left as it is.
+// The record of the written new part (`SplitRecord`) is on the row before the cap is sent, and a
+// transient failure keeps it. Every provider writes in that order (Outlook used to cap first).
 
-@Suite("A split interrupted after its cap ends complete on its retry", .serialized, .processGlobalState)
-struct SplitRetriedAfterItsOwnCapTests {
+/// The user-visible refusal when the new part of an unfinished split was deleted (as ruled).
+private let newPartDeletedReason = "This change to the repeating event wasn't finished because its new part was deleted. Check the event's later occurrences, and make the change again if you still want it."
 
-    @Test("Outlook: a split whose cap was written and whose new part was not is written whole on its retry, and the row is not retired")
-    func outlookSplitInterruptedAfterItsCapIsFinished() async throws {
-        let graph = GraphSeries.calendar(daily: true)
-        // Named in the series' own zone, where Graph dates the cap's end.
-        let zone = "America/Los_Angeles"
-        let rid = GraphFixture.wall(GraphFixture.occurrenceStart, in: zone)
-        // The cap is written, then the connection drops before its response arrives: no new part.
-        graph.loseNextResponse("PATCH")
-        let rows = try await outlook(graph, eventId: "ser-1", [
-            "edit_scope": .string("this_and_following"), "recurrence_id": .string(rid),
-            "title": .string("Retitled"), "timezone": .string(zone),
-        ], account: "own-cap-x", drains: 2)
-
-        #expect(rows.isEmpty, "the split did not end complete: \(reasons(rows))")
-        #expect(graph.created.count == 1, "the new part was not written: \(graph.created.count)")
-        let created = graph.created.first
-        #expect(instant(created?["start"]) == GraphFixture.occurrenceStart,
-                "the new part does not start at the split: \(created?["start"] ?? "none")")
-        #expect(created?["subject"] as? String == "Retitled", "the new part is not the edit: \(created?["subject"] ?? "none")")
-        let cap = try #require(ExchangeCalendarProvider.graphEndDateBefore(
-            naiveISO: rid, allDay: false, zone: TimeZone(identifier: zone)!))
-        let range = (graph.event("ser-1")?["recurrence"] as? [String: Any])?["range"] as? [String: Any]
-        #expect(range?["type"] as? String == "endDate" && range?["endDate"] as? String == cap,
-                "the series does not end before the split: \(range ?? [:])")
-        #expect(graph.event("ser-1")?["subject"] as? String == "Planning", "the series' own occurrences were changed")
+/// One calendar, faked on the wire, holding a weekly series to split, a one-off event to retitle
+/// after it, and what the tests ask of it: the writes as they arrive, in order, and the split's
+/// outcome there.
+final class SplitHarness: @unchecked Sendable {
+    enum Kind: String, CaseIterable, CustomTestStringConvertible, Sendable {
+        case google, outlook, calDAV
+        var testDescription: String { rawValue }
     }
 
-    @Test("Google: a split whose cap's response was lost ends complete on its retry, its new time on a series on named days included")
-    func googleSplitWhoseCapResponseWasLostEndsComplete() async throws {
-        let rid = "\(day(7))T09:00:00"
-        // The new part is written, then the cap, whose response is lost. A series on its weekday,
-        // given a new time on the same date: the retry's own-cap read names no occurrence to date it.
-        let r = try await google(GoogleSeries.calendar(rule: GoogleSeries.onItsWeekday), eventId: GoogleSeries.id, [
-            "edit_scope": .string("this_and_following"), "recurrence_id": .string(rid),
-            "start_iso": .string("\(day(7))T11:00:00"), "timezone": .string("UTC"),
-        ], account: "own-cap-g", loseNext: "PATCH", drains: 2)
+    let kind: Kind
+    let http = FakeHTTP.Scenario()
+    let provider: any CalendarProvider
+    let calendarId: String
+    let seriesId: String
+    /// An id naming the split's own occurrence, where the calendar has one (not CalDAV here).
+    let occurrenceId: String?
+    let recurrenceId: String
+    let zone: String
+    let nextEventId: String
+    private let arrivals = NSLock()
+    private var log: [String] = []
+    private var capHook: (@Sendable () -> Void)?
 
-        #expect(r.rows.isEmpty, "the split did not end complete: \(reasons(r.rows)); writes: \(r.calendar.writes)")
-        let successor = r.calendar.event(
-            GoogleCalendarProvider.deterministicSplitEventId(masterId: GoogleSeries.id, recurrenceId: rid))
-        #expect(instant(successor?["start"]) == utcAt("\(day(7))T11:00:00"),
-                "no following part at the new time: \(successor?["start"] ?? "none")")
-        let cap = try #require(GoogleCalendarProvider.googleUntilString(beforeNaiveISO: rid, allDay: false, zone: utc))
-        let master = r.calendar.event(GoogleSeries.id)
-        let rule = (master?["recurrence"] as? [String])?.first { $0.uppercased().hasPrefix("RRULE:") }
-        #expect(rule.map { RecurrenceTail.isCapped($0, at: cap) } == true, "the series does not end before the split: \(rule ?? "none")")
-        #expect(instant(master?["start"]) == utcAt("\(day(0))T09:00:00"), "the series moved: \(master?["start"] ?? "none")")
+    let google: FakeGoogleCalendar?
+    let graph: FakeGraphCalendar?
+    let store: FakeCalDAVStore?
+
+    static let calDAVSeriesPath = "/cal/ser-c.ics"
+    static let calDAVOneOffPath = "/cal/one-off.ics"
+
+    init(_ kind: Kind, googleRule: String = GoogleSeries.weekly, graphRange: [String: Any]? = nil,
+         calDAVRule: String = "RRULE:FREQ=WEEKLY") {
+        self.kind = kind
+        switch kind {
+        case .google:
+            let calendar = FakeGoogleCalendar(GoogleSeries.calendar(rule: googleRule) + [FakeGoogleCalendar.timed(id: "one-off", day: day(1))])
+            calendar.install(on: http)
+            google = calendar; graph = nil; store = nil
+            provider = GoogleCalendarProvider(accessToken: { _ in "test-token" }, session: http.session)
+            calendarId = "primary"; seriesId = GoogleSeries.id; occurrenceId = GoogleSeries.later
+            recurrenceId = "\(day(7))T09:00:00"; zone = "UTC"; nextEventId = "one-off"
+        case .outlook:
+            var series = GraphSeries.series(daily: true)
+            if let graphRange, var recurrence = series["recurrence"] as? [String: Any] {
+                var range = recurrence["range"] as? [String: Any] ?? [:]
+                for (key, value) in graphRange { range[key] = value }
+                recurrence["range"] = range
+                series["recurrence"] = recurrence
+            }
+            let calendar = FakeGraphCalendar([
+                series, GraphSeries.occurrence(id: GraphSeries.first, at: GraphFixture.start),
+                GraphSeries.occurrence(id: GraphSeries.later, at: GraphFixture.occurrenceStart),
+                GraphFixture.event(id: "one-off", online: false),
+            ])
+            calendar.install(on: http)
+            google = nil; graph = calendar; store = nil
+            provider = ExchangeCalendarProvider(mailbox: "calendar@example.com", accessToken: { _ in "test-token" },
+                                                session: http.session)
+            calendarId = "primary"; seriesId = "ser-1"; occurrenceId = GraphSeries.later
+            zone = "America/Los_Angeles"; recurrenceId = GraphFixture.wall(GraphFixture.occurrenceStart, in: zone)
+            nextEventId = "one-off"
+        case .calDAV:
+            let calendar = FakeCalDAVStore(servesETags: true)
+            calendar.seed(path: Self.calDAVSeriesPath, ics: calDAVSeries(uid: "ser-c", rule: calDAVRule))
+            calendar.seed(path: Self.calDAVOneOffPath, ics: Self.oneOffICS)
+            http.register(path: "/cal/", method: "GET") { calendar.handleGET($0) }
+            http.register(path: "/cal/", method: "PUT") { calendar.handlePUT($0) }
+            google = nil; graph = nil; store = calendar
+            let home = URL(string: "https://caldav.example.com/cal/")!
+            provider = CalDAVProvider(
+                client: CalDAVClient(username: "user@example.com", password: "pw", session: http.session),
+                calendarHomeURL: home, serverBaseURL: home)
+            calendarId = "/cal/"; seriesId = Self.calDAVSeriesPath; occurrenceId = nil
+            recurrenceId = "\(day(7))T09:00:00"; zone = "UTC"; nextEventId = Self.calDAVOneOffPath
+        }
+        google?.beforeWrite { [unowned self] method, id in
+            self.arrived("\(method) \(id)", cap: method == "PATCH" && id == self.seriesId)
+        }
+        graph?.beforeWrite { [unowned self] method, id in
+            self.arrived(id.isEmpty ? method : "\(method) \(id)", cap: method == "PATCH" && id == self.seriesId)
+        }
+        store?.beforePUT { [unowned self] path in self.arrived("PUT \(path)", cap: path == self.seriesId) }
+    }
+
+    deinit { http.close() }
+
+    static let oneOffICS = [
+        "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//TabMail//Test//EN", "BEGIN:VEVENT",
+        "UID:one-off", "DTSTAMP:\(compact(day(-14)))T000000Z",
+        "DTSTART:\(compact(day(1)))T090000Z", "DTEND:\(compact(day(1)))T093000Z",
+        "SUMMARY:Standup", "END:VEVENT", "END:VCALENDAR",
+    ].joined(separator: "\r\n")
+
+    private func arrived(_ write: String, cap: Bool) {
+        let hook = arrivals.withLock { () -> (@Sendable () -> Void)? in
+            log.append(write)
+            return cap ? capHook : nil
+        }
+        hook?()
+    }
+
+    /// Every write of the split, as it arrived (refused ones included), in order; the one-off's
+    /// own write is left out.
+    var splitWrites: [String] { arrivals.withLock { log }.filter { !$0.hasSuffix(nextEventId) } }
+
+    func isCap(_ write: String) -> Bool { write == "PATCH \(seriesId)" || write == "PUT \(seriesId)" }
+    func isCreate(_ write: String) -> Bool { !isCap(write) }
+
+    /// Runs as the cap arrives at the calendar, before it is applied.
+    func onCap(_ hook: @escaping @Sendable () -> Void) { arrivals.withLock { capHook = hook } }
+
+    var arguments: [String: JSONValue] {
+        ["edit_scope": .string("this_and_following"), "recurrence_id": .string(recurrenceId),
+         "title": .string("Retitled"), "timezone": .string(zone)]
+    }
+
+    /// The next cap is refused with a server error, and changes nothing.
+    func failCap() {
+        google?.failNext("PATCH", with: 500)
+        graph?.failNext("PATCH", with: 500)
+        store?.failNextPUT(path: Self.calDAVSeriesPath, with: 500)
+    }
+
+    /// The next cap is written and its answer is lost; nil where the fake can't lose one.
+    var loseCap: (() -> Void)? {
+        if let google { return { google.loseNextResponse("PATCH") } }
+        if let graph { return { graph.loseNextResponse("PATCH") } }
+        return nil
+    }
+
+    var newPartIds: [String] {
+        switch kind {
+        case .google:
+            let id = GoogleCalendarProvider.deterministicSplitEventId(masterId: seriesId, recurrenceId: recurrenceId)
+            return google?.event(id).map { $0["status"] as? String == "cancelled" ? [] : [id] } ?? []
+        case .outlook:
+            return graph?.created.compactMap { $0["id"] as? String } ?? []
+        case .calDAV:
+            let paths = Set((store?.recordedPuts() ?? []).filter { $0.returnedETag != nil }.map(\.path))
+            return paths.filter { $0 != seriesId && $0 != nextEventId && store?.storedICS(path: $0) != nil }.sorted()
+        }
+    }
+
+    /// The user deletes the split's new part.
+    func deleteNewPart(googleReads: FakeGoogleCalendar.DeletedRead = .cancelled, calDAVReads: Int = 404) {
+        switch kind {
+        case .google:
+            google?.userDeletes(GoogleCalendarProvider.deterministicSplitEventId(masterId: seriesId, recurrenceId: recurrenceId),
+                                reads: googleReads)
+        case .outlook:
+            for id in newPartIds { graph?.userDeletes(id) }
+        case .calDAV:
+            for path in newPartIds { store?.userDeletes(path: path, reads: calDAVReads) }
+        }
+    }
+
+    /// Whether the series now ends with the split's cap, just before the split.
+    var seriesCapped: Bool {
+        guard let tz = CalendarTimeZoneResolver.zone(named: zone, in: .none) else { return false }
+        switch kind {
+        case .google:
+            guard let cap = GoogleCalendarProvider.googleUntilString(beforeNaiveISO: recurrenceId, allDay: false, zone: tz) else { return false }
+            let rule = (google?.event(seriesId)?["recurrence"] as? [String])?.first { $0.uppercased().hasPrefix("RRULE:") }
+            return rule?.uppercased().contains("UNTIL=\(cap)") == true
+        case .outlook:
+            let cap = ExchangeCalendarProvider.graphEndDateBefore(naiveISO: recurrenceId, allDay: false, zone: tz)
+            let range = (graph?.event(seriesId)?["recurrence"] as? [String: Any])?["range"] as? [String: Any]
+            return range?["type"] as? String == "endDate" && range?["endDate"] as? String == cap
+        case .calDAV:
+            guard let cap = GoogleCalendarProvider.googleUntilString(beforeNaiveISO: recurrenceId, allDay: false, zone: tz) else { return false }
+            return store?.storedICS(path: seriesId)?.contains("UNTIL=\(cap)") == true
+        }
+    }
+
+    /// The series' rule (Google and CalDAV) or range (Outlook), as text, to compare before and after.
+    var seriesEnd: String {
+        switch kind {
+        case .google:
+            return (google?.event(seriesId)?["recurrence"] as? [String])?.joined(separator: "\n") ?? "none"
+        case .outlook:
+            let range = (graph?.event(seriesId)?["recurrence"] as? [String: Any])?["range"] as? [String: Any] ?? [:]
+            return range.keys.sorted().map { "\($0)=\(range[$0] ?? "")" }.joined(separator: ";")
+        case .calDAV:
+            return store?.storedICS(path: seriesId)?.split(separator: "\r\n").filter { $0.hasPrefix("RRULE") }.joined() ?? "none"
+        }
+    }
+
+    /// Whether the one-off queued after the split was retitled.
+    var nextWritten: Bool {
+        switch kind {
+        case .google: return google?.event(nextEventId)?["summary"] as? String == "Renamed"
+        case .outlook: return graph?.event(nextEventId)?["subject"] as? String == "Renamed"
+        case .calDAV: return store?.storedICS(path: nextEventId)?.contains("SUMMARY:Renamed") == true
+        }
+    }
+}
+
+/// Whether the split's record was on its row, each time a cap reached the calendar.
+private final class KeptAtCap: @unchecked Sendable {
+    private let lock = NSLock()
+    private var kept: [Bool] = []
+    func append(_ value: Bool) { lock.withLock { kept.append(value) } }
+    var values: [Bool] { lock.withLock { kept } }
+}
+
+/// The split's row, as `drainSplit` hands it to `watch`, for a change between two drains.
+private final class WatchedRow: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pool: DatabasePool?
+    private var id: String?
+    func set(_ pool: DatabasePool, _ id: String) { lock.withLock { self.pool = pool; self.id = id } }
+
+    /// The split's row now, or nil when it is gone or was not watched.
+    var row: PendingCalendarOperation? {
+        let (pool, id) = lock.withLock { (self.pool, self.id) }
+        guard let pool, let id else { return nil }
+        return (try? pool.read { db in try PendingCalendarOperation.fetchOne(db, key: id) }) ?? nil
+    }
+
+    /// When the row says the calendar first answered "not found" for the split's new part.
+    var partNotFoundSince: Double? {
+        guard let data = row?.argumentsJSON.data(using: .utf8),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+        return (object[SplitRecord.partNotFoundSinceKey] as? NSNumber)?.doubleValue
+    }
+
+    /// Keeps on the row that the calendar first answered "not found" for the split's new part
+    /// `seconds` ago, as the queue keeps it.
+    func backdatePartNotFound(by seconds: TimeInterval) {
+        let (pool, id) = lock.withLock { (self.pool, self.id) }
+        guard let pool, let id else {
+            Issue.record("the split's row was not watched")
+            return
+        }
+        do {
+            try pool.write { db in
+                guard var row = try PendingCalendarOperation.fetchOne(db, key: id) else {
+                    Issue.record("the split's row is gone")
+                    return
+                }
+                var arguments = row.arguments
+                arguments[SplitRecord.partNotFoundSinceKey] = .double(Date().addingTimeInterval(-seconds).timeIntervalSince1970)
+                row.argumentsJSON = String(decoding: try JSONEncoder().encode(arguments), as: UTF8.self)
+                try row.update(db)
+            }
+        } catch {
+            Issue.record("could not change the split's row: \(error)")
+        }
+    }
+}
+
+/// What a drain of a split left: its row (nil once it completed) and the next change's.
+private struct SplitDrain {
+    let split: PendingCalendarOperation?
+    let next: PendingCalendarOperation?
+}
+
+/// The split `harness` names (`arguments`, by `eventId`) and, queued after it on the same account, a
+/// retitle of the harness' one-off, drained `drains` times through the real queue on their own
+/// database. `between` runs before every drain after the first: the user's change between two
+/// attempts. `watch` gets the database and the split's row id before the first drain.
+private func drainSplit(
+    _ harness: SplitHarness, account: String, eventId: String? = nil, arguments: [String: JSONValue]? = nil,
+    drains: Int, between: () -> Void = {}, watch: (DatabasePool, String) -> Void = { _, _ in }
+) async throws -> SplitDrain {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    var config = Configuration()
+    config.foreignKeysEnabled = true
+    let pool = try DatabasePool(path: dir.appendingPathComponent("test.sqlite").path, configuration: config)
+    let appDb = try AppDatabase(dbPool: pool)
+    let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+        let prev = current; current = appDb; return prev
+    }
+    try await pool.write { db in
+        var acc = Account(emailAddress: "cal@example.com", displayName: "Cal", provider: .gmail)
+        acc.id = account
+        try acc.insert(db)
+    }
+    await AccountManager.shared.registerCalendarProviderForTesting(accountId: account, provider: harness.provider)
+    defer {
+        Task { await AccountManager.shared.unregisterCalendarProviderForTesting(accountId: account) }
+        InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir)
+    }
+
+    let split = PendingCalendarOperation(
+        operationType: .edit, accountId: account, eventId: eventId ?? harness.seriesId,
+        calendarId: harness.calendarId, arguments: arguments ?? harness.arguments)
+    var later = PendingCalendarOperation(
+        operationType: .edit, accountId: account, eventId: harness.nextEventId,
+        calendarId: harness.calendarId, arguments: ["title": .string("Renamed")])
+    later.createdAt = split.createdAt.addingTimeInterval(1)
+    let next = later
+    try await pool.write { db in
+        try split.insert(db)
+        try next.insert(db)
+    }
+    watch(pool, split.id)
+
+    for attempt in 0..<drains {
+        if attempt > 0 { between() }
+        await AccountManager.shared.drainCalendarQueue()
+    }
+    return try await pool.read { db in
+        SplitDrain(split: try PendingCalendarOperation.fetchOne(db, key: split.id),
+                   next: try PendingCalendarOperation.fetchOne(db, key: next.id))
+    }
+}
+
+private func describe(_ row: PendingCalendarOperation?) -> String {
+    row.map { "\($0.status) \($0.failureReason ?? "")" } ?? "gone"
+}
+
+@Suite("A split interrupted between its writes: never written again, finished or refused (#601)", .serialized, .processGlobalState)
+struct SplitInterruptedBetweenItsWritesTests {
+
+    @Test("T1: the cap fails, the user deletes the new part, the retry writes nothing and is refused; the next change drains",
+          arguments: SplitHarness.Kind.allCases)
+    func newPartDeletedBeforeTheRetry(_ kind: SplitHarness.Kind) async throws {
+        let harness = SplitHarness(kind)
+        harness.failCap()
+        var writesBeforeDelete = 0
+        let r = try await drainSplit(harness, account: "split-t1-\(kind)", drains: 2, between: {
+            writesBeforeDelete = harness.splitWrites.count
+            harness.deleteNewPart()
+        })
+        let after = Array(harness.splitWrites.dropFirst(writesBeforeDelete))
+        #expect(after.isEmpty, "\(kind): the retry wrote after the new part was deleted: \(after)")
+        #expect(r.split?.status == PendingStatus.failed.rawValue && r.split?.failureReason == newPartDeletedReason,
+                "\(kind): the split was not refused with the ruled reason: \(describe(r.split))")
+        #expect(r.next == nil && harness.nextWritten, "\(kind): the account's next change did not drain: \(describe(r.next))")
+        #expect(!harness.seriesCapped, "\(kind): the series was capped with its new part gone")
+    }
+
+    @Test("T1: Google, a deleted new part read as cancelled, 404 or 410, refuses the same way",
+          arguments: [FakeGoogleCalendar.DeletedRead.cancelled, .status(404), .status(410)])
+    func googleDeletedPartEveryAnswer(_ reads: FakeGoogleCalendar.DeletedRead) async throws {
+        let harness = SplitHarness(.google)
+        harness.failCap()
+        var writesBeforeDelete = 0
+        let r = try await drainSplit(harness, account: "split-t1g-\(reads)", drains: 2, between: {
+            writesBeforeDelete = harness.splitWrites.count
+            harness.deleteNewPart(googleReads: reads)
+        })
+        #expect(harness.splitWrites.dropFirst(writesBeforeDelete).isEmpty, "wrote after the delete: \(harness.splitWrites)")
+        #expect(r.split?.failureReason == newPartDeletedReason, "\(describe(r.split))")
+        #expect(r.next == nil && harness.nextWritten, "the next change did not drain: \(describe(r.next))")
+    }
+
+    @Test("T1: CalDAV, a deleted new part read as 404 or 410, refuses the same way", arguments: [404, 410])
+    func calDAVDeletedPartEveryAnswer(_ reads: Int) async throws {
+        let harness = SplitHarness(.calDAV)
+        harness.failCap()
+        var writesBeforeDelete = 0
+        let r = try await drainSplit(harness, account: "split-t1c-\(reads)", drains: 2, between: {
+            writesBeforeDelete = harness.splitWrites.count
+            harness.deleteNewPart(calDAVReads: reads)
+        })
+        #expect(harness.splitWrites.dropFirst(writesBeforeDelete).isEmpty, "wrote after the delete: \(harness.splitWrites)")
+        #expect(r.split?.failureReason == newPartDeletedReason, "\(describe(r.split))")
+        #expect(r.next == nil && harness.nextWritten, "the next change did not drain: \(describe(r.next))")
+    }
+
+    @Test("T2: the cap fails and the new part is intact: the retry writes only the cap and the split ends complete",
+          arguments: SplitHarness.Kind.allCases)
+    func capFailedPartIntact(_ kind: SplitHarness.Kind) async throws {
+        let harness = SplitHarness(kind)
+        harness.failCap()
+        var writesBeforeRetry = 0
+        let r = try await drainSplit(harness, account: "split-t2-\(kind)", drains: 2, between: {
+            writesBeforeRetry = harness.splitWrites.count
+        })
+        let retry = Array(harness.splitWrites.dropFirst(writesBeforeRetry))
+        #expect(r.split == nil, "\(kind): the split did not complete: \(describe(r.split))")
+        #expect(harness.newPartIds.count == 1, "\(kind): not one new part: \(harness.newPartIds)")
+        #expect(harness.seriesCapped, "\(kind): the series does not end before the split: \(harness.seriesEnd)")
+        #expect(!retry.isEmpty && retry.allSatisfy(harness.isCap), "\(kind): the retry wrote more than the cap: \(retry)")
+        #expect(r.next == nil && harness.nextWritten, "\(kind): the next change did not drain: \(describe(r.next))")
+    }
+
+    @Test("T2/T3: the cap's answer is lost, named by the series or by its occurrence: the split ends complete",
+          arguments: [SplitHarness.Kind.google, .outlook], [false, true])
+    func capAnswerLost(_ kind: SplitHarness.Kind, namedByOccurrence: Bool) async throws {
+        let harness = SplitHarness(kind)
+        let loseCap = try #require(harness.loseCap)
+        loseCap()
+        let named = namedByOccurrence ? try #require(harness.occurrenceId) : harness.seriesId
+        let r = try await drainSplit(harness, account: "split-t3-\(kind)-\(namedByOccurrence)", eventId: named, drains: 2)
+        #expect(r.split == nil, "\(kind) named \(named): the split did not complete: \(describe(r.split))")
+        #expect(harness.newPartIds.count == 1, "\(kind): not one new part: \(harness.newPartIds)")
+        #expect(harness.seriesCapped, "\(kind): the series does not end before the split: \(harness.seriesEnd)")
+        #expect(harness.splitWrites.filter(harness.isCreate).count == 1, "\(kind): the new part was written again: \(harness.splitWrites)")
+    }
+
+    @Test("T4: Outlook, a numbered or end-dated series interrupted after its create keeps its end on the new part",
+          arguments: ["numbered", "endDate"])
+    func outlookNewPartKeepsTheSeriesEnd(_ type: String) async throws {
+        let end = GraphFixture.utcDay(GraphFixture.start.addingTimeInterval(70 * 86_400))
+        let range: [String: Any] = type == "numbered"
+            ? ["type": "numbered", "numberOfOccurrences": 5]
+            : ["type": "endDate", "endDate": end]
+        let harness = SplitHarness(.outlook, graphRange: range)
+        harness.failCap()
+        let r = try await drainSplit(harness, account: "split-t4-\(type)", drains: 2)
+        #expect(r.split == nil, "\(type): the split did not complete: \(describe(r.split))")
+        let part = try #require(harness.graph?.created.first)
+        let newRange = (part["recurrence"] as? [String: Any])?["range"] as? [String: Any]
+        #expect(newRange?["type"] as? String == type, "\(type): the new part's range is \(newRange ?? [:])")
+        if type == "numbered" {
+            // Every seventh day from the series' first: the first is before the split, four are left.
+            #expect(newRange?["numberOfOccurrences"] as? Int == 4, "the count left is \(newRange ?? [:])")
+        } else {
+            #expect(newRange?["endDate"] as? String == end, "the original end is not kept: \(newRange ?? [:])")
+        }
+    }
+
+    @Test("T5: a transient failure of the cap keeps the record on the requeued row", arguments: SplitHarness.Kind.allCases)
+    func recordSurvivesTheRequeue(_ kind: SplitHarness.Kind) async throws {
+        let harness = SplitHarness(kind)
+        harness.failCap()
+        let r = try await drainSplit(harness, account: "split-t5-\(kind)", drains: 1)
+        let row = try #require(r.split)
+        #expect(row.status == PendingStatus.queued.rawValue, "\(kind): \(describe(row))")
+        let record = try #require(SplitRecord(row.arguments), "\(kind): the requeue erased the record: \(row.argumentsJSON)")
+        #expect(record.seriesId == harness.seriesId && record.splitAt == harness.recurrenceId, "\(kind): \(record)")
+        #expect(harness.newPartIds == [record.newPartId], "\(kind): the record names \(record.newPartId), the calendar holds \(harness.newPartIds)")
+    }
+
+    @Test("T6: the record is on the row when the cap reaches the calendar", arguments: SplitHarness.Kind.allCases)
+    func recordIsKeptBeforeTheCap(_ kind: SplitHarness.Kind) async throws {
+        let harness = SplitHarness(kind)
+        let seen = KeptAtCap()
+        let r = try await drainSplit(harness, account: "split-t6-\(kind)", drains: 1, watch: { pool, id in
+            harness.onCap {
+                let kept = (try? pool.read { db in try PendingCalendarOperation.fetchOne(db, key: id) })
+                    .flatMap { $0 }.flatMap { SplitRecord($0.arguments) } != nil
+                seen.append(kept)
+            }
+        })
+        #expect(r.split == nil, "\(kind): \(describe(r.split))")
+        #expect(seen.values == [true], "\(kind): the cap was sent before the record was kept: \(seen.values)")
+    }
+
+    @Test("T7: Google, the create's answer is lost and the user deletes the new part (read as cancelled): the retry is refused at once, with no cap and no wedge")
+    func googleCreateAnswerLostThenDeleted() async throws {
+        let harness = SplitHarness(.google)
+        harness.google?.loseNextResponse("POST")
+        let r = try await drainSplit(harness, account: "split-t7-cancelled", drains: 2, between: {
+            harness.deleteNewPart(googleReads: .cancelled)
+        })
+        #expect(!harness.splitWrites.contains(where: harness.isCap), "the series was capped: \(harness.splitWrites)")
+        #expect(harness.newPartIds.isEmpty, "the deleted new part was made again: \(harness.newPartIds)")
+        #expect(r.split?.failureReason == newPartDeletedReason, "\(describe(r.split))")
+        #expect(r.next == nil && harness.nextWritten, "the next change did not drain: \(describe(r.next))")
+    }
+
+    @Test("T7: Google, the create's answer is lost and the new part then reads as not found: within the grace the change stays queued, with no cap",
+          arguments: [404, 410])
+    func googleCreateAnswerLostThenNotFoundWithinTheGrace(_ code: Int) async throws {
+        let harness = SplitHarness(.google)
+        harness.google?.loseNextResponse("POST")
+        let r = try await drainSplit(harness, account: "split-t7-grace-\(code)", drains: 2, between: {
+            harness.deleteNewPart(googleReads: .status(code))
+        })
+        #expect(!harness.splitWrites.contains(where: harness.isCap), "the series was capped: \(harness.splitWrites)")
+        #expect(harness.newPartIds.isEmpty, "the new part was made again: \(harness.newPartIds)")
+        #expect(r.split?.status == PendingStatus.queued.rawValue,
+                "a not-found answer just after Google said the id exists may be lag: the change stays queued. \(describe(r.split))")
+    }
+
+    @Test("T7: Google, the new part still reads as not found past the grace: the change is refused, with no cap, and the next change drains",
+          arguments: [404, 410])
+    func googleCreateAnswerLostThenNotFoundPastTheGrace(_ code: Int) async throws {
+        let harness = SplitHarness(.google)
+        harness.google?.loseNextResponse("POST")
+        let watched = WatchedRow()
+        let grace = TimeInterval(SyncConfig.splitPartNotFoundGraceMinutes * 60)
+        let r = try await drainSplit(harness, account: "split-t7-past-\(code)", drains: 2, between: {
+            harness.deleteNewPart(googleReads: .status(code))
+            // The first not-found answer for this operation came longer ago than the grace.
+            watched.backdatePartNotFound(by: grace + 60)
+        }, watch: { pool, id in watched.set(pool, id) })
+        #expect(!harness.splitWrites.contains(where: harness.isCap), "the series was capped: \(harness.splitWrites)")
+        #expect(harness.newPartIds.isEmpty, "the new part was made again: \(harness.newPartIds)")
+        #expect(r.split?.status == PendingStatus.failed.rawValue && r.split?.failureReason == newPartDeletedReason,
+                "\(describe(r.split))")
+        #expect(r.next == nil && harness.nextWritten, "the next change did not drain: \(describe(r.next))")
+    }
+
+    @Test("T7: Google, the first not-found answer is kept on the row, later ones within the grace do not move it, and once the grace has passed since it the change is refused")
+    func googleFirstNotFoundIsKeptAndCounted() async throws {
+        let harness = SplitHarness(.google)
+        harness.google?.loseNextResponse("POST")
+        let watched = WatchedRow()
+        let grace = TimeInterval(SyncConfig.splitPartNotFoundGraceMinutes * 60)
+        var statusAfterFirst: String?
+        var sinceAfterFirst: Double?
+        var statusAfterSecond: String?
+        var sinceAfterSecond: Double?
+        var drain = 0
+        let between: () -> Void = {
+            drain += 1
+            if drain == 1 {
+                // The create landed with its answer lost; the user deletes the new part.
+                harness.deleteNewPart(googleReads: .status(404))
+            } else if drain == 2 {
+                // After the first drain that got a not-found answer, with no time kept before it.
+                statusAfterFirst = watched.row?.status
+                sinceAfterFirst = watched.partNotFoundSince
+            } else {
+                // After a second not-found answer within the grace; then the first one is moved
+                // back past the grace.
+                statusAfterSecond = watched.row?.status
+                sinceAfterSecond = watched.partNotFoundSince
+                watched.backdatePartNotFound(by: grace + 60)
+            }
+        }
+        let watch: (DatabasePool, String) -> Void = { pool, id in watched.set(pool, id) }
+        let r = try await drainSplit(harness, account: "split-t7-first", drains: 4, between: between, watch: watch)
+
+        #expect(statusAfterFirst == PendingStatus.queued.rawValue, "the first not-found answer did not keep the row queued: \(statusAfterFirst ?? "gone")")
+        let first = try #require(sinceAfterFirst, "the first not-found answer was not kept on the row")
+        #expect(statusAfterSecond == PendingStatus.queued.rawValue, "a not-found answer within the grace did not keep the row queued: \(statusAfterSecond ?? "gone")")
+        #expect(sinceAfterSecond == first,
+                "a later not-found answer moved the first one's time, so the grace would never end: \(first) then \(String(describing: sinceAfterSecond))")
+        #expect(r.split?.status == PendingStatus.failed.rawValue && r.split?.failureReason == newPartDeletedReason,
+                "past the grace since the first not-found answer the change was not refused: \(describe(r.split))")
+        #expect(!harness.seriesCapped && !harness.splitWrites.contains(where: harness.isCap),
+                "the series was capped: \(harness.splitWrites)")
+        #expect(harness.newPartIds.isEmpty, "the new part was made again: \(harness.newPartIds)")
+        #expect(r.next == nil && harness.nextWritten, "the next change did not drain: \(describe(r.next))")
+    }
+
+    @Test("T8: Outlook writes the new part before the cap, and never again after a cap was sent")
+    func outlookCreatesBeforeItCaps() async throws {
+        let harness = SplitHarness(.outlook)
+        harness.failCap()
+        let r = try await drainSplit(harness, account: "split-t8", drains: 2)
+        let writes = harness.splitWrites
+        let firstCap = try #require(writes.firstIndex(where: harness.isCap), "no cap: \(writes)")
+        #expect(writes.filter { $0 == "POST" }.count == 1, "\(writes)")
+        #expect(!writes[firstCap...].contains("POST"), "a POST after a cap: \(writes)")
+        #expect(r.split == nil, "\(describe(r.split))")
+    }
+
+    @Test("T10: finishing a split whose series already ends before it writes nothing and keeps the user's end",
+          arguments: SplitHarness.Kind.allCases, ["until", "count"])
+    func finishWritesNothingOnAnEndedSeries(_ kind: SplitHarness.Kind, end: String) async throws {
+        let early = "\(compact(day(3)))T235959Z"
+        let googleRule = end == "until" ? "RRULE:FREQ=WEEKLY;UNTIL=\(early)" : "RRULE:FREQ=WEEKLY;COUNT=1"
+        let graphRange: [String: Any] = end == "until"
+            ? ["type": "endDate", "endDate": GraphFixture.utcDay(GraphFixture.start.addingTimeInterval(2 * 86_400))]
+            : ["type": "numbered", "numberOfOccurrences": 1]
+        let harness = SplitHarness(kind, googleRule: googleRule, graphRange: graphRange, calDAVRule: googleRule)
+        let before = harness.seriesEnd
+        // The new part a first attempt made, and its record on the row.
+        let partId: String
+        switch kind {
+        case .google:
+            partId = GoogleCalendarProvider.deterministicSplitEventId(masterId: harness.seriesId, recurrenceId: harness.recurrenceId)
+            var part = FakeGoogleCalendar.timed(id: partId, day: day(7))
+            part["recurrence"] = ["RRULE:FREQ=WEEKLY"]
+            harness.google?.store(part)
+        case .outlook:
+            partId = "part-1"
+            harness.graph?.store(GraphFixture.event(id: partId, start: GraphFixture.occurrenceStart, online: false, recurring: true))
+        case .calDAV:
+            partId = "/cal/part-1.ics"
+            harness.store?.seed(path: partId, ics: calDAVSeries(uid: "part-1", rule: "RRULE:FREQ=WEEKLY"))
+        }
+        var arguments = harness.arguments
+        arguments[SplitRecord.argumentKey] = .dictionary(
+            SplitRecord(seriesId: harness.seriesId, newPartId: partId, splitAt: harness.recurrenceId).jsonObject.mapValues { .string($0) })
+        let r = try await drainSplit(harness, account: "split-t10-\(kind)-\(end)", arguments: arguments, drains: 1)
+        #expect(r.split == nil, "\(kind) \(end): \(describe(r.split))")
+        #expect(harness.splitWrites.isEmpty, "\(kind) \(end): wrote \(harness.splitWrites)")
+        #expect(harness.seriesEnd == before, "\(kind) \(end): the series' end changed from \(before) to \(harness.seriesEnd)")
+    }
+}
+
+@Suite("The split record is reserved for the queue (#601)", .serialized, .processGlobalState)
+struct SplitRecordIsReservedTests {
+
+    @Test("T9: a split record or first not-found time in a tool call's arguments is dropped when the change is queued")
+    func forgedRecordIsDropped() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let pool = try DatabasePool(path: dir.appendingPathComponent("test.sqlite").path)
+        let appDb = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let prev = current; current = appDb; return prev
+        }
+        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir) }
+        let account = "split-t9"
+        try await pool.write { db in
+            var acc = Account(emailAddress: "cal@example.com", displayName: "Cal", provider: .gmail)
+            acc.id = account
+            try acc.insert(db)
+        }
+        let forged = SplitRecord(seriesId: "ser-g", newPartId: "ser-g-forged", splitAt: "\(day(7))T09:00:00")
+        let op = try await AccountManager.shared.queueCalendarOperation(
+            type: .edit, accountId: account, eventId: "ser-g", calendarId: "primary",
+            arguments: ["edit_scope": .string("this_and_following"), "recurrence_id": .string(forged.splitAt),
+                        "title": .string("Retitled"),
+                        SplitRecord.argumentKey: .dictionary(forged.jsonObject.mapValues { .string($0) }),
+                        // A forged "first not found long ago" would refuse the split on its first
+                        // not-found answer, with no grace.
+                        SplitRecord.partNotFoundSinceKey: .double(Date().addingTimeInterval(-86_400).timeIntervalSince1970)])
+        let stored = try #require(try await pool.read { db in try PendingCalendarOperation.fetchOne(db, key: op.id) })
+        #expect(SplitRecord(stored.arguments) == nil, "the forged record was queued: \(stored.argumentsJSON)")
+        #expect(stored.arguments[SplitRecord.partNotFoundSinceKey] == nil,
+                "the forged first not-found time was queued: \(stored.argumentsJSON)")
+        #expect(stored.arguments["title"] != nil, "the rest of the arguments were not kept: \(stored.argumentsJSON)")
+    }
+
+    @Test("A record round-trips through the stored arguments, and a partial one is no record")
+    func recordRoundTrips() throws {
+        let record = SplitRecord(seriesId: "ser", newPartId: "part", splitAt: "\(day(7))T09:00:00")
+        let stored = PendingCalendarOperation(
+            operationType: .edit, accountId: "a", eventId: "ser", calendarId: "primary",
+            arguments: [SplitRecord.argumentKey: .dictionary(record.jsonObject.mapValues { .string($0) })])
+        #expect(SplitRecord(stored.arguments) == record)
+        var partial = record.jsonObject
+        partial["new_part_id"] = nil
+        #expect(SplitRecord([SplitRecord.argumentKey: .dictionary(partial.mapValues { .string($0) })]) == nil)
     }
 }

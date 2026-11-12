@@ -226,7 +226,7 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         do {
             named = try await CalendarSeriesScope.read(
                 event: fetchedEvent, eventId: eventId, recurrenceId: recurrenceIdArg, scope: resolvedScope,
-                calendarId: lookupCalId, zone: tz, splitting: false, provider: provider)
+                calendarId: lookupCalId, zone: tz, provider: provider)
         } catch let refused as CalendarProviderError {
             // A provider's refusal, worded for an edit (`reason`): `notSupported`'s own, and the
             // edit's words for a neutral case (a series not in this calendar, #729).

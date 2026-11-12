@@ -414,6 +414,8 @@ struct CalendarSplitConflictDispositionTests {
 
     private struct SplitDrainResult {
         let remaining: Int
+        /// The split's row after the drain; nil once it is gone.
+        let row: PendingCalendarOperation?
         let outcome: CalendarOpOutcome
         let wire: [String]
         /// The `recurrence` array of every PATCH that reached the wire, in order.
@@ -426,7 +428,8 @@ struct CalendarSplitConflictDispositionTests {
     private func drainOneSplitThroughRealGoogleProvider(
         accountId: String,
         createResponse: FakeHTTP.CannedResponse,
-        successorGetResponse: FakeHTTP.CannedResponse
+        successorGetResponse: FakeHTTP.CannedResponse,
+        notFoundFirstAnswered: Date? = nil
     ) async throws -> SplitDrainResult {
         let (pool, dir, previous) = try makeCalendarConflictTestDB(accountId: accountId)
         let http = FakeHTTP.Scenario()
@@ -454,16 +457,22 @@ struct CalendarSplitConflictDispositionTests {
             InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir)
         }
 
+        var arguments: [String: JSONValue] = [
+            "summary": .string("Weekly sync (new room)"),
+            "edit_scope": .string("this_and_following"),
+            "recurrence_id": .string(Self.recurrenceId)
+        ]
+        // An earlier attempt of this operation already got a "not found" for the new part, at
+        // this time: kept on the row as the queue keeps it.
+        if let notFoundFirstAnswered {
+            arguments[SplitRecord.partNotFoundSinceKey] = .double(notFoundFirstAnswered.timeIntervalSince1970)
+        }
         let op = PendingCalendarOperation(
             operationType: .edit,
             accountId: accountId,
             eventId: Self.masterId,
             calendarId: "primary",
-            arguments: [
-                "summary": .string("Weekly sync (new room)"),
-                "edit_scope": .string("this_and_following"),
-                "recurrence_id": .string(Self.recurrenceId)
-            ]
+            arguments: arguments
         )
         try await pool.write { db in try op.insert(db) }
 
@@ -473,7 +482,9 @@ struct CalendarSplitConflictDispositionTests {
         await AccountManager.shared.drainCalendarQueue()
         let result = await outcome
 
-        let remaining = try await pool.read { db in try PendingCalendarOperation.fetchCount(db) }
+        let (remaining, row) = try await pool.read { db in
+            (try PendingCalendarOperation.fetchCount(db), try PendingCalendarOperation.fetchOne(db, key: op.id))
+        }
         let patched: [[String]] = http.recordedCalls()
             .filter { $0.method == "PATCH" }
             .map { call in
@@ -484,7 +495,7 @@ struct CalendarSplitConflictDispositionTests {
                 return rec
             }
         return SplitDrainResult(
-            remaining: remaining, outcome: result,
+            remaining: remaining, row: row, outcome: result,
             wire: http.servedCallSequence(), patchedRecurrences: patched)
     }
 
@@ -530,18 +541,35 @@ struct CalendarSplitConflictDispositionTests {
                 "the master must not be capped when its successor was not created: a cap with no successor leaves the series ending early on the server. got \(result.patchedRecurrences)")
     }
 
-    @Test("A PROVEN duplicate whose proof read then fails keeps the intention queued with nothing capped")
-    func provenDuplicateWhoseProofReadFailsDoesNotUncapTheMaster() async throws {
+    /// The grace `SyncConfig.splitPartNotFoundGraceMinutes` gives a "not found" answer for a new
+    /// part Google has just said exists, in seconds.
+    private static var grace: TimeInterval { TimeInterval(SyncConfig.splitPartNotFoundGraceMinutes * 60) }
+
+    private static func notFoundBody(_ code: Int) -> FakeHTTP.CannedResponse {
+        .raw(statusCode: code, headers: ["Content-Type": "application/json"],
+             body: googleErrorBody(code: code, reason: code == 404 ? "notFound" : "deleted"))
+    }
+
+    private static let provenDuplicate = FakeHTTP.CannedResponse.raw(
+        statusCode: 409, headers: ["Content-Type": "application/json"],
+        body: googleErrorBody(code: 409, reason: "duplicate"))
+
+    private static let refusal = "This change to the repeating event wasn't finished because its new part was deleted. Check the event's later occurrences, and make the change again if you still want it."
+
+    @Test("A PROVEN duplicate whose proof read answers not found within the grace keeps the intention queued with nothing capped",
+          arguments: [404, 410], [false, true])
+    func provenDuplicateWhoseProofReadFailsDoesNotUncapTheMaster(_ code: Int, answeredBefore: Bool) async throws {
+        // The first "not found" for this operation is this one, or one a minute ago: either way
+        // well inside the grace.
+        let aMinuteAgo = Date().addingTimeInterval(-60)
+        try #require(60 < Self.grace, "a minute must be inside the grace for this test to say anything")
         let result = try await drainOneSplitThroughRealGoogleProvider(
-            accountId: "cal-r14-f2-proven-unreadable",
-            createResponse: .raw(
-                statusCode: 409, headers: ["Content-Type": "application/json"],
-                body: Self.googleErrorBody(code: 409, reason: "duplicate")),
+            accountId: "cal-r14-f2-proven-unreadable-\(code)-\(answeredBefore)",
+            createResponse: Self.provenDuplicate,
             // Google positively said our id already exists, then would not hand
             // the resource back — read-after-write lag, a transient 404.
-            successorGetResponse: .raw(
-                statusCode: 404, headers: ["Content-Type": "application/json"],
-                body: Self.googleErrorBody(code: 404, reason: "notFound")))
+            successorGetResponse: Self.notFoundBody(code),
+            notFoundFirstAnswered: answeredBefore ? aMinuteAgo : nil)
 
         #expect(result.wire == Self.readsBeforeCreate + [
             "POST \(Self.createPath)",
@@ -551,9 +579,55 @@ struct CalendarSplitConflictDispositionTests {
         #expect(result.patchedRecurrences.isEmpty,
                 "the split stops at the failed read with nothing capped; the retry re-proves the duplicate and caps. got \(result.patchedRecurrences)")
 
-        #expect(result.remaining == 1,
-                "'we could not read it back' is not a provider-authoritative statement that the work is done or inapplicable — never-drop clause 2. The proof-GET's 404 must not be allowed to masquerade as 'the original event is gone' and delete the row.")
+        #expect(result.remaining == 1 && result.row?.status == PendingStatus.queued.rawValue,
+                "'we could not read it back' right after Google said the id exists is not a provider-authoritative statement that the work is done or inapplicable — never-drop clause 2. Within the grace the proof read's \(code) must not retire the row. got \(result.row.map { "\($0.status) \($0.failureReason ?? "")" } ?? "gone")")
         #expect(isStillQueued(result.outcome), "got \(result.outcome)")
+    }
+
+    @Test("A PROVEN duplicate whose proof read still answers not found past the grace is refused with nothing capped",
+          arguments: [404, 410])
+    func provenDuplicateNotFoundPastTheGraceIsRefused(_ code: Int) async throws {
+        let result = try await drainOneSplitThroughRealGoogleProvider(
+            accountId: "cal-601-past-grace-\(code)",
+            createResponse: Self.provenDuplicate,
+            successorGetResponse: Self.notFoundBody(code),
+            notFoundFirstAnswered: Date().addingTimeInterval(-(Self.grace + 60)))
+
+        #expect(result.patchedRecurrences.isEmpty,
+                "a split whose new part is gone must not cap the series: got \(result.patchedRecurrences)")
+        #expect(!result.wire.dropFirst(Self.readsBeforeCreate.count + 1).contains { $0.hasPrefix("POST") },
+                "the new part was created again: \(result.wire)")
+        #expect(result.row?.status == PendingStatus.failed.rawValue && result.row?.failureReason == Self.refusal,
+                "past the grace the new part counts as deleted and the change is refused: got \(result.row.map { "\($0.status) \($0.failureReason ?? "")" } ?? "gone")")
+        guard case .permanentFailure(let reason) = result.outcome else {
+            Issue.record("the refusal must be announced as terminal, got \(result.outcome)")
+            return
+        }
+        #expect(reason == Self.refusal, "got \(reason)")
+    }
+
+    @Test("A PROVEN duplicate whose new part reads as cancelled is refused at once, with nothing capped")
+    func provenDuplicateCancelledIsRefusedAtOnce() async throws {
+        let successorId = GoogleCalendarProvider.deterministicSplitEventId(
+            masterId: Self.masterId, recurrenceId: Self.recurrenceId)
+        let result = try await drainOneSplitThroughRealGoogleProvider(
+            accountId: "cal-601-cancelled",
+            createResponse: Self.provenDuplicate,
+            successorGetResponse: .raw(
+                statusCode: 200, headers: ["Content-Type": "application/json"],
+                body: Data("""
+                {"id":"\(successorId)","summary":"Weekly sync (new room)","status":"cancelled",
+                 "recurrence":["RRULE:FREQ=WEEKLY;BYDAY=WE"]}
+                """.utf8)))
+
+        #expect(result.patchedRecurrences.isEmpty,
+                "a split whose new part was deleted must not cap the series: got \(result.patchedRecurrences)")
+        #expect(result.row?.status == PendingStatus.failed.rawValue && result.row?.failureReason == Self.refusal,
+                "`cancelled` is Google's own answer that the part was deleted: refused on the first answer, with no grace. got \(result.row.map { "\($0.status) \($0.failureReason ?? "")" } ?? "gone")")
+        guard case .permanentFailure = result.outcome else {
+            Issue.record("the refusal must be announced as terminal, got \(result.outcome)")
+            return
+        }
     }
 
     @Test("CONTROL — a proven duplicate whose proof read SUCCEEDS still retires the op, so the two survivals above are not 'the drain never deletes'")
