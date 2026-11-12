@@ -747,6 +747,57 @@ struct BodyAddressGateTests {
             "an identity that cannot be verified must FAIL CLOSED — this guard has no backstop")
     }
 
+    /// The attached-email file list (`AccountManager.fetchAttachedEmailAttachments`) addresses the
+    /// wire by the same `(folderPath, messageId)` pair as `fetchAttachment(for:)`, so mid-move it
+    /// would list a different message's attached email. This runs the method itself: mid-move it
+    /// throws the typed pending-move case before any provider is resolved; the settled control
+    /// fails for some other reason (the fixture account has no `imapHost`, so provider resolution
+    /// throws), proving the guard is what refused the first call.
+    @Test("Listing an attached email's files is refused mid-move, and only there")
+    func attachedEmailFileListIsRefusedMidMove() async throws {
+        let accountId = "gate-attached-email-files"
+        let (pool, dir, previous) = try Self.fixture(accountId: accountId, provider: .imap)
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+
+        let movedId = try Self.insertOptimisticallyMovedHeader(
+            accountId: accountId, sourcePath: "INBOX", destinationPath: "Archive",
+            uid: "41", rfc822: "victim@example.com", pool: pool)
+        let moved = try #require(try await pool.read { db in
+            try MessageHeader.fetchOne(db, key: movedId)
+        })
+        var pendingMoveId: String?
+        var unexpected: Error?
+        do {
+            _ = try await AccountManager.shared.fetchAttachedEmailAttachments(for: moved, section: "att")
+            Issue.record("listing must refuse a mid-move address before it reaches the wire")
+        } catch let ProviderError.addressPendingMove(id) {
+            pendingMoveId = id
+        } catch {
+            unexpected = error
+        }
+        #expect(
+            pendingMoveId == moved.id,
+            "the list must throw the typed pending-move case carrying this row's id; got \(unexpected.map { "\($0)" } ?? "no throw")")
+
+        let acct = try #require(try await pool.read { db in try Account.fetchOne(db, key: accountId) })
+        #expect(acct.imapHost == nil,
+                "fixture precondition: without this the settled control would attempt a live connection")
+        let settled = try Self.makeHeader(
+            accountId: accountId, folderPath: "Archive", uid: "77",
+            rfc822: "settled@example.com", observedUidValidity: 202, pool: pool)
+        do {
+            _ = try await AccountManager.shared.fetchAttachedEmailAttachments(for: settled, section: "att")
+            Issue.record("fixture check: the settled control has no reachable provider and must fail")
+        } catch let ProviderError.addressPendingMove(id) {
+            Issue.record("a settled address must not be refused as mid-move (id: \(id))")
+        } catch {
+            // Expected: provider resolution fails, so the guard let it past.
+        }
+    }
+
     /// 🚨 **Pins the CLASSIFICATION that two callers depend on.** `ProviderError.addressPendingMove`
     /// is deterministic and pre-wire: retrying the same stale value cannot succeed, and the
     /// connection is fine. Two consequences ride on that:

@@ -321,12 +321,22 @@ struct GraphAttachmentBytesTests {
         id: "fwd", name: "Fwd: plan.eml", contentType: "message/rfc822", isInline: false,
         contentId: nil, bytes: Data(), isAttachedEmail: true)
 
+    /// An inline image inside the attached email: shown in its body, never listed.
+    private static let attachedInlineImage = GraphAttachmentServer.File(
+        id: "sig", name: "sig.png", contentType: "image/png", isInline: true,
+        contentId: "sig@example.com", bytes: Data(repeating: 0x11, count: 32))
+    /// A file inside the attached email that has no name: never listed.
+    private static let attachedUnnamedFile = GraphAttachmentServer.File(
+        id: "unnamed", name: "", contentType: "application/octet-stream", isInline: false,
+        contentId: nil, bytes: Data(repeating: 0x22, count: 16))
+
     private static func attachedEmailServer(
+        files attachedFiles: [GraphAttachmentServer.File] = [report, notes, attachedInlineImage, attachedUnnamedFile],
         dated: Bool = true, failingOpens: Int = 0, listContinues: Bool = false
     ) -> GraphAttachmentServer {
         GraphAttachmentServer(
             messageId: messageId, html: "<p>See the attached mail</p>",
-            files: [forwarded], pageSize: 10, attachedEmailFiles: [report, notes],
+            files: [forwarded], pageSize: 10, attachedEmailFiles: attachedFiles,
             attachedEmailDated: dated, failingAttachedEmailOpens: failingOpens,
             attachedEmailListContinues: listContinues)
     }
@@ -361,6 +371,19 @@ struct GraphAttachmentBytesTests {
         #expect(!info.attachments.contains { $0.parentEmlSection != nil })
     }
 
+    @Test("Main app: an attached email with no files is not marked to list files on open")
+    func attachedEmailWithoutFilesListsNothingOnOpen() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        Self.attachedEmailServer(files: []).install(on: http)
+
+        let info = try await Self.mainApp(http).fetchMessage(id: Self.messageId, folder: "inbox-id")
+
+        let chip = try #require(info.attachments.first { $0.section == Self.forwarded.id })
+        #expect(chip.filesListedOnOpen == nil, "no file list is fetched for an email without files")
+        #expect((info.htmlBody ?? "").contains("class=\"tm-eml-section\""), "it is still previewed")
+    }
+
     @Test("Main app: an attached email Graph returns without a date has no date in its preview")
     func attachedEmailWithoutDateHasNone() async throws {
         let http = FakeHTTP.Scenario()
@@ -386,7 +409,9 @@ struct GraphAttachmentBytesTests {
             Issue.record("the attached email's files are listed")
             return
         }
-        #expect(Set(files.map(\.filename)) == ["report.pdf", "notes.txt"])
+        #expect(files.count == 2)
+        #expect(Set(files.map(\.filename)) == ["report.pdf", "notes.txt"],
+                "its inline image and its unnamed file are not listed")
         #expect(files.allSatisfy { $0.parentEmlSection == Self.forwarded.id })
     }
 

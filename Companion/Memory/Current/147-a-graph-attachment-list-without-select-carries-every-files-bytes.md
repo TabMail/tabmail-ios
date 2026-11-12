@@ -117,6 +117,9 @@ uncast `$select` or nested `$expand` inside the expansion, and anything below an
 attached email's own list, one of its files by id, plain or cast); 501 for a shape it does not model.
 It also covers an upper-case `CID:`, the cap in both readers, an inline GET that fails or has no
 bytes, a tap download with no bytes, and, for an attached email: a read downloads none of its files'
-bytes, no made-up date, opening it lists its files, a failed open is shown and a second open lists
-them, a continued list fails, and opening one of its files returns its bytes. `GraphPageLinkTests`
+bytes, no made-up date, one without files is not marked, opening it lists its files (not its inline
+image or an unnamed file), a failed open is shown and a second open lists them, a continued list
+fails, and opening one of its files returns its bytes. `AttachedEmailFilesListerTests` pins which chip
+gets a lister (`AttachmentListView.filesLister`), and `BodyAddressGateTests` that the list is refused
+mid-move. `GraphPageLinkTests`
 pins `isGraphPageLink` both ways.

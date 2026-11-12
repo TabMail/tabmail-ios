@@ -39,6 +39,18 @@ struct AttachmentListView: View {
         let listFiles: (() async throws -> [AttachmentInfo])?
     }
 
+    /// The lister an attached email's sheet runs when it opens: `list` for this
+    /// chip's section when its files are listed on open
+    /// (`AttachmentInfo.filesListedOnOpen`), else `nil`.
+    static func filesLister(
+        for attachment: AttachmentInfo,
+        list: @escaping (String) async throws -> [AttachmentInfo]
+    ) -> (() async throws -> [AttachmentInfo])? {
+        guard attachment.filesListedOnOpen == true else { return nil }
+        let section = attachment.section
+        return { try await list(section) }
+    }
+
     private func isEmlAttachment(_ attachment: AttachmentInfo) -> Bool {
         attachment.contentType.lowercased().hasPrefix("message/rfc822")
             || attachment.filename.lowercased().hasSuffix(".eml")
@@ -75,12 +87,9 @@ struct AttachmentListView: View {
                             // surface them as a mini attachment strip.
                             PreviewFreezeGate.shared.begin()
                             let nested = attachments.filter { $0.parentEmlSection == attachment.section }
-                            let listFiles: (() async throws -> [AttachmentInfo])?
-                            if attachment.filesListedOnOpen == true {
-                                let manager = manager, message = message, section = attachment.section
-                                listFiles = { try await manager.fetchAttachedEmailAttachments(for: message, section: section) }
-                            } else {
-                                listFiles = nil
+                            let manager = manager, message = message
+                            let listFiles = Self.filesLister(for: attachment) { section in
+                                try await manager.fetchAttachedEmailAttachments(for: message, section: section)
                             }
                             emlPreview = EmlPreviewState(
                                 html: html,
