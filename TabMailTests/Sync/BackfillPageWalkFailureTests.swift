@@ -51,6 +51,45 @@ struct BackfillPageWalkFailureTests {
         try #require(try F.folder(accountId, path, pool: pool)).backfillComplete
     }
 
+    // MARK: - What a walked page writes
+
+    /// The page walk's insert tail: every loaded message gets its row; a message
+    /// served with a body has it written to search, and its row gets the snippet
+    /// taken from that body and `bodyComplete`; a message served with no body gets
+    /// its row and neither. The same tail inserts the catch-up's direct load
+    /// (ADR-IOS-107), so this pins what both write.
+    @Test("Gmail: a walked page's messages are inserted, and a fetched body sets the snippet and bodyComplete")
+    func gmailWalkedPageWritesBodiesAndSnippets() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let accountId = "gm-walk-bodies"
+        let body = "Quarterly planning notes for the walked page"
+        let server = StatefulGmailActionServer(messages: [
+            StatefulGmailActionServer.Seed(
+                rfc822MessageId: "b1@example.com", providerMessageId: "b1", labels: ["INBOX"],
+                internalDate: F.daysAgo(1), bodyText: body),
+            F.gmailSeed("b2", label: "INBOX", daysAgo: 2),
+        ])
+        defer { server.close() }
+        server.servePagedListings(pageSize: F.pageSize)
+        let account = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .gmail, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: "INBOX", role: .inbox, pool: pool)
+        let engine = await F.registeredEngine(accountId: accountId, provider: server.provider())
+
+        _ = await engine.runBackfill(account: account, deadline: F.deadline())
+
+        let rows = try await pool.read { db in
+            try MessageHeader.filter(Column("folderId") == "\(accountId):INBOX").fetchAll(db)
+        }
+        let byId = Dictionary(rows.map { ($0.messageId, $0) }, uniquingKeysWith: { first, _ in first })
+        #expect(Set(byId.keys) == ["b1", "b2"], "rows: \(byId.keys.sorted())")
+        let withBody = try #require(byId["b1"])
+        #expect(withBody.bodyComplete, "the fetched body was written to search")
+        #expect(withBody.snippet.contains("Quarterly planning notes"), "the snippet comes from the body: \(withBody.snippet)")
+        let withoutBody = try #require(byId["b2"])
+        #expect(!withoutBody.bodyComplete && withoutBody.snippet.isEmpty, "no body: no snippet, not complete")
+    }
+
     // MARK: - A page-list request that fails
 
     /// Page 2's request, which carries the token page 1 saved, fails once with

@@ -862,6 +862,93 @@ extension SyncEngine {
         return db.changesCount > 0
     }
 
+    // MARK: - Gmail/Exchange page walk: the insert tail
+
+    /// The page walk's insert tail, shared with the catch-up's direct load
+    /// (ADR-IOS-107 decision 8): inserts the fetched `headers` into `folder`
+    /// (`insertBackfillBatch`, the premise-less overload: neither Gmail nor
+    /// Exchange has a UIDVALIDITY), indexes the inserted rows for search, writes
+    /// each fetched body (`bodies`, keyed by provider message id) to FTS and sets
+    /// the snippet and `bodyComplete` only for the bodies FTS confirmed, and
+    /// enqueues the inserted rows on `BackfillBodyQueue`. Returns how many rows
+    /// were inserted.
+    func insertFetchedBackfillMessages(
+        _ headers: [MessageHeaderInfo],
+        bodies bodyData: [String: (htmlBody: String?, textBody: String?)],
+        folder: Folder
+    ) async -> Int {
+        // Step 1: Insert headers to GRDB (batch dedup).
+        // The premise-LESS overload, deliberately: this is the
+        // Gmail/Exchange page walk, and neither provider has a
+        // UIDVALIDITY concept at all, so there is no premise to
+        // hold and nothing a guard could compare. That overload
+        // has no refusal channel to discard (round 13 blocker 3),
+        // so this call site cannot silently swallow one.
+        let (inserted, ftsRecords, ccBccUpdates) = await insertBackfillBatch(
+            headers, folderId: folder.id, accountId: folder.accountId,
+            folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox,
+            observedEpoch: nil
+        )
+        if !ftsRecords.isEmpty { await indexHeadersForFTS(ftsRecords) }
+        if !ccBccUpdates.isEmpty { try? await SearchIndex.shared.updateCcBcc(ccBccUpdates) }
+
+        // Step 2: Write bodies to FTS for inserted messages.
+        // Match body data to headerIds using ftsRecords (which have headerId + messageId).
+        // 🚨 TWO BUFFERS, TWO KEY SPACES (F2). `ftsBodyBuffer` is keyed by
+        // CONTENT (it addresses FTS rows); `snippetBuffer` is keyed by
+        // `messageHeader.id` (`applySnippetUpdates` writes
+        // `UPDATE messageHeader … WHERE id = ?`). The confirmation set
+        // comes back in content-key space, so the two are zipped by
+        // INDEX below — never by comparing an id from one space against
+        // the other.
+        var ftsBodyBuffer: [(contentKey: ContentKey, body: String)] = []
+        var snippetBuffer: [(headerId: String, snippet: String)] = []
+        for ftsRecord in ftsRecords {
+            if let body = bodyData[ftsRecord.messageId] {
+                let plainText = EmailFilter.extractPlainText(htmlBody: body.htmlBody, textBody: body.textBody)
+                if let plainText, !plainText.isEmpty {
+                    ftsBodyBuffer.append((contentKey: ftsRecord.contentKey, body: plainText))
+                    let snippet = EmailFilter.snippetFromPlainText(plainText)
+                    snippetBuffer.append((headerId: ftsRecord.headerId, snippet: snippet))
+                }
+            }
+        }
+        if !ftsBodyBuffer.isEmpty {
+            do {
+                let writtenIds = try await SearchIndex.shared.updateBodies(ftsBodyBuffer)
+                // Only set bodyComplete for items actually written to FTS.
+                // Both buffers were appended in lockstep, so entry i of
+                // `snippetBuffer` is the header for entry i of
+                // `ftsBodyBuffer` — that positional pairing is what
+                // carries the confirmation across the key-space boundary.
+                let confirmedSnippets = zip(ftsBodyBuffer, snippetBuffer)
+                    .filter { writtenIds.contains($0.0.contentKey) }
+                    .map(\.1)
+                applySnippetUpdates(confirmedSnippets)
+                let skipped = ftsBodyBuffer.count - writtenIds.count
+                if skipped > 0 {
+                    BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) wrote \(writtenIds.count)/\(ftsBodyBuffer.count) bodies to FTS (\(skipped) deferred)")
+                } else {
+                    BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) wrote \(ftsBodyBuffer.count) bodies to FTS")
+                }
+            } catch {
+                BackgroundSyncLogger.logDebug("[Backfill] FTS body write failed: \(error)")
+                BackgroundSyncLogger.logError("FTS body write failed for \(folder.name): \(error)", source: "backfill")
+            }
+        }
+
+        // Enqueue to ActiveBodyQueue — items with bodies already in FTS will be
+        // skipped (forwarding inbox items to ActiveAIQueue); items without
+        // bodies will be fetched by the queue.
+        if !ftsRecords.isEmpty {
+            await BackfillBodyQueue.shared.enqueueItems(
+                ftsRecords: ftsRecords, accountId: folder.accountId,
+                folderPath: folder.path, isInInbox: folder.role == .inbox
+            )
+        }
+        return inserted
+    }
+
     // MARK: - Unified Backfill Walk
 
     /// Crawl folders for this account, inserting headers AND indexing bodies in the same walk.
@@ -2050,76 +2137,7 @@ extension SyncEngine {
                     }
 
                     if !headers.isEmpty {
-                        // Step 1: Insert headers to GRDB (batch dedup).
-                        // The premise-LESS overload, deliberately: this is the
-                        // Gmail/Exchange page walk, and neither provider has a
-                        // UIDVALIDITY concept at all, so there is no premise to
-                        // hold and nothing a guard could compare. That overload
-                        // has no refusal channel to discard (round 13 blocker 3),
-                        // so this call site cannot silently swallow one.
-                        let (inserted, ftsRecords, ccBccUpdates) = await insertBackfillBatch(
-                            headers, folderId: folder.id, accountId: folder.accountId,
-                            folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox,
-                            observedEpoch: nil
-                        )
-                        if !ftsRecords.isEmpty { await indexHeadersForFTS(ftsRecords) }
-                        if !ccBccUpdates.isEmpty { try? await SearchIndex.shared.updateCcBcc(ccBccUpdates) }
-                        insertedCount = inserted
-
-                        // Step 2: Write bodies to FTS for inserted messages.
-                        // Match body data to headerIds using ftsRecords (which have headerId + messageId).
-                        // 🚨 TWO BUFFERS, TWO KEY SPACES (F2). `ftsBodyBuffer` is keyed by
-                        // CONTENT (it addresses FTS rows); `snippetBuffer` is keyed by
-                        // `messageHeader.id` (`applySnippetUpdates` writes
-                        // `UPDATE messageHeader … WHERE id = ?`). The confirmation set
-                        // comes back in content-key space, so the two are zipped by
-                        // INDEX below — never by comparing an id from one space against
-                        // the other.
-                        var ftsBodyBuffer: [(contentKey: ContentKey, body: String)] = []
-                        var snippetBuffer: [(headerId: String, snippet: String)] = []
-                        for ftsRecord in ftsRecords {
-                            if let body = bodyData[ftsRecord.messageId] {
-                                let plainText = EmailFilter.extractPlainText(htmlBody: body.htmlBody, textBody: body.textBody)
-                                if let plainText, !plainText.isEmpty {
-                                    ftsBodyBuffer.append((contentKey: ftsRecord.contentKey, body: plainText))
-                                    let snippet = EmailFilter.snippetFromPlainText(plainText)
-                                    snippetBuffer.append((headerId: ftsRecord.headerId, snippet: snippet))
-                                }
-                            }
-                        }
-                        if !ftsBodyBuffer.isEmpty {
-                            do {
-                                let writtenIds = try await SearchIndex.shared.updateBodies(ftsBodyBuffer)
-                                // Only set bodyComplete for items actually written to FTS.
-                                // Both buffers were appended in lockstep, so entry i of
-                                // `snippetBuffer` is the header for entry i of
-                                // `ftsBodyBuffer` — that positional pairing is what
-                                // carries the confirmation across the key-space boundary.
-                                let confirmedSnippets = zip(ftsBodyBuffer, snippetBuffer)
-                                    .filter { writtenIds.contains($0.0.contentKey) }
-                                    .map(\.1)
-                                applySnippetUpdates(confirmedSnippets)
-                                let skipped = ftsBodyBuffer.count - writtenIds.count
-                                if skipped > 0 {
-                                    BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) wrote \(writtenIds.count)/\(ftsBodyBuffer.count) bodies to FTS (\(skipped) deferred)")
-                                } else {
-                                    BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) wrote \(ftsBodyBuffer.count) bodies to FTS")
-                                }
-                            } catch {
-                                BackgroundSyncLogger.logDebug("[Backfill] FTS body write failed: \(error)")
-                                BackgroundSyncLogger.logError("FTS body write failed for \(folder.name): \(error)", source: "backfill")
-                            }
-                        }
-
-                        // Enqueue to ActiveBodyQueue — items with bodies already in FTS will be
-                        // skipped (forwarding inbox items to ActiveAIQueue); items without
-                        // bodies will be fetched by the queue.
-                        if !ftsRecords.isEmpty {
-                            await BackfillBodyQueue.shared.enqueueItems(
-                                ftsRecords: ftsRecords, accountId: folder.accountId,
-                                folderPath: folder.path, isInInbox: folder.role == .inbox
-                            )
-                        }
+                        insertedCount = await insertFetchedBackfillMessages(headers, bodies: bodyData, folder: folder)
                     }
 
                     // The page's token. The messages that loaded are already

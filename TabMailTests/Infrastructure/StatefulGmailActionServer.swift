@@ -27,19 +27,24 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         /// metadata GET asks for `metadataHeaders=Received` (the real API
         /// returns only the requested headers under `format=metadata`).
         let received: [String]
+        /// The `text/plain` body the `format=full` GET serves (the backfill's
+        /// fetch). Nil serves an empty body, as before.
+        let bodyText: String?
 
         init(
             rfc822MessageId: String,
             providerMessageId: String,
             labels: Set<String>,
             internalDate: Date? = nil,
-            received: [String] = []
+            received: [String] = [],
+            bodyText: String? = nil
         ) {
             self.rfc822MessageId = rfc822MessageId
             self.providerMessageId = providerMessageId
             self.labels = labels
             self.internalDate = internalDate
             self.received = received
+            self.bodyText = bodyText
         }
     }
 
@@ -75,6 +80,7 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         var labels: Set<String>
         var internalDate: Date? = nil
         var received: [String] = []
+        var bodyText: String? = nil
     }
 
     /// Which injected failure (if any) `/messages/{id}/modify` must serve for
@@ -313,7 +319,8 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                         providerMessageId: $0.providerMessageId,
                         labels: $0.labels,
                         internalDate: $0.internalDate,
-                        received: $0.received
+                        received: $0.received,
+                        bodyText: $0.bodyText
                     ))
                 }
             ),
@@ -455,7 +462,8 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                 providerMessageId: seed.providerMessageId,
                 labels: seed.labels,
                 internalDate: seed.internalDate,
-                received: seed.received
+                received: seed.received,
+                bodyText: seed.bodyText
             )
             model.record(seed.providerMessageId, .messageAdded, labels: seed.labels)
         }
@@ -1134,7 +1142,8 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                 .compactMap { $0.value?.lowercased() }
             let response = format == "minimal"
                 ? Self.minimalResponse(message)
-                : Self.metadataResponse(message, requestedHeaders: Set(requestedHeaders))
+                : Self.metadataResponse(
+                    message, requestedHeaders: Set(requestedHeaders), servesBody: format == "full")
             let latency = state.value.withLock { $0.getLatencyByProviderId[providerId] ?? 0 }
             guard latency > 0 else { return response }
             return .parked { Thread.sleep(forTimeInterval: latency); return response }
@@ -1455,6 +1464,16 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         return true
     }
 
+    /// A payload `body`: `text` base64url-encoded, as Gmail serves it; empty for nil.
+    private static func bodyObject(_ text: String?) -> [String: Any] {
+        guard let text else { return ["size": 0, "data": ""] }
+        let data = Data(text.utf8)
+        let encoded = data.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        return ["size": data.count, "data": encoded]
+    }
+
     /// `format=minimal`: ids, labels and dates only — no payload.
     private static func minimalResponse(_ message: Message) -> FakeHTTP.CannedResponse {
         let object: [String: Any] = [
@@ -1468,7 +1487,7 @@ final class StatefulGmailActionServer: @unchecked Sendable {
     }
 
     private static func metadataResponse(
-        _ message: Message, requestedHeaders: Set<String> = []
+        _ message: Message, requestedHeaders: Set<String> = [], servesBody: Bool = false
     ) -> FakeHTTP.CannedResponse {
         let internalMs = String(Int64((message.internalDate ?? Date()).timeIntervalSince1970 * 1_000))
         var headers: [[String: String]] = message.received.map { ["name": "Received", "value": $0] }
@@ -1490,7 +1509,7 @@ final class StatefulGmailActionServer: @unchecked Sendable {
             "payload": [
                 "mimeType": "text/plain",
                 "headers": headers,
-                "body": ["size": 0, "data": ""],
+                "body": Self.bodyObject(servesBody ? message.bodyText : nil),
             ],
         ]
         let data = (try? JSONSerialization.data(withJSONObject: object)) ?? Data()
