@@ -33,7 +33,8 @@ import GRDB
 // - the card shows each occurrence's own start; two dates naming one occurrence delete it once;
 // - the result names each date beside the occurrence it named; a delete that fails after the card
 //   is named with its reason, one that fails for a passing reason is named queued;
-// - Google deletes notify guests as every iOS delete does (`sendUpdates=all`);
+// - Google deletes notify guests only when the call says `send_invitations: true` (`sendUpdates=all`),
+//   otherwise nobody (`sendUpdates=none`), the Thunderbird add-on's rule;
 // - CalDAV goes through #661's EXDATE write, and refuses a resource holding only changed
 //   occurrences before the card.
 // Every date is relative to today.
@@ -240,7 +241,7 @@ private func google(
 @Suite("calendar_event_edit exdates_add: Google", .serialized, .processGlobalState)
 struct CalendarEditExdatesGoogleTests {
 
-    @Test("two dates given with the series' id delete exactly those two occurrences, one delete each, guests notified, and the answer names each date deleted")
+    @Test("two dates given with the series' id delete exactly those two occurrences, one delete each, nobody notified, and the answer names each date deleted")
     func twoDatesDeleteThoseOccurrences() async throws {
         let dates = ["\(day(7))T09:00:00", "\(day(14))T09:00:00"]
         let ids = [GoogleWeekly.instanceId(day(7)), GoogleWeekly.instanceId(day(14))]
@@ -253,9 +254,20 @@ struct CalendarEditExdatesGoogleTests {
             #expect(g.calendar.event(id)?["status"] as? String == "cancelled", "\(id) is still there")
         }
         #expect(g.calendar.event(GoogleWeekly.instanceId(day(0)))?["status"] as? String == "confirmed", "another occurrence was deleted")
-        #expect(g.calendar.deleteSendUpdates == ["all", "all"], "guests were not notified as every delete notifies them: \(g.calendar.deleteSendUpdates)")
+        #expect(g.calendar.deleteSendUpdates == ["none", "none"], "guests were notified though send_invitations was not given: \(g.calendar.deleteSendUpdates)")
         // Each row shows its own occurrence's start, never the series' (day 0).
         expectDeleted(g.run, ids: ids, dates: dates, starts: [ids[0]: instant(day(7)), ids[1]: instant(day(14))])
+    }
+
+    @Test("send_invitations decides whether each occurrence's delete notifies guests: only true notifies them",
+          arguments: [(JSONValue.bool(true), "all"), (.bool(false), "none")])
+    func sendInvitationsDecidesNotification(given: JSONValue, expected: String) async throws {
+        let dates = ["\(day(7))T09:00:00", "\(day(14))T09:00:00"]
+        let g = try await google([
+            "exdates_add": .array(dates.map { .string($0) }), "timezone": .string("UTC"),
+            "send_invitations": given,
+        ], account: "exdates-g-notify-\(expected)")
+        #expect(g.calendar.deleteSendUpdates == [expected, expected], "send_invitations \(given) sent \(g.calendar.deleteSendUpdates); \(g.run.out)")
     }
 
     @Test("a declined card deletes nothing: the card was shown, nothing is queued or written, and the answer says cancelled")
