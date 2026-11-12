@@ -170,10 +170,14 @@ struct NeverUploadedDraftPlaceholderSyncTests {
                 """, arguments: [Self.previousRelease])
         }
         _ = try AppDatabase(dbPool: f.pool)
-        #expect(try operationCount(f) == 0, """
-            the boundary did not retire the save; a queued operation would protect \
-            the placeholder by itself and the sync below would measure nothing
-            """)
+        // #531 (owner 2026-11-12): the boundary re-queues this unsent draft's
+        // save. A queued save protects the placeholder by itself, so remove it
+        // here to keep measuring the full sync's own stale rule (the state
+        // after that save is gone for any other reason).
+        #expect(try operationCount(f) == 1, "the boundary did not re-queue the unsent draft's save")
+        try await f.pool.writeWithoutTransaction { db in
+            try db.execute(sql: "DELETE FROM pendingOperation")
+        }
         return (stored.id, placeholderHeaderId)
     }
 

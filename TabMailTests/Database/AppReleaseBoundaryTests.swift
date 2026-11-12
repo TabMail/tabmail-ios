@@ -159,6 +159,10 @@ struct AppReleaseBoundaryTests {
         }
     }
 
+    private func allOperations(_ fixture: Fixture) throws -> [PendingOperation] {
+        try fixture.pool.read { db in try PendingOperation.fetchAll(db) }
+    }
+
     private func lastFullSyncAt(_ fixture: Fixture) throws -> Date? {
         try fixture.pool.read { db in
             try Account.fetchOne(db, key: Self.accountId)?.lastFullSyncAt
@@ -243,11 +247,15 @@ struct AppReleaseBoundaryTests {
         // caller, so driving it is what makes this a test of the launch.
         _ = try AppDatabase(dbPool: f.pool)
 
-        let survivors = try operationIds(f)
-        #expect(survivors.isEmpty, """
+        // #531 (owner 2026-11-12): the seeded draft is unsent, so the boundary
+        // re-queues its save; every other row is retired.
+        let survivors = try allOperations(f)
+        #expect(survivors.map(\.type) == [.saveDraft], """
             a previous release's queued operations must not execute under this \
-            binary's semantics. Rows left: \(survivors)
+            binary's semantics; only the unsent draft's save is re-queued. \
+            Rows left: \(survivors.map(\.type))
             """)
+        #expect(survivors.first?.draftId == "boundary-draft")
         #expect(try lastFullSyncAt(f) == nil, """
             retiring the queue leaves optimistic local state the server never \
             heard about; the accounts must be marked full-sync-due in the SAME \
@@ -256,10 +264,93 @@ struct AppReleaseBoundaryTests {
         #expect(try stamp(f) == AppDatabase.currentAppRelease,
                 "the boundary must record the release it retired for, or it fires again next launch")
         #expect(try authoredContentSurvives(f), """
-            the carve-out is scoped to QUEUE STATE. A retired `.saveDraft` loses \
-            only the automatic push intention — the authored draft, the queued \
-            send and the user's mail all keep their existing lifecycle.
+            the carve-out is scoped to QUEUE STATE — the authored draft, the \
+            queued send and the user's mail all keep their existing lifecycle.
             """)
+    }
+
+    // MARK: - #531 — which drafts the boundary re-queues
+
+    private func seedDraft(
+        _ fixture: Fixture, id: String, status: String?, epoch: String? = "E1",
+        accountId: String = AppReleaseBoundaryTests.accountId
+    ) throws {
+        let now = Date().timeIntervalSince1970
+        var draft = Draft(
+            id: id, accountId: accountId,
+            toJSON: "[\"recipient@example.com\"]", ccJSON: "[]", bccJSON: "[]",
+            subject: id, body: "body", replyToId: nil, isForward: false,
+            editHistoryJSON: nil, createdAt: now, updatedAt: now,
+            serverDraftId: status == nil ? nil : "server-\(id)", serverPushStatus: status,
+            rfc822MessageId: nil, attachmentsDirName: nil)
+        draft.instanceEpoch = epoch
+        let stored = draft
+        try fixture.pool.writeWithoutTransaction { db in try stored.insert(db) }
+    }
+
+    /// **THE PROPERTY: the boundary re-queues a save only for a draft whose
+    /// latest content has not reached the server.** A pushed draft is not
+    /// re-sent, a draft handed to the Outbox is not pushed back to Drafts, and
+    /// every non-draft action is still retired.
+    @Test("The release boundary re-queues only unsent drafts, and still retires every other action")
+    @MainActor
+    func boundaryReQueuesOnlyUnsentDrafts() throws {
+        let f = try fixture()
+        defer { finish(f) }
+
+        try seedDraft(f, id: "never-pushed", status: nil)
+        try seedDraft(f, id: "edited-after-push", status: "dirty")
+        try seedDraft(f, id: "already-pushed", status: "pushed")
+        try seedDraft(f, id: "being-sent", status: nil)
+        try seedDraft(f, id: "push-interrupted", status: "pushing")
+        try seedDraft(f, id: "no-generation", status: nil, epoch: "")
+        // A second account whose Drafts folder is not named "Drafts".
+        let gmailAccountId = "release-boundary-gmail"
+        let gmailDraftsPath = "[Gmail]/Drafts"
+        try f.pool.writeWithoutTransaction { db in
+            var account = Account(
+                emailAddress: "gmail-boundary@example.com", displayName: "Gmail", provider: .gmail)
+            account.id = gmailAccountId
+            try account.insert(db)
+            try Folder(name: "Drafts", path: gmailDraftsPath, role: .drafts, accountId: gmailAccountId)
+                .insert(db)
+        }
+        try seedDraft(f, id: "gmail-unsent", status: nil, accountId: gmailAccountId)
+        // An orphan whose account is gone. The schema cascades a deleted
+        // account's drafts, so the orphan is written with foreign keys off.
+        try f.pool.writeWithoutTransaction { db in
+            try db.execute(sql: "PRAGMA foreign_keys = OFF")
+        }
+        try seedDraft(f, id: "orphan", status: nil, accountId: "release-boundary-gone")
+        try f.pool.writeWithoutTransaction { db in
+            try db.execute(sql: "PRAGMA foreign_keys = ON")
+        }
+        var outbox = OutboxMessage(
+            accountId: Self.accountId,
+            draft: DraftMessage(to: ["recipient@example.com"], subject: "s", body: "b"))
+        outbox.draftId = "being-sent"
+        let storedOutbox = outbox
+        try f.pool.writeWithoutTransaction { db in try storedOutbox.insert(db) }
+        try seedOperation(f, messageIds: ["61"])
+        try seedOperation(f, messageIds: ["62"], type: .markRead)
+        try seedUndecodableOperation(f, id: "legacy-row")
+        try setStamp(f, to: Self.previousRelease)
+
+        _ = try AppDatabase(dbPool: f.pool)
+
+        let survivors = try allOperations(f)
+        #expect(survivors.allSatisfy { $0.type == .saveDraft },
+                "a non-draft action survived the boundary: \(survivors.map(\.type))")
+        #expect(Set(survivors.compactMap(\.draftId))
+                == ["never-pushed", "edited-after-push", "push-interrupted", "gmail-unsent"])
+        #expect(survivors.count == 4)
+        guard survivors.count == 4 else { return }
+        for op in survivors {
+            let expectedPath = op.draftId == "gmail-unsent" ? gmailDraftsPath : "Drafts"
+            #expect(op.folderPath == expectedPath, "\(op.draftId ?? "") queued to \(op.folderPath)")
+            #expect(op.accountId == (op.draftId == "gmail-unsent" ? gmailAccountId : Self.accountId))
+            #expect(op.instanceEpoch == "E1")
+        }
     }
 
     // MARK: - 2. An unchanged release does not purge
@@ -628,7 +719,10 @@ struct AppReleaseBoundaryTests {
         try clearStampRefusal(f)
         _ = try AppDatabase(dbPool: f.pool)
 
-        #expect(try operationCount(f) == 0, "an interrupted retirement must be retried, not silently skipped")
+        // #531: the seeded unsent draft's save is the only row the boundary re-queues.
+        let requeued = try allOperations(f)
+        #expect(requeued.map(\.type) == [.saveDraft],
+                "an interrupted retirement must be retried, not silently skipped: \(requeued.map(\.type))")
         #expect(try lastFullSyncAt(f) == nil, "the retirement landed without marking the accounts full-sync-due")
         #expect(try stamp(f) == AppDatabase.currentAppRelease,
                 "the boundary must record the release it retired for, or it fires again next launch")
@@ -641,7 +735,7 @@ struct AppReleaseBoundaryTests {
         let fresh = try seedOperation(f, messageIds: ["103"])
         _ = try AppDatabase(dbPool: f.pool)
         let afterRelaunch = try operationIds(f)
-        #expect(afterRelaunch == [fresh.id], """
+        #expect(afterRelaunch == ([fresh.id] + requeued.map(\.id)).sorted(), """
             a same-release relaunch destroyed work admitted after the boundary: \
             \(afterRelaunch)
             """)

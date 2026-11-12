@@ -81,6 +81,14 @@ lifecycle carve-out this operates under is stated in
 `Companion/Rules/Active/never-drop-user-intention.md` (2026-09-06 amendment) — it is **not** a fifth
 exit, because it answers no question about any individual operation.
 
+**2026-11-12 amendment (owner ruling, GitHub #531): unsent draft saves are re-queued at the
+boundary.** The owner reversed the 2026-09-06 "no draft sweeper or automatic re-admission" acceptance
+above (kept as history). In the same transaction as the delete, the boundary admits a fresh
+`.saveDraft` (`PendingOperation.draftSave`, shared with `queueDraftSave`) for every `Draft` whose
+`serverPushStatus` is `NULL`/`dirty`/`pushing`, with a non-empty `instanceEpoch`, an existing account
+and no owning `outboxMessage`. Selection reads `Draft` state only, never the retired rows, so decision
+2 ("retire without decoding") is unchanged; every other action is still retired.
+
 **Relates:** ADR-IOS-068, ADR-IOS-069, ADR-IOS-070 (migration immutability precedent),
 `KNOWN_ISSUES.md` (`IOS-ACTION-001`, `IOS-ACTION-003`), migrations
 `v74_purgeLegacyPendingOperations` and `v89_createAppReleaseStamp`,

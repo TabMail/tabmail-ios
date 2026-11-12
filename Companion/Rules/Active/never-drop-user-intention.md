@@ -87,6 +87,15 @@
 > the blanket predicate-free purge is now a recurring launch rule rather than a single historical
 > migration.
 >
+> **2026-11-12 amendment (owner ruling, GitHub #531): the boundary re-queues unsent draft saves.**
+> The owner reversed the 2026-09-06 acceptance above that a retired `.saveDraft` waits for the user's
+> next save; the 2026-09-06 text is kept as history. In the same transaction that deletes the queue,
+> `retirePreviousReleaseActionQueue` admits a fresh `.saveDraft` (`PendingOperation.draftSave`, the
+> row `queueDraftSave` admits) for every `Draft` whose `serverPushStatus` is `NULL`, `dirty` or
+> `pushing`, that has a non-empty `instanceEpoch`, belongs to an existing account and is not owned by an
+> `outboxMessage`. It reads `Draft` state only, never the retired rows, so "retire without decoding"
+> still holds. Every other action is still retired. A pushed draft is not re-sent.
+>
 > **2026-09-06 amendment: ordinary message actions have a fifth runtime exit.** This latest
 > amendment supersedes the earlier four-exit enumeration and its statement that exit 4 is the
 > only failure exit; all earlier text is retained as history. Exit 5 is **the counted provider

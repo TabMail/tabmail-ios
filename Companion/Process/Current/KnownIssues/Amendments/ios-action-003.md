@@ -22,6 +22,10 @@
 
 ✅ **ACCEPTED (2026-09-06, owner-approved)** — every app-release change retires the action queue.
 
+**AMENDED 2026-11-12 (owner ruling, GitHub #531):** the boundary now re-queues unsent draft saves in
+the same transaction; see "Draft saves re-queued" below. The 2026-09-06 draft acceptance is kept as
+history.
+
 ## Subsystem and search terms
 
 Action queue; `pendingOperation`; app upgrade; app version; release boundary; `appReleaseStamp`;
@@ -79,3 +83,14 @@ for `v74`: deciding per row would mean decoding each one and validating its addr
 whatever keying the previous release used — the "reconstruct an address the system was already told
 and discarded" pattern `MIS-IOS-003` and `CLAUDE.md`'s *THE ADDRESS PROBLEM* forbid. The boundary
 deliberately holds no per-operation version field, no ordering backfill and no replay history.
+
+**Draft saves re-queued, 2026-11-12 (owner ruling, GitHub #531).** The owner reversed the "no draft
+sweeper and no automatic re-admission" acceptance above: a retired `.saveDraft` left a draft that never
+reached the server or other devices until the user edited it again, and nothing told the user. In the
+same transaction that deletes the queue, `retirePreviousReleaseActionQueue` now admits a fresh
+`.saveDraft` (`PendingOperation.draftSave`, the row `queueDraftSave` admits) for every `Draft` whose
+`serverPushStatus` is `NULL`, `dirty` or `pushing`, with a non-empty `instanceEpoch`, an existing
+account and no owning `outboxMessage`. It reads `Draft` state, never the retired rows, so the boundary
+still decodes nothing it deletes. A pushed draft is not re-sent; every other action is still retired
+and keeps the accepted cost above. Tests: `AppReleaseBoundaryTests.boundaryReQueuesOnlyUnsentDrafts`,
+`NeverDropExitClosureTests.anAppUpdateReQueuesAnUnsentDraftSave` (IntentionLedger, FakeIMAPServer).
