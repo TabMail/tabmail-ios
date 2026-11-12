@@ -23,11 +23,11 @@ import GRDB
 // following ones named at the first occurrence is a change of the whole series. Dates are the
 // series' own, in its zone.
 //
-// **INVARIANT 3.** *A series whose rule names its days or dates (BYDAY, BYMONTHDAY, BYYEARDAY,
-// BYWEEKNO, BYMONTH, BYSETPOS) is never moved to another date with its stored rule:* every provider
-// keeps the stored rule when the start moves, so it would go on repeating on the old days. Such an
-// edit is refused before the card and before the write, with nothing written, unless it gives the new
-// rule. A move to another time on the same date, and a move of a rule that names no days, pass.
+// **INVARIANT 3.** *A series whose rule names its days or dates (BYDAY, BYMONTHDAY, BYMONTH) moves
+// them with a move to another date*, as Google Calendar does: the whole series' rule, or the new
+// part's of a split, repeats on the new day. A day named by its position keeps its rule; a day of the
+// year, a week number and a series whose own zone is not known are refused before the card and before
+// the write, with nothing written, unless the edit gives the new rule.
 //
 // **INVARIANT 4 (the property).** *An occurrence is named by where it is now* (`recurrence_id` is
 // the start the listing shows), *and an edit is either refused before its card (no card, nothing
@@ -807,7 +807,7 @@ private func calDAV(_ store: FakeCalDAVStore, eventId: String, _ arguments: [Str
                                arguments: arguments, provider: provider)
 }
 
-@Suite("A series whose rule names its days is not moved to another date without its new rule", .serialized, .processGlobalState)
+@Suite("A series whose rule names its days moves them with a move to another date", .serialized, .processGlobalState)
 struct CalendarSeriesDayMoveTests {
 
     private func refused(_ rows: [PendingCalendarOperation]) -> Bool {
@@ -815,24 +815,36 @@ struct CalendarSeriesDayMoveTests {
             && rows.first?.failureReason?.contains(namedDaysRefusal) == true
     }
 
-    @Test("Google: every occurrence, named from the first, moved to another date is refused, with nothing written")
-    func googleEveryOccurrenceToAnotherDateIsRefused() async throws {
+    @Test("Google: every occurrence, named from the first, moved to another date moves the series onto the new weekday")
+    func googleEveryOccurrenceToAnotherDateTurnsItsDays() async throws {
         let r = try await google(GoogleSeries.calendar(rule: GoogleSeries.onItsWeekday), eventId: GoogleSeries.first, [
             "start_iso": .string("\(day(1))T09:00:00"), "timezone": .string("UTC"),
         ], account: "days-g-all")
-        #expect(r.calendar.writes.isEmpty, "writes: \(r.calendar.writes)")
-        #expect(instant(r.calendar.event(GoogleSeries.id)?["start"]) == utcAt("\(day(0))T09:00:00"))
-        #expect(refused(r.rows), "rows: \(reasons(r.rows))")
+        let series = r.calendar.event(GoogleSeries.id)
+        #expect(instant(series?["start"]) == utcAt("\(day(1))T09:00:00"),
+                "the series did not move: \(series?["start"] ?? "none"); rows: \(reasons(r.rows))")
+        #expect(series?["recurrence"] as? [String] == ["RRULE:FREQ=WEEKLY;BYDAY=\(weekdayCode(day(1)))"],
+                "the series repeats on its old day: \(series?["recurrence"] ?? "none")")
+        #expect(r.rows.isEmpty, "rows: \(reasons(r.rows))")
     }
 
-    @Test("Google: an occurrence and the following ones moved to another date are refused, with no split")
-    func googleFollowingToAnotherDateIsRefused() async throws {
+    @Test("Google: an occurrence and the following ones moved to another date split there onto the new weekday, the earlier ones kept")
+    func googleFollowingToAnotherDateTurnsTheNewPartsDays() async throws {
+        let rid = "\(day(7))T09:00:00"
         let r = try await google(GoogleSeries.calendar(rule: GoogleSeries.onItsWeekday), eventId: GoogleSeries.id, [
-            "edit_scope": .string("this_and_following"), "recurrence_id": .string("\(day(7))T09:00:00"),
+            "edit_scope": .string("this_and_following"), "recurrence_id": .string(rid),
             "start_iso": .string("\(day(8))T09:00:00"), "timezone": .string("UTC"),
         ], account: "days-g-following")
-        #expect(r.calendar.writes.isEmpty, "writes: \(r.calendar.writes)")
-        #expect(refused(r.rows), "rows: \(reasons(r.rows))")
+        let successor = r.calendar.event(
+            GoogleCalendarProvider.deterministicSplitEventId(masterId: GoogleSeries.id, recurrenceId: rid))
+        #expect(instant(successor?["start"]) == utcAt("\(day(8))T09:00:00"),
+                "no following part on the new date: \(successor?["start"] ?? "none"); rows: \(reasons(r.rows))")
+        #expect(successor?["recurrence"] as? [String] == ["RRULE:FREQ=WEEKLY;BYDAY=\(weekdayCode(day(8)))"],
+                "the following part repeats on the old day: \(successor?["recurrence"] ?? "none")")
+        let master = r.calendar.event(GoogleSeries.id)
+        let rule = (master?["recurrence"] as? [String])?.first ?? ""
+        #expect(rule.contains("BYDAY=\(weekdayCode(day(0)))") && rule.contains("UNTIL="), "the earlier part changed: \(rule)")
+        #expect(r.rows.isEmpty, "rows: \(reasons(r.rows))")
     }
 
     @Test("Google: every occurrence moved to another time on the same date moves the series and keeps its days")
@@ -874,7 +886,7 @@ struct CalendarSeriesDayMoveTests {
         #expect(r.rows.isEmpty, "rows: \(reasons(r.rows))")
     }
 
-    @Test("Google: a series kept in another zone, moved to the next of its own dates, is refused though the edit's zone sees the same date")
+    @Test("Google: a series kept in another zone, moved to the next of its own dates, turns its days though the edit's zone sees the same date")
     func googleDatesAreTheSeriesOwn() async throws {
         // A series at 23:00 in Tokyo (14:00 UTC) on its weekday, named from its first occurrence.
         let id = "ser-t"
@@ -890,32 +902,56 @@ struct CalendarSeriesDayMoveTests {
         let moved = try await google(seed, eventId: "\(id)_first", [
             "start_iso": .string("\(day(0))T16:00:00"), "timezone": .string("UTC"),
         ], account: "days-g-zone")
-        #expect(moved.calendar.writes.isEmpty, "writes: \(moved.calendar.writes)")
-        #expect(refused(moved.rows), "rows: \(reasons(moved.rows))")
-        #expect(moved.rows.first?.failureReason?.contains("from \(day(0)) to \(day(1))") == true, "rows: \(reasons(moved.rows))")
+        #expect(moved.calendar.event(id)?["recurrence"] as? [String] == ["RRULE:FREQ=WEEKLY;BYDAY=\(weekdayCode(day(1)))"],
+                "not turned by Tokyo's date: \(moved.calendar.event(id)?["recurrence"] ?? "none"); rows: \(reasons(moved.rows))")
+        #expect(moved.rows.isEmpty, "rows: \(reasons(moved.rows))")
         // 10:00 UTC is 19:00 the same day in Tokyo (control).
         let kept = try await google(seed, eventId: "\(id)_first", [
             "start_iso": .string("\(day(0))T10:00:00"), "timezone": .string("UTC"),
         ], account: "days-g-zone-control")
         #expect(instant(kept.calendar.event(id)?["start"]) == utcAt("\(day(0))T10:00:00"),
                 "the series did not move: \(kept.calendar.event(id)?["start"] ?? "none"); rows: \(reasons(kept.rows))")
+        #expect(kept.calendar.event(id)?["recurrence"] as? [String] == [GoogleSeries.onItsWeekday],
+                "the same date in Tokyo kept no days: \(kept.calendar.event(id)?["recurrence"] ?? "none")")
         #expect(kept.rows.isEmpty, "rows: \(reasons(kept.rows))")
     }
 
-    @Test("Outlook: every occurrence of a weekly series (its weekday named), named from the first, moved to another date is refused")
-    func outlookEveryOccurrenceToAnotherDateIsRefused() async throws {
+    @Test("Outlook: every occurrence of a weekly series (its weekday named), named from the first, moved to another date moves its weekday")
+    func outlookEveryOccurrenceToAnotherDateTurnsItsDays() async throws {
         let graph = GraphSeries.calendar()
+        let before = (graph.event("ser-1")?["recurrence"] as? [String: Any])?["pattern"] as? [String: Any]
         let rows = try await outlook(graph, eventId: GraphSeries.first, [
             "start_iso": .string(GraphFixture.naive(GraphFixture.start.addingTimeInterval(86_400))),
             "timezone": .string("UTC"),
         ], account: "days-x-all")
-        #expect(graph.patches("ser-1").isEmpty && graph.patches(GraphSeries.first).isEmpty,
-                "patched: series \(graph.patches("ser-1").count), occurrence \(graph.patches(GraphSeries.first).count)")
-        #expect(refused(rows), "rows: \(reasons(rows))")
+        let days = try #require(before?["daysOfWeek"] as? [String])
+        let names = ExchangeCalendarProvider.graphWeekdays
+        let turned = days.compactMap { names.firstIndex(of: $0).map { names[($0 + 1) % names.count] } }
+        let pattern = (graph.event("ser-1")?["recurrence"] as? [String: Any])?["pattern"] as? [String: Any]
+        #expect(pattern?["daysOfWeek"] as? [String] == turned, "pattern: \(pattern ?? [:]); rows: \(reasons(rows))")
+        #expect(pattern?["firstDayOfWeek"] as? String == before?["firstDayOfWeek"] as? String, "a weekly series' week start moved")
+        #expect(rows.isEmpty, "rows: \(reasons(rows))")
     }
 
-    @Test("CalDAV: a series on named weekdays moved to another date is refused, with nothing PUT")
-    func calDAVToAnotherDateIsRefused() async throws {
+    @Test("Google: a series with a deleted occurrence moved to another weekday and back keeps that occurrence back, as Google's own editor leaves it")
+    func googleDayMoveThereAndBackKeepsTheDeletedOccurrenceBack() async throws {
+        let exdate = "EXDATE:\(compact(day(14)))T090000Z"
+        var series = GoogleSeries.series(rule: GoogleSeries.onItsWeekday)
+        series["recurrence"] = [GoogleSeries.onItsWeekday, exdate]
+        let there = try await google(GoogleSeries.calendar(rule: GoogleSeries.onItsWeekday).map { $0["id"] as? String == GoogleSeries.id ? series : $0 },
+                                     eventId: GoogleSeries.first, [
+            "start_iso": .string("\(day(1))T09:00:00"), "timezone": .string("UTC"),
+        ], account: "days-g-exdate-there")
+        let moved = try #require(there.calendar.event(GoogleSeries.id), "rows: \(reasons(there.rows))")
+        let back = try await google([moved, GoogleSeries.instance(day(1))], eventId: GoogleSeries.instanceId(day(1)), [
+            "start_iso": .string("\(day(0))T09:00:00"), "timezone": .string("UTC"),
+        ], account: "days-g-exdate-back")
+        let recurrence = back.calendar.event(GoogleSeries.id)?["recurrence"] as? [String]
+        #expect(recurrence == [GoogleSeries.onItsWeekday], "after there and back: \(recurrence ?? []); rows \(reasons(there.rows + back.rows))")
+    }
+
+    @Test("CalDAV: a series on named weekdays kept in UTC, its zone not named, is refused a new start, with nothing PUT")
+    func calDAVWithoutItsZoneIsRefused() async throws {
         let rule = "RRULE:FREQ=WEEKLY;BYDAY=\(weekdayCode(day(0)))"
         for (account, arguments): (String, [String: JSONValue]) in [
             ("days-c-all", ["edit_scope": .string("all"),
@@ -932,6 +968,27 @@ struct CalendarSeriesDayMoveTests {
             #expect(store.recordedPuts().isEmpty, "\(account): \(store.recordedPuts().count) PUT")
             #expect(store.storedICS(path: "/cal/wk-1.ics") == ics, "\(account): the series changed")
             #expect(rows.count == 1 && rows.first?.status == PendingStatus.failed.rawValue, "\(account): rows \(reasons(rows))")
+        }
+    }
+
+    @Test("CalDAV: a series on named weekdays moved to another date moves onto the new weekday, its following part too")
+    func calDAVToAnotherDateTurnsItsDays() async throws {
+        let rule = "RRULE:FREQ=WEEKLY;BYDAY=\(weekdayCode(day(0)))"
+        for (account, arguments, path, from): (String, [String: JSONValue], String?, Int) in [
+            ("days-c-turn-all", ["edit_scope": .string("all"), "recurrence_id": .string("\(day(0))T09:00:00"),
+                                 "start_iso": .string("\(day(1))T09:00:00"), "timezone": .string("UTC")], "/cal/wk-3.ics", 1),
+            ("days-c-turn-following", ["edit_scope": .string("this_and_following"), "recurrence_id": .string("\(day(7))T09:00:00"),
+                                       "start_iso": .string("\(day(8))T09:00:00"), "timezone": .string("UTC")], nil, 8),
+        ] {
+            let store = FakeCalDAVStore(servesETags: true)
+            store.seed(path: "/cal/wk-3.ics", ics: calDAVSeries(uid: "wk-3", rule: rule, tzid: "Etc/UTC"))
+            let rows = try await calDAV(store, eventId: "/cal/wk-3.ics", arguments, account: account)
+            #expect(rows.isEmpty, "\(account): rows \(reasons(rows))")
+            // The following part is the resource the split PUT besides the series.
+            let target = path ?? store.recordedPuts().first { $0.path != "/cal/wk-3.ics" }?.path
+            let written = target.flatMap { store.storedICS(path: $0) }
+            let rules = written?.components(separatedBy: "\r\n").filter { $0.hasPrefix("RRULE:") } ?? []
+            #expect(rules == ["RRULE:FREQ=WEEKLY;BYDAY=\(weekdayCode(day(from)))"], "\(account): \(rules)")
         }
     }
 
@@ -1037,6 +1094,27 @@ private func outlookTool(_ graph: FakeGraphCalendar, _ arguments: [String: JSONV
     let provider = ExchangeCalendarProvider(mailbox: "calendar@example.com", accessToken: { _ in "test-token" },
                                             session: http.session)
     return try await runTool(arguments, eventId: eventId, account: account, provider: provider)
+}
+
+private func calDAVTool(_ store: FakeCalDAVStore, _ arguments: [String: JSONValue], eventId: String,
+                        account: String) async throws -> ToolRun {
+    let http = FakeHTTP.Scenario()
+    defer { http.close() }
+    http.register(path: "/cal/", method: "GET") { store.handleGET($0) }
+    http.register(path: "/cal/", method: "PUT") { store.handlePUT($0) }
+    let home = URL(string: "https://caldav.example.com/cal/")!
+    let provider = CalDAVProvider(
+        client: CalDAVClient(username: "user@example.com", password: "pw", session: http.session),
+        calendarHomeURL: home, serverBaseURL: home)
+    return try await runTool(arguments, eventId: eventId, account: account, provider: provider)
+}
+
+/// A Graph recurrence as written, read back as the RRULE the card shows: the week start is named
+/// only for a weekly series every few weeks, as Graph keeps it.
+private func shownRule(_ recurrence: Any?) throws -> String {
+    let data = try JSONSerialization.data(withJSONObject: try #require(recurrence as? [String: Any]))
+    let rule = try #require(ExchangeCalendarProvider.rrule(try JSONDecoder().decode(MSPatternedRecurrence.self, from: data)).first)
+    return "repeat → " + rule.dropFirst("RRULE:".count)
 }
 
 @Suite("calendar_event_edit takes a time change of every occurrence where Google Calendar does", .serialized, .processGlobalState)
@@ -1230,27 +1308,383 @@ struct CalendarEditToolSeriesScopeTests {
         #expect(r.run.out.contains("edit_scope: all"), "\(r.run.out)")
     }
 
-    @Test("Google: a series on named weekdays, named from a later occurrence and moved to another date, is refused before the card")
-    func laterOccurrenceToAnotherDateIsRefusedOnNamedDays() async throws {
+    @Test("Google: a series on named weekdays, named from a later occurrence and moved to another date, splits there onto the new weekday, the card saying so")
+    func laterOccurrenceToAnotherDateTurnsTheDaysOnNamedDays() async throws {
         let r = try await googleTool([
             "start_iso": .string("\(day(8))T09:00:00"), "timezone": .string("UTC"),
         ], eventId: GoogleSeries.later, account: "series-tool-g-byday", rule: GoogleSeries.onItsWeekday)
-        #expect(r.run.out.contains(namedDaysRefusal) && r.run.out.contains("NOT changed"), "\(r.run.out)")
-        #expect(r.run.cards.isEmpty && r.run.queued.isEmpty && r.calendar.writes.isEmpty,
-                "cards \(r.run.cards.count) queued \(r.run.queued.count) writes \(r.calendar.writes)")
+        let turned = "FREQ=WEEKLY;BYDAY=\(weekdayCode(day(8)))"
+        #expect(r.run.cards.count == 1 && r.run.cards.first?.changes.contains("repeat → \(turned)") == true,
+                "cards: \(r.run.cards.map(\.changes)); \(r.run.out)")
+        let successor = r.calendar.event(
+            GoogleCalendarProvider.deterministicSplitEventId(masterId: GoogleSeries.id, recurrenceId: "\(day(7))T09:00:00"))
+        #expect(successor?["recurrence"] as? [String] == ["RRULE:" + turned],
+                "the following part: \(successor?["recurrence"] ?? "none"); writes \(r.calendar.writes); \(r.run.out)")
+        #expect(r.run.queued.isEmpty, "rows: \(reasons(r.run.queued))")
     }
 
-    @Test("Outlook: a weekly series (its weekday named), named from a later occurrence and moved to another date, is refused before the card")
-    func laterOccurrenceToAnotherDateIsRefusedOnOutlook() async throws {
+    @Test("Google: a whole series on named weekdays moved to another day says on its card that its exceptions are reset")
+    func googleWholeSeriesDayMoveCardSaysTheReset() async throws {
+        let r = try await googleTool([
+            "start_iso": .string("\(day(1))T09:00:00"), "timezone": .string("UTC"),
+        ], eventId: GoogleSeries.first, account: "series-tool-g-reset-note", rule: GoogleSeries.onItsWeekday)
+        let changes = r.run.cards.first?.changes ?? []
+        #expect(changes.contains(CalendarToolHelpers.dayMoveResetNote) && !changes.contains(CalendarToolHelpers.ruleChangeResetNote),
+                "card: \(changes); \(r.run.out)")
+    }
+
+    @Test("Google: a split onto another day drops the new part's excluded dates and keeps its added dates, as a move of the whole series does")
+    func splitOntoAnotherDayDropsExcludedDates() async throws {
+        let exdate = "EXDATE:\(compact(day(14)))T090000Z"
+        let rdate = "RDATE:\(compact(day(16)))T090000Z"
+        let seed = GoogleSeries.calendar(rule: GoogleSeries.onItsWeekday).map { event -> [String: Any] in
+            guard event["id"] as? String == GoogleSeries.id else { return event }
+            var series = event
+            series["recurrence"] = [GoogleSeries.onItsWeekday, exdate, rdate]
+            return series
+        }
+        let r = try await googleTool([
+            "start_iso": .string("\(day(8))T09:00:00"), "timezone": .string("UTC"),
+        ], eventId: GoogleSeries.later, account: "series-tool-g-split-exdate", seed: seed)
+        let successor = r.calendar.event(
+            GoogleCalendarProvider.deterministicSplitEventId(masterId: GoogleSeries.id, recurrenceId: "\(day(7))T09:00:00"))
+        let written = try #require(successor?["recurrence"] as? [String], "no new part: \(r.calendar.writes); \(r.run.out)")
+        #expect(written.first == "RRULE:FREQ=WEEKLY;BYDAY=\(weekdayCode(day(8)))", "written: \(written)")
+        #expect(!written.contains { $0.uppercased().hasPrefix("EXDATE") }, "an excluded date stays: \(written)")
+        #expect(written.contains { $0.uppercased().hasPrefix("RDATE") }, "the added date is gone: \(written)")
+        #expect(r.run.cards.first?.changes.contains(CalendarToolHelpers.dayMoveResetNote) == true,
+                "card: \(r.run.cards.first?.changes ?? [])")
+    }
+
+    @Test("Google: a split onto another day of a rule named by position keeps its rule and the new part's excluded dates, and its card names neither")
+    func positionalSplitOntoAnotherDayKeepsExcludedDates() async throws {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = utc
+        let ordinal = (cal.component(.day, from: try #require(Date.fromISO8601("\(day(0))T09:00:00Z"))) - 1) / 7 + 1
+        let rule = "RRULE:FREQ=MONTHLY;BYDAY=\(ordinal)\(weekdayCode(day(0)))"
+        let exdate = "EXDATE:\(compact(day(14)))T090000Z"
+        let seed = GoogleSeries.calendar(rule: rule).map { event -> [String: Any] in
+            guard event["id"] as? String == GoogleSeries.id else { return event }
+            var series = event
+            series["recurrence"] = [rule, exdate]
+            return series
+        }
+        let r = try await googleTool([
+            "start_iso": .string("\(day(8))T09:00:00"), "timezone": .string("UTC"),
+        ], eventId: GoogleSeries.later, account: "series-tool-g-split-positional", seed: seed)
+        let successor = r.calendar.event(
+            GoogleCalendarProvider.deterministicSplitEventId(masterId: GoogleSeries.id, recurrenceId: "\(day(7))T09:00:00"))
+        let written = try #require(successor?["recurrence"] as? [String], "no new part: \(r.calendar.writes); \(r.run.out)")
+        #expect(written.contains { $0.uppercased().hasPrefix("EXDATE") }, "the excluded date was dropped: \(written)")
+        let changes = r.run.cards.first?.changes ?? []
+        #expect(!changes.contains(CalendarToolHelpers.dayMoveResetNote) && !changes.contains { $0.hasPrefix("repeat → ") },
+                "card: \(changes)")
+    }
+
+    @Test("Google: the card of a split onto another day shows the rule the new part is written with, its count what is left")
+    func splitCardShowsTheWrittenRule() async throws {
+        let rule = "RRULE:FREQ=WEEKLY;COUNT=10;BYDAY=\(weekdayCode(day(0)))"
+        let r = try await googleTool([
+            "start_iso": .string("\(day(8))T09:00:00"), "timezone": .string("UTC"),
+        ], eventId: GoogleSeries.later, account: "series-tool-g-card-count", rule: rule)
+        let successor = r.calendar.event(
+            GoogleCalendarProvider.deterministicSplitEventId(masterId: GoogleSeries.id, recurrenceId: "\(day(7))T09:00:00"))
+        let written = try #require((successor?["recurrence"] as? [String])?.first, "no new part: \(r.calendar.writes); \(r.run.out)")
+        #expect(written == "RRULE:FREQ=WEEKLY;COUNT=9;BYDAY=\(weekdayCode(day(8)))", "written: \(written)")
+        let shown = r.run.cards.first?.changes.first { $0.hasPrefix("repeat → ") }
+        #expect(shown == "repeat → " + written.dropFirst("RRULE:".count), "card \(shown ?? "none"), written \(written)")
+    }
+
+    @Test("Outlook: the card of a split onto another day shows the week start Graph writes for a series every other week")
+    func outlookSplitCardShowsTheWrittenWeekStart() async throws {
+        var series = GraphSeries.series()
+        var recurrence = try #require(series["recurrence"] as? [String: Any])
+        var pattern = try #require(recurrence["pattern"] as? [String: Any])
+        pattern["interval"] = 2
+        pattern["firstDayOfWeek"] = "sunday"
+        recurrence["pattern"] = pattern
+        series["recurrence"] = recurrence
+        let graph = FakeGraphCalendar([series, GraphSeries.occurrence(id: GraphSeries.first, at: GraphFixture.start),
+                                       GraphSeries.occurrence(id: GraphSeries.later, at: GraphFixture.occurrenceStart)])
+        let r = try await outlookTool(graph, [
+            "start_iso": .string(GraphFixture.naive(GraphFixture.occurrenceStart.addingTimeInterval(86_400))),
+            "timezone": .string("UTC"),
+        ], eventId: GraphSeries.later, account: "series-tool-x-card-wkst")
+        let written = (graph.created.first?["recurrence"] as? [String: Any])?["pattern"] as? [String: Any]
+        let first = try #require(written?["firstDayOfWeek"] as? String, "no new part: \(r.out)")
+        #expect(first == "monday", "Graph's week start did not turn with the days: \(first)")
+        let shown = r.cards.first?.changes.first { $0.hasPrefix("repeat → ") } ?? ""
+        #expect(shown.hasSuffix(";WKST=MO"), "card \(shown), written week start \(first)")
+    }
+
+    /// A whole-number UTC offset (hours) for the series' zone, chosen from the device's own: two to
+    /// three hours east of it, or, where that passes the last zone (UTC+14), two to three hours west.
+    /// Either way the device's 01:00 and 23:00 on one day fall on two dates in the series' zone.
+    static var seriesZoneHours: Int {
+        let device = Double(TimeZone.current.secondsFromGMT()) / 3_600
+        let east = Int(device.rounded(.up)) + 2
+        return east <= 14 ? east : Int(device.rounded(.down)) - 2
+    }
+
+    @Test("Outlook: a whole-series move dated the same day on the device and in the edit's zone, but on another in the series' own, turns the pattern")
+    func outlookMoveAcrossTheSeriesZoneDateTurnsThePattern() async throws {
+        // Stored at 01:00 on day D on the device, moved to 23:00 on D: the same date on the device
+        // and in the edit's zone (the device's), another in the series' zone (`seriesZoneHours`).
+        let device = TimeZone.current
+        let hours = Self.seriesZoneHours
+        let seriesZone = hours == 0 ? "Etc/GMT" : "Etc/GMT\(hours > 0 ? "-" : "+")\(abs(hours))"
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = device
+        let dayD = cal.startOfDay(for: Date().addingTimeInterval(9 * 86_400))
+        let start = dayD.addingTimeInterval(3_600)
+        let moved = dayD.addingTimeInterval(23 * 3_600)
+        let seriesTZ = try #require(TimeZone(identifier: seriesZone))
+        var seriesCal = Calendar(identifier: .gregorian)
+        seriesCal.timeZone = seriesTZ
+        try #require(cal.isDate(start, inSameDayAs: moved) && !seriesCal.isDate(start, inSameDayAs: moved),
+                     "the case is not built: series zone \(seriesZone), device \(device.identifier)")
+        var series = GraphSeries.onDevice(GraphFixture.event(id: "ser-1", start: start, recurring: true), start: start)
+        var recurrence = try #require(series["recurrence"] as? [String: Any])
+        var range = try #require(recurrence["range"] as? [String: Any])
+        range["recurrenceTimeZone"] = seriesZone
+        recurrence["range"] = range
+        series["recurrence"] = recurrence
+        let graph = FakeGraphCalendar([series, GraphSeries.occurrence(id: GraphSeries.first, at: start)])
+        let before = try #require((recurrence["pattern"] as? [String: Any])?["daysOfWeek"] as? [String])
+        let rows = try await outlook(graph, eventId: GraphSeries.first, [
+            "start_iso": .string(EKEventStoreHelper.toNaiveISO(moved, timeZone: device)),
+            "timezone": .string(device.identifier),
+        ], account: "days-x-series-zone-date")
+        let step = seriesCal.dateComponents([.day], from: seriesCal.startOfDay(for: start), to: seriesCal.startOfDay(for: moved)).day ?? 0
+        let names = ExchangeCalendarProvider.graphWeekdays
+        let turned = before.compactMap { names.firstIndex(of: $0).map { names[($0 + step + names.count) % names.count] } }
+        let pattern = (graph.event("ser-1")?["recurrence"] as? [String: Any])?["pattern"] as? [String: Any]
+        #expect(pattern?["daysOfWeek"] as? [String] == turned, "pattern: \(pattern ?? [:]); rows: \(reasons(rows))")
+        #expect(rows.isEmpty, "rows: \(reasons(rows))")
+    }
+
+    @Test("Outlook: the card of a numbered split onto another day shows the count the new part is written with")
+    func outlookCountSplitCard() async throws {
+        var series = GraphSeries.series()
+        var recurrence = try #require(series["recurrence"] as? [String: Any])
+        var range = try #require(recurrence["range"] as? [String: Any])
+        range["type"] = "numbered"
+        range["numberOfOccurrences"] = 10
+        recurrence["range"] = range
+        series["recurrence"] = recurrence
+        let graph = FakeGraphCalendar([series, GraphSeries.occurrence(id: GraphSeries.first, at: GraphFixture.start),
+                                       GraphSeries.occurrence(id: GraphSeries.later, at: GraphFixture.occurrenceStart)])
+        let r = try await outlookTool(graph, [
+            "start_iso": .string(GraphFixture.naive(GraphFixture.occurrenceStart.addingTimeInterval(86_400))),
+            "timezone": .string("UTC"),
+        ], eventId: GraphSeries.later, account: "series-tool-x-card-count")
+        let written = try #require(graph.created.first?["recurrence"], "no new part: \(r.out)")
+        #expect(((written as? [String: Any])?["range"] as? [String: Any])?["numberOfOccurrences"] as? Int == 9, "written: \(written)")
+        let shown = r.cards.first?.changes.first { $0.hasPrefix("repeat → ") }
+        #expect(shown == (try shownRule(written)), "card \(shown ?? "none"), written \(written)")
+        #expect(r.cards.first?.changes.contains(CalendarToolHelpers.dayMoveResetNote) == true,
+                "card: \(r.cards.first?.changes ?? [])")
+    }
+
+    @Test("Outlook: a split moved past the end date of its series is refused before the card, with nothing queued")
+    func outlookSplitPastTheSeriesEndIsRefusedBeforeTheCard() async throws {
+        // The series ends on its second occurrence's date; that occurrence and the following ones
+        // are moved two days on, past the end, in the series' zone and in UTC alike.
+        var series = GraphSeries.series()
+        var recurrence = try #require(series["recurrence"] as? [String: Any])
+        var range = try #require(recurrence["range"] as? [String: Any])
+        range["type"] = "endDate"
+        range["endDate"] = GraphFixture.utcDay(GraphFixture.occurrenceStart)
+        recurrence["range"] = range
+        series["recurrence"] = recurrence
+        let graph = FakeGraphCalendar([series, GraphSeries.occurrence(id: GraphSeries.first, at: GraphFixture.start),
+                                       GraphSeries.occurrence(id: GraphSeries.later, at: GraphFixture.occurrenceStart)])
+        let r = try await outlookTool(graph, [
+            "start_iso": .string(GraphFixture.naive(GraphFixture.occurrenceStart.addingTimeInterval(2 * 86_400))),
+            "timezone": .string("UTC"),
+        ], eventId: GraphSeries.later, account: "series-tool-x-past-end")
+        #expect(r.out.contains("NOT changed") && r.out.contains("already ends before it"), "\(r.out)")
+        #expect(r.cards.isEmpty, "a card was shown: \(r.cards.map(\.changes))")
+        #expect(r.queued.isEmpty, "queued: \(r.queued.map(\.argumentsJSON))")
+        #expect(graph.created.isEmpty, "a new part was written: \(graph.created)")
+    }
+
+    @Test("Outlook: the card of a split every week onto another day names no week start, as Graph's rule has none")
+    func outlookWeeklySplitCardHasNoWeekStart() async throws {
+        let graph = GraphSeries.calendar()
+        let r = try await outlookTool(graph, [
+            "start_iso": .string(GraphFixture.naive(GraphFixture.occurrenceStart.addingTimeInterval(86_400))),
+            "timezone": .string("UTC"),
+        ], eventId: GraphSeries.later, account: "series-tool-x-card-no-wkst")
+        let written = try #require(graph.created.first?["recurrence"], "no new part: \(r.out)")
+        let shown = r.cards.first?.changes.first { $0.hasPrefix("repeat → ") }
+        #expect(shown == (try shownRule(written)) && shown?.contains("WKST") == false, "card \(shown ?? "none"), written \(written)")
+    }
+
+    @Test("Outlook: an all-day series kept in a zone TabMail does not recognize, moved to another day, shows the turned repeat the write makes")
+    func outlookUnrecognizedRangeZoneCardShowsTheTurn() async throws {
+        var series = GraphFixture.event(id: "ser-ad", online: false, recurring: true, allDay: true)
+        var recurrence = try #require(series["recurrence"] as? [String: Any])
+        var range = try #require(recurrence["range"] as? [String: Any])
+        range["recurrenceTimeZone"] = "Custom Server Zone"
+        recurrence["range"] = range
+        series["recurrence"] = recurrence
+        var first = GraphFixture.event(id: "ser-ad-occ", start: GraphFixture.start, online: false,
+                                       seriesMasterId: "ser-ad", allDay: true)
+        first["originalStart"] = GraphFixture.allDayPlace(GraphFixture.utcDay(GraphFixture.start), in: "UTC")
+        let graph = FakeGraphCalendar([series, first], zones: ["Custom Server Zone": utc])
+        let next = GraphFixture.utcDay(GraphFixture.start.addingTimeInterval(86_400))
+        let r = try await outlookTool(graph, [
+            "edit_scope": .string("all"), "start_iso": .string("\(next)T00:00:00"), "timezone": .string("UTC"),
+        ], eventId: "ser-ad-occ", account: "series-tool-x-card-unknown-zone")
+        let written = graph.event("ser-ad")?["recurrence"] as? [String: Any]
+        let names = ExchangeCalendarProvider.graphWeekdays
+        let turned = names.firstIndex(of: GraphFixture.weekday(GraphFixture.start)).map { [names[($0 + 1) % names.count]] }
+        #expect((written?["pattern"] as? [String: Any])?["daysOfWeek"] as? [String] == turned, "written: \(written ?? [:]); \(r.out)")
+        let shown = r.cards.first?.changes.first { $0.hasPrefix("repeat → ") }
+        #expect(shown != nil && shown == (try? shownRule(written)), "card \(shown ?? "none"), written \(written ?? [:])")
+    }
+
+    @Test("CalDAV: the card of a numbered split onto another day shows the rule the new part is written with, its count what is left")
+    func calDAVSplitCardShowsTheWrittenRule() async throws {
+        let store = FakeCalDAVStore(servesETags: true)
+        store.seed(path: "/cal/wk-c.ics", ics: calDAVSeries(
+            uid: "wk-c", rule: "RRULE:FREQ=WEEKLY;COUNT=10;BYDAY=\(weekdayCode(day(0)))", tzid: "Etc/UTC"))
+        let r = try await calDAVTool(store, [
+            "edit_scope": .string("this_and_following"), "recurrence_id": .string("\(day(7))T09:00:00"),
+            "start_iso": .string("\(day(8))T09:00:00"), "timezone": .string("UTC"),
+        ], eventId: "/cal/wk-c.ics", account: "series-tool-c-card-count")
+        let part = store.recordedPuts().first { $0.path != "/cal/wk-c.ics" }?.path
+        let written = try #require(part.flatMap { store.storedICS(path: $0) }?.components(separatedBy: "\r\n")
+            .first { $0.hasPrefix("RRULE:") }, "no new part: \(r.out)")
+        #expect(written == "RRULE:FREQ=WEEKLY;COUNT=9;BYDAY=\(weekdayCode(day(8)))", "written: \(written)")
+        let shown = r.cards.first?.changes.first { $0.hasPrefix("repeat → ") }
+        #expect(shown == "repeat → " + written.dropFirst("RRULE:".count), "card \(shown ?? "none"), written \(written)")
+        #expect(r.cards.first?.changes.contains(CalendarToolHelpers.dayMoveResetNote) == true,
+                "card: \(r.cards.first?.changes ?? [])")
+    }
+
+    /// A CalDAV series repeating by `rule` from day 0, its occurrence on day 14 deleted (an EXDATE),
+    /// the one on day 21 changed to an hour later (an override) and an extra one added on day 17
+    /// (an RDATE), moved as a whole a day on through the edit tool: the resource's lines after the
+    /// write, and the run.
+    private func calDAVMoveWithExceptions(rule: String, account: String, split: Bool = false,
+                                          splitTo: String = "\(day(8))T09:00:00") async throws -> (lines: [String], run: ToolRun) {
+        let series = calDAVSeries(uid: "wk-x", rule: rule, tzid: "Etc/UTC")
+            .replacingOccurrences(of: "SUMMARY:Standup\r\nEND:VEVENT",
+                                  with: "EXDATE;TZID=Etc/UTC:\(compact(day(14)))T090000\r\n"
+                                      + "RDATE;TZID=Etc/UTC:\(compact(day(17)))T090000\r\nSUMMARY:Standup\r\nEND:VEVENT")
+            .replacingOccurrences(of: "END:VCALENDAR", with: [
+                "BEGIN:VEVENT", "UID:wk-x", "DTSTAMP:\(compact(day(-14)))T000000Z",
+                "RECURRENCE-ID;TZID=Etc/UTC:\(compact(day(21)))T090000",
+                "DTSTART;TZID=Etc/UTC:\(compact(day(21)))T100000", "DTEND;TZID=Etc/UTC:\(compact(day(21)))T103000",
+                "SUMMARY:Standup (changed)", "END:VEVENT", "END:VCALENDAR",
+            ].joined(separator: "\r\n"))
+        let store = FakeCalDAVStore(servesETags: true)
+        store.seed(path: "/cal/wk-x.ics", ics: series)
+        // A split is made at day 7 and moved to day 8; its new part is the resource the split PUT
+        // besides the series.
+        let r = try await calDAVTool(store, split ? [
+            "edit_scope": .string("this_and_following"), "recurrence_id": .string("\(day(7))T09:00:00"),
+            "start_iso": .string(splitTo), "timezone": .string("UTC"),
+        ] : [
+            "edit_scope": .string("all"), "recurrence_id": .string("\(day(0))T09:00:00"),
+            "start_iso": .string("\(day(1))T09:00:00"), "timezone": .string("UTC"),
+        ], eventId: "/cal/wk-x.ics", account: account)
+        let path = split ? store.recordedPuts().first { $0.path != "/cal/wk-x.ics" }?.path : "/cal/wk-x.ics"
+        return (path.flatMap { store.storedICS(path: $0) }?.components(separatedBy: "\r\n") ?? [], r)
+    }
+
+    @Test("CalDAV: a whole series moved to another day with its rule's days resets every exception, as Google does, and the card says so")
+    func calDAVDayMoveResetsExceptions() async throws {
+        // The deleted week comes back on its new day and the changed one's edit is dropped.
+        let (lines, r) = try await calDAVMoveWithExceptions(
+            rule: "RRULE:FREQ=WEEKLY;BYDAY=\(weekdayCode(day(0)))", account: "series-tool-c-day-move-resets")
+        #expect(lines.contains("RRULE:FREQ=WEEKLY;BYDAY=\(weekdayCode(day(1)))"), "not moved: \(lines); \(r.out)")
+        #expect(!lines.contains { $0.hasPrefix("EXDATE") || $0.hasPrefix("RECURRENCE-ID") },
+                "an exception outside the new rule remains: \(lines)")
+        // An added date is the user's own occurrence, not an exception to the rule: it stays,
+        // moved the day on with the series' start, as every date tied to the start is.
+        #expect(lines.contains { $0.hasPrefix("RDATE") && $0.hasSuffix(":\(compact(day(18)))T090000") },
+                "the added date was dropped: \(lines)")
+        #expect(r.cards.first?.changes.contains(CalendarToolHelpers.dayMoveResetNote) == true,
+                "card: \(r.cards.first?.changes ?? [])")
+    }
+
+    @Test("CalDAV: a split onto another day that turns its rule drops the new part's exceptions, and the card says so")
+    func calDAVSplitDayMoveResetsExceptions() async throws {
+        let (lines, r) = try await calDAVMoveWithExceptions(
+            rule: "RRULE:FREQ=WEEKLY;BYDAY=\(weekdayCode(day(0)))", account: "series-tool-c-split-resets", split: true)
+        #expect(lines.contains { $0.hasPrefix("RRULE:FREQ=WEEKLY") && $0.contains("BYDAY=\(weekdayCode(day(8)))") },
+                "the new part is not on the new day: \(lines); \(r.out)")
+        #expect(!lines.contains { $0.hasPrefix("EXDATE") || $0.hasPrefix("RECURRENCE-ID") },
+                "an exception outside the new rule remains in the new part: \(lines)")
+        // Kept, moved the day on with the new part's start.
+        #expect(lines.contains { $0.hasPrefix("RDATE") && $0.hasSuffix(":\(compact(day(18)))T090000") },
+                "the added date was dropped from the new part: \(lines)")
+        #expect(r.cards.first?.changes.contains(CalendarToolHelpers.dayMoveResetNote) == true,
+                "card: \(r.cards.first?.changes ?? [])")
+    }
+
+    @Test("CalDAV: a split that does not turn its rule (a new time on its own day) keeps the new part's exceptions, and the card names neither")
+    func calDAVUnturnedSplitKeepsExceptions() async throws {
+        let (lines, r) = try await calDAVMoveWithExceptions(
+            rule: "RRULE:FREQ=WEEKLY;BYDAY=\(weekdayCode(day(0)))", account: "series-tool-c-split-unturned", split: true,
+            splitTo: "\(day(7))T11:00:00")
+        #expect(lines.contains { $0.hasPrefix("EXDATE") } && lines.contains { $0.hasPrefix("RECURRENCE-ID") },
+                "an exception was dropped from the new part: \(lines); \(r.out)")
+        let changes = r.cards.first?.changes ?? []
+        #expect(!changes.contains(CalendarToolHelpers.dayMoveResetNote) && !changes.contains { $0.hasPrefix("repeat → ") },
+                "card: \(changes)")
+    }
+
+    @Test("CalDAV: a whole series named by position moved to another day keeps its rule and every exception, and the card names neither")
+    func calDAVPositionalMoveKeepsExceptions() async throws {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = utc
+        let ordinal = (cal.component(.day, from: try #require(Date.fromISO8601("\(day(0))T09:00:00Z"))) - 1) / 7 + 1
+        let rule = "RRULE:FREQ=MONTHLY;BYDAY=\(ordinal)\(weekdayCode(day(0)))"
+        let (lines, r) = try await calDAVMoveWithExceptions(rule: rule, account: "series-tool-c-positional-keeps")
+        #expect(lines.contains(rule), "the rule changed: \(lines); \(r.out)")
+        #expect(lines.contains { $0.hasPrefix("EXDATE") } && lines.contains { $0.hasPrefix("RECURRENCE-ID") },
+                "an exception was dropped: \(lines)")
+        let changes = r.cards.first?.changes ?? []
+        #expect(!changes.contains(CalendarToolHelpers.dayMoveResetNote) && !changes.contains { $0.hasPrefix("repeat → ") },
+                "card: \(changes)")
+    }
+
+    @Test("Google: a split onto another day at an occurrence moved from its place is refused with nothing written, so a move counted from its place is never written from where it is now")
+    func splitAtAMovedOccurrenceOntoAnotherDayIsRefused() async throws {
+        // The day move of a split is counted from the occurrence's place (`CalendarSeriesScope.dayMove`),
+        // which is right only because no split is made at a moved one.
+        let seed = GoogleSeries.calendar(rule: GoogleSeries.onItsWeekday).filter { $0["id"] as? String != GoogleSeries.later }
+            + [GoogleSeries.moved(day(7), start: "\(day(9))T09:00:00", end: "\(day(9))T09:30:00")]
+        let r = try await googleTool([
+            "edit_scope": .string("this_and_following"), "recurrence_id": .string("\(day(9))T09:00:00"),
+            "start_iso": .string("\(day(10))T09:00:00"), "timezone": .string("UTC"),
+        ], eventId: GoogleSeries.later, account: "series-tool-g-moved-split-days", seed: seed)
+        #expect(r.calendar.writes.isEmpty, "written: \(r.calendar.writes); \(r.run.out)")
+        // The edit reached the split, which refused it for its moved occurrence.
+        try #require(r.run.queued.count == 1, "the edit did not reach the split: \(r.run.out)")
+        #expect(r.run.queued.first?.status == PendingStatus.failed.rawValue
+                && r.run.queued.first?.failureReason?.contains("split at a moved occurrence") == true,
+                "rows: \(reasons(r.run.queued)); \(r.run.out)")
+    }
+
+    @Test("Outlook: a weekly series (its weekday named), named from a later occurrence and moved to another date, splits there onto the new weekday")
+    func laterOccurrenceToAnotherDateTurnsTheDaysOnOutlook() async throws {
         let graph = GraphSeries.calendar()
         let r = try await outlookTool(graph, [
             "start_iso": .string(GraphFixture.naive(GraphFixture.occurrenceStart.addingTimeInterval(86_400))),
             "timezone": .string("UTC"),
         ], eventId: GraphSeries.later, account: "series-tool-x-byday")
-        #expect(r.out.contains(namedDaysRefusal) && r.out.contains("NOT changed"), "\(r.out)")
-        #expect(r.cards.isEmpty && r.queued.isEmpty, "cards \(r.cards.count) queued \(r.queued.count)")
-        #expect(graph.created.isEmpty && graph.patches("ser-1").isEmpty,
-                "created \(graph.created.count), series patches \(graph.patches("ser-1").count)")
+        #expect(r.cards.count == 1 && r.queued.isEmpty, "cards \(r.cards.count) queued \(reasons(r.queued)); \(r.out)")
+        let names = ExchangeCalendarProvider.graphWeekdays
+        let own = GraphFixture.weekday(GraphFixture.start)
+        let next = names.firstIndex(of: own).map { names[($0 + 1) % names.count] }
+        let pattern = (graph.created.first?["recurrence"] as? [String: Any])?["pattern"] as? [String: Any]
+        #expect(next != nil && pattern?["daysOfWeek"] as? [String] == next.map { [$0] },
+                "the following part: \(pattern ?? [:]); created \(graph.created.count); \(r.out)")
     }
 }
 
@@ -1677,8 +2111,8 @@ struct CalendarSeriesScopeRouteTests {
 
 // MARK: - A move to another date of a series on named days
 
-@Suite("CalendarSeriesScope.dayMoveRefusal")
-struct CalendarSeriesScopeDayMoveRefusalTests {
+@Suite("CalendarSeriesScope.dayMove")
+struct CalendarSeriesScopeDayMoveUnitTests {
 
     private static let byDay = "RRULE:FREQ=WEEKLY;BYDAY=\(weekdayCode(day(0)))"
 
@@ -1690,90 +2124,110 @@ struct CalendarSeriesScopeDayMoveRefusalTests {
         .init(eventId: "ser", event: series, seriesId: "ser", series: series, occurrence: occurrence)
     }
 
-    private func refusal(_ args: [String: JSONValue], rule: String = CalendarSeriesScopeDayMoveRefusalTests.byDay, scope: String = "all",
-                         zone: TimeZone = utc, occurrence: GCalEvent? = nil) -> String? {
-        CalendarSeriesScope.dayMoveRefusal(args, named: Self.named(Self.series([rule]), occurrence: occurrence), scope: scope, zone: zone)
+    private static func move(_ from: Int, _ to: Int) -> RecurrenceDayShift.Move? {
+        guard let a = RecurrenceTail.Day(iso: day(from)), let b = RecurrenceTail.Day(iso: day(to)) else { return nil }
+        return .init(from: a, to: b)
+    }
+
+    private func dayMove(_ args: [String: JSONValue], rule: String = CalendarSeriesScopeDayMoveUnitTests.byDay, scope: String = "all",
+                         zone: TimeZone = utc, occurrence: GCalEvent? = nil) throws -> RecurrenceDayShift.Move? {
+        try CalendarSeriesScope.dayMove(args, named: Self.named(Self.series([rule]), occurrence: occurrence), scope: scope, zone: zone)
+    }
+
+    private func reason(_ body: () throws -> RecurrenceDayShift.Move?) -> String? {
+        do { _ = try body(); return nil } catch CalendarProviderError.notSupported(let reason) { return reason } catch { return "\(error)" }
     }
 
     private static let toAnotherDate: [String: JSONValue] = ["start_iso": .string("\(day(1))T09:00:00")]
 
-    @Test("each rule part that names days or dates refuses a move to another date, and the refusal names it")
-    func everyNamedPartRefuses() {
-        for (rule, part) in [
-            ("RRULE:FREQ=WEEKLY;BYDAY=MO,WE", "BYDAY=MO,WE"),
-            ("RRULE:FREQ=MONTHLY;BYMONTHDAY=15", "BYMONTHDAY=15"),
-            ("RRULE:FREQ=YEARLY;BYYEARDAY=100", "BYYEARDAY=100"),
-            ("RRULE:FREQ=YEARLY;BYWEEKNO=20", "BYWEEKNO=20"),
-            ("RRULE:FREQ=YEARLY;BYMONTH=3", "BYMONTH=3"),
-            ("RRULE:FREQ=MONTHLY;BYSETPOS=1", "BYSETPOS=1"),
-            ("rrule:freq=weekly;byday=mo", "byday=mo"),
-        ] {
-            let reason = refusal(Self.toAnotherDate, rule: rule)
-            #expect(reason?.contains(namedDaysRefusal) == true && reason?.contains(part) == true, "\(rule): \(reason ?? "passed")")
-            #expect(reason?.contains("from \(day(0)) to \(day(1))") == true, "\(rule): \(reason ?? "passed")")
+    @Test("a move to another date of a series on named days or dates is the move from its date to the new one")
+    func namedDaysMove() throws {
+        for rule in ["RRULE:FREQ=WEEKLY;BYDAY=MO,WE", "RRULE:FREQ=MONTHLY;BYMONTHDAY=15", "RRULE:FREQ=YEARLY;BYMONTH=3",
+                     "RRULE:FREQ=MONTHLY;BYDAY=2TU", "RRULE:FREQ=MONTHLY;BYSETPOS=1;BYDAY=MO", "rrule:freq=weekly;byday=mo"] {
+            #expect(try dayMove(Self.toAnotherDate, rule: rule) == Self.move(0, 1), "\(rule)")
         }
     }
 
-    @Test("a rule that names no days passes: its days follow the start")
-    func ruleWithoutNamedDaysPasses() {
+    @Test("a day of the year or a week number is refused, naming it: no move by whole days carries it")
+    func unmovablePartsAreRefused() {
+        for (rule, part) in [("RRULE:FREQ=YEARLY;BYYEARDAY=100", "BYYEARDAY=100"), ("RRULE:FREQ=YEARLY;BYWEEKNO=20", "BYWEEKNO=20"),
+                             ("RRULE:FREQ=MONTHLY;BYMONTHDAY=-1", "BYMONTHDAY=-1")] {
+            let refusal = reason { try dayMove(Self.toAnotherDate, rule: rule) }
+            #expect(refusal?.contains(part) == true, "\(rule): \(refusal ?? "passed")")
+        }
+    }
+
+    @Test("a rule that names no days is no move: its days follow the start")
+    func ruleWithoutNamedDaysIsNoMove() throws {
         for rule in ["RRULE:FREQ=DAILY", "RRULE:FREQ=WEEKLY;INTERVAL=2;COUNT=5", "RRULE:FREQ=MONTHLY;UNTIL=20991231T000000Z",
                      "RRULE:FREQ=YEARLY;WKST=SU"] {
-            #expect(refusal(Self.toAnotherDate, rule: rule) == nil, "\(rule)")
+            #expect(try dayMove(Self.toAnotherDate, rule: rule) == nil, "\(rule)")
         }
         let exdate = Self.series(["RRULE:FREQ=WEEKLY", "EXDATE:\(compact(day(7)))T090000Z"])
-        #expect(CalendarSeriesScope.dayMoveRefusal(Self.toAnotherDate, named: Self.named(exdate), scope: "all", zone: utc) == nil)
-        #expect(CalendarSeriesScope.dayMoveRefusal(Self.toAnotherDate, named: Self.named(Self.series(nil)), scope: "all", zone: utc) == nil)
+        #expect(try CalendarSeriesScope.dayMove(Self.toAnotherDate, named: Self.named(exdate), scope: "all", zone: utc) == nil)
+        #expect(try CalendarSeriesScope.dayMove(Self.toAnotherDate, named: Self.named(Self.series(nil)), scope: "all", zone: utc) == nil)
     }
 
-    @Test("another time on the same date, an end alone, one occurrence, and an edit that moves nothing pass")
-    func sameDateEndOnlyAndOneOccurrencePass() {
-        #expect(refusal(["start_iso": .string("\(day(0))T15:00:00")]) == nil)
-        #expect(refusal(["end_iso": .string("\(day(3))T10:00:00")]) == nil)
-        #expect(refusal(["recurrence_id": .string("\(day(7))T09:00:00"), "start_iso": .string("\(day(8))T09:00:00")],
-                        scope: "this_only") == nil)
-        #expect(refusal(["title": .string("Renamed")]) == nil)
+    @Test("another time on the same date, an end alone, one occurrence, and an edit that moves nothing are no move")
+    func sameDateEndOnlyAndOneOccurrenceAreNoMove() throws {
+        #expect(try dayMove(["start_iso": .string("\(day(0))T15:00:00")]) == nil)
+        #expect(try dayMove(["end_iso": .string("\(day(3))T10:00:00")]) == nil)
+        #expect(try dayMove(["recurrence_id": .string("\(day(7))T09:00:00"), "start_iso": .string("\(day(8))T09:00:00")],
+                            scope: "this_only") == nil)
+        #expect(try dayMove(["title": .string("Renamed")]) == nil)
     }
 
-    @Test("a new rule given with the move passes; a recurrence the builder writes no rule from is no new rule")
-    func givenRulePasses() {
+    @Test("a new rule given with the move is written as given; a recurrence the builder writes no rule from is no new rule")
+    func givenRuleIsNoMove() throws {
         var withRule = Self.toAnotherDate
         withRule["recurrence"] = .dictionary(["freq": .string("WEEKLY")])
-        #expect(refusal(withRule) == nil)
+        #expect(try dayMove(withRule) == nil)
         withRule["recurrence"] = .dictionary(["freq": .string("FORTNIGHTLY")])
-        #expect(refusal(withRule)?.contains(namedDaysRefusal) == true)
+        #expect(try dayMove(withRule) == Self.move(0, 1))
         withRule["recurrence"] = .string("weekly")
-        #expect(refusal(withRule)?.contains(namedDaysRefusal) == true)
+        #expect(try dayMove(withRule) == Self.move(0, 1))
     }
 
-    @Test("an occurrence and the following ones are compared with the start the occurrence has now, not the series' first, nor its place")
-    func followingComparesWithItsOccurrenceNow() {
+    @Test("an occurrence and the following ones: the date is judged where the occurrence is now, the move counted from its place in the series")
+    func followingMovesFromItsPlace() throws {
+        // Scheduled on day 7, moved on its own to day 9: a new time on day 9 keeps its date; day 10
+        // moves the days from day 7, the place the new part's rule repeats from.
+        let moved = gcalEvent(id: "ser_occ", start: timed(day(9)), end: nil, recurrence: nil, series: "ser", original: timed(day(7)))
+        #expect(try dayMove(["recurrence_id": .string("\(day(9))T09:00:00"), "start_iso": .string("\(day(9))T11:00:00")],
+                            scope: "this_and_following", occurrence: moved) == nil)
+        #expect(try dayMove(["recurrence_id": .string("\(day(9))T09:00:00"), "start_iso": .string("\(day(10))T09:00:00")],
+                            scope: "this_and_following", occurrence: moved) == Self.move(7, 10))
+        // Back onto its own date from where it is now is a move of its days by none.
+        #expect(try dayMove(["recurrence_id": .string("\(day(9))T09:00:00"), "start_iso": .string("\(day(7))T09:00:00")],
+                            scope: "this_and_following", occurrence: moved) == nil)
+    }
+
+    @Test("a split at an occurrence still at its place moves the days from it; a split with no occurrence read is no move, left to the scope's own refusal")
+    func splitMovesFromItsOccurrence() throws {
+        // A split's retry after its new part was written never comes here: the queue finishes it
+        // from its `SplitRecord`, whose new part already carries the turned rule.
         let rid = JSONValue.string("\(day(7))T09:00:00")
         let unmoved = gcalEvent(id: "ser_occ", start: timed(day(7)), end: nil, recurrence: nil, series: "ser", original: timed(day(7)))
-        #expect(refusal(["recurrence_id": rid, "start_iso": .string("\(day(7))T11:00:00")], scope: "this_and_following",
-                        occurrence: unmoved) == nil)
-        #expect(refusal(["recurrence_id": rid, "start_iso": .string("\(day(8))T09:00:00")], scope: "this_and_following",
-                        occurrence: unmoved)?.contains("from \(day(7)) to \(day(8))") == true)
-        // Moved on its own to day 9 (its place still day 7): a new time on day 9 keeps its date.
-        let moved = gcalEvent(id: "ser_occ", start: timed(day(9)), end: nil, recurrence: nil, series: "ser", original: timed(day(7)))
-        #expect(refusal(["recurrence_id": .string("\(day(9))T09:00:00"), "start_iso": .string("\(day(9))T11:00:00")],
-                        scope: "this_and_following", occurrence: moved) == nil)
-        #expect(refusal(["recurrence_id": .string("\(day(0))T09:00:00"), "start_iso": .string("\(day(1))T09:00:00")])?
-            .contains(namedDaysRefusal) == true)
+        for target in [8, 10, 13] {
+            let args: [String: JSONValue] = ["recurrence_id": rid, "start_iso": .string("\(day(target))T09:00:00")]
+            #expect(try dayMove(args, scope: "this_and_following", occurrence: unmoved) == Self.move(7, target), "to day \(target)")
+            #expect(try dayMove(args, scope: "this_and_following") == nil, "to day \(target), no occurrence read")
+        }
     }
 
-    @Test("an all-day series is compared by date")
-    func allDayByDate() {
+    @Test("an all-day series is moved by date")
+    func allDayByDate() throws {
         let allDay = gcalEvent(id: "ser", start: GCalDateTime(dateTime: nil, date: day(0), timeZone: nil),
                                end: GCalDateTime(dateTime: nil, date: day(1), timeZone: nil), recurrence: [Self.byDay])
         let occurrence = gcalEvent(id: "ser_occ", start: GCalDateTime(dateTime: nil, date: day(7), timeZone: nil), end: nil,
                                    recurrence: nil, series: "ser", original: GCalDateTime(dateTime: nil, date: day(7), timeZone: nil))
-        func allDayRefusal(_ args: [String: JSONValue], scope: String = "all") -> String? {
-            CalendarSeriesScope.dayMoveRefusal(args, named: Self.named(allDay, occurrence: occurrence), scope: scope, zone: utc)
+        func allDayMove(_ args: [String: JSONValue], scope: String = "all") throws -> RecurrenceDayShift.Move? {
+            try CalendarSeriesScope.dayMove(args, named: Self.named(allDay, occurrence: occurrence), scope: scope, zone: utc)
         }
-        #expect(allDayRefusal(["start_iso": .string("\(day(0))T00:00:00")]) == nil)
-        #expect(allDayRefusal(["start_iso": .string("\(day(2))T00:00:00")])?.contains(namedDaysRefusal) == true)
-        #expect(allDayRefusal(["recurrence_id": .string(day(7)), "start_iso": .string("\(day(7))T00:00:00")],
-                              scope: "this_and_following") == nil)
+        #expect(try allDayMove(["start_iso": .string("\(day(0))T00:00:00")]) == nil)
+        #expect(try allDayMove(["start_iso": .string("\(day(2))T00:00:00")]) == Self.move(0, 2))
+        #expect(try allDayMove(["recurrence_id": .string(day(7)), "start_iso": .string("\(day(7))T00:00:00")],
+                               scope: "this_and_following") == nil)
     }
 
     @Test("the dates are the series' own, in its zone, not the edit's")
@@ -1783,21 +2237,20 @@ struct CalendarSeriesScopeDayMoveRefusalTests {
         // date. 10:00 UTC is 19:00 the same day in Tokyo.
         let series = gcalEvent(id: "ser", start: GCalDateTime(dateTime: "\(day(0))T14:00:00Z", date: nil, timeZone: "Asia/Tokyo"),
                                end: nil, recurrence: [Self.byDay])
-        func tokyoRefusal(_ start: String, zone: TimeZone = utc) -> String? {
-            CalendarSeriesScope.dayMoveRefusal(["start_iso": .string(start)], named: Self.named(series), scope: "all", zone: zone)
+        func tokyoMove(_ start: String, zone: TimeZone = utc) throws -> RecurrenceDayShift.Move? {
+            try CalendarSeriesScope.dayMove(["start_iso": .string(start)], named: Self.named(series), scope: "all", zone: zone)
         }
-        #expect(tokyoRefusal("\(day(0))T16:00:00")?.contains("from \(day(0)) to \(day(1))") == true,
-                "\(tokyoRefusal("\(day(0))T16:00:00") ?? "passed")")
-        #expect(tokyoRefusal("\(day(0))T10:00:00") == nil)
+        #expect(try tokyoMove("\(day(0))T16:00:00") == Self.move(0, 1))
+        #expect(try tokyoMove("\(day(0))T10:00:00") == nil)
         // The edit's zone reads the naive start; the date is still Tokyo's.
         let honolulu = try #require(TimeZone(identifier: "Pacific/Honolulu"))
-        #expect(tokyoRefusal("\(day(0))T06:00:00", zone: honolulu)?.contains(namedDaysRefusal) == true,
+        #expect(try tokyoMove("\(day(0))T06:00:00", zone: honolulu) == Self.move(0, 1),
                 "06:00 in Honolulu is 01:00 the next day in Tokyo")
-        #expect(tokyoRefusal("\(day(-1))T20:00:00", zone: honolulu) == nil, "20:00 the day before in Honolulu is 15:00 in Tokyo")
+        #expect(try tokyoMove("\(day(-1))T20:00:00", zone: honolulu) == nil, "20:00 the day before in Honolulu is 15:00 in Tokyo")
     }
 
     @Test("a series whose own zone is not known is refused a new start, even on its date")
-    func unknownZoneIsRefused() {
+    func unknownZoneIsRefused() throws {
         // A CalDAV series kept in UTC names no zone (#679); an Outlook series whose recurrence zone
         // TabMail does not recognize has none it can read either.
         let zoneless = gcalEvent(id: "ser", start: GCalDateTime(dateTime: "\(day(0))T09:00:00Z", date: nil, timeZone: nil),
@@ -1805,13 +2258,15 @@ struct CalendarSeriesScopeDayMoveRefusalTests {
         var outlook = Self.series([Self.byDay])
         outlook.recurrenceTimeZoneName = "Not a zone"
         for series in [zoneless, outlook] {
-            let reason = CalendarSeriesScope.dayMoveRefusal(["start_iso": .string("\(day(0))T15:00:00")], named: Self.named(series),
-                                                            scope: "all", zone: utc)
-            #expect(reason?.contains("its own time zone is not known") == true, "\(reason ?? "passed")")
+            let refusal = reason {
+                try CalendarSeriesScope.dayMove(["start_iso": .string("\(day(0))T15:00:00")], named: Self.named(series),
+                                                scope: "all", zone: utc)
+            }
+            #expect(refusal?.contains("its own time zone is not known") == true, "\(refusal ?? "passed")")
         }
         outlook.recurrenceTimeZoneName = "UTC"
-        #expect(CalendarSeriesScope.dayMoveRefusal(["start_iso": .string("\(day(0))T15:00:00")], named: Self.named(outlook),
-                                                   scope: "all", zone: utc) == nil, "a series naming its zone (control)")
+        #expect(try CalendarSeriesScope.dayMove(["start_iso": .string("\(day(0))T15:00:00")], named: Self.named(outlook),
+                                                scope: "all", zone: utc) == nil, "a series naming its zone (control)")
     }
 }
 
@@ -2348,8 +2803,8 @@ struct InvariantCase: CustomTestStringConvertible, Sendable {
         case "this_only":
             return .one
         case "this_and_following":
-            // A series on named days to another date with no new rule, refused before the card.
-            if kind == .dateNamedDays { return .refused }
+            // A series on named days moved to another date moves its days with it, as Google
+            // Calendar does: the same extent as a series naming none.
             switch state {
             case .unmoved: return .fromHereOn
             // From the first occurrence on is every occurrence: an edit of the whole series.
@@ -2362,8 +2817,7 @@ struct InvariantCase: CustomTestStringConvertible, Sendable {
         default:
             switch kind {
             case .rename, .timeOfDay: return .whole
-            case .dateNamedDays: return .refused
-            case .datePlain, .dateWithRule:
+            case .dateNamedDays, .datePlain, .dateWithRule:
                 switch state {
                 case .unmoved: return .fromHereOn
                 case .firstMoved: return .whole
@@ -2991,6 +3445,50 @@ struct SplitInterruptedBetweenItsWritesTests {
         #expect(harness.seriesCapped, "\(kind): the series does not end before the split: \(harness.seriesEnd)")
         #expect(!retry.isEmpty && retry.allSatisfy(harness.isCap), "\(kind): the retry wrote more than the cap: \(retry)")
         #expect(r.next == nil && harness.nextWritten, "\(kind): the next change did not drain: \(describe(r.next))")
+    }
+
+    @Test("T2: a split onto another day whose cap fails is finished from its record: the new part keeps its turned rule with no excluded date, and the series is capped",
+          arguments: [SplitHarness.Kind.google, .calDAV])
+    func dayMoveSplitFinishedFromItsRecord(_ kind: SplitHarness.Kind) async throws {
+        // A weekly series on its first day's weekday, its week-3 occurrence deleted, moved from the
+        // week-2 occurrence on to the next day. The new part's rule turns to that day and the
+        // excluded date goes (ruling (a)); the retry writes only the cap (`finishSplit`).
+        let rule = GoogleSeries.onItsWeekday
+        let harness = SplitHarness(kind, googleRule: rule, calDAVRule: rule)
+        switch kind {
+        case .google:
+            var series = try #require(harness.google?.event(harness.seriesId))
+            series["recurrence"] = [rule, "EXDATE:\(compact(day(14)))T090000Z"]
+            harness.google?.store(series)
+        case .calDAV:
+            // In a named zone: a series in UTC with no TZID names none, and a move of its days is
+            // refused (#679).
+            harness.store?.seed(path: SplitHarness.calDAVSeriesPath, ics: calDAVSeries(
+                uid: "ser-c", rule: "\(rule)\r\nEXDATE;TZID=Etc/UTC:\(compact(day(14)))T090000", tzid: "Etc/UTC"))
+        case .outlook:
+            Issue.record("Outlook keeps no excluded dates in its pattern; not a case of this test")
+            return
+        }
+        harness.failCap()
+        var arguments = harness.arguments
+        arguments["start_iso"] = .string("\(day(8))T09:00:00")
+        var writesBeforeRetry = 0
+        let r = try await drainSplit(harness, account: "split-day-move-\(kind)", arguments: arguments, drains: 2, between: {
+            writesBeforeRetry = harness.splitWrites.count
+        })
+        let retry = Array(harness.splitWrites.dropFirst(writesBeforeRetry))
+        #expect(r.split == nil, "\(kind): the split did not complete: \(describe(r.split))")
+        #expect(!retry.isEmpty && retry.allSatisfy(harness.isCap), "\(kind): the retry wrote more than the cap: \(retry)")
+        #expect(harness.seriesCapped, "\(kind): the series does not end before the split: \(harness.seriesEnd)")
+        let partId = try #require(harness.newPartIds.first, "\(kind): no new part: \(harness.splitWrites)")
+        let lines: [String]
+        switch kind {
+        case .google: lines = harness.google?.event(partId)?["recurrence"] as? [String] ?? []
+        default: lines = harness.store?.storedICS(path: partId)?.components(separatedBy: "\r\n") ?? []
+        }
+        #expect(lines.contains { $0.hasPrefix("RRULE:") && $0.contains("BYDAY=\(weekdayCode(day(8)))") },
+                "\(kind): the new part's rule did not turn: \(lines)")
+        #expect(!lines.contains { $0.uppercased().hasPrefix("EXDATE") }, "\(kind): an excluded date stays on the new part: \(lines)")
     }
 
     @Test("T2/T3: the cap's answer is lost, named by the series or by its occurrence: the split ends complete",

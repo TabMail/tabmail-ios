@@ -18,6 +18,26 @@ actor CalDAVProvider: CalendarProvider {
         return edited != rule(event.recurrence)
     }
 
+    /// CalDAV's rules for a move to another day (`CalendarProvider.dayMovedRules`), from the stored
+    /// resource as the write reads it: its RRULE turned for an edit of every occurrence, or the new
+    /// part's (`splitRules`, at the slot `splitSeries` checks) turned for a split, as
+    /// `mergePatchIntoICS` turns the one RRULE it writes.
+    func dayMovedRules(calendarId: String, eventId: String, series: GCalEvent, scope: String, recurrenceId: String?,
+                       zone: TimeZone, move: RecurrenceDayShift.Move) async throws -> [String] {
+        let (seriesHref, occurrenceKey) = try CalDAVOccurrences.OccurrenceId.split(eventId)
+        let (data, _) = try await client.get(url: try resolveEventURL(seriesHref, calendarId: calendarId))
+        guard let masterICS = String(data: data, encoding: .utf8), let stored = Self.extractRRule(from: masterICS) else {
+            throw CalendarProviderError.notSupported("the repeating event's rule could not be read, so its days can't be moved with it")
+        }
+        guard scope == "this_and_following" else { return [try RecurrenceDayShift.shifted(stored, by: move)] }
+        guard let recurrenceId else { throw CalendarProviderError.notSupported(CalendarSeriesScope.seriesNotRead) }
+        let slot = try CalDAVOccurrences.scopedEditSlot(
+            icsText: masterICS, href: seriesHref, key: occurrenceKey, recurrenceId: recurrenceId, zone: zone, forSplit: true)
+        let rules = try Self.splitRules(masterICS: masterICS, slot: slot, recurrenceId: recurrenceId, recurrenceIdZone: zone,
+                                        zones: CalendarTimeZoneContext(calendarText: masterICS))
+        return [try RecurrenceDayShift.shifted(rules.newRule, by: move)]
+    }
+
     private let client: CalDAVClient
     private let calendarHomeURL: URL
     private let serverBaseURL: URL
@@ -620,56 +640,13 @@ actor CalDAVProvider: CalendarProvider {
             icsText: masterICS, href: seriesHref, key: occurrenceKey,
             recurrenceId: recurrenceId, zone: recurrenceIdZone, forSplit: true)
 
-        // 2. Parse the original RRULE so we can build the capped variant + the
-        //    new-series RRULE (the original end carried over).
-        guard let originalRRule = Self.extractRRule(from: masterICS) else {
-            throw CalendarProviderError.notSupported("Master event has no RRULE; can't split.")
-        }
-        // RFC 5545 §3.3.10: the UNTIL value type must match DTSTART's. If the
-        // master's DTSTART is a bare DATE (all-day), UNTIL must be a bare DATE.
-        let masterIsAllDay = Self.icsIsAllDay(masterICS)
-        // The cap is an ABSOLUTE boundary (RFC 5545 UNTIL is UTC for a timed
-        // DTSTART), so it is computed from the declared frame directly — no
-        // conversion, the instant is the instant.
-        guard let untilValue = GoogleCalendarProvider.googleUntilString(beforeNaiveISO: slot, allDay: masterIsAllDay, zone: recurrenceIdZone) else {
-            throw CalendarProviderError.notSupported("Invalid recurrence_id '\(recurrenceId)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
-        }
-        // The new series' DTSTART, by contrast, is a WALL CLOCK the successor
-        // resource carries in the master's frame, so it must be handed a
-        // master-frame value AND the frame that value is now in. Capping in one
-        // frame while starting the successor in another is how a split
-        // duplicates or drops the boundary occurrence.
-        //
-        // `seriesSplitResources` writes this master-frame value straight into the
-        // new part's DTSTART, in the master's own value type and TZID, so it is
-        // never read back in another frame. (The successor used to be rebuilt
-        // from fields, and a `.utc` master's value was re-read in the device
-        // zone, which moved the successor's start by the device's UTC offset
-        // while `untilValue` above stayed on the correct instant.)
-        // The stored resource's zone context, read once for every zone this write resolves.
+        // 2. The capped series' rule and the new part's (`splitRules`), worked out before the cap
+        //    PUT in step 3, so a split the series cannot take is refused with nothing written.
         let zones = CalendarTimeZoneContext(calendarText: masterICS)
-        let masterKindForSplit = Self.masterDTStartKind(from: masterICS)
-        guard let masterFrameRecurrenceId = try Self.recurrenceIdInMasterFrame(
-            slot, declaredZone: recurrenceIdZone, kind: masterKindForSplit, zones: zones
-        ) else {
-            throw CalendarProviderError.notSupported(
-                "Could not express recurrence_id '\(recurrenceId)' (\(recurrenceIdZone.identifier)) in this event's timezone — refusing to split a series at an occurrence we cannot name."
-            )
-        }
-        // The new series ends where the original one did: the same UNTIL, or
-        // what is left of its COUNT. Worked out here, before the cap PUT in
-        // step 3, so a split the series cannot take (it already ends before the
-        // split, or its COUNT cannot be counted) is refused with nothing written.
-        // A patch that brings its own recurrence is still written as given
-        // (`seriesSplitResources` applies it over this one), but the check runs all the same:
-        // it is also what stops the cap from moving the end of a series that
-        // already ended before the split.
-        let newSeriesRRule = try RecurrenceTail.newSeriesRule(
-            from: originalRRule,
-            seriesStart: Self.masterDTStartDay(from: masterICS),
-            split: RecurrenceTail.Day(iso: masterFrameRecurrenceId),
-            capUntil: untilValue)
-        let cappedRRule = GoogleCalendarProvider.replaceOrAppendUntil(in: originalRRule, untilValue: untilValue)
+        let rules = try Self.splitRules(masterICS: masterICS, slot: slot, recurrenceId: recurrenceId,
+                                        recurrenceIdZone: recurrenceIdZone, zones: zones)
+        let (masterFrameRecurrenceId, newSeriesRRule, cappedRRule) =
+            (rules.masterFrameRecurrenceId, rules.newRule, rules.cappedRule)
         // Both resources are built from the STORED series before anything is
         // written (`seriesSplitResources`): the new part is a copy of the series
         // re-anchored at the split, so it keeps every property the series has.
@@ -879,6 +856,65 @@ actor CalDAVProvider: CalendarProvider {
             if line.hasPrefix("RRULE:") { return line }
         }
         return nil
+    }
+
+    /// A split's two rules, from the stored series `masterICS` and the occurrence's checked `slot`
+    /// (`CalDAVOccurrences.scopedEditSlot`): the slot in the series' own frame, the series' rule
+    /// capped just before it, and the new part's rule, ending where the series did
+    /// (`RecurrenceTail.newSeriesRule`), its days counted in the series' own frame. The one
+    /// computation `splitSeries` writes and the card shows (`dayMovedRules`).
+    static func splitRules(
+        masterICS: String, slot: String, recurrenceId: String, recurrenceIdZone: TimeZone, zones: CalendarTimeZoneContext
+    ) throws -> (masterFrameRecurrenceId: String, newRule: String, cappedRule: String) {
+        // The original RRULE, to build the capped variant and the new-series RRULE (the original
+        // end carried over).
+        guard let originalRRule = Self.extractRRule(from: masterICS) else {
+            throw CalendarProviderError.notSupported("Master event has no RRULE; can't split.")
+        }
+        // RFC 5545 §3.3.10: the UNTIL value type must match DTSTART's. If the
+        // master's DTSTART is a bare DATE (all-day), UNTIL must be a bare DATE.
+        let masterIsAllDay = Self.icsIsAllDay(masterICS)
+        // The cap is an ABSOLUTE boundary (RFC 5545 UNTIL is UTC for a timed
+        // DTSTART), so it is computed from the declared frame directly — no
+        // conversion, the instant is the instant.
+        guard let untilValue = GoogleCalendarProvider.googleUntilString(beforeNaiveISO: slot, allDay: masterIsAllDay, zone: recurrenceIdZone) else {
+            throw CalendarProviderError.notSupported("Invalid recurrence_id '\(recurrenceId)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
+        }
+        // The new series' DTSTART, by contrast, is a WALL CLOCK the successor
+        // resource carries in the master's frame, so it must be handed a
+        // master-frame value AND the frame that value is now in. Capping in one
+        // frame while starting the successor in another is how a split
+        // duplicates or drops the boundary occurrence.
+        //
+        // `seriesSplitResources` writes this master-frame value straight into the
+        // new part's DTSTART, in the master's own value type and TZID, so it is
+        // never read back in another frame. (The successor used to be rebuilt
+        // from fields, and a `.utc` master's value was re-read in the device
+        // zone, which moved the successor's start by the device's UTC offset
+        // while `untilValue` above stayed on the correct instant.)
+        let masterKindForSplit = Self.masterDTStartKind(from: masterICS)
+        guard let masterFrameRecurrenceId = try Self.recurrenceIdInMasterFrame(
+            slot, declaredZone: recurrenceIdZone, kind: masterKindForSplit, zones: zones
+        ) else {
+            throw CalendarProviderError.notSupported(
+                "Could not express recurrence_id '\(recurrenceId)' (\(recurrenceIdZone.identifier)) in this event's timezone — refusing to split a series at an occurrence we cannot name."
+            )
+        }
+        // The new series ends where the original one did: the same UNTIL, or
+        // what is left of its COUNT. Worked out before the split's cap PUT,
+        // so a split the series cannot take (it already ends before the
+        // split, or its COUNT cannot be counted) is refused with nothing written.
+        // A patch that brings its own recurrence is still written as given
+        // (`seriesSplitResources` applies it over this one), but the check runs all the same:
+        // it is also what stops the cap from moving the end of a series that
+        // already ended before the split.
+        let newSeriesRRule = try RecurrenceTail.newSeriesRule(
+            from: originalRRule,
+            seriesStart: Self.masterDTStartDay(from: masterICS),
+            split: RecurrenceTail.Day(iso: masterFrameRecurrenceId),
+            capUntil: untilValue)
+        let cappedRRule = GoogleCalendarProvider.replaceOrAppendUntil(in: originalRRule, untilValue: untilValue)
+        return (masterFrameRecurrenceId, newSeriesRRule, cappedRRule)
     }
 
     /// The MASTER VEVENT's DTSTART day as written, which is the day in the
@@ -1125,8 +1161,22 @@ actor CalDAVProvider: CalendarProvider {
                 newLine: "TRANSP:\(transparency.uppercased())"
             )
         }
-        let patchedRRule = patch.recurrence?.first(where: { $0.uppercased().hasPrefix("RRULE:") })
+        // A move to another day with no rule given turns the days the stored rule names
+        // (`RecurrenceDayShift`): the series' own on an edit of every occurrence, the new part's on a
+        // split (its end already carried over by `RecurrenceTail.newSeriesRule`).
+        let patchedRRule = try patch.recurrence?.first(where: { $0.uppercased().hasPrefix("RRULE:") })
+            ?? patch.ruleDayMove.flatMap { move in try extractRRule(from: result).map { try RecurrenceDayShift.shifted($0, by: move) } }
         if let rrule = patchedRRule {
+            // A move to another day that changes the rule resets every exception, as Google
+            // Calendar does (measured): its changed occurrences (override VEVENTs) and deleted ones
+            // (EXDATE) go, so a deleted occurrence comes back on its new day and a changed one's
+            // edit is dropped.
+            if patch.recurrence == nil, patch.ruleDayMove != nil,
+               extractRRule(from: result).map(GoogleCalendarProvider.canonicalRRULE) != GoogleCalendarProvider.canonicalRRULE(rrule) {
+                result = rewriteVEvents(in: result) { block, isSeries in
+                    isSeries ? rewriteTopLevel(block) { _, name in name == "EXDATE" ? [] : nil } : nil
+                }
+            }
             // `replaceRRule` handles the existing-RRULE case AND the
             // master-has-no-RRULE case via its replaceOrAppendInMaster fallback.
             if extractRRule(from: result) != nil {

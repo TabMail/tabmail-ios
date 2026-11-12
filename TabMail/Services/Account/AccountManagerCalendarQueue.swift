@@ -948,10 +948,10 @@ extension AccountManager {
             // `GCalEventInput.attendeeChange`, and the provider's write applies it to the stored
             // guests of the item it writes; a whole-series write reaches each changed occurrence as
             // the series' difference, on that occurrence's own guests (`AttendeeChange`, #620).
-            if let reason = CalendarSeriesScope.dayMoveRefusal(
-                routed.args, named: named, scope: routed.scope, zone: recurrenceIdZone) {
-                throw CalendarProviderError.notSupported(reason)
-            }
+            // A move to another day of a series whose rule names its days turns those days with it
+            // (`CalendarSeriesScope.dayMove`), on the rule each provider writes.
+            let ruleDayMove = try CalendarSeriesScope.dayMove(
+                routed.args, named: named, scope: routed.scope, zone: recurrenceIdZone)
             // 🚨 AN RRULE `UNTIL`'S VALUE TYPE BELONGS TO THE DTSTART, AND ON AN EDIT THE DTSTART
             // BELONGS TO THE RESOURCE. RFC 5545 §3.3.10: "The value of the UNTIL rule part MUST have
             // the same value type as the DTSTART property." `buildGCalEventInput` renders the UNTIL
@@ -1081,7 +1081,8 @@ extension AccountManager {
                 occurrenceStartDay: occurrenceStartDay) {
                 throw CalendarProviderError.notSupported(reason)
             }
-            let input = try CalendarToolHelpers.buildGCalEventInput(routed.args, isAllDay: resolvedAllDay)
+            var input = try CalendarToolHelpers.buildGCalEventInput(routed.args, isAllDay: resolvedAllDay)
+            input.ruleDayMove = ruleDayMove
 
             switch scope {
             case "this_only":

@@ -1210,6 +1210,10 @@ enum CalendarToolHelpers {
     /// and moved occurrences when its rule, start or end changes (#423, measured), and other
     /// calendars may when its rule does.
     static let ruleChangeResetNote = "Occurrences you changed individually may be reset."
+    /// The card's note for a whole series, or a split's new part, moved to another day with its
+    /// rule's days: the calendar resets every exception there, as Google Calendar and Outlook do
+    /// (measured).
+    static let dayMoveResetNote = "Occurrences you changed or deleted individually are reset: a deleted one comes back on the new day, and a changed one loses its change."
     /// The days a rule's day parts name, in words for the confirmation card: `on Monday, Wednesday`,
     /// `on the first Monday`, `on day 1, day 15`, `on the last day`, `in March`, `week starts Monday`. Nil when there are none.
     private static func recurrenceDaysText(_ parts: [String]) -> String? {

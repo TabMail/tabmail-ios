@@ -25,8 +25,8 @@ import Foundation
 ///   series is never moved by the distance from a later occurrence.
 /// - **A change of an occurrence and the following ones named at the series' first occurrence is a
 ///   change of the whole series**, as in Google Calendar; one named before it is refused.
-/// - **A series whose rule names its days is not moved to another date without its new rule**
-///   (`dayMoveRefusal`).
+/// - **A series whose rule names its days moves them with a move to another date** (`dayMove`), as
+///   Google Calendar does.
 ///
 /// First or later is judged on the occurrence's place in the series (`originalStartTime`); a
 /// date or a time change, and the move back to the first occurrence's date, on where it is now
@@ -281,47 +281,63 @@ enum CalendarSeriesScope {
     }
 
     /// 🚨 **THE ONE PLACE A MOVE OF A SERIES TO ANOTHER DAY IS DECIDED: a series whose rule names its
-    /// days is not moved to another date unless the edit gives its new rule.**
+    /// days moves them with it**, as Google Calendar does (`RecurrenceDayShift`).
     ///
     /// Every provider keeps the stored rule when a series' start moves, so a series repeating on
-    /// named days moved to another date would go on repeating on the old days, and its first
-    /// occurrence would be the only one on the new day. Returns why the edit is refused, or nil.
-    ///
-    /// Refused: an edit in scope "all" or `this_and_following` whose new start is on another date
-    /// than what it moves (an "all" edit: the series' own start; a `this_and_following` edit: the
-    /// start its occurrence has now), of a series whose RRULE has a part in `namedDayParts`, giving
-    /// no `recurrence` that `buildGCalEventInput` writes in its place. A move to another time on the
-    /// same date, an end alone, `this_only`, and a rule that names no days (its days follow the
-    /// start) pass.
+    /// named days moved to another date would go on repeating on the old days. Returns the move
+    /// the write carries (`GCalEventInput.ruleDayMove`): each provider turns the days of the rule it
+    /// writes by it (the whole series' rule, or the new part's rule of a split, its end carried as
+    /// the split carries it). Nil when there is nothing to turn: a scope other than "all" or
+    /// `this_and_following`, no new start, a new start on the same date as what it moves (an "all"
+    /// edit: the series' own start; a `this_and_following` edit: the start its occurrence has
+    /// now), a rule that names no days (its days follow the start), or an edit that gives its own
+    /// rule (`recurrence`), which is written as given.
     ///
     /// The dates are the series' own, in its zone (`GCalEvent.seriesZone`), where its rule repeats.
-    /// When they can't be told (a timed series whose zone is not known), the move is refused.
+    ///
+    /// Throws `notSupported`, with nothing written: when the dates can't be told (a timed series
+    /// whose zone is not known), and when the rule names its days in a way a move can't carry
+    /// (`RecurrenceDayShift.shifted`).
     ///
     /// Called before the confirmation card (`CalendarEventEditTool`) and again before the write
     /// (`AccountManagerCalendarQueue`), on every provider, with what `read` returns and the edit as
-    /// `route` sent it. A split the queue finishes from its `SplitRecord` (#601) is not checked
-    /// again: the attempt that wrote its new part passed it.
-    static func dayMoveRefusal(_ args: [String: JSONValue], named: Named, scope: String, zone: TimeZone) -> String? {
+    /// `route` sent it. A split's move is counted from its occurrence's place in the series
+    /// (`originalStartTime`). A split the queue finishes from its `SplitRecord` (#601) is not
+    /// checked again: the attempt that wrote its new part, its rule turned, passed it.
+    static func dayMove(_ args: [String: JSONValue], named: Named, scope: String, zone: TimeZone) throws -> RecurrenceDayShift.Move? {
         guard scope == "all" || scope == "this_and_following",
               let start = CalendarToolHelpers.stringArgOpt(args, "start_iso"),
               !givesRule(args) else { return nil }
         // Both scopes read the series (`usesSeries`); one not read is refused, never passed.
-        guard let series = named.series else { return seriesNotRead }
-        let days = namedDays(series)
-        guard !days.isEmpty else { return nil }
-        let instead = "give the new repeat rule (recurrence) with the move, or change just that date (edit_scope 'this_only' with recurrence_id)"
-        let moved = scope == "this_and_following" ? named.occurrence?.start : series.start
-        guard let from = place(moved),
-              let dates = dates(of: start, and: from, series: series, zone: zone) else {
-            return "this repeating event repeats on named days (\(days.joined(separator: ";"))), and it can't be told whether the new start (\(start)) keeps its date, as its own time zone is not known; \(instead)"
+        let series = try named.readSeries()
+        let rules = (series.recurrence ?? []).filter { $0.uppercased().hasPrefix("RRULE:") }
+        guard rules.contains(where: RecurrenceDayShift.namesDays) else { return nil }
+        // Whether the date changes is judged on where the occurrence is now; how far the days turn,
+        // from its place in the series (its scheduled slot), the frame the new part's rule repeats
+        // in. An "all" edit moves the series from its own start.
+        let now: Place?
+        let slot: Place?
+        if scope == "this_and_following" {
+            // A missing `recurrence_id` is refused by the caller's scope switch, as in `route`.
+            guard let occurrence = named.occurrence else { return nil }
+            now = place(occurrence.start)
+            slot = place(occurrence.originalStartTime) ?? place(occurrence.start)
+        } else {
+            now = place(series.start)
+            slot = now
         }
-        guard dates.given != dates.place else { return nil }
-        return "this repeating event repeats on named days (\(days.joined(separator: ";"))), so moving it from \(dates.place) to \(dates.given) would leave its days unchanged; \(instead)"
+        let unknownZone = CalendarProviderError.notSupported(
+            "this repeating event repeats on named days (\(namedDays(series).joined(separator: ";"))), and it can't be told whether the new start (\(start)) keeps its date, as its own time zone is not known; give the new repeat rule (recurrence) with the move, or change just that date (edit_scope 'this_only' with recurrence_id)")
+        guard let now, let current = dates(of: start, and: now, series: series, zone: zone) else { throw unknownZone }
+        guard current.given != current.place else { return nil }
+        guard let slot, let dates = dates(of: start, and: slot, series: series, zone: zone),
+              let fromDay = RecurrenceTail.Day(iso: dates.place),
+              let toDay = RecurrenceTail.Day(iso: dates.given) else { throw unknownZone }
+        let move = RecurrenceDayShift.Move(from: fromDay, to: toDay)
+        guard move.days != 0 else { return nil }
+        for rule in rules { _ = try RecurrenceDayShift.shifted(rule, by: move) }
+        return move
     }
-
-    /// The RRULE parts that name the days or dates a series repeats on. A rule with none of them
-    /// repeats on its start's day, so its days move with the start.
-    static let namedDayParts: Set<String> = ["BYDAY", "BYMONTHDAY", "BYYEARDAY", "BYWEEKNO", "BYMONTH", "BYSETPOS"]
 
     /// Where an occurrence is, or is placed in its series, as `route` compares it.
     private enum Place: Equatable {
@@ -480,7 +496,7 @@ enum CalendarSeriesScope {
         (series.recurrence ?? []).flatMap { line -> [String] in
             guard line.uppercased().hasPrefix("RRULE:") else { return [] }
             return line.dropFirst("RRULE:".count).split(separator: ";").map(String.init).filter { part in
-                namedDayParts.contains(part.split(separator: "=", maxSplits: 1).first.map { $0.uppercased() } ?? "")
+                RecurrenceDayShift.namedDayParts.contains(part.split(separator: "=", maxSplits: 1).first.map { $0.uppercased() } ?? "")
             }
         }
     }
