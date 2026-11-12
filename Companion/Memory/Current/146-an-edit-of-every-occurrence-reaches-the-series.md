@@ -461,3 +461,17 @@ rule above when #613 settled that an occurrence is named where it is now.
 
 1. The add-on refuses a new rule given together with a day move (specific to its writer); here a new
    rule given with the move is what lets a series on named days move to another date.
+
+## `recurrence_id` is read in the device's zone, never the edit's `timezone` (#794)
+
+`recurrence_id` is an identifier copied from read output, which prints an occurrence's start in the
+device's zone. The edit tool reads it there (`ridZone` = `ToolContext.deviceZone`), whatever
+`timezone` the edit names; `timezone` applies only to the edit's new times. The tool queues that zone
+as `recurrence_id_timezone` (`CalendarToolHelpers.stampingRecurrenceIdZone`), and the drain reads it
+back (`CalendarToolHelpers.recurrenceIdZone`; a row without it is read in the edit's zone, as queued).
+Every provider call that takes `recurrenceIdZone` (lookup, one-occurrence write, split, `dayMovedRules`,
+`finishSplit`, `occurrenceStartDay`) gets this zone; `CalendarSeriesScope.route` takes it separately
+(`recurrenceIdZone:`) and names a `recurrence_id` it mints in it, while the new times and `dayMove`
+stay in the edit's zone. A CalDAV floating series is matched by wall clock in this zone, so it is
+unaffected. Matches the Thunderbird add-on (`occurrenceNamedBy`, user's zone). Pinned by
+`CalendarRecurrenceIdZoneTests` (device, edit and drain zones all different).

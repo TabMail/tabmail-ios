@@ -758,6 +758,123 @@ struct CalendarQueuedZoneStampTests {
 
 // MARK: - The card names a zone only when it is not the device's
 
+// MARK: - A recurrence_id names the occurrence the read tools printed, whatever zone the edit names (#794)
+//
+// INVARIANT: the `recurrence_id` the read tools print (an occurrence's start in the device's zone)
+// names that same occurrence when it is passed back to `calendar_event_edit`, whatever `timezone`
+// the edit gives for its new times. `timezone` applies to the new times only. It used to be read in
+// the edit's `timezone`, where it named no occurrence, so the edit was refused before its card.
+//
+// The device is in one zone, the edit names a second, and the queue drains in the host's, a third:
+// each case names the occurrence as the read tools print it in the device's zone and its new time in
+// the edit's zone, and checks the occurrence named is the one written, at the card's start.
+
+/// The device's zone and the zone the edit names: two zones that differ from each other and from the
+/// host's at `at`.
+private func deviceAndEditZones(at: Date) throws -> (device: TimeZone, edit: TimeZone) {
+    let zones = try zonesNotTheHost(at: at)
+    return (zones[0], zones[1])
+}
+
+@Suite("A recurrence_id names the occurrence the read tools printed, whatever zone the edit names (#794)", .serialized, .processGlobalState)
+struct CalendarRecurrenceIdZoneTests {
+
+    @Test("Google: one occurrence named as printed, with its new time in another zone, is the one moved")
+    func googleThisOnly() async throws {
+        let slot = try #require(utcAt("\(day(7))T09:00:00"))
+        let (device, edit) = try deviceAndEditZones(at: slot)
+        try await withGoogle("rid-g-one") { calendar, pool in
+            let r = try await runEdit([
+                "edit_scope": .string("this_only"), "recurrence_id": .string(naive(slot, device)),
+                "timezone": .string(edit.identifier),
+                "start_iso": .string(naive(slot.addingTimeInterval(3_600), edit)),
+                "end_iso": .string(naive(slot.addingTimeInterval(5_400), edit)),
+            ], eventId: GoogleSeries.instanceId(day(7)), calendarId: "primary", account: "rid-g-one", pool: pool, deviceZone: device)
+            let card = try #require(r.card, "\(r.cards.count) cards: \(summary(r))")
+            let written = instant(calendar.event(GoogleSeries.instanceId(day(7)))?["start"])
+            #expect(written == slot.addingTimeInterval(3_600), "written \(String(describing: written)); \(summary(r))")
+            #expect(written == (try cardInstant(card, "start")), "card \(card.changes)")
+            #expect(card.startDate == slot, "the card shows \(card.startDate), not the occurrence named")
+        }
+    }
+
+    @Test("Google: a change from an occurrence named as printed, with its new time in another zone, splits there")
+    func googleThisAndFollowing() async throws {
+        let slot = try #require(utcAt("\(day(7))T09:00:00"))
+        let (device, edit) = try deviceAndEditZones(at: slot)
+        let rid = naive(slot, device)
+        try await withGoogle("rid-g-following") { calendar, pool in
+            let r = try await runEdit([
+                "edit_scope": .string("this_and_following"), "recurrence_id": .string(rid),
+                "timezone": .string(edit.identifier),
+                "start_iso": .string(naive(slot.addingTimeInterval(3_600), edit)),
+                "end_iso": .string(naive(slot.addingTimeInterval(5_400), edit)),
+            ], eventId: GoogleSeries.id, calendarId: "primary", account: "rid-g-following", pool: pool, deviceZone: device)
+            _ = try #require(r.card, "\(r.cards.count) cards: \(summary(r))")
+            let successor = calendar.event(GoogleCalendarProvider.deterministicSplitEventId(masterId: GoogleSeries.id, recurrenceId: rid))
+            #expect(instant(successor?["start"]) == slot.addingTimeInterval(3_600),
+                    "new part \(successor?["start"] ?? "none"); writes \(calendar.writes); \(summary(r))")
+            #expect((calendar.event(GoogleSeries.id)?["recurrence"] as? [String])?.contains { $0.contains("UNTIL=") } == true,
+                    "the earlier part was not capped: \(calendar.event(GoogleSeries.id)?["recurrence"] ?? "none")")
+        }
+    }
+
+    @Test("Outlook: one occurrence named as printed, with its new time in another zone, is the one moved")
+    func outlookThisOnly() async throws {
+        let slot = GraphFixture.occurrenceStart
+        let (device, edit) = try deviceAndEditZones(at: slot)
+        try await withOutlook("rid-x-one") { graph, pool in
+            let r = try await runEdit([
+                "edit_scope": .string("this_only"), "recurrence_id": .string(naive(slot, device)),
+                "timezone": .string(edit.identifier),
+                "start_iso": .string(naive(slot.addingTimeInterval(1_800), edit)),
+                "end_iso": .string(naive(slot.addingTimeInterval(3_600), edit)),
+            ], eventId: GraphSeries.later, calendarId: "primary", account: "rid-x-one", pool: pool, deviceZone: device)
+            _ = try #require(r.card, "\(r.cards.count) cards: \(summary(r))")
+            let written = instant(graph.event(GraphSeries.later)?["start"])
+            #expect(written == slot.addingTimeInterval(1_800), "written \(String(describing: written)); \(summary(r))")
+        }
+    }
+
+    @Test("CalDAV: one occurrence named as printed, with its new time in another zone, is the one moved")
+    func calDAVThisOnly() async throws {
+        let fixture = try OccurrenceWireFixture.make()
+        let slot = try fixture.occurrence(2)
+        let (device, edit) = try deviceAndEditZones(at: slot)
+        try await withCalDAV("rid-c-one", fixture: fixture) { harness, pool in
+            let r = try await runEdit([
+                "edit_scope": .string("this_only"), "recurrence_id": .string(naive(slot, device)),
+                "timezone": .string(edit.identifier),
+                "start_iso": .string(naive(slot.addingTimeInterval(3_600), edit)),
+                "end_iso": .string(naive(slot.addingTimeInterval(5_400), edit)),
+            ], eventId: OccurrenceWireFixture.seriesPath, calendarId: OccurrenceWireFixture.calendarId,
+               account: "rid-c-one", pool: pool, deviceZone: device)
+            _ = try #require(r.card, "\(r.cards.count) cards: \(summary(r))")
+            let occurrence = try? await OccurrenceWireFixture.makeProvider(harness.http)
+                .getEvent(calendarId: OccurrenceWireFixture.calendarId, eventId: try fixture.occurrenceId(2))
+            #expect(occurrence?.startDate == slot.addingTimeInterval(3_600),
+                    "written \(String(describing: occurrence?.startDate)); \(summary(r))")
+        }
+    }
+
+    @Test("CalDAV floating series: the occurrence at the wall clock printed is the one changed, whatever zone the edit names")
+    func calDAVFloatingThisOnly() async throws {
+        let fixture = try floatingSeries(first: day(0), start: "090000", end: "093000", rule: "FREQ=WEEKLY")
+        let (device, edit) = try deviceAndEditZones(at: fixture.first)
+        try await withCalDAV("rid-c-float-one", fixture: fixture) { harness, pool in
+            let r = try await runEdit([
+                "edit_scope": .string("this_only"), "recurrence_id": .string("\(day(14))T09:00:00"),
+                "timezone": .string(edit.identifier),
+                "title": .string("Standup (renamed)"),
+            ], eventId: OccurrenceWireFixture.seriesPath, calendarId: OccurrenceWireFixture.calendarId,
+               account: "rid-c-float-one", pool: pool, deviceZone: device)
+            let lines = CalDAVProvider.icsLines(harness.store.storedICS(path: OccurrenceWireFixture.seriesPath) ?? "")
+            #expect(lines.filter { $0.hasPrefix("RECURRENCE-ID") } == ["RECURRENCE-ID:\(compact(day(14)))T090000"],
+                    "changed \(lines.filter { $0.hasPrefix("RECURRENCE-ID") }); \(summary(r))")
+        }
+    }
+}
+
 @Suite("The calendar card names a zone only when it is not the device's (#753)")
 struct CalendarCardZoneLabelTests {
     private func detail(_ zone: String?) -> AgentToolRouter.ActionConfirmation.CalendarEventDetail {

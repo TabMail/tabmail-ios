@@ -169,6 +169,11 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         // The edit names the zone its times are in from here on (`stampingZone`): every check below
         // that reads the arguments, the card, and the queued edit, which the drain reads in it.
         arguments = CalendarToolHelpers.stampingZone(arguments, tz)
+        // `recurrence_id` is copied from read output, which prints it in the device's zone: it is
+        // read there, whatever `timezone` names for the new times (#794, as the Thunderbird add-on).
+        // Queued with the edit, so the drain reads it in the same zone.
+        let ridZone = deviceZone
+        arguments = CalendarToolHelpers.stampingRecurrenceIdZone(arguments, ridZone)
         // Resolve the recurring-edit scope up front — it drives both the
         // confirmation-card date math (which occurrence to show) and the
         // scope clause appended to `changes`. Resolved here, before the API
@@ -245,7 +250,7 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         do {
             named = try await CalendarSeriesScope.read(
                 event: fetchedEvent, eventId: eventId, recurrenceId: recurrenceIdArg, scope: resolvedScope,
-                calendarId: lookupCalId, zone: tz, provider: provider)
+                calendarId: lookupCalId, zone: ridZone, provider: provider)
         } catch let refused as CalendarProviderError {
             // A provider's refusal, worded for an edit (`reason`): `notSupported`'s own, and the
             // edit's words for a neutral case (a series not in this calendar, #729).
@@ -283,7 +288,7 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         var turnsDays = false
         do {
             let given = arguments
-            let routed = try CalendarSeriesScope.route(arguments, scope: resolvedScope, named: named, zone: tz)
+            let routed = try CalendarSeriesScope.route(arguments, scope: resolvedScope, named: named, zone: tz, recurrenceIdZone: ridZone)
             arguments = routed.args
             resolvedScope = routed.scope
             recurrenceIdArg = routed.recurrenceId
@@ -305,7 +310,7 @@ struct CalendarEventEditTool: AgentTool, Sendable {
                 let series = try named.readSeries()
                 let rules = try await provider.dayMovedRules(
                     calendarId: lookupCalId, eventId: queuedEventId, series: series,
-                    scope: resolvedScope, recurrenceId: recurrenceIdArg, zone: tz, move: move)
+                    scope: resolvedScope, recurrenceId: recurrenceIdArg, zone: ridZone, move: move)
                 // A move that leaves the rule as it is (one named by position) changes nothing the
                 // card should name, and resets no exception. One that turns it resets them on every
                 // calendar, for the whole series or the split's new part.
@@ -353,7 +358,7 @@ struct CalendarEventEditTool: AgentTool, Sendable {
             do {
                 occurrenceStartDay = try await provider.occurrenceStartDay(
                     calendarId: lookupCalId, eventId: eventId, recurrenceId: rid,
-                    recurrenceIdZone: tz)
+                    recurrenceIdZone: ridZone)
             } catch {
                 return ToolJSON.string(from: [
                     "ok": false,
@@ -412,7 +417,7 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         // now, + master duration) rather than the master: one time per occurrence.
         let cardStart: Date?
         if showsOccurrence, let rid = recurrenceIdArg,
-           let occ = EKEventStoreHelper.parseNaiveISO(rid, timeZone: tz) {
+           let occ = EKEventStoreHelper.parseNaiveISO(rid, timeZone: ridZone) {
             cardStart = occ
         } else {
             cardStart = shown.startDate

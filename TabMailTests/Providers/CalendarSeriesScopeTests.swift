@@ -1879,7 +1879,7 @@ struct CalendarSeriesScopeRouteTests {
 
     private func route(_ args: [String: JSONValue], _ named: CalendarSeriesScope.Named, scope: String = "all",
                        zone: TimeZone = utc) throws -> Went {
-        let routed = try CalendarSeriesScope.route(args, scope: scope, named: named, zone: zone)
+        let routed = try CalendarSeriesScope.route(args, scope: scope, named: named, zone: zone, recurrenceIdZone: zone)
         #expect(CalendarToolHelpers.stringArgOpt(routed.args, "edit_scope") ?? scope == routed.scope,
                 "the arguments' edit_scope is not the scope written")
         // Routed again, it routes to itself: the queue decides what the card said. The queue reads
@@ -1890,7 +1890,7 @@ struct CalendarSeriesScopeRouteTests {
         } else {
             reread = Self.named(try named.readSeries())
         }
-        let again = try CalendarSeriesScope.route(routed.args, scope: routed.scope, named: reread, zone: zone)
+        let again = try CalendarSeriesScope.route(routed.args, scope: routed.scope, named: reread, zone: zone, recurrenceIdZone: zone)
         #expect(again.scope == routed.scope && again.args == routed.args, "routed again: \(again.scope), not \(routed.scope)")
         return Went(scope: routed.scope, recurrenceId: routed.recurrenceId,
                     start: CalendarToolHelpers.stringArgOpt(routed.args, "start_iso"),
@@ -1900,7 +1900,7 @@ struct CalendarSeriesScopeRouteTests {
     private func refusal(_ args: [String: JSONValue], _ named: CalendarSeriesScope.Named, scope: String = "all",
                          zone: TimeZone = utc) -> String? {
         do {
-            _ = try CalendarSeriesScope.route(args, scope: scope, named: named, zone: zone)
+            _ = try CalendarSeriesScope.route(args, scope: scope, named: named, zone: zone, recurrenceIdZone: zone)
             return nil
         } catch CalendarProviderError.notSupported(let reason) {
             return reason

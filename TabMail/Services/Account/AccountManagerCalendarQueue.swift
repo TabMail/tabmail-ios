@@ -907,8 +907,12 @@ extension AccountManager {
             // function `buildGCalEventInput` uses. The edit tool queues the zone its card used
             // when the assistant gave none (`stampingZone`, #753), so this is that zone, not the
             // device's at the drain; only a row queued before that stamp has none.
-            let recurrenceIdZone = try CalendarToolHelpers.resolveWriteTimeZone(
+            let editZone = try CalendarToolHelpers.resolveWriteTimeZone(
                 args, consequence: "it did not change the event")
+            // `recurrence_id` is read in the zone the edit tool read it in, the device's at the
+            // tool, where the read tools print it, whatever `timezone` names for the new times
+            // (#794); the edit's own times stay in `editZone`.
+            let recurrenceIdZone = try CalendarToolHelpers.recurrenceIdZone(args, editZone: editZone)
             // 🚨 A SPLIT WHOSE NEW PART WAS WRITTEN IS NEVER RUN AGAIN (#601). An earlier attempt
             // of this operation created the new part and kept its record (`recordSplit`) before
             // the cap; its cap failed or its answer was lost. Only the cap is left: it is written
@@ -934,7 +938,7 @@ extension AccountManager {
             let named = try await CalendarSeriesScope.read(
                 eventId: eventId, recurrenceId: CalendarToolHelpers.stringArgOpt(args, "recurrence_id"),
                 scope: givenScope, calendarId: calId, zone: recurrenceIdZone, provider: provider)
-            let routed = try CalendarSeriesScope.route(args, scope: givenScope, named: named, zone: recurrenceIdZone)
+            let routed = try CalendarSeriesScope.route(args, scope: givenScope, named: named, zone: editZone, recurrenceIdZone: recurrenceIdZone)
             // The tool makes an "all" edit that moves a later occurrence to another date a split before
             // its card; one that reaches the queue as "all" was confirmed as a change of every
             // occurrence and the series changed since. It is not split here.
@@ -953,7 +957,7 @@ extension AccountManager {
             // A move to another day of a series whose rule names its days turns those days with it
             // (`CalendarSeriesScope.dayMove`), on the rule each provider writes.
             let ruleDayMove = try CalendarSeriesScope.dayMove(
-                routed.args, named: named, scope: routed.scope, zone: recurrenceIdZone)
+                routed.args, named: named, scope: routed.scope, zone: editZone)
             // 🚨 AN RRULE `UNTIL`'S VALUE TYPE BELONGS TO THE DTSTART, AND ON AN EDIT THE DTSTART
             // BELONGS TO THE RESOURCE. RFC 5545 §3.3.10: "The value of the UNTIL rule part MUST have
             // the same value type as the DTSTART property." `buildGCalEventInput` renders the UNTIL
