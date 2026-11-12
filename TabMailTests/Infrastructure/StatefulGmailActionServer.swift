@@ -223,6 +223,9 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         /// Called with the refused token each time the paged listing refuses a
         /// page token, before the refusal is answered. See `onRejectedPageToken(_:)`.
         var rejectedPageTokenHook: (@Sendable (String) -> Void)?
+        /// Called each time a message GET of that provider message id is
+        /// served, before it is answered. See `onGet(providerMessageId:_:)`.
+        var getHookByProviderId: [String: @Sendable () -> Void] = [:]
         /// An injected failure of the `/messages` listing (action lookups
         /// excluded). See `failListings(status:label:onlyWithPageToken:times:)`.
         var listingFailure: ListingFailure?
@@ -326,6 +329,14 @@ final class StatefulGmailActionServer: @unchecked Sendable {
     /// writer acting on the folder while the walk's request is in flight.
     func onRejectedPageToken(_ hook: (@Sendable (String) -> Void)?) {
         state.value.withLock { $0.rejectedPageTokenHook = hook }
+    }
+
+    /// Run `hook` whenever `GET /messages/{providerMessageId}` is served,
+    /// before it is answered (an injected failure included): a stand-in for
+    /// another writer acting on the folder while the walk's fetch of that
+    /// message is in flight. nil removes it.
+    func onGet(providerMessageId: String, _ hook: (@Sendable () -> Void)?) {
+        state.value.withLock { $0.getHookByProviderId[providerMessageId] = hook }
     }
 
     /// Refuse the next `POST /labels` with 409 "Label name exists or
@@ -888,6 +899,9 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         }
         http.register(path: "/messages/", method: "GET") { [state] request in
             let providerId = request.url.pathComponents.last ?? ""
+            if let hook = state.value.withLock({ $0.getHookByProviderId[providerId] }) {
+                hook()
+            }
             let injected = state.value.withLock { model -> (failure: GetFailure, delay: TimeInterval)? in
                 guard let failure = model.getFailureByProviderId[providerId] else { return nil }
                 model.getFailuresServedByProviderId[providerId, default: 0] += 1

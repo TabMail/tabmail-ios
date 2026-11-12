@@ -83,6 +83,39 @@ struct BackfillPageWalkHoldBoundTests {
         #expect(try F.messageIds(accountId, "INBOX", pool: pool).isEmpty)
     }
 
+    /// The mirror order: page 1's m1 answers 503 at once, and m2 answers 400
+    /// (about that message) later, so the per-message failure is the last to
+    /// reach the walk. The page is still held: the stricter failure decides,
+    /// not the last one. Once the 503 clears, the 400 alone is passed over
+    /// and the folder completes without m2.
+    @Test("Gmail: a page whose per-message failure arrives last is still held")
+    func gmailPerMessageFailureLastStillHolds() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        Self.setHoldClock(nil)
+        let accountId = "gm-per-message-last"
+        let (server, account) = try Self.gmailInbox(accountId, pool: pool)
+        defer { server.close() }
+        server.injectGetFailure(providerMessageId: "m1", .status(503))
+        server.injectGetFailure(providerMessageId: "m2", .status(400), answeredAfter: 0.5)
+        let engine = await F.registeredEngine(accountId: accountId, provider: server.provider())
+
+        _ = await engine.runBackfill(account: account, deadline: F.deadline())
+
+        #expect(server.getFailuresServedCount(providerMessageId: "m1") == 1)
+        #expect(server.getFailuresServedCount(providerMessageId: "m2") == 1)
+        #expect(try !Self.isComplete(accountId, "INBOX", pool: pool), "a held page was passed over because its last failure was per message")
+        #expect(F.gmailListPageTokens(server, label: "INBOX") == [nil],
+                "the walk moved past the held page: \(F.gmailListPageTokens(server, label: "INBOX"))")
+        #expect(try F.messageIds(accountId, "INBOX", pool: pool).isEmpty)
+
+        server.clearGetFailure(providerMessageId: "m1")
+        _ = await engine.runBackfill(account: account, deadline: F.deadline())
+
+        #expect(try Self.isComplete(accountId, "INBOX", pool: pool), "the 400 alone held the page")
+        #expect(try F.messageIds(accountId, "INBOX", pool: pool) == ["m1", "m3"])
+    }
+
     /// The page's last message fails because the token refresh a 401 triggers
     /// fails (what a refused or unreachable sign-in looks like to the walk).
     /// That is not an answer about the message, so the page is held inside
@@ -268,6 +301,97 @@ struct BackfillPageWalkHoldBoundTests {
         #expect(try F.messageIds(accountId, "INBOX", pool: pool) == ["m1", "m2", "m3"])
     }
 
+    /// Page 1 is held on m1, then m1 arrives by another path (scrolling to
+    /// older mail inserts it), so the next call finds every id on page 1
+    /// already loaded and moves on without fetching; page 2 is then held.
+    /// Page 2's bound starts at its own first hold, not page 1's.
+    @Test("Gmail: a page held after an already-loaded page was moved past starts a fresh bound")
+    func gmailPageHeldAfterAllExistAdvanceStartsAFreshBound() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        defer { Self.setHoldClock(nil) }
+        let accountId = "gm-fresh-after-all-exist"
+        let (server, account) = try Self.gmailInbox(accountId, pool: pool)
+        defer { server.close() }
+        server.injectGetFailure(providerMessageId: "m1", .status(503))
+        server.injectGetFailure(providerMessageId: "m3", .status(503))
+        let engine = await F.registeredEngine(accountId: accountId, provider: server.provider())
+        let start = Date()
+        let secondHold = start.addingTimeInterval(Self.bound - Self.margin)
+
+        Self.setHoldClock(start)
+        _ = await engine.runBackfill(account: account, deadline: F.deadline())
+        try F.insertHeader("m1", accountId: accountId, path: "INBOX", pool: pool)
+        Self.setHoldClock(secondHold)
+        _ = await engine.runBackfill(account: account, deadline: F.deadline())
+        #expect(server.getFailuresServedCount(providerMessageId: "m1") == 1,
+                "precondition: page 1 was moved past with every id already loaded, not fetched again")
+        #expect(server.getFailuresServedCount(providerMessageId: "m3") == 1, "precondition: page 2 is held")
+
+        Self.setHoldClock(start.addingTimeInterval(Self.bound + Self.margin))
+        _ = await engine.runBackfill(account: account, deadline: F.deadline())
+        #expect(try !Self.isComplete(accountId, "INBOX", pool: pool), "page 2 inherited page 1's bound and was passed over early")
+
+        Self.setHoldClock(secondHold.addingTimeInterval(Self.bound + Self.margin))
+        _ = await engine.runBackfill(account: account, deadline: F.deadline())
+        #expect(try Self.isComplete(accountId, "INBOX", pool: pool), "page 2 stayed held past its own bound")
+        #expect(try F.messageIds(accountId, "INBOX", pool: pool) == ["m1", "m2"])
+    }
+
+    /// The two user gestures that start a folder's walk over from the top.
+    enum WalkRestartingWipe: String, CaseIterable, Sendable {
+        /// Reset Message Data on one account (`AccountDetailView.resetMessageDataTxn`).
+        case accountReset
+        /// Delete All Email Index Data in Settings (`SettingsView.localIndexWipeTxn`).
+        case settingsWipe
+    }
+
+    /// The first page is held, then the user resets the account's message
+    /// data or wipes the local index. Both clear the saved token and the
+    /// page's first hold, so the page held after the wipe starts a fresh
+    /// bound even though it is the same first page with the same (absent)
+    /// token.
+    @Test("Gmail: a page held again after an account reset or the Settings wipe starts a fresh bound",
+          arguments: WalkRestartingWipe.allCases)
+    func gmailPageHeldAfterWipeStartsAFreshBound(_ wipe: WalkRestartingWipe) async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        defer { Self.setHoldClock(nil) }
+        let accountId = "gm-fresh-after-\(wipe.rawValue)"
+        let (server, account) = try Self.gmailInbox(accountId, pool: pool)
+        defer { server.close() }
+        server.injectGetFailure(providerMessageId: "m1", .status(503))
+        let engine = await F.registeredEngine(accountId: accountId, provider: server.provider())
+        let start = Date()
+        let secondHold = start.addingTimeInterval(Self.bound - Self.margin)
+
+        Self.setHoldClock(start)
+        _ = await engine.runBackfill(account: account, deadline: F.deadline())
+        #expect(try F.folder(accountId, "INBOX", pool: pool)?.backfillPageHeldSince != nil, "precondition: page 1 is held")
+        try await pool.write { db in
+            switch wipe {
+            case .accountReset: try AccountDetailView.resetMessageDataTxn(db, accountId: accountId)
+            case .settingsWipe: try SettingsView.localIndexWipeTxn(db)
+            }
+        }
+        let wiped = try #require(try F.folder(accountId, "INBOX", pool: pool))
+        #expect(wiped.backfillPageToken == nil && wiped.backfillPageHeldSince == nil,
+                "the wipe left the walk's position behind: token \(String(describing: wiped.backfillPageToken)), first hold \(String(describing: wiped.backfillPageHeldSince))")
+
+        Self.setHoldClock(secondHold)
+        _ = await engine.runBackfill(account: account, deadline: F.deadline())
+        Self.setHoldClock(start.addingTimeInterval(Self.bound + Self.margin))
+        _ = await engine.runBackfill(account: account, deadline: F.deadline())
+        #expect(try !Self.isComplete(accountId, "INBOX", pool: pool), "the page held after the wipe kept the old bound and was passed over early")
+        #expect(F.gmailListPageTokens(server, label: "INBOX").allSatisfy { $0 == nil },
+                "the walk moved past the held first page: \(F.gmailListPageTokens(server, label: "INBOX"))")
+
+        Self.setHoldClock(secondHold.addingTimeInterval(Self.bound + Self.margin))
+        _ = await engine.runBackfill(account: account, deadline: F.deadline())
+        #expect(try Self.isComplete(accountId, "INBOX", pool: pool), "the page stayed held past its fresh bound")
+        #expect(try F.messageIds(accountId, "INBOX", pool: pool) == ["m2", "m3"])
+    }
+
     // MARK: - Another writer, and a page list with no answer
 
     /// While the walk's request with its saved token is in flight, another
@@ -312,6 +436,52 @@ struct BackfillPageWalkHoldBoundTests {
         #expect(inbox.backfillPageHeldSince.map { abs($0.timeIntervalSince(siblingHeldSince)) < 1 } == true,
                 "the restart dropped the other writer's hold time: \(String(describing: inbox.backfillPageHeldSince))")
         #expect(!inbox.backfillComplete)
+    }
+
+    /// While page 2's m3 is being fetched (and answers 503), another writer
+    /// saves a different token for the folder with an old hold time, one
+    /// already past the bound. The walk holds its page for this call without
+    /// acting on that writer's state: it neither moves the token on nor takes
+    /// over the other page's first hold, so nothing is passed over and the
+    /// folder does not complete.
+    @Test("Gmail: a page held after another writer moved its token keeps that writer's token and hold time")
+    func gmailHoldAfterTheTokenMovedMidFetchKeepsTheOtherWritersState() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        defer { Self.setHoldClock(nil) }
+        let accountId = "gm-token-moved-mid-fetch"
+        let folderId = "\(accountId):INBOX"
+        let (server, account) = try Self.gmailInbox(accountId, pool: pool)
+        defer { server.close() }
+        server.injectGetFailure(providerMessageId: "m3", .status(503))
+        let start = Date()
+        let otherToken = "other-writer-page-token"
+        let otherHeldSince = Date(timeIntervalSince1970: (start.timeIntervalSince1970 - Self.bound - Self.margin).rounded())
+        let otherWrote = OSAllocatedUnfairLock(initialState: false)
+        server.onGet(providerMessageId: "m3") {
+            guard !otherWrote.withLock({ $0 }) else { return }
+            // Another writer moves the folder on while this fetch is in flight.
+            try? pool.write { db in
+                _ = try Folder.filter(Column("id") == folderId).updateAll(db,
+                    Column("backfillPageToken").set(to: otherToken),
+                    Column("backfillPageHeldSince").set(to: otherHeldSince))
+            }
+            otherWrote.withLock { $0 = true }
+        }
+        let engine = await F.registeredEngine(accountId: accountId, provider: server.provider())
+
+        Self.setHoldClock(start)
+        _ = await engine.runBackfill(account: account, deadline: F.deadline())
+
+        #expect(otherWrote.withLock { $0 }, "precondition: the other writer ran")
+        #expect(server.getFailuresServedCount(providerMessageId: "m3") == 1)
+        let inbox = try #require(try F.folder(accountId, "INBOX", pool: pool))
+        #expect(inbox.backfillPageToken == otherToken,
+                "the walk overwrote a token another writer saved: \(String(describing: inbox.backfillPageToken))")
+        #expect(inbox.backfillPageHeldSince.map { abs($0.timeIntervalSince(otherHeldSince)) < 1 } == true,
+                "the walk changed the other writer's hold time: \(String(describing: inbox.backfillPageHeldSince))")
+        #expect(!inbox.backfillComplete, "the walk passed the held page over")
+        #expect(try F.messageIds(accountId, "INBOX", pool: pool) == ["m1", "m2"])
     }
 
     /// Page 2's listing gets no answer once (the connection drops). That is
@@ -411,15 +581,13 @@ struct BackfillPageWalkHoldBoundTests {
 
     // MARK: - The worker's pace after a call that only held a page
 
-    /// A call that lists a held page again and loads nothing new did no work,
-    /// and after a call that did no work the backfill worker waits the
-    /// profile's idle delay, not the delay it uses between productive calls.
-    @Test("A call that only holds a page did no work, and the worker then waits the idle delay")
-    func heldPageCallIsPacedByTheIdleDelay() async throws {
+    /// A call that lists a held page again and loads nothing new did no work.
+    @Test("A call that only holds a page again reports no work")
+    func heldPageCallReportsNoWork() async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         Self.setHoldClock(nil)
-        let accountId = "gm-held-pace"
+        let accountId = "gm-held-no-work"
         let (server, account) = try Self.gmailInbox(accountId, pool: pool)
         defer { server.close() }
         server.injectGetFailure(providerMessageId: "m1", .status(503))
@@ -430,11 +598,59 @@ struct BackfillPageWalkHoldBoundTests {
 
         #expect(firstDidWork, "precondition: the first call loaded m2")
         #expect(!secondDidWork, "a call that only held a page again reported work")
-        for profile in [BackfillProfile.low, .normal, .aggressive, .turbo] {
-            #expect(SyncEngine.backfillInterCycleDelay(didWork: false, profile: profile) == profile.interCycleIdleDelay,
-                    "after a call with no work (\(profile))")
-            #expect(SyncEngine.backfillInterCycleDelay(didWork: true, profile: profile) == profile.interCycleActiveDelay,
-                    "after a call with work (\(profile))")
+    }
+
+    /// Poll `condition` until it holds or `seconds` pass; whether it held.
+    private static func eventually(within seconds: TimeInterval, _ condition: () -> Bool) async -> Bool {
+        let end = Date().addingTimeInterval(seconds)
+        while Date() < end {
+            if condition() { return true }
+            try? await Task.sleep(for: .milliseconds(50))
         }
+        return condition()
+    }
+
+    /// The real backfill worker (`startBackfill`) on the fast-sync profile,
+    /// whose delay between productive calls is zero. Page 1 is held on m1: the
+    /// first call loads m2 and holds, the second only holds again and did no
+    /// work. The worker then waits the profile's idle delay before listing
+    /// the held page again, instead of listing it at network rate; and it
+    /// does list it again once that delay has passed.
+    @Test("On the fast-sync profile the backfill worker lists a held page again only after the idle delay")
+    func heldPageWorkerWaitsTheIdleDelay() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        Self.setHoldClock(nil)
+        let wifiOnlyKey = "backgroundSyncWiFiOnly"
+        let savedWifiOnly = UserDefaults.standard.object(forKey: wifiOnlyKey)
+        defer { UserDefaults.standard.set(savedWifiOnly, forKey: wifiOnlyKey) }
+        UserDefaults.standard.set(false, forKey: wifiOnlyKey)
+        let accountId = "gm-held-worker-pace"
+        let (server, account) = try Self.gmailInbox(accountId, pool: pool)
+        defer { server.close() }
+        server.injectGetFailure(providerMessageId: "m1", .status(503))
+        let engine = await F.registeredEngine(accountId: accountId, provider: server.provider())
+        let wasFastSync = await MainActor.run { AccountManagerState.shared.fastSyncModeActive }
+        await MainActor.run { AccountManagerState.shared.fastSyncModeActive = true }
+        let profile = await engine.getBackfillProfile()
+        let idleDelay = profile.interCycleIdleDelay
+        let listings = { F.gmailListRequests(server, label: "INBOX") }
+
+        await engine.startBackfill(account: account)
+        let heldTwice = await Self.eventually(within: F.safetySeconds) { listings() >= 2 }
+        try? await Task.sleep(for: .seconds(idleDelay / 2))
+        let listedInsideTheIdleDelay = listings()
+        let listedAgainAfterIt = await Self.eventually(within: idleDelay + F.safetySeconds) { listings() >= 3 }
+        await engine.remove(accountId: accountId)
+        await MainActor.run { AccountManagerState.shared.fastSyncModeActive = wasFastSync }
+
+        #expect(profile == .turbo, "precondition: the worker ran on the fast-sync profile")
+        #expect(profile.interCycleActiveDelay == 0, "precondition: the fast-sync profile does not wait between productive calls")
+        #expect(heldTwice, "precondition: the worker listed the held page twice; listings: \(listings())")
+        #expect(listedInsideTheIdleDelay <= 2,
+                "the worker listed a held page again without waiting the idle delay: \(listedInsideTheIdleDelay) listings within \(idleDelay / 2)s")
+        #expect(listedAgainAfterIt, "the worker stopped instead of listing the held page again after the idle delay")
+        #expect(try !Self.isComplete(accountId, "INBOX", pool: pool), "a held page was passed over")
+        #expect(try F.messageIds(accountId, "INBOX", pool: pool) == ["m2"])
     }
 }

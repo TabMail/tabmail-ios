@@ -263,11 +263,17 @@ enum SyncConfig {
     /// restart it. Past it, those messages are passed over like a per-message failure
     /// and the walk moves on.
     ///
+    /// The bound is wall-clock time from the page's first hold, not time spent trying:
+    /// it includes time when no attempt was possible (the app suspended, the device
+    /// offline, sign-in refused). It applies to the page, not to each message: once a
+    /// page has been held past it, a message on that page is passed over on its first
+    /// failure, even one that never failed before.
+    ///
     /// Why an hour: a provider incident, a rate-limit window or a spell offline usually
-    /// clears within minutes, and a hold must outlast that so an ordinary blip never
-    /// moves the walk past mail it could have loaded. It must still end, because one
-    /// message that keeps failing for good would otherwise stop its folder from ever
-    /// completing.
+    /// clears within minutes, and a hold should outlast that so an ordinary blip seen
+    /// while the walk keeps trying does not move it past mail it could have loaded.
+    /// It must still end, because one message that keeps failing for good would
+    /// otherwise stop its folder from ever completing.
     static let backfillPageHoldMinutes: Double = 60
     /// `backfillPageHoldMinutes` in seconds, for comparing against elapsed time.
     static var backfillPageHoldSeconds: TimeInterval { backfillPageHoldMinutes * 60 }

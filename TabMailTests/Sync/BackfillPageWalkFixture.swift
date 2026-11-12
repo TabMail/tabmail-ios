@@ -45,6 +45,23 @@ enum BackfillPageWalkFixture {
         }
     }
 
+    /// Insert a header for `messageId` straight into the database, as a path
+    /// other than the page walk (scrolling to older mail, another walker) does.
+    static func insertHeader(_ messageId: String, accountId: String, path: String, pool: DatabasePool) throws {
+        try pool.write { db in
+            var header = MessageHeader(
+                messageId: messageId, subject: "inserted \(messageId)", from: "Sender",
+                fromAddress: "sender@example.com", to: "recipient@example.com",
+                date: daysAgo(1), snippet: "inserted",
+                folderId: "\(accountId):\(path)", accountId: accountId, folderPath: path,
+                isInInbox: false
+            )
+            header.rfc822MessageId = "\(messageId)@example.com"
+            header.headerComplete = true
+            try header.insert(db)
+        }
+    }
+
     static func folder(_ accountId: String, _ path: String, pool: DatabasePool) throws -> Folder? {
         try FolderEpochTestFixture.readFolder(accountId: accountId, path: path, pool: pool)
     }

@@ -715,6 +715,10 @@ extension SyncEngine {
         /// name. The page is held while less than
         /// `SyncConfig.backfillPageHoldMinutes` has passed since its first hold,
         /// then the walk moves past those messages like a per-message failure.
+        /// That is wall-clock time from the page's first hold, including time
+        /// when no attempt was possible (the app suspended, the device offline,
+        /// sign-in refused), and it is per page, not per message: once the page
+        /// is past it, a message on it is passed over on its first failure.
         case hold = 1
 
         static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
@@ -791,6 +795,7 @@ extension SyncEngine {
         strictestFailure: BackfillFetchFailureKind?, firstHeld: Date?, now: Date
     ) -> BackfillPageDecision {
         guard strictestFailure == .hold else { return .advance }
+        // A clock set back before `firstHeld` gives a negative time, so the page is held longer; the hold still ends once the clock passes the bound again.
         let heldSeconds = now.timeIntervalSince(firstHeld ?? now)
         guard heldSeconds < SyncConfig.backfillPageHoldSeconds else {
             return .passOverAfterHoldBound(heldSeconds: heldSeconds)
@@ -2088,11 +2093,16 @@ extension SyncEngine {
                     //    duplicates).
                     //  - A message with a `hold` failure, inside the hold bound:
                     //    HOLD the token (neither advance nor clear) and skip this
-                    //    folder for the rest of the call. The walk never moves
-                    //    past those messages inside the bound, so the folder
-                    //    cannot complete without them, and a later call lists only
-                    //    this page again. The page's first hold is saved on the
-                    //    folder, so the bound counts across calls and relaunches.
+                    //    folder for the rest of the call. The walk never advances
+                    //    the saved token past a held page inside the bound, so the
+                    //    folder cannot complete from that page, and a later call
+                    //    lists only this page again. The guarantee is about the
+                    //    saved token, not the held messages: on Exchange the token
+                    //    is an offset (`$skip`), so a held message that newer
+                    //    removals shift out of the page is passed over like any
+                    //    message the listing no longer returns. The page's first
+                    //    hold is saved on the folder, so the bound counts across
+                    //    calls and relaunches.
                     //  - Otherwise advance; any message that failed per message,
                     //    or kept failing past the bound, is passed over.
                     if streamInterrupted {
@@ -2129,7 +2139,7 @@ extension SyncEngine {
                                 isLastPage = true
                             }
                             if case .passOverAfterHoldBound(let heldSeconds) = decision {
-                                BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) \(failedCount) message(s) on this page kept failing for \(Int(heldSeconds))s, past the \(Int(SyncConfig.backfillPageHoldSeconds))s hold bound — advancing past them; this walk does not return to them")
+                                BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) \(failedCount) message(s) on this page failed \(Int(heldSeconds))s (wall-clock, attempts or not) after the page's first hold, past the page's \(Int(SyncConfig.backfillPageHoldSeconds))s hold bound — advancing past them on this failure; this walk does not return to them")
                             } else if failedCount > 0 {
                                 BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) \(failedCount) message(s) on this page failed for that message alone — advancing past them; this walk does not return to them")
                             }
