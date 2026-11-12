@@ -389,6 +389,26 @@ actor MockEmailProvider: EmailProvider {
         return appendToSentResult
     }
 
+    // MARK: - Change reading (ADR-IOS-111)
+
+    /// The scripted change reader. Nil = the provider has no reader (the
+    /// protocol default), so the engine keeps its pre-existing change path.
+    /// The closure sees each request, so a test can assert the scope and the
+    /// recheck lists it was asked with.
+    var changeReader: (@Sendable (ChangeCursor, ChangeRequest) async throws -> ChangeSet?)?
+    private(set) var changeRequests: [(cursor: ChangeCursor, request: ChangeRequest)] = []
+
+    func setChangeReader(_ reader: (@Sendable (ChangeCursor, ChangeRequest) async throws -> ChangeSet?)?) {
+        changeReader = reader
+    }
+
+    func fetchChanges(since cursor: ChangeCursor, request: ChangeRequest) async throws -> ChangeSet? {
+        // Not in `callLog`: every delta pass asks, and call-order tests predate the seam.
+        changeRequests.append((cursor, request))
+        guard let changeReader else { return nil }
+        return try await changeReader(cursor, request)
+    }
+
     func fetchHistory(since historyId: String) async throws -> HistoryResponse? {
         callLog.append("fetchHistory(since:\(historyId))")
         if let error = fetchHistoryThrows { throw error }

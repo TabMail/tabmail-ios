@@ -122,7 +122,8 @@ actor GmailProvider: EmailProvider {
     private static let draftResourceLookupPageSize = 500
 
     private let accessToken: @Sendable (_ forceRefresh: Bool) async throws -> String
-    private let userEmail: String
+    /// Internal so the change reader (`GmailProviderChanges.swift`) can name the account in its logs.
+    let userEmail: String
     private let baseURL = "https://gmail.googleapis.com/gmail/v1/users/me"
 
     /// Legacy `tm_*` Gmail label IDs observed on the account during the most

@@ -480,6 +480,17 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         }
     }
 
+    /// Another client creates or renames a user label: `labels.list` serves it.
+    /// Gmail's history reports no label creation, rename or deletion.
+    func setUserLabel(id: String, name: String) {
+        state.value.withLock { $0.userLabels[id] = name }
+    }
+
+    /// Another client deletes a user label.
+    func removeUserLabel(id: String) {
+        state.value.withLock { _ = $0.userLabels.removeValue(forKey: id) }
+    }
+
     /// Another client changes a message's labels (read, star, archive, trash,
     /// a user label); `/history` reports the change like any other.
     func applyLabelChange(providerMessageId: String, add: Set<String> = [], remove: Set<String> = []) {

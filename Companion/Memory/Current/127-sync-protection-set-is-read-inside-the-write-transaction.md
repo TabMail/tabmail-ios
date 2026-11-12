@@ -55,3 +55,9 @@ When the owner reports "archive undone, no snippet", grep the log for
 for the same UID before suspecting the queue. Any NEW sync consumer of the protection set must call
 `liveRecentlyCompleted()` inside its write transaction; a value captured before a network await is the
 #106 defect again.
+
+**Note (2026-11-12, ADR-IOS-111):** the change apply reads both shields (the pending-operation snapshot
+and `liveRecentlyCompleted()`) INSIDE each folder's own write transaction (`SyncEngine.applyFolderChanges`),
+never once per pass: the folders are applied one transaction each with awaits between them, so a
+completion that lands while an earlier folder is applied is honoured by the later folders. Fence F3
+(`ChangeSeamFenceTests`) pins that the pass file never reads them.

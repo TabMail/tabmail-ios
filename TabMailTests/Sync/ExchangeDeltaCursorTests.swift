@@ -179,7 +179,7 @@ struct ExchangeDeltaCursorTests {
             return inbox.serve(request)
         }
 
-        await SyncEngine().captureSyncCursors(account: account, provider: Self.provider(accountId, http), deltaReachedCursor: false)
+        await SyncEngine().captureSyncCursors(account: account, provider: Self.provider(accountId, http))
 
         let walk = Self.deltaRequests(http)
         #expect(walk.first?.contains("/mailFolders/\(Self.inboxId)/messages/delta") == true, "the capture walks the Inbox: \(walk)")
@@ -281,7 +281,7 @@ struct ExchangeDeltaCursorTests {
         #expect(try Self.removedEmailIsStored(accountId, pool: pool), "a refused round applies none of its pages")
         #expect(try Self.storedCursor(accountId, pool: pool) == nil)
 
-        await SyncEngine().captureSyncCursors(account: account, provider: provider, deltaReachedCursor: false)
+        await SyncEngine().captureSyncCursors(account: account, provider: provider)
 
         #expect(Self.deltaRequests(http).count == 3, "the capture walks the Inbox, one page, for a new cursor")
         #expect(try Self.storedCursor(accountId, pool: pool) == InboxModel.finalDeltaLink)

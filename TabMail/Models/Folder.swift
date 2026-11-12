@@ -251,6 +251,13 @@ struct Folder: Codable, FetchableRecord, PersistableRecord, Identifiable, Hashab
     /// content (ADR-004). Nil means "no state yet". The UIDVALIDITY purge clears it
     /// with the folder's other sync cursors.
     var catchUpState: String?
+    /// The sync engine's change-reading state for this folder (ADR-IOS-111), a
+    /// `FolderChangeState` in JSON. Engine-owned and provider-blind: it says
+    /// whether the provider's change bookmark covers the folder (then the full
+    /// sync's window listing skips it) and which message ids a change was
+    /// declined for under the user's own action, to read again on the next pass.
+    /// Message ids only, never content (ADR-004). Nil means "not tracked".
+    var changeState: String?
 
     init(name: String, path: String, role: FolderRole, accountId: String) {
         self.id = "\(accountId):\(path)"

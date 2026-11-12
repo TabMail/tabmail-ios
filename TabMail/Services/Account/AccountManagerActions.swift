@@ -211,8 +211,9 @@ struct ExpectedMessageIdentity: Sendable, Equatable {
     /// `MessageMetadata.rfc822MessageId` is `String?` by construction (nil
     /// whenever the provider payload omits the header) and three production
     /// statements assign that Optional straight onto an EXISTING row with no nil
-    /// check — `SyncEngine.gmailDeltaSync` ×2 and `SyncEngine.exchangeDeltaSync`
-    /// ×3, i.e. FIVE — so a stored identity can go from present to absent by PROPAGATION
+    /// check — `SyncEngine.gmailDeltaSync` ×2 (since replaced by the change apply,
+    /// whose merge writes a present value only) and `SyncEngine.exchangeDeltaSync`
+    /// ×3, i.e. FIVE when written — so a stored identity can go from present to absent by PROPAGATION
     /// even though nothing nulls it literally. **The failure direction is why
     /// this stays as-is rather than being tightened:** this type is a VETO only,
     /// so a propagated nil causes a spurious refusal, which one ordinary gesture

@@ -746,3 +746,17 @@ The owner's rulings of 2026-11-09:
 - Folding the walk into the catch-up: the walk's immediate count trigger is worth keeping, and it
   already shares the one removal path.
 - A last-range completion stamp: it misses mid-listing changes (above).
+
+### Amendment (2026-11-12, ADR-IOS-111: change reading; #783)
+
+- **Arming is the lapse mark.** The catch-up still receives every syncable folder; Gmail's plan already
+  lists a folder only on its first listing, a listing in progress, or after a lapse, so a tracked folder
+  gets no scheduled check. A change-bookmark refusal marks ONE lapse per folder (`applyChangeRefusal`,
+  which calls `lapseDeltaCursor`); a re-read list over `SyncConfig.changeRecheckLimit` marks one folder
+  (`markCatchUpLapse`). No separate `catchUpArmed` flag or `completedFullCheck` result was added: the lapse
+  counter already says "one more full check is due" and the listing records when it was done.
+- **No lapse at a new bookmark (#783).** The Gmail cursor is no longer captured after the full sync (the
+  deleted Gmail arm of `captureSyncCursors` marked a lapse on every capture that replaced an unreached
+  cursor, so a new account's catch-up listed every folder twice). The candidate is read before the
+  listings and stored after them with no lapse mark.
+- IMAP's daily check is unchanged until its reader lands.

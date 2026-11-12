@@ -812,4 +812,13 @@ enum SyncConfig {
     /// truncation — the rule it would violate is the one about hardcoding a bare
     /// numeric literal at the site, which is why it lives here.
     static let upsertInsertedIdLogCap = 20
+
+    // MARK: - Change reading (ADR-IOS-111)
+
+    /// Most message ids one folder keeps on its re-read list
+    /// (`FolderChangeState.recheck`): changes the apply declined because the
+    /// user's own action on the message was in flight. Each id is read again on
+    /// every pass until it applies. Over this many, the extra ids are not kept and
+    /// the folder's catch-up is armed instead, so a whole-folder check finds them.
+    static let changeRecheckLimit = 200
 }

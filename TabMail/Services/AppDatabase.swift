@@ -4384,6 +4384,19 @@ final class AppDatabase: Sendable {
                 END
                 """)
         }
+
+        // The engine's own change-reading state per folder (ADR-IOS-111): whether
+        // the provider's change bookmark covers the folder, and the message ids a
+        // change was declined for under the user's own action, to read again on
+        // the next pass. Provider-blind JSON, message ids only (ADR-004). NULL
+        // means "not tracked, nothing to re-read".
+        migrator.registerTimedMigration(
+            "v102_addFolderChangeState", foreignKeyChecks: .immediate
+        ) { db in
+            try db.alter(table: "folder") { t in
+                t.add(column: "changeState", .text)
+            }
+        }
     }
 
     /// PORT — v2final `AppDatabase.seedDraftLastTouchedSeq`. Extracted to a static

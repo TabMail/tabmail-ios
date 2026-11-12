@@ -498,6 +498,34 @@ the synthetic All Mail marker is sent as typed: `GmailProviderMockTests.syntheti
 asserts the guard refuses the marker in the path and in folder parameters such as
 `labelIds`, and never in `q`.
 
+## Change reading — one generic apply under the seam (ADR-IOS-111)
+
+`ChangeApplyTests` drives `SyncEngine.performDeltaSync` / `performChangePass` with a scripted
+`MockEmailProvider.changeReader`, so each apply rule is checked without any provider's reader: a full
+record inserts the row with references and user labels and the cursor is stored last; a partial record
+writes only its present fields; a replay leaves the same rows; a flag change, an insert and a removal kept
+back under a shield (pending flag op, pending destructive op, recent completion, the user's op on the same
+message in ANOTHER folder when ids are stable) go on the folder's re-read list and land once the shield is
+gone, and the next read is asked to re-read them; with an address epoch the identity term stays
+folder-scoped; over `SyncConfig.changeRecheckLimit` the folder's catch-up is armed; a Drafts insert
+replaces its placeholder and carries the body; a failed read applies its removals, keeps the cursor and
+throws; a refusal clears the bookmark, untracks every folder, marks one lapse, makes the full sync due and
+reads again with no bookmark in the same pass; a candidate is stored only once every waiting folder is
+listed, with no lapse mark, and turns tracking on; the read's folder list is applied; a provider with no
+reader keeps its old path. `GmailChangeReadingTests` checks Gmail's reader against
+`StatefulGmailActionServer` (folder list per scope, a candidate before any listing, refusal, zero change,
+re-reads, a failed detail read) and, end to end: a change to older mail made during a new bookmark's
+listing reaches the next pass (R2-1); a kept-back change on older mail lands once its op is gone (R2-2); a
+tracked account's full sync sends no window listing (R2-3); a refusal re-lists in the same pass with ONE
+catch-up check and none later, also eight days on (R2-4, R2-7); a label created, renamed or deleted shows on
+the next pass (R2-5); a stale read during the app's own archive heals into All Mail (R2-6, #735); a new
+account lists each folder once for the catch-up (R2-8, #783). `ChangeSeamFenceTests` holds fences F1-F4
+(no provider cast in the engine's change files, no database in a reader, the shields read only inside the
+per-folder transaction, no window listing for a tracked folder) and the v102 migration.
+`ChangeApplyFuzzTests` runs seeded interleavings of other-client changes, queued and drained ops and
+completions during a read, checking that queued intentions keep their rows, a completion during a read
+stops that pass's insert, and every reported message converges after quiescence.
+
 ## Delta detail fetches — a failed fetch is never taken for a deleted message
 
 `DeltaDetailFetchFailureTests` drives production `SyncEngine.performDeltaSync` end to end on

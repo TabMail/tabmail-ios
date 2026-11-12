@@ -12,7 +12,8 @@ import Testing
 /// and no other app file may hold its own copy of the excluded-label list.
 @Suite("Gmail All Mail membership has one source")
 struct GmailAllMailMembershipFenceTests {
-    static let deltaFile = "TabMail/Services/Sync/SyncEngineDeltaSync.swift"
+    /// Gmail's change reader, where a message's folders are decided from its labels.
+    static let deltaFile = "TabMail/Providers/GmailProviderChanges.swift"
     static let providerFile = "TabMail/Providers/GmailProvider.swift"
     static let excludedLabels = ["INBOX", "SENT", "TRASH", "SPAM", "DRAFT"].map { "\"\($0)\"" }
 
@@ -30,7 +31,7 @@ struct GmailAllMailMembershipFenceTests {
         let delta = try #require(files.first { $0.relativePath == Self.deltaFile })
         #expect(!delta.source.contains("archivePath"))
         #expect(!delta.source.contains("labelIds.contains(folder.path)"))
-        #expect(delta.source.contains("GmailProvider.folder("))
+        #expect(delta.source.contains("folder(folder.path, containsMessageWithLabels:"))
     }
 
     @Test("The excluded-label list exists only in GmailProvider")

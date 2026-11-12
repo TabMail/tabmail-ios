@@ -248,6 +248,7 @@ struct V54MergeFragmentedThreadsTests {
             "TabMail/Services/Sync/SyncEngineFullSync.swift",
             "TabMail/Services/Sync/SyncEngine.swift",
             "TabMail/Services/Sync/SyncEngineDeltaSync.swift",
+            "TabMail/Services/Sync/SyncEngineChangesApply.swift",
             "TabMail/Services/Sync/SyncEngineBackfillDeep.swift",
             "TabMail/Services/Account/AccountManagerOutbox.swift",
             "TabMail/Services/NSEDataBridge.swift",

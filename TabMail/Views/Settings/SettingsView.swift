@@ -606,9 +606,13 @@ struct SettingsView: View {
             oldestSyncedDate = NULL,
             backfillUidCursor = NULL,
             backfillPageToken = NULL,
-            backfillPageHeldSince = NULL
+            backfillPageHeldSince = NULL,
+            changeState = NULL
         WHERE path != ''
-        """
+        """,
+        // The change bookmarks go with the rows (ADR-IOS-111): a tracked folder
+        // gets no window listing, so a kept bookmark would leave it empty.
+        "UPDATE account SET lastHistoryId = NULL",
     ]
 
     private func nukeDatabase() async {
