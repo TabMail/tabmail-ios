@@ -421,17 +421,19 @@ struct ActionConfirmationCard: View {
                     .font(.caption2)
                     .foregroundStyle(Theme.textSecondary)
                     .lineLimit(1)
-                // Always-visible timezone row so the user can verify which zone
-                // the agent interpreted naive datetimes in before accepting.
-                Label {
-                    Text(eventTimezoneLabel(event))
-                        .font(.caption2)
-                        .foregroundStyle(Theme.textSecondary)
-                        .lineLimit(1)
-                } icon: {
-                    Image(systemName: "globe")
-                        .font(.caption2)
-                        .foregroundStyle(Theme.textSecondary.opacity(0.6))
+                // The zone row appears only when the times above are in a zone other than
+                // the device's, as Google Calendar shows it (#753).
+                if let zoneLabel = Self.eventTimezoneLabel(event, deviceZone: .current) {
+                    Label {
+                        Text(zoneLabel)
+                            .font(.caption2)
+                            .foregroundStyle(Theme.textSecondary)
+                            .lineLimit(1)
+                    } icon: {
+                        Image(systemName: "globe")
+                            .font(.caption2)
+                            .foregroundStyle(Theme.textSecondary.opacity(0.6))
+                    }
                 }
                 if !event.attendees.isEmpty {
                     Label {
@@ -523,16 +525,22 @@ struct ActionConfirmationCard: View {
         .padding(.horizontal, 8)
     }
 
-    /// Resolved timezone label for the event row — always shows IANA id so the
-    /// user can verify the zone before accepting (especially when the agent
-    /// silently fell back to device local).
-    private func eventTimezoneLabel(_ event: AgentToolRouter.ActionConfirmation.CalendarEventDetail) -> String {
-        let tz: TimeZone = if let tzId = event.timeZoneId,
-                              let resolved = CalendarTimeZoneResolver.zone(named: tzId, in: .none) {
-            resolved
-        } else {
-            .current
+    /// The zone the event row's times are shown in: the one the tool wrote them in
+    /// (`timeZoneId`, the zone it queues), or the device's when it names none.
+    nonisolated static func eventZone(_ event: AgentToolRouter.ActionConfirmation.CalendarEventDetail) -> TimeZone {
+        if let tzId = event.timeZoneId,
+           let resolved = CalendarTimeZoneResolver.zone(named: tzId, in: .none) {
+            return resolved
         }
+        return .current
+    }
+
+    /// The event row's zone label, with its IANA id, or nil when the times are in `deviceZone`
+    /// (the device's zone as the card is shown): like Google Calendar, the card names a zone
+    /// only when it is not the user's own (#753).
+    nonisolated static func eventTimezoneLabel(_ event: AgentToolRouter.ActionConfirmation.CalendarEventDetail, deviceZone: TimeZone) -> String? {
+        let tz = eventZone(event)
+        if tz.identifier == deviceZone.identifier { return nil }
         let abbr = tz.abbreviation() ?? tz.identifier
         // If abbreviation == identifier (rare), don't duplicate.
         if abbr == tz.identifier { return tz.identifier }
@@ -542,12 +550,7 @@ struct ActionConfirmationCard: View {
     private func formatEventTime(_ event: AgentToolRouter.ActionConfirmation.CalendarEventDetail) -> String {
         // The dedicated 🌐 row beneath this label carries the timezone — keep
         // the time string itself clean so we don't render the zone twice.
-        let tz: TimeZone = if let tzId = event.timeZoneId,
-                              let resolved = CalendarTimeZoneResolver.zone(named: tzId, in: .none) {
-            resolved
-        } else {
-            .current
-        }
+        let tz = Self.eventZone(event)
 
         if event.isAllDay {
             let fmt = DateFormatter()

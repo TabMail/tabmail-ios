@@ -22,18 +22,37 @@ enum CalendarToolHelpers {
         return .current
     }
 
-    /// Resolve the `timezone` argument for a WRITE: the zone the argument names, or the device's zone
+    /// Resolve the `timezone` argument for a WRITE: the zone the argument names, or `deviceZone`
     /// when there is none. A zone the resolver does not recognize is refused (`notSupported`, naming
     /// the zone) instead of being replaced by the device's zone, which would write every time in the
     /// edit at the wrong instant. `consequence` says what was therefore not done; `remedy`, when
     /// given, replaces the default advice that follows it.
-    static func resolveWriteTimeZone(_ arguments: [String: JSONValue], consequence: String, remedy: String? = nil) throws -> TimeZone {
-        guard let tzId = stringArgOpt(arguments, "timezone"), !tzId.isEmpty else { return .current }
+    ///
+    /// A write tool passes the device zone it snapshotted at its start (`ToolContext.deviceZone`)
+    /// and queues that zone in the arguments (`stampingZone`), so the queue's drain finds a
+    /// `timezone` and never reads the device's zone at the drain (#753). Only a row queued before
+    /// that stamp existed reaches the drain without one, and is read in the device's zone then, as
+    /// it always was.
+    static func resolveWriteTimeZone(_ arguments: [String: JSONValue], deviceZone: TimeZone = .current, consequence: String, remedy: String? = nil) throws -> TimeZone {
+        guard let tzId = stringArgOpt(arguments, "timezone"), !tzId.isEmpty else { return deviceZone }
         guard let tz = CalendarTimeZoneResolver.zone(named: tzId, in: .none) else {
             if let remedy { throw CalendarProviderError.unrecognizedTimeZone(tzId, consequence: consequence, remedy: remedy) }
             throw CalendarProviderError.unrecognizedTimeZone(tzId, consequence: consequence)
         }
         return tz
+    }
+
+    /// `arguments` naming the zone its naive times are in: when the assistant gave no `timezone`
+    /// (none, or an empty one, as `resolveWriteTimeZone` reads it), `zone`, the device zone the
+    /// tool snapshotted at its start and showed on the card, by its identifier. A `timezone` the
+    /// assistant gave is kept as given; the drain resolves it as the tool did. Nothing else
+    /// changes: the times stay naive, an all-day date stays a date. So a queued write is drained
+    /// in the zone its card showed, whatever the device's zone is at the drain (#753).
+    static func stampingZone(_ arguments: [String: JSONValue], _ zone: TimeZone) -> [String: JSONValue] {
+        if let given = stringArgOpt(arguments, "timezone"), !given.isEmpty { return arguments }
+        var stamped = arguments
+        stamped["timezone"] = .string(zone.identifier)
+        return stamped
     }
 
     // MARK: - Date Range Resolution (matching TB's resolveDateRange)

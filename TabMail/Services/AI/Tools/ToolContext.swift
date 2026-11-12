@@ -62,23 +62,36 @@ struct ToolContext: Sendable {
     @MainActor
     var router: AgentToolRouter { routerOverride ?? AgentToolRouter.shared }
 
+    /// Test-only device zone. `nil` in production: `deviceZone` is the device's zone.
+    private let deviceZoneOverride: TimeZone?
+
+    /// The device's time zone, as a calendar write tool snapshots it once, as the first step of
+    /// its operation (root rule "snapshot settings at operation start", #753): the card, the
+    /// queued arguments and the result all use that one value, never the device's zone read again
+    /// later. Tests set a zone that is not the host's, so the queue's drain (which runs in the
+    /// host's zone) stands for a device whose zone changed between the card and the drain.
+    var deviceZone: TimeZone { deviceZoneOverride ?? .current }
+
     /// Production default: uses app singletons.
     init() {
         self.db = AppDatabase.rawPool
         self.translator = ChatIdTranslator.shared
         self.routerOverride = nil
+        self.deviceZoneOverride = nil
     }
 
-    /// Test injection: provide custom DB, translator, and (optionally) router.
+    /// Test injection: provide custom DB, translator, and (optionally) router and device zone.
     /// Pass an explicit `AgentToolRouter()` to isolate the test from any other suite
     /// that touches the singleton in parallel.
     init(
         db: any DatabaseReader & Sendable,
         translator: any ChatIdTranslating,
-        router: AgentToolRouter? = nil
+        router: AgentToolRouter? = nil,
+        deviceZone: TimeZone? = nil
     ) {
         self.db = db
         self.translator = translator
         self.routerOverride = router
+        self.deviceZoneOverride = deviceZone
     }
 }

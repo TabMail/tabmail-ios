@@ -354,19 +354,24 @@ extension CalDAVProvider {
 
     // MARK: - Patch and attendee answers
 
-    /// Apply the user's patch to a copy (`mergePatchIntoICS` on the resource's series VEVENT). The
-    /// copy stays in its own zone, so the patch's zones are dropped (`Date.fromISO8601` has already
-    /// resolved its times). A new start with no end keeps the copy's `length`; an end replaces a
+    /// Apply the user's patch to a copy (`mergePatchIntoICS` on the resource's series VEVENT). A
+    /// zoned copy stays in its own zone, so the patch's zones are dropped (`Date.fromISO8601` has
+    /// already resolved its times). A floating copy keeps them: its wall clock is the patch's time
+    /// in the zone the patch names (`formatDTLine`, #753), and a derived end is named in the
+    /// start's zone. A new start with no end keeps the copy's `length`; an end replaces a
     /// `DURATION`, since RFC 5545 forbids both in one VEVENT.
     private static func mergePatchKeepingLength(
         _ patch: GCalEventInput, into ics: String, length: TimeInterval, zones: CalendarTimeZoneContext
     ) throws -> String {
         var effective = patch
-        effective.startTimeZone = nil
-        effective.endTimeZone = nil
+        let kind = masterDTStartKind(from: ics)
+        if kind != .floating {
+            effective.startTimeZone = nil
+            effective.endTimeZone = nil
+        }
         var base = ics
         let hasDuration = masterTopLevelLines(ics).contains { icsProperty($0)?.name == "DURATION" }
-        if case .allDay = masterDTStartKind(from: ics) {
+        if case .allDay = kind {
             if effective.endDate != nil {
                 if hasDuration { base = removeFromMasterVEvent(in: base, propertyKey: "DURATION") }
             } else if let start = effective.startDate, !hasDuration {
@@ -377,6 +382,7 @@ extension CalDAVProvider {
                 if hasDuration { base = removeFromMasterVEvent(in: base, propertyKey: "DURATION") }
             } else if let start = effective.startDateTime, let startDate = Date.fromISO8601(start), !hasDuration {
                 effective.endDateTime = startDate.addingTimeInterval(length).iso8601String(timeZone: TimeZone(identifier: "UTC") ?? .current)
+                effective.endTimeZone = effective.startTimeZone
             }
         }
         return try mergePatchIntoICS(base, patch: effective, zones: zones)

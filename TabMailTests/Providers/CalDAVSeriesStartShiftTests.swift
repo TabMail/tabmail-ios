@@ -259,6 +259,10 @@ struct CalDAVSeriesStartShiftTests {
         var patch = GCalEventInput()
         patch.startDateTime = iso.string(from: start)
         patch.endDateTime = iso.string(from: start.addingTimeInterval(3600))
+        // A floating value is written as the wall clock in the zone the patch is labelled with
+        // (#753): the tools always label it with the zone their card showed.
+        patch.startTimeZone = TimeZone.current.identifier
+        patch.endTimeZone = TimeZone.current.identifier
         let merged = try CalDAVProvider.mergePatchIntoICS(ics, patch: patch)
         #expect(merged.contains("DTSTART:20990302T150000"))
         #expect(merged.contains("EXDATE:20990316T150000"))

@@ -680,6 +680,31 @@ struct CalDAVOccurrenceOverrideTests {
         }
     }
 
+    @Test("a floating occurrence moved is written at the wall clock of the zone the edit names, keeping its length (#753)",
+          arguments: CopyKind.allCases)
+    func floatingCopyUsesTheEditsZone(_ kind: CopyKind) throws {
+        let floating = Fixture.series([
+            "BEGIN:VEVENT", "UID:series-1", "DTSTAMP:20990101T000000Z", "DTSTART:20990506T170000",
+            "DTEND:20990506T174500", "RRULE:FREQ=WEEKLY;UNTIL=20991230T170000", "SUMMARY:Sync", "END:VEVENT",
+        ])
+        // 18:30 in Kathmandu: the card showed 18:30, whatever zone the device is in at the write.
+        var patch = Fixture.patch(start: "2099-05-20T18:30:00+05:45")
+        patch.startTimeZone = "Asia/Kathmandu"
+        let (block, _) = try kind.copy(of: floating, patch: patch)
+        #expect(block.contains("DTSTART:20990520T183000"), Comment(rawValue: block.joined(separator: "\n")))
+        #expect(block.contains("DTEND:20990520T191500"), Comment(rawValue: block.joined(separator: "\n")))
+
+        // A floating time with no zone named has no wall clock to write: refused, nothing written.
+        #expect {
+            _ = try kind.copy(of: floating, patch: Fixture.patch(start: "2099-05-20T18:30:00+05:45"))
+        } throws: { error in
+            if case CalendarProviderError.notSupported(let reason) = error {
+                return reason == CalDAVProvider.floatingWriteNeedsZoneMessage
+            }
+            return false
+        }
+    }
+
     @Test("a one-occurrence edit of a series that can't be read writes nothing and is refused as unsupported")
     func unreadableSeriesIsRefused() {
         let noStart = Fixture.series(["BEGIN:VEVENT", "UID:series-7", "RRULE:FREQ=WEEKLY", "SUMMARY:Broken", "END:VEVENT"])
@@ -844,6 +869,30 @@ struct CalDAVSeriesSplitCopyTests {
 
 @Suite("CalDAV edit of a whole series keeps attendees and alarms")
 struct CalDAVWholeSeriesEditTests {
+
+    @Test("a new time of a floating event is written at the wall clock of the zone the edit names; with no zone named it is refused (#753)")
+    func floatingWholeEventNeedsTheEditsZone() throws {
+        let floating = Fixture.series([
+            "BEGIN:VEVENT", "UID:series-1", "DTSTAMP:20990101T000000Z", "DTSTART:20990506T170000",
+            "DTEND:20990506T174500", "RRULE:FREQ=WEEKLY;UNTIL=20991230T170000", "SUMMARY:Sync", "END:VEVENT",
+        ])
+        var patch = Fixture.patch(start: "2099-05-06T18:30:00+05:45", end: "2099-05-06T19:15:00+05:45")
+        patch.startTimeZone = "Asia/Kathmandu"
+        patch.endTimeZone = "Asia/Kathmandu"
+        let block = Fixture.master(try CalDAVProvider.mergePatchIntoICS(floating, patch: patch))
+        #expect(block.contains("DTSTART:20990506T183000") && block.contains("DTEND:20990506T191500"),
+                Comment(rawValue: block.joined(separator: "\n")))
+
+        // A floating time with no zone named has no wall clock to write: refused, nothing written.
+        #expect {
+            _ = try CalDAVProvider.mergePatchIntoICS(floating, patch: Fixture.patch(start: "2099-05-06T18:30:00+05:45"))
+        } throws: { error in
+            if case CalendarProviderError.notSupported(let reason) = error {
+                return reason == CalDAVProvider.floatingWriteNeedsZoneMessage
+            }
+            return false
+        }
+    }
 
     @Test("an attendee change keeps every staying attendee's role and answer")
     func attendeeChangeKeepsOthers() throws {

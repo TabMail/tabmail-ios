@@ -22,6 +22,11 @@ struct CalendarEventCreateTool: AgentTool, Sendable {
     /// ADR-IOS-053: real entry point — delivers the confirmation card to the
     /// invoking session via `invocation.uiSink` (nil sink → declined fast-fail).
     func execute(arguments: [String: JSONValue], invocation: ToolInvocation) async throws -> String {
+        // The device's zone, snapshotted as this operation's first step (#753): a `timezone` the
+        // assistant did not give is this zone for the card, the queued create and the result, so
+        // the event is written where the card showed it even if the device's zone changes before
+        // the queue drains.
+        let deviceZone = ctx.deviceZone
         let title = CalendarToolHelpers.stringArg(arguments, "title")
         let startIso = CalendarToolHelpers.stringArg(arguments, "start_iso")
         let endIso = CalendarToolHelpers.stringArg(arguments, "end_iso")
@@ -30,7 +35,7 @@ struct CalendarEventCreateTool: AgentTool, Sendable {
         // read as the device's zone (which would create the event at the wrong time).
         let tz: TimeZone
         do {
-            tz = try CalendarToolHelpers.resolveWriteTimeZone(arguments, consequence: "it did not create the event")
+            tz = try CalendarToolHelpers.resolveWriteTimeZone(arguments, deviceZone: deviceZone, consequence: "it did not create the event")
         } catch CalendarProviderError.notSupported(let reason) {
             return ToolJSON.string(from: [
                 "ok": false,
@@ -147,7 +152,7 @@ struct CalendarEventCreateTool: AgentTool, Sendable {
                 isAllDay: allDay ?? false,
                 changes: details,
                 attendees: attendeeNames,
-                timeZoneId: CalendarToolHelpers.stringArgOpt(arguments, "timezone"),
+                timeZoneId: tz.identifier,
                 notes: CalendarToolHelpers.stringArgOpt(arguments, "description")
             )],
             via: invocation.uiSink
@@ -168,14 +173,14 @@ struct CalendarEventCreateTool: AgentTool, Sendable {
         // so subsequent edit/delete targets the correct calendar even if the user changes
         // their preferred calendar later.
         let calendarId = await CalendarProviderDispatch.defaultCalendarIdForCreation(for: backend.provider)
-        let result = try await queueCalendarCreate(accountId: backend.account.id, calendarId: calendarId, arguments: arguments, startDate: startDate, endDate: endDate, isAllDay: allDay ?? false, cardState: cardState)
+        let result = try await queueCalendarCreate(accountId: backend.account.id, calendarId: calendarId, arguments: arguments, zone: tz, startDate: startDate, endDate: endDate, isAllDay: allDay ?? false, cardState: cardState)
 
         return result
     }
 
     // MARK: - Calendar (Queued)
 
-    private func queueCalendarCreate(accountId: String, calendarId: String, arguments: [String: JSONValue], startDate: Date, endDate: Date, isAllDay: Bool, cardState: AgentToolRouter.ActionConfirmation.ResponseState) async throws -> String {
+    private func queueCalendarCreate(accountId: String, calendarId: String, arguments: [String: JSONValue], zone resolvedTz: TimeZone, startDate: Date, endDate: Date, isAllDay: Bool, cardState: AgentToolRouter.ActionConfirmation.ResponseState) async throws -> String {
         let manager = AccountManager.shared
         let generatedEventId = PendingCalendarOperation.generateGoogleEventId(from: UUID().uuidString)
 
@@ -185,8 +190,9 @@ struct CalendarEventCreateTool: AgentTool, Sendable {
         // would 400 with "Missing end time." even though execute() resolved
         // defaults locally for the confirmation card. Bake the resolved values
         // into the args we persist so the drain sees a complete payload.
-        let resolvedTz = CalendarToolHelpers.resolveTimeZone(arguments)
-        var queuedArgs = arguments
+        // They are written in the zone the card showed (`resolvedTz`, from the snapshot), and that
+        // zone is queued with them (`stampingZone`), so the drain reads them where they were meant.
+        var queuedArgs = CalendarToolHelpers.stampingZone(arguments, resolvedTz)
         let isoFmt = DateFormatter()
         isoFmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
         isoFmt.timeZone = resolvedTz

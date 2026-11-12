@@ -1065,6 +1065,47 @@ naming the field and the value, with nothing sent.
   on Google, Outlook and CalDAV, is refused before both cards with nothing sent; a rule Outlook
   can't hold is refused before both cards.
 
+## Calendar writes queued across a zone change — written as the card showed
+
+`TabMailTests/Tools/CalendarWriteZoneSnapshotTests.swift` pins #753: a confirmed
+`calendar_event_create` or `calendar_event_edit` writes the time its card showed, whatever zone the
+device is in when the queue drains. Each case runs the real tool with `ToolContext(deviceZone:)` set
+to a zone that is not the host's (the zone the user confirmed in), drains the real queue in the
+host's zone, and compares the write on the fake with the card.
+
+- `CalendarWriteZoneSnapshotTests`: timed create on Google, Outlook and CalDAV (start and end); a
+  whole-series time change on Google, Outlook and CalDAV; one occurrence (`this_only`) on Google,
+  Outlook and CalDAV; Google `this_and_following` (the new part starts at the card's start, the old
+  part is capped); a zone change between two creates applies to the second; a CalDAV event with
+  floating times is written at the card's wall clock. Controls: an assistant-named zone (IANA or
+  Windows) is shown on the card and written in that zone; an all-day create keeps its date; a row queued with no zone (before
+  #753) drains in the device's zone. Red-first: with the zone stamp removed every non-control case
+  but the floating one fails; with the floating formatter reverted the floating case fails.
+- `CalendarCardZoneLabelTests`: the card names a zone only when it is not the device's; a Windows
+  name is the zone it names.
+- `CalendarQueuedZoneStampTests`: the queued arguments name the card's zone when the assistant gave
+  none (or an empty one) and change nothing else; a zone the assistant named (IANA or Windows) is
+  queued as given; with no zone given the write resolves to the snapshotted zone. (The queue deletes
+  a done row, and the tool starts a drain of its own, so the integration cases check the write, not
+  the row.)
+- Floating CalDAV series (#761, folded into #753): `this_only` and `this_and_following` of a weekly
+  floating series confirmed in one zone and drained in the host's change the occurrence at the named
+  wall clock, at the card's wall clock; an edit of every occurrence named by an occurrence id alone
+  (no `recurrence_id`) drained in another zone is written and not retired as not found, for a
+  floating and a zoned series; a zoned `this_only` row without a `recurrence_id` ends with that
+  refusal, never as "not found";
+  control: an HOURLY floating series (which CalDAV does not expand) is refused before the card in any
+  zone, nothing written.
+- `CalDAVFloatingOccurrenceMatchTests`: `CalDAVOccurrences.scopedEdit` finds a floating occurrence by
+  its wall clock in a zone that is not the host's (by `recurrence_id`, and with its occurrence id for a
+  split), a moved changed copy where it is now, a changed copy held without its series, and a DAILY
+  series named from zones a day apart (Kiritimati, Pago Pago) never lands on the day before or after. Controls:
+  a wall clock no occurrence starts at names none; a listing still shows a moved floating occurrence
+  at its wall clock on the device. Also `exdates_add` reads its dates in the tool's snapshot zone.
+- `CalDAVWholeSeriesEditTests.floatingWholeEventNeedsTheEditsZone`: `mergePatchIntoICS` writes a
+  floating time at the wall clock of the zone the patch names, and refuses an unlabelled one
+  (`floatingWriteNeedsZoneMessage`).
+
 ## CalDAV organizer — every event with guests names its organizer
 
 `TabMailTests/Providers/CalDAVOrganizerTests.swift` pins ADR-IOS-109 (#711): every CalDAV PUT runs

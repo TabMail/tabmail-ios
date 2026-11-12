@@ -127,7 +127,7 @@ enum CalDAVOccurrences {
         guard let master = components.first(where: { $0.recurrenceId == nil }) else {
             // Only changed occurrences, no series (an invitation to single occurrences,
             // RFC 4791 §4.1): each is listed where it is.
-            return standaloneRows(overrides, href: href, timeMin: timeMin, timeMax: timeMax).map(\.row)
+            return standaloneRows(overrides, href: href, timeMin: timeMin, timeMax: timeMax, floatingZone: .current).map(\.row)
         }
         let series: Series
         switch shape(of: master, overrides: overrides) {
@@ -141,7 +141,9 @@ enum CalDAVOccurrences {
         guard let timeMax else {
             return [notListedRow(master, href: href, reason: "the listing has no end")]
         }
-        guard let rows = occurrenceRows(of: series, overrides: overrides, href: href, timeMin: timeMin, timeMax: timeMax) else {
+        guard let rows = occurrenceRows(
+            of: series, overrides: overrides, href: href, timeMin: timeMin, timeMax: timeMax, floatingZone: .current
+        ) else {
             return [notListedRow(master, href: href, reason: "more than \(Config.maxRuleSteps) repeats before the range")]
         }
         return rows.map(\.row)
@@ -150,9 +152,11 @@ enum CalDAVOccurrences {
     /// The occurrences of `series` that overlap the range, where each is now, with its key:
     /// every override at its own time, and every other occurrence where the series puts it.
     /// A cancelled one is a row with status `cancelled`. nil when the rule takes more than
-    /// `Config.maxRuleSteps` periods to reach the range's end.
+    /// `Config.maxRuleSteps` periods to reach the range's end. A changed occurrence's floating
+    /// start and end are read in `floatingZone` (`placed`).
     private static func occurrenceRows(
-        of series: Series, overrides: [ICSParser.VEventComponent], href: String, timeMin: Date?, timeMax: Date
+        of series: Series, overrides: [ICSParser.VEventComponent], href: String, timeMin: Date?, timeMax: Date,
+        floatingZone: TimeZone
     ) -> [(key: String, row: GCalEvent)]? {
         guard let lastDay = series.frame.day(of: timeMax) else { return nil }
         // Occurrences on days before this one end before the range starts.
@@ -167,8 +171,10 @@ enum CalDAVOccurrences {
             guard let rid = override.recurrenceId,
                   let key = occurrenceKey(ofValue: rid.value, params: rid.params, in: series),
                   overridden.insert(key).inserted else { continue }
-            guard let overrideSpan = spanOf(override), overlaps(overrideSpan, timeMin: timeMin, timeMax: timeMax) else { continue }
-            rows.append((key, occurrenceRow(override.event, href: href, key: key, recurrence: series.recurrenceLines, frame: series.frame)))
+            let place = placed(override, floatingZone: floatingZone)
+            guard let overrideSpan = place.span, overlaps(overrideSpan, timeMin: timeMin, timeMax: timeMax) else { continue }
+            rows.append((key, occurrenceRow(
+                override.event, times: place, href: href, key: key, recurrence: series.recurrenceLines, frame: series.frame)))
         }
         for instance in found where !overridden.contains(instance.key) {
             guard overlaps((start: instance.start, end: instance.end), timeMin: timeMin, timeMax: timeMax) else { continue }
@@ -181,16 +187,19 @@ enum CalDAVOccurrences {
     }
 
     /// The changed occurrences of a resource that holds no series, each where it is, with the
-    /// key its own RECURRENCE-ID gives it (`standaloneKey`).
+    /// key its own RECURRENCE-ID gives it (`standaloneKey`), a floating start and end read in
+    /// `floatingZone` (`placed`).
     private static func standaloneRows(
-        _ overrides: [ICSParser.VEventComponent], href: String, timeMin: Date?, timeMax: Date?
+        _ overrides: [ICSParser.VEventComponent], href: String, timeMin: Date?, timeMax: Date?, floatingZone: TimeZone
     ) -> [(key: String, row: GCalEvent)] {
         overrides.compactMap { override in
+            let place = placed(override, floatingZone: floatingZone)
             guard let rid = override.recurrenceId,
                   let key = standaloneKey(of: rid, zones: override.zones),
-                  let overrideSpan = spanOf(override),
+                  let overrideSpan = place.span,
                   overlaps(overrideSpan, timeMin: timeMin, timeMax: timeMax) else { return nil }
-            return (key, occurrenceRow(override.event, href: href, key: key, recurrence: nil, frame: .floating))
+            return (key, occurrenceRow(
+                override.event, times: place, href: href, key: key, recurrence: nil, frame: .floating(floatingZone)))
         }
     }
 
@@ -219,7 +228,7 @@ enum CalDAVOccurrences {
         let overrides = components.filter { $0.recurrenceId != nil }
         guard let master = components.first(where: { $0.recurrenceId == nil }) else {
             return overrides.first { override in override.recurrenceId.flatMap { standaloneKey(of: $0, zones: override.zones) } == wanted }
-                .map { occurrenceRow($0.event, href: href, key: wanted, recurrence: nil, frame: .floating) }
+                .map { occurrenceRow($0.event, href: href, key: wanted, recurrence: nil, frame: .floating(.current)) }
         }
         guard case .series(let series) = shape(of: master, overrides: overrides) else { return nil }
         return occurrence(key: wanted, in: series, overrides: overrides, href: href)
@@ -295,7 +304,9 @@ enum CalDAVOccurrences {
         if let master = components.first(where: { $0.recurrenceId == nil }) {
             try refuseUnknownSeriesZone(of: master, refusal: .change)
             var series: Series
-            switch shape(of: master, overrides: overrides) {
+            // A floating series is read in `zone`, the zone `recurrence_id` is in, so the two are
+            // compared by wall clock whatever the device's zone is now (#753, #761).
+            switch shape(of: master, overrides: overrides, floatingZone: zone) {
             case .single:
                 throw CalendarProviderError.notSupported(
                     "This event does not repeat, so it has no single occurrence to change. Nothing was changed. Edit the whole event with edit_scope all.")
@@ -307,7 +318,9 @@ enum CalDAVOccurrences {
             }
             if forSplit { series = series.withoutEnd }
             seriesFrame = series.frame
-            guard let found = occurrenceRows(of: series, overrides: overrides, href: href, timeMin: timeMin, timeMax: timeMax) else {
+            guard let found = occurrenceRows(
+                of: series, overrides: overrides, href: href, timeMin: timeMin, timeMax: timeMax, floatingZone: zone
+            ) else {
                 throw CalendarProviderError.notSupported(
                     "TabMail can't work out the occurrences of this repeating event, so it can't change one of them or split the series at one. Nothing was changed.")
             }
@@ -316,7 +329,7 @@ enum CalDAVOccurrences {
             guard key != nil, !forSplit else {
                 throw CalendarProviderError.seriesNotInThisCalendar
             }
-            rows = standaloneRows(overrides, href: href, timeMin: timeMin, timeMax: timeMax)
+            rows = standaloneRows(overrides, href: href, timeMin: timeMin, timeMax: timeMax, floatingZone: zone)
         }
 
         var candidates: [OccurrenceCandidate] = []
@@ -526,15 +539,20 @@ enum CalDAVOccurrences {
     /// How a series' DTSTART places its occurrences.
     private enum Frame {
         case allDay
-        case floating
+        /// A floating series, its wall times read in the zone given: the device's for a listing,
+        /// and for a one-occurrence edit or split the zone the operation names its
+        /// `recurrence_id` in, so an occurrence is matched by its wall clock in that zone however
+        /// the device's zone changed since (#753, #761).
+        case floating(TimeZone)
         case utc
         case zoned(TimeZone, tzid: String)
 
-        /// The zone the series' wall times are read in. An all-day date and a floating time
-        /// are read in the device's, like every other all-day and floating value in the app.
+        /// The zone the series' wall times are read in. An all-day date is read in the device's,
+        /// like every other all-day value in the app; a floating time in the zone its frame names.
         var zone: TimeZone {
             switch self {
-            case .allDay, .floating: return .current
+            case .allDay: return .current
+            case .floating(let zone): return zone
             case .utc: return .gmt
             case .zoned(let zone, _): return zone
             }
@@ -588,7 +606,10 @@ enum CalDAVOccurrences {
         case series(Series)
     }
 
-    private static func shape(of master: ICSParser.VEventComponent, overrides: [ICSParser.VEventComponent]) -> Shape {
+    /// `floatingZone` is the zone a floating series' wall times are read in (`Frame.floating`).
+    private static func shape(
+        of master: ICSParser.VEventComponent, overrides: [ICSParser.VEventComponent], floatingZone: TimeZone = .current
+    ) -> Shape {
         guard !master.rrules.isEmpty || !master.rdates.isEmpty || master.hasExRule else { return .single }
         guard !master.hasExRule else { return .unexpandable(reason: "it has an EXRULE") }
         guard master.rrules.count <= 1 else { return .unexpandable(reason: "it has more than one RRULE") }
@@ -612,7 +633,7 @@ enum CalDAVOccurrences {
             } else if let params = dtstart.params, let tzid = ICSParser.extractTZID(params) {
                 frame = .zoned(ICSParser.wallTimeZone(params: params, zones: master.zones), tzid: tzid)
             } else {
-                frame = .floating
+                frame = .floating(floatingZone)
             }
         }
 
@@ -831,7 +852,7 @@ enum CalDAVOccurrences {
             if !upper.hasSuffix("Z"), params.flatMap(ICSParser.extractTZID) == nil {
                 return wallTime(upper).map { wallKey(day: $0.day, hour: $0.hour, minute: $0.minute, second: $0.second) }
             }
-            return valueInstant(value, params: params, in: series).flatMap { wallKey(of: $0, in: .current) }
+            return valueInstant(value, params: params, in: series).flatMap { wallKey(of: $0, in: series.frame.zone) }
         }
         return valueInstant(value, params: params, in: series).flatMap(utcKey)
     }
@@ -929,6 +950,58 @@ enum CalDAVOccurrences {
 
     // MARK: - Rows
 
+    /// Where a changed occurrence is: its start and end as a row shows them, and its span for the
+    /// range check (`spanOf`).
+    private struct Placed {
+        let start: GCalDateTime?
+        let end: GCalDateTime?
+        let span: (start: Date, end: Date)?
+    }
+
+    /// `component` (a changed occurrence) placed with its floating values read as wall times in
+    /// `floatingZone`: a floating start, and an end that is floating or follows from the start
+    /// (a DURATION, or none). `ICSParser` reads a floating value in the device's zone, so a listing
+    /// (which passes that zone) is unchanged; a one-occurrence edit or split passes the zone its
+    /// `recurrence_id` is in (`scopedEdit`), so it compares the occurrence by its wall clock there
+    /// (#753, #761). Every other value stays where `ICSParser` put it.
+    private static func placed(_ component: ICSParser.VEventComponent, floatingZone: TimeZone) -> Placed {
+        let asParsed = Placed(start: component.event.start, end: component.event.end, span: spanOf(component))
+        guard !component.isAllDay, let dtstart = component.dtstart, isFloating(dtstart),
+              let parsedStart = component.startDate,
+              let start = floatingInstant(dtstart.value, in: floatingZone) else { return asParsed }
+        let end: Date?
+        if let dtend = component.dtend {
+            guard isFloating(dtend) else {
+                return Placed(start: dateTime(start), end: component.event.end,
+                              span: (start: start, end: max(component.endDate ?? start, start)))
+            }
+            guard let wallEnd = floatingInstant(dtend.value, in: floatingZone) else { return asParsed }
+            end = wallEnd
+        } else {
+            // A DURATION keeps its length from the start; with none, the row has no end, as parsed.
+            end = component.endDate.map { start.addingTimeInterval($0.timeIntervalSince(parsedStart)) }
+        }
+        return Placed(start: dateTime(start), end: end.map(dateTime) ?? component.event.end,
+                      span: (start: start, end: max(end ?? start, start)))
+    }
+
+    /// A DATE-TIME with no `Z` and no TZID: RFC 5545 floating time.
+    private static func isFloating(_ property: ICSParser.PropertyValue) -> Bool {
+        !isDateValue(property.value, params: property.params)
+            && !property.value.uppercased().hasSuffix("Z")
+            && property.params.flatMap(ICSParser.extractTZID) == nil
+    }
+
+    private static func floatingInstant(_ value: String, in zone: TimeZone) -> Date? {
+        wallTime(value.uppercased()).flatMap {
+            wallInstant(day: $0.day, hour: $0.hour, minute: $0.minute, second: $0.second, in: zone)
+        }
+    }
+
+    private static func dateTime(_ instant: Date) -> GCalDateTime {
+        GCalDateTime(dateTime: instant.iso8601String(), date: nil, timeZone: nil)
+    }
+
     /// A component's start and end, for the range check: its own times, and for an all-day
     /// one its dates on the device (one day when it gives no end).
     private static func spanOf(_ component: ICSParser.VEventComponent) -> (start: Date, end: Date)? {
@@ -977,12 +1050,15 @@ enum CalDAVOccurrences {
     }
 
     /// `frame` places a floating key (`seriesSlot`): the series' own, or `.floating` for a changed
-    /// occurrence in a resource without its series, read like every other floating time.
-    private static func occurrenceRow(_ event: GCalEvent, href: String, key: String, recurrence: [String]?, frame: Frame) -> GCalEvent {
+    /// occurrence in a resource without its series. `times`, when given, is where the occurrence
+    /// is (`placed`); else where `event` says.
+    private static func occurrenceRow(
+        _ event: GCalEvent, times: Placed? = nil, href: String, key: String, recurrence: [String]?, frame: Frame
+    ) -> GCalEvent {
         var row = GCalEvent(
             id: OccurrenceId.make(seriesHref: href, key: key),
             summary: event.summary, location: event.location, description: event.description,
-            start: event.start, end: event.end, attendees: event.attendees, organizer: event.organizer,
+            start: times.map(\.start) ?? event.start, end: times.map(\.end) ?? event.end, attendees: event.attendees, organizer: event.organizer,
             recurrence: recurrence, transparency: event.transparency, status: event.status,
             htmlLink: event.htmlLink, created: event.created, updated: event.updated,
             recurringEventId: href, conferenceUrl: event.conferenceUrl)

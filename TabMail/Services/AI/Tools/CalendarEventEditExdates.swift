@@ -72,8 +72,9 @@ enum CalendarEventEditExdates {
     }
 
     /// The call's own checks: `exdates_add` alone (no other argument outside `allowedKeys`), a
-    /// non-empty list of dates (strings), and a `timezone` TabMail recognizes.
-    static func check(_ arguments: [String: JSONValue], compoundId: String) -> Checked {
+    /// non-empty list of dates (strings), and a `timezone` TabMail recognizes. With no `timezone`
+    /// the dates are read in `deviceZone`, the zone the tool snapshotted at its start (#753).
+    static func check(_ arguments: [String: JSONValue], compoundId: String, deviceZone: TimeZone) -> Checked {
         var others = arguments.keys.filter { !allowedKeys.contains($0) }.sorted()
         if !isAllScope(arguments["edit_scope"]) { others.append("edit_scope") }
         // The other change goes FIRST: on Google and Outlook a change to the series (its times, its
@@ -103,7 +104,7 @@ enum CalendarEventEditExdates {
         // would name other occurrences), as every calendar write refuses it.
         do {
             let zone = try CalendarToolHelpers.resolveWriteTimeZone(
-                arguments, consequence: "it did not delete any occurrence",
+                arguments, deviceZone: deviceZone, consequence: "it did not delete any occurrence",
                 remedy: "Nothing was deleted. Name the zone by its IANA name (e.g. 'America/Los_Angeles') and call calendar_event_edit again")
             return .dates(dates, zone: zone)
         } catch CalendarProviderError.notSupported(let reason) {

@@ -621,9 +621,10 @@ struct CalDAVOccurrenceWireTests {
             for eventId in [occurrenceId, W.seriesPath] {
                 let (store, http) = W.serve(fixture)
                 defer { http.close() }
+                // A floating occurrence has no zone: in any zone it is named by its wall clock (#761).
                 let recurrenceId = frame == .allDay
                     ? OccurrenceFixture.isoDate(shown, .current)
-                    : OccurrenceFixture.naive(shown, toolZone)
+                    : OccurrenceFixture.naive(shown, frame == .floating ? .current : toolZone)
                 let label = "\(frame) series, \(move), named in \(toolZone.identifier) by \(eventId)"
                 let split: () async throws -> Void = {
                     _ = try await W.makeProvider(http).splitSeries(
