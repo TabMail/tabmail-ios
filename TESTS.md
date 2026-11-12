@@ -1090,11 +1090,14 @@ host's zone, and compares the write on the fake with the card.
   the row.)
 - Floating CalDAV series (#761, folded into #753): `this_only` and `this_and_following` of a weekly
   floating series confirmed in one zone and drained in the host's change the occurrence at the named
-  wall clock, at the card's wall clock; an HOURLY floating series, in a zone a whole number of hours
-  from the host's where one exists, changes the occurrence named and no neighbour.
+  wall clock, at the card's wall clock; an edit of every occurrence named by an occurrence id alone
+  (no `recurrence_id`) drained in another zone is written and not retired as not found;
+  control: an HOURLY floating series (which CalDAV does not expand) is refused before the card in any
+  zone, nothing written.
 - `CalDAVFloatingOccurrenceMatchTests`: `CalDAVOccurrences.scopedEdit` finds a floating occurrence by
   its wall clock in a zone that is not the host's (by `recurrence_id`, and with its occurrence id for a
-  split), a moved changed copy where it is now, and a changed copy held without its series. Controls:
+  split), a moved changed copy where it is now, a changed copy held without its series, and a DAILY
+  series named from zones a day apart (Kiritimati, Pago Pago) never lands on the day before or after. Controls:
   a wall clock no occurrence starts at names none; a listing still shows a moved floating occurrence
   at its wall clock on the device. Also `exdates_add` reads its dates in the tool's snapshot zone.
 - `CalDAVWholeSeriesEditTests.floatingWholeEventNeedsTheEditsZone`: `mergePatchIntoICS` writes a

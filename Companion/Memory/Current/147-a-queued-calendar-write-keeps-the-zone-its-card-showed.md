@@ -43,6 +43,18 @@ was written 15:00 London.
   device's zone, so what the user sees is unchanged. Deletes go by occurrence key (wall digits for a
   floating series), already zone-free. `CalendarEventEditExdates.check` reads its dates in the tool's
   snapshot zone (`deviceZone:`), not the host's.
+- An occurrence id given WITHOUT a `recurrence_id` (`CalendarSeriesScope.read`; at the drain, an edit of
+  every occurrence that moves no time, which `route` queues as given) is named by the start
+  the provider read it at, shown and looked up in the device's zone (`namedZone`), the zone a CalDAV
+  floating time is read in. Named in the edit's zone instead, a queued edit drained after a zone change
+  gave a floating occurrence another wall clock, the lookup found none, and the drain retired the
+  confirmed edit as "event not found" (found in the post-review confirmation run). A time with a zone
+  names the same instant in either zone.
+- CalDAV expands no rule finer than DAILY (`shape`: HOURLY is unexpandable), so a one-occurrence edit
+  of an HOURLY series is refused, never matched to a neighbour. A neighbour could only be hit where two
+  zones' offsets differ by a day or more (Kiritimati vs Pago Pago); the DAILY far-zone test pins that.
+- Limitation (accepted): for a floating series with a zoned or UTC DTEND the occurrence length is still
+  measured in the device's zone (rare, non-standard).
 
 ## Tests
 
@@ -53,4 +65,6 @@ turns every non-control case red; the floating case is red with the formatter re
 floating-series cases (this_only, this_and_following, HOURLY) and `CalDAVFloatingOccurrenceMatchTests`
 (#761: series, moved copy, copy without its series, plus a listing control) pin the wall-clock match;
 `CalDAVWholeSeriesEditTests.floatingWholeEventNeedsTheEditsZone` pins the unlabelled-floating refusal
-of `mergePatchIntoICS`.
+of `mergePatchIntoICS`. `CalDAVOccurrenceWireTests.splitIsRefusedExactlyAtMovedOccurrencesInEveryFrame`
+names a floating occurrence by its wall clock from every zone (it used to convert the device-zone
+instant, the reading #761 replaced). Mutations are recorded in the plan's mutation ledger.

@@ -118,7 +118,16 @@ enum CalendarSeriesScope {
         provider: any CalendarProvider
     ) async throws -> Named {
         if let seriesId = event.recurringEventId, !seriesId.isEmpty, seriesId != eventId {
-            guard let named = recurrenceId ?? shownStart(of: event, zone: zone) else {
+            // An occurrence id given without a `recurrence_id` names the occurrence by the start it
+            // has now, as the provider read it: in the device's zone, the zone a CalDAV floating time
+            // (no zone) is read in (`ICSParser`), so it is shown and looked up in that zone. Shown in
+            // `zone` instead, a floating occurrence's wall clock is another one whenever `zone` is not
+            // the device's (a queued edit drained after the device's zone changed, #753), and the
+            // lookup, which compares floating times by wall clock in the zone it is given (#761),
+            // finds none (the drain then retires the confirmed edit as not found) or another. A
+            // time with a zone names the same instant in either zone.
+            let namedZone = recurrenceId == nil ? TimeZone.current : zone
+            guard let named = recurrenceId ?? shownStart(of: event, zone: namedZone) else {
                 throw CalendarProviderError.notSupported(
                     "the start of the occurrence this event_id names can't be read; pass recurrence_id (the occurrence's start_iso as calendar_event_read shows it)")
             }
@@ -128,7 +137,7 @@ enum CalendarSeriesScope {
             // occurrences has no series to read (#720).
             guard usesSeries(scope) else {
                 let occurrence = try await provider.occurrence(
-                    calendarId: calendarId, eventId: eventId, recurrenceId: named, recurrenceIdZone: zone)
+                    calendarId: calendarId, eventId: eventId, recurrenceId: named, recurrenceIdZone: namedZone)
                 return Named(eventId: eventId, event: event, seriesId: seriesId, series: nil, occurrence: occurrence)
             }
             // The series, for an edit of every occurrence or a split. Where the calendar holds no
@@ -138,7 +147,7 @@ enum CalendarSeriesScope {
             // A deleted occurrence, which Google and CalDAV read by its id with status `cancelled`,
             // is the lookup's not-found: no provider's lookup finds one.
             let occurrence = try await provider.occurrence(
-                calendarId: calendarId, eventId: eventId, recurrenceId: named, recurrenceIdZone: zone)
+                calendarId: calendarId, eventId: eventId, recurrenceId: named, recurrenceIdZone: namedZone)
             return Named(eventId: eventId, event: event, seriesId: seriesId, series: series, occurrence: occurrence)
         }
         guard let recurrenceId, !(event.recurrence ?? []).isEmpty else {

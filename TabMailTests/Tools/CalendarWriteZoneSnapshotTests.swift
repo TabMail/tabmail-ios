@@ -590,24 +590,45 @@ struct CalendarWriteZoneSnapshotTests {
         }
     }
 
-    @Test("CalDAV floating HOURLY series: the occurrence at the named wall clock is the one changed, never a neighbour")
-    func calDAVFloatingHourlyNeverWrongOccurrence() async throws {
+    @Test("CalDAV floating series: an edit of every occurrence named by an occurrence id alone is written at a drain in another zone, never retired as not found")
+    func calDAVFloatingOccurrenceIdDrainsInAnotherZone() async throws {
+        let fixture = try floatingSeries(first: day(0), start: "090000", end: "093000", rule: "FREQ=WEEKLY")
+        let zone = try confirmZone(at: fixture.first)
+        let (store, http) = OccurrenceWireFixture.serve(fixture)
+        defer { http.close() }
+        let occurrenceId = CalDAVOccurrences.OccurrenceId.make(
+            seriesHref: OccurrenceWireFixture.seriesPath, key: "\(compact(day(14)))T090000")
+        // As the tool queues an edit of every occurrence that moves no time, named by an occurrence
+        // id: no recurrence_id (`CalendarSeriesScope.route` sends it as given), the card's zone
+        // stamped. The queue drains in the host's zone and names the occurrence by the start it reads.
+        let rows = try await drainCalendarOperation(
+            type: .edit, accountId: "zone-c-float-id", eventId: occurrenceId, calendarId: OccurrenceWireFixture.calendarId,
+            arguments: ["title": .string("Renamed"), "timezone": .string(zone.identifier)],
+            provider: OccurrenceWireFixture.makeProvider(http))
+        let lines = CalDAVProvider.icsLines(store.storedICS(path: OccurrenceWireFixture.seriesPath) ?? "")
+        let outcome = rows.map { "\($0.status) \($0.failureReason ?? "")" }
+        #expect(lines.contains("SUMMARY:Renamed") && !lines.contains("SUMMARY:Standup"),
+                "written \(lines.filter { $0.hasPrefix("SUMMARY") }); rows \(outcome)")
+        #expect(lines.contains("DTSTART:\(compact(day(0)))T090000") && !lines.contains { $0.hasPrefix("RECURRENCE-ID") },
+                "the series' times changed: \(lines.filter { $0.hasPrefix("DT") || $0.hasPrefix("RECURRENCE-ID") }); rows \(outcome)")
+    }
+
+    @Test("control: a floating HOURLY series, whose occurrences TabMail can't work out, is refused before the card in any zone; nothing is written")
+    func calDAVFloatingHourlyIsRefused() async throws {
+        // A one-occurrence edit could only reach a neighbour where occurrences are closer together
+        // than two zones' offsets differ. CalDAV expands no rule finer than DAILY, so an HOURLY
+        // series is refused, never matched (`CalDAVOccurrences.shape`'s unexpandable rule).
         let fixture = try floatingSeries(first: day(3), start: "080000", end: "083000", rule: "FREQ=HOURLY;COUNT=12")
-        // A zone a whole number of hours from the host's, where one exists: there the old reading
-        // (the series in the host's zone, `recurrence_id` in the card's) named another occurrence.
-        let zone = try zonesWholeHoursFromTheHost(at: fixture.first)
-        try await withCalDAV("zone-c-float-hourly", fixture: fixture) { harness, pool in
-            let r = try await runEdit([
-                "edit_scope": .string("this_only"), "recurrence_id": .string("\(day(3))T12:00:00"),
-                "start_iso": .string("\(day(3))T12:15:00"), "end_iso": .string("\(day(3))T12:45:00"),
-            ], eventId: OccurrenceWireFixture.seriesPath, calendarId: OccurrenceWireFixture.calendarId,
-               account: "zone-c-float-hourly", pool: pool, deviceZone: zone)
-            let stored = harness.store.storedICS(path: OccurrenceWireFixture.seriesPath) ?? ""
-            let lines = CalDAVProvider.icsLines(stored)
-            #expect(lines.filter { $0.hasPrefix("RECURRENCE-ID") } == ["RECURRENCE-ID:\(compact(day(3)))T120000"],
-                    "changed \(lines.filter { $0.hasPrefix("RECURRENCE-ID") }) (\(zone.identifier)); \(summary(r))")
-            #expect(lines.contains("DTSTART:\(compact(day(3)))T121500"),
-                    "written \(lines.filter { $0.hasPrefix("DT") }); \(summary(r))")
+        for zone in [TimeZone.current] + (try zonesNotTheHost(at: fixture.first)) {
+            try await withCalDAV("zone-c-float-hourly", fixture: fixture) { harness, pool in
+                let r = try await runEdit([
+                    "edit_scope": .string("this_only"), "recurrence_id": .string("\(day(3))T12:00:00"),
+                    "start_iso": .string("\(day(3))T12:15:00"), "end_iso": .string("\(day(3))T12:45:00"),
+                ], eventId: OccurrenceWireFixture.seriesPath, calendarId: OccurrenceWireFixture.calendarId,
+                   account: "zone-c-float-hourly", pool: pool, deviceZone: zone)
+                #expect(r.cards.isEmpty && r.out.contains("can't work out the occurrences"), "\(zone.identifier): \(summary(r))")
+                #expect(harness.store.recordedPuts().isEmpty, "\(zone.identifier): wrote \(harness.store.recordedPuts().map(\.path))")
+            }
         }
     }
 
@@ -768,6 +789,23 @@ struct CalDAVFloatingOccurrenceMatchTests {
                 icsText: series(), href: href, key: "\(compact(day(14)))T090000",
                 recurrenceId: "\(day(14))T09:00:00", zone: zone, forSplit: true)
             #expect(named.key == "\(compact(day(14)))T090000", "\(zone.identifier)")
+        }
+    }
+
+    @Test("a DAILY series named from zones up to a day apart (Kiritimati, Pago Pago) finds the occurrence at the named wall clock, never the day before or after")
+    func dailySeriesFromZonesADayApart() throws {
+        let ics = OccurrenceFixture.ics([[
+            "UID:daily-1", "DTSTAMP:\(compact(day(0)))T000000Z",
+            "DTSTART:\(compact(day(0)))T090000", "DTEND:\(compact(day(0)))T093000",
+            "SUMMARY:Daily", "RRULE:FREQ=DAILY",
+        ].joined(separator: "\n")])
+        for name in ["Pacific/Kiritimati", "Pacific/Pago_Pago"] {
+            let zone = try #require(TimeZone(identifier: name))
+            for offset in [13, 14, 15] {
+                let named = try CalDAVOccurrences.scopedEdit(
+                    icsText: ics, href: href, key: nil, recurrenceId: "\(day(offset))T09:00:00", zone: zone, forSplit: false)
+                #expect(named.key == "\(compact(day(offset)))T090000", "\(name), day \(offset): found \(named.key)")
+            }
         }
     }
 
