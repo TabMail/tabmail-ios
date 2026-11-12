@@ -30,6 +30,10 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         /// The `text/plain` body the `format=full` GET serves (the backfill's
         /// fetch). Nil serves an empty body, as before.
         let bodyText: String?
+        /// Header values the metadata GET serves in place of (or next to) the
+        /// fake's defaults, keyed by header name as written (`Subject`, `Cc`,
+        /// `In-Reply-To`, `References`, ...). Empty keeps the defaults.
+        let headers: [String: String]
 
         init(
             rfc822MessageId: String,
@@ -37,7 +41,8 @@ final class StatefulGmailActionServer: @unchecked Sendable {
             labels: Set<String>,
             internalDate: Date? = nil,
             received: [String] = [],
-            bodyText: String? = nil
+            bodyText: String? = nil,
+            headers: [String: String] = [:]
         ) {
             self.rfc822MessageId = rfc822MessageId
             self.providerMessageId = providerMessageId
@@ -45,6 +50,7 @@ final class StatefulGmailActionServer: @unchecked Sendable {
             self.internalDate = internalDate
             self.received = received
             self.bodyText = bodyText
+            self.headers = headers
         }
     }
 
@@ -81,6 +87,7 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         var internalDate: Date? = nil
         var received: [String] = []
         var bodyText: String? = nil
+        var headers: [String: String] = [:]
     }
 
     /// Which injected failure (if any) `/messages/{id}/modify` must serve for
@@ -322,7 +329,8 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                         labels: $0.labels,
                         internalDate: $0.internalDate,
                         received: $0.received,
-                        bodyText: $0.bodyText
+                        bodyText: $0.bodyText,
+                        headers: $0.headers
                     ))
                 }
             ),
@@ -465,7 +473,8 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                 labels: seed.labels,
                 internalDate: seed.internalDate,
                 received: seed.received,
-                bodyText: seed.bodyText
+                bodyText: seed.bodyText,
+                headers: seed.headers
             )
             model.record(seed.providerMessageId, .messageAdded, labels: seed.labels)
         }
@@ -1553,10 +1562,14 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         var headers: [[String: String]] = message.received.map { ["name": "Received", "value": $0] }
         headers += [
             ["name": "Message-ID", "value": "<\(message.rfc822MessageId)>"],
-            ["name": "Subject", "value": "Stateful action message"],
-            ["name": "From", "value": "sender@example.com"],
-            ["name": "To", "value": "recipient@example.com"],
+            ["name": "Subject", "value": message.headers["Subject"] ?? "Stateful action message"],
+            ["name": "From", "value": message.headers["From"] ?? "sender@example.com"],
+            ["name": "To", "value": message.headers["To"] ?? "recipient@example.com"],
         ]
+        let defaulted: Set<String> = ["Subject", "From", "To"]
+        for name in message.headers.keys.sorted() where !defaulted.contains(name) {
+            headers.append(["name": name, "value": message.headers[name]!])
+        }
         // `format=metadata` + `metadataHeaders=…` returns ONLY the named headers.
         if !requestedHeaders.isEmpty {
             headers = headers.filter { requestedHeaders.contains($0["name"]!.lowercased()) }
