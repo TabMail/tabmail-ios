@@ -16,11 +16,15 @@ import GRDB
 //     server-confirmed deletion takes;
 //   - the provider's new opaque state, in the SAME transaction as the flag updates
 //     and removals, so a crash resumes from the last write.
-// It changes or removes only rows the device already holds. It never inserts: new
-// mail is the ordinary sync's job and older mail is the backfill's. When the
-// provider reports mail inside the folder's local range that no row holds (an old
-// message moved in), the same transaction re-arms the folder's backfill walk,
-// unless a storage limit is in force.
+//   - messages the provider fetched for ids the server lists in the folder that no
+//     row holds (the direct load): the backfill page walk's own insert tail
+//     (`insertFetchedBackfillMessages`), BEFORE the state is written.
+// *Superseded (2026-11-12, the direct load):* "It changes or removes only rows the
+// device already holds. It never inserts: new mail is the ordinary sync's job and
+// older mail is the backfill's. When the provider reports mail inside the folder's
+// local range that no row holds (an old message moved in), the same transaction
+// re-arms the folder's backfill walk, unless a storage limit is in force." The
+// catch-up never writes the walk's bookkeeping.
 // No provider is named here: the step does the same thing for every provider, and a
 // provider without catch-up returns nothing.
 
@@ -155,25 +159,28 @@ extension SyncEngine {
             folders: folders, localRows: SyncEngineCatchUpRowReader(pool: dbPool), context: context)
         let windowMode = provider.staleWindowMode
         for result in results {
-            await applyCatchUpResult(
-                result, windowMode: windowMode, storageLimitInForce: context.storageLimitInForce)
+            await applyCatchUpResult(result, windowMode: windowMode)
         }
     }
 
-    /// Apply one folder's catch-up result: ONE write transaction for the flag
-    /// updates, the removals and the new state. Nothing is ever inserted.
-    /// `storageLimitInForce` is the pass's snapshot (`CatchUpContext`).
+    /// Apply one folder's catch-up result: first the messages the provider loaded
+    /// (`result.loaded`), through the backfill page walk's insert tail; then ONE
+    /// write transaction for the flag updates, the removals and the new state.
+    /// The loads go first so the state that moves the listing past them is never
+    /// written without them: a crash in between lists them again, and the insert
+    /// skips what is already there.
     @discardableResult
-    func applyCatchUpResult(
-        _ result: CatchUpFolderResult, windowMode: StaleWindowMode, storageLimitInForce: Bool
-    ) async -> CatchUpApplyOutcome {
+    func applyCatchUpResult(_ result: CatchUpFolderResult, windowMode: StaleWindowMode) async -> CatchUpApplyOutcome {
         let folderId = result.folderId
+        if !result.loaded.isEmpty { await insertCatchUpLoads(result) }
+        if !result.loadFailures.isEmpty && DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): \(result.loadFailures.count) missing id(s) did not load: \(result.loadFailures.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: ", "))")
+        }
 
         let outcome: CatchUpApplyOutcome
         do {
             outcome = try await dbPool.write { db in
-                try Self.applyCatchUpTransaction(
-                    result, windowMode: windowMode, storageLimitInForce: storageLimitInForce, db: db)
+                try Self.applyCatchUpTransaction(result, windowMode: windowMode, db: db)
             }
         } catch {
             BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): apply failed: \(error)")
@@ -196,6 +203,22 @@ extension SyncEngine {
             break
         }
         return outcome
+    }
+
+    /// The direct load's insert: the loaded messages go into the folder through the
+    /// page walk's own insert tail, read with the folder as it is now. A folder
+    /// that is gone or quarantined gets nothing; its transaction below writes
+    /// nothing either, so the provider lists the same ids again later.
+    private func insertCatchUpLoads(_ result: CatchUpFolderResult) async {
+        let folderId = result.folderId
+        guard let folder = try? await dbPool.read({ db in try Folder.fetchOne(db, key: folderId) }),
+              folder.uidValidityResetPendingAt == nil else { return }
+        let headers = result.loaded.compactMap(\.header)
+        let bodies = Dictionary(
+            result.loaded.map { ($0.id, (htmlBody: $0.htmlBody, textBody: $0.textBody)) },
+            uniquingKeysWith: { first, _ in first })
+        let inserted = await insertFetchedBackfillMessages(headers, bodies: bodies, folder: folder)
+        BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): loaded \(headers.count) missing message(s), inserted \(inserted)")
     }
 
     /// A delta-cursor lapse, inside the caller's write transaction: the account's
@@ -230,7 +253,7 @@ extension SyncEngine {
     /// The transaction itself. Everything it decides on is read INSIDE it: the folder
     /// row (quarantine, epoch), the pending operations and the recent completions.
     nonisolated static func applyCatchUpTransaction(
-        _ result: CatchUpFolderResult, windowMode: StaleWindowMode, storageLimitInForce: Bool, db: Database
+        _ result: CatchUpFolderResult, windowMode: StaleWindowMode, db: Database
     ) throws -> CatchUpApplyOutcome {
         guard let folder = try Folder.fetchOne(db, key: result.folderId),
               folder.uidValidityResetPendingAt == nil else { return .skipped }
@@ -276,30 +299,15 @@ extension SyncEngine {
             folderRole: folder.role, ids: result.removedIds,
             recentlyCompleted: recentlyCompleted, db: db)
 
-        // Mail the server lists inside the folder's local range that no row holds:
-        // the existing, insert-only backfill walk loads it from the top. Only a
-        // COMPLETE walk is re-armed, as read in this transaction (`folder` above):
-        // restarting an unfinished walk would throw its position away, and a walk
-        // can complete or be reset between the provider's listing and this write.
-        // A declined re-arm loses nothing: the walk goes on and loads everything
-        // below its position, and the next check asks again for what is still
-        // missing. While a storage limit is in force (the pass's snapshot) nothing
-        // is re-armed: the limit means old mail is not kept, the storage prune
-        // deletes it oldest first, and a re-arm would load back exactly what the
-        // prune deleted, to be pruned again, every check (ADR-IOS-107 decision 8).
-        let rearm = result.rearmBackfill && folder.backfillComplete && !storageLimitInForce
+        // Mail the server lists that no row holds was loaded before this
+        // transaction (`insertCatchUpLoads`); the walk's bookkeeping is never
+        // written here. *Superseded (2026-11-12, the direct load):* the re-arm of
+        // a completed walk (`backfillComplete = 0, backfillPageToken = NULL,
+        // backfillPageHeldSince = NULL` with the state), declined for an
+        // unfinished walk and while a storage limit was in force.
         try db.execute(
             sql: "UPDATE folder SET catchUpState = ? WHERE id = ?",
             arguments: [result.newState, folder.id])
-        if rearm {
-            // Written with the state of the check that asked, so a crash cannot
-            // leave one without the other. The page hold time belongs to the token
-            // being cleared, so it is cleared in the same write, like every
-            // other write that moves or clears `backfillPageToken`.
-            try db.execute(
-                sql: "UPDATE folder SET backfillComplete = 0, backfillPageToken = NULL, backfillPageHeldSince = NULL WHERE id = ?",
-                arguments: [folder.id])
-        }
         return .applied(updatedFlags: updatedFlags, removedIds: removedIds)
     }
 }

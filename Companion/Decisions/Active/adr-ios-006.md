@@ -1,6 +1,11 @@
 
 ## ADR-IOS-006: Storage-Budget Retention with Progressive Crawling
 
+> **Current note (2026-11-12).** While a storage limit is in force, a Gmail catch-up listing goes no
+> lower than a folder's oldest local row, so the catch-up's direct load brings no pruned old mail
+> back; the re-arm (and its decline) is gone (ADR-IOS-107 decision 8, "the direct load"). The
+> 2026-11-11 note below is superseded and kept as written.
+>
 > **Current note (2026-11-11).** While a storage limit is in force (`StorageEstimator.budgetMB` finite;
 > the code's default is `Int.max`, unlimited), the full sync's catch-up re-arms no backfill walk and
 > lists no Gmail mail older than a folder's oldest local row, so mail the prune deleted is not loaded

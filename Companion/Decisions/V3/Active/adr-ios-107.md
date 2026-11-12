@@ -24,6 +24,11 @@ corrected).
 is dropped. A Gmail folder is listed in exactly three cases: its first listing, a listing in progress,
 and after a lapse. `SyncConfig.gmailCatchUpFullCheckIntervalSeconds` is deleted; the expensive-network
 wait stays; IMAP keeps its daily check).
+**Amended 2026-11-12: the direct load** (decisions 1, 3, 4 and 8, owner ruling: the Gmail catch-up
+loads a missing id itself, through the backfill page walk's own insert tail, bounded per pass, newest
+first; a membership page's token moves on only once its missing ids have loaded or been classified
+done; the backfill re-arm, its storage-limit decline and `CatchUpFolderResult.rearmBackfill` are
+removed; a missing id that keeps failing holds its range for at most the page walk's hold bound).
 
 **Context.** Every sync path windows its work, and changes to older mail fall outside every window:
 
@@ -73,6 +78,15 @@ The owner's rulings of 2026-11-09:
        cursor is valid it inserts such a message itself. The epoch listing still covers a move the
        delta never applied (a lapse, or a change whose GET failed, #464).
      - *Superseded (2026-11-10):* "No request names an id outside the range the device holds."
+     - *Amended 2026-11-12 (Gmail, the direct load):* the result carries `loaded` (the messages a
+       provider fetched, header and body, for ids the server lists in the folder that no local row
+       holds) and `loadFailures` (the ids that did not load, each with the page walk's own failure
+       class). The apply inserts `loaded` through the backfill page walk's insert tail
+       (`SyncEngine.insertFetchedBackfillMessages`, the one insert path both use). So the Gmail
+       catch-up does insert, but only what the server lists in the folder, only through the
+       backfill's insert path, and never above the newest local row. The sentences above that say
+       the result has no field for a message without a local row, and that the catch-up inserts
+       nothing, are superseded for Gmail; IMAP still returns no loads.
    - The do-nothing default returns `[]`. Gmail, Exchange and Demo use it until their own
      catch-up lands. (Gmail's landed with decision 8; Exchange and Demo still use the default.)
    - No cast, switch or knob names a provider above the boundary (ADR-IOS-060). The only generic
@@ -90,8 +104,19 @@ The owner's rulings of 2026-11-09:
    `SyncConfig.catchUpRequestTimeoutSeconds = 3`; a timeout or any failure ends that folder's work
    for the pass. **The added hold is typically about 2 s, and at most about 5 s** (the budget plus
    one request that started just inside it).
+   - *Amended 2026-11-12 (the direct load):* the Gmail catch-up's loads run in batches of
+     `BackfillProfile.normal.gmailBodyConcurrency` (10) concurrent `format=full` GETs, the width the
+     provider uses for every body fetch. The budget is checked before every request OR every batch,
+     and one batch is bounded as a whole by `catchUpRequestTimeoutSeconds`, so the added hold is
+     still at most the budget plus one timeout; the request count may pass the budget check by at
+     most one batch less one (the seeded direct-load property checks this).
 4. **The generic apply** (`SyncEngineCatchUp.swift`) uses the existing paths only.
-   1. Nothing is inserted (decision 1).
+   1. Nothing is inserted (decision 1). *Amended 2026-11-12 (the direct load):* except the result's
+      `loaded` messages, which go in first, through the backfill page walk's insert tail, read with
+      the folder as it is then (a folder that is gone or quarantined gets nothing). They go in BEFORE
+      the transaction below writes the new state, so a crash in between lists them again rather than
+      losing them, and the insert skips what is already there. The transaction itself still inserts
+      nothing and never writes the walk's bookkeeping.
    2. ONE write transaction re-reads the folder (it must exist and not be quarantined) and
       applies the epoch gate: the result's epoch must equal the folder's stored known epoch.
       - If both are known and they differ, it writes nothing and fires the turnover reaction, exactly
@@ -286,7 +311,14 @@ The owner's rulings of 2026-11-09:
      `after:` bound is never below 0. The flag lists still start at the range's first local row, and
      no list reaches above the newest local row." Within that superseded text, *superseded
      (2026-11-10):* "so no request reaches outside the local range."
-   - **No old mail is loaded back under a storage limit** (amendment 2026-11-11). When the step
+   - **No old mail is loaded back under a storage limit** (amended 2026-11-12, the direct load:
+     what holds now is that a new Gmail listing under a storage limit lists nothing older than the
+     folder's oldest local row, so the direct load loads nothing older back. The re-arm and its
+     decline are gone. A message the server lists BETWEEN kept rows is loaded like any missing id:
+     the prune deletes oldest first by `date`, so such an id is rare (a row whose `providerDate` and
+     `date` order differently) and costs one load until the next prune. Test:
+     `GmailCatchUpTests.storageLimitLoadsNothingBelowTheOldestKeptRow`, which replaces
+     `storageLimitStopsTheReload`.) Its text as of 2026-11-11 follows. When the step
      starts, `runCatchUp` snapshots whether the user's Email Index Limit is finite
      (`StorageEstimator.budgetMB != Int.max`) into `CatchUpContext.storageLimitInForce`; nothing
      reads the limit again during the step (root rule: snapshot settings at operation start). While
@@ -351,10 +383,53 @@ The owner's rulings of 2026-11-09:
    - **Candidates carried across passes.** A range's candidates are saved in the state
      (`listing.pendingCandidates`) and verified before the next range, so a range whose GETs run past
      the budget is never listed again for them (liveness on a slow link).
-   - **Never inserts; placeholders.** Results carry no new rows. A synthetic placeholder id
+   - **Never inserts; placeholders.** *Superseded (2026-11-12, the direct load):* "Results carry no
+     new rows." Results carry the loaded missing messages (next bullet). A synthetic placeholder id
      (`isSyntheticPlaceholderId`) is never named in a request, never removed, and never counted as
      missing. Results carry `epoch: nil`; Gmail folders have no known epoch, so the gate passes and the
      `.date` window mode applies.
+   - **Missing mail is loaded by the check: the direct load** (owner ruling 2026-11-12). An id a
+     membership page names that no local row in the folder holds (mail moved in, mail older than
+     every local row in an epoch listing, or new mail beyond the sync window after a lapse) is
+     missing. Before that page's token moves on, `GmailProvider.loadMissing` fetches the page's
+     missing ids, newest first (the list's own order), through the backfill's own fetch
+     (`fetchBackfillBatch`: header and body in one `format=full` GET), in batches (decision 3).
+     - **A range moves on only once its missing ids are done.** A page's token is saved only after
+       every missing id on it has loaded or been classified done. If the budget runs out part way,
+       the range keeps the page's token as it was and the next pass lists the same page again, where
+       what loaded is no longer missing. No id list is kept in the state.
+     - **Classification** (the page walk's own rule, `SyncEngine.backfillFetchFailureKind`). Gone or
+       about the message (404/410, any other 4xx except 401/403/429, a `DecodingError`, an answer
+       with no header) counts as done at once. Transient (5xx, 429, 403, a connection error, no
+       answer within the timeout) holds the range.
+     - **The unloadable-id bound.** A held range is held for at most `SyncConfig.backfillPageHoldMinutes`
+       (60) wall-clock from its FIRST hold (`RangeScan.loadHeldSince`, on the page walk's hold clock
+       `SyncEngine.backfillPageHoldNow`, decided by `SyncEngine.decideBackfillPage`); past that, the
+       id counts as done, like a per-message failure, and the range moves on. The first-hold time is
+       an additive optional field in the `catchUpState` JSON (no migration) and goes with the range
+       when the range moves on. No new constant. An id counted done is tried again at the next
+       listing (after the next lapse).
+     - **The insert** is the page walk's insert tail, extracted test-first into one helper
+       (`SyncEngine.insertFetchedBackfillMessages`, called by the walk and by the apply): the batch
+       insert (which skips an id protected by a pending destructive op), the search index, FTS
+       bodies, snippets and `bodyComplete` for confirmed bodies, and the `BackfillBodyQueue`
+       enqueue. A missing id refused by the insert (a queued op) is loaded at a later listing.
+     - **The walk is never touched.** The check writes none of the walk's bookkeeping
+       (`backfillComplete`, `backfillPageToken`, `backfillPageHeldSince`, `backfillVersion`),
+       whatever the walk's state; an unfinished walk goes on from its page. `walkColumnWritesAreNamedSites`
+       lists one site fewer (the re-arm in `SyncEngineCatchUp.swift`).
+     - **Why** (owner 2026-11-12). After a lapse, new Inbox mail beyond the full sync's window had no
+       row: the re-arm was declined for an unfinished walk and under a storage limit, and an
+       accepted re-arm restarted a walk that lists from the top down, so new mail below the window
+       waited for a whole re-walk. Tests: `GmailCatchUpTests.lapseLoadsNewMailBeyondTheWindow`
+       (walk complete, unfinished, storage limit), `directLoadResumesAcrossPasses`,
+       `goneMissingIdNeverWedgesARange`, `failingMissingIdHoldsTheRangeUntilTheBound`,
+       `seededDirectLoadProperty` (replacing `seededRearmProperty`).
+   - *Superseded (2026-11-12, the direct load): the re-arm.* The bullets below ("Moved-in mail
+     re-arms the backfill", "Only a completed walk is re-armed") describe the re-arm as it was.
+     What still holds from them: what leaves an id missing, and that each listing is a fresh
+     chance to load. Removed: `CatchUpFolderResult.rearmBackfill`, `Listing.foundMissing`, the
+     re-arm write and the `storageLimitInForce` decline in `applyCatchUpTransaction`.
    - **Moved-in mail re-arms the backfill** (amended 2026-11-11: the re-arm record is removed). When
      a check's listing completes, the server ids it listed that no local row in the folder holds (an
      old message moved or archived into the folder) are missing.
@@ -453,7 +528,10 @@ The owner's rulings of 2026-11-09:
      check interval after the walk completes. The backfill-version compare-and-set below is
      unchanged: two walks are not serialized, so a second walk can complete a folder and a re-arm
      land while the first walk's iteration is in flight.
-   - **The backfill walk never overwrites a re-arm** (amendment 2026-11-11). The re-arm can land
+   - **The backfill walk never overwrites a re-arm** (amendment 2026-11-11). *Note (2026-11-12, the
+     direct load):* there is no re-arm any more; the compare-and-set on `Folder.backfillVersion` is
+     kept, because it still keeps a walk iteration from overwriting a reset or a second walk's
+     write made while its page was in flight. The re-arm can land
      while a page-token walk iteration (Gmail and Exchange, `SyncEngine.runBackfill`) is waiting on
      its page; no serial gate covers both (`oneSyncAtATime` serializes the sync passes, and the walk
      does not take it). Since only a completed walk is re-armed, that takes a second walk (the

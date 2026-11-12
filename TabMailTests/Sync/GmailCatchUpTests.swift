@@ -21,7 +21,7 @@ private let labelPath = "Label_7"
 /// `SyncEngine.runCatchUp`, or runs the whole foreground poll
 /// (`SyncEngine.sync(account:)`: delta, due full sync, cursor capture), then asserts
 /// what the user would see: the local rows' read/starred state, which rows exist,
-/// and whether the folder's backfill was re-armed. The wire is asserted only where
+/// and which missing messages the check loaded. The wire is asserted only where
 /// the invariant IS about the wire (bounds, budget, no request when nothing is due).
 ///
 /// `.serialized, .processGlobalState`: every case swaps `AppDatabase.shared`, and
@@ -72,8 +72,8 @@ struct GmailCatchUpTests {
     /// provider adds All Mail).
     private static let syncFolders: [(path: String, role: FolderRole)] = [(inboxPath, .inbox), (allMailPath, .archive)]
 
-    /// One prepared world. Every folder starts with its backfill complete, so a
-    /// re-arm is observable and no background walk runs unless one is re-armed.
+    /// One prepared world. Every folder starts with its backfill complete, so no
+    /// background walk runs unless a test starts one.
     private static func withWorld(
         _ name: String,
         seeds: [StatefulGmailActionServer.Seed],
@@ -391,9 +391,9 @@ struct GmailCatchUpTests {
 
     /// A folder whose walk is complete is listed down to the epoch: its oldest
     /// range (listed last, newest first) starts at 0, so a message older than
-    /// every local row (moved in from another device) is missing, re-arms the
-    /// walk, and loads. Nothing newer than the newest local row is listed.
-    @Test("A completed folder is listed down to the epoch: mail older than every local row re-arms the walk and loads; placeholder ids are never named",
+    /// every local row (moved in from another device) is missing and the check
+    /// loads it. Nothing newer than the newest local row is listed.
+    @Test("A completed folder is listed down to the epoch: the check loads mail older than every local row; placeholder ids are never named",
           .enabled(if: !NetworkMonitor.checkExpensive()))
     func completedFolderIsListedFromTheEpoch() async throws {
         let clock = Clock()
@@ -419,12 +419,10 @@ struct GmailCatchUpTests {
             #expect(!world.server.messageGets().contains("sent-local-1"), "a placeholder id is never named")
             let inbox = try Self.rows(world, inboxPath)
             #expect(inbox["sent-local-1"] != nil, "a placeholder row is never removed")
-            #expect(Set(inbox.keys) == ["oldest", "sent-local-1", "newest"], "the check itself inserts nothing")
+            #expect(Set(inbox.keys) == ["oldest", "sent-local-1", "newest", "ancient"],
+                    "the check loads the message older than every local row, and nothing newer than the newest")
             let folder = try Self.folder(world, inboxPath)
-            #expect(!folder.backfillComplete && folder.backfillPageToken == nil, "the walk is re-armed")
-
-            try await Self.backfillUntilComplete(world)
-            #expect(try Self.rows(world, inboxPath)["ancient"] != nil, "the re-armed walk loads the message")
+            #expect(folder.backfillComplete && folder.backfillPageToken == nil, "the walk is left as it was")
         }
     }
 
@@ -1096,7 +1094,7 @@ struct GmailCatchUpTests {
         }
         let now = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded(.down))
         let running = GmailCatchUpState(
-            lastCompletedAt: now.addingTimeInterval(-60), listing: .init(nextBeforeSecond: 42, toEpoch: true, foundMissing: true),
+            lastCompletedAt: now.addingTimeInterval(-60), listing: .init(nextBeforeSecond: 42, toEpoch: true, pendingCandidates: ["c1"]),
             createdAt: now.addingTimeInterval(-600), lastAttemptAt: now.addingTimeInterval(-30))
         let runningJSON = try #require(running.encoded())
         let states: [String: String?] = [
@@ -1212,7 +1210,7 @@ struct GmailCatchUpTests {
         #expect(!gmail.contains("StorageEstimator"), "the storage limit comes only from the CatchUpContext snapshot")
         let engine = try source("TabMail/Services/Sync/SyncEngineCatchUp.swift")
         #expect(engine.components(separatedBy: "StorageEstimator").count == 2,
-                "the engine reads the storage limit once, in runCatchUp's snapshot; the apply takes it from there")
+                "the engine reads the storage limit once, in runCatchUp's snapshot")
         #expect(!gmail.contains("UserDefaults"), "no setting is read mid-pass: what the pass needs comes from the CatchUpContext snapshot")
     }
 
@@ -1220,17 +1218,17 @@ struct GmailCatchUpTests {
     /// `backfillPageToken`, are written by NAME (a GRDB column assignment or a
     /// SQL or Swift assignment of a literal) outside the walk's own
     /// compare-and-set (`advanceBackfillPageWalk`) only at the sites named here:
-    /// the catch-up re-arm of a completed walk, the IMAP walk's completions, user
-    /// and maintenance resets, and migrations. None of them is a periodic check
-    /// that could restart an unfinished walk, so between two re-arms a walk
-    /// always completes. A new writer of that shape is added here with its
+    /// the IMAP walk's completions, user and maintenance resets, and migrations.
+    /// The catch-up writes none (2026-11-12: it loads missing mail itself; its
+    /// re-arm is gone). None of them is a periodic check that could restart an
+    /// unfinished walk. A new writer of that shape is added here with its
     /// reason, or the fence fails. This is a lexical census and cannot see a
     /// whole-record write (`record.update(db)`), which writes both columns with
     /// whatever the record holds: `SyncEngine.fullSync`'s folder upsert and the
     /// `AccountManagerUidValidityReset` writes are such writers, each of a row it
     /// read in the same transaction (ADR-IOS-107's writer list). The property
-    /// itself is proven by the seeded property tests and the walk and re-arm
-    /// tests; this fence only supplements them.
+    /// itself is proven by the seeded property tests and the walk tests; this
+    /// fence only supplements them.
     @Test("Every write of the walk's columns outside the walk's compare-and-set is a named site")
     func walkColumnWritesAreNamedSites() throws {
         let named: [String: (lines: Int, site: String)] = [
@@ -1241,7 +1239,6 @@ struct GmailCatchUpTests {
             "TabMail/Services/Sync/SyncEngineBackfill.swift": (2, "the fast-sync reset"),
             "TabMail/Services/Sync/SyncEngineBackfillWalk.swift": (
                 3, "the IMAP walk's completions (2); the walk's refused-token restart (compare-and-set on the saved token) (1)"),
-            "TabMail/Services/Sync/SyncEngineCatchUp.swift": (1, "the catch-up re-arm of a completed walk"),
             "TabMail/Views/Settings/SettingsView.swift": (2, "the Settings reset"),
             "TabMail/Views/Settings/AccountDetailView.swift": (1, "the account's re-sync reset"),
         ]
@@ -1353,7 +1350,7 @@ struct GmailCatchUpTests {
         }
     }
 
-    // MARK: - Seeded re-arm property
+    // MARK: - Seeded direct-load property
 
     /// Runs a backfill walk one iteration at a time: between steps the walk waits
     /// in its next page request, held at the fake server, so a check or another
@@ -1416,7 +1413,7 @@ struct GmailCatchUpTests {
         }
     }
 
-    /// One random step of the re-arm property.
+    /// One random step of the direct-load property.
     private enum RearmStep: CaseIterable {
         case moveIn, moveOut, delete, trash, queueOp, removeOp, failGet, healGets
         case walk, check, deltaInsert, lapse, newEngine, settingsReset, otherWalkCompletes
@@ -1437,8 +1434,8 @@ struct GmailCatchUpTests {
     private static let rearmPropertyMinCheckBudget = 4
     private static let rearmPropertyCheckBudgetSpread = 120
     private static let rearmPropertyMaxCheckPasses = 5
-    /// Rounds at rest: a missing id needs at most one check to re-arm a completed
-    /// walk, one walk, and one more of each after a walk it overtook.
+    /// Rounds at rest: a missing id loads at the first check that lists its
+    /// range; a walk reset by a random step completes in the first round.
     private static let rearmPropertyRestRounds = 4
 
     /// Random server changes, queued and removed actions, failing and healing
@@ -1446,21 +1443,21 @@ struct GmailCatchUpTests {
     /// later steps run), budgeted checks over a clock that moves 0 to 2 days per
     /// check, delta-style inserts, lapses, a new `SyncEngine` on the same
     /// database, the Settings reset, and a second walk completing a folder. After
-    /// every step:
-    /// - P3: a check never changes the walk position or completion of a folder
-    ///   whose walk was unfinished before it.
-    /// - P4: a re-arm made while an iteration was held leaves the folder
-    ///   unfinished at the top once the iteration is released.
-    /// - P2: every re-arm comes with a completed check; re-arms never outnumber
-    ///   completed checks.
+    /// every check:
+    /// - P3: the check never writes the walk's bookkeeping (completion, page
+    ///   token, page hold time, row version), whatever the walk's state.
+    /// - P2: the check's requests stay within its budget plus one batch of
+    ///   concurrent loads (the budget is checked before each batch).
     /// Then, with the server and the faults at rest, `rearmPropertyRestRounds`
     /// rounds of "lapse, check to completion, walk to completion":
     /// - P1: every id the folder's walk lists, dated up to the newest local row
-    ///   and protected by no queued action, has a row.
-    @Test("Seeded: re-arms stay bounded, never move an unfinished walk, are never lost, and every loadable missing id loads",
+    ///   and protected by no queued action, has a row: no loadable missing id
+    ///   is lost. (Replaces the re-arm property of 2026-11-11: re-arms bounded,
+    ///   never moving an unfinished walk, never lost.)
+    @Test("Seeded: the direct load stays bounded, never writes the walk's bookkeeping, and every loadable missing id loads",
           .enabled(if: !NetworkMonitor.checkExpensive()),
           arguments: Array(UInt64(1)...UInt64(24)))
-    func seededRearmProperty(seed: UInt64) async throws {
+    func seededDirectLoadProperty(seed: UInt64) async throws {
         var rng = SplitMix64(seed: seed)
         let clock = Clock()
         let paths = [inboxPath, labelPath]
@@ -1486,10 +1483,7 @@ struct GmailCatchUpTests {
             var engine = world.engine
             let stepper = WalkStepper(server: world.server)
             var now = clock.now
-            var rearms: [String: Int] = [:]
-            var completedChecks: [String: Int] = [:]
-            // Folders re-armed while a walk iteration was held; the next step releases it.
-            var rearmedWhileHeld: Set<String> = []
+            let batch = BackfillProfile.normal.gmailBodyConcurrency
 
             func folderRows() throws -> [String: Folder] {
                 Dictionary(uniqueKeysWithValues: try paths.map { ($0, try Self.folder(world, $0)) })
@@ -1506,7 +1500,7 @@ struct GmailCatchUpTests {
 
             do {
                 for stepIndex in 0..<Self.rearmPropertySteps {
-                    let kind = rearmedWhileHeld.isEmpty ? RearmStep.pick(&rng) : .walk
+                    let kind = RearmStep.pick(&rng)
                     let id = ids[rng.pick(ids.count)]
                     let path = paths[rng.pick(paths.count)]
                     let label = "seed \(seed) step \(stepIndex) \(kind)"
@@ -1540,9 +1534,12 @@ struct GmailCatchUpTests {
                         // on its first listing, a listing in progress, or after a lapse.
                         now = now.addingTimeInterval(TimeInterval(rng.pick(Int(2 * SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds) + 1)))
                         let budget = Self.rearmPropertyMinCheckBudget + rng.pick(Self.rearmPropertyCheckBudgetSpread)
+                        let requestsBefore = world.server.http.recordedCalls().count
                         await engine.runCatchUp(
                             provider: world.provider, folderIds: paths.map(world.folderId),
                             context: Self.requestBudget(world.server, budget, at: now))
+                        let spent = world.server.http.recordedCalls().count - requestsBefore
+                        #expect(spent <= budget + batch - 1, "\(label): \(spent) requests on a budget of \(budget)")
                         now = now.addingTimeInterval(TimeInterval(budget + 1))
                     case .deltaInsert:
                         // A row for a message the server has in the folder, as a delta inserts it.
@@ -1577,32 +1574,13 @@ struct GmailCatchUpTests {
                     }
 
                     let after = try folderRows()
-                    let releasedHeld = kind == .walk ? rearmedWhileHeld : []
-                    rearmedWhileHeld = []
+                    guard kind == .check else { continue }
                     for path in paths {
                         guard let old = before[path], let new = after[path] else { continue }
-                        let oldState = GmailCatchUpState.decode(old.catchUpState)
-                        let newState = GmailCatchUpState.decode(new.catchUpState)
-                        let rearmed = kind == .check && old.backfillComplete && !new.backfillComplete
-                        if releasedHeld.contains(path) {
-                            #expect(!new.backfillComplete && new.backfillPageToken == nil,
-                                    "\(label) \(path): the released iteration overwrote a re-arm made while it was held")
-                        }
-                        guard kind == .check else { continue }
-                        if !old.backfillComplete {
-                            #expect(!new.backfillComplete && new.backfillPageToken == old.backfillPageToken,
-                                    "\(label) \(path): a check moved an unfinished walk from \(old.backfillPageToken ?? "the top")")
-                        }
-                        let completed = newState?.lastCompletedAt != nil && newState?.lastCompletedAt != oldState?.lastCompletedAt
-                        if completed { completedChecks[path, default: 0] += 1 }
-                        guard rearmed else { continue }
-                        rearms[path, default: 0] += 1
-                        #expect(completed && new.backfillPageToken == nil, "\(label) \(path): a re-arm without a completed check")
-                        if stepper.isParked { rearmedWhileHeld.insert(path) }
-                    }
-                    for path in paths {
-                        #expect(rearms[path, default: 0] <= completedChecks[path, default: 0],
-                                "\(label) \(path): \(rearms[path, default: 0]) re-arms, \(completedChecks[path, default: 0]) completed checks")
+                        #expect(new.backfillComplete == old.backfillComplete && new.backfillPageToken == old.backfillPageToken
+                                    && new.backfillPageHeldSince == old.backfillPageHeldSince
+                                    && new.backfillVersion == old.backfillVersion,
+                                "\(label) \(path): a check wrote the walk's bookkeeping")
                     }
                 }
 
@@ -1646,11 +1624,11 @@ struct GmailCatchUpTests {
         }
     }
 
-    // MARK: - Moved-in mail re-arms the backfill
+    // MARK: - Moved-in mail is loaded by the check
 
-    @Test("An old message moved from Inbox to a label is loaded into the label by the re-armed backfill",
+    @Test("An old message moved from Inbox to a label is loaded into the label by the check",
           .enabled(if: !NetworkMonitor.checkExpensive()))
-    func moveToLabelRearmsBackfill() async throws {
+    func moveToLabelIsLoadedByTheCheck() async throws {
         let clock = Clock()
         let seeds = [
             Self.seed("l1", clock.daysAgo(30), [labelPath]),
@@ -1665,18 +1643,15 @@ struct GmailCatchUpTests {
         try await Self.withWorld("gcu-move-label", seeds: seeds, local: local) { world async throws in
             await Self.pass(world)
             #expect(try Self.rows(world, inboxPath)["m"] == nil, "precondition: the move left the Inbox")
-            #expect(try !Self.folder(world, labelPath).backfillComplete, "the label's backfill is re-armed")
-            #expect(try Self.rows(world, labelPath)["m"] == nil, "the catch-up itself never inserts")
-
-            try await Self.backfillUntilComplete(world)
-            #expect(try Self.rows(world, labelPath)["m"] != nil, "the backfill loads the moved message into the label")
+            #expect(try Self.rows(world, labelPath)["m"] != nil, "the check loads the moved message into the label")
+            #expect(try Self.folder(world, labelPath).backfillComplete, "the label's walk is left as it was")
         }
     }
 
     /// A server id the membership list names in a range whose local rows do not
     /// hold it can still be in the folder locally, under a stored date in another
     /// range (its local date differs from Gmail's). It is not missing: the
-    /// folder's own lookup finds it, so nothing is recorded and nothing re-arms.
+    /// folder's own lookup finds it, so nothing is loaded.
     @Test("A listed id held locally in the folder under a date in another range is not missing",
           .enabled(if: !NetworkMonitor.checkExpensive()))
     func idHeldUnderAnotherRangeIsNotMissing() async throws {
@@ -1702,14 +1677,14 @@ struct GmailCatchUpTests {
                 passes += 1
             } while try Self.state(world, labelPath)?.lastCompletedAt == nil && passes < 4
             #expect(try Self.state(world, labelPath)?.lastCompletedAt != nil, "precondition: the check completed")
-            #expect(try Self.folder(world, labelPath).backfillComplete, "nothing re-armed the backfill")
+            #expect(world.server.fullMessageGets().isEmpty, "nothing is loaded")
             #expect(try Self.rows(world, labelPath)["h"] != nil, "the row stays")
         }
     }
 
-    @Test("An old message archived from Inbox is loaded into All Mail by the re-armed backfill",
+    @Test("An old message archived from Inbox is loaded into All Mail by the check",
           .enabled(if: !NetworkMonitor.checkExpensive()))
-    func archiveRearmsAllMailBackfill() async throws {
+    func archiveIsLoadedIntoAllMail() async throws {
         let clock = Clock()
         let seeds = [
             Self.seed("a1", clock.daysAgo(30), []),
@@ -1724,19 +1699,18 @@ struct GmailCatchUpTests {
         try await Self.withWorld("gcu-archive", seeds: seeds, local: local) { world async throws in
             await Self.pass(world)
             #expect(try Self.rows(world, inboxPath)["m"] == nil, "precondition: the archive left the Inbox")
-            #expect(try !Self.folder(world, allMailPath).backfillComplete, "All Mail's backfill is re-armed")
-
-            try await Self.backfillUntilComplete(world)
-            #expect(try Self.rows(world, allMailPath)["m"] != nil, "the backfill loads the archived message into All Mail")
+            #expect(try Self.rows(world, allMailPath)["m"] != nil, "the check loads the archived message into All Mail")
+            #expect(try Self.folder(world, allMailPath).backfillComplete, "All Mail's walk is left as it was")
         }
     }
 
-    /// A re-arm moves the walk back to the top, so the time the old page was
-    /// first held goes with its token: a page the re-armed walk holds later
-    /// starts its own hold bound instead of inheriting the old one.
-    @Test("A re-arm clears the page hold time together with the page token",
+    /// The check never writes the walk's bookkeeping: a walk held at a page keeps
+    /// its page token and the time that page was first held, while the check
+    /// loads the missing message itself. (Replaces "a re-arm clears the page hold
+    /// time together with the page token", 2026-11-11: there is no re-arm.)
+    @Test("A check loads a missing message and leaves the walk's page token and page hold time as they were",
           .enabled(if: !NetworkMonitor.checkExpensive()))
-    func rearmClearsThePageHoldTime() async throws {
+    func checkKeepsThePageHoldTime() async throws {
         let clock = Clock()
         let seeds = [
             Self.seed("l1", clock.daysAgo(30), [labelPath]),
@@ -1747,31 +1721,33 @@ struct GmailCatchUpTests {
             Local(id: "l1", path: labelPath, date: clock.daysAgo(30)),
             Local(id: "l3", path: labelPath, date: clock.daysAgo(40)),
         ]
-        try await Self.withWorld("gcu-rearm-clears-hold", seeds: seeds, local: local) { world async throws in
+        try await Self.withWorld("gcu-check-keeps-hold", seeds: seeds, local: local) { world async throws in
             let folderId = world.folderId(labelPath)
             let heldSince = clock.hoursAgo(2)
             try await world.pool.write { db in
                 try db.execute(
-                    sql: "UPDATE folder SET backfillPageHeldSince = ? WHERE id = ?", arguments: [heldSince, folderId])
+                    sql: "UPDATE folder SET backfillComplete = 0, backfillPageToken = '1', backfillPageHeldSince = ? WHERE id = ?",
+                    arguments: [heldSince, folderId])
             }
-            #expect(try Self.folder(world, labelPath).backfillPageHeldSince != nil, "precondition: a hold time is stored")
+            let before = try Self.folder(world, labelPath)
 
             await Self.pass(world, [labelPath])
-            let folder = try Self.folder(world, labelPath)
-            #expect(!folder.backfillComplete, "precondition: the check re-armed the walk for m")
-            #expect(folder.backfillPageToken == nil, "the walk restarts at the top")
-            #expect(folder.backfillPageHeldSince == nil, "the hold time of the cleared token is cleared with it")
+            let after = try Self.folder(world, labelPath)
+            #expect(try Self.rows(world, labelPath)["m"] != nil, "the check loads m")
+            #expect(!after.backfillComplete && after.backfillPageToken == "1", "the walk stays where it was")
+            #expect(after.backfillPageHeldSince == before.backfillPageHeldSince, "the page hold time is kept")
+            #expect(after.backfillVersion == before.backfillVersion, "the walk's bookkeeping was not written")
         }
     }
 
     /// A message in a label that is also in Trash (or Spam) is not in the label's
     /// walk: Gmail leaves Spam and Trash mail out of a list that does not ask for
     /// it. The label's check lists what its walk lists, so such a message is not
-    /// missing there and re-arms nothing. The Trash folder's own list still asks
-    /// for Trash mail, so its row stays.
-    @Test("A message in a label that is also in Trash re-arms nothing; the Trash folder still lists it",
+    /// missing there and is not loaded into it. The Trash folder's own list still
+    /// asks for Trash mail, so its row stays.
+    @Test("A message in a label that is also in Trash is not loaded into the label; the Trash folder still lists it",
           .enabled(if: !NetworkMonitor.checkExpensive()))
-    func labelledTrashMailRearmsNothing() async throws {
+    func labelledTrashMailIsNotLoadedIntoTheLabel() async throws {
         let clock = Clock()
         let trashPath = "TRASH"
         let seeds = [
@@ -1789,11 +1765,11 @@ struct GmailCatchUpTests {
             await Self.pass(world, [labelPath, trashPath])
 
             #expect(try Self.state(world, labelPath)?.lastCompletedAt != nil, "precondition: the label's check completed")
-            #expect(try Self.folder(world, labelPath).backfillComplete, "nothing re-armed the label's walk")
+            #expect(try Self.rows(world, labelPath)["t"] == nil, "the Trash message is not loaded into the label")
 
             #expect(try Self.state(world, trashPath)?.lastCompletedAt != nil, "precondition: the Trash folder's check completed")
             #expect(try Self.rows(world, trashPath)["t"] != nil, "the Trash row stays")
-            #expect(try Self.folder(world, trashPath).backfillComplete, "nothing re-armed the Trash folder's walk")
+            #expect(world.server.fullMessageGets().isEmpty, "nothing is loaded")
 
             let membership = world.server.listRequests().filter {
                 !$0.query.contains("is:unread") && !$0.query.contains("is:starred")
@@ -1807,8 +1783,8 @@ struct GmailCatchUpTests {
     }
 
     /// Checks an expensive-network wait and an hour apart. Each check is started
-    /// by a lapse; the spacing keeps every check past the previous one's page
-    /// hold bound.
+    /// by a lapse; the spacing keeps every check past the previous one's hold
+    /// bound.
     private static let checkSpacing = SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds + 3_600
 
     /// The clock of check `check`.
@@ -1817,31 +1793,25 @@ struct GmailCatchUpTests {
     }
 
     /// One check of the label, started by a lapse (a Gmail folder has no
-    /// periodic check), with an unlimited budget; when it re-armed the
-    /// walk, the walk runs to completion. True when it re-armed. With
-    /// `pastPageHolds`, the walk's first call runs at the check's time on the
-    /// page hold clock (`SyncEngine.backfillPageHoldNowForTesting`) and the rest
-    /// past the hold bound, as the next check later would: a page held by a failing
-    /// fetch is passed over instead of holding the walk. The caller resets the
-    /// hold clock.
+    /// periodic check), with an unlimited budget, run until its listing
+    /// completes. With `pastLoadHolds`, the check's first pass runs at its time on
+    /// the hold clock (`SyncEngine.backfillPageHoldNowForTesting`) and a second
+    /// pass past the hold bound, so a missing id whose load keeps failing with a
+    /// `hold` failure is passed over. The caller resets the hold clock.
     private static func labelCheckAfterLapse(
-        _ world: World, _ clock: Clock, _ check: Int, pastPageHolds: Bool = false
-    ) async throws -> Bool {
+        _ world: World, _ clock: Clock, _ check: Int, pastLoadHolds: Bool = false
+    ) async throws {
         try await lapse(world)
         let at = checkDay(clock, check)
         let completedBefore = try state(world, labelPath)?.lastCompletedAt
+        if pastLoadHolds { SyncEngine.backfillPageHoldNowForTesting.withLock { $0 = at } }
         await pass(world, [labelPath], context: unlimited(at: { at }))
-        #expect(try state(world, labelPath)?.lastCompletedAt != completedBefore, "precondition: check \(check) completed")
-        guard try !folder(world, labelPath).backfillComplete else { return false }
-        if pastPageHolds {
-            let accountId = world.accountId
-            let account = try #require(try await world.pool.read { db in try Account.fetchOne(db, key: accountId) })
-            SyncEngine.backfillPageHoldNowForTesting.withLock { $0 = at }
-            _ = await world.engine.runBackfill(account: account)
+        if pastLoadHolds, try state(world, labelPath)?.lastCompletedAt == completedBefore {
+            #expect(try state(world, labelPath)?.listing?.range?.loadHeldSince == at, "precondition: the range is held")
             SyncEngine.backfillPageHoldNowForTesting.withLock { $0 = at.addingTimeInterval(SyncConfig.backfillPageHoldSeconds + 1) }
+            await pass(world, [labelPath], context: unlimited(at: { at }))
         }
-        try await backfillUntilComplete(world)
-        return true
+        #expect(try state(world, labelPath)?.lastCompletedAt != completedBefore, "precondition: check \(check) completed")
     }
 
     /// What keeps a moved-in message from loading for a while.
@@ -1852,21 +1822,21 @@ struct GmailCatchUpTests {
         case failingGet
     }
 
-    /// A missing id the backfill cannot load re-arms the backfill once per
-    /// check, never more; the walk still loads everything else, and a message moved in later
-    /// loads at the next check. Once the cause passes (the queued archive is
-    /// removed, the GET answers again) the id loads at the next check.
-    @Test("A missing id the backfill cannot load re-arms once per check; a message moved in later loads; once it can load it loads at the next check",
+    /// A missing id the check cannot load never stops the rest: the check loads
+    /// everything else and completes (a queued destructive op keeps the insert
+    /// from writing it; a `503` holds the range only until the hold bound). A
+    /// message moved in later loads at the next check, and once the cause passes
+    /// the id loads at the next check. (Replaces "re-arms once per check",
+    /// 2026-11-11: there is no re-arm.)
+    @Test("A missing id the check cannot load never stops the rest; a message moved in later loads; once it can load it loads at the next check",
           .enabled(if: !NetworkMonitor.checkExpensive()),
           arguments: LoadBlock.allCases)
-    func unloadableMissingIdRearmsOncePerCheck(block: LoadBlock) async throws {
+    func unloadableMissingIdNeverStopsTheRest(block: LoadBlock) async throws {
         let clock = Clock()
         let seeds = [
             Self.seed("l1", clock.daysAgo(30), [labelPath]),
             Self.seed("m", clock.daysAgo(35), [labelPath]),
             Self.seed("n", clock.daysAgo(36), [inboxPath]),
-            // Loads with m's first re-arm, so that walk's page loads something
-            // even when m's GET fails.
             Self.seed("k", clock.daysAgo(37), [labelPath]),
             Self.seed("l3", clock.daysAgo(40), [labelPath]),
         ]
@@ -1880,25 +1850,19 @@ struct GmailCatchUpTests {
             case .failingGet: world.server.injectGetFailure(providerMessageId: "m", .status(503))
             }
             defer { SyncEngine.backfillPageHoldNowForTesting.withLock { $0 = nil } }
-            var rearmChecks: [Int] = []
-            func check(_ check: Int) async throws {
-                if try await Self.labelCheckAfterLapse(world, clock, check, pastPageHolds: block == .failingGet) {
-                    rearmChecks.append(check)
-                }
-            }
+            let pastLoadHolds = block == .failingGet
 
-            for index in 0..<2 { try await check(index) }
-            #expect(rearmChecks == [0, 1], "an id the backfill cannot load re-armed it at checks \(rearmChecks) of 2 checks")
-            #expect(try Self.rows(world, labelPath)["m"] == nil, "precondition: the backfill could not load it")
-            #expect(try Self.rows(world, labelPath)["k"] != nil, "precondition: the walk loaded the rest")
+            try await Self.labelCheckAfterLapse(world, clock, 0, pastLoadHolds: pastLoadHolds)
+            #expect(try Self.rows(world, labelPath)["m"] == nil, "precondition: m could not load")
+            #expect(try Self.rows(world, labelPath)["k"] != nil, "the check loaded the rest")
             if block == .failingGet {
-                #expect(world.server.getFailuresServedCount(providerMessageId: "m") >= 1, "precondition: m's GET was answered 503")
+                #expect(world.server.getFailuresServedCount(providerMessageId: "m") >= 2, "precondition: m's GET was answered 503")
             }
 
             world.server.applyLabelChange(providerMessageId: "n", add: [labelPath], remove: [inboxPath])
-            try await check(2)
-            #expect(rearmChecks == [0, 1, 2], "the check after a message moved in re-arms once: \(rearmChecks)")
-            #expect(try Self.rows(world, labelPath)["n"] != nil, "and the backfill loads it")
+            try await Self.labelCheckAfterLapse(world, clock, 1, pastLoadHolds: pastLoadHolds)
+            #expect(try Self.rows(world, labelPath)["n"] != nil, "a message moved in later loads at the next check")
+            #expect(try Self.rows(world, labelPath)["m"] == nil, "precondition: m still could not load")
 
             switch block {
             case .queuedArchive:
@@ -1909,9 +1873,9 @@ struct GmailCatchUpTests {
             case .failingGet:
                 world.server.clearGetFailures()
             }
-            try await check(3)
-            #expect(rearmChecks == [0, 1, 2, 3], "once m can load, the next check re-arms: \(rearmChecks)")
-            #expect(try Self.rows(world, labelPath)["m"] != nil, "m loads")
+            try await Self.labelCheckAfterLapse(world, clock, 2)
+            #expect(try Self.rows(world, labelPath)["m"] != nil, "once m can load, the next check loads it")
+            #expect(try Self.folder(world, labelPath).backfillComplete, "the walk is never touched")
         }
     }
 
@@ -1924,9 +1888,9 @@ struct GmailCatchUpTests {
         case heldPastTheBound
     }
 
-    /// A fetch that failed during the walk is one of the catch-up's triggers:
-    /// the walk completes without the message, and the next check finds it
-    /// missing, re-arms the walk, and it loads.
+    /// A fetch that failed during the walk leaves an id missing: the walk
+    /// completes without the message, and the next check (after a lapse) finds it
+    /// missing and loads it.
     @Test("An id the walk passed over because its fetch failed loads at the next check",
           .enabled(if: !NetworkMonitor.checkExpensive()),
           arguments: PassedOverFetch.allCases)
@@ -1952,9 +1916,11 @@ struct GmailCatchUpTests {
                 world.server.injectGetFailure(providerMessageId: "m", .status(503))
             }
 
-            let at = Self.checkDay(clock, 0)
-            await Self.pass(world, [labelPath], context: Self.unlimited(at: { at }))
-            #expect(try !Self.folder(world, labelPath).backfillComplete, "precondition: the first check re-armed the walk")
+            // The label's walk runs from the top.
+            let labelId = world.folderId(labelPath)
+            try await world.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET backfillComplete = 0, backfillPageToken = NULL WHERE id = ?", arguments: [labelId])
+            }
             if failure == .heldPastTheBound {
                 let accountId = world.accountId
                 let account = try #require(try await world.pool.read { db in try Account.fetchOne(db, key: accountId) })
@@ -1976,8 +1942,8 @@ struct GmailCatchUpTests {
                 world.server.clearGetFailures()
             }
 
-            #expect(try await Self.labelCheckAfterLapse(world, clock, 1), "the next check re-arms the walk for m")
-            #expect(try Self.rows(world, labelPath)["m"] != nil, "m loads")
+            try await Self.labelCheckAfterLapse(world, clock, 1)
+            #expect(try Self.rows(world, labelPath)["m"] != nil, "the next check loads m")
         }
     }
 
@@ -2000,13 +1966,13 @@ struct GmailCatchUpTests {
         }
     }
 
-    /// A check never restarts an unfinished walk: a message moved in above the
-    /// walk's position is not re-armed for while the walk runs on, so the first
-    /// check after the walk completes re-arms once and the
-    /// message loads. The check after that finds nothing new.
-    @Test("A check never restarts an unfinished walk; the first check after the walk completes re-arms once",
+    /// A check never writes an unfinished walk's bookkeeping: a message moved in
+    /// above the walk's position is loaded by the check itself, and the walk
+    /// goes on from where it was. (Replaces "the first check after the walk
+    /// completes re-arms once", 2026-11-11: there is no re-arm.)
+    @Test("A check loads a message moved in above an unfinished walk's position and leaves the walk where it was",
           .enabled(if: !NetworkMonitor.checkExpensive()))
-    func unfinishedWalkIsNotRearmedUntilItCompletes() async throws {
+    func checkLoadsAboveAnUnfinishedWalk() async throws {
         let clock = Clock()
         // The walk lists newest first, one id per page: l1, l2, l3, l4 before the
         // move; l1, m, l2, l3, l4 after it.
@@ -2027,40 +1993,21 @@ struct GmailCatchUpTests {
             let walkToken = "2"
             try Self.setPartialWalk(world, labelPath, pageToken: walkToken)
             world.server.applyLabelChange(providerMessageId: "m", add: [labelPath], remove: [inboxPath])
-            func check(_ check: Int) async throws {
-                // A Gmail folder has no periodic check: a lapse starts each one.
-                try await Self.lapse(world)
-                let at = Self.checkDay(clock, check)
-                let completedBefore = try Self.state(world, labelPath)?.lastCompletedAt
-                await Self.pass(world, [labelPath], context: Self.unlimited(at: { at }))
-                #expect(try Self.state(world, labelPath)?.lastCompletedAt != completedBefore,
-                        "precondition: check \(check) completed")
-            }
 
-            try await check(0)
+            try await Self.labelCheckAfterLapse(world, clock, 0)
             let during = try Self.folder(world, labelPath)
             #expect(!during.backfillComplete && during.backfillPageToken == walkToken,
                     "the check leaves the unfinished walk where it was")
+            #expect(try Self.rows(world, labelPath)["m"] != nil, "the check loads m")
 
             try await Self.backfillUntilComplete(world)
-            #expect(try Self.rows(world, labelPath)["m"] == nil,
-                    "precondition: the walk went on from its position and never reached m")
-
-            try await check(1)
-            let after = try Self.folder(world, labelPath)
-            #expect(!after.backfillComplete && after.backfillPageToken == nil,
-                    "the first check after the walk completes re-arms it")
-            try await Self.backfillUntilComplete(world)
-            #expect(try Self.rows(world, labelPath)["m"] != nil, "the re-armed walk loads m")
-
-            try await check(2)
-            #expect(try Self.folder(world, labelPath).backfillComplete, "the next check re-arms nothing")
+            #expect(Set(try Self.rows(world, labelPath).keys) == ["l1", "l2", "l3", "l4", "m"], "the walk loads the rest")
         }
     }
 
     /// The huge-folder case: many not-yet-walked ids are missing (an old message
     /// gave the folder a local row far below the walk's position). No check
-    /// moves the walk's position backwards.
+    /// moves the walk's position backwards; the check loads them itself.
     @Test("No check moves an unfinished walk's position backwards, even with many missing ids",
           .enabled(if: !NetworkMonitor.checkExpensive()))
     func checksNeverMoveAnUnfinishedWalkBack() async throws {
@@ -2096,6 +2043,8 @@ struct GmailCatchUpTests {
                 let folder = try Self.folder(world, labelPath)
                 #expect(!folder.backfillComplete && folder.backfillPageToken == position,
                         "check \(check) left the walk at \(folder.backfillPageToken ?? "the top"), not at \(position)")
+                let held = try Self.rows(world, labelPath)
+                #expect(unwalked.allSatisfy { held[$0] != nil }, "check \(check) loaded the not-yet-walked ids itself")
             }
         }
     }
@@ -2103,16 +2052,18 @@ struct GmailCatchUpTests {
     /// How long a test waits for a held request to arrive.
     private static let holdArrivalSeconds: Double = 30
 
-    /// A catch-up re-arm lands while a backfill walk iteration is in flight on the
-    /// same folder (its page answered from the server before the move). The
-    /// walk's bookkeeping write for that page, whether it moves the page token or
-    /// completes the folder, must not overwrite the re-arm: the walk starts again
-    /// from the top and loads the moved-in message. Each case holds a different
-    /// write site: a page with or without new mail, and a middle or the last page.
-    @Test("A re-arm landing during a backfill walk iteration is not overwritten; the walk restarts and loads the moved-in mail",
+    /// A check lands while a backfill walk iteration is in flight on the same
+    /// folder (its page answered from the server before the move). The check
+    /// loads the moved-in message itself and writes none of the walk's
+    /// bookkeeping, so the walk's write for that page (moving the page token or
+    /// completing the folder) lands and the walk goes on from its page. Each case
+    /// holds a different write site: a page with or without new mail, and a
+    /// middle or the last page. (Replaces "a re-arm landing during a walk
+    /// iteration is not overwritten", 2026-11-11: there is no re-arm.)
+    @Test("A check landing during a backfill walk iteration loads the moved-in mail; the walk's write lands and the walk goes on",
           .enabled(if: !NetworkMonitor.checkExpensive()),
           arguments: [(false, false), (true, false), (false, true), (true, true)])
-    func rearmDuringWalkIterationIsKept(pageHasNewMail: Bool, lastPage: Bool) async throws {
+    func checkDuringWalkIterationLetsTheWalkGoOn(pageHasNewMail: Bool, lastPage: Bool) async throws {
         let clock = Clock()
         // The walk lists newest first, one id per page: l1, l2, l3 before the
         // move; l1, m, l2, l3 after it.
@@ -2144,39 +2095,37 @@ struct GmailCatchUpTests {
             let arrived = await Task.detached { hold.waitUntilReached(seconds: Self.holdArrivalSeconds) }.value
             try #require(arrived, "precondition: the walk's page request is held")
 
-            // Meanwhile: a second walk (nothing serializes two walks) completes the
-            // folder, the message moves into the label, and the catch-up re-arms
-            // the completed walk.
-            try Self.completeWalk(world, labelPath)
+            // Meanwhile: the message moves into the label and the check runs.
+            let before = try Self.folder(world, labelPath)
             world.server.applyLabelChange(providerMessageId: "m", add: [labelPath], remove: [inboxPath])
             await Self.pass(world, [labelPath])
-            let rearmed = try Self.folder(world, labelPath)
-            #expect(!rearmed.backfillComplete && rearmed.backfillPageToken == nil,
-                    "precondition: the catch-up re-armed the walk while its iteration was in flight")
+            #expect(try Self.rows(world, labelPath)["m"] != nil, "the check loads the moved-in message")
+            #expect(try Self.folder(world, labelPath).backfillVersion == before.backfillVersion,
+                    "the check wrote none of the walk's bookkeeping")
 
             hold.release.signal()
             _ = await walk.value
 
-            #expect(try Self.rows(world, labelPath)["m"] != nil, "the moved-in message is loaded")
+            #expect(try Self.rows(world, labelPath)["m"] != nil)
             #expect(try Self.rows(world, labelPath)[heldId] != nil)
             #expect(try Self.folder(world, labelPath).backfillComplete, "the walk completes")
             let walkLists = world.server.listRequests().filter { $0.labelId == labelPath && $0.bound("after") == nil }
             #expect(walkLists.first?.pageToken == readToken, "precondition: the held page was the iteration's")
-            #expect(walkLists.dropFirst().first.map { $0.pageToken == nil } == true,
-                    "after the re-arm the walk starts again from the top")
+            #expect(walkLists.dropFirst().allSatisfy { $0.pageToken != nil },
+                    "the walk goes on from its page, never from the top: \(walkLists.map { $0.pageToken ?? "top" })")
         }
     }
 
     /// The same interleaving at the top of a folder: the walk's iteration read the
-    /// folder with no page token and not complete, which is exactly what a re-arm
-    /// writes. The page was answered before the move, and the moved-in message
-    /// sorts before where that page ends, so walking on from it never reaches the
-    /// message. The walk's write, whether it moves the page token or completes the
-    /// folder, must still miss and the walk start again from the top.
-    @Test("A re-arm landing while the walk is at the top of a folder is not overwritten; the walk restarts and loads the moved-in mail",
+    /// folder with no page token and not complete. The page was answered before
+    /// the move, and the moved-in message sorts before where that page ends, so
+    /// walking on from it never reaches the message: the check loads it, and the
+    /// walk's write lands. (Replaces "a re-arm at the top of the walk is not
+    /// overwritten", 2026-11-11: there is no re-arm.)
+    @Test("A check landing while the walk is at the top of a folder loads the moved-in mail; the walk's write lands",
           .enabled(if: !NetworkMonitor.checkExpensive()),
           arguments: [false, true])
-    func rearmAtTheTopOfTheWalkIsKept(lastPage: Bool) async throws {
+    func checkAtTheTopOfTheWalkLetsTheWalkGoOn(lastPage: Bool) async throws {
         let clock = Clock()
         // Newest first: z, y, l before the move; z, m, y, l after it.
         let seeds = [
@@ -2206,27 +2155,22 @@ struct GmailCatchUpTests {
             let arrived = await Task.detached { hold.waitUntilReached(seconds: Self.holdArrivalSeconds) }.value
             try #require(arrived, "precondition: the walk's page request is held")
 
-            // Meanwhile: a second walk completes the folder, the message moves into
-            // the label, and the catch-up re-arms the completed walk. The re-arm
-            // writes the very state this iteration read.
-            try Self.completeWalk(world, labelPath)
+            // Meanwhile: the message moves into the label and the check runs.
             let before = try Self.folder(world, labelPath)
             world.server.applyLabelChange(providerMessageId: "m", add: [labelPath], remove: [inboxPath])
             await Self.pass(world, [labelPath])
-            let rearmed = try Self.folder(world, labelPath)
-            #expect(rearmed.backfillVersion > before.backfillVersion && !rearmed.backfillComplete && rearmed.backfillPageToken == nil,
-                    "precondition: the catch-up re-armed the walk while its iteration was in flight")
+            #expect(try Self.rows(world, labelPath)["m"] != nil, "the check loads the moved-in message")
+            #expect(try Self.folder(world, labelPath).backfillVersion == before.backfillVersion,
+                    "the check wrote none of the walk's bookkeeping")
 
             hold.release.signal()
             _ = await walk.value
 
-            #expect(try Self.rows(world, labelPath)["m"] != nil, "the moved-in message is loaded")
             #expect(try Self.folder(world, labelPath).backfillComplete, "the walk completes")
             let walkLists = world.server.listRequests().filter { $0.labelId == labelPath && $0.bound("after") == nil }
-            #expect(walkLists.count >= 2)
-            guard walkLists.count >= 2 else { return }
-            #expect(walkLists[0].pageToken == nil, "precondition: the held page was the folder's first")
-            #expect(walkLists[1].pageToken == nil, "after the re-arm the walk starts again from the top")
+            #expect(walkLists.first?.pageToken == nil, "precondition: the held page was the folder's first")
+            #expect(walkLists.dropFirst().allSatisfy { $0.pageToken != nil },
+                    "the walk goes on from its page, never from the top again: \(walkLists.map { $0.pageToken ?? "top" })")
         }
     }
 
@@ -2234,7 +2178,9 @@ struct GmailCatchUpTests {
 
     /// A folder the storage prune thinned: three kept Inbox rows within one
     /// week, and two server messages no row holds any more, one between the
-    /// kept rows and one older than all of them.
+    /// kept rows (inside the kept range, so it loads like any missing id; the
+    /// prune deletes oldest first, so a pruned message is never there) and one
+    /// older than all of them.
     private static func prunedWorld(_ clock: Clock) -> (seeds: [StatefulGmailActionServer.Seed], local: [Local]) {
         let kept: [(String, Double)] = [("k1", 30), ("k2", 31), ("k3", 33)]
         let seeds = kept.map { Self.seed($0.0, clock.daysAgo($0.1), [inboxPath]) } + [
@@ -2252,13 +2198,14 @@ struct GmailCatchUpTests {
         }
     }
 
-    /// With a storage limit the pruned mail is what the limit dropped: a
-    /// completed check neither re-arms the walk for it (the one between the kept
-    /// rows included) nor lists below the oldest kept row, and the walk loads
-    /// nothing back. Without a limit the same check re-arms and loads both.
-    @Test("Under a storage limit a completed check re-arms nothing, lists nothing older than the oldest kept row, and the walk reloads nothing; without one it re-arms and loads",
+    /// With a storage limit the pruned mail is what the limit dropped: the check
+    /// lists nothing below the oldest kept row, so it loads nothing older back.
+    /// Without a limit the same check lists down to the epoch and loads both.
+    /// The walk is never touched. (Superseded 2026-11-12: "re-arms nothing"; the
+    /// re-arm is gone, and the message between the kept rows loads either way.)
+    @Test("Under a storage limit the check lists and loads nothing older than the oldest kept row; without one it loads both",
           arguments: [true, false])
-    func storageLimitStopsTheReload(limit: Bool) async throws {
+    func storageLimitLoadsNothingBelowTheOldestKeptRow(limit: Bool) async throws {
         let clock = Clock()
         let (seeds, local) = Self.prunedWorld(clock)
         try await Self.withWorld("gcu-pruned-\(limit)", seeds: seeds, local: local) { world async throws in
@@ -2272,19 +2219,13 @@ struct GmailCatchUpTests {
             } else {
                 #expect(lowest == 0, "without a limit the oldest range reaches the epoch")
             }
-            let folder = try Self.folder(world, inboxPath)
-            #expect(folder.backfillComplete == limit, limit ? "the walk is not re-armed" : "the walk is re-armed")
-
-            let accountId = world.accountId
-            let account = try #require(try await world.pool.read { db in try Account.fetchOne(db, key: accountId) })
-            _ = await world.engine.runBackfill(account: account)
-            try await Self.backfillUntilComplete(world)
+            #expect(try Self.folder(world, inboxPath).backfillComplete, "the walk is left as it was")
             let inbox = Set(try Self.rows(world, inboxPath).keys)
             if limit {
-                #expect(inbox == ["k1", "k2", "k3"], "the walk loads nothing back")
-                #expect(!world.server.messageGets().contains { $0.hasPrefix("pruned") }, "no pruned message is downloaded")
+                #expect(inbox == ["k1", "k2", "k3", "pruned-mid"], "nothing older than the oldest kept row is loaded")
+                #expect(!world.server.messageGets().contains("pruned-old"), "the old pruned message is never downloaded")
             } else {
-                #expect(inbox == ["k1", "k2", "k3", "pruned-mid", "pruned-old"], "the re-armed walk loads both")
+                #expect(inbox == ["k1", "k2", "k3", "pruned-mid", "pruned-old"], "the check loads both")
             }
         }
     }
@@ -2306,7 +2247,7 @@ struct GmailCatchUpTests {
             let oldestKept = Int(clock.daysAgo(33).timeIntervalSince1970) - SyncConfig.catchUpGmailRangeSlackSeconds
             let lowest = try #require(world.server.listRequests().compactMap { $0.bound("after") }.min())
             #expect(lowest >= oldestKept, "no list goes below the oldest kept row")
-            #expect(try Self.folder(world, inboxPath).backfillComplete, "the walk is not re-armed")
+            #expect(!world.server.messageGets().contains("pruned-old"), "the old pruned message is never downloaded")
         }
     }
 
@@ -2323,6 +2264,184 @@ struct GmailCatchUpTests {
     private static func lapse(_ world: World) async throws {
         let accountId = world.accountId
         try await world.pool.write { db in try SyncEngine.lapseDeltaCursor(accountId: accountId, newCursor: nil, db: db) }
+    }
+
+    // MARK: - The direct load after a lapse
+
+    /// The walk's state when the lapse comes.
+    enum LapseWalk: String, CaseIterable, Sendable {
+        /// The folder's walk is complete.
+        case complete
+        /// The folder's walk is unfinished, its page token mid-folder.
+        case unfinished
+        /// The walk is complete and a finite storage limit is in force.
+        case storageLimit
+    }
+
+    /// How many new Inbox messages arrive during the lapse, and how many of them
+    /// the full sync's window inserts (the newest).
+    private static let lapseNewCount = 200
+    private static let lapseWindowCount = 50
+
+    /// An Inbox with ten old local rows (30 to 39 days ago) the first listing has
+    /// covered, then a lapse during which `lapseNewCount` new messages arrive,
+    /// half an hour apart, `n0` the newest. The full sync after the lapse inserts
+    /// the newest `lapseWindowCount`; the rest have no row. Returns the new ids,
+    /// newest first.
+    private static func lapseWithNewMail(_ world: World, _ clock: Clock, walk: LapseWalk) async throws -> [String] {
+        await pass(world, [inboxPath], context: unlimited(storageLimit: walk == .storageLimit, at: { clock.now }))
+        #expect(try state(world, inboxPath)?.lastCompletedAt != nil, "precondition: the first listing completed")
+        if walk == .unfinished { try setPartialWalk(world, inboxPath, pageToken: "5") }
+
+        let ids = (0..<lapseNewCount).map { "n\($0)" }
+        var window: [Local] = []
+        for (index, id) in ids.enumerated() {
+            let date = clock.hoursAgo(1 + Double(index) / 2)
+            world.server.addMessage(seed(id, date, [inboxPath]))
+            if index < lapseWindowCount { window.append(Local(id: id, path: inboxPath, date: date, isRead: false)) }
+        }
+        try insert(window, accountId: world.accountId, pool: world.pool)
+        try await lapse(world)
+        return ids
+    }
+
+    private static func lapseWorld(_ clock: Clock) -> (seeds: [StatefulGmailActionServer.Seed], local: [Local]) {
+        let days = (0..<10).map { 30 + Double($0) }
+        return (days.enumerated().map { seed("o\($0.offset)", clock.daysAgo($0.element), [inboxPath]) },
+                days.enumerated().map { Local(id: "o\($0.offset)", path: inboxPath, date: clock.daysAgo($0.element)) })
+    }
+
+    /// The history expires (404) and 200 new Inbox messages arrived meanwhile:
+    /// the full sync inserts the newest 50, and the listing after the lapse loads
+    /// the other 150 itself, whatever the walk's state and under a storage limit
+    /// too (they are newer than the oldest kept row). The walk is never touched.
+    /// Before the direct load, the check asked for a re-arm, which was declined
+    /// for an unfinished walk and under a storage limit, and an accepted re-arm
+    /// only restarted a walk that lists from the top down.
+    @Test("After a lapse, new Inbox mail beyond the sync window is loaded by the check, whatever the walk's state, under a storage limit too",
+          .enabled(if: !NetworkMonitor.checkExpensive()),
+          arguments: LapseWalk.allCases)
+    func lapseLoadsNewMailBeyondTheWindow(walk: LapseWalk) async throws {
+        let clock = Clock()
+        let (seeds, local) = Self.lapseWorld(clock)
+        try await Self.withWorld("gcu-lapse-load-\(walk.rawValue)", seeds: seeds, local: local) { world async throws in
+            let ids = try await Self.lapseWithNewMail(world, clock, walk: walk)
+            let before = try Self.folder(world, inboxPath)
+            let missing = Array(ids.dropFirst(Self.lapseWindowCount))
+            #expect(try Self.rows(world, inboxPath)[missing[0]] == nil, "precondition: beyond the window has no row")
+
+            let at = clock.now.addingTimeInterval(60)
+            await Self.pass(world, [inboxPath], context: Self.unlimited(storageLimit: walk == .storageLimit, at: { at }))
+
+            let inbox = try Self.rows(world, inboxPath)
+            let absent = ids.filter { inbox[$0] == nil }
+            #expect(absent.isEmpty, "all \(ids.count) new messages have a row; absent: \(absent.prefix(10))")
+            #expect(try Self.state(world, inboxPath)?.lastCompletedAt == at, "the listing after the lapse completed")
+            #expect(Set(world.server.fullMessageGets()) == Set(missing), "exactly the missing ones were fetched")
+            let after = try Self.folder(world, inboxPath)
+            #expect(after.backfillComplete == before.backfillComplete && after.backfillPageToken == before.backfillPageToken
+                        && after.backfillVersion == before.backfillVersion, "the walk is never touched")
+        }
+    }
+
+    /// A pass budget that runs out part way through a range's loads: what loaded
+    /// stays, newest first; the range is not passed and the next pass lists the
+    /// same page again and loads the rest, until all 200 have a row. No pass goes
+    /// past its budget by more than one batch of concurrent loads.
+    @Test("A budget that runs out mid-range loads the newest first and the next passes load the rest",
+          .enabled(if: !NetworkMonitor.checkExpensive()))
+    func directLoadResumesAcrossPasses() async throws {
+        let clock = Clock()
+        let (seeds, local) = Self.lapseWorld(clock)
+        let batch = BackfillProfile.normal.gmailBodyConcurrency
+        let budget = 3 * batch - 1
+        try await Self.withWorld("gcu-lapse-load-budget", seeds: seeds, local: local) { world async throws in
+            let ids = try await Self.lapseWithNewMail(world, clock, walk: .complete)
+            let missing = Array(ids.dropFirst(Self.lapseWindowCount))
+
+            var passes = 0
+            while try Self.state(world, inboxPath)?.listing != nil || passes == 0, passes < 2 * missing.count / batch {
+                let requestsBefore = world.server.http.recordedCalls().count
+                await Self.pass(world, [inboxPath], context: Self.requestBudget(world.server, budget))
+                let spent = world.server.http.recordedCalls().count - requestsBefore
+                #expect(spent <= budget + batch - 1, "pass \(passes) made \(spent) requests on a budget of \(budget)")
+                if passes == 0 {
+                    let inbox = try Self.rows(world, inboxPath)
+                    let loaded = missing.filter { inbox[$0] != nil }
+                    #expect(!loaded.isEmpty && loaded.count < missing.count, "precondition: the first pass loads part: \(loaded.count)")
+                    #expect(loaded == Array(missing.prefix(loaded.count)), "the first pass loads the newest first")
+                    #expect(try Self.state(world, inboxPath)?.listing?.range != nil, "the range is not passed")
+                }
+                passes += 1
+            }
+            let inbox = try Self.rows(world, inboxPath)
+            #expect(ids.allSatisfy { inbox[$0] != nil }, "all \(ids.count) new messages have a row after \(passes) passes")
+            #expect(try Self.state(world, inboxPath)?.listing == nil, "the listing completed")
+        }
+    }
+
+    /// One missing id that is gone (404) never wedges its range: it counts as
+    /// done, the other 199 show and the range completes in the same pass.
+    @Test("A missing id answered 404 counts as done: the other 199 show and the listing completes in the same pass",
+          .enabled(if: !NetworkMonitor.checkExpensive()))
+    func goneMissingIdNeverWedgesARange() async throws {
+        let clock = Clock()
+        let (seeds, local) = Self.lapseWorld(clock)
+        try await Self.withWorld("gcu-lapse-load-404", seeds: seeds, local: local) { world async throws in
+            let ids = try await Self.lapseWithNewMail(world, clock, walk: .complete)
+            let gone = ids[ids.count / 2 + Self.lapseWindowCount / 2]
+            world.server.injectGetFailure(providerMessageId: gone, .status(404))
+
+            let at = clock.now.addingTimeInterval(60)
+            await Self.pass(world, [inboxPath], context: Self.unlimited(at: { at }))
+
+            let inbox = try Self.rows(world, inboxPath)
+            #expect(ids.filter { inbox[$0] != nil }.count == ids.count - 1, "the other \(ids.count - 1) show")
+            #expect(inbox[gone] == nil)
+            #expect(world.server.getFailuresServedCount(providerMessageId: gone) == 1, "precondition: its GET was answered 404, once")
+            #expect(try Self.state(world, inboxPath)?.lastCompletedAt == at, "the listing completes in the same pass")
+        }
+    }
+
+    /// One missing id whose GET keeps answering 503 holds its range, as a held
+    /// page holds the walk, for `SyncConfig.backfillPageHoldMinutes` wall-clock
+    /// from the range's first hold; once the clock passes the bound it counts as
+    /// done and the range completes. The other 199 show from the first pass.
+    @Test("A missing id answered 503 holds its range until the hold bound, then the range completes; the other 199 show",
+          .enabled(if: !NetworkMonitor.checkExpensive()))
+    func failingMissingIdHoldsTheRangeUntilTheBound() async throws {
+        let clock = Clock()
+        let (seeds, local) = Self.lapseWorld(clock)
+        try await Self.withWorld("gcu-lapse-load-503", seeds: seeds, local: local) { world async throws in
+            defer { SyncEngine.backfillPageHoldNowForTesting.withLock { $0 = nil } }
+            let ids = try await Self.lapseWithNewMail(world, clock, walk: .complete)
+            let failing = ids[ids.count / 2 + Self.lapseWindowCount / 2]
+            world.server.injectGetFailure(providerMessageId: failing, .status(503))
+            let completedBefore = try Self.state(world, inboxPath)?.lastCompletedAt
+            let at = clock.now.addingTimeInterval(60)
+            func holdClock(_ offset: TimeInterval) {
+                SyncEngine.backfillPageHoldNowForTesting.withLock { $0 = at.addingTimeInterval(offset) }
+            }
+
+            holdClock(0)
+            await Self.pass(world, [inboxPath], context: Self.unlimited(at: { at }))
+            #expect(try Self.state(world, inboxPath)?.listing?.range?.loadHeldSince == at, "the range is held from now")
+            #expect(try Self.state(world, inboxPath)?.lastCompletedAt == completedBefore, "the listing does not complete")
+            var inbox = try Self.rows(world, inboxPath)
+            #expect(ids.filter { inbox[$0] != nil }.count == ids.count - 1, "the other \(ids.count - 1) show")
+
+            holdClock(SyncConfig.backfillPageHoldSeconds - 1)
+            await Self.pass(world, [inboxPath], context: Self.unlimited(at: { at }))
+            #expect(try Self.state(world, inboxPath)?.listing?.range?.loadHeldSince == at, "inside the bound it stays held from its first hold")
+
+            holdClock(SyncConfig.backfillPageHoldSeconds + 1)
+            await Self.pass(world, [inboxPath], context: Self.unlimited(at: { at }))
+            #expect(try Self.state(world, inboxPath)?.listing == nil, "past the bound the range completes")
+            #expect(try Self.state(world, inboxPath)?.lastCompletedAt == at)
+            inbox = try Self.rows(world, inboxPath)
+            #expect(inbox[failing] == nil && ids.filter { inbox[$0] != nil }.count == ids.count - 1)
+            #expect(world.server.getFailuresServedCount(providerMessageId: failing) == 3, "precondition: answered 503 at each pass")
+        }
     }
 
     /// A lapse keeps the listing's place: the listing goes on from where it

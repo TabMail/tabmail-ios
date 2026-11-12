@@ -66,9 +66,8 @@ struct CatchUpContext: Sendable {
     /// Whether the user's Email Index Limit (`StorageEstimator.budgetMB`) was a
     /// finite limit when the pass began. The limit means old mail is not kept:
     /// the storage prune deletes the oldest rows once the store passes it
-    /// (ADR-IOS-006). So while it holds, no catch-up loads old mail back: the
-    /// apply re-arms no backfill walk, and a provider lists no mail older than the
-    /// folder's oldest local row (ADR-IOS-107 decision 8).
+    /// (ADR-IOS-006). So while it holds, a provider lists no mail older than the
+    /// folder's oldest local row, and so loads none back (ADR-IOS-107 decision 8).
     var storageLimitInForce = false
 
     /// The production snapshot: the budget starts now.
@@ -101,8 +100,7 @@ struct CatchUpFolderResult: Sendable {
     /// sync applies nothing unless this equals the folder's stored known epoch; a
     /// result whose epoch DIFFERS from a known stored one reports a turnover.
     let epoch: UInt32?
-    /// Changes to rows the device already holds. There is no field for a message
-    /// without a local row: the catch-up never inserts (ADR-IOS-107).
+    /// Changes to rows the device already holds.
     var flagUpdates: [CatchUpFlagUpdate] = []
     /// Provider ids the server has PROVEN absent. They go through the one removal
     /// path (`SyncEngine.deleteConfirmedGhostHeaders`).
@@ -110,17 +108,17 @@ struct CatchUpFolderResult: Sendable {
     /// The folder's new opaque state, written in the same transaction as the
     /// results. Nil clears it.
     var newState: String?
-    /// Re-arm the folder's existing backfill walk (`backfillComplete = false`,
-    /// `backfillPageToken = NULL`) in the same transaction: the server lists a
-    /// message in the folder that the device holds no row for (an old message
-    /// moved into the folder). The catch-up itself never inserts; the
-    /// backfill, which only inserts, loads it. The apply re-arms only a folder
-    /// whose walk is COMPLETE, read inside its own transaction: a check never
-    /// restarts an unfinished walk, which would throw away its position. It
-    /// re-arms nothing while a storage limit is in force
-    /// (`CatchUpContext.storageLimitInForce`): the missing mail may be what the
-    /// storage prune deleted, and loading it back would only be pruned again.
-    var rearmBackfill = false
+    /// Messages the provider fetched, with their bodies, for ids the server lists
+    /// in the folder that no local row in the folder holds (mail moved in, or new
+    /// mail beyond the sync window after a lapse). Only the ones that loaded (a
+    /// header). The apply inserts them through the backfill page walk's own insert
+    /// tail (`SyncEngine.insertFetchedBackfillMessages`) BEFORE it writes
+    /// `newState`, so a crash between the two lists them again rather than losing
+    /// them (ADR-IOS-107 decision 8, the direct load).
+    var loaded: [BackfillResult] = []
+    /// The missing ids that did not load, each with the page walk's own
+    /// classification of its failure (`SyncEngine.backfillFetchFailureKind`).
+    var loadFailures: [String: SyncEngine.BackfillFetchFailureKind] = [:]
 }
 
 /// The delta-cursor lapse marker every provider's catch-up state may carry

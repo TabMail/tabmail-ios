@@ -602,6 +602,17 @@ final class StatefulGmailActionServer: @unchecked Sendable {
     }
 
     /// The provider ids of every `GET /messages/{id}` received so far, in order.
+    /// The ids of the `format=full` message GETs (the backfill's fetch), in order.
+    func fullMessageGets() -> [String] {
+        http.recordedCalls().compactMap { call in
+            guard call.method == "GET", let components = URLComponents(string: call.url),
+                  components.path.contains("/messages/"),
+                  components.queryItems?.contains(where: { $0.name == "format" && $0.value == "full" }) == true
+            else { return nil }
+            return components.path.split(separator: "/").last.map(String.init)
+        }
+    }
+
     func messageGets() -> [String] {
         http.recordedCalls().compactMap { call in
             guard call.method == "GET", let components = URLComponents(string: call.url),

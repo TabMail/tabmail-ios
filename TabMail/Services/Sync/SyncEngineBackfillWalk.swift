@@ -831,12 +831,12 @@ extension SyncEngine {
     /// compare-and-set on the bookkeeping's row version alone: it lands only while
     /// the folder still holds `readVersion`, the `Folder.backfillVersion` the
     /// iteration read with the folder. Every write of the bookkeeping bumps that
-    /// version (the `folder_bumpBackfillVersion` trigger), including a catch-up
-    /// re-arm (ADR-IOS-107) that writes the very state the iteration read, so a
-    /// re-arm landing while the iteration is on the network makes this match
+    /// version (the `folder_bumpBackfillVersion` trigger), including a reset that
+    /// writes the very state the iteration read, so a reset or a second walk's
+    /// write landing while the iteration is on the network makes this match
     /// nothing and return false: the caller stops the folder's iteration, never
     /// retries the stale write, and the next iteration re-reads the folder and
-    /// walks on from what it then holds: from the top after a re-arm or a reset,
+    /// walks on from what it then holds: from the top after a reset,
     /// or the same saved page again when the version moved with the token
     /// unchanged (a whole-record folder write, such as the full sync's folder
     /// upsert, names both columns with their values unchanged and so bumps the
@@ -2008,8 +2008,10 @@ extension SyncEngine {
                     let (pageIds, nextToken) = pageResult
                     // Every bookkeeping write below is compare-and-set on the row
                     // version read with the folder at this iteration's start
-                    // (`advanceBackfillPageWalk`), so a catch-up re-arm landing
-                    // mid-iteration is never overwritten.
+                    // (`advanceBackfillPageWalk`), so a reset or a second walk's
+                    // write landing mid-iteration is never overwritten. (The
+                    // catch-up's re-arm, which this first guarded, is gone since
+                    // 2026-11-12: the catch-up loads missing mail itself.)
                     let readVersion = folder.backfillVersion
 
                     if pageIds.isEmpty && nextToken == nil {
@@ -2019,7 +2021,7 @@ extension SyncEngine {
                                 folderId: folder.id, readVersion: readVersion, nextToken: nil, complete: true, db: db)
                         }
                         if advanced == false {
-                            BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) bookkeeping changed during the iteration (a re-arm, a reset or a folder rewrite) — re-reading it")
+                            BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) bookkeeping changed during the iteration (a reset, a second walk or a folder rewrite) — re-reading it")
                             continue
                         }
                         BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) fully crawled (no more pages)")
@@ -2078,7 +2080,7 @@ extension SyncEngine {
                                 complete: nextToken == nil, db: db)
                         }
                         guard advanced else {
-                            BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) bookkeeping changed during the iteration (a re-arm, a reset or a folder rewrite) — re-reading it")
+                            BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) bookkeeping changed during the iteration (a reset, a second walk or a folder rewrite) — re-reading it")
                             continue
                         }
                         if nextToken == nil {
@@ -2194,7 +2196,7 @@ extension SyncEngine {
                                     complete: nextToken == nil, db: db)
                             }
                             guard advanced else {
-                                BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) bookkeeping changed during the iteration (a re-arm, a reset or a folder rewrite) — re-reading it")
+                                BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) bookkeeping changed during the iteration (a reset, a second walk or a folder rewrite) — re-reading it")
                                 if insertedCount > 0 { didWork = true }
                                 continue
                             }

@@ -1,6 +1,12 @@
 
 ## ADR-IOS-005: Progressive Background Backfill
 
+> **Current note (2026-11-12).** The full sync's catch-up never re-arms or otherwise writes the walk:
+> a Gmail check loads mail missing from a folder itself, through the page walk's own insert tail
+> (`SyncEngine.insertFetchedBackfillMessages`), and under a storage limit lists nothing older than the
+> folder's oldest local row (ADR-IOS-107 decision 8, "the direct load"). The 2026-11-11 note below is
+> superseded and kept as written.
+>
 > **Current note (2026-11-11).** A completed walk can be re-armed by the full sync's catch-up when
 > old mail moves into the folder (ADR-IOS-107 decision 8), but never while a storage limit is in
 > force: then the catch-up loads no old mail back, because the limit means old mail is not kept
