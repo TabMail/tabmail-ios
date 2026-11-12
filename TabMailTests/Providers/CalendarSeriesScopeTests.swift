@@ -4036,7 +4036,7 @@ struct SplitInterruptedBetweenItsWritesTests {
             "title": .string("Renamed past"), "timezone": .string("UTC"), SplitRecord.argumentKey: record.argument,
         ]
         let r = try await drainSplit(harness, account: "split-past-end-retry", arguments: arguments, drains: 1)
-        #expect(r.split == nil, describe(r.split))
+        #expect(r.split == nil, "\(describe(r.split))")
         #expect(harness.google?.event(GoogleSeries.instanceId(day(7)))?["summary"] as? String == "Renamed past",
                 "the kept edit was not written: \(harness.splitWrites)")
         #expect(!harness.splitWrites.contains { $0.hasPrefix("POST") || harness.isCap($0) }, "a part or a cap was written: \(harness.splitWrites)")

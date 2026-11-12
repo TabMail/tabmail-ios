@@ -1488,7 +1488,7 @@ struct CalDAVSplitRollbackTests {
         //    `AccountManager.isCalendarBadRequestError` does not
         //    classify, so the op requeues forever and its account joins
         //    `failedAccounts` — the wedge, which is a dropped user intention.
-        #expect(result.id == successorPath)
+        #expect(result?.id == successorPath)
         // 2. The series is CAPPED, so its later occurrences show once.
         let master = store.storedICS(path: Self.masterPath)
         #expect(master?.contains("UNTIL=") == true,

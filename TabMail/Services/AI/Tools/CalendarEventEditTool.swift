@@ -312,7 +312,7 @@ struct CalendarEventEditTool: AgentTool, Sendable {
                case .pastEnd = try await provider.splitCut(calendarId: lookupCalId, eventId: queuedEventId, recurrenceId: rid, zone: tz) {
                 pastEnd = true
                 let changesRule = try CalendarToolHelpers.buildGCalEventInput(arguments, isAllDay: occurrence.isAllDay).recurrence != nil
-                if changesRule || (try CalendarSeriesScope.dayMove(arguments, named: named, scope: resolvedScope, zone: tz)) != nil {
+                if try changesRule || (CalendarSeriesScope.dayMove(arguments, named: named, scope: resolvedScope, zone: tz)) != nil {
                     throw CalendarProviderError.notSupported(SplitCarry.pastEndRuleRefusal)
                 }
             }
