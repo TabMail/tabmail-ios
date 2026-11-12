@@ -739,6 +739,8 @@ extension AccountManager {
         provider: any CalendarProvider
     ) async throws -> (newSeriesId: String?, createdRealId: String?) {
         let args = op.arguments
+        // Whom this write notifies, as the call that queued it asked (`send_invitations`).
+        let sendUpdates = CalendarToolHelpers.sendUpdates(args)
         // 🚨 A NORMAL RETURN FROM THIS FUNCTION IS THE DRAIN'S SUCCESS PATH
         // (R12-T8). The three guards below used to `return (nil, nil)` after
         // logging "dropping" — which deletes the row AND fires
@@ -817,7 +819,7 @@ extension AccountManager {
             }
             var createdRealId: String? = nil
             do {
-                let created = try await provider.createEvent(calendarId: calId, event: input, sendUpdates: "all")
+                let created = try await provider.createEvent(calendarId: calId, event: input, sendUpdates: sendUpdates)
                 BackgroundSyncLogger.logDebug("[CalendarQueue] Created event id=\(created.id ?? "nil")")
                 // Return the real id so the tool can use it in its result
                 // string. Without this, the tool's optimistic `event_id:
@@ -1092,7 +1094,7 @@ extension AccountManager {
                 _ = try await provider.updateOccurrence(
                     calendarId: calId, eventId: writeId, recurrenceId: rid,
                     recurrenceIdZone: recurrenceIdZone,
-                    event: input, sendUpdates: "all"
+                    event: input, sendUpdates: sendUpdates
                 )
                 BackgroundSyncLogger.logDebug("[CalendarQueue] Updated event id=\(eventId) scope=this_only at \(rid) (\(recurrenceIdZone.identifier))")
             case "this_and_following":
@@ -1106,7 +1108,7 @@ extension AccountManager {
                 let created = try await provider.splitSeries(
                     calendarId: calId, eventId: writeId, recurrenceId: rid,
                     recurrenceIdZone: recurrenceIdZone,
-                    patch: input, sendUpdates: "all",
+                    patch: input, sendUpdates: sendUpdates,
                     record: SplitRecorder(
                         keep: { record in try await self.recordSplit(opId: opId, record) },
                         partNotFound: { try await self.noteSplitPartNotFound(opId: opId) })
@@ -1119,7 +1121,7 @@ extension AccountManager {
                 // miss for any occurrence on or after `rid`.
                 return (created.id, nil)
             case "all":
-                _ = try await provider.updateEvent(calendarId: calId, eventId: writeId, event: input, sendUpdates: "all")
+                _ = try await provider.updateEvent(calendarId: calId, eventId: writeId, event: input, sendUpdates: sendUpdates)
                 BackgroundSyncLogger.logDebug("[CalendarQueue] Updated event id=\(writeId) scope=all")
             default:
                 // Unknown edit_scope value — reject rather than silently defaulting
@@ -1137,7 +1139,7 @@ extension AccountManager {
                 throw CalendarProviderError.notSupported(
                     "the queued calendar delete carries no event id and can never be executed")
             }
-            try await provider.deleteEvent(calendarId: calId, eventId: eventId, sendUpdates: "all")
+            try await provider.deleteEvent(calendarId: calId, eventId: eventId, sendUpdates: sendUpdates)
             BackgroundSyncLogger.logDebug("[CalendarQueue] Deleted event id=\(eventId)")
         }
         return (nil, nil)

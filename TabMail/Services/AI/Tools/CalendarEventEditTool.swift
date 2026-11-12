@@ -222,7 +222,7 @@ struct CalendarEventEditTool: AgentTool, Sendable {
 
         if let exdates {
             return try await CalendarEventEditExdates.execute(
-                dates: exdates.dates, zone: exdates.zone,
+                dates: exdates.dates, zone: exdates.zone, sendInvitations: arguments["send_invitations"],
                 target: .init(
                     event: fetchedEvent, eventId: eventId, compoundId: compoundId,
                     accountId: resolvedAccountId, lookupCalendarId: lookupCalId,

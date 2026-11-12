@@ -22,7 +22,8 @@ import Foundation
 ///   (`AccountManager.queueCalendarOperations`): all or nothing. Nothing is looked up again.
 /// - The result names each date beside the start of the occurrence it named, deleted, queued or
 ///   failed with the reason; never "updated". An occurrence id equal to the series' is refused.
-/// - Deletes notify guests as every iOS calendar delete does (`sendUpdates` "all", in the queue).
+/// - Each delete carries the call's `send_invitations`, so guests are notified only when it is true
+///   (`CalendarToolHelpers.sendUpdates`, in the queue).
 enum CalendarEventEditExdates {
 
     /// How long the tool waits, for every queued delete together, for the drain to report them
@@ -144,7 +145,7 @@ enum CalendarEventEditExdates {
 
     /// Look every date up, show the delete card, and queue one delete per occurrence.
     static func execute(
-        dates: [String], zone: TimeZone, target: Target, provider: any CalendarProvider,
+        dates: [String], zone: TimeZone, sendInvitations: JSONValue?, target: Target, provider: any CalendarProvider,
         translator: any ChatIdTranslating, invocation: ToolInvocation
     ) async throws -> String {
         // The dates are the series' occurrences: an occurrence id is looked up through its series,
@@ -233,6 +234,7 @@ enum CalendarEventEditExdates {
         let ops = occurrences.map { entry in
             var arguments: [String: JSONValue] = ["event_id": .string(entry.id)]
             if let calendarId = target.calendarId { arguments["calendar_id"] = .string(calendarId) }
+            if let sendInvitations { arguments["send_invitations"] = sendInvitations }
             return PendingCalendarOperation(
                 operationType: .delete, accountId: target.accountId, eventId: entry.id,
                 calendarId: target.calendarId, arguments: arguments)

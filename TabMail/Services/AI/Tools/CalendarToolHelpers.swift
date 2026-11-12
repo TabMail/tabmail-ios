@@ -111,6 +111,15 @@ enum CalendarToolHelpers {
         return nil
     }
 
+    /// Whom a calendar write the assistant asked for notifies, as the provider's `sendUpdates`
+    /// value: every guest ("all") only when the call said `send_invitations: true`, nobody ("none")
+    /// when it said false or nothing. The tools' schema says the argument "Defaults to false", and
+    /// the Thunderbird add-on sends invitations only when it is true. Read from the arguments a
+    /// queued operation stores, so the choice is the one made when the write was queued.
+    static func sendUpdates(_ args: [String: JSONValue]) -> String {
+        boolArg(args, "send_invitations") == true ? "all" : "none"
+    }
+
     // MARK: - Multi-Calendar Fetch
 
     /// Fetch events from ALL calendars across ALL accounts.
