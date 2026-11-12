@@ -1146,3 +1146,33 @@ resource names one or the server advertises the user's address, and never with a
   trapping it).
 - `MultistatusParserTests.parsePropertyWithSeveralHrefs`: a property with several hrefs gives every
   one, in order (`propertyHrefs`); `properties` is unchanged.
+
+## Calendar recurrence — checked against libical and ical.js
+
+`TabMailTests/Providers/CalendarOracle/` pins ADR-IOS-110: TabMail's own recurrence code gives the
+occurrences two independent engines give for the same calendar text, libical 4.0.7 and the ical.js
+Thunderbird ships (comm-central `226a299e`). The expected occurrences are fixtures generated on a
+developer Mac by `Scripts/cal-oracle/generate.sh` (`TabMailTests/Fixtures/CalendarOracle/`, one
+file per family plus a manifest); where the engines disagree, the fixture names the answer followed
+and why. Dates are fixed (1896-2019; every DTSTAMP is 2020-01-01), under the testing rules'
+exception for dates in 2020 and earlier. The fixtures also carry each rule's rule-only days, for the
+rule-day and split-count suites of a later slice; nothing reads them yet.
+
+- `CalendarOracleIntegrityTests`: every family file the manifest names is in the test bundle with
+  its SHA-256 and case count; case ids are unique; no case expects the same occurrence key twice;
+  the listing suite's arguments are exactly the
+  asserted cases (a parameterized test with no arguments passes silently, a stale bundle reports a
+  plausible count); every parked case names its filed issue.
+- `CalendarOracleListingTests`: for every case, Foundation's zone data first agrees with each
+  zoned occurrence's offset (a difference is reported as zone-data drift); then
+  `CalDAVOccurrences.listing` over the case's window lists exactly the expected occurrences by key
+  (start, end, status, moved; no key twice), and each key reads back
+  (`CalDAVOccurrences.occurrence(key:)`) as the listed row; a rule TabMail does not expand is one row
+  marked not listed.
+- Families so far: RFC 5545 §3.8.5.3's own examples (12, checked against the RFC's printed answer
+  too), spring-forward gaps (7: New York, Berlin, Sydney, Adelaide, Lord Howe, Santiago and Havana
+  at midnight), fall-back repeats (6: New York, Sydney, Lord Howe, Havana, Santiago and Tehran),
+  the century leap pair (2: a yearly all-day 29 February series across 1896-1904, where 1900 is
+  skipped, and across 1996-2004, where 2000 is listed).
+- Parked cases (fail on `main`, kept out of the run under their issue, `CalendarOracle.parked`):
+  none in these families.

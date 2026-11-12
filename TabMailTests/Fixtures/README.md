@@ -127,6 +127,27 @@ to return an OK without any data." Our tests include a case for this
 
 ---
 
+## Calendar oracle fixtures (`CalendarOracle/`)
+
+Expected occurrences of repeating events (ADR-IOS-110), generated, never hand-written, by
+`Scripts/cal-oracle/generate.sh` (README there) from the inputs in `Scripts/cal-oracle/cases.json`.
+Two engines expand the exact calendar text each case carries:
+
+| Engine | Version | Source |
+|---|---|---|
+| libical | 4.0.7, Homebrew bottle, system zoneinfo | [libical](https://github.com/libical/libical) ([CHANGELOG](https://github.com/libical/libical/blob/master/CHANGELOG.md)) |
+| ical.js | Thunderbird's `calendar/base/modules/Ical.sys.mjs` at comm-central `226a299e`, SHA-256 `968a58922da7b61cbc57655f9772bd70d2977237f7f9621c1ef3e2922c87173e` | [releases-comm-central](https://raw.githubusercontent.com/mozilla/releases-comm-central/226a299e/calendar/base/modules/Ical.sys.mjs) |
+
+The rules the fixtures encode so far: [RFC 5545](https://www.rfc-editor.org/rfc/rfc5545) §3.3.5
+(wall times a change skips or repeats), §3.3.10 (RRULE, including an invalid date such as 29
+February in a common year being skipped), §3.8.5.1 (EXDATE) and §3.8.5.3 (RRULE and its examples),
+and [RFC 4791](https://www.rfc-editor.org/rfc/rfc4791) §9.9 (the window overlap). No case uses RDATE
+or RECURRENCE-ID yet. The `ruleDays` blocks are for a later slice's suites; no test reads them yet. Where the engines disagree, both answers are kept and the case's `resolution`
+names the one followed and why; `cal-oracle-manifest.json` lists every file's SHA-256 and case
+count, the engine versions, and every disagreement. Regenerate, never edit by hand.
+
+---
+
 ## Update protocol
 
 When Gmail/Graph change schemas, or a new RFC is relevant:

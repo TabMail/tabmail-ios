@@ -1,0 +1,746 @@
+{
+  "cases": [
+    {
+      "id": "rfc-examples/daily-count-10",
+      "family": "rfc-examples",
+      "why": "RFC 5545's 'Daily for 10 occurrences'.",
+      "references": [
+        "RFC 5545 §3.8.5.3"
+      ],
+      "zones": [
+        "America/New_York"
+      ],
+      "master": [
+        "DTSTART;TZID=America/New_York:19970902T090000",
+        "DTEND;TZID=America/New_York:19970902T100000",
+        "RRULE:FREQ=DAILY;COUNT=10"
+      ],
+      "window": {
+        "from": "1997-09-01T00:00:00Z",
+        "to": "1997-09-15T00:00:00Z"
+      },
+      "frame": "zoned:America/New_York",
+      "expect": "occurrences",
+      "ruleDays": true,
+      "rfc": {
+        "days": [
+          "1997-09-02..1997-09-11"
+        ],
+        "wall": "09:00:00"
+      }
+    },
+    {
+      "id": "rfc-examples/daily-until-1997-12-24",
+      "family": "rfc-examples",
+      "why": "RFC 5545's 'Daily until December 24, 1997': 09:00 stays the wall time across the 1997-10-26 change to EST, and UNTIL ends it on December 23.",
+      "references": [
+        "RFC 5545 §3.8.5.3"
+      ],
+      "zones": [
+        "America/New_York"
+      ],
+      "master": [
+        "DTSTART;TZID=America/New_York:19970902T090000",
+        "DTEND;TZID=America/New_York:19970902T100000",
+        "RRULE:FREQ=DAILY;UNTIL=19971224T000000Z"
+      ],
+      "window": {
+        "from": "1997-09-01T00:00:00Z",
+        "to": "1998-01-01T00:00:00Z"
+      },
+      "frame": "zoned:America/New_York",
+      "expect": "occurrences",
+      "ruleDays": true,
+      "rfc": {
+        "days": [
+          "1997-09-02..1997-12-23"
+        ],
+        "wall": "09:00:00"
+      }
+    },
+    {
+      "id": "rfc-examples/every-other-week-tu-th-count-8",
+      "family": "rfc-examples",
+      "why": "RFC 5545's 'Every other week on Tuesday and Thursday, for 8 occurrences' (WKST=SU).",
+      "references": [
+        "RFC 5545 §3.8.5.3"
+      ],
+      "zones": [
+        "America/New_York"
+      ],
+      "master": [
+        "DTSTART;TZID=America/New_York:19970902T090000",
+        "DTEND;TZID=America/New_York:19970902T100000",
+        "RRULE:FREQ=WEEKLY;INTERVAL=2;COUNT=8;WKST=SU;BYDAY=TU,TH"
+      ],
+      "window": {
+        "from": "1997-09-01T00:00:00Z",
+        "to": "1997-11-01T00:00:00Z"
+      },
+      "frame": "zoned:America/New_York",
+      "expect": "occurrences",
+      "ruleDays": true,
+      "rfc": {
+        "days": [
+          "1997-09-02",
+          "1997-09-04",
+          "1997-09-16",
+          "1997-09-18",
+          "1997-09-30",
+          "1997-10-02",
+          "1997-10-14",
+          "1997-10-16"
+        ],
+        "wall": "09:00:00"
+      }
+    },
+    {
+      "id": "rfc-examples/monthly-first-friday-count-10",
+      "family": "rfc-examples",
+      "why": "RFC 5545's 'Monthly on the first Friday for 10 occurrences', across both 1997-1998 changes.",
+      "references": [
+        "RFC 5545 §3.8.5.3"
+      ],
+      "zones": [
+        "America/New_York"
+      ],
+      "master": [
+        "DTSTART;TZID=America/New_York:19970905T090000",
+        "DTEND;TZID=America/New_York:19970905T100000",
+        "RRULE:FREQ=MONTHLY;COUNT=10;BYDAY=1FR"
+      ],
+      "window": {
+        "from": "1997-09-01T00:00:00Z",
+        "to": "1998-07-01T00:00:00Z"
+      },
+      "frame": "zoned:America/New_York",
+      "expect": "occurrences",
+      "ruleDays": true,
+      "rfc": {
+        "days": [
+          "1997-09-05",
+          "1997-10-03",
+          "1997-11-07",
+          "1997-12-05",
+          "1998-01-02",
+          "1998-02-06",
+          "1998-03-06",
+          "1998-04-03",
+          "1998-05-01",
+          "1998-06-05"
+        ],
+        "wall": "09:00:00"
+      }
+    },
+    {
+      "id": "rfc-examples/monthly-second-to-last-monday-count-6",
+      "family": "rfc-examples",
+      "why": "RFC 5545's 'Monthly on the second-to-last Monday of the month for 6 months' (BYDAY=-2MO).",
+      "references": [
+        "RFC 5545 §3.8.5.3"
+      ],
+      "zones": [
+        "America/New_York"
+      ],
+      "master": [
+        "DTSTART;TZID=America/New_York:19970922T090000",
+        "DTEND;TZID=America/New_York:19970922T100000",
+        "RRULE:FREQ=MONTHLY;COUNT=6;BYDAY=-2MO"
+      ],
+      "window": {
+        "from": "1997-09-01T00:00:00Z",
+        "to": "1998-03-01T00:00:00Z"
+      },
+      "frame": "zoned:America/New_York",
+      "expect": "occurrences",
+      "ruleDays": true,
+      "rfc": {
+        "days": [
+          "1997-09-22",
+          "1997-10-20",
+          "1997-11-17",
+          "1997-12-22",
+          "1998-01-19",
+          "1998-02-16"
+        ],
+        "wall": "09:00:00"
+      }
+    },
+    {
+      "id": "rfc-examples/monthly-first-and-last-day-count-10",
+      "family": "rfc-examples",
+      "why": "RFC 5545's 'Monthly on the first and last day of the month for 10 occurrences' (BYMONTHDAY=1,-1).",
+      "references": [
+        "RFC 5545 §3.8.5.3"
+      ],
+      "zones": [
+        "America/New_York"
+      ],
+      "master": [
+        "DTSTART;TZID=America/New_York:19970930T090000",
+        "DTEND;TZID=America/New_York:19970930T100000",
+        "RRULE:FREQ=MONTHLY;COUNT=10;BYMONTHDAY=1,-1"
+      ],
+      "window": {
+        "from": "1997-09-01T00:00:00Z",
+        "to": "1998-03-01T00:00:00Z"
+      },
+      "frame": "zoned:America/New_York",
+      "expect": "occurrences",
+      "ruleDays": true,
+      "rfc": {
+        "days": [
+          "1997-09-30",
+          "1997-10-01",
+          "1997-10-31",
+          "1997-11-01",
+          "1997-11-30",
+          "1997-12-01",
+          "1997-12-31",
+          "1998-01-01",
+          "1998-01-31",
+          "1998-02-01"
+        ],
+        "wall": "09:00:00"
+      }
+    },
+    {
+      "id": "rfc-examples/yearly-20th-monday",
+      "family": "rfc-examples",
+      "why": "RFC 5545's 'Every 20th Monday of the year, forever' (YEARLY;BYDAY=20MO), three years of it.",
+      "references": [
+        "RFC 5545 §3.8.5.3"
+      ],
+      "zones": [
+        "America/New_York"
+      ],
+      "master": [
+        "DTSTART;TZID=America/New_York:19970519T090000",
+        "DTEND;TZID=America/New_York:19970519T100000",
+        "RRULE:FREQ=YEARLY;BYDAY=20MO"
+      ],
+      "window": {
+        "from": "1997-05-01T00:00:00Z",
+        "to": "2000-01-01T00:00:00Z"
+      },
+      "frame": "zoned:America/New_York",
+      "expect": "occurrences",
+      "ruleDays": true,
+      "rfc": {
+        "days": [
+          "1997-05-19",
+          "1998-05-18",
+          "1999-05-17"
+        ],
+        "wall": "09:00:00"
+      }
+    },
+    {
+      "id": "rfc-examples/friday-the-13th",
+      "family": "rfc-examples",
+      "why": "RFC 5545's 'Every Friday the 13th, forever', whose EXDATE removes DTSTART (not itself a Friday the 13th).",
+      "references": [
+        "RFC 5545 §3.8.5.3"
+      ],
+      "zones": [
+        "America/New_York"
+      ],
+      "master": [
+        "DTSTART;TZID=America/New_York:19970902T090000",
+        "DTEND;TZID=America/New_York:19970902T100000",
+        "EXDATE;TZID=America/New_York:19970902T090000",
+        "RRULE:FREQ=MONTHLY;BYDAY=FR;BYMONTHDAY=13"
+      ],
+      "window": {
+        "from": "1997-09-01T00:00:00Z",
+        "to": "2001-01-01T00:00:00Z"
+      },
+      "frame": "zoned:America/New_York",
+      "expect": "occurrences",
+      "ruleDays": true,
+      "rfc": {
+        "days": [
+          "1998-02-13",
+          "1998-03-13",
+          "1998-11-13",
+          "1999-08-13",
+          "2000-10-13"
+        ],
+        "wall": "09:00:00"
+      }
+    },
+    {
+      "id": "rfc-examples/us-presidential-election-day",
+      "family": "rfc-examples",
+      "why": "RFC 5545's 'Every 4 years, the first Tuesday after a Monday in November' (YEARLY;INTERVAL=4 with BYMONTH, BYDAY and BYMONTHDAY).",
+      "references": [
+        "RFC 5545 §3.8.5.3"
+      ],
+      "zones": [
+        "America/New_York"
+      ],
+      "master": [
+        "DTSTART;TZID=America/New_York:19961105T090000",
+        "DTEND;TZID=America/New_York:19961105T100000",
+        "RRULE:FREQ=YEARLY;INTERVAL=4;BYMONTH=11;BYDAY=TU;BYMONTHDAY=2,3,4,5,6,7,8"
+      ],
+      "window": {
+        "from": "1996-11-01T00:00:00Z",
+        "to": "2005-01-01T00:00:00Z"
+      },
+      "frame": "zoned:America/New_York",
+      "expect": "occurrences",
+      "ruleDays": true,
+      "rfc": {
+        "days": [
+          "1996-11-05",
+          "2000-11-07",
+          "2004-11-02"
+        ],
+        "wall": "09:00:00"
+      }
+    },
+    {
+      "id": "rfc-examples/wkst-mo",
+      "family": "rfc-examples",
+      "why": "RFC 5545's WKST example with WKST=MO: weeks start on Monday, so August 10 is in DTSTART's week.",
+      "references": [
+        "RFC 5545 §3.8.5.3"
+      ],
+      "zones": [
+        "America/New_York"
+      ],
+      "master": [
+        "DTSTART;TZID=America/New_York:19970805T090000",
+        "DTEND;TZID=America/New_York:19970805T100000",
+        "RRULE:FREQ=WEEKLY;INTERVAL=2;COUNT=4;BYDAY=TU,SU;WKST=MO"
+      ],
+      "window": {
+        "from": "1997-08-01T00:00:00Z",
+        "to": "1997-09-15T00:00:00Z"
+      },
+      "frame": "zoned:America/New_York",
+      "expect": "occurrences",
+      "ruleDays": true,
+      "rfc": {
+        "days": [
+          "1997-08-05",
+          "1997-08-10",
+          "1997-08-19",
+          "1997-08-24"
+        ],
+        "wall": "09:00:00"
+      }
+    },
+    {
+      "id": "rfc-examples/wkst-su",
+      "family": "rfc-examples",
+      "why": "RFC 5545's WKST example with WKST=SU: changing only WKST gives different days.",
+      "references": [
+        "RFC 5545 §3.8.5.3"
+      ],
+      "zones": [
+        "America/New_York"
+      ],
+      "master": [
+        "DTSTART;TZID=America/New_York:19970805T090000",
+        "DTEND;TZID=America/New_York:19970805T100000",
+        "RRULE:FREQ=WEEKLY;INTERVAL=2;COUNT=4;BYDAY=TU,SU;WKST=SU"
+      ],
+      "window": {
+        "from": "1997-08-01T00:00:00Z",
+        "to": "1997-09-15T00:00:00Z"
+      },
+      "frame": "zoned:America/New_York",
+      "expect": "occurrences",
+      "ruleDays": true,
+      "rfc": {
+        "days": [
+          "1997-08-05",
+          "1997-08-17",
+          "1997-08-19",
+          "1997-08-31"
+        ],
+        "wall": "09:00:00"
+      }
+    },
+    {
+      "id": "rfc-examples/february-30-ignored",
+      "family": "rfc-examples",
+      "why": "RFC 5545's 'an invalid date (i.e., February 30) is ignored' (MONTHLY;BYMONTHDAY=15,30;COUNT=5).",
+      "references": [
+        "RFC 5545 §3.8.5.3"
+      ],
+      "zones": [
+        "America/New_York"
+      ],
+      "master": [
+        "DTSTART;TZID=America/New_York:20070115T090000",
+        "DTEND;TZID=America/New_York:20070115T100000",
+        "RRULE:FREQ=MONTHLY;BYMONTHDAY=15,30;COUNT=5"
+      ],
+      "window": {
+        "from": "2007-01-01T00:00:00Z",
+        "to": "2007-04-15T00:00:00Z"
+      },
+      "frame": "zoned:America/New_York",
+      "expect": "occurrences",
+      "ruleDays": true,
+      "rfc": {
+        "days": [
+          "2007-01-15",
+          "2007-01-30",
+          "2007-02-15",
+          "2007-03-15",
+          "2007-03-30"
+        ],
+        "wall": "09:00:00"
+      }
+    },
+    {
+      "id": "dst-gap/new-york-daily-0230",
+      "family": "dst-gap",
+      "why": "02:30 does not exist on 2019-03-10 in New York (02:00 EST becomes 03:00 EDT): that occurrence is at 03:30 EDT, the UTC offset before the gap; the next day is 02:30 again.",
+      "references": [
+        "RFC 5545 §3.3.5",
+        "ADR-IOS-108 decision 1"
+      ],
+      "zones": [
+        "America/New_York"
+      ],
+      "master": [
+        "DTSTART;TZID=America/New_York:20190308T023000",
+        "DTEND;TZID=America/New_York:20190308T033000",
+        "RRULE:FREQ=DAILY"
+      ],
+      "window": {
+        "from": "2019-03-07T00:00:00Z",
+        "to": "2019-03-14T00:00:00Z"
+      },
+      "frame": "zoned:America/New_York",
+      "expect": "occurrences"
+    },
+    {
+      "id": "dst-gap/berlin-weekly-sunday-0230",
+      "family": "dst-gap",
+      "why": "A weekly Sunday 02:30 in Berlin across the 2019-03-31 change (02:00 CET becomes 03:00 CEST): 03:30 that Sunday, 02:30 again the Sunday after.",
+      "references": [
+        "RFC 5545 §3.3.5",
+        "ADR-IOS-108 decision 1"
+      ],
+      "zones": [
+        "Europe/Berlin"
+      ],
+      "master": [
+        "DTSTART;TZID=Europe/Berlin:20190317T023000",
+        "DTEND;TZID=Europe/Berlin:20190317T033000",
+        "RRULE:FREQ=WEEKLY;BYDAY=SU"
+      ],
+      "window": {
+        "from": "2019-03-15T00:00:00Z",
+        "to": "2019-04-20T00:00:00Z"
+      },
+      "frame": "zoned:Europe/Berlin",
+      "expect": "occurrences"
+    },
+    {
+      "id": "dst-gap/sydney-weekly-sunday-0230",
+      "family": "dst-gap",
+      "why": "A southern-hemisphere change: Sydney goes from 02:00 AEST to 03:00 AEDT on 2019-10-06, so the weekly 02:30 is 03:30 that Sunday only.",
+      "references": [
+        "RFC 5545 §3.3.5",
+        "ADR-IOS-108 decision 1"
+      ],
+      "zones": [
+        "Australia/Sydney"
+      ],
+      "master": [
+        "DTSTART;TZID=Australia/Sydney:20190922T023000",
+        "DTEND;TZID=Australia/Sydney:20190922T033000",
+        "RRULE:FREQ=WEEKLY;BYDAY=SU"
+      ],
+      "window": {
+        "from": "2019-09-20T00:00:00Z",
+        "to": "2019-10-21T00:00:00Z"
+      },
+      "frame": "zoned:Australia/Sydney",
+      "expect": "occurrences"
+    },
+    {
+      "id": "dst-gap/adelaide-daily-0215",
+      "family": "dst-gap",
+      "why": "A half-hour zone: Adelaide goes from 02:00 ACST (+09:30) to 03:00 ACDT (+10:30) on 2019-10-06, so 02:15 that day is 03:15.",
+      "references": [
+        "RFC 5545 §3.3.5",
+        "ADR-IOS-108 decision 1"
+      ],
+      "zones": [
+        "Australia/Adelaide"
+      ],
+      "master": [
+        "DTSTART;TZID=Australia/Adelaide:20191004T021500",
+        "DTEND;TZID=Australia/Adelaide:20191004T031500",
+        "RRULE:FREQ=DAILY"
+      ],
+      "window": {
+        "from": "2019-10-03T00:00:00Z",
+        "to": "2019-10-09T00:00:00Z"
+      },
+      "frame": "zoned:Australia/Adelaide",
+      "expect": "occurrences"
+    },
+    {
+      "id": "dst-gap/lord-howe-daily-0215",
+      "family": "dst-gap",
+      "why": "A 30-minute change: Lord Howe goes from 02:00 (+10:30) to 02:30 (+11:00) on 2019-10-06, so 02:15 that day is 02:45.",
+      "references": [
+        "RFC 5545 §3.3.5",
+        "ADR-IOS-108 decision 1"
+      ],
+      "zones": [
+        "Australia/Lord_Howe"
+      ],
+      "master": [
+        "DTSTART;TZID=Australia/Lord_Howe:20191004T021500",
+        "DTEND;TZID=Australia/Lord_Howe:20191004T031500",
+        "RRULE:FREQ=DAILY"
+      ],
+      "window": {
+        "from": "2019-10-03T00:00:00Z",
+        "to": "2019-10-09T00:00:00Z"
+      },
+      "frame": "zoned:Australia/Lord_Howe",
+      "expect": "occurrences"
+    },
+    {
+      "id": "dst-gap/santiago-daily-0030",
+      "family": "dst-gap",
+      "why": "Midnight skipped: Santiago goes from 00:00 (-04) to 01:00 (-03) on 2019-09-08, so 00:30 that day is 01:30.",
+      "references": [
+        "RFC 5545 §3.3.5",
+        "ADR-IOS-108 decision 1"
+      ],
+      "zones": [
+        "America/Santiago"
+      ],
+      "master": [
+        "DTSTART;TZID=America/Santiago:20190906T003000",
+        "DTEND;TZID=America/Santiago:20190906T013000",
+        "RRULE:FREQ=DAILY"
+      ],
+      "window": {
+        "from": "2019-09-05T00:00:00Z",
+        "to": "2019-09-11T00:00:00Z"
+      },
+      "frame": "zoned:America/Santiago",
+      "expect": "occurrences"
+    },
+    {
+      "id": "dst-gap/havana-weekly-sunday-0030",
+      "family": "dst-gap",
+      "why": "Midnight skipped: Havana goes from 00:00 CST to 01:00 CDT on 2019-03-10, so the weekly Sunday 00:30 is 01:30 that Sunday only.",
+      "references": [
+        "RFC 5545 §3.3.5",
+        "ADR-IOS-108 decision 1"
+      ],
+      "zones": [
+        "America/Havana"
+      ],
+      "master": [
+        "DTSTART;TZID=America/Havana:20190224T003000",
+        "DTEND;TZID=America/Havana:20190224T013000",
+        "RRULE:FREQ=WEEKLY;BYDAY=SU"
+      ],
+      "window": {
+        "from": "2019-02-23T00:00:00Z",
+        "to": "2019-03-25T00:00:00Z"
+      },
+      "frame": "zoned:America/Havana",
+      "expect": "occurrences"
+    },
+    {
+      "id": "dst-repeat/new-york-daily-0130",
+      "family": "dst-repeat",
+      "why": "01:30 happens twice on 2019-11-03 in New York (02:00 EDT becomes 01:00 EST): the occurrence is the first, 01:30 EDT.",
+      "references": [
+        "RFC 5545 §3.3.5",
+        "ADR-IOS-108 decision 1"
+      ],
+      "zones": [
+        "America/New_York"
+      ],
+      "master": [
+        "DTSTART;TZID=America/New_York:20191101T013000",
+        "DTEND;TZID=America/New_York:20191101T023000",
+        "RRULE:FREQ=DAILY"
+      ],
+      "window": {
+        "from": "2019-10-31T00:00:00Z",
+        "to": "2019-11-06T00:00:00Z"
+      },
+      "frame": "zoned:America/New_York",
+      "expect": "occurrences"
+    },
+    {
+      "id": "dst-repeat/sydney-daily-0230",
+      "family": "dst-repeat",
+      "why": "Sydney goes back from 03:00 AEDT to 02:00 AEST on 2019-04-07, so 02:30 happens twice; the occurrence is the first, 02:30 AEDT.",
+      "references": [
+        "RFC 5545 §3.3.5",
+        "ADR-IOS-108 decision 1"
+      ],
+      "zones": [
+        "Australia/Sydney"
+      ],
+      "master": [
+        "DTSTART;TZID=Australia/Sydney:20190405T023000",
+        "DTEND;TZID=Australia/Sydney:20190405T033000",
+        "RRULE:FREQ=DAILY"
+      ],
+      "window": {
+        "from": "2019-04-04T00:00:00Z",
+        "to": "2019-04-10T00:00:00Z"
+      },
+      "frame": "zoned:Australia/Sydney",
+      "expect": "occurrences"
+    },
+    {
+      "id": "dst-repeat/lord-howe-daily-0145",
+      "family": "dst-repeat",
+      "why": "A 30-minute fold: Lord Howe goes back from 02:00 (+11:00) to 01:30 (+10:30) on 2019-04-07, so 01:45 happens twice; the occurrence is the first.",
+      "references": [
+        "RFC 5545 §3.3.5",
+        "ADR-IOS-108 decision 1"
+      ],
+      "zones": [
+        "Australia/Lord_Howe"
+      ],
+      "master": [
+        "DTSTART;TZID=Australia/Lord_Howe:20190405T014500",
+        "DTEND;TZID=Australia/Lord_Howe:20190405T024500",
+        "RRULE:FREQ=DAILY"
+      ],
+      "window": {
+        "from": "2019-04-04T00:00:00Z",
+        "to": "2019-04-10T00:00:00Z"
+      },
+      "frame": "zoned:Australia/Lord_Howe",
+      "expect": "occurrences"
+    },
+    {
+      "id": "dst-repeat/havana-daily-0030",
+      "family": "dst-repeat",
+      "why": "Midnight fold: Havana goes back from 01:00 CDT to 00:00 CST on 2019-11-03, so 00:30 happens twice; the occurrence is the first, 00:30 CDT.",
+      "references": [
+        "RFC 5545 §3.3.5",
+        "ADR-IOS-108 decision 1"
+      ],
+      "zones": [
+        "America/Havana"
+      ],
+      "master": [
+        "DTSTART;TZID=America/Havana:20191101T003000",
+        "DTEND;TZID=America/Havana:20191101T013000",
+        "RRULE:FREQ=DAILY"
+      ],
+      "window": {
+        "from": "2019-10-31T00:00:00Z",
+        "to": "2019-11-06T00:00:00Z"
+      },
+      "frame": "zoned:America/Havana",
+      "expect": "occurrences"
+    },
+    {
+      "id": "dst-repeat/santiago-weekly-saturday-2330",
+      "family": "dst-repeat",
+      "why": "A fold before midnight: Santiago goes back from 24:00 (-03) to 23:00 (-04) at the end of Saturday 2019-04-06, so 23:30 that Saturday happens twice; the occurrence is the first.",
+      "references": [
+        "RFC 5545 §3.3.5",
+        "ADR-IOS-108 decision 1"
+      ],
+      "zones": [
+        "America/Santiago"
+      ],
+      "master": [
+        "DTSTART;TZID=America/Santiago:20190323T233000",
+        "DTEND;TZID=America/Santiago:20190324T003000",
+        "RRULE:FREQ=WEEKLY;BYDAY=SA"
+      ],
+      "window": {
+        "from": "2019-03-22T00:00:00Z",
+        "to": "2019-04-20T00:00:00Z"
+      },
+      "frame": "zoned:America/Santiago",
+      "expect": "occurrences"
+    },
+    {
+      "id": "dst-repeat/tehran-daily-2330",
+      "family": "dst-repeat",
+      "why": "A half-hour zone folding at midnight: Tehran goes back from 24:00 (+04:30) to 23:00 (+03:30) at the end of 2019-09-21, so 23:30 that day happens twice; the occurrence is the first.",
+      "references": [
+        "RFC 5545 §3.3.5",
+        "ADR-IOS-108 decision 1"
+      ],
+      "zones": [
+        "Asia/Tehran"
+      ],
+      "master": [
+        "DTSTART;TZID=Asia/Tehran:20190919T233000",
+        "DTEND;TZID=Asia/Tehran:20190920T003000",
+        "RRULE:FREQ=DAILY"
+      ],
+      "window": {
+        "from": "2019-09-18T00:00:00Z",
+        "to": "2019-09-25T00:00:00Z"
+      },
+      "frame": "zoned:Asia/Tehran",
+      "expect": "occurrences"
+    },
+    {
+      "id": "leap-years/yearly-february-29-from-1896",
+      "family": "leap-years",
+      "why": "A yearly all-day series on 29 February from 1896: 1900 is divisible by 100 and not by 400, so it has no 29 February and is skipped; the next occurrence is 1904.",
+      "references": [
+        "RFC 5545 §3.3.10"
+      ],
+      "master": [
+        "DTSTART;VALUE=DATE:18960229",
+        "DTEND;VALUE=DATE:18960301",
+        "RRULE:FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=29"
+      ],
+      "window": {
+        "from": "1896-01-01T00:00:00Z",
+        "to": "1904-06-01T00:00:00Z"
+      },
+      "frame": "allDay",
+      "expect": "occurrences",
+      "ruleDays": true
+    },
+    {
+      "id": "leap-years/yearly-february-29-from-1996",
+      "family": "leap-years",
+      "why": "A yearly all-day series on 29 February from 1996: 2000 is divisible by 400, so it is a leap year and has an occurrence, as 1996 and 2004 do.",
+      "references": [
+        "RFC 5545 §3.3.10"
+      ],
+      "master": [
+        "DTSTART;VALUE=DATE:19960229",
+        "DTEND;VALUE=DATE:19960301",
+        "RRULE:FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=29"
+      ],
+      "window": {
+        "from": "1996-01-01T00:00:00Z",
+        "to": "2004-06-01T00:00:00Z"
+      },
+      "frame": "allDay",
+      "expect": "occurrences",
+      "ruleDays": true
+    }
+  ],
+  "families": {
+    "rfc-examples": "RFC 5545 §3.8.5.3's own RRULE examples, verbatim (America/New_York, 1997-2007); RFC 5545 prints their answer, a third witness the generator checks.",
+    "dst-gap": "RFC 5545 §3.3.5: a wall time that a change to summer time skips takes the UTC offset from before the change; the series keeps its wall time on every other day.",
+    "dst-repeat": "RFC 5545 §3.3.5: a wall time that a change back repeats names the first of the two instants.",
+    "leap-years": "RFC 5545 §3.3.10: a rule that gives an invalid date (29 February in a common year) skips it. The Gregorian century rule: 1900 is a common year, 2000 is a leap year."
+  }
+}

@@ -1,0 +1,1086 @@
+{
+  "about": "RFC 5545 §3.3.5: a wall time that a change back repeats names the first of the two instants.",
+  "cases": [
+    {
+      "expect": "occurrences",
+      "expected": [
+        {
+          "end": "2019-11-01T06:30:00Z",
+          "key": "20191101T053000Z",
+          "moved": false,
+          "offset": -14400,
+          "start": "2019-11-01T05:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-11-01T01:30:00"
+        },
+        {
+          "end": "2019-11-02T06:30:00Z",
+          "key": "20191102T053000Z",
+          "moved": false,
+          "offset": -14400,
+          "start": "2019-11-02T05:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-11-02T01:30:00"
+        },
+        {
+          "end": "2019-11-03T06:30:00Z",
+          "key": "20191103T053000Z",
+          "moved": false,
+          "offset": -14400,
+          "start": "2019-11-03T05:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-11-03T01:30:00"
+        },
+        {
+          "end": "2019-11-04T07:30:00Z",
+          "key": "20191104T063000Z",
+          "moved": false,
+          "offset": -18000,
+          "start": "2019-11-04T06:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-11-04T01:30:00"
+        },
+        {
+          "end": "2019-11-05T07:30:00Z",
+          "key": "20191105T063000Z",
+          "moved": false,
+          "offset": -18000,
+          "start": "2019-11-05T06:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-11-05T01:30:00"
+        }
+      ],
+      "frame": "zoned:America/New_York",
+      "icaljs": [
+        {
+          "end": "2019-11-01T06:30:00Z",
+          "key": "20191101T053000Z",
+          "moved": false,
+          "offset": -14400,
+          "start": "2019-11-01T05:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-11-01T01:30:00"
+        },
+        {
+          "end": "2019-11-02T06:30:00Z",
+          "key": "20191102T053000Z",
+          "moved": false,
+          "offset": -14400,
+          "start": "2019-11-02T05:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-11-02T01:30:00"
+        },
+        {
+          "end": "2019-11-03T07:30:00Z",
+          "key": "20191103T063000Z",
+          "moved": false,
+          "offset": -18000,
+          "start": "2019-11-03T06:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-11-03T01:30:00"
+        },
+        {
+          "end": "2019-11-04T07:30:00Z",
+          "key": "20191104T063000Z",
+          "moved": false,
+          "offset": -18000,
+          "start": "2019-11-04T06:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-11-04T01:30:00"
+        },
+        {
+          "end": "2019-11-05T07:30:00Z",
+          "key": "20191105T063000Z",
+          "moved": false,
+          "offset": -18000,
+          "start": "2019-11-05T06:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-11-05T01:30:00"
+        }
+      ],
+      "ics": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//example.com//TabMail calendar oracle//EN\r\nBEGIN:VTIMEZONE\r\nTZID:America/New_York\r\nX-LIC-LOCATION:America/New_York\r\nBEGIN:STANDARD\r\nTZNAME:EST\r\nTZOFFSETFROM:-045602\r\nTZOFFSETTO:-0500\r\nDTSTART:18831118T120358\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:EDT\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nDTSTART:19180331T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU;UNTIL=19200328T070000Z\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:EST\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nDTSTART:19181027T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU;UNTIL=19201031T060000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:EDT\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nDTSTART:19210424T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=4;BYDAY=-1SU;UNTIL=19410427T070000Z\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:EST\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nDTSTART:19210925T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=9;BYDAY=-1SU;UNTIL=19410928T060000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:EWT\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nDTSTART:19420209T020000\r\nEND:DAYLIGHT\r\nBEGIN:DAYLIGHT\r\nTZNAME:EPT\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0400\r\nDTSTART:19450814T190000\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:EST\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nDTSTART:19450930T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=9;BYDAY=-1SU;UNTIL=19540926T060000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:EDT\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nDTSTART:19460428T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=4;BYDAY=-1SU;UNTIL=19730429T070000Z\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:EST\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nDTSTART:19551030T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU;UNTIL=20061029T060000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:EDT\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nDTSTART:19740106T020000\r\nRDATE:19750223T020000\r\nEND:DAYLIGHT\r\nBEGIN:DAYLIGHT\r\nTZNAME:EDT\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nDTSTART:19760425T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=4;BYDAY=-1SU;UNTIL=19860427T070000Z\r\nEND:DAYLIGHT\r\nBEGIN:DAYLIGHT\r\nTZNAME:EDT\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nDTSTART:19870405T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=4;BYDAY=1SU;UNTIL=20060402T070000Z\r\nEND:DAYLIGHT\r\nBEGIN:DAYLIGHT\r\nTZNAME:EDT\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nDTSTART:20070311T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU;UNTIL=20370308T070000Z\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:EST\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nDTSTART:20071104T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU;UNTIL=20361102T060000Z\r\nEND:STANDARD\r\nBEGIN:STANDARD\r\nTZNAME:EST\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nDTSTART:20371101T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:EDT\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nDTSTART:20380314T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU\r\nEND:DAYLIGHT\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:dst-repeat-new-york-daily-0130@example.com\r\nDTSTAMP:20200101T000000Z\r\nSUMMARY:dst-repeat/new-york-daily-0130\r\nDTSTART;TZID=America/New_York:20191101T013000\r\nDTEND;TZID=America/New_York:20191101T023000\r\nRRULE:FREQ=DAILY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+      "id": "dst-repeat/new-york-daily-0130",
+      "libical": [
+        {
+          "end": "2019-11-01T06:30:00Z",
+          "key": "20191101T053000Z",
+          "moved": false,
+          "offset": -14400,
+          "start": "2019-11-01T05:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-11-01T01:30:00"
+        },
+        {
+          "end": "2019-11-02T06:30:00Z",
+          "key": "20191102T053000Z",
+          "moved": false,
+          "offset": -14400,
+          "start": "2019-11-02T05:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-11-02T01:30:00"
+        },
+        {
+          "end": "2019-11-03T05:30:00Z",
+          "key": "20191103T053000Z",
+          "moved": false,
+          "offset": -14400,
+          "start": "2019-11-03T05:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-11-03T01:30:00"
+        },
+        {
+          "end": "2019-11-04T07:30:00Z",
+          "key": "20191104T063000Z",
+          "moved": false,
+          "offset": -18000,
+          "start": "2019-11-04T06:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-11-04T01:30:00"
+        },
+        {
+          "end": "2019-11-05T07:30:00Z",
+          "key": "20191105T063000Z",
+          "moved": false,
+          "offset": -18000,
+          "start": "2019-11-05T06:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-11-05T01:30:00"
+        }
+      ],
+      "references": [
+        "RFC 5545 §3.3.5",
+        "ADR-IOS-108 decision 1"
+      ],
+      "resolution": {
+        "follows": "libical",
+        "lengthFrom": "icaljs",
+        "references": [
+          "RFC 5545 §3.3.5",
+          "RFC 5545 §3.8.5.3",
+          "libical CHANGELOG 4.0.6",
+          "https://github.com/kewisch/ical.js/issues/1051",
+          "ADR-IOS-108 decision 1"
+        ],
+        "why": "RFC 5545 §3.3.5 names the first of the two instants of a wall time a change back repeats, and §3.8.5.3 gives every occurrence the exact length DTEND less DTSTART. libical 4.0.7 places the start at the first instant (libical 4.0.6: 'Resolve local times in a fall-back overlap to the first occurrence') but gives that occurrence no length (its end equals its start). ical.js places the repeated wall time at the second instant (ical.js issue 1051) and keeps the length. So the starts follow libical and the lengths ical.js."
+      },
+      "why": "01:30 happens twice on 2019-11-03 in New York (02:00 EDT becomes 01:00 EST): the occurrence is the first, 01:30 EDT.",
+      "window": {
+        "from": "2019-10-31T00:00:00Z",
+        "to": "2019-11-06T00:00:00Z"
+      }
+    },
+    {
+      "expect": "occurrences",
+      "expected": [
+        {
+          "end": "2019-04-04T16:30:00Z",
+          "key": "20190404T153000Z",
+          "moved": false,
+          "offset": 39600,
+          "start": "2019-04-04T15:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-05T02:30:00"
+        },
+        {
+          "end": "2019-04-05T16:30:00Z",
+          "key": "20190405T153000Z",
+          "moved": false,
+          "offset": 39600,
+          "start": "2019-04-05T15:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-06T02:30:00"
+        },
+        {
+          "end": "2019-04-06T16:30:00Z",
+          "key": "20190406T153000Z",
+          "moved": false,
+          "offset": 39600,
+          "start": "2019-04-06T15:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-07T02:30:00"
+        },
+        {
+          "end": "2019-04-07T17:30:00Z",
+          "key": "20190407T163000Z",
+          "moved": false,
+          "offset": 36000,
+          "start": "2019-04-07T16:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-08T02:30:00"
+        },
+        {
+          "end": "2019-04-08T17:30:00Z",
+          "key": "20190408T163000Z",
+          "moved": false,
+          "offset": 36000,
+          "start": "2019-04-08T16:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-09T02:30:00"
+        },
+        {
+          "end": "2019-04-09T17:30:00Z",
+          "key": "20190409T163000Z",
+          "moved": false,
+          "offset": 36000,
+          "start": "2019-04-09T16:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-10T02:30:00"
+        }
+      ],
+      "frame": "zoned:Australia/Sydney",
+      "icaljs": [
+        {
+          "end": "2019-04-04T16:30:00Z",
+          "key": "20190404T153000Z",
+          "moved": false,
+          "offset": 39600,
+          "start": "2019-04-04T15:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-05T02:30:00"
+        },
+        {
+          "end": "2019-04-05T16:30:00Z",
+          "key": "20190405T153000Z",
+          "moved": false,
+          "offset": 39600,
+          "start": "2019-04-05T15:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-06T02:30:00"
+        },
+        {
+          "end": "2019-04-06T17:30:00Z",
+          "key": "20190406T163000Z",
+          "moved": false,
+          "offset": 36000,
+          "start": "2019-04-06T16:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-07T02:30:00"
+        },
+        {
+          "end": "2019-04-07T17:30:00Z",
+          "key": "20190407T163000Z",
+          "moved": false,
+          "offset": 36000,
+          "start": "2019-04-07T16:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-08T02:30:00"
+        },
+        {
+          "end": "2019-04-08T17:30:00Z",
+          "key": "20190408T163000Z",
+          "moved": false,
+          "offset": 36000,
+          "start": "2019-04-08T16:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-09T02:30:00"
+        },
+        {
+          "end": "2019-04-09T17:30:00Z",
+          "key": "20190409T163000Z",
+          "moved": false,
+          "offset": 36000,
+          "start": "2019-04-09T16:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-10T02:30:00"
+        }
+      ],
+      "ics": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//example.com//TabMail calendar oracle//EN\r\nBEGIN:VTIMEZONE\r\nTZID:Australia/Sydney\r\nX-LIC-LOCATION:Australia/Sydney\r\nBEGIN:STANDARD\r\nTZNAME:AEST\r\nTZOFFSETFROM:+100452\r\nTZOFFSETTO:+1000\r\nDTSTART:18950201T000000\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:AEDT\r\nTZOFFSETFROM:+1000\r\nTZOFFSETTO:+1100\r\nDTSTART:19170101T020000\r\nRDATE:19420101T020000\r\nRDATE:19420927T020000\r\nRDATE:19431003T020000\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:AEST\r\nTZOFFSETFROM:+1100\r\nTZOFFSETTO:+1000\r\nDTSTART:19170325T030000\r\nEND:STANDARD\r\nBEGIN:STANDARD\r\nTZNAME:AEST\r\nTZOFFSETFROM:+1100\r\nTZOFFSETTO:+1000\r\nDTSTART:19420329T030000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU;UNTIL=19440325T160000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:AEDT\r\nTZOFFSETFROM:+1000\r\nTZOFFSETTO:+1100\r\nDTSTART:19711031T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU;UNTIL=19851026T160000Z\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:AEST\r\nTZOFFSETFROM:+1100\r\nTZOFFSETTO:+1000\r\nDTSTART:19720227T030000\r\nEND:STANDARD\r\nBEGIN:STANDARD\r\nTZNAME:AEST\r\nTZOFFSETFROM:+1100\r\nTZOFFSETTO:+1000\r\nDTSTART:19730304T030000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=1SU;UNTIL=19810228T160000Z\r\nEND:STANDARD\r\nBEGIN:STANDARD\r\nTZNAME:AEST\r\nTZOFFSETFROM:+1100\r\nTZOFFSETTO:+1000\r\nDTSTART:19820404T030000\r\nEND:STANDARD\r\nBEGIN:STANDARD\r\nTZNAME:AEST\r\nTZOFFSETFROM:+1100\r\nTZOFFSETTO:+1000\r\nDTSTART:19830306T030000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=1SU;UNTIL=19850302T160000Z\r\nEND:STANDARD\r\nBEGIN:STANDARD\r\nTZNAME:AEST\r\nTZOFFSETFROM:+1100\r\nTZOFFSETTO:+1000\r\nDTSTART:19860316T030000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=3SU;UNTIL=19890318T160000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:AEDT\r\nTZOFFSETFROM:+1000\r\nTZOFFSETTO:+1100\r\nDTSTART:19861019T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYMONTHDAY=19,25;BYDAY=SU;\r\n UNTIL=19871024T160000Z\r\nEND:DAYLIGHT\r\nBEGIN:DAYLIGHT\r\nTZNAME:AEDT\r\nTZOFFSETFROM:+1000\r\nTZOFFSETTO:+1100\r\nDTSTART:19881030T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU;UNTIL=19991030T160000Z\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:AEST\r\nTZOFFSETFROM:+1100\r\nTZOFFSETTO:+1000\r\nDTSTART:19900304T030000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=1SU;UNTIL=19950304T160000Z\r\nEND:STANDARD\r\nBEGIN:STANDARD\r\nTZNAME:AEST\r\nTZOFFSETFROM:+1100\r\nTZOFFSETTO:+1000\r\nDTSTART:19960331T030000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU;UNTIL=20050326T160000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:AEDT\r\nTZOFFSETFROM:+1000\r\nTZOFFSETTO:+1100\r\nDTSTART:20000827T020000\r\nEND:DAYLIGHT\r\nBEGIN:DAYLIGHT\r\nTZNAME:AEDT\r\nTZOFFSETFROM:+1000\r\nTZOFFSETTO:+1100\r\nDTSTART:20011028T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU;UNTIL=20071027T160000Z\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:AEST\r\nTZOFFSETFROM:+1100\r\nTZOFFSETTO:+1000\r\nDTSTART:20060402T030000\r\nRDATE:20070325T030000\r\nEND:STANDARD\r\nBEGIN:STANDARD\r\nTZNAME:AEST\r\nTZOFFSETFROM:+1100\r\nTZOFFSETTO:+1000\r\nDTSTART:20080406T030000\r\nRRULE:FREQ=YEARLY;BYMONTH=4;BYDAY=1SU;UNTIL=20370404T160000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:AEDT\r\nTZOFFSETFROM:+1000\r\nTZOFFSETTO:+1100\r\nDTSTART:20081005T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=1SU;UNTIL=20361004T160000Z\r\nEND:DAYLIGHT\r\nBEGIN:DAYLIGHT\r\nTZNAME:AEDT\r\nTZOFFSETFROM:+1000\r\nTZOFFSETTO:+1100\r\nDTSTART:20371004T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=1SU\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:AEST\r\nTZOFFSETFROM:+1100\r\nTZOFFSETTO:+1000\r\nDTSTART:20380404T030000\r\nRRULE:FREQ=YEARLY;BYMONTH=4;BYDAY=1SU\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:dst-repeat-sydney-daily-0230@example.com\r\nDTSTAMP:20200101T000000Z\r\nSUMMARY:dst-repeat/sydney-daily-0230\r\nDTSTART;TZID=Australia/Sydney:20190405T023000\r\nDTEND;TZID=Australia/Sydney:20190405T033000\r\nRRULE:FREQ=DAILY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+      "id": "dst-repeat/sydney-daily-0230",
+      "libical": [
+        {
+          "end": "2019-04-04T16:30:00Z",
+          "key": "20190404T153000Z",
+          "moved": false,
+          "offset": 39600,
+          "start": "2019-04-04T15:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-05T02:30:00"
+        },
+        {
+          "end": "2019-04-05T16:30:00Z",
+          "key": "20190405T153000Z",
+          "moved": false,
+          "offset": 39600,
+          "start": "2019-04-05T15:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-06T02:30:00"
+        },
+        {
+          "end": "2019-04-06T15:30:00Z",
+          "key": "20190406T153000Z",
+          "moved": false,
+          "offset": 39600,
+          "start": "2019-04-06T15:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-07T02:30:00"
+        },
+        {
+          "end": "2019-04-07T17:30:00Z",
+          "key": "20190407T163000Z",
+          "moved": false,
+          "offset": 36000,
+          "start": "2019-04-07T16:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-08T02:30:00"
+        },
+        {
+          "end": "2019-04-08T17:30:00Z",
+          "key": "20190408T163000Z",
+          "moved": false,
+          "offset": 36000,
+          "start": "2019-04-08T16:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-09T02:30:00"
+        },
+        {
+          "end": "2019-04-09T17:30:00Z",
+          "key": "20190409T163000Z",
+          "moved": false,
+          "offset": 36000,
+          "start": "2019-04-09T16:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-10T02:30:00"
+        }
+      ],
+      "references": [
+        "RFC 5545 §3.3.5",
+        "ADR-IOS-108 decision 1"
+      ],
+      "resolution": {
+        "follows": "libical",
+        "lengthFrom": "icaljs",
+        "references": [
+          "RFC 5545 §3.3.5",
+          "RFC 5545 §3.8.5.3",
+          "libical CHANGELOG 4.0.6",
+          "https://github.com/kewisch/ical.js/issues/1051",
+          "ADR-IOS-108 decision 1"
+        ],
+        "why": "RFC 5545 §3.3.5 names the first of the two instants of a wall time a change back repeats, and §3.8.5.3 gives every occurrence the exact length DTEND less DTSTART. libical 4.0.7 places the start at the first instant (libical 4.0.6: 'Resolve local times in a fall-back overlap to the first occurrence') but gives that occurrence no length (its end equals its start). ical.js places the repeated wall time at the second instant (ical.js issue 1051) and keeps the length. So the starts follow libical and the lengths ical.js."
+      },
+      "why": "Sydney goes back from 03:00 AEDT to 02:00 AEST on 2019-04-07, so 02:30 happens twice; the occurrence is the first, 02:30 AEDT.",
+      "window": {
+        "from": "2019-04-04T00:00:00Z",
+        "to": "2019-04-10T00:00:00Z"
+      }
+    },
+    {
+      "expect": "occurrences",
+      "expected": [
+        {
+          "end": "2019-04-04T15:45:00Z",
+          "key": "20190404T144500Z",
+          "moved": false,
+          "offset": 39600,
+          "start": "2019-04-04T14:45:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-05T01:45:00"
+        },
+        {
+          "end": "2019-04-05T15:45:00Z",
+          "key": "20190405T144500Z",
+          "moved": false,
+          "offset": 39600,
+          "start": "2019-04-05T14:45:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-06T01:45:00"
+        },
+        {
+          "end": "2019-04-06T15:45:00Z",
+          "key": "20190406T144500Z",
+          "moved": false,
+          "offset": 39600,
+          "start": "2019-04-06T14:45:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-07T01:45:00"
+        },
+        {
+          "end": "2019-04-07T16:15:00Z",
+          "key": "20190407T151500Z",
+          "moved": false,
+          "offset": 37800,
+          "start": "2019-04-07T15:15:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-08T01:45:00"
+        },
+        {
+          "end": "2019-04-08T16:15:00Z",
+          "key": "20190408T151500Z",
+          "moved": false,
+          "offset": 37800,
+          "start": "2019-04-08T15:15:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-09T01:45:00"
+        },
+        {
+          "end": "2019-04-09T16:15:00Z",
+          "key": "20190409T151500Z",
+          "moved": false,
+          "offset": 37800,
+          "start": "2019-04-09T15:15:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-10T01:45:00"
+        }
+      ],
+      "frame": "zoned:Australia/Lord_Howe",
+      "icaljs": [
+        {
+          "end": "2019-04-04T15:45:00Z",
+          "key": "20190404T144500Z",
+          "moved": false,
+          "offset": 39600,
+          "start": "2019-04-04T14:45:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-05T01:45:00"
+        },
+        {
+          "end": "2019-04-05T15:45:00Z",
+          "key": "20190405T144500Z",
+          "moved": false,
+          "offset": 39600,
+          "start": "2019-04-05T14:45:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-06T01:45:00"
+        },
+        {
+          "end": "2019-04-06T16:15:00Z",
+          "key": "20190406T151500Z",
+          "moved": false,
+          "offset": 37800,
+          "start": "2019-04-06T15:15:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-07T01:45:00"
+        },
+        {
+          "end": "2019-04-07T16:15:00Z",
+          "key": "20190407T151500Z",
+          "moved": false,
+          "offset": 37800,
+          "start": "2019-04-07T15:15:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-08T01:45:00"
+        },
+        {
+          "end": "2019-04-08T16:15:00Z",
+          "key": "20190408T151500Z",
+          "moved": false,
+          "offset": 37800,
+          "start": "2019-04-08T15:15:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-09T01:45:00"
+        },
+        {
+          "end": "2019-04-09T16:15:00Z",
+          "key": "20190409T151500Z",
+          "moved": false,
+          "offset": 37800,
+          "start": "2019-04-09T15:15:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-10T01:45:00"
+        }
+      ],
+      "ics": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//example.com//TabMail calendar oracle//EN\r\nBEGIN:VTIMEZONE\r\nTZID:Australia/Lord_Howe\r\nX-LIC-LOCATION:Australia/Lord_Howe\r\nBEGIN:STANDARD\r\nTZNAME:AEST\r\nTZOFFSETFROM:+103620\r\nTZOFFSETTO:+1000\r\nDTSTART:18950201T000000\r\nEND:STANDARD\r\nBEGIN:STANDARD\r\nTZNAME:+1030\r\nTZOFFSETFROM:+1000\r\nTZOFFSETTO:+1030\r\nDTSTART:19810301T000000\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:+1130\r\nTZOFFSETFROM:+1030\r\nTZOFFSETTO:+1130\r\nDTSTART:19811025T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU;UNTIL=19841027T153000Z\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:+1030\r\nTZOFFSETFROM:+1130\r\nTZOFFSETTO:+1030\r\nDTSTART:19820307T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=1SU;UNTIL=19850302T143000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:+11\r\nTZOFFSETFROM:+1030\r\nTZOFFSETTO:+1100\r\nDTSTART:19851027T020000\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:+1030\r\nTZOFFSETFROM:+1100\r\nTZOFFSETTO:+1030\r\nDTSTART:19860316T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=3SU;UNTIL=19890318T150000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:+11\r\nTZOFFSETFROM:+1030\r\nTZOFFSETTO:+1100\r\nDTSTART:19861019T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYMONTHDAY=19,25;BYDAY=SU;\r\n UNTIL=19871024T153000Z\r\nEND:DAYLIGHT\r\nBEGIN:DAYLIGHT\r\nTZNAME:+11\r\nTZOFFSETFROM:+1030\r\nTZOFFSETTO:+1100\r\nDTSTART:19881030T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU;UNTIL=19991030T153000Z\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:+1030\r\nTZOFFSETFROM:+1100\r\nTZOFFSETTO:+1030\r\nDTSTART:19900304T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=1SU;UNTIL=19950304T150000Z\r\nEND:STANDARD\r\nBEGIN:STANDARD\r\nTZNAME:+1030\r\nTZOFFSETFROM:+1100\r\nTZOFFSETTO:+1030\r\nDTSTART:19960331T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU;UNTIL=20050326T150000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:+11\r\nTZOFFSETFROM:+1030\r\nTZOFFSETTO:+1100\r\nDTSTART:20000827T020000\r\nEND:DAYLIGHT\r\nBEGIN:DAYLIGHT\r\nTZNAME:+11\r\nTZOFFSETFROM:+1030\r\nTZOFFSETTO:+1100\r\nDTSTART:20011028T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU;UNTIL=20071027T153000Z\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:+1030\r\nTZOFFSETFROM:+1100\r\nTZOFFSETTO:+1030\r\nDTSTART:20060402T020000\r\nRDATE:20070325T020000\r\nEND:STANDARD\r\nBEGIN:STANDARD\r\nTZNAME:+1030\r\nTZOFFSETFROM:+1100\r\nTZOFFSETTO:+1030\r\nDTSTART:20080406T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=4;BYDAY=1SU;UNTIL=20370404T150000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:+11\r\nTZOFFSETFROM:+1030\r\nTZOFFSETTO:+1100\r\nDTSTART:20081005T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=1SU;UNTIL=20361004T153000Z\r\nEND:DAYLIGHT\r\nBEGIN:DAYLIGHT\r\nTZNAME:+11\r\nTZOFFSETFROM:+1030\r\nTZOFFSETTO:+1100\r\nDTSTART:20371004T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=1SU\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:+1030\r\nTZOFFSETFROM:+1100\r\nTZOFFSETTO:+1030\r\nDTSTART:20380404T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=4;BYDAY=1SU\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:dst-repeat-lord-howe-daily-0145@example.com\r\nDTSTAMP:20200101T000000Z\r\nSUMMARY:dst-repeat/lord-howe-daily-0145\r\nDTSTART;TZID=Australia/Lord_Howe:20190405T014500\r\nDTEND;TZID=Australia/Lord_Howe:20190405T024500\r\nRRULE:FREQ=DAILY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+      "id": "dst-repeat/lord-howe-daily-0145",
+      "libical": [
+        {
+          "end": "2019-04-04T15:45:00Z",
+          "key": "20190404T144500Z",
+          "moved": false,
+          "offset": 39600,
+          "start": "2019-04-04T14:45:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-05T01:45:00"
+        },
+        {
+          "end": "2019-04-05T15:45:00Z",
+          "key": "20190405T144500Z",
+          "moved": false,
+          "offset": 39600,
+          "start": "2019-04-05T14:45:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-06T01:45:00"
+        },
+        {
+          "end": "2019-04-06T15:45:00Z",
+          "key": "20190406T144500Z",
+          "moved": false,
+          "offset": 39600,
+          "start": "2019-04-06T14:45:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-07T01:45:00"
+        },
+        {
+          "end": "2019-04-07T16:15:00Z",
+          "key": "20190407T151500Z",
+          "moved": false,
+          "offset": 37800,
+          "start": "2019-04-07T15:15:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-08T01:45:00"
+        },
+        {
+          "end": "2019-04-08T16:15:00Z",
+          "key": "20190408T151500Z",
+          "moved": false,
+          "offset": 37800,
+          "start": "2019-04-08T15:15:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-09T01:45:00"
+        },
+        {
+          "end": "2019-04-09T16:15:00Z",
+          "key": "20190409T151500Z",
+          "moved": false,
+          "offset": 37800,
+          "start": "2019-04-09T15:15:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-10T01:45:00"
+        }
+      ],
+      "references": [
+        "RFC 5545 §3.3.5",
+        "ADR-IOS-108 decision 1"
+      ],
+      "resolution": {
+        "follows": "libical",
+        "references": [
+          "RFC 5545 §3.3.5",
+          "libical CHANGELOG 4.0.6",
+          "https://github.com/kewisch/ical.js/issues/1051",
+          "ADR-IOS-108 decision 1"
+        ],
+        "why": "RFC 5545 §3.3.5 names the first of the two instants of a wall time a change back repeats. libical 4.0.7 places 01:45 on 2019-04-07 at the first instant, +11:00 (libical 4.0.6: 'Resolve local times in a fall-back overlap to the first occurrence'); its end, 15:45Z (02:15 at +10:30), is past the 30-minute fold, so its length is right. ical.js places it at the second instant, +10:30 (ical.js issue 1051)."
+      },
+      "why": "A 30-minute fold: Lord Howe goes back from 02:00 (+11:00) to 01:30 (+10:30) on 2019-04-07, so 01:45 happens twice; the occurrence is the first.",
+      "window": {
+        "from": "2019-04-04T00:00:00Z",
+        "to": "2019-04-10T00:00:00Z"
+      }
+    },
+    {
+      "expect": "occurrences",
+      "expected": [
+        {
+          "end": "2019-11-01T05:30:00Z",
+          "key": "20191101T043000Z",
+          "moved": false,
+          "offset": -14400,
+          "start": "2019-11-01T04:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-11-01T00:30:00"
+        },
+        {
+          "end": "2019-11-02T05:30:00Z",
+          "key": "20191102T043000Z",
+          "moved": false,
+          "offset": -14400,
+          "start": "2019-11-02T04:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-11-02T00:30:00"
+        },
+        {
+          "end": "2019-11-03T05:30:00Z",
+          "key": "20191103T043000Z",
+          "moved": false,
+          "offset": -14400,
+          "start": "2019-11-03T04:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-11-03T00:30:00"
+        },
+        {
+          "end": "2019-11-04T06:30:00Z",
+          "key": "20191104T053000Z",
+          "moved": false,
+          "offset": -18000,
+          "start": "2019-11-04T05:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-11-04T00:30:00"
+        },
+        {
+          "end": "2019-11-05T06:30:00Z",
+          "key": "20191105T053000Z",
+          "moved": false,
+          "offset": -18000,
+          "start": "2019-11-05T05:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-11-05T00:30:00"
+        }
+      ],
+      "frame": "zoned:America/Havana",
+      "icaljs": [
+        {
+          "end": "2019-11-01T05:30:00Z",
+          "key": "20191101T043000Z",
+          "moved": false,
+          "offset": -14400,
+          "start": "2019-11-01T04:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-11-01T00:30:00"
+        },
+        {
+          "end": "2019-11-02T05:30:00Z",
+          "key": "20191102T043000Z",
+          "moved": false,
+          "offset": -14400,
+          "start": "2019-11-02T04:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-11-02T00:30:00"
+        },
+        {
+          "end": "2019-11-03T06:30:00Z",
+          "key": "20191103T053000Z",
+          "moved": false,
+          "offset": -18000,
+          "start": "2019-11-03T05:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-11-03T00:30:00"
+        },
+        {
+          "end": "2019-11-04T06:30:00Z",
+          "key": "20191104T053000Z",
+          "moved": false,
+          "offset": -18000,
+          "start": "2019-11-04T05:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-11-04T00:30:00"
+        },
+        {
+          "end": "2019-11-05T06:30:00Z",
+          "key": "20191105T053000Z",
+          "moved": false,
+          "offset": -18000,
+          "start": "2019-11-05T05:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-11-05T00:30:00"
+        }
+      ],
+      "ics": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//example.com//TabMail calendar oracle//EN\r\nBEGIN:VTIMEZONE\r\nTZID:America/Havana\r\nX-LIC-LOCATION:America/Havana\r\nBEGIN:STANDARD\r\nTZNAME:HMT\r\nTZOFFSETFROM:-052928\r\nTZOFFSETTO:-052936\r\nDTSTART:18900101T000000\r\nEND:STANDARD\r\nBEGIN:STANDARD\r\nTZNAME:CST\r\nTZOFFSETFROM:-052936\r\nTZOFFSETTO:-0500\r\nDTSTART:19250719T120000\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:CDT\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nDTSTART:19280610T000000\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:CST\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nDTSTART:19281010T000000\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:CDT\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nDTSTART:19400602T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=6;BYDAY=1SU;UNTIL=19420607T050000Z\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:CST\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nDTSTART:19400901T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=9;BYDAY=1SU;UNTIL=19420906T040000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:CDT\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nDTSTART:19450603T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=6;BYDAY=1SU;UNTIL=19460602T050000Z\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:CST\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nDTSTART:19450902T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=9;BYDAY=1SU;UNTIL=19460901T040000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:CDT\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nDTSTART:19650601T000000\r\nRDATE:19660529T000000\r\nRDATE:19670408T000000\r\nRDATE:19680414T000000\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:CST\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nDTSTART:19650930T000000\r\nRDATE:19661002T000000\r\nEND:STANDARD\r\nBEGIN:STANDARD\r\nTZNAME:CST\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nDTSTART:19670910T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=9;BYDAY=2SU;UNTIL=19680908T040000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:CDT\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nDTSTART:19690427T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=4;BYDAY=-1SU;UNTIL=19770424T050000Z\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:CST\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nDTSTART:19691026T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU;UNTIL=19711031T040000Z\r\nEND:STANDARD\r\nBEGIN:STANDARD\r\nTZNAME:CST\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nDTSTART:19721008T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYMONTHDAY=8;UNTIL=19741008T040000Z\r\nEND:STANDARD\r\nBEGIN:STANDARD\r\nTZNAME:CST\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nDTSTART:19751026T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU;UNTIL=19771030T040000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:CDT\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nDTSTART:19780507T000000\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:CST\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nDTSTART:19781008T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=2SU;UNTIL=19901014T040000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:CDT\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nDTSTART:19790318T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=3SU;UNTIL=19800316T050000Z\r\nEND:DAYLIGHT\r\nBEGIN:DAYLIGHT\r\nTZNAME:CDT\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nDTSTART:19810510T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=5;BYMONTHDAY=5,6,10;BYDAY=SU;\r\n UNTIL=19850505T050000Z\r\nEND:DAYLIGHT\r\nBEGIN:DAYLIGHT\r\nTZNAME:CDT\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nDTSTART:19860316T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=3SU;UNTIL=19890319T050000Z\r\nEND:DAYLIGHT\r\nBEGIN:DAYLIGHT\r\nTZNAME:CDT\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nDTSTART:19900401T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=4;BYDAY=1SU;UNTIL=19970406T050000Z\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:CST\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nDTSTART:19911013T010000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=2SU;UNTIL=19951008T050000Z\r\nEND:STANDARD\r\nBEGIN:STANDARD\r\nTZNAME:CST\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nDTSTART:19961006T010000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYMONTHDAY=6,12;BYDAY=SU;\r\n UNTIL=19971012T050000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:CDT\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nDTSTART:19980329T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU;UNTIL=19990328T050000Z\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:CST\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nDTSTART:19981025T010000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU;UNTIL=20031026T050000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:CDT\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nDTSTART:20000402T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=4;BYDAY=1SU;UNTIL=20030406T050000Z\r\nEND:DAYLIGHT\r\nBEGIN:DAYLIGHT\r\nTZNAME:CDT\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nDTSTART:20040328T000000\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:CST\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nDTSTART:20061029T010000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU;UNTIL=20101031T050000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:CDT\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nDTSTART:20070311T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYMONTHDAY=11,16;BYDAY=SU;\r\n UNTIL=20080316T050000Z\r\nEND:DAYLIGHT\r\nBEGIN:DAYLIGHT\r\nTZNAME:CDT\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nDTSTART:20090308T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU;UNTIL=20100314T050000Z\r\nEND:DAYLIGHT\r\nBEGIN:DAYLIGHT\r\nTZNAME:CDT\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nDTSTART:20110320T000000\r\nRDATE:20120401T000000\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:CST\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nDTSTART:20111113T010000\r\nEND:STANDARD\r\nBEGIN:STANDARD\r\nTZNAME:CST\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nDTSTART:20121104T010000\r\nRRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU;UNTIL=20251102T050000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:CDT\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nDTSTART:20130310T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU;UNTIL=20260308T050000Z\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:CST\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nDTSTART:20271107T010000\r\nRRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU;UNTIL=20361102T050000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:CDT\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nDTSTART:20280312T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU;UNTIL=20370308T050000Z\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:CST\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nDTSTART:20371101T010000\r\nRRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:CDT\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nDTSTART:20380314T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU\r\nEND:DAYLIGHT\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:dst-repeat-havana-daily-0030@example.com\r\nDTSTAMP:20200101T000000Z\r\nSUMMARY:dst-repeat/havana-daily-0030\r\nDTSTART;TZID=America/Havana:20191101T003000\r\nDTEND;TZID=America/Havana:20191101T013000\r\nRRULE:FREQ=DAILY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+      "id": "dst-repeat/havana-daily-0030",
+      "libical": [
+        {
+          "end": "2019-11-01T05:30:00Z",
+          "key": "20191101T043000Z",
+          "moved": false,
+          "offset": -14400,
+          "start": "2019-11-01T04:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-11-01T00:30:00"
+        },
+        {
+          "end": "2019-11-02T05:30:00Z",
+          "key": "20191102T043000Z",
+          "moved": false,
+          "offset": -14400,
+          "start": "2019-11-02T04:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-11-02T00:30:00"
+        },
+        {
+          "end": "2019-11-03T04:30:00Z",
+          "key": "20191103T043000Z",
+          "moved": false,
+          "offset": -14400,
+          "start": "2019-11-03T04:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-11-03T00:30:00"
+        },
+        {
+          "end": "2019-11-04T06:30:00Z",
+          "key": "20191104T053000Z",
+          "moved": false,
+          "offset": -18000,
+          "start": "2019-11-04T05:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-11-04T00:30:00"
+        },
+        {
+          "end": "2019-11-05T06:30:00Z",
+          "key": "20191105T053000Z",
+          "moved": false,
+          "offset": -18000,
+          "start": "2019-11-05T05:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-11-05T00:30:00"
+        }
+      ],
+      "references": [
+        "RFC 5545 §3.3.5",
+        "ADR-IOS-108 decision 1"
+      ],
+      "resolution": {
+        "follows": "libical",
+        "lengthFrom": "icaljs",
+        "references": [
+          "RFC 5545 §3.3.5",
+          "RFC 5545 §3.8.5.3",
+          "libical CHANGELOG 4.0.6",
+          "https://github.com/kewisch/ical.js/issues/1051",
+          "ADR-IOS-108 decision 1"
+        ],
+        "why": "RFC 5545 §3.3.5 names the first of the two instants of a wall time a change back repeats, and §3.8.5.3 gives every occurrence the exact length DTEND less DTSTART. libical 4.0.7 places the start at the first instant (libical 4.0.6: 'Resolve local times in a fall-back overlap to the first occurrence') but gives that occurrence no length (its end equals its start). ical.js places the repeated wall time at the second instant (ical.js issue 1051) and keeps the length. So the starts follow libical and the lengths ical.js."
+      },
+      "why": "Midnight fold: Havana goes back from 01:00 CDT to 00:00 CST on 2019-11-03, so 00:30 happens twice; the occurrence is the first, 00:30 CDT.",
+      "window": {
+        "from": "2019-10-31T00:00:00Z",
+        "to": "2019-11-06T00:00:00Z"
+      }
+    },
+    {
+      "expect": "occurrences",
+      "expected": [
+        {
+          "end": "2019-03-24T03:30:00Z",
+          "key": "20190324T023000Z",
+          "moved": false,
+          "offset": -10800,
+          "start": "2019-03-24T02:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-03-23T23:30:00"
+        },
+        {
+          "end": "2019-03-31T03:30:00Z",
+          "key": "20190331T023000Z",
+          "moved": false,
+          "offset": -10800,
+          "start": "2019-03-31T02:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-03-30T23:30:00"
+        },
+        {
+          "end": "2019-04-07T03:30:00Z",
+          "key": "20190407T023000Z",
+          "moved": false,
+          "offset": -10800,
+          "start": "2019-04-07T02:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-06T23:30:00"
+        },
+        {
+          "end": "2019-04-14T04:30:00Z",
+          "key": "20190414T033000Z",
+          "moved": false,
+          "offset": -14400,
+          "start": "2019-04-14T03:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-13T23:30:00"
+        }
+      ],
+      "frame": "zoned:America/Santiago",
+      "icaljs": [
+        {
+          "end": "2019-03-24T03:30:00Z",
+          "key": "20190324T023000Z",
+          "moved": false,
+          "offset": -10800,
+          "start": "2019-03-24T02:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-03-23T23:30:00"
+        },
+        {
+          "end": "2019-03-31T03:30:00Z",
+          "key": "20190331T023000Z",
+          "moved": false,
+          "offset": -10800,
+          "start": "2019-03-31T02:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-03-30T23:30:00"
+        },
+        {
+          "end": "2019-04-07T04:30:00Z",
+          "key": "20190407T033000Z",
+          "moved": false,
+          "offset": -14400,
+          "start": "2019-04-07T03:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-06T23:30:00"
+        },
+        {
+          "end": "2019-04-14T04:30:00Z",
+          "key": "20190414T033000Z",
+          "moved": false,
+          "offset": -14400,
+          "start": "2019-04-14T03:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-13T23:30:00"
+        }
+      ],
+      "ics": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//example.com//TabMail calendar oracle//EN\r\nBEGIN:VTIMEZONE\r\nTZID:America/Santiago\r\nX-LIC-LOCATION:America/Santiago\r\nBEGIN:STANDARD\r\nTZNAME:SMT\r\nTZOFFSETFROM:-044245\r\nTZOFFSETTO:-044245\r\nDTSTART:18900101T000000\r\nEND:STANDARD\r\nBEGIN:STANDARD\r\nTZNAME:-05\r\nTZOFFSETFROM:-044245\r\nTZOFFSETTO:-0500\r\nDTSTART:19100110T000000\r\nEND:STANDARD\r\nBEGIN:STANDARD\r\nTZNAME:SMT\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-044245\r\nDTSTART:19160701T000000\r\nEND:STANDARD\r\nBEGIN:STANDARD\r\nTZNAME:-04\r\nTZOFFSETFROM:-044245\r\nTZOFFSETTO:-0400\r\nDTSTART:19180910T000000\r\nEND:STANDARD\r\nBEGIN:STANDARD\r\nTZNAME:SMT\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-044245\r\nDTSTART:19190701T000000\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:-04\r\nTZOFFSETFROM:-044245\r\nTZOFFSETTO:-0400\r\nDTSTART:19270901T000000\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:-05\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nDTSTART:19280401T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=4;BYMONTHDAY=1;UNTIL=19320401T040000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:-04\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nDTSTART:19280901T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=9;BYMONTHDAY=1;UNTIL=19310901T050000Z\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:-04\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nDTSTART:19320901T000000\r\nEND:STANDARD\r\nBEGIN:STANDARD\r\nTZNAME:-05\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nDTSTART:19420601T000000\r\nEND:STANDARD\r\nBEGIN:STANDARD\r\nTZNAME:-04\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nDTSTART:19420801T000000\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:-03\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0300\r\nDTSTART:19460715T000000\r\nEND:DAYLIGHT\r\nBEGIN:DAYLIGHT\r\nTZNAME:-04\r\nTZOFFSETFROM:-0300\r\nTZOFFSETTO:-0400\r\nDTSTART:19460829T000000\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:-05\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nDTSTART:19470401T000000\r\nEND:STANDARD\r\nBEGIN:STANDARD\r\nTZNAME:-04\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nDTSTART:19470521T230000\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:-03\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0300\r\nDTSTART:19681103T000000\r\nRDATE:19691123T000000\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:-04\r\nTZOFFSETFROM:-0300\r\nTZOFFSETTO:-0400\r\nDTSTART:19690330T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU;UNTIL=19700329T030000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:-03\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0300\r\nDTSTART:19701011T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYMONTHDAY=11,15;BYDAY=SU;\r\n UNTIL=19721015T040000Z\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:-04\r\nTZOFFSETFROM:-0300\r\nTZOFFSETTO:-0400\r\nDTSTART:19710314T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYMONTHDAY=9,10,11,13,14,15;BYDAY=SU;\r\n UNTIL=19860309T030000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:-03\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0300\r\nDTSTART:19730930T000000\r\nEND:DAYLIGHT\r\nBEGIN:DAYLIGHT\r\nTZNAME:-03\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0300\r\nDTSTART:19741013T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYMONTHDAY=9,10,11,12,13,14,15;BYDAY=SU;\r\n UNTIL=19891015T040000Z\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:-04\r\nTZOFFSETFROM:-0300\r\nTZOFFSETTO:-0400\r\nDTSTART:19870412T000000\r\nEND:STANDARD\r\nBEGIN:STANDARD\r\nTZNAME:-04\r\nTZOFFSETFROM:-0300\r\nTZOFFSETTO:-0400\r\nDTSTART:19880313T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYMONTHDAY=10,12,13,14,15;BYDAY=SU;\r\n UNTIL=19960310T030000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:-03\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0300\r\nDTSTART:19900916T000000\r\nEND:DAYLIGHT\r\nBEGIN:DAYLIGHT\r\nTZNAME:-03\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0300\r\nDTSTART:19911013T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYMONTHDAY=12,13,15;BYDAY=SU;\r\n UNTIL=19971012T040000Z\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:-04\r\nTZOFFSETFROM:-0300\r\nTZOFFSETTO:-0400\r\nDTSTART:19970330T000000\r\nRDATE:19980315T000000\r\nRDATE:19990404T000000\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:-03\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0300\r\nDTSTART:19980927T000000\r\nEND:DAYLIGHT\r\nBEGIN:DAYLIGHT\r\nTZNAME:-03\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0300\r\nDTSTART:19991010T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYMONTHDAY=9,10,11,12,13,14,15;BYDAY=SU;\r\n UNTIL=20101010T040000Z\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:-04\r\nTZOFFSETFROM:-0300\r\nTZOFFSETTO:-0400\r\nDTSTART:20000312T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU;UNTIL=20070311T030000Z\r\nEND:STANDARD\r\nBEGIN:STANDARD\r\nTZNAME:-04\r\nTZOFFSETFROM:-0300\r\nTZOFFSETTO:-0400\r\nDTSTART:20080330T000000\r\nRDATE:20090315T000000\r\nRDATE:20100404T000000\r\nRDATE:20110508T000000\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:-03\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0300\r\nDTSTART:20110821T000000\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:-04\r\nTZOFFSETFROM:-0300\r\nTZOFFSETTO:-0400\r\nDTSTART:20120429T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=4;BYDAY=-1SU;UNTIL=20140427T030000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:-03\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0300\r\nDTSTART:20120902T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=9;BYMONTHDAY=2,7,8;BYDAY=SU;\r\n UNTIL=20140907T040000Z\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:-04\r\nTZOFFSETFROM:-0300\r\nTZOFFSETTO:-0400\r\nDTSTART:20160515T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=5;BYMONTHDAY=13,14,15;BYDAY=SU;\r\n UNTIL=20180513T030000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:-03\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0300\r\nDTSTART:20160814T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=8;BYDAY=2SU;UNTIL=20180812T040000Z\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:-04\r\nTZOFFSETFROM:-0300\r\nTZOFFSETTO:-0400\r\nDTSTART:20190407T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=4;BYMONTHDAY=2,3,4,5,6,7,8;BYDAY=SU;\r\n UNTIL=20370405T030000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:-03\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0300\r\nDTSTART:20190908T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=9;BYMONTHDAY=5,6,8,11;BYDAY=SU;\r\n UNTIL=20220911T040000Z\r\nEND:DAYLIGHT\r\nBEGIN:DAYLIGHT\r\nTZNAME:-03\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0300\r\nDTSTART:20230903T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=9;BYMONTHDAY=2,3,4,5,6,7,8;BYDAY=SU;\r\n UNTIL=20360907T040000Z\r\nEND:DAYLIGHT\r\nBEGIN:DAYLIGHT\r\nTZNAME:-03\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0300\r\nDTSTART:20370906T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=9;BYMONTHDAY=2,3,4,5,6,7,8;BYDAY=SU\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:-04\r\nTZOFFSETFROM:-0300\r\nTZOFFSETTO:-0400\r\nDTSTART:20380404T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=4;BYMONTHDAY=2,3,4,5,6,7,8;BYDAY=SU\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:dst-repeat-santiago-weekly-saturday-2330@example.com\r\nDTSTAMP:20200101T000000Z\r\nSUMMARY:dst-repeat/santiago-weekly-saturday-2330\r\nDTSTART;TZID=America/Santiago:20190323T233000\r\nDTEND;TZID=America/Santiago:20190324T003000\r\nRRULE:FREQ=WEEKLY;BYDAY=SA\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+      "id": "dst-repeat/santiago-weekly-saturday-2330",
+      "libical": [
+        {
+          "end": "2019-03-24T03:30:00Z",
+          "key": "20190324T023000Z",
+          "moved": false,
+          "offset": -10800,
+          "start": "2019-03-24T02:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-03-23T23:30:00"
+        },
+        {
+          "end": "2019-03-31T03:30:00Z",
+          "key": "20190331T023000Z",
+          "moved": false,
+          "offset": -10800,
+          "start": "2019-03-31T02:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-03-30T23:30:00"
+        },
+        {
+          "end": "2019-04-07T02:30:00Z",
+          "key": "20190407T023000Z",
+          "moved": false,
+          "offset": -10800,
+          "start": "2019-04-07T02:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-06T23:30:00"
+        },
+        {
+          "end": "2019-04-14T04:30:00Z",
+          "key": "20190414T033000Z",
+          "moved": false,
+          "offset": -14400,
+          "start": "2019-04-14T03:30:00Z",
+          "status": "confirmed",
+          "wall": "2019-04-13T23:30:00"
+        }
+      ],
+      "references": [
+        "RFC 5545 §3.3.5",
+        "ADR-IOS-108 decision 1"
+      ],
+      "resolution": {
+        "follows": "libical",
+        "lengthFrom": "icaljs",
+        "references": [
+          "RFC 5545 §3.3.5",
+          "RFC 5545 §3.8.5.3",
+          "libical CHANGELOG 4.0.6",
+          "https://github.com/kewisch/ical.js/issues/1051",
+          "ADR-IOS-108 decision 1"
+        ],
+        "why": "RFC 5545 §3.3.5 names the first of the two instants of a wall time a change back repeats, and §3.8.5.3 gives every occurrence the exact length DTEND less DTSTART. libical 4.0.7 places the start at the first instant (libical 4.0.6: 'Resolve local times in a fall-back overlap to the first occurrence') but gives that occurrence no length (its end equals its start). ical.js places the repeated wall time at the second instant (ical.js issue 1051) and keeps the length. So the starts follow libical and the lengths ical.js."
+      },
+      "why": "A fold before midnight: Santiago goes back from 24:00 (-03) to 23:00 (-04) at the end of Saturday 2019-04-06, so 23:30 that Saturday happens twice; the occurrence is the first.",
+      "window": {
+        "from": "2019-03-22T00:00:00Z",
+        "to": "2019-04-20T00:00:00Z"
+      }
+    },
+    {
+      "expect": "occurrences",
+      "expected": [
+        {
+          "end": "2019-09-19T20:00:00Z",
+          "key": "20190919T190000Z",
+          "moved": false,
+          "offset": 16200,
+          "start": "2019-09-19T19:00:00Z",
+          "status": "confirmed",
+          "wall": "2019-09-19T23:30:00"
+        },
+        {
+          "end": "2019-09-20T20:00:00Z",
+          "key": "20190920T190000Z",
+          "moved": false,
+          "offset": 16200,
+          "start": "2019-09-20T19:00:00Z",
+          "status": "confirmed",
+          "wall": "2019-09-20T23:30:00"
+        },
+        {
+          "end": "2019-09-21T20:00:00Z",
+          "key": "20190921T190000Z",
+          "moved": false,
+          "offset": 16200,
+          "start": "2019-09-21T19:00:00Z",
+          "status": "confirmed",
+          "wall": "2019-09-21T23:30:00"
+        },
+        {
+          "end": "2019-09-22T21:00:00Z",
+          "key": "20190922T200000Z",
+          "moved": false,
+          "offset": 12600,
+          "start": "2019-09-22T20:00:00Z",
+          "status": "confirmed",
+          "wall": "2019-09-22T23:30:00"
+        },
+        {
+          "end": "2019-09-23T21:00:00Z",
+          "key": "20190923T200000Z",
+          "moved": false,
+          "offset": 12600,
+          "start": "2019-09-23T20:00:00Z",
+          "status": "confirmed",
+          "wall": "2019-09-23T23:30:00"
+        },
+        {
+          "end": "2019-09-24T21:00:00Z",
+          "key": "20190924T200000Z",
+          "moved": false,
+          "offset": 12600,
+          "start": "2019-09-24T20:00:00Z",
+          "status": "confirmed",
+          "wall": "2019-09-24T23:30:00"
+        }
+      ],
+      "frame": "zoned:Asia/Tehran",
+      "icaljs": [
+        {
+          "end": "2019-09-19T20:00:00Z",
+          "key": "20190919T190000Z",
+          "moved": false,
+          "offset": 16200,
+          "start": "2019-09-19T19:00:00Z",
+          "status": "confirmed",
+          "wall": "2019-09-19T23:30:00"
+        },
+        {
+          "end": "2019-09-20T20:00:00Z",
+          "key": "20190920T190000Z",
+          "moved": false,
+          "offset": 16200,
+          "start": "2019-09-20T19:00:00Z",
+          "status": "confirmed",
+          "wall": "2019-09-20T23:30:00"
+        },
+        {
+          "end": "2019-09-21T21:00:00Z",
+          "key": "20190921T200000Z",
+          "moved": false,
+          "offset": 12600,
+          "start": "2019-09-21T20:00:00Z",
+          "status": "confirmed",
+          "wall": "2019-09-21T23:30:00"
+        },
+        {
+          "end": "2019-09-22T21:00:00Z",
+          "key": "20190922T200000Z",
+          "moved": false,
+          "offset": 12600,
+          "start": "2019-09-22T20:00:00Z",
+          "status": "confirmed",
+          "wall": "2019-09-22T23:30:00"
+        },
+        {
+          "end": "2019-09-23T21:00:00Z",
+          "key": "20190923T200000Z",
+          "moved": false,
+          "offset": 12600,
+          "start": "2019-09-23T20:00:00Z",
+          "status": "confirmed",
+          "wall": "2019-09-23T23:30:00"
+        },
+        {
+          "end": "2019-09-24T21:00:00Z",
+          "key": "20190924T200000Z",
+          "moved": false,
+          "offset": 12600,
+          "start": "2019-09-24T20:00:00Z",
+          "status": "confirmed",
+          "wall": "2019-09-24T23:30:00"
+        }
+      ],
+      "ics": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//example.com//TabMail calendar oracle//EN\r\nBEGIN:VTIMEZONE\r\nTZID:Asia/Tehran\r\nX-LIC-LOCATION:Asia/Tehran\r\nBEGIN:STANDARD\r\nTZNAME:TMT\r\nTZOFFSETFROM:+032544\r\nTZOFFSETTO:+032544\r\nDTSTART:19160101T000000\r\nEND:STANDARD\r\nBEGIN:STANDARD\r\nTZNAME:+0330\r\nTZOFFSETFROM:+032544\r\nTZOFFSETTO:+0330\r\nDTSTART:19350613T000000\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:+0430\r\nTZOFFSETFROM:+0330\r\nTZOFFSETTO:+0430\r\nDTSTART:19770321T230000\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:+04\r\nTZOFFSETFROM:+0430\r\nTZOFFSETTO:+0400\r\nDTSTART:19771021T000000\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:+05\r\nTZOFFSETFROM:+0400\r\nTZOFFSETTO:+0500\r\nDTSTART:19780325T000000\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:+04\r\nTZOFFSETFROM:+0500\r\nTZOFFSETTO:+0400\r\nDTSTART:19780805T010000\r\nEND:STANDARD\r\nBEGIN:STANDARD\r\nTZNAME:+0330\r\nTZOFFSETFROM:+0400\r\nTZOFFSETTO:+0330\r\nDTSTART:19781111T000000\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:+0430\r\nTZOFFSETFROM:+0330\r\nTZOFFSETTO:+0430\r\nDTSTART:19790526T000000\r\nRDATE:19800321T000000\r\nRDATE:19910503T000000\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:+0330\r\nTZOFFSETFROM:+0430\r\nTZOFFSETTO:+0330\r\nDTSTART:19790919T000000\r\nRDATE:19800923T000000\r\nEND:STANDARD\r\nBEGIN:STANDARD\r\nTZNAME:+0330\r\nTZOFFSETFROM:+0430\r\nTZOFFSETTO:+0330\r\nDTSTART:19910922T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=9;BYMONTHDAY=22;UNTIL=19950921T193000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:+0430\r\nTZOFFSETFROM:+0330\r\nTZOFFSETTO:+0430\r\nDTSTART:19920322T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYMONTHDAY=22;UNTIL=19950321T203000Z\r\nEND:DAYLIGHT\r\nBEGIN:DAYLIGHT\r\nTZNAME:+0430\r\nTZOFFSETFROM:+0330\r\nTZOFFSETTO:+0430\r\nDTSTART:19960321T000000\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:+0330\r\nTZOFFSETFROM:+0430\r\nTZOFFSETTO:+0330\r\nDTSTART:19960921T000000\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:+0430\r\nTZOFFSETFROM:+0330\r\nTZOFFSETTO:+0430\r\nDTSTART:19970322T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYMONTHDAY=22;UNTIL=19990321T203000Z\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:+0330\r\nTZOFFSETFROM:+0430\r\nTZOFFSETTO:+0330\r\nDTSTART:19970922T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=9;BYMONTHDAY=22;UNTIL=19990921T193000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:+0430\r\nTZOFFSETFROM:+0330\r\nTZOFFSETTO:+0430\r\nDTSTART:20000321T000000\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:+0330\r\nTZOFFSETFROM:+0430\r\nTZOFFSETTO:+0330\r\nDTSTART:20000921T000000\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:+0430\r\nTZOFFSETFROM:+0330\r\nTZOFFSETTO:+0430\r\nDTSTART:20010322T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYMONTHDAY=22;UNTIL=20030321T203000Z\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:+0330\r\nTZOFFSETFROM:+0430\r\nTZOFFSETTO:+0330\r\nDTSTART:20010922T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=9;BYMONTHDAY=22;UNTIL=20030921T193000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:+0430\r\nTZOFFSETFROM:+0330\r\nTZOFFSETTO:+0430\r\nDTSTART:20040321T000000\r\nRDATE:20050322T000000\r\nRDATE:20080321T000000\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:+0330\r\nTZOFFSETFROM:+0430\r\nTZOFFSETTO:+0330\r\nDTSTART:20040921T000000\r\nRDATE:20050922T000000\r\nRDATE:20080921T000000\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:+0430\r\nTZOFFSETFROM:+0330\r\nTZOFFSETTO:+0430\r\nDTSTART:20090322T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYMONTHDAY=22;UNTIL=20110321T203000Z\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:+0330\r\nTZOFFSETFROM:+0430\r\nTZOFFSETTO:+0330\r\nDTSTART:20090922T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=9;BYMONTHDAY=22;UNTIL=20110921T193000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:+0430\r\nTZOFFSETFROM:+0330\r\nTZOFFSETTO:+0430\r\nDTSTART:20120321T000000\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:+0330\r\nTZOFFSETFROM:+0430\r\nTZOFFSETTO:+0330\r\nDTSTART:20120921T000000\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:+0430\r\nTZOFFSETFROM:+0330\r\nTZOFFSETTO:+0430\r\nDTSTART:20130322T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYMONTHDAY=22;UNTIL=20150321T203000Z\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:+0330\r\nTZOFFSETFROM:+0430\r\nTZOFFSETTO:+0330\r\nDTSTART:20130922T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=9;BYMONTHDAY=22;UNTIL=20150921T193000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:+0430\r\nTZOFFSETFROM:+0330\r\nTZOFFSETTO:+0430\r\nDTSTART:20160321T000000\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:+0330\r\nTZOFFSETFROM:+0430\r\nTZOFFSETTO:+0330\r\nDTSTART:20160921T000000\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:+0430\r\nTZOFFSETFROM:+0330\r\nTZOFFSETTO:+0430\r\nDTSTART:20170322T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYMONTHDAY=22;UNTIL=20190321T203000Z\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:+0330\r\nTZOFFSETFROM:+0430\r\nTZOFFSETTO:+0330\r\nDTSTART:20170922T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=9;BYMONTHDAY=22;UNTIL=20190921T193000Z\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:+0430\r\nTZOFFSETFROM:+0330\r\nTZOFFSETTO:+0430\r\nDTSTART:20200321T000000\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:+0330\r\nTZOFFSETFROM:+0430\r\nTZOFFSETTO:+0330\r\nDTSTART:20200921T000000\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nTZNAME:+0430\r\nTZOFFSETFROM:+0330\r\nTZOFFSETTO:+0430\r\nDTSTART:20210322T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYMONTHDAY=22;UNTIL=20220321T203000Z\r\nEND:DAYLIGHT\r\nBEGIN:STANDARD\r\nTZNAME:+0330\r\nTZOFFSETFROM:+0430\r\nTZOFFSETTO:+0330\r\nDTSTART:20210922T000000\r\nRRULE:FREQ=YEARLY;BYMONTH=9;BYMONTHDAY=22;UNTIL=20220921T193000Z\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:dst-repeat-tehran-daily-2330@example.com\r\nDTSTAMP:20200101T000000Z\r\nSUMMARY:dst-repeat/tehran-daily-2330\r\nDTSTART;TZID=Asia/Tehran:20190919T233000\r\nDTEND;TZID=Asia/Tehran:20190920T003000\r\nRRULE:FREQ=DAILY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+      "id": "dst-repeat/tehran-daily-2330",
+      "libical": [
+        {
+          "end": "2019-09-19T20:00:00Z",
+          "key": "20190919T190000Z",
+          "moved": false,
+          "offset": 16200,
+          "start": "2019-09-19T19:00:00Z",
+          "status": "confirmed",
+          "wall": "2019-09-19T23:30:00"
+        },
+        {
+          "end": "2019-09-20T20:00:00Z",
+          "key": "20190920T190000Z",
+          "moved": false,
+          "offset": 16200,
+          "start": "2019-09-20T19:00:00Z",
+          "status": "confirmed",
+          "wall": "2019-09-20T23:30:00"
+        },
+        {
+          "end": "2019-09-21T19:00:00Z",
+          "key": "20190921T190000Z",
+          "moved": false,
+          "offset": 16200,
+          "start": "2019-09-21T19:00:00Z",
+          "status": "confirmed",
+          "wall": "2019-09-21T23:30:00"
+        },
+        {
+          "end": "2019-09-22T21:00:00Z",
+          "key": "20190922T200000Z",
+          "moved": false,
+          "offset": 12600,
+          "start": "2019-09-22T20:00:00Z",
+          "status": "confirmed",
+          "wall": "2019-09-22T23:30:00"
+        },
+        {
+          "end": "2019-09-23T21:00:00Z",
+          "key": "20190923T200000Z",
+          "moved": false,
+          "offset": 12600,
+          "start": "2019-09-23T20:00:00Z",
+          "status": "confirmed",
+          "wall": "2019-09-23T23:30:00"
+        },
+        {
+          "end": "2019-09-24T21:00:00Z",
+          "key": "20190924T200000Z",
+          "moved": false,
+          "offset": 12600,
+          "start": "2019-09-24T20:00:00Z",
+          "status": "confirmed",
+          "wall": "2019-09-24T23:30:00"
+        }
+      ],
+      "references": [
+        "RFC 5545 §3.3.5",
+        "ADR-IOS-108 decision 1"
+      ],
+      "resolution": {
+        "follows": "libical",
+        "lengthFrom": "icaljs",
+        "references": [
+          "RFC 5545 §3.3.5",
+          "RFC 5545 §3.8.5.3",
+          "libical CHANGELOG 4.0.6",
+          "https://github.com/kewisch/ical.js/issues/1051",
+          "ADR-IOS-108 decision 1"
+        ],
+        "why": "RFC 5545 §3.3.5 names the first of the two instants of a wall time a change back repeats, and §3.8.5.3 gives every occurrence the exact length DTEND less DTSTART. libical 4.0.7 places the start at the first instant (libical 4.0.6: 'Resolve local times in a fall-back overlap to the first occurrence') but gives that occurrence no length (its end equals its start). ical.js places the repeated wall time at the second instant (ical.js issue 1051) and keeps the length. So the starts follow libical and the lengths ical.js."
+      },
+      "why": "A half-hour zone folding at midnight: Tehran goes back from 24:00 (+04:30) to 23:00 (+03:30) at the end of 2019-09-21, so 23:30 that day happens twice; the occurrence is the first.",
+      "window": {
+        "from": "2019-09-18T00:00:00Z",
+        "to": "2019-09-25T00:00:00Z"
+      }
+    }
+  ],
+  "family": "dst-repeat",
+  "generator": {
+    "command": "Scripts/cal-oracle/generate.sh",
+    "version": "1.0.0"
+  },
+  "oracles": {
+    "icaljs": {
+      "sha256": "968a58922da7b61cbc57655f9772bd70d2977237f7f9621c1ef3e2922c87173e",
+      "source": "comm-central 226a299e calendar/base/modules/Ical.sys.mjs"
+    },
+    "libical": {
+      "build": "Homebrew bottle",
+      "tzdata": "system zoneinfo 2026f",
+      "version": "4.0.7"
+    }
+  },
+  "schema": 1,
+  "zoneWitness": {
+    "icuTzdata": "2026a",
+    "node": "26.12.1"
+  }
+}

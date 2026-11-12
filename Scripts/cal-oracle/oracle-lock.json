@@ -1,0 +1,20 @@
+{
+  "generator": {
+    "version": "1.0.0"
+  },
+  "icaljs": {
+    "path": "calendar/base/modules/Ical.sys.mjs",
+    "revision": "226a299e",
+    "sha256": "968a58922da7b61cbc57655f9772bd70d2977237f7f9621c1ef3e2922c87173e",
+    "url": "https://raw.githubusercontent.com/mozilla/releases-comm-central/226a299e/calendar/base/modules/Ical.sys.mjs"
+  },
+  "libical": {
+    "build": "Homebrew bottle",
+    "icuFormula": "icu4c@79",
+    "tzdata": "system zoneinfo",
+    "version": "4.0.7"
+  },
+  "node": {
+    "major": 26
+  }
+}

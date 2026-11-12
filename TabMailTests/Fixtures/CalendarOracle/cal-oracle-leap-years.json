@@ -1,0 +1,182 @@
+{
+  "about": "RFC 5545 §3.3.10: a rule that gives an invalid date (29 February in a common year) skips it. The Gregorian century rule: 1900 is a common year, 2000 is a leap year.",
+  "cases": [
+    {
+      "expect": "occurrences",
+      "expected": [
+        {
+          "end": "1896-03-01",
+          "key": "18960229",
+          "moved": false,
+          "start": "1896-02-29",
+          "status": "confirmed"
+        },
+        {
+          "end": "1904-03-01",
+          "key": "19040229",
+          "moved": false,
+          "start": "1904-02-29",
+          "status": "confirmed"
+        }
+      ],
+      "frame": "allDay",
+      "icaljs": [
+        {
+          "end": "1896-03-01",
+          "key": "18960229",
+          "moved": false,
+          "start": "1896-02-29",
+          "status": "confirmed"
+        },
+        {
+          "end": "1904-03-01",
+          "key": "19040229",
+          "moved": false,
+          "start": "1904-02-29",
+          "status": "confirmed"
+        }
+      ],
+      "ics": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//example.com//TabMail calendar oracle//EN\r\nBEGIN:VEVENT\r\nUID:leap-years-yearly-february-29-from-1896@example.com\r\nDTSTAMP:20200101T000000Z\r\nSUMMARY:leap-years/yearly-february-29-from-1896\r\nDTSTART;VALUE=DATE:18960229\r\nDTEND;VALUE=DATE:18960301\r\nRRULE:FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=29\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+      "id": "leap-years/yearly-february-29-from-1896",
+      "libical": [],
+      "references": [
+        "RFC 5545 §3.3.10"
+      ],
+      "resolution": {
+        "follows": "icaljs",
+        "references": [
+          "RFC 5545 §3.3.10",
+          "libical icaltime.h: icaltime_as_timet is defined from 1902-01-01"
+        ],
+        "why": "ical.js gives 29 February 1896 and 1904 and skips 1900, a common year (RFC 5545 §3.3.10: an invalid date is ignored). libical's own rule iterator gives the same days (the rule days agree), but its listing converts times to seconds since 1970, which libical defines only from 1902-01-01, so with a window that starts before 1902 it lists nothing."
+      },
+      "ruleDays": {
+        "days": [
+          "1896-02-29",
+          "1904-02-29"
+        ],
+        "dtstart": "1896-02-29",
+        "through": "1904-06-01"
+      },
+      "why": "A yearly all-day series on 29 February from 1896: 1900 is divisible by 100 and not by 400, so it has no 29 February and is skipped; the next occurrence is 1904.",
+      "window": {
+        "from": "1896-01-01T00:00:00Z",
+        "to": "1904-06-01T00:00:00Z"
+      }
+    },
+    {
+      "expect": "occurrences",
+      "expected": [
+        {
+          "end": "1996-03-01",
+          "key": "19960229",
+          "moved": false,
+          "start": "1996-02-29",
+          "status": "confirmed"
+        },
+        {
+          "end": "2000-03-01",
+          "key": "20000229",
+          "moved": false,
+          "start": "2000-02-29",
+          "status": "confirmed"
+        },
+        {
+          "end": "2004-03-01",
+          "key": "20040229",
+          "moved": false,
+          "start": "2004-02-29",
+          "status": "confirmed"
+        }
+      ],
+      "frame": "allDay",
+      "icaljs": [
+        {
+          "end": "1996-03-01",
+          "key": "19960229",
+          "moved": false,
+          "start": "1996-02-29",
+          "status": "confirmed"
+        },
+        {
+          "end": "2000-03-01",
+          "key": "20000229",
+          "moved": false,
+          "start": "2000-02-29",
+          "status": "confirmed"
+        },
+        {
+          "end": "2004-03-01",
+          "key": "20040229",
+          "moved": false,
+          "start": "2004-02-29",
+          "status": "confirmed"
+        }
+      ],
+      "ics": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//example.com//TabMail calendar oracle//EN\r\nBEGIN:VEVENT\r\nUID:leap-years-yearly-february-29-from-1996@example.com\r\nDTSTAMP:20200101T000000Z\r\nSUMMARY:leap-years/yearly-february-29-from-1996\r\nDTSTART;VALUE=DATE:19960229\r\nDTEND;VALUE=DATE:19960301\r\nRRULE:FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=29\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+      "id": "leap-years/yearly-february-29-from-1996",
+      "libical": [
+        {
+          "end": "1996-03-01",
+          "key": "19960229",
+          "moved": false,
+          "start": "1996-02-29",
+          "status": "confirmed"
+        },
+        {
+          "end": "2000-03-01",
+          "key": "20000229",
+          "moved": false,
+          "start": "2000-02-29",
+          "status": "confirmed"
+        },
+        {
+          "end": "2004-03-01",
+          "key": "20040229",
+          "moved": false,
+          "start": "2004-02-29",
+          "status": "confirmed"
+        }
+      ],
+      "references": [
+        "RFC 5545 §3.3.10"
+      ],
+      "resolution": null,
+      "ruleDays": {
+        "days": [
+          "1996-02-29",
+          "2000-02-29",
+          "2004-02-29"
+        ],
+        "dtstart": "1996-02-29",
+        "through": "2004-06-01"
+      },
+      "why": "A yearly all-day series on 29 February from 1996: 2000 is divisible by 400, so it is a leap year and has an occurrence, as 1996 and 2004 do.",
+      "window": {
+        "from": "1996-01-01T00:00:00Z",
+        "to": "2004-06-01T00:00:00Z"
+      }
+    }
+  ],
+  "family": "leap-years",
+  "generator": {
+    "command": "Scripts/cal-oracle/generate.sh",
+    "version": "1.0.0"
+  },
+  "oracles": {
+    "icaljs": {
+      "sha256": "968a58922da7b61cbc57655f9772bd70d2977237f7f9621c1ef3e2922c87173e",
+      "source": "comm-central 226a299e calendar/base/modules/Ical.sys.mjs"
+    },
+    "libical": {
+      "build": "Homebrew bottle",
+      "tzdata": "system zoneinfo 2026f",
+      "version": "4.0.7"
+    }
+  },
+  "schema": 1,
+  "zoneWitness": {
+    "icuTzdata": "2026a",
+    "node": "26.12.1"
+  }
+}
