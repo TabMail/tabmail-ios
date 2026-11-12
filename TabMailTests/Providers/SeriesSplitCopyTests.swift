@@ -816,9 +816,10 @@ struct ExchangeSplitCarryTests {
         var patch = GCalEventInput()
         patch.startDateTime = Self.week(1, plusDays: 1).iso8601String()
         patch.startTimeZone = "UTC"
-        let graph = FakeGraphCalendar([GraphSplitFixture.series(range: GraphSplitFixture.noEnd), named, other] + [2].map(Self.part))
+        // Listed with the other one first: in that order it would land on the named one's day.
+        let graph = FakeGraphCalendar([GraphSplitFixture.series(range: GraphSplitFixture.noEnd), other, named] + [2].map(Self.part))
         graph.refusesSameDayMoves.withLock { $0 = true }
-        let r = try await split(named: "ser-1-occ-1", start: Self.week(1, plusDays: 2), exceptions: [named, other],
+        let r = try await split(named: "ser-1-occ-1", start: Self.week(1, plusDays: 2), exceptions: [other, named],
                                 parts: [2], patch: patch, graph: graph)
         defer { r.http.close() }
         #expect(r.error == nil, "a move landed on a held day: \(String(describing: r.error)); \(r.http.servedCallSequence())")
