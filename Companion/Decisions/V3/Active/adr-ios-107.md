@@ -33,6 +33,10 @@ removed; a missing id that keeps failing holds its range for at most the page wa
 not land writes no catch-up state and the page walk keeps its page token; an id loaded earlier in the
 same pass counts as held; a duplicate id in one insert chunk is skipped as the same message instead
 of rolling back the chunk; the load hold clock is per page, cleared whenever the page moves on).
+**Amended 2026-11-12: the hold bound under the pass budget** (decision 8, review round 6: loads that
+stop on the pass budget with nothing loaded hold the page like a held load, so the hold bound also
+ends a page a slow link never finishes; loads that stop on the budget after loading some clear the
+page's hold clock).
 
 **Context.** Every sync path windows its work, and changes to older mail fall outside every window:
 
@@ -406,7 +410,11 @@ The owner's rulings of 2026-11-09:
      - **A range moves on only once its missing ids are done.** A page's token is saved only after
        every missing id on it has loaded or been classified done. If the budget runs out part way,
        the range keeps the page's token as it was and the next pass lists the same page again, where
-       what loaded is no longer missing. No id list is kept in the state. *Amended 2026-11-12:*
+       what loaded is no longer missing. No id list is kept in the state. *Amended 2026-11-12
+       (the hold bound under the pass budget):* that holds while the pass loaded some of the
+       page's ids. When the loads stop on the budget with nothing loaded (every id asked for was
+       held, or the budget ran out before any was asked for), the page is held (next bullet but
+       one), so it is listed again for at most the hold bound. *Amended 2026-11-12:*
        within one pass, an id the pass already loaded counts as held (`loadedThisPass` in
        `catchUpFolder`), because the loads are inserted only after the provider returns. So an id
        listed again in the same pass is never fetched or inserted twice: a listing that completes
@@ -433,6 +441,21 @@ The owner's rulings of 2026-11-09:
        bound after an earlier page's hold passed its ids over on their first failure. A batch whose
        timeout fires holds every id it has no answer for (the bound above still applies; on a
        persistently slow link those ids count as done after it, the trade-off already stated).
+       *Amended 2026-11-12 (the hold bound under the pass budget, review round 6):* the bound
+       applies wherever the loads stop. When they stop on the pass budget, the page is held if this
+       pass loaded none of its ids (every id asked for was held, or the budget ran out before any
+       was asked for, as when the membership list alone spends it): the clock starts or is kept,
+       and once the bound has passed, the held ids and the ids not yet asked for count as done and
+       the page moves on (the listing goes on with the next page or list, and completes). When they
+       stop on the budget after loading some, the page is moving: it is listed again on the next
+       pass and its clock is cleared, so a page whose loads keep moving is never passed over for an
+       earlier hold, and every loadable id on it loads. The pass budget and the request timeout are
+       unchanged. Tests: `GmailCatchUpTests.budgetStoppedHoldStartsTheClock`,
+       `slowLinkHoldEndsAtTheBound`, `budgetStopAfterLoadsRestartsTheHoldClock`. *Superseded:* the
+       budget stop came before the hold handling, so on a slow link (a batch that always times out
+       past a budget smaller than one batch, or a list that alone spends the budget) the clock
+       never started, the bound was never consulted, and every pass listed the same page again for
+       as long as the link stayed slow.
      - **The insert** is the page walk's insert tail, extracted test-first into one helper
        (`SyncEngine.insertFetchedBackfillMessages`, called by the walk and by the apply): the batch
        insert (which skips an id protected by a pending destructive op), the search index, FTS
@@ -643,6 +666,11 @@ The owner's rulings of 2026-11-09:
      `providerDate`. Such a row would fall outside its range's list, become a candidate and be kept by
      its GET: one cheap `format=minimal` GET per listing (the first and one after each lapse since
      2026-11-12; weekly from 2026-11-11; daily before).
+   - **Cost: a new account's first sync** (2026-11-12). The capture writes a new Gmail account's
+     first cursor through `lapseDeltaCursor`, after the same full sync's catch-up has started each
+     folder's first listing, so that first cursor counts as a lapse and a new Gmail account's first
+     sync lists each folder twice until the cursor is captured before the catch-up lists
+     (tabmail-ios #783).
 
 **Consequences.**
 

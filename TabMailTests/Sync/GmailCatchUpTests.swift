@@ -2673,6 +2673,131 @@ struct GmailCatchUpTests {
         }
     }
 
+    // MARK: - Loads that stop on the pass budget
+
+    /// Two local Inbox rows, one and three days old (one range: inside
+    /// `catchUpGmailRangeMaxSpanSeconds`), and more server messages between
+    /// them that no row holds than one load batch
+    /// (`BackfillProfile.normal.gmailBodyConcurrency`) takes.
+    private static func pastOneBatchWorld(_ clock: Clock) -> (seeds: [StatefulGmailActionServer.Seed], local: [Local], missing: [String]) {
+        let batch = BackfillProfile.normal.gmailBodyConcurrency
+        let missing = (0..<(batch + 2)).map { (id: "s\($0)", date: clock.daysAgo(1.1 + 0.15 * Double($0))) }
+        let local = [Local(id: "l0", path: inboxPath, date: clock.daysAgo(1)), Local(id: "l1", path: inboxPath, date: clock.daysAgo(3))]
+        return (local.map { Self.seed($0.id, $0.date, [inboxPath]) } + missing.map { Self.seed($0.id, $0.date, [inboxPath]) },
+                local, missing.map(\.id))
+    }
+
+    /// Every load GET of `ids` answers only after the request timeout.
+    private static func stallLoads(_ world: World, _ ids: [String]) {
+        for id in ids { world.server.holdGet(providerMessageId: id, forSeconds: SyncConfig.catchUpRequestTimeoutSeconds + 2) }
+    }
+
+    /// The pass budget covers the membership list and one batch of loads, and
+    /// every GET of the batch times out: the loads stop on the budget with every
+    /// id they asked for held. The page is held, so its hold clock starts.
+    @Test("Loads that time out under a pass budget smaller than one batch start the hold clock",
+          .enabled(if: !NetworkMonitor.checkExpensive()))
+    func budgetStoppedHoldStartsTheClock() async throws {
+        let clock = Clock()
+        let (seeds, local, missing) = Self.pastOneBatchWorld(clock)
+        try await Self.withWorld("gcu-budget-hold", seeds: seeds, local: local) { world async throws in
+            defer { SyncEngine.backfillPageHoldNowForTesting.withLock { $0 = nil } }
+            let at = clock.now
+            SyncEngine.backfillPageHoldNowForTesting.withLock { $0 = at }
+            Self.stallLoads(world, missing)
+
+            await Self.pass(world, [inboxPath], context: Self.requestBudget(world.server, 2))
+
+            let gets = world.server.fullMessageGets().count
+            #expect(gets > 0 && gets <= BackfillProfile.normal.gmailBodyConcurrency,
+                    "precondition: one batch was asked for, then the budget was spent: \(gets) GETs")
+            let state = try #require(try Self.state(world, inboxPath))
+            #expect(state.lastCompletedAt == nil && state.listing?.range?.step == .membership, "precondition: the page is not passed over")
+            #expect(state.listing?.range?.loadHeldSince == at, "the held page starts the hold clock")
+        }
+    }
+
+    /// A link where every load times out, under a pass budget smaller than one
+    /// batch: the page is held from its first hold; once the hold bound has
+    /// passed, the held ids and the ids never asked for count as done, the page
+    /// moves on, and the listing completes without asking for them again.
+    @Test("On a link where every load times out, past the hold bound the page moves on and the listing completes",
+          .enabled(if: !NetworkMonitor.checkExpensive()))
+    func slowLinkHoldEndsAtTheBound() async throws {
+        let clock = Clock()
+        let (seeds, local, missing) = Self.pastOneBatchWorld(clock)
+        try await Self.withWorld("gcu-slow-link", seeds: seeds, local: local) { world async throws in
+            defer { SyncEngine.backfillPageHoldNowForTesting.withLock { $0 = nil } }
+            let at = clock.now
+            func holdClock(_ offset: TimeInterval) {
+                SyncEngine.backfillPageHoldNowForTesting.withLock { $0 = at.addingTimeInterval(offset) }
+            }
+            Self.stallLoads(world, missing)
+
+            holdClock(0)
+            await Self.pass(world, [inboxPath], context: Self.requestBudget(world.server, 2))
+            #expect(try Self.state(world, inboxPath)?.listing?.range?.loadHeldSince == at, "precondition: the page is held from now")
+
+            holdClock(SyncConfig.backfillPageHoldSeconds + 1)
+            await Self.pass(world, [inboxPath], context: Self.requestBudget(world.server, 2))
+            let moved = try #require(try Self.state(world, inboxPath)?.listing?.range, "precondition: the range is in progress")
+            #expect(moved.step == .unread && moved.loadHeldSince == nil, "past the bound the page moves on")
+
+            let getsBefore = world.server.fullMessageGets().count
+            await Self.pass(world, [inboxPath], context: Self.unlimited(at: { at }))
+            #expect(try Self.state(world, inboxPath)?.lastCompletedAt == at, "the listing completes")
+            #expect(world.server.fullMessageGets().count == getsBefore, "the ids counted done are not asked for again in this listing")
+            let inbox = try Self.rows(world, inboxPath)
+            #expect(inbox["l0"] != nil && inbox["l1"] != nil && missing.allSatisfy { inbox[$0] == nil })
+        }
+    }
+
+    /// Loads that stop on the budget with nothing loaded hold the page; loads
+    /// that stop on it after loading some show the page is moving, so its clock
+    /// starts again at its next hold. A page whose loads keep moving is never
+    /// passed over for an earlier hold, however long it takes, and every id
+    /// loads.
+    @Test("Loads that stop on the budget after loading some restart the hold clock, so a moving page is never passed over",
+          .enabled(if: !NetworkMonitor.checkExpensive()))
+    func budgetStopAfterLoadsRestartsTheHoldClock() async throws {
+        let clock = Clock()
+        let (seeds, local, missing) = Self.pastOneBatchWorld(clock)
+        try await Self.withWorld("gcu-budget-moving", seeds: seeds, local: local) { world async throws in
+            defer { SyncEngine.backfillPageHoldNowForTesting.withLock { $0 = nil } }
+            let at = clock.now
+            func holdClock(_ offset: TimeInterval) {
+                SyncEngine.backfillPageHoldNowForTesting.withLock { $0 = at.addingTimeInterval(offset) }
+            }
+            let bound = SyncConfig.backfillPageHoldSeconds
+
+            // The list alone spends the budget: no id is asked for.
+            holdClock(0)
+            await Self.pass(world, [inboxPath], context: Self.requestBudget(world.server, 1))
+            #expect(world.server.fullMessageGets().isEmpty, "precondition: no load was asked for")
+            #expect(try Self.state(world, inboxPath)?.listing?.range?.loadHeldSince == at, "loads that loaded nothing hold the page")
+
+            // Past the bound, one batch loads before the budget is spent.
+            holdClock(bound + 1)
+            await Self.pass(world, [inboxPath], context: Self.requestBudget(world.server, 2))
+            let afterOneBatch = try Self.rows(world, inboxPath)
+            #expect(missing.filter { afterOneBatch[$0] != nil }.count == BackfillProfile.normal.gmailBodyConcurrency,
+                    "precondition: one batch loaded")
+            let moving = try #require(try Self.state(world, inboxPath)?.listing?.range, "precondition: the range is in progress")
+            #expect(moving.step == .membership && moving.loadHeldSince == nil, "the page moved: it is listed again, its clock cleared")
+
+            // The list alone spends the budget again: held from now, not from the first hold.
+            holdClock(bound + 2)
+            await Self.pass(world, [inboxPath], context: Self.requestBudget(world.server, 1))
+            let held = try #require(try Self.state(world, inboxPath)?.listing?.range, "the page is not passed over")
+            #expect(held.step == .membership && held.loadHeldSince == at.addingTimeInterval(bound + 2))
+
+            await Self.pass(world, [inboxPath], context: Self.unlimited(at: { at }))
+            let inbox = try Self.rows(world, inboxPath)
+            #expect(missing.allSatisfy { inbox[$0] != nil }, "every id loads: absent \(missing.filter { inbox[$0] == nil })")
+            #expect(try Self.state(world, inboxPath)?.lastCompletedAt == at)
+        }
+    }
+
     /// A lapse keeps the listing's place: the listing goes on from where it
     /// stopped, and because the lapse came after it started, a new listing
     /// starts as soon as it completes and repairs a change in a range the first

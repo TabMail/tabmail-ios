@@ -88,7 +88,10 @@ struct GmailCatchUpState: Codable, Equatable, Sendable {
         /// gets its own bound; it also goes with the range when the range
         /// advances. *Superseded (2026-11-12):* "it goes with the range when the
         /// range advances" alone, which let a page that loaded cleanly keep an
-        /// earlier page's clock.
+        /// earlier page's clock. *Amended (2026-11-12):* loads that stop on the
+        /// pass budget with nothing loaded hold the page too (the clock starts or
+        /// is kept, and past the bound the page moves on), and loads that stop on
+        /// the budget after loading some clear it.
         var loadHeldSince: Date?
     }
 
@@ -242,6 +245,7 @@ extension GmailProvider {
         case failure(any Error)
         /// A missing id of the range failed to load with a `hold` failure, inside
         /// the hold bound: the page is listed and loaded again on a later pass.
+        /// (A page held when its loads stopped on the budget stops with `budget`.)
         case loadHeld
     }
 
@@ -510,23 +514,36 @@ extension GmailProvider {
                             result.loaded += load.loaded
                             loadedThisPass.formUnion(load.loaded.map(\.id))
                             result.loadFailures.merge(load.failures) { _, latest in latest }
-                            // Out of budget part way: the page is listed again on
-                            // the next pass, where what loaded is no longer missing.
-                            guard load.complete else {
+                            // Out of budget part way after loading some of the
+                            // page's ids: the page is listed again on the next pass,
+                            // where what loaded is no longer missing. It moved, so it
+                            // is not held, and its hold clock starts again at its
+                            // next hold: a page whose loads keep moving is never
+                            // passed over for an earlier hold.
+                            if !load.complete && !load.loaded.isEmpty {
+                                scan.loadHeldSince = nil
                                 listing.range = scan
                                 throw RangeStop.budget
                             }
-                            // A `hold` failure holds the range, as it holds the walk's
-                            // page: inside the bound the page is listed and loaded
-                            // again later; past it the id counts as done. Gone or
+                            // The page is held: a `hold` failure (a transient error,
+                            // or no answer within the timeout), as it holds the walk's
+                            // page, or loads that stopped on the budget with nothing
+                            // loaded (every id asked for held, or a slow link where
+                            // the list alone spent the budget and none was asked
+                            // for). Inside the bound the page is listed and loaded
+                            // again later; past it the held ids and the ids not yet
+                            // asked for count as done and the page moves on. Gone or
                             // per-message failures count as done at once.
-                            if load.failures.values.contains(.hold) {
+                            // *Superseded (2026-11-12):* the budget stop came first,
+                            // so a page whose loads always ran out of budget never
+                            // started the clock and was listed again forever.
+                            if load.failures.values.contains(.hold) || !load.complete {
                                 let now = SyncEngine.backfillPageHoldNow()
                                 let firstHeld = scan.loadHeldSince ?? now
                                 scan.loadHeldSince = firstHeld
                                 if case .hold = SyncEngine.decideBackfillPage(strictestFailure: .hold, firstHeld: firstHeld, now: now) {
                                     listing.range = scan
-                                    throw RangeStop.loadHeld
+                                    throw load.complete ? RangeStop.loadHeld : RangeStop.budget
                                 }
                             }
                         }
