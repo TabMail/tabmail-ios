@@ -17,17 +17,17 @@ import UIKit
 private enum JapaneseHeaderFixture {
     static let reply = "Thanks, that works for us.\n\nBest,\n Alex"
 
-    static func sentLine(colon: String) -> String {
+    static func sentLine(colon: String, label: String = "\u{9001}\u{4FE1}") -> String {
         let d = Calendar(identifier: .gregorian).date(byAdding: .day, value: -3, to: Date()) ?? Date()
         let c = Calendar(identifier: .gregorian).dateComponents([.year, .month, .day], from: d)
-        return "\u{9001}\u{4FE1}\(colon)\(c.year ?? 0) \u{5E74} \(c.month ?? 0) \u{6708} \(c.day ?? 0) \u{65E5} 9:30"
+        return "\(label)\(colon)\(c.year ?? 0) \u{5E74} \(c.month ?? 0) \u{6708} \(c.day ?? 0) \u{65E5} 9:30"
     }
 
     /// 差出人 / 送信 / 宛先 / Cc / 件名 header block followed by the earlier message.
-    static func block(colon: String) -> [String] {
+    static func block(colon: String, sentLabel: String = "\u{9001}\u{4FE1}") -> [String] {
         [
             "\u{5DEE}\u{51FA}\u{4EBA}\(colon)Sender Name <sender@example.com>",
-            sentLine(colon: colon),
+            sentLine(colon: colon, label: sentLabel),
             "\u{5B9B}\u{5148}\(colon)Recipient One <one@example.com>; Recipient Two <two@example.com>",
             "Cc: Recipient Three <three@example.com>",
             "\u{4EF6}\u{540D}\(colon)Re: Example subject",
@@ -59,6 +59,21 @@ struct JapaneseOutlookReplyHeaderSplitTests {
         #expect(quotes.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix(JapaneseHeaderFixture.fromLabel))
     }
 
+    @Test("送信日時 (new Outlook / OWA) as the sent label: the quote starts at 差出人")
+    func sentDateTimeLabel() {
+        let block = JapaneseHeaderFixture.block(colon: ": ", sentLabel: "\u{9001}\u{4FE1}\u{65E5}\u{6642}")
+        let body = JapaneseHeaderFixture.reply + "\n\n" + block.joined(separator: "\n")
+        let (message, quotes) = EmailFilter.splitMessageAndQuotes(body)
+        #expect(message.trimmingCharacters(in: .whitespacesAndNewlines) == JapaneseHeaderFixture.reply)
+        #expect(quotes.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix(JapaneseHeaderFixture.fromLabel))
+    }
+
+    @Test("a body 差出人 line with no 送信 line after it is not a boundary")
+    func loneFromLineIsNotABoundary() {
+        let body = "Please write the sender like this:\n\u{5DEE}\u{51FA}\u{4EBA}: Sender Name\nThanks, see you soon.\nBest"
+        #expect(EmailFilter.splitMessageAndQuotes(body).quotes.isEmpty)
+    }
+
     @Test("a lone 件名 line in the body is not a boundary")
     func loneSubjectLineIsNotABoundary() {
         let body = "Please use this subject line.\n\u{4EF6}\u{540D}: Example subject\nThanks."
@@ -71,7 +86,7 @@ struct JapaneseOutlookReplyHeaderSplitTests {
 @Suite("Japanese Outlook reply header — hosted WKWebView", .serialized, .processGlobalState)
 struct JapaneseOutlookReplyHeaderHostedTests {
 
-    /// Returns "<wrapper count>|<wrapper text starts with 差出人 or dash line>|<reply visible outside wrapper>".
+    /// Returns "<wrapper count>|<差出人 inside wrapper>|<reply inside wrapper>|<dash line inside wrapper>".
     private func probe(html: String, tag: String) async -> String {
         let headerId = "ja-outlook-\(tag)-\(CanaryKit.nonce())"
         guard let host = await HostedRenderView(html: html, headerId: headerId) else {
@@ -85,7 +100,8 @@ struct JapaneseOutlookReplyHeaderHostedTests {
           var inside = ws.length ? ws[0].textContent : '';
           var replyInside = inside.indexOf('Thanks, that works for us.') >= 0;
           var fromInside = inside.indexOf('\\u5DEE\\u51FA\\u4EBA') >= 0;
-          return ws.length + '|' + fromInside + '|' + replyInside;
+          var dashInside = inside.indexOf('------------') >= 0;
+          return ws.length + '|' + fromInside + '|' + replyInside + '|' + dashInside;
         })()
         """)
     }
@@ -106,17 +122,17 @@ struct JapaneseOutlookReplyHeaderHostedTests {
 
     @Test("no dash line, ASCII colon: the block is collapsed, the reply stays visible")
     func standaloneAsciiColon() async {
-        #expect(await probe(html: html(colon: ": ", dashLine: false), tag: "ascii") == "1|true|false")
+        #expect(await probe(html: html(colon: ": ", dashLine: false), tag: "ascii") == "1|true|false|false")
     }
 
     @Test("no dash line, full-width colon: the block is collapsed, the reply stays visible")
     func standaloneFullWidthColon() async {
-        #expect(await probe(html: html(colon: " \u{FF1A} ", dashLine: false), tag: "fullwidth") == "1|true|false")
+        #expect(await probe(html: html(colon: " \u{FF1A} ", dashLine: false), tag: "fullwidth") == "1|true|false|false")
     }
 
-    @Test("dash line before the Japanese block: the block is collapsed, the reply stays visible")
+    @Test("dash line before the Japanese block: the quote starts at the dash line, the reply stays visible")
     func dashSeparated() async {
-        #expect(await probe(html: html(colon: "\u{FF1A}", dashLine: true), tag: "dash") == "1|true|false")
+        #expect(await probe(html: html(colon: "\u{FF1A}", dashLine: true), tag: "dash") == "1|true|false|true")
     }
 
     @Test("control: a lone 件名 line is not collapsed")
