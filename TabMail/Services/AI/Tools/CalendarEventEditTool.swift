@@ -89,7 +89,7 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         // first, and once the event is read it goes its own way (`CalendarEventEditExdates`).
         var exdates: (dates: [String], zone: TimeZone)?
         if CalendarEventEditExdates.isRequested(arguments) {
-            switch CalendarEventEditExdates.check(arguments, compoundId: compoundId) {
+            switch CalendarEventEditExdates.check(arguments, compoundId: compoundId, deviceZone: deviceZone) {
             case .refused(let output): return output
             case .dates(let dates, let zone): exdates = (dates, zone)
             }

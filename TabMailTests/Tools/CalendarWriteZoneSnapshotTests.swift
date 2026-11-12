@@ -299,6 +299,28 @@ private func calDAVListing(_ harness: CalDAVToolWire.Harness, from: Date, to: Da
         query: nil, singleEvents: true, maxResults: 250, orderBy: "startTime")
 }
 
+/// A repeating CalDAV event with floating times (no zone): from `first` (`yyyy-MM-dd`) at the wall
+/// clock `start` to `end` (`HHmmss`), repeating by `rule`. `zone` and `first` are the fixture's
+/// bookkeeping; the times themselves name no zone.
+private func floatingSeries(first: String, start: String, end: String, rule: String) throws -> OccurrenceWireFixture {
+    let ics = OccurrenceFixture.ics([[
+        "UID:standup-1", "DTSTAMP:\(compact(first))T000000Z",
+        "DTSTART:\(compact(first))T\(start)", "DTEND:\(compact(first))T\(end)",
+        "SUMMARY:Standup", "RRULE:\(rule)",
+    ].joined(separator: "\n")])
+    return OccurrenceWireFixture(zone: .gmt, first: try #require(utcAt("\(first)T12:00:00")), ics: ics)
+}
+
+/// A zone a whole number of hours from the host's at `at`, where one of the candidates is; else
+/// one with another offset than the host's.
+private func zonesWholeHoursFromTheHost(at: Date) throws -> TimeZone {
+    let candidates = ["Asia/Tokyo", "Europe/Berlin", "America/New_York", "Pacific/Honolulu"].compactMap(TimeZone.init(identifier:))
+    let host = TimeZone.current.secondsFromGMT(for: at)
+    let other = candidates.filter { $0.secondsFromGMT(for: at) != host }
+    return try #require(other.first { ($0.secondsFromGMT(for: at) - host) % 3_600 == 0 } ?? other.first,
+                        "no zone with another offset than the host's")
+}
+
 // MARK: - The suite
 
 @Suite("A queued calendar write is drained in the zone its card showed (#753)", .serialized, .processGlobalState)
@@ -520,6 +542,75 @@ struct CalendarWriteZoneSnapshotTests {
         }
     }
 
+    // MARK: Edit, CalDAV floating series (#753 review, #761)
+    //
+    // A floating series' occurrences have no zone: the one a `recurrence_id` names is the one at
+    // that wall clock. Confirmed in one zone and drained in another, the edit lands on it.
+
+    @Test("CalDAV floating series: one occurrence named by its recurrence_id is the one changed, to the card's wall clock")
+    func calDAVFloatingThisOnly() async throws {
+        let fixture = try floatingSeries(first: day(0), start: "090000", end: "093000", rule: "FREQ=WEEKLY")
+        let zone = try confirmZone(at: fixture.first)
+        try await withCalDAV("zone-c-float-one", fixture: fixture) { harness, pool in
+            let r = try await runEdit([
+                "edit_scope": .string("this_only"), "recurrence_id": .string("\(day(14))T09:00:00"),
+                "start_iso": .string("\(day(14))T10:00:00"), "end_iso": .string("\(day(14))T10:30:00"),
+            ], eventId: OccurrenceWireFixture.seriesPath, calendarId: OccurrenceWireFixture.calendarId,
+               account: "zone-c-float-one", pool: pool, deviceZone: zone)
+            let stored = harness.store.storedICS(path: OccurrenceWireFixture.seriesPath) ?? ""
+            let lines = CalDAVProvider.icsLines(stored)
+            #expect(lines.filter { $0.hasPrefix("RECURRENCE-ID") } == ["RECURRENCE-ID:\(compact(day(14)))T090000"],
+                    "changed \(lines.filter { $0.hasPrefix("RECURRENCE-ID") }); \(summary(r))")
+            #expect(lines.contains("DTSTART:\(compact(day(14)))T100000") && lines.contains("DTEND:\(compact(day(14)))T103000"),
+                    "written \(lines.filter { $0.hasPrefix("DT") }); \(summary(r))")
+        }
+    }
+
+    @Test("CalDAV floating series: a change of an occurrence and the following ones splits at it and starts at the card's wall clock")
+    func calDAVFloatingThisAndFollowing() async throws {
+        let fixture = try floatingSeries(first: day(0), start: "090000", end: "093000", rule: "FREQ=WEEKLY")
+        let zone = try confirmZone(at: fixture.first)
+        try await withCalDAV("zone-c-float-following", fixture: fixture) { harness, pool in
+            let r = try await runEdit([
+                "edit_scope": .string("this_and_following"), "recurrence_id": .string("\(day(14))T09:00:00"),
+                "start_iso": .string("\(day(14))T10:00:00"), "end_iso": .string("\(day(14))T10:30:00"),
+            ], eventId: OccurrenceWireFixture.seriesPath, calendarId: OccurrenceWireFixture.calendarId,
+               account: "zone-c-float-following", pool: pool, deviceZone: zone)
+            let newPaths = Set(harness.store.recordedPuts().map(\.path)).subtracting([OccurrenceWireFixture.seriesPath])
+            let newPart = newPaths.compactMap { harness.store.storedICS(path: $0) }.map(CalDAVProvider.icsLines)
+            #expect(newPart.count == 1 && newPart.first?.contains("DTSTART:\(compact(day(14)))T100000") == true,
+                    "new part \(newPart.map { $0.filter { $0.hasPrefix("DT") } }); \(summary(r))")
+            let earlier = CalDAVProvider.icsLines(harness.store.storedICS(path: OccurrenceWireFixture.seriesPath) ?? "")
+            // The earlier part ends after the occurrence a week before the one named, and before it.
+            let until = earlier.first { $0.hasPrefix("RRULE:") }?
+                .split(separator: ";").first { $0.hasPrefix("UNTIL=") }
+                .map { String($0.dropFirst("UNTIL=".count)).replacingOccurrences(of: "Z", with: "") }
+            #expect(until.map { $0 >= "\(compact(day(7)))T090000" && $0 < "\(compact(day(14)))T090000" } == true,
+                    "the earlier part is not capped at the occurrence named: \(earlier.filter { $0.hasPrefix("RRULE") })")
+        }
+    }
+
+    @Test("CalDAV floating HOURLY series: the occurrence at the named wall clock is the one changed, never a neighbour")
+    func calDAVFloatingHourlyNeverWrongOccurrence() async throws {
+        let fixture = try floatingSeries(first: day(3), start: "080000", end: "083000", rule: "FREQ=HOURLY;COUNT=12")
+        // A zone a whole number of hours from the host's, where one exists: there the old reading
+        // (the series in the host's zone, `recurrence_id` in the card's) named another occurrence.
+        let zone = try zonesWholeHoursFromTheHost(at: fixture.first)
+        try await withCalDAV("zone-c-float-hourly", fixture: fixture) { harness, pool in
+            let r = try await runEdit([
+                "edit_scope": .string("this_only"), "recurrence_id": .string("\(day(3))T12:00:00"),
+                "start_iso": .string("\(day(3))T12:15:00"), "end_iso": .string("\(day(3))T12:45:00"),
+            ], eventId: OccurrenceWireFixture.seriesPath, calendarId: OccurrenceWireFixture.calendarId,
+               account: "zone-c-float-hourly", pool: pool, deviceZone: zone)
+            let stored = harness.store.storedICS(path: OccurrenceWireFixture.seriesPath) ?? ""
+            let lines = CalDAVProvider.icsLines(stored)
+            #expect(lines.filter { $0.hasPrefix("RECURRENCE-ID") } == ["RECURRENCE-ID:\(compact(day(3)))T120000"],
+                    "changed \(lines.filter { $0.hasPrefix("RECURRENCE-ID") }) (\(zone.identifier)); \(summary(r))")
+            #expect(lines.contains("DTSTART:\(compact(day(3)))T121500"),
+                    "written \(lines.filter { $0.hasPrefix("DT") }); \(summary(r))")
+        }
+    }
+
     // MARK: Controls (hold today, with or without the fix)
 
     @Test("a zone the assistant names (IANA or Windows) is shown on the card and written in that zone")
@@ -629,5 +720,107 @@ struct CalendarCardZoneLabelTests {
         let device = try #require(TimeZone(identifier: "Asia/Tokyo"))
         #expect(ActionConfirmationCard.eventTimezoneLabel(detail("Tokyo Standard Time"), deviceZone: device) == nil)
         #expect(ActionConfirmationCard.eventZone(detail("Tokyo Standard Time")).identifier == "Asia/Tokyo")
+    }
+}
+
+// MARK: - A floating occurrence is found by its wall clock in the zone that names it (#761)
+//
+// INVARIANT: a floating time is a wall clock with no zone, so the occurrence a `recurrence_id`
+// names is the one at that wall clock, whatever zone the `recurrence_id` is read in and whatever
+// the device's zone is. It used to be compared as an instant, the series read in the device's
+// zone and the `recurrence_id` in the zone the call named: after a change of the device's zone
+// the occurrence was not found (#761), or, with a series a whole number of hours apart, another
+// one was (#753 review). The host's zone stands for the device's; each case names the occurrence
+// in zones whose offset is not the host's.
+
+@Suite("A floating CalDAV occurrence is found by its wall clock in the zone that names it (#761)")
+struct CalDAVFloatingOccurrenceMatchTests {
+    private let href = OccurrenceFixture.href
+
+    /// A weekly floating series from day 0 at 09:00, with `extra` VEVENTs after it.
+    private func series(_ extra: [String] = []) -> String {
+        OccurrenceFixture.ics([[
+            "UID:standup-1", "DTSTAMP:\(compact(day(0)))T000000Z",
+            "DTSTART:\(compact(day(0)))T090000", "DTEND:\(compact(day(0)))T093000",
+            "SUMMARY:Standup", "RRULE:FREQ=WEEKLY",
+        ].joined(separator: "\n")] + extra)
+    }
+
+    /// Week 1's occurrence moved to the next day at 10:00, as a changed copy.
+    private var movedCopy: String {
+        [
+            "UID:standup-1", "DTSTAMP:\(compact(day(0)))T000000Z",
+            "RECURRENCE-ID:\(compact(day(7)))T090000",
+            "DTSTART:\(compact(day(8)))T100000", "DTEND:\(compact(day(8)))T103000",
+            "SUMMARY:Standup (moved)",
+        ].joined(separator: "\n")
+    }
+
+    private func zones() throws -> [TimeZone] { try zonesNotTheHost(at: try #require(utcAt("\(day(14))T09:00:00"))) }
+
+    @Test("an occurrence of the series is found at the wall clock named, by recurrence_id alone or with its occurrence id")
+    func seriesOccurrence() throws {
+        for zone in try zones() {
+            let slot = try CalDAVOccurrences.scopedEditSlot(
+                icsText: series(), href: href, key: nil, recurrenceId: "\(day(14))T09:00:00", zone: zone, forSplit: false)
+            #expect(slot == "\(day(14))T09:00:00", "\(zone.identifier)")
+            let named = try CalDAVOccurrences.scopedEdit(
+                icsText: series(), href: href, key: "\(compact(day(14)))T090000",
+                recurrenceId: "\(day(14))T09:00:00", zone: zone, forSplit: true)
+            #expect(named.key == "\(compact(day(14)))T090000", "\(zone.identifier)")
+        }
+    }
+
+    @Test("control: a wall clock no occurrence starts at names none, in any zone")
+    func noOccurrenceAtThatWallClock() throws {
+        for zone in try zones() {
+            #expect(throws: CalDAVError.self, "\(zone.identifier)") {
+                try CalDAVOccurrences.scopedEditSlot(
+                    icsText: series(), href: href, key: nil, recurrenceId: "\(day(14))T10:00:00", zone: zone, forSplit: false)
+            }
+        }
+    }
+
+    @Test("a moved occurrence is found where it is now, at its wall clock")
+    func movedOccurrence() throws {
+        for zone in try zones() {
+            let named = try CalDAVOccurrences.scopedEdit(
+                icsText: series([movedCopy]), href: href, key: nil, recurrenceId: "\(day(8))T10:00:00", zone: zone, forSplit: false)
+            #expect(named.key == "\(compact(day(7)))T090000", "\(zone.identifier)")
+        }
+    }
+
+    @Test("a changed occurrence held without its series is found where it is now, at its wall clock")
+    func occurrenceWithoutItsSeries() throws {
+        let ics = OccurrenceFixture.ics([movedCopy])
+        for zone in try zones() {
+            let named = try CalDAVOccurrences.scopedEdit(
+                icsText: ics, href: href, key: "\(compact(day(7)))T090000", recurrenceId: "\(day(8))T10:00:00", zone: zone, forSplit: false)
+            #expect(named.key == "\(compact(day(7)))T090000", "\(zone.identifier)")
+        }
+    }
+
+    @Test("control: a listing shows a moved floating occurrence at its wall clock on the device")
+    func listingIsUnchanged() throws {
+        let from = try #require(utcAt("\(day(6))T00:00:00"))
+        let to = try #require(utcAt("\(day(10))T00:00:00"))
+        let rows = OccurrenceFixture.listing(series([movedCopy]), from: from, to: to)
+        let moved = try #require(rows.first { $0.summary == "Standup (moved)" }, "rows: \(rows.map(\.summary))")
+        #expect(moved.startDate == EKEventStoreHelper.parseNaiveISO("\(day(8))T10:00:00", timeZone: .current))
+        #expect(moved.endDate == EKEventStoreHelper.parseNaiveISO("\(day(8))T10:30:00", timeZone: .current))
+    }
+
+    @Test("exdates_add with no zone given reads its dates in the zone the tool snapshotted")
+    func exdatesUseTheSnapshotZone() throws {
+        let zone = try zones()[0]
+        let checked = CalendarEventEditExdates.check(
+            ["event_id": .string("1"), "exdates_add": .array([.string("\(day(14))T09:00:00")])],
+            compoundId: "acct:event", deviceZone: zone)
+        guard case .dates(let dates, let resolved) = checked else {
+            Issue.record("refused: \(checked)")
+            return
+        }
+        #expect(dates == ["\(day(14))T09:00:00"])
+        #expect(resolved.identifier == zone.identifier)
     }
 }

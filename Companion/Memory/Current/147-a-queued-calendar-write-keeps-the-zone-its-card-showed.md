@@ -6,7 +6,9 @@ queue, zone change between confirm and drain, travel, card zone, `timeZoneId`,
 `ActionConfirmationCard.eventTimezoneLabel`, `eventZone`, zone row only when not the device's, Google
 Calendar behaviour, CalDAV floating write, `formatDTLine` `.floating`, `floatingWriteNeedsZoneMessage`,
 `mergePatchKeepingLength`, `CalendarWriteZoneSnapshotTests`, `CalendarCardZoneLabelTests`, snapshot
-settings at operation start, #753, #761.
+settings at operation start, floating occurrence match, `CalDAVOccurrences.scopedEdit`, `Frame.floating`,
+`placed`, `CalDAVFloatingOccurrenceMatchTests`, `CalendarEventEditExdates.check(deviceZone:)`, HOURLY
+wrong occurrence, #753, #761.
 
 ## The rule
 
@@ -29,12 +31,26 @@ was written 15:00 London.
   device's zone at the write. An unlabelled floating patch is refused (`floatingWriteNeedsZoneMessage`),
   nothing written. `mergePatchKeepingLength` keeps the patch's labels on a floating copy and names a
   derived end in the start's zone; a zoned copy still drops them.
-- Not fixed here: finding ONE occurrence of a floating CalDAV series after a zone change (the lookup
-  reads floating frames in the device's zone, ADR-IOS-108): filed as #761.
+- History: the first #753 commit left finding ONE occurrence of a floating CalDAV series after a zone
+  change to #761 (the lookup read floating frames in the device's zone, ADR-IOS-108). Review round 1
+  showed the drain then missed the occurrence (or, on an HOURLY series a whole number of hours away,
+  changed another one), so #761 was folded into #753 (master-agent ruling 2026-11-12).
+- Floating occurrences are matched by wall clock in the operation's zone: `CalDAVOccurrences.scopedEdit`
+  (the one matcher behind `updateOccurrence`, `splitSeries`, `occurrence` and `occurrenceStartDay`)
+  reads a floating series in the zone its `recurrence_id` is in (`Frame.floating(TimeZone)`, through
+  `shape(floatingZone:)`, `occurrenceRows` and `standaloneRows`), and a changed copy's floating start
+  and end there too (`placed`). A listing and `occurrence(key:)` still read floating times in the
+  device's zone, so what the user sees is unchanged. Deletes go by occurrence key (wall digits for a
+  floating series), already zone-free. `CalendarEventEditExdates.check` reads its dates in the tool's
+  snapshot zone (`deviceZone:`), not the host's.
 
 ## Tests
 
 `TabMailTests/Tools/CalendarWriteZoneSnapshotTests.swift` drives the real tools with
 `ToolContext(deviceZone:)` set to a zone that is not the host's, drains in the host's zone, and
 compares the write on the Google, Graph and CalDAV fakes with the card. The stamp-removal inversion
-turns every non-control case red; the floating case is red with the formatter reverted.
+turns every non-control case red; the floating case is red with the formatter reverted. Its
+floating-series cases (this_only, this_and_following, HOURLY) and `CalDAVFloatingOccurrenceMatchTests`
+(#761: series, moved copy, copy without its series, plus a listing control) pin the wall-clock match;
+`CalDAVWholeSeriesEditTests.floatingWholeEventNeedsTheEditsZone` pins the unlabelled-floating refusal
+of `mergePatchIntoICS`.

@@ -1088,6 +1088,18 @@ host's zone, and compares the write on the fake with the card.
   queued as given; with no zone given the write resolves to the snapshotted zone. (The queue deletes
   a done row, and the tool starts a drain of its own, so the integration cases check the write, not
   the row.)
+- Floating CalDAV series (#761, folded into #753): `this_only` and `this_and_following` of a weekly
+  floating series confirmed in one zone and drained in the host's change the occurrence at the named
+  wall clock, at the card's wall clock; an HOURLY floating series, in a zone a whole number of hours
+  from the host's where one exists, changes the occurrence named and no neighbour.
+- `CalDAVFloatingOccurrenceMatchTests`: `CalDAVOccurrences.scopedEdit` finds a floating occurrence by
+  its wall clock in a zone that is not the host's (by `recurrence_id`, and with its occurrence id for a
+  split), a moved changed copy where it is now, and a changed copy held without its series. Controls:
+  a wall clock no occurrence starts at names none; a listing still shows a moved floating occurrence
+  at its wall clock on the device. Also `exdates_add` reads its dates in the tool's snapshot zone.
+- `CalDAVWholeSeriesEditTests.floatingWholeEventNeedsTheEditsZone`: `mergePatchIntoICS` writes a
+  floating time at the wall clock of the zone the patch names, and refuses an unlabelled one
+  (`floatingWriteNeedsZoneMessage`).
 
 ## CalDAV organizer — every event with guests names its organizer
 
