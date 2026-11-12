@@ -719,8 +719,11 @@ enum SyncConfig {
     /// `catchUpPassBudgetSeconds + catchUpRequestTimeoutSeconds` (about 5 s). A
     /// timeout ends the step for the pass; the state written so far resumes it.
     static let catchUpRequestTimeoutSeconds: TimeInterval = 3
-    /// How often a folder gets a full listing even when nothing signals a change
-    /// (seconds). Runs only on a non-expensive network, oldest folder first.
+    /// How often an IMAP folder gets a full listing even when nothing signals a
+    /// change (seconds). Runs only on a non-expensive network, oldest folder first.
+    /// Gmail has no such interval: the history delta follows every folder while
+    /// its cursor is valid, so a Gmail folder is listed only the first time and
+    /// after a lapse of the cursor (`GmailProvider.catchUpPlan`).
     static let catchUpFullCheckIntervalSeconds: TimeInterval = 86_400
     /// The longest a folder's full listing waits for a non-expensive network
     /// (seconds), counted from its last completed listing, or from the catch-up's
@@ -732,6 +735,22 @@ enum SyncConfig {
     /// About 50 bytes per message on the wire, so a dense range stays far inside
     /// the request timeout even on a slow link.
     static let catchUpListingRangeSpan = 1000
+    /// Most local rows one Gmail listing range covers. A range is taken from the
+    /// folder's local rows in provider-date order, so this bounds the membership
+    /// listing of a dense folder to about one page.
+    static let catchUpGmailRangeRowLimit = 500
+    /// Longest stretch of provider dates one Gmail listing range covers (seconds),
+    /// counted from the range's first local row. The read and starred lists of a
+    /// range are account-wide over this stretch, so this bounds them for a sparse
+    /// folder in a busy account.
+    static let catchUpGmailRangeMaxSpanSeconds = 7 * 86_400
+    /// Seconds by which every Gmail listing window is widened at each end. Gmail's
+    /// `after:`/`before:` take whole seconds and their inclusiveness is not
+    /// documented, so one second on each side makes sure a range's own rows are
+    /// always listed.
+    static let catchUpGmailRangeSlackSeconds = 1
+    /// `maxResults` of one Gmail catch-up list request (Gmail's documented maximum).
+    static let catchUpGmailListPageSize = 500
 
     // MARK: - Sent-Reply Parent Discovery
 

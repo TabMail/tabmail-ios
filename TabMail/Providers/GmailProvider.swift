@@ -109,6 +109,10 @@ actor GmailProvider: EmailProvider {
     /// `folder(_:containsMessageWithLabels:)`, so listing and delta apply one rule.
     nonisolated static let allMailExcludedLabelIds = ["INBOX", "SENT", "TRASH", "SPAM", "DRAFT"]
 
+    /// The folders whose own windowed list asks Gmail for Spam and Trash mail
+    /// (`messageListPath`).
+    nonisolated static let spamTrashFolderIds: Set<String> = ["TRASH", "SPAM"]
+
     /// Whether a message carrying `labelIds` belongs in the local folder `path`:
     /// All Mail holds every message without an excluded label; every other
     /// folder is the Gmail label of the same id.
@@ -1244,32 +1248,114 @@ actor GmailProvider: EmailProvider {
         return listResponse.messages?.map(\.id) ?? []
     }
 
+    /// A provider-date window for a list request, in whole epoch seconds, sent as
+    /// `after:<after> before:<before>` (Gmail evaluates both against `internalDate`,
+    /// i.e. `MessageHeader.providerDate`).
+    struct ListWindow: Sendable, Equatable {
+        let after: Int
+        let before: Int
+
+        var query: String { "after:\(after) before:\(before)" }
+    }
+
     /// Single-page listing for cursor-based backfill. Returns one page of message IDs
-    /// plus the nextPageToken for resuming. No date filter — walks the entire label listing
-    /// newest→oldest. Archive path uses exclusion query.
+    /// plus the nextPageToken for resuming. With no `window`, no date filter — walks
+    /// the entire label listing newest→oldest. Archive path uses exclusion query.
+    /// With a `window` (the catch-up, ADR-IOS-107), only messages whose
+    /// `internalDate` lies in it; the Spam and Trash folders' own lists send
+    /// `includeSpamTrash`, so they list their own mail, and every other folder
+    /// lists what its walk lists (no Spam or Trash mail); a `400` then keeps its body,
+    /// so the catch-up can log its reason (`badRequestReason`).
     func listMessageIdsPage(
         folder: String,
         pageToken: String? = nil,
-        pageSize: Int = 500
+        pageSize: Int = 500,
+        window: ListWindow? = nil
     ) async throws -> (ids: [String], nextPageToken: String?) {
         try Task.checkCancellation()
+        let path = Self.messageListPath(folder: folder, window: window, pageToken: pageToken, pageSize: pageSize)
+        return try await listMessageIds(path: path, preservingBadRequestBody: window != nil)
+    }
 
+    /// One page of the ids of ALL the account's messages matching `search`
+    /// (for example `is:unread`) whose `internalDate` lies in `window`, Spam and
+    /// Trash included. Not scoped to a folder: a message moved between this and
+    /// another request is still answered for. A `400` keeps its body, so the
+    /// catch-up can log its reason (`badRequestReason`).
+    func listAccountMessageIdsPage(
+        search: String, window: ListWindow, pageToken: String?, pageSize: Int
+    ) async throws -> (ids: [String], nextPageToken: String?) {
+        try Task.checkCancellation()
+        let path = Self.accountMessageListPath(search: search, window: window, pageToken: pageToken, pageSize: pageSize)
+        return try await listMessageIds(path: path, preservingBadRequestBody: true)
+    }
+
+    /// One message's label ids (`format=minimal`), or nil when Gmail answers that
+    /// it is gone (404/410). Any other failure throws.
+    func fetchMessageLabelIds(id: String) async throws -> [String]? {
+        let data: Data
+        do {
+            data = try await request(path: "/messages/\(id)\(GmailAPI.minimalQuery)")
+        } catch where isHttpGoneStatus(error) {
+            return nil
+        }
+        return try JSONDecoder().decode(GmailMessage.self, from: data).labelIds ?? []
+    }
+
+    private func listMessageIds(
+        path: String, preservingBadRequestBody: Bool
+    ) async throws -> (ids: [String], nextPageToken: String?) {
+        let data = preservingBadRequestBody
+            ? try await requestPreservingBadRequestBody(path: path, method: "GET", body: nil)
+            : try await request(path: path)
+        let listResponse = try JSONDecoder().decode(GmailMessageListResponse.self, from: data)
+        let ids = listResponse.messages?.map(\.id) ?? []
+        return (ids: ids, nextPageToken: listResponse.nextPageToken)
+    }
+
+    /// The `messages.list` path for one folder. All Mail is the exclusion query and
+    /// never a label id; a `window` adds its bounds to the query.
+    nonisolated static func messageListPath(
+        folder: String, window: ListWindow?, pageToken: String?, pageSize: Int
+    ) -> String {
         var path: String
         if folder == GmailProvider.archivePath {
-            let q = GmailProvider.allMailExclusionQuery
+            let q = [GmailProvider.allMailExclusionQuery, window?.query].compactMap { $0 }.joined(separator: " ")
             let encoded = q.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? q
             path = "/messages?maxResults=\(pageSize)&q=\(encoded)"
         } else {
             path = "/messages?labelIds=\(folder)&maxResults=\(pageSize)"
+            if let q = window?.query {
+                path += "&q=\(q.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? q)"
+            }
         }
+        // What this relies on: a search (`q`) list and a list of any label
+        // other than SPAM or TRASH leave Spam and Trash mail out unless
+        // `includeSpamTrash` is sent (unsent = false), while a list by
+        // `labelIds=TRASH` or `SPAM` returns that folder's mail without it (the
+        // Spam and Trash walks list that way). Google's reference documents
+        // the flag but not how it combines with `labelIds`. A folder's windowed
+        // list asks for it only for the Spam and Trash folders themselves, so
+        // every other folder's check lists what its own walk lists: a message
+        // in a label that is also in Trash or Spam is not missing there (#540).
+        if window != nil, spamTrashFolderIds.contains(folder) { path += "&includeSpamTrash=true" }
         if let token = pageToken {
             path += "&pageToken=\(token)"
         }
+        return path
+    }
 
-        let data = try await request(path: path)
-        let listResponse = try JSONDecoder().decode(GmailMessageListResponse.self, from: data)
-        let ids = listResponse.messages?.map(\.id) ?? []
-        return (ids: ids, nextPageToken: listResponse.nextPageToken)
+    /// The account-wide `messages.list` path for `search` within `window`.
+    nonisolated static func accountMessageListPath(
+        search: String, window: ListWindow, pageToken: String?, pageSize: Int
+    ) -> String {
+        let q = "\(search) \(window.query)"
+        let encoded = q.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? q
+        var path = "/messages?maxResults=\(pageSize)&q=\(encoded)&includeSpamTrash=true"
+        if let token = pageToken {
+            path += "&pageToken=\(token)"
+        }
+        return path
     }
 
     func fetchOlderMessages(folder: String, before: Date, limit: Int) async throws -> [MessageHeaderInfo] {
@@ -1562,17 +1648,16 @@ actor GmailProvider: EmailProvider {
     /// `resolveActionMessageId`'s / `resolveTokenMember`'s list and metadata
     /// calls. Both of those methods are RFC-search machinery that v3 does not
     /// have (D4: durable ops key on Gmail's native `message.id`, so nothing
-    /// resolves an identity by search), leaving `modifyMessage`'s and
-    /// `trashOrUntrashMessage`'s POSTs as the only body-classifying call sites
-    /// on this tree. A `GET` arm here would be
-    /// unreachable code, and its absence cannot silently mis-route anything:
-    /// the `default` arm below traps at the callsite rather than quietly
-    /// downgrading to the bodyless path.
+    /// resolves an identity by search). On this tree the call sites are
+    /// `modifyMessage`'s and `trashOrUntrashMessage`'s POSTs, and the `GET` of
+    /// the catch-up's own list requests (`listMessageIds` with
+    /// `preservingBadRequestBody`, ADR-IOS-107), which reads a `400`'s reason
+    /// (`badRequestReason`). Any other method hits the `default` arm,
+    /// which traps at the call site rather than quietly downgrading to the
+    /// bodyless path.
     ///
     /// `method` and `body` are deliberately NOT defaulted (the reference
-    /// defaults them to `"GET"` / `nil`): on this tree `GET` hits the
-    /// `default` trap, so a default that reaches it would be a latent crash
-    /// rather than a convenience.
+    /// defaults them to `"GET"` / `nil`), so every call site names what it sends.
     private func requestPreservingBadRequestBody(
         path: String,
         method: String,
@@ -1590,6 +1675,10 @@ actor GmailProvider: EmailProvider {
             case "POST":
                 return try await authedHTTP.requestPreservingBadRequestBody(
                     url: url, method: "POST", body: body ?? Data()
+                )
+            case "GET":
+                return try await authedHTTP.requestPreservingBadRequestBody(
+                    url: url, method: "GET", body: nil
                 )
             default:
                 fatalError("GmailProvider.requestPreservingBadRequestBody: unsupported HTTP method \(method)")
@@ -1678,6 +1767,23 @@ actor GmailProvider: EmailProvider {
         guard let rejection = Self.structuredBadRequestRejection(error) else { return false }
         return rejection.reason == "invalidArgument"
             && rejection.message.hasPrefix("Invalid id value")
+    }
+
+    /// For an HTTP `400` answer, its structured error reason (`errors[0].reason`),
+    /// or `"unparsed"` when the body has none; `nil` for any other error. Gmail
+    /// answers an invalid supplied value with `400` (`badRequest`; Google's
+    /// `INVALID_ARGUMENT`) and documents no wording for a page token it no longer
+    /// accepts (https://developers.google.com/workspace/gmail/api/guides/handle-errors,
+    /// https://google.aip.dev/158), so the catch-up's own listings treat any `400`
+    /// to a request carrying a saved token as that, and restart the list once. The
+    /// reason is only logged.
+    nonisolated static func badRequestReason(_ error: Error) -> String? {
+        guard case ProviderError.networkError(let underlying) = error,
+              case HTTPError.networkErrorWithBody(let statusCode, let body) = underlying,
+              statusCode == 400
+        else { return nil }
+        let decoded = try? JSONDecoder().decode(GmailAPIErrorBody.self, from: body)
+        return decoded?.error.errors?.first?.reason ?? "unparsed"
     }
 
     /// The `(reason, message)` pair of a Gmail `400` whose STRUCTURED body we

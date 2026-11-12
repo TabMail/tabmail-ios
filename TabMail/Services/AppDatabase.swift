@@ -4306,6 +4306,32 @@ final class AppDatabase: Sendable {
                 t.add(column: "backfillPageHeldSince", .datetime)
             }
         }
+
+        // The backfill bookkeeping's row version. The trigger bumps it on EVERY
+        // update that writes `backfillPageToken` or `backfillComplete`, whether or
+        // not the value changes, so a write of the very state a page-token walk
+        // read (a reset, a second walk, a whole-record folder update) still moves
+        // it, and no writer can forget it. The walk's own write compares it
+        // (`SyncEngine.advanceBackfillPageWalk`). *Superseded (2026-11-12, the
+        // catch-up loads missing mail itself and no longer re-arms the walk):*
+        // the example was "a catch-up re-arm that writes the very state a
+        // page-token walk read".
+        // Convergence: a fresh install and an upgraded DB both end with the column
+        // at 0 on every row and the one trigger.
+        migrator.registerTimedMigration(
+            "v100_addFolderBackfillVersion", foreignKeyChecks: .immediate
+        ) { db in
+            try db.alter(table: "folder") { t in
+                t.add(column: "backfillVersion", .integer).notNull().defaults(to: 0)
+            }
+            try db.execute(sql: """
+                CREATE TRIGGER folder_bumpBackfillVersion
+                AFTER UPDATE OF backfillPageToken, backfillComplete ON folder
+                BEGIN
+                    UPDATE folder SET backfillVersion = backfillVersion + 1 WHERE id = NEW.id;
+                END
+                """)
+        }
     }
 
     /// PORT — v2final `AppDatabase.seedDraftLastTouchedSeq`. Extracted to a static

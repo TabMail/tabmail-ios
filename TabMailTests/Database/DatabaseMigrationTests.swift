@@ -1477,10 +1477,12 @@ struct FolderCatchUpStateMigrationTests {
         let column = try #require(columns.first { ($0["name"] as String) == "catchUpState" })
         #expect((column["notnull"] as Int) == 0)
         #expect((column["type"] as String).uppercased() == "TEXT")
-        let folders = try db.read { try Folder.fetchAll($0) }
-        #expect(folders.count == 1)
-        guard folders.count == 1 else { return }
-        #expect(folders[0].catchUpState == nil)
+        // Read the column itself: the current `Folder` model may carry columns a
+        // later migration adds.
+        let states = try db.read { try Row.fetchAll($0, sql: "SELECT catchUpState FROM folder") }
+        #expect(states.count == 1)
+        guard states.count == 1 else { return }
+        #expect((states[0]["catchUpState"] as String?) == nil)
     }
 }
 
@@ -1510,10 +1512,75 @@ struct FolderBackfillPageHeldSinceMigrationTests {
         let column = try #require(columns.first { ($0["name"] as String) == "backfillPageHeldSince" })
         #expect((column["notnull"] as Int) == 0)
         #expect((column["type"] as String).uppercased() == "DATETIME")
-        let folders = try db.read { try Folder.fetchAll($0) }
+        // Read the columns themselves: the current `Folder` model carries
+        // columns a later migration adds (`backfillVersion`, v100).
+        let folders = try db.read { try Row.fetchAll($0, sql: "SELECT backfillPageHeldSince, backfillPageToken FROM folder") }
         #expect(folders.count == 1)
         guard folders.count == 1 else { return }
-        #expect(folders[0].backfillPageHeldSince == nil)
-        #expect(folders[0].backfillPageToken == "saved-page-token")
+        #expect((folders[0]["backfillPageHeldSince"] as Date?) == nil)
+        #expect((folders[0]["backfillPageToken"] as String?) == "saved-page-token")
+    }
+}
+
+// MARK: - v100 — folder.backfillVersion
+
+/// `v100_addFolderBackfillVersion` adds the backfill bookkeeping's row version and
+/// the trigger that bumps it. Every write of the bookkeeping must move it, even
+/// one that writes the value already there (a re-arm of a folder whose walk is at
+/// its top), and nothing else may.
+@Suite("Migration v100 — folder.backfillVersion")
+struct FolderBackfillVersionMigrationTests {
+    private static func migratedWithOneFolder() throws -> (DatabaseQueue, String) {
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let db = try DatabaseQueue(configuration: configuration)
+        var migrator = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &migrator)
+        try migrator.migrate(db, upTo: "v99_addFolderBackfillPageHeldSince")
+        try TestDatabase.insertAccount(db, id: "acc1", email: "one@example.com")
+        try TestDatabase.insertFolder(db)
+        try migrator.migrate(db, upTo: "v100_addFolderBackfillVersion")
+        let id = try db.read { try String.fetchOne($0, sql: "SELECT id FROM folder") }
+        return (db, try #require(id))
+    }
+
+    private static func version(_ db: DatabaseQueue, _ id: String) throws -> Int {
+        try db.read { try Int.fetchOne($0, sql: "SELECT backfillVersion FROM folder WHERE id = ?", arguments: [id]) } ?? -1
+    }
+
+    @Test("v100 starts every existing folder at version 0")
+    func existingFoldersStartAtZero() throws {
+        let (db, id) = try Self.migratedWithOneFolder()
+        let columns = try db.read { try Row.fetchAll($0, sql: "PRAGMA table_info(folder)") }
+        let column = try #require(columns.first { ($0["name"] as String) == "backfillVersion" })
+        #expect((column["notnull"] as Int) == 1)
+        #expect(try Self.version(db, id) == 0)
+    }
+
+    @Test("Every write of the page token or the complete flag bumps the version, even an unchanged one")
+    func everyBookkeepingWriteBumps() throws {
+        let (db, id) = try Self.migratedWithOneFolder()
+        let writes = [
+            "UPDATE folder SET backfillComplete = 0, backfillPageToken = NULL WHERE id = ?",
+            "UPDATE folder SET backfillComplete = 0, backfillPageToken = NULL WHERE id = ?",
+            "UPDATE folder SET backfillPageToken = 'next' WHERE id = ?",
+            "UPDATE folder SET backfillComplete = 1, backfillPageToken = NULL WHERE id = ?",
+            // The completion flag alone, both ways, as the IMAP walk writes it.
+            "UPDATE folder SET backfillComplete = 1 WHERE id = ?",
+            "UPDATE folder SET backfillComplete = 0 WHERE id = ?",
+        ]
+        for (index, sql) in writes.enumerated() {
+            try db.write { try $0.execute(sql: sql, arguments: [id]) }
+            #expect(try Self.version(db, id) == index + 1, "write \(index + 1): \(sql)")
+        }
+    }
+
+    @Test("A write that leaves the bookkeeping out does not bump the version")
+    func otherWritesDoNotBump() throws {
+        let (db, id) = try Self.migratedWithOneFolder()
+        try db.write {
+            try $0.execute(sql: "UPDATE folder SET unreadCount = unreadCount + 1, oldestSyncedDate = NULL, backfillPageHeldSince = CURRENT_TIMESTAMP WHERE id = ?", arguments: [id])
+        }
+        #expect(try Self.version(db, id) == 0)
     }
 }

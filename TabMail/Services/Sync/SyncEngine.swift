@@ -577,8 +577,10 @@ actor SyncEngine {
                 }
             }
 
+            let deltaReachedCursor = deltaSyncSucceeded
             await queue.execute(priority: .headerFetch) {
-                await self.captureSyncCursors(account: account, provider: provider)
+                await self.captureSyncCursors(
+                    account: account, provider: provider, deltaReachedCursor: deltaReachedCursor)
             }
 
             let now = Date()

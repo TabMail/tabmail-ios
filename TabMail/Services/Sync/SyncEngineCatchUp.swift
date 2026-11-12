@@ -16,8 +16,16 @@ import GRDB
 //     server-confirmed deletion takes;
 //   - the provider's new opaque state, in the SAME transaction as the flag updates
 //     and removals, so a crash resumes from the last write.
-// It changes or removes only rows the device already holds. It never inserts: new
-// mail is the ordinary sync's job and older mail is the backfill's.
+//   - messages the provider fetched for ids the server lists in the folder that no
+//     row holds (the direct load): the backfill page walk's own insert tail
+//     (`insertFetchedBackfillMessages`), BEFORE the state is written; if any of
+//     them did not land, nothing is written.
+// *Superseded (2026-11-12, the direct load):* "It changes or removes only rows the
+// device already holds. It never inserts: new mail is the ordinary sync's job and
+// older mail is the backfill's. When the provider reports mail inside the folder's
+// local range that no row holds (an old message moved in), the same transaction
+// re-arms the folder's backfill walk, unless a storage limit is in force." The
+// catch-up never writes the walk's bookkeeping.
 // No provider is named here: the step does the same thing for every provider, and a
 // provider without catch-up returns nothing.
 
@@ -26,7 +34,8 @@ enum CatchUpApplyOutcome: Sendable, Equatable {
     /// Applied, with the state written in the same transaction.
     case applied(updatedFlags: Int, removedIds: [String])
     /// Nothing written: the folder is gone or quarantined, its epoch is unknown or
-    /// unproven for this result, or the write failed. The
+    /// unproven for this result, or the write failed (a write of the loaded
+    /// messages included). The
     /// provider redoes the work from its previous state on a later pass.
     case skipped
     /// The provider was served a different epoch than the folder's stored one.
@@ -92,6 +101,35 @@ struct SyncEngineCatchUpRowReader: CatchUpLocalRowReader {
                 """, arguments: [folderId, afterId, afterId, limit]).map(Self.localRow)
         }
     }
+
+    private static func datedRow(_ row: Row) -> CatchUpLocalRow {
+        var local = localRow(row)
+        local.orderDate = row["providerDate"]
+        return local
+    }
+
+    /// Served by the v91 `(folderId, providerDate)` index. `providerDate` is NOT
+    /// NULL, so no row falls out of a bound by SQL's three-valued logic.
+    func rows(folderId: String, orderDatesFrom lower: Date, before upper: Date) async throws -> [CatchUpLocalRow] {
+        try await pool.read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT \(Self.columns), providerDate FROM messageHeader
+                WHERE folderId = ? AND providerDate >= ? AND providerDate < ?
+                ORDER BY providerDate, messageId
+                """, arguments: [folderId, lower, upper]).map(Self.datedRow)
+        }
+    }
+
+    /// Served by the same index, scanned backwards.
+    func newestRows(folderId: String, orderDatesBefore upper: Date?, limit: Int) async throws -> [CatchUpLocalRow] {
+        try await pool.read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT \(Self.columns), providerDate FROM messageHeader
+                WHERE folderId = ? AND (? IS NULL OR providerDate < ?)
+                ORDER BY providerDate DESC, messageId DESC LIMIT ?
+                """, arguments: [folderId, upper, upper, limit]).map(Self.datedRow)
+        }
+    }
 }
 
 extension SyncEngine {
@@ -100,9 +138,13 @@ extension SyncEngine {
     /// re-read here so the provider sees this pass's STATUS values and epochs.
     /// Never throws: a failure costs this pass's catch-up, never the full sync, and
     /// it cannot trigger the full sync's connection-error retry (which would double
-    /// the hold). `context` defaults to the production snapshot taken right now.
+    /// the hold). `context` defaults to the production snapshot taken right now,
+    /// first, before anything else: the network state and whether a storage limit
+    /// is in force are read once and hold for the whole step.
     func runCatchUp(provider: any EmailProvider, folderIds: [String], context: CatchUpContext? = nil) async {
-        let context = context ?? .forPass(isExpensiveNetwork: NetworkMonitor.checkExpensive())
+        let context = context ?? .forPass(
+            isExpensiveNetwork: NetworkMonitor.checkExpensive(),
+            storageLimitInForce: StorageEstimator.budgetMB != Int.max)
         let ids = folderIds
         let folders: [Folder]
         do {
@@ -123,11 +165,25 @@ extension SyncEngine {
         }
     }
 
-    /// Apply one folder's catch-up result: ONE write transaction for the flag
-    /// updates, the removals and the new state. Nothing is ever inserted.
+    /// Apply one folder's catch-up result: first the messages the provider loaded
+    /// (`result.loaded`), through the backfill page walk's insert tail; then ONE
+    /// write transaction for the flag updates, the removals and the new state.
+    /// The loads go first so the state that moves the listing past them is never
+    /// written without them: a crash in between lists them again, and the insert
+    /// skips what is already there. A load that did not land (a write chunk
+    /// failed, or the folder could take nothing) writes nothing at all, the
+    /// state included: the listing stays where it was and the provider lists
+    /// those ranges again on a later pass.
     @discardableResult
     func applyCatchUpResult(_ result: CatchUpFolderResult, windowMode: StaleWindowMode) async -> CatchUpApplyOutcome {
         let folderId = result.folderId
+        if !result.loadFailures.isEmpty && DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): \(result.loadFailures.count) missing id(s) did not load: \(result.loadFailures.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: ", "))")
+        }
+        if !result.loaded.isEmpty, !(await insertCatchUpLoads(result)) {
+            BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): \(result.loaded.count) loaded message(s) did not all land — nothing written, the listing stays where it was")
+            return .skipped
+        }
 
         let outcome: CatchUpApplyOutcome
         do {
@@ -155,6 +211,53 @@ extension SyncEngine {
             break
         }
         return outcome
+    }
+
+    /// The direct load's insert: the loaded messages go into the folder through the
+    /// page walk's own insert tail, read with the folder as it is now. A folder
+    /// that is gone or quarantined gets nothing; its transaction below writes
+    /// nothing either, so the provider lists the same ids again later. True only
+    /// when every write chunk landed.
+    private func insertCatchUpLoads(_ result: CatchUpFolderResult) async -> Bool {
+        let folderId = result.folderId
+        guard let folder = try? await dbPool.read({ db in try Folder.fetchOne(db, key: folderId) }),
+              folder.uidValidityResetPendingAt == nil else { return false }
+        let headers = result.loaded.compactMap(\.header)
+        let bodies = Dictionary(
+            result.loaded.map { ($0.id, (htmlBody: $0.htmlBody, textBody: $0.textBody)) },
+            uniquingKeysWith: { first, _ in first })
+        let insert = await insertFetchedBackfillMessages(headers, bodies: bodies, folder: folder)
+        BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): loaded \(headers.count) missing message(s), inserted \(insert.inserted)")
+        return insert.allLanded
+    }
+
+    /// A delta-cursor lapse, inside the caller's write transaction: the account's
+    /// cursor (`Account.lastHistoryId`) becomes `newCursor` (nil clears it) and every
+    /// one of the account's folders gets the lapse marker in its catch-up state
+    /// (`CatchUpLapse`: the count under `CatchUpLapse.countKey` goes up by one).
+    /// Both or neither: the changes the lost history held reach no delta, and the
+    /// marker makes the provider list each folder again, in full, once the listing
+    /// in progress (if any) completes. The marker never clears the state, so a
+    /// listing in progress keeps its place and a folder keeps its schedule (the
+    /// expensive-network wait is not restarted). A NULL state stays NULL: no state
+    /// already means a full check is due. A state that is not a JSON object
+    /// becomes NULL, the same start. Used wherever a cursor is cleared or replaced
+    /// by one the delta did not reach. Provider-blind: the cursor column and the
+    /// marker are the same for every provider that has a delta cursor. It runs
+    /// under the account's one-sync-at-a-time lock, as the catch-up does, so no
+    /// catch-up of the account reads a state before a lapse and writes it after.
+    nonisolated static func lapseDeltaCursor(accountId: String, newCursor: String?, db: Database) throws {
+        try db.execute(sql: "UPDATE account SET lastHistoryId = ? WHERE id = ?", arguments: [newCursor, accountId])
+        // CASE evaluates lazily: the JSON functions only see valid JSON objects.
+        try db.execute(sql: """
+            UPDATE folder SET catchUpState = CASE
+                WHEN json_valid(catchUpState) THEN CASE
+                    WHEN json_type(catchUpState) = 'object' THEN json_set(
+                        catchUpState, '$.' || ?, COALESCE(json_extract(catchUpState, '$.' || ?), 0) + 1)
+                    ELSE NULL END
+                ELSE NULL END
+            WHERE accountId = ? AND catchUpState IS NOT NULL
+            """, arguments: [CatchUpLapse.countKey, CatchUpLapse.countKey, accountId])
     }
 
     /// The transaction itself. Everything it decides on is read INSIDE it: the folder
@@ -206,6 +309,12 @@ extension SyncEngine {
             folderRole: folder.role, ids: result.removedIds,
             recentlyCompleted: recentlyCompleted, db: db)
 
+        // Mail the server lists that no row holds was loaded before this
+        // transaction (`insertCatchUpLoads`); the walk's bookkeeping is never
+        // written here. *Superseded (2026-11-12, the direct load):* the re-arm of
+        // a completed walk (`backfillComplete = 0, backfillPageToken = NULL,
+        // backfillPageHeldSince = NULL` with the state), declined for an
+        // unfinished walk and while a storage limit was in force.
         try db.execute(
             sql: "UPDATE folder SET catchUpState = ? WHERE id = ?",
             arguments: [result.newState, folder.id])

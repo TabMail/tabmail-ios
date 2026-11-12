@@ -23,6 +23,9 @@ struct CatchUpLocalRow: Sendable, Equatable {
     let messageId: String
     let isRead: Bool
     let isFlagged: Bool
+    /// `MessageHeader.providerDate`, the key the provider orders and windows by.
+    /// Set only by the order-date accessor; nil from the others.
+    var orderDate: Date? = nil
 }
 
 /// Read access to a folder's local rows, by range, so a provider can compare a
@@ -38,11 +41,20 @@ protocol CatchUpLocalRowReader: Sendable {
     /// Up to `limit` rows in ascending provider-id order, after `afterId`
     /// (nil starts at the beginning) — an ordered scan of the whole folder.
     func rows(folderId: String, after afterId: String?, limit: Int) async throws -> [CatchUpLocalRow]
+    /// Every row whose provider order date (`MessageHeader.providerDate`) is at or
+    /// after `lower` and before `upper`, ascending by that date and then by id.
+    /// Each row carries its `orderDate`. For a provider that windows by date.
+    func rows(folderId: String, orderDatesFrom lower: Date, before upper: Date) async throws -> [CatchUpLocalRow]
+    /// The newest `limit` rows whose provider order date is before `upper` (nil: no
+    /// upper bound), descending by that date and then by id. Each row carries its
+    /// `orderDate`. For a provider that lists a folder newest first.
+    func newestRows(folderId: String, orderDatesBefore upper: Date?, limit: Int) async throws -> [CatchUpLocalRow]
 }
 
 /// What one catch-up call may spend and on what kind of network. A value snapshot
 /// taken by the caller at the start of the operation (root rule: snapshot settings
-/// at operation start); the provider never re-reads the network state itself.
+/// at operation start); neither the provider nor the apply re-reads the network
+/// state or the storage limit itself.
 struct CatchUpContext: Sendable {
     /// `NetworkMonitor.checkExpensive()` as it stood when the pass began.
     let isExpensiveNetwork: Bool
@@ -51,14 +63,21 @@ struct CatchUpContext: Sendable {
     /// The clock the budget is measured on. Injectable so a test can spend the
     /// budget deterministically; production passes `Date.init`.
     let clock: @Sendable () -> Date
+    /// Whether the user's Email Index Limit (`StorageEstimator.budgetMB`) was a
+    /// finite limit when the pass began. The limit means old mail is not kept:
+    /// the storage prune deletes the oldest rows once the store passes it
+    /// (ADR-IOS-006). So while it holds, a provider lists no mail older than the
+    /// folder's oldest local row, and so loads none back (ADR-IOS-107 decision 8).
+    var storageLimitInForce = false
 
     /// The production snapshot: the budget starts now.
-    static func forPass(isExpensiveNetwork: Bool) -> CatchUpContext {
+    static func forPass(isExpensiveNetwork: Bool, storageLimitInForce: Bool) -> CatchUpContext {
         let now = Date()
         return CatchUpContext(
             isExpensiveNetwork: isExpensiveNetwork,
             deadline: now.addingTimeInterval(SyncConfig.catchUpPassBudgetSeconds),
-            clock: { Date() })
+            clock: { Date() },
+            storageLimitInForce: storageLimitInForce)
     }
 
     /// Checked before EVERY request: false once the pass budget is spent.
@@ -81,8 +100,7 @@ struct CatchUpFolderResult: Sendable {
     /// sync applies nothing unless this equals the folder's stored known epoch; a
     /// result whose epoch DIFFERS from a known stored one reports a turnover.
     let epoch: UInt32?
-    /// Changes to rows the device already holds. There is no field for a message
-    /// without a local row: the catch-up never inserts (ADR-IOS-107).
+    /// Changes to rows the device already holds.
     var flagUpdates: [CatchUpFlagUpdate] = []
     /// Provider ids the server has PROVEN absent. They go through the one removal
     /// path (`SyncEngine.deleteConfirmedGhostHeaders`).
@@ -90,12 +108,70 @@ struct CatchUpFolderResult: Sendable {
     /// The folder's new opaque state, written in the same transaction as the
     /// results. Nil clears it.
     var newState: String?
+    /// Messages the provider fetched, with their bodies, for ids the server lists
+    /// in the folder that no local row in the folder holds (mail moved in, or new
+    /// mail beyond the sync window after a lapse). Only the ones that loaded (a
+    /// header). The apply inserts them through the backfill page walk's own insert
+    /// tail (`SyncEngine.insertFetchedBackfillMessages`) BEFORE it writes
+    /// `newState`, so a crash between the two lists them again rather than losing
+    /// them (ADR-IOS-107 decision 8, the direct load).
+    var loaded: [BackfillResult] = []
+    /// The missing ids that did not load, each with the page walk's own
+    /// classification of its failure (`SyncEngine.backfillFetchFailureKind`).
+    var loadFailures: [String: SyncEngine.BackfillFetchFailureKind] = [:]
+}
+
+/// The delta-cursor lapse marker every provider's catch-up state may carry
+/// (ADR-IOS-107). A lapse (`SyncEngine.lapseDeltaCursor`) never clears a folder's
+/// state: it adds one to the integer under `countKey` in the state's JSON object,
+/// and leaves a NULL state NULL (a folder with no state is due for a full check
+/// anyway). The provider decides what a lapse means for its folders; Gmail starts
+/// a new listing as soon as the one in progress completes. A state that is not a
+/// JSON object becomes NULL. A provider whose state ignores the key loses it at
+/// its next write, which is harmless for a provider that has no delta cursor.
+enum CatchUpLapse {
+    /// The key of the lapse count in a state's JSON object.
+    static let countKey = "lapseCount"
+}
+
+/// The time rules every provider's catch-up shares: when a folder's full check is
+/// due, and whether an expensive network may still hold it back.
+enum CatchUpSchedule {
+    /// True when the folder has never completed a listing, or its last one
+    /// completed at least `interval` ago. A provider with a periodic check passes
+    /// its own interval from `SyncConfig`, below the provider boundary (IMAP:
+    /// daily). Gmail has no periodic check (`GmailProvider.catchUpPlan`).
+    static func fullCheckDue(lastCompletedAt: Date?, now: Date, interval: TimeInterval) -> Bool {
+        guard let lastCompletedAt else { return true }
+        return now.timeIntervalSince(lastCompletedAt) >= interval
+    }
+
+    /// True when a folder WITH a state has waited for a non-expensive network for
+    /// at least `SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds`, counted from its
+    /// last completed listing or, before the first, from `createdAt`. A folder with
+    /// no state has not started waiting.
+    static func waitedTooLong(hasState: Bool, lastCompletedAt: Date?, createdAt: Date?, now: Date) -> Bool {
+        guard hasState else { return false }
+        guard let since = lastCompletedAt ?? createdAt else { return true }
+        return now.timeIntervalSince(since) >= SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds
+    }
+
+    /// `folders` in the order a pass works them: never-tried first, then by the
+    /// last try (a completion is a try), so a folder whose requests keep failing
+    /// goes behind the others and cannot hold their catch-up past its bound.
+    /// Stable on the caller's order for ties.
+    static func leastRecentlyAttemptedFirst(_ folders: [Folder], lastAttemptAt: (Folder) -> Date?) -> [Folder] {
+        folders.enumerated().sorted { lhs, rhs in
+            let l = lastAttemptAt(lhs.element) ?? .distantPast, r = lastAttemptAt(rhs.element) ?? .distantPast
+            return l == r ? lhs.offset < rhs.offset : l < r
+        }.map(\.element)
+    }
 }
 
 extension EmailProvider {
-    /// Default: no catch-up. A provider without support (Gmail, Exchange and Demo
-    /// until their own catch-up lands) returns nothing, and the full sync then
-    /// writes nothing.
+    /// Default: no catch-up. A provider without support (Exchange and Demo until
+    /// their own catch-up lands) returns nothing, and the full sync then writes
+    /// nothing.
     func catchUp(
         folders: [Folder], localRows: any CatchUpLocalRowReader, context: CatchUpContext
     ) async -> [CatchUpFolderResult] {

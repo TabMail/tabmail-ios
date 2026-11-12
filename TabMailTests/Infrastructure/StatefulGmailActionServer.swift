@@ -27,19 +27,24 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         /// metadata GET asks for `metadataHeaders=Received` (the real API
         /// returns only the requested headers under `format=metadata`).
         let received: [String]
+        /// The `text/plain` body the `format=full` GET serves (the backfill's
+        /// fetch). Nil serves an empty body, as before.
+        let bodyText: String?
 
         init(
             rfc822MessageId: String,
             providerMessageId: String,
             labels: Set<String>,
             internalDate: Date? = nil,
-            received: [String] = []
+            received: [String] = [],
+            bodyText: String? = nil
         ) {
             self.rfc822MessageId = rfc822MessageId
             self.providerMessageId = providerMessageId
             self.labels = labels
             self.internalDate = internalDate
             self.received = received
+            self.bodyText = bodyText
         }
     }
 
@@ -75,6 +80,7 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         var labels: Set<String>
         var internalDate: Date? = nil
         var received: [String] = []
+        var bodyText: String? = nil
     }
 
     /// Which injected failure (if any) `/messages/{id}/modify` must serve for
@@ -105,6 +111,8 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         let id: Int
         let providerMessageId: String
         let change: HistoryChange
+        /// The message's labels after the change.
+        let labels: [String]
     }
 
     private struct State: Sendable {
@@ -196,17 +204,24 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         /// empty — models a dangling-pagination edge case (SPEC-B3).
         var spuriousNextPageTokenTargets: Set<String> = []
         /// Largest page the `/messages` listing serves, the rest behind a
-        /// `nextPageToken`. Nil (the default) lists every match on one page
-        /// with no token. See `servePagedListings(pageSize:)`.
+        /// `nextPageToken`. Nil (the default): `maxResults` alone decides the
+        /// page size. See `servePagedListings(pageSize:)`.
         var listPageSize: Int?
-        /// Page tokens the paged listing handed out and still accepts, each
-        /// mapped to the offset its page starts at.
-        var livePageTokens: [String: Int] = [:]
-        var pageTokenSerial = 0
-        /// While true the paged listing refuses every request carrying a
-        /// page token, the ones it handed out included.
+        /// The generation page tokens are minted in. A minted token is
+        /// `<offset>~<generation>~<signature>`: the offset its page starts at,
+        /// and a signature of the list it came from (`pageTokenSignature`). One
+        /// from an older generation (`expireIssuedPageTokens()`), one sent with a
+        /// different list (`labelIds`, `q` or `includeSpamTrash`), or one not in
+        /// this form at all, is refused. A token with no signature (`<offset>`,
+        /// generation 0, or `<offset>~<generation>`) is one a test wrote into a
+        /// folder by hand; the app only replays tokens this fake minted, so it is
+        /// accepted on any list, as before.
+        var pageTokenGeneration = 0
+        /// The page tokens the listing refused, in order.
+        var rejectedPageTokens: [String] = []
+        /// While true the listing refuses every request carrying a page token,
+        /// the ones it handed out included.
         var rejectsEveryPageToken = false
-        var rejectedPageTokensServed = 0
         /// Injected failures of the message GET `GET /messages/{id}` (the
         /// backfill's full-format fetch included), per provider message id,
         /// served until `clearGetFailures()`.
@@ -220,8 +235,8 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         /// no answer. The first, unforced token read still succeeds.
         var failsTokenRefresh = false
         var failedTokenRefreshes = 0
-        /// Called with the refused token each time the paged listing refuses a
-        /// page token, before the refusal is answered. See `onRejectedPageToken(_:)`.
+        /// Called with the refused token each time the listing refuses a page
+        /// token, before the refusal is answered. See `onRejectedPageToken(_:)`.
         var rejectedPageTokenHook: (@Sendable (String) -> Void)?
         /// Called each time a message GET of that provider message id is
         /// served, before it is answered. See `onGet(providerMessageId:_:)`.
@@ -230,19 +245,44 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         /// excluded). See `failListings(status:label:onlyWithPageToken:times:)`.
         var listingFailure: ListingFailure?
         var listingFailuresServed = 0
+        /// Seconds every `GET /messages/{id}` naming a provider id is withheld for.
+        var getLatencyByProviderId: [String: TimeInterval] = [:]
+        /// Seconds every account-wide `is:unread` / `is:starred` list is withheld for.
+        var searchListLatency: TimeInterval = 0
+        /// At most this many ids per page of an account-wide `is:unread` /
+        /// `is:starred` list, whatever `maxResults` asks for (Gmail may answer a
+        /// page with fewer than `maxResults`). Nil: `maxResults` alone decides.
+        var searchListPageLimit: Int?
+        /// At most this many ids per page of a folder list with no date bound (the
+        /// backfill walk's), whatever `maxResults` asks for. Nil: `maxResults`.
+        var walkListPageLimit: Int?
+        /// Parks the next folder list with no date bound until signalled.
+        var nextWalkListHold: WalkListHold?
+        /// The next this many list requests carrying a page token are answered
+        /// with a `400` whose wording says nothing about the page token.
+        var tokenedListBadRequestsRemaining = 0
+        var badRequestedPageTokens: [String] = []
+        /// `/history` answers `404` (expired) for any `startHistoryId` below this.
+        var historyFloor = 0
+        /// `/history` answers with more records than one delta takes on.
+        var historyTooLong = false
 
         /// Record the label difference between `before` and `after` as history,
-        /// as Gmail does for every label change it applies.
+        /// as Gmail does for every label change it applies. Labels the message
+        /// already had (or lacked) are not recorded.
         mutating func recordLabelChange(_ providerMessageId: String, before: Set<String>, after: Set<String>) {
             let added = after.subtracting(before).sorted()
             let removed = before.subtracting(after).sorted()
-            if !added.isEmpty { record(providerMessageId, .labelsAdded(added)) }
-            if !removed.isEmpty { record(providerMessageId, .labelsRemoved(removed)) }
+            if !added.isEmpty { record(providerMessageId, .labelsAdded(added), labels: after) }
+            if !removed.isEmpty { record(providerMessageId, .labelsRemoved(removed), labels: after) }
         }
 
-        mutating func record(_ providerMessageId: String, _ change: HistoryChange) {
+        /// Advance the history id and record `change`; `labels` are the message's
+        /// labels after it, served as the record's `message.labelIds`.
+        mutating func record(_ providerMessageId: String, _ change: HistoryChange, labels: Set<String>) {
             historyId += 1
-            history.append(HistoryEvent(id: historyId, providerMessageId: providerMessageId, change: change))
+            history.append(HistoryEvent(
+                id: historyId, providerMessageId: providerMessageId, change: change, labels: labels.sorted()))
         }
     }
 
@@ -281,7 +321,8 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                         providerMessageId: $0.providerMessageId,
                         labels: $0.labels,
                         internalDate: $0.internalDate,
-                        received: $0.received
+                        received: $0.received,
+                        bodyText: $0.bodyText
                     ))
                 }
             ),
@@ -410,8 +451,8 @@ final class StatefulGmailActionServer: @unchecked Sendable {
     /// every later request naming it gets Gmail's `404`.
     func removeMessage(providerMessageId: String) {
         state.value.withLock { model in
-            guard model.messagesByProviderId.removeValue(forKey: providerMessageId) != nil else { return }
-            model.record(providerMessageId, .messageDeleted)
+            guard let removed = model.messagesByProviderId.removeValue(forKey: providerMessageId) else { return }
+            model.record(providerMessageId, .messageDeleted, labels: removed.labels)
         }
     }
 
@@ -423,9 +464,10 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                 providerMessageId: seed.providerMessageId,
                 labels: seed.labels,
                 internalDate: seed.internalDate,
-                received: seed.received
+                received: seed.received,
+                bodyText: seed.bodyText
             )
-            model.record(seed.providerMessageId, .messageAdded)
+            model.record(seed.providerMessageId, .messageAdded, labels: seed.labels)
         }
     }
 
@@ -445,6 +487,134 @@ final class StatefulGmailActionServer: @unchecked Sendable {
     /// The mailbox's current `historyId`, the cursor a synced client holds.
     func currentHistoryId() -> String {
         state.value.withLock { String($0.historyId) }
+    }
+
+    /// Gmail has dropped the history up to now: `/history` answers `404` for any
+    /// `startHistoryId` older than the current one.
+    func expireHistory() {
+        state.value.withLock { $0.historyFloor = $0.historyId }
+    }
+
+    /// While on, `/history` answers with more records than one delta takes on
+    /// (`GmailAPI.historyMaxChanges`), as after a burst of changes.
+    func answerHistoryTooLong(_ on: Bool) {
+        state.value.withLock { $0.historyTooLong = on }
+    }
+
+    /// Serve `/profile` with the mailbox's history id.
+    /// Opt-in, so a full sync in a suite that never asked for it still captures
+    /// no cursor, as before. `/history` is always served.
+    func serveProfile() {
+        http.register(path: "/profile", method: "GET") { [state] _ in
+            let (historyId, total) = state.value.withLock { ($0.historyId, $0.messagesByProviderId.count) }
+            return .json(raw: #"{ "emailAddress": "user@example.com", "historyId": "\#(historyId)", "messagesTotal": \#(total) }"#)
+        }
+    }
+
+    /// Make every `GET /messages/{providerMessageId}` take `seconds` to answer
+    /// (0 ends it). The wait is off the transport's loader thread (`.parked`).
+    func holdGet(providerMessageId: String, forSeconds seconds: TimeInterval) {
+        state.value.withLock { $0.getLatencyByProviderId[providerMessageId] = seconds }
+    }
+
+    /// Make every account-wide `is:unread` / `is:starred` list take `seconds`.
+    func holdSearchLists(forSeconds seconds: TimeInterval) {
+        state.value.withLock { $0.searchListLatency = seconds }
+    }
+
+    /// One held backfill-walk list request: `reached` is signalled when the request
+    /// arrives (its answer already computed from the server as it stood then),
+    /// `release` lets the answer go out.
+    final class WalkListHold: @unchecked Sendable {
+        let reached = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+
+        /// Blocks the calling thread until the held request arrives or `seconds`
+        /// pass. Synchronous on purpose: call it from a detached task, never
+        /// directly from async test code.
+        func waitUntilReached(seconds: Double) -> Bool {
+            reached.wait(timeout: .now() + seconds) == .success
+        }
+    }
+
+    /// Hold the next folder list with no date bound (a backfill walk page). Its
+    /// answer is computed when it arrives and sent once `release` is signalled,
+    /// so a test can change the server and the device in between.
+    func holdNextWalkList() -> WalkListHold {
+        let hold = WalkListHold()
+        state.value.withLock { $0.nextWalkListHold = hold }
+        return hold
+    }
+
+    /// Answer every folder list with no date bound (a backfill walk page) with at
+    /// most `ids` ids, so a walk takes many pages.
+    func limitWalkListPages(to ids: Int) {
+        state.value.withLock { $0.walkListPageLimit = ids }
+    }
+
+    /// Answer the next `count` list requests that carry a page token with a `400`
+    /// whose structured error is about something else (`failedPrecondition`).
+    func answerTokenedListsWithUnrelatedBadRequest(count: Int) {
+        state.value.withLock { $0.tokenedListBadRequestsRemaining = count }
+    }
+
+    /// The page tokens answered with that unrelated `400` so far.
+    func badRequestedPageTokens() -> [String] {
+        state.value.withLock { $0.badRequestedPageTokens }
+    }
+
+    /// Answer every account-wide `is:unread` / `is:starred` list page with at
+    /// most `ids` ids, so a list takes many pages.
+    func limitSearchListPages(to ids: Int) {
+        state.value.withLock { $0.searchListPageLimit = ids }
+    }
+
+    /// One `GET /messages` list request as the fake received it.
+    struct ListRequest: Sendable, Equatable {
+        let labelId: String?
+        let query: String
+        let includeSpamTrash: Bool
+        let pageToken: String?
+
+        /// The epoch seconds of the query's `after:` / `before:` bound, if any.
+        func bound(_ name: String) -> Int? {
+            query.split(separator: " ").first { $0.hasPrefix("\(name):") }
+                .flatMap { Int($0.dropFirst(name.count + 1)) }
+        }
+    }
+
+    /// Every list request received so far, in order.
+    func listRequests() -> [ListRequest] {
+        http.recordedCalls().compactMap { call in
+            guard call.method == "GET", let components = URLComponents(string: call.url),
+                  components.path.hasSuffix("/messages") else { return nil }
+            let items = components.queryItems ?? []
+            return ListRequest(
+                labelId: items.first { $0.name == "labelIds" }?.value,
+                query: items.first { $0.name == "q" }?.value ?? "",
+                includeSpamTrash: items.first { $0.name == "includeSpamTrash" }?.value == "true",
+                pageToken: items.first { $0.name == "pageToken" }?.value)
+        }
+    }
+
+    /// The ids of the `format=full` message GETs (the backfill's fetch), in order.
+    func fullMessageGets() -> [String] {
+        http.recordedCalls().compactMap { call in
+            guard call.method == "GET", let components = URLComponents(string: call.url),
+                  components.path.contains("/messages/"),
+                  components.queryItems?.contains(where: { $0.name == "format" && $0.value == "full" }) == true
+            else { return nil }
+            return components.path.split(separator: "/").last.map(String.init)
+        }
+    }
+
+    /// The provider ids of every `GET /messages/{id}` received so far, in order.
+    func messageGets() -> [String] {
+        http.recordedCalls().compactMap { call in
+            guard call.method == "GET", let components = URLComponents(string: call.url),
+                  components.path.contains("/messages/") else { return nil }
+            return components.path.split(separator: "/").last.map(String.init)
+        }
     }
 
     /// A `/messages/{id}/trash` or `/untrash` failure that says nothing about
@@ -562,11 +732,11 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         state.value.withLock { $0.unclassified400OnGetProviderIds.removeAll() }
     }
 
-    /// Page the `/messages` listing as Gmail does: at most `pageSize` ids per
-    /// response (or `maxResults`, if smaller) and a `nextPageToken` while more
-    /// remain. A request whose `pageToken` this listing did not hand out, or
-    /// has since expired, gets a `400`. Gmail documents no wording for a page
-    /// token it no longer accepts, so only the status is modelled.
+    /// Serve at most `pageSize` ids per `/messages` response (or `maxResults`,
+    /// if smaller). Every listing pages as Gmail does, with a `nextPageToken`
+    /// while more remain; a request whose `pageToken` is not one this listing
+    /// mints, or has since expired, gets a `400`. Gmail documents no wording
+    /// for a page token it no longer accepts, so only the status is modelled.
     func servePagedListings(pageSize: Int) {
         state.value.withLock { $0.listPageSize = pageSize }
     }
@@ -574,7 +744,7 @@ final class StatefulGmailActionServer: @unchecked Sendable {
     /// Expire every page token handed out so far; tokens handed out later
     /// are accepted again.
     func expireIssuedPageTokens() {
-        state.value.withLock { $0.livePageTokens.removeAll() }
+        state.value.withLock { $0.pageTokenGeneration += 1 }
     }
 
     /// While `rejecting`, refuse every paged listing request that carries a
@@ -585,7 +755,12 @@ final class StatefulGmailActionServer: @unchecked Sendable {
 
     /// How many listing requests were refused for their page token.
     func rejectedPageTokenCount() -> Int {
-        state.value.withLock { $0.rejectedPageTokensServed }
+        state.value.withLock { $0.rejectedPageTokens.count }
+    }
+
+    /// The page tokens the listing refused with a `400`, in order.
+    func rejectedPageTokens() -> [String] {
+        state.value.withLock { $0.rejectedPageTokens }
     }
 
     /// A failure the message GET serves instead of the message: a bare HTTP
@@ -711,6 +886,35 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         return (try? JSONSerialization.data(withJSONObject: object)) ?? Data()
     }
 
+    /// A short signature of one list request (`labelIds`, `q`,
+    /// `includeSpamTrash`): FNV-1a over the three, 8 hex digits. Stable across
+    /// runs, so a minted token reads the same in every log.
+    private static func pageTokenSignature(label: String?, query: String, includeSpamTrash: Bool) -> String {
+        var hash: UInt32 = 2_166_136_261
+        for byte in "\(label ?? "")|\(query)|\(includeSpamTrash)".utf8 {
+            hash = (hash ^ UInt32(byte)) &* 16_777_619
+        }
+        return String(format: "%08x", hash)
+    }
+
+    /// The `400` a label list answers for a `q` term this fake cannot apply.
+    /// Test-only: see the `/messages` route.
+    private static func unsupportedLabelQueryBody(_ remainder: String) -> Data {
+        let message = "Unsupported query term for a label list in this fake: \(remainder)"
+        let object: [String: Any] = [
+            "error": [
+                "errors": [[
+                    "domain": "global",
+                    "reason": "invalidArgument",
+                    "message": message,
+                ]],
+                "code": 400,
+                "message": message,
+            ],
+        ]
+        return (try? JSONSerialization.data(withJSONObject: object)) ?? Data()
+    }
+
     /// Gmail's structured `400` shape for a page token it does not accept.
     /// The wording is this fake's: Gmail documents none, and the client reads
     /// only the status.
@@ -741,6 +945,23 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                 "errors": [[
                     "domain": "global",
                     "reason": "invalidArgument",
+                    "message": message,
+                ]],
+                "code": 400,
+                "message": message,
+            ],
+        ]
+        return (try? JSONSerialization.data(withJSONObject: object)) ?? Data()
+    }
+
+    /// A `400` in Gmail's structured shape whose wording names no parameter.
+    private static func unrelatedBadRequestErrorBody() -> Data {
+        let message = "Precondition check failed."
+        let object: [String: Any] = [
+            "error": [
+                "errors": [[
+                    "domain": "global",
+                    "reason": "failedPrecondition",
                     "message": message,
                 ]],
                 "code": 400,
@@ -872,14 +1093,32 @@ final class StatefulGmailActionServer: @unchecked Sendable {
             return .bytes(body, contentType: "application/json")
         }
         // `history.list`: every recorded change newer than `startHistoryId`,
-        // one record each, with the mailbox's current `historyId`. A cursor
-        // older than the fake's first id is still answered (no expiry modelled).
+        // one record each, with the mailbox's current `historyId`. Each record's
+        // message carries its labels after the change, as Gmail's does. A cursor
+        // below the floor `expireHistory()` set is answered `404` (expired); with
+        // `answerHistoryTooLong(true)` the answer holds more records than one
+        // delta takes on. A cursor older than the fake's first id is otherwise
+        // answered (no expiry unless asked).
         http.register(path: "/history", method: "GET") { [state] request in
             let start = (URLComponents(url: request.url, resolvingAgainstBaseURL: false)?.queryItems ?? [])
                 .first(where: { $0.name == "startHistoryId" })?.value.flatMap(Int.init) ?? 0
-            let (records, historyId) = state.value.withLock { model -> ([[String: Any]], Int) in
-                let records = model.history.filter { $0.id > start }.map { event -> [String: Any] in
-                    let message: [String: Any] = ["id": event.providerMessageId, "threadId": "thread-\(event.providerMessageId)"]
+            let (events, historyId, expired, tooLong) = state.value.withLock { model in
+                (model.history.filter { $0.id > start }, model.historyId, start < model.historyFloor, model.historyTooLong)
+            }
+            if expired { return .status(404) }
+            let records: [[String: Any]]
+            if tooLong {
+                records = (0...GmailAPI.historyMaxChanges).map { index in
+                    ["id": String(historyId), "labelsAdded": [[
+                        "message": ["id": "history-burst-\(index)", "threadId": "thread-history-burst-\(index)", "labelIds": ["UNREAD"]],
+                        "labelIds": ["UNREAD"],
+                    ]]]
+                }
+            } else {
+                records = events.map { event -> [String: Any] in
+                    let message: [String: Any] = [
+                        "id": event.providerMessageId, "threadId": "thread-\(event.providerMessageId)", "labelIds": event.labels,
+                    ]
                     var record: [String: Any] = ["id": String(event.id)]
                     switch event.change {
                     case .messageAdded: record["messagesAdded"] = [["message": message]]
@@ -889,7 +1128,6 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                     }
                     return record
                 }
-                return (records, model.historyId)
             }
             let body = (try? JSONSerialization.data(withJSONObject: [
                 "history": records,
@@ -932,31 +1170,72 @@ final class StatefulGmailActionServer: @unchecked Sendable {
             }
             let message = state.value.withLock { $0.messagesByProviderId[providerId] }
             guard let message else { return .status(404) }
+            let format = (URLComponents(url: request.url, resolvingAgainstBaseURL: false)?.queryItems ?? [])
+                .first { $0.name == "format" }?.value
             let requestedHeaders = (URLComponents(url: request.url, resolvingAgainstBaseURL: false)?
                 .queryItems ?? [])
                 .filter { $0.name == "metadataHeaders" }
                 .compactMap { $0.value?.lowercased() }
-            return Self.metadataResponse(message, requestedHeaders: Set(requestedHeaders))
+            let response = format == "minimal"
+                ? Self.minimalResponse(message)
+                : Self.metadataResponse(
+                    message, requestedHeaders: Set(requestedHeaders), servesBody: format == "full")
+            let latency = state.value.withLock { $0.getLatencyByProviderId[providerId] ?? 0 }
+            guard latency > 0 else { return response }
+            return .parked { Thread.sleep(forTimeInterval: latency); return response }
         }
         http.register(path: "/messages", method: "GET") { [state] request in
             let components = URLComponents(url: request.url, resolvingAgainstBaseURL: false)
             let queryItems = components?.queryItems ?? []
             let rawQuery = queryItems.first(where: { $0.name == "q" })?.value ?? ""
-            // `before:<epoch>` is evaluated against `internalDate`, as Gmail does;
-            // the token is removed so the remaining query compares as before.
-            let beforeEpoch = rawQuery
-                .split(separator: " ")
-                .first { $0.hasPrefix("before:") }
-                .flatMap { Double($0.dropFirst("before:".count)) }
-            let query = rawQuery
-                .split(separator: " ")
-                .filter { !$0.hasPrefix("before:") }
+            let tokens = rawQuery.split(separator: " ").map(String.init)
+            // `before:<epoch>` and `after:<epoch>` are evaluated against
+            // `internalDate`, as Gmail does: `before:` strictly below, `after:`
+            // strictly above (the stricter reading of an undocumented edge).
+            // `is:unread` / `is:starred` test the UNREAD / STARRED labels. These
+            // tokens are removed so the remaining query compares as before.
+            // A bound whose value is not a number is not removed: it stays in
+            // the remaining query, where a label list refuses it (below).
+            func epoch(_ token: String, _ name: String) -> Double? {
+                token.hasPrefix(name) ? Double(token.dropFirst(name.count)) : nil
+            }
+            let beforeEpoch = tokens.lazy.compactMap { epoch($0, "before:") }.first
+            let afterEpoch = tokens.lazy.compactMap { epoch($0, "after:") }.first
+            let wantsUnread = tokens.contains("is:unread")
+            let wantsStarred = tokens.contains("is:starred")
+            let query = tokens
+                .filter { epoch($0, "before:") == nil && epoch($0, "after:") == nil && $0 != "is:unread" && $0 != "is:starred" }
                 .joined(separator: " ")
+            let pageToken = queryItems.first(where: { $0.name == "pageToken" })?.value
             let label = queryItems.first(where: { $0.name == "labelIds" })?.value
             let includeSpamTrash = queryItems.first(where: { $0.name == "includeSpamTrash" })?.value == "true"
-            let maxResults = queryItems.first(where: { $0.name == "maxResults" })?.value
+            let requestedMaxResults = queryItems.first(where: { $0.name == "maxResults" })?.value
                 .flatMap(Int.init) ?? Int.max
+            let searchPageLimit = (wantsUnread || wantsStarred) ? state.value.withLock { $0.searchListPageLimit } : nil
+            let isWalkList = label != nil && beforeEpoch == nil && afterEpoch == nil && query.isEmpty
+            let walkPageLimit = isWalkList ? state.value.withLock { $0.walkListPageLimit } : nil
+            let maxResults = min(requestedMaxResults, searchPageLimit ?? walkPageLimit ?? Int.max)
+            if let token = pageToken,
+               state.value.withLock({ model -> Bool in
+                   guard model.tokenedListBadRequestsRemaining > 0 else { return false }
+                   model.tokenedListBadRequestsRemaining -= 1
+                   model.badRequestedPageTokens.append(token)
+                   return true
+               }) {
+                return .bytes(Self.unrelatedBadRequestErrorBody(), contentType: "application/json", statusCode: 400)
+            }
             let actionRFC = Self.rfcIdentity(fromSearchQuery: query)
+            // Deliberate test-only strictness, NOT Gmail's behaviour: real Gmail
+            // treats a `q` term it does not know as search text. A label list
+            // here applies only `before:` / `after:` (numeric epochs) and
+            // `is:unread` / `is:starred`, so any other term left in `q` (a
+            // malformed bound, a stray word) would otherwise be ignored and the
+            // whole label listed. Refusing it makes such a request fail loudly in
+            // a test instead of passing on a list it never asked for. Action
+            // lookups (`rfc822msgid:`) keep their own matching below.
+            if label != nil, actionRFC == nil, !query.isEmpty {
+                return .bytes(Self.unsupportedLabelQueryBody(query), contentType: "application/json", statusCode: 400)
+            }
             if actionRFC != nil {
                 let lookupFailed = state.value.withLock { model -> Bool in
                     guard model.lookupFailuresRemaining > 0 else { return false }
@@ -974,7 +1253,6 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                state.value.withLock({ $0.deletedLabelIds.contains(label) }) {
                 return .bytes(Self.invalidLabelErrorBody(label), contentType: "application/json", statusCode: 400)
             }
-            let pageToken = queryItems.first(where: { $0.name == "pageToken" })?.value
             let listingFailure = state.value.withLock { model -> ListingFailure? in
                 guard actionRFC == nil, var failure = model.listingFailure else { return nil }
                 if let only = failure.label, only != label { return nil }
@@ -1000,10 +1278,11 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                         if !includeSpamTrash, !message.labels.isDisjoint(with: ["TRASH", "SPAM"]) {
                             return false
                         }
-                        if let beforeEpoch {
-                            let internalEpoch = (message.internalDate ?? Date()).timeIntervalSince1970
-                            guard internalEpoch < beforeEpoch else { return false }
-                        }
+                        let internalEpoch = (message.internalDate ?? Date()).timeIntervalSince1970
+                        if let beforeEpoch, internalEpoch >= beforeEpoch { return false }
+                        if let afterEpoch, internalEpoch <= afterEpoch { return false }
+                        if wantsUnread, !message.labels.contains("UNREAD") { return false }
+                        if wantsStarred, !message.labels.contains("STARRED") { return false }
                         if let rfc822MessageId = actionRFC {
                             let isExactMatch = message.rfc822MessageId == rfc822MessageId
                             let isDecoyMatch = model.substringDecoyMatches[message.providerMessageId] == rfc822MessageId
@@ -1011,7 +1290,10 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                             if let label { return message.labels.contains(label) }
                             return Self.satisfiesQueryExclusions(query, labels: message.labels)
                         }
+                        // `labelIds` AND the query's tokens above.
                         if let label { return message.labels.contains(label) }
+                        // An account-wide search (`is:unread`, `is:starred`).
+                        if (wantsUnread || wantsStarred) && query.isEmpty { return true }
                         return query == GmailProvider.allMailExclusionQuery
                             && Self.satisfiesQueryExclusions(query, labels: message.labels)
                     }
@@ -1025,26 +1307,36 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                     }
                     .map { ["id": $0.providerMessageId, "threadId": "thread-\($0.providerMessageId)"] }
             }
-            // Unpaged (the default): every match up to `maxResults`, no token.
+            // Pages as Gmail serves them: at most `maxResults` ids (or a smaller
+            // page this fake was told to serve) and a `nextPageToken` while more
+            // remain. A token is the offset its page starts at, in the current
+            // generation (`pageTokenGeneration`), signed with the list it came
+            // from (`pageTokenSignature`), as Gmail ties a token to its request;
+            // any other token gets a `400`. See `State.pageTokenGeneration`.
+            let signature = Self.pageTokenSignature(label: label, query: rawQuery, includeSpamTrash: includeSpamTrash)
             let page = state.value.withLock { model -> (refs: [[String: String]], nextPageToken: String?)? in
-                guard let pageSize = model.listPageSize else {
-                    return (Array(matches.prefix(maxResults)), nil)
-                }
+                let pageSize = min(maxResults, model.listPageSize ?? Int.max)
                 var start = 0
                 if let pageToken {
-                    guard !model.rejectsEveryPageToken, let resume = model.livePageTokens[pageToken] else {
-                        model.rejectedPageTokensServed += 1
+                    let parts = pageToken.split(separator: "~", omittingEmptySubsequences: false)
+                    let generation = parts.count >= 2 ? Int(parts[1]) : 0
+                    let signed = parts.count == 3 ? String(parts[2]) : nil
+                    // An unsigned token is accepted only because tests write
+                    // tokens into folders by hand. Every token this fake issues
+                    // is signed and is checked here against its list's query.
+                    guard !model.rejectsEveryPageToken, parts.count <= 3,
+                          let offset = parts.first.flatMap({ Int($0) }), offset >= 0,
+                          generation == model.pageTokenGeneration,
+                          signed == nil || signed == signature else {
+                        model.rejectedPageTokens.append(pageToken)
                         return nil
                     }
-                    start = min(resume, matches.count)
+                    start = min(offset, matches.count)
                 }
-                let end = min(matches.count, start + min(pageSize, maxResults))
+                let end = pageSize >= matches.count - start ? matches.count : start + pageSize
                 var next: String?
                 if end < matches.count {
-                    model.pageTokenSerial += 1
-                    let token = "page-token-\(model.pageTokenSerial)"
-                    model.livePageTokens[token] = end
-                    next = token
+                    next = "\(end)~\(model.pageTokenGeneration)~\(signature)"
                 }
                 return (Array(matches[start..<end]), next)
             }
@@ -1063,7 +1355,19 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                 responseObject["nextPageToken"] = "spurious-canary-page-2"
             }
             let body = (try? JSONSerialization.data(withJSONObject: responseObject)) ?? Data()
-            return .bytes(body, contentType: "application/json")
+            if isWalkList, let hold = state.value.withLock({ model -> WalkListHold? in
+                defer { model.nextWalkListHold = nil }
+                return model.nextWalkListHold
+            }) {
+                return .parked {
+                    hold.reached.signal()
+                    hold.release.wait()
+                    return .bytes(body, contentType: "application/json")
+                }
+            }
+            let latency = (wantsUnread || wantsStarred) ? state.value.withLock { $0.searchListLatency } : 0
+            guard latency > 0 else { return .bytes(body, contentType: "application/json") }
+            return .parked { Thread.sleep(forTimeInterval: latency); return .bytes(body, contentType: "application/json") }
         }
         let serveModify: @Sendable (FakeHTTP.Request) -> FakeHTTP.CannedResponse = { [state] request in
             guard request.url.path.hasSuffix("/modify") else { return .status(404) }
@@ -1220,8 +1524,30 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         return true
     }
 
+    /// A payload `body`: `text` base64url-encoded, as Gmail serves it; empty for nil.
+    private static func bodyObject(_ text: String?) -> [String: Any] {
+        guard let text else { return ["size": 0, "data": ""] }
+        let data = Data(text.utf8)
+        let encoded = data.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        return ["size": data.count, "data": encoded]
+    }
+
+    /// `format=minimal`: ids, labels and dates only — no payload.
+    private static func minimalResponse(_ message: Message) -> FakeHTTP.CannedResponse {
+        let object: [String: Any] = [
+            "id": message.providerMessageId,
+            "threadId": "thread-\(message.providerMessageId)",
+            "labelIds": Array(message.labels).sorted(),
+            "internalDate": String(Int64((message.internalDate ?? Date()).timeIntervalSince1970 * 1_000)),
+        ]
+        let data = (try? JSONSerialization.data(withJSONObject: object)) ?? Data()
+        return .bytes(data, contentType: "application/json")
+    }
+
     private static func metadataResponse(
-        _ message: Message, requestedHeaders: Set<String> = []
+        _ message: Message, requestedHeaders: Set<String> = [], servesBody: Bool = false
     ) -> FakeHTTP.CannedResponse {
         let internalMs = String(Int64((message.internalDate ?? Date()).timeIntervalSince1970 * 1_000))
         var headers: [[String: String]] = message.received.map { ["name": "Received", "value": $0] }
@@ -1243,7 +1569,7 @@ final class StatefulGmailActionServer: @unchecked Sendable {
             "payload": [
                 "mimeType": "text/plain",
                 "headers": headers,
-                "body": ["size": 0, "data": ""],
+                "body": Self.bodyObject(servesBody ? message.bodyText : nil),
             ],
         ]
         let data = (try? JSONSerialization.data(withJSONObject: object)) ?? Data()

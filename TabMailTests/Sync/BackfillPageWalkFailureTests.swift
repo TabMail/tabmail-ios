@@ -51,6 +51,118 @@ struct BackfillPageWalkFailureTests {
         try #require(try F.folder(accountId, path, pool: pool)).backfillComplete
     }
 
+    // MARK: - What a walked page writes
+
+    /// The page walk's insert tail: every loaded message gets its row; a message
+    /// served with a body has it written to search, and its row gets the snippet
+    /// taken from that body and `bodyComplete`; a message served with no body gets
+    /// its row and neither. The same tail inserts the catch-up's direct load
+    /// (ADR-IOS-107), so this pins what both write.
+    @Test("Gmail: a walked page's messages are inserted, and a fetched body sets the snippet and bodyComplete")
+    func gmailWalkedPageWritesBodiesAndSnippets() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let accountId = "gm-walk-bodies"
+        let body = "Quarterly planning notes for the walked page"
+        let server = StatefulGmailActionServer(messages: [
+            StatefulGmailActionServer.Seed(
+                rfc822MessageId: "b1@example.com", providerMessageId: "b1", labels: ["INBOX"],
+                internalDate: F.daysAgo(1), bodyText: body),
+            F.gmailSeed("b2", label: "INBOX", daysAgo: 2),
+        ])
+        defer { server.close() }
+        server.servePagedListings(pageSize: F.pageSize)
+        let account = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .gmail, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: "INBOX", role: .inbox, pool: pool)
+        let engine = await F.registeredEngine(accountId: accountId, provider: server.provider())
+
+        _ = await engine.runBackfill(account: account, deadline: F.deadline())
+
+        let rows = try await pool.read { db in
+            try MessageHeader.filter(Column("folderId") == "\(accountId):INBOX").fetchAll(db)
+        }
+        let byId = Dictionary(rows.map { ($0.messageId, $0) }, uniquingKeysWith: { first, _ in first })
+        #expect(Set(byId.keys) == ["b1", "b2"], "rows: \(byId.keys.sorted())")
+        let withBody = try #require(byId["b1"])
+        #expect(withBody.bodyComplete, "the fetched body was written to search")
+        #expect(withBody.snippet.contains("Quarterly planning notes"), "the snippet comes from the body: \(withBody.snippet)")
+        let withoutBody = try #require(byId["b2"])
+        #expect(!withoutBody.bodyComplete && withoutBody.snippet.isEmpty, "no body: no snippet, not complete")
+    }
+
+    private static func headerInfo(_ id: String) -> MessageHeaderInfo {
+        MessageHeaderInfo(
+            messageId: id, rfc822MessageId: "\(id)@example.com", inReplyTo: nil, references: [],
+            threadId: nil, subject: "chunk \(id)", from: "Sender",
+            fromAddress: "sender@example.com", to: "recipient@example.com",
+            cc: "", bcc: "", replyTo: nil,
+            date: F.daysAgo(1), snippet: "chunk",
+            isRead: true, isFlagged: false, hasAttachments: false,
+            isReplied: false, isForwarded: false, actionTag: nil)
+    }
+
+    /// Make every insert of a message header with `messageId` fail, as a write
+    /// that throws inside the insert's transaction does.
+    private static func failInserts(of messageId: String, pool: DatabasePool) throws {
+        try pool.write { db in
+            try db.execute(sql: """
+                CREATE TRIGGER test_failInsert BEFORE INSERT ON messageHeader
+                WHEN NEW.messageId = '\(messageId)'
+                BEGIN SELECT RAISE(ABORT, 'injected insert failure'); END
+                """)
+        }
+    }
+
+    /// The same id twice in one batch is the same message (a provider id names
+    /// one message): the insert tail gives it one row, and its neighbours in the
+    /// same write chunk land too.
+    @Test("A duplicate id in one insert chunk is skipped as the same message; its neighbours land")
+    func duplicateIdInAChunkKeepsItsNeighbours() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let accountId = "gm-chunk-duplicate"
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .gmail, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: "INBOX", role: .inbox, pool: pool)
+        let folder = try #require(try F.folder(accountId, "INBOX", pool: pool))
+        let engine = SyncEngine()
+
+        _ = await engine.insertFetchedBackfillMessages(
+            ["d1", "d2", "d2", "d3"].map(Self.headerInfo), bodies: [:], folder: folder)
+
+        #expect(try F.messageIds(accountId, "INBOX", pool: pool) == ["d1", "d2", "d3"])
+    }
+
+    /// A page whose messages loaded but whose insert failed (the write
+    /// transaction threw, so its chunk rolled back) keeps its page token: the
+    /// folder is not walked on past messages that have no row, and it is not
+    /// listed again in the same call. Once the write succeeds, the next call
+    /// lists that page again and the folder completes with every message.
+    @Test("Gmail: a page whose insert fails keeps its page token; the next call loads it")
+    func gmailFailedInsertKeepsThePageToken() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        Self.setHoldClock(nil)
+        let accountId = "gm-insert-fails"
+        let (server, account) = try Self.gmailInbox(accountId, pool: pool)
+        defer { server.close() }
+        try Self.failInserts(of: "m1", pool: pool)
+        let engine = await F.registeredEngine(accountId: accountId, provider: server.provider())
+
+        _ = await engine.runBackfill(account: account, deadline: F.deadline())
+
+        #expect(try !Self.isComplete(accountId, "INBOX", pool: pool), "the folder completed past messages that have no row")
+        #expect(try F.folder(accountId, "INBOX", pool: pool)?.backfillPageToken == nil, "the page token moved past messages that have no row")
+        #expect(try F.messageIds(accountId, "INBOX", pool: pool).isEmpty, "precondition: the first page's insert failed")
+        #expect(F.gmailListPageTokens(server, label: "INBOX") == [nil],
+                "the folder is listed once in the call: \(F.gmailListPageTokens(server, label: "INBOX"))")
+
+        try await pool.write { db in try db.execute(sql: "DROP TRIGGER test_failInsert") }
+        _ = await engine.runBackfill(account: account, deadline: F.deadline())
+
+        #expect(try Self.isComplete(accountId, "INBOX", pool: pool))
+        #expect(try F.messageIds(accountId, "INBOX", pool: pool) == ["m1", "m2", "m3"])
+    }
+
     // MARK: - A page-list request that fails
 
     /// Page 2's request, which carries the token page 1 saved, fails once with

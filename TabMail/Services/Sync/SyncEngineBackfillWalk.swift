@@ -827,6 +827,131 @@ extension SyncEngine {
         }
     }
 
+    /// The page walk's bookkeeping write for one folder (Gmail and Exchange),
+    /// compare-and-set on the bookkeeping's row version alone: it lands only while
+    /// the folder still holds `readVersion`, the `Folder.backfillVersion` the
+    /// iteration read with the folder. Every write of the bookkeeping bumps that
+    /// version (the `folder_bumpBackfillVersion` trigger), including a reset that
+    /// writes the very state the iteration read, so a reset or a second walk's
+    /// write landing while the iteration is on the network makes this match
+    /// nothing and return false: the caller stops the folder's iteration, never
+    /// retries the stale write, and the next iteration re-reads the folder and
+    /// walks on from what it then holds: from the top after a reset,
+    /// or the same saved page again when the version moved with the token
+    /// unchanged (a whole-record folder write, such as the full sync's folder
+    /// upsert, names both columns with their values unchanged and so bumps the
+    /// version too; that costs one extra list request). `complete` marks the folder crawled and clears its
+    /// token; otherwise the token moves to `nextToken`. Either way the page's
+    /// hold time (`backfillPageHeldSince`) is cleared in the same write, because
+    /// it belongs to the token being replaced. SQLite's change count excludes
+    /// the trigger's own update, so it reports this statement alone.
+    nonisolated static func advanceBackfillPageWalk(
+        folderId: String, readVersion: Int, nextToken: String?, complete: Bool, db: Database
+    ) throws -> Bool {
+        if complete {
+            try db.execute(sql: """
+                UPDATE folder SET backfillComplete = 1, backfillPageToken = NULL, backfillPageHeldSince = NULL
+                WHERE id = ? AND backfillVersion = ?
+                """, arguments: [folderId, readVersion])
+        } else {
+            try db.execute(sql: """
+                UPDATE folder SET backfillPageToken = ?, backfillPageHeldSince = NULL
+                WHERE id = ? AND backfillVersion = ?
+                """, arguments: [nextToken, folderId, readVersion])
+        }
+        return db.changesCount > 0
+    }
+
+    // MARK: - Gmail/Exchange page walk: the insert tail
+
+    /// The page walk's insert tail, shared with the catch-up's direct load
+    /// (ADR-IOS-107 decision 8): inserts the fetched `headers` into `folder`
+    /// (`insertBackfillBatch`, the premise-less overload: neither Gmail nor
+    /// Exchange has a UIDVALIDITY), indexes the inserted rows for search, writes
+    /// each fetched body (`bodies`, keyed by provider message id) to FTS and sets
+    /// the snippet and `bodyComplete` only for the bodies FTS confirmed, and
+    /// enqueues the inserted rows on `BackfillBodyQueue`. Returns how many rows
+    /// were inserted, and whether every write chunk landed: `allLanded` is
+    /// false when a chunk's transaction failed, so some of `headers` have no
+    /// row. Neither caller moves its bookkeeping past them then: the walk keeps
+    /// its page token, the catch-up writes no state.
+    func insertFetchedBackfillMessages(
+        _ headers: [MessageHeaderInfo],
+        bodies bodyData: [String: (htmlBody: String?, textBody: String?)],
+        folder: Folder
+    ) async -> (inserted: Int, allLanded: Bool) {
+        // Step 1: Insert headers to GRDB (batch dedup).
+        // The premise-LESS overload, deliberately: this is the
+        // Gmail/Exchange page walk, and neither provider has a
+        // UIDVALIDITY concept at all, so there is no premise to
+        // hold and nothing a guard could compare. That overload
+        // has no refusal channel to discard (round 13 blocker 3),
+        // so this call site cannot silently swallow one.
+        let (inserted, ftsRecords, ccBccUpdates, chunkFailed) = await insertBackfillBatch(
+            headers, folderId: folder.id, accountId: folder.accountId,
+            folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox,
+            observedEpoch: nil
+        )
+        if !ftsRecords.isEmpty { await indexHeadersForFTS(ftsRecords) }
+        if !ccBccUpdates.isEmpty { try? await SearchIndex.shared.updateCcBcc(ccBccUpdates) }
+
+        // Step 2: Write bodies to FTS for inserted messages.
+        // Match body data to headerIds using ftsRecords (which have headerId + messageId).
+        // 🚨 TWO BUFFERS, TWO KEY SPACES (F2). `ftsBodyBuffer` is keyed by
+        // CONTENT (it addresses FTS rows); `snippetBuffer` is keyed by
+        // `messageHeader.id` (`applySnippetUpdates` writes
+        // `UPDATE messageHeader … WHERE id = ?`). The confirmation set
+        // comes back in content-key space, so the two are zipped by
+        // INDEX below — never by comparing an id from one space against
+        // the other.
+        var ftsBodyBuffer: [(contentKey: ContentKey, body: String)] = []
+        var snippetBuffer: [(headerId: String, snippet: String)] = []
+        for ftsRecord in ftsRecords {
+            if let body = bodyData[ftsRecord.messageId] {
+                let plainText = EmailFilter.extractPlainText(htmlBody: body.htmlBody, textBody: body.textBody)
+                if let plainText, !plainText.isEmpty {
+                    ftsBodyBuffer.append((contentKey: ftsRecord.contentKey, body: plainText))
+                    let snippet = EmailFilter.snippetFromPlainText(plainText)
+                    snippetBuffer.append((headerId: ftsRecord.headerId, snippet: snippet))
+                }
+            }
+        }
+        if !ftsBodyBuffer.isEmpty {
+            do {
+                let writtenIds = try await SearchIndex.shared.updateBodies(ftsBodyBuffer)
+                // Only set bodyComplete for items actually written to FTS.
+                // Both buffers were appended in lockstep, so entry i of
+                // `snippetBuffer` is the header for entry i of
+                // `ftsBodyBuffer` — that positional pairing is what
+                // carries the confirmation across the key-space boundary.
+                let confirmedSnippets = zip(ftsBodyBuffer, snippetBuffer)
+                    .filter { writtenIds.contains($0.0.contentKey) }
+                    .map(\.1)
+                applySnippetUpdates(confirmedSnippets)
+                let skipped = ftsBodyBuffer.count - writtenIds.count
+                if skipped > 0 {
+                    BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) wrote \(writtenIds.count)/\(ftsBodyBuffer.count) bodies to FTS (\(skipped) deferred)")
+                } else {
+                    BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) wrote \(ftsBodyBuffer.count) bodies to FTS")
+                }
+            } catch {
+                BackgroundSyncLogger.logDebug("[Backfill] FTS body write failed: \(error)")
+                BackgroundSyncLogger.logError("FTS body write failed for \(folder.name): \(error)", source: "backfill")
+            }
+        }
+
+        // Enqueue to ActiveBodyQueue — items with bodies already in FTS will be
+        // skipped (forwarding inbox items to ActiveAIQueue); items without
+        // bodies will be fetched by the queue.
+        if !ftsRecords.isEmpty {
+            await BackfillBodyQueue.shared.enqueueItems(
+                ftsRecords: ftsRecords, accountId: folder.accountId,
+                folderPath: folder.path, isInInbox: folder.role == .inbox
+            )
+        }
+        return (inserted, !chunkFailed)
+    }
+
     // MARK: - Unified Backfill Walk
 
     /// Crawl folders for this account, inserting headers AND indexing bodies in the same walk.
@@ -1884,16 +2009,23 @@ extension SyncEngine {
                         continue
                     }
                     let (pageIds, nextToken) = pageResult
+                    // Every bookkeeping write below is compare-and-set on the row
+                    // version read with the folder at this iteration's start
+                    // (`advanceBackfillPageWalk`), so a reset or a second walk's
+                    // write landing mid-iteration is never overwritten. (The
+                    // catch-up's re-arm, which this first guarded, is gone since
+                    // 2026-11-12: the catch-up loads missing mail itself.)
+                    let readVersion = folder.backfillVersion
 
                     if pageIds.isEmpty && nextToken == nil {
                         // No more pages — folder fully crawled
-                        try? await AppDatabase.backgroundPool.write { db in
-                            _ = try Folder.filter(Column("id") == folder.id)
-                                .updateAll(db,
-                                    Column("backfillComplete").set(to: true),
-                                    Column("backfillPageToken").set(to: nil as String?),
-                                    Column("backfillPageHeldSince").set(to: nil as Date?)
-                                )
+                        let advanced = try? await AppDatabase.backgroundPool.write { db in
+                            try Self.advanceBackfillPageWalk(
+                                folderId: folder.id, readVersion: readVersion, nextToken: nil, complete: true, db: db)
+                        }
+                        if advanced == false {
+                            BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) bookkeeping changed during the iteration (a reset, a second walk or a folder rewrite) — re-reading it")
+                            continue
                         }
                         BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) fully crawled (no more pages)")
                         BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress)/\(folder.name) fully crawled (no more pages)")
@@ -1943,22 +2075,18 @@ extension SyncEngine {
                                     .updateAll(db, Column("oldestSyncedDate").set(to: d))
                             }
                         }
-                        // Safe to advance — all IDs on this page already exist in GRDB
-                        try await AppDatabase.backgroundPool.write { db in
-                            _ = try Folder.filter(Column("id") == folder.id)
-                                .updateAll(db,
-                                    Column("backfillPageToken").set(to: nextToken),
-                                    Column("backfillPageHeldSince").set(to: nil as Date?))
+                        // Safe to advance — all IDs on this page already exist in GRDB.
+                        // The last page completes the folder in the same write.
+                        let advanced = try await AppDatabase.backgroundPool.write { db in
+                            try Self.advanceBackfillPageWalk(
+                                folderId: folder.id, readVersion: readVersion, nextToken: nextToken,
+                                complete: nextToken == nil, db: db)
+                        }
+                        guard advanced else {
+                            BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) bookkeeping changed during the iteration (a reset, a second walk or a folder rewrite) — re-reading it")
+                            continue
                         }
                         if nextToken == nil {
-                            try? await AppDatabase.backgroundPool.write { db in
-                                _ = try Folder.filter(Column("id") == folder.id)
-                                    .updateAll(db,
-                                        Column("backfillComplete").set(to: true),
-                                        Column("backfillPageToken").set(to: nil as String?),
-                                        Column("backfillPageHeldSince").set(to: nil as Date?)
-                                    )
-                            }
                             BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) fully crawled (last page, all exist)")
                             didWork = true
                         } else {
@@ -2013,77 +2141,22 @@ extension SyncEngine {
                         }
                     }
 
+                    var insertLanded = true
                     if !headers.isEmpty {
-                        // Step 1: Insert headers to GRDB (batch dedup).
-                        // The premise-LESS overload, deliberately: this is the
-                        // Gmail/Exchange page walk, and neither provider has a
-                        // UIDVALIDITY concept at all, so there is no premise to
-                        // hold and nothing a guard could compare. That overload
-                        // has no refusal channel to discard (round 13 blocker 3),
-                        // so this call site cannot silently swallow one.
-                        let (inserted, ftsRecords, ccBccUpdates) = await insertBackfillBatch(
-                            headers, folderId: folder.id, accountId: folder.accountId,
-                            folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox,
-                            observedEpoch: nil
-                        )
-                        if !ftsRecords.isEmpty { await indexHeadersForFTS(ftsRecords) }
-                        if !ccBccUpdates.isEmpty { try? await SearchIndex.shared.updateCcBcc(ccBccUpdates) }
-                        insertedCount = inserted
-
-                        // Step 2: Write bodies to FTS for inserted messages.
-                        // Match body data to headerIds using ftsRecords (which have headerId + messageId).
-                        // 🚨 TWO BUFFERS, TWO KEY SPACES (F2). `ftsBodyBuffer` is keyed by
-                        // CONTENT (it addresses FTS rows); `snippetBuffer` is keyed by
-                        // `messageHeader.id` (`applySnippetUpdates` writes
-                        // `UPDATE messageHeader … WHERE id = ?`). The confirmation set
-                        // comes back in content-key space, so the two are zipped by
-                        // INDEX below — never by comparing an id from one space against
-                        // the other.
-                        var ftsBodyBuffer: [(contentKey: ContentKey, body: String)] = []
-                        var snippetBuffer: [(headerId: String, snippet: String)] = []
-                        for ftsRecord in ftsRecords {
-                            if let body = bodyData[ftsRecord.messageId] {
-                                let plainText = EmailFilter.extractPlainText(htmlBody: body.htmlBody, textBody: body.textBody)
-                                if let plainText, !plainText.isEmpty {
-                                    ftsBodyBuffer.append((contentKey: ftsRecord.contentKey, body: plainText))
-                                    let snippet = EmailFilter.snippetFromPlainText(plainText)
-                                    snippetBuffer.append((headerId: ftsRecord.headerId, snippet: snippet))
-                                }
-                            }
-                        }
-                        if !ftsBodyBuffer.isEmpty {
-                            do {
-                                let writtenIds = try await SearchIndex.shared.updateBodies(ftsBodyBuffer)
-                                // Only set bodyComplete for items actually written to FTS.
-                                // Both buffers were appended in lockstep, so entry i of
-                                // `snippetBuffer` is the header for entry i of
-                                // `ftsBodyBuffer` — that positional pairing is what
-                                // carries the confirmation across the key-space boundary.
-                                let confirmedSnippets = zip(ftsBodyBuffer, snippetBuffer)
-                                    .filter { writtenIds.contains($0.0.contentKey) }
-                                    .map(\.1)
-                                applySnippetUpdates(confirmedSnippets)
-                                let skipped = ftsBodyBuffer.count - writtenIds.count
-                                if skipped > 0 {
-                                    BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) wrote \(writtenIds.count)/\(ftsBodyBuffer.count) bodies to FTS (\(skipped) deferred)")
-                                } else {
-                                    BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) wrote \(ftsBodyBuffer.count) bodies to FTS")
-                                }
-                            } catch {
-                                BackgroundSyncLogger.logDebug("[Backfill] FTS body write failed: \(error)")
-                                BackgroundSyncLogger.logError("FTS body write failed for \(folder.name): \(error)", source: "backfill")
-                            }
-                        }
-
-                        // Enqueue to ActiveBodyQueue — items with bodies already in FTS will be
-                        // skipped (forwarding inbox items to ActiveAIQueue); items without
-                        // bodies will be fetched by the queue.
-                        if !ftsRecords.isEmpty {
-                            await BackfillBodyQueue.shared.enqueueItems(
-                                ftsRecords: ftsRecords, accountId: folder.accountId,
-                                folderPath: folder.path, isInInbox: folder.role == .inbox
-                            )
-                        }
+                        let insert = await insertFetchedBackfillMessages(headers, bodies: bodyData, folder: folder)
+                        insertedCount = insert.inserted
+                        insertLanded = insert.allLanded
+                    }
+                    // A write chunk that failed left some of this page's messages
+                    // without a row: the token stays where it is (so the next
+                    // call lists this page again and the insert skips what did
+                    // land) and the folder is skipped for the rest of the call,
+                    // so a failing write is not retried at network rate.
+                    guard insertLanded else {
+                        pageWalkSkippedFolderIds.insert(folder.id)
+                        if insertedCount > 0 { didWork = true }
+                        BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) a write of this page's messages failed — keeping the saved page token and skipping this folder for the rest of this cycle; the next cycle lists this page again")
+                        continue
                     }
 
                     // The page's token. The messages that loaded are already
@@ -2129,11 +2202,20 @@ extension SyncEngine {
                         case .advance, .passOverAfterHoldBound:
                             // A page passed over after the bound walks on in this cycle.
                             pageWalkSkippedFolderIds.remove(folder.id)
-                            try await AppDatabase.backgroundPool.write { db in
-                                _ = try Folder.filter(Column("id") == folder.id)
-                                    .updateAll(db,
-                                        Column("backfillPageToken").set(to: nextToken),
-                                        Column("backfillPageHeldSince").set(to: nil as Date?))
+                            // The last page completes the folder in the same
+                            // write, whether or not anything on it loaded: a
+                            // page whose messages all failed per message (or
+                            // past the hold bound) has been passed over, and
+                            // the folder is done.
+                            let advanced = try await AppDatabase.backgroundPool.write { db in
+                                try Self.advanceBackfillPageWalk(
+                                    folderId: folder.id, readVersion: readVersion, nextToken: nextToken,
+                                    complete: nextToken == nil, db: db)
+                            }
+                            guard advanced else {
+                                BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) bookkeeping changed during the iteration (a reset, a second walk or a folder rewrite) — re-reading it")
+                                if insertedCount > 0 { didWork = true }
+                                continue
                             }
                             if nextToken == nil {
                                 isLastPage = true
@@ -2167,16 +2249,8 @@ extension SyncEngine {
                     }
                 }
 
-                // Gmail/Exchange: mark folder complete if this was the last page
+                // Gmail/Exchange: the last page's write above marked the folder complete
                 if isLastPage {
-                    try? await AppDatabase.backgroundPool.write { db in
-                        _ = try Folder.filter(Column("id") == folder.id)
-                            .updateAll(db,
-                                Column("backfillComplete").set(to: true),
-                                Column("backfillPageToken").set(to: nil as String?),
-                                Column("backfillPageHeldSince").set(to: nil as Date?)
-                            )
-                    }
                     BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) fully crawled (last page processed)")
                     BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress)/\(folder.name) fully crawled (last page processed)")
                 }
