@@ -1091,7 +1091,9 @@ host's zone, and compares the write on the fake with the card.
 - Floating CalDAV series (#761, folded into #753): `this_only` and `this_and_following` of a weekly
   floating series confirmed in one zone and drained in the host's change the occurrence at the named
   wall clock, at the card's wall clock; an edit of every occurrence named by an occurrence id alone
-  (no `recurrence_id`) drained in another zone is written and not retired as not found;
+  (no `recurrence_id`) drained in another zone is written and not retired as not found, for a
+  floating and a zoned series; a zoned `this_only` row without a `recurrence_id` ends with that
+  refusal, never as "not found";
   control: an HOURLY floating series (which CalDAV does not expand) is refused before the card in any
   zone, nothing written.
 - `CalDAVFloatingOccurrenceMatchTests`: `CalDAVOccurrences.scopedEdit` finds a floating occurrence by

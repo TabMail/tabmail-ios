@@ -613,6 +613,48 @@ struct CalendarWriteZoneSnapshotTests {
                 "the series' times changed: \(lines.filter { $0.hasPrefix("DT") || $0.hasPrefix("RECURRENCE-ID") }); rows \(outcome)")
     }
 
+    @Test("CalDAV zoned series: an edit of every occurrence named by an occurrence id alone is written at a drain in another zone, never retired as not found")
+    func calDAVZonedOccurrenceIdAllDrainsInAnotherZone() async throws {
+        let fixture = try OccurrenceWireFixture.make()
+        let zone = try confirmZone(at: try fixture.occurrence(2))
+        let (store, http) = OccurrenceWireFixture.serve(fixture)
+        defer { http.close() }
+        // An edit of every occurrence that moves no time is queued as given: no recurrence_id. The
+        // drain names the occurrence by the start the provider read, in the zone it read it in, and
+        // looks it up there; looked up in the queued zone, the same text is another instant.
+        let rows = try await drainCalendarOperation(
+            type: .edit, accountId: "zone-c-zoned-id-all", eventId: try fixture.occurrenceId(2),
+            calendarId: OccurrenceWireFixture.calendarId,
+            arguments: ["title": .string("Renamed"), "timezone": .string(zone.identifier)],
+            provider: OccurrenceWireFixture.makeProvider(http))
+        let lines = CalDAVProvider.icsLines(store.storedICS(path: OccurrenceWireFixture.seriesPath) ?? "")
+        let outcome = rows.map { "\($0.status) \($0.failureReason ?? "")" }
+        #expect(lines.contains("SUMMARY:Renamed") && !lines.contains("SUMMARY:Standup"),
+                "written \(lines.filter { $0.hasPrefix("SUMMARY") }); rows \(outcome)")
+        #expect(!outcome.contains { $0.contains("not found") }, "rows \(outcome)")
+    }
+
+    @Test("CalDAV zoned series: a this_only edit named by an occurrence id alone is refused at a drain in another zone for its missing recurrence_id, never retired as not found")
+    func calDAVZonedOccurrenceIdThisOnlyDrainsInAnotherZone() async throws {
+        // The tool refuses this_only without a recurrence_id before its card, and so does the
+        // drain's write; a row without one is still read first (`CalendarSeriesScope.read`'s
+        // this_only branch). That read finds the occurrence the id names, so the row ends with the
+        // refusal that is true, never as an event the server no longer has.
+        let fixture = try OccurrenceWireFixture.make()
+        let zone = try confirmZone(at: try fixture.occurrence(2))
+        let (store, http) = OccurrenceWireFixture.serve(fixture)
+        defer { http.close() }
+        let rows = try await drainCalendarOperation(
+            type: .edit, accountId: "zone-c-zoned-id-one", eventId: try fixture.occurrenceId(2),
+            calendarId: OccurrenceWireFixture.calendarId,
+            arguments: ["edit_scope": .string("this_only"), "title": .string("Renamed"), "timezone": .string(zone.identifier)],
+            provider: OccurrenceWireFixture.makeProvider(http))
+        let outcome = rows.map { "\($0.status) \($0.failureReason ?? "")" }
+        #expect(outcome.contains { $0.contains("requires recurrence_id") }, "rows \(outcome)")
+        #expect(!outcome.contains { $0.contains("not found") }, "rows \(outcome)")
+        #expect(store.storedICS(path: OccurrenceWireFixture.seriesPath) == fixture.ics, "the series changed")
+    }
+
     @Test("control: a floating HOURLY series, whose occurrences TabMail can't work out, is refused before the card in any zone; nothing is written")
     func calDAVFloatingHourlyIsRefused() async throws {
         // A one-occurrence edit could only reach a neighbour where occurrences are closer together
