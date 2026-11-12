@@ -2463,14 +2463,11 @@ extension AccountManager {
                     htmlContent: MessageBody.plainTextToHTML(draft.body)
                 ).save(db)
 
-                var saveDraftOp = PendingOperation(
-                    type: .saveDraft,
-                    messageIds: [draft.id, placeholderMessageId],
+                var saveDraftOp = PendingOperation.draftSave(
+                    draftId: draft.id,
                     accountId: accountId,
                     folderPath: folderPath,
-                    instanceEpoch: instanceEpoch,
-                    draftId: draft.id
-                )
+                    instanceEpoch: instanceEpoch)
                 try saveDraftOp.insert(db)
 
                 return (

@@ -3068,6 +3068,89 @@ struct NeverDropExitClosureTests {
         await finish(f)
     }
 
+    // MARK: - #531 — an app update does not drop an unsent draft save
+
+    /// **THE INVARIANT: a draft save the user made but that had not reached the
+    /// server when the app updated is still accounted for — it reaches the
+    /// Drafts mailbox — while every other queued action is retired as before.**
+    /// Owner ruling 2026-11-12, reversing the 2026-09-06 acceptance that a
+    /// retired `.saveDraft` waits for the user's next save.
+    ///
+    /// RED PROOF (recorded): on `main`, the boundary deletes the `.saveDraft`
+    /// row and re-queues nothing, so the drain issues no APPEND and the ledger
+    /// settles the intention UNACCOUNTED (`stillQueued=false endStateAchieved=false`).
+    @Test("An unsent draft save retired by an app update is re-queued and pushed; other actions stay retired")
+    @MainActor
+    func anAppUpdateReQueuesAnUnsentDraftSave() async throws {
+        let server = FakeIMAPServer(mailboxes: ["INBOX": [], "Drafts": []])
+        server.setUidValidity(10, for: "INBOX")
+        server.setUidValidity(10, for: "Drafts")
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(
+            accountId: "closure-release-draft",
+            folders: [("INBOX", .inbox, 10), ("Drafts", .drafts, 10)])
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+
+        let draftId = "draft-release-1"
+        let now = Date().timeIntervalSince1970
+        try await f.pool.write { db in
+            var draft = Draft(
+                id: draftId, accountId: f.accountId, toJSON: "[\"to@example.com\"]",
+                ccJSON: "[]", bccJSON: "[]",
+                subject: "update draft", body: "typed before the update", replyToId: nil,
+                isForward: false, editHistoryJSON: nil, createdAt: now, updatedAt: now,
+                serverDraftId: nil, serverPushStatus: nil,
+                rfc822MessageId: nil, attachmentsDirName: nil)
+            draft.instanceEpoch = "E1"
+            try draft.insert(db)
+        }
+        // The previous release's queue: the draft's save and an ordinary action.
+        try insert([
+            PendingOperation.draftSave(
+                draftId: draftId, accountId: f.accountId, folderPath: "Drafts", instanceEpoch: "E1"),
+            PendingOperation(
+                type: .markRead, messageIds: ["77"], accountId: f.accountId,
+                folderPath: "INBOX", observedUidValidity: 10),
+        ], into: f.pool)
+
+        let ledger = IntentionLedger()
+        ledger.record(label: "save draft before update", durableIdentity: draftId) { db in
+            try Draft.fetchOne(db, key: draftId)?.serverPushStatus == "pushed"
+        }
+
+        try await f.pool.write { db in
+            try db.execute(sql: """
+                INSERT INTO appReleaseStamp (id, release) VALUES (1, '0.0.1 (1)')
+                ON CONFLICT(id) DO UPDATE SET release = excluded.release
+                """)
+        }
+        let crossed = try AppDatabase.retirePreviousReleaseActionQueue(
+            on: f.pool, currentRelease: AppDatabase.currentAppRelease)
+        #expect(crossed)
+
+        let afterBoundary = try operations(f.pool)
+        #expect(
+            afterBoundary.map(\.type) == [.saveDraft],
+            "only the unsent draft save may survive the boundary; got \(afterBoundary.map(\.type))")
+
+        await AccountManager.shared.drainPendingQueue()
+
+        let outcomes = await ledger.settle(pool: f.pool, reportedIds: [])
+        #expect(outcomes.count == 1)
+        guard outcomes.count == 1 else { return }
+        #expect(outcomes[0].outcome == .executed)
+        let drafts = server.messageIDs(in: "Drafts")
+        #expect(drafts.count == 1, "the draft must land exactly once in Drafts: \(drafts)")
+        #expect(server.recordedCommands().filter { $0.uppercased().contains("STORE") }.isEmpty,
+                "the retired markRead must not reach the wire")
+        #expect(try operations(f.pool).isEmpty)
+        #expect(server.wrongMessageViolations().isEmpty)
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
     // MARK: - R12-T4 — the OTHER throw type the `.saveDraft` arm can now raise
 
     /// **THE INVARIANT, and it is the DELIBERATELY HELD direction — read the

@@ -363,6 +363,22 @@ struct PendingOperation: Codable, FetchableRecord, MutablePersistableRecord, Ide
 
     /// PORT — exact injective generation-bearing placeholder shape from
     /// v2final `PendingOperation.draftPlaceholderMessageId`.
+    /// The durable `.saveDraft` producer for one draft generation. Shared by
+    /// `AccountManager.queueDraftSave` and the app-release boundary's re-queue
+    /// of unsent drafts (`AppDatabase.retirePreviousReleaseActionQueue`), so
+    /// both admit the identical row.
+    static func draftSave(
+        draftId: String, accountId: String, folderPath: String, instanceEpoch: String
+    ) -> PendingOperation {
+        PendingOperation(
+            type: .saveDraft,
+            messageIds: [draftId, draftPlaceholderMessageId(draftId: draftId, instanceEpoch: instanceEpoch)],
+            accountId: accountId,
+            folderPath: folderPath,
+            instanceEpoch: instanceEpoch,
+            draftId: draftId)
+    }
+
     static func draftPlaceholderMessageId(draftId: String, instanceEpoch: String?) -> String {
         let bare = "draft-\(MessageIdentity.colonSafeMessageIdComponent(draftId))"
         guard let instanceEpoch, !instanceEpoch.isEmpty else { return bare }

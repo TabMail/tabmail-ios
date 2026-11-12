@@ -256,11 +256,10 @@ final class AppDatabase: Sendable {
     ///
     /// 🚨 THE CARVE-OUT DOES NOT EXTEND PAST QUEUE STATE. Authored `Draft` and
     /// `outboxMessage` rows, bodies, attachments and FTS content keep their
-    /// existing lifecycle and are not touched here. A retired `.saveDraft` loses
-    /// only the automatic server-push intention — the local `Draft` row keeps the
-    /// content, and reopening/editing/saving admits fresh work. Sync alone cannot
-    /// upload content that never reached the server, and no draft sweeper or
-    /// automatic re-admission is added to pretend otherwise.
+    /// existing lifecycle and are not touched here. Sync alone cannot upload
+    /// content that never reached the server, so (owner ruling 2026-11-12, #531,
+    /// reversing the 2026-09-06 acceptance) the same transaction re-queues a
+    /// `.saveDraft` for every unsent draft; every other action is still retired.
     ///
     /// 🚨 ONE TRANSACTION, AND THAT IS THE WHOLE SAFETY ARGUMENT. The delete, the
     /// full-sync marking and the new stamp commit together or not at all. A
@@ -298,6 +297,30 @@ final class AppDatabase: Sendable {
             let doomed = try Int.fetchOne(
                 db, sql: "SELECT COUNT(*) FROM pendingOperation") ?? 0
             try db.execute(sql: "DELETE FROM pendingOperation")
+            // Owner ruling 2026-11-12 (#531): the boundary retires every action
+            // EXCEPT the push of an unsent draft, which is re-queued here, in the
+            // same transaction, from the `Draft` row's own state (the old queue
+            // rows are never read). Selected: exactly the push states
+            // `DraftStore.pushDraftToServer` admits (`"pushing"` is reset to
+            // `"dirty"` by the residue sweep that follows), with the generation
+            // `queueDraftSave` requires, and not already handed to the Outbox.
+            let unsentDrafts = try Draft.fetchAll(db, sql: """
+                SELECT * FROM draft
+                WHERE (serverPushStatus IS NULL OR serverPushStatus IN ('dirty', 'pushing'))
+                  AND instanceEpoch IS NOT NULL AND instanceEpoch != ''
+                  AND accountId IN (SELECT id FROM account)
+                  AND id NOT IN (SELECT draftId FROM outboxMessage WHERE draftId IS NOT NULL)
+                """)
+            for draft in unsentDrafts {
+                guard let instanceEpoch = draft.instanceEpoch else { continue }
+                let folderPath = try Folder
+                    .filter(Column("accountId") == draft.accountId && Column("role") == FolderRole.drafts.rawValue)
+                    .fetchOne(db)?.path ?? "Drafts"
+                var op = PendingOperation.draftSave(
+                    draftId: draft.id, accountId: draft.accountId,
+                    folderPath: folderPath, instanceEpoch: instanceEpoch)
+                try op.insert(db)
+            }
             // The existing full-sync mechanism, reused rather than reinvented:
             // `SyncEngine.fullSync`'s source-folder reconciliation is what
             // repairs an optimistic move whose durable operation just went away.

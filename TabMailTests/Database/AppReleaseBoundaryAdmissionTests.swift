@@ -618,33 +618,24 @@ struct AppReleaseBoundaryAdmissionTests {
 
     // MARK: - 4. A never-uploaded draft
 
-    /// **THE PROPERTY: the boundary retires a never-uploaded draft's `.saveDraft`
-    /// operation and keeps everything the user typed — and saving again admits
-    /// fresh work that survives.**
+    /// **THE PROPERTY: the boundary retires the previous release's `.saveDraft`
+    /// row for a never-uploaded draft, re-queues a fresh save for it in the same
+    /// transaction, and keeps everything the user typed.**
     ///
-    /// 🚨 THE ACCEPTED COST IS EXACTLY ONE THING, AND THIS PINS ITS EDGES. What
-    /// is lost is the automatic push intention. What is NOT lost is the `Draft`
-    /// row, its body, its subject, or the optimistic header and body the save
-    /// minted — and the recovery is the user reopening and saving, which is the
-    /// same "repeat the gesture" cost the whole boundary is priced on.
-    ///
-    /// ⚠️ WHAT THIS DELIBERATELY DOES NOT ASSERT: that sync uploads the draft.
-    /// It cannot — sync reconciles what the server has, and this draft never
-    /// reached the server (`serverDraftId` is nil throughout, asserted). A test
-    /// that waited for an upload would be asserting the draft sweeper the design
-    /// explicitly refuses to add.
+    /// History: until 2026-11-12 this pinned the opposite (the save was retired
+    /// and the user had to save again). The owner reversed that acceptance
+    /// (#531); the push itself is pinned end to end in
+    /// `NeverDropExitClosureTests.anAppUpdateReQueuesAnUnsentDraftSave`.
     ///
     /// The admission is `AccountManager.queueDraftSave`, the production Save
-    /// path, on both sides of the boundary — so "reopening/editing/saving admits
-    /// new work" is measured through the same door the user goes through.
+    /// path.
     ///
-    /// RED PROOF (recorded): with the boundary body replaced by `return false`,
-    /// `retiredSave` fails — the original `.saveDraft` is still queued after the
-    /// upgrade. Adding `pendingOperation`-shaped cleanup that also touched
-    /// `Draft` would fail `survivingDraft?.body == authoredBody`.
-    @Test("A never-uploaded draft's save is retired while its authored content remains, and saving again admits new work")
+    /// RED PROOF (recorded 2026-11-12): on the pre-#531 boundary, `requeued` is
+    /// empty after the upgrade. Adding `pendingOperation`-shaped cleanup that
+    /// also touched `Draft` would fail `survivingDraft?.body == authoredBody`.
+    @Test("A never-uploaded draft's save is re-queued across the boundary and its authored content remains")
     @MainActor
-    func aNeverUploadedDraftsSaveIsRetiredWhileItsContentRemains() async throws {
+    func aNeverUploadedDraftsSaveIsReQueuedWhileItsContentRemains() async throws {
         let f = try fixture(accountId: "boundary-draft", provider: .imap)
         defer { finish(f) }
 
@@ -686,11 +677,18 @@ struct AppReleaseBoundaryAdmissionTests {
         try setStamp(f, to: Self.previousRelease)
         _ = try AppDatabase(dbPool: f.pool)
 
-        let retiredSave = try operations(f)
-        #expect(retiredSave.isEmpty, """
-            the never-uploaded draft's save operation survived the upgrade: \
-            \(retiredSave.map(\.type.rawValue))
+        // #531 (owner 2026-11-12): the previous release's row is retired and a
+        // fresh save for the same unsent draft is re-queued in its place.
+        let requeued = try operations(f)
+        #expect(requeued.map(\.type) == [.saveDraft], """
+            the never-uploaded draft's save was not re-queued by the upgrade: \
+            \(requeued.map(\.type.rawValue))
             """)
+        guard let requeuedSave = requeued.first else { return }
+        #expect(requeuedSave.id != originalSave.id, "the previous release's row was kept rather than retired")
+        #expect(requeuedSave.draftId == stored.id)
+        #expect(requeuedSave.instanceEpoch == "E-boundary-draft")
+        #expect(requeuedSave.folderPath == Self.draftsPath)
 
         // THE CONTENT SURVIVES — byte for byte, and still unsent.
         let survivingDraft = try draftRow(f, id: stored.id)
@@ -712,34 +710,11 @@ struct AppReleaseBoundaryAdmissionTests {
         #expect(try bodyExists(f, contentKey: placeholderHeaderId),
                 "the authored draft body row was destroyed with the queue")
 
-        // THE RECOVERY — reopening, editing and saving admits fresh work. This
-        // is the whole of the accepted cost: one repeated gesture.
-        try write(f) { db in
-            try db.execute(
-                sql: "UPDATE draft SET body = ?, updatedAt = ? WHERE id = ?",
-                arguments: ["\(authoredBody) — and one more line", Date().timeIntervalSince1970,
-                            stored.id])
-        }
-        let admittedAgain = await AccountManager.shared.queueDraftSave(
-            draftId: stored.id, accountId: f.accountId)
-        #expect(admittedAgain, "saving again must admit fresh work")
-        await settle()
-
-        let afterOps = try operations(f)
-        #expect(afterOps.map(\.type) == [.saveDraft], """
-            saving again did not admit a save: \(afterOps.map(\.type.rawValue))
-            """)
-        guard let freshSave = afterOps.first else { return }
-        #expect(freshSave.id != originalSave.id, """
-            the "fresh" save is the retired row's id, so nothing new was admitted
-            """)
-        #expect(freshSave.draftId == stored.id, "the fresh save does not name the user's draft")
-
         // And it is current-release work, so the next ordinary launch keeps it.
         _ = try AppDatabase(dbPool: f.pool)
         let afterRelaunch = try operationIds(f)
-        #expect(afterRelaunch == [freshSave.id], """
-            the re-admitted save did not survive the next same-release launch: \
+        #expect(afterRelaunch == [requeuedSave.id], """
+            the re-queued save did not survive the next same-release launch: \
             \(afterRelaunch)
             """)
     }
