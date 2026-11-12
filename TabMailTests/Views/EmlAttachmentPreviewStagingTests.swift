@@ -192,3 +192,36 @@ struct EmlAttachmentPreviewStagingTests {
         #expect((try? Data(contentsOf: landed[0])) == Self.attackerBytes)
     }
 }
+
+/// Opening an attached email whose files are listed on open runs a lister; one
+/// whose files came with the message runs none. Without the lister the sheet
+/// shows none of the attached email's files.
+@Suite("AttachmentListView: which attached email lists its files on open")
+@MainActor
+struct AttachedEmailFilesListerTests {
+    private static func chip(filesListedOnOpen: Bool) -> AttachmentInfo {
+        AttachmentInfo(
+            filename: "Fwd: plan.eml", contentType: "message/rfc822", section: "fwd",
+            size: 100, encoding: nil, filesListedOnOpen: filesListedOnOpen)
+    }
+
+    @Test("A chip marked to list its files on open gets a lister for its own section")
+    func flaggedChipListsItsOwnSection() async throws {
+        let lister = AttachmentListView.filesLister(for: Self.chip(filesListedOnOpen: true)) { section in
+            [AttachmentInfo(filename: "report.pdf", contentType: "application/pdf",
+                            section: "\(section)|report", size: 1, encoding: nil, parentEmlSection: section)]
+        }
+        let list = try #require(lister, "the attached email's files are listed when it opens")
+        let files = try await list()
+        #expect(files.map(\.section) == ["fwd|report"])
+    }
+
+    @Test("A chip whose files came with the message gets no lister")
+    func unflaggedChipHasNoLister() {
+        let lister = AttachmentListView.filesLister(for: Self.chip(filesListedOnOpen: false)) { _ in
+            Issue.record("a chip whose files came with the message must not list them again")
+            return []
+        }
+        #expect(lister == nil)
+    }
+}

@@ -14,17 +14,18 @@ import SwiftMail
 /// These cover the three Microsoft Graph paths that are load-bearing for
 /// `.eml`-style nested message rendering:
 ///
-/// 1. `#microsoft.graph.itemAttachment` discovery on a message → `$expand` call
-///    on `microsoft.graph.itemattachment/item` → marker emission + nested
-///    attachment classification, including the required SECOND list call to
-///    `.../microsoft.graph.itemattachment/item/attachments` (Graph's nested
-///    `$expand` does not reliably return nested attachments — documented
-///    limitation).
-/// 2. The compound `"outerId|innerId"` section format built at marker time →
-///    `fetchAttachment` routes the download to
-///    `.../microsoft.graph.itemattachment/item/attachments/{innerId}`.
-/// 3. Performance guard: when the nested `item.hasAttachments == false`, no
-///    fallback list call is made (one round-trip saved per expansion).
+/// 1. `#microsoft.graph.itemAttachment` discovery on a message → `$expand` of
+///    `microsoft.graph.itemattachment/item` with a `$select` cast to
+///    `microsoft.graph.message` (envelope and body, no files) → marker emission;
+///    the attached email's files are listed when it is opened
+///    (`AttachmentInfo.filesListedOnOpen`), never by the read. Graph has no list
+///    of its own for them: `.../microsoft.graph.itemattachment/item/attachments`
+///    is a 400 (measured).
+/// 2. The compound `"outerId|innerId"` section → `fetchAttachment` takes the
+///    file's bytes from the plain expansion of the attached email; there is no
+///    route to the file by id (a 400, measured).
+/// 3. When the nested `item.hasAttachments == false`, nothing is marked to be
+///    listed on open.
 ///
 /// All response bodies are synthesised at test time from the schema cited in
 /// `TabMailTests/Fixtures/README.md` (Microsoft Graph v1.0 — attachment
@@ -60,16 +61,15 @@ struct ExchangeProviderMockTests {
         #expect(http.recordedCalls().isEmpty)
     }
 
-    // MARK: - Test 1: itemAttachment expand + nested-list fallback + marker
+    // MARK: - Test 1: itemAttachment envelope expand + marker
 
-    @Test("fetchMessage expands itemAttachment, lists nested children, emits marker")
+    @Test("fetchMessage reads an itemAttachment's envelope and body with a cast $select, emits the marker, lists no files")
     func itemAttachmentExpandAndFallback() async throws {
         FakeHTTP.reset()
         defer { FakeHTTP.reset() }
 
         let messageId = "msg-graph-1"
         let outerAttId = "outer-itemattachment-id"
-        let innerPdfId = "inner-pdf-id"
 
         // Top-level message JSON — schema per
         // learn.microsoft.com/en-us/graph/api/resources/message
@@ -105,9 +105,8 @@ struct ExchangeProviderMockTests {
         """
         FakeHTTP.register(path: "/messages/\(messageId)/attachments", method: "GET", response: .json(raw: attachmentsJSON))
 
-        // $expand call — returns envelope + body + hasAttachments=true, but no
-        // attachments list (Graph's nested expand limitation, verified against
-        // learn.microsoft.com/en-us/answers/questions/1013332/).
+        // $expand call with the cast $select — returns envelope + body +
+        // hasAttachments=true, and no attachments (measured).
         let expandedJSON = """
         {
           "@odata.type": "#microsoft.graph.itemAttachment",
@@ -131,27 +130,6 @@ struct ExchangeProviderMockTests {
             response: .json(raw: expandedJSON)
         )
 
-        // Fallback list call for nested attachments — documented path.
-        let nestedListJSON = """
-        {
-          "value": [
-            {
-              "@odata.type": "#microsoft.graph.fileAttachment",
-              "id": "\(innerPdfId)",
-              "name": "nested-report.pdf",
-              "contentType": "application/pdf",
-              "size": 54321,
-              "isInline": false
-            }
-          ]
-        }
-        """
-        FakeHTTP.register(
-            path: "/messages/\(messageId)/attachments/\(outerAttId)/microsoft.graph.itemattachment/item/attachments",
-            method: "GET",
-            response: .json(raw: nestedListJSON)
-        )
-
         let provider = ExchangeProvider(
             userEmail: "test@example.com",
             accessToken: { _ in "fake-graph-token" },
@@ -168,21 +146,21 @@ struct ExchangeProviderMockTests {
         #expect(html.contains("data-subject=\"Nested message subject\""))
         #expect(html.contains("Nested body text"))
 
-        // Top-level attachment (the .eml itself) + nested PDF both appear.
-        #expect(info.attachments.count == 2)
+        // Only the top-level attachment (the .eml itself); its files are listed
+        // when it is opened.
+        #expect(info.attachments.count == 1)
         let topLevel = info.attachments.first { $0.section == outerAttId }
         #expect(topLevel != nil)
         #expect(topLevel?.parentEmlSection == nil)
+        #expect(topLevel?.filesListedOnOpen == true)
 
-        let nested = info.attachments.first { $0.filename == "nested-report.pdf" }
-        let pdf = try #require(nested)
-        #expect(pdf.parentEmlSection == outerAttId)
-        #expect(pdf.section == "\(outerAttId)|\(innerPdfId)")  // compound format
-        #expect(pdf.contentType == "application/pdf")
-
-        // Confirm the fallback URL was hit — the whole point of this test.
+        // The read asked for the envelope with the cast $select, and never for
+        // the attached email's files.
         let calls = FakeHTTP.recordedCalls().map { $0.url }
-        #expect(calls.contains { $0.contains("/microsoft.graph.itemattachment/item/attachments") && !$0.contains("/attachments/\(innerPdfId)") })
+        #expect(calls.contains {
+            $0.contains("/attachments/\(outerAttId)?$expand=\(ExchangeProvider.attachedEmailEnvelopeExpand)")
+        })
+        #expect(!calls.contains { $0.contains("/microsoft.graph.itemattachment/item/attachments") })
     }
 
     /// A crafted display name on an attached message's From, To or Cc stays
@@ -243,7 +221,7 @@ struct ExchangeProviderMockTests {
 
     // MARK: - Test 2: compound section → correct download URL
 
-    @Test("fetchAttachment with compound section routes to the nested-item URL")
+    @Test("fetchAttachment with compound section takes the file's bytes from the attached email's plain expansion")
     func compoundSectionDownloadsFromNestedItemPath() async throws {
         FakeHTTP.reset()
         defer { FakeHTTP.reset() }
@@ -254,21 +232,28 @@ struct ExchangeProviderMockTests {
         let fileBytes = Data("hello nested attachment".utf8)
         let base64 = fileBytes.base64EncodedString()
 
-        let expectedPath = "/messages/\(messageId)/attachments/\(outerAttId)/microsoft.graph.itemattachment/item/attachments/\(innerAttId)"
+        let expectedPath = "/messages/\(messageId)/attachments/\(outerAttId)?$expand=\(ExchangeProvider.attachedEmailPlainExpand)"
 
-        // Graph returns fileAttachment JSON with contentBytes (standard base64).
-        // Source: learn.microsoft.com/en-us/graph/api/resources/fileattachment.
+        // The plain expansion: the attached email with every file and its
+        // contentBytes (standard base64), measured.
         let responseJSON = """
         {
-          "@odata.type": "#microsoft.graph.fileAttachment",
-          "id": "\(innerAttId)",
-          "name": "leaf.pdf",
-          "contentType": "application/pdf",
-          "size": \(fileBytes.count),
-          "contentBytes": "\(base64)"
+          "@odata.type": "#microsoft.graph.itemAttachment",
+          "id": "\(outerAttId)",
+          "item": {
+            "@odata.type": "#microsoft.graph.message",
+            "hasAttachments": true,
+            "attachments": [
+              {"@odata.type": "#microsoft.graph.fileAttachment", "id": "sibling-id", "name": "other.txt",
+               "contentType": "text/plain", "size": 5, "isInline": false, "contentBytes": "b3RoZXI="},
+              {"@odata.type": "#microsoft.graph.fileAttachment", "id": "\(innerAttId)", "name": "leaf.pdf",
+               "contentType": "application/pdf", "size": \(fileBytes.count), "isInline": false,
+               "contentBytes": "\(base64)"}
+            ]
+          }
         }
         """
-        FakeHTTP.register(path: expectedPath, method: "GET", response: .json(raw: responseJSON))
+        FakeHTTP.register(path: "/messages/\(messageId)/attachments/\(outerAttId)?", method: "GET", response: .json(raw: responseJSON))
 
         let provider = ExchangeProvider(
             userEmail: "test@example.com",
@@ -280,10 +265,10 @@ struct ExchangeProviderMockTests {
         let data = try await provider.fetchAttachment(messageId: messageId, attachmentId: compoundId)
 
         #expect(data == fileBytes)
-        // Verify the exact URL segment was used — the whole point.
         let urls = FakeHTTP.recordedCalls().map { $0.url }
-        #expect(urls.contains { $0.contains(expectedPath) })
+        #expect(urls.contains { $0.hasSuffix(expectedPath) })
         #expect(!urls.contains { $0.contains("/attachments/\(compoundId)") })  // NOT the plain form
+        #expect(!urls.contains { $0.contains("/item/attachments/") })  // no route by id (a 400)
     }
 
     // MARK: - Test 2.5: file-uploaded .eml (filename-based, fileAttachment)
@@ -407,9 +392,9 @@ struct ExchangeProviderMockTests {
         #expect(fetchedString.contains("%%SYNTHETIC-PDF-BYTES%%"))
     }
 
-    // MARK: - Test 3: hasAttachments=false → no fallback list call
+    // MARK: - Test 3: hasAttachments=false → nothing listed on open
 
-    @Test("fetchMessage skips nested-list call when inner item.hasAttachments == false")
+    @Test("fetchMessage marks no files to list on open when inner item.hasAttachments == false")
     func skipsFallbackWhenNoNestedAttachments() async throws {
         FakeHTTP.reset()
         defer { FakeHTTP.reset() }
@@ -429,7 +414,7 @@ struct ExchangeProviderMockTests {
         """
         FakeHTTP.register(path: "/messages/\(messageId)/attachments", method: "GET", response: .json(raw: attachmentsJSON))
 
-        // Expand returns hasAttachments=false — no fallback call expected.
+        // Expand returns hasAttachments=false — nothing to list on open.
         let expandedJSON = """
         {
           "@odata.type": "#microsoft.graph.itemAttachment",
@@ -449,10 +434,8 @@ struct ExchangeProviderMockTests {
             response: .json(raw: expandedJSON)
         )
 
-        // Intentionally DO NOT register the fallback URL — if the provider
-        // calls it, FakeHTTP returns 599 and decoding throws, the enclosing
-        // try/catch logs + swallows, and the marker still renders without
-        // children. The assertion below checks the URL was never touched.
+        // Intentionally DO NOT register the nested list URL — it is a 400 on
+        // Graph. The assertion below checks the URL was never touched.
 
         let provider = ExchangeProvider(
             userEmail: "test@example.com",
@@ -464,9 +447,10 @@ struct ExchangeProviderMockTests {
         let html = try #require(info.htmlBody)
         #expect(html.contains("class=\"tm-eml-section\""))
 
-        // Only the .eml top-level chip — no nested PDFs.
+        // Only the .eml top-level chip — no nested PDFs, none to list on open.
         #expect(info.attachments.count == 1)
         #expect(info.attachments.first?.parentEmlSection == nil)
+        #expect(info.attachments.first?.filesListedOnOpen == nil)
 
         // Verify fallback URL was NOT called.
         let urls = FakeHTTP.recordedCalls().map { $0.url }
@@ -850,7 +834,8 @@ struct ExchangeProviderSelectionWiringTests {
                 "\(Self.graphBase)/mailFolders/fetch-route/messages?$select=\(h)"
                     + "&$top=5&$orderby=receivedDateTime desc&$skip=3"),
             normalizedURL("\(Self.graphBase)/messages/full-route?$select=\(Self.fullFields)"),
-            normalizedURL("\(Self.graphBase)/messages/full-route/attachments"),
+            normalizedURL(
+                "\(Self.graphBase)/messages/full-route/attachments?\(GraphAPI.attachmentMetadataQuery)"),
             normalizedURL("\(Self.graphBase)/messages/backfill-route?$select=\(Self.backfillFields)"),
             normalizedURL(
                 "\(Self.graphBase)/mailFolders/search-route/messages?$select=\(h)"

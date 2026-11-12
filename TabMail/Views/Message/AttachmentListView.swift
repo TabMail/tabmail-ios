@@ -34,6 +34,21 @@ struct AttachmentListView: View {
         let html: String
         let filename: String
         let nestedAttachments: [AttachmentInfo]
+        /// Lists the attached email's files when they are listed on open
+        /// (`AttachmentInfo.filesListedOnOpen`), else `nil`.
+        let listFiles: (() async throws -> [AttachmentInfo])?
+    }
+
+    /// The lister an attached email's sheet runs when it opens: `list` for this
+    /// chip's section when its files are listed on open
+    /// (`AttachmentInfo.filesListedOnOpen`), else `nil`.
+    static func filesLister(
+        for attachment: AttachmentInfo,
+        list: @escaping (String) async throws -> [AttachmentInfo]
+    ) -> (() async throws -> [AttachmentInfo])? {
+        guard attachment.filesListedOnOpen == true else { return nil }
+        let section = attachment.section
+        return { try await list(section) }
     }
 
     private func isEmlAttachment(_ attachment: AttachmentInfo) -> Bool {
@@ -72,10 +87,15 @@ struct AttachmentListView: View {
                             // surface them as a mini attachment strip.
                             PreviewFreezeGate.shared.begin()
                             let nested = attachments.filter { $0.parentEmlSection == attachment.section }
+                            let manager = manager, message = message
+                            let listFiles = Self.filesLister(for: attachment) { section in
+                                try await manager.fetchAttachedEmailAttachments(for: message, section: section)
+                            }
                             emlPreview = EmlPreviewState(
                                 html: html,
                                 filename: attachment.filename,
-                                nestedAttachments: nested
+                                nestedAttachments: nested,
+                                listFiles: listFiles
                             )
                         } else if let existing = downloadedFiles[attachment.section] {
                             // Imperative QuickLook — detached from this re-rendering
@@ -158,6 +178,7 @@ struct AttachmentListView: View {
                 html: preview.html,
                 filename: preview.filename,
                 nestedAttachments: preview.nestedAttachments,
+                listFiles: preview.listFiles,
                 parentMessage: message
             ) {
                 emlPreview = nil

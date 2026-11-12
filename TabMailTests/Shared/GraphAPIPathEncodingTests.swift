@@ -114,13 +114,13 @@ struct GraphAPIPathEncodingTests {
 
         let url = try soleRecordedURL(scenario)
         #expect(url == "\(Self.base)/messages/\(Self.hostileIdEncoded)"
-                + "?\(GraphAPI.fullSelection.queryParameter)&$expand=attachments")
+                + "?\(GraphAPI.fullSelection.queryParameter)")
         #expect(!url.contains("/messages/AA/BB"))
         #expect(url.split(separator: "?").count == 2)
         #expect(!url.contains("#"))
     }
 
-    @Test("messageFull: an ordinary id is not escaped and $select/$expand are verbatim")
+    @Test("messageFull: an ordinary id is not escaped, $select is verbatim, nothing is expanded")
     func messageFullLeavesOrdinaryIdAlone() async throws {
         let scenario = FakeHTTP.Scenario()
         defer { scenario.close() }
@@ -131,9 +131,9 @@ struct GraphAPIPathEncodingTests {
 
         let url = try soleRecordedURL(scenario)
         #expect(url == "\(Self.base)/messages/\(Self.ordinaryId)"
-                + "?\(GraphAPI.fullSelection.queryParameter)&$expand=attachments")
+                + "?\(GraphAPI.fullSelection.queryParameter)")
         #expect(!url.contains("%"))
-        #expect(url.hasSuffix("&$expand=attachments"))
+        #expect(!url.contains("$expand"))
     }
 
     // MARK: - attachment (two segments)

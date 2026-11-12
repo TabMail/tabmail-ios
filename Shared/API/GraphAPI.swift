@@ -88,6 +88,33 @@ enum GraphAPI {
     /// message full fetches (main-app `fetchMessage`, NSE `messageFull`).
     static let fullSelection = headerOnlySelection.appending("body", "parentFolderId")
 
+    /// Attachment metadata, without the bytes. Listed without `$select`, Graph
+    /// returns every file attachment's bytes (`contentBytes`, base64) with the
+    /// list; learn.microsoft.com/graph/outlook-large-attachments (Step 4) asks
+    /// for a `$select` that leaves `contentBytes` out. `contentId` belongs to the
+    /// derived `fileAttachment` type, and Graph refuses it unqualified in a
+    /// `$select` on the base attachment type (400), so an inline image's content
+    /// id comes with its bytes from that attachment's own GET. Used by main-app
+    /// `fetchMessage` and NSE `messageFull`.
+    static let attachmentMetadataQuery = "$select=id,name,contentType,size,isInline"
+
+    /// Pages of one message's attachment list read before giving up. Graph caps a
+    /// message at 150 MB, so a real list ends long before; the cap only stops a
+    /// list that never does.
+    static let maxAttachmentListPages = 50
+
+    /// Whether a page link (`@odata.nextLink`) is one this client may send its
+    /// token to: https on graph.microsoft.com, default port, no user info. A link
+    /// that is not is refused before any request.
+    static func isGraphPageLink(_ url: String) -> Bool {
+        guard let components = URLComponents(string: url) else { return false }
+        return components.scheme == "https"
+            && components.host?.lowercased() == "graph.microsoft.com"
+            && components.user == nil
+            && components.password == nil
+            && (components.port == nil || components.port == 443)
+    }
+
     // MARK: - Path-segment encoding (single source of truth for BOTH targets)
 
     /// Percent-encode `value` as one strict path segment, or `nil` if it cannot
@@ -196,8 +223,11 @@ enum GraphAPI {
 
     /// Fetch a message with body + metadata. Returns the canonical
     /// (MessageMetadata, RenderedBody) tuple via shared `BodyRenderer`.
-    /// Graph's `$expand=attachments` returns attachments inline — efficient for
-    /// body rendering without a second round trip.
+    /// Attachments are listed as metadata only (`attachmentMetadataQuery`). When
+    /// the body has a `cid:` reference, the listed inline images' bytes are
+    /// fetched once each (`fetchInlineImages`); no other attachment's bytes are
+    /// fetched. A failed listing fails the call, so no body is staged without
+    /// its attachment list.
     static func messageFull(
         http: AuthedHTTP,
         id: String,
@@ -209,23 +239,16 @@ enum GraphAPI {
             throw HTTPError.invalidURL("Graph message id")
         }
         let selection = fullSelection
-        let url = "\(baseURL)/messages/\(encodedId)?\(selection.queryParameter)&$expand=attachments"
+        let url = "\(baseURL)/messages/\(encodedId)?\(selection.queryParameter)"
         let data = try await http.get(url)
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let metadata = GraphParse.parseMessage(json, selection: selection) else {
             throw HTTPError.networkError(statusCode: 0)
         }
         let (rawHtml, rawText) = GraphParse.extractBody(from: json)
-        let attArray = json["attachments"] as? [[String: Any]]
-        let attachments = GraphParse.extractAttachmentRefs(from: attArray)
-        // Graph's `$expand=attachments` already inlines `contentBytes` on
-        // each FileAttachment, so CID inline images come back in the same
-        // messageFull response — no second roundtrip. Cap at the shared
-        // `BodyRenderer.maxInlineImages` so both main-app and NSE decode
-        // the same subset.
-        let inlineImages = Array(
-            GraphParse.extractInlineImageRefs(from: attArray).prefix(BodyRenderer.maxInlineImages)
-        )
+        let listed = try await attachmentList(http: http, encodedMessageId: encodedId)
+        let attachments = GraphParse.extractAttachmentRefs(from: listed)
+        let inlineImages = await fetchInlineImages(http: http, messageId: id, listed: listed, html: rawHtml)
         let ingredients = RawBodyIngredients(
             rawHTML: rawHtml, rawText: rawText,
             attachments: attachments, inlineImages: inlineImages,
@@ -245,8 +268,11 @@ enum GraphAPI {
         return (metadata, rendered)
     }
 
-    /// Fetch raw attachment bytes by attachment id.
-    static func attachment(http: AuthedHTTP, messageId: String, attachmentId: String) async throws -> Data {
+    /// One attachment of a message, as Graph returns it: a file attachment
+    /// carries its `contentId`, `isInline` and bytes (`contentBytes`).
+    static func attachment(
+        http: AuthedHTTP, messageId: String, attachmentId: String
+    ) async throws -> [String: Any] {
         guard let encodedMessageId = encodedGraphPathSegment(messageId) else {
             throw HTTPError.invalidURL("Graph message id")
         }
@@ -255,12 +281,69 @@ enum GraphAPI {
         }
         let url = "\(baseURL)/messages/\(encodedMessageId)/attachments/\(encodedAttachmentId)"
         let data = try await http.get(url)
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let b64 = json["contentBytes"] as? String,
-              let bytes = Data(base64Encoded: b64) else {
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw HTTPError.networkError(statusCode: 0)
         }
-        return bytes
+        return json
+    }
+
+    /// A message's attachments, metadata only (`attachmentMetadataQuery`), every
+    /// page. A list that does not end within `maxAttachmentListPages` pages, or
+    /// whose next link is not a Graph page link, throws rather than return part
+    /// of it.
+    private static func attachmentList(
+        http: AuthedHTTP, encodedMessageId: String
+    ) async throws -> [[String: Any]] {
+        var next: String? = "\(baseURL)/messages/\(encodedMessageId)/attachments?\(attachmentMetadataQuery)"
+        var listed: [[String: Any]] = []
+        var pages = 0
+        while let url = next {
+            guard pages < maxAttachmentListPages else { throw HTTPError.networkError(statusCode: 0) }
+            guard isGraphPageLink(url) else { throw HTTPError.invalidURL("Graph pagination") }
+            let data = try await http.get(url)
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let value = json["value"] as? [[String: Any]] else {
+                throw HTTPError.networkError(statusCode: 0)
+            }
+            listed += value
+            next = json["@odata.nextLink"] as? String
+            pages += 1
+        }
+        return listed
+    }
+
+    /// The listed inline images (`isInline`, `image/*`), each fetched once by id
+    /// when the HTML body has a `cid:` reference (case-insensitive), until
+    /// `BodyRenderer.maxInlineImages` are resolved (the main app's
+    /// `ExchangeProvider.readMessage` applies the same rule). The list cannot
+    /// carry a content id, so which image a `cid:` names is known only after its
+    /// GET. An image that fails to fetch, or comes back without bytes or a
+    /// content id, is left out, so a `cid:` naming it stays unresolved and the
+    /// main app fetches the body again.
+    private static func fetchInlineImages(
+        http: AuthedHTTP, messageId: String, listed: [[String: Any]], html: String?
+    ) async -> [InlineImageRef] {
+        guard html?.range(of: "cid:", options: .caseInsensitive) != nil else { return [] }
+        var images: [InlineImageRef] = []
+        for entry in listed where images.count < BodyRenderer.maxInlineImages {
+            guard (entry["isInline"] as? Bool) == true,
+                  let contentType = entry["contentType"] as? String,
+                  contentType.lowercased().hasPrefix("image/"),
+                  let id = entry["id"] as? String else { continue }
+            do {
+                let attachment = try await attachment(http: http, messageId: messageId, attachmentId: id)
+                if let image = GraphParse.extractInlineImageRefs(from: [attachment]).first {
+                    images.append(image)
+                }
+            } catch {
+                // Debug-gated with `#if DEBUG`: `Shared/` also builds into the
+                // notification service extension, which has no `DebugModeManager`.
+                #if DEBUG
+                print("[GraphAPI] Inline image fetch failed: \(error)")
+                #endif
+            }
+        }
+        return images
     }
 
     // NOTE — THIS SURFACE IS DELIBERATELY READ-ONLY. It used to carry `patch`

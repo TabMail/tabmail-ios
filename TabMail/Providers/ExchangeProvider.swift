@@ -278,38 +278,46 @@ actor ExchangeProvider: EmailProvider {
         // inline images (CID refs), ICS calendar invites, or signature images.
         var attachments: [AttachmentInfo] = []
         var inlineImages: [InlineImage] = []
-        // Don't use $select here — contentId is a property of fileAttachment subtype,
-        // not the base attachment type, so $select rejects it with HTTP 400.
-        // Without $select, the API returns all properties including contentId.
-        let listed = try await listAttachments(path: "/messages/\(encodedId)/attachments")
+        // Metadata only: the bytes of a file are fetched when the user opens it,
+        // and an inline image's once, below (`GraphAPI.attachmentMetadataQuery`).
+        let listed = try await listAttachments(
+            path: "/messages/\(encodedId)/attachments?\(GraphAPI.attachmentMetadataQuery)")
         let hasCidRefs = htmlBody?.range(of: "cid:", options: .caseInsensitive) != nil
         for att in listed {
             // Only a file attachment has bytes TabMail can carry (#241).
             if forDraft, !Self.isFileAttachment(att) { throw DraftCopyUnsupportedAttachment() }
-            if !forDraft, att.isInline == true, let rawCid = att.contentId,
-               let ct = att.contentType, ct.lowercased().hasPrefix("image/") {
-                let cid = rawCid.trimmingCharacters(in: .whitespacesAndNewlines)
-                    .trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !cid.isEmpty, hasCidRefs else { continue }
-                guard inlineImages.count < SyncConfig.maxInlineImages else { continue }
+            if !forDraft, hasCidRefs, inlineImages.count < SyncConfig.maxInlineImages,
+               att.isInline == true, let ct = att.contentType, ct.lowercased().hasPrefix("image/") {
+                // The body has a cid: reference, so this inline image is fetched:
+                // its content id comes with its bytes, in one GET (the list cannot
+                // carry the content id). It is resolved inline only when that GET
+                // returns bytes and a content id. Otherwise (the GET failed, or
+                // returned no bytes or no content id) it is listed below like any
+                // file, as is an inline image that is not fetched (no cid: in the
+                // body, or past the cap), so it is never lost.
                 do {
-                    let data = try await fetchAttachment(messageId: id, attachmentId: att.id)
-                    inlineImages.append(InlineImage(contentId: cid, contentType: ct, data: data))
+                    let file = try await fetchFileAttachment(messageId: id, attachmentId: att.id)
+                    let cid = (file.contentId ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                        .trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !cid.isEmpty {
+                        inlineImages.append(InlineImage(contentId: cid, contentType: ct, data: file.data))
+                        continue
+                    }
                 } catch {
-                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] Failed to fetch inline image \(cid): \(error)") }
+                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] Failed to fetch inline image \(att.id), listing it as a file: \(error)") }
                 }
-                continue
             }
 
             let isItemAttachment = (att.odataType ?? "").lowercased().contains("itemattachment")
             if isItemAttachment {
-                // Nested email (.eml equivalent). Expand to get its envelope, body, and
-                // child attachments, then inline it as a `<div class="tm-eml-section">`
-                // marker so the main message render + `EmlAttachmentPreview` both work
-                // without a second round-trip.
+                // Nested email (.eml equivalent). Read its envelope and body, without
+                // its files, and inline them as a `<div class="tm-eml-section">`
+                // marker, so the main message render, search, AI and
+                // `EmlAttachmentPreview` see it as on IMAP and Gmail. Its files are
+                // listed when the user opens it (`fetchAttachedEmailAttachments`).
                 do {
-                    let (markerHtml, nestedAttachments) = try await fetchExpandedItemAttachment(
+                    let (markerHtml, hasFiles) = try await fetchAttachedEmail(
                         messageId: id, itemAttachmentId: att.id, fallbackName: att.name
                     )
                     htmlBody = (htmlBody ?? "") + markerHtml
@@ -320,9 +328,9 @@ actor ExchangeProvider: EmailProvider {
                         contentType: att.contentType ?? "message/rfc822",
                         section: att.id,
                         size: att.size ?? 0,
-                        encoding: nil
+                        encoding: nil,
+                        filesListedOnOpen: hasFiles
                     ))
-                    attachments.append(contentsOf: nestedAttachments)
                 } catch {
                     // Fall back to surfacing the itemAttachment as an unexpandable chip.
                     // User won't be able to preview inline, but at least sees it exists.
@@ -389,41 +397,30 @@ actor ExchangeProvider: EmailProvider {
         return FullMessageInfo(header: header, htmlBody: htmlBody, textBody: textBody, attachments: attachments, inlineImages: inlineImages)
     }
 
-    /// Fetch a `#microsoft.graph.itemAttachment` with its nested `item` (envelope
-    /// + body), then separately list the item's own attachments, and convert to
-    /// (`<div class="tm-eml-section">` marker HTML, nested `[AttachmentInfo]`).
+    /// Read an attached email (`#microsoft.graph.itemAttachment`) for its marker:
+    /// its envelope and body, without its files, as `<div class="tm-eml-section">`
+    /// marker HTML, and whether it has files (`hasAttachments`).
     ///
-    /// Graph's nested `$expand` for the item's own attachments is documented as
-    /// NOT reliably returning them — the only supported `$expand` is the outer
-    /// `microsoft.graph.itemattachment/item`. We therefore make a second call
-    /// to `.../microsoft.graph.itemattachment/item/attachments` when the nested
-    /// item reports `hasAttachments == true`.
-    /// Sources:
-    /// - learn.microsoft.com/en-us/graph/api/attachment-get (supported $expand)
-    /// - learn.microsoft.com/en-us/answers/questions/1013332/ (double-expand limit)
-    ///
-    /// Nested attachments' `section` is encoded as `"<outerAttId>\(Self.nestedSeparator)<innerAttId>"`
-    /// so `fetchAttachment` knows to route the download via the compound path.
-    /// They are tagged `parentEmlSection = outerAttId` so `AttachmentListView`
-    /// hides them from the top-level list and `EmlAttachmentPreview` surfaces
-    /// them inside the `.eml` sheet.
-    private func fetchExpandedItemAttachment(
+    /// The expansion selects the message's properties with a type cast
+    /// (`attachedEmailEnvelopeExpand`): measured on a test mailbox, it returns
+    /// them with no `attachments` and no bytes. Without the cast it is a 400
+    /// (`subject` is not on `outlookItem`), and the plain expansion carries every
+    /// file of the attached email with its bytes, so a read does not use it.
+    /// `receivedDateTime` can be absent (it was, for a draft's attached email);
+    /// the marker then has no date, as for an IMAP or Gmail attached email with
+    /// no Date header.
+    private func fetchAttachedEmail(
         messageId: String,
         itemAttachmentId: String,
         fallbackName: String?
-    ) async throws -> (markerHtml: String, nestedAttachments: [AttachmentInfo]) {
-        let expand = "microsoft.graph.itemattachment/item"
-        let encodedMessageId = try Self.encodedGraphPathSegment(messageId, context: "Graph message id")
-        let encodedAttachmentId = try Self.encodedGraphPathSegment(itemAttachmentId, context: "Graph attachment id")
-        let path = "/messages/\(encodedMessageId)/attachments/\(encodedAttachmentId)?$expand=\(expand)"
-        let data = try await request(path: path)
-        let expanded = try JSONDecoder().decode(GraphItemAttachmentExpanded.self, from: data)
+    ) async throws -> (markerHtml: String, hasFiles: Bool) {
+        let expanded = try await expandAttachedEmail(
+            messageId: messageId, itemAttachmentId: itemAttachmentId,
+            expand: Self.attachedEmailEnvelopeExpand, as: GraphItemAttachmentExpanded.self)
         let filename = expanded.name ?? fallbackName ?? "attached-email.eml"
 
         var envelope = EmlMarker.Envelope()
         var nestedBodyHtml = ""
-        var nestedAtts: [AttachmentInfo] = []
-
         if let item = expanded.item {
             envelope.subject = item.subject
             envelope.from = Self.formatRecipient(item.from)
@@ -436,37 +433,6 @@ actor ExchangeProvider: EmailProvider {
             } else if item.body?.contentType == "text", let content = item.body?.content {
                 nestedBodyHtml = MessageBody.plainTextToHTML(content)
             }
-
-            // List the nested message's attachments explicitly — the outer
-            // $expand does not include them. Do nothing when hasAttachments is
-            // false (common case, skips a round-trip).
-            if item.hasAttachments == true {
-                let childList: [GraphAttachmentMeta]
-                do {
-                    childList = try await listItemAttachmentChildren(
-                        messageId: messageId,
-                        itemAttachmentId: itemAttachmentId
-                    )
-                } catch {
-                    // Marker still renders without children — the envelope/body
-                    // is useful on its own.
-                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] Failed to list nested attachments for \(itemAttachmentId): \(error)") }
-                    childList = []
-                }
-                for childAtt in childList {
-                    // Skip inline images — rendered inside the .eml body via CID.
-                    if childAtt.isInline == true { continue }
-                    guard let childName = childAtt.name, !childName.isEmpty else { continue }
-                    nestedAtts.append(AttachmentInfo(
-                        filename: childName,
-                        contentType: childAtt.contentType ?? "application/octet-stream",
-                        section: "\(itemAttachmentId)\(Self.nestedSeparator)\(childAtt.id)",
-                        size: childAtt.size ?? 0,
-                        encoding: nil,
-                        parentEmlSection: itemAttachmentId
-                    ))
-                }
-            }
         }
 
         let markerHtml = EmlMarker.build(
@@ -475,25 +441,62 @@ actor ExchangeProvider: EmailProvider {
             envelope: envelope,
             bodyHtml: nestedBodyHtml
         )
-        return (markerHtml, nestedAtts)
+        return (markerHtml, expanded.item?.hasAttachments == true)
     }
 
-    /// List the attachments of an itemAttachment's nested `item`.
-    /// URL segment `microsoft.graph.itemattachment/item/attachments` is the
-    /// documented path for retrieving nested-message attachments when the
-    /// item's nested-attachment `$expand` is not supported.
-    /// Source: learn.microsoft.com/en-us/graph/api/attachment-list
-    private func listItemAttachmentChildren(
-        messageId: String,
-        itemAttachmentId: String
-    ) async throws -> [GraphAttachmentMeta] {
+    /// The files of the attached email at `section`, listed when the user opens
+    /// it. Graph has no other route to them: the attached email's own list
+    /// (`.../microsoft.graph.itemattachment/item/attachments`) is a 400, and a
+    /// nested `$expand` of its attachments is a 400 uncast and dropped from the
+    /// answer cast (all measured). So they come from the plain expansion, which
+    /// carries every file's bytes; the bytes are not kept.
+    ///
+    /// Each file's `section` is `"<outerAttId>\(Self.nestedSeparator)<innerAttId>"`,
+    /// which `fetchAttachment` resolves, and its `parentEmlSection` is the
+    /// attached email's id, so `EmlAttachmentPreview` lists it. Inline parts and
+    /// files without a name are left out, as before. A list that Graph says
+    /// continues (`attachments@odata.nextLink`) cannot be followed, the list's
+    /// own route being a 400, so it THROWS rather than show part of it.
+    func fetchAttachedEmailAttachments(messageId: String, section: String) async throws -> [AttachmentInfo] {
+        let expanded = try await expandAttachedEmail(
+            messageId: messageId, itemAttachmentId: section,
+            expand: Self.attachedEmailPlainExpand, as: GraphAttachedEmailFiles.self)
+        guard expanded.item?.attachmentsNextLink == nil else {
+            throw ProviderError.invalidURL("Graph attached email attachments continue past one page")
+        }
+        return (expanded.item?.attachments ?? []).compactMap { file in
+            guard file.isInline != true, let name = file.name, !name.isEmpty else { return nil }
+            return AttachmentInfo(
+                filename: name,
+                contentType: file.contentType ?? "application/octet-stream",
+                section: "\(section)\(Self.nestedSeparator)\(file.id)",
+                size: file.size ?? 0,
+                encoding: nil,
+                parentEmlSection: section
+            )
+        }
+    }
+
+    /// GET `/messages/{id}/attachments/{itemAttachmentId}?$expand=<expand>`.
+    private func expandAttachedEmail<T: Decodable>(
+        messageId: String, itemAttachmentId: String, expand: String, as type: T.Type
+    ) async throws -> T {
         let encodedMessageId = try Self.encodedGraphPathSegment(messageId, context: "Graph message id")
         let encodedAttachmentId = try Self.encodedGraphPathSegment(itemAttachmentId, context: "Graph attachment id")
-        let path = "/messages/\(encodedMessageId)/attachments/\(encodedAttachmentId)/microsoft.graph.itemattachment/item/attachments"
-        let data = try await request(path: path)
-        let response = try JSONDecoder().decode(GraphAttachmentListResponse.self, from: data)
-        return response.value
+        let path = "/messages/\(encodedMessageId)/attachments/\(encodedAttachmentId)?$expand=\(expand)"
+        return try JSONDecoder().decode(T.self, from: try await request(path: path))
     }
+
+    /// The plain expansion of an attached email: the item with every file and
+    /// its bytes (attachment-get, Example 4; measured).
+    static let attachedEmailPlainExpand = "microsoft.graph.itemattachment/item"
+
+    /// The expansion a read uses: the attached email's envelope and body, cast
+    /// to `microsoft.graph.message`, with no attachments and no bytes (measured).
+    static let attachedEmailEnvelopeExpand = attachedEmailPlainExpand + "($select="
+        + ["subject", "from", "toRecipients", "ccRecipients", "receivedDateTime", "body", "hasAttachments"]
+            .map { "microsoft.graph.message/\($0)" }.joined(separator: ",")
+        + ")"
 
     /// Separator between outer itemAttachment id and inner file attachment id in
     /// the `section` field, used only for Exchange nested-attachment downloads.
@@ -1171,14 +1174,14 @@ actor ExchangeProvider: EmailProvider {
     /// a draft read keeps exactly the files listed and a draft save deletes the
     /// server files the local draft lacks, so a page read as the whole list would
     /// drop the later files on open and delete them on the next save. More than
-    /// `ExchangeDraftConfig.maxAttachmentListPages` pages throws
+    /// `GraphAPI.maxAttachmentListPages` pages throws
     /// `GraphAttachmentListIncomplete` rather than act on part of the list.
     private func listAttachments(path: String) async throws -> [GraphAttachmentMeta] {
         var page = try JSONDecoder().decode(GraphAttachmentListResponse.self, from: try await request(path: path))
         var attachments = page.value
         var pages = 1
         while let link = page.odataNextLink {
-            guard pages < ExchangeDraftConfig.maxAttachmentListPages else { throw GraphAttachmentListIncomplete() }
+            guard pages < GraphAPI.maxAttachmentListPages else { throw GraphAttachmentListIncomplete() }
             page = try JSONDecoder().decode(GraphAttachmentListResponse.self, from: try await requestAbsolute(url: link))
             attachments += page.value
             pages += 1
@@ -1187,7 +1190,7 @@ actor ExchangeProvider: EmailProvider {
     }
 
     /// A message's attachment list did not end within
-    /// `ExchangeDraftConfig.maxAttachmentListPages` pages.
+    /// `GraphAPI.maxAttachmentListPages` pages.
     struct GraphAttachmentListIncomplete: Error {}
 
     /// Whether a Graph attachment is a `#microsoft.graph.fileAttachment`. A list
@@ -1328,9 +1331,12 @@ actor ExchangeProvider: EmailProvider {
     /// Handles two ID forms:
     /// - Plain `<attId>` → top-level attachment at `/messages/{msgId}/attachments/{attId}`.
     /// - Compound `<outerItemAttId>|<innerAttId>` → file attachment nested inside
-    ///   an `itemAttachment`. Graph requires a cast in the URL segment:
-    ///   `/messages/{msgId}/attachments/{outerItemAttId}/microsoft.graph.itemattachment/item/attachments/{innerAttId}`.
-    ///   Source: learn.microsoft.com/en-us/graph/api/attachment-get.
+    ///   an `itemAttachment`. Graph has no route to one file by id: both
+    ///   `.../{outerItemAttId}/microsoft.graph.itemattachment/item/attachments/{innerAttId}`
+    ///   and its `microsoft.graph.message` cast are a 400 (measured). Its bytes
+    ///   come from the plain expansion of the attached email, which carries
+    ///   every one of its files with their bytes, so opening one downloads its
+    ///   siblings too; only the opened file's bytes are returned.
     func fetchAttachment(messageId: String, attachmentId: String) async throws -> Data {
         // Nested attachment inside a file-uploaded `.eml`: re-fetch parent
         // `.eml` bytes and resolve via EmlParsing. Checked BEFORE the
@@ -1343,25 +1349,38 @@ actor ExchangeProvider: EmailProvider {
             return bytes
         }
 
-        let encodedMessageId = try Self.encodedGraphPathSegment(messageId, context: "Graph message id")
-        let path: String
         if let sepRange = attachmentId.range(of: Self.nestedSeparator) {
             let outer = String(attachmentId[..<sepRange.lowerBound])
             let inner = String(attachmentId[sepRange.upperBound...])
-            let encodedOuter = try Self.encodedGraphPathSegment(outer, context: "Graph attachment id")
-            let encodedInner = try Self.encodedGraphPathSegment(inner, context: "Graph nested attachment id")
-            path = "/messages/\(encodedMessageId)/attachments/\(encodedOuter)/microsoft.graph.itemattachment/item/attachments/\(encodedInner)"
-        } else {
-            let encodedAttachmentId = try Self.encodedGraphPathSegment(attachmentId, context: "Graph attachment id")
-            path = "/messages/\(encodedMessageId)/attachments/\(encodedAttachmentId)"
+            let expanded = try await expandAttachedEmail(
+                messageId: messageId, itemAttachmentId: outer,
+                expand: Self.attachedEmailPlainExpand, as: GraphAttachedEmailFiles.self)
+            guard let file = expanded.item?.attachments?.first(where: { $0.id == inner }),
+                  let base64Content = file.contentBytes,
+                  let decoded = Data(base64Encoded: base64Content) else {
+                throw ProviderError.messageNotFound
+            }
+            return decoded
         }
-        let data = try await request(path: path)
-        let attachment = try JSONDecoder().decode(GraphAttachmentDetail.self, from: data)
+        return try await fetchFileAttachment(messageId: messageId, attachmentId: attachmentId).data
+    }
+
+    /// A top-level file attachment's bytes and content id, in one GET.
+    private func fetchFileAttachment(
+        messageId: String, attachmentId: String
+    ) async throws -> (contentId: String?, data: Data) {
+        let encodedMessageId = try Self.encodedGraphPathSegment(messageId, context: "Graph message id")
+        let encodedAttachmentId = try Self.encodedGraphPathSegment(attachmentId, context: "Graph attachment id")
+        return try await fileAttachment(path: "/messages/\(encodedMessageId)/attachments/\(encodedAttachmentId)")
+    }
+
+    private func fileAttachment(path: String) async throws -> (contentId: String?, data: Data) {
+        let attachment = try JSONDecoder().decode(GraphAttachmentDetail.self, from: try await request(path: path))
         guard let base64Content = attachment.contentBytes,
               let decoded = Data(base64Encoded: base64Content) else {
             throw ProviderError.messageNotFound
         }
-        return decoded
+        return (attachment.contentId, decoded)
     }
 
     // MARK: - Backfill
@@ -1698,15 +1717,7 @@ actor ExchangeProvider: EmailProvider {
 
     /// Used by delta pagination — the next/delta links are absolute URLs.
     private func requestAbsolute(url: String, extraHeaders: [String: String] = [:]) async throws -> Data {
-        guard let components = URLComponents(string: url),
-              components.scheme == "https",
-              components.host?.lowercased() == "graph.microsoft.com",
-              components.user == nil,
-              components.password == nil,
-              components.port == nil || components.port == 443
-        else {
-            throw ProviderError.invalidURL("Graph pagination")
-        }
+        guard GraphAPI.isGraphPageLink(url) else { throw ProviderError.invalidURL("Graph pagination") }
 
         do {
             return try await authedHTTP.get(url, extraHeaders: extraHeaders)
@@ -2102,30 +2113,27 @@ private struct GraphAttachmentMeta: Decodable {
     let contentType: String?
     let size: Int?
     let isInline: Bool?
-    let contentId: String?
     /// Discriminator for polymorphic Attachment subtypes:
     /// `#microsoft.graph.fileAttachment`, `#microsoft.graph.itemAttachment`,
     /// `#microsoft.graph.referenceAttachment`. itemAttachment represents a
     /// nested message (the `.eml` equivalent) and needs $expand to get its
-    /// envelope + body + nested attachments.
+    /// envelope and body, or its files (`fetchAttachedEmailAttachments`).
     let odataType: String?
 
     enum CodingKeys: String, CodingKey {
-        case id, name, contentType, size, isInline, contentId
+        case id, name, contentType, size, isInline
         case odataType = "@odata.type"
     }
 }
 
 private struct GraphAttachmentDetail: Decodable {
     let contentBytes: String?
+    let contentId: String?
 }
 
-/// Response to `/messages/{id}/attachments/{attId}?$expand=microsoft.graph.itemattachment/item`.
-/// Graph embeds the nested Message's envelope + body directly. The nested
-/// message's own attachments are NOT populated by this call (Graph's nested
-/// $expand is documented as not reliably returning them) — `attachments` here
-/// is nil in practice; listing them requires a separate call to
-/// `.../microsoft.graph.itemattachment/item/attachments`.
+/// Response to `/messages/{id}/attachments/{attId}?$expand=`
+/// `ExchangeProvider.attachedEmailEnvelopeExpand`: the attached email's envelope
+/// and body, no attachments (measured). See `ExchangeProvider.fetchAttachedEmail`.
 private struct GraphItemAttachmentExpanded: Decodable {
     let id: String
     let name: String?
@@ -2142,7 +2150,35 @@ private struct GraphExpandedMessageItem: Decodable {
     let receivedDateTime: String?
     let body: GraphBody?
     let hasAttachments: Bool?
-    let attachments: [GraphAttachmentMeta]?
+}
+
+/// Response to `/messages/{id}/attachments/{attId}?$expand=`
+/// `ExchangeProvider.attachedEmailPlainExpand`: the attached email with every
+/// one of its attachments, each file with its bytes (measured; no `attachments`
+/// key when it has none). Read only when the user opens the attached email or
+/// one of its files.
+private struct GraphAttachedEmailFiles: Decodable {
+    let item: Item?
+
+    struct Item: Decodable {
+        let attachments: [File]?
+        /// Not measured: if Graph pages the expanded list, the rest has no route.
+        let attachmentsNextLink: String?
+
+        enum CodingKeys: String, CodingKey {
+            case attachments
+            case attachmentsNextLink = "attachments@odata.nextLink"
+        }
+    }
+
+    struct File: Decodable {
+        let id: String
+        let name: String?
+        let contentType: String?
+        let size: Int?
+        let isInline: Bool?
+        let contentBytes: String?
+    }
 }
 
 private struct GraphDeltaResponse: Decodable {
@@ -2189,8 +2225,4 @@ enum ExchangeDraftConfig {
     /// Each PUT's byte range; Graph asks for under 4 MB per request.
     static let uploadChunkBytes = 3 * 1024 * 1024
     static let uploadHosts: Set<String> = ["outlook.office.com", "outlook.office365.com"]
-    /// Pages of one message's attachment list read before giving up. Graph caps a
-    /// message at 150 MB, so a real list ends long before; the cap only stops a
-    /// list that never does.
-    static let maxAttachmentListPages = 50
 }

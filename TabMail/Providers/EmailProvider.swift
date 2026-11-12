@@ -183,14 +183,27 @@ struct AttachmentInfo: Sendable, Codable {
     /// `attachmentsJSON` rows (without this key) defaults to nil (= top-level).
     /// Older records show all attachments flat until next body re-fetch.
     let parentEmlSection: String?
+    /// `true` on an attached email whose own files are not in the message's
+    /// attachment list: the provider lists them only when the user opens that
+    /// email, through `EmailProvider.fetchAttachedEmailAttachments`, because
+    /// listing them costs the files' bytes. Otherwise `nil`: the files of an
+    /// attached email, if any, are in the list with `parentEmlSection`.
+    ///
+    /// Optional for the same reason as `parentEmlSection`: a row stored before
+    /// this key decodes it as `nil`, and `nil` is not encoded.
+    let filesListedOnOpen: Bool?
 
-    init(filename: String, contentType: String, section: String, size: Int, encoding: String?, parentEmlSection: String? = nil) {
+    init(
+        filename: String, contentType: String, section: String, size: Int, encoding: String?,
+        parentEmlSection: String? = nil, filesListedOnOpen: Bool = false
+    ) {
         self.filename = filename
         self.contentType = contentType
         self.section = section
         self.size = size
         self.encoding = encoding
         self.parentEmlSection = parentEmlSection
+        self.filesListedOnOpen = filesListedOnOpen ? true : nil
     }
 }
 
@@ -450,6 +463,13 @@ protocol EmailProvider: Sendable {
     /// epoch); a throw is never "gone".
     func fetchDraftCopy(identity: DraftDeleteIdentity) async throws -> FullMessageInfo?
 
+    /// The files inside the attached email at `section` of message `messageId`,
+    /// for an attachment whose `AttachmentInfo.filesListedOnOpen` is set; each
+    /// carries `parentEmlSection == section`. Called when the user opens that
+    /// attached email. THROWS when the list could not be read in full; an empty
+    /// result means the attached email has no files.
+    func fetchAttachedEmailAttachments(messageId: String, section: String) async throws -> [AttachmentInfo]
+
     // Incremental sync (optional — Gmail uses history.list, IMAP returns nil)
     func fetchHistory(since historyId: String) async throws -> HistoryResponse?
     func fetchMessageHeaders(ids: [String]) async throws -> [MessageHeaderInfo]
@@ -519,6 +539,14 @@ extension EmailProvider {
     ) async throws -> DraftCreatedAddress? {
         throw ProviderError.actionIdentityResolutionFailed(
             "resolveDraftResource: provider has no contained-message adapter")
+    }
+
+    /// Default for providers that list an attached email's files with the
+    /// message (they never set `AttachmentInfo.filesListedOnOpen`, so this is
+    /// never called for them) and for test doubles. Outlook overrides it.
+    func fetchAttachedEmailAttachments(messageId: String, section: String) async throws -> [AttachmentInfo] {
+        throw ProviderError.actionIdentityResolutionFailed(
+            "fetchAttachedEmailAttachments: provider lists attached emails' files with the message")
     }
 
     /// Default `nil` — UIDVALIDITY is an IMAP concept, so every other provider
