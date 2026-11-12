@@ -1931,6 +1931,16 @@ struct CalendarSeriesScopeRouteTests {
                 == Went(scope: "this_and_following", recurrenceId: "\(day(7))T18:00:00", start: "\(day(8))T09:00:00", eventId: "ser_occ"))
     }
 
+    @Test("a recurrence_id route names for a later occurrence is in the recurrence_id's zone, not the edit's (#794)")
+    func mintedRecurrenceIdIsInTheRecurrenceIdZone() throws {
+        let later = Self.named(Self.timedSeries, occurrence: Self.occurrence(timed(day(7))))
+        let tokyo = try #require(TimeZone(identifier: "Asia/Tokyo"))
+        let routed = try CalendarSeriesScope.route(
+            ["start_iso": .string("\(day(8))T09:00:00")], scope: "all", named: later, zone: utc, recurrenceIdZone: tokyo)
+        #expect(routed.scope == "this_and_following" && routed.recurrenceId == "\(day(7))T18:00:00",
+                "\(routed.scope) at \(routed.recurrenceId ?? "-")")
+    }
+
     @Test("the first occurrence named by its id is the whole series, a plain move, at the first occurrence")
     func firstOccurrenceIsTheSeries() throws {
         let first = Self.occurrence(timed(day(0)))
