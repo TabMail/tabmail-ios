@@ -362,10 +362,11 @@ struct CalendarEditExdatesGoogleTests {
         "start_iso", "timezone", "title", "transparency",
     ]
     /// What an exdates_add call may carry (edit_scope only as "all", tested on its own below).
-    static let allowedWithExdates: Set<String> = ["calendar_id", "edit_scope", "event_id", "exdates_add", "send_invitations", "timezone"]
+    /// `send_invitations` is retired (guests are always notified), so it is refused like any change.
+    static let allowedWithExdates: Set<String> = ["calendar_id", "edit_scope", "event_id", "exdates_add", "timezone"]
     /// Every schema property that is a change, and one key outside the schema the edit path applies.
     static let refusedKeys = schemaProperties.filter { !allowedWithExdates.contains($0) } + ["attendees"]
-    static let refusedKeyCount = 12
+    static let refusedKeyCount = 13
 
     /// A value of the shape each key takes.
     static func value(for key: String) -> JSONValue {
