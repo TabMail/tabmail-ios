@@ -421,6 +421,21 @@ occurrence whose earlier-placed neighbour is shown after the cut, then GET the c
 `shownEdits*`, reset keeps deleted), `ExchangeSplitCarryTests` (`pastEndRetryMovesOnce`,
 `shownEditsAreOrderedOffHeldDays`, `movedSplitRetryMovesEditedOnce`, `movedSplitKeptItemKeepsItsGuests`).
 
+**The card asks the write's cut (amended 2026-11-12, review rounds 3-4):** the card of a split named
+at a moved occurrence asks `CalendarProvider.splitCut` (each calendar's `splitPoint`, nothing written).
+Past the end it shows no reset note and refuses a rule or day change before the card
+(`SplitCarry.pastEndRuleRefusal`). `splitSeries` returns `GCalEvent?`: nil when no new part is made,
+and the queue's past-end retry answers nil, so the tool prints no `new_series_event_id`. Outlook:
+`moveOrder` neither dates nor orders a stay (no target, or a target at the instant it is at); moves are
+dated in `GCalEvent.seriesZone` (range zone, else the start's); a past-end edit is ordered before its
+record; the carry's listing window is dated in UTC; a timed series with no readable zone is refused
+before the POST only when `movesAnOccurrence` (a time-setting edit, or a changed occurrence away from
+its place), so a deletion or a rename still works. `MockCalendarProvider.splitCut` cuts at
+`recurrenceId` unless set. Tests: card and answer past the end on Google, Outlook and CalDAV;
+`movedSplitCardShowsTheWrittenRule`; Google `pastEndKeepsItsRecordFirstAndRetryNotifies`; queue
+`pastEndRetryWritesOnlyItsEdits`; `ExchangeSplitCarryTests` `zoneless*`, `splitEditsAreOrderedOffHeldDays`;
+`SplitCarryTests` `moveOrderNeedsNoZoneForStays`, `malformedEditLengthIsNotRead`.
+
 Tests: `SplitCarryTests`, `ExchangeSplitCarryTests` (whole copy, every page, failure before the cap
 and `finishSplit`, `carryOrder` against the fake's opt-in same-day refusal, deletes before moves,
 guests, end only), `CalendarEditToolSeriesScopeTests.renameSplitCarriesLaterExceptions` /

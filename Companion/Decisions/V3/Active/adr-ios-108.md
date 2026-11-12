@@ -198,6 +198,15 @@ of the resource, which holds every occurrence (irreversible wire operation #5, n
   and by its retry (`finishSplit`) alike. Past the end,
   Google and Outlook keep a record (`SplitRecord.pastEnd`) with absolute targets before the first
   write, and a retry finishes from it (`finishShownEdit`), so no occurrence moves twice.
+  **Amended 2026-11-12 (review rounds 3-4):** the confirmation card asks the calendar where the write
+  cuts (`CalendarProvider.splitCut`, the same `splitPoint`) whenever the occurrence named was moved:
+  past the end it shows no reset note and refuses a change of the repeat or its days before the card,
+  in the write's words (`SplitCarry.pastEndRuleRefusal`). `splitSeries` returns the new part or nil
+  when none is made, so such an edit, and its retry, answer with no new series id. Outlook dates only
+  the occurrences that actually move (`moveOrder`; a stay, at the instant it is at, is not dated) in
+  the series' zone (`GCalEvent.seriesZone`), dates the carry's listing window in UTC, and refuses a
+  timed series with no zone it can read only when the split moves an occurrence
+  (`movesAnOccurrence`), before the new part is created; a deletion or a rename needs no zone.
 - The series id with a moved occurrence's new time edits that occurrence in place, and with its old
   place is not found, the same as on Google, whose resolver finds no instance there.
 - A retry after a lost response is reported not found, with nothing written, when the first attempt
