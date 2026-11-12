@@ -970,6 +970,43 @@ struct CalendarRecurrenceIdZoneTests {
         }
     }
 
+    @Test("CalDAV: a read by start_iso keeps its timezone: it finds the event at that zone's wall clock and prints in it")
+    func readByStartKeepsItsTimezone() async throws {
+        let fixture = try OccurrenceWireFixture.make()
+        let slot = try fixture.occurrence(2)
+        let (device, read) = try deviceAndEditZones(at: slot)
+        try await withCalDAV("rid-c-read-start", fixture: fixture) { _, pool in
+            let printed = try await CalendarEventReadTool(context: ToolContext(db: pool, translator: ChatIdTranslator.createIsolated(), deviceZone: device))
+                .execute(arguments: ["start_iso": .string(naive(slot, read)), "timezone": .string(read.identifier)])
+            #expect(printed.contains("timezone: \(read.identifier)"), "printed: \(printed)")
+            #expect(printed.contains("start_iso: \(naive(slot, read))"), "printed: \(printed)")
+        }
+    }
+
+    @Test("CalDAV: a timed occurrence given all_day with only a new end, named as printed in another zone, is found and shown on the card")
+    func calDAVTimedToAllDayEndOnlyAcrossZones() async throws {
+        let fixture = try OccurrenceWireFixture.make()
+        let slot = try fixture.occurrence(2)
+        let (device, edit) = try deviceAndEditZones(at: slot)
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.timeZone = device
+        fmt.dateFormat = "yyyy-MM-dd"
+        let end = fmt.string(from: slot.addingTimeInterval(2 * 86_400))
+        try await withCalDAV("rid-c-allday-end", fixture: fixture) { harness, pool in
+            let r = try await runEdit([
+                "edit_scope": .string("this_only"), "recurrence_id": .string(naive(slot, device)),
+                "timezone": .string(edit.identifier), "all_day": .bool(true), "end_iso": .string(end),
+            ], eventId: OccurrenceWireFixture.seriesPath, calendarId: OccurrenceWireFixture.calendarId,
+               account: "rid-c-allday-end", pool: pool, deviceZone: device)
+            // The occurrence is found and its card shown; this calendar then refuses to change a repeating
+            // occurrence's kind at the write, with nothing written, which is not what this test is about.
+            let card = try #require(r.card, "\(r.cards.count) cards: \(summary(r))")
+            #expect(card.startDate == slot, "the card shows \(card.startDate), not the occurrence named")
+            _ = harness
+        }
+    }
+
     // MARK: Each place the recurrence_id's zone and the edit's zone part (#794 review)
 
     @Test("a queued edit with no recurrence_id zone (queued before it was) reads its recurrence_id in the edit's zone")

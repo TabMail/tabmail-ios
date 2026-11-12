@@ -487,5 +487,8 @@ is still read in `timezone` (parity gap with Thunderbird, to be filed). Pinned b
 `CalendarRecurrenceIdZoneTests.readByIdThenEditNamesTheSameOccurrence` (device, edit and read zones
 all different). The review's mutants on the device-zone / edit-zone split are pinned in the same suite
 and `CalendarSeriesScopeRouteTests.mintedRecurrenceIdIsInTheRecurrenceIdZone`; giving
-`occurrenceStartDay` the edit's zone is an equivalent mutant (that path runs only for an all-day
-`this_only` edit, whose `recurrence_id` is a date every provider matches by date).
+`occurrenceStartDay` the edit's zone is equivalent on Google and Outlook (which take the
+`recurrence_id`'s date and ignore the zone) and on a CalDAV all-day series, but NOT on a CalDAV timed
+series given `all_day` with an end alone, where the occurrence is looked up by its time in that zone;
+`calDAVTimedToAllDayEndOnlyAcrossZones` pins that path. A read by `start_iso` keeping its `timezone`
+is pinned by `readByStartKeepsItsTimezone`.
