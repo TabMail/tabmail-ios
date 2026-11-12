@@ -496,6 +496,48 @@ struct BackfillUIDWalkRaceTests {
         #expect(missing.isEmpty, "\(reset): backfill never loaded UIDs \(missing.sorted()) after the reset")
     }
 
+    /// The walker resumes at cursor 4000 with UID 5000 above it already
+    /// loaded, and every range below the cursor is empty. It confirms them
+    /// all (its first progress write lands), and the reset (which removes UID
+    /// 5000) lands after its workers joined, before its final write. That
+    /// completion is the first thing it writes after the reset: it is refused,
+    /// so the reset folder is not marked complete without UID 5000, and the
+    /// call, which loaded nothing and landed nothing, reports no work.
+    @Test("A reset between a walk's last range and its completion: the completion is refused and the call reports no work",
+          arguments: UserReset.allCases)
+    func resetBeforeTheWalkEndWrite(_ reset: UserReset) async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        defer { F.clearWalkCheckpoints() }
+        let savedCcBcc = UserDefaults.standard.object(forKey: Self.ccBccKey)
+        defer { UserDefaults.standard.set(savedCcBcc, forKey: Self.ccBccKey) }
+
+        let walk = try await Self.makeWalk(
+            accountId: "uid-race-walk-end-\(reset)", serverUIDs: [Self.aboveCursor],
+            cursor: Self.resumedCursor, localUIDs: [Self.aboveCursor], pool: pool)
+        defer { Self.tearDown(walk) }
+
+        let progressCursor = Locked<Int?>(nil)
+        F.atCheckpoint(1, .afterWorkersJoinedBeforeFinalBookkeeping(folderId: walk.folderId)) {
+            progressCursor.set(try? walk.row().backfillUidCursor)
+            await reset.run(on: walk, missingLocally: [Self.aboveCursor])
+        }
+        let didWork = await walk.call()
+
+        #expect(progressCursor.get().map { $0 < Self.resumedCursor } == true,
+                "\(reset): precondition: the walk's own progress write landed before the reset (cursor \(String(describing: progressCursor.get())))")
+        let row = try walk.row()
+        #expect(!row.backfillComplete, "\(reset): the stale walker completed the reset folder")
+        let claim = try walk.claim()
+        #expect(claim == nil, "\(reset): after the walker's call, \(claim ?? "")")
+        #expect(!didWork, "\(reset): the call's only write after the reset was refused and it loaded nothing, yet it reported work")
+
+        try await walk.callUntilComplete()
+        #expect(try walk.row().backfillComplete, "\(reset): the folder's walk never completed again after the reset")
+        let missing = Set(walk.serverUIDs()).subtracting(try walk.local())
+        #expect(missing.isEmpty, "\(reset): backfill never loaded UIDs \(missing.sorted()) again after the reset")
+    }
+
     /// The walker resumes at a cursor below the smallest chunk any profile
     /// uses, so one empty range is all that is left. Nothing disturbs it.
     /// Its progress write and its completion are both its own, so the call

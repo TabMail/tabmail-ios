@@ -147,8 +147,9 @@ extension SyncEngine {
     /// `BackfillWalkCheckpointForTesting` / `backfillWalkCheckpointHooksForTesting`
     /// in the same function's file at the tag, same one-shot/remove-before-await
     /// discipline, same `Mutex`-boxed dictionary. What differs: the reference has
-    /// ONE checkpoint (`afterWorkersJoinedBeforeFinalBookkeeping`) and its hook
-    /// is `throws` so an injected failure surfaces; these three are
+    /// ONE checkpoint (`afterWorkersJoinedBeforeFinalBookkeeping`, which this
+    /// file has too) and its hook is `throws` so an injected failure surfaces;
+    /// these four are
     /// non-throwing, because every one of them exists to let another task RUN,
     /// not to inject a failure — the failures in this file have their own two
     /// seams above.
@@ -166,6 +167,10 @@ extension SyncEngine {
         /// post-FETCH epoch check passed, BEFORE `insertBackfillBatch` — the
         /// "already-fetched batch outside SQLite" window.
         case beforeInsertingFetchedChunk(folderId: String)
+        /// After the IMAP walk's workers joined, BEFORE its final bookkeeping
+        /// (the final cursor or completion write) — the window between the
+        /// walk's last progress write and the write that ends the pass.
+        case afterWorkersJoinedBeforeFinalBookkeeping(folderId: String)
     }
 
     static let backfillWalkCheckpointHooksForTesting = Mutex<[
@@ -1932,6 +1937,10 @@ extension SyncEngine {
                     // binding rule and `walkEpoch` above for the capture. Do not
                     // reintroduce a mirror read here, per chunk or otherwise.
 
+                    #if DEBUG
+                    await Self.runBackfillWalkCheckpointForTesting(
+                        .afterWorkersJoinedBeforeFinalBookkeeping(folderId: folder.id))
+                    #endif
                     // Persist confirmed cursor — only advances past ranges that succeeded
                     let finalCursor = await cursor.currentCursor
                     let isComplete = await cursor.isComplete
