@@ -86,7 +86,7 @@ private enum ZoneSeries {
         return cal.date(byAdding: .day, value: 7 * week, to: start)!
     }
 
-    static func calendar(start: Date, label: String, stored: String, allDay: Bool = false) -> FakeGraphCalendar {
+    static func calendar(start: Date, label: String, stored: String, allDay: Bool = false, extra: [[String: Any]] = []) -> FakeGraphCalendar {
         func dated(_ e: inout [String: Any], _ at: Date) {
             if allDay {
                 let date = String(wall(at, in: stored).prefix(10))
@@ -120,7 +120,7 @@ private enum ZoneSeries {
             e["originalStart"] = at.iso8601String(timeZone: zone(stored))
             return e
         }
-        return FakeGraphCalendar([series] + occurrences)
+        return FakeGraphCalendar([series] + occurrences + extra)
     }
 
     /// A zone Graph keeps a series in whose rules are not the device's: `Pacific Standard Time`,
@@ -531,8 +531,10 @@ struct ExchangeSeriesDayTests {
         // A Tokyo series read in the device's zone; the split's new part was made and recorded,
         // and the cap is written by the retry (`finishSplit`).
         let first = Self.intoTheNextDeviceDay.0
-        let graph = ZoneSeries.calendar(start: first, label: Self.device, stored: Self.tokyo)
         let split = ZoneSeries.place(first, week: 1, stored: Self.tokyo)
+        // The new part the first attempt made: the retry finds it before it finishes (`eventExists`).
+        let part = GraphFixture.event(id: "zs-new", start: split, online: false)
+        let graph = ZoneSeries.calendar(start: first, label: Self.device, stored: Self.tokyo, extra: [part])
         let http = FakeHTTP.Scenario()
         defer { http.close() }
         graph.install(on: http)

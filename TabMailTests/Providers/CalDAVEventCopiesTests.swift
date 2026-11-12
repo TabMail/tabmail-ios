@@ -758,11 +758,13 @@ struct CalDAVSeriesSplitCopyTests {
         #expect(part.contains("EXDATE:20990527T170000Z") && part.contains("RDATE:20990529T170000Z"), Comment(rawValue: part.joined(separator: "\n")))
         let moved = try #require(Fixture.overrides(out.newPart).first)
         #expect(Fixture.overrides(out.newPart).count == 1)
-        #expect(moved.contains("SUMMARY:Late change") && moved.contains("UID:series-1-split"))
+        // The edit set the title, so the carried occurrence takes it; the rest stays its own.
+        #expect(moved.contains("SUMMARY:Sync") && moved.contains("UID:series-1-split"))
+        #expect(moved.contains("DTSTART:20990527T180000Z"), "the changed occurrence lost its own time")
         #expect(moved.contains("RECURRENCE-ID:20990527T170000Z"), "a moved occurrence lost its absolute time")
     }
 
-    @Test("a split that moves the new part's start moves the dates and occurrences tied to it; the capped series keeps its own")
+    @Test("a split that moves the new part's start resets what follows, moving its added dates; the capped series keeps its own")
     func movedNewPartTakesItsDatesAlong() throws {
         let ics = Fixture.series([
             "BEGIN:VEVENT", "UID:series-1", "DTSTART:20990506T170000Z", "DTEND:20990506T174500Z",
@@ -778,12 +780,12 @@ struct CalDAVSeriesSplitCopyTests {
         let part = Fixture.master(out.newPart)
         let partText = Comment(rawValue: part.joined(separator: "\n"))
         #expect(part.contains("DTSTART:20990520T180000Z") && part.contains("DTEND:20990520T184500Z"), partText)
-        // Each value names an occurrence of the new part, which now falls an hour later.
-        #expect(part.contains("EXDATE:20990527T180000Z") && part.contains("RDATE:20990529T180000Z"), partText)
+        // A new start resets the later occurrences, as Google Calendar does: the added date moves
+        // with the new part, the excluded dates and the changed occurrences go.
+        #expect(part.contains("RDATE:20990529T180000Z"), partText)
+        #expect(!part.contains { $0.hasPrefix("EXDATE") }, partText)
         #expect(part.contains("RRULE:FREQ=WEEKLY;UNTIL=20991230T180000Z"), partText)
-        let moved = try #require(Fixture.overrides(out.newPart).first)
-        #expect(moved.contains("RECURRENCE-ID:20990603T180000Z"), "the changed occurrence no longer names one of the new part's occurrences")
-        #expect(moved.contains("DTSTART:20990603T190000Z"), "the changed occurrence's own time is the user's and stays")
+        #expect(Fixture.overrides(out.newPart).isEmpty, "a reset carried a changed occurrence")
         // The capped series was not moved.
         let capped = Fixture.master(out.cappedSeries)
         #expect(capped.contains("DTSTART:20990506T170000Z") && capped.contains("EXDATE:20990513T170000Z")
@@ -808,7 +810,8 @@ struct CalDAVSeriesSplitCopyTests {
         let overrides = Fixture.overrides(out.newPart)
         #expect(overrides.count == 1, "the occurrence at the split was lost or doubled: \(overrides.count)")
         guard overrides.count == 1 else { return }
-        #expect(overrides[0].contains("SUMMARY:Changed at the split") && overrides[0].contains("RECURRENCE-ID:20990520T170000Z"))
+        #expect(overrides[0].contains("SUMMARY:Sync") && overrides[0].contains("RECURRENCE-ID:20990520T170000Z")
+                && overrides[0].contains("DTSTART:20990520T180000Z"))
     }
 
     @Test("a split that changes only the repeat rule asks every attendee but the organizer again")

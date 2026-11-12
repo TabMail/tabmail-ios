@@ -72,9 +72,6 @@ struct CalDAVOccurrenceEditToolToWireTests {
         let editScope: String?
         let givesRecurrenceId: Bool
         let refused: Bool
-        /// A split at a moved occurrence is made at its place (#687): the following ones are
-        /// counted from the occurrence's place, not from where it is listed now.
-        var splitFromPlace = false
     }
 
     /// Every scope the tool takes, by each id kind. None is refused: the whole event by one
@@ -105,7 +102,7 @@ struct CalDAVOccurrenceEditToolToWireTests {
             Case(label: "no edit_scope", occurrenceId: byOccurrence, editScope: nil, givesRecurrenceId: false, refused: false),
             Case(label: "no edit_scope, a recurrence_id", occurrenceId: byOccurrence, editScope: nil, givesRecurrenceId: true, refused: false),
             Case(label: "edit_scope this_only", occurrenceId: byOccurrence, editScope: "this_only", givesRecurrenceId: true, refused: false),
-            Case(label: "edit_scope this_and_following", occurrenceId: byOccurrence, editScope: "this_and_following", givesRecurrenceId: true, refused: false, splitFromPlace: true),
+            Case(label: "edit_scope this_and_following", occurrenceId: byOccurrence, editScope: "this_and_following", givesRecurrenceId: true, refused: false),
         ]
     }
 
@@ -203,7 +200,8 @@ struct CalDAVOccurrenceEditToolToWireTests {
             // What an edit of the whole event does to an occurrence moved on its own is not
             // this property's, so a moved occurrence is not checked for it.
             if extent == .whole, start == shown, start != (try fixture.occurrence(week)) { continue }
-            let changed = extent.covers(start, cardStart: entry.splitFromPlace ? try fixture.occurrence(week) : card.startDate)
+            // A split at a moved occurrence changes it and what is shown after it (owner rule).
+            let changed = extent.covers(start, cardStart: card.startDate)
             #expect(row.summary == (changed ? Self.newTitle : "Standup"),
                     "\(label): the occurrence at \(row.start?.dateTime ?? "nil") \(changed ? "does not show" : "shows") the edit; the card named \(extent) from \(card.startDate)")
         }

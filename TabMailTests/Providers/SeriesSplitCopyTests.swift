@@ -627,6 +627,96 @@ struct ExchangeSplitCarryTests {
         return Run(graph: graph, http: http, provider: provider, records: records, error: thrown)
     }
 
+    /// Splits `ser-1` named at its exception `named` (one of `exceptions`), which starts at `start`
+    /// now.
+    private func split(
+        named: String, start: Date, exceptions: [[String: Any]], parts: [Int], patch: GCalEventInput,
+        series: [String: Any] = GraphSplitFixture.series(range: GraphSplitFixture.noEnd)
+    ) async throws -> Run {
+        let graph = FakeGraphCalendar([series] + exceptions + parts.map(Self.part))
+        let http = FakeHTTP.Scenario()
+        graph.install(on: http)
+        let ok = ["Content-Type": "application/json"]
+        var expanded = series
+        expanded["exceptionOccurrences"] = exceptions
+        http.register(path: "/v1.0/me/events/ser-1?$expand=exceptionOccurrences", method: "GET",
+                      response: .raw(statusCode: 200, headers: ok, body: try JSONSerialization.data(withJSONObject: expanded)))
+        http.register(path: "/v1.0/me/events/ser-1?$select=cancelledOccurrences", method: "GET",
+                      response: .raw(statusCode: 200, headers: ok, body: try JSONSerialization.data(withJSONObject: ["cancelledOccurrences": [String]()])))
+        let provider = GraphSplitFixture.provider(http)
+        let records = SplitRecordBox()
+        var thrown: Error?
+        do {
+            _ = try await provider.splitSeries(
+                eventId: named, recurrenceId: GraphFixture.wall(start, in: GraphSplitFixture.zone), recurrenceIdZone: .current,
+                patch: patch, record: records.recorder)
+        } catch {
+            thrown = error
+        }
+        return Run(graph: graph, http: http, provider: provider, records: records, error: thrown)
+    }
+
+    /// The instant a Graph `start` names.
+    private static func instant(_ value: Any?) -> Date? {
+        guard let time = value as? [String: Any], let wall = time["dateTime"] as? String,
+              let zone = (time["timeZone"] as? String).flatMap({ CalendarTimeZoneResolver.zone(named: $0, in: .none) }) else { return nil }
+        return EKEventStoreHelper.parseNaiveISO(String(wall.prefix(19)), timeZone: zone)
+    }
+
+    @Test("a split named at a moved occurrence edits it and what is shown after it where they are, and keeps what is shown before it whole (owner rule)")
+    func movedSplitChangesWhatIsShownAfter() async throws {
+        // Week 1's occurrence moved two days on: the cut is week 2.
+        let named = Self.exception(1, at: Self.week(1, plusDays: 2))
+        let movedOut = Self.exception(0, at: Self.week(1, plusDays: 3))   // earlier place, shown after
+        let movedIn = Self.exception(3, at: Self.week(1, plusDays: 1))    // later place, shown before
+        let later = Self.exception(4) { $0["location"] = ["displayName": "Room 9"] }
+        let r = try await split(named: "ser-1-occ-1", start: Self.week(1, plusDays: 2), exceptions: [named, movedOut, movedIn, later],
+                                parts: [2, 3, 4], patch: Self.rename)
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error)); \(r.http.servedCallSequence())")
+        #expect(Self.instant(r.graph.created.first?["start"]) == Self.week(2), "the new part does not start at week 2: \(r.graph.created.first?["start"] ?? "none")")
+        #expect(r.graph.event("ser-1-occ-1")?["subject"] as? String == "Renamed", "the named occurrence was not edited where it is")
+        #expect(r.graph.event("ser-1-occ-0")?["subject"] as? String == "Renamed", "an occurrence shown after the named one was not edited")
+        let kept = r.graph.event("created-1-w3")
+        #expect(kept?["subject"] as? String != "Renamed" && Self.instant(kept?["start"]) == Self.week(1, plusDays: 1),
+                "an occurrence shown before the named one changed: \(kept ?? [:])")
+        let carried = r.graph.event("created-1-w4")
+        // The new part holds the title; the carry writes the occurrence's own room and never its old title.
+        #expect(Self.displayName(carried?["location"]) == "Room 9", "\(carried ?? [:])")
+        #expect(r.graph.patches("created-1-w4").allSatisfy { $0["subject"] == nil }, "the carry wrote the old title: \(r.graph.patches("created-1-w4"))")
+        #expect(!r.graph.patches("ser-1").isEmpty, "the series was not capped")
+    }
+
+    @Test("a new start at a moved occurrence moves it where it is and the new part by the same amount (owner rule b, c)")
+    func movedSplitResetShifts() async throws {
+        let named = Self.exception(1, at: Self.week(1, plusDays: 2))
+        let movedIn = Self.exception(3, at: Self.week(1, plusDays: 1))
+        var patch = GCalEventInput()
+        patch.startDateTime = Self.week(1, plusDays: 2).addingTimeInterval(3_600).iso8601String()
+        patch.startTimeZone = "UTC"
+        let r = try await split(named: "ser-1-occ-1", start: Self.week(1, plusDays: 2), exceptions: [named, movedIn],
+                                parts: [2, 3], patch: patch)
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error)); \(r.http.servedCallSequence())")
+        #expect(Self.instant(r.graph.created.first?["start"]) == Self.week(2).addingTimeInterval(3_600),
+                "the new part: \(r.graph.created.first?["start"] ?? "none")")
+        #expect(Self.instant(r.graph.event("ser-1-occ-1")?["start"]) == Self.week(1, plusDays: 2).addingTimeInterval(3_600),
+                "the named occurrence did not move: \(r.graph.event("ser-1-occ-1") ?? [:])")
+        #expect(Self.instant(r.graph.event("created-1-w3")?["start"]) == Self.week(1, plusDays: 1), "the kept occurrence moved")
+    }
+
+    @Test("a split named at an occurrence moved past the series' last place makes no new part and edits it where it is (owner rule e)")
+    func movedPastTheEndEditsWhereItIs() async throws {
+        let named = Self.exception(1, at: Self.week(2, plusDays: 2))
+        let r = try await split(
+            named: "ser-1-occ-1", start: Self.week(2, plusDays: 2), exceptions: [named], parts: [], patch: Self.rename,
+            series: GraphSplitFixture.series(range: ["type": "numbered", "endDate": "0001-01-01", "numberOfOccurrences": 2]))
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error)); \(r.http.servedCallSequence())")
+        #expect(r.graph.created.isEmpty && r.graph.patches("ser-1").isEmpty, "a part was made or the series capped: \(r.http.servedCallSequence())")
+        #expect(r.graph.event("ser-1-occ-1")?["subject"] as? String == "Renamed")
+    }
+
     private static var rename: GCalEventInput {
         var patch = GCalEventInput()
         patch.summary = "Renamed"

@@ -181,6 +181,14 @@ of the resource, which holds every occurrence (irreversible wire operation #5, n
   **Amended 2026-11-12 (#563, #687):** no longer refused. The split is made at the occurrence's place
   in the series (`CalDAVOccurrences.scopedEdit` gives the slot), and the moved occurrence is carried
   onto the new part with its own times, as Google Calendar does (memory 142, "Exceptions after the split").
+  **Amended again 2026-11-12 (#687, owner ruling):** the split is made where the occurrence is NOW
+  shown, not at its place: the cut is its current start (the next rule date on or after it, a
+  same-date all-day counts), and the split changes it and every occurrence shown at or after it,
+  leaving those shown before it untouched, on Google, Outlook and CalDAV alike (`SplitCarry.cut`,
+  `SplitCarry.partition`). A start given in the edit moves the later ones by the same amount; a reset
+  leaves those shown before it alone, and deletions between its old and new place stay deleted. Moved
+  past the series' last occurrence, no new part is made: only it is edited, and a rule change there is
+  refused. Memory 142, "Split at a moved occurrence".
 - The series id with a moved occurrence's new time edits that occurrence in place, and with its old
   place is not found, the same as on Google, whose resolver finds no instance there.
 - A retry after a lost response is reported not found, with nothing written, when the first attempt

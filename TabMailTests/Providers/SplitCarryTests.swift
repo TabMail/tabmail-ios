@@ -85,24 +85,156 @@ struct SplitCarryTests {
         #expect(SplitCarry.mode(edit: same, place: place, storedRules: [], seriesZone: pacific) == .carry)
     }
 
-    // MARK: place
+    // MARK: cut (calendar order, owner rule 2026-11-12)
 
-    @Test("a moved occurrence is split at its place; an unmoved one at its recurrence id")
-    func placeOfMovedOccurrence() throws {
-        let moved = try Self.occurrence(place: 7, start: Self.at(9), end: Self.at(9, "09:30:00"))
-        let naive = SplitCarry.placeNaive(of: moved, recurrenceId: String(Self.at(9).dropLast()), zone: .gmt)
-        #expect(naive == String(Self.at(7).dropLast()))
-        let plain = try Self.occurrence(place: 7, start: Self.at(7), end: Self.at(7, "09:30:00"))
-        #expect(SplitCarry.placeNaive(of: plain, recurrenceId: "given", zone: .gmt) == "given")
+    /// A weekly series from today at 09:00 UTC, with `rule`'s end.
+    private static func weekly(_ end: String = "") throws -> GCalEvent {
+        var series = Self.series
+        series["recurrence"] = ["RRULE:FREQ=WEEKLY" + end]
+        return try Self.event(series)
     }
+
+    private static func instant(_ text: String) -> GCalDateTime { GCalDateTime(dateTime: text, date: nil, timeZone: "UTC") }
+
+    @Test("an unmoved occurrence is cut at its place, addressed by its recurrence id")
+    func cutOfUnmovedOccurrence() throws {
+        let plain = try Self.occurrence(place: 7, start: Self.at(7), end: Self.at(7, "09:30:00"))
+        let cut = try #require(SplitCarry.cut(named: plain, series: try Self.weekly()))
+        #expect(cut == .at(Self.instant(Self.at(7))))
+        guard case .at(let at) = cut else { return }
+        #expect(SplitCarry.splitAt(at, named: plain, recurrenceId: "given", zone: .gmt) == "given")
+    }
+
+    @Test("an occurrence moved later is cut at the first place after where it is now, not its own place")
+    func cutOfOccurrenceMovedLater() throws {
+        let moved = try Self.occurrence(place: 7, start: Self.at(9), end: Self.at(9, "09:30:00"))
+        let cut = try #require(SplitCarry.cut(named: moved, series: try Self.weekly()))
+        #expect(cut == .at(Self.instant(Self.at(14))))
+        guard case .at(let at) = cut else { return }
+        #expect(SplitCarry.splitAt(at, named: moved, recurrenceId: "ignored", zone: .gmt) == String(Self.at(14).dropLast()))
+    }
+
+    @Test("an occurrence moved earlier is cut at the first place after where it is now, before its own place")
+    func cutOfOccurrenceMovedEarlier() throws {
+        let moved = try Self.occurrence(place: 14, start: Self.at(5), end: Self.at(5, "09:30:00"))
+        #expect(SplitCarry.cut(named: moved, series: try Self.weekly()) == .at(Self.instant(Self.at(7))))
+    }
+
+    @Test("(a) a place at exactly the moved start counts as after it: the cut is that place")
+    func cutAtTie() throws {
+        let moved = try Self.occurrence(place: 7, start: Self.at(14), end: Self.at(14, "09:30:00"))
+        #expect(SplitCarry.cut(named: moved, series: try Self.weekly()) == .at(Self.instant(Self.at(14))))
+        // Later on the same day as a place is after it.
+        let later = try Self.occurrence(place: 7, start: Self.at(14, "10:00:00"), end: Self.at(14, "10:30:00"))
+        #expect(SplitCarry.cut(named: later, series: try Self.weekly()) == .at(Self.instant(Self.at(21))))
+    }
+
+    @Test("(e) an occurrence moved past the series' last place has no cut")
+    func cutPastEnd() throws {
+        let moved = try Self.occurrence(place: 7, start: Self.at(9), end: Self.at(9, "09:30:00"))
+        #expect(SplitCarry.cut(named: moved, series: try Self.weekly(";COUNT=2")) == .pastEnd)
+        #expect(SplitCarry.cut(named: moved, series: try Self.weekly(";COUNT=3")) == .at(Self.instant(Self.at(14))))
+    }
+
+    @Test("(f) all-day: a place on the same date as the moved occurrence counts as after it")
+    func cutAllDaySameDate() throws {
+        func day(_ n: Int) -> String { String(Self.at(n).prefix(10)) }
+        let series = try Self.event([
+            "id": "s", "start": ["date": day(0)], "end": ["date": day(1)], "recurrence": ["RRULE:FREQ=WEEKLY"],
+        ])
+        let moved = try Self.event([
+            "id": "s_7", "recurringEventId": "s", "originalStartTime": ["date": day(7)],
+            "start": ["date": day(14)], "end": ["date": day(15)],
+        ])
+        #expect(SplitCarry.cut(named: moved, series: series) == .at(GCalDateTime(dateTime: nil, date: day(14), timeZone: nil)))
+    }
+
+    // MARK: partition
+
+    @Test("exceptions sort into four groups by place against the cut and start against the named one; a deleted one goes by its place")
+    func partitionGroups() throws {
+        // Named: placed day 7, moved to day 9; cut at day 14.
+        let namedStart = Self.instant(Self.at(9))
+        let cut = SplitCarry.Cut.at(Self.instant(Self.at(14)))
+        let earlier = try Self.occurrence(place: 0, start: Self.at(1), end: Self.at(1, "09:30:00"))     // untouched
+        let named = try Self.occurrence(place: 7, start: Self.at(9), end: Self.at(9, "09:30:00"))       // edited where it is
+        let movedOut = try Self.occurrence(place: 0, start: Self.at(10), end: Self.at(10, "09:30:00"))  // edited where it is
+        let later = try Self.occurrence(place: 21, start: Self.at(22), end: Self.at(22, "09:30:00"))    // tail
+        let movedIn = try Self.occurrence(place: 28, start: Self.at(8), end: Self.at(8, "09:30:00"))    // kept whole
+        let tie = try Self.occurrence(place: 35, start: Self.at(9), end: Self.at(9, "09:30:00"))        // (a): tail
+        let parts = try #require(SplitCarry.partition([
+            .changed(earlier), .changed(named), .changed(movedOut), .changed(later), .changed(movedIn), .changed(tie),
+            .deleted(place: Self.instant(Self.at(7))), .deleted(place: Self.instant(Self.at(42))),
+        ], cut: cut, namedStart: namedStart))
+        #expect(parts.edited.map(\.id) == ["s_7", "s_0"])
+        #expect(parts.kept.map(\.id) == ["s_28"])
+        #expect(parts.tail.count == 3)
+        #expect(parts.tail.compactMap { if case .changed(let e) = $0 { return e.id } else { return nil } } == ["s_21", "s_35"])
+        #expect(parts.tail.contains { if case .deleted(let p) = $0 { return p.dateTime == Self.at(42) } else { return false } })
+    }
+
+    @Test("(e) with no cut, every occurrence shown from the named one on is edited where it is")
+    func partitionPastEnd() throws {
+        let named = try Self.occurrence(place: 7, start: Self.at(30), end: Self.at(30, "09:30:00"))
+        let before = try Self.occurrence(place: 0, start: Self.at(2), end: Self.at(2, "09:30:00"))
+        let parts = try #require(SplitCarry.partition([.changed(named), .changed(before)], cut: .pastEnd, namedStart: Self.instant(Self.at(30))))
+        #expect(parts.edited.map(\.id) == ["s_7"] && parts.tail.isEmpty && parts.kept.isEmpty)
+    }
+
+    // MARK: the edit's times
 
     @Test("an end given alone at a moved occurrence keeps its length from where it is now")
     func endOnlyAtMovedOccurrence() throws {
-        let moved = try Self.occurrence(place: 7, start: Self.at(9), end: Self.at(9, "09:30:00"))
         var edit = GCalEventInput()
         edit.endDateTime = Self.at(9, "10:00:00")
-        let written = try #require(SplitCarry.partEdit(edit, named: moved))
-        #expect(written.endDateTime.flatMap(Date.fromISO8601) == Date.fromISO8601(Self.at(7, "10:00:00")))
+        let written = try #require(SplitCarry.partEdit(edit, namedStart: Self.instant(Self.at(9)), cut: Self.instant(Self.at(14))))
+        #expect(written.endDateTime.flatMap(Date.fromISO8601) == Date.fromISO8601(Self.at(14, "10:00:00")))
+    }
+
+    @Test("(b) a start given moves the new part from the cut as far as it moves the named occurrence")
+    func startGivenShiftsFromTheCut() throws {
+        var edit = GCalEventInput()
+        edit.startDateTime = Self.at(9, "11:00:00")
+        edit.endDateTime = Self.at(9, "11:30:00")
+        let written = try #require(SplitCarry.partEdit(edit, namedStart: Self.instant(Self.at(9)), cut: Self.instant(Self.at(14))))
+        #expect(written.startDateTime.flatMap(Date.fromISO8601) == Date.fromISO8601(Self.at(14, "11:00:00")))
+        #expect(written.endDateTime.flatMap(Date.fromISO8601) == Date.fromISO8601(Self.at(14, "11:30:00")))
+        // At a cut that is the named start, the edit is written as given.
+        let same = try #require(SplitCarry.partEdit(edit, namedStart: Self.instant(Self.at(9)), cut: Self.instant(Self.at(9))))
+        #expect(same.startDateTime == edit.startDateTime)
+    }
+
+    @Test("(b) an edited occurrence moves by the shift; a retry moves it to the start kept, never twice")
+    func editsMoveOnceAcrossARetry() throws {
+        let movedOut = try Self.occurrence(place: 0, start: Self.at(10), end: Self.at(10, "09:45:00"))
+        let first = try #require(SplitCarry.edits(of: [movedOut], shift: 7200, length: nil, fields: [.summary]))
+        #expect(first.first?.start?.dateTime.flatMap(Date.fromISO8601) == Date.fromISO8601(Self.at(10, "11:00:00")))
+        #expect(first.first?.end?.dateTime.flatMap(Date.fromISO8601) == Date.fromISO8601(Self.at(10, "11:45:00")))
+        let targets = SplitCarry.targets(of: first)
+        // The write landed: the occurrence now starts at 11:00. The retry leaves its time as it is.
+        let written = try Self.occurrence(place: 0, start: Self.at(10, "11:00:00"), end: Self.at(10, "11:45:00"))
+        let retry = try #require(SplitCarry.edits(of: [written], targets: targets, length: nil, fields: [.summary]))
+        #expect(retry.count == 1 && retry.first?.start == nil)
+        // It did not land: the retry moves it as the first attempt would have.
+        let again = try #require(SplitCarry.edits(of: [movedOut], targets: targets, length: nil, fields: [.summary]))
+        #expect(again.first?.start?.dateTime.flatMap(Date.fromISO8601) == Date.fromISO8601(Self.at(10, "11:00:00")))
+        // An occurrence with no target kept is not edited.
+        let other = try Self.occurrence(place: 21, start: Self.at(23), end: Self.at(23, "09:30:00"))
+        #expect(SplitCarry.edits(of: [other], targets: targets, length: nil, fields: [.summary])?.isEmpty == true)
+    }
+
+    @Test("an occurrence placed after the cut but shown before the named one is planned whole; on a reset the named one is planned at its moved start")
+    func planKeptWholeAndNamedOnReset() throws {
+        let series = try Self.event(Self.series)
+        let movedIn = try Self.occurrence(place: 28, start: Self.at(8), end: Self.at(8, "09:30:00"))
+        let named = try Self.occurrence(place: 14, start: Self.at(12), end: Self.at(12, "09:30:00"))
+        let plan = try #require(SplitCarry.plan(
+            exceptions: [], kept: [movedIn], named: named, shift: 3600, series: series, newPart: series, fields: [.summary]))
+        #expect(plan.changed.count == 2)
+        guard plan.changed.count == 2 else { return }
+        #expect(plan.changed[0].whole && plan.changed[0].start?.dateTime == Self.at(8))
+        #expect(!plan.changed[1].whole)
+        #expect(plan.changed[1].start?.dateTime.flatMap(Date.fromISO8601) == Date.fromISO8601(Self.at(12, "10:00:00")))
     }
 
     // MARK: plan
@@ -197,6 +329,121 @@ struct SplitCarryTests {
         patch.endTimeZone = "UTC"
         let override = Self.overrideLines(try Self.calDAVSplit(patch))
         #expect(override.contains("DTSTART:20990120T110000Z") && override.contains("DTEND:20990120T120000Z"), "override: \(override)")
+    }
+
+    /// A weekly series from Monday 2099-01-05 09:00 UTC, its occurrence placed on the 12th (the one
+    /// named) moved to the 14th, so the cut is the 19th; the one placed on the 5th moved to the
+    /// 15th (shown after the named one); the one placed on the 26th moved to the 13th (shown before
+    /// it); and the one on February 2 changed in place.
+    private static let calDAVMovedSeries = """
+    BEGIN:VCALENDAR
+    VERSION:2.0
+    PRODID:-//Test//EN
+    BEGIN:VEVENT
+    UID:moved-1
+    DTSTAMP:20990101T000000Z
+    DTSTART:20990105T090000Z
+    DTEND:20990105T093000Z
+    SUMMARY:Standup
+    RRULE:FREQ=WEEKLY
+    END:VEVENT
+    BEGIN:VEVENT
+    UID:moved-1
+    RECURRENCE-ID:20990112T090000Z
+    DTSTAMP:20990101T000000Z
+    DTSTART:20990114T090000Z
+    DTEND:20990114T093000Z
+    SUMMARY:Standup
+    END:VEVENT
+    BEGIN:VEVENT
+    UID:moved-1
+    RECURRENCE-ID:20990105T090000Z
+    DTSTAMP:20990101T000000Z
+    DTSTART:20990115T090000Z
+    DTEND:20990115T093000Z
+    SUMMARY:Standup
+    END:VEVENT
+    BEGIN:VEVENT
+    UID:moved-1
+    RECURRENCE-ID:20990126T090000Z
+    DTSTAMP:20990101T000000Z
+    DTSTART:20990113T090000Z
+    DTEND:20990113T093000Z
+    SUMMARY:Standup
+    END:VEVENT
+    BEGIN:VEVENT
+    UID:moved-1
+    RECURRENCE-ID:20990202T090000Z
+    DTSTAMP:20990101T000000Z
+    DTSTART:20990202T090000Z
+    DTEND:20990202T093000Z
+    SUMMARY:Standup
+    LOCATION:Room 9
+    END:VEVENT
+    END:VCALENDAR
+    """.replacingOccurrences(of: "\n", with: "\r\n")
+
+    /// The lines of the override placed at `rid` (its RECURRENCE-ID value) in `ics`.
+    private static func override(_ rid: String, in ics: String) -> [String] {
+        let lines = ics.components(separatedBy: "\r\n").flatMap { $0.components(separatedBy: "\n") }
+        guard let at = lines.firstIndex(of: "RECURRENCE-ID:\(rid)"),
+              let begin = lines[..<at].lastIndex(of: "BEGIN:VEVENT") else { return [] }
+        let end = lines[at...].firstIndex(of: "END:VEVENT") ?? lines.endIndex
+        return Array(lines[begin..<end])
+    }
+
+    private static func calDAVMovedSplit(_ patch: GCalEventInput) throws -> CalDAVProvider.SeriesSplitResources {
+        let named = (start: try #require(Date.fromISO8601("2099-01-14T09:00:00Z")), place: try #require(Date.fromISO8601("2099-01-12T09:00:00Z")))
+        return try CalDAVProvider.seriesSplitResources(
+            storedICS: calDAVMovedSeries, slotNaiveISO: "2099-01-19T09:00:00", cappedRRule: "RRULE:FREQ=WEEKLY;UNTIL=20990119T085959Z",
+            newRRule: "RRULE:FREQ=WEEKLY", newUid: "moved-2", patch: patch, now: Date(),
+            zones: CalendarTimeZoneContext(calendarText: calDAVMovedSeries), named: named)
+    }
+
+    @Test("CalDAV: a split named at a moved occurrence edits what is shown after it where it is, and keeps what is shown before it whole (owner rule)")
+    func calDAVMovedSplitGroups() throws {
+        var patch = GCalEventInput()
+        patch.summary = "Renamed"
+        let r = try Self.calDAVMovedSplit(patch)
+        #expect(r.mode == .carry)
+        // On the capped series: the named one and the one shown after it, edited where they are.
+        #expect(Self.override("20990112T090000Z", in: r.cappedSeries).contains("SUMMARY:Renamed"), "\(r.cappedSeries)")
+        #expect(Self.override("20990105T090000Z", in: r.cappedSeries).contains("SUMMARY:Renamed"), "\(r.cappedSeries)")
+        // On the new part: the one shown before the named one, whole; the later one carried.
+        let kept = Self.override("20990126T090000Z", in: r.newPart)
+        #expect(kept.contains("SUMMARY:Standup") && kept.contains("DTSTART:20990113T090000Z"), "kept: \(kept)")
+        let carried = Self.override("20990202T090000Z", in: r.newPart)
+        #expect(carried.contains("SUMMARY:Renamed") && carried.contains("LOCATION:Room 9"), "carried: \(carried)")
+        #expect(r.newPart.contains("DTSTART:20990119T090000Z"))
+    }
+
+    @Test("CalDAV: a new start at a moved occurrence moves it where it is by the same amount and still keeps what is shown before it (owner rule b, c)")
+    func calDAVMovedSplitReset() throws {
+        var patch = GCalEventInput()
+        // The new part's start as the provider gives it (`partEdit`): the cut, an hour on.
+        patch.startDateTime = "2099-01-19T10:00:00Z"
+        patch.startTimeZone = "UTC"
+        let r = try Self.calDAVMovedSplit(patch)
+        #expect(r.mode == .reset)
+        let named = Self.override("20990112T090000Z", in: r.cappedSeries)
+        #expect(named.contains("DTSTART:20990114T100000Z") && named.contains("DTEND:20990114T103000Z"), "named: \(named)")
+        // Kept at its own time, named by the new part's occurrence its place now is (an hour on).
+        let kept = Self.override("20990126T100000Z", in: r.newPart)
+        #expect(kept.contains("DTSTART:20990113T090000Z") && kept.contains("SUMMARY:Standup"), "kept: \(kept)")
+        #expect(Self.override("20990202T090000Z", in: r.newPart).isEmpty && Self.override("20990202T100000Z", in: r.newPart).isEmpty,
+                "the reset kept a later change")
+    }
+
+    @Test("CalDAV: an occurrence moved past the series' last place: the edit reaches what is shown from it on, and nothing else (owner rule e)")
+    func calDAVPastEnd() throws {
+        var patch = GCalEventInput()
+        patch.summary = "Renamed"
+        let edited = try CalDAVProvider.pastEndResource(
+            storedICS: Self.calDAVMovedSeries, patch: patch, shownFrom: try #require(Date.fromISO8601("2099-01-14T09:00:00Z")),
+            shift: 0, length: nil, zones: CalendarTimeZoneContext(calendarText: Self.calDAVMovedSeries))
+        #expect(Self.override("20990112T090000Z", in: edited).contains("SUMMARY:Renamed"))
+        #expect(Self.override("20990126T090000Z", in: edited).contains("SUMMARY:Standup"), "an occurrence shown before it changed")
+        #expect(edited.contains("RRULE:FREQ=WEEKLY\r\n"), "the rule changed")
     }
 
     @Test("a moved occurrence keeps its times; with an end set, its own start plus the new part's length")

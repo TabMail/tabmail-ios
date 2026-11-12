@@ -308,9 +308,15 @@ struct CalendarEventEditTool: AgentTool, Sendable {
             // refused here, with nothing queued.
             if let move = try CalendarSeriesScope.dayMove(arguments, named: named, scope: resolvedScope, zone: tz) {
                 let series = try named.readSeries()
-                // A split starts at the PLACE of the occurrence named (#687), as its write does.
+                // A split starts at its cut (`SplitCarry.cut`), the first place of the series at or
+                // after where the occurrence named starts now, as its write does.
                 let splitAt = recurrenceIdArg.map { rid in
-                    named.occurrence.flatMap { SplitCarry.placeNaive(of: $0, recurrenceId: rid, zone: ridZone) } ?? rid
+                    named.occurrence.flatMap { occurrence in
+                        SplitCarry.cut(named: occurrence, series: series).flatMap { cut -> String? in
+                            guard case .at(let at) = cut else { return nil }
+                            return SplitCarry.splitAt(at, named: occurrence, recurrenceId: rid, zone: ridZone)
+                        }
+                    } ?? rid
                 }
                 let rules = try await provider.dayMovedRules(
                     calendarId: lookupCalId, eventId: queuedEventId, series: series,
@@ -397,15 +403,15 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         // A split resets the occurrences after it that were changed or deleted one by one when
         // its new part's start moves or its rule changes, and carries them otherwise: the one
         // predicate every calendar's write calls (`SplitCarry.mode`), fed the edit as the queue
-        // builds it, at the place of the occurrence named (#563).
+        // builds it, against where the occurrence named starts now (#563): the write checks the
+        // edit moved to its cut (`SplitCarry.partEdit`) against the cut, which is the same check.
         var splitResets = false
-        if resolvedScope == "this_and_following", let occurrence = named.occurrence, let place = occurrence.originalStartTime,
+        if resolvedScope == "this_and_following", let occurrence = named.occurrence, let start = occurrence.start,
            var edit = try? CalendarToolHelpers.buildGCalEventInput(
                arguments, isAllDay: CalendarToolHelpers.boolArg(arguments, "all_day") ?? occurrence.isAllDay) {
             edit.ruleDayMove = try? CalendarSeriesScope.dayMove(arguments, named: named, scope: resolvedScope, zone: tz)
             let series = try named.readSeries()
-            splitResets = SplitCarry.partEdit(edit, named: occurrence)
-                .map { SplitCarry.mode(edit: $0, place: place, storedRules: series.recurrence ?? [], seriesZone: series.isAllDay ? nil : series.seriesZone) == .reset } ?? false
+            splitResets = SplitCarry.mode(edit: edit, place: start, storedRules: series.recurrence ?? [], seriesZone: series.isAllDay ? nil : series.seriesZone) == .reset
         }
         if turnsDays || splitResets {
             changes.append(CalendarToolHelpers.exceptionsResetNote)

@@ -513,11 +513,11 @@ struct CalDAVOccurrenceWireTests {
                 "the edit did not land on the moved occurrence alone: \(after.map { [$0.id, $0.location] })")
     }
 
-    @Test("this_and_following at a moved occurrence, by its id or the series id with the start the listing showed, splits at its place (#687)")
+    @Test("this_and_following at a moved occurrence, by its id or the series id with the start the listing showed, keeps it where it was moved (owner rule)")
     func splitAtMovedOccurrenceIsAtItsPlace() async throws {
-        // The split starts at the occurrence's place in the series, and changes the occurrences
-        // from that place on: week 2's moved into week 5 (weeks 3 and 4 between), and week 3's
-        // moved to the next day (none between), as Google Calendar does.
+        // The split cuts at the first place at or after where the occurrence is now, and changes
+        // it and every occurrence shown after it: week 2's moved into week 5 (weeks 3 and 4
+        // between, which stay as they are), and week 3's moved to the next day.
         let movedFar = try W.makeMoved(week: 2, toWeek: 5)
         let movedNear = try W.makeChanged()
         let fixtures: [(label: String, fixture: W, week: Int, shown: Date)] = [
@@ -573,7 +573,7 @@ struct CalDAVOccurrenceWireTests {
         case none, retitledInPlace, sameDay, nextDay
     }
 
-    @Test("this_and_following at an occurrence, moved or not, splits at its place in every series frame, from the device's zone or another, by either id (#687)",
+    @Test("this_and_following at an occurrence splits at the first place at or after where it is now, in every series frame, from the device's zone or another, by either id (owner rule)",
           arguments: SeriesFrame.allCases, Move.allCases)
     func splitIsAtThePlaceInEveryFrame(_ frame: SeriesFrame, _ move: Move) async throws {
         // An all-day occurrence has no time of day to move within its day.
@@ -633,10 +633,12 @@ struct CalDAVOccurrenceWireTests {
                     Issue.record("\(label): the split failed: \(error)")
                 }
                 #expect(store.recordedPuts().count == 2, "\(label): the split did not write its new part and the capped series: \(store.recordedPuts().map(\.path))")
-                // The new part starts at the occurrence's place, moved or not (#687).
+                // The new part starts at the first place at or after where the occurrence is now: its
+                // own place when it starts there, else the next week's (owner rule, 2026-11-12).
+                let cut = move == .sameDay || move == .nextDay ? try #require(calendar.date(byAdding: .day, value: 7, to: slot)) : slot
                 let part = store.recordedPuts().map(\.path).first { $0 != W.seriesPath }
                 let partICS = part.flatMap { store.storedICS(path: $0) } ?? ""
-                #expect(partICS.contains(try frame.line("DTSTART", slot)), "\(label): the new part does not start at the place: \(partICS)")
+                #expect(partICS.contains(try frame.line("DTSTART", cut)), "\(label): the new part does not start at the cut: \(partICS)")
             }
         }
     }

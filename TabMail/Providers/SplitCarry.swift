@@ -89,20 +89,14 @@ enum SplitCarry {
         return given.identifier == zone.identifier
     }
 
-    /// The place of `occurrence` in its series, as a naive wall clock in `zone`, in the form a
-    /// split's `recurrence_id` takes: `yyyy-MM-dd'T'HH:mm:ss` for a timed occurrence, the date for
-    /// an all-day one (in the form `recurrenceId` has). `recurrenceId` itself when the occurrence
-    /// starts at its place, so an unmoved occurrence's split is addressed exactly as before. Nil
-    /// when the place can't be read.
-    static func placeNaive(of occurrence: GCalEvent, recurrenceId: String, zone: TimeZone) -> String? {
+    /// The split point of a split at `cut` named at `occurrence`, as a naive wall clock in `zone`,
+    /// in the form a split's `recurrence_id` takes: `yyyy-MM-dd'T'HH:mm:ss` for a timed series,
+    /// the date for an all-day one (in the form `recurrenceId` has). `recurrenceId` itself when the
+    /// occurrence starts at its place, so an unmoved occurrence's split is addressed exactly as
+    /// before. Nil when the cut can't be read.
+    static func splitAt(_ cut: GCalDateTime, named occurrence: GCalEvent, recurrenceId: String, zone: TimeZone) -> String? {
         guard RecurrenceOccurrenceResolver.wasMoved(occurrence) else { return recurrenceId }
-        guard let place = occurrence.originalStartTime else { return nil }
-        if let date = place.date {
-            let day = String(date.prefix(10))
-            return recurrenceId.contains("T") ? "\(day)T00:00:00" : day
-        }
-        guard let instant = place.dateTime.flatMap(Date.fromISO8601) else { return nil }
-        return naive(instant, in: zone)
+        return naive(of: cut, recurrenceId: recurrenceId, zone: zone)
     }
 
     /// `instant` as a naive `yyyy-MM-dd'T'HH:mm:ss` wall clock in `zone`.
@@ -115,28 +109,39 @@ enum SplitCarry {
         return formatter.string(from: instant)
     }
 
-    /// The edit the new part is written with. An end given alone, at an occurrence moved from its
-    /// place, gives the length from where that occurrence starts now (Google: the new end minus
-    /// the moved occurrence's current start), and the new part, which starts at the place, keeps
-    /// that length. Every other edit is written as given. Nil when the length can't be read.
-    static func partEdit(_ edit: GCalEventInput, named: GCalEvent) -> GCalEventInput? {
-        guard edit.startDate == nil, edit.startDateTime == nil,
-              edit.endDate != nil || edit.endDateTime != nil,
-              RecurrenceOccurrenceResolver.wasMoved(named) else { return edit }
-        guard let place = named.originalStartTime, let start = named.start else { return nil }
+    /// The edit the new part is written with, the new part starting at `cut`. Each time the edit
+    /// gives is measured from where the occurrence named starts now (`namedStart`) and moved by
+    /// the same amount from the cut: an end given alone keeps the length it gives from that start
+    /// (Google: the new end minus the moved occurrence's current start), and a start given moves
+    /// the new part, and every occurrence after it, as far as it moves the one named (owner rule,
+    /// 2026-11-12). At a cut that is the named start (an occurrence never moved), the edit is
+    /// written as given. Nil when a time can't be read.
+    static func partEdit(_ edit: GCalEventInput, namedStart: GCalDateTime, cut: GCalDateTime) -> GCalEventInput? {
+        guard isInTail(namedStart, split: cut) != true || isInTail(cut, split: namedStart) != true else { return edit }
         var written = edit
-        if let end = edit.endDate {
-            guard let from = start.date.flatMap(day), let to = day(end), let at = place.date.flatMap(day),
-                  let days = gregorianUTC.dateComponents([.day], from: from, to: to).day,
-                  let moved = gregorianUTC.date(byAdding: .day, value: days, to: at) else { return nil }
-            written.endDate = dayString(moved)
-        } else if let end = edit.endDateTime.flatMap(Date.fromISO8601) {
-            guard let from = start.dateTime.flatMap(Date.fromISO8601),
-                  let at = place.dateTime.flatMap(Date.fromISO8601) else { return nil }
-            let zone = edit.endTimeZone.flatMap { CalendarTimeZoneResolver.zone(named: $0, in: .none) } ?? .gmt
-            written.endDateTime = at.addingTimeInterval(end.timeIntervalSince(from)).iso8601String(timeZone: zone)
+        if let date = cut.date {
+            guard let from = namedStart.date.flatMap(day), let at = day(date) else { return nil }
+            func moved(_ text: String?) -> String?? {
+                guard let text else { return .some(nil) }
+                guard let to = day(text), let days = gregorianUTC.dateComponents([.day], from: from, to: to).day,
+                      let out = gregorianUTC.date(byAdding: .day, value: days, to: at) else { return nil }
+                return .some(dayString(out))
+            }
+            guard let start = moved(edit.startDate), let end = moved(edit.endDate) else { return nil }
+            written.startDate = start
+            written.endDate = end
         } else {
-            return nil
+            guard let from = namedStart.dateTime.flatMap(Date.fromISO8601), let at = cut.dateTime.flatMap(Date.fromISO8601) else { return nil }
+            func moved(_ text: String?, zone name: String?) -> String?? {
+                guard let text else { return .some(nil) }
+                guard let given = Date.fromISO8601(text) else { return nil }
+                let zone = name.flatMap { CalendarTimeZoneResolver.zone(named: $0, in: .none) } ?? .gmt
+                return .some(at.addingTimeInterval(given.timeIntervalSince(from)).iso8601String(timeZone: zone))
+            }
+            guard let start = moved(edit.startDateTime, zone: edit.startTimeZone),
+                  let end = moved(edit.endDateTime, zone: edit.endTimeZone) else { return nil }
+            written.startDateTime = start
+            written.endDateTime = end
         }
         return written
     }
@@ -167,6 +172,9 @@ enum SplitCarry {
         let exception: GCalEvent
         let start: GCalDateTime?
         let end: GCalDateTime?
+        /// Written whole, the fields the edit set and its guests included (`Parts.kept`): the
+        /// occurrence is shown before the one named, so the edit does not reach it.
+        var whole = false
     }
 
     /// What a carry writes: the places deleted on their own, and the changed occurrences.
@@ -185,8 +193,25 @@ enum SplitCarry {
     /// when it starts elsewhere than its place or lasts other than the series: start kept, end its
     /// own, or its own start plus L when the edit set the end. Nil when a time or place can't be
     /// read.
-    static func plan(exceptions: [Exception], series: GCalEvent, newPart: GCalEvent, fields: Set<Field>) -> Plan? {
+    ///
+    /// `kept` (`Parts.kept`) are written whole at their own times, in either mode. `named`, on a
+    /// reset, is the occurrence named when it was moved and is placed in the new part: it is
+    /// carried like a changed one, at its own times moved by `shift`, so it starts where the edit
+    /// put it.
+    static func plan(
+        exceptions: [Exception], kept: [GCalEvent] = [], named: GCalEvent? = nil, shift: TimeInterval = 0,
+        series: GCalEvent, newPart: GCalEvent, fields: Set<Field>
+    ) -> Plan? {
         var plan = Plan()
+        for event in kept {
+            guard let place = event.originalStartTime, let start = event.start, let end = event.end else { return nil }
+            plan.changed.append(Change(place: place, exception: event, start: start, end: end, whole: true))
+        }
+        if let named {
+            guard let place = named.originalStartTime, let start = named.start, let end = named.end,
+                  let edit = edits(of: [named], shift: shift, length: length(of: newPart), fields: fields)?.first else { return nil }
+            plan.changed.append(Change(place: place, exception: named, start: edit.start ?? start, end: edit.end ?? end))
+        }
         let seriesLength = length(of: series)
         let partLength = length(of: newPart)
         for exception in exceptions {
@@ -210,6 +235,393 @@ enum SplitCarry {
             }
         }
         return plan
+    }
+
+    // MARK: - Calendar order (a split named at a moved occurrence)
+
+    /// Where a split cuts its series.
+    enum Cut: Equatable {
+        /// The old series keeps every place before this one; the new part starts here.
+        case at(GCalDateTime)
+        /// The series has no place at or after the occurrence named: nothing is cut, and the edit
+        /// is written onto the occurrences shown from the named one on (`Parts.edited`).
+        case pastEnd
+    }
+
+    /// The pattern of a series, as a split reads it to find its cut.
+    struct Pattern {
+        /// The series' RRULE line.
+        let rule: String
+        /// The series' first start.
+        let start: GCalDateTime
+        /// The zone its places are wall clocks in (nil for an all-day series).
+        let zone: TimeZone?
+        /// Its added places (`RDATE`).
+        var added: [GCalDateTime] = []
+        var anchor: RecurrenceTail.Anchor = .dtstart
+        var missingDay: RecurrenceTail.MissingMonthDay = .skip
+    }
+
+    /// THE cut of a split named at an occurrence that starts at `namedStart` and has its place at
+    /// `namedPlace` (owner rule, 2026-11-12: a split changes the occurrence named and every one
+    /// shown after it, by where each is now). It is the first place of the series at or after
+    /// `namedStart` (an instant for a timed series, a date for an all-day one, a tie counting as
+    /// after), so every occurrence that was never moved falls on the side it is shown on. For an
+    /// occurrence that was never moved it is its place, worked out without reading the rule.
+    /// Nil when the rule or a time can't be read.
+    static func cut(namedStart: GCalDateTime, namedPlace: GCalDateTime, moved: Bool, pattern: Pattern) -> Cut? {
+        guard moved else { return .at(namedPlace) }
+        let ruleCut = ruleCut(after: namedStart, pattern: pattern)
+        guard let ruleCut else { return nil }
+        var candidates: [GCalDateTime] = []
+        if case .at(let place) = ruleCut { candidates.append(place) }
+        for added in pattern.added {
+            guard let after = isInTail(added, split: namedStart) else { return nil }
+            if after { candidates.append(added) }
+        }
+        var first: GCalDateTime?
+        for candidate in candidates {
+            guard let current = first else { first = candidate; continue }
+            guard let earlier = isInTail(current, split: candidate) else { return nil }
+            if earlier { first = candidate }
+        }
+        return first.map(Cut.at) ?? .pastEnd
+    }
+
+    /// The cut of a split of `series` named at the occurrence `named` (`cut`), the series' pattern
+    /// read from its `recurrence` lines: its RRULE, and its added dates (`RDATE`, read with
+    /// `zones`). Its places are wall clocks in `zone`, the series' own (`seriesZone`) when not
+    /// given. `rdates` are `RDATE` lines the series holds outside `recurrence` (a CalDAV series
+    /// as `ICSParser` reads it). Nil when the occurrence or the series can't be read.
+    static func cut(
+        named: GCalEvent, series: GCalEvent, rdates: [String] = [], zone: TimeZone? = nil,
+        zones: CalendarTimeZoneContext = .none,
+        anchor: RecurrenceTail.Anchor = .dtstart, missingDay: RecurrenceTail.MissingMonthDay = .skip
+    ) -> Cut? {
+        guard let namedStart = named.start, let namedPlace = named.originalStartTime ?? named.start else { return nil }
+        let moved = RecurrenceOccurrenceResolver.wasMoved(named)
+        guard moved else { return .at(namedPlace) }
+        let lines = (series.recurrence ?? []) + rdates
+        guard let rule = lines.first(where: isRule), let start = series.start else { return nil }
+        var added: [GCalDateTime] = []
+        for line in lines where line.uppercased().hasPrefix("RDATE") {
+            guard (try? CalDAVProvider.filterDateList(line, zones: zones, keep: { instant in
+                added.append(series.isAllDay
+                    ? GCalDateTime(dateTime: nil, date: naive(instant, in: .gmt).prefix(10).description, timeZone: nil)
+                    : GCalDateTime(dateTime: instant.iso8601String(), date: nil, timeZone: "UTC"))
+                return true
+            })) != nil else { return nil }
+        }
+        let pattern = Pattern(
+            rule: rule, start: start, zone: series.isAllDay ? nil : zone ?? series.seriesZone,
+            added: added, anchor: anchor, missingDay: missingDay)
+        return cut(namedStart: namedStart, namedPlace: namedPlace, moved: true, pattern: pattern)
+    }
+
+    /// The naive wall clock (`yyyy-MM-dd'T'HH:mm:ss`, or the date for an all-day series written
+    /// as `recurrenceId` is) `cut` is in `zone`.
+    static func naive(of cut: GCalDateTime, recurrenceId: String, zone: TimeZone) -> String? {
+        if let date = cut.date {
+            let day = String(date.prefix(10))
+            return recurrenceId.contains("T") ? "\(day)T00:00:00" : day
+        }
+        return cut.dateTime.flatMap(Date.fromISO8601).map { naive($0, in: zone) }
+    }
+
+    /// The first place the RRULE gives at or after `namedStart`, or `.pastEnd` when its COUNT or
+    /// UNTIL ends the series before one.
+    private static func ruleCut(after namedStart: GCalDateTime, pattern: Pattern) -> Cut? {
+        let body = pattern.rule.uppercased().hasPrefix("RRULE:") ? String(pattern.rule.dropFirst("RRULE:".count)) : pattern.rule
+        let parts = body.uppercased().split(separator: ";").map(String.init)
+        let until = parts.first { $0.hasPrefix("UNTIL=") }.map { String($0.dropFirst("UNTIL=".count)) }
+        let count = parts.first { $0.hasPrefix("COUNT=") }.flatMap { Int($0.dropFirst("COUNT=".count)) }
+        if parts.contains(where: { $0.hasPrefix("COUNT=") }), count == nil { return nil }
+
+        // The place on `day`, and the first day of the pattern on or after `from`.
+        let place: (RecurrenceTail.Day) -> GCalDateTime?
+        let fromDay: RecurrenceTail.Day
+        let seriesDay: RecurrenceTail.Day
+        if let date = pattern.start.date {
+            guard let start = RecurrenceTail.Day(iso: date), let named = namedStart.date.flatMap({ RecurrenceTail.Day(iso: $0) }) else { return nil }
+            seriesDay = start
+            fromDay = named
+            place = { GCalDateTime(dateTime: nil, date: $0.description, timeZone: nil) }
+        } else {
+            guard let zone = pattern.zone, let start = pattern.start.dateTime.flatMap(Date.fromISO8601),
+                  let named = namedStart.dateTime.flatMap(Date.fromISO8601) else { return nil }
+            let wall = naive(start, in: zone)
+            guard let startDay = RecurrenceTail.Day(iso: wall), let namedDay = RecurrenceTail.Day(iso: naive(named, in: zone)) else { return nil }
+            seriesDay = startDay
+            fromDay = namedDay
+            let time = String(wall.dropFirst(11))
+            place = { day in
+                GoogleCalendarProvider.naiveInstant("\(day)T\(time)", zone: zone)
+                    .map { GCalDateTime(dateTime: $0.iso8601String(), date: nil, timeZone: "UTC") }
+            }
+        }
+        var day = fromDay
+        while true {
+            switch RecurrenceTail.firstDay(of: pattern.rule, seriesStart: seriesDay, onOrAfter: day, anchor: pattern.anchor, missingDay: pattern.missingDay) {
+            case .unsupported: return nil
+            case .none: return .pastEnd
+            case .day(let found):
+                guard let at = place(found), let after = isInTail(at, split: namedStart) else { return nil }
+                guard after else { day = found.adding(days: 1); continue }
+                if let count {
+                    guard let before = RecurrenceTail.occurrences(
+                        of: pattern.rule, seriesStart: seriesDay, before: found, anchor: pattern.anchor, missingDay: pattern.missingDay)
+                    else { return nil }
+                    if before >= count { return .pastEnd }
+                }
+                if let until {
+                    guard let ends = endsBefore(at, until: until) else { return nil }
+                    if ends { return .pastEnd }
+                }
+                return .at(at)
+            }
+        }
+    }
+
+    /// Whether an `UNTIL` value ends the series before `place`: a UTC date-time compares by
+    /// instant, any other by date (a date `UNTIL` takes in its whole day). Nil when unreadable.
+    private static func endsBefore(_ place: GCalDateTime, until: String) -> Bool? {
+        if until.hasSuffix("Z"), until.count == 16, let instant = place.dateTime.flatMap(Date.fromISO8601) {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.calendar = gregorianUTC
+            formatter.timeZone = .gmt
+            formatter.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+            guard let end = formatter.date(from: until) else { return nil }
+            return end < instant
+        }
+        guard let untilDay = RecurrenceTail.Day(ical: until) else { return nil }
+        let placeDay: RecurrenceTail.Day?
+        if let date = place.date {
+            placeDay = RecurrenceTail.Day(iso: date)
+        } else {
+            placeDay = place.dateTime.flatMap(Date.fromISO8601).flatMap { RecurrenceTail.Day(iso: naive($0, in: .gmt)) }
+        }
+        guard let placeDay else { return nil }
+        return untilDay < placeDay
+    }
+
+    /// The exceptions of a series sorted by calendar order around a split (`partition`).
+    struct Parts {
+        /// Placed at or after the cut and shown at or after the occurrence named: carried or reset
+        /// as the split's mode says (`plan`).
+        var tail: [Exception] = []
+        /// Placed at or after the cut but shown before the occurrence named: carried into the new
+        /// part WHOLE, the fields the edit set included, in either mode, so they keep what they
+        /// show (`plan`'s `kept`).
+        var kept: [GCalEvent] = []
+        /// Placed before the cut (or anywhere, with no cut) but shown at or after the occurrence
+        /// named (the occurrence named among them, when it was moved later): edited where they
+        /// are, on the old series (`edits`).
+        var edited: [GCalEvent] = []
+    }
+
+    /// `exceptions` (every one the series holds, wherever it is placed) sorted around a split cut
+    /// at `cut` and named at an occurrence that starts at `namedStart`. A deleted occurrence goes
+    /// by its place; one placed before the cut and shown before the named one is not touched.
+    /// Nil when a place or start can't be read.
+    static func partition(_ exceptions: [Exception], cut: Cut, namedStart: GCalDateTime) -> Parts? {
+        var parts = Parts()
+        for exception in exceptions {
+            guard let place = exception.place else { return nil }
+            let placedAfter: Bool
+            switch cut {
+            case .pastEnd: placedAfter = false
+            case .at(let at):
+                guard let after = isInTail(place, split: at) else { return nil }
+                placedAfter = after
+            }
+            switch exception {
+            case .deleted:
+                if placedAfter { parts.tail.append(exception) }
+            case .changed(let event):
+                guard let start = event.start, let shownAfter = isInTail(start, split: namedStart) else { return nil }
+                switch (placedAfter, shownAfter) {
+                case (true, true): parts.tail.append(exception)
+                case (true, false): parts.kept.append(event)
+                case (false, true): parts.edited.append(event)
+                case (false, false): break
+                }
+            }
+        }
+        return parts
+    }
+
+    /// What an edit writes onto one occurrence it changes where it is: the fields the edit set,
+    /// and its own times (`start`, `end`, absolute) when the edit moves or ends it.
+    struct Edit {
+        let exception: GCalEvent
+        let start: GCalDateTime?
+        let end: GCalDateTime?
+    }
+
+    /// The writes of an edit onto `occurrences` where they are: each moved by `shift` (the new
+    /// start given less the named occurrence's start), and, when the edit set the end, lasting
+    /// `length` (the new part's) from its new start. Nil when a time can't be read.
+    static func edits(of occurrences: [GCalEvent], shift: TimeInterval, length: TimeInterval?, fields: Set<Field>) -> [Edit]? {
+        var out: [Edit] = []
+        for event in occurrences {
+            guard let start = event.start, let end = event.end else { return nil }
+            guard shift != 0 || fields.contains(.end) else {
+                out.append(Edit(exception: event, start: nil, end: nil))
+                continue
+            }
+            guard let movedStart = adding(shift, to: start) else { return nil }
+            let movedEnd: GCalDateTime?
+            if fields.contains(.end) {
+                guard let length else { return nil }
+                movedEnd = adding(length, to: movedStart)
+            } else {
+                movedEnd = adding(shift, to: end)
+            }
+            guard let movedEnd else { return nil }
+            out.append(Edit(exception: event, start: movedStart, end: movedEnd))
+        }
+        return out
+    }
+
+    /// The values of the fields the edit set (`fields`, not the end), as `source` holds them: the
+    /// new part once it is written, which a retry reads back, or the edit itself when the split
+    /// writes no new part (`Cut.pastEnd`).
+    static func values(of source: GCalEventInput, fields: Set<Field>) -> GCalEventInput {
+        var input = GCalEventInput()
+        if fields.contains(.summary) { input.summary = source.summary }
+        if fields.contains(.location) { input.location = source.location }
+        if fields.contains(.description) { input.description = source.description }
+        if fields.contains(.transparency) { input.transparency = source.transparency }
+        return input
+    }
+
+    /// `values(of:fields:)` read from the new part.
+    static func values(of part: GCalEvent, fields: Set<Field>) -> GCalEventInput {
+        var source = GCalEventInput()
+        source.summary = part.summary
+        source.location = part.location
+        source.description = part.description
+        source.transparency = part.transparency
+        return values(of: source, fields: fields)
+    }
+
+    /// The one-occurrence write of `edit` (`edits`): `values`, the guests' change `guests`, and
+    /// its times when it moves or ends elsewhere. The same input a "this occurrence" edit writes.
+    static func input(for edit: Edit, values: GCalEventInput, guests: AttendeeChange?) -> GCalEventInput {
+        var input = values
+        input.attendeeChange = guests
+        if let start = edit.start, let end = edit.end {
+            input.startDate = start.date
+            input.startDateTime = start.dateTime
+            input.startTimeZone = start.timeZone
+            input.endDate = end.date
+            input.endDateTime = end.dateTime
+            input.endTimeZone = end.timeZone
+        }
+        return input
+    }
+
+    /// The edits a retry writes onto `occurrences` (`Parts.edited` as the series holds them now):
+    /// each to the start `targets` kept for its place (`SplitRecord.edits`), so one already
+    /// written is not moved again. An occurrence with no target kept is not edited. Nil when a
+    /// time can't be read.
+    static func edits(of occurrences: [GCalEvent], targets: [String: String], length: TimeInterval?, fields: Set<Field>) -> [Edit]? {
+        var out: [Edit] = []
+        for event in occurrences {
+            guard let place = event.originalStartTime.map(key), let target = targets[place] else { continue }
+            guard let start = event.start else { return nil }
+            var shift: TimeInterval = 0
+            if !target.isEmpty {
+                guard let to = time(target), let moved = seconds(from: start, to: to) else { return nil }
+                shift = moved
+            }
+            guard let edit = edits(of: [event], shift: shift, length: length, fields: fields)?.first else { return nil }
+            out.append(edit)
+        }
+        return out
+    }
+
+    /// The edits' targets a split keeps on its record (`SplitRecord.edits`): each edited
+    /// occurrence's place (`key`) to the start it is moved to, or "" when it keeps its start.
+    static func targets(of edits: [Edit]) -> [String: String] {
+        var out: [String: String] = [:]
+        for edit in edits {
+            guard let place = edit.exception.originalStartTime else { continue }
+            out[key(place)] = edit.start.map(key) ?? ""
+        }
+        return out
+    }
+
+    /// A place or start as a record keeps it: its instant (ISO 8601, UTC) or its date.
+    static func key(_ time: GCalDateTime) -> String {
+        if let date = time.date { return String(date.prefix(10)) }
+        return time.dateTime.flatMap(Date.fromISO8601)?.iso8601String() ?? (time.dateTime ?? "")
+    }
+
+    /// The place or start a record keeps (`key`).
+    static func time(_ key: String) -> GCalDateTime? {
+        if key.contains("T") {
+            guard Date.fromISO8601(key) != nil else { return nil }
+            return GCalDateTime(dateTime: key, date: nil, timeZone: "UTC")
+        }
+        return day(key) != nil ? GCalDateTime(dateTime: nil, date: key, timeZone: nil) : nil
+    }
+
+    /// The time from `from` to `to`: seconds, or whole days in seconds for dates.
+    private static func seconds(from: GCalDateTime, to: GCalDateTime) -> TimeInterval? {
+        if let a = from.date.flatMap(day), let b = to.date.flatMap(day) { return b.timeIntervalSince(a) }
+        guard let a = from.dateTime.flatMap(Date.fromISO8601), let b = to.dateTime.flatMap(Date.fromISO8601) else { return nil }
+        return b.timeIntervalSince(a)
+    }
+
+    /// How far `edit` moves the occurrence that starts at `start`, and how long it then lasts when
+    /// the edit gives an end. Nil when a time can't be read.
+    static func moved(by edit: GCalEventInput, start: GCalDateTime) -> (shift: TimeInterval, length: TimeInterval?)? {
+        var shift: TimeInterval = 0
+        if let given = edit.startDate ?? edit.startDateTime {
+            let to = edit.startDate != nil
+                ? GCalDateTime(dateTime: nil, date: given, timeZone: nil)
+                : GCalDateTime(dateTime: given, date: nil, timeZone: edit.startTimeZone)
+            guard let seconds = seconds(from: start, to: to) else { return nil }
+            shift = seconds
+        }
+        guard let givenEnd = edit.endDate ?? edit.endDateTime else { return (shift, nil) }
+        guard let newStart = adding(shift, to: start) else { return nil }
+        let to = edit.endDate != nil
+            ? GCalDateTime(dateTime: nil, date: givenEnd, timeZone: nil)
+            : GCalDateTime(dateTime: givenEnd, date: nil, timeZone: edit.endTimeZone)
+        guard let length = seconds(from: newStart, to: to) else { return nil }
+        return (shift, length)
+    }
+
+    /// `occurrences` with the one placed at `place` (the occurrence named) last.
+    static func namedLast(_ occurrences: [GCalEvent], place: GCalDateTime?) -> [GCalEvent] {
+        guard let place else { return occurrences }
+        let isNamed = { (event: GCalEvent) in event.originalStartTime.map(key) == key(place) }
+        return occurrences.filter { !isNamed($0) } + occurrences.filter(isNamed)
+    }
+
+    /// The occurrence named, when the split places it in the new part (`Parts.tail`): found by
+    /// its place.
+    static func named(in parts: Parts, place: GCalDateTime) -> GCalEvent? {
+        for exception in parts.tail {
+            guard case .changed(let event) = exception, let at = event.originalStartTime else { continue }
+            if key(at) == key(place) { return event }
+        }
+        return nil
+    }
+
+    /// The shift a new part's start gives: from `cut` to where the new part starts. Zero when the
+    /// new part starts at its cut.
+    static func shift(cut: GCalDateTime, newPart: GCalEvent) -> TimeInterval? {
+        guard let start = newPart.start else { return nil }
+        if let date = cut.date {
+            guard let from = day(date), let to = start.date.flatMap(day) else { return nil }
+            return to.timeIntervalSince(from)
+        }
+        guard let from = cut.dateTime.flatMap(Date.fromISO8601), let to = start.dateTime.flatMap(Date.fromISO8601) else { return nil }
+        return to.timeIntervalSince(from)
     }
 
     /// Whether `place` is at or after the split at `split`: instants for a timed series, dates for

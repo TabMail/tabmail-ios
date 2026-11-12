@@ -388,6 +388,22 @@ Google Calendar's rule, measured on a test calendar, now followed on Google, Out
 - Carry writes send the providers' usual update emails to attendees (owner ruling: accepted).
 - A numbered series keeps its remaining COUNT on the new part (Google's own 8 -> 11 is not copied).
 
+**Split at a moved occurrence (amended 2026-11-12, owner ruling, supersedes "starts at the PLACE"
+above):** the split cuts where the named occurrence is now shown (`SplitCarry.cut`: its current start,
+or the next rule date on or after it; COUNT/UNTIL/RDATE honoured; an all-day one on the same date
+counts as after). `SplitCarry.partition` sorts every exception by where it is shown: at or after the
+cut goes to the new part (`tail`), before it stays on the capped series untouched (`kept`, written
+whole at its own times when the cap would drop its place), and the named one is `edited`.
+(a) an occurrence at exactly the cut changes; (b) a typed start shifts the later ones by the same
+amount (`partEdit`: t -> cut + (t - namedStart)); (c) a reset leaves those shown before untouched;
+(d) deletions between its old place and the cut stay deleted, even on a reset; (e) moved past the
+series' last occurrence (`Cut.pastEnd`): no new part, only it is edited (`editShown`), a rule change
+refused; (f) all-day same date = after. The shift and per-occurrence edits are on `SplitRecord`
+(`named_place`, `named_start`, `edits`), so a retry does not shift twice. Rows queued before this
+parse without them and are read as named at the cut. Tests: `SplitCarryTests` cut/partition,
+`movedSplit*` in `CalendarEditToolSeriesScopeTests` and `ExchangeSplitCarryTests`,
+`SplitCarryTests.calDAVMovedSplit*`/`calDAVPastEnd`.
+
 Tests: `SplitCarryTests`, `ExchangeSplitCarryTests` (whole copy, every page, failure before the cap
 and `finishSplit`, `carryOrder` against the fake's opt-in same-day refusal, deletes before moves,
 guests, end only), `CalendarEditToolSeriesScopeTests.renameSplitCarriesLaterExceptions` /
