@@ -568,4 +568,48 @@ struct CalendarToolResolvedAccountTests {
             #expect(queued.isEmpty, "got \(queued.count) queued op(s)")
         }
     }
+
+    // MARK: - send_invitations reaches the write
+
+    enum InvitingTool: String, CaseIterable, CustomTestStringConvertible {
+        case create, edit, delete
+        var testDescription: String { rawValue }
+    }
+
+    /// The tool keeps the call's `send_invitations` on the operation it queues, so the write asks the
+    /// calendar to notify guests only when the call said true (#778).
+    @Test("A tool's send_invitations reaches its write: true notifies guests, leaving it out notifies nobody",
+          arguments: InvitingTool.allCases, [true, false])
+    func sendInvitationsReachesTheWrite(_ kind: InvitingTool, given: Bool) async throws {
+        try await withCalendars(registered: [.a], preferred: .a) { f in
+            await f.mockA.setGetEventResult(Self.event(id: "evt-inv", summary: "Quarterly review"))
+            await f.mockA.setCreateEventResult(Self.event(id: "evt-created", summary: "Planning review"))
+            let ctx = ToolContext(db: f.pool, translator: MockChatIdTranslator())
+            let invocation = ToolInvocation(uiSink: RecordingConfirmSink(), sessionKey: "cal-tool-inv-\(kind.rawValue)")
+            let eventId = JSONValue.string(CompoundEventId.make(accountId: f.accountA, eventId: "evt-inv"))
+            var args: [String: JSONValue]
+            switch kind {
+            case .create: args = Self.createArguments
+            case .edit: args = ["event_id": eventId, "title": .string("Renamed review"), "all_day": .bool(false)]
+            case .delete: args = ["event_id": eventId]
+            }
+            if given { args["send_invitations"] = .bool(true) }
+            let output: String
+            switch kind {
+            case .create: output = try await CalendarEventCreateTool(context: ctx).execute(arguments: args, invocation: invocation)
+            case .edit: output = try await CalendarEventEditTool(context: ctx).execute(arguments: args, invocation: invocation)
+            case .delete: output = try await CalendarEventDeleteTool(context: ctx).execute(arguments: args, invocation: invocation)
+            }
+            await AccountManager.shared.drainCalendarQueue()
+            let sent: [String]
+            switch kind {
+            case .create: sent = await f.mockA.createdEvents.map(\.sendUpdates)
+            case .edit: sent = await f.mockA.updatedEvents.map(\.sendUpdates)
+            case .delete: sent = await f.mockA.deletedEvents.map(\.sendUpdates)
+            }
+            // A write the mock answers without a result may be retried; every attempt must ask the same.
+            #expect(!sent.isEmpty && sent.allSatisfy { $0 == (given ? "all" : "none") },
+                    "send_invitations \(given) wrote \(sent); tool said: \(output)")
+        }
+    }
 }

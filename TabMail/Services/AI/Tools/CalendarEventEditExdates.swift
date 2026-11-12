@@ -22,8 +22,9 @@ import Foundation
 ///   (`AccountManager.queueCalendarOperations`): all or nothing. Nothing is looked up again.
 /// - The result names each date beside the start of the occurrence it named, deleted, queued or
 ///   failed with the reason; never "updated". An occurrence id equal to the series' is refused.
-/// - Each delete carries the call's `send_invitations`, so guests are notified only when it is true
-///   (`CalendarToolHelpers.sendUpdates`, in the queue).
+/// - Each delete carries the call's `send_invitations`, which the queue passes as `sendUpdates`
+///   (`CalendarToolHelpers.sendUpdates`): on Google, guests are notified only when it is true. Outlook
+///   and CalDAV notify guests through the provider or the server, whatever it says.
 enum CalendarEventEditExdates {
 
     /// How long the tool waits, for every queued delete together, for the drain to report them

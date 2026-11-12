@@ -120,4 +120,85 @@ struct CalendarQueueSendInvitationsTests {
         let sent = try await drain(type: .delete, sendInvitations: entry.element.given, index: entry.offset)
         #expect(sent == [entry.element.expected], "send_invitations \(String(describing: entry.element.given)) sent \(sent)")
     }
+
+    /// `yyyy-MM-dd'T'HH:mm:ss` in UTC at 09:00, `days` days from today.
+    private static func at9(_ days: Int) -> String {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC")!
+        let day = cal.date(byAdding: .day, value: days, to: cal.startOfDay(for: Date())) ?? Date()
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd'T'09:00:00"
+        fmt.timeZone = cal.timeZone
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        return fmt.string(from: day)
+    }
+
+    /// A weekly timed series with a guest, and its occurrence a week after it starts.
+    private static func series() -> GCalEvent {
+        GCalEvent(
+            id: "ser-1", summary: "Standup", location: nil, description: nil,
+            start: GCalDateTime(dateTime: at9(14) + "Z", date: nil, timeZone: "UTC"),
+            end: GCalDateTime(dateTime: at9(14).replacingOccurrences(of: "T09:00", with: "T09:30") + "Z", date: nil, timeZone: "UTC"),
+            attendees: [GCalAttendee(email: "guest@example.com", displayName: nil, responseStatus: "needsAction", organizer: nil, self: nil)],
+            organizer: nil, recurrence: ["RRULE:FREQ=WEEKLY"],
+            transparency: nil, status: nil, htmlLink: nil, created: nil, updated: nil)
+    }
+
+    private static func occurrence() -> GCalEvent {
+        var occurrence = GCalEvent(
+            id: "ser-1_occ", summary: "Standup", location: nil, description: nil,
+            start: GCalDateTime(dateTime: at9(21) + "Z", date: nil, timeZone: "UTC"),
+            end: GCalDateTime(dateTime: at9(21).replacingOccurrences(of: "T09:00", with: "T09:30") + "Z", date: nil, timeZone: "UTC"),
+            attendees: nil, organizer: nil, recurrence: nil,
+            transparency: nil, status: nil, htmlLink: nil, created: nil, updated: nil,
+            recurringEventId: "ser-1")
+        occurrence.originalStartTime = occurrence.start
+        return occurrence
+    }
+
+    /// Queues a retitle of one occurrence (`this_only`) or of it and the ones after it
+    /// (`this_and_following`), drains it, and returns the `sendUpdates` the provider was asked for.
+    private func drainSeriesEdit(scope: String, sendInvitations: JSONValue?, index: Int) async throws -> [String] {
+        let accountId = "cal-sendinv-\(scope)-\(index)"
+        let (pool, dir, previous) = try makeTestDB(accountId: accountId)
+        let mock = MockCalendarProvider()
+        await mock.setGetEventResult(Self.series())
+        await mock.setOccurrenceResult(Self.occurrence())
+        await mock.setUpdateOccurrenceResult(Self.occurrence())
+        await mock.setSplitSeriesResult(Self.series())
+        await AccountManager.shared.registerCalendarProviderForTesting(accountId: accountId, provider: mock)
+        defer {
+            Task { await AccountManager.shared.unregisterCalendarProviderForTesting(accountId: accountId) }
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir)
+        }
+        var args: [String: JSONValue] = [
+            "title": .string("Standup moved"), "all_day": .bool(false), "timezone": .string("UTC"),
+            "edit_scope": .string(scope), "recurrence_id": .string(Self.at9(21)),
+        ]
+        if let sendInvitations { args["send_invitations"] = sendInvitations }
+        let rows = try await drainEdit(accountId: accountId, eventId: "ser-1", calendarId: "primary",
+                                       arguments: args, provider: mock)
+        #expect(rows.isEmpty, "the edit was not written: \(rows.map { $0.failureReason ?? $0.status })")
+        return scope == "this_only"
+            ? await mock.updatedOccurrences.map(\.sendUpdates)
+            : await mock.splitSeriesCalls.map(\.sendUpdates)
+    }
+
+    @Test("a queued edit of one occurrence notifies guests only when send_invitations is true", arguments: Array(cases.enumerated()))
+    func editOccurrence(entry: (offset: Int, element: (given: JSONValue?, expected: String))) async throws {
+        let sent = try await drainSeriesEdit(scope: "this_only", sendInvitations: entry.element.given, index: entry.offset)
+        #expect(sent == [entry.element.expected], "send_invitations \(String(describing: entry.element.given)) sent \(sent)")
+    }
+
+    @Test("a queued split (this and following) notifies guests only when send_invitations is true", arguments: Array(cases.enumerated()))
+    func editSplit(entry: (offset: Int, element: (given: JSONValue?, expected: String))) async throws {
+        let sent = try await drainSeriesEdit(scope: "this_and_following", sendInvitations: entry.element.given, index: entry.offset)
+        #expect(sent == [entry.element.expected], "send_invitations \(String(describing: entry.element.given)) sent \(sent)")
+    }
+
+    @Test("send_invitations given as the text \"true\" notifies nobody: only a true boolean does")
+    func textTrueNotifiesNobody() async throws {
+        let sent = try await drain(type: .delete, sendInvitations: .string("true"), index: 9)
+        #expect(sent == ["none"], "send_invitations \"true\" (text) sent \(sent)")
+    }
 }
