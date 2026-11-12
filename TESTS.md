@@ -49,7 +49,9 @@ unrecognized stored zone keeps the write's earlier label (#746). The fake also s
 series write whose start or end is labelled with a zone other than the range's two days longer, as
 measured for #747 (`allDaySeriesLengthened`); `ExchangeAllDaySeriesLengthTests` holds a whole-series
 move, a length edit and a split of an all-day series kept in Pacific, Tokyo or an IANA zone to the
-series' length and zone.
+series' length and zone. `ExchangeSeriesDayTests` holds a series kept in Tokyo, moved or split
+across midnight in only one of the series' and the device's zones, to a range `startDate` on the
+written start's day in the series' zone.
 `ExchangeSeriesZoneHelperTests` pins `inSeriesZone` (the British Columbia change, DST edges, the date
 line, fractional offsets, a stored IANA name, an unknown zone, an all-day relabel, and the instant property).
 The fake also models the recurrence

@@ -1928,8 +1928,10 @@ struct ExchangeCalendarEditPreservationTests {
         patch.endTimeZone = zone.label
 
         let answer = provider.editResetsChangedOccurrences(read, edit: patch)
-        // A label no zone is known by can't be written in the series' zone (#719): Exchange refuses
-        // it beside the series' stored zone, and nothing changes.
+        // A label no zone is known by can't be written in the series' zone (#719): the app sends it
+        // as given and Graph refuses it (the fake's measured 400 for another zone; a made-up name is
+        // measured refused too), so nothing changes. The tools never give one: an unrecognized
+        // `timezone` is refused before the card (`resolveWriteTimeZone`).
         if zone == .unresolvable {
             await #expect(throws: (any Error).self) { _ = try await provider.updateEvent(eventId: "ser-w", event: patch) }
             #expect(answer, "\(zone): the card says no reset")

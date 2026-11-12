@@ -100,7 +100,16 @@ that aren't included in the request body maintain their previous values".
   time") writes that instant in the series' zone, as Google Calendar does; re-zoning a series is #667.
   A stored zone the app can't convert (`Customized Time Zone`, not recognized by
   `CalendarTimeZoneResolver`) keeps the label the write had before #719, unchanged; what Exchange does
-  with it is not measured (#746). Reads still ask for the device's zone, so a write no longer echoes
+  with it is not measured (#746). A timed label no zone is known by is sent as given and refused by
+  Graph (400), not by the app; the tools never give one, since an unrecognized `timezone` is refused
+  before the card (`resolveWriteTimeZone`), and a start or end that names no instant is refused
+  before the card too (`CalendarToolHelpers.unreadableWallTime`). A wall time a clock change skips
+  is read as the instant an hour on (Foundation's reading, the tools' too), so it is written there.
+  The range's `startDate` beside a series start, a whole-series date-move check and a split's new
+  part are all dated in the series' zone (`ExchangeCalendarProvider.seriesDay`), so the start and
+  its range always name the same day; before, they were dated on the device, which named another
+  day whenever the device and the series disagreed on the date (pinned by `ExchangeSeriesDayTests`).
+  Reads still ask for the device's zone, so a write no longer echoes
   the read's label. Pinned by `ExchangeSeriesZoneLabelTests` (through the queue, on
   `FakeGraphCalendar`'s measured refusal) and `ExchangeSeriesZoneHelperTests`.
 - **An all-day series' dates are written under the series' stored zone too (#747, 2026-11-11).** The

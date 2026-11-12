@@ -426,3 +426,103 @@ struct ExchangeAllDaySeriesLengthTests {
                 "\(stored): the capped series is \(canonical(series?["start"])) to \(canonical(series?["end"]))")
     }
 }
+
+// INVARIANT (system property, #719 review): a series' start and its range's `startDate` name the
+// same day, in the series' zone, and a move writes a new `startDate` exactly when that day changes.
+// The series is kept far from the device (`Tokyo Standard Time`; Graph renders its times in the
+// device's zone on a read), so its day and the device's differ across most of the day. Not modelled
+// by the fake (unmeasured what Graph does with a mismatch), so asserted on the written body.
+@Suite("An Outlook series' start and range start name the same day in the series' zone (#719)", .serialized, .processGlobalState)
+struct ExchangeSeriesDayTests {
+    static let tokyo = "Tokyo Standard Time"
+    static var device: String { TimeZone.current.identifier }
+    static func dayIn(_ date: Date, _ zoneName: String) -> String { String(wall(date, in: zoneName).prefix(10)) }
+
+    /// Each pair (series start, new start) as Tokyo wall times on `day(0)`/`day(1)`.
+    static let intoTheNextSeriesDay = (at(day(0), "20:00:00", in: "Asia/Tokyo"), at(day(1), "08:00:00", in: "Asia/Tokyo"))
+    static let intoTheNextDeviceDay = (at(day(0), "08:00:00", in: "Asia/Tokyo"), at(day(0), "20:00:00", in: "Asia/Tokyo"))
+    static var seriesDayOnlyCrosses: Bool {
+        dayIn(intoTheNextSeriesDay.0, device) == dayIn(intoTheNextSeriesDay.1, device)
+    }
+    static var deviceDayOnlyCrosses: Bool {
+        dayIn(intoTheNextDeviceDay.0, device) != dayIn(intoTheNextDeviceDay.1, device)
+    }
+    static var deviceDayIsNotTokyos: Bool {
+        dayIn(intoTheNextDeviceDay.0, device) != dayIn(intoTheNextDeviceDay.0, "Asia/Tokyo")
+    }
+
+    func move(_ graph: FakeGraphCalendar, to newStart: Date) async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        graph.install(on: http)
+        var patch = GCalEventInput()
+        patch.startDateTime = newStart.iso8601String(timeZone: zone("Asia/Tokyo"))
+        patch.startTimeZone = "Asia/Tokyo"
+        patch.endDateTime = newStart.addingTimeInterval(3_600).iso8601String(timeZone: zone("Asia/Tokyo"))
+        patch.endTimeZone = "Asia/Tokyo"
+        let provider = ExchangeCalendarProvider(mailbox: "calendar@example.com", accessToken: { _ in "test-token" },
+                                                session: http.session)
+        _ = try await provider.updateEvent(eventId: ZoneSeries.id, event: patch)
+    }
+
+    @Test("a move into the next day in the series' zone, the same day on the device, writes the range start on the series' new day",
+          .enabled(if: seriesDayOnlyCrosses))
+    func moveCrossesTheSeriesDayOnly() async throws {
+        let (from, to) = Self.intoTheNextSeriesDay
+        let graph = ZoneSeries.calendar(start: from, label: Self.device, stored: Self.tokyo)
+        try await move(graph, to: to)
+
+        let sent = graph.patches(ZoneSeries.id).last
+        let range = (sent?["recurrence"] as? [String: Any])?["range"] as? [String: Any]
+        #expect(range?["startDate"] as? String == Self.dayIn(to, "Asia/Tokyo"),
+                "the series moved to \(Self.dayIn(to, "Asia/Tokyo")) in its zone; the write's range: \(canonical(range))")
+        #expect(range?["startDate"] as? String == dateOf(sent?["start"]),
+                "the range starts \(range?["startDate"] as? String ?? "none"), the start \(canonical(sent?["start"]))")
+        #expect(label(sent?["start"]) == Self.tokyo && label(sent?["end"]) == Self.tokyo,
+                "the write is labelled \(canonical(sent?["start"])) to \(canonical(sent?["end"]))")
+    }
+
+    @Test("a move into the next day on the device, the same day in the series' zone, writes no recurrence",
+          .enabled(if: deviceDayOnlyCrosses))
+    func moveCrossesTheDeviceDayOnly() async throws {
+        let (from, to) = Self.intoTheNextDeviceDay
+        let graph = ZoneSeries.calendar(start: from, label: Self.device, stored: Self.tokyo)
+        try await move(graph, to: to)
+
+        let sent = graph.patches(ZoneSeries.id)
+        #expect(sent.count == 1 && sent.allSatisfy { $0["recurrence"] == nil },
+                "the series stays on its day in its zone, yet the write carried \(sent.map { canonical($0["recurrence"]) })")
+        #expect(dateOf(sent.last?["start"]) == Self.dayIn(from, "Asia/Tokyo"), "the start is written \(canonical(sent.last?["start"]))")
+        #expect(instant(graph.event(ZoneSeries.id)?["start"]) == to, "the series starts \(canonical(graph.event(ZoneSeries.id)?["start"]))")
+    }
+
+    @Test("a split's new part, renamed or moved within the series' day across the device's midnight, starts its range on its start's day",
+          .enabled(if: deviceDayIsNotTokyos), arguments: [false, true])
+    func splitRangeStartsOnTheStartsDay(_ moved: Bool) async throws {
+        // Weekly from day(0) at 20:00 Tokyo, or 08:00 for the rename; split at the second occurrence.
+        let first = moved ? Self.intoTheNextDeviceDay.1 : Self.intoTheNextDeviceDay.0
+        let graph = ZoneSeries.calendar(start: first, label: Self.device, stored: Self.tokyo)
+        let split = ZoneSeries.place(first, week: 1, stored: Self.tokyo)
+        let newStart = moved ? split.addingTimeInterval(-12 * 3_600) : split
+        var arguments: [String: JSONValue] = [
+            "edit_scope": .string("this_and_following"), "recurrence_id": .string(wall(split, in: Self.device)),
+            "title": .string("Renamed"), "timezone": .string(Self.device),
+        ]
+        if moved {
+            arguments["start_iso"] = .string(wall(newStart, in: Self.device))
+            arguments["end_iso"] = .string(wall(newStart.addingTimeInterval(3_600), in: Self.device))
+        }
+        let rows = try await outlook(graph, arguments, account: "seriesday-split-\(moved)")
+
+        #expect(rows.isEmpty, "the split was not written: \(reasons(rows))")
+        #expect(graph.created.count == 1, "\(graph.created.count) new parts")
+        guard graph.created.count == 1 else { return }
+        let created = graph.created[0]
+        #expect(instant(created["start"]) == newStart, "the new part starts \(canonical(created["start"]))")
+        #expect(rangeOf(created)?["startDate"] as? String == dateOf(created["start"]),
+                "the new part's range starts \(canonical(rangeOf(created))), its start \(canonical(created["start"]))")
+        #expect(rangeOf(created)?["startDate"] as? String == Self.dayIn(newStart, "Asia/Tokyo"),
+                "the new part's range starts \(canonical(rangeOf(created))), on \(Self.dayIn(newStart, "Asia/Tokyo")) in the series' zone")
+        #expect(label(created["end"]) == Self.tokyo, "the new part's end is labelled \(canonical(created["end"]))")
+    }
+}

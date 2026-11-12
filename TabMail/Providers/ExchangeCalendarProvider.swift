@@ -745,7 +745,12 @@ actor ExchangeCalendarProvider: CalendarProvider {
         let edited = GoogleCalendarProvider.mergeMasterAndPatch(
             master: stored.event, patch: patch, newStartNaiveISO: newStartNaiveISO,
             newStartZone: newStartZone, newRecurrence: [])
-        guard let newDay = Self.day(edited.startDate, edited.startDateTime, in: edited.startTimeZone) else {
+        // Dated in the zone the new part is written in (#719): the copied range's, so its start
+        // and its range's `startDate` name the same day.
+        let copiedZone = patch.recurrence?.isEmpty ?? true
+            ? ((stored.raw["recurrence"] as? [String: Any])?["range"] as? [String: Any])?["recurrenceTimeZone"] as? String
+            : nil
+        guard let newDay = Self.seriesDay(edited.startDate, edited.startDateTime, in: edited.startTimeZone, seriesZone: copiedZone) else {
             throw CalendarProviderError.notSupported("The repeating event's start can't be read, so it can't be split.")
         }
         var written = GCalEventInput()
@@ -1028,8 +1033,8 @@ actor ExchangeCalendarProvider: CalendarProvider {
         if allowRecurrence, sparse.recurrence == nil, movesTime,
            var stored = existing.raw["recurrence"] as? [String: Any],
            var range = stored["range"] as? [String: Any],
-           let newDay = Self.day(merged.startDate, merged.startDateTime, in: merged.startTimeZone),
-           newDay != Self.day(current.start?.date, current.start?.dateTime, in: current.start?.timeZone) {
+           let newDay = Self.seriesDay(merged.startDate, merged.startDateTime, in: merged.startTimeZone, seriesZone: storedZoneName),
+           newDay != Self.seriesDay(current.start?.date, current.start?.dateTime, in: current.start?.timeZone, seriesZone: storedZoneName) {
             range["startDate"] = newDay
             stored["range"] = range
             json["recurrence"] = stored
@@ -1234,6 +1239,21 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// The tools spell a start with its label's offset, so that wall time is the
     /// instant the start names. A string in no `yyyy-MM-ddTHH:mm:ss` form (no
     /// wall time, or a one-digit hour such as `…T9:00`) is dated as written.
+    /// The day a start falls on in the series' zone `seriesZone` (its range's `recurrenceTimeZone`,
+    /// as Graph returned it): the day a series' start is written on since #719, so a range's
+    /// `startDate` and the start it is written beside name the same day, and a move changes the
+    /// series' date exactly when it changes that day. An all-day `date` is its own day. When the
+    /// series names no zone, or one TabMail does not recognize (#746), the device's day (`day`), as
+    /// before #719, because the start is then written as it was given.
+    nonisolated static func seriesDay(_ date: String?, _ dateTime: String?, in timeZone: String?, seriesZone: String?) -> String? {
+        if let date { return String(date.prefix(10)) }
+        guard let dateTime, let seriesZone, let series = CalendarTimeZoneResolver.zone(named: seriesZone, in: .none),
+              let given = CalendarTimeZoneResolver.zone(named: timeZone ?? TimeZone.current.identifier, in: .none)
+        else { return day(date, dateTime, in: timeZone) }
+        return RecurrenceOccurrenceResolver.renderNaive(String(graphNaiveDateTime(dateTime).prefix(19)), from: given, to: series)
+            .map { String($0.prefix(10)) }
+    }
+
     nonisolated static func day(_ date: String?, _ dateTime: String?, in timeZone: String?) -> String? {
         if let date { return String(date.prefix(10)) }
         guard let dateTime else { return nil }
@@ -1685,7 +1705,9 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// the stored name is the one label measured accepted that needs no mapping table.
     ///
     /// Given as it is when there is no series zone, or when the label, the series zone or the wall
-    /// time can't be read: the write keeps the label it had before #719. What Exchange does with a
+    /// time can't be read: the write keeps the label it had before #719. (A wall time a clock change
+    /// skips is read, as the instant an hour on, as the tools read it; a time that can't be read at
+    /// all is refused before the card, `CalendarToolHelpers.unreadableWallTime`.) What Exchange does with a
     /// series kept in a zone the app does not recognize (`Customized Time Zone`) is not measured
     /// (#746).
     ///

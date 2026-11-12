@@ -615,6 +615,23 @@ struct RecurrenceDaysToolTests {
         }
     }
 
+    @Test("an edit whose start or end names no time is refused before the card, naming it, with nothing sent (#719)",
+          arguments: ["start_iso", "end_iso"])
+    func unreadableTimeRefusedBeforeTheCard(_ key: String) async throws {
+        let mock = MockCalendarProvider()
+        await mock.setGetEventResult(Self.event(id: "evt-series"))
+        try await withCalendar(mock) { pool in
+            let sink = RecordingConfirmSink()
+            let output = try await CalendarEventEditTool(context: ToolContext(db: pool, translator: MockChatIdTranslator())).execute(
+                arguments: ["event_id": .string("evt-series"), key: .string("next Tuesday T9"), "timezone": .string("America/New_York")],
+                invocation: ToolInvocation(uiSink: sink, sessionKey: "rd-edit-time"))
+            #expect(output.contains(key) && output.contains("next Tuesday T9") && output.contains("NOT changed"), "tool said: \(output)")
+            #expect(sink.calendarEvents.isEmpty, "a card was shown for a time that names no instant")
+            let updated = await mock.updatedEvents
+            #expect(updated.isEmpty)
+        }
+    }
+
     @Test("an invalid until is refused before the create and edit cards on Google, Outlook and CalDAV, with nothing sent",
           arguments: ["google", "outlook", "caldav"])
     func invalidUntilRefusedOnEveryCalendar(_ calendar: String) async throws {

@@ -141,7 +141,18 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         // the device's zone (which would move the event to the wrong time). The queue refuses it
         // the same way (`resolveWriteTimeZone`) for an edit that reaches it.
         do {
-            _ = try CalendarToolHelpers.resolveWriteTimeZone(arguments, consequence: "it did not change the event")
+            let zone = try CalendarToolHelpers.resolveWriteTimeZone(arguments, consequence: "it did not change the event")
+            // A start or end that names no instant can't be written at a time the card shows:
+            // refused here, with nothing written, rather than sent and refused after the card
+            // (#719: an Outlook series write is converted to the series' zone, which needs the
+            // instant).
+            if let reason = CalendarToolHelpers.unreadableWallTime(arguments, in: zone) {
+                return ToolJSON.string(from: [
+                    "ok": false,
+                    "error": "calendar_event_edit failed: \(reason) The event was NOT changed. Correct the time and call calendar_event_edit again.",
+                    "event_id": compoundId,
+                ] as [String: Any])
+            }
         } catch CalendarProviderError.notSupported(let reason) {
             return ToolJSON.string(from: [
                 "ok": false,

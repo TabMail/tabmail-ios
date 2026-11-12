@@ -137,6 +137,39 @@ struct ExchangeSeriesZoneHelperTests {
         }
     }
 
+    @Test("U8: a wall time a clock change skips is read as the instant an hour on, as the tools read it, and written in the series' zone")
+    func skippedWallTime() throws {
+        // The US spring-forward Sunday of next year, 02:30 in New York: no such wall time.
+        let change = sunday(2, of: 3, hour: 0)
+        let wallText = String(wall(change, in: "UTC").prefix(10)) + "T02:30:00"
+        let given: [String: Any] = ["dateTime": wallText, "timeZone": "America/New_York"]
+        let read = try #require(CalendarToolHelpers.toolInstant(wallText, timeZone: zone("America/New_York")))
+        let out = ExchangeCalendarProvider.inSeriesZone(given, seriesZone: "Pacific Standard Time", allDay: false)
+        #expect(out["timeZone"] as? String == "Pacific Standard Time", "kept \(out)")
+        #expect(instant(out) == read, "\(given) became \(out), not the instant the tools read")
+        #expect(CalendarToolHelpers.unreadableWallTime(["start_iso": .string(wallText)], in: zone("America/New_York")) == nil,
+                "a skipped wall time is refused")
+        #expect(CalendarToolHelpers.unreadableWallTime(["start_iso": .string("soon")], in: zone("America/New_York")) == nil,
+                "a value with no time part is the date check's")
+        #expect(CalendarToolHelpers.unreadableWallTime(["end_iso": .string("\(wallText.prefix(10))T25:99")], in: zone("America/New_York")) != nil,
+                "an unreadable time is not refused")
+    }
+
+    @Test("U9: a start's day in the series' zone is the date of the start written there; a series with no zone known keeps the device's day")
+    func seriesDay() throws {
+        let date = next(month: 4, day: 7, hour: 8, in: "Asia/Tokyo")
+        let given = wall(date, in: "Asia/Tokyo")
+        let pacific = ExchangeCalendarProvider.seriesDay(nil, given, in: "Asia/Tokyo", seriesZone: "Pacific Standard Time")
+        let written = ExchangeCalendarProvider.inSeriesZone(["dateTime": given, "timeZone": "Asia/Tokyo"], seriesZone: "Pacific Standard Time", allDay: false)
+        #expect(pacific == (written["dateTime"] as? String).map { String($0.prefix(10)) }, "\(pacific ?? "none") vs \(written)")
+        #expect(pacific == String(wall(date, in: "America/Los_Angeles").prefix(10)))
+        #expect(ExchangeCalendarProvider.seriesDay("2027-01-05", nil, in: nil, seriesZone: "Tokyo Standard Time") == "2027-01-05")
+        for unknown in [nil, "Customized Time Zone"] as [String?] {
+            #expect(ExchangeCalendarProvider.seriesDay(nil, given, in: "Asia/Tokyo", seriesZone: unknown)
+                        == ExchangeCalendarProvider.day(nil, given, in: "Asia/Tokyo"), "\(unknown ?? "none")")
+        }
+    }
+
     @Test("property: every sampled (label, stored zone, date) keeps its instant and takes the stored name verbatim")
     func instantAndNameProperty() throws {
         let labels = ["America/Vancouver", "America/New_York", "UTC", "Asia/Tokyo", "Asia/Kathmandu",
