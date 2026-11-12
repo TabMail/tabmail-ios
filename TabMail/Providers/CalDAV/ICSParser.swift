@@ -307,22 +307,14 @@ enum ICSParser {
 
     private static func parseICSDate(_ value: String, params: String?, zones: CalendarTimeZoneContext) -> Date? {
         let cleaned = value.trimmingCharacters(in: .whitespaces)
-        let fmt = DateFormatter()
-        fmt.locale = Locale(identifier: "en_US_POSIX")
-
         if cleaned.hasSuffix("Z") {
-            fmt.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
-            fmt.timeZone = TimeZone(identifier: "UTC")
-            return fmt.date(from: cleaned)
+            return FixedDateFormat.formatter("yyyyMMdd'T'HHmmss'Z'", timeZone: .gmt).date(from: cleaned)
         }
         if cleaned.count == 8 {
-            fmt.dateFormat = "yyyyMMdd"
-            fmt.timeZone = .current
-            return fmt.date(from: cleaned)
+            return FixedDateFormat.formatter("yyyyMMdd", timeZone: .current).date(from: cleaned)
         }
-        fmt.dateFormat = "yyyyMMdd'T'HHmmss"
-        fmt.timeZone = wallTimeZone(params: params, zones: zones)
-        return fmt.date(from: cleaned)
+        return FixedDateFormat.formatter("yyyyMMdd'T'HHmmss", timeZone: wallTimeZone(params: params, zones: zones))
+            .date(from: cleaned)
     }
 
     /// The zone this parser reads a DATE-TIME's wall time in: the zone the TZID
@@ -358,10 +350,7 @@ enum ICSParser {
         let isDate = ICSValueType.statesDate(dtstartParams ?? "")
             || (value.count == 8 && !value.contains("T"))
         guard isDate else { return value }
-        let fmt = DateFormatter()
-        fmt.locale = Locale(identifier: "en_US_POSIX")
-        fmt.timeZone = TimeZone(identifier: "UTC")
-        fmt.dateFormat = "yyyyMMdd"
+        let fmt = FixedDateFormat.formatter("yyyyMMdd", timeZone: .gmt)
         var utc = Calendar(identifier: .gregorian)
         utc.timeZone = TimeZone(identifier: "UTC") ?? .current
         guard let day = fmt.date(from: value), let next = utc.date(byAdding: .day, value: 1, to: day) else { return nil }

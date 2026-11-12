@@ -206,11 +206,7 @@ actor DemoCalendarProvider: CalendarProvider {
         // ASCII digits. A DateFormatter left on the device locale renders the
         // device calendar and numerals (Buddhist years, Arabic-Indic digits),
         // which the date-only consumers cannot place (#166).
-        let dayFormatter = DateFormatter()
-        dayFormatter.locale = Locale(identifier: "en_US_POSIX")
-        dayFormatter.calendar = Calendar(identifier: .gregorian)
-        dayFormatter.dateFormat = "yyyy-MM-dd"
-        dayFormatter.timeZone = TimeZone(identifier: "UTC")
+        let dayFormatter = FixedDateFormat.formatter("yyyy-MM-dd", timeZone: .gmt)
 
         let startDT: GCalDateTime
         let endDT: GCalDateTime
@@ -244,11 +240,7 @@ actor DemoCalendarProvider: CalendarProvider {
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         // Parse the caller's Gregorian ASCII DATE on every device locale (the
         // writer above pins the same contract).
-        let dayFormatter = DateFormatter()
-        dayFormatter.locale = Locale(identifier: "en_US_POSIX")
-        dayFormatter.calendar = Calendar(identifier: .gregorian)
-        dayFormatter.dateFormat = "yyyy-MM-dd"
-        dayFormatter.timeZone = TimeZone(identifier: "UTC")
+        let dayFormatter = FixedDateFormat.formatter("yyyy-MM-dd", timeZone: .gmt)
 
         var startDate = Date()
         var endDate = Date().addingTimeInterval(3600)

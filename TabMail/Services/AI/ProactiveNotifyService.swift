@@ -206,7 +206,7 @@ actor ProactiveNotifyService {
         }
         // Within window check
         if let dueDateStr = reminder.dueDate, let dueDate = parseDateStatic(dueDateStr) {
-            let calendar = Calendar.current
+            let calendar = Calendar(identifier: .gregorian)
             let today = calendar.startOfDay(for: now)
             let dueMidnight = calendar.startOfDay(for: dueDate)
             let daysDiff = calendar.dateComponents([.day], from: today, to: dueMidnight).day ?? 0
@@ -222,7 +222,7 @@ actor ProactiveNotifyService {
     /// Static version of parseDueDateTime for use in static methods.
     static func parseDueDateTimeStatic(_ reminder: Reminder) -> Date? {
         guard let dueDateStr = reminder.dueDate, let date = parseDateStatic(dueDateStr) else { return nil }
-        let calendar = Calendar.current
+        let calendar = Calendar(identifier: .gregorian)
         var components = calendar.dateComponents([.year, .month, .day], from: date)
         if let timeStr = reminder.dueTime {
             let timeParts = timeStr.split(separator: ":")
@@ -238,16 +238,7 @@ actor ProactiveNotifyService {
     }
 
     private static func parseDateStatic(_ str: String) -> Date? {
-        let parts = str.split(separator: "-")
-        guard parts.count == 3,
-              let year = Int(parts[0]),
-              let month = Int(parts[1]),
-              let day = Int(parts[2]) else { return nil }
-        var comps = DateComponents()
-        comps.year = year
-        comps.month = month
-        comps.day = day
-        return Calendar.current.date(from: comps)
+        FixedDateFormat.gregorianDay(str, timeZone: .current)
     }
 
     /// Schedule `UNCalendarNotificationTrigger` for reminders with due dates.
@@ -274,6 +265,8 @@ actor ProactiveNotifyService {
             windowDays: windowDays
         )
 
+        // The trigger matches these components in the phone's calendar, so they come
+        // from the phone's calendar (an instant split, not a stored Gregorian day).
         let calendar = Calendar.current
         for (fireDate, reminder) in toSchedule {
             let content = UNMutableNotificationContent()
@@ -491,7 +484,7 @@ actor ProactiveNotifyService {
     private func isWithinWindow(_ reminder: Reminder) -> Bool {
         guard let dueDateStr = reminder.dueDate else { return true }
         guard let dueDate = parseDate(dueDateStr) else { return true }
-        let calendar = Calendar.current
+        let calendar = Calendar(identifier: .gregorian)
         let today = calendar.startOfDay(for: Date())
         let dueMidnight = calendar.startOfDay(for: dueDate)
         let daysDiff = calendar.dateComponents([.day], from: today, to: dueMidnight).day ?? 0
@@ -501,7 +494,7 @@ actor ProactiveNotifyService {
     /// Parse "YYYY-MM-DD" + optional "HH:MM" into a Date.
     private func parseDueDateTime(_ reminder: Reminder) -> Date? {
         guard let dueDateStr = reminder.dueDate, let date = parseDate(dueDateStr) else { return nil }
-        let calendar = Calendar.current
+        let calendar = Calendar(identifier: .gregorian)
         var components = calendar.dateComponents([.year, .month, .day], from: date)
         if let timeStr = reminder.dueTime {
             let timeParts = timeStr.split(separator: ":")
@@ -517,15 +510,6 @@ actor ProactiveNotifyService {
     }
 
     private func parseDate(_ str: String) -> Date? {
-        let parts = str.split(separator: "-")
-        guard parts.count == 3,
-              let year = Int(parts[0]),
-              let month = Int(parts[1]),
-              let day = Int(parts[2]) else { return nil }
-        var comps = DateComponents()
-        comps.year = year
-        comps.month = month
-        comps.day = day
-        return Calendar.current.date(from: comps)
+        FixedDateFormat.gregorianDay(str, timeZone: .current)
     }
 }

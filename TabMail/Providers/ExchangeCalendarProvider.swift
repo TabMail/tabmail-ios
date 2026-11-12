@@ -674,12 +674,8 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// unless the caller supplied `timezone`.
     /// Returns nil if `naiveISO` can't be parsed.
     static func graphEndDateBefore(naiveISO: String, allDay: Bool, zone: TimeZone) -> String? {
-        let dtFmt = DateFormatter()
-        dtFmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        dtFmt.timeZone = zone
-        let dateFmt = DateFormatter()
-        dateFmt.dateFormat = "yyyy-MM-dd"
-        dateFmt.timeZone = zone
+        let dtFmt = FixedDateFormat.formatter("yyyy-MM-dd'T'HH:mm:ss", timeZone: zone)
+        let dateFmt = FixedDateFormat.formatter("yyyy-MM-dd", timeZone: zone)
         let parsed = dtFmt.date(from: naiveISO)
             ?? dateFmt.date(from: String(naiveISO.prefix(10)))
         guard let date = parsed else { return nil }
@@ -689,9 +685,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = zone
         guard let dayBefore = cal.date(byAdding: .day, value: -1, to: date) else { return nil }
-        let out = DateFormatter()
-        out.dateFormat = "yyyy-MM-dd"
-        out.timeZone = zone
+        let out = FixedDateFormat.formatter("yyyy-MM-dd", timeZone: zone)
         return out.string(from: dayBefore)
     }
 
@@ -1248,16 +1242,12 @@ actor ExchangeCalendarProvider: CalendarProvider {
         times.endTimeZone = merged.endTimeZone
         var json = toGraphEventJSON(times)
         guard json["isAllDay"] as? Bool != true else { return NSDictionary(dictionary: json) }
-        let wall = DateFormatter()
-        wall.locale = Locale(identifier: "en_US_POSIX")
-        wall.calendar = Calendar(identifier: .gregorian)
-        wall.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
         for (key, value) in json {
             guard let part = value as? [String: Any], let label = part["timeZone"] as? String else { continue }
             guard let zone = CalendarTimeZoneResolver.zone(named: label, in: .none),
                   let dateTime = part["dateTime"] as? String
             else { return nil }
-            wall.timeZone = zone
+            let wall = FixedDateFormat.formatter("yyyy-MM-dd'T'HH:mm:ss", timeZone: zone)
             guard let instant = wall.date(from: String(dateTime.prefix(19))) else { return nil }
             json[key] = ["instant": instant.timeIntervalSince1970]
         }
@@ -1358,19 +1348,14 @@ actor ExchangeCalendarProvider: CalendarProvider {
     nonisolated static func day(_ date: String?, _ dateTime: String?, in timeZone: String?) -> String? {
         if let date { return String(date.prefix(10)) }
         guard let dateTime else { return nil }
-        let wall = DateFormatter()
-        wall.locale = Locale(identifier: "en_US_POSIX")
-        wall.calendar = Calendar(identifier: .gregorian)
-        wall.timeZone = timeZone.flatMap { CalendarTimeZoneResolver.zone(named: $0, in: .none) } ?? .current
-        wall.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        let wall = FixedDateFormat.formatter(
+            "yyyy-MM-dd'T'HH:mm:ss",
+            timeZone: timeZone.flatMap { CalendarTimeZoneResolver.zone(named: $0, in: .none) } ?? .current
+        )
         guard let instant = wall.date(from: String(graphNaiveDateTime(dateTime).prefix(19))) else {
             return String(dateTime.prefix(10))
         }
-        let fmt = DateFormatter()
-        fmt.locale = Locale(identifier: "en_US_POSIX")
-        fmt.calendar = Calendar(identifier: .gregorian)
-        fmt.timeZone = .current
-        fmt.dateFormat = "yyyy-MM-dd"
+        let fmt = FixedDateFormat.formatter("yyyy-MM-dd", timeZone: .current)
         return fmt.string(from: instant)
     }
 
@@ -1418,9 +1403,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         let windowSeconds: TimeInterval = 25 * 60 * 60
         let minDate = centerDate.addingTimeInterval(-windowSeconds)
         let maxDate = centerDate.addingTimeInterval(windowSeconds)
-        let utcFmt = DateFormatter()
-        utcFmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        utcFmt.timeZone = TimeZone(identifier: "UTC")
+        let utcFmt = FixedDateFormat.formatter("yyyy-MM-dd'T'HH:mm:ss", timeZone: .gmt)
         let startQS = utcFmt.string(from: minDate)
         let endQS = utcFmt.string(from: maxDate)
 
@@ -1445,10 +1428,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
                     "Microsoft Graph returned an occurrence of \(masterId) in an unrecognized timezone ('\(start.timeZone ?? "")') — refusing to edit an occurrence that may not be the one you named."
                 )
             }
-            let fmt = DateFormatter()
-            fmt.locale = Locale(identifier: "en_US_POSIX")
-            fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-            fmt.timeZone = startZone
+            let fmt = FixedDateFormat.formatter("yyyy-MM-dd'T'HH:mm:ss", timeZone: startZone)
             guard let instant = fmt.date(from: String(dt.prefix(19))) else {
                 throw CalendarProviderError.notSupported(
                     "Could not interpret the start time of an occurrence of \(masterId) returned by Microsoft Graph ('\(dt)') — refusing to edit an occurrence that may not be the one you named."
@@ -1756,9 +1736,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // We need to convert to RFC 3339: "2024-01-15T14:30:00+00:00"
         // A read: a zone the resolver does not recognize is read in the device's zone, as before.
         let zone = CalendarTimeZoneResolver.zone(named: timeZone, in: .none) ?? .current
-        let fmt = DateFormatter()
-        fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        fmt.timeZone = zone
+        let fmt = FixedDateFormat.formatter("yyyy-MM-dd'T'HH:mm:ss", timeZone: zone)
 
         // Try parsing with fractional seconds
         let cleanDateTime = String(dateTime.prefix(19)) // Strip fractional seconds
@@ -1786,14 +1764,9 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// `other`; as given when the two are the same zone or the wall time does not parse.
     nonisolated static func wallTime(_ wall: String, from zone: TimeZone, to other: TimeZone) -> String {
         guard zone != other else { return wall }
-        let fmt = DateFormatter()
-        fmt.locale = Locale(identifier: "en_US_POSIX")
-        fmt.calendar = Calendar(identifier: .gregorian)
-        fmt.timeZone = zone
-        fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        let fmt = FixedDateFormat.formatter("yyyy-MM-dd'T'HH:mm:ss", timeZone: zone)
         guard let instant = fmt.date(from: String(wall.prefix(19))) else { return wall }
-        fmt.timeZone = other
-        return fmt.string(from: instant)
+        return FixedDateFormat.formatter("yyyy-MM-dd'T'HH:mm:ss", timeZone: other).string(from: instant)
     }
 
     /// A start or end (`{dateTime, timeZone}`, as `toGraphEventJSON` writes it) for an existing
@@ -1829,14 +1802,10 @@ actor ExchangeCalendarProvider: CalendarProvider {
               let label = time["timeZone"] as? String, let given = CalendarTimeZoneResolver.zone(named: label, in: .none),
               let wall = time["dateTime"] as? String
         else { return time }
-        let fmt = DateFormatter()
-        fmt.locale = Locale(identifier: "en_US_POSIX")
-        fmt.calendar = Calendar(identifier: .gregorian)
-        fmt.timeZone = given
-        fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        guard let instant = fmt.date(from: String(wall.prefix(19))) else { return time }
-        fmt.timeZone = stored
-        return ["dateTime": fmt.string(from: instant), "timeZone": seriesZone]
+        let format = "yyyy-MM-dd'T'HH:mm:ss"
+        guard let instant = FixedDateFormat.formatter(format, timeZone: given).date(from: String(wall.prefix(19)))
+        else { return time }
+        return ["dateTime": FixedDateFormat.formatter(format, timeZone: stored).string(from: instant), "timeZone": seriesZone]
     }
 
     /// `attendeeTypes` (lowercased address → Graph type) keeps an existing
@@ -1927,17 +1896,12 @@ actor ExchangeCalendarProvider: CalendarProvider {
             // its wall time in the range's zone, where Graph reads the pattern; an
             // all-day start is its date there.
             let recEventStart: Date? = {
-                let f = DateFormatter()
-                f.locale = Locale(identifier: "en_US_POSIX")
-                f.calendar = Calendar(identifier: .gregorian)
-                f.timeZone = rangeZone
                 if let startWallTime {
-                    f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-                    return f.date(from: String(startWallTime.prefix(19)))
+                    return FixedDateFormat.formatter("yyyy-MM-dd'T'HH:mm:ss", timeZone: rangeZone)
+                        .date(from: String(startWallTime.prefix(19)))
                 }
                 if let sd = input.startDate {
-                    f.dateFormat = "yyyy-MM-dd"
-                    return f.date(from: sd)
+                    return FixedDateFormat.formatter("yyyy-MM-dd", timeZone: rangeZone).date(from: sd)
                 }
                 return nil
             }()
@@ -2005,33 +1969,21 @@ actor ExchangeCalendarProvider: CalendarProvider {
         let ownDate = "\(d.prefix(4))-\(d.dropFirst(4).prefix(2))-\(d.suffix(2))"
 
         // The UNTIL's instant: only a UTC one is read; every other shape keeps its own date.
-        let parser = DateFormatter()
-        parser.locale = Locale(identifier: "en_US_POSIX")
-        parser.calendar = Calendar(identifier: .gregorian)
-        if compact.count == 16, compact.hasSuffix("Z") {
-            parser.timeZone = TimeZone(identifier: "UTC")
-            parser.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
-        } else {
-            return ownDate
-        }
+        guard compact.count == 16, compact.hasSuffix("Z") else { return ownDate }
+        let parser = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss'Z'", timeZone: .gmt)
         guard let instant = parser.date(from: compact) else { return ownDate }
 
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = timeZone
-        let local = DateFormatter()
-        local.locale = Locale(identifier: "en_US_POSIX")
-        local.calendar = calendar
-        local.timeZone = timeZone
         var lastInstant = instant
-        local.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        if let startWallTime, let start = local.date(from: String(startWallTime.prefix(19))) {
-            local.dateFormat = "HHmmss"
-            if local.string(from: instant) < local.string(from: start) {
+        let wall = FixedDateFormat.formatter("yyyy-MM-dd'T'HH:mm:ss", timeZone: timeZone)
+        if let startWallTime, let start = wall.date(from: String(startWallTime.prefix(19))) {
+            let clock = FixedDateFormat.formatter("HHmmss", timeZone: timeZone)
+            if clock.string(from: instant) < clock.string(from: start) {
                 lastInstant = calendar.startOfDay(for: instant).addingTimeInterval(-1)
             }
         }
-        local.dateFormat = "yyyy-MM-dd"
-        return local.string(from: lastInstant)
+        return FixedDateFormat.formatter("yyyy-MM-dd", timeZone: timeZone).string(from: lastInstant)
     }
 
     /// Why Graph cannot hold `rrule`, or nil when `parseRRULEToGraphRecurrence` maps it exactly (#513).

@@ -10,12 +10,7 @@ import Foundation
 enum EmailDateParsing {
     /// RFC 2822 §3.3 date format, e.g. `"Wed, 2 Oct 2025 01:50:00 +0000"`.
     /// Source: RFC 2822 / RFC 5322 §3.3.
-    static let rfc2822: DateFormatter = {
-        let fmt = DateFormatter()
-        fmt.locale = Locale(identifier: "en_US_POSIX")
-        fmt.dateFormat = "EEE, d MMM yyyy HH:mm:ss Z"
-        return fmt
-    }()
+    static let rfc2822: DateFormatter = FixedDateFormat.formatter("EEE, d MMM yyyy HH:mm:ss Z", timeZone: .current)
 
     /// The timestamp of one `Received:` trace header (RFC 5322 §3.6.7:
     /// `"Received:" *received-token ";" date-time CRLF`). The date is everything

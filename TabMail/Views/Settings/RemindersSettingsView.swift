@@ -252,20 +252,8 @@ private enum DueDateUrgency {
 private func dueDateLabel(for reminder: Reminder) -> (text: String, urgency: DueDateUrgency)? {
     guard let dueDateStr = reminder.dueDate else { return nil }
 
-    let parts = dueDateStr.split(separator: "-")
-    guard parts.count == 3,
-          let year = Int(parts[0]),
-          let month = Int(parts[1]),
-          let day = Int(parts[2]) else {
-        return nil
-    }
-
-    let calendar = Calendar.current
-    var comps = DateComponents()
-    comps.year = year
-    comps.month = month
-    comps.day = day
-    guard let dueDate = calendar.date(from: comps) else { return nil }
+    let calendar = Calendar(identifier: .gregorian)
+    guard let dueDate = FixedDateFormat.gregorianDay(dueDateStr, timeZone: calendar.timeZone) else { return nil }
 
     let dueMidnight = calendar.startOfDay(for: dueDate)
     let todayMidnight = calendar.startOfDay(for: Date())
@@ -282,8 +270,7 @@ private func dueDateLabel(for reminder: Reminder) -> (text: String, urgency: Due
     } else if dueMidnight == tomorrowMidnight {
         return ("Due Tomorrow", .tomorrow)
     } else {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "EEE, MMM d"
+        let formatter = FixedDateFormat.formatter("EEE, MMM d", timeZone: .current)
         return ("Due \(formatter.string(from: dueMidnight))", .future)
     }
 }

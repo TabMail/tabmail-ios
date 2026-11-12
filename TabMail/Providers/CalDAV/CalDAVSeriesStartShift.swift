@@ -268,12 +268,7 @@ extension CalDAVProvider {
     }
 
     private static func wallFormatter(_ format: String) -> DateFormatter {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.calendar = Calendar(identifier: .gregorian)
-        formatter.timeZone = .gmt
-        formatter.dateFormat = format
-        return formatter
+        FixedDateFormat.formatter(format, timeZone: .gmt)
     }
 
     /// The calendar day a wall clock falls on, counted from 1970-01-01

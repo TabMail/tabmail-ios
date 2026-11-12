@@ -89,17 +89,10 @@ extension Date {
             return "Yesterday"
         } else if let weekAgo = calendar.date(byAdding: .day, value: -6, to: calendar.startOfDay(for: Date())),
                   self >= weekAgo {
-            let formatter = DateFormatter()
-            formatter.dateFormat = "EEEE"
-            return formatter.string(from: self)
+            return FixedDateFormat.formatter("EEEE", timeZone: .current).string(from: self)
         } else {
-            let formatter = DateFormatter()
-            if !calendar.isDate(self, equalTo: Date(), toGranularity: .year) {
-                formatter.dateFormat = "MMM d, yyyy"
-            } else {
-                formatter.dateFormat = "MMM d"
-            }
-            return formatter.string(from: self)
+            let format = calendar.isDate(self, equalTo: Date(), toGranularity: .year) ? "MMM d" : "MMM d, yyyy"
+            return FixedDateFormat.formatter(format, timeZone: .current).string(from: self)
         }
     }
 }

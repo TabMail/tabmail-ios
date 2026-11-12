@@ -97,16 +97,15 @@ enum ICSBuilder {
     /// Build a simple HTML body for the invitation email (fallback for clients
     /// that don't render ICS inline).
     static func buildInvitationBody(_ spec: EventSpec) -> String {
-        let dateFormatter = DateFormatter()
-        dateFormatter.dateStyle = .full
-        dateFormatter.timeStyle = spec.isAllDay ? .none : .short
+        // Sent to the other attendees: the phone's language and 12/24-hour setting, Gregorian years.
+        let dateFormatter = FixedDateFormat.localized(
+            dateStyle: .full, timeStyle: spec.isAllDay ? .none : .short, timeZone: .current)
 
         var html = "<div style=\"font-family: -apple-system, sans-serif; font-size: 14px;\">"
         html += "<h3>\(escapeHTML(spec.title))</h3>"
         html += "<p><strong>When:</strong> \(escapeHTML(dateFormatter.string(from: spec.startDate)))"
         if !spec.isAllDay {
-            let endFmt = DateFormatter()
-            endFmt.timeStyle = .short
+            let endFmt = FixedDateFormat.localized(dateStyle: .none, timeStyle: .short, timeZone: .current)
             html += " – \(escapeHTML(endFmt.string(from: spec.endDate)))"
         }
         html += "</p>"
@@ -125,17 +124,13 @@ enum ICSBuilder {
 
     /// UTC timestamp: `YYYYMMDDTHHMMSSZ`
     private static func formatUTC(_ date: Date) -> String {
-        let fmt = DateFormatter()
-        fmt.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
-        fmt.timeZone = TimeZone(identifier: "UTC")
+        let fmt = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss'Z'", timeZone: .gmt)
         return fmt.string(from: date)
     }
 
     /// Date-only: `YYYYMMDD`
     private static func formatDateOnly(_ date: Date) -> String {
-        let fmt = DateFormatter()
-        fmt.dateFormat = "yyyyMMdd"
-        fmt.timeZone = TimeZone.current
+        let fmt = FixedDateFormat.formatter("yyyyMMdd", timeZone: .current)
         return fmt.string(from: date)
     }
 
@@ -326,9 +321,8 @@ enum ICSBuilder {
     /// Renders a clean table layout matching TB's calendar invite style,
     /// with dark mode support matching our WebView theme.
     static func buildIncomingInviteBody(_ invite: ParsedInvite) -> String {
-        let dateFormatter = DateFormatter()
-        dateFormatter.dateStyle = .full
-        dateFormatter.timeStyle = invite.isAllDay ? .none : .short
+        let dateFormatter = FixedDateFormat.localized(
+            dateStyle: .full, timeStyle: invite.isAllDay ? .none : .short, timeZone: .current)
 
         // Header: "X has invited you to Y" / "X has cancelled Y"
         let orgName = invite.organizer.map { $0.name.isEmpty ? $0.email : $0.name } ?? "Someone"
@@ -361,8 +355,7 @@ enum ICSBuilder {
         if let start = invite.startDate {
             var when = escapeHTML(dateFormatter.string(from: start))
             if !invite.isAllDay, let end = invite.endDate {
-                let endFmt = DateFormatter()
-                endFmt.timeStyle = .short
+                let endFmt = FixedDateFormat.localized(dateStyle: .none, timeStyle: .short, timeZone: .current)
                 when += " – \(escapeHTML(endFmt.string(from: end)))"
             }
             html += "<tr><td class=\"tm-ics-label\">When:</td>"
@@ -472,32 +465,25 @@ enum ICSBuilder {
     private static func parseICSDate(_ value: String, params: String?, zones: CalendarTimeZoneContext) -> Date? {
         let cleaned = value.trimmingCharacters(in: .whitespaces)
 
-        let fmt = DateFormatter()
-        fmt.locale = Locale(identifier: "en_US_POSIX")
-
         if cleaned.hasSuffix("Z") {
-            fmt.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
-            fmt.timeZone = TimeZone(identifier: "UTC")
-            return fmt.date(from: cleaned)
+            return FixedDateFormat.formatter("yyyyMMdd'T'HHmmss'Z'", timeZone: .gmt).date(from: cleaned)
         }
 
         if cleaned.count == 8 {
             // Date-only (all-day)
-            fmt.dateFormat = "yyyyMMdd"
-            fmt.timeZone = .current
-            return fmt.date(from: cleaned)
+            return FixedDateFormat.formatter("yyyyMMdd", timeZone: .current).date(from: cleaned)
         }
 
         // Date-time with optional timezone
-        fmt.dateFormat = "yyyyMMdd'T'HHmmss"
+        let wallZone: TimeZone
         if let params, let tzid = extractTZID(params) {
             // A zone the resolver does not recognize is read in the device's zone: this is a
             // read-only summary of an incoming invite, never written anywhere.
-            fmt.timeZone = CalendarTimeZoneResolver.zone(named: tzid, in: zones) ?? .current
+            wallZone = CalendarTimeZoneResolver.zone(named: tzid, in: zones) ?? .current
         } else {
-            fmt.timeZone = .current
+            wallZone = .current
         }
-        return fmt.date(from: cleaned)
+        return FixedDateFormat.formatter("yyyyMMdd'T'HHmmss", timeZone: wallZone).date(from: cleaned)
     }
 
     /// Extract TZID from property parameters.

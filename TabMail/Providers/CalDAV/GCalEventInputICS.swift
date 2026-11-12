@@ -168,16 +168,12 @@ extension GCalEventInput {
     // MARK: - Private Helpers
 
     private func formatUTC(_ date: Date) -> String {
-        let fmt = DateFormatter()
-        fmt.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
-        fmt.timeZone = TimeZone(identifier: "UTC")
+        let fmt = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss'Z'", timeZone: .gmt)
         return fmt.string(from: date)
     }
 
     private func formatLocal(_ date: Date, timeZone tz: TimeZone) -> String {
-        let fmt = DateFormatter()
-        fmt.dateFormat = "yyyyMMdd'T'HHmmss"
-        fmt.timeZone = tz
+        let fmt = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss", timeZone: tz)
         return fmt.string(from: date)
     }
 

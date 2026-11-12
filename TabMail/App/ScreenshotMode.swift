@@ -60,11 +60,7 @@ enum ScreenshotMode {
         let cal = Calendar(identifier: .gregorian)
         for i in (0..<30).reversed() {
             let d = cal.date(byAdding: .day, value: -i, to: Date())!
-            let dateStr = {
-                let f = DateFormatter()
-                f.dateFormat = "yyyy-MM-dd"
-                return f.string(from: d)
-            }()
+            let dateStr = FixedDateFormat.formatter("yyyy-MM-dd", timeZone: .current).string(from: d)
             let calls = Double.random(in: 5...40)
             let input = Double.random(in: 800...4000)
             let output = Double.random(in: 200...1200)

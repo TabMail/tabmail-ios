@@ -61,7 +61,7 @@ struct EKEventStoreHelperTests {
     @Test("prettyDate returns non-empty string")
     func prettyDateNonEmpty() {
         let date = Date()
-        let pretty = EKEventStoreHelper.prettyDate(date)
+        let pretty = EKEventStoreHelper.prettyDate(date, timeZone: .current)
         #expect(!pretty.isEmpty)
     }
 
@@ -71,10 +71,56 @@ struct EKEventStoreHelperTests {
         let components = DateComponents(year: 2024, month: 3, day: 15)
         let calendar = Calendar.current
         let date = calendar.date(from: components)!
-        let pretty = EKEventStoreHelper.prettyDate(date)
+        let pretty = EKEventStoreHelper.prettyDate(date, timeZone: .current)
         #expect(pretty.contains("Friday") || pretty.contains("friday"))
     }
 
+    @Test("prettyDate is the English Gregorian header the assistant reads the year from")
+    func prettyDateIsGregorianEnglish() throws {
+        let zone = try #require(TimeZone(identifier: "Asia/Bangkok"))
+        var gregorian = Calendar(identifier: .gregorian)
+        gregorian.timeZone = zone
+        let date = Date().addingTimeInterval(7 * 86_400)
+        let p = gregorian.dateComponents([.year, .month, .day, .weekday], from: date)
+        let weekdays = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+        let months = ["January", "February", "March", "April", "May", "June", "July",
+                      "August", "September", "October", "November", "December"]
+        let expected = "\(weekdays[p.weekday! - 1]), \(months[p.month! - 1]) \(p.day!), \(p.year!)"
+        #expect(EKEventStoreHelper.prettyDate(date, timeZone: zone) == expected)
+    }
+
+    /// A wall time in a zone, the expected header there.
+    struct HeaderCase: CustomStringConvertible, Sendable {
+        let zone: String
+        let wall: DateComponents
+        let expected: String
+        var description: String { "\(zone) \(expected)" }
+    }
+
+    /// Far-future fixed dates (the 2099+ exception to relative test dates): 1 January
+    /// 2100 is a Friday, so 30 and 31 December 2099 fall in week 1 of week-year 2100
+    /// and a week-based `YYYY` would write 2100. Each wall time is 30 minutes from
+    /// midnight in a zone at an end of the offset range (UTC+14, UTC-11), so whatever
+    /// the simulator's zone, a header that ignored `timeZone` names the wrong day in at
+    /// least one case.
+    static let yearEndHeaders: [HeaderCase] = [
+        HeaderCase(zone: "Pacific/Kiritimati",
+                   wall: DateComponents(year: 2099, month: 12, day: 31, hour: 0, minute: 30),
+                   expected: "Thursday, December 31, 2099"),
+        HeaderCase(zone: "Pacific/Pago_Pago",
+                   wall: DateComponents(year: 2099, month: 12, day: 30, hour: 23, minute: 30),
+                   expected: "Wednesday, December 30, 2099"),
+    ]
+
+    @Test("prettyDate writes the calendar year, not the week-based one, in the given zone",
+          arguments: yearEndHeaders)
+    func prettyDateYearEndInZone(_ header: HeaderCase) throws {
+        let zone = try #require(TimeZone(identifier: header.zone))
+        var gregorian = Calendar(identifier: .gregorian)
+        gregorian.timeZone = zone
+        let instant = try #require(gregorian.date(from: header.wall))
+        #expect(EKEventStoreHelper.prettyDate(instant, timeZone: zone) == header.expected)
+    }
     @Test("dayKey same for dates on same day")
     func dayKeySameDay() {
         let calendar = Calendar.current

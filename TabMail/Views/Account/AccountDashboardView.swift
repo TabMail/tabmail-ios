@@ -590,9 +590,7 @@ struct AccountDashboardView: View {
 
     /// Pad daily stats to always show 30 days, sorted oldest→newest (left→right, today on right).
     private func paddedDailyStats(_ stats: [DayStats]) -> [DayStats] {
-        let fmt = DateFormatter()
-        fmt.dateFormat = "yyyy-MM-dd"
-        fmt.timeZone = TimeZone(identifier: "UTC")
+        let fmt = FixedDateFormat.formatter("yyyy-MM-dd", timeZone: .gmt)
 
         // Build lookup from existing stats
         var lookup: [String: DayStats] = [:]
@@ -617,12 +615,9 @@ struct AccountDashboardView: View {
 
     /// Format "yyyy-MM-dd" → short display like "Mar 10"
     private func shortDate(_ dateString: String) -> String {
-        let parser = DateFormatter()
-        parser.dateFormat = "yyyy-MM-dd"
-        parser.timeZone = TimeZone(identifier: "UTC")
+        let parser = FixedDateFormat.formatter("yyyy-MM-dd", timeZone: .gmt)
         guard let date = parser.date(from: dateString) else { return dateString }
-        let display = DateFormatter()
-        display.dateFormat = "MMM d"
+        let display = FixedDateFormat.formatter("MMM d", timeZone: .current)
         return display.string(from: date)
     }
 

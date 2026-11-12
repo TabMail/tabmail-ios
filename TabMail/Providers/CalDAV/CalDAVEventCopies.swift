@@ -774,39 +774,29 @@ extension CalDAVProvider {
     private static func formatLike(_ line: String, instant: Date, zones: CalendarTimeZoneContext) throws -> String? {
         guard let p = icsProperty(line) else { return nil }
         let value = p.value.trimmingCharacters(in: .whitespaces)
-        let fmt = DateFormatter()
-        fmt.locale = Locale(identifier: "en_US_POSIX")
+        let fmt: DateFormatter
         if ICSValueType.statesDate(p.params) || (value.count == 8 && !value.contains("T")) {
             // `parseICSDateTime` reads a date at midnight UTC; write it back the same way.
-            fmt.dateFormat = "yyyyMMdd"
-            fmt.timeZone = TimeZone(identifier: "UTC")
+            fmt = FixedDateFormat.formatter("yyyyMMdd", timeZone: .gmt)
         } else if value.uppercased().hasSuffix("Z") {
-            fmt.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
-            fmt.timeZone = TimeZone(identifier: "UTC")
+            fmt = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss'Z'", timeZone: .gmt)
         } else if let tzid = splitParams(p.params).first(where: { $0.uppercased().hasPrefix("TZID=") }) {
-            fmt.dateFormat = "yyyyMMdd'T'HHmmss"
-            fmt.timeZone = try zone(forTZID: String(tzid.dropFirst("TZID=".count)), zones: zones)
+            let lineZone = try zone(forTZID: String(tzid.dropFirst("TZID=".count)), zones: zones)
+            fmt = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss", timeZone: lineZone)
         } else {
-            fmt.dateFormat = "yyyyMMdd'T'HHmmss"
-            fmt.timeZone = .current
+            fmt = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss", timeZone: .current)
         }
         return "\(p.rawName)\(p.params):\(fmt.string(from: instant))"
     }
 
     private static func utcStamp(_ date: Date) -> String {
-        let fmt = DateFormatter()
-        fmt.locale = Locale(identifier: "en_US_POSIX")
-        fmt.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
-        fmt.timeZone = TimeZone(identifier: "UTC")
+        let fmt = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss'Z'", timeZone: .gmt)
         return fmt.string(from: date)
     }
 
     /// `yyyy-MM-dd` plus whole days, on the Gregorian calendar in UTC (a calendar date has no zone).
     private static func shiftedDate(_ ymd: String, days: Int) -> String? {
-        let fmt = DateFormatter()
-        fmt.locale = Locale(identifier: "en_US_POSIX")
-        fmt.dateFormat = "yyyy-MM-dd"
-        fmt.timeZone = TimeZone(identifier: "UTC")
+        let fmt = FixedDateFormat.formatter("yyyy-MM-dd", timeZone: .gmt)
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = TimeZone(identifier: "UTC") ?? .current
         guard let start = fmt.date(from: String(ymd.prefix(10))),

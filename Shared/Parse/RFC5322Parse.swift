@@ -103,12 +103,8 @@ enum RFC5322Parse {
             // RFC 5322 §3.3: `day-of-week` and `second` are BOTH optional.
             "d MMM yyyy HH:mm Z",
         ]
-        let df = DateFormatter()
-        df.locale = Locale(identifier: "en_US_POSIX")
-        df.timeZone = TimeZone(secondsFromGMT: 0)
         for fmt in formatters {
-            df.dateFormat = fmt
-            if let d = df.date(from: trimmed) { return d }
+            if let d = FixedDateFormat.formatter(fmt, timeZone: .gmt).date(from: trimmed) { return d }
         }
         return nil
     }
