@@ -1535,11 +1535,12 @@ struct BackfillOnlyFolderEpochTests {
     }
 }
 
-/// Signal gate for the two-walk interleaving above. Polled with a bounded
+/// Signal gate for the two-walk interleaving above (shared with
+/// `BackfillUIDWalkRaceTests`). Polled with a bounded
 /// ceiling rather than built on continuations so a test that mis-sequences its
 /// signals FAILS instead of hanging the whole suite. `Mutex` per the project's
 /// resilience rule 5 (never `nonisolated(unsafe)`).
-private final class BackfillWalkHandshake: Sendable {
+final class BackfillWalkHandshake: Sendable {
     private let signalled = Mutex<Set<String>>([])
 
     func signal(_ name: String) {

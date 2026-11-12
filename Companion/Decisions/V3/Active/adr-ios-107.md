@@ -620,6 +620,40 @@ The owner's rulings of 2026-11-09:
      write that changed neither column (*superseded:* "and walks it from the top"). It never
      retries the stale write. SQLite's change count excludes the trigger's own
      update, so it reports the walk's statement alone.
+     - **One version for every walk, never repeated** (amendment 2026-11-12,
+       `v101_backfillVersionCoversUidCursorAndNeverRepeats`; v100 unchanged). Two changes to the
+       contract above. (1) The trigger now also fires on every UPDATE that writes
+       `backfillUidCursor`, and the IMAP UID walk's six bookkeeping writes (the UIDNEXT 1
+       completion, the initial cursor, the two throttled progress writes, the final completion, the
+       final cursor) go through `SyncEngine.writeUIDWalkPosition`: the UIDVALIDITY guard
+       (`crawlWalkWriteAllowed`) AND a compare-and-set on the version the walk read with the folder
+       (`UIDWalkPosition`). A write that lands reads the version it left back in its own
+       transaction, so the walk never refuses a position it wrote itself. A version miss marks the
+       position lost: the workers stop claiming ranges, the pass skips its final writes and declines
+       the folder for the rest of the call (the IMAP walk's existing refusal shape; the page walk
+       re-reads instead), and the next call walks on from what the folder then holds. A refused
+       write is no work for the call's `didWork`. This closes the IMAP side of the overwrite: a
+       user reset (Reset Message Data, the Settings wipe, Smart Reindex) or a second walker writing
+       the cursor or the completion while a batch was in flight, which the epoch guard cannot see
+       because none of them touches UIDVALIDITY. The full-sync upsert costs the IMAP walk at most
+       the progress since its last throttled write (one second) per full sync. (2) Every version
+       is drawn from one database-wide counter (`backfillVersionCounter`, one row, seeded with the
+       highest existing version), on a bump and on an insert (`folder_seedBackfillVersion`).
+       `Folder.id` is the deterministic `"\(accountId):\(path)"`, so a folder deleted and re-created
+       under the same id used to start again at 0 and could climb back to the exact version an
+       in-flight walk of the old row had read (ABA), landing that walk's write on the new row. A
+       whole-record write from a stale record is also overwritten by a fresh value now.
+       *Superseded (2026-11-12):* "bumps it on every UPDATE that writes `backfillPageToken` or
+       `backfillComplete`, even when the value is unchanged, and never on an insert (a new folder
+       starts at 0)" and "a future whole-record write from a stale record would [write an older
+       version back]".
+     - **A failed insert chunk is reported to every IMAP caller** (amendment 2026-11-12). The
+       premised `SyncEngine.insertBackfillBatch` returns `.landed(…, allLanded:)`, false when a
+       write chunk's transaction threw (the same report the premise-less overload gives as
+       `failed`, which the page walk and the catch-up already honour). The IMAP walk fails that
+       range rather than confirming it (its cursor stays above it) and declines the folder for the
+       rest of the call; self-heal puts its hourly stamp back, so the next sync's self-heal loads
+       the messages.
    - **The delta-cursor lapse** (`SyncEngine.lapseDeltaCursor`; amended 2026-11-11: a marker, not a
      clear). One provider-blind helper writes the account's new cursor (nil clears it) AND marks the
      lapse in `catchUpState` for every folder of the account, in the caller's transaction: the

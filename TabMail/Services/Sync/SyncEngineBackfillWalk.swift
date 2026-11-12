@@ -56,6 +56,38 @@ private actor UIDListCursor {
 private struct BackfillWorkerOutcome: Sendable {
     var didWork = false
     var epochDisagreed = false
+    /// A write chunk of this worker's batch failed, so the range was failed
+    /// rather than confirmed (`BackfillBatchOutcome.landed`'s `allLanded`).
+    var insertFailed = false
+}
+
+/// The IMAP UID walk's hold on its folder's walk position: the
+/// `Folder.backfillVersion` its next bookkeeping write must still find. It
+/// starts as the version the walk read with the folder and moves to the
+/// version each of the walk's OWN writes leaves (read back inside that write's
+/// transaction), so the walk never refuses a position it wrote itself. A write
+/// that finds any other version marks the position lost: something else (a
+/// reset, a second walker, a whole-record folder write) wrote the bookkeeping
+/// meanwhile, and the walk stops, writes nothing more, and leaves the folder to
+/// the next call, which re-reads it. Shared by the walk's parallel workers;
+/// every read and record happens inside a write transaction on the database's
+/// single writer, so the walk's own writes never interleave between a read and
+/// its record.
+final class UIDWalkPosition: Sendable {
+    private struct State {
+        var version: Int
+        var lost = false
+    }
+    private let state: Mutex<State>
+
+    init(readVersion: Int) {
+        state = Mutex(State(version: readVersion))
+    }
+
+    var expectedVersion: Int { state.withLock { $0.version } }
+    var isLost: Bool { state.withLock { $0.lost } }
+    func recordOwnWrite(version: Int) { state.withLock { $0.version = version } }
+    func markLost() { state.withLock { $0.lost = true } }
 }
 
 extension SyncEngine {
@@ -862,6 +894,37 @@ extension SyncEngine {
         return db.changesCount > 0
     }
 
+    /// The IMAP UID walk's bookkeeping write for one folder: `assignments`
+    /// (its cursor, its completion, and with them `lastKnownUidNext`) land only
+    /// while the folder still holds `premiseEpoch` (`crawlWalkWriteAllowed`, the
+    /// UIDVALIDITY guard) AND the row version `position` expects. The version
+    /// half is the page walk's compare-and-set (`advanceBackfillPageWalk`): every
+    /// write of `backfillUidCursor` or `backfillComplete` gives the folder a
+    /// fresh version (`folder_bumpBackfillVersion`), so a reset or a second
+    /// walker's write landing while this walk is on the network makes the write
+    /// match nothing. A version miss marks `position` lost; a write that lands
+    /// records the version it left, read back in this transaction, so the
+    /// walk's next write expects its own. Returns whether the write landed.
+    nonisolated static func writeUIDWalkPosition(
+        _ db: Database, folderId: String, premiseEpoch: UInt32?, position: UIDWalkPosition,
+        _ assignments: [ColumnAssignment]
+    ) throws -> Bool {
+        guard try crawlWalkWriteAllowed(db, folderId: folderId, premiseEpoch: premiseEpoch) else {
+            return false
+        }
+        let changed = try Folder
+            .filter(Column("id") == folderId && Column("backfillVersion") == position.expectedVersion)
+            .updateAll(db, assignments)
+        guard changed > 0 else {
+            position.markLost()
+            return false
+        }
+        let written = try Int.fetchOne(
+            db, sql: "SELECT backfillVersion FROM folder WHERE id = ?", arguments: [folderId])
+        if let written { position.recordOwnWrite(version: written) }
+        return true
+    }
+
     // MARK: - Gmail/Exchange page walk: the insert tail
 
     /// The page walk's insert tail, shared with the catch-up's direct load
@@ -1299,6 +1362,14 @@ extension SyncEngine {
                     // `crawlWalkWriteAllowed` CASes the row against it inside each
                     // write's own transaction (NB3/NB4).
                     var premiseEpoch = storedEpoch
+                    // THE POSITION every bookkeeping write this pass makes is
+                    // compared against: the row version read with the folder at
+                    // this iteration's start. A reset or a second walker that
+                    // writes the cursor or the completion meanwhile moves it, and
+                    // this pass's next write then lands nothing
+                    // (`writeUIDWalkPosition`). The walk-start bootstrap below
+                    // writes only the stamp, which leaves the version alone.
+                    let position = UIDWalkPosition(readVersion: folder.backfillVersion)
 
                     // Initialize cursor (from DB or UIDNEXT)
                     let cursorValue: Int
@@ -1415,14 +1486,12 @@ extension SyncEngine {
                                         throw FreshCursorWriteFailureForTesting()
                                     }
                                     #endif
-                                    guard try Self.crawlWalkWriteAllowed(
-                                        db, folderId: folderId, premiseEpoch: writePremise
-                                    ) else { return false }
-                                    _ = try Folder.filter(Column("id") == folderId)
-                                        .updateAll(db,
+                                    guard try Self.writeUIDWalkPosition(
+                                        db, folderId: folderId, premiseEpoch: writePremise, position: position, [
                                             Column("backfillComplete").set(to: true),
-                                            Column("lastKnownUidNext").set(to: uidNext)
-                                        )
+                                            Column("lastKnownUidNext").set(to: uidNext),
+                                        ]
+                                    ) else { return false }
                                     _ = try Self.bootstrapCrawledFolderUidValidity(
                                         db, folderId: folderId, observed: walkEpoch)
                                     return true
@@ -1443,14 +1512,17 @@ extension SyncEngine {
                                 BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) fully crawled (UIDNEXT=1, no messages)")
                             } else if !epochDeclinedFolderIds.contains(folder.id) {
                                 // Refused, not thrown: another pass moved the stamp
-                                // out from under this one. Same spin argument as the
-                                // throw — decline for the rest of the call.
+                                // or wrote the walk position out from under this
+                                // one. Same spin argument as the throw — decline
+                                // for the rest of the call.
                                 epochDeclinedFolderIds.insert(folder.id)
                                 if DebugModeManager.isLoggingEnabled() {
-                                    BackgroundSyncLogger.logDebug("[Backfill] \(folder.name): skipping fully-crawled write — the folder no longer holds the UIDVALIDITY this pass premised (\(String(describing: writePremise))); declining for this call, retry next cycle")
+                                    BackgroundSyncLogger.logDebug("[Backfill] \(folder.name): skipping fully-crawled write — the folder no longer holds the UIDVALIDITY this pass premised (\(String(describing: writePremise))) or its walk position moved; declining for this call, retry next cycle")
                                 }
                             }
-                            didWork = true
+                            // A refused or failed write landed nothing, so the call
+                            // made no progress here, as in the page walk.
+                            if written { didWork = true }
                             await updateBackfillProgressForAccount(account)
                             continue
                         }
@@ -1510,14 +1582,12 @@ extension SyncEngine {
                                     throw FreshCursorWriteFailureForTesting()
                                 }
                                 #endif
-                                guard try Self.crawlWalkWriteAllowed(
-                                    db, folderId: folderId, premiseEpoch: writePremise
-                                ) else { return (landed: false, stamped: false) }
-                                _ = try Folder.filter(Column("id") == folderId)
-                                    .updateAll(db,
+                                guard try Self.writeUIDWalkPosition(
+                                    db, folderId: folderId, premiseEpoch: writePremise, position: position, [
                                         Column("backfillUidCursor").set(to: initialCursor),
-                                        Column("lastKnownUidNext").set(to: uidNext)
-                                    )
+                                        Column("lastKnownUidNext").set(to: uidNext),
+                                    ]
+                                ) else { return (landed: false, stamped: false) }
                                 let stamped = try Self.bootstrapCrawledFolderUidValidity(
                                     db, folderId: folderId, observed: walkEpoch)
                                 return (landed: true, stamped: stamped)
@@ -1532,7 +1602,7 @@ extension SyncEngine {
                         guard planted.landed else {
                             epochDeclinedFolderIds.insert(folder.id)
                             if DebugModeManager.isLoggingEnabled() {
-                                BackgroundSyncLogger.logDebug("[Backfill] \(folder.name): skipping initial cursor write — the folder no longer holds the UIDVALIDITY this pass premised (\(String(describing: writePremise))); declining for this call, retry next cycle")
+                                BackgroundSyncLogger.logDebug("[Backfill] \(folder.name): skipping initial cursor write — the folder no longer holds the UIDVALIDITY this pass premised (\(String(describing: writePremise))) or its walk position moved; declining for this call, retry next cycle")
                             }
                             continue
                         }
@@ -1578,6 +1648,7 @@ extension SyncEngine {
                     // one.
                     let expectedEpoch = walkEpoch
                     var epochMovedMidWalk = false
+                    var insertFailedMidWalk = false
                     await withTaskGroup(of: BackfillWorkerOutcome.self) { group in
                         for workerIndex in 0..<workerCount {
                             group.addTask { [self] in
@@ -1603,6 +1674,15 @@ extension SyncEngine {
                                 while let range = await cursor.nextRange() {
                                     guard !Task.isCancelled else {
                                         // Cancelled — return range for retry next cycle
+                                        await cursor.failRange(from: range.from, to: range.to)
+                                        break
+                                    }
+                                    // Something else wrote the walk position since
+                                    // this pass read it (a progress write below
+                                    // found another version): stop walking. The
+                                    // pass writes nothing more, and the next call
+                                    // walks on from what the folder then holds.
+                                    guard !position.isLost else {
                                         await cursor.failRange(from: range.from, to: range.to)
                                         break
                                     }
@@ -1661,16 +1741,19 @@ extension SyncEngine {
                                                 // `resetEmptyFolderCrawlEpoch`), and
                                                 // BOTH fail open under an
                                                 // epoch comparison — hence the CAS.
-                                                guard try Self.crawlWalkWriteAllowed(
-                                                    db, folderId: folderCaptured.id, premiseEpoch: walkWritePremise
+                                                // Also compare-and-set on the walk
+                                                // position: a reset or a second walker
+                                                // landing during this range's SEARCH
+                                                // is never overwritten.
+                                                guard try Self.writeUIDWalkPosition(
+                                                    db, folderId: folderCaptured.id, premiseEpoch: walkWritePremise,
+                                                    position: position, [Column("backfillUidCursor").set(to: snapshotCursor)]
                                                 ) else {
                                                     if DebugModeManager.isLoggingEnabled() {
-                                                        print("[Backfill] \(folderCaptured.name) w\(workerIndex): skipping progress cursor write — the folder no longer holds the UIDVALIDITY this pass premised")
+                                                        print("[Backfill] \(folderCaptured.name) w\(workerIndex): skipping progress cursor write — the folder no longer holds the UIDVALIDITY this pass premised or its walk position moved")
                                                     }
                                                     return
                                                 }
-                                                _ = try Folder.filter(Column("id") == folderCaptured.id)
-                                                    .updateAll(db, Column("backfillUidCursor").set(to: snapshotCursor))
                                             }
                                             await self.updateBackfillProgressForAccount(accountCaptured)
                                         }
@@ -1765,7 +1848,7 @@ extension SyncEngine {
                                         // tuple member, so this leg cannot be skipped by
                                         // omission — `break` inside `guard else` targets
                                         // the `while` (a `switch` would have swallowed it).
-                                        guard case .landed(let inserted, let ftsRecords, let ccBccUpdates) =
+                                        guard case .landed(let inserted, let ftsRecords, let ccBccUpdates, let allLanded) =
                                             await self.insertBackfillBatch(
                                                 fetchedHeaders, folderId: folderCaptured.id, accountId: folderCaptured.accountId,
                                                 folderPath: folderCaptured.path, folderRole: folderCaptured.role, isInInbox: folderCaptured.role == .inbox,
@@ -1789,6 +1872,20 @@ extension SyncEngine {
                                                 folderPath: folderCaptured.path, isInInbox: folderCaptured.role == .inbox
                                             )
                                         }
+                                        // A write chunk failed: some of this
+                                        // range's messages have no row, so the
+                                        // range is FAILED, never confirmed, and
+                                        // the cursor stays above it. This worker
+                                        // stops (failed ranges are served first,
+                                        // so continuing would retry the failing
+                                        // write at once), and the pass declines
+                                        // the folder for the rest of the call.
+                                        guard allLanded else {
+                                            await cursor.failRange(from: range.from, to: range.to)
+                                            outcome.insertFailed = true
+                                            BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) range \(range.from)...\(range.to): a write of its messages failed — keeping the range for the next call")
+                                            break
+                                        }
                                     }
 
                                     // Confirm AFTER successful DB insert
@@ -1798,16 +1895,15 @@ extension SyncEngine {
                                         let snapshotCursor = await cursor.currentCursor
                                         try? await AppDatabase.backgroundPool.write { db in
                                             // NB2/NB4 — see the empty-range twin above.
-                                            guard try Self.crawlWalkWriteAllowed(
-                                                db, folderId: folderCaptured.id, premiseEpoch: walkWritePremise
+                                            guard try Self.writeUIDWalkPosition(
+                                                db, folderId: folderCaptured.id, premiseEpoch: walkWritePremise,
+                                                position: position, [Column("backfillUidCursor").set(to: snapshotCursor)]
                                             ) else {
                                                 if DebugModeManager.isLoggingEnabled() {
-                                                    print("[Backfill] \(folderCaptured.name) w\(workerIndex): skipping progress cursor write — the folder no longer holds the UIDVALIDITY this pass premised")
+                                                    print("[Backfill] \(folderCaptured.name) w\(workerIndex): skipping progress cursor write — the folder no longer holds the UIDVALIDITY this pass premised or its walk position moved")
                                                 }
                                                 return
                                             }
-                                            _ = try Folder.filter(Column("id") == folderCaptured.id)
-                                                .updateAll(db, Column("backfillUidCursor").set(to: snapshotCursor))
                                         }
                                         await self.updateBackfillProgressForAccount(accountCaptured)
                                     }
@@ -1818,6 +1914,7 @@ extension SyncEngine {
                         for await workerResult in group {
                             if workerResult.didWork { didWork = true }
                             if workerResult.epochDisagreed { epochMovedMidWalk = true }
+                            if workerResult.insertFailed { insertFailedMidWalk = true }
                         }
                     }
 
@@ -1857,9 +1954,11 @@ extension SyncEngine {
                     // (`crawlWalkWriteAllowed`) — as, since round 12, are the two
                     // `case .fresh` writes `9e0c4797e` left bare while claiming
                     // otherwise; the disproving search is
-                    // `rg -n 'Column\("backfillUidCursor"\)\.set|Column\("backfillComplete"\)\.set|Column\("lastKnownUidNext"\)\.set|crawlWalkWriteAllowed'`
+                    // `rg -n 'Column\("backfillUidCursor"\)\.set|Column\("backfillComplete"\)\.set|Column\("lastKnownUidNext"\)\.set|crawlWalkWriteAllowed|writeUIDWalkPosition'`
                     // over this file, and every IMAP-branch bookkeeping write it
-                    // returns now sits under a guard. What they persisted is sound on
+                    // returns now sits under a guard. (2026-11-12: every one of them
+                    // now goes through `writeUIDWalkPosition`, which adds the walk
+                    // position's version compare-and-set to the UIDVALIDITY guard.) What they persisted is sound on
                     // its own terms: a cursor can only advance past a range that a
                     // worker confirmed, and a worker only confirms a range whose own
                     // SEARCH and FETCH agreed with `expectedEpoch` — so every
@@ -1887,6 +1986,31 @@ extension SyncEngine {
                         await updateBackfillProgressForAccount(account)
                         continue
                     }
+                    // The walk position moved under this pass (a progress write
+                    // found another version): something else wrote the cursor or
+                    // the completion, and this pass's view of the folder is stale.
+                    // It writes nothing more; the folder is declined for the rest
+                    // of the call, like every other refused write, and the next
+                    // call re-reads it and walks on from what it then holds. Rows
+                    // this pass inserted stay (they are real mail) and count as
+                    // work.
+                    if position.isLost {
+                        epochDeclinedFolderIds.insert(folder.id)
+                        if DebugModeManager.isLoggingEnabled() {
+                            BackgroundSyncLogger.logDebug("[Backfill] \(folder.name): its walk position was written by something else mid-walk — skipping cursor/completeness bookkeeping, retry next cycle")
+                        }
+                        await updateBackfillProgressForAccount(account)
+                        continue
+                    }
+                    // A write chunk failed: its range was failed, so the cursor
+                    // persisted below stays above it and the folder cannot
+                    // complete from this pass. Decline it for the rest of the
+                    // call so the failing write is not retried at network rate;
+                    // the next call walks the range again (the insert skips what
+                    // did land).
+                    if insertFailedMidWalk {
+                        epochDeclinedFolderIds.insert(folder.id)
+                    }
                     // Both final writes are guarded and re-read the folder row inside
                     // their own transaction (NB4), and both report whether they
                     // actually landed. A write that did NOT land leaves the folder
@@ -1894,19 +2018,19 @@ extension SyncEngine {
                     // folder straight back with no inter-folder delay — a
                     // network-rate spin under a persistent write failure or a
                     // concurrent re-stamp (the NB3 shape). Decline it for the rest
-                    // of this call instead; the next call retries.
+                    // of this call instead; the next call retries. A refused or
+                    // failed final write landed nothing, so it is no work.
                     let folderId = folder.id
+                    var finalWriteLanded = false
                     if isComplete {
                         let written = ((try? await AppDatabase.backgroundPool.write { db -> Bool in
-                            guard try Self.crawlWalkWriteAllowed(
-                                db, folderId: folderId, premiseEpoch: walkWritePremise) else { return false }
-                            _ = try Folder.filter(Column("id") == folderId)
-                                .updateAll(db,
+                            try Self.writeUIDWalkPosition(
+                                db, folderId: folderId, premiseEpoch: walkWritePremise, position: position, [
                                     Column("backfillComplete").set(to: true),
-                                    Column("backfillUidCursor").set(to: nil as Int?)
-                                )
-                            return true
+                                    Column("backfillUidCursor").set(to: nil as Int?),
+                                ])
                         }) ?? false)
+                        finalWriteLanded = written
                         if written {
                             BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) fully crawled (all ranges confirmed)")
                             BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress)/\(folder.name) fully crawled (all ranges confirmed)")
@@ -1918,12 +2042,11 @@ extension SyncEngine {
                         }
                     } else {
                         let written = ((try? await AppDatabase.backgroundPool.write { db -> Bool in
-                            guard try Self.crawlWalkWriteAllowed(
-                                db, folderId: folderId, premiseEpoch: walkWritePremise) else { return false }
-                            _ = try Folder.filter(Column("id") == folderId)
-                                .updateAll(db, Column("backfillUidCursor").set(to: finalCursor))
-                            return true
+                            try Self.writeUIDWalkPosition(
+                                db, folderId: folderId, premiseEpoch: walkWritePremise, position: position,
+                                [Column("backfillUidCursor").set(to: finalCursor)])
                         }) ?? false)
+                        finalWriteLanded = written
                         if !written {
                             epochDeclinedFolderIds.insert(folder.id)
                             if DebugModeManager.isLoggingEnabled() {
@@ -1936,7 +2059,7 @@ extension SyncEngine {
                             BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress)/\(folder.name) has failed ranges — retry next cycle (cursor at \(finalCursor))")
                         }
                     }
-                    didWork = true
+                    if finalWriteLanded { didWork = true }
                     await updateBackfillProgressForAccount(account)
                     continue
 

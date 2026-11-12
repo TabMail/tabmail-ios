@@ -61,10 +61,14 @@ struct Folder: Codable, FetchableRecord, PersistableRecord, Identifiable, Hashab
     /// was set under, so every write that moves or clears `backfillPageToken`
     /// clears it in the same write. Nil: the current page has not been held.
     var backfillPageHeldSince: Date?
-    /// Row version of the backfill bookkeeping. A database trigger bumps it on
-    /// every update that writes `backfillPageToken` or `backfillComplete`, so the
-    /// page-token walk's write can tell whether anything wrote them since it read
-    /// the folder (`SyncEngine.advanceBackfillPageWalk`). Never set it by hand.
+    /// Row version of the backfill bookkeeping. A database trigger sets it to a
+    /// fresh value on every update that writes `backfillPageToken`,
+    /// `backfillComplete` or `backfillUidCursor`, and when the row is inserted, so
+    /// either walk's write can tell whether anything wrote them since it read the
+    /// folder (`SyncEngine.advanceBackfillPageWalk`, `SyncEngine.writeUIDWalkPosition`).
+    /// Values come from one database-wide counter and never repeat, so a deleted
+    /// and re-created folder (same deterministic id) never shows a version an old
+    /// walk read. Never set it by hand.
     var backfillVersion: Int = 0
     /// IMAP UIDVALIDITY — **the epoch the LOCAL UIDs in this folder belong to**,
     /// NOT "the epoch the server most recently reported". It is the

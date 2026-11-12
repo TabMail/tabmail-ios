@@ -1238,7 +1238,7 @@ struct GmailCatchUpTests {
             "TabMail/Services/Demo/DemoSeed.swift": (1, "demo folders start complete"),
             "TabMail/Services/Sync/SyncEngineBackfill.swift": (2, "the fast-sync reset"),
             "TabMail/Services/Sync/SyncEngineBackfillWalk.swift": (
-                3, "the IMAP walk's completions (2); the walk's refused-token restart (compare-and-set on the saved token) (1)"),
+                3, "the IMAP walk's completions, compare-and-set on the version through `writeUIDWalkPosition` (2); the walk's refused-token restart (compare-and-set on the saved token) (1)"),
             "TabMail/Views/Settings/SettingsView.swift": (2, "the Settings reset"),
             "TabMail/Views/Settings/AccountDetailView.swift": (1, "the account's re-sync reset"),
         ]
@@ -2232,6 +2232,81 @@ struct GmailCatchUpTests {
             #expect(try Self.folder(world, labelPath).backfillComplete, "the walk completes")
             let rows = try Self.rows(world, labelPath)
             #expect(rows["l1"] != nil, "the row the reset deleted comes back on the walk's next pass")
+            #expect(rows["l2"] != nil && rows["l3"] != nil)
+        }
+    }
+
+    /// The folder row is deleted and created again under the same id while a
+    /// walk iteration is in flight (`Folder.id` is `"\(accountId):\(path)"`, so
+    /// a folder that disappears and comes back reuses it), and the new row then
+    /// goes through as many bookkeeping writes as the old one had. The
+    /// iteration read the OLD row's version; its stale page-outcome write must
+    /// not land on the NEW row because the new row happens to hold the same
+    /// number. The new row's walk starts from the top, so `l1`, whose row went
+    /// with the old folder, loads again. A stale token written onto the new row
+    /// would walk on from the page after the held one and never list `l1`.
+    /// (`Folder.backfillVersion` values never repeat, migration v101.)
+    @Test("A folder row deleted and re-created mid-iteration never takes the stale iteration's write: the new walk starts from the top",
+          .enabled(if: !NetworkMonitor.checkExpensive()))
+    func recreatedFolderRowNeverTakesAStaleWalkWrite() async throws {
+        let clock = Clock()
+        // The walk lists newest first, one id per page: l1, l2, l3.
+        let seeds = [
+            Self.seed("l1", clock.daysAgo(10), [labelPath]),
+            Self.seed("l2", clock.daysAgo(20), [labelPath]),
+            Self.seed("l3", clock.daysAgo(30), [labelPath]),
+        ]
+        let local = seeds.map { Local(id: $0.providerMessageId, path: labelPath, date: $0.internalDate!) }
+        try await Self.withWorld("gcu-walk-recreated-row", seeds: seeds, local: local) { world async throws in
+            world.server.limitWalkListPages(to: 1)
+            // The iteration reads the page after l1's.
+            let readToken = "1"
+            let labelId = world.folderId(labelPath)
+            let accountId = world.accountId
+            try await world.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET backfillComplete = 0, backfillPageToken = ? WHERE id = ?",
+                               arguments: [readToken, labelId])
+            }
+            let read = try Self.folder(world, labelPath)
+            let account = try #require(try await world.pool.read { db in try Account.fetchOne(db, key: accountId) })
+
+            let hold = world.server.holdNextWalkList()
+            defer { hold.release.signal() }
+            let walk = Task { await world.engine.runBackfill(account: account) }
+            let arrived = await Task.detached { hold.waitUntilReached(seconds: Self.holdArrivalSeconds) }.value
+            try #require(arrived, "precondition: the walk's page request is held")
+
+            // Meanwhile: the folder goes away with its rows, and comes back.
+            try await world.pool.write { db in
+                try db.execute(sql: "DELETE FROM messageHeader WHERE folderId = ?", arguments: [labelId])
+                try db.execute(sql: "DELETE FROM folder WHERE id = ?", arguments: [labelId])
+            }
+            try FolderEpochTestFixture.insertFolder(accountId: accountId, path: labelPath, role: .custom, pool: world.pool)
+            // The new row's own bookkeeping writes, as many as it takes to reach
+            // the version the iteration read if the numbering repeats (each write
+            // gives it a fresh version; with repeating numbers that climbs back to
+            // the old row's).
+            var recreated = try Self.folder(world, labelPath)
+            for _ in 0..<(read.backfillVersion + 1) where recreated.backfillVersion < read.backfillVersion {
+                try await world.pool.write { db in
+                    try db.execute(sql: "UPDATE folder SET backfillComplete = 0 WHERE id = ?", arguments: [labelId])
+                }
+                recreated = try Self.folder(world, labelPath)
+            }
+            #expect(recreated.backfillPageToken == nil && !recreated.backfillComplete,
+                    "precondition: the new row's walk is at the top")
+            #expect(try Self.rows(world, labelPath).isEmpty, "precondition: the old folder's rows went with it")
+
+            hold.release.signal()
+            _ = await walk.value
+            try await Self.backfillUntilComplete(world)
+
+            let walkLists = world.server.listRequests().filter { $0.labelId == labelPath && $0.bound("after") == nil }
+            #expect(walkLists.first?.pageToken == readToken, "precondition: the held page was the iteration's")
+            #expect(try Self.folder(world, labelPath).backfillComplete, "the walk completes")
+            let rows = try Self.rows(world, labelPath)
+            #expect(rows["l1"] != nil,
+                    "the new folder's walk never listed its first page (the stale iteration's token landed on the new row; versions read \(read.backfillVersion), new row \(recreated.backfillVersion)): \(walkLists.map { $0.pageToken ?? "top" })")
             #expect(rows["l2"] != nil && rows["l3"] != nil)
         }
     }

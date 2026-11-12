@@ -1584,3 +1584,103 @@ struct FolderBackfillVersionMigrationTests {
         #expect(try Self.version(db, id) == 0)
     }
 }
+
+// MARK: - v101 — the backfill version covers the UID cursor and never repeats
+
+/// `v101_backfillVersionCoversUidCursorAndNeverRepeats` makes every walk's
+/// position part of the row version (the IMAP walk's `backfillUidCursor`
+/// joins the page walk's columns), and makes every version a folder row ever
+/// holds unique across the database, so a folder deleted and re-created under
+/// the same id never shows a version a walk read from the old row.
+@Suite("Migration v101 — backfillVersion covers the UID cursor and never repeats")
+struct FolderBackfillVersionNeverRepeatsMigrationTests {
+    /// Migrated to v100 with one folder whose version the v100 trigger moved to
+    /// `bumpsBefore`, then to v101.
+    private static func migrated(bumpsBefore: Int = 2) throws -> (DatabaseQueue, String) {
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let db = try DatabaseQueue(configuration: configuration)
+        var migrator = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &migrator)
+        try migrator.migrate(db, upTo: "v100_addFolderBackfillVersion")
+        try TestDatabase.insertAccount(db, id: "acc1", email: "one@example.com")
+        try TestDatabase.insertFolder(db)
+        let id = try #require(try db.read { try String.fetchOne($0, sql: "SELECT id FROM folder") })
+        for _ in 0..<bumpsBefore {
+            try db.write { try $0.execute(sql: "UPDATE folder SET backfillComplete = 0 WHERE id = ?", arguments: [id]) }
+        }
+        try migrator.migrate(db, upTo: "v101_backfillVersionCoversUidCursorAndNeverRepeats")
+        return (db, id)
+    }
+
+    private static func version(_ db: DatabaseQueue, _ id: String) throws -> Int {
+        try db.read { try Int.fetchOne($0, sql: "SELECT backfillVersion FROM folder WHERE id = ?", arguments: [id]) } ?? -1
+    }
+
+    @Test("v101 keeps every existing folder's version")
+    func existingVersionsKept() throws {
+        let (db, id) = try Self.migrated(bumpsBefore: 2)
+        #expect(try Self.version(db, id) == 2)
+    }
+
+    @Test("Every write of the UID cursor moves the version, even an unchanged one, as the page walk's columns do")
+    func everyCursorWriteMoves() throws {
+        let (db, id) = try Self.migrated()
+        let writes = [
+            "UPDATE folder SET backfillUidCursor = 10 WHERE id = ?",
+            "UPDATE folder SET backfillUidCursor = 10 WHERE id = ?",
+            "UPDATE folder SET backfillUidCursor = NULL WHERE id = ?",
+            "UPDATE folder SET backfillComplete = 1 WHERE id = ?",
+            "UPDATE folder SET backfillPageToken = 'next' WHERE id = ?",
+        ]
+        var seen = [try Self.version(db, id)]
+        for sql in writes {
+            try db.write { try $0.execute(sql: sql, arguments: [id]) }
+            let now = try Self.version(db, id)
+            #expect(now > seen.last!, "\(sql): version \(now) after \(seen)")
+            seen.append(now)
+        }
+    }
+
+    @Test("A write that leaves the bookkeeping out does not move the version")
+    func otherWritesDoNotMove() throws {
+        let (db, id) = try Self.migrated()
+        let before = try Self.version(db, id)
+        try db.write {
+            try $0.execute(sql: "UPDATE folder SET unreadCount = unreadCount + 1, lastKnownUidNext = 50, backfillPageHeldSince = CURRENT_TIMESTAMP WHERE id = ?", arguments: [id])
+        }
+        #expect(try Self.version(db, id) == before)
+    }
+
+    @Test("A folder deleted and re-created under the same id never holds a version the old row held")
+    func recreatedRowNeverRepeatsAVersion() throws {
+        let (db, id) = try Self.migrated(bumpsBefore: 0)
+        var oldVersions: Set<Int> = [try Self.version(db, id)]
+        for _ in 0..<3 {
+            try db.write { try $0.execute(sql: "UPDATE folder SET backfillComplete = 0 WHERE id = ?", arguments: [id]) }
+            oldVersions.insert(try Self.version(db, id))
+        }
+        try db.write { try $0.execute(sql: "DELETE FROM folder WHERE id = ?", arguments: [id]) }
+        let recreated = try TestDatabase.insertFolder(db)
+        #expect(recreated.id == id, "precondition: the re-created folder has the old id")
+        var newVersions: [Int] = [try Self.version(db, id)]
+        for _ in 0..<4 {
+            try db.write { try $0.execute(sql: "UPDATE folder SET backfillComplete = 0 WHERE id = ?", arguments: [id]) }
+            newVersions.append(try Self.version(db, id))
+        }
+        let repeated = newVersions.filter(oldVersions.contains)
+        #expect(repeated.isEmpty, "the re-created row held \(repeated), which the old row held (old \(oldVersions.sorted()), new \(newVersions))")
+    }
+
+    @Test("A folder inserted with a version written by hand gets a fresh one")
+    func insertedVersionIsSeeded() throws {
+        let (db, id) = try Self.migrated(bumpsBefore: 3)
+        let existing = try Self.version(db, id)
+        var other = Folder(name: "Other", path: "Other", role: .custom, accountId: "acc1")
+        other.backfillVersion = existing
+        let otherId = other.id
+        try db.write { [other] in try other.insert($0) }
+        let seeded = try Self.version(db, otherId)
+        #expect(seeded > existing, "the inserted row kept or reused version \(seeded); the existing row holds \(existing)")
+    }
+}

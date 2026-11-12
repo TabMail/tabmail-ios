@@ -282,6 +282,12 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// window — infinite-scroll paging, whose cursor IS the window — opts in via
         /// `honorSearchDateCriteria()`.
         var honorsSearchDateCriteria = false
+        /// Whether UID SEARCH honours a `UID <set>` search key (RFC 3501 §6.4.4).
+        /// `false` by default for the same reason as `honorsSearchDateCriteria`:
+        /// this fake has always answered with the whole mailbox. A fixture whose
+        /// subject is the backfill UID walk's per-range SEARCH opts in via
+        /// `honorSearchUIDSetCriterion()`, or every range finds every message.
+        var honorsSearchUIDSetCriterion = false
         /// B1 (ADR-IOS-068/D4) — mailboxes whose APPEND is accepted, assigned a
         /// UID and acknowledged normally, but whose tagged OK omits the
         /// `APPENDUID` response code even though this server advertises UIDPLUS.
@@ -902,6 +908,15 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// `State.honorsSearchDateCriteria`.
     func honorSearchDateCriteria() {
         withState { $0.honorsSearchDateCriteria = true }
+    }
+
+    /// Test seam: make UID SEARCH answer only with the messages whose UID is in
+    /// the search's `UID <set>` key, instead of the whole mailbox. Required by a
+    /// fixture that walks a folder by UID range (the backfill UID walk), where a
+    /// server that ignores the range lets every range fetch every message. Off
+    /// by default; see `State.honorsSearchUIDSetCriterion`.
+    func honorSearchUIDSetCriterion() {
+        withState { $0.honorsSearchUIDSetCriterion = true }
     }
 
     /// RFC 3501 §6.4.4 at DAY granularity, which is all the wire form carries
@@ -2140,7 +2155,16 @@ final class FakeIMAPServer: @unchecked Sendable {
             let dateFiltered = honorsDates
                 ? all.filter { Self.matchesSearchDateCriteria($0, args: subargs) }
                 : all
+            // The `UID <set>` key, when the fixture opted in: the token after a
+            // standalone `UID` in the search arguments.
+            let tokens = subargs.split(separator: " ").map(String.init)
+            let uidSetKey = withState { $0.honorsSearchUIDSetCriterion }
+                ? tokens.firstIndex { $0.uppercased() == "UID" }
+                    .flatMap { $0 + 1 < tokens.count ? tokens[$0 + 1] : nil }
+                : nil
+            let uidSet = uidSetKey.map { Set(parseUIDSet($0, in: mailbox)) }
             let uids = dateFiltered
+                .filter { uidSet?.contains($0.uid) ?? true }
                 .map { String($0.uid) }
                 .joined(separator: " ")
             return "* SEARCH \(uids)\r\n\(tag) OK UID SEARCH completed\r\n"

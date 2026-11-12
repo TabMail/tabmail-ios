@@ -4332,6 +4332,58 @@ final class AppDatabase: Sendable {
                 END
                 """)
         }
+
+        // The backfill row version now covers every walk and never repeats.
+        //
+        // 1. The IMAP UID walk's position, `backfillUidCursor`, joins the columns
+        //    whose every write bumps the version, so the UID walk compares the
+        //    version exactly as the page walk does (`SyncEngine.writeUIDWalkPosition`).
+        // 2. Every new version is drawn from ONE database-wide counter, both on a
+        //    bump and when a folder row is inserted. `Folder.id` is the
+        //    deterministic `"\(accountId):\(path)"`, so a folder that is deleted and
+        //    re-created reuses its id; under v100 the new row started again at 0 and
+        //    could climb back to the exact version a walk of the old row had read,
+        //    and that walk's write would then land on the new row. A whole-record
+        //    `Folder.update` that writes a stale `backfillVersion` is also
+        //    overwritten by the trigger with a fresh value, never one already used.
+        //
+        // The counter starts at the highest version any row holds, so no existing
+        // row's value is ever issued again. Convergence: a fresh install and an
+        // upgraded DB both end with the one-row counter at or above every row's
+        // version, the replaced update trigger and the new insert trigger.
+        migrator.registerTimedMigration(
+            "v101_backfillVersionCoversUidCursorAndNeverRepeats", foreignKeyChecks: .immediate
+        ) { db in
+            try db.execute(sql: """
+                CREATE TABLE backfillVersionCounter (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    value INTEGER NOT NULL
+                )
+                """)
+            try db.execute(sql: """
+                INSERT INTO backfillVersionCounter (id, value)
+                SELECT 1, COALESCE(MAX(backfillVersion), 0) FROM folder
+                """)
+            try db.execute(sql: "DROP TRIGGER folder_bumpBackfillVersion")
+            try db.execute(sql: """
+                CREATE TRIGGER folder_bumpBackfillVersion
+                AFTER UPDATE OF backfillPageToken, backfillComplete, backfillUidCursor ON folder
+                BEGIN
+                    UPDATE backfillVersionCounter SET value = value + 1 WHERE id = 1;
+                    UPDATE folder SET backfillVersion = (SELECT value FROM backfillVersionCounter WHERE id = 1)
+                    WHERE id = NEW.id;
+                END
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER folder_seedBackfillVersion
+                AFTER INSERT ON folder
+                BEGIN
+                    UPDATE backfillVersionCounter SET value = value + 1 WHERE id = 1;
+                    UPDATE folder SET backfillVersion = (SELECT value FROM backfillVersionCounter WHERE id = 1)
+                    WHERE id = NEW.id;
+                END
+                """)
+        }
     }
 
     /// PORT — v2final `AppDatabase.seedDraftLastTouchedSeq`. Extracted to a static
