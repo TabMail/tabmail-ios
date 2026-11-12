@@ -619,3 +619,17 @@ census. The census greps were re-run and are unchanged (8 / 3 / 5 / 3 / 2). Item
 unchanged: the organizer step runs after `requireDeletedAlone` and before the PUT, and it only
 inserts ORGANIZER lines (it never removes or rewrites a VEVENT, so no VEVENT's identity changes),
 and a lookup that fails throws before the PUT, so nothing is written then.
+
+**(9) The Outlook split carry's `DELETE` of an occurrence of the new part — IN the set (2026-11-12, #563).**
+When a "this and following" split carries the occurrences deleted one by one after it
+(`ExchangeCalendarProvider.carry`, carry mode), it sends `DELETE /me/events/{id}` for the new part's
+occurrence at each deleted place. Graph documents no per-occurrence restore, so by the property it is
+counted. What it removes is a fresh, plain occurrence of a series this same split created moments
+before, at a place the user had already deleted in the series it came from; it holds nothing of the
+user's own. Its guards: the occurrence is found among the new part's `/instances` (every page) by its
+place (`originalStart`), never by position; a place not listed is done (a 404/410 is done); the
+deletes run only in carry mode, after the split's record is kept and before the cap, so a failure
+leaves the series whole. The census count is now nine.
+
+**Negative case.** Re-adjudicate if the carry ever deletes an occurrence of a series it did not just
+create, matches an occurrence by anything other than its place, or deletes outside carry mode.

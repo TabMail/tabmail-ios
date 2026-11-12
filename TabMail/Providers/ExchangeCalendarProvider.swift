@@ -481,7 +481,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
               let partPatch = SplitCarry.partEdit(patch, named: found) else {
             throw CalendarProviderError.notSupported("the place in the series of the occurrence named can't be read, so the series can't be split at it")
         }
-        let mode = SplitCarry.mode(edit: partPatch, place: splitPlace, storedRules: masterRecurrence)
+        let mode = SplitCarry.mode(edit: partPatch, place: splitPlace, storedRules: masterRecurrence, seriesZone: master.isAllDay ? nil : master.seriesZone)
         guard let capEndDate = Self.graphEndDateBefore(naiveISO: place, allDay: master.isAllDay, zone: recurrenceIdZone),
               let cappedJSON = Self.splitCapJSON(master: master, storedRecurrence: storedRecurrence, capEndDate: capEndDate) else {
             throw CalendarProviderError.notSupported("Invalid recurrence_id '\(recurrenceId)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
@@ -729,10 +729,17 @@ actor ExchangeCalendarProvider: CalendarProvider {
               let from = GoogleCalendarProvider.naiveInstant(first.description, zone: .gmt)?.addingTimeInterval(-2 * 86_400),
               let to = GoogleCalendarProvider.naiveInstant(last.description, zone: .gmt)?.addingTimeInterval(3 * 86_400) else { throw unplaced }
         let encodedPart = try Self.encodedGraphPathSegment(newPartId, context: "Graph event id")
-        let listed = try await request(
-            path: "/events/\(encodedPart)/instances?startDateTime=\(from.iso8601String())&endDateTime=\(to.iso8601String())&$top=1000",
-            timeZoneName: seriesZone)
-        let instances = ((try JSONSerialization.jsonObject(with: listed) as? [String: Any])?["value"] as? [[String: Any]]) ?? []
+        // Every page: an occurrence past the first is carried like any other.
+        var instances: [[String: Any]] = []
+        var next: String? = "/events/\(encodedPart)/instances?startDateTime=\(from.iso8601String())&endDateTime=\(to.iso8601String())&$top=1000"
+        while let path = next {
+            let listed = try await request(path: path, timeZoneName: seriesZone)
+            guard let page = try JSONSerialization.jsonObject(with: listed) as? [String: Any] else {
+                throw CalendarProviderError.notSupported("the new part's occurrences can't be read, so the changed ones can't be carried")
+            }
+            instances += page["value"] as? [[String: Any]] ?? []
+            next = try (page["@odata.nextLink"] as? String).map { try graphPath(ofNextLink: $0) }
+        }
         func instanceId(at place: GCalDateTime) -> String? {
             instances.first { instance in
                 guard let original = instance["originalStart"] as? String, let at = Date.fromISO8601(original) else { return false }
@@ -763,21 +770,15 @@ actor ExchangeCalendarProvider: CalendarProvider {
             }
         }
         for change in try Self.carryOrder(plan.changed, zone: zone) {
-            guard let id = instanceId(at: change.place) else { continue }
-            let own = exceptions.first { $0.raw["id"] as? String == change.exception.id }?.raw ?? [:]
-            var json: [String: Any] = [:]
-            for field in change.own {
-                switch field {
-                case .summary: json["subject"] = own["subject"] ?? ""
-                case .location: json["location"] = own["location"] ?? ["displayName": ""]
-                case .description: json["body"] = own["body"] ?? ["contentType": "text", "content": ""]
-                case .transparency: json["showAs"] = own["showAs"] ?? "busy"
-                case .attendees:
-                    let held = own["attendees"] as? [[String: Any]] ?? []
-                    json["attendees"] = difference.map { Self.appliedAttendeesJSON($0, to: held) } ?? held
-                case .end: break
-                }
+            // A changed occurrence the new part does not list can't be carried: refused before the
+            // cap, with the series whole. (A deleted place not listed is done, above.)
+            guard let id = instanceId(at: change.place) else {
+                throw CalendarProviderError.notSupported("a changed occurrence of this repeating event isn't on its new part, so its change can't be carried")
             }
+            let own = exceptions.first { $0.raw["id"] as? String == change.exception.id }?.raw ?? [:]
+            var json = Self.carriedJSON(own, fields: fields)
+            let held = own["attendees"] as? [[String: Any]] ?? []
+            json["attendees"] = difference.map { Self.appliedAttendeesJSON($0, to: held) } ?? held
             if let start = change.start, let end = change.end {
                 var times = GCalEventInput()
                 times.startDate = start.date
@@ -796,9 +797,36 @@ actor ExchangeCalendarProvider: CalendarProvider {
             let encoded = try Self.encodedGraphPathSegment(id, context: "Graph event instance id")
             _ = try await request(path: "/events/\(encoded)", method: "PATCH", body: try JSONSerialization.data(withJSONObject: json))
             if DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[ExchangeCalendar] split carried a changed occurrence onto \(id): \(change.own.sorted().map(\.rawValue)) times=\(change.start != nil)")
+                BackgroundSyncLogger.logDebug("[ExchangeCalendar] split carried a changed occurrence onto \(id): keys=\(json.keys.sorted()) times=\(change.start != nil)")
             }
         }
+    }
+
+    /// The JSON a carry writes for the changed occurrence `exception` (read with every property):
+    /// each property a split's new part copies (`splitCopiedKeys`) but `isAllDay` (an occurrence
+    /// keeps its series' form), and but those the edit set (`fields`), which the new part already
+    /// holds. Guests and times are written by the carry itself.
+    nonisolated static func carriedJSON(_ exception: [String: Any], fields: Set<SplitCarry.Field>) -> [String: Any] {
+        var set: Set<String> = ["isAllDay"]
+        for field in fields {
+            switch field {
+            case .summary: set.insert("subject")
+            case .location: set.formUnion(["location", "locations"])
+            case .description: set.insert("body")
+            case .transparency: set.insert("showAs")
+            case .attendees, .end: break
+            }
+        }
+        return exception.filter { splitCopiedKeys.contains($0.key) && !set.contains($0.key) }
+    }
+
+    /// The path, under `baseURL`, of a Graph `@odata.nextLink`. A link to anywhere else is
+    /// refused: the token is never sent off Graph.
+    func graphPath(ofNextLink link: String) throws -> String {
+        guard link.hasPrefix(baseURL + "/") else {
+            throw CalendarProviderError.notSupported("Graph gave a next page outside Microsoft Graph, so it was not read")
+        }
+        return String(link.dropFirst(baseURL.count))
     }
 
     /// `changes` in the order Graph takes them: an occurrence moved to another date goes once no

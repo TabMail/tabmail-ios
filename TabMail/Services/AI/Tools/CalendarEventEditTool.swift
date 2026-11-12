@@ -405,7 +405,7 @@ struct CalendarEventEditTool: AgentTool, Sendable {
             edit.ruleDayMove = try? CalendarSeriesScope.dayMove(arguments, named: named, scope: resolvedScope, zone: tz)
             let series = try named.readSeries()
             splitResets = SplitCarry.partEdit(edit, named: occurrence)
-                .map { SplitCarry.mode(edit: $0, place: place, storedRules: series.recurrence ?? []) == .reset } ?? false
+                .map { SplitCarry.mode(edit: $0, place: place, storedRules: series.recurrence ?? [], seriesZone: series.isAllDay ? nil : series.seriesZone) == .reset } ?? false
         }
         if turnsDays || splitResets {
             changes.append(CalendarToolHelpers.exceptionsResetNote)

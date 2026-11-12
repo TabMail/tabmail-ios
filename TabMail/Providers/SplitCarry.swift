@@ -15,11 +15,13 @@ import Foundation
 ///   is capped before that place, and an occurrence moved from its place is carried like any
 ///   other changed occurrence.
 /// - **Reset** (`Mode.reset`) when the edit moves the new part's start (another instant or day
-///   than the place) or changes its rule: nothing is carried; deleted occurrences come back and
+///   than the place, or the same instant in another time zone) or changes its rule: nothing is carried; deleted occurrences come back and
 ///   changed ones lose their change, and the new part's excluded dates go.
-/// - **Carry** (`Mode.carry`) otherwise: a deleted occurrence stays deleted; a changed one keeps
-///   its own changes, except the fields the edit sets, which overwrite them; an end given alone
-///   gives it its own start plus the new part's length; its guests get the series' difference.
+/// - **Carry** (`Mode.carry`) otherwise: a deleted occurrence stays deleted; a changed one is
+///   carried WHOLE (everything it holds that the calendar lets the organizer write, its guests'
+///   answers included), except the fields the edit sets, which the new part already holds; an end
+///   given alone gives it its own start plus the new part's length; its guests get the series'
+///   difference.
 ///   Only an edit that leaves the start where it is carries, so no carried place moves.
 enum SplitCarry {
     /// Whether a split carries the exceptions after it or resets them.
@@ -53,7 +55,9 @@ enum SplitCarry {
     /// calendar's write call, so the two can't disagree. Reset when the edit gives a start that is
     /// not the place (another instant, another day, or the other kind), turns the rule's days
     /// (`ruleDayMove`), or gives a rule other than the stored one.
-    static func mode(edit: GCalEventInput, place: GCalDateTime, storedRules: [String]) -> Mode {
+    /// `seriesZone` is the zone the series' start is kept in (nil for a floating or all-day one):
+    /// a start given in another zone at the same instant is a new start.
+    static func mode(edit: GCalEventInput, place: GCalDateTime, storedRules: [String], seriesZone: TimeZone?) -> Mode {
         if edit.ruleDayMove != nil { return .reset }
         if let rules = edit.recurrence?.filter(isRule), !rules.isEmpty {
             let given = Set(rules.map(GoogleCalendarProvider.canonicalRRULE))
@@ -66,12 +70,24 @@ enum SplitCarry {
             } else {
                 guard let given = edit.startDateTime.flatMap(Date.fromISO8601),
                       let at = place.dateTime.flatMap(Date.fromISO8601), given == at else { return .reset }
+                // Another time zone at the same instant is a new start too: Google's own
+                // "this and following" resets the later exceptions for a zone-only change
+                // (measured on a test calendar), and the same rule holds on every calendar.
+                if let zone = edit.startTimeZone, let seriesZone, !sameZone(zone, seriesZone) { return .reset }
             }
         }
         return .carry
     }
 
     private static func isRule(_ line: String) -> Bool { line.uppercased().hasPrefix("RRULE:") }
+
+    /// Whether the zone named `name` is `zone`: the name resolves (`CalendarTimeZoneResolver`, so a
+    /// Windows name and its IANA name agree) to the same zone. A name that does not resolve is
+    /// another zone.
+    private static func sameZone(_ name: String, _ zone: TimeZone) -> Bool {
+        guard let given = CalendarTimeZoneResolver.zone(named: name, in: .none) else { return false }
+        return given.identifier == zone.identifier
+    }
 
     /// The place of `occurrence` in its series, as a naive wall clock in `zone`, in the form a
     /// split's `recurrence_id` takes: `yyyy-MM-dd'T'HH:mm:ss` for a timed occurrence, the date for
@@ -142,15 +158,13 @@ enum SplitCarry {
         }
     }
 
-    /// What a carry writes for one changed occurrence of the new part, at `place`: its own value
-    /// of each field in `own` (the calendar takes it from the exception it read), and its own times
-    /// (`start`, `end`, absolute) when it starts or ends elsewhere than the new part's plain
-    /// occurrence there. `guests` is set when the occurrence holds guests of its own: its own list
-    /// with the edit's change applied as the series' difference.
+    /// What a carry writes for one changed occurrence of the new part, at `place`: the whole
+    /// `exception` as the calendar read it, but for the fields the edit set (the calendar copies
+    /// its own read of it), and its own times (`start`, `end`, absolute) when it starts or ends
+    /// elsewhere than the new part's plain occurrence there.
     struct Change {
         let place: GCalDateTime
         let exception: GCalEvent
-        let own: Set<Field>
         let start: GCalDateTime?
         let end: GCalDateTime?
     }
@@ -166,11 +180,11 @@ enum SplitCarry {
     /// series `series` (its fields are what an occurrence's own change differs from), under an
     /// edit that set `fields`.
     ///
-    /// For each changed occurrence, a field is its own when its value differs from the series'
-    /// and the edit did not set it; the edit's value is the new part's already. Its times are its
-    /// own when it starts elsewhere than its place or lasts other than the series: start kept, end
-    /// its own, or its own start plus L when the edit set the end. One with nothing of its own left
-    /// is not written. Nil when a time or place can't be read.
+    /// Every changed occurrence is written: what makes it an exception may be anything it holds
+    /// (a guest's answer, a reminder, a colour), so none is judged unchanged. Its times are its own
+    /// when it starts elsewhere than its place or lasts other than the series: start kept, end its
+    /// own, or its own start plus L when the edit set the end. Nil when a time or place can't be
+    /// read.
     static func plan(exceptions: [Exception], series: GCalEvent, newPart: GCalEvent, fields: Set<Field>) -> Plan? {
         var plan = Plan()
         let seriesLength = length(of: series)
@@ -181,14 +195,6 @@ enum SplitCarry {
                 plan.deleted.append(place)
             case .changed(let event):
                 guard let place = event.originalStartTime, let start = event.start, let end = event.end else { return nil }
-                var own = Set<Field>()
-                if !fields.contains(.summary), (event.summary ?? "") != (series.summary ?? "") { own.insert(.summary) }
-                if !fields.contains(.location), (event.location ?? "") != (series.location ?? "") { own.insert(.location) }
-                if !fields.contains(.description), (event.description ?? "") != (series.description ?? "") { own.insert(.description) }
-                if !fields.contains(.transparency), (event.transparency ?? "opaque") != (series.transparency ?? "opaque") {
-                    own.insert(.transparency)
-                }
-                if guestAddresses(event) != guestAddresses(series) { own.insert(.attendees) }
                 let moved = RecurrenceOccurrenceResolver.wasMoved(event)
                 let ownLength = length(of: event)
                 var times: (GCalDateTime, GCalDateTime)?
@@ -200,8 +206,7 @@ enum SplitCarry {
                 } else if moved || ownLength == nil || ownLength != seriesLength {
                     times = (start, end)
                 }
-                if own.isEmpty, times == nil { continue }
-                plan.changed.append(Change(place: place, exception: event, own: own, start: times?.0, end: times?.1))
+                plan.changed.append(Change(place: place, exception: event, start: times?.0, end: times?.1))
             }
         }
         return plan
@@ -214,11 +219,6 @@ enum SplitCarry {
         guard let instant = place.dateTime.flatMap(Date.fromISO8601),
               let at = split.dateTime.flatMap(Date.fromISO8601) else { return nil }
         return instant >= at
-    }
-
-    /// The guests of `event` by address, lowercased.
-    private static func guestAddresses(_ event: GCalEvent) -> Set<String> {
-        Set((event.attendees ?? []).compactMap { $0.email?.lowercased() })
     }
 
     /// How long `event` lasts: seconds for a timed one, whole days (in seconds) for an all-day one.

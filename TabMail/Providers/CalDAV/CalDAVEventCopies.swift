@@ -87,7 +87,7 @@ extension CalDAVProvider {
         let place = masterDTStartKind(from: storedICS) == .allDay
             ? GCalDateTime(dateTime: nil, date: String(slotNaiveISO.prefix(10)), timeZone: nil)
             : GCalDateTime(dateTime: slotInstant.iso8601String(), date: nil, timeZone: "UTC")
-        let mode = SplitCarry.mode(edit: patch, place: place, storedRules: extractRRule(from: storedICS).map { [$0] } ?? [])
+        let mode = SplitCarry.mode(edit: patch, place: place, storedRules: extractRRule(from: storedICS).map { [$0] } ?? [], seriesZone: try seriesStartZone(slotLine, zones: zones))
         guard let duration = try extractMasterDuration(from: storedICS, zones: zones) else {
             throw CalendarProviderError.notSupported("The repeating event's length can't be read, so it can't be split.")
         }
@@ -194,6 +194,14 @@ extension CalDAVProvider {
             throw CalendarProviderError.notSupported("The repeating event's time zone can't be read, so it can't be split.")
         }
         return (slotLine, slotInstant)
+    }
+
+    /// The zone the series' start line `line` is kept in: its TZID's zone, UTC for a UTC value,
+    /// nil for a floating or all-day one (no zone of its own).
+    static func seriesStartZone(_ line: String, zones: CalendarTimeZoneContext) throws -> TimeZone? {
+        guard let property = icsProperty(line) else { return nil }
+        if let tzid = ICSParser.extractTZID(property.params) { return try zone(forTZID: tzid, zones: zones) }
+        return line.uppercased().hasSuffix("Z") ? .gmt : nil
     }
 
     /// The series' half of a split (`seriesSplitResources`, and `finishSplit` on its own): the

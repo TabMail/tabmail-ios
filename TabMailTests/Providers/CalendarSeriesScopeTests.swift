@@ -1299,6 +1299,143 @@ struct CalendarEditToolSeriesScopeTests {
         #expect(capped, "the series was not capped: \(r.calendar.writes)")
     }
 
+    /// Splits `seed`'s series at day 7 with `patch` on the provider, straight against the fake.
+    private func googleSplit(_ seed: [[String: Any]], patch: GCalEventInput, failCarry: Bool = false)
+        async throws -> (calendar: FakeGoogleCalendar, records: SplitRecordBox, provider: GoogleCalendarProvider, http: FakeHTTP.Scenario, error: Error?) {
+        let http = FakeHTTP.Scenario()
+        let calendar = FakeGoogleCalendar(seed)
+        calendar.install(on: http)
+        // The first PATCH after the create is the carry: refused for good.
+        if failCarry { calendar.failNext("PATCH", with: 400) }
+        let provider = GoogleCalendarProvider(accessToken: { _ in "test-token" }, session: http.session)
+        let records = SplitRecordBox()
+        var thrown: Error?
+        do {
+            _ = try await provider.splitSeries(
+                calendarId: "primary", eventId: GoogleSeries.id, recurrenceId: "\(day(7))T09:00:00",
+                recurrenceIdZone: utc, patch: patch, sendUpdates: "all", record: records.recorder)
+        } catch {
+            thrown = error
+        }
+        return (calendar, records, provider, http, thrown)
+    }
+
+    private var carriedPartId: String {
+        GoogleCalendarProvider.deterministicSplitEventId(masterId: GoogleSeries.id, recurrenceId: "\(day(7))T09:00:00")
+    }
+
+    private func isCapped(_ calendar: FakeGoogleCalendar) -> Bool {
+        (calendar.event(GoogleSeries.id)?["recurrence"] as? [String])?.contains { $0.contains("UNTIL=") } == true
+    }
+
+    @Test("Google: a split carries a later occurrence WHOLE: a guest's own decline and its own colour survive a rename (#563)")
+    func carryKeepsGuestAnswerAndColour() async throws {
+        var series = GoogleSeries.series(rule: GoogleSeries.weekly)
+        series["attendees"] = [["email": "guest@example.com", "responseStatus": "needsAction"]]
+        var declined = GoogleSeries.instance(day(21))
+        declined["attendees"] = [["email": "guest@example.com", "responseStatus": "declined"]]
+        declined["colorId"] = "4"
+        var patch = GCalEventInput()
+        patch.summary = "Team standup"
+        let r = try await googleSplit([series, GoogleSeries.instance(day(7)), declined], patch: patch)
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error))")
+        let carried = r.calendar.event("\(carriedPartId)_\(compact(day(21)))T090000Z")
+        let answer = (carried?["attendees"] as? [[String: Any]])?.first?["responseStatus"] as? String
+        #expect(answer == "declined", "the guest's decline was lost: \(carried ?? [:]); \(r.calendar.writes)")
+        #expect(carried?["colorId"] as? String == "4", "the occurrence's own colour was lost: \(carried ?? [:])")
+        #expect(carried?["summary"] as? String == "Team standup", "the edit's title did not reach it: \(carried ?? [:])")
+    }
+
+    @Test("Google: a carry refused for good stops the split before the cap; the retry (finishSplit) carries, then caps (#563)")
+    func carryFailureStopsBeforeTheCapAndTheRetryCarries() async throws {
+        var changed = GoogleSeries.instance(day(21))
+        changed["location"] = "Room 9"
+        var patch = GCalEventInput()
+        patch.summary = "Team standup"
+        let r = try await googleSplit(GoogleSeries.calendar + [changed], patch: patch, failCarry: true)
+        defer { r.http.close() }
+        #expect(r.error != nil, "the refused carry did not stop the split")
+        #expect(!isCapped(r.calendar), "the series was capped though its carry failed: \(r.calendar.writes)")
+        let record = try #require(r.records.records.first, "no record was kept before the carry")
+        try await r.provider.finishSplit(calendarId: "primary", record: record, zone: utc, guests: nil)
+        let carried = r.calendar.event("\(carriedPartId)_\(compact(day(21)))T090000Z")
+        #expect(carried?["location"] as? String == "Room 9", "the retry did not carry: \(carried ?? [:]); \(r.calendar.writes)")
+        #expect(isCapped(r.calendar), "the retry did not cap: \(r.calendar.writes)")
+    }
+
+    @Test("Google: the edit's guest change reaches a carried occurrence's OWN guests as the series' difference (#563)")
+    func carryAppliesGuestChangeToOwnGuests() async throws {
+        var series = GoogleSeries.series(rule: GoogleSeries.weekly)
+        series["attendees"] = [["email": "a@example.com"]]
+        var own = GoogleSeries.instance(day(21))
+        own["attendees"] = [["email": "a@example.com"], ["email": "extra@example.com", "responseStatus": "accepted"]]
+        var patch = GCalEventInput()
+        patch.attendeeChange = AttendeeChange(adds: [.init(email: "new@example.com", name: nil)])
+        let r = try await googleSplit([series, GoogleSeries.instance(day(7)), own], patch: patch)
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error))")
+        let carried = r.calendar.event("\(carriedPartId)_\(compact(day(21)))T090000Z")
+        let guests = Set((carried?["attendees"] as? [[String: Any]] ?? []).compactMap { $0["email"] as? String })
+        #expect(guests == ["a@example.com", "extra@example.com", "new@example.com"], "guests: \(guests); \(carried ?? [:])")
+    }
+
+    @Test("Google: an end given alone at a split gives a carried moved occurrence its own start plus the new length (#563)")
+    func endOnlySplitMovesCarriedEnd() async throws {
+        let moved = GoogleSeries.moved(day(21), start: "\(day(22))T11:00:00", end: "\(day(22))T11:30:00")
+        var patch = GCalEventInput()
+        patch.endDateTime = "\(day(7))T10:00:00Z"
+        patch.endTimeZone = "UTC"
+        let r = try await googleSplit(GoogleSeries.calendar + [moved], patch: patch)
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error))")
+        let carried = r.calendar.event("\(carriedPartId)_\(compact(day(21)))T090000Z")
+        #expect(instant(carried?["start"]) == utcAt("\(day(22))T11:00:00") && instant(carried?["end"]) == utcAt("\(day(22))T12:00:00"),
+                "the carried occurrence: \(carried ?? [:]); \(r.calendar.writes)")
+    }
+
+    @Test("Google: a rename shows no reset note on its card, and a moved start does (card = write)")
+    func googleCarryCardShowsNoResetNote() async throws {
+        let r = try await googleTool([
+            "edit_scope": .string("this_and_following"), "recurrence_id": .string("\(day(7))T09:00:00"),
+            "title": .string("Team standup"), "timezone": .string("UTC"),
+        ], eventId: GoogleSeries.later, account: "series-tool-g-carry-card", seed: GoogleSeries.calendar)
+        #expect(r.run.cards.first?.changes.contains(CalendarToolHelpers.exceptionsResetNote) == false,
+                "a carrying split's card says it resets: \(r.run.cards.first?.changes ?? [])")
+    }
+
+    @Test("Google: a split that changes only the time zone (same instant) resets the later exceptions and its card says so, as Google's own split does")
+    func zoneOnlySplitResets() async throws {
+        let seed = GoogleSeries.calendar + [GoogleSeries.deleted(day(14))]
+        let r = try await googleTool([
+            "edit_scope": .string("this_and_following"), "recurrence_id": .string("\(day(7))T09:00:00"),
+            // Reykjavik keeps UTC's offset all year: the same instant, another zone.
+            "start_iso": .string("\(day(7))T09:00:00"), "timezone": .string("Atlantic/Reykjavik"),
+        ], eventId: GoogleSeries.later, account: "series-tool-g-zone-only", seed: seed)
+        #expect(r.run.cards.first?.changes.contains(CalendarToolHelpers.exceptionsResetNote) == true,
+                "card: \(r.run.cards.first?.changes ?? []); \(r.run.out)")
+        let part = r.calendar.event(carriedPartId)
+        let rules = part?["recurrence"] as? [String] ?? []
+        #expect(part != nil && !rules.contains { $0.hasPrefix("EXDATE") }, "the deleted occurrence was kept deleted: \(rules); \(r.calendar.writes)")
+    }
+
+    @Test("Outlook: a split that moves the start shows the reset note; a rename shows none (card = write)")
+    func outlookResetNoteFollowsTheMode() async throws {
+        let later = GraphFixture.naive(GraphFixture.occurrenceStart)
+        let moved = try await outlookTool(GraphSeries.calendar(), [
+            "edit_scope": .string("this_and_following"), "recurrence_id": .string(later),
+            "start_iso": .string(GraphFixture.naive(GraphFixture.occurrenceStart.addingTimeInterval(3_600))), "timezone": .string("UTC"),
+        ], eventId: GraphSeries.later, account: "series-tool-x-reset-note")
+        #expect(moved.cards.first?.changes.contains(CalendarToolHelpers.exceptionsResetNote) == true,
+                "card: \(moved.cards.first?.changes ?? []); \(moved.out)")
+        let renamed = try await outlookTool(GraphSeries.calendar(), [
+            "edit_scope": .string("this_and_following"), "recurrence_id": .string(later),
+            "title": .string("Team standup"), "timezone": .string("UTC"),
+        ], eventId: GraphSeries.later, account: "series-tool-x-carry-note")
+        #expect(renamed.cards.count == 1 && renamed.cards.first?.changes.contains(CalendarToolHelpers.exceptionsResetNote) == false,
+                "card: \(renamed.cards.first?.changes ?? []); \(renamed.out)")
+    }
+
     @Test("Outlook: a new date of every occurrence named at a moved later occurrence splits at its place (#687)")
     func everyOccurrenceToAnotherDateAtAMovedOccurrenceSplitsAtItsPlace() async throws {
         // The later occurrence, moved on its own two days on, named by its id; the series every seventh

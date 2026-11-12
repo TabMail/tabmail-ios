@@ -568,42 +568,192 @@ private enum GraphSplitFixture {
 
 @Suite("Outlook split carries the occurrences after it changed or deleted one by one (#563)", .serialized)
 struct ExchangeSplitCarryTests {
-    @Test("a rename from an occurrence on keeps a deleted later occurrence deleted and a changed one's own room")
-    func renameCarriesLaterExceptions() async throws {
-        let series = GraphSplitFixture.series(range: GraphSplitFixture.noEnd)
-        let changedAt = GraphFixture.onDevice(days: 14, hour: 10)
-        let deletedAt = GraphFixture.onDevice(days: 21, hour: 10)
-        var exception = GraphFixture.event(id: "ser-1-occ-2", start: changedAt, online: false, seriesMasterId: "ser-1")
-        exception["location"] = ["displayName": "Room 9"]
-        // The new part's occurrences at the same places, as Graph lists them once it is made.
-        let partOccurrences = [("created-1-w2", changedAt), ("created-1-w3", deletedAt)].map { id, at in
-            GraphFixture.event(id: id, start: at, online: false, seriesMasterId: "created-1")
-        }
+    /// The occurrence `weeks` after the series' first, at 10:00 on the device.
+    private static func week(_ weeks: Int, hour: Int = 10, plusDays: Int = 0) -> Date {
+        GraphFixture.onDevice(days: 7 * weeks + plusDays, hour: hour)
+    }
+
+    /// An exception of `ser-1` at week `place`, now at `at`.
+    private static func exception(_ place: Int, at: Date? = nil, edit: (inout [String: Any]) -> Void = { _ in }) -> [String: Any] {
+        var e = GraphFixture.event(id: "ser-1-occ-\(place)", start: at ?? week(place), online: false, seriesMasterId: "ser-1")
+        e["originalStart"] = GraphFixture.rfc3339(week(place))
+        edit(&e)
+        return e
+    }
+
+    /// The new part's (`created-1`) occurrence at week `place`, as Graph lists it once the part is made.
+    private static func part(_ place: Int) -> [String: Any] {
+        GraphFixture.event(id: "created-1-w\(place)", start: week(place), online: false, seriesMasterId: "created-1")
+    }
+
+    struct Run {
+        let graph: FakeGraphCalendar
+        let http: FakeHTTP.Scenario
+        let provider: ExchangeCalendarProvider
+        let records: SplitRecordBox
+        let error: Error?
+    }
+
+    /// Splits `ser-1` at week 1 with `patch`. `exceptions` are its changed occurrences (as Graph
+    /// expands them), `cancelled` the weeks deleted one by one, `parts` the new part's occurrences.
+    private func split(
+        exceptions: [[String: Any]], cancelled: [Int] = [], parts: [Int], patch: GCalEventInput,
+        series: [String: Any] = GraphSplitFixture.series(range: GraphSplitFixture.noEnd),
+        configure: (FakeGraphCalendar, FakeHTTP.Scenario) -> Void = { _, _ in }
+    ) async throws -> Run {
         let graph = FakeGraphCalendar([series, GraphFixture.event(id: "ser-1-occ", start: GraphSplitFixture.occurrence, online: false,
-                                                                  seriesMasterId: "ser-1"), exception] + partOccurrences)
+                                                                  seriesMasterId: "ser-1")] + exceptions + parts.map(Self.part))
         let http = FakeHTTP.Scenario()
-        defer { http.close() }
         graph.install(on: http)
         let ok = ["Content-Type": "application/json"]
         var expanded = series
-        expanded["exceptionOccurrences"] = [exception]
+        expanded["exceptionOccurrences"] = exceptions
         http.register(path: "/v1.0/me/events/ser-1?$expand=exceptionOccurrences", method: "GET",
                       response: .raw(statusCode: 200, headers: ok, body: try JSONSerialization.data(withJSONObject: expanded)))
-        let cancelled = ["cancelledOccurrences": ["OID.ser-1.\(GraphFixture.deviceDay(deletedAt))"]]
+        let names = ["cancelledOccurrences": cancelled.map { "OID.ser-1.\(GraphFixture.deviceDay(Self.week($0)))" }]
         http.register(path: "/v1.0/me/events/ser-1?$select=cancelledOccurrences", method: "GET",
-                      response: .raw(statusCode: 200, headers: ok, body: try JSONSerialization.data(withJSONObject: cancelled)))
+                      response: .raw(statusCode: 200, headers: ok, body: try JSONSerialization.data(withJSONObject: names)))
+        configure(graph, http)
+        let provider = GraphSplitFixture.provider(http)
+        let records = SplitRecordBox()
+        var thrown: Error?
+        do {
+            _ = try await provider.splitSeries(
+                eventId: "ser-1", recurrenceId: GraphSplitFixture.recurrenceId, recurrenceIdZone: .current, patch: patch,
+                record: records.recorder)
+        } catch {
+            thrown = error
+        }
+        return Run(graph: graph, http: http, provider: provider, records: records, error: thrown)
+    }
 
+    private static var rename: GCalEventInput {
         var patch = GCalEventInput()
         patch.summary = "Renamed"
-        _ = try await GraphSplitFixture.provider(http).splitSeries(
-            eventId: "ser-1", recurrenceId: GraphSplitFixture.recurrenceId, recurrenceIdZone: .current, patch: patch)
+        return patch
+    }
 
-        #expect(http.recordedCalls().filter { $0.method == "POST" }.count == 1 && graph.event("created-1") != nil,
-                "no new part: \(http.servedCallSequence())")
-        #expect(graph.event("created-1-w3") == nil, "the deleted occurrence came back: \(http.servedCallSequence())")
-        let carried = (graph.event("created-1-w2")?["location"] as? [String: Any])?["displayName"] as? String
-        #expect(carried == "Room 9", "the changed occurrence lost its room: \(carried ?? "none"); \(http.servedCallSequence())")
-        #expect(!graph.patches("ser-1").isEmpty, "the series was not capped: \(http.servedCallSequence())")
+    private static func displayName(_ value: Any?) -> String? { (value as? [String: Any])?["displayName"] as? String }
+
+    @Test("a rename from an occurrence on keeps a deleted later occurrence deleted and a changed one's own room")
+    func renameCarriesLaterExceptions() async throws {
+        let r = try await split(exceptions: [Self.exception(2) { $0["location"] = ["displayName": "Room 9"] }],
+                                cancelled: [3], parts: [2, 3], patch: Self.rename)
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error))")
+        #expect(r.http.recordedCalls().filter { $0.method == "POST" }.count == 1 && r.graph.event("created-1") != nil,
+                "no new part: \(r.http.servedCallSequence())")
+        #expect(r.graph.event("created-1-w3") == nil, "the deleted occurrence came back: \(r.http.servedCallSequence())")
+        let carried = Self.displayName(r.graph.event("created-1-w2")?["location"])
+        #expect(carried == "Room 9", "the changed occurrence lost its room: \(carried ?? "none"); \(r.http.servedCallSequence())")
+        #expect(!r.graph.patches("ser-1").isEmpty, "the series was not capped: \(r.http.servedCallSequence())")
+    }
+
+    @Test("a changed occurrence is carried WHOLE: its own importance, categories and reminder survive a rename (C1)")
+    func carryCopiesTheWholeException() async throws {
+        let r = try await split(exceptions: [Self.exception(2) { e in
+            e["importance"] = "low"
+            e["categories"] = ["Red category"]
+            e["reminderMinutesBeforeStart"] = 5
+        }], parts: [2], patch: Self.rename)
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error))")
+        let carried = r.graph.event("created-1-w2")
+        #expect(carried?["importance"] as? String == "low" && carried?["categories"] as? [String] == ["Red category"]
+                    && carried?["reminderMinutesBeforeStart"] as? Int == 5,
+                "the exception's own properties were lost: \(carried ?? [:]); \(r.http.servedCallSequence())")
+        // The title the edit set is the new part's: the carry does not write the exception's old one back.
+        #expect(r.graph.patches("created-1-w2").allSatisfy { $0["subject"] == nil }, "the carry wrote the old title: \(r.graph.patches("created-1-w2"))")
+    }
+
+    @Test("an exception listed past the first page of the new part's occurrences is still carried (C2)")
+    func carryReadsEveryPage() async throws {
+        let r = try await split(exceptions: [Self.exception(2) { $0["location"] = ["displayName": "Room 9"] }],
+                                parts: [2], patch: Self.rename) { graph, http in
+            let ok = ["Content-Type": "application/json"]
+            http.register(path: "/v1.0/me/events/created-1/instances", method: "GET") { request in
+                if request.url.absoluteString.contains("skiptoken") {
+                    let page = ["value": [graph.event("created-1-w2") ?? [:]]]
+                    // swiftlint:disable:next force_try
+                    return .raw(statusCode: 200, headers: ok, body: try! JSONSerialization.data(withJSONObject: page))
+                }
+                let first: [String: Any] = ["value": [], "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/events/created-1/instances?$skiptoken=p2"]
+                // swiftlint:disable:next force_try
+                return .raw(statusCode: 200, headers: ok, body: try! JSONSerialization.data(withJSONObject: first))
+            }
+        }
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error))")
+        #expect(Self.displayName(r.graph.event("created-1-w2")?["location"]) == "Room 9",
+                "the exception on page 2 was not carried: \(r.http.servedCallSequence())")
+    }
+
+    @Test("a carry refused for good stops the split before the cap; the retry (finishSplit) carries, then caps")
+    func carryFailureStopsBeforeTheCapAndTheRetryCarries() async throws {
+        let r = try await split(exceptions: [Self.exception(2) { $0["location"] = ["displayName": "Room 9"] }],
+                                parts: [2], patch: Self.rename) { graph, _ in graph.failNext("PATCH", with: 400) }
+        defer { r.http.close() }
+        #expect(r.error != nil, "the refused carry did not stop the split")
+        #expect(r.graph.patches("ser-1").isEmpty, "the series was capped though its carry failed: \(r.http.servedCallSequence())")
+        let record = try #require(r.records.records.first, "no record was kept before the carry")
+        try await r.provider.finishSplit(record: record, zone: .current, guests: nil)
+        #expect(Self.displayName(r.graph.event("created-1-w2")?["location"]) == "Room 9",
+                "the retry did not carry: \(r.http.servedCallSequence())")
+        #expect(!r.graph.patches("ser-1").isEmpty, "the retry did not cap: \(r.http.servedCallSequence())")
+    }
+
+    @Test("moves are ordered so none lands on a day another occurrence still holds (carryOrder)")
+    func carryOrdersMovesOffHeldDays() async throws {
+        // Week 2's moved onto week 3's day; week 3's moved a day on. Week 3 must move first.
+        let r = try await split(exceptions: [Self.exception(2, at: Self.week(3, hour: 12)),
+                                             Self.exception(3, at: Self.week(3, hour: 10, plusDays: 1))],
+                                parts: [2, 3], patch: Self.rename) { graph, _ in graph.refusesSameDayMoves.withLock { $0 = true } }
+        defer { r.http.close() }
+        #expect(r.error == nil, "a move landed on a held day: \(String(describing: r.error)); \(r.http.servedCallSequence())")
+        #expect(GraphFixture.instant(r.graph.event("created-1-w2")?["start"] as? [String: Any]) == Self.week(3, hour: 12)
+                    && GraphFixture.instant(r.graph.event("created-1-w3")?["start"] as? [String: Any]) == Self.week(3, hour: 10, plusDays: 1),
+                "not both moved: \(r.http.servedCallSequence())")
+    }
+
+    @Test("the deleted places go before the moves, so a move onto a deleted occurrence's day is taken")
+    func carryDeletesBeforeMoves() async throws {
+        // Week 2's moved onto week 3's day; week 3's deleted.
+        let r = try await split(exceptions: [Self.exception(2, at: Self.week(3, hour: 12))], cancelled: [3],
+                                parts: [2, 3], patch: Self.rename) { graph, _ in graph.refusesSameDayMoves.withLock { $0 = true } }
+        defer { r.http.close() }
+        #expect(r.error == nil, "the move went before the delete: \(String(describing: r.error)); \(r.http.servedCallSequence())")
+        #expect(r.graph.event("created-1-w3") == nil && GraphFixture.instant(r.graph.event("created-1-w2")?["start"] as? [String: Any]) == Self.week(3, hour: 12),
+                "\(r.http.servedCallSequence())")
+    }
+
+    @Test("the edit's guest change reaches a carried occurrence's OWN guests as the series' difference")
+    func carryAppliesGuestChangeToOwnGuests() async throws {
+        let extra: [String: Any] = ["emailAddress": ["address": "extra@example.com", "name": "Extra"], "type": "required",
+                                    "status": ["response": "accepted", "time": "0001-01-01T00:00:00Z"]]
+        var patch = GCalEventInput()
+        patch.attendeeChange = AttendeeChange(adds: [.init(email: "new@example.com", name: nil)])
+        let r = try await split(exceptions: [Self.exception(2) { e in
+            e["attendees"] = (e["attendees"] as? [[String: Any]] ?? []) + [extra]
+        }], parts: [2], patch: patch)
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error))")
+        let guests = Set((r.graph.event("created-1-w2")?["attendees"] as? [[String: Any]] ?? []).compactMap {
+            (($0["emailAddress"] as? [String: Any])?["address"] as? String)?.lowercased()
+        })
+        #expect(guests.contains("extra@example.com") && guests.contains("new@example.com"), "guests: \(guests)")
+    }
+
+    @Test("an end given alone gives a carried moved occurrence its own start plus the new length")
+    func endOnlySplitMovesCarriedEnd() async throws {
+        let movedTo = Self.week(2, hour: 14)
+        var patch = GCalEventInput()
+        patch.endDateTime = GraphSplitFixture.occurrence.addingTimeInterval(3_600).iso8601String()
+        let r = try await split(exceptions: [Self.exception(2, at: movedTo)], parts: [2], patch: patch)
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error))")
+        let carried = r.graph.event("created-1-w2")
+        #expect(GraphFixture.instant(carried?["start"] as? [String: Any]) == movedTo && GraphFixture.instant(carried?["end"] as? [String: Any]) == movedTo.addingTimeInterval(3_600),
+                "the carried occurrence: \(carried ?? [:]); \(r.http.servedCallSequence())")
     }
 }
 

@@ -127,6 +127,13 @@ final class FakeGraphCalendar: Sendable {
     /// The user deletes `id` in their calendar app.
     func userDeletes(_ id: String) { events.withLock { $0[id] = nil } }
 
+    /// When set, an occurrence moved onto a DAY another occurrence of its series starts on (in the
+    /// device's zone) is refused with 400 `ErrorOccurrenceCrossingBoundary`, as Exchange documents
+    /// the rule ("an occurrence can't be moved to or past the day of an adjacent occurrence",
+    /// EWS `ErrorOccurrenceCrossingBoundary`). Off by default, where only the same start time is
+    /// refused.
+    let refusesSameDayMoves = Mutex(false)
+
     /// `"PATCH <id>"` / `"POST"` for every write that arrived, refused ones included, in order.
     var writes: [String] { writeLog.withLock { $0 } }
 
@@ -376,7 +383,9 @@ final class FakeGraphCalendar: Sendable {
                 return .json(raw: #"{"error":{"code":"UnknownError","message":""}}"#, statusCode: 405)
             }
             if let master = stored["seriesMasterId"] as? String, let start = patch["start"],
-               let at = Self.instant(start), occurrence(of: master, other: parts[0], startsAt: at) {
+               let at = Self.instant(start),
+               occurrence(of: master, other: parts[0], startsAt: at)
+                || (refusesSameDayMoves.withLock { $0 } && occurrence(of: master, other: parts[0], startsOnDayOf: at)) {
                 return .json(raw: #"{"error":{"code":"ErrorOccurrenceCrossingBoundary","message":"An occurrence can't be moved onto another occurrence of its series."}}"#,
                              statusCode: 400)
             }
@@ -533,6 +542,17 @@ final class FakeGraphCalendar: Sendable {
 
     /// Whether an occurrence of `master` other than `other` starts at `at` now: Graph refuses a move
     /// of an occurrence onto another one of its series.
+    private func occurrence(of master: String, other: String, startsOnDayOf at: Date) -> Bool {
+        let calendar = Calendar(identifier: .gregorian)
+        return events.withLock { Array($0.values) }
+            .compactMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
+            .contains { event in
+                guard event["seriesMasterId"] as? String == master, event["id"] as? String != other,
+                      let start = Self.instant(event["start"]) else { return false }
+                return calendar.isDate(start, inSameDayAs: at)
+            }
+    }
+
     private func occurrence(of master: String, other: String, startsAt at: Date) -> Bool {
         events.withLock { Array($0.values) }
             .compactMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }

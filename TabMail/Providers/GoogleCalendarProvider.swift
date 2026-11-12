@@ -854,7 +854,7 @@ actor GoogleCalendarProvider: CalendarProvider {
               let partPatch = SplitCarry.partEdit(patch, named: found) else {
             throw CalendarProviderError.notSupported("the place in the series of the occurrence named can't be read, so the series can't be split at it")
         }
-        let mode = SplitCarry.mode(edit: partPatch, place: splitPlace, storedRules: masterRecurrence)
+        let mode = SplitCarry.mode(edit: partPatch, place: splitPlace, storedRules: masterRecurrence, seriesZone: master.isAllDay ? nil : master.seriesZone)
 
         // 3. Locate the master's RRULE line and compute the capped variant.
         guard let originalRRule = masterRecurrence.first(where: { $0.uppercased().hasPrefix("RRULE:") }) else {
@@ -1108,11 +1108,14 @@ actor GoogleCalendarProvider: CalendarProvider {
     }
 
     /// Writes each changed occurrence of `exceptions` onto the new part `newPartId`
-    /// (`SplitCarry.plan`): a PATCH of its occurrence there, by id (`instanceId`), with its own
-    /// values of the fields the edit did not set, its own times, and its own guests with the
-    /// edit's change applied as the series' difference. Every value is absolute, so a write that
-    /// runs again changes nothing. Deleted places need nothing here: the create excluded them.
-    /// Invitations go as the split's create sends them (`sendUpdates`).
+    /// (`SplitCarry.plan`): a PATCH of its occurrence there, by id (`instanceId`), with the WHOLE
+    /// exception as Google read it (`carriedJSON`): every property but the ones the server owns
+    /// and the ones the edit set, its guests with their answers and the edit's change applied as
+    /// the series' difference, and its own times. Every value is absolute, so a write that runs
+    /// again changes nothing. Deleted places need nothing here: the create excluded them.
+    /// Invitations go as the split's create sends them (`sendUpdates`), with its conference and
+    /// attachment flags, so a conference or attachment the exception holds is written as the
+    /// create writes the series'.
     private func carry(
         calendarId: String, exceptions: [TailException], master: GCalEvent, masterJSON: [String: Any],
         newPart: GCalEvent, newPartId: String, fields: Set<SplitCarry.Field>, guests: AttendeeChange?,
@@ -1130,33 +1133,41 @@ actor GoogleCalendarProvider: CalendarProvider {
                   let own = exceptions.first(where: { $0.json["id"] as? String == change.exception.id })?.json else {
                 throw CalendarProviderError.notSupported("a changed occurrence of this repeating event can't be addressed on its new part, so its change can't be carried")
             }
-            var json: [String: Any] = [:]
-            for field in change.own {
-                switch field {
-                case .summary, .location, .description:
-                    json[field.rawValue] = own[field.rawValue] ?? ""
-                case .transparency:
-                    json["transparency"] = own["transparency"] ?? "opaque"
-                case .attendees:
-                    let held = own["attendees"] as? [[String: Any]] ?? []
-                    json["attendees"] = difference.map { Self.applied($0, to: held) } ?? held
-                case .end:
-                    break
-                }
-            }
+            var json = Self.carriedJSON(own, fields: fields)
+            let held = (own["attendees"] as? [[String: Any]] ?? []).map { $0.filter { !Self.serverOwnedAttendeeKeys.contains($0.key) } }
+            json["attendees"] = difference.map { Self.applied($0, to: held) } ?? held
             if let start = change.start, let end = change.end {
                 json["start"] = Self.timeJSON(start)
                 json["end"] = Self.timeJSON(end)
             }
             let encodedId = try Self.encodedPathSegment(id, "Google occurrence id")
             _ = try await request(
-                path: "/calendars/\(encodedCalId)/events/\(encodedId)?sendUpdates=\(sendUpdates)",
+                path: "/calendars/\(encodedCalId)/events/\(encodedId)?sendUpdates=\(sendUpdates)&conferenceDataVersion=1&supportsAttachments=true",
                 method: "PATCH",
                 body: try JSONSerialization.data(withJSONObject: json))
             if DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[GoogleCalendar] split carried a changed occurrence onto \(id): \(change.own.sorted().map(\.rawValue)) times=\(change.start != nil)")
+                BackgroundSyncLogger.logDebug("[GoogleCalendar] split carried a changed occurrence onto \(id): keys=\(json.keys.sorted()) times=\(change.start != nil)")
             }
         }
+    }
+
+    /// The keys of a changed occurrence a carry does not copy: the ones the server owns, the
+    /// occurrence's times and status (written by the carry itself, or the new part's own), and its
+    /// guests (written with the edit's change applied).
+    private static let carryLeftKeys: Set<String> = ["start", "end", "status", "recurrence", "attendees"]
+
+    /// The JSON a carry writes for the changed occurrence `exception`: every property it holds
+    /// but `serverOwnedEventKeys`, `carryLeftKeys`, and those the edit set (`fields`), which the
+    /// new part already holds.
+    static func carriedJSON(_ exception: [String: Any], fields: Set<SplitCarry.Field>) -> [String: Any] {
+        var set: Set<String> = []
+        for field in fields {
+            switch field {
+            case .summary, .location, .description, .transparency: set.insert(field.rawValue)
+            case .attendees, .end: break
+            }
+        }
+        return exception.filter { !serverOwnedEventKeys.contains($0.key) && !carryLeftKeys.contains($0.key) && !set.contains($0.key) }
     }
 
     /// A start or end as Google's JSON writes it.

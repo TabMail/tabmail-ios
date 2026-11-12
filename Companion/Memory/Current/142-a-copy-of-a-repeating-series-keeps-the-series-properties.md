@@ -353,13 +353,33 @@ Google Calendar's rule, measured on a test calendar, now followed on Google, Out
   to; the series is capped before that place, and the moved occurrence is carried like any other
   changed one (#687; the old "split at a moved occurrence" refusal is gone).
 - **Reset** (`SplitCarry.Mode.reset`) when the edit gives a start other than the place (another
-  instant or day) or another rule (`ruleDayMove`, or a RRULE other than the stored one): nothing is
+  instant or day, or the same instant in another time zone: Google's own web "this and following"
+  resets for a zone-only change, measured on the Workspace test calendar 2026-11-12; Outlook is
+  unmeasured and follows the same rule) or another rule (`ruleDayMove`, or a RRULE other than the stored one): nothing is
   carried, deleted occurrences come back, changed ones lose their change, and the new part's EXDATE
   lines go (RDATE stays). The card shows `CalendarToolHelpers.exceptionsResetNote`.
 - **Carry** otherwise: a deleted occurrence stays deleted (Google: an EXDATE in the create; Outlook:
-  the new part's occurrence DELETEd, 404/410 = done; CalDAV: EXDATE and overrides kept); a changed one
-  keeps its own fields except those the edit sets (`SplitCarry.Field`), its own times, an end given
-  alone giving its own start plus the new part's length, and its guests take the series' difference.
+  the new part's occurrence DELETEd, 404/410 = done; CalDAV: EXDATE and overrides kept); EVERY changed
+  one is carried WHOLE (amended 2026-11-12, review C1: a fixed field diff lost a guest's own decline,
+  a colour, a reminder): everything it holds that the organizer can write, except the fields the
+  edit sets (`SplitCarry.Field`, which the new part holds already); its own times, an end given alone
+  giving its own start plus the new part's length; its guests (answers included) with the edit's
+  change applied as the series' difference. Google: `carriedJSON` = the exception's JSON minus
+  `serverOwnedEventKeys`, times, status and guests, PATCHed with `conferenceDataVersion=1` and
+  `supportsAttachments=true` as the create is. Outlook: `carriedJSON` = the exception's
+  `splitCopiedKeys` but `isAllDay`. CalDAV: the override VEVENT is kept byte for byte (`carryPatch`
+  only overwrites the set fields and, for an end given alone, DTEND).
+- **Not carried (the provider gives the organizer no way to write it):** Google: the keys the server
+  owns (`creator`, `organizer` outside an import, `hangoutLink`, `locked`, attendees' `self`/`id`/
+  `organizer`); an attendee's `responseStatus` IS written (Google documents it writable), how it
+  reaches the attendee's own copy is unmeasured. Outlook: attendees' answers (`status` is read-only
+  to an update: the new part's occurrence starts unanswered), the exception's own online meeting
+  (`onlineMeeting`/`isOnlineMeeting`: the new part has its own), its attachments (a separate
+  endpoint, not copied, as the split's own copy does not), and extensions/extended properties.
+- **Outlook reads every page** of the new part's `/instances` (`@odata.nextLink`, refused if it
+  leaves Graph, review C2). A deleted place not listed is done; a CHANGED one not listed is refused
+  before the cap. `exceptionOccurrences` is read with a plain `$expand` and no `$select`: measured,
+  not documented (Graph documents it with both).
 - The mode and set fields are on `SplitRecord` (`mode`, `fields`), so a retry (`finishSplit`) carries
   as the first attempt did, before the cap. A carry write that fails for good stops before the cap
   (owner ruling); the residual case is iOS #769.
@@ -368,9 +388,11 @@ Google Calendar's rule, measured on a test calendar, now followed on Google, Out
 - Carry writes send the providers' usual update emails to attendees (owner ruling: accepted).
 - A numbered series keeps its remaining COUNT on the new part (Google's own 8 -> 11 is not copied).
 
-Tests: `SplitCarryTests`, `ExchangeSplitCarryTests`,
-`CalendarEditToolSeriesScopeTests.renameSplitCarriesLaterExceptions` /
-`followingAtAMovedLaterOccurrenceCarriesIt`, the Google/Outlook invariant matrices (moved states now
+Tests: `SplitCarryTests`, `ExchangeSplitCarryTests` (whole copy, every page, failure before the cap
+and `finishSplit`, `carryOrder` against the fake's opt-in same-day refusal, deletes before moves,
+guests, end only), `CalendarEditToolSeriesScopeTests.renameSplitCarriesLaterExceptions` /
+`followingAtAMovedLaterOccurrenceCarriesIt` / `carryKeepsGuestAnswerAndColour` /
+`carryFailureStopsBeforeTheCapAndTheRetryCarries` / `zoneOnlySplitResets` / `outlookResetNoteFollowsTheMode`, the Google/Outlook invariant matrices (moved states now
 split at the place), `CalDAVOccurrenceWireTests.splitIsAtThePlaceInEveryFrame`.
 
 ## Tests
