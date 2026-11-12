@@ -751,7 +751,7 @@ struct ExchangeSeriesSplitCopyTests {
         #expect(pattern["type"] as? String == "daily", "the stored rule replaced the edited one: \(canonical(pattern))")
         let startWall = try #require((created["start"] as? [String: Any])?["dateTime"] as? String)
         let range = try #require(recurrence["range"] as? [String: Any])
-        #expect(range["startDate"] as? String == String(GraphSplitFixture.recurrenceId.prefix(10)), "\(canonical(range))")
+        #expect(range["startDate"] as? String == String(startWall.prefix(10)), "\(canonical(range))")
 
         let storedRecurrence = try #require(series["recurrence"] as? [String: Any])
         let capped = try #require(graph.event("ser-1")?["recurrence"] as? [String: Any])
