@@ -39,6 +39,17 @@ actor CalDAVProvider: CalendarProvider {
         return [try RecurrenceDayShift.shifted(rules.newRule, by: move)]
     }
 
+    /// CalDAV's split cut (`CalendarProvider.splitCut`): `splitPoint`'s, from the stored resource
+    /// as `splitSeries` reads it.
+    func splitCut(calendarId: String, eventId: String, recurrenceId: String, zone: TimeZone) async throws -> SplitCarry.Cut {
+        let (seriesHref, occurrenceKey) = try CalDAVOccurrences.OccurrenceId.split(eventId)
+        let (data, _) = try await client.get(url: try resolveEventURL(seriesHref, calendarId: calendarId))
+        guard let masterICS = String(data: data, encoding: .utf8), !masterICS.isEmpty else {
+            throw CalDAVError.parseError("Empty response for event \(eventId)")
+        }
+        return try Self.splitPoint(masterICS: masterICS, href: seriesHref, key: occurrenceKey, recurrenceId: recurrenceId, zone: zone).cut
+    }
+
     private let client: CalDAVClient
     private let calendarHomeURL: URL
     private let serverBaseURL: URL
@@ -619,7 +630,7 @@ actor CalDAVProvider: CalendarProvider {
         patch: GCalEventInput,
         sendUpdates: String,
         record: SplitRecorder
-    ) async throws -> GCalEvent {
+    ) async throws -> GCalEvent? {
         // An occurrence id addresses its series' resource, and its key names the occurrence.
         // The split's new part is named from the series' href and the checked slot whichever
         // id the edit was given, so a retry and the same split asked for through the series
@@ -646,9 +657,10 @@ actor CalDAVProvider: CalendarProvider {
             masterICS: masterICS, href: seriesHref, key: occurrenceKey, recurrenceId: recurrenceId, zone: recurrenceIdZone)
         let zones = point.zones
         guard let slot = point.slot, case .at(let cutTime) = point.cut else {
-            return try await editShown(
+            _ = try await editShown(
                 url: eventURL, storedICS: masterICS, etag: etag, href: seriesHref, patch: patch,
                 namedStart: point.namedStart, shownFrom: point.shownFrom, zones: zones)
+            return nil
         }
         let namedStart = point.namedStart, namedPlace = point.namedPlace, namedInstants = point.namedInstants
         guard let patch = SplitCarry.partEdit(patch, namedStart: namedStart, cut: cutTime) else {

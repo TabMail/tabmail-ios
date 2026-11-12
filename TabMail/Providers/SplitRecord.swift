@@ -30,7 +30,7 @@ import Foundation
 /// An edit named at an occurrence moved past the series' last place (`SplitCarry.Cut.pastEnd`)
 /// writes no new part and no cap, only the edits of the occurrences shown from the one named on.
 /// Google and Outlook write those one by one, so they keep a record too (`pastEnd`) before the
-/// first: `splitAt` is "", `newPartId` is the occurrence named (what the edit answers with), and the targets are absolute, so a retry
+/// first: `splitAt` is "", `newPartId` is the occurrence named (an id only; no new part is made, so the edit answers with no new series id), and the targets are absolute, so a retry
 /// (`CalendarProvider.finishShownEdit`) never moves one twice and never looks for the one named
 /// where it was.
 /// It holds ids, instants, the mode and field names only, no event content (ADR-004): a

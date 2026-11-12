@@ -286,6 +286,8 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         // part, which resets every occurrence changed or deleted one by one there
         // (`CalendarToolHelpers.exceptionsResetNote`).
         var turnsDays = false
+        // A split named at an occurrence moved past the series' last place (`SplitCarry.Cut.pastEnd`).
+        var pastEnd = false
         do {
             let given = arguments
             let routed = try CalendarSeriesScope.route(arguments, scope: resolvedScope, named: named, zone: tz, recurrenceIdZone: ridZone)
@@ -299,6 +301,19 @@ struct CalendarEventEditTool: AgentTool, Sendable {
                    let new = CalendarToolHelpers.stringArgOpt(arguments, key), new != old,
                    let line = changes.firstIndex(of: "\(label) → \(old)") {
                     changes[line] = "\(label) → \(new)"
+                }
+            }
+            // A split named at a moved occurrence cuts where the calendar's write cuts
+            // (`splitCut`). Past the series' last place it makes no new part: only the occurrences
+            // shown are edited, nothing is reset, and a change of the repeat is refused here, in the
+            // write's words, before the user confirms.
+            if resolvedScope == "this_and_following", let rid = recurrenceIdArg,
+               let occurrence = named.occurrence, RecurrenceOccurrenceResolver.wasMoved(occurrence),
+               case .pastEnd = try await provider.splitCut(calendarId: lookupCalId, eventId: queuedEventId, recurrenceId: rid, zone: tz) {
+                pastEnd = true
+                let changesRule = try CalendarToolHelpers.buildGCalEventInput(arguments, isAllDay: occurrence.isAllDay).recurrence != nil
+                if changesRule || (try CalendarSeriesScope.dayMove(arguments, named: named, scope: resolvedScope, zone: tz)) != nil {
+                    throw CalendarProviderError.notSupported(SplitCarry.pastEndRuleRefusal)
                 }
             }
             // A move to another day of a series whose rule names its days turns them with it; the
@@ -398,7 +413,7 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         // builds it, against where the occurrence named starts now (#563): the write checks the
         // edit moved to its cut (`SplitCarry.partEdit`) against the cut, which is the same check.
         var splitResets = false
-        if resolvedScope == "this_and_following", let occurrence = named.occurrence, let start = occurrence.start,
+        if resolvedScope == "this_and_following", !pastEnd, let occurrence = named.occurrence, let start = occurrence.start,
            var edit = try? CalendarToolHelpers.buildGCalEventInput(
                arguments, isAllDay: CalendarToolHelpers.boolArg(arguments, "all_day") ?? occurrence.isAllDay) {
             edit.ruleDayMove = try? CalendarSeriesScope.dayMove(arguments, named: named, scope: resolvedScope, zone: tz)

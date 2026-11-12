@@ -460,7 +460,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         patch: GCalEventInput,
         sendUpdates: String = "all",
         record: SplitRecorder
-    ) async throws -> GCalEvent {
+    ) async throws -> GCalEvent? {
         // The agent may have passed an INSTANCE id — Graph instance events
         // don't carry the series `recurrence`; only the master does. Resolve
         // via `seriesMasterId` (mapped onto `recurringEventId` by toGCalEvent)
@@ -486,7 +486,8 @@ actor ExchangeCalendarProvider: CalendarProvider {
         let found = point.found, namedStart = point.namedStart, namedPlace = point.namedPlace
         let seriesZone = master.recurrenceTimeZoneName
         guard let place = point.place, case .at(let splitPlace) = point.cut else {
-            return try await editShown(seriesId: eventId, series: master, named: found, patch: patch, seriesZone: seriesZone, record: record)
+            _ = try await editShown(seriesId: eventId, series: master, named: found, patch: patch, seriesZone: seriesZone, record: record)
+            return nil
         }
         guard let partPatch = SplitCarry.partEdit(patch, namedStart: namedStart, cut: splitPlace) else {
             throw CalendarProviderError.notSupported("where the occurrence named falls in its series can't be read, so the series can't be split at it")
@@ -513,6 +514,12 @@ actor ExchangeCalendarProvider: CalendarProvider {
         let exceptions = try await seriesExceptions(seriesId: eventId, series: master, seriesZone: seriesZone)
         guard let parts = SplitCarry.partition(exceptions.map(\.carried), cut: point.cut, namedStart: namedStart) else {
             throw CalendarProviderError.notSupported("a changed occurrence of this repeating event has a time TabMail can't read, so it was not split")
+        }
+        // The order the carry and the edits are written in dates their moves in the series' zone
+        // (`moveOrder`): a timed series with none and occurrences to carry or edit is refused here, before the new
+        // part is created.
+        guard exceptions.isEmpty || master.isAllDay || master.seriesZone != nil else {
+            throw CalendarProviderError.notSupported("an occurrence of this repeating event can't be dated in its time zone, so its change can't be carried")
         }
         let cappedBody = try JSONSerialization.data(withJSONObject: cappedJSON)
 
@@ -742,7 +749,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         guard let edits = SplitCarry.edits(
             of: parts.edited, targets: record.edits, length: SplitCarry.length(of: newPart), fields: record.fields) else { throw unreadable }
         let values = SplitCarry.values(of: newPart, fields: record.fields)
-        for edit in try Self.editOrder(edits, zone: seriesZone.flatMap { CalendarTimeZoneResolver.zone(named: $0, in: .none) }) {
+        for edit in try Self.editOrder(edits, zone: series.seriesZone) {
             guard let id = edit.exception.id else { throw unreadable }
             _ = try await patchOccurrence(instanceId: id, event: SplitCarry.input(for: edit, values: values, guests: guests))
         }
@@ -765,10 +772,12 @@ actor ExchangeCalendarProvider: CalendarProvider {
         guard let shown = SplitCarry.shownEdits(exceptions: exceptions.map(\.carried), named: named, seriesId: seriesId, patch: patch) else {
             throw CalendarProviderError.notSupported(Self.shownEditUnreadable)
         }
+        // Ordered before the record and the first write, so edits Graph can't take are refused
+        // with nothing written.
+        let ordered = try Self.editOrder(shown.edits, zone: series.seriesZone)
         try await record(shown.record)
         return try await writeShownEdits(
-            shown.edits, values: SplitCarry.values(of: patch, fields: shown.record.fields), guests: patch.attendeeChange,
-            seriesZone: seriesZone) ?? named
+            ordered, values: SplitCarry.values(of: patch, fields: shown.record.fields), guests: patch.attendeeChange) ?? named
     }
 
     /// `CalendarProvider.finishShownEdit`: the edits of `record` still to write, from the series'
@@ -781,18 +790,18 @@ actor ExchangeCalendarProvider: CalendarProvider {
             throw CalendarProviderError.notSupported(Self.shownEditUnreadable)
         }
         _ = try await writeShownEdits(
-            edits, values: SplitCarry.values(of: edit, fields: record.fields), guests: guests, seriesZone: seriesZone)
+            try Self.editOrder(edits, zone: snapshot.event.seriesZone), values: SplitCarry.values(of: edit, fields: record.fields), guests: guests)
     }
 
     private static let shownEditUnreadable = "a changed occurrence of this repeating event has a time TabMail can't read, so it was not changed"
 
-    /// Writes `edits` in the order Graph takes moves (`editOrder`), each as a "this occurrence"
-    /// edit; the last one written, nil when none.
+    /// Writes `edits`, already in the order Graph takes moves (`editOrder`), each as a "this
+    /// occurrence" edit; the last one written, nil when none.
     private func writeShownEdits(
-        _ edits: [SplitCarry.Edit], values: GCalEventInput, guests: AttendeeChange?, seriesZone: String?
+        _ edits: [SplitCarry.Edit], values: GCalEventInput, guests: AttendeeChange?
     ) async throws -> GCalEvent? {
         var last: GCalEvent?
-        for edit in try Self.editOrder(edits, zone: seriesZone.flatMap { CalendarTimeZoneResolver.zone(named: $0, in: .none) }) {
+        for edit in edits {
             guard let id = edit.exception.id else {
                 throw CalendarProviderError.notSupported("a changed occurrence of this repeating event can't be addressed, so it was not changed")
             }
@@ -818,7 +827,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         fields: Set<SplitCarry.Field>, guests: AttendeeChange?, seriesZone: String?
     ) async throws {
         guard !plan.deleted.isEmpty || !plan.changed.isEmpty else { return }
-        let zone = seriesZone.flatMap { CalendarTimeZoneResolver.zone(named: $0, in: .none) }
+        let zone = series.seriesZone
         let unplaced = CalendarProviderError.notSupported(
             "an occurrence of this repeating event can't be dated in its time zone, so its change can't be carried")
 
@@ -951,21 +960,22 @@ actor ExchangeCalendarProvider: CalendarProvider {
 
     /// `moves` in the order Graph takes them: an occurrence moved to another date goes once no
     /// occurrence not yet moved still holds that date (the date it is `at`), so none is moved onto
-    /// a date another occurrence holds (`ErrorOccurrenceCrossingBoundary`). Those that stay on
-    /// their date go first. Moves that hold each other's dates in a ring keep their order; Graph
+    /// a date another occurrence holds (`ErrorOccurrenceCrossingBoundary`). Those that don't move
+    /// (no target) go first and are not dated: no zone is needed for them. Those that stay on their
+    /// date go next. Moves that hold each other's dates in a ring keep their order; Graph
     /// refuses the first of them.
     nonisolated static func moveOrder<Move>(
         _ moves: [Move], at: (Move) -> GCalDateTime, to: (Move) -> GCalDateTime?, zone: TimeZone?
     ) throws -> [Move] {
         let unplaced = CalendarProviderError.notSupported(
             "an occurrence of this repeating event can't be dated in its time zone, so its change can't be carried")
-        var pending: [(move: Move, place: String, target: String)] = try moves.map { move in
-            guard let place = seriesDate(of: at(move), seriesZone: zone) else { throw unplaced }
-            guard let start = to(move) else { return (move, place, place) }
-            guard let target = seriesDate(of: start, seriesZone: zone) else { throw unplaced }
+        var ordered = moves.filter { to($0) == nil }
+        var pending: [(move: Move, place: String, target: String)] = try moves.compactMap { move in
+            guard let start = to(move) else { return nil }
+            guard let place = seriesDate(of: at(move), seriesZone: zone),
+                  let target = seriesDate(of: start, seriesZone: zone) else { throw unplaced }
             return (move, place, target)
         }
-        var ordered: [Move] = []
         while !pending.isEmpty {
             let held = pending.map(\.place)
             let next = pending.firstIndex { $0.target == $0.place }
@@ -1205,6 +1215,13 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // A move of the new part to another day turns the days the pattern names.
         if let move { recurrence = try turned(recurrence, by: move) }
         return recurrence
+    }
+
+    /// Outlook's split cut (`CalendarProvider.splitCut`): `splitPoint`'s, with the series read as
+    /// `splitSeries` reads it.
+    func splitCut(calendarId: String = "primary", eventId: String, recurrenceId: String, zone: TimeZone) async throws -> SplitCarry.Cut {
+        let (masterId, snapshot) = try await resolveToMaster(eventId: eventId, select: Self.splitSelect)
+        return try await splitPoint(named: eventId, masterId: masterId, master: snapshot.event, recurrenceId: recurrenceId, zone: zone).cut
     }
 
     /// Where a split of `master` named at `recurrenceId` (read in `zone`) cuts it: the occurrence

@@ -180,7 +180,7 @@ actor MockCalendarProvider: CalendarProvider {
 
     /// Records the split. Once `splitSeriesResult` is set (the new part is "created") the
     /// `SplitRecord` is handed to `record`, then `splitSeriesCapThrows` stands for the cap failing.
-    func splitSeries(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, patch: GCalEventInput, sendUpdates: String, record: SplitRecorder) async throws -> GCalEvent {
+    func splitSeries(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, patch: GCalEventInput, sendUpdates: String, record: SplitRecorder) async throws -> GCalEvent? {
         callLog.append("splitSeries(calendarId:\(calendarId),eventId:\(eventId),recurrenceId:\(recurrenceId),recurrenceIdZone:\(recurrenceIdZone.identifier),sendUpdates:\(sendUpdates))")
         splitSeriesCalls.append((calendarId: calendarId, eventId: eventId, recurrenceId: recurrenceId, recurrenceIdZone: recurrenceIdZone, patch: patch, sendUpdates: sendUpdates))
         if let error = splitSeriesThrows { throw error }

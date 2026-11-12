@@ -929,7 +929,7 @@ extension AccountManager {
                     calendarId: calId, record: record,
                     edit: try CalendarToolHelpers.buildGCalEventInput(args, isAllDay: nil), guests: AttendeeChange(arguments: args))
                 BackgroundSyncLogger.logDebug("[CalendarQueue] Finished the edit past the end of \(record.seriesId)")
-                return (record.newPartId, nil)
+                return (nil, nil)
             }
             if let record = SplitRecord(args) {
                 guard try await provider.eventExists(calendarId: calId, eventId: record.newPartId) else {
@@ -1130,13 +1130,14 @@ extension AccountManager {
                         keep: { record in try await self.recordSplit(opId: opId, record) },
                         partNotFound: { try await self.noteSplitPartNotFound(opId: opId) })
                 )
-                BackgroundSyncLogger.logDebug("[CalendarQueue] Updated event id=\(eventId) scope=this_and_following at \(rid) (\(recurrenceIdZone.identifier)) — new series id=\(created.id ?? "?")")
+                BackgroundSyncLogger.logDebug("[CalendarQueue] Updated event id=\(eventId) scope=this_and_following at \(rid) (\(recurrenceIdZone.identifier)) — new series id=\(created?.id ?? "none")")
                 // Surface the new series id so `awaitCalendarOpOutcome` can hand
                 // it back to the tool — the LLM needs it to address occurrences
                 // in the split's second half. Without this, follow-up edits
                 // continue to target the master (now truncated) and silently
                 // miss for any occurrence on or after `rid`.
-                return (created.id, nil)
+                // An edit past the series' last place makes no new part (nil): nothing to surface.
+                return (created?.id, nil)
             case "all":
                 _ = try await provider.updateEvent(calendarId: calId, eventId: writeId, event: input, sendUpdates: "all")
                 BackgroundSyncLogger.logDebug("[CalendarQueue] Updated event id=\(writeId) scope=all")

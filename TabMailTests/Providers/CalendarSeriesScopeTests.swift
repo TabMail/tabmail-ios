@@ -1441,6 +1441,37 @@ struct CalendarEditToolSeriesScopeTests {
         #expect(r.calendar.event(GoogleSeries.instanceId(day(0)))?["summary"] as? String == "Standup")
     }
 
+    /// A weekly series of three, whose day-7 occurrence moved past its last place, to day 20.
+    private var pastEndSeed: [[String: Any]] {
+        [GoogleSeries.series(rule: "RRULE:FREQ=WEEKLY;COUNT=3"), GoogleSeries.instance(day(0)),
+         GoogleSeries.moved(day(7), start: "\(day(20))T09:00:00", end: "\(day(20))T09:30:00")]
+    }
+
+    @Test("Google: a new start from an occurrence moved past the series' end resets nothing, so its card shows no reset note, and the answer names no new series")
+    func movedPastTheEndCardAndAnswerMatchTheWrite() async throws {
+        let r = try await googleTool([
+            "edit_scope": .string("this_and_following"), "recurrence_id": .string("\(day(20))T09:00:00"),
+            "start_iso": .string("\(day(20))T10:00:00"), "timezone": .string("UTC"),
+        ], eventId: GoogleSeries.instanceId(day(7)), account: "series-tool-g-past-end-card", seed: pastEndSeed)
+        #expect(r.run.cards.count == 1 && r.run.cards.first?.changes.contains(CalendarToolHelpers.exceptionsResetNote) == false,
+                "card: \(r.run.cards.first?.changes ?? []); \(r.run.out)")
+        #expect(instant(r.calendar.event(GoogleSeries.instanceId(day(7)))?["start"]) == utcAt("\(day(20))T10:00:00"),
+                "the named occurrence did not move: \(r.calendar.writes); \(r.run.out)")
+        #expect(!r.run.out.contains("new_series_event_id") && !r.run.out.contains("only covers occurrences before"),
+                "an edit that made no new part named one: \(r.run.out)")
+    }
+
+    @Test("Google: a change of the repeat from an occurrence moved past the series' end is refused before the card, with nothing queued or written")
+    func movedPastTheEndRuleChangeRefusedBeforeTheCard() async throws {
+        let r = try await googleTool([
+            "edit_scope": .string("this_and_following"), "recurrence_id": .string("\(day(20))T09:00:00"),
+            "recurrence": .dictionary(["freq": .string("DAILY")]), "timezone": .string("UTC"),
+        ], eventId: GoogleSeries.instanceId(day(7)), account: "series-tool-g-past-end-rule", seed: pastEndSeed)
+        #expect(r.run.cards.isEmpty && r.run.queued.isEmpty && !r.calendar.writes.contains { !$0.hasPrefix("GET") },
+                "cards \(r.run.cards.count) queued \(r.run.queued.count) writes \(r.calendar.writes)")
+        #expect(r.run.out.contains(SplitCarry.pastEndRuleRefusal), "\(r.run.out)")
+    }
+
     private func isCapped(_ calendar: FakeGoogleCalendar) -> Bool {
         (calendar.event(GoogleSeries.id)?["recurrence"] as? [String])?.contains { $0.contains("UNTIL=") } == true
     }
@@ -3987,6 +4018,29 @@ struct SplitInterruptedBetweenItsWritesTests {
         #expect(r.split == nil, "\(kind) \(end): \(describe(r.split))")
         #expect(harness.splitWrites.isEmpty, "\(kind) \(end): wrote \(harness.splitWrites)")
         #expect(harness.seriesEnd == before, "\(kind) \(end): the series' end changed from \(before) to \(harness.seriesEnd)")
+    }
+
+    @Test("Google: the retry of an edit past the series' end writes the edits it kept and nothing else: no new part, no cap")
+    func pastEndRetryWritesOnlyItsEdits() async throws {
+        let harness = SplitHarness(.google)
+        // The occurrence placed on day 7, moved to day 8: the one the first attempt named.
+        harness.google?.store(GoogleSeries.moved(day(7), start: "\(day(8))T09:00:00", end: "\(day(8))T09:30:00"))
+        let before = harness.seriesEnd
+        let place = SplitCarry.key(GCalDateTime(dateTime: "\(day(7))T09:00:00Z", date: nil, timeZone: nil))
+        let start = SplitCarry.key(GCalDateTime(dateTime: "\(day(8))T09:00:00Z", date: nil, timeZone: nil))
+        let record = SplitRecord.pastEnd(
+            seriesId: harness.seriesId, namedId: GoogleSeries.instanceId(day(7)), fields: [.summary],
+            namedPlace: place, namedStart: start, edits: [place: ""], editLength: nil)
+        let arguments: [String: JSONValue] = [
+            "edit_scope": .string("this_and_following"), "recurrence_id": .string("\(day(8))T09:00:00"),
+            "title": .string("Renamed past"), "timezone": .string("UTC"), SplitRecord.argumentKey: record.argument,
+        ]
+        let r = try await drainSplit(harness, account: "split-past-end-retry", arguments: arguments, drains: 1)
+        #expect(r.split == nil, describe(r.split))
+        #expect(harness.google?.event(GoogleSeries.instanceId(day(7)))?["summary"] as? String == "Renamed past",
+                "the kept edit was not written: \(harness.splitWrites)")
+        #expect(!harness.splitWrites.contains { $0.hasPrefix("POST") || harness.isCap($0) }, "a part or a cap was written: \(harness.splitWrites)")
+        #expect(harness.seriesEnd == before)
     }
 }
 
