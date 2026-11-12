@@ -62,7 +62,7 @@ Search the topic text below as subsystem keywords. Each link is mandatory when i
 | HTML Email Render Pipeline (AutoSizingHTMLView) — MUST stay idempotent (ADR-IOS-039) | [read in full](Companion/Memory/Current/037-html-email-render-pipeline-autosizinghtmlview-must-stay-idempotent-adr-i.md) |
 | Swift Gotchas | [read in full](Companion/Memory/Current/038-swift-gotchas.md) |
 | Folder.== must include every UI-visible field | [read in full](Companion/Memory/Current/039-folder-must-include-every-ui-visible-field.md) |
-| IMAP Folder Role Detection & Dedup (iCloud "Trash" + "Deleted Messages"; leaf-name match for `INBOX.Sent`; `RETURN (SPECIAL-USE)` only when advertised) | [read in full](Companion/Memory/Current/040-imap-folder-role-detection-dedup-icloud-trash-deleted-messages.md) |
+| IMAP Folder Role Detection & Dedup (iCloud "Trash" + "Deleted Messages"; leaf-name match for `INBOX.Sent`; `RETURN (SPECIAL-USE)` only when advertised; no Sent folder ⇒ IMAP CREATEs "Sent" for the sent copy) | [read in full](Companion/Memory/Current/040-imap-folder-role-detection-dedup-icloud-trash-deleted-messages.md) |
 | Two-Tier Sync (ADR-IOS-009) | [read in full](Companion/Memory/Current/041-two-tier-sync-adr-ios-009.md) |
 | `syncStartup` Budget Discipline (v50/v51 lesson) | [read in full](Companion/Memory/Current/042-syncstartup-budget-discipline-v50-v51-lesson.md) |
 | Stale Message Detection (syncMessages) | [read in full](Companion/Memory/Current/043-stale-message-detection-syncmessages.md) |

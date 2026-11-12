@@ -171,7 +171,7 @@ actor DemoProvider: EmailProvider {
         // header is the demo's sent copy, as it is for a real account until sync.
     }
 
-    func appendToSentFolder(draft: DraftMessage, sentFolderPath: String, messageId: String) async throws -> Bool {
+    func appendToSentFolder(draft: DraftMessage, sentFolderPath: String?, messageId: String) async throws -> Bool {
         // The outbox's optimistic Sent header is the demo's copy; nothing to append.
         true
     }

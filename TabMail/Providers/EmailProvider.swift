@@ -427,10 +427,13 @@ protocol EmailProvider: Sendable {
     /// For IMAP: explicit APPEND. For Gmail/Exchange: no-op (API auto-saves).
     /// - Parameters:
     ///   - draft: The sent message content.
-    ///   - sentFolderPath: Server-side Sent folder path.
+    ///   - sentFolderPath: Server-side Sent folder path, or `nil` when the
+    ///     account has no Sent folder (none found by SPECIAL-USE or by name).
+    ///     IMAP then creates a folder named "Sent" and appends there (owner
+    ///     ruling, tabmail-ios #533); the API providers save the copy anyway.
     ///   - messageId: The RFC822 Message-ID used during SMTP send (for dedup).
     /// - Returns: `true` if the message was appended (or confirmed already present).
-    func appendToSentFolder(draft: DraftMessage, sentFolderPath: String, messageId: String) async throws -> Bool
+    func appendToSentFolder(draft: DraftMessage, sentFolderPath: String?, messageId: String) async throws -> Bool
 
     /// Save a draft using only typed provider-native prior authority.
     func saveDraft(

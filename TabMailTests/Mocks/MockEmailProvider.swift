@@ -273,7 +273,7 @@ actor MockEmailProvider: EmailProvider {
     var markedFlaggedIds: [(ids: [String], flagged: Bool, folder: String)] = []
     var movedIds: [(ids: [String], from: String, to: String)] = []
     var sentDrafts: [DraftMessage] = []
-    var appendedToSent: [(draft: DraftMessage, sentFolderPath: String, messageId: String)] = []
+    var appendedToSent: [(draft: DraftMessage, sentFolderPath: String?, messageId: String)] = []
 
     // MARK: - EmailProvider Protocol
 
@@ -382,8 +382,8 @@ actor MockEmailProvider: EmailProvider {
         if let error = sendThrows { throw error }
     }
 
-    func appendToSentFolder(draft: DraftMessage, sentFolderPath: String, messageId: String) async throws -> Bool {
-        callLog.append("appendToSentFolder(sentFolderPath:\(sentFolderPath),messageId:\(messageId))")
+    func appendToSentFolder(draft: DraftMessage, sentFolderPath: String?, messageId: String) async throws -> Bool {
+        callLog.append("appendToSentFolder(sentFolderPath:\(sentFolderPath ?? "nil"),messageId:\(messageId))")
         appendedToSent.append((draft: draft, sentFolderPath: sentFolderPath, messageId: messageId))
         if let error = appendToSentThrows { throw error }
         return appendToSentResult

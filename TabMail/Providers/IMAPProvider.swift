@@ -5701,8 +5701,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
 
     /// Append a sent message to the IMAP Sent folder. Dedup-safe: searches by Message-ID
     /// before appending so retries after crash/disconnect don't create duplicates.
-    func appendToSentFolder(draft: DraftMessage, sentFolderPath: String, messageId: String) async throws -> Bool {
+    func appendToSentFolder(draft: DraftMessage, sentFolderPath: String?, messageId: String) async throws -> Bool {
         let senderAddr = senderEmail
+        let sentFolderPath = try await sentFolderPathCreatingIfNone(sentFolderPath)
         return try await withActionConnection(folder: sentFolderPath) { server in
             let existing = try await self.searchByMessageId(messageId, server: server)
             if !existing.isEmpty {
@@ -5714,6 +5715,36 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             _ = try await server.append(email: email, to: sentFolderPath, flags: [.seen], internalDate: Date())
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Appended sent message \(messageId) to \(sentFolderPath)") }
             return true
+        }
+    }
+
+    /// Name of the folder created when an account has no Sent folder.
+    static let createdSentFolderName = "Sent"
+
+    /// The Sent folder to append to. With `nil` (the account has no Sent folder,
+    /// none found by SPECIAL-USE or by name) it CREATEs `createdSentFolderName`
+    /// in the personal namespace (`INBOX.Sent` on a server whose folders live
+    /// under INBOX) and returns that path; the next folder sync gives it the
+    /// Sent role by name.
+    ///
+    /// A failed CREATE is not an error here: the usual cause is that the folder
+    /// already exists (an earlier send created it before the folder sync saw it,
+    /// or an existing row never got the role), and servers word that refusal
+    /// differently. The APPEND's own SELECT is the authority: if the folder
+    /// really is missing it throws, and the outbox retries the copy later.
+    private func sentFolderPathCreatingIfNone(_ sentFolderPath: String?) async throws -> String {
+        if let sentFolderPath { return sentFolderPath }
+        return try await withActionConnectionNoSelect { server in
+            let name = Self.createdSentFolderName
+            let namespaces = await server.namespaces
+            let path = namespaces?.resolveMailboxPath(name) ?? name
+            do {
+                try await server.createMailbox(path)
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] No Sent folder — created \(path)") }
+            } catch {
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] No Sent folder — CREATE \(path) refused (\(error)); appending to it anyway") }
+            }
+            return path
         }
     }
 

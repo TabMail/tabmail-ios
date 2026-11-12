@@ -804,7 +804,7 @@ actor GmailProvider: EmailProvider {
     }
 
     /// Gmail API auto-saves sent messages to the Sent label — no explicit append needed.
-    func appendToSentFolder(draft: DraftMessage, sentFolderPath: String, messageId: String) async throws -> Bool {
+    func appendToSentFolder(draft: DraftMessage, sentFolderPath: String?, messageId: String) async throws -> Bool {
         return true
     }
 
