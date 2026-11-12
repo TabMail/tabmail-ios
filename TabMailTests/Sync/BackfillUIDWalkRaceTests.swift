@@ -538,6 +538,58 @@ struct BackfillUIDWalkRaceTests {
         #expect(missing.isEmpty, "\(reset): backfill never loaded UIDs \(missing.sorted()) again after the reset")
     }
 
+    /// The walker resumes at cursor 4000 (UID 5000 above it already loaded)
+    /// over empty ranges, and the commit of its progress write fails: the
+    /// transaction rolls back, and with it the folder's version and the
+    /// counter that issued it. The reset (which removes UID 5000) then lands
+    /// after the workers joined, before the final write, and its bump is the
+    /// next one in the database: it reissues the very version the rolled-back
+    /// write produced. The walk never takes a version it did not commit for
+    /// its own, so it never writes over the reset.
+    @Test("A walk-position write whose commit failed never lets the walk write over a later reset",
+          arguments: UserReset.allCases)
+    func rolledBackPositionWriteNeverOverwritesAReset(_ reset: UserReset) async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        defer { F.clearWalkCheckpoints() }
+        let savedCcBcc = UserDefaults.standard.object(forKey: Self.ccBccKey)
+        defer { UserDefaults.standard.set(savedCcBcc, forKey: Self.ccBccKey) }
+
+        let walk = try await Self.makeWalk(
+            accountId: "uid-race-rolled-back-\(reset)", serverUIDs: [Self.aboveCursor],
+            cursor: Self.resumedCursor, localUIDs: [Self.aboveCursor], pool: pool)
+        defer { Self.tearDown(walk) }
+
+        let failCommits = FailCursorWriteCommits()
+        pool.add(transactionObserver: failCommits)
+        defer { pool.remove(transactionObserver: failCommits) }
+        let counterBefore = try await pool.read {
+            try Int.fetchOne($0, sql: "SELECT value FROM backfillVersionCounter WHERE id = 1")
+        }
+        failCommits.arm(true)
+        let resetVersion = Locked<Int?>(nil)
+        F.atCheckpoint(1, .afterWorkersJoinedBeforeFinalBookkeeping(folderId: walk.folderId)) {
+            failCommits.arm(false)
+            await reset.run(on: walk, missingLocally: [Self.aboveCursor])
+            resetVersion.set(try? walk.row().backfillVersion)
+        }
+        _ = await walk.call()
+
+        #expect(failCommits.failed > 0, "\(reset): precondition: the commit of a walk-position write failed")
+        #expect(resetVersion.get() != nil && resetVersion.get() == counterBefore.map { $0 + 1 },
+                "\(reset): precondition: the reset's version (\(String(describing: resetVersion.get()))) is the one the rolled-back write produced (\(String(describing: counterBefore.map { $0 + 1 })))")
+        let row = try walk.row()
+        #expect(!row.backfillComplete && row.backfillUidCursor == nil,
+                "\(reset): the walk wrote over the reset: complete \(row.backfillComplete), cursor \(String(describing: row.backfillUidCursor))")
+        let claim = try walk.claim()
+        #expect(claim == nil, "\(reset): after the walker's call, \(claim ?? "")")
+
+        try await walk.callUntilComplete()
+        #expect(try walk.row().backfillComplete, "\(reset): the folder's walk never completed again after the reset")
+        let missing = Set(walk.serverUIDs()).subtracting(try walk.local())
+        #expect(missing.isEmpty, "\(reset): backfill never loaded UIDs \(missing.sorted()) again after the reset")
+    }
+
     /// The walker resumes at a cursor below the smallest chunk any profile
     /// uses, so one empty range is all that is left. Nothing disturbs it.
     /// Its progress write and its completion are both its own, so the call
@@ -609,6 +661,32 @@ struct BackfillUIDWalkRaceTests {
                 "\(write): precondition: nothing the call did landed (complete \(row.backfillComplete), cursor \(String(describing: row.backfillUidCursor)), loaded \(loaded.sorted()))")
         #expect(!didWork, "\(write): the call landed nothing, yet reported work")
     }
+}
+
+/// While armed, fails the commit of every transaction that wrote a folder's
+/// UID cursor: the transaction rolls back after its statements ran, as an I/O
+/// error or a full disk at commit would.
+private final class FailCursorWriteCommits: TransactionObserver, @unchecked Sendable {
+    private let state = Mutex((armed: false, pending: false, failed: 0))
+    var failed: Int { state.withLock { $0.failed } }
+    func arm(_ armed: Bool) { state.withLock { $0.armed = armed } }
+    func observes(eventsOfKind eventKind: DatabaseEventKind) -> Bool {
+        if case .update(let tableName, let columnNames) = eventKind {
+            return tableName == "folder" && columnNames.contains("backfillUidCursor")
+        }
+        return false
+    }
+    func databaseDidChange(with event: DatabaseEvent) { state.withLock { $0.pending = true } }
+    func databaseWillCommit() throws {
+        let fail = state.withLock { value -> Bool in
+            guard value.armed, value.pending else { return false }
+            value.failed += 1
+            return true
+        }
+        if fail { throw NSError(domain: "InjectedCommitFailure", code: 1) }
+    }
+    func databaseDidCommit(_ db: Database) { state.withLock { $0.pending = false } }
+    func databaseDidRollback(_ db: Database) { state.withLock { $0.pending = false } }
 }
 
 /// A value a checkpoint hook sets and the test reads afterwards.

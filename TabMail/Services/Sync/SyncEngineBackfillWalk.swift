@@ -909,7 +909,8 @@ extension SyncEngine {
     /// walker's write landing while this walk is on the network makes the write
     /// match nothing. A version miss marks `position` lost; a write that lands
     /// records the version it left, read back in this transaction, so the
-    /// walk's next write expects its own. Returns whether the write landed.
+    /// walk's next write expects its own — once the transaction commits, and
+    /// not before. Returns whether the write landed.
     nonisolated static func writeUIDWalkPosition(
         _ db: Database, folderId: String, premiseEpoch: UInt32?, position: UIDWalkPosition,
         _ assignments: [ColumnAssignment]
@@ -926,7 +927,15 @@ extension SyncEngine {
         }
         let written = try Int.fetchOne(
             db, sql: "SELECT backfillVersion FROM folder WHERE id = ?", arguments: [folderId])
-        if let written { position.recordOwnWrite(version: written) }
+        // The version this write produced is the walk's own only once its
+        // transaction commits. A transaction that rolls back (an error at
+        // COMMIT, or a later statement in it failing) puts the row and the
+        // version counter back, and the next bump in the database (a reset's,
+        // a sibling walker's) then issues this very version again: recorded
+        // now, it would let the walk write over that bump.
+        if let written {
+            db.afterNextTransaction(onCommit: { _ in position.recordOwnWrite(version: written) })
+        }
         return true
     }
 
