@@ -2444,6 +2444,235 @@ struct GmailCatchUpTests {
         }
     }
 
+    // MARK: - An id listed twice in one pass, and loads that do not land
+
+    /// Two local Inbox rows, `l0` a day old and `l1` two days old (one range),
+    /// and two server messages no row holds: `m` between them, `x` older.
+    private static func twoMissingWorld(_ clock: Clock) -> (seeds: [StatefulGmailActionServer.Seed], local: [Local]) {
+        let dates = (l0: clock.daysAgo(1), m: clock.daysAgo(1.5), l1: clock.daysAgo(2), x: clock.daysAgo(2.5))
+        return ([seed("l0", dates.l0, [inboxPath]), seed("m", dates.m, [inboxPath]),
+                 seed("l1", dates.l1, [inboxPath]), seed("x", dates.x, [inboxPath])],
+                [Local(id: "l0", path: inboxPath, date: dates.l0), Local(id: "l1", path: inboxPath, date: dates.l1)])
+    }
+
+    /// How many `format=full` GETs named `id`.
+    private static func fullGets(_ world: World, _ id: String) -> Int {
+        world.server.fullMessageGets().filter { $0 == id }.count
+    }
+
+    /// Make every insert of a message header with `messageId` fail, as a write
+    /// that throws inside the insert's transaction does.
+    private static func failInserts(of messageId: String, _ world: World) throws {
+        try world.pool.write { db in
+            try db.execute(sql: """
+                CREATE TRIGGER test_failInsert BEFORE INSERT ON messageHeader
+                WHEN NEW.messageId = '\(messageId)'
+                BEGIN SELECT RAISE(ABORT, 'injected insert failure'); END
+                """)
+        }
+    }
+
+    private static func healInserts(_ world: World) throws {
+        try world.pool.write { db in try db.execute(sql: "DROP TRIGGER test_failInsert") }
+    }
+
+    /// The property every pass keeps: each id it listed as missing is present
+    /// locally after it. Here the two ranges' membership windows meet: each is
+    /// widened by `catchUpGmailRangeSlackSeconds`, so a message dated exactly
+    /// at the newer range's start is listed by both, in the same pass. It loads
+    /// once, and it and every other missing message have a row.
+    @Test("Every id a pass lists as missing is present after it; an id where two ranges' lists meet loads once",
+          .enabled(if: !NetworkMonitor.checkExpensive()))
+    func idWhereTwoRangesMeetLoadsOnce() async throws {
+        let clock = Clock()
+        let (l0, l1) = (clock.daysAgo(1), clock.daysAgo(30))
+        let newer = GmailProvider.catchUpRange(
+            nextBeforeSecond: nil, head: [l0, l1], rowLimit: SyncConfig.catchUpGmailRangeRowLimit,
+            maxSpanSeconds: SyncConfig.catchUpGmailRangeMaxSpanSeconds, toEpoch: true)
+        let seam = Date(timeIntervalSince1970: TimeInterval(newer.from))
+        let missing = [("x1", clock.daysAgo(2)), ("x2", clock.daysAgo(3)), ("x3", clock.daysAgo(4)),
+                       ("seam", seam), ("y", clock.daysAgo(20))]
+        let seeds = [Self.seed("l0", l0, [inboxPath]), Self.seed("l1", l1, [inboxPath])]
+            + missing.map { Self.seed($0.0, $0.1, [inboxPath]) }
+        let local = [Local(id: "l0", path: inboxPath, date: l0), Local(id: "l1", path: inboxPath, date: l1)]
+        try await Self.withWorld("gcu-seam-once", seeds: seeds, local: local) { world async throws in
+            await Self.pass(world, [inboxPath], context: Self.unlimited(at: { clock.now }))
+
+            let seamSecond = newer.from
+            let listingSeam = world.server.listRequests().filter { request in
+                guard request.labelId == inboxPath, let after = request.bound("after"), let before = request.bound("before") else { return false }
+                return after < seamSecond && seamSecond < before
+            }
+            #expect(listingSeam.count == 2, "precondition: both ranges' membership lists cover the seam: \(listingSeam.count)")
+            #expect(try Self.state(world, inboxPath)?.lastCompletedAt == clock.now, "precondition: the listing completed")
+            let inbox = try Self.rows(world, inboxPath)
+            let absent = missing.map(\.0).filter { inbox[$0] == nil }
+            #expect(absent.isEmpty, "every id the pass listed as missing has a row; absent: \(absent)")
+            #expect(Self.fullGets(world, "seam") == 1, "the id both ranges list loads once")
+        }
+    }
+
+    /// A listing in progress when a lapse comes completes in the next pass, and
+    /// a new listing starts at once in the same pass and lists the same range
+    /// again. The missing ids the first listing loaded are not inserted until the
+    /// pass returns; they count as held, so they load once and both show.
+    @Test("A listing restarted in the same pass after a lapse loads a missing id once, and nothing is lost",
+          .enabled(if: !NetworkMonitor.checkExpensive()))
+    func lapseRestartInOnePassLoadsOnce() async throws {
+        let clock = Clock()
+        let (seeds, local) = Self.twoMissingWorld(clock)
+        try await Self.withWorld("gcu-lapse-restart-once", seeds: seeds, local: local) { world async throws in
+            // The first listing's membership list, then the budget runs out
+            // before its loads: the listing is in progress.
+            await Self.pass(world, [inboxPath], context: Self.requestBudget(world.server, 1))
+            #expect(try Self.state(world, inboxPath)?.listing?.range != nil, "precondition: the listing is in progress")
+            try await Self.lapse(world)
+
+            let listsBefore = world.server.listRequests().filter { $0.labelId == inboxPath }.count
+            await Self.pass(world, [inboxPath], context: Self.unlimited(at: { clock.now }))
+
+            let membership = world.server.listRequests().filter { $0.labelId == inboxPath }.count - listsBefore
+            #expect(membership == 2, "precondition: the listing completed and a new one listed the range again: \(membership)")
+            let done = try #require(try Self.state(world, inboxPath))
+            #expect(done.listing == nil && !done.lapsedSinceLastListing, "the new listing completed and covers the lapse")
+            let inbox = try Self.rows(world, inboxPath)
+            #expect(inbox["m"] != nil && inbox["x"] != nil, "both missing messages show")
+            #expect(Self.fullGets(world, "m") == 1 && Self.fullGets(world, "x") == 1,
+                    "each loads once: m \(Self.fullGets(world, "m")), x \(Self.fullGets(world, "x"))")
+        }
+    }
+
+    /// The membership list's first page loads `m`; the request for its second
+    /// page, carrying the saved token, gets a `400`, so the list starts again
+    /// from the range's start and lists `m` again in the same pass. It loads
+    /// once, and everything shows.
+    @Test("A membership list restarted after a 400 on its token, after a page that loaded, loads that id once",
+          .enabled(if: !NetworkMonitor.checkExpensive()))
+    func badRequestRestartAfterALoadLoadsOnce() async throws {
+        let clock = Clock()
+        let (seeds, local) = Self.twoMissingWorld(clock)
+        try await Self.withWorld("gcu-400-after-load", seeds: seeds, local: local) { world async throws in
+            world.server.servePagedListings(pageSize: 2)
+            world.server.answerTokenedListsWithUnrelatedBadRequest(count: 1)
+
+            await Self.pass(world, [inboxPath], context: Self.unlimited(at: { clock.now }))
+
+            #expect(world.server.badRequestedPageTokens().count == 1, "precondition: the second page's request got the 400")
+            #expect(world.server.listRequests().filter { $0.labelId == inboxPath && $0.pageToken == nil }.count == 2,
+                    "precondition: the membership list started over once")
+            #expect(try Self.state(world, inboxPath)?.lastCompletedAt == clock.now, "precondition: the listing completed")
+            let inbox = try Self.rows(world, inboxPath)
+            #expect(inbox["m"] != nil && inbox["x"] != nil, "both missing messages show")
+            #expect(Self.fullGets(world, "m") == 1, "the id the first page loaded loads once: \(Self.fullGets(world, "m"))")
+        }
+    }
+
+    /// A batch of loads whose timeout fires before one GET answers: the answered
+    /// id loads, and the unanswered one is held (no answer is a `hold`), so the
+    /// range waits for it instead of passing it over; once it answers it loads.
+    @Test("A load batch that times out holds its unanswered ids; they load at a later pass",
+          .enabled(if: !NetworkMonitor.checkExpensive()))
+    func batchTimeoutHoldsUnansweredIds() async throws {
+        let clock = Clock()
+        let (seeds, local) = Self.twoMissingWorld(clock)
+        try await Self.withWorld("gcu-batch-timeout", seeds: seeds, local: local) { world async throws in
+            defer { SyncEngine.backfillPageHoldNowForTesting.withLock { $0 = nil } }
+            let at = clock.now
+            SyncEngine.backfillPageHoldNowForTesting.withLock { $0 = at }
+            world.server.holdGet(providerMessageId: "m", forSeconds: SyncConfig.catchUpRequestTimeoutSeconds + 2)
+
+            await Self.pass(world, [inboxPath], context: Self.unlimited(at: { at }))
+
+            var inbox = try Self.rows(world, inboxPath)
+            #expect(inbox["x"] != nil && inbox["m"] == nil, "precondition: the answered id loaded, the unanswered one did not")
+            #expect(try Self.state(world, inboxPath)?.listing?.range?.loadHeldSince == at, "the unanswered id holds the range")
+            #expect(try Self.state(world, inboxPath)?.lastCompletedAt == nil, "the listing does not pass it over")
+
+            world.server.holdGet(providerMessageId: "m", forSeconds: 0)
+            SyncEngine.backfillPageHoldNowForTesting.withLock { $0 = at.addingTimeInterval(60) }
+            await Self.pass(world, [inboxPath], context: Self.unlimited(at: { at }))
+
+            inbox = try Self.rows(world, inboxPath)
+            #expect(inbox["m"] != nil, "the held id loads once it answers")
+            #expect(try Self.state(world, inboxPath)?.lastCompletedAt == at, "then the listing completes")
+        }
+    }
+
+    /// The insert of a loaded message fails (its write transaction throws), so
+    /// its chunk rolls back. The pass writes no catch-up state: the range stays
+    /// unlisted and the next pass lists it again, and once the write succeeds
+    /// both messages show.
+    @Test("A failed insert of loaded mail writes no catch-up state; the range is listed and loaded again",
+          .enabled(if: !NetworkMonitor.checkExpensive()))
+    func failedInsertKeepsTheRangeUnlisted() async throws {
+        let clock = Clock()
+        let (seeds, local) = Self.twoMissingWorld(clock)
+        try await Self.withWorld("gcu-insert-fails", seeds: seeds, local: local) { world async throws in
+            await Self.pass(world, [inboxPath], context: Self.requestBudget(world.server, 1))
+            let before = try Self.folder(world, inboxPath).catchUpState
+            #expect(GmailCatchUpState.decode(before)?.listing?.range != nil, "precondition: the listing is in progress")
+            try Self.failInserts(of: "m", world)
+
+            await Self.pass(world, [inboxPath], context: Self.unlimited(at: { clock.now }))
+
+            #expect(Self.fullGets(world, "m") == 1, "precondition: m was loaded")
+            #expect(try Self.rows(world, inboxPath)["m"] == nil, "precondition: its insert failed")
+            #expect(try Self.folder(world, inboxPath).catchUpState == before, "the state is as it was: the range stays unlisted")
+
+            try Self.healInserts(world)
+            await Self.pass(world, [inboxPath], context: Self.unlimited(at: { clock.now }))
+
+            let inbox = try Self.rows(world, inboxPath)
+            #expect(inbox["m"] != nil && inbox["x"] != nil, "the next pass lists the range again and both show")
+            #expect(try Self.state(world, inboxPath)?.lastCompletedAt == clock.now)
+        }
+    }
+
+    /// The hold clock is per page. Page A holds at T and loads at a later pass,
+    /// so its page moves on; page B of the same range then holds more than the
+    /// bound after T. It is held from its own first hold, not passed over.
+    @Test("A hold on a later page starts its own bound once an earlier page of the range has loaded",
+          .enabled(if: !NetworkMonitor.checkExpensive()))
+    func laterPageHoldStartsItsOwnBound() async throws {
+        let clock = Clock()
+        let dates = (l0: clock.daysAgo(1), a: clock.daysAgo(2), b: clock.daysAgo(3), l1: clock.daysAgo(4))
+        let seeds = [Self.seed("l0", dates.l0, [inboxPath]), Self.seed("a", dates.a, [inboxPath]),
+                     Self.seed("b", dates.b, [inboxPath]), Self.seed("l1", dates.l1, [inboxPath])]
+        let local = [Local(id: "l0", path: inboxPath, date: dates.l0), Local(id: "l1", path: inboxPath, date: dates.l1)]
+        try await Self.withWorld("gcu-hold-per-page", seeds: seeds, local: local) { world async throws in
+            defer { SyncEngine.backfillPageHoldNowForTesting.withLock { $0 = nil } }
+            // Page A is [l0, a], page B is [b, l1].
+            world.server.servePagedListings(pageSize: 2)
+            let at = clock.now
+            func holdClock(_ offset: TimeInterval) {
+                SyncEngine.backfillPageHoldNowForTesting.withLock { $0 = at.addingTimeInterval(offset) }
+            }
+
+            world.server.injectGetFailure(providerMessageId: "a", .status(503))
+            holdClock(0)
+            await Self.pass(world, [inboxPath], context: Self.unlimited(at: { at }))
+            #expect(try Self.state(world, inboxPath)?.listing?.range?.loadHeldSince == at, "precondition: page A holds at T")
+
+            world.server.clearGetFailure(providerMessageId: "a")
+            world.server.injectGetFailure(providerMessageId: "b", .status(503))
+            let later = SyncConfig.backfillPageHoldSeconds + 60
+            holdClock(later)
+            await Self.pass(world, [inboxPath], context: Self.unlimited(at: { at }))
+
+            #expect(try Self.rows(world, inboxPath)["a"] != nil, "precondition: page A loaded and its page moved on")
+            #expect(world.server.getFailuresServedCount(providerMessageId: "b") == 1, "precondition: page B's id failed")
+            #expect(try Self.state(world, inboxPath)?.lastCompletedAt == nil, "page B's id is held, not passed over")
+            #expect(try Self.state(world, inboxPath)?.listing?.range?.loadHeldSince == at.addingTimeInterval(later),
+                    "page B is held from its own first hold")
+
+            world.server.clearGetFailures()
+            holdClock(later + 60)
+            await Self.pass(world, [inboxPath], context: Self.unlimited(at: { at }))
+            #expect(try Self.rows(world, inboxPath)["b"] != nil, "page B's id loads once it answers")
+            #expect(try Self.state(world, inboxPath)?.lastCompletedAt == at)
+        }
+    }
+
     /// A lapse keeps the listing's place: the listing goes on from where it
     /// stopped, and because the lapse came after it started, a new listing
     /// starts as soon as it completes and repairs a change in a range the first

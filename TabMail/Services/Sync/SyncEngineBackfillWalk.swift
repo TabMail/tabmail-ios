@@ -871,12 +871,15 @@ extension SyncEngine {
     /// each fetched body (`bodies`, keyed by provider message id) to FTS and sets
     /// the snippet and `bodyComplete` only for the bodies FTS confirmed, and
     /// enqueues the inserted rows on `BackfillBodyQueue`. Returns how many rows
-    /// were inserted.
+    /// were inserted, and whether every write chunk landed: `allLanded` is
+    /// false when a chunk's transaction failed, so some of `headers` have no
+    /// row. Neither caller moves its bookkeeping past them then: the walk keeps
+    /// its page token, the catch-up writes no state.
     func insertFetchedBackfillMessages(
         _ headers: [MessageHeaderInfo],
         bodies bodyData: [String: (htmlBody: String?, textBody: String?)],
         folder: Folder
-    ) async -> Int {
+    ) async -> (inserted: Int, allLanded: Bool) {
         // Step 1: Insert headers to GRDB (batch dedup).
         // The premise-LESS overload, deliberately: this is the
         // Gmail/Exchange page walk, and neither provider has a
@@ -884,7 +887,7 @@ extension SyncEngine {
         // hold and nothing a guard could compare. That overload
         // has no refusal channel to discard (round 13 blocker 3),
         // so this call site cannot silently swallow one.
-        let (inserted, ftsRecords, ccBccUpdates) = await insertBackfillBatch(
+        let (inserted, ftsRecords, ccBccUpdates, chunkFailed) = await insertBackfillBatch(
             headers, folderId: folder.id, accountId: folder.accountId,
             folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox,
             observedEpoch: nil
@@ -946,7 +949,7 @@ extension SyncEngine {
                 folderPath: folder.path, isInInbox: folder.role == .inbox
             )
         }
-        return inserted
+        return (inserted, !chunkFailed)
     }
 
     // MARK: - Unified Backfill Walk
@@ -2138,8 +2141,22 @@ extension SyncEngine {
                         }
                     }
 
+                    var insertLanded = true
                     if !headers.isEmpty {
-                        insertedCount = await insertFetchedBackfillMessages(headers, bodies: bodyData, folder: folder)
+                        let insert = await insertFetchedBackfillMessages(headers, bodies: bodyData, folder: folder)
+                        insertedCount = insert.inserted
+                        insertLanded = insert.allLanded
+                    }
+                    // A write chunk that failed left some of this page's messages
+                    // without a row: the token stays where it is (so the next
+                    // call lists this page again and the insert skips what did
+                    // land) and the folder is skipped for the rest of the call,
+                    // so a failing write is not retried at network rate.
+                    guard insertLanded else {
+                        pageWalkSkippedFolderIds.insert(folder.id)
+                        if insertedCount > 0 { didWork = true }
+                        BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) a write of this page's messages failed — keeping the saved page token and skipping this folder for the rest of this cycle; the next cycle lists this page again")
+                        continue
                     }
 
                     // The page's token. The messages that loaded are already

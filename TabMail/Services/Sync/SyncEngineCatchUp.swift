@@ -18,7 +18,8 @@ import GRDB
 //     and removals, so a crash resumes from the last write.
 //   - messages the provider fetched for ids the server lists in the folder that no
 //     row holds (the direct load): the backfill page walk's own insert tail
-//     (`insertFetchedBackfillMessages`), BEFORE the state is written.
+//     (`insertFetchedBackfillMessages`), BEFORE the state is written; if any of
+//     them did not land, nothing is written.
 // *Superseded (2026-11-12, the direct load):* "It changes or removes only rows the
 // device already holds. It never inserts: new mail is the ordinary sync's job and
 // older mail is the backfill's. When the provider reports mail inside the folder's
@@ -33,7 +34,8 @@ enum CatchUpApplyOutcome: Sendable, Equatable {
     /// Applied, with the state written in the same transaction.
     case applied(updatedFlags: Int, removedIds: [String])
     /// Nothing written: the folder is gone or quarantined, its epoch is unknown or
-    /// unproven for this result, or the write failed. The
+    /// unproven for this result, or the write failed (a write of the loaded
+    /// messages included). The
     /// provider redoes the work from its previous state on a later pass.
     case skipped
     /// The provider was served a different epoch than the folder's stored one.
@@ -168,13 +170,19 @@ extension SyncEngine {
     /// write transaction for the flag updates, the removals and the new state.
     /// The loads go first so the state that moves the listing past them is never
     /// written without them: a crash in between lists them again, and the insert
-    /// skips what is already there.
+    /// skips what is already there. A load that did not land (a write chunk
+    /// failed, or the folder could take nothing) writes nothing at all, the
+    /// state included: the listing stays where it was and the provider lists
+    /// those ranges again on a later pass.
     @discardableResult
     func applyCatchUpResult(_ result: CatchUpFolderResult, windowMode: StaleWindowMode) async -> CatchUpApplyOutcome {
         let folderId = result.folderId
-        if !result.loaded.isEmpty { await insertCatchUpLoads(result) }
         if !result.loadFailures.isEmpty && DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): \(result.loadFailures.count) missing id(s) did not load: \(result.loadFailures.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: ", "))")
+        }
+        if !result.loaded.isEmpty, !(await insertCatchUpLoads(result)) {
+            BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): \(result.loaded.count) loaded message(s) did not all land — nothing written, the listing stays where it was")
+            return .skipped
         }
 
         let outcome: CatchUpApplyOutcome
@@ -208,17 +216,19 @@ extension SyncEngine {
     /// The direct load's insert: the loaded messages go into the folder through the
     /// page walk's own insert tail, read with the folder as it is now. A folder
     /// that is gone or quarantined gets nothing; its transaction below writes
-    /// nothing either, so the provider lists the same ids again later.
-    private func insertCatchUpLoads(_ result: CatchUpFolderResult) async {
+    /// nothing either, so the provider lists the same ids again later. True only
+    /// when every write chunk landed.
+    private func insertCatchUpLoads(_ result: CatchUpFolderResult) async -> Bool {
         let folderId = result.folderId
         guard let folder = try? await dbPool.read({ db in try Folder.fetchOne(db, key: folderId) }),
-              folder.uidValidityResetPendingAt == nil else { return }
+              folder.uidValidityResetPendingAt == nil else { return false }
         let headers = result.loaded.compactMap(\.header)
         let bodies = Dictionary(
             result.loaded.map { ($0.id, (htmlBody: $0.htmlBody, textBody: $0.textBody)) },
             uniquingKeysWith: { first, _ in first })
-        let inserted = await insertFetchedBackfillMessages(headers, bodies: bodies, folder: folder)
-        BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): loaded \(headers.count) missing message(s), inserted \(inserted)")
+        let insert = await insertFetchedBackfillMessages(headers, bodies: bodies, folder: folder)
+        BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): loaded \(headers.count) missing message(s), inserted \(insert.inserted)")
+        return insert.allLanded
     }
 
     /// A delta-cursor lapse, inside the caller's write transaction: the account's

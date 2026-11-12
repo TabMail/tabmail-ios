@@ -82,8 +82,13 @@ struct GmailCatchUpState: Codable, Equatable, Sendable {
         /// hold clock (`SyncEngine.backfillPageHoldNow`). The range is held while
         /// less than `SyncConfig.backfillPageHoldMinutes` has passed since; after
         /// that such an id counts as done, like a per-message failure. Optional,
-        /// so a state saved without it decodes; it goes with the range when the
-        /// range advances.
+        /// so a state saved without it decodes. It is cleared whenever the
+        /// list's page moves on (its token is saved or restarted), as the walk
+        /// clears its page hold time with every token write, so each held page
+        /// gets its own bound; it also goes with the range when the range
+        /// advances. *Superseded (2026-11-12):* "it goes with the range when the
+        /// range advances" alone, which let a page that loaded cleanly keep an
+        /// earlier page's clock.
         var loadHeldSince: Date?
     }
 
@@ -339,6 +344,12 @@ extension GmailProvider {
         let pageSize = SyncConfig.catchUpGmailListPageSize
         // The listing covered the folder and no new one started after it.
         var listingDone = false
+        // Ids this pass loaded. They are inserted only after the pass returns,
+        // so the local rows do not hold them yet; they count as held, so an id
+        // listed again in the same pass (a listing restarted after a lapse, a
+        // list restarted after a `400`, the slack where two ranges meet) is
+        // never loaded twice.
+        var loadedThisPass = Set<String>()
 
         rangeLoop: while true {
             // A row the listing left out is only a candidate: its own answer
@@ -466,6 +477,7 @@ extension GmailProvider {
                             BackgroundSyncLogger.logDebug("[CatchUp] \(step.rawValue) list: HTTP 400 (\(reason)) on a saved page token — restarting that list once")
                         }
                         scan.pageToken = nil
+                        scan.loadHeldSince = nil
                         restartedThisPass.insert(step)
                         switch step {
                         case .membership: scan.namedIds = []
@@ -481,7 +493,9 @@ extension GmailProvider {
                         // Server ids in the range with no local row in the folder
                         // (mail moved in, or new mail past the sync window after a
                         // lapse) are loaded now, before the page's token moves on.
-                        let unseen = page.ids.filter { rangeRowsById[$0] == nil && !isSyntheticPlaceholderId($0) }
+                        let unseen = page.ids.filter {
+                            rangeRowsById[$0] == nil && !loadedThisPass.contains($0) && !isSyntheticPlaceholderId($0)
+                        }
                         var held = Set<String>()
                         if !unseen.isEmpty {
                             do {
@@ -494,6 +508,7 @@ extension GmailProvider {
                         if !missing.isEmpty {
                             let load = await loadMissing(missing, context: context)
                             result.loaded += load.loaded
+                            loadedThisPass.formUnion(load.loaded.map(\.id))
                             result.loadFailures.merge(load.failures) { _, latest in latest }
                             // Out of budget part way: the page is listed again on
                             // the next pass, where what loaded is no longer missing.
@@ -525,7 +540,11 @@ extension GmailProvider {
                         scan.starredIds += page.ids.filter { named.contains($0) }
                     }
 
+                    // The page moves on, and its hold clock goes with it, as the
+                    // walk clears its page hold time with every token write: a
+                    // later page's first hold starts its own bound.
                     scan.pageToken = page.nextPageToken
+                    scan.loadHeldSince = nil
                     if scan.pageToken == nil {
                         switch step {
                         case .membership:

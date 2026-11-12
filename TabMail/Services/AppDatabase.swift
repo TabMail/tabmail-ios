@@ -4309,9 +4309,13 @@ final class AppDatabase: Sendable {
 
         // The backfill bookkeeping's row version. The trigger bumps it on EVERY
         // update that writes `backfillPageToken` or `backfillComplete`, whether or
-        // not the value changes, so a catch-up re-arm that writes the very state a
-        // page-token walk read still moves it, and no writer can forget it. The
-        // walk's own write compares it (`SyncEngine.advanceBackfillPageWalk`).
+        // not the value changes, so a write of the very state a page-token walk
+        // read (a reset, a second walk, a whole-record folder update) still moves
+        // it, and no writer can forget it. The walk's own write compares it
+        // (`SyncEngine.advanceBackfillPageWalk`). *Superseded (2026-11-12, the
+        // catch-up loads missing mail itself and no longer re-arms the walk):*
+        // the example was "a catch-up re-arm that writes the very state a
+        // page-token walk read".
         // Convergence: a fresh install and an upgraded DB both end with the column
         // at 0 on every row and the one trigger.
         migrator.registerTimedMigration(

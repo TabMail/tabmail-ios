@@ -132,6 +132,10 @@ extension SyncEngine {
     /// THIS overload ever needs guarding, it must move to the premised one above
     /// — which is exactly the coupling blocker 3 asked for, expressed as a
     /// signature rather than as a warning nobody reads.
+    ///
+    /// `failed` is true when a chunk's write transaction threw: its rows did
+    /// not land (it rolled back as a whole). A caller must not move its
+    /// bookkeeping past them.
     func insertBackfillBatch(
         _ headers: [MessageHeaderInfo],
         folderId: String,
@@ -140,13 +144,13 @@ extension SyncEngine {
         folderRole: FolderRole,
         isInInbox: Bool,
         observedEpoch: UInt32?
-    ) async -> (inserted: Int, ftsRecords: [FTSHeaderRecord], ccBccFtsUpdates: [(contentKey: ContentKey, cc: String, bcc: String)]) {
+    ) async -> (inserted: Int, ftsRecords: [FTSHeaderRecord], ccBccFtsUpdates: [(contentKey: ContentKey, cc: String, bcc: String)], failed: Bool) {
         let result = await insertBackfillBatchGuardable(
             headers, folderId: folderId, accountId: accountId, folderPath: folderPath,
             folderRole: folderRole, isInInbox: isInInbox, epochPremise: nil,
             observedEpoch: observedEpoch
         )
-        return (result.inserted, result.ftsRecords, result.ccBccFtsUpdates)
+        return (result.inserted, result.ftsRecords, result.ccBccFtsUpdates, result.failed)
     }
 
     private func insertBackfillBatchGuardable(
@@ -158,8 +162,8 @@ extension SyncEngine {
         isInInbox: Bool,
         epochPremise: SyncEngine.CrawlEpochPremise?,
         observedEpoch: UInt32?
-    ) async -> (inserted: Int, ftsRecords: [FTSHeaderRecord], ccBccFtsUpdates: [(contentKey: ContentKey, cc: String, bcc: String)], refused: Bool) {
-        guard !headers.isEmpty else { return (0, [], [], false) }
+    ) async -> (inserted: Int, ftsRecords: [FTSHeaderRecord], ccBccFtsUpdates: [(contentKey: ContentKey, cc: String, bcc: String)], refused: Bool, failed: Bool) {
+        guard !headers.isEmpty else { return (0, [], [], false, false) }
 
         let sourceBoundEpoch = observedEpoch.flatMap { epoch in
             epoch > 0 ? Int(exactly: epoch) : nil
@@ -170,6 +174,7 @@ extension SyncEngine {
         var discoveredParents: [String] = []
         var ccBccFtsUpdates: [(contentKey: ContentKey, cc: String, bcc: String)] = []
         var anyChunkRefused = false
+        var anyChunkFailed = false
 
         // CHUNKED async insert: split the batch into transactions of
         // SyncConfig.backfillInsertChunkSize rows so each holds the single GRDB
@@ -220,6 +225,14 @@ extension SyncEngine {
                         var ccBcc: [(contentKey: ContentKey, cc: String, bcc: String)] = []
                         var inserted = 0
                         var unread = 0
+                        // Ids this chunk has inserted. `existingIds` was read
+                        // before the loop, so a second entry for the same id in
+                        // `chunk` would hit the primary key and roll back the
+                        // whole chunk, neighbours included. Every caller hands
+                        // this function one id space at a time (a Gmail or Graph
+                        // id, or a UID under the one epoch the call carries), so
+                        // a repeated id is the same message: it is skipped.
+                        var insertedIds = Set<String>()
 
                         let needsCcBccBackfill = !UserDefaults.standard.bool(forKey: "ccBccBackfillDone")
                         for info in chunk {
@@ -262,6 +275,7 @@ extension SyncEngine {
                                 }
                                 continue
                             }
+                            guard insertedIds.insert(info.messageId).inserted else { continue }
 
                             var header = MessageHeader(
                                 messageId: info.messageId,
@@ -364,6 +378,7 @@ extension SyncEngine {
                 ccBccFtsUpdates.append(contentsOf: result.ccBcc)
                 discoveredParents.append(contentsOf: result.parents)
             } catch {
+                anyChunkFailed = true
                 BackgroundSyncLogger.logDebug("[Backfill] Insert chunk failed: \(error)")
             }
         }
@@ -380,6 +395,6 @@ extension SyncEngine {
             }
         }
         ReplyParentResolver.postParentNotifications(discoveredParents)
-        return (count, ftsRecords, ccBccFtsUpdates, anyChunkRefused)
+        return (count, ftsRecords, ccBccFtsUpdates, anyChunkRefused, anyChunkFailed)
     }
 }

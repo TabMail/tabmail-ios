@@ -29,6 +29,10 @@ loads a missing id itself, through the backfill page walk's own insert tail, bou
 first; a membership page's token moves on only once its missing ids have loaded or been classified
 done; the backfill re-arm, its storage-limit decline and `CatchUpFolderResult.rearmBackfill` are
 removed; a missing id that keeps failing holds its range for at most the page walk's hold bound).
+**Amended 2026-11-12: loads that did not land** (decisions 4 and 8, review round 5: a load that does
+not land writes no catch-up state and the page walk keeps its page token; an id loaded earlier in the
+same pass counts as held; a duplicate id in one insert chunk is skipped as the same message instead
+of rolling back the chunk; the load hold clock is per page, cleared whenever the page moves on).
 
 **Context.** Every sync path windows its work, and changes to older mail fall outside every window:
 
@@ -116,7 +120,12 @@ The owner's rulings of 2026-11-09:
       the folder as it is then (a folder that is gone or quarantined gets nothing). They go in BEFORE
       the transaction below writes the new state, so a crash in between lists them again rather than
       losing them, and the insert skips what is already there. The transaction itself still inserts
-      nothing and never writes the walk's bookkeeping.
+      nothing and never writes the walk's bookkeeping. *Amended 2026-11-12 (loads that did not
+      land):* if any loaded message did not land (an insert chunk's write transaction failed, or the
+      folder could take nothing), the apply writes nothing at all for that result, the state
+      included (`CatchUpApplyOutcome.skipped`), so the listing stays where it was and lists those
+      ranges again on a later pass. *Superseded:* a failed insert chunk was only logged, and the
+      transaction then wrote the state that moved the listing past the messages it lost.
    2. ONE write transaction re-reads the folder (it must exist and not be quarantined) and
       applies the epoch gate: the result's epoch must equal the folder's stored known epoch.
       - If both are known and they differ, it writes nothing and fires the turnover reaction, exactly
@@ -397,7 +406,15 @@ The owner's rulings of 2026-11-09:
      - **A range moves on only once its missing ids are done.** A page's token is saved only after
        every missing id on it has loaded or been classified done. If the budget runs out part way,
        the range keeps the page's token as it was and the next pass lists the same page again, where
-       what loaded is no longer missing. No id list is kept in the state.
+       what loaded is no longer missing. No id list is kept in the state. *Amended 2026-11-12:*
+       within one pass, an id the pass already loaded counts as held (`loadedThisPass` in
+       `catchUpFolder`), because the loads are inserted only after the provider returns. So an id
+       listed again in the same pass is never fetched or inserted twice: a listing that completes
+       and restarts at once after a lapse, a list restarted after a `400` on its saved token, and
+       the `catchUpGmailRangeSlackSeconds` overlap where two ranges' membership windows meet.
+       *Superseded:* "missing" was decided from the local rows alone, so such an id was loaded
+       twice and the duplicate rolled back its whole insert chunk (up to
+       `backfillInsertChunkSize` messages), after which the state moved the listing past them.
      - **Classification** (the page walk's own rule, `SyncEngine.backfillFetchFailureKind`). Gone or
        about the message (404/410, any other 4xx except 401/403/429, a `DecodingError`, an answer
        with no header) counts as done at once. Transient (5xx, 429, 403, a connection error, no
@@ -408,12 +425,34 @@ The owner's rulings of 2026-11-09:
        id counts as done, like a per-message failure, and the range moves on. The first-hold time is
        an additive optional field in the `catchUpState` JSON (no migration) and goes with the range
        when the range moves on. No new constant. An id counted done is tried again at the next
-       listing (after the next lapse).
+       listing (after the next lapse). *Amended 2026-11-12 (per page):* `loadHeldSince` is cleared
+       whenever the list's page moves on (its token is saved, or restarted after a `400`), as the
+       walk clears `backfillPageHeldSince` with every write of its token, so the bound runs from the
+       first hold of the page now held. *Superseded:* "from its FIRST hold" counted per range and was
+       never reset by a page that loaded, so a hold on a later page of the same range more than the
+       bound after an earlier page's hold passed its ids over on their first failure. A batch whose
+       timeout fires holds every id it has no answer for (the bound above still applies; on a
+       persistently slow link those ids count as done after it, the trade-off already stated).
      - **The insert** is the page walk's insert tail, extracted test-first into one helper
        (`SyncEngine.insertFetchedBackfillMessages`, called by the walk and by the apply): the batch
        insert (which skips an id protected by a pending destructive op), the search index, FTS
        bodies, snippets and `bodyComplete` for confirmed bodies, and the `BackfillBodyQueue`
        enqueue. A missing id refused by the insert (a queued op) is loaded at a later listing.
+       *Amended 2026-11-12 (loads that did not land):* the helper returns whether every write chunk
+       landed (`allLanded`), and neither caller moves past rows that did not: the apply writes no
+       state (decision 4.1), and the page walk keeps its page token and skips the folder for the
+       rest of the call, so the next call lists the same page again. And a duplicate id inside one
+       chunk no longer rolls the chunk back: the batch insert (`insertBackfillBatchGuardable`)
+       skips an id the chunk has already inserted. That is safe for every caller because a
+       primary-key hit there can only be such a duplicate (the existence check inside the chunk's
+       transaction already covers every row of the folder, and the key is account, folder path and
+       id), and each call carries ids from one id space: a Gmail or Graph id names one message, and
+       an IMAP UID names one message under the single epoch the call carries (its insert is gated on
+       that epoch). A UID reused after a UIDVALIDITY reset is not a duplicate within a chunk: it
+       meets the existence check against the old row, which the reset's purge removes, never the
+       primary key. *Superseded:* the chunk's existence check was read once before its loop, so a
+       second entry for the same id hit the primary key and rolled back the whole chunk, neighbours
+       included.
      - **The walk is never touched.** The check writes none of the walk's bookkeeping
        (`backfillComplete`, `backfillPageToken`, `backfillPageHeldSince`, `backfillVersion`),
        whatever the walk's state; an unfinished walk goes on from its page. `walkColumnWritesAreNamedSites`
