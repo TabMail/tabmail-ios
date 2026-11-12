@@ -1045,7 +1045,7 @@ actor ExchangeProvider: EmailProvider {
     }
 
     /// Exchange/Graph API auto-saves sent messages to Sent Items — no explicit append needed.
-    func appendToSentFolder(draft: DraftMessage, sentFolderPath: String, messageId: String) async throws -> Bool {
+    func appendToSentFolder(draft: DraftMessage, sentFolderPath: String?, messageId: String) async throws -> Bool {
         return true
     }
 

@@ -1003,11 +1003,11 @@ extension AccountManager {
             return false
         }
 
-        guard let sentPath else {
-            BackgroundSyncLogger.logDebug("[Outbox] WARNING: No Sent folder found for account \(accountId)")
-            // No Sent folder configured — can't append. Mark as appended to avoid
-            // blocking the outbox forever. The message was sent via SMTP.
-            return await markAppendedToSent(outboxId: outboxId)
+        // No local Sent row: the provider keeps the copy anyway. IMAP asks the
+        // server for its Sent folder and creates "Sent" only when the server has
+        // none (tabmail-ios #533). A failure retries like any append.
+        if sentPath == nil {
+            BackgroundSyncLogger.logDebug("[Outbox] No local Sent folder for account \(accountId) — provider will find or create one")
         }
 
         do {

@@ -174,6 +174,23 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// different states, and only this seam produces the first without the
         /// second. Empty for every pre-existing test.
         var listHiddenMailboxes: Set<String> = []
+        /// Hierarchy delimiter on every LIST line and in the NAMESPACE reply.
+        /// "/" for every pre-existing test.
+        var hierarchyDelimiter = "/"
+        /// Personal namespace prefix in the NAMESPACE reply (for example
+        /// `"INBOX."` on a server that keeps every folder under INBOX). Empty
+        /// for every pre-existing test.
+        var personalNamespacePrefix = ""
+        /// RFC 6154 special-use attributes per mailbox (for example `\Sent`).
+        /// `onPlainList` decides whether a plain LIST carries them too, or only
+        /// a `LIST ... RETURN (SPECIAL-USE)` (RFC 6154 §2 makes the plain-LIST
+        /// copy a MAY). Empty for every pre-existing test.
+        var specialUseAttributes: [String: (attribute: String, onPlainList: Bool)] = [:]
+        /// When set, SELECT/EXAMINE and APPEND refuse a mailbox that does not
+        /// exist (`NO [TRYCREATE]` for APPEND, RFC 3501 §6.3.11), as a real
+        /// server does; CREATE is then the only way to make one. Off for every
+        /// pre-existing test, where any name SELECTs and APPEND makes it.
+        var requireExistingMailboxes = false
         /// Per-mailbox UIDVALIDITY reported by SELECT/EXAMINE (RFC 3501
         /// §2.3.1.1). Missing entry defaults to 1 — every pre-existing test
         /// relies on that fixed value, so this is purely additive. ADR-IOS-060
@@ -794,6 +811,41 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// for the genuine deletion it models.
     func hideMailboxFromList(_ name: String) {
         withState { _ = $0.listHiddenMailboxes.insert(name) }
+    }
+
+    /// The server's folder layout: the hierarchy delimiter on LIST lines and
+    /// the personal namespace prefix NAMESPACE reports (for example `"."` and
+    /// `"INBOX."` for a server that keeps every folder under INBOX).
+    func setHierarchy(delimiter: String, personalNamespacePrefix: String) {
+        withState {
+            $0.hierarchyDelimiter = delimiter
+            $0.personalNamespacePrefix = personalNamespacePrefix
+        }
+    }
+
+    /// Gives `mailbox` an RFC 6154 special-use attribute such as `\Sent`.
+    /// With `onPlainList == false` only `LIST ... RETURN (SPECIAL-USE)` reports
+    /// it, which RFC 6154 §2 allows: the plain-LIST copy is a MAY. Advertising
+    /// `SPECIAL-USE` (and `LIST-EXTENDED`, without which a RETURN option is
+    /// answered BAD) is the caller's choice of `capabilities`.
+    func setSpecialUse(_ attribute: String, for mailbox: String, onPlainList: Bool) {
+        withState { $0.specialUseAttributes[mailbox] = (attribute, onPlainList) }
+    }
+
+    /// SELECT/EXAMINE and APPEND refuse a mailbox that does not exist, as a
+    /// real server does, so only CREATE can bring one into being.
+    func requireExistingMailboxes() {
+        withState { $0.requireExistingMailboxes = true }
+    }
+
+    /// Whether `mailbox` exists: it has an entry (possibly empty) and was not
+    /// `markMailboxDeleted`. The same presence rule LIST uses.
+    func mailboxExists(_ mailbox: String) -> Bool {
+        withState { Self.mailboxExists(mailbox, in: $0) }
+    }
+
+    private static func mailboxExists(_ mailbox: String, in state: State) -> Bool {
+        state.messagesByMailbox[mailbox] != nil && state.deletedMailboxes[mailbox] == nil
     }
 
     /// Undo `markMailboxDeleted` — the name exists again. Models the second half
@@ -1737,6 +1789,9 @@ final class FakeIMAPServer: @unchecked Sendable {
                     ? "\(tag) NO [NONEXISTENT] Mailbox does not exist\r\n"
                     : "\(tag) NO Mailbox does not exist\r\n"
             }
+            if withState({ $0.requireExistingMailboxes && !Self.mailboxExists(mailbox, in: $0) }) {
+                return "\(tag) NO [NONEXISTENT] Mailbox does not exist\r\n"
+            }
             selectedMailbox = mailbox
             let (messages, uidValidity, suppressUidValidity, suppressUidNext) = withState { state in
                 (
@@ -1778,7 +1833,8 @@ final class FakeIMAPServer: @unchecked Sendable {
             guard let selectedMailbox else { return "\(tag) NO No mailbox selected\r\n" }
             return handleFetch(tag: tag, args: args, uidMode: false, mailbox: selectedMailbox)
         case "NAMESPACE":
-            return "* NAMESPACE ((\"\" \"/\")) NIL NIL\r\n\(tag) OK NAMESPACE completed\r\n"
+            let (prefix, delimiter) = withState { ($0.personalNamespacePrefix, $0.hierarchyDelimiter) }
+            return "* NAMESPACE ((\"\(prefix)\" \"\(delimiter)\")) NIL NIL\r\n\(tag) OK NAMESPACE completed\r\n"
         case "LIST":
             // Reflects actual mailbox presence (unlike the old static "always
             // INBOX" stub) so `mailboxConfirmedAbsent`'s LIST probe is
@@ -1786,16 +1842,38 @@ final class FakeIMAPServer: @unchecked Sendable {
             // `messagesByMailbox` entry and was never `markMailboxDeleted`.
             // `hideMailboxFromList` omits it HERE ONLY — the mailbox still
             // exists everywhere else, which is the whole point of that seam.
-            let pattern = args.replacingOccurrences(of: "\"", with: "")
+            //
+            // RFC 5258 return options (`LIST "" "*" RETURN (SPECIAL-USE)`)
+            // follow the pattern; they are cut off before the pattern is read.
+            // A server that does not advertise LIST-EXTENDED rejects them, as
+            // a real one that only parses the plain LIST does.
+            let upperArgs = args.uppercased()
+            let returnRange = upperArgs.range(of: " RETURN ")
+            if returnRange != nil, !capabilities.contains("LIST-EXTENDED") {
+                return "\(tag) BAD Could not parse command\r\n"
+            }
+            let patternArgs = returnRange.map { String(args[..<$0.lowerBound]) } ?? args
+            let wantsSpecialUse = returnRange.map {
+                upperArgs[$0.upperBound...].contains("SPECIAL-USE")
+            } ?? false
+            let pattern = patternArgs.replacingOccurrences(of: "\"", with: "")
                 .split(separator: " ").map(String.init).last ?? "*"
-            let matches: [String] = withState { state in
-                state.messagesByMailbox.keys
+            let (matches, delimiter, specialUse): ([String], String, [String: (attribute: String, onPlainList: Bool)]) = withState { state in
+                (state.messagesByMailbox.keys
                     .filter { state.deletedMailboxes[$0] == nil }
                     .filter { !state.listHiddenMailboxes.contains($0) }
                     .filter { Self.imapListPatternMatches(pattern: pattern, name: $0) }
-                    .sorted()
+                    .sorted(),
+                 state.hierarchyDelimiter,
+                 state.specialUseAttributes)
             }
-            var response = matches.map { "* LIST (\\HasNoChildren) \"/\" \"\($0)\"\r\n" }.joined()
+            var response = matches.map { name -> String in
+                var attributes = "\\HasNoChildren"
+                if let special = specialUse[name], special.onPlainList || wantsSpecialUse {
+                    attributes += " \(special.attribute)"
+                }
+                return "* LIST (\(attributes)) \"\(delimiter)\" \"\(name)\"\r\n"
+            }.joined()
             response += "\(tag) OK LIST completed\r\n"
             return response
         case "ID":
@@ -1832,6 +1910,20 @@ final class FakeIMAPServer: @unchecked Sendable {
         case "APPEND":
             guard authenticated else { return "\(tag) NO Not authenticated\r\n" }
             return handleAppend(tag: tag, args: args)
+        case "CREATE":
+            // RFC 3501 §6.3.3: an existing name is refused (RFC 5530
+            // `[ALREADYEXISTS]`); otherwise the mailbox exists, empty, from now on.
+            guard authenticated else { return "\(tag) NO Not authenticated\r\n" }
+            let mailbox = Self.firstQuoted(args) ?? args.trimmingCharacters(in: .whitespaces)
+            let created = withState { state -> Bool in
+                if Self.mailboxExists(mailbox, in: state) { return false }
+                state.deletedMailboxes[mailbox] = nil
+                state.messagesByMailbox[mailbox] = []
+                return true
+            }
+            return created
+                ? "\(tag) OK CREATE completed\r\n"
+                : "\(tag) NO [ALREADYEXISTS] Mailbox already exists\r\n"
         default:
             return "\(tag) BAD Unknown command \(command)\r\n"
         }
@@ -1964,6 +2056,10 @@ final class FakeIMAPServer: @unchecked Sendable {
         let raw = String(remaining[afterOpen..<closeIdx])
             .replacingOccurrences(of: "\\\"", with: "\"")
             .replacingOccurrences(of: "\\\\", with: "\\")
+
+        if withState({ $0.requireExistingMailboxes && !Self.mailboxExists(mailbox, in: $0) }) {
+            return "\(tag) NO [TRYCREATE] Mailbox does not exist\r\n"
+        }
 
         let (newUID, uidvalidity, appendUidWithheld) = withState { state -> (Int, Int, Bool) in
             let existing = state.messagesByMailbox[mailbox] ?? []

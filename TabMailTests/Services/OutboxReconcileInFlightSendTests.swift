@@ -70,11 +70,10 @@ struct OutboxReconcileInFlightSendTests {
 
     /// Installs a temp file-backed `DatabasePool` as `AppDatabase.shared`, seeds
     /// the account the outbox row's foreign key needs, and — unlike the sibling
-    /// outbox suites — seeds a **Sent folder**. That is deliberate: without one,
-    /// `attemptSentAppend` short-circuits to `markAppendedToSent` and never calls
-    /// the provider, so "the message never reached Sent" would be
-    /// unobservable — and that consequence is half of what this suite exists to
-    /// pin.
+    /// outbox suites — seeds a **Sent folder**, so the append the provider
+    /// records goes to a real Sent path and "the message never reached Sent"
+    /// is observable — and that consequence is half of what this suite exists
+    /// to pin. (Without one, the provider is asked to create a Sent folder.)
     private func makeTestDB() throws -> (pool: DatabasePool, dir: URL, previous: AppDatabase?) {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

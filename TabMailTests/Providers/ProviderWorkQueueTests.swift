@@ -494,7 +494,7 @@ private actor WorkQueueMockProvider: EmailProvider {
     func markFlagged(ids: [String], flagged: Bool, folder: String) async throws {}
     func move(ids: [String], from: String, to: String) async throws {}
     func send(draft: DraftMessage) async throws {}
-    func appendToSentFolder(draft: DraftMessage, sentFolderPath: String, messageId: String) async throws -> Bool { true }
+    func appendToSentFolder(draft: DraftMessage, sentFolderPath: String?, messageId: String) async throws -> Bool { true }
     func saveDraft(_ draft: DraftMessage, existingIdentity: DraftDeleteIdentity?, draftsFolderPath: String) async throws -> DraftSaveOutcome { .unaddressable }
     func deleteDraft(identity: DraftDeleteIdentity) async throws {}
     func fetchHistory(since historyId: String) async throws -> HistoryResponse? { nil }
