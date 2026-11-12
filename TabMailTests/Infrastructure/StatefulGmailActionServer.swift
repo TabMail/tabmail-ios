@@ -1321,6 +1321,9 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                     let parts = pageToken.split(separator: "~", omittingEmptySubsequences: false)
                     let generation = parts.count >= 2 ? Int(parts[1]) : 0
                     let signed = parts.count == 3 ? String(parts[2]) : nil
+                    // An unsigned token is accepted only because tests write
+                    // tokens into folders by hand. Every token this fake issues
+                    // is signed and is checked here against its list's query.
                     guard !model.rejectsEveryPageToken, parts.count <= 3,
                           let offset = parts.first.flatMap({ Int($0) }), offset >= 0,
                           generation == model.pageTokenGeneration,
