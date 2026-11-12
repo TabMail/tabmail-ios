@@ -313,8 +313,8 @@ struct ExchangeSeriesZoneLabelTests {
                 "the write is labelled \(canonical(sent?["start"])) to \(canonical(sent?["end"])), not the series' stored name")
     }
 
-    @Test("T10: a split whose new part fails puts the series back as it was, through a revert the server accepts")
-    func splitWhoseCreateFailsIsReverted() async throws {
+    @Test("T10: a split whose new part fails leaves the series as it was, with nothing written to it")
+    func splitWhoseCreateFailsLeavesTheSeries() async throws {
         let stored = ZoneSeries.storedOtherThanDevice
         let device = TimeZone.current.identifier
         let start = ZoneSeries.sameDay(day(0), stored: stored)
@@ -330,8 +330,8 @@ struct ExchangeSeriesZoneLabelTests {
 
         let what = "series kept in \(stored), device \(device)"
         let sent = graph.patches(ZoneSeries.id)
-        #expect(sent.count == 2, "\(what): \(sent.count) series writes, not a cap and its revert")
-        #expect(sent.allSatisfy { label($0["start"]) == stored }, "\(what): labelled \(sent.map { canonical($0["start"]) })")
+        // The new part is made first (#754), so a failed one leaves no cap to undo.
+        #expect(sent.isEmpty, "\(what): \(sent.count) series writes after the new part failed: \(sent.map { canonical($0["start"]) })")
         let after = graph.event(ZoneSeries.id)
         #expect(canonical(after?["recurrence"]) == canonical(before["recurrence"]),
                 "\(what): the series' recurrence is \(canonical(after?["recurrence"]))")
