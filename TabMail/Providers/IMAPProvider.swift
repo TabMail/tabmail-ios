@@ -3392,14 +3392,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     func fetchFolders() async throws -> [FolderInfo] {
         try await withActionConnectionNoSelect { server in
             let mailboxes = try await Self.listMailboxesWithSpecialUse(server)
+            let roles = Self.discoveredRoles(
+                mailboxes, namespacePrefix: await Self.personalNamespacePrefix(server))
 
-            // Build (info, attributes) pairs so the dedup pass can prefer the
-            // folder carrying the actual SPECIAL-USE flag (RFC 6154) over a
-            // folder that only matched the name-based heuristic. iCloud, for
-            // example, exposes both "Trash" and "Deleted Messages" — only one
-            // typically carries `\Trash`, and the other should fall back to
-            // `.custom` instead of duplicating the role.
-            var pairs: [(info: FolderInfo, attributes: Mailbox.Info.Attributes, delimiter: String?)] = []
+            var folders: [FolderInfo] = []
             for info in mailboxes {
                 guard info.isSelectable else { continue }
                 var unread = 0
@@ -3427,25 +3423,48 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 } catch {
                     if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] STATUS failed for \(info.name): \(error)") }
                 }
-                pairs.append((
-                    info: FolderInfo(
-                        name: info.name,
-                        path: info.name,
-                        role: IMAPProvider.mapRole(
-                            attributes: info.attributes, name: info.name,
-                            delimiter: info.hierarchyDelimiter),
-                        unreadCount: unread,
-                        totalCount: total,
-                        uidNext: uidNextVal,
-                        highestModSeq: highestModSeqVal,
-                        uidValidity: uidValidityVal
-                    ),
-                    attributes: info.attributes,
-                    delimiter: info.hierarchyDelimiter
+                folders.append(FolderInfo(
+                    name: info.name,
+                    path: info.name,
+                    role: roles[info.name] ?? .custom,
+                    unreadCount: unread,
+                    totalCount: total,
+                    uidNext: uidNextVal,
+                    highestModSeq: highestModSeqVal,
+                    uidValidity: uidValidityVal
                 ))
             }
-            return IMAPProvider.dedupRoles(pairs)
+            return folders
         }
+    }
+
+    /// The role of each selectable mailbox, as the server reports it: the
+    /// special-use attribute first, then the name (`mapRole`), with one folder
+    /// per role (`dedupRoles`). Pairs keep the attributes so the dedup pass can
+    /// prefer the folder carrying the actual SPECIAL-USE flag (RFC 6154) over a
+    /// folder that only matched by name. iCloud, for example, exposes both
+    /// "Trash" and "Deleted Messages" and only one carries `\Trash`; the other
+    /// falls back to `.custom` instead of duplicating the role.
+    ///
+    /// The single source of server-side roles: `fetchFolders` and the
+    /// no-Sent-folder check before a Sent copy (`sentFolderPathCreatingIfNone`)
+    /// both use it, so they cannot disagree about which folder is Sent.
+    static func discoveredRoles(_ mailboxes: [Mailbox.Info], namespacePrefix: String?) -> [String: FolderRole] {
+        let pairs = mailboxes.filter(\.isSelectable).map { mailbox in
+            (info: FolderInfo(
+                name: mailbox.name,
+                path: mailbox.name,
+                role: mapRole(
+                    attributes: mailbox.attributes, name: mailbox.name,
+                    delimiter: mailbox.hierarchyDelimiter, namespacePrefix: namespacePrefix),
+                unreadCount: 0,
+                totalCount: 0),
+             attributes: mailbox.attributes,
+             delimiter: mailbox.hierarchyDelimiter)
+        }
+        return Dictionary(
+            dedupRoles(pairs, namespacePrefix: namespacePrefix).map { ($0.path, $0.role) },
+            uniquingKeysWith: { first, _ in first })
     }
 
     /// Every mailbox, carrying its RFC 6154 special-use attributes.
@@ -5718,33 +5737,43 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         }
     }
 
-    /// Name of the folder created when an account has no Sent folder.
+    /// Name of the folder created when the server has no Sent folder.
     static let createdSentFolderName = "Sent"
 
-    /// The Sent folder to append to. With `nil` (the account has no Sent folder,
-    /// none found by SPECIAL-USE or by name) it CREATEs `createdSentFolderName`
-    /// in the personal namespace (`INBOX.Sent` on a server whose folders live
-    /// under INBOX) and returns that path; the next folder sync gives it the
-    /// Sent role by name.
+    /// The Sent folder to append to. `sentFolderPath` is the account's local
+    /// Sent row; with `nil` the SERVER decides, because the local rows can be
+    /// stale: a row stored before its role could be recognised keeps `.custom`
+    /// (folder sync never rewrites a role), and the first send can run before
+    /// the first folder sync. So the folder list is read again and given roles
+    /// exactly as folder sync gives them (`discoveredRoles`). A Sent folder
+    /// found there takes the copy. Only when the server has none (no
+    /// special-use `\Sent`, no Sent name) is `createdSentFolderName` CREATEd;
+    /// the fork places it in the personal namespace (`INBOX.Sent` under an
+    /// `INBOX.` prefix), as it does for the SELECT and APPEND that follow. The
+    /// next folder sync gives it the Sent role by name.
     ///
     /// A failed CREATE is not an error here: the usual cause is that the folder
-    /// already exists (an earlier send created it before the folder sync saw it,
-    /// or an existing row never got the role), and servers word that refusal
-    /// differently. The APPEND's own SELECT is the authority: if the folder
-    /// really is missing it throws, and the outbox retries the copy later.
+    /// already exists, and servers word that refusal differently. The APPEND's
+    /// own SELECT is the authority: if the folder really is missing it throws,
+    /// and the outbox retries the copy later.
     private func sentFolderPathCreatingIfNone(_ sentFolderPath: String?) async throws -> String {
         if let sentFolderPath { return sentFolderPath }
         return try await withActionConnectionNoSelect { server in
-            let name = Self.createdSentFolderName
-            let namespaces = await server.namespaces
-            let path = namespaces?.resolveMailboxPath(name) ?? name
-            do {
-                try await server.createMailbox(path)
-                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] No Sent folder — created \(path)") }
-            } catch {
-                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] No Sent folder — CREATE \(path) refused (\(error)); appending to it anyway") }
+            let mailboxes = try await Self.listMailboxesWithSpecialUse(server)
+            let roles = Self.discoveredRoles(
+                mailboxes, namespacePrefix: await Self.personalNamespacePrefix(server))
+            if let serverSent = roles.first(where: { $0.value == .sent })?.key {
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] No local Sent row — the server's Sent folder is \(serverSent)") }
+                return serverSent
             }
-            return path
+            let name = Self.createdSentFolderName
+            do {
+                try await server.createMailbox(name)
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Server has no Sent folder — created \(name)") }
+            } catch {
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Server has no Sent folder — CREATE \(name) refused (\(error)); appending to it anyway") }
+            }
+            return name
         }
     }
 
@@ -7303,13 +7332,17 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
 
     /// Pure mapping function — exposed for tests + the role-dedup pass.
     ///
-    /// `name` is the full mailbox name and `delimiter` the server's hierarchy
-    /// delimiter. The name fallback matches the LAST segment (the leaf), so a
+    /// `name` is the full mailbox name, `delimiter` the server's hierarchy
+    /// delimiter and `namespacePrefix` its personal-namespace prefix (NAMESPACE,
+    /// RFC 2342). The name fallback compares `roleMatchName`: the name with a
+    /// leading `INBOX` parent or the personal-namespace prefix removed, so a
     /// server that keeps every folder under INBOX (`INBOX.Sent`, `INBOX/Sent`)
-    /// and sends no special-use attributes still gets its Sent folder. INBOX
-    /// itself matches only as the whole name: a folder `Old/INBOX` is not the
-    /// inbox.
-    static func mapRole(attributes: Mailbox.Info.Attributes, name: String, delimiter: String?) -> FolderRole {
+    /// and sends no special-use attributes still gets its Sent folder. Any other
+    /// nested folder (`Clients/Sent`, `Work/Archive`) is an ordinary folder.
+    /// INBOX itself matches only as the whole name.
+    static func mapRole(
+        attributes: Mailbox.Info.Attributes, name: String, delimiter: String?, namespacePrefix: String?
+    ) -> FolderRole {
         // Check IMAP special-use attributes first (RFC 6154)
         if attributes.contains(.inbox) { return .inbox }
         if attributes.contains(.sent) { return .sent }
@@ -7320,19 +7353,36 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
 
         // Name-based fallback, for servers that send no special-use attributes.
         if canonicalNames[.inbox]?.contains(name.lowercased()) == true { return .inbox }
-        let leaf = leafName(name, delimiter: delimiter).lowercased()
-        for (role, names) in canonicalNames where role != .inbox && names.contains(leaf) {
+        let matchName = roleMatchName(name, delimiter: delimiter, namespacePrefix: namespacePrefix).lowercased()
+        for (role, names) in canonicalNames where role != .inbox && names.contains(matchName) {
             return role
         }
         return .custom
     }
 
-    /// The last segment of a mailbox name: `INBOX.Sent` with delimiter `.`
-    /// gives `Sent`. The whole name when there is no delimiter or none in it.
-    static func leafName(_ name: String, delimiter: String?) -> String {
-        guard let delimiter, !delimiter.isEmpty,
-              let range = name.range(of: delimiter, options: .backwards) else { return name }
-        return String(name[range.upperBound...])
+    /// The part of a mailbox name the role names are compared with: the name
+    /// without a leading `INBOX` parent (`INBOX.Sent` with delimiter `.` gives
+    /// `Sent`) or without the personal-namespace prefix. Every other name is
+    /// returned whole, so a folder nested under a user folder never matches.
+    static func roleMatchName(_ name: String, delimiter: String?, namespacePrefix: String?) -> String {
+        if let delimiter, !delimiter.isEmpty {
+            let inboxParent = "INBOX" + delimiter
+            if name.count > inboxParent.count,
+               name.prefix(inboxParent.count).uppercased() == inboxParent.uppercased() {
+                return String(name.dropFirst(inboxParent.count))
+            }
+        }
+        if let namespacePrefix, !namespacePrefix.isEmpty,
+           name.count > namespacePrefix.count, name.hasPrefix(namespacePrefix) {
+            return String(name.dropFirst(namespacePrefix.count))
+        }
+        return name
+    }
+
+    /// The server's personal-namespace prefix (`INBOX.` on a server that keeps
+    /// every folder under INBOX), or nil when it reports none.
+    static func personalNamespacePrefix(_ server: IMAPServer) async -> String? {
+        await server.namespaces?.personal.first?.prefix
     }
 
     /// Returns the IMAP SPECIAL-USE attribute that corresponds to a role,
@@ -7351,9 +7401,13 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
 
     /// Lower index = more canonical name for the role. Returns Int.max
     /// when the name is not in the list — so unknown names lose tiebreaks.
-    /// Ranks the leaf, as `mapRole` matches it (INBOX only as the whole name).
-    static func canonicalNameRank(_ name: String, role: FolderRole, delimiter: String?) -> Int {
-        let lower = (role == .inbox ? name : leafName(name, delimiter: delimiter)).lowercased()
+    /// Ranks `roleMatchName`, as `mapRole` matches it (INBOX only as the whole name).
+    static func canonicalNameRank(
+        _ name: String, role: FolderRole, delimiter: String?, namespacePrefix: String?
+    ) -> Int {
+        let lower = (role == .inbox
+            ? name
+            : roleMatchName(name, delimiter: delimiter, namespacePrefix: namespacePrefix)).lowercased()
         guard let names = canonicalNames[role],
               let idx = names.firstIndex(of: lower) else { return .max }
         return idx
@@ -7364,7 +7418,8 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// the deduped list — losers are demoted to `.custom`. `.custom` and `.inbox`
     /// are passed through unchanged (multiple inboxes don't occur on real IMAP).
     static func dedupRoles(
-        _ folders: [(info: FolderInfo, attributes: Mailbox.Info.Attributes, delimiter: String?)]
+        _ folders: [(info: FolderInfo, attributes: Mailbox.Info.Attributes, delimiter: String?)],
+        namespacePrefix: String?
     ) -> [FolderInfo] {
         let grouped = Dictionary(grouping: folders.indices, by: { folders[$0].info.role })
         var demoted: Set<Int> = []
@@ -7381,8 +7436,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 let aHasAttr = attr.map { fa.attributes.contains($0) } ?? false
                 let bHasAttr = attr.map { fb.attributes.contains($0) } ?? false
                 if aHasAttr != bHasAttr { return aHasAttr }
-                let aRank = canonicalNameRank(fa.info.name, role: role, delimiter: fa.delimiter)
-                let bRank = canonicalNameRank(fb.info.name, role: role, delimiter: fb.delimiter)
+                let aRank = canonicalNameRank(
+                    fa.info.name, role: role, delimiter: fa.delimiter, namespacePrefix: namespacePrefix)
+                let bRank = canonicalNameRank(
+                    fb.info.name, role: role, delimiter: fb.delimiter, namespacePrefix: namespacePrefix)
                 if aRank != bRank { return aRank < bRank }
                 return fa.info.name.count < fb.info.name.count
             }!

@@ -123,10 +123,9 @@ struct IMAPFolderRoleDiscoveryTests {
                 "a server without SPECIAL-USE must never be sent a RETURN option: \(listCommands)")
     }
 
-    /// Nested folders whose LAST segment is a role name lose to the top-level
-    /// role folder (shorter name, same canonical rank), and a nested `INBOX`
-    /// is never the inbox.
-    @Test("Leaf matching keeps the top-level role folder and never a nested INBOX")
+    /// A role name nested under a user folder is an ordinary folder, and a
+    /// nested `INBOX` is never the inbox.
+    @Test("A nested role name keeps the top-level role folder and never a nested INBOX")
     func nestedRoleNamesLoseToTopLevel() async throws {
         let server = FakeIMAPServer(
             username: Self.uniqueUsername(),
@@ -140,5 +139,32 @@ struct IMAPFolderRoleDiscoveryTests {
         #expect(roles["Clients/Sent"] == .custom)
         #expect(roles["INBOX"] == .inbox)
         #expect(roles["Old/INBOX"] == .custom)
+    }
+
+    /// A user folder nested under another user folder is never a role folder,
+    /// even when its name is a role name and the top-level role folder has a
+    /// less canonical name (`Sent Messages`, `Deleted Items`). Sent copies and
+    /// deletes must not land in the user's own `Clients/Sent` or
+    /// `Projects/Trash`, and a lone `Work/Archive` is not the archive.
+    @Test("A role name under a user folder never takes the role from a top-level alias")
+    func nestedRoleNameLosesToTopLevelAlias() async throws {
+        let server = FakeIMAPServer(
+            username: Self.uniqueUsername(),
+            mailboxes: [
+                "INBOX": [], "Sent Messages": [], "Clients/Sent": [],
+                "Deleted Items": [], "Projects/Trash": [], "Work/Archive": [],
+            ])
+        try server.start()
+        defer { server.stop() }
+
+        let roles = try await Self.roles(on: server)
+
+        #expect(roles["Sent Messages"] == .sent)
+        #expect(roles["Clients/Sent"] == .custom)
+        #expect(roles["Deleted Items"] == .trash)
+        #expect(roles["Projects/Trash"] == .custom)
+        #expect(roles["Work/Archive"] == .custom)
+        #expect(roles.values.filter { $0 == .sent }.count == 1, "exactly one Sent folder")
+        #expect(roles.values.filter { $0 == .trash }.count == 1, "exactly one Trash folder")
     }
 }

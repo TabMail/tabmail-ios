@@ -1003,11 +1003,11 @@ extension AccountManager {
             return false
         }
 
-        // No Sent folder (none found by SPECIAL-USE or by name): the provider
-        // keeps the copy anyway — IMAP creates a "Sent" folder and appends there
-        // (owner ruling, tabmail-ios #533). A failure retries like any append.
+        // No local Sent row: the provider keeps the copy anyway. IMAP asks the
+        // server for its Sent folder and creates "Sent" only when the server has
+        // none (tabmail-ios #533). A failure retries like any append.
         if sentPath == nil {
-            BackgroundSyncLogger.logDebug("[Outbox] No Sent folder for account \(accountId) — provider will create one")
+            BackgroundSyncLogger.logDebug("[Outbox] No local Sent folder for account \(accountId) — provider will find or create one")
         }
 
         do {

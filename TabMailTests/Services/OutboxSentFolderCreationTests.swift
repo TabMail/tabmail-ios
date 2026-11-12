@@ -9,9 +9,10 @@ import Testing
 
 /// The system property: a message the server accepted for delivery leaves the
 /// sender a copy in a Sent folder on their IMAP server, even when the account
-/// has no Sent folder (none found by SPECIAL-USE or by name). In that case a
-/// folder named "Sent" is created in the personal namespace and the copy goes
-/// there. The outbox row is finished only once that copy exists.
+/// has no local Sent row. The SERVER's Sent folder (by SPECIAL-USE or by name)
+/// takes the copy; only when the server has none is a folder named "Sent"
+/// created in the personal namespace, so an existing Sent folder never gets a
+/// duplicate beside it. The outbox row is finished only once that copy exists.
 ///
 /// Each case runs the real outbox drain (`AccountManager.drainOutbox`, its
 /// pending-Sent-append phase) and the real `IMAPProvider` against
@@ -34,8 +35,9 @@ struct OutboxSentFolderCreationTests {
     }
 
     /// A temporary database installed as `AppDatabase.shared`, holding one IMAP
-    /// account and its Inbox, plus a Sent row only when `sentFolderPath` is given.
-    private func makeFixture(sentFolderPath: String? = nil) throws -> Fixture {
+    /// account and its Inbox, plus a Sent row only when `sentFolderPath` is given
+    /// and an ordinary (`.custom`) row for each of `customFolderPaths`.
+    private func makeFixture(sentFolderPath: String? = nil, customFolderPaths: [String] = []) throws -> Fixture {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         var configuration = Configuration()
@@ -56,6 +58,9 @@ struct OutboxSentFolderCreationTests {
             try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: account.id).insert(db)
             if let sentFolderPath {
                 try Folder(name: sentFolderPath, path: sentFolderPath, role: .sent, accountId: account.id).insert(db)
+            }
+            for path in customFolderPaths {
+                try Folder(name: path, path: path, role: .custom, accountId: account.id).insert(db)
             }
         }
         return Fixture(pool: pool, directory: directory, previous: previous, accountId: account.id)
@@ -86,8 +91,12 @@ struct OutboxSentFolderCreationTests {
         try fixture.pool.read { db in try OutboxMessage.fetchOne(db, key: id) }
     }
 
-    private static func strictServer(mailboxes: [String: [FakeIMAPServer.Message]]) -> FakeIMAPServer {
-        let server = FakeIMAPServer(username: "sent-\(UUID().uuidString.lowercased())", mailboxes: mailboxes)
+    private static func strictServer(
+        mailboxes: [String: [FakeIMAPServer.Message]],
+        capabilities: [String] = FakeIMAPServer.defaultCapabilities
+    ) -> FakeIMAPServer {
+        let server = FakeIMAPServer(
+            username: "sent-\(UUID().uuidString.lowercased())", capabilities: capabilities, mailboxes: mailboxes)
         server.requireExistingMailboxes()
         return server
     }
@@ -161,9 +170,10 @@ struct OutboxSentFolderCreationTests {
     }
 
     /// RED-FIRST: the server already has a "Sent" folder the account holds no
-    /// Sent row for (it was created by an earlier send before a folder sync saw
-    /// it). The refused CREATE makes no second folder and the copy still lands.
-    @Test("A Sent folder the account has no row for: the refused CREATE is harmless and the copy lands there")
+    /// Sent row for (an earlier send created it before a folder sync saw it, or
+    /// the first send runs before the first folder sync). The server is asked
+    /// first, so no CREATE is sent and the copy lands in that folder.
+    @Test("A Sent folder the account has no row for: no CREATE, and the copy lands there")
     func existingUnroledSentFolderTakesTheCopy() async throws {
         let fixture = try makeFixture()
         defer { finish(fixture) }
@@ -174,7 +184,57 @@ struct OutboxSentFolderCreationTests {
 
         try await drainOutbox(fixture, against: server)
 
+        #expect(Self.createCommands(server).isEmpty, "a CREATE was sent although the server has a Sent folder")
         #expect(Self.holdsOnly(server, "Sent", messageId))
+        #expect(try outboxRow(fixture, outboxId) == nil)
+    }
+
+    /// RED-FIRST: an existing account on a server that keeps folders under
+    /// INBOX and sends no special-use attributes. Its Sent folder
+    /// `INBOX.Sent Items` was stored as an ordinary folder before such names
+    /// were recognised, and folder sync never rewrites a stored role, so the
+    /// account still has no Sent row. The copy must go into the server's real
+    /// Sent folder: creating `INBOX.Sent` beside it would leave the user a
+    /// second Sent folder, visible in every mail client.
+    @Test("A Sent folder stored as an ordinary folder takes the copy; no second Sent folder is created")
+    func sentFolderStoredAsCustomTakesTheCopy() async throws {
+        let fixture = try makeFixture(customFolderPaths: ["INBOX.Sent Items"])
+        defer { finish(fixture) }
+        let (outboxId, messageId) = try seedSentAwaitingCopy(fixture)
+        let server = Self.strictServer(mailboxes: ["INBOX": [], "INBOX.Sent Items": []])
+        server.setHierarchy(delimiter: ".", personalNamespacePrefix: "INBOX.")
+        try server.start()
+        defer { server.stop() }
+
+        try await drainOutbox(fixture, against: server)
+
+        #expect(Self.createCommands(server).isEmpty, "a CREATE was sent although the server has a Sent folder")
+        #expect(!server.mailboxExists("INBOX.Sent"), "a second Sent folder was created beside the real one")
+        #expect(Self.holdsOnly(server, "INBOX.Sent Items", messageId), "the copy is not in the server's Sent folder")
+        #expect(try outboxRow(fixture, outboxId) == nil)
+    }
+
+    /// RED-FIRST: a server that advertises SPECIAL-USE and marks its
+    /// non-English Sent folder `\Sent` only on `LIST ... RETURN (SPECIAL-USE)`
+    /// (RFC 6154 §2). The account's row for it is ordinary, as stored before
+    /// the RETURN listing was read. The copy goes to that folder; no CREATE.
+    @Test("A Sent folder only RETURN (SPECIAL-USE) marks takes the copy; no CREATE")
+    func specialUseSentFolderTakesTheCopy() async throws {
+        let fixture = try makeFixture(customFolderPaths: ["Envoyes"])
+        defer { finish(fixture) }
+        let (outboxId, messageId) = try seedSentAwaitingCopy(fixture)
+        let server = Self.strictServer(
+            mailboxes: ["INBOX": [], "Envoyes": []],
+            capabilities: FakeIMAPServer.defaultCapabilities + ["SPECIAL-USE"])
+        server.setSpecialUse("\\Sent", for: "Envoyes", onPlainList: false)
+        try server.start()
+        defer { server.stop() }
+
+        try await drainOutbox(fixture, against: server)
+
+        #expect(Self.createCommands(server).isEmpty, "a CREATE was sent although the server marks a folder \\Sent")
+        #expect(!server.mailboxExists("Sent"), "a second Sent folder was created beside the real one")
+        #expect(Self.holdsOnly(server, "Envoyes", messageId), "the copy is not in the server's Sent folder")
         #expect(try outboxRow(fixture, outboxId) == nil)
     }
 

@@ -428,9 +428,9 @@ protocol EmailProvider: Sendable {
     /// - Parameters:
     ///   - draft: The sent message content.
     ///   - sentFolderPath: Server-side Sent folder path, or `nil` when the
-    ///     account has no Sent folder (none found by SPECIAL-USE or by name).
-    ///     IMAP then creates a folder named "Sent" and appends there (owner
-    ///     ruling, tabmail-ios #533); the API providers save the copy anyway.
+    ///     account has no local Sent row. IMAP then asks the server for its Sent
+    ///     folder and creates one named "Sent" only when the server has none
+    ///     (tabmail-ios #533); the API providers save the copy anyway.
     ///   - messageId: The RFC822 Message-ID used during SMTP send (for dedup).
     /// - Returns: `true` if the message was appended (or confirmed already present).
     func appendToSentFolder(draft: DraftMessage, sentFolderPath: String?, messageId: String) async throws -> Bool
