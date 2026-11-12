@@ -6281,10 +6281,55 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
 
     /// The recipients as one header field body, each written as a draft writes
     /// it: every mailbox a recipient names, or, for text that is not a mailbox
-    /// list, the text itself (which SwiftMail encodes, never reads as an address). SwiftMail never writes a control character into an address, so a
-    /// recipient cannot end the field and add a header line of its own.
-    static func recipientsFieldBody(_ recipients: [String]) -> String {
-        draftRecipients(recipients).map(\.description).joined(separator: ", ")
+    /// list, the text itself (which SwiftMail encodes, never reads as an address). The only
+    /// line break SwiftMail writes into an address is a fold (CRLF and a space) inside a long
+    /// encoded name, so a recipient cannot end the field and add a header line of its own.
+    ///
+    /// The body follows `name:`, folded by `foldedFieldBody`. Each recipient carries
+    /// the comma that follows it when another recipient comes next, so the comma is
+    /// counted on the line it ends.
+    static func recipientsFieldBody(_ name: String, _ recipients: [String]) -> String {
+        let written = draftRecipients(recipients).map(\.description)
+        let tokens = written.enumerated().map { index, recipient in
+            index < written.count - 1 ? recipient + "," : recipient
+        }
+        return foldedFieldBody(name, tokens)
+    }
+
+    /// RFC 5322 §2.1.1: a header line SHOULD be at most 78 characters and MUST be at
+    /// most 998. A References history of many short identifiers, a long recipient
+    /// list, or one long Message-ID passes 998 on a single line.
+    static let headerLineSoftLimit = 78
+
+    /// The body of the header field named `name`, following its colon: `tokens` in
+    /// order, each preceded by its folding white space, which is a space, or CRLF and
+    /// a space where the token would take its line past `headerLineSoftLimit` octets.
+    /// The first token is no exception: RFC 5322 allows folding white space before
+    /// every msg-id (§3.6.4) and every address (§3.4). A token is never split, so a
+    /// long list never makes a line longer than RFC 5322 allows (#430), but a single
+    /// token longer than 997 octets is written whole on a line of its own.
+    static func foldedFieldBody(_ name: String, _ tokens: [String]) -> String {
+        var body = ""
+        var lineLength = "\(name):".utf8.count
+        for token in tokens {
+            if lineLength + 1 + token.utf8.count > headerLineSoftLimit {
+                body += "\r\n"
+                lineLength = 0
+            }
+            body += " " + token
+            lineLength += 1 + token.utf8.count
+        }
+        return body
+    }
+
+    /// `foldedFieldBody` of the bracketed `<id>`s (`threadingMessageIDs`) as the
+    /// value SwiftMail writes after `name: `: SwiftMail supplies the space before
+    /// the first identifier, so that space is dropped.
+    /// When the first identifier itself starts a new line the value starts with the
+    /// fold, which SwiftMail's header check accepts as folding white space.
+    static func messageIDFieldValue(_ name: String, _ ids: [String]) -> String {
+        let body = foldedFieldBody(name, ids)
+        return body.hasPrefix(" ") ? String(body.dropFirst()) : body
     }
 
     /// Bracket outgoing threading IDs from incoming mail, omitting empty IDs and
@@ -6352,13 +6397,15 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             email.messageID = MessageID(messageId)
         }
         // Set threading headers (RFC 2822 requires angle brackets around message IDs)
+        // SwiftMail writes an additional header verbatim, so both are folded here
+        // (#430): a long References history otherwise passes 998 octets on one line.
         var headers: [String: String] = [:]
         if let inReplyTo = Self.threadingMessageIDs(draft.inReplyTo.map { [$0] } ?? []).first {
-            headers["In-Reply-To"] = inReplyTo
+            headers["In-Reply-To"] = Self.messageIDFieldValue("In-Reply-To", [inReplyTo])
         }
         let references = Self.threadingMessageIDs(draft.references)
         if !references.isEmpty {
-            headers["References"] = references.joined(separator: " ")
+            headers["References"] = Self.messageIDFieldValue("References", references)
         }
         if !headers.isEmpty {
             email.additionalHeaders = headers
