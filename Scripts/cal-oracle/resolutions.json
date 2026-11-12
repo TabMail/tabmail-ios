@@ -1,0 +1,173 @@
+{
+  "dst-gap/adelaide-daily-0215": {
+    "follows": "icaljs",
+    "except": {
+      "2019-10-06": "libical"
+    },
+    "why": "RFC 5545 §3.3.5 reads a wall time a change to summer time skips with the UTC offset from before the change. libical 4.0.7 places the skipped day's occurrence so (03:15 ACDT), but in its ICU build the next day keeps the later time of day too (fixed in libical 4.0.8: 'recurrences with a DAILY or longer frequency no longer move to a later time of day after an occurrence or DTSTART falls in a DST gap'). ical.js reads the skipped wall time with the offset from after the change, an hour early, and is right on every other day. So every day follows ical.js except the skipped day, which follows libical.",
+    "references": [
+      "RFC 5545 §3.3.5",
+      "libical CHANGELOG 4.0.8 (unreleased): DST-gap time drift in ICU builds",
+      "ADR-IOS-108 decision 1"
+    ]
+  },
+  "dst-gap/berlin-weekly-sunday-0230": {
+    "follows": "icaljs",
+    "except": {
+      "2019-03-31": "libical"
+    },
+    "why": "RFC 5545 §3.3.5 reads a wall time a change to summer time skips with the UTC offset from before the change. libical 4.0.7 places the skipped day's occurrence so (03:30 CEST), but in its ICU build the next week keeps the later time of day too (fixed in libical 4.0.8: 'recurrences with a DAILY or longer frequency no longer move to a later time of day after an occurrence or DTSTART falls in a DST gap'). ical.js reads the skipped wall time with the offset from after the change, an hour early, and is right on every other day. So every day follows ical.js except the skipped day, which follows libical.",
+    "references": [
+      "RFC 5545 §3.3.5",
+      "libical CHANGELOG 4.0.8 (unreleased): DST-gap time drift in ICU builds",
+      "ADR-IOS-108 decision 1"
+    ]
+  },
+  "dst-gap/havana-weekly-sunday-0030": {
+    "follows": "icaljs",
+    "except": {
+      "2019-03-10": "libical"
+    },
+    "why": "RFC 5545 §3.3.5 reads a wall time a change to summer time skips with the UTC offset from before the change. libical 4.0.7 places the skipped day's occurrence so (01:30 CDT), but in its ICU build the next week keeps the later time of day too (fixed in libical 4.0.8: 'recurrences with a DAILY or longer frequency no longer move to a later time of day after an occurrence or DTSTART falls in a DST gap'). ical.js reads the skipped wall time with the offset from after the change, an hour early, and is right on every other day. So every day follows ical.js except the skipped day, which follows libical.",
+    "references": [
+      "RFC 5545 §3.3.5",
+      "libical CHANGELOG 4.0.8 (unreleased): DST-gap time drift in ICU builds",
+      "ADR-IOS-108 decision 1"
+    ]
+  },
+  "dst-gap/lord-howe-daily-0215": {
+    "follows": "icaljs",
+    "except": {
+      "2019-10-06": "libical"
+    },
+    "why": "RFC 5545 §3.3.5 reads a wall time a change to summer time skips with the UTC offset from before the change. libical 4.0.7 places the skipped day's occurrence so (02:45 +11:00), but in its ICU build the next day keeps the later time of day too (fixed in libical 4.0.8: 'recurrences with a DAILY or longer frequency no longer move to a later time of day after an occurrence or DTSTART falls in a DST gap'). ical.js reads the skipped wall time with the offset from after the change, an hour early, and is right on every other day. So every day follows ical.js except the skipped day, which follows libical.",
+    "references": [
+      "RFC 5545 §3.3.5",
+      "libical CHANGELOG 4.0.8 (unreleased): DST-gap time drift in ICU builds",
+      "ADR-IOS-108 decision 1"
+    ]
+  },
+  "dst-gap/new-york-daily-0230": {
+    "follows": "icaljs",
+    "except": {
+      "2019-03-10": "libical"
+    },
+    "why": "RFC 5545 §3.3.5 reads a wall time a change to summer time skips with the UTC offset from before the change. libical 4.0.7 places the skipped day's occurrence so (03:30 EDT), but in its ICU build the next day keeps the later time of day too (fixed in libical 4.0.8: 'recurrences with a DAILY or longer frequency no longer move to a later time of day after an occurrence or DTSTART falls in a DST gap'). ical.js reads the skipped wall time with the offset from after the change, an hour early, and is right on every other day. So every day follows ical.js except the skipped day, which follows libical.",
+    "references": [
+      "RFC 5545 §3.3.5",
+      "libical CHANGELOG 4.0.8 (unreleased): DST-gap time drift in ICU builds",
+      "ADR-IOS-108 decision 1"
+    ]
+  },
+  "dst-gap/santiago-daily-0030": {
+    "follows": "icaljs",
+    "except": {
+      "2019-09-08": "libical"
+    },
+    "why": "RFC 5545 §3.3.5 reads a wall time a change to summer time skips with the UTC offset from before the change. libical 4.0.7 places the skipped day's occurrence so (01:30 -03), but in its ICU build the next day keeps the later time of day too (fixed in libical 4.0.8: 'recurrences with a DAILY or longer frequency no longer move to a later time of day after an occurrence or DTSTART falls in a DST gap'). ical.js reads the skipped wall time with the offset from after the change, an hour early, and is right on every other day. So every day follows ical.js except the skipped day, which follows libical.",
+    "references": [
+      "RFC 5545 §3.3.5",
+      "libical CHANGELOG 4.0.8 (unreleased): DST-gap time drift in ICU builds",
+      "ADR-IOS-108 decision 1"
+    ]
+  },
+  "dst-gap/sydney-weekly-sunday-0230": {
+    "follows": "icaljs",
+    "except": {
+      "2019-10-06": "libical"
+    },
+    "why": "RFC 5545 §3.3.5 reads a wall time a change to summer time skips with the UTC offset from before the change. libical 4.0.7 places the skipped day's occurrence so (03:30 AEDT), but in its ICU build the next week keeps the later time of day too (fixed in libical 4.0.8: 'recurrences with a DAILY or longer frequency no longer move to a later time of day after an occurrence or DTSTART falls in a DST gap'). ical.js reads the skipped wall time with the offset from after the change, an hour early, and is right on every other day. So every day follows ical.js except the skipped day, which follows libical.",
+    "references": [
+      "RFC 5545 §3.3.5",
+      "libical CHANGELOG 4.0.8 (unreleased): DST-gap time drift in ICU builds",
+      "ADR-IOS-108 decision 1"
+    ]
+  },
+  "dst-repeat/havana-daily-0030": {
+    "follows": "libical",
+    "lengthFrom": "icaljs",
+    "why": "RFC 5545 §3.3.5 names the first of the two instants of a wall time a change back repeats, and §3.8.5.3 gives every occurrence the exact length DTEND less DTSTART. libical 4.0.7 places the start at the first instant (libical 4.0.6: 'Resolve local times in a fall-back overlap to the first occurrence') but gives that occurrence no length (its end equals its start). ical.js places the repeated wall time at the second instant (ical.js issue 1051) and keeps the length. So the starts follow libical and the lengths ical.js.",
+    "references": [
+      "RFC 5545 §3.3.5",
+      "RFC 5545 §3.8.5.3",
+      "libical CHANGELOG 4.0.6",
+      "https://github.com/kewisch/ical.js/issues/1051",
+      "ADR-IOS-108 decision 1"
+    ]
+  },
+  "dst-repeat/lord-howe-daily-0145": {
+    "follows": "libical",
+    "why": "RFC 5545 §3.3.5 names the first of the two instants of a wall time a change back repeats. libical 4.0.7 places 01:45 on 2019-04-07 at the first instant, +11:00 (libical 4.0.6: 'Resolve local times in a fall-back overlap to the first occurrence'); its end, 15:45Z (02:15 at +10:30), is past the 30-minute fold, so its length is right. ical.js places it at the second instant, +10:30 (ical.js issue 1051).",
+    "references": [
+      "RFC 5545 §3.3.5",
+      "libical CHANGELOG 4.0.6",
+      "https://github.com/kewisch/ical.js/issues/1051",
+      "ADR-IOS-108 decision 1"
+    ]
+  },
+  "dst-repeat/new-york-daily-0130": {
+    "follows": "libical",
+    "lengthFrom": "icaljs",
+    "why": "RFC 5545 §3.3.5 names the first of the two instants of a wall time a change back repeats, and §3.8.5.3 gives every occurrence the exact length DTEND less DTSTART. libical 4.0.7 places the start at the first instant (libical 4.0.6: 'Resolve local times in a fall-back overlap to the first occurrence') but gives that occurrence no length (its end equals its start). ical.js places the repeated wall time at the second instant (ical.js issue 1051) and keeps the length. So the starts follow libical and the lengths ical.js.",
+    "references": [
+      "RFC 5545 §3.3.5",
+      "RFC 5545 §3.8.5.3",
+      "libical CHANGELOG 4.0.6",
+      "https://github.com/kewisch/ical.js/issues/1051",
+      "ADR-IOS-108 decision 1"
+    ]
+  },
+  "dst-repeat/santiago-weekly-saturday-2330": {
+    "follows": "libical",
+    "lengthFrom": "icaljs",
+    "why": "RFC 5545 §3.3.5 names the first of the two instants of a wall time a change back repeats, and §3.8.5.3 gives every occurrence the exact length DTEND less DTSTART. libical 4.0.7 places the start at the first instant (libical 4.0.6: 'Resolve local times in a fall-back overlap to the first occurrence') but gives that occurrence no length (its end equals its start). ical.js places the repeated wall time at the second instant (ical.js issue 1051) and keeps the length. So the starts follow libical and the lengths ical.js.",
+    "references": [
+      "RFC 5545 §3.3.5",
+      "RFC 5545 §3.8.5.3",
+      "libical CHANGELOG 4.0.6",
+      "https://github.com/kewisch/ical.js/issues/1051",
+      "ADR-IOS-108 decision 1"
+    ]
+  },
+  "dst-repeat/sydney-daily-0230": {
+    "follows": "libical",
+    "lengthFrom": "icaljs",
+    "why": "RFC 5545 §3.3.5 names the first of the two instants of a wall time a change back repeats, and §3.8.5.3 gives every occurrence the exact length DTEND less DTSTART. libical 4.0.7 places the start at the first instant (libical 4.0.6: 'Resolve local times in a fall-back overlap to the first occurrence') but gives that occurrence no length (its end equals its start). ical.js places the repeated wall time at the second instant (ical.js issue 1051) and keeps the length. So the starts follow libical and the lengths ical.js.",
+    "references": [
+      "RFC 5545 §3.3.5",
+      "RFC 5545 §3.8.5.3",
+      "libical CHANGELOG 4.0.6",
+      "https://github.com/kewisch/ical.js/issues/1051",
+      "ADR-IOS-108 decision 1"
+    ]
+  },
+  "dst-repeat/tehran-daily-2330": {
+    "follows": "libical",
+    "lengthFrom": "icaljs",
+    "why": "RFC 5545 §3.3.5 names the first of the two instants of a wall time a change back repeats, and §3.8.5.3 gives every occurrence the exact length DTEND less DTSTART. libical 4.0.7 places the start at the first instant (libical 4.0.6: 'Resolve local times in a fall-back overlap to the first occurrence') but gives that occurrence no length (its end equals its start). ical.js places the repeated wall time at the second instant (ical.js issue 1051) and keeps the length. So the starts follow libical and the lengths ical.js.",
+    "references": [
+      "RFC 5545 §3.3.5",
+      "RFC 5545 §3.8.5.3",
+      "libical CHANGELOG 4.0.6",
+      "https://github.com/kewisch/ical.js/issues/1051",
+      "ADR-IOS-108 decision 1"
+    ]
+  },
+  "rfc-examples/yearly-20th-monday": {
+    "follows": "libical",
+    "ruleDays": "libical",
+    "why": "RFC 5545 §3.8.5.3 prints May 19 1997, May 18 1998 and May 17 1999 for YEARLY;BYDAY=20MO (the 20th Monday of the year, §3.3.10 BYDAY with a number in a YEARLY rule), which libical gives. ical.js at this revision gives every Monday.",
+    "references": [
+      "RFC 5545 §3.8.5.3",
+      "RFC 5545 §3.3.10"
+    ]
+  },
+  "leap-years/yearly-february-29-from-1896": {
+    "follows": "icaljs",
+    "why": "ical.js gives 29 February 1896 and 1904 and skips 1900, a common year (RFC 5545 §3.3.10: an invalid date is ignored). libical's own rule iterator gives the same days (the rule days agree), but its listing converts times to seconds since 1970, which libical defines only from 1902-01-01, so with a window that starts before 1902 it lists nothing.",
+    "references": [
+      "RFC 5545 §3.3.10",
+      "libical icaltime.h: icaltime_as_timet is defined from 1902-01-01"
+    ]
+  }
+}
