@@ -3562,7 +3562,9 @@ private var collapseQuotesJS: String {
                         /^\\*?(\\uBCF4\\uB0B8\\s*\\uC0AC\\uB78C|\\uBCF4\\uB0B8\\s*\\uB0A0\\uC9DC)\\s*:\\*?\\s*/i.test(next) ||
                         /^\\*?(\\uBC1B\\uB294\\s*\\uC0AC\\uB78C|\\uC81C\\uBAA9)\\s*:\\*?\\s*/i.test(next) ||
                         /^\\*?(\\u53D1\\u4EF6\\u4EBA|\\u65E5\\u671F)\\s*:/.test(next) ||
-                        /^\\*?(\\u6536\\u4EF6\\u4EBA|\\u4E3B\\u9898)\\s*:\\*?\\s*/.test(next)) {
+                        /^\\*?(\\u6536\\u4EF6\\u4EBA|\\u4E3B\\u9898)\\s*:\\*?\\s*/.test(next) ||
+                        /^\\*?(\\u5DEE\\u51FA\\u4EBA|\\u9001\\u4FE1\\u65E5\\u6642|\\u9001\\u4FE1)\\s*[:\\uFF1A]\\*?\\s*/.test(next) ||
+                        /^\\*?(\\u5B9B\\u5148|\\u4EF6\\u540D)\\s*[:\\uFF1A]\\*?\\s*/.test(next)) {
                         hasSenderHeader = true; break;
                     }
                 }
@@ -3578,6 +3580,11 @@ private var collapseQuotesJS: String {
             // Chinese sender headers
             if (/^\\*?\\u53D1\\u4EF6\\u4EBA\\s*:\\*?\\s*/.test(trimmed) ||
                 /^\\*?\\u65E5\\u671F\\s*:\\*?\\s*/.test(trimmed)) {
+                boundaryLine = i; break;
+            }
+
+            // Japanese Outlook sender header (差出人), ASCII or full-width colon
+            if (/^\\*?\\u5DEE\\u51FA\\u4EBA\\s*[:\\uFF1A]\\*?\\s*/.test(trimmed)) {
                 boundaryLine = i; break;
             }
 
