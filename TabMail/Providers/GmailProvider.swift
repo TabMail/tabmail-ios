@@ -2318,29 +2318,11 @@ actor GmailProvider: EmailProvider {
         }
     }
 
-    /// RFC 5322 §2.1.1: a header line SHOULD be at most 78 characters and MUST be at
-    /// most 998. A References history of many short identifiers, or one long
-    /// Message-ID, passes 998 on a single line.
-    private static let headerLineSoftLimit = 78
-
-    /// An `In-Reply-To` or `References` field, `<id>`s in order, folded with CRLF and
-    /// a space before any identifier that would take its line past
-    /// `headerLineSoftLimit` octets. RFC 5322 §3.6.4 allows folding white space
-    /// before every msg-id, the first included, so an identifier is never split and
-    /// one too long to share a line starts its own.
+    /// An `In-Reply-To` or `References` field, folded as the IMAP path folds it
+    /// (`IMAPProvider.foldedFieldBody`). `ids` must already be bracketed `<id>`s
+    /// (`IMAPProvider.threadingMessageIDs`).
     nonisolated static func messageIDField(_ name: String, _ ids: [String]) -> String {
-        var field = "\(name):"
-        var lineLength = field.utf8.count
-        for id in ids {
-            let token = id.hasPrefix("<") ? id : "<\(id)>"
-            if lineLength + 1 + token.utf8.count > headerLineSoftLimit {
-                field += "\r\n"
-                lineLength = 0
-            }
-            field += " " + token
-            lineLength += 1 + token.utf8.count
-        }
-        return field
+        "\(name):" + IMAPProvider.foldedFieldBody(name, ids)
     }
 
     nonisolated func buildRFC822(draft: DraftMessage) -> String {
@@ -2352,12 +2334,12 @@ actor GmailProvider: EmailProvider {
             let bracketed = messageId.hasPrefix("<") ? messageId : "<\(messageId)>"
             lines.append("Message-ID: \(bracketed)")
         }
-        lines.append("To: \(IMAPProvider.recipientsFieldBody(draft.to))")
-        if !draft.cc.isEmpty { lines.append("Cc: \(IMAPProvider.recipientsFieldBody(draft.cc))") }
+        lines.append("To:\(IMAPProvider.recipientsFieldBody("To", draft.to))")
+        if !draft.cc.isEmpty { lines.append("Cc:\(IMAPProvider.recipientsFieldBody("Cc", draft.cc))") }
         // Gmail delivers to the Bcc header's recipients (documented for
         // users.messages.send). Leaving the header out of the delivered copies
         // while a draft and the Sent copy keep it is observed, not documented.
-        if !draft.bcc.isEmpty { lines.append("Bcc: \(IMAPProvider.recipientsFieldBody(draft.bcc))") }
+        if !draft.bcc.isEmpty { lines.append("Bcc:\(IMAPProvider.recipientsFieldBody("Bcc", draft.bcc))") }
         lines.append("Subject: \(RFC2047.encodeHeaderValue(draft.subject))")
         if let replyTo = IMAPProvider.threadingMessageIDs(draft.inReplyTo.map { [$0] } ?? []).first {
             lines.append(Self.messageIDField("In-Reply-To", [replyTo]))
@@ -2405,11 +2387,11 @@ actor GmailProvider: EmailProvider {
             let bracketed = messageId.hasPrefix("<") ? messageId : "<\(messageId)>"
             message += "Message-ID: \(bracketed)\r\n"
         }
-        message += "To: \(IMAPProvider.recipientsFieldBody(draft.to))\r\n"
-        if !draft.cc.isEmpty { message += "Cc: \(IMAPProvider.recipientsFieldBody(draft.cc))\r\n" }
+        message += "To:\(IMAPProvider.recipientsFieldBody("To", draft.to))\r\n"
+        if !draft.cc.isEmpty { message += "Cc:\(IMAPProvider.recipientsFieldBody("Cc", draft.cc))\r\n" }
         // See buildRFC822: Gmail delivers to Bcc recipients and, as observed,
         // leaves the header out of the delivered copies.
-        if !draft.bcc.isEmpty { message += "Bcc: \(IMAPProvider.recipientsFieldBody(draft.bcc))\r\n" }
+        if !draft.bcc.isEmpty { message += "Bcc:\(IMAPProvider.recipientsFieldBody("Bcc", draft.bcc))\r\n" }
         message += "Subject: \(RFC2047.encodeHeaderValue(draft.subject))\r\n"
         if let replyTo = IMAPProvider.threadingMessageIDs(draft.inReplyTo.map { [$0] } ?? []).first {
             message += Self.messageIDField("In-Reply-To", [replyTo]) + "\r\n"

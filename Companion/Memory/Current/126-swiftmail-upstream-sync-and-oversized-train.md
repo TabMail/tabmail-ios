@@ -490,6 +490,12 @@ serializer that writes recipients:
   build-macos, build-ios, build-android and lint.
 - App and NSE pin `4da38768ceac62bd5f38250bebe50985608da1a3` (`project.yml` and the root
   `Package.resolved`).
+- Since #430 (2026-11-11) the "single-line `In-Reply-To` and `References` values" in the #220
+  collision check above no longer holds: the app folds both with CRLF and a space (a long parent id
+  starts the `In-Reply-To` value with a fold), relying on `SMTPServer.checkHeaderFields` unfolding
+  CRLF-space and CRLF-tab before it refuses a line break. `IMAPThreadHeaderFoldingTests` sends the
+  kept-in-Sent and draft copies through the real APPEND, so a repin that tightens that check fails
+  there. Check it on every collision review that touches the header writer or that check (memory 067).
 
 ## 2026-11-10 — upstream `faa1c2a` and address-list folding (#447)
 
