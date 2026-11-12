@@ -1065,6 +1065,30 @@ naming the field and the value, with nothing sent.
   on Google, Outlook and CalDAV, is refused before both cards with nothing sent; a rule Outlook
   can't hold is refused before both cards.
 
+## Calendar writes queued across a zone change — written as the card showed
+
+`TabMailTests/Tools/CalendarWriteZoneSnapshotTests.swift` pins #753: a confirmed
+`calendar_event_create` or `calendar_event_edit` writes the time its card showed, whatever zone the
+device is in when the queue drains. Each case runs the real tool with `ToolContext(deviceZone:)` set
+to a zone that is not the host's (the zone the user confirmed in), drains the real queue in the
+host's zone, and compares the write on the fake with the card.
+
+- `CalendarWriteZoneSnapshotTests`: timed create on Google, Outlook and CalDAV (start and end); a
+  whole-series time change on Google, Outlook and CalDAV; one occurrence (`this_only`) on Google,
+  Outlook and CalDAV; Google `this_and_following` (the new part starts at the card's start, the old
+  part is capped); a zone change between two creates applies to the second; a CalDAV event with
+  floating times is written at the card's wall clock. Controls: an assistant-named zone (IANA or
+  Windows) is shown on the card and written in that zone; an all-day create keeps its date; a row queued with no zone (before
+  #753) drains in the device's zone. Red-first: with the zone stamp removed every non-control case
+  but the floating one fails; with the floating formatter reverted the floating case fails.
+- `CalendarCardZoneLabelTests`: the card names a zone only when it is not the device's; a Windows
+  name is the zone it names.
+- `CalendarQueuedZoneStampTests`: the queued arguments name the card's zone when the assistant gave
+  none (or an empty one) and change nothing else; a zone the assistant named (IANA or Windows) is
+  queued as given; with no zone given the write resolves to the snapshotted zone. (The queue deletes
+  a done row, and the tool starts a drain of its own, so the integration cases check the write, not
+  the row.)
+
 ## CalDAV organizer — every event with guests names its organizer
 
 `TabMailTests/Providers/CalDAVOrganizerTests.swift` pins ADR-IOS-109 (#711): every CalDAV PUT runs

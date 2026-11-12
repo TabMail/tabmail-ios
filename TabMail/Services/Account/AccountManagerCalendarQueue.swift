@@ -904,7 +904,9 @@ extension AccountManager {
             // Resolving it here, once, is what lets every provider agree.
             // A `timezone` the resolver does not recognize is refused here, before
             // the occurrence reads below use it as the frame, through the same
-            // function `buildGCalEventInput` uses.
+            // function `buildGCalEventInput` uses. The edit tool queues the zone its card used
+            // when the assistant gave none (`stampingZone`, #753), so this is that zone, not the
+            // device's at the drain; only a row queued before that stamp has none.
             let recurrenceIdZone = try CalendarToolHelpers.resolveWriteTimeZone(
                 args, consequence: "it did not change the event")
             // 🚨 A SPLIT WHOSE NEW PART WAS WRITTEN IS NEVER RUN AGAIN (#601). An earlier attempt

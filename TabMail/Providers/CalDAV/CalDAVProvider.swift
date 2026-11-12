@@ -1430,12 +1430,22 @@ actor CalDAVProvider: CalendarProvider {
             fmt.timeZone = TimeZone(identifier: "UTC")
             return "\(name):\(fmt.string(from: date))"
         case .floating:
+            // A floating time is a wall clock with no zone: it is written as the wall clock the
+            // edit gave, which is its time in the zone the edit names (its label, which
+            // `buildGCalEventInput` sets on every timed value), never in the device's zone at the
+            // write, which may not be the zone the card showed (#753).
+            guard let tzid, !tzid.isEmpty else {
+                throw CalendarProviderError.notSupported(Self.floatingWriteNeedsZoneMessage)
+            }
             let fmt = DateFormatter()
             fmt.dateFormat = "yyyyMMdd'T'HHmmss"
-            fmt.timeZone = .current
+            fmt.timeZone = try zone(forTZID: tzid, zones: zones)
             return "\(name):\(fmt.string(from: date))"
         }
     }
+
+    static let floatingWriteNeedsZoneMessage =
+        "This event's times have no time zone, and the change does not say which zone its new times are in, so TabMail can't work out their wall clock. Nothing was changed."
 
     /// RFC 5545 §3.3.11 text-value escape (`\` `;` `,` `\n`). Matches the impl
     /// in `GCalEventInput.toICS` — duplicated here because that file's

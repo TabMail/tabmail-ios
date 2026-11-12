@@ -22,6 +22,11 @@ struct CalendarEventEditTool: AgentTool, Sendable {
     /// ADR-IOS-053: real entry point — delivers the confirmation card to the
     /// invoking session via `invocation.uiSink` (nil sink → declined fast-fail).
     func execute(arguments: [String: JSONValue], invocation: ToolInvocation) async throws -> String {
+        // The device's zone, snapshotted as this operation's first step (#753): a `timezone` the
+        // assistant did not give is this zone for the occurrence read, the routing, the card, the
+        // queued edit and the result, so the edit is written where the card showed it even if the
+        // device's zone changes before the queue drains.
+        let deviceZone = ctx.deviceZone
         // `CalendarSeriesScope.route` may make an edit of every occurrence a split before the card.
         var arguments = arguments
         guard case .string(let rawEventId) = arguments["event_id"],
@@ -140,13 +145,14 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         // A `timezone` TabMail does not recognize is refused before the card, rather than read as
         // the device's zone (which would move the event to the wrong time). The queue refuses it
         // the same way (`resolveWriteTimeZone`) for an edit that reaches it.
+        let tz: TimeZone
         do {
-            let zone = try CalendarToolHelpers.resolveWriteTimeZone(arguments, consequence: "it did not change the event")
+            tz = try CalendarToolHelpers.resolveWriteTimeZone(arguments, deviceZone: deviceZone, consequence: "it did not change the event")
             // A start or end that names no instant can't be written at a time the card shows:
             // refused here, with nothing written, rather than sent and refused after the card
             // (#719: an Outlook series write is converted to the series' zone, which needs the
             // instant).
-            if let reason = CalendarToolHelpers.unreadableWallTime(arguments, in: zone) {
+            if let reason = CalendarToolHelpers.unreadableWallTime(arguments, in: tz) {
                 return ToolJSON.string(from: [
                     "ok": false,
                     "error": "calendar_event_edit failed: \(reason) The event was NOT changed. Correct the time and call calendar_event_edit again.",
@@ -160,6 +166,9 @@ struct CalendarEventEditTool: AgentTool, Sendable {
                 "event_id": compoundId,
             ] as [String: Any])
         }
+        // The edit names the zone its times are in from here on (`stampingZone`): every check below
+        // that reads the arguments, the card, and the queued edit, which the drain reads in it.
+        arguments = CalendarToolHelpers.stampingZone(arguments, tz)
         // Resolve the recurring-edit scope up front — it drives both the
         // confirmation-card date math (which occurrence to show) and the
         // scope clause appended to `changes`. Resolved here, before the API
@@ -176,7 +185,6 @@ struct CalendarEventEditTool: AgentTool, Sendable {
                 ] as [String: Any]))
             }
         }
-        let tz = CalendarToolHelpers.resolveTimeZone(arguments)
 
         // Fetch current event details from API for confirmation card: the event, and when it names
         // an occurrence of a series, its series and that occurrence (`CalendarSeriesScope.read`), as
@@ -445,7 +453,7 @@ struct CalendarEventEditTool: AgentTool, Sendable {
                 isAllDay: shown.isAllDay,
                 changes: changes,
                 attendees: [],
-                timeZoneId: CalendarToolHelpers.stringArgOpt(arguments, "timezone"),
+                timeZoneId: tz.identifier,
                 notes: CalendarToolHelpers.stringArgOpt(arguments, "description")
             )],
             via: invocation.uiSink
@@ -464,12 +472,12 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         }
         // Queued with the id `route` gives: the series' for a new time of every occurrence named from
         // one of them, which the queue reads as a move of the series on its own date.
-        return try await queueCalendarEdit(accountId: resolvedAccountId, calendarId: calendarId, calendarName: calendarName, eventId: eventId, queuedEventId: queuedEventId, compoundId: compoundId, arguments: arguments, resolvedScope: resolvedScope, recurrenceId: recurrenceIdArg, cardState: cardState, eventTitle: proposedTitle, translator: ctx.translator)
+        return try await queueCalendarEdit(accountId: resolvedAccountId, calendarId: calendarId, calendarName: calendarName, eventId: eventId, queuedEventId: queuedEventId, compoundId: compoundId, arguments: arguments, resolvedScope: resolvedScope, recurrenceId: recurrenceIdArg, zone: tz, cardState: cardState, eventTitle: proposedTitle, translator: ctx.translator)
     }
 
     // MARK: - Calendar (Queued)
 
-    private func queueCalendarEdit(accountId: String, calendarId: String?, calendarName: String?, eventId: String, queuedEventId: String, compoundId: String, arguments: [String: JSONValue], resolvedScope: String, recurrenceId: String?, cardState: AgentToolRouter.ActionConfirmation.ResponseState, eventTitle: String, translator: any ChatIdTranslating) async throws -> String {
+    private func queueCalendarEdit(accountId: String, calendarId: String?, calendarName: String?, eventId: String, queuedEventId: String, compoundId: String, arguments: [String: JSONValue], resolvedScope: String, recurrenceId: String?, zone resolvedTz: TimeZone, cardState: AgentToolRouter.ActionConfirmation.ResponseState, eventTitle: String, translator: any ChatIdTranslating) async throws -> String {
         let manager = AccountManager.shared
         let op = try await manager.queueCalendarOperation(
             type: .edit,
@@ -483,7 +491,6 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         // proposedTitle from execute() (fetched event or fallback). Used both
         // for the result string and the new-series pill caching after a split.
         let title = CalendarToolHelpers.stringArgOpt(arguments, "title") ?? eventTitle
-        let resolvedTz = CalendarToolHelpers.resolveTimeZone(arguments)
         let touchesDateTime = CalendarToolHelpers.stringArgOpt(arguments, "start_iso") != nil
             || CalendarToolHelpers.stringArgOpt(arguments, "end_iso") != nil
         BackgroundSyncLogger.logDebug("[CalendarEventEditTool] Queued edit (op: \(op.id), event: \(eventId)) scope=\(resolvedScope)")
