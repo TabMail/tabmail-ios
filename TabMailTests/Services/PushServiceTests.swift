@@ -84,3 +84,43 @@ struct PushErrorTests {
         #expect(!reqFailed.localizedDescription.isEmpty)
     }
 }
+
+#if DEBUG
+/// The unit-test host never raises the notification permission alert: nothing
+/// answers it, and it keeps the host scene inactive for the rest of the run.
+@Suite("Push permission policy")
+struct PushPermissionPolicyTests {
+    @Test("injected XCTest environments skip the request; a plain launch requests")
+    func injectedEnvironmentDecision() {
+        #expect(PushPermissionPolicy.decision(environment: [:]) == .request)
+        #expect(PushPermissionPolicy.decision(environment: [
+            "XCTestConfigurationFilePath": "/tmp/test.xctestconfiguration"
+        ]) == .skippedUnitTestHost)
+        #expect(PushPermissionPolicy.decision(environment: [
+            "XCTestBundlePath": "/tmp/TabMailTests.xctest"
+        ]) == .skippedUnitTestHost)
+    }
+
+    @Test("the app-hosted unit-test host skips the notification request")
+    func unitTestHostSkipsRequest() {
+        let environment = ProcessInfo.processInfo.environment
+        let isXCTestHost = environment["XCTestConfigurationFilePath"] != nil
+            || environment["XCTestBundlePath"] != nil
+        #expect(isXCTestHost, "this invariant must run in the ordinary XCTest app host")
+        #expect(PushPermissionPolicy.hostDecision == .skippedUnitTestHost)
+    }
+
+    @Test("every path to the notification request goes through the policy guard")
+    func requestIsGuarded() throws {
+        let source = try String(contentsOfFile: #filePath.replacingOccurrences(
+            of: "TabMailTests/Services/PushServiceTests.swift",
+            with: "TabMail/Services/PushNotificationService.swift"), encoding: .utf8)
+        let body = try #require(source.range(of: "func requestPermissionAndRegister() async {"))
+        let request = try #require(source.range(of: "requestAuthorization(options:"))
+        let guardLine = try #require(source.range(of: "guard PushPermissionPolicy.hostDecision == .request else"))
+        #expect(body.upperBound < guardLine.lowerBound && guardLine.upperBound < request.lowerBound)
+        #expect(source.components(separatedBy: "requestAuthorization(").count == 2,
+                "one notification request site, behind the guard")
+    }
+}
+#endif
