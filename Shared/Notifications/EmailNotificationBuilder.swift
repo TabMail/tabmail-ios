@@ -91,17 +91,9 @@ enum EmailNotificationBuilder {
     /// use the raw reminder content without a due prefix.
     static func formatDueLabel(dueDate: String?, dueTime: String?) -> String? {
         guard let dueDateStr = dueDate else { return nil }
-        let parts = dueDateStr.split(separator: "-")
-        guard parts.count == 3,
-              let year = Int(parts[0]),
-              let month = Int(parts[1]),
-              let day = Int(parts[2]) else { return nil }
-
-        var comps = DateComponents()
-        comps.year = year; comps.month = month; comps.day = day
-        let calendar = Calendar(identifier: .gregorian) // the due date is a Gregorian `yyyy-MM-dd`
+        let calendar = Calendar(identifier: .gregorian)
         let today = calendar.startOfDay(for: Date())
-        guard let dueDateObj = calendar.date(from: comps) else { return nil }
+        guard let dueDateObj = FixedDateFormat.gregorianDay(dueDateStr, timeZone: calendar.timeZone) else { return nil }
         let dueMidnight = calendar.startOfDay(for: dueDateObj)
         guard let tomorrow = calendar.date(byAdding: .day, value: 1, to: today) else { return nil }
 

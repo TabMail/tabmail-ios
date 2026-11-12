@@ -97,16 +97,15 @@ enum ICSBuilder {
     /// Build a simple HTML body for the invitation email (fallback for clients
     /// that don't render ICS inline).
     static func buildInvitationBody(_ spec: EventSpec) -> String {
-        let dateFormatter = DateFormatter()
-        dateFormatter.dateStyle = .full
-        dateFormatter.timeStyle = spec.isAllDay ? .none : .short
+        // Sent to the other attendees: the phone's language and 12/24-hour setting, Gregorian years.
+        let dateFormatter = FixedDateFormat.localized(
+            dateStyle: .full, timeStyle: spec.isAllDay ? .none : .short, timeZone: .current)
 
         var html = "<div style=\"font-family: -apple-system, sans-serif; font-size: 14px;\">"
         html += "<h3>\(escapeHTML(spec.title))</h3>"
         html += "<p><strong>When:</strong> \(escapeHTML(dateFormatter.string(from: spec.startDate)))"
         if !spec.isAllDay {
-            let endFmt = DateFormatter()
-            endFmt.timeStyle = .short
+            let endFmt = FixedDateFormat.localized(dateStyle: .none, timeStyle: .short, timeZone: .current)
             html += " – \(escapeHTML(endFmt.string(from: spec.endDate)))"
         }
         html += "</p>"
@@ -322,9 +321,8 @@ enum ICSBuilder {
     /// Renders a clean table layout matching TB's calendar invite style,
     /// with dark mode support matching our WebView theme.
     static func buildIncomingInviteBody(_ invite: ParsedInvite) -> String {
-        let dateFormatter = DateFormatter()
-        dateFormatter.dateStyle = .full
-        dateFormatter.timeStyle = invite.isAllDay ? .none : .short
+        let dateFormatter = FixedDateFormat.localized(
+            dateStyle: .full, timeStyle: invite.isAllDay ? .none : .short, timeZone: .current)
 
         // Header: "X has invited you to Y" / "X has cancelled Y"
         let orgName = invite.organizer.map { $0.name.isEmpty ? $0.email : $0.name } ?? "Someone"
@@ -357,8 +355,7 @@ enum ICSBuilder {
         if let start = invite.startDate {
             var when = escapeHTML(dateFormatter.string(from: start))
             if !invite.isAllDay, let end = invite.endDate {
-                let endFmt = DateFormatter()
-                endFmt.timeStyle = .short
+                let endFmt = FixedDateFormat.localized(dateStyle: .none, timeStyle: .short, timeZone: .current)
                 when += " – \(escapeHTML(endFmt.string(from: end)))"
             }
             html += "<tr><td class=\"tm-ics-label\">When:</td>"

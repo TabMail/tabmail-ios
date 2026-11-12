@@ -61,7 +61,7 @@ struct EKEventStoreHelperTests {
     @Test("prettyDate returns non-empty string")
     func prettyDateNonEmpty() {
         let date = Date()
-        let pretty = EKEventStoreHelper.prettyDate(date)
+        let pretty = EKEventStoreHelper.prettyDate(date, timeZone: .current)
         #expect(!pretty.isEmpty)
     }
 
@@ -71,8 +71,22 @@ struct EKEventStoreHelperTests {
         let components = DateComponents(year: 2024, month: 3, day: 15)
         let calendar = Calendar.current
         let date = calendar.date(from: components)!
-        let pretty = EKEventStoreHelper.prettyDate(date)
+        let pretty = EKEventStoreHelper.prettyDate(date, timeZone: .current)
         #expect(pretty.contains("Friday") || pretty.contains("friday"))
+    }
+
+    @Test("prettyDate is the English Gregorian header the assistant reads the year from")
+    func prettyDateIsGregorianEnglish() throws {
+        let zone = try #require(TimeZone(identifier: "Asia/Bangkok"))
+        var gregorian = Calendar(identifier: .gregorian)
+        gregorian.timeZone = zone
+        let date = Date().addingTimeInterval(7 * 86_400)
+        let p = gregorian.dateComponents([.year, .month, .day, .weekday], from: date)
+        let weekdays = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+        let months = ["January", "February", "March", "April", "May", "June", "July",
+                      "August", "September", "October", "November", "December"]
+        let expected = "\(weekdays[p.weekday! - 1]), \(months[p.month! - 1]) \(p.day!), \(p.year!)"
+        #expect(EKEventStoreHelper.prettyDate(date, timeZone: zone) == expected)
     }
 
     @Test("dayKey same for dates on same day")

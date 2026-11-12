@@ -16,11 +16,22 @@ displayed, never what is stored or sent.
 2. **No code anywhere else sets `dateFormat`**, in any target: not on a fresh `DateFormatter`, and not
    on one the builder returned (a site that needs a second pattern asks the builder for a second
    formatter). Parse paths count as much as format paths.
-3. **Display formatting that should follow the phone** (`dateStyle`, `timeStyle`,
-   `setLocalizedDateFormatFromTemplate`) sets no `dateFormat` and does not go through the builder.
-4. `ISO8601DateFormatter` is Gregorian already and is not affected.
-5. A `YYYY-MM-DD` value read by hand into `DateComponents` is turned into a `Date` with
-   `Calendar(identifier: .gregorian)`, never `Calendar.current` (the reminder due-date readers).
+3. **Human-readable dates that leave the device or reach the assistant** (an invite's "When:", a
+   reply or forward attribution line, an attached message's "Date:", the calendar tool's day header)
+   are in the Gregorian calendar too. Where the text should keep the phone's language and 12/24-hour
+   setting it comes from `FixedDateFormat.localized(dateStyle:timeStyle:timeZone:)` (the phone's locale,
+   a Gregorian calendar, the styles); where it must match the Thunderbird add-on's English text it is a
+   fixed pattern from `FixedDateFormat.formatter`. No `setLocalizedDateFormatFromTemplate` or
+   `dateFormat(fromTemplate:)` anywhere: a template is a format too.
+4. **On-device display that follows the phone** builds a `DateFormatter` with `dateStyle`/`timeStyle`
+   only, or a date `FormatStyle`, at a site listed by name in the fence's display allow-list. A new site
+   either uses `FixedDateFormat` or is added to the list with what it shows. SwiftUI
+   `Text(date, style:)` is display and not listed.
+5. `ISO8601DateFormatter` is Gregorian already and is not affected.
+6. A stored `yyyy-MM-dd` day (a reminder's due date) is read with `FixedDateFormat.gregorianDay(_:timeZone:)`,
+   and the day arithmetic around it uses `Calendar(identifier: .gregorian)`, never `Calendar.current`.
+   The one phone-calendar use on those paths splits a notification's fire instant into the components
+   a `UNCalendarNotificationTrigger` matches in the phone's calendar.
 
 ## Why
 
@@ -38,15 +49,24 @@ builder sets both.
 
 ## How it is enforced
 
-- `TabMailTests/Services/FixedDateFormatFenceTests.swift` reads every target folder's Swift source at
-  run time (everything at the repository top level except the test target) and fails on a `dateFormat`
-  assignment outside `Shared/FixedDateFormat.swift`, with comments and string literals ignored. It was
-  red on the pre-fix source (97 sites).
+- `TabMailTests/Services/FixedDateFormatFenceTests.swift` reads the Swift source of every app and
+  extension target listed in `project.yml` (test targets skipped) at run time, with comments and string
+  contents ignored and interpolations kept as code, and fails on, outside `Shared/FixedDateFormat.swift`:
+  a `dateFormat` set by `=`, `+=` (also split across lines), `override var`, key-value coding or a key
+  path; a localized template; a `DateFormatter` built or subclassed, or a date `FormatStyle`
+  (`.formatted(date:time:)`, `.dateTime`, `Date.FormatStyle`, `VerbatimFormatStyle`), except at the
+  named display-only sites (file and exact count). On the four reminder due-date files it also fails on
+  `Calendar.current` and its kin beyond the named trigger use, on a `DateComponents` year set by hand, and
+  when the file no longer calls `FixedDateFormat.gregorianDay`. A self-test pins each pattern, including
+  the comment, string, raw multi-line string and interpolation cases. It was red on the pre-fix source
+  (96 `dateFormat` sites, the boundary `FormatStyle` and formatter sites, every due-date file).
 - `TabMailTests/Services/FixedDateFormatTests.swift` presets a formatter to a non-Gregorian phone
   default (Buddhist with `th_TH`/`en_TH`, Japanese, Umm al-Qura with `en_SA`/`ar_SA`) and shows
   `FixedDateFormat.pin` still yields Gregorian, `en_US_POSIX` and the given zone, with exact round
-  trips; it also formats a date built in a Buddhist calendar and checks the Gregorian year. The
-  simulator's own locale and calendar are never switched.
+  trips; it also formats a date built in a Buddhist calendar and checks the Gregorian year. It checks
+  `localized` (Gregorian calendar, the locale's language, the locale's 12- or 24-hour clock) and
+  `gregorianDay` (the Gregorian day, the Buddhist year 543 on, malformed values nil). The simulator's
+  own locale and calendar are never switched.
 
 ## Not covered (reviewed, left as is)
 

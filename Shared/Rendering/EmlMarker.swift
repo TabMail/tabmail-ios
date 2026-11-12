@@ -198,10 +198,7 @@ enum EmlMarker {
     /// Long-form date used inside the envelope table (`"Oct 2, 2025 at 01:50"`).
     /// Distinct from the ISO-8601 string stored in `data-date` on the marker,
     /// which is machine-readable for `parseEmlSectionMetadata`.
-    static let dateFormatter: DateFormatter = {
-        let fmt = DateFormatter()
-        fmt.dateStyle = .medium
-        fmt.timeStyle = .short
-        return fmt
-    }()
+    /// Stored in search text and read by the assistant, so Gregorian whatever the phone's calendar.
+    static let dateFormatter: DateFormatter = FixedDateFormat.localized(
+        dateStyle: .medium, timeStyle: .short, timeZone: .current)
 }

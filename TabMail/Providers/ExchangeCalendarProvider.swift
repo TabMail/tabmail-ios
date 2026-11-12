@@ -1802,14 +1802,10 @@ actor ExchangeCalendarProvider: CalendarProvider {
               let label = time["timeZone"] as? String, let given = CalendarTimeZoneResolver.zone(named: label, in: .none),
               let wall = time["dateTime"] as? String
         else { return time }
-        let fmt = DateFormatter()
-        fmt.locale = Locale(identifier: "en_US_POSIX")
-        fmt.calendar = Calendar(identifier: .gregorian)
-        fmt.timeZone = given
-        fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        guard let instant = fmt.date(from: String(wall.prefix(19))) else { return time }
-        fmt.timeZone = stored
-        return ["dateTime": fmt.string(from: instant), "timeZone": seriesZone]
+        let format = "yyyy-MM-dd'T'HH:mm:ss"
+        guard let instant = FixedDateFormat.formatter(format, timeZone: given).date(from: String(wall.prefix(19)))
+        else { return time }
+        return ["dateTime": FixedDateFormat.formatter(format, timeZone: stored).string(from: instant), "timeZone": seriesZone]
     }
 
     /// `attendeeTypes` (lowercased address → Graph type) keeps an existing

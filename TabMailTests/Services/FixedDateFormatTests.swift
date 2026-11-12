@@ -134,4 +134,65 @@ struct FixedDateFormatTests {
         #expect(text.hasPrefix(String(format: "%04d-", gregorianYear)))
         #expect(formatter.date(from: text) == buddhistDate)
     }
+
+    @Test("gregorianDay reads a stored yyyy-MM-dd as that Gregorian day in the zone", arguments: zones)
+    func gregorianDayIsTheGregorianDay(_ zoneID: String) throws {
+        let zone = try #require(TimeZone(identifier: zoneID))
+        let p = Self.gregorianParts(Self.sampleDate(), zone)
+        let stored = String(format: "%04d-%02d-%02d", p.year!, p.month!, p.day!)
+        let day = try #require(FixedDateFormat.gregorianDay(stored, timeZone: zone))
+
+        var gregorian = Calendar(identifier: .gregorian)
+        gregorian.timeZone = zone
+        #expect(day == gregorian.startOfDay(for: Self.sampleDate()))
+        #expect(Self.gregorianParts(day, zone).year == p.year)
+        // The same instant in the Buddhist calendar is 543 years on: the stored year
+        // was read as Gregorian, not as a Buddhist year.
+        var buddhist = Calendar(identifier: .buddhist)
+        buddhist.timeZone = zone
+        #expect(buddhist.component(.year, from: day) == p.year! + 543)
+    }
+
+    @Test("gregorianDay returns nil unless the value is three dash-separated integers",
+          arguments: ["", "2026-11", "a-b-c", "2026/11/20", "2026-11-20-1"])
+    func gregorianDayRejectsMalformed(_ value: String) {
+        #expect(FixedDateFormat.gregorianDay(value, timeZone: .gmt) == nil)
+    }
+
+    @Test("localized keeps the locale's language but counts years in the Gregorian calendar",
+          arguments: phoneDefaults, zones)
+    func localizedIsGregorian(_ phone: PhoneDefault, _ zoneID: String) throws {
+        let zone = try #require(TimeZone(identifier: zoneID))
+        let locale = Locale(identifier: phone.locale)
+        let formatter = FixedDateFormat.localized(dateStyle: .long, timeStyle: .short,
+                                                  timeZone: zone, locale: locale)
+        #expect(formatter.calendar.identifier == .gregorian)
+        #expect(formatter.calendar.timeZone == zone)
+        #expect(formatter.timeZone == zone)
+        #expect(formatter.locale.identifier == phone.locale)
+        #expect(formatter.dateFormat.isEmpty == false)
+
+        let date = Self.sampleDate()
+        let phoneStyle = Self.phoneFormatter(phone)
+        phoneStyle.timeZone = zone
+        phoneStyle.dateStyle = .long
+        phoneStyle.timeStyle = .short
+        #expect(formatter.string(from: date) != phoneStyle.string(from: date),
+                "\(phone): the localized form matches the phone's own calendar")
+        if locale.numberingSystem.identifier == "latn" {
+            let year = try #require(Self.gregorianParts(date, zone).year)
+            #expect(formatter.string(from: date).contains(String(year)))
+        }
+    }
+
+    @Test("localized honours the locale's 12- or 24-hour clock")
+    func localizedHonoursHourCycle() throws {
+        let date = Self.sampleDate()
+        let twelve = FixedDateFormat.localized(dateStyle: .none, timeStyle: .short, timeZone: .gmt,
+                                               locale: Locale(identifier: "en_US")).string(from: date)
+        let twentyFour = FixedDateFormat.localized(dateStyle: .none, timeStyle: .short, timeZone: .gmt,
+                                                   locale: Locale(identifier: "en_GB")).string(from: date)
+        #expect(twelve.contains("AM") || twelve.contains("PM"), "en_US short time: \(twelve)")
+        #expect(!twentyFour.contains("AM") && !twentyFour.contains("PM"), "en_GB short time: \(twentyFour)")
+    }
 }

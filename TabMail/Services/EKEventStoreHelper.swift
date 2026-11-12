@@ -180,20 +180,12 @@ enum EKEventStoreHelper {
         return fmt.string(from: date)
     }
 
-    /// Format a date as a pretty day header (e.g., "Monday, January 15, 2025").
-    static func prettyDate(_ date: Date) -> String {
-        let fmt = DateFormatter()
-        fmt.dateStyle = .full
-        fmt.timeZone = .current
-        return fmt.string(from: date)
-    }
-
-    /// Format a date as a pretty day header in the specified timezone.
+    /// The day header of the assistant's calendar listing in `timeZone`, e.g.
+    /// "Monday, January 15, 2025": the Thunderbird add-on's header on an English system.
+    /// Gregorian and English on every phone, because the assistant reads the year
+    /// from it and writes it back into `start_iso`.
     static func prettyDate(_ date: Date, timeZone: TimeZone) -> String {
-        let fmt = DateFormatter()
-        fmt.dateStyle = .full
-        fmt.timeZone = timeZone
-        return fmt.string(from: date)
+        FixedDateFormat.formatter("EEEE, MMMM d, yyyy", timeZone: timeZone).string(from: date)
     }
 
     /// Parse a naive ISO date string (no timezone) into a Date in the user's local timezone.

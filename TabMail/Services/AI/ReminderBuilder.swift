@@ -286,18 +286,9 @@ enum ReminderBuilder {
     /// Used for visual highlighting in reminder cards.
     static func isUrgent(_ reminder: Reminder) -> Bool {
         guard let dueDateStr = reminder.dueDate else { return false }
-        let parts = dueDateStr.split(separator: "-")
-        guard parts.count == 3,
-              let year = Int(parts[0]),
-              let month = Int(parts[1]),
-              let day = Int(parts[2]) else { return false }
-        var comps = DateComponents()
-        comps.year = year
-        comps.month = month
-        comps.day = day
-        let calendar = Calendar(identifier: .gregorian) // the due date is a Gregorian `yyyy-MM-dd`
+        let calendar = Calendar(identifier: .gregorian)
         let today = calendar.startOfDay(for: Date())
-        guard let dueDate = calendar.date(from: comps) else { return false }
+        guard let dueDate = FixedDateFormat.gregorianDay(dueDateStr, timeZone: calendar.timeZone) else { return false }
         let dueMidnight = calendar.startOfDay(for: dueDate)
         let tomorrow = calendar.date(byAdding: .day, value: 1, to: today)!
         return dueMidnight <= today || dueMidnight == tomorrow
@@ -323,7 +314,7 @@ enum ReminderBuilder {
         let allReminders = await buildReminderList()
         guard !allReminders.isEmpty else { return [] }
 
-        let calendar = Calendar(identifier: .gregorian) // due dates are Gregorian `yyyy-MM-dd`
+        let calendar = Calendar(identifier: .gregorian)
         let today = calendar.startOfDay(for: Date())
         let tomorrow = calendar.date(byAdding: .day, value: 1, to: today)!
 
@@ -331,23 +322,12 @@ enum ReminderBuilder {
         var otherReminders: [Reminder] = []
 
         for reminder in allReminders {
-            if let dueDateStr = reminder.dueDate {
-                let parts = dueDateStr.split(separator: "-")
-                if parts.count == 3,
-                   let year = Int(parts[0]),
-                   let month = Int(parts[1]),
-                   let day = Int(parts[2]) {
-                    var comps = DateComponents()
-                    comps.year = year
-                    comps.month = month
-                    comps.day = day
-                    if let dueDate = calendar.date(from: comps) {
-                        let dueMidnight = calendar.startOfDay(for: dueDate)
-                        if dueMidnight <= today || dueMidnight == tomorrow {
-                            dueReminders.append(reminder)
-                            continue
-                        }
-                    }
+            if let dueDateStr = reminder.dueDate,
+               let dueDate = FixedDateFormat.gregorianDay(dueDateStr, timeZone: calendar.timeZone) {
+                let dueMidnight = calendar.startOfDay(for: dueDate)
+                if dueMidnight <= today || dueMidnight == tomorrow {
+                    dueReminders.append(reminder)
+                    continue
                 }
             }
             otherReminders.append(reminder)
@@ -400,23 +380,14 @@ enum ReminderBuilder {
         guard !defaults.bool(forKey: didAutoDisableKey) else { return false }
         guard let firstLaunchDate = defaults.object(forKey: "firstLaunchDate") as? Date else { return false }
 
-        let calendar = Calendar(identifier: .gregorian) // due dates are Gregorian `yyyy-MM-dd`
+        let calendar = Calendar(identifier: .gregorian)
         let cutoff = calendar.startOfDay(for: firstLaunchDate)
         var hashesToDisable: [String] = []
 
         for reminder in reminders {
             guard reminder.enabled else { continue }
-            guard let dueDateStr = reminder.dueDate else { continue }
-            let parts = dueDateStr.split(separator: "-")
-            guard parts.count == 3,
-                  let year = Int(parts[0]),
-                  let month = Int(parts[1]),
-                  let day = Int(parts[2]) else { continue }
-            var comps = DateComponents()
-            comps.year = year
-            comps.month = month
-            comps.day = day
-            guard let dueDate = calendar.date(from: comps) else { continue }
+            guard let dueDateStr = reminder.dueDate,
+                  let dueDate = FixedDateFormat.gregorianDay(dueDateStr, timeZone: calendar.timeZone) else { continue }
             let dueMidnight = calendar.startOfDay(for: dueDate)
 
             if dueMidnight < cutoff {

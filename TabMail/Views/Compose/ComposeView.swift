@@ -2640,7 +2640,7 @@ struct ComposeView: View {
             if let quote, !ExternalDraftAdoption.isAdoptedKey(draftId) {
                 let reply = quote.header
                 let resolvedForward = replyTo != nil ? isForward : draft.isForward
-                let dateStr = reply.date.formatted(date: .abbreviated, time: .shortened)
+                let dateStr = FixedDateFormat.localized(dateStyle: .medium, timeStyle: .short, timeZone: .current).string(from: reply.date)
                 if resolvedForward {
                     quotedAttribution = "---------- Forwarded message ----------\nFrom: \(reply.from)\nDate: \(dateStr)\nSubject: \(reply.subject)"
                 } else {
@@ -3122,7 +3122,7 @@ struct ComposeView: View {
             currentSignature = resolvedAccount?.signature ?? ""
 
             // Quote shown separately below TextEditor
-            let dateStr = reply.date.formatted(date: .abbreviated, time: .shortened)
+            let dateStr = FixedDateFormat.localized(dateStyle: .medium, timeStyle: .short, timeZone: .current).string(from: reply.date)
             if isForward {
                 quotedAttribution = "---------- Forwarded message ----------\nFrom: \(reply.from)\nDate: \(dateStr)\nSubject: \(reply.subject)"
             } else {
