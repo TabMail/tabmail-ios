@@ -110,17 +110,25 @@ struct PushPermissionPolicyTests {
         #expect(PushPermissionPolicy.hostDecision == .skippedUnitTestHost)
     }
 
-    @Test("every path to the notification request goes through the policy guard")
+    @Test("the app's only notification request sits behind the policy guard")
     func requestIsGuarded() throws {
-        let source = try String(contentsOfFile: #filePath.replacingOccurrences(
-            of: "TabMailTests/Services/PushServiceTests.swift",
-            with: "TabMail/Services/PushNotificationService.swift"), encoding: .utf8)
-        let body = try #require(source.range(of: "func requestPermissionAndRegister() async {"))
-        let request = try #require(source.range(of: "requestAuthorization(options:"))
-        let guardLine = try #require(source.range(of: "guard PushPermissionPolicy.hostDecision == .request else"))
+        let appRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("TabMail")
+        let enumerator = try #require(FileManager.default.enumerator(at: appRoot, includingPropertiesForKeys: nil))
+        var sites: [String] = []
+        var serviceSource = ""
+        for case let url as URL in enumerator where url.pathExtension == "swift" {
+            let source = try String(contentsOf: url, encoding: .utf8)
+            let count = source.components(separatedBy: "requestAuthorization(").count - 1
+            sites += Array(repeating: url.lastPathComponent, count: count)
+            if url.lastPathComponent == "PushNotificationService.swift" { serviceSource = source }
+        }
+        #expect(sites == ["PushNotificationService.swift"], "exactly one notification request in TabMail/, found: \(sites)")
+        let body = try #require(serviceSource.range(of: "func requestPermissionAndRegister() async {"))
+        let guardLine = try #require(serviceSource.range(of: "guard PushPermissionPolicy.hostDecision == .request else"))
+        let request = try #require(serviceSource.range(of: "requestAuthorization("))
         #expect(body.upperBound < guardLine.lowerBound && guardLine.upperBound < request.lowerBound)
-        #expect(source.components(separatedBy: "requestAuthorization(").count == 2,
-                "one notification request site, behind the guard")
     }
 }
 #endif

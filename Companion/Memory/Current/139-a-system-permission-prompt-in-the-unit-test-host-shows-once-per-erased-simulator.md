@@ -28,6 +28,14 @@ process, installed from `ProcessGlobalTestState.withLock`. If a test starts reac
 (Calendar `requestFullAccessToEvents`, microphone `requestRecordPermission`), add it there. A
 stand-in scoped to one test cannot work: the request is queued work that outlives the test.
 
+**Amendment 2026-11-12 (#786).** Notification requests are no longer answered by
+`TestPermissionPrompts`: the app skips the request in the DEBUG unit-test host
+(`PushPermissionPolicy` in `PushNotificationService`). The swizzle could not cover the request the
+host makes before the first process-global test installs it, and a pool simulator with reset grants
+then showed the alert on every run. `TestPermissionPrompts` now answers Contacts only. A new system
+permission request reached from app code belongs behind a test-host policy like that one; a request
+only a test mounts can still go in `TestPermissionPrompts`.
+
 ## How to diagnose the next one
 
 A failure that appears only in the first run after `simctl erase` and never again is a one-time
