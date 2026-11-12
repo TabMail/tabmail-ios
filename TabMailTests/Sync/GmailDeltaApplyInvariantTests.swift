@@ -702,6 +702,12 @@ struct GmailDeltaApplyInvariantTests {
     func newRowsQueuedForBodies() async throws {
         try await Self.withWorld(seeds: []) { w in
             w.server.addMessage(Self.seed("p16-new", labels: ["INBOX"]))
+            // A phase left by an earlier test would satisfy the check below without this pass.
+            let phaseBefore = await MainActor.run { () -> SyncPhase? in
+                AccountManagerState.shared.clearSyncPhases()
+                return AccountManagerState.shared.syncPhase
+            }
+            #expect(phaseBefore == nil, "no phase is shown before the pass")
             try await w.completedDelta()
             let row = try #require(try w.row("p16-new", in: w.inbox))
             #expect(await ActiveBodyQueue.shared.isQueuedOrInFlight(headerId: row.id), "the new row waits for its body")
