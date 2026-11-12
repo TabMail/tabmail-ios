@@ -275,6 +275,15 @@ actor PushNotificationService {
     /// Silent push (content-available: 1) works without user permission,
     /// but we request alert+sound+badge for future visible notifications.
     func requestPermissionAndRegister() async {
+        #if DEBUG
+        // The unit-test host must not raise the system notification alert:
+        // nothing answers it, and it keeps the host scene inactive for the
+        // rest of the process. Release keeps the plain request.
+        guard PushPermissionPolicy.hostDecision == .request else {
+            BackgroundSyncLogger.logDebug("[Push] Notification authorization SKIPPED (unit-test host)")
+            return
+        }
+        #endif
         do {
             let granted = try await UNUserNotificationCenter.current().requestAuthorization(options: [.badge, .alert, .sound])
             BackgroundSyncLogger.logDebug("[Push] Notification authorization: \(granted ? "granted" : "denied")")
@@ -1817,3 +1826,27 @@ struct SystemNotificationSettingsProvider: NotificationSettingsProviding {
         )
     }
 }
+
+#if DEBUG
+/// DEBUG-only policy for the notification permission request. An app-hosted
+/// XCTest launch never requests it: nothing answers the system alert, and it
+/// keeps the host scene inactive, where SwiftUI does not start a newly shown
+/// view's `.task`. Release keeps the plain request without XCTest
+/// environment access.
+enum PushPermissionPolicy {
+    enum Decision: Equatable, Sendable {
+        case skippedUnitTestHost
+        case request
+    }
+
+    static func decision(environment: [String: String]) -> Decision {
+        if environment["XCTestConfigurationFilePath"] != nil
+            || environment["XCTestBundlePath"] != nil {
+            return .skippedUnitTestHost
+        }
+        return .request
+    }
+
+    static let hostDecision = decision(environment: ProcessInfo.processInfo.environment)
+}
+#endif

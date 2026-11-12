@@ -448,7 +448,11 @@ fix gates at shared chokepoints, not per-tool patches:
   when view tests mount it, and either system alert left the scene
   inactive, where the next splash's setup task never started. (The Contacts
   prompt only showed in the first full-suite run on a freshly erased
-  simulator; the simulator then records it as denied.) Found while making that
+  simulator; the simulator then records it as denied.) *(Amended 2026-11-12, #786: the
+  notification half is replaced. The app skips the notification request in
+  the DEBUG unit-test host, `PushPermissionPolicy`, because the swizzle missed
+  requests made before the first process-global test installed it;
+  `TestPermissionPrompts` now answers Contacts only.)* Found while making that
   fixture reliable: RootView's splash setup task was keyed by
   `demoStore.isActive`. A demo that ends and starts again while the
   splash is still animating out (RootView animates `isActive` with a

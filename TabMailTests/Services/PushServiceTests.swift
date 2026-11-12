@@ -84,3 +84,51 @@ struct PushErrorTests {
         #expect(!reqFailed.localizedDescription.isEmpty)
     }
 }
+
+#if DEBUG
+/// The unit-test host never raises the notification permission alert: nothing
+/// answers it, and it keeps the host scene inactive for the rest of the run.
+@Suite("Push permission policy")
+struct PushPermissionPolicyTests {
+    @Test("injected XCTest environments skip the request; a plain launch requests")
+    func injectedEnvironmentDecision() {
+        #expect(PushPermissionPolicy.decision(environment: [:]) == .request)
+        #expect(PushPermissionPolicy.decision(environment: [
+            "XCTestConfigurationFilePath": "/tmp/test.xctestconfiguration"
+        ]) == .skippedUnitTestHost)
+        #expect(PushPermissionPolicy.decision(environment: [
+            "XCTestBundlePath": "/tmp/TabMailTests.xctest"
+        ]) == .skippedUnitTestHost)
+    }
+
+    @Test("the app-hosted unit-test host skips the notification request")
+    func unitTestHostSkipsRequest() {
+        let environment = ProcessInfo.processInfo.environment
+        let isXCTestHost = environment["XCTestConfigurationFilePath"] != nil
+            || environment["XCTestBundlePath"] != nil
+        #expect(isXCTestHost, "this invariant must run in the ordinary XCTest app host")
+        #expect(PushPermissionPolicy.hostDecision == .skippedUnitTestHost)
+    }
+
+    @Test("the app's only notification request sits behind the policy guard")
+    func requestIsGuarded() throws {
+        let appRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("TabMail")
+        let enumerator = try #require(FileManager.default.enumerator(at: appRoot, includingPropertiesForKeys: nil))
+        var sites: [String] = []
+        var serviceSource = ""
+        for case let url as URL in enumerator where url.pathExtension == "swift" {
+            let source = try String(contentsOf: url, encoding: .utf8)
+            let count = source.components(separatedBy: "requestAuthorization(").count - 1
+            sites += Array(repeating: url.lastPathComponent, count: count)
+            if url.lastPathComponent == "PushNotificationService.swift" { serviceSource = source }
+        }
+        #expect(sites == ["PushNotificationService.swift"], "exactly one notification request in TabMail/, found: \(sites)")
+        let body = try #require(serviceSource.range(of: "func requestPermissionAndRegister() async {"))
+        let guardLine = try #require(serviceSource.range(of: "guard PushPermissionPolicy.hostDecision == .request else"))
+        let request = try #require(serviceSource.range(of: "requestAuthorization("))
+        #expect(body.upperBound < guardLine.lowerBound && guardLine.upperBound < request.lowerBound)
+    }
+}
+#endif
