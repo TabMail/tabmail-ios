@@ -37,10 +37,16 @@ extension SyncEngine {
     enum BackfillBatchOutcome: Sendable {
         /// The batch was admitted. `inserted == 0` is ordinary dedup, NOT a
         /// refusal — that distinction is the whole point of the other case.
+        /// `allLanded` is false when a chunk's write transaction threw: that
+        /// chunk rolled back as a whole, so some of the batch has no row, and
+        /// the caller must not move its bookkeeping past them (the UID walk
+        /// fails the range, self-heal leaves its pass open). The same report
+        /// the premise-less overload gives as `failed`.
         case landed(
             inserted: Int,
             ftsRecords: [FTSHeaderRecord],
-            ccBccFtsUpdates: [(contentKey: ContentKey, cc: String, bcc: String)]
+            ccBccFtsUpdates: [(contentKey: ContentKey, cc: String, bcc: String)],
+            allLanded: Bool
         )
         /// At least one chunk's in-transaction CAS refused: the folder no longer
         /// holds the `lastKnownUidValidity` the caller premised. NOTHING was
@@ -119,7 +125,8 @@ extension SyncEngine {
         return .landed(
             inserted: result.inserted,
             ftsRecords: result.ftsRecords,
-            ccBccFtsUpdates: result.ccBccFtsUpdates
+            ccBccFtsUpdates: result.ccBccFtsUpdates,
+            allLanded: !result.failed
         )
     }
 

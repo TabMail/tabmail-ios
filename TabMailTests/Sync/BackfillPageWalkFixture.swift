@@ -7,7 +7,9 @@ import GRDB
 @testable import TabMail
 
 /// Shared setup and observations for the Gmail/Exchange backfill page-walk
-/// suites (`BackfillPageWalkTokenTests`, `BackfillPageWalkFailureTests`).
+/// suites (`BackfillPageWalkTokenTests`, `BackfillPageWalkFailureTests`), and
+/// the checkpoint chaining and position oracle of the IMAP UID walk's suites
+/// (`BackfillUIDWalkRaceTests`, `BackfillInsertFailureTests`).
 enum BackfillPageWalkFixture {
     /// Safety stop for a regressed walk; a correct one needs well under a second per folder.
     static let safetySeconds: TimeInterval = 20
@@ -93,6 +95,56 @@ enum BackfillPageWalkFixture {
             guard call.method == "GET", let url = URL(string: call.url) else { return nil }
             return url.path.hasSuffix("/messages") && call.url.contains("labelIds=\(label)") ? url : nil
         }
+    }
+
+    // MARK: - Interleaving a walk (`SyncEngine.BackfillWalkCheckpointForTesting`)
+
+    /// Run `body` at the `number`th time any walker reaches `checkpoint`; the
+    /// earlier arrivals run through. One-shot, like every walk checkpoint: a
+    /// second walker reaching the checkpoint while `body` runs goes straight
+    /// through.
+    static func atCheckpoint(
+        _ number: Int, _ checkpoint: SyncEngine.BackfillWalkCheckpointForTesting,
+        _ body: @escaping @Sendable () async -> Void
+    ) {
+        SyncEngine.backfillWalkCheckpointHooksForTesting.withLock {
+            $0[checkpoint] = {
+                if number <= 1 {
+                    await body()
+                } else {
+                    BackfillPageWalkFixture.atCheckpoint(number - 1, checkpoint, body)
+                }
+            }
+        }
+    }
+
+    static func clearWalkCheckpoints() {
+        SyncEngine.backfillWalkCheckpointHooksForTesting.withLock { $0.removeAll() }
+    }
+
+    // MARK: - Invariant on the IMAP walk's saved position
+
+    /// The IMAP UID walk's position claims everything above it was loaded: a
+    /// complete folder holds every UID the server lists, and a cursor at C
+    /// holds every listed UID above C (the walk runs from UIDNEXT down to 1 and
+    /// never looks above its cursor again). An incomplete folder with no cursor
+    /// claims nothing. Returns what is wrong, or nil. `local` and `server` are
+    /// UIDs.
+    static func uidPositionClaimsMissingMail(_ folder: Folder, local: Set<Int>, server: [Int]) -> String? {
+        let claimed: [Int]
+        let position: String
+        if folder.backfillComplete {
+            claimed = server
+            position = "complete"
+        } else if let cursor = folder.backfillUidCursor {
+            claimed = server.filter { $0 > cursor }
+            position = "cursor \(cursor)"
+        } else {
+            return nil
+        }
+        let missing = claimed.filter { !local.contains($0) }.sorted()
+        guard !missing.isEmpty else { return nil }
+        return "the walk stands at \(position) but UIDs \(missing) above that point are not loaded"
     }
 
     /// Graph listing requests for `folderId`'s messages, failed and refused ones included.
