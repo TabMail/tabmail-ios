@@ -165,6 +165,83 @@ struct OutboxStrandedClaimTests {
         await AccountManager.shared.unregisterProviderForTesting(accountId: accountId)
     }
 
+    /// #531 — **a send the user already made survives an app update, goes out
+    /// once, and its draft is not pushed back to Drafts.** The release boundary
+    /// re-queues saves only for unsent drafts that no `outboxMessage` owns; this
+    /// pins the other half: the outbox-owned draft's send is still accounted
+    /// for, and no `.saveDraft` (a stray Drafts copy) is admitted for it.
+    @Test("A pending outbox send survives the app-update boundary, goes out once, and leaves no Drafts copy")
+    @MainActor
+    func pendingOutboxSendSurvivesTheReleaseBoundary() async throws {
+        let suffix = UUID().uuidString.lowercased()
+        let accountId = "acc-boundary-send-\(suffix)"
+        let outboxId = "outbox-boundary-send-\(suffix)"
+        let draftId = "draft-boundary-send-\(suffix)"
+        let (pool, directory, previous) = try makeTestDB(accountId: accountId)
+        defer { restore(pool: pool, directory: directory, previous: previous) }
+
+        let now = Date().timeIntervalSince1970
+        try await pool.write { db in
+            var draft = Draft(
+                id: draftId, accountId: accountId, toJSON: "[\"recipient@example.com\"]",
+                ccJSON: "[]", bccJSON: "[]", subject: "Sent before the update", body: "Body",
+                replyToId: nil, isForward: false, editHistoryJSON: nil,
+                createdAt: now, updatedAt: now, serverDraftId: nil, serverPushStatus: nil,
+                rfc822MessageId: nil, attachmentsDirName: nil)
+            draft.instanceEpoch = "E1"
+            try draft.insert(db)
+            // The previous release's queue still held this draft's save.
+            var save = PendingOperation.draftSave(
+                draftId: draftId, accountId: accountId, folderPath: "Drafts", instanceEpoch: "E1")
+            try save.insert(db)
+        }
+        var message = OutboxMessage(
+            accountId: accountId,
+            draft: DraftMessage(to: ["recipient@example.com"], subject: "Sent before the update", body: "Body"))
+        message.id = outboxId
+        message.draftId = draftId
+        message.instanceEpoch = "E1"
+        message.holdUntil = Date().addingTimeInterval(-3600)
+        let storedMessage = message
+        try await pool.write { try storedMessage.insert($0) }
+
+        let ledger = IntentionLedger()
+        ledger.record(label: "send queued before update", durableIdentity: outboxId) { db in
+            try OutboxMessage.fetchOne(db, key: outboxId) == nil
+        }
+
+        // THE APP UPDATE.
+        try await pool.write { db in
+            try db.execute(sql: """
+                INSERT INTO appReleaseStamp (id, release) VALUES (1, '0.0.1 (1)')
+                ON CONFLICT(id) DO UPDATE SET release = excluded.release
+                """)
+        }
+        let crossed = try AppDatabase.retirePreviousReleaseActionQueue(
+            on: pool, currentRelease: AppDatabase.currentAppRelease)
+        #expect(crossed)
+        let opsAfterBoundary = try await pool.read { try PendingOperation.fetchAll($0) }
+        #expect(opsAfterBoundary.isEmpty, """
+            the boundary re-queued work for a draft the Outbox owns: \
+            \(opsAfterBoundary.map(\.type))
+            """)
+        #expect(try row(pool, id: outboxId) != nil, "the boundary destroyed the queued send")
+
+        let provider = MockEmailProvider()
+        await AccountManager.shared.registerProviderForTesting(accountId: accountId, provider: provider)
+        await AccountManager.shared.drainPendingQueue()
+        await AccountManager.shared.drainOutbox()
+
+        #expect(await provider.sentDrafts.count == 1, "the send must go out exactly once")
+        let draftSaves = await provider.callLog.filter { $0.hasPrefix("saveDraft") }
+        #expect(draftSaves.isEmpty, "a stray Drafts copy was pushed for a sent draft: \(draftSaves)")
+        let outcomes = await ledger.settle(pool: pool, reportedIds: [])
+        #expect(outcomes.count == 1)
+        guard outcomes.count == 1 else { return }
+        #expect(outcomes[0].outcome == .executed)
+        await AccountManager.shared.unregisterProviderForTesting(accountId: accountId)
+    }
+
     /// D-3 — Outbox Reliability Rule 2: "Never `try?` on outbox state
     /// transitions ... Silent swallowing = message loss or double-send."
     ///

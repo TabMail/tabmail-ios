@@ -272,11 +272,12 @@ struct AppReleaseBoundaryTests {
     // MARK: - #531 — which drafts the boundary re-queues
 
     private func seedDraft(
-        _ fixture: Fixture, id: String, status: String?, epoch: String? = "E1"
+        _ fixture: Fixture, id: String, status: String?, epoch: String? = "E1",
+        accountId: String = AppReleaseBoundaryTests.accountId
     ) throws {
         let now = Date().timeIntervalSince1970
         var draft = Draft(
-            id: id, accountId: Self.accountId,
+            id: id, accountId: accountId,
             toJSON: "[\"recipient@example.com\"]", ccJSON: "[]", bccJSON: "[]",
             subject: id, body: "body", replyToId: nil, isForward: false,
             editHistoryJSON: nil, createdAt: now, updatedAt: now,
@@ -301,6 +302,29 @@ struct AppReleaseBoundaryTests {
         try seedDraft(f, id: "edited-after-push", status: "dirty")
         try seedDraft(f, id: "already-pushed", status: "pushed")
         try seedDraft(f, id: "being-sent", status: nil)
+        try seedDraft(f, id: "push-interrupted", status: "pushing")
+        try seedDraft(f, id: "no-generation", status: nil, epoch: "")
+        // A second account whose Drafts folder is not named "Drafts".
+        let gmailAccountId = "release-boundary-gmail"
+        let gmailDraftsPath = "[Gmail]/Drafts"
+        try f.pool.writeWithoutTransaction { db in
+            var account = Account(
+                emailAddress: "gmail-boundary@example.com", displayName: "Gmail", provider: .gmail)
+            account.id = gmailAccountId
+            try account.insert(db)
+            try Folder(name: "Drafts", path: gmailDraftsPath, role: .drafts, accountId: gmailAccountId)
+                .insert(db)
+        }
+        try seedDraft(f, id: "gmail-unsent", status: nil, accountId: gmailAccountId)
+        // An orphan whose account is gone. The schema cascades a deleted
+        // account's drafts, so the orphan is written with foreign keys off.
+        try f.pool.writeWithoutTransaction { db in
+            try db.execute(sql: "PRAGMA foreign_keys = OFF")
+        }
+        try seedDraft(f, id: "orphan", status: nil, accountId: "release-boundary-gone")
+        try f.pool.writeWithoutTransaction { db in
+            try db.execute(sql: "PRAGMA foreign_keys = ON")
+        }
         var outbox = OutboxMessage(
             accountId: Self.accountId,
             draft: DraftMessage(to: ["recipient@example.com"], subject: "s", body: "b"))
@@ -317,11 +341,14 @@ struct AppReleaseBoundaryTests {
         let survivors = try allOperations(f)
         #expect(survivors.allSatisfy { $0.type == .saveDraft },
                 "a non-draft action survived the boundary: \(survivors.map(\.type))")
-        #expect(Set(survivors.compactMap(\.draftId)) == ["never-pushed", "edited-after-push"])
-        #expect(survivors.count == 2)
-        guard survivors.count == 2 else { return }
+        #expect(Set(survivors.compactMap(\.draftId))
+                == ["never-pushed", "edited-after-push", "push-interrupted", "gmail-unsent"])
+        #expect(survivors.count == 4)
+        guard survivors.count == 4 else { return }
         for op in survivors {
-            #expect(op.folderPath == "Drafts")
+            let expectedPath = op.draftId == "gmail-unsent" ? gmailDraftsPath : "Drafts"
+            #expect(op.folderPath == expectedPath, "\(op.draftId ?? "") queued to \(op.folderPath)")
+            #expect(op.accountId == (op.draftId == "gmail-unsent" ? gmailAccountId : Self.accountId))
             #expect(op.instanceEpoch == "E1")
         }
     }
