@@ -18,12 +18,14 @@ import Testing
 ///   (`=` or `+=`, also across lines), an `override var dateFormat`, a key-value or
 ///   key-path write of `dateFormat`, or a localized template
 ///   (`setLocalizedDateFormatFromTemplate`, `dateFormat(fromTemplate:…)`);
-/// - a `DateFormatter` built (or subclassed) outside `FixedDateFormat`, except at
-///   the named display-only sites below, which set only `dateStyle`/`timeStyle`
-///   and follow the phone;
-/// - a date `FormatStyle` (`.formatted(date:time:)`, `.dateTime`, `Date.FormatStyle`,
-///   `VerbatimFormatStyle`), which takes the phone's calendar unless one is pinned,
-///   except at the named display-only sites below;
+/// - a `DateFormatter` built (also `= .init()`), subclassed or used through
+///   `DateFormatter.localizedString`, or a `DateIntervalFormatter`, outside
+///   `FixedDateFormat`, except at the named display-only sites below, which set
+///   only `dateStyle`/`timeStyle` and follow the phone;
+/// - a date `FormatStyle` (`.formatted(date:time:)`, `.dateTime`, `.interval`,
+///   `Date.FormatStyle`, `IntervalFormatStyle`, `VerbatimFormatStyle`), which takes
+///   the phone's calendar unless one is pinned, except at the named display-only
+///   sites below;
 /// - on the stored reminder due-date paths, the phone's calendar or a hand-built
 ///   `DateComponents` year instead of `FixedDateFormat.gregorianDay`.
 ///
@@ -102,13 +104,18 @@ struct FixedDateFormatFenceTests {
         .formatterBuilt: [
             (#"(?<![A-Za-z0-9_])DateFormatter\s*(\(|\.\s*init\b)"#, false),
             (#"\bclass\s+\w+\s*:\s*([\w.]+\s*,\s*)*DateFormatter\b"#, false),
+            (#":\s*DateFormatter\s*[!?]?\s*=\s*\.\s*init\b"#, false),
+            (#"\bDateFormatter\s*\.\s*localizedString\b"#, false),
+            (#"\bDateIntervalFormatter\b"#, false),
         ],
         .formatStyle: [
             (#"\bVerbatimFormatStyle\b"#, false),
             (#"\bDate\s*\.\s*FormatStyle\b"#, false),
             (#"\.formatted\s*\(\s*(date|time)\s*:"#, false),
             (#"\.formatted\s*\(\s*\.\s*(dateTime|verbatim)\b"#, false),
-            (#"\bformat\s*:\s*\.\s*(dateTime|verbatim)\b"#, false),
+            (#"\bformat\s*:\s*\.\s*(dateTime|verbatim|interval)\b"#, false),
+            (#"\.formatted\s*\(\s*\.\s*interval\b"#, false),
+            (#"\bIntervalFormatStyle\b"#, false),
         ],
         .phoneCalendar: [
             (#"\bCalendar\s*\.\s*(current|autoupdatingCurrent)\b"#, false),
@@ -237,17 +244,42 @@ struct FixedDateFormatFenceTests {
         return result
     }
 
-    /// The `- path:` source roots of every app and extension target in `project.yml`
-    /// (test targets skipped).
-    static func productSourceRoots(projectYML: String) -> Set<String> {
+    struct SourceRoots: Equatable {
+        /// The `- path:` source roots of every app and extension target.
         var roots: Set<String> = []
+        /// What the reader met and could not read: a source entry that is not `- path:`
+        /// (a bare name), an inline `sources:`, target templates, an `include:`, a target
+        /// with no type, or an app or extension target with no path read. Any entry
+        /// fails the fence, so a target can never drop out of the scan silently.
+        var unparsed: [String] = []
+    }
+
+    /// The source roots of every app and extension target in `project.yml` (test
+    /// targets skipped). Reads the `targets:` block written as `- path:` lists only.
+    static func productSourceRoots(projectYML: String) -> SourceRoots {
+        var result = SourceRoots()
         var inTargets = false
+        var targetName: String?
         var targetType: String?
         var targetPaths: [String] = []
+        var inSources = false
+        var itemIndent: Int?
         func closeTarget() {
-            if let type = targetType, !testTargetTypes.contains(type) { roots.formUnion(targetPaths) }
+            if let name = targetName {
+                if let type = targetType {
+                    if !testTargetTypes.contains(type) {
+                        if targetPaths.isEmpty { result.unparsed.append("target \(name): no source path read") }
+                        result.roots.formUnion(targetPaths)
+                    }
+                } else {
+                    result.unparsed.append("target \(name): no type read")
+                }
+            }
+            targetName = nil
             targetType = nil
             targetPaths = []
+            inSources = false
+            itemIndent = nil
         }
         for raw in projectYML.components(separatedBy: "\n") {
             let line = raw.replacingOccurrences(of: "\t", with: "    ")
@@ -257,24 +289,51 @@ struct FixedDateFormatFenceTests {
             if indent == 0 {
                 if inTargets { closeTarget() }
                 inTargets = body == "targets:"
+                if body.hasPrefix("targetTemplates:") || body.hasPrefix("include:") {
+                    result.unparsed.append(body)
+                }
                 continue
             }
             guard inTargets else { continue }
-            if indent == 2 && body.hasSuffix(":") {
+            if indent == 2 {
                 closeTarget()
-            } else if indent == 4 && body.hasPrefix("type:") {
-                targetType = body.dropFirst("type:".count).trimmingCharacters(in: .whitespaces)
-            } else if body.hasPrefix("- path:") {
+                if body.hasSuffix(":") {
+                    targetName = String(body.dropLast())
+                } else {
+                    result.unparsed.append(body)
+                }
+                continue
+            }
+            if indent == 4 && !body.hasPrefix("- ") {
+                inSources = false
+                if body.hasPrefix("type:") {
+                    targetType = body.dropFirst("type:".count).trimmingCharacters(in: .whitespaces)
+                } else if body.hasPrefix("sources:") {
+                    inSources = true
+                    itemIndent = nil
+                    if body != "sources:" { result.unparsed.append("target \(targetName ?? "?"): \(body)") }
+                } else if body.hasPrefix("templates:") {
+                    result.unparsed.append("target \(targetName ?? "?"): \(body)")
+                }
+                continue
+            }
+            guard inSources else { continue }
+            if itemIndent == nil && body.hasPrefix("- ") { itemIndent = indent }
+            guard indent == itemIndent else { continue }   // a path's own settings
+            if body.hasPrefix("- path:") {
                 targetPaths.append(body.dropFirst("- path:".count)
                     .trimmingCharacters(in: CharacterSet.whitespaces.union(CharacterSet(charactersIn: "\"'"))))
+            } else {
+                result.unparsed.append("target \(targetName ?? "?") source: \(body)")
             }
         }
         if inTargets { closeTarget() }
-        return roots
+        return result
     }
 
     struct Scan {
         var roots: Set<String> = []
+        var unparsedProjectEntries: [String] = []
         /// Repository-relative path → findings, one entry per scanned Swift file.
         var files: [String: [Rule: [Int]]] = [:]
     }
@@ -283,7 +342,9 @@ struct FixedDateFormatFenceTests {
         let root = repositoryRoot().standardizedFileURL
         let yml = try String(contentsOf: root.appendingPathComponent("project.yml"), encoding: .utf8)
         var scan = Scan()
-        scan.roots = productSourceRoots(projectYML: yml)
+        let sourceRoots = productSourceRoots(projectYML: yml)
+        scan.roots = sourceRoots.roots
+        scan.unparsedProjectEntries = sourceRoots.unparsed
         for sourceRoot in scan.roots {
             guard let walker = FileManager.default.enumerator(
                 at: root.appendingPathComponent(sourceRoot), includingPropertiesForKeys: nil)
@@ -336,11 +397,17 @@ struct FixedDateFormatFenceTests {
         if comps.year == 2 {}
         let day = FixedDateFormat.gregorianDay(s, timeZone: .gmt)
         Text("to \(oldest, format: .dateTime.month().year()) then .formatted(date: x) \(n)")
+        let f: DateFormatter = .init()
+        let ls = DateFormatter.localizedString(from: d, dateStyle: .long, timeStyle: .none)
+        let di = DateIntervalFormatter()
+        let iv = (a..<b).formatted(.interval.day())
+        let ifs = Date.IntervalFormatStyle(date: .long, time: .omitted)
+        Text(a..<b, format: .interval)
         """##
         let found = Self.findings(in: source)
         #expect(found[.fixedFormat] == [2, 8, 10, 12, 18, 19, 20, 21, 22])
-        #expect(found[.formatterBuilt] == [1, 8, 9, 18])
-        #expect(found[.formatStyle] == [23, 24, 25, 26, 27, 36])
+        #expect(found[.formatterBuilt] == [1, 8, 9, 18, 37, 38, 39])
+        #expect(found[.formatStyle] == [23, 24, 25, 26, 27, 36, 40, 41, 42])
         #expect(found[.phoneCalendar] == [30, 30, 31, 31])
         #expect(found[.handBuiltYear] == [32, 33])
         #expect(found[.gregorianDayCall] == [35])
@@ -377,18 +444,69 @@ struct FixedDateFormatFenceTests {
               targets:
                 App: all
         """
-        #expect(Self.productSourceRoots(projectYML: yml) == ["App", "Shared", "Ext"])
+        #expect(Self.productSourceRoots(projectYML: yml) == SourceRoots(roots: ["App", "Shared", "Ext"]))
+    }
+
+    @Test("project.yml parsing fails loudly on a source entry it cannot read")
+    func projectSourceRootsFailLoudly() {
+        let yml = """
+        include:
+          - base.yml
+        targetTemplates:
+          Base:
+            type: framework
+        targets:
+          App:
+            type: application
+            sources:
+              - path: App
+              - Widgets
+          Ext:
+            type: app-extension
+            sources: [Ext]
+          Kit:
+            type: framework
+            templates:
+              - Base
+          Bare:
+            sources:
+              - path: Bare
+          Tests:
+            type: bundle.unit-test
+            sources:
+              - Tests
+        """
+        let parsed = Self.productSourceRoots(projectYML: yml)
+        #expect(parsed.roots == ["App"])
+        #expect(parsed.unparsed == [
+            "include:",
+            "targetTemplates:",
+            "target App source: - Widgets",
+            "target Ext: sources: [Ext]",
+            "target Ext: no source path read",
+            "target Kit: templates:",
+            "target Kit: no source path read",
+            "target Bare: no type read",
+            "target Tests source: - Tests",
+        ])
     }
 
     @Test("no fixed format, DateFormatter or date FormatStyle outside FixedDateFormat in any target")
     func noFormatterOutsideHelper() throws {
         let scan = try Self.scanTargets()
+        #expect(scan.unparsedProjectEntries.isEmpty,
+                "project.yml entries the fence cannot read, so their sources would go unscanned: \(scan.unparsedProjectEntries)")
         #expect(Self.requiredSourceRoots.isSubset(of: scan.roots),
                 "project.yml source roots \(scan.roots.sorted()); a target is missing, so the fence is vacuous for it")
         #expect(scan.files.count > 100, "scanned only \(scan.files.count) Swift files")
         let helper = scan.files[Self.helperFile] ?? [:]
         #expect(helper[.fixedFormat]?.count == 1,
                 "\(Self.helperFile) should set a format exactly once; found \(helper[.fixedFormat] ?? [])")
+        // The simulator runs the Gregorian calendar and its calendar is never switched
+        // here, so a helper that read the phone's calendar would pass every behaviour
+        // test; this keeps the helper from reading it at all.
+        #expect(helper[.phoneCalendar]?.isEmpty ?? false,
+                "\(Self.helperFile) reads the phone's calendar at lines \(helper[.phoneCalendar] ?? [])")
 
         var fixed: [String] = []
         var built: [String] = []

@@ -53,9 +53,14 @@ builder sets both.
   extension target listed in `project.yml` (test targets skipped) at run time, with comments and string
   contents ignored and interpolations kept as code, and fails on, outside `Shared/FixedDateFormat.swift`:
   a `dateFormat` set by `=`, `+=` (also split across lines), `override var`, key-value coding or a key
-  path; a localized template; a `DateFormatter` built or subclassed, or a date `FormatStyle`
-  (`.formatted(date:time:)`, `.dateTime`, `Date.FormatStyle`, `VerbatimFormatStyle`), except at the
-  named display-only sites (file and exact count). On the four reminder due-date files it also fails on
+  path; a localized template; a `DateFormatter` built (also `= .init()`), subclassed or used through
+  `DateFormatter.localizedString`, a `DateIntervalFormatter`, or a date `FormatStyle`
+  (`.formatted(date:time:)`, `.dateTime`, `.interval`, `Date.FormatStyle`, `IntervalFormatStyle`,
+  `VerbatimFormatStyle`), except at the named display-only sites (file and exact count). It fails on any
+  `project.yml` source entry it cannot read (a bare name, an inline list, target templates, `include:`,
+  a target without a type or a path), so no target leaves the scan silently, and on any phone-calendar
+  reference inside `Shared/FixedDateFormat.swift` itself (the simulator is Gregorian, so behaviour tests
+  alone cannot see one). On the four reminder due-date files it also fails on
   `Calendar.current` and its kin beyond the named trigger use, on a `DateComponents` year set by hand, and
   when the file no longer calls `FixedDateFormat.gregorianDay`. A self-test pins each pattern, including
   the comment, string, raw multi-line string and interpolation cases. It was red on the pre-fix source
