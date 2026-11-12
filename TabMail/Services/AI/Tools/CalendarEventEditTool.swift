@@ -266,9 +266,13 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         // occurrence is a change of it and the following ones; a new time of day named from one is
         // the whole series' new time, its start and end moved to the first occurrence's date. When
         // the assistant must ask the user which occurrences, it is refused here. A move to another
-        // date of a series whose rule names its days, with no new rule, is refused here too
-        // (`CalendarSeriesScope.dayMoveRefusal`, which the queue applies again before the write).
+        // date of a series whose rule names its days turns those days with it
+        // (`CalendarSeriesScope.dayMove`, which the queue applies again before the write).
         let queuedEventId: String
+        // A move to another day that turns the rule's days, of the whole series or a split's new
+        // part, which resets every occurrence changed or deleted one by one there
+        // (`CalendarToolHelpers.dayMoveResetNote`).
+        var turnsDays = false
         do {
             let given = arguments
             let routed = try CalendarSeriesScope.route(arguments, scope: resolvedScope, named: named, zone: tz)
@@ -284,8 +288,28 @@ struct CalendarEventEditTool: AgentTool, Sendable {
                     changes[line] = "\(label) → \(new)"
                 }
             }
-            if let reason = CalendarSeriesScope.dayMoveRefusal(arguments, named: named, scope: resolvedScope, zone: tz) {
-                throw CalendarProviderError.notSupported(reason)
+            // A move to another day of a series whose rule names its days turns them with it; the
+            // card says how the repeat changes.
+            // The rules shown are every one the calendar writes (`dayMovedRules`): the whole
+            // series' or the new part's, its end as the split carries it. One it can't tell is
+            // refused here, with nothing queued.
+            if let move = try CalendarSeriesScope.dayMove(arguments, named: named, scope: resolvedScope, zone: tz) {
+                let series = try named.readSeries()
+                let rules = try await provider.dayMovedRules(
+                    calendarId: lookupCalId, eventId: queuedEventId, series: series,
+                    scope: resolvedScope, recurrenceId: recurrenceIdArg, zone: tz, move: move)
+                // A move that leaves the rule as it is (one named by position) changes nothing the
+                // card should name, and resets no exception. One that turns it resets them on every
+                // calendar, for the whole series or the split's new part.
+                let stored = (series.recurrence ?? []).filter { $0.uppercased().hasPrefix("RRULE:") }
+                if try stored.contains(where: {
+                    GoogleCalendarProvider.canonicalRRULE(try RecurrenceDayShift.shifted($0, by: move)) != GoogleCalendarProvider.canonicalRRULE($0)
+                }) {
+                    turnsDays = true
+                    for rule in rules {
+                        changes.append("repeat → \(rule.dropFirst("RRULE:".count))")
+                    }
+                }
             }
         } catch CalendarProviderError.notSupported(let reason) {
             return ToolJSON.string(from: [
@@ -353,7 +377,9 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         // (`shown`, the series read above) and the edit as routed, which is what the queue writes; a
         // rename, or a rule equal to the stored one, which the assistant re-sends with other edits,
         // gets no line.
-        if resolvedScope == "all", shown.recurrence?.isEmpty == false,
+        if turnsDays {
+            changes.append(CalendarToolHelpers.dayMoveResetNote)
+        } else if resolvedScope == "all", shown.recurrence?.isEmpty == false,
            let edit = try? CalendarToolHelpers.buildGCalEventInput(
                arguments, isAllDay: CalendarToolHelpers.boolArg(arguments, "all_day") ?? shown.isAllDay),
            provider.editResetsChangedOccurrences(shown, edit: edit) {

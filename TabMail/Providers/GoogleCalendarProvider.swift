@@ -95,6 +95,16 @@ protocol CalendarProvider: Sendable {
     /// refused, as `splitSeries` is.
     func finishSplit(calendarId: String, record: SplitRecord, zone: TimeZone) async throws
 
+    /// Every repeat rule, as an RRULE, that this calendar writes when a move to another day turns
+    /// the days of `series` (`GCalEventInput.ruleDayMove`): the whole series' rules for scope "all",
+    /// the new part's for a split (`this_and_following` at `recurrenceId`, read in `zone`), its end
+    /// carried as the split carries it. `eventId` is the id the edit is written to. The
+    /// confirmation card shows them; each calendar's write is built by the same functions from
+    /// what it reads. Throws `notSupported` when the move or the split can't be carried, or the
+    /// rule written can't be told: nothing is shown or written then.
+    func dayMovedRules(calendarId: String, eventId: String, series: GCalEvent, scope: String, recurrenceId: String?,
+                       zone: TimeZone, move: RecurrenceDayShift.Move) async throws -> [String]
+
     /// Whether the whole-series edit `edit` (the input the write is given) resets the
     /// occurrences of `event` changed one by one, as this calendar's write treats them: on
     /// Outlook and Google, any change of the series' rule, start or end; on CalDAV, a change of
@@ -180,6 +190,10 @@ extension CalendarProvider {
     }
     func finishSplit(calendarId: String, record: SplitRecord, zone: TimeZone) async throws {
         throw CalendarProviderError.notSupported(Self.splitNotSupported)
+    }
+    func dayMovedRules(calendarId: String, eventId: String, series: GCalEvent, scope: String, recurrenceId: String?,
+                       zone: TimeZone, move: RecurrenceDayShift.Move) async throws -> [String] {
+        throw CalendarProviderError.notSupported("Moving a repeating event's named days to another date is not supported on this calendar provider.")
     }
     private static var splitNotSupported: String {
         "Splitting a recurring series at a given occurrence is not yet supported on this calendar provider. Edit the whole series or use the Thunderbird add-on for this-and-following edits."
@@ -649,6 +663,11 @@ actor GoogleCalendarProvider: CalendarProvider {
         if keepStoredDates, let rule = event.recurrence {
             edit.recurrence = Self.recurrence(existing.recurrence, withRuleFrom: rule)
         }
+        // A move to another day turns the days the stored rule names (`RecurrenceDayShift`), and
+        // its excluded dates go with the old days (`turned`).
+        if edit.recurrence == nil, let move = event.ruleDayMove, let stored = existing.recurrence {
+            edit.recurrence = try Self.turned(stored, by: move)
+        }
         let merged = Self.mergeExistingEventWithPatch(existing: existing, patch: edit)
         let encodedCalId = try Self.encodedPathSegment(calendarId, "Google calendar id")
         let encodedEventId = try Self.encodedPathSegment(eventId, "Google event id")
@@ -779,6 +798,21 @@ actor GoogleCalendarProvider: CalendarProvider {
         return found.instance
     }
 
+    /// Google's rules for a move to another day (`CalendarProvider.dayMovedRules`): every RRULE of
+    /// the series turned (`turned`) for an edit of every occurrence, or the new part's
+    /// (`splitTailRule`, the end the split carries over) turned for a split.
+    nonisolated func dayMovedRules(calendarId: String, eventId: String, series: GCalEvent, scope: String, recurrenceId: String?,
+                                   zone: TimeZone, move: RecurrenceDayShift.Move) async throws -> [String] {
+        let rules = (series.recurrence ?? []).filter { $0.uppercased().hasPrefix("RRULE:") }
+        guard scope == "this_and_following" else { return try Self.turned(rules, by: move) }
+        guard let rule = rules.first, let recurrenceId,
+              let cap = Self.googleUntilString(beforeNaiveISO: recurrenceId, allDay: series.isAllDay, zone: zone) else {
+            throw CalendarProviderError.notSupported("the occurrence the series would be split at can't be told, so its days can't be moved with it")
+        }
+        return [try RecurrenceDayShift.shifted(
+            Self.splitTailRule(master: series, rule: rule, recurrenceId: recurrenceId, recurrenceIdZone: zone, capUntil: cap), by: move)]
+    }
+
     /// Split a recurring series at `recurrenceId`:
     /// 1. POST the new part: a copy of the stored series (`splitNewPartJSON`) starting at
     ///    recurrenceId, with the master's RRULE ending where the original series ended
@@ -838,17 +872,21 @@ actor GoogleCalendarProvider: CalendarProvider {
         // (`mergeMasterAndPatch` prefers it), but the check runs all the same:
         // it is also what stops the cap from moving the end of a series that
         // already ended before the split.
-        let days = Self.splitDaysInMasterFrame(master: master, recurrenceId: recurrenceId, recurrenceIdZone: recurrenceIdZone)
-        let newSeriesRRule = try RecurrenceTail.newSeriesRule(
-            from: originalRRule, seriesStart: days.seriesStart, split: days.split, capUntil: untilValue)
+        let tailRRule = try Self.splitTailRule(
+            master: master, rule: originalRRule, recurrenceId: recurrenceId, recurrenceIdZone: recurrenceIdZone, capUntil: untilValue)
+        // A move of the new part to another day turns the days its rule names, its end as above.
+        let newSeriesRRule = try patch.ruleDayMove.map { try RecurrenceDayShift.shifted(tailRRule, by: $0) } ?? tailRRule
         guard let slot = Self.splitInstant(naiveISO: recurrenceId, allDay: master.isAllDay, zone: recurrenceIdZone) else {
             throw CalendarProviderError.notSupported("Invalid recurrence_id '\(recurrenceId)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
         }
         // Excluded and added dates go with the part they fall in. Pure, so a
         // series that can't be read is refused here, before anything is written.
-        let recurrenceParts = try Self.splitRecurrence(
+        var recurrenceParts = try Self.splitRecurrence(
             masterRecurrence, cappedRRule: cappedRRule,
             tailRRule: newSeriesRRule, slot: slot)
+        // A day move that changes the new part's rule drops its excluded dates, as on the whole
+        // series (`withoutExcludedDates`).
+        if newSeriesRRule != tailRRule { recurrenceParts.tail = Self.withoutExcludedDates(recurrenceParts.tail) }
 
         // The new part starts at an occurrence that starts at `recurrenceId` now, the one
         // `occurrence` finds, and was not moved from its place in the series; otherwise the split
@@ -1293,6 +1331,17 @@ actor GoogleCalendarProvider: CalendarProvider {
         return out.string(from: untilDate)
     }
 
+    /// The rule of a split's new part: `rule` (the master's RRULE) ending where the series did
+    /// (`RecurrenceTail.newSeriesRule`), its days counted in the master's frame
+    /// (`splitDaysInMasterFrame`). The one computation the split writes and its card shows
+    /// (`dayMovedRules`).
+    static func splitTailRule(
+        master: GCalEvent, rule: String, recurrenceId: String, recurrenceIdZone: TimeZone, capUntil: String
+    ) throws -> String {
+        let days = splitDaysInMasterFrame(master: master, recurrenceId: recurrenceId, recurrenceIdZone: recurrenceIdZone)
+        return try RecurrenceTail.newSeriesRule(from: rule, seriesStart: days.seriesStart, split: days.split, capUntil: capUntil)
+    }
+
     /// The original series' first day and the split occurrence's day, both in
     /// the frame the master's RRULE expands in: plain dates for an all-day
     /// series, the master's `start.timeZone` for a timed one. A day that cannot
@@ -1380,6 +1429,24 @@ actor GoogleCalendarProvider: CalendarProvider {
             }
         }
         return (capped, tail)
+    }
+
+    /// `recurrence` with the days of each RRULE line turned by `move` (`RecurrenceDayShift`), and
+    /// its excluded dates dropped when that changes a rule (`withoutExcludedDates`).
+    static func turned(_ recurrence: [String], by move: RecurrenceDayShift.Move) throws -> [String] {
+        func isRule(_ line: String) -> Bool { line.uppercased().hasPrefix("RRULE:") }
+        let lines = try recurrence.map { isRule($0) ? try RecurrenceDayShift.shifted($0, by: move) : $0 }
+        return lines == recurrence ? lines : withoutExcludedDates(lines)
+    }
+
+    /// The one rule for the lines of a recurrence whose rule a day move changed (the whole series'
+    /// or a split's new part; CalDAV drops its EXDATEs the same way in `mergePatchIntoICS`): its
+    /// excluded dates (`EXDATE`) go, as Google Calendar's own editor drops them on a change of
+    /// weekday (measured), so the deleted occurrences come back on their new days and an excluded
+    /// date left on an old day can't delete one again after a move back. Added dates (`RDATE`) and
+    /// every other line are kept.
+    static func withoutExcludedDates(_ recurrence: [String]) -> [String] {
+        recurrence.filter { $0.prefix(while: { $0 != ":" && $0 != ";" }).uppercased() != "EXDATE" }
     }
 
     /// A series' `recurrence` lines with the rule replaced by the one `patch` writes (#513): the
@@ -2065,6 +2132,10 @@ struct GCalEventInput: Sendable {
     /// An edit's guest change, which each provider's write applies to the stored guests of every
     /// item it covers (#620). Nil when the edit names nobody: no guest list is written.
     var attendeeChange: AttendeeChange?
+    /// A move of a series to another day whose rule names its days, with no rule given
+    /// (`CalendarSeriesScope.dayMove`): each provider turns the days of the rule it writes by it
+    /// (`RecurrenceDayShift`), the whole series' rule or a split's new part's. Nil otherwise.
+    var ruleDayMove: RecurrenceDayShift.Move?
 
     func toJSON() -> [String: Any] {
         var json: [String: Any] = [:]

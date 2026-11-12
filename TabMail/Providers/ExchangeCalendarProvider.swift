@@ -719,7 +719,8 @@ actor ExchangeCalendarProvider: CalendarProvider {
     ///   keep their address, name and type; one the change adds is `required`. Their
     ///   answers are not copied: Graph lets only the attendee write a response, so the new part's
     ///   attendees start unanswered, as they do when Outlook splits a series itself.
-    /// - The recurrence keeps the stored pattern exactly. Its range keeps its end date (verbatim)
+    /// - The recurrence keeps the stored pattern exactly, its named days turned when the split
+    ///   moves the new part to another day (`patch.ruleDayMove`, `newPartRecurrence`). Its range keeps its end date (verbatim)
     ///   and zone and starts on the new start's date; a range that ends after a number of
     ///   occurrences stays numbered with what is left of the number (`occurrencesLeft`), as on
     ///   Google and CalDAV. A range whose end date is before the new start is refused, so no new
@@ -780,41 +781,95 @@ actor ExchangeCalendarProvider: CalendarProvider {
         if let description = patch.description, let body = Self.onlineMeetingBody(stored.raw, notes: description) {
             json["body"] = body
         }
-        if patch.recurrence?.isEmpty ?? true,
-           var recurrence = stored.raw["recurrence"] as? [String: Any],
-           let storedRange = recurrence["range"] as? [String: Any] {
-            var range = storedRange
-            range["startDate"] = newDay
-            switch range["type"] as? String {
-            case "numbered":
-                // What is left of the count, as Google and CalDAV write it (`RecurrenceTail`). The
-                // stored `endDate` of a numbered range is a placeholder ("0001-01-01", measured).
-                range["numberOfOccurrences"] = try Self.occurrencesLeft(
-                    stored: stored, storedRange: storedRange, splitNaiveISO: newStartNaiveISO, splitZone: newStartZone)
-                range.removeValue(forKey: "endDate")
-            case "endDate":
-                if let endDate = range["endDate"] as? String, endDate < newDay {
-                    throw CalendarProviderError.notSupported(
-                        "Can't split this series at the occurrence on \(newDay): the series already ends before it (on \(endDate)), so there are no occurrences from that point on to change.")
-                }
-                range.removeValue(forKey: "numberOfOccurrences")
-            default:
-                range.removeValue(forKey: "endDate")
-                range.removeValue(forKey: "numberOfOccurrences")
-            }
-            recurrence["range"] = range
-            json["recurrence"] = recurrence
+        if patch.recurrence?.isEmpty ?? true, let recurrence = stored.raw["recurrence"] as? [String: Any] {
+            json["recurrence"] = try Self.newPartRecurrence(
+                stored: stored, storedRecurrence: recurrence, newDay: newDay,
+                splitNaiveISO: newStartNaiveISO, splitZone: newStartZone, move: patch.ruleDayMove)
             // The new part is written in the zone its copied range names: a timed one at the same
             // instant (#719), as Google Calendar keeps a series' zone on "this and following", an
             // all-day one on the same dates (#747), or Graph stores it two days longer.
-            let seriesZone = storedRange["recurrenceTimeZone"] as? String
-            let allDay = json["isAllDay"] as? Bool ?? (written.startDate != nil)
-            for key in ["start", "end"] {
-                if let time = json[key] as? [String: Any] { json[key] = Self.inSeriesZone(time, seriesZone: seriesZone, allDay: allDay) }
+            if let storedRange = recurrence["range"] as? [String: Any] {
+                let seriesZone = storedRange["recurrenceTimeZone"] as? String
+                let allDay = json["isAllDay"] as? Bool ?? (written.startDate != nil)
+                for key in ["start", "end"] {
+                    if let time = json[key] as? [String: Any] { json[key] = Self.inSeriesZone(time, seriesZone: seriesZone, allDay: allDay) }
+                }
             }
         }
         json["transactionId"] = transactionId
         return json
+    }
+
+    /// The recurrence of a split's new part, from the stored series' (`storedRecurrence`): the
+    /// stored pattern, turned by `move` when the split moves it to another day (`turned`), and the
+    /// stored range starting on `newDay` with what is left of its end (see `splitNewPartJSON`).
+    /// The one computation the split writes and its card shows (`dayMovedRules`). Unchanged when it
+    /// has no range.
+    nonisolated static func newPartRecurrence(
+        stored: EditSnapshot, storedRecurrence: [String: Any], newDay: String,
+        splitNaiveISO: String, splitZone: TimeZone, move: RecurrenceDayShift.Move?
+    ) throws -> [String: Any] {
+        guard let storedRange = storedRecurrence["range"] as? [String: Any] else { return storedRecurrence }
+        var recurrence = storedRecurrence
+        var range = storedRange
+        range["startDate"] = newDay
+        switch range["type"] as? String {
+        case "numbered":
+            // What is left of the count, as Google and CalDAV write it (`RecurrenceTail`). The
+            // stored `endDate` of a numbered range is a placeholder ("0001-01-01", measured).
+            range["numberOfOccurrences"] = try occurrencesLeft(
+                stored: stored, storedRange: storedRange, splitNaiveISO: splitNaiveISO, splitZone: splitZone)
+            range.removeValue(forKey: "endDate")
+        case "endDate":
+            if let endDate = range["endDate"] as? String, endDate < newDay {
+                throw CalendarProviderError.notSupported(
+                    "Can't split this series at the occurrence on \(newDay): the series already ends before it (on \(endDate)), so there are no occurrences from that point on to change.")
+            }
+            range.removeValue(forKey: "numberOfOccurrences")
+        default:
+            range.removeValue(forKey: "endDate")
+            range.removeValue(forKey: "numberOfOccurrences")
+        }
+        recurrence["range"] = range
+        // A move of the new part to another day turns the days the pattern names.
+        if let move { recurrence = try turned(recurrence, by: move) }
+        return recurrence
+    }
+
+    /// Outlook's rules for a move to another day (`CalendarProvider.dayMovedRules`): the series'
+    /// recurrence as Graph stores it, read as the write reads it, turned (`turned`) with its range
+    /// starting on the move's day for an edit of every occurrence (`graphPatchJSON`), or as the
+    /// split's new part (`newPartRecurrence`), read back as an RRULE with the first day of the
+    /// week Graph keeps for a weekly series every few weeks. A recurrence that can't be read back
+    /// is refused, so the card never leaves out a change the write makes.
+    func dayMovedRules(calendarId: String, eventId: String, series: GCalEvent, scope: String, recurrenceId: String?,
+                       zone: TimeZone, move: RecurrenceDayShift.Move) async throws -> [String] {
+        let unreadable = CalendarProviderError.notSupported(
+            "this repeating event's pattern can't be read back as a rule, so its days can't be moved with it")
+        let (_, snapshot) = try await resolveToMaster(eventId: eventId, select: Self.splitSelect)
+        guard var stored = snapshot.raw["recurrence"] as? [String: Any],
+              var range = stored["range"] as? [String: Any] else { throw unreadable }
+        let recurrence: [String: Any]
+        if scope == "this_and_following" {
+            guard let recurrenceId else { throw unreadable }
+            recurrence = try Self.newPartRecurrence(
+                stored: snapshot, storedRecurrence: stored, newDay: move.to.description,
+                splitNaiveISO: recurrenceId, splitZone: zone, move: move)
+        } else {
+            range["startDate"] = move.to.description
+            stored["range"] = range
+            recurrence = try Self.turned(stored, by: move)
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: recurrence),
+              let decoded = try? JSONDecoder().decode(MSPatternedRecurrence.self, from: data),
+              var rule = Self.rrule(decoded).first else { throw unreadable }
+        let pattern = recurrence["pattern"] as? [String: Any]
+        if pattern?["type"] as? String == "weekly", (pattern?["interval"] as? Int ?? 1) > 1,
+           let first = pattern?["firstDayOfWeek"] as? String,
+           let index = Self.graphWeekdays.firstIndex(of: first.lowercased()) {
+            rule += ";WKST=" + RecurrenceDayShift.weekdayCodes[index]
+        }
+        return [rule]
     }
 
     /// The `numberOfOccurrences` of a split's new part when the stored series' range is numbered:
@@ -1030,7 +1085,16 @@ actor ExchangeCalendarProvider: CalendarProvider {
                 BackgroundSyncLogger.logDebug("[ExchangeCalendar] graphPatchJSON: guest change applied to 1 item, guests \(own.count)->\(after.count)")
             }
         }
-        if allowRecurrence, sparse.recurrence == nil, movesTime,
+        // A move to another day whose rule names its days (`ruleDayMove`, decided in the series'
+        // own zone) writes the stored pattern turned, its range starting on the move's day, whatever
+        // day the edit's own zone dates the start on.
+        if allowRecurrence, sparse.recurrence == nil, movesTime, let move = patch.ruleDayMove,
+           var stored = existing.raw["recurrence"] as? [String: Any],
+           var range = stored["range"] as? [String: Any] {
+            range["startDate"] = move.to.description
+            stored["range"] = range
+            json["recurrence"] = try Self.turned(stored, by: move)
+        } else if allowRecurrence, sparse.recurrence == nil, movesTime,
            var stored = existing.raw["recurrence"] as? [String: Any],
            var range = stored["range"] as? [String: Any],
            let newDay = Self.seriesDay(merged.startDate, merged.startDateTime, in: merged.startTimeZone, seriesZone: storedZoneName),
@@ -1043,6 +1107,43 @@ actor ExchangeCalendarProvider: CalendarProvider {
             json["body"] = body
         }
         return json
+    }
+
+    /// Graph's day names, in the order of `RecurrenceDayShift.weekdayCodes`.
+    static let graphWeekdays = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+
+    /// A stored recurrence (Graph's `patternedRecurrence`) with the days its pattern names turned by
+    /// `move`, by the rule an RRULE's are (`RecurrenceDayShift`): weekdays (`daysOfWeek`) turn, and
+    /// the first day of the week with them when a weekly pattern repeats every few weeks; a day of
+    /// the month (`dayOfMonth`) and a month (`month`) move. A pattern naming a day by its position
+    /// (`relativeMonthly`, `relativeYearly`) is kept, as an RRULE's `BYDAY=2TU` is. Its range is
+    /// kept. Throws `notSupported` for a day a move can't carry.
+    nonisolated static func turned(_ recurrence: [String: Any], by move: RecurrenceDayShift.Move) throws -> [String: Any] {
+        guard move.days != 0, var pattern = recurrence["pattern"] as? [String: Any] else { return recurrence }
+        let type = pattern["type"] as? String
+        guard type != "relativeMonthly", type != "relativeYearly" else { return recurrence }
+        func turn(_ name: String) throws -> String {
+            guard let index = graphWeekdays.firstIndex(of: name.lowercased()) else {
+                throw CalendarProviderError.notSupported("this repeating event's days (\(name)) can't be moved to another day")
+            }
+            let code = try RecurrenceDayShift.weekday(RecurrenceDayShift.weekdayCodes[index], by: move.days)
+            return graphWeekdays[RecurrenceDayShift.weekdayCodes.firstIndex(of: code) ?? index]
+        }
+        if let days = pattern["daysOfWeek"] as? [String], !days.isEmpty {
+            pattern["daysOfWeek"] = try days.map(turn)
+            if type == "weekly", (pattern["interval"] as? Int ?? 1) > 1, let first = pattern["firstDayOfWeek"] as? String {
+                pattern["firstDayOfWeek"] = try turn(first)
+            }
+        }
+        if let day = pattern["dayOfMonth"] as? Int, day != 0 {
+            pattern["dayOfMonth"] = try RecurrenceDayShift.monthDay(day, by: move.monthDays)
+        }
+        if let month = pattern["month"] as? Int, month != 0 {
+            pattern["month"] = RecurrenceDayShift.month(month, by: move.months)
+        }
+        var turned = recurrence
+        turned["pattern"] = pattern
+        return turned
     }
 
     /// The rule a whole-series edit `patch` writes on the series `existing` (#423): nil when it
