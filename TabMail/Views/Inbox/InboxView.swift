@@ -137,6 +137,49 @@ struct HeaderRekeyReceiver: ViewModifier {
     }
 }
 
+/// Settles the gesture-time hide of rows whose move `AccountManager.move`
+/// reported as not moved (`.messageMovesRefused`). The refusal happens in the
+/// queued write, after the gesture already hid the row, so the synchronous
+/// skipped-ids return of the view model cannot see it. Delivery mirrors
+/// `HeaderRekeyReceiver`, which settles the same sets for a completed move.
+struct MoveRefusalReceiver: ViewModifier {
+    @Binding var dismissedMessages: Set<String>
+    @Binding var swipeFadingMessages: Set<String>
+
+    func body(content: Content) -> some View {
+        content.onReceive(
+            NotificationCenter.default.publisher(for: .messageMovesRefused)
+        ) { notification in
+            guard let ids = Self.refusedIds(from: notification) else { return }
+            var dismissed = dismissedMessages
+            var fading = swipeFadingMessages
+            Self.apply(ids, dismissedMessages: &dismissed, swipeFadingMessages: &fading)
+            guard dismissed != dismissedMessages || fading != swipeFadingMessages else { return }
+            BackgroundSyncLogger.logInbox(
+                "[RoleActionTrace] view phase=unhiddenAfterRefusal ids=[\(ids.sorted().joined(separator: ","))]")
+            withAnimation(.easeOut(duration: 0.35)) {
+                dismissedMessages = dismissed
+                swipeFadingMessages = fading
+            }
+        }
+    }
+
+    nonisolated static func refusedIds(from notification: Notification) -> Set<String>? {
+        guard let ids = notification.object as? [String], !ids.isEmpty else { return nil }
+        return Set(ids)
+    }
+
+    /// Pure transition seam: a row whose move was refused is no longer hidden.
+    nonisolated static func apply(
+        _ refusedIds: Set<String>,
+        dismissedMessages: inout Set<String>,
+        swipeFadingMessages: inout Set<String>
+    ) {
+        dismissedMessages.subtract(refusedIds)
+        swipeFadingMessages.subtract(refusedIds)
+    }
+}
+
 struct InboxView: View {
     let title: String
     let folders: [Folder]
@@ -924,6 +967,9 @@ struct InboxView: View {
             swipeFadingMessages: $swipeFadingMessages,
             selectedMessageId: $selectedMessageId,
             pushedMessageId: $pushedMessageId))
+        .modifier(MoveRefusalReceiver(
+            dismissedMessages: $dismissedMessages,
+            swipeFadingMessages: $swipeFadingMessages))
         .onDisappear {
             let detailPushed: Bool = selectedMessageId != nil || pushedMessageId != nil
             BackgroundSyncLogger.logInbox("[\(viewModel.instanceTag)] InboxView.onDisappear sideButtonsReady=\(sideButtonsReady) chatExpanded=\(chatExpanded) selection=\(String(describing: selection)) detailPushed=\(detailPushed)")

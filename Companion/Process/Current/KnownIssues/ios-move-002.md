@@ -42,6 +42,32 @@
 > answer for the source UID (`onlyLocal` and `onlyRemote` named different UIDs). The UID-remap healer
 > then resolved it, which is precisely what this record predicts for that branch. The closure is
 > undisturbed.
+>
+> **AMENDMENT (2026-11-11, tabmail-ios #441) — the MOVE family's phantom dismissal now has a
+> channel back to the View.** The Status cell's *"the refusal happens later inside
+> `AccountManager.move`, which has no channel back to the View"* is no longer true.
+> `AccountManager.move` now posts `.messageMovesRefused` (object: `[String]` header ids) on the
+> MainActor before it returns, naming every requested member it did not move and that nothing
+> still outstanding will move: requested ids minus durably admitted ids, minus ids coalesced into
+> a deferred successor, minus ids it registered as a deferred successor. `InboxView`'s
+> `MoveRefusalReceiver` (pure seam `MoveRefusalReceiver.apply`) removes those ids from
+> `dismissedMessages` and `swipeFadingMessages`, the same way `HeaderRekeyReceiver` settles them
+> for a completed move. So an admission-refused archive/delete/move, including the epoch-moved
+> refusal this record describes, shows its row again as soon as the queued write settles; it is
+> no longer hidden for the life of the `@State`. The orphaned Undo entry for a refused move is
+> unchanged by this amendment. Nothing about admission, the two-sided gate, or flip-back
+> conditions (α)–(δ) changes: the report only READS the admission outcome. Pins:
+> `InboxRefusedMoveVisibilityTests` (visible set + `IntentionLedger` REPORTED-REFUSED, with an
+> admitted-move positive control) and the report assertion in `IdResetDispositionMatrixTests`.
+> Two further facts, same date: (1) each reported id is also reported under the id a
+> provider-proven re-key has since handed it to (`MessageHeaderRekey.currentHeaderId(afterHandoffFrom:)`),
+> because `HeaderRekeyReceiver` moves the View's hide to the new id while `move` re-resolves by the
+> exact id the gesture named; (2) a deferred successor dropped later
+> (`dropDeferredMoveSuccessors`, or a group `materializeDeferredMoveSuccessors` cannot address)
+> posts the same report. The design is announce-based rather than a "queued set" returned to
+> the gesture because gestures queue after they return and deferred successors are decided
+> later. The role-folder path (`moveToRoleFolderPerAccount`) is not reported: only
+> `performCoordinatedRoleMove` reaches it, and that path never touches the View's hide sets.
 <!-- KNOWN-ISSUES-AMENDMENT-END -->
 # IOS-MOVE-002
 

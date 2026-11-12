@@ -302,6 +302,8 @@ struct IdResetDispositionMatrixTests {
         let imap = provider(server)
         try await imap.connect()
         let reset = resetState(targetRfc: targetRfc, gesture: cell.gesture, decoyRfc: decoyRfc)
+        let refusalTap = MoveRefusalTap(watching: [header.id])
+        defer { refusalTap.stop() }
 
         switch cell.phase {
         case .recognizedBeforeAdmission:
@@ -359,6 +361,14 @@ struct IdResetDispositionMatrixTests {
                 #expect(outcome == .executed)
             }
         }
+
+        // A move refused before any local mutation must be reported back to the
+        // list that hid its row at gesture time (#441); an admitted move, whose
+        // local row already left the source, must not be.
+        let refusedBeforeMutation = cell.phase == .recognizedBeforeAdmission
+            && (cell.gesture == .archive || cell.gesture == .delete)
+        #expect(refusalTap.snapshot == (refusedBeforeMutation ? [header.id] : []),
+                "move refusal report for \(cell.description)")
 
         let remaining = try await fixture.pool.read { db in try PendingOperation.fetchAll(db) }
         #expect(remaining.isEmpty, "the parent must terminate and no split child may remain")
