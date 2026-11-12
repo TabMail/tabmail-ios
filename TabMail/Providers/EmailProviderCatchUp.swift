@@ -41,16 +41,20 @@ protocol CatchUpLocalRowReader: Sendable {
     /// Up to `limit` rows in ascending provider-id order, after `afterId`
     /// (nil starts at the beginning) — an ordered scan of the whole folder.
     func rows(folderId: String, after afterId: String?, limit: Int) async throws -> [CatchUpLocalRow]
-    /// Rows whose provider order date (`MessageHeader.providerDate`) is at or after
-    /// `lower` (nil: no lower bound) and before `upper` (nil: no upper bound),
-    /// ascending by that date and then by id, at most `limit` of them (nil: all).
+    /// Every row whose provider order date (`MessageHeader.providerDate`) is at or
+    /// after `lower` and before `upper`, ascending by that date and then by id.
     /// Each row carries its `orderDate`. For a provider that windows by date.
-    func rows(folderId: String, orderDatesFrom lower: Date?, before upper: Date?, limit: Int?) async throws -> [CatchUpLocalRow]
+    func rows(folderId: String, orderDatesFrom lower: Date, before upper: Date) async throws -> [CatchUpLocalRow]
+    /// The newest `limit` rows whose provider order date is before `upper` (nil: no
+    /// upper bound), descending by that date and then by id. Each row carries its
+    /// `orderDate`. For a provider that lists a folder newest first.
+    func newestRows(folderId: String, orderDatesBefore upper: Date?, limit: Int) async throws -> [CatchUpLocalRow]
 }
 
 /// What one catch-up call may spend and on what kind of network. A value snapshot
 /// taken by the caller at the start of the operation (root rule: snapshot settings
-/// at operation start); the provider never re-reads the network state itself.
+/// at operation start); neither the provider nor the apply re-reads the network
+/// state or the storage limit itself.
 struct CatchUpContext: Sendable {
     /// `NetworkMonitor.checkExpensive()` as it stood when the pass began.
     let isExpensiveNetwork: Bool
@@ -59,14 +63,22 @@ struct CatchUpContext: Sendable {
     /// The clock the budget is measured on. Injectable so a test can spend the
     /// budget deterministically; production passes `Date.init`.
     let clock: @Sendable () -> Date
+    /// Whether the user's Email Index Limit (`StorageEstimator.budgetMB`) was a
+    /// finite limit when the pass began. The limit means old mail is not kept:
+    /// the storage prune deletes the oldest rows once the store passes it
+    /// (ADR-IOS-006). So while it holds, no catch-up loads old mail back: the
+    /// apply re-arms no backfill walk, and a provider lists no mail older than the
+    /// folder's oldest local row (ADR-IOS-107 decision 8).
+    var storageLimitInForce = false
 
     /// The production snapshot: the budget starts now.
-    static func forPass(isExpensiveNetwork: Bool) -> CatchUpContext {
+    static func forPass(isExpensiveNetwork: Bool, storageLimitInForce: Bool) -> CatchUpContext {
         let now = Date()
         return CatchUpContext(
             isExpensiveNetwork: isExpensiveNetwork,
             deadline: now.addingTimeInterval(SyncConfig.catchUpPassBudgetSeconds),
-            clock: { Date() })
+            clock: { Date() },
+            storageLimitInForce: storageLimitInForce)
     }
 
     /// Checked before EVERY request: false once the pass budget is spent.
@@ -104,8 +116,24 @@ struct CatchUpFolderResult: Sendable {
     /// moved into the folder). The catch-up itself never inserts; the
     /// backfill, which only inserts, loads it. The apply re-arms only a folder
     /// whose walk is COMPLETE, read inside its own transaction: a check never
-    /// restarts an unfinished walk, which would throw away its position.
+    /// restarts an unfinished walk, which would throw away its position. It
+    /// re-arms nothing while a storage limit is in force
+    /// (`CatchUpContext.storageLimitInForce`): the missing mail may be what the
+    /// storage prune deleted, and loading it back would only be pruned again.
     var rearmBackfill = false
+}
+
+/// The delta-cursor lapse marker every provider's catch-up state may carry
+/// (ADR-IOS-107). A lapse (`SyncEngine.lapseDeltaCursor`) never clears a folder's
+/// state: it adds one to the integer under `countKey` in the state's JSON object,
+/// and leaves a NULL state NULL (a folder with no state is due for a full check
+/// anyway). The provider decides what a lapse means for its folders; Gmail starts
+/// a new listing as soon as the one in progress completes. A state that is not a
+/// JSON object becomes NULL. A provider whose state ignores the key loses it at
+/// its next write, which is harmless for a provider that has no delta cursor.
+enum CatchUpLapse {
+    /// The key of the lapse count in a state's JSON object.
+    static let countKey = "lapseCount"
 }
 
 /// The time rules every provider's catch-up shares: when a folder's full check is

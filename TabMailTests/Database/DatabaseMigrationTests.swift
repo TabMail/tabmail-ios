@@ -1565,6 +1565,9 @@ struct FolderBackfillVersionMigrationTests {
             "UPDATE folder SET backfillComplete = 0, backfillPageToken = NULL WHERE id = ?",
             "UPDATE folder SET backfillPageToken = 'next' WHERE id = ?",
             "UPDATE folder SET backfillComplete = 1, backfillPageToken = NULL WHERE id = ?",
+            // The completion flag alone, both ways, as the IMAP walk writes it.
+            "UPDATE folder SET backfillComplete = 1 WHERE id = ?",
+            "UPDATE folder SET backfillComplete = 0 WHERE id = ?",
         ]
         for (index, sql) in writes.enumerated() {
             try db.write { try $0.execute(sql: sql, arguments: [id]) }

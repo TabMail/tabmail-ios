@@ -19,7 +19,8 @@ import GRDB
 // It changes or removes only rows the device already holds. It never inserts: new
 // mail is the ordinary sync's job and older mail is the backfill's. When the
 // provider reports mail inside the folder's local range that no row holds (an old
-// message moved in), the same transaction re-arms the folder's backfill walk.
+// message moved in), the same transaction re-arms the folder's backfill walk,
+// unless a storage limit is in force.
 // No provider is named here: the step does the same thing for every provider, and a
 // provider without catch-up returns nothing.
 
@@ -95,20 +96,32 @@ struct SyncEngineCatchUpRowReader: CatchUpLocalRowReader {
         }
     }
 
+    private static func datedRow(_ row: Row) -> CatchUpLocalRow {
+        var local = localRow(row)
+        local.orderDate = row["providerDate"]
+        return local
+    }
+
     /// Served by the v91 `(folderId, providerDate)` index. `providerDate` is NOT
     /// NULL, so no row falls out of a bound by SQL's three-valued logic.
-    func rows(folderId: String, orderDatesFrom lower: Date?, before upper: Date?, limit: Int?) async throws -> [CatchUpLocalRow] {
+    func rows(folderId: String, orderDatesFrom lower: Date, before upper: Date) async throws -> [CatchUpLocalRow] {
         try await pool.read { db in
-            // SQLite reads a negative LIMIT as no limit.
             try Row.fetchAll(db, sql: """
                 SELECT \(Self.columns), providerDate FROM messageHeader
-                WHERE folderId = ? AND (? IS NULL OR providerDate >= ?) AND (? IS NULL OR providerDate < ?)
-                ORDER BY providerDate, messageId LIMIT ?
-                """, arguments: [folderId, lower, lower, upper, upper, limit ?? -1]).map { row in
-                    var local = Self.localRow(row)
-                    local.orderDate = row["providerDate"]
-                    return local
-                }
+                WHERE folderId = ? AND providerDate >= ? AND providerDate < ?
+                ORDER BY providerDate, messageId
+                """, arguments: [folderId, lower, upper]).map(Self.datedRow)
+        }
+    }
+
+    /// Served by the same index, scanned backwards.
+    func newestRows(folderId: String, orderDatesBefore upper: Date?, limit: Int) async throws -> [CatchUpLocalRow] {
+        try await pool.read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT \(Self.columns), providerDate FROM messageHeader
+                WHERE folderId = ? AND (? IS NULL OR providerDate < ?)
+                ORDER BY providerDate DESC, messageId DESC LIMIT ?
+                """, arguments: [folderId, upper, upper, limit]).map(Self.datedRow)
         }
     }
 }
@@ -119,9 +132,13 @@ extension SyncEngine {
     /// re-read here so the provider sees this pass's STATUS values and epochs.
     /// Never throws: a failure costs this pass's catch-up, never the full sync, and
     /// it cannot trigger the full sync's connection-error retry (which would double
-    /// the hold). `context` defaults to the production snapshot taken right now.
+    /// the hold). `context` defaults to the production snapshot taken right now,
+    /// first, before anything else: the network state and whether a storage limit
+    /// is in force are read once and hold for the whole step.
     func runCatchUp(provider: any EmailProvider, folderIds: [String], context: CatchUpContext? = nil) async {
-        let context = context ?? .forPass(isExpensiveNetwork: NetworkMonitor.checkExpensive())
+        let context = context ?? .forPass(
+            isExpensiveNetwork: NetworkMonitor.checkExpensive(),
+            storageLimitInForce: StorageEstimator.budgetMB != Int.max)
         let ids = folderIds
         let folders: [Folder]
         do {
@@ -138,20 +155,25 @@ extension SyncEngine {
             folders: folders, localRows: SyncEngineCatchUpRowReader(pool: dbPool), context: context)
         let windowMode = provider.staleWindowMode
         for result in results {
-            await applyCatchUpResult(result, windowMode: windowMode)
+            await applyCatchUpResult(
+                result, windowMode: windowMode, storageLimitInForce: context.storageLimitInForce)
         }
     }
 
     /// Apply one folder's catch-up result: ONE write transaction for the flag
     /// updates, the removals and the new state. Nothing is ever inserted.
+    /// `storageLimitInForce` is the pass's snapshot (`CatchUpContext`).
     @discardableResult
-    func applyCatchUpResult(_ result: CatchUpFolderResult, windowMode: StaleWindowMode) async -> CatchUpApplyOutcome {
+    func applyCatchUpResult(
+        _ result: CatchUpFolderResult, windowMode: StaleWindowMode, storageLimitInForce: Bool
+    ) async -> CatchUpApplyOutcome {
         let folderId = result.folderId
 
         let outcome: CatchUpApplyOutcome
         do {
             outcome = try await dbPool.write { db in
-                try Self.applyCatchUpTransaction(result, windowMode: windowMode, db: db)
+                try Self.applyCatchUpTransaction(
+                    result, windowMode: windowMode, storageLimitInForce: storageLimitInForce, db: db)
             }
         } catch {
             BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): apply failed: \(error)")
@@ -178,21 +200,37 @@ extension SyncEngine {
 
     /// A delta-cursor lapse, inside the caller's write transaction: the account's
     /// cursor (`Account.lastHistoryId`) becomes `newCursor` (nil clears it) and every
-    /// one of the account's folders loses its catch-up state. Both or neither: the
-    /// changes the lost history held reach no delta, and the cleared state makes
-    /// each folder's next catch-up a full listing, which is what finds them. Used
-    /// wherever a cursor is cleared or replaced by one the delta did not reach.
-    /// Provider-blind: the cursor column and the state are the same for every
-    /// provider that has a delta cursor.
+    /// one of the account's folders gets the lapse marker in its catch-up state
+    /// (`CatchUpLapse`: the count under `CatchUpLapse.countKey` goes up by one).
+    /// Both or neither: the changes the lost history held reach no delta, and the
+    /// marker makes the provider list each folder again, in full, once the listing
+    /// in progress (if any) completes. The marker never clears the state, so a
+    /// listing in progress keeps its place and a folder keeps its schedule (the
+    /// expensive-network wait is not restarted). A NULL state stays NULL: no state
+    /// already means a full check is due. A state that is not a JSON object
+    /// becomes NULL, the same start. Used wherever a cursor is cleared or replaced
+    /// by one the delta did not reach. Provider-blind: the cursor column and the
+    /// marker are the same for every provider that has a delta cursor. It runs
+    /// under the account's one-sync-at-a-time lock, as the catch-up does, so no
+    /// catch-up of the account reads a state before a lapse and writes it after.
     nonisolated static func lapseDeltaCursor(accountId: String, newCursor: String?, db: Database) throws {
         try db.execute(sql: "UPDATE account SET lastHistoryId = ? WHERE id = ?", arguments: [newCursor, accountId])
-        try db.execute(sql: "UPDATE folder SET catchUpState = NULL WHERE accountId = ?", arguments: [accountId])
+        // CASE evaluates lazily: the JSON functions only see valid JSON objects.
+        try db.execute(sql: """
+            UPDATE folder SET catchUpState = CASE
+                WHEN json_valid(catchUpState) THEN CASE
+                    WHEN json_type(catchUpState) = 'object' THEN json_set(
+                        catchUpState, '$.' || ?, COALESCE(json_extract(catchUpState, '$.' || ?), 0) + 1)
+                    ELSE NULL END
+                ELSE NULL END
+            WHERE accountId = ? AND catchUpState IS NOT NULL
+            """, arguments: [CatchUpLapse.countKey, CatchUpLapse.countKey, accountId])
     }
 
     /// The transaction itself. Everything it decides on is read INSIDE it: the folder
     /// row (quarantine, epoch), the pending operations and the recent completions.
     nonisolated static func applyCatchUpTransaction(
-        _ result: CatchUpFolderResult, windowMode: StaleWindowMode, db: Database
+        _ result: CatchUpFolderResult, windowMode: StaleWindowMode, storageLimitInForce: Bool, db: Database
     ) throws -> CatchUpApplyOutcome {
         guard let folder = try Folder.fetchOne(db, key: result.folderId),
               folder.uidValidityResetPendingAt == nil else { return .skipped }
@@ -245,8 +283,11 @@ extension SyncEngine {
         // can complete or be reset between the provider's listing and this write.
         // A declined re-arm loses nothing: the walk goes on and loads everything
         // below its position, and the next check asks again for what is still
-        // missing.
-        let rearm = result.rearmBackfill && folder.backfillComplete
+        // missing. While a storage limit is in force (the pass's snapshot) nothing
+        // is re-armed: the limit means old mail is not kept, the storage prune
+        // deletes it oldest first, and a re-arm would load back exactly what the
+        // prune deleted, to be pruned again, every check (ADR-IOS-107 decision 8).
+        let rearm = result.rearmBackfill && folder.backfillComplete && !storageLimitInForce
         try db.execute(
             sql: "UPDATE folder SET catchUpState = ? WHERE id = ?",
             arguments: [result.newState, folder.id])

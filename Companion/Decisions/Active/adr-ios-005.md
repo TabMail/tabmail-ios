@@ -1,6 +1,11 @@
 
 ## ADR-IOS-005: Progressive Background Backfill
 
+> **Current note (2026-11-11).** A completed walk can be re-armed by the full sync's catch-up when
+> old mail moves into the folder (ADR-IOS-107 decision 8), but never while a storage limit is in
+> force: then the catch-up loads no old mail back, because the limit means old mail is not kept
+> (ADR-IOS-107, "No old mail is loaded back under a storage limit"). The text below is kept as written.
+
 **Context:** Initial sync fetches only the latest N messages (50 inbox, 25 others) with a hardcoded 30-day age limit. Users with months of email history see a sparse mailbox. Opening a non-synced email could silently fail if the provider was disconnected.
 
 **Decision:**

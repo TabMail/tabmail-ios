@@ -836,7 +836,11 @@ extension SyncEngine {
     /// re-arm landing while the iteration is on the network makes this match
     /// nothing and return false: the caller stops the folder's iteration, never
     /// retries the stale write, and the next iteration re-reads the folder and
-    /// walks it from the top. `complete` marks the folder crawled and clears its
+    /// walks on from what it then holds: from the top after a re-arm or a reset,
+    /// or the same saved page again when the version moved with the token
+    /// unchanged (a whole-record folder write, such as the full sync's folder
+    /// upsert, names both columns with their values unchanged and so bumps the
+    /// version too; that costs one extra list request). `complete` marks the folder crawled and clears its
     /// token; otherwise the token moves to `nextToken`. Either way the page's
     /// hold time (`backfillPageHeldSince`) is cleared in the same write, because
     /// it belongs to the token being replaced. SQLite's change count excludes
@@ -1928,7 +1932,7 @@ extension SyncEngine {
                                 folderId: folder.id, readVersion: readVersion, nextToken: nil, complete: true, db: db)
                         }
                         if advanced == false {
-                            BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) state changed during the iteration (re-armed) — re-reading it")
+                            BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) bookkeeping changed during the iteration (a re-arm, a reset or a folder rewrite) — re-reading it")
                             continue
                         }
                         BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) fully crawled (no more pages)")
@@ -1987,7 +1991,7 @@ extension SyncEngine {
                                 complete: nextToken == nil, db: db)
                         }
                         guard advanced else {
-                            BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) state changed during the iteration (re-armed) — re-reading it")
+                            BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) bookkeeping changed during the iteration (a re-arm, a reset or a folder rewrite) — re-reading it")
                             continue
                         }
                         if nextToken == nil {
@@ -2172,7 +2176,7 @@ extension SyncEngine {
                                     complete: nextToken == nil, db: db)
                             }
                             guard advanced else {
-                                BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) state changed during the iteration (re-armed) — re-reading it")
+                                BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) bookkeeping changed during the iteration (a re-arm, a reset or a folder rewrite) — re-reading it")
                                 if insertedCount > 0 { didWork = true }
                                 continue
                             }

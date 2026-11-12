@@ -2,6 +2,7 @@
 ### Progressive Backfill & Storage Budget (ADR-IOS-005, ADR-IOS-006)
 - **No age cutoff** — backfill always walks to completion: IMAP walks UID range from UIDNEXT-1 to UID 1, Gmail/Exchange exhausts all page tokens. Storage budget is the only gate.
 - `StorageEstimator.budgetMB` (UserDefaults, default 2048) — global storage soft cap across all accounts
+- **Storage limit vs the catch-up re-arm (2026-11-11, ADR-IOS-107 decision 8).** `SyncEngine.runCatchUp` snapshots `StorageEstimator.budgetMB != Int.max` into `CatchUpContext.storageLimitInForce` (the code's default budget is `Int.max`, unlimited, despite the line above). While it holds, `applyCatchUpTransaction` declines every re-arm and a Gmail listing goes no lower than the folder's oldest local row, so the prune's deletions are not reloaded weekly (prune orders by `date`, ranges by `providerDate`, so pruned ids sit between kept rows too). Trade-off: under a limit, old mail moved into a folder is not loaded. Tests: `GmailCatchUpTests.storageLimitStopsTheReload`, `productionSnapshotTakesTheStorageLimit`.
 - After initial sync, `SyncEngine.startBackfill()` fetches older messages in background
 - **Backfills ALL folders** (not just primary/secondary) — sorted by priority: inbox → favorites → secondary → custom
 - IMAP backfill uses UID range walking (no SEARCH, avoids NIO 8KB buffer limit)

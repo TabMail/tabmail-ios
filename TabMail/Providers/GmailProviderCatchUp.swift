@@ -18,13 +18,31 @@ struct GmailCatchUpState: Codable, Equatable, Sendable {
     /// When the catch-up last tried a listing for the folder, whether or not it
     /// succeeded. Drives the order (`CatchUpSchedule.leastRecentlyAttemptedFirst`).
     var lastAttemptAt: Date?
+    /// How many delta-cursor lapses the folder's state has seen. Written only by
+    /// `SyncEngine.lapseDeltaCursor`, inside this JSON under
+    /// `CatchUpLapse.countKey` (the property name must stay equal to it); the
+    /// catch-up carries it forward unchanged.
+    var lapseCount: Int?
+    /// `lapseCount` as it stood when the last COMPLETED listing started.
+    var listedLapseCount: Int?
+
+    /// A lapse came after the last completed listing started (before any listing
+    /// completed: any lapse at all). Changes the lost history held may sit in
+    /// ranges that listing had already passed, so a new listing is due at once.
+    var lapsedSinceLastListing: Bool { (lapseCount ?? 0) > (listedLapseCount ?? 0) }
 
     struct Listing: Codable, Equatable, Sendable {
-        /// The next range starts at this epoch second; nil starts at the folder's
-        /// oldest local row. A listing that starts while the folder's backfill
-        /// walk is complete starts at 0, so it also lists mail older than every
-        /// local row.
-        var nextFromSecond: Int?
+        /// The next range ends just before this epoch second; nil starts at the
+        /// folder's newest local row. Ranges go from the newest local row to the
+        /// oldest, so recent mail is checked first.
+        var nextBeforeSecond: Int?
+        /// Whether the oldest range reaches down to the epoch, so the listing
+        /// also covers mail older than every local row. Set when the listing
+        /// starts: true while the folder's backfill walk is complete and no
+        /// storage limit is in force (`CatchUpContext.storageLimitInForce`).
+        var toEpoch = false
+        /// `GmailCatchUpState.lapseCount` when this listing started.
+        var lapseCountAtStart: Int?
         /// Whether a range listed so far found a missing id: one the server lists
         /// in the folder that no local row in the folder holds.
         var foundMissing = false
@@ -93,58 +111,87 @@ extension GmailProvider {
     }
 
     /// The per-folder decision: IMAP's without the HIGHESTMODSEQ signal (Gmail has
-    /// none). A folder lists when its full check is due (weekly,
-    /// `SyncConfig.gmailCatchUpFullCheckIntervalSeconds`, or at once when a lapse
-    /// cleared its state), or continues a listing in progress; on an expensive
-    /// network only once it has waited `SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds`.
-    /// A folder with no state on an expensive network gets `.none`; the caller
-    /// writes a state carrying `createdAt` so the wait has a start.
+    /// none). A folder continues a listing in progress (a lapse never interrupts
+    /// one), or starts one when its full check is due (weekly,
+    /// `SyncConfig.gmailCatchUpFullCheckIntervalSeconds`; no state at all is due),
+    /// or when a lapse came after its last completed listing started
+    /// (`GmailCatchUpState.lapsedSinceLastListing`). On an expensive network only
+    /// once it has waited `SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds` since
+    /// its last completed listing (a lapse does not restart the wait). A folder
+    /// with no state on an expensive network gets `.none`; the caller writes a
+    /// state carrying `createdAt` so the wait has a start.
     nonisolated static func catchUpPlan(state: GmailCatchUpState?, isExpensiveNetwork: Bool, now: Date) -> CatchUpPlan {
         let waitedTooLong = CatchUpSchedule.waitedTooLong(
             hasState: state != nil, lastCompletedAt: state?.lastCompletedAt, createdAt: state?.createdAt, now: now)
         if isExpensiveNetwork && !waitedTooLong { return .none }
         if let listing = state?.listing { return .list(listing) }
-        if CatchUpSchedule.fullCheckDue(
+        if state?.lapsedSinceLastListing == true || CatchUpSchedule.fullCheckDue(
             lastCompletedAt: state?.lastCompletedAt, now: now, interval: SyncConfig.gmailCatchUpFullCheckIntervalSeconds) {
-            return .list(GmailCatchUpState.Listing())
+            return .list(GmailCatchUpState.Listing(lapseCountAtStart: state?.lapseCount))
         }
         return .none
     }
 
     /// One listing range, in whole epoch seconds. Ranges tile the folder's local
-    /// range without gaps: each starts where the previous one ended.
+    /// range without gaps, newest first: each ends where the previous (newer)
+    /// one started.
     struct CatchUpRange: Codable, Equatable, Sendable {
-        /// Where the range starts (inclusive): the previous range's end, or the
-        /// first range's first local row.
+        /// Where the range starts (inclusive): the next (older) range ends here.
+        /// The oldest range of a listing that reaches the epoch starts at 0.
         let from: Int
-        /// The second of the range's first local row (`>= from`). The stretch
-        /// before it holds no local row.
+        /// The second of the range's oldest local row (`>= from`). The stretch
+        /// before it held no local row when the range was cut.
         let firstLocal: Int
-        /// Where the range ends (exclusive).
+        /// One past the second of the range's newest local row (`<= upTo`). The
+        /// stretch from it to `upTo` held no local row when the range was cut.
+        let localEnd: Int
+        /// Where the range ends (exclusive): the previous (newer) range's start,
+        /// or the first range's `localEnd`.
         let upTo: Int
     }
 
-    /// The range starting at `nextFromSecond`, given the order dates of the first
-    /// local rows at or after it (`head`, ascending, non-empty, at most
-    /// `rowLimit + 1` of them). The range holds at most `rowLimit` rows unless more
-    /// than that share its first second, ends on a whole second (rows sharing the
-    /// cut second go to the next range), and spans at most `maxSpanSeconds` from its
-    /// first local row.
+    /// The range ending just before `nextBeforeSecond` (nil: just after the newest
+    /// local row), given the order dates of the newest local rows before it
+    /// (`head`, descending, non-empty, at most `rowLimit + 1` of them). The range
+    /// holds at most `rowLimit` rows unless more than that share its newest
+    /// second, starts on a whole second (rows sharing the cut second go to the
+    /// next range), and its local rows span at most `maxSpanSeconds`. When it
+    /// holds every remaining row and `toEpoch` is set, it starts at 0.
     nonisolated static func catchUpRange(
-        nextFromSecond: Int?, head: [Date], rowLimit: Int, maxSpanSeconds: Int
+        nextBeforeSecond: Int?, head: [Date], rowLimit: Int, maxSpanSeconds: Int, toEpoch: Bool
     ) -> CatchUpRange {
         let second = { (date: Date) in Int(date.timeIntervalSince1970.rounded(.down)) }
-        let firstLocal = second(head[0])
-        var upTo = head.count > rowLimit
-            ? max(second(head[rowLimit]), firstLocal + 1)
-            : second(head[head.count - 1]) + 1
-        upTo = min(upTo, firstLocal + maxSpanSeconds)
-        return CatchUpRange(from: min(nextFromSecond ?? firstLocal, firstLocal), firstLocal: firstLocal, upTo: upTo)
+        let seconds = head.map(second)
+        let newest = seconds[0]
+        let localEnd = newest + 1
+        var from: Int
+        var holdsTheRest: Bool
+        if seconds.count > rowLimit {
+            from = min(seconds[rowLimit] + 1, newest)
+            holdsTheRest = false
+        } else {
+            from = seconds[seconds.count - 1]
+            holdsTheRest = true
+        }
+        if from < localEnd - maxSpanSeconds {
+            from = localEnd - maxSpanSeconds
+            holdsTheRest = false
+        }
+        let firstLocal = seconds.filter { $0 >= from }.min() ?? newest
+        if holdsTheRest && toEpoch { from = min(from, 0) }
+        return CatchUpRange(from: from, firstLocal: firstLocal, localEnd: localEnd, upTo: nextBeforeSecond ?? localEnd)
+    }
+
+    /// Whether a listing starting now reaches down to the epoch: only while the
+    /// folder's walk is complete (an unfinished walk reaches older mail itself)
+    /// and no storage limit is in force (the limit means old mail is not kept).
+    private nonisolated static func listsToEpoch(_ folder: Folder, context: CatchUpContext) -> Bool {
+        folder.backfillComplete && !context.storageLimitInForce
     }
 
     /// `EmailProvider.catchUp` for Gmail (ADR-IOS-107). For each folder whose full
     /// check is due (weekly, or after a lapse) or whose listing is in progress: a listing by
-    /// provider-date ranges taken from the local rows, resuming across passes.
+    /// provider-date ranges taken from the local rows, newest first, resuming across passes.
     /// Per range, the folder's membership list, then the account-wide `is:unread`
     /// and `is:starred` lists over the same dates (so a message moved between two
     /// requests can never get a wrong flag), each resuming at its saved page, then
@@ -212,18 +259,21 @@ extension GmailProvider {
             waiting.newState = GmailCatchUpState(createdAt: context.clock()).encoded()
             return waiting
         }
-        // A new listing of a folder whose walk is complete starts at the epoch,
-        // not at the oldest local row: a message older than every local row that
-        // moved in is missing too, and only a re-armed walk loads it. An
-        // unfinished walk reaches that mail itself.
-        if state?.listing == nil && folder.backfillComplete { listing.nextFromSecond = 0 }
+        // A new listing of a folder whose walk is complete reaches down to the
+        // epoch, not only to the oldest local row: a message older than every
+        // local row that moved in is missing too, and only a re-armed walk loads
+        // it. An unfinished walk reaches that mail itself. Under a storage limit
+        // the oldest local row is where kept mail ends, so the listing stops there.
+        if state?.listing == nil { listing.toEpoch = Self.listsToEpoch(folder, context: context) }
 
         var result = CatchUpFolderResult(folderId: folder.id, epoch: nil)
+        var newState = state ?? GmailCatchUpState(createdAt: context.clock())
         let path = folder.path
         let rowLimit = SyncConfig.catchUpGmailRangeRowLimit
         let slack = SyncConfig.catchUpGmailRangeSlackSeconds
         let pageSize = SyncConfig.catchUpGmailListPageSize
-        var completed = false
+        // The listing covered the folder and no new one started after it.
+        var listingDone = false
 
         rangeLoop: while true {
             // A row the listing left out is only a candidate: its own answer
@@ -254,20 +304,49 @@ extension GmailProvider {
                 result.removedIds.append(id)
             }
 
-            // The range whose lists are in progress, or the next one: from the
-            // local rows, never past them.
+            // The range whose lists are in progress, or the next older one: from
+            // the local rows, never past them.
             if listing.range == nil {
                 do {
-                    let lower = listing.nextFromSecond.map { Date(timeIntervalSince1970: TimeInterval($0)) }
-                    let head = try await localRows.rows(folderId: folder.id, orderDatesFrom: lower, before: nil, limit: rowLimit + 1)
+                    let upper = listing.nextBeforeSecond.map { Date(timeIntervalSince1970: TimeInterval($0)) }
+                    let head = try await localRows.newestRows(folderId: folder.id, orderDatesBefore: upper, limit: rowLimit + 1)
                     let headDates = head.compactMap(\.orderDate)
                     guard !headDates.isEmpty, headDates.count == head.count else {
-                        completed = head.isEmpty
-                        break rangeLoop
+                        guard head.isEmpty else { break rangeLoop }
+                        // The listing covered the folder. Ask for a re-arm of the
+                        // backfill when something is missing; the apply declines it
+                        // while the folder's walk is unfinished or a storage limit
+                        // is in force. One completed listing asks at most once, so
+                        // an id that cannot load costs one ids-only re-walk per
+                        // listing (weekly, plus the listing after each lapse), and
+                        // is tried again at each. What leaves an id missing, and so
+                        // asks: mail moved in from elsewhere (older than the newest
+                        // rows, which no window reaches) that no delta brought (a
+                        // lapse), and a fetch that failed during the walk: the walk
+                        // passes over an id whose GET fails about the message
+                        // itself, or keeps failing past the page hold bound, and
+                        // only the next check finds it missing and re-arms for it.
+                        newState.lastCompletedAt = context.clock()
+                        newState.listedLapseCount = listing.lapseCountAtStart
+                        if listing.foundMissing { result.rearmBackfill = true }
+                        guard newState.lapsedSinceLastListing, !context.isExpensiveNetwork else {
+                            listingDone = true
+                            break rangeLoop
+                        }
+                        // A lapse came after this listing started, so a change the
+                        // lost history held may sit in a range it had already
+                        // listed: a new listing starts at once, newest first. On an
+                        // expensive network it waits instead, like every listing,
+                        // for `SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds`
+                        // after this completion (`catchUpPlan`).
+                        listing = GmailCatchUpState.Listing(
+                            toEpoch: Self.listsToEpoch(folder, context: context), lapseCountAtStart: newState.lapseCount)
+                        continue rangeLoop
                     }
                     listing.range = GmailCatchUpState.RangeScan(range: Self.catchUpRange(
-                        nextFromSecond: listing.nextFromSecond, head: headDates,
-                        rowLimit: rowLimit, maxSpanSeconds: SyncConfig.catchUpGmailRangeMaxSpanSeconds))
+                        nextBeforeSecond: listing.nextBeforeSecond, head: headDates,
+                        rowLimit: rowLimit, maxSpanSeconds: SyncConfig.catchUpGmailRangeMaxSpanSeconds,
+                        toEpoch: listing.toEpoch))
                 } catch {
                     break rangeLoop
                 }
@@ -276,22 +355,24 @@ extension GmailProvider {
             let range = scan.range
 
             // The range's rows as the device holds them now. More than `rowLimit`
-            // rows only when more than that share the range's first second.
+            // rows only when more than that share the range's newest second.
             let rangeRows: [CatchUpLocalRow]
             do {
                 rangeRows = try await localRows.rows(
                     folderId: folder.id,
                     orderDatesFrom: Date(timeIntervalSince1970: TimeInterval(range.from)),
-                    before: Date(timeIntervalSince1970: TimeInterval(range.upTo)),
-                    limit: nil)
+                    before: Date(timeIntervalSince1970: TimeInterval(range.upTo)))
             } catch {
                 break rangeLoop
             }
             let rangeRowsById = Dictionary(rangeRows.map { ($0.messageId, $0) }, uniquingKeysWith: { first, _ in first })
 
-            // Never before the epoch: a listing from 0 has no slack below it.
+            // Never before the epoch: a range from 0 has no slack below it. The
+            // flag lists cover only the stretch the range's local rows held when
+            // it was cut, so a sparse folder never asks for the account's flags
+            // over a long empty stretch.
             let membershipWindow = ListWindow(after: max(0, range.from - slack), before: range.upTo + slack)
-            let flagWindow = ListWindow(after: range.firstLocal - slack, before: range.upTo + slack)
+            let flagWindow = ListWindow(after: range.firstLocal - slack, before: range.localEnd + slack)
             var listsComplete = false
             // The lists of this range that started over in this pass after a
             // `400`. In memory only: each pass may start a list over once, so a
@@ -395,15 +476,17 @@ extension GmailProvider {
             // The range's lists are complete: its flags count for every named row
             // whose local flags are what they were when the membership list
             // completed and whose date the flag lists covered, and the cursor
-            // moves past it. A row dated before the flag window (one that arrived
-            // in the range's stretch before its first local row after the range
-            // was cut) was never asked about, so its absence from them says nothing.
+            // moves past it. A row dated outside the flag window (one that arrived
+            // in the range's stretch before its oldest or after its newest local
+            // row after the range was cut) was never asked about, so its absence
+            // from them says nothing.
             let unread = Set(scan.unreadIds)
             let starred = Set(scan.starredIds)
             let flagWindowStart = Date(timeIntervalSince1970: TimeInterval(flagWindow.after))
+            let flagWindowEnd = Date(timeIntervalSince1970: TimeInterval(flagWindow.before))
             for named in scan.named {
                 guard let row = rangeRowsById[named.id], row.isRead == named.isRead, row.isFlagged == named.isFlagged else { continue }
-                guard let orderDate = row.orderDate, orderDate >= flagWindowStart else { continue }
+                guard let orderDate = row.orderDate, orderDate >= flagWindowStart, orderDate < flagWindowEnd else { continue }
                 let isRead = !unread.contains(named.id)
                 let isFlagged = starred.contains(named.id)
                 if isRead != row.isRead || isFlagged != row.isFlagged {
@@ -411,32 +494,14 @@ extension GmailProvider {
                 }
             }
             listing.range = nil
-            listing.nextFromSecond = range.upTo
+            listing.nextBeforeSecond = range.from
         }
 
-        var newState = state ?? GmailCatchUpState(createdAt: context.clock())
         newState.lastAttemptAt = context.clock()
-        if completed {
-            // The listing covered the folder. Ask for a re-arm of the backfill
-            // when something is missing; the apply declines it while the
-            // folder's walk is unfinished. One completed check asks at most once,
-            // so an id that cannot load costs one ids-only re-walk per check
-            // (weekly, plus the check after each lapse), and is tried again at
-            // each. What leaves an id missing, and so asks: mail moved in from
-            // elsewhere (older than the newest rows, which no window reaches), a
-            // lapse (the state is cleared), and a fetch that failed during the
-            // walk: the walk passes over an id whose GET fails about the message
-            // itself, or keeps failing past the page hold bound, and only the
-            // next check finds it missing and re-arms for it.
-            newState.lastCompletedAt = context.clock()
-            newState.listing = nil
-            result.rearmBackfill = listing.foundMissing
-        } else {
-            newState.listing = listing
-        }
+        newState.listing = listingDone ? nil : listing
         result.newState = newState.encoded()
         if DebugModeManager.isLoggingEnabled() {
-            BackgroundSyncLogger.logDebug("[CatchUp] \(path): flags=\(result.flagUpdates.count) removed=\(result.removedIds.count) rearm=\(result.rearmBackfill) \(completed ? "listing complete" : "resumes at \(listing.nextFromSecond.map(String.init) ?? "start")")")
+            BackgroundSyncLogger.logDebug("[CatchUp] \(path): flags=\(result.flagUpdates.count) removed=\(result.removedIds.count) rearm=\(result.rearmBackfill) \(listingDone ? "listing complete" : "resumes before \(listing.nextBeforeSecond.map(String.init) ?? "the newest row")")")
         }
         return result
     }

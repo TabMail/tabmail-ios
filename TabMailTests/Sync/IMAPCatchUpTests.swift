@@ -785,7 +785,7 @@ struct CatchUpApplyTests {
         result.flagUpdates = [CatchUpFlagUpdate(messageId: "1", isRead: true, isFlagged: true)]
         result.removedIds = ["3"]
         result.newState = "opaque-state"
-        let outcome = await SyncEngine().applyCatchUpResult(result, windowMode: .uid)
+        let outcome = await SyncEngine().applyCatchUpResult(result, windowMode: .uid, storageLimitInForce: false)
 
         #expect(outcome == .applied(updatedFlags: 1, removedIds: ["\(w.folderId):3"]))
         let folderId = w.folderId
@@ -808,13 +808,13 @@ struct CatchUpApplyTests {
         var other = CatchUpFolderResult(folderId: w.folderId, epoch: Self.epoch + 1)
         other.removedIds = ["1", "2", "3"]
         other.newState = "must-not-land"
-        let turned = await SyncEngine().applyCatchUpResult(other, windowMode: .uid)
+        let turned = await SyncEngine().applyCatchUpResult(other, windowMode: .uid, storageLimitInForce: false)
         #expect(turned == .turnover(accountId: "cua-epoch", folderPath: "Archive", stored: Self.epoch, observed: Self.epoch + 1))
 
         var unbound = CatchUpFolderResult(folderId: w.folderId, epoch: nil)
         unbound.removedIds = ["1", "2", "3"]
         unbound.newState = "must-not-land"
-        #expect(await SyncEngine().applyCatchUpResult(unbound, windowMode: .uid) == .skipped,
+        #expect(await SyncEngine().applyCatchUpResult(unbound, windowMode: .uid, storageLimitInForce: false) == .skipped,
                 "an IMAP result that names no epoch is unproven")
 
         #expect(try FolderEpochTestFixture.headerCount(accountId: "cua-epoch", path: "Archive", pool: w.pool) == 3)
@@ -833,7 +833,7 @@ struct CatchUpApplyTests {
         result.flagUpdates = [CatchUpFlagUpdate(messageId: "1", isRead: true, isFlagged: false)]
         result.removedIds = ["3"]
         result.newState = "must-not-land"
-        #expect(await SyncEngine().applyCatchUpResult(result, windowMode: .uid) == .skipped)
+        #expect(await SyncEngine().applyCatchUpResult(result, windowMode: .uid, storageLimitInForce: false) == .skipped)
         #expect(try FolderEpochTestFixture.headerCount(accountId: "cua-quarantine", path: "Archive", pool: w.pool) == 3)
         #expect(try Self.catchUpState(w.pool, w.folderId) == nil)
     }
@@ -844,7 +844,7 @@ struct CatchUpApplyTests {
         defer { AppDatabase.shared.withLock { $0 = w.previous }; TestDatabaseTeardown.retire(pool: w.pool, directory: w.dir) }
         var result = CatchUpFolderResult(folderId: w.folderId, epoch: Self.epoch)
         result.removedIds = ["1"]
-        #expect(await SyncEngine().applyCatchUpResult(result, windowMode: .uid) == .skipped)
+        #expect(await SyncEngine().applyCatchUpResult(result, windowMode: .uid, storageLimitInForce: false) == .skipped)
         #expect(try FolderEpochTestFixture.headerCount(accountId: "cua-unknown", path: "Archive", pool: w.pool) == 3)
     }
 

@@ -1329,8 +1329,12 @@ actor GmailProvider: EmailProvider {
                 path += "&q=\(q.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? q)"
             }
         }
-        // Gmail leaves Spam and Trash mail out of a list unless
-        // `includeSpamTrash` is sent (unsent = false). A folder's windowed
+        // What this relies on: a search (`q`) list and a list of any label
+        // other than SPAM or TRASH leave Spam and Trash mail out unless
+        // `includeSpamTrash` is sent (unsent = false), while a list by
+        // `labelIds=TRASH` or `SPAM` returns that folder's mail without it (the
+        // Spam and Trash walks list that way). Google's reference documents
+        // the flag but not how it combines with `labelIds`. A folder's windowed
         // list asks for it only for the Spam and Trash folders themselves, so
         // every other folder's check lists what its own walk lists: a message
         // in a label that is also in Trash or Spam is not missing there (#540).
