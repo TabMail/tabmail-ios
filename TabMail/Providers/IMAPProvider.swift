@@ -3391,7 +3391,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
 
     func fetchFolders() async throws -> [FolderInfo] {
         try await withActionConnectionNoSelect { server in
-            let mailboxes = try await server.listMailboxes()
+            let mailboxes = try await Self.listMailboxesWithSpecialUse(server)
 
             // Build (info, attributes) pairs so the dedup pass can prefer the
             // folder carrying the actual SPECIAL-USE flag (RFC 6154) over a
@@ -3399,7 +3399,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // example, exposes both "Trash" and "Deleted Messages" — only one
             // typically carries `\Trash`, and the other should fall back to
             // `.custom` instead of duplicating the role.
-            var pairs: [(info: FolderInfo, attributes: Mailbox.Info.Attributes)] = []
+            var pairs: [(info: FolderInfo, attributes: Mailbox.Info.Attributes, delimiter: String?)] = []
             for info in mailboxes {
                 guard info.isSelectable else { continue }
                 var unread = 0
@@ -3431,17 +3431,64 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     info: FolderInfo(
                         name: info.name,
                         path: info.name,
-                        role: IMAPProvider.mapRole(attributes: info.attributes, name: info.name),
+                        role: IMAPProvider.mapRole(
+                            attributes: info.attributes, name: info.name,
+                            delimiter: info.hierarchyDelimiter),
                         unreadCount: unread,
                         totalCount: total,
                         uidNext: uidNextVal,
                         highestModSeq: highestModSeqVal,
                         uidValidity: uidValidityVal
                     ),
-                    attributes: info.attributes
+                    attributes: info.attributes,
+                    delimiter: info.hierarchyDelimiter
                 ))
             }
             return IMAPProvider.dedupRoles(pairs)
+        }
+    }
+
+    /// Every mailbox, carrying its RFC 6154 special-use attributes.
+    ///
+    /// A plain LIST is not enough: RFC 6154 §2 lets a server leave `\Sent` and
+    /// the rest out of a plain LIST ("MAY include"); only
+    /// `LIST ... RETURN (SPECIAL-USE)` must carry them. When the server
+    /// advertises `SPECIAL-USE`, the fork's `listSpecialUseMailboxes()` sends
+    /// that LIST and its attributes are merged onto the plain listing by name.
+    ///
+    /// Without the capability the plain listing is returned untouched.
+    /// `listSpecialUseMailboxes()` must NOT be called then: on such a server it
+    /// invents attributes from substrings of folder names (any name containing
+    /// "sent", "draft", "all" + "mail" …), which would hand roles to ordinary
+    /// folders. The capability test below is the fork's own test
+    /// (`capabilities.contains(Capability("SPECIAL-USE"))`, an exact-token
+    /// match), so the fork always takes its SPECIAL-USE branch when called here.
+    static func listMailboxesWithSpecialUse(_ server: IMAPServer) async throws -> [Mailbox.Info] {
+        let mailboxes = try await server.listMailboxes()
+        let capabilities = try await server.fetchCapabilities()
+        guard capabilities.contains(where: { $0.name == "SPECIAL-USE" && $0.value == nil }) else {
+            return mailboxes
+        }
+        let special = try await server.listSpecialUseMailboxes()
+        return mergeSpecialUseAttributes(into: mailboxes, from: special)
+    }
+
+    /// Adds each special-use listing's attributes to the plain-listing entry of
+    /// the same name. Names only in `special` are not added: the plain listing
+    /// (namespace-aware) stays the folder list; `special` only annotates it.
+    static func mergeSpecialUseAttributes(
+        into mailboxes: [Mailbox.Info], from special: [Mailbox.Info]
+    ) -> [Mailbox.Info] {
+        var specialByName: [String: Mailbox.Info.Attributes] = [:]
+        for entry in special {
+            specialByName[entry.name, default: []].formUnion(entry.attributes)
+        }
+        return mailboxes.map { mailbox in
+            guard let extra = specialByName[mailbox.name] else { return mailbox }
+            return Mailbox.Info(
+                name: mailbox.name,
+                attributes: mailbox.attributes.union(extra),
+                hierarchyDelimiter: mailbox.hierarchyDelimiter)
         }
     }
 
@@ -7211,10 +7258,6 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     }
 
 
-    private func mapRole(_ attributes: Mailbox.Info.Attributes, name: String) -> FolderRole {
-        IMAPProvider.mapRole(attributes: attributes, name: name)
-    }
-
     /// Canonical name lists for name-based role detection (lowercased).
     /// Order matters: index 0 is the preferred canonical name and wins
     /// dedup tiebreaks (e.g., "Trash" beats "Deleted Messages" on iCloud).
@@ -7228,7 +7271,14 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     ]
 
     /// Pure mapping function — exposed for tests + the role-dedup pass.
-    static func mapRole(attributes: Mailbox.Info.Attributes, name: String) -> FolderRole {
+    ///
+    /// `name` is the full mailbox name and `delimiter` the server's hierarchy
+    /// delimiter. The name fallback matches the LAST segment (the leaf), so a
+    /// server that keeps every folder under INBOX (`INBOX.Sent`, `INBOX/Sent`)
+    /// and sends no special-use attributes still gets its Sent folder. INBOX
+    /// itself matches only as the whole name: a folder `Old/INBOX` is not the
+    /// inbox.
+    static func mapRole(attributes: Mailbox.Info.Attributes, name: String, delimiter: String?) -> FolderRole {
         // Check IMAP special-use attributes first (RFC 6154)
         if attributes.contains(.inbox) { return .inbox }
         if attributes.contains(.sent) { return .sent }
@@ -7237,12 +7287,21 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         if attributes.contains(.archive) { return .archive }
         if attributes.contains(.junk) { return .spam }
 
-        // Name-based fallback — many servers don't return special-use flags without RETURN (SPECIAL-USE)
-        let lower = name.lowercased()
-        for (role, names) in canonicalNames where names.contains(lower) {
+        // Name-based fallback, for servers that send no special-use attributes.
+        if canonicalNames[.inbox]?.contains(name.lowercased()) == true { return .inbox }
+        let leaf = leafName(name, delimiter: delimiter).lowercased()
+        for (role, names) in canonicalNames where role != .inbox && names.contains(leaf) {
             return role
         }
         return .custom
+    }
+
+    /// The last segment of a mailbox name: `INBOX.Sent` with delimiter `.`
+    /// gives `Sent`. The whole name when there is no delimiter or none in it.
+    static func leafName(_ name: String, delimiter: String?) -> String {
+        guard let delimiter, !delimiter.isEmpty,
+              let range = name.range(of: delimiter, options: .backwards) else { return name }
+        return String(name[range.upperBound...])
     }
 
     /// Returns the IMAP SPECIAL-USE attribute that corresponds to a role,
@@ -7261,8 +7320,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
 
     /// Lower index = more canonical name for the role. Returns Int.max
     /// when the name is not in the list — so unknown names lose tiebreaks.
-    static func canonicalNameRank(_ name: String, role: FolderRole) -> Int {
-        let lower = name.lowercased()
+    /// Ranks the leaf, as `mapRole` matches it (INBOX only as the whole name).
+    static func canonicalNameRank(_ name: String, role: FolderRole, delimiter: String?) -> Int {
+        let lower = (role == .inbox ? name : leafName(name, delimiter: delimiter)).lowercased()
         guard let names = canonicalNames[role],
               let idx = names.firstIndex(of: lower) else { return .max }
         return idx
@@ -7273,7 +7333,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// the deduped list — losers are demoted to `.custom`. `.custom` and `.inbox`
     /// are passed through unchanged (multiple inboxes don't occur on real IMAP).
     static func dedupRoles(
-        _ folders: [(info: FolderInfo, attributes: Mailbox.Info.Attributes)]
+        _ folders: [(info: FolderInfo, attributes: Mailbox.Info.Attributes, delimiter: String?)]
     ) -> [FolderInfo] {
         let grouped = Dictionary(grouping: folders.indices, by: { folders[$0].info.role })
         var demoted: Set<Int> = []
@@ -7290,8 +7350,8 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 let aHasAttr = attr.map { fa.attributes.contains($0) } ?? false
                 let bHasAttr = attr.map { fb.attributes.contains($0) } ?? false
                 if aHasAttr != bHasAttr { return aHasAttr }
-                let aRank = canonicalNameRank(fa.info.name, role: role)
-                let bRank = canonicalNameRank(fb.info.name, role: role)
+                let aRank = canonicalNameRank(fa.info.name, role: role, delimiter: fa.delimiter)
+                let bRank = canonicalNameRank(fb.info.name, role: role, delimiter: fb.delimiter)
                 if aRank != bRank { return aRank < bRank }
                 return fa.info.name.count < fb.info.name.count
             }!
