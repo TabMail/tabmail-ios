@@ -858,7 +858,9 @@ actor CalDAVProvider: CalendarProvider {
             beforeNaiveISO: record.splitAt, allDay: Self.icsIsAllDay(storedICS), zone: zone) else {
             throw CalendarProviderError.notSupported("Invalid recurrence_id '\(record.splitAt)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
         }
-        let zones = CalendarTimeZoneContext(calendarText: storedICS)
+        // Floating times are read in the operation's zone, as the first attempt read them
+        // (`splitPoint`), so the retry sorts the occurrences around the named one as it did.
+        let zones = CalendarTimeZoneContext(calendarText: storedICS).readingFloating(in: zone)
         guard let masterFrameSlot = try Self.recurrenceIdInMasterFrame(
             record.splitAt, declaredZone: zone, kind: Self.masterDTStartKind(from: storedICS), zones: zones
         ) else {
@@ -888,7 +890,7 @@ actor CalDAVProvider: CalendarProvider {
             return instant
         } ?? slotInstant
         let edit = try Self.occurrenceEdit(
-            fields: record.fields, from: partICS, slotInstant: slotInstant, shownFrom: shownFrom, zones: CalendarTimeZoneContext(calendarText: partICS))
+            fields: record.fields, from: partICS, slotInstant: slotInstant, shownFrom: shownFrom, zones: CalendarTimeZoneContext(calendarText: partICS).readingFloating(in: zone))
         let cappedSeries = try Self.cappedSeriesResource(
             storedICS: storedICS, slotInstant: slotInstant, cappedRRule: cappedRRule, zones: zones, edit: edit)
         etagCache.removeValue(forKey: record.seriesId)

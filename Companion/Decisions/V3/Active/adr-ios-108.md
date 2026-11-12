@@ -194,7 +194,8 @@ of the resource, which holds every occurrence (irreversible wire operation #5, n
   line) call, so the card can never cut where the write does not (CalDAV reads the resource's
   `RDATE` lines there; Outlook places a pattern from its range start and a missing month day on the
   month's last). A floating CalDAV series is read in the zone the operation was queued with
-  (`CalendarTimeZoneContext.readingFloating(in:)`), never the device's at the drain. Past the end,
+  (`CalendarTimeZoneContext.readingFloating(in:)`), never the device's at the drain, by the split
+  and by its retry (`finishSplit`) alike. Past the end,
   Google and Outlook keep a record (`SplitRecord.pastEnd`) with absolute targets before the first
   write, and a retry finishes from it (`finishShownEdit`), so no occurrence moves twice.
 - The series id with a moved occurrence's new time edits that occurrence in place, and with its old

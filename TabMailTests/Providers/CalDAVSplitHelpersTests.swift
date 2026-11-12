@@ -1649,6 +1649,66 @@ struct CalDAVSplitRollbackTests {
     }
 
     @Test("""
+    a floating series split at a moved occurrence, its cap refused and finished later while the \
+    device is in another zone: the retry edits the same occurrences shown after the named one
+    """)
+    func floatingSplitRetryEditsTheSameOccurrences() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let store = FakeCalDAVStore(servesETags: true)
+        // The operation's zone, five hours behind the device's.
+        let zone = try #require(TimeZone(secondsFromGMT: TimeZone.current.secondsFromGMT() - 5 * 3600))
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .gmt
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = calendar
+        formatter.timeZone = .gmt
+        formatter.dateFormat = "yyyyMMdd"
+        let today = calendar.startOfDay(for: Date())
+        func day(_ n: Int) -> String { formatter.string(from: calendar.date(byAdding: .day, value: n, to: today) ?? today) }
+        // Weekly at 10:00 floating. Day 7's occurrence moved to day 9 at 10:00 (named); day 0's
+        // moved to day 9 at 12:00: placed before the cut (day 14), shown after the named one.
+        let ics = [
+            "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Example//EN",
+            "BEGIN:VEVENT", "UID:floating-split@example.com", "DTSTAMP:\(day(0))T000000Z",
+            "DTSTART:\(day(0))T100000", "DTEND:\(day(0))T103000", "RRULE:FREQ=WEEKLY", "SUMMARY:Standup", "END:VEVENT",
+            "BEGIN:VEVENT", "UID:floating-split@example.com", "DTSTAMP:\(day(0))T000000Z", "RECURRENCE-ID:\(day(7))T100000",
+            "DTSTART:\(day(9))T100000", "DTEND:\(day(9))T103000", "SUMMARY:Standup", "END:VEVENT",
+            "BEGIN:VEVENT", "UID:floating-split@example.com", "DTSTAMP:\(day(0))T000000Z", "RECURRENCE-ID:\(day(0))T100000",
+            "DTSTART:\(day(9))T120000", "DTEND:\(day(9))T123000", "SUMMARY:Standup", "END:VEVENT",
+            "END:VCALENDAR",
+        ].joined(separator: "\r\n")
+        store.seed(path: Self.masterPath, ics: ics)
+        let refuseNext = Mutex(true)
+        http.register(path: "/cal/", method: "GET") { store.handleGET($0) }
+        http.register(path: "/cal/", method: "PUT") { store.handlePUT($0) }
+        http.register(path: Self.masterPath, method: "PUT") { request in
+            // The first cap is refused and not kept.
+            if refuseNext.withLock({ refuse in defer { refuse = false }; return refuse }) { return .raw(statusCode: 500) }
+            return store.handlePUT(request)
+        }
+        let provider = Self.makeProvider(http)
+        let records = SplitRecordBox()
+        var patch = GCalEventInput()
+        patch.summary = "Renamed"
+        let named = "\(day(9).prefix(4))-\(day(9).dropFirst(4).prefix(2))-\(day(9).suffix(2))T10:00:00"
+        await #expect(throws: (any Error).self) {
+            _ = try await provider.splitSeries(
+                calendarId: Self.calendarId, eventId: Self.masterEventId, recurrenceId: named,
+                recurrenceIdZone: zone, patch: patch, sendUpdates: "none", record: records.recorder)
+        }
+        let record = try #require(records.records.first, "the split kept no record before its cap")
+        try await provider.finishSplit(calendarId: Self.calendarId, record: record, zone: zone, guests: nil)
+        let capped = try #require(store.storedICS(path: Self.masterPath))
+        let blocks = capped.components(separatedBy: "BEGIN:VEVENT")
+        let shownAfter = try #require(blocks.first { $0.contains("RECURRENCE-ID:\(day(0))T100000") }, "\(capped)")
+        #expect(shownAfter.contains("SUMMARY:Renamed"), "the retry skipped an occurrence shown after the named one: \(shownAfter)")
+        let namedBlock = try #require(blocks.first { $0.contains("RECURRENCE-ID:\(day(7))T100000") }, "\(capped)")
+        #expect(namedBlock.contains("SUMMARY:Renamed"), "\(namedBlock)")
+    }
+
+    @Test("""
     Held direction — create-only PUTs still assert absence: creating an event \
     whose resource already exists is REFUSED, so the new-resource guard that \
     makes retries idempotent is not weakened

@@ -410,7 +410,7 @@ the card shows is the cut written (CalDAV with the resource's `RDATE` lines; Out
 start, a missing month day on the month's last). A date or local `UNTIL` is read in the series' zone
 (`SplitCarry.endsBefore`). A floating CalDAV series is read in the operation's zone
 (`CalendarTimeZoneContext.readingFloating(in:)`, `ICSParser.components(floatingZone:)`,
-`CalDAVOccurrences.occurrence(floatingZone:)`). Outlook writes the edits of occurrences where they
+`CalDAVOccurrences.occurrence(floatingZone:)`), by the split and by its retry (`finishSplit`) alike. Outlook writes the edits of occurrences where they
 are in Graph's move order (`editOrder`, the same `moveOrder` as `carryOrder`). Past the end (e),
 Google and Outlook keep `SplitRecord.pastEnd` (`split_at` "", `new_part_id` the named occurrence,
 absolute `edits`, `edit_length`) before the first write; the queue finishes such a record with
