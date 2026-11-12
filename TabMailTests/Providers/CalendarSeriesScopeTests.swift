@@ -1486,6 +1486,29 @@ struct CalendarEditToolSeriesScopeTests {
                 "card: \(r.cards.first?.changes ?? [])")
     }
 
+    @Test("Outlook: a split moved past the end date of its series is refused before the card, with nothing queued")
+    func outlookSplitPastTheSeriesEndIsRefusedBeforeTheCard() async throws {
+        // The series ends on its second occurrence's date; that occurrence and the following ones
+        // are moved two days on, past the end, in the series' zone and in UTC alike.
+        var series = GraphSeries.series()
+        var recurrence = try #require(series["recurrence"] as? [String: Any])
+        var range = try #require(recurrence["range"] as? [String: Any])
+        range["type"] = "endDate"
+        range["endDate"] = GraphFixture.utcDay(GraphFixture.occurrenceStart)
+        recurrence["range"] = range
+        series["recurrence"] = recurrence
+        let graph = FakeGraphCalendar([series, GraphSeries.occurrence(id: GraphSeries.first, at: GraphFixture.start),
+                                       GraphSeries.occurrence(id: GraphSeries.later, at: GraphFixture.occurrenceStart)])
+        let r = try await outlookTool(graph, [
+            "start_iso": .string(GraphFixture.naive(GraphFixture.occurrenceStart.addingTimeInterval(2 * 86_400))),
+            "timezone": .string("UTC"),
+        ], eventId: GraphSeries.later, account: "series-tool-x-past-end")
+        #expect(r.out.contains("NOT changed") && r.out.contains("already ends before it"), "\(r.out)")
+        #expect(r.cards.isEmpty, "a card was shown: \(r.cards.map(\.changes))")
+        #expect(r.queued.isEmpty, "queued: \(r.queued.map(\.argumentsJSON))")
+        #expect(graph.created.isEmpty, "a new part was written: \(graph.created)")
+    }
+
     @Test("Outlook: the card of a split every week onto another day names no week start, as Graph's rule has none")
     func outlookWeeklySplitCardHasNoWeekStart() async throws {
         let graph = GraphSeries.calendar()
@@ -1541,14 +1564,16 @@ struct CalendarEditToolSeriesScopeTests {
                 "card: \(r.cards.first?.changes ?? [])")
     }
 
-    /// A CalDAV series repeating by `rule` from day 0, its occurrence on day 14 deleted (an EXDATE)
-    /// and the one on day 21 changed to an hour later (an override), moved as a whole a day on
-    /// through the edit tool: the resource's lines after the write, and the run.
+    /// A CalDAV series repeating by `rule` from day 0, its occurrence on day 14 deleted (an EXDATE),
+    /// the one on day 21 changed to an hour later (an override) and an extra one added on day 17
+    /// (an RDATE), moved as a whole a day on through the edit tool: the resource's lines after the
+    /// write, and the run.
     private func calDAVMoveWithExceptions(rule: String, account: String, split: Bool = false,
                                           splitTo: String = "\(day(8))T09:00:00") async throws -> (lines: [String], run: ToolRun) {
         let series = calDAVSeries(uid: "wk-x", rule: rule, tzid: "Etc/UTC")
             .replacingOccurrences(of: "SUMMARY:Standup\r\nEND:VEVENT",
-                                  with: "EXDATE;TZID=Etc/UTC:\(compact(day(14)))T090000\r\nSUMMARY:Standup\r\nEND:VEVENT")
+                                  with: "EXDATE;TZID=Etc/UTC:\(compact(day(14)))T090000\r\n"
+                                      + "RDATE;TZID=Etc/UTC:\(compact(day(17)))T090000\r\nSUMMARY:Standup\r\nEND:VEVENT")
             .replacingOccurrences(of: "END:VCALENDAR", with: [
                 "BEGIN:VEVENT", "UID:wk-x", "DTSTAMP:\(compact(day(-14)))T000000Z",
                 "RECURRENCE-ID;TZID=Etc/UTC:\(compact(day(21)))T090000",
@@ -1578,6 +1603,10 @@ struct CalendarEditToolSeriesScopeTests {
         #expect(lines.contains("RRULE:FREQ=WEEKLY;BYDAY=\(weekdayCode(day(1)))"), "not moved: \(lines); \(r.out)")
         #expect(!lines.contains { $0.hasPrefix("EXDATE") || $0.hasPrefix("RECURRENCE-ID") },
                 "an exception outside the new rule remains: \(lines)")
+        // An added date is the user's own occurrence, not an exception to the rule: it stays,
+        // moved the day on with the series' start, as every date tied to the start is.
+        #expect(lines.contains { $0.hasPrefix("RDATE") && $0.hasSuffix(":\(compact(day(18)))T090000") },
+                "the added date was dropped: \(lines)")
         #expect(r.cards.first?.changes.contains(CalendarToolHelpers.dayMoveResetNote) == true,
                 "card: \(r.cards.first?.changes ?? [])")
     }
@@ -1590,6 +1619,9 @@ struct CalendarEditToolSeriesScopeTests {
                 "the new part is not on the new day: \(lines); \(r.out)")
         #expect(!lines.contains { $0.hasPrefix("EXDATE") || $0.hasPrefix("RECURRENCE-ID") },
                 "an exception outside the new rule remains in the new part: \(lines)")
+        // Kept, moved the day on with the new part's start.
+        #expect(lines.contains { $0.hasPrefix("RDATE") && $0.hasSuffix(":\(compact(day(18)))T090000") },
+                "the added date was dropped from the new part: \(lines)")
         #expect(r.cards.first?.changes.contains(CalendarToolHelpers.dayMoveResetNote) == true,
                 "card: \(r.cards.first?.changes ?? [])")
     }

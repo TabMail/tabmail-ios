@@ -293,7 +293,7 @@ computation, turned afterwards. Rules (`RecurrenceDayShift.shifted`): weekdays t
 month; a positional day (numbered BYDAY, BYSETPOS, Graph relative patterns) keeps the WHOLE rule;
 BYYEARDAY, BYWEEKNO, a negative BYMONTHDAY and one moved out of 1..31 are refused before the card.
 When the written rule differs from the stored one (`canonicalRRULE`), exceptions reset: Google's split
-new part drops its EXDATE lines and keeps RDATE (ruling a); CalDAV drops EXDATE and override VEVENTs;
+new part drops its EXDATE lines and keeps RDATE; CalDAV drops EXDATE and override VEVENTs and keeps RDATE;
 Outlook's pattern change already resets. The card asks `CalendarProvider.dayMovedRules` (built by the
 same functions the write uses) and, in "all" and `this_and_following` alike, lists `repeat → <rule>`
 plus `CalendarToolHelpers.dayMoveResetNote` only when a rule actually turns; a positional rule shows
@@ -303,7 +303,7 @@ again, so the new part keeps the rule turned on the first attempt (test
 `SplitInterruptedBetweenItsWritesTests.dayMoveSplitFinishedFromItsRecord`). The first build's
 retry-after-own-cap dating from `recurrence_id` and its Outlook `capEndDate`→`noEnd` case went with
 `afterOwnSplitCap`. The picked day is converted into the series' zone before its weekday is read, a
-deliberate difference from Google's web app (owner ruling 2026-11-11). On Outlook the move's days
+deliberate difference from Google's web app. On Outlook the move's days
 (`GCalEvent.seriesZone` frame) and #747's `seriesDay` (the split's `newDay`, the date-move step's
 check) are both series-zone days; `splitNewPartJSON` turns the pattern in `newPartRecurrence`, then
 relabels start and end with `inSeriesZone` as #747 does.
