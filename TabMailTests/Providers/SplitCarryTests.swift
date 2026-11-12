@@ -299,12 +299,14 @@ struct SplitCarryTests {
     @Test("Outlook orders moves without dating an occurrence that does not move, so a series with no readable zone still writes it")
     func moveOrderNeedsNoZoneForStays() throws {
         let time = GCalDateTime(dateTime: Self.at(30), date: nil, timeZone: nil)
-        let stays: [(at: GCalDateTime, to: GCalDateTime?)] = [(time, nil), (time, nil)]
+        let later = GCalDateTime(dateTime: Self.at(31), date: nil, timeZone: nil)
+        // No target, and a target at the instant it is at: neither moves.
+        let stays: [(at: GCalDateTime, to: GCalDateTime?)] = [(time, nil), (time, time)]
         let ordered = try ExchangeCalendarProvider.moveOrder(stays, at: \.at, to: \.to, zone: nil)
         #expect(ordered.count == 2)
         // A move is dated: with no zone to date it in, it is refused before anything is written.
         #expect(throws: CalendarProviderError.self) {
-            try ExchangeCalendarProvider.moveOrder([(at: time, to: Optional(time))], at: \.at, to: \.to, zone: nil)
+            try ExchangeCalendarProvider.moveOrder([(at: time, to: Optional(later))], at: \.at, to: \.to, zone: nil)
         }
     }
 

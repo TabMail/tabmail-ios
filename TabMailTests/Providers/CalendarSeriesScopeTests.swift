@@ -1472,6 +1472,54 @@ struct CalendarEditToolSeriesScopeTests {
         #expect(r.run.out.contains(SplitCarry.pastEndRuleRefusal), "\(r.run.out)")
     }
 
+    @Test("Google: an edit past the series' end keeps its record before its first write, and its retry tells the guests as the first attempt does")
+    func pastEndKeepsItsRecordFirstAndRetryNotifies() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let calendar = FakeGoogleCalendar(pastEndSeed)
+        calendar.install(on: http)
+        calendar.failNext("PATCH", with: 400)
+        let provider = GoogleCalendarProvider(accessToken: { _ in "test-token" }, session: http.session)
+        let records = SplitRecordBox()
+        var patch = GCalEventInput()
+        patch.summary = "Team standup"
+        await #expect(throws: (any Error).self) {
+            _ = try await provider.splitSeries(
+                calendarId: "primary", eventId: GoogleSeries.instanceId(day(7)), recurrenceId: "\(day(20))T09:00:00",
+                recurrenceIdZone: utc, patch: patch, sendUpdates: "all", record: records.recorder)
+        }
+        let record = try #require(records.records.first, "no record was kept before the first write")
+        #expect(record.isPastEnd)
+        try await provider.finishShownEdit(calendarId: "primary", record: record, edit: patch, guests: nil)
+        #expect(calendar.event(GoogleSeries.instanceId(day(7)))?["summary"] as? String == "Team standup")
+        let patches = http.recordedCalls().filter { $0.method == "PATCH" }
+        #expect(!patches.isEmpty && patches.allSatisfy { $0.url.contains("sendUpdates=all") },
+                "a write did not tell the guests: \(patches.map(\.url))")
+    }
+
+    @Test("Outlook: a new start from an occurrence moved past the series' end shows no reset note and answers with no new series")
+    func outlookMovedPastTheEndCardAndAnswerMatchTheWrite() async throws {
+        // Two occurrences; the second moved a day later, past the series' last place.
+        var series = GraphSeries.series()
+        var recurrence = try #require(series["recurrence"] as? [String: Any])
+        var range = try #require(recurrence["range"] as? [String: Any])
+        range["type"] = "numbered"
+        range["numberOfOccurrences"] = 2
+        recurrence["range"] = range
+        series["recurrence"] = recurrence
+        let movedTo = GraphFixture.occurrenceStart.addingTimeInterval(86_400)
+        let graph = FakeGraphCalendar([series, GraphSeries.occurrence(id: GraphSeries.first, at: GraphFixture.start),
+                                       GraphSeries.moved(id: GraphSeries.later, from: GraphFixture.occurrenceStart, to: movedTo)])
+        let r = try await outlookTool(graph, [
+            "edit_scope": .string("this_and_following"), "recurrence_id": .string(GraphFixture.naive(movedTo)),
+            "start_iso": .string(GraphFixture.naive(movedTo.addingTimeInterval(3_600))), "timezone": .string("UTC"),
+        ], eventId: GraphSeries.later, account: "series-tool-x-past-end-card")
+        #expect(r.cards.count == 1 && r.cards.first?.changes.contains(CalendarToolHelpers.exceptionsResetNote) == false,
+                "card: \(r.cards.first?.changes ?? []); \(r.out)")
+        #expect(graph.created.isEmpty, "a new part was made: \(graph.created)")
+        #expect(!r.out.contains("new_series_event_id"), "\(r.out)")
+    }
+
     private func isCapped(_ calendar: FakeGoogleCalendar) -> Bool {
         (calendar.event(GoogleSeries.id)?["recurrence"] as? [String])?.contains { $0.contains("UNTIL=") } == true
     }
@@ -1707,6 +1755,22 @@ struct CalendarEditToolSeriesScopeTests {
         #expect(shown == "repeat → " + written.dropFirst("RRULE:".count), "card \(shown ?? "none"), written \(written)")
     }
 
+    @Test("Google: the card of a split onto another day named at a moved occurrence shows the rule the new part is written with")
+    func movedSplitCardShowsTheWrittenRule() async throws {
+        let rule = "RRULE:FREQ=WEEKLY;COUNT=10;BYDAY=\(weekdayCode(day(0)))"
+        // The occurrence placed on day 14 moved to day 16: the cut is day 21.
+        let seed = [GoogleSeries.series(rule: rule), GoogleSeries.moved(day(14), start: "\(day(16))T09:00:00", end: "\(day(16))T09:30:00")]
+        let r = try await googleTool([
+            "edit_scope": .string("this_and_following"), "recurrence_id": .string("\(day(16))T09:00:00"),
+            "start_iso": .string("\(day(17))T09:00:00"), "timezone": .string("UTC"),
+        ], eventId: GoogleSeries.instanceId(day(14)), account: "series-tool-g-moved-card-rule", seed: seed)
+        let successor = r.calendar.event(
+            GoogleCalendarProvider.deterministicSplitEventId(masterId: GoogleSeries.id, recurrenceId: "\(day(21))T09:00:00"))
+        let written = try #require((successor?["recurrence"] as? [String])?.first, "no new part: \(r.calendar.writes); \(r.run.out)")
+        let shown = r.run.cards.first?.changes.first { $0.hasPrefix("repeat → ") }
+        #expect(shown == "repeat → " + written.dropFirst("RRULE:".count), "card \(shown ?? "none"), written \(written)")
+    }
+
     @Test("Outlook: the card of a split onto another day shows the week start Graph writes for a series every other week")
     func outlookSplitCardShowsTheWrittenWeekStart() async throws {
         var series = GraphSeries.series()
@@ -1905,6 +1969,28 @@ struct CalendarEditToolSeriesScopeTests {
         ], eventId: "/cal/wk-x.ics", account: account)
         let path = split ? store.recordedPuts().first { $0.path != "/cal/wk-x.ics" }?.path : "/cal/wk-x.ics"
         return (path.flatMap { store.storedICS(path: $0) }?.components(separatedBy: "\r\n") ?? [], r)
+    }
+
+    @Test("CalDAV: a new start from an occurrence moved past the series' end shows no reset note, writes no new part and answers with no new series")
+    func calDAVMovedPastTheEndCardAndAnswerMatchTheWrite() async throws {
+        // Two occurrences; the second, day 7's, moved to day 10, past the series' last place.
+        let series = calDAVSeries(uid: "pe-x", rule: "RRULE:FREQ=WEEKLY;COUNT=2", tzid: "Etc/UTC")
+            .replacingOccurrences(of: "END:VCALENDAR", with: [
+                "BEGIN:VEVENT", "UID:pe-x", "DTSTAMP:\(compact(day(-14)))T000000Z",
+                "RECURRENCE-ID;TZID=Etc/UTC:\(compact(day(7)))T090000",
+                "DTSTART;TZID=Etc/UTC:\(compact(day(10)))T090000", "DTEND;TZID=Etc/UTC:\(compact(day(10)))T093000",
+                "SUMMARY:Standup", "END:VEVENT", "END:VCALENDAR",
+            ].joined(separator: "\r\n"))
+        let store = FakeCalDAVStore(servesETags: true)
+        store.seed(path: "/cal/pe-x.ics", ics: series)
+        let r = try await calDAVTool(store, [
+            "edit_scope": .string("this_and_following"), "recurrence_id": .string("\(day(10))T09:00:00"),
+            "start_iso": .string("\(day(10))T10:00:00"), "timezone": .string("UTC"),
+        ], eventId: "/cal/pe-x.ics", account: "series-tool-c-past-end-card")
+        #expect(r.cards.count == 1 && r.cards.first?.changes.contains(CalendarToolHelpers.exceptionsResetNote) == false,
+                "card: \(r.cards.first?.changes ?? []); \(r.out)")
+        #expect(store.recordedPuts().allSatisfy { $0.path == "/cal/pe-x.ics" }, "a new part was written: \(store.recordedPuts().map(\.path))")
+        #expect(!r.out.contains("new_series_event_id"), "\(r.out)")
     }
 
     @Test("CalDAV: a whole series moved to another day with its rule's days resets every exception, as Google does, and the card says so")

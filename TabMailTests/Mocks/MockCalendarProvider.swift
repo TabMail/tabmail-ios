@@ -65,6 +65,9 @@ actor MockCalendarProvider: CalendarProvider {
     var eventExistsThrows: Error?
     var finishSplitThrows: Error?
     var finishSplitCalls: [SplitRecord] = []
+    /// What `splitCut` returns; nil cuts at `recurrenceId`, as a split of an occurrence that was
+    /// never moved does.
+    var splitCutResult: SplitCarry.Cut?
     /// What `occurrence` returns; nil gives an occurrence that starts at `recurrenceId` and was
     /// never moved (`syntheticOccurrence`), all-day when the event `getEvent` returns is.
     var occurrenceResult: GCalEvent?
@@ -204,6 +207,13 @@ actor MockCalendarProvider: CalendarProvider {
         if let error = finishSplitThrows { throw error }
     }
 
+    func splitCut(calendarId: String, eventId: String, recurrenceId: String, zone: TimeZone) async throws -> SplitCarry.Cut {
+        callLog.append("splitCut(calendarId:\(calendarId),eventId:\(eventId),recurrenceId:\(recurrenceId))")
+        if let error = splitSeriesThrows { throw error }
+        return splitCutResult ?? .at(GCalDateTime(dateTime: recurrenceId, date: nil, timeZone: zone.identifier))
+    }
+
+    func setSplitCutResult(_ cut: SplitCarry.Cut?) { splitCutResult = cut }
     func setSplitSeriesCapThrows(_ error: Error?) { splitSeriesCapThrows = error }
     func setEventExistsResult(_ exists: Bool) { eventExistsResult = exists }
     func setEventExistsThrows(_ error: Error?) { eventExistsThrows = error }

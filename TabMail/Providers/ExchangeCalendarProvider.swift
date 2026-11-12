@@ -515,10 +515,12 @@ actor ExchangeCalendarProvider: CalendarProvider {
         guard let parts = SplitCarry.partition(exceptions.map(\.carried), cut: point.cut, namedStart: namedStart) else {
             throw CalendarProviderError.notSupported("a changed occurrence of this repeating event has a time TabMail can't read, so it was not split")
         }
-        // The order the carry and the edits are written in dates their moves in the series' zone
-        // (`moveOrder`): a timed series with none and occurrences to carry or edit is refused here, before the new
-        // part is created.
-        guard exceptions.isEmpty || master.isAllDay || master.seriesZone != nil else {
+        // The order the carry and the edits are written in dates their moves, and only their moves,
+        // in the series' zone (`moveOrder`): a timed series with none whose split moves an
+        // occurrence (`movesAnOccurrence`) is refused here, before the new part is created. A
+        // deletion or a rename needs no zone.
+        guard master.isAllDay || master.seriesZone != nil
+              || !Self.movesAnOccurrence(exceptions.map(\.carried), edit: partPatch) else {
             throw CalendarProviderError.notSupported("an occurrence of this repeating event can't be dated in its time zone, so its change can't be carried")
         }
         let cappedBody = try JSONSerialization.data(withJSONObject: cappedJSON)
@@ -831,15 +833,14 @@ actor ExchangeCalendarProvider: CalendarProvider {
         let unplaced = CalendarProviderError.notSupported(
             "an occurrence of this repeating event can't be dated in its time zone, so its change can't be carried")
 
-        // The new part's occurrences around every place and every time a carried one moves to.
-        var dates = plan.deleted.compactMap { Self.seriesDate(of: $0, seriesZone: zone) }
-        for change in plan.changed {
-            guard let place = Self.seriesDate(of: change.place, seriesZone: zone) else { throw unplaced }
-            dates.append(place)
-            if let start = change.start {
-                guard let target = Self.seriesDate(of: start, seriesZone: zone) else { throw unplaced }
-                dates.append(target)
-            }
+        // The new part's occurrences around every place and every time a carried one moves to. The
+        // window is dated in UTC: its two days before and three after cover any zone's offset, so
+        // it needs no series zone (a deletion or a rename of a series with none is carried).
+        let windowZone = series.isAllDay ? nil : TimeZone.gmt
+        var dates: [String] = []
+        for time in plan.deleted + plan.changed.flatMap({ [$0.place] + ($0.start.map { [$0] } ?? []) }) {
+            guard let date = Self.seriesDate(of: time, seriesZone: windowZone) else { throw unplaced }
+            dates.append(date)
         }
         guard let first = dates.min().flatMap({ RecurrenceTail.Day(iso: $0) }), let last = dates.max().flatMap({ RecurrenceTail.Day(iso: $0) }),
               let from = GoogleCalendarProvider.naiveInstant(first.description, zone: .gmt)?.addingTimeInterval(-2 * 86_400),
@@ -958,10 +959,24 @@ actor ExchangeCalendarProvider: CalendarProvider {
                       to: { $0.start }, zone: zone)
     }
 
+    /// Whether a split with `edit` of a series with `exceptions` moves an occurrence, so its carry
+    /// or its edits date a move in the series' zone (`moveOrder`): an edit that sets a time, with
+    /// any exception, or a changed occurrence that starts away from its place. A deletion or a
+    /// rename moves nothing.
+    nonisolated static func movesAnOccurrence(_ exceptions: [SplitCarry.Exception], edit: GCalEventInput) -> Bool {
+        let setsTime = edit.startDateTime != nil || edit.startDate != nil || edit.endDateTime != nil || edit.endDate != nil
+        return exceptions.contains { exception in
+            guard case .changed(let event) = exception else { return setsTime }
+            guard let start = event.start, let place = event.originalStartTime else { return true }
+            return setsTime || SplitCarry.key(start) != SplitCarry.key(place)
+        }
+    }
+
     /// `moves` in the order Graph takes them: an occurrence moved to another date goes once no
     /// occurrence not yet moved still holds that date (the date it is `at`), so none is moved onto
     /// a date another occurrence holds (`ErrorOccurrenceCrossingBoundary`). Those that don't move
-    /// (no target) go first and are not dated: no zone is needed for them. Those that stay on their
+    /// (no target, or a target at the instant they are at) go first and are not dated: no zone is
+    /// needed for them. Those that stay on their
     /// date go next. Moves that hold each other's dates in a ring keep their order; Graph
     /// refuses the first of them.
     nonisolated static func moveOrder<Move>(
@@ -969,9 +984,10 @@ actor ExchangeCalendarProvider: CalendarProvider {
     ) throws -> [Move] {
         let unplaced = CalendarProviderError.notSupported(
             "an occurrence of this repeating event can't be dated in its time zone, so its change can't be carried")
-        var ordered = moves.filter { to($0) == nil }
+        func stays(_ move: Move) -> Bool { to(move).map { SplitCarry.key($0) == SplitCarry.key(at(move)) } ?? true }
+        var ordered = moves.filter(stays)
         var pending: [(move: Move, place: String, target: String)] = try moves.compactMap { move in
-            guard let start = to(move) else { return nil }
+            guard !stays(move), let start = to(move) else { return nil }
             guard let place = seriesDate(of: at(move), seriesZone: zone),
                   let target = seriesDate(of: start, seriesZone: zone) else { throw unplaced }
             return (move, place, target)
