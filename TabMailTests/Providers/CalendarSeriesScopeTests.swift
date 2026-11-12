@@ -1062,7 +1062,10 @@ private func runTool(_ arguments: [String: JSONValue], eventId: String, account:
     let out: String
     var declined = false
     do {
-        out = try await CalendarEventEditTool(context: ToolContext(db: db, translator: MockChatIdTranslator()))
+        // The recurrence_ids these tests give are printed as the read tools print them, in the
+        // device's zone (#794): the zone each edit names, so the device is in that zone here.
+        let printedZone = CalendarToolHelpers.stringArgOpt(args, "timezone").flatMap { CalendarTimeZoneResolver.zone(named: $0, in: .none) }
+        out = try await CalendarEventEditTool(context: ToolContext(db: db, translator: MockChatIdTranslator(), deviceZone: printedZone))
             .execute(arguments: args, invocation: ToolInvocation(uiSink: sink, sessionKey: "series-tool-\(account)"))
     } catch let error as ToolDeclinedError {
         out = error.output
@@ -2462,7 +2465,7 @@ struct CalDAVSeriesScopeTests {
         }
         let before = harness.http.recordedCalls().count
         let sink = H.ConfirmingSink(http: harness.http)
-        let output = try await CalendarEventEditTool(context: ToolContext(db: harness.pool, translator: translator)).execute(
+        let output = try await CalendarEventEditTool(context: ToolContext(db: harness.pool, translator: translator, deviceZone: fixture.zone)).execute(
             arguments: arguments, invocation: ToolInvocation(uiSink: sink, sessionKey: session))
         let cards = await MainActor.run { sink.confirmations.count }
         #expect(cards == 0, "a card was shown: \(output)")
@@ -2527,7 +2530,7 @@ struct DeletedAfterTheCardTests {
         await H.recordCalendar(of: eventId, accountId: harness.accountId, translator: translator)
         let store = harness.store
         let sink = RecordingCardSink(beforeConfirming: { store.seed(path: W.seriesPath, ics: deleted) })
-        let output = try await CalendarEventEditTool(context: ToolContext(db: harness.pool, translator: translator)).execute(
+        let output = try await CalendarEventEditTool(context: ToolContext(db: harness.pool, translator: translator, deviceZone: fixture.zone)).execute(
             arguments: [
                 "event_id": .string(String(numericId)), "edit_scope": .string("this_only"),
                 "recurrence_id": .string(OccurrenceFixture.naive(occurrence, fixture.zone)),
@@ -2695,7 +2698,7 @@ struct RewrittenAfterTheCardTests {
         }
         let store = harness.store
         let sink = RecordingCardSink(beforeConfirming: { store.seed(path: W.seriesPath, ics: rewritten.ics) })
-        let output = try await CalendarEventEditTool(context: ToolContext(db: harness.pool, translator: translator)).execute(
+        let output = try await CalendarEventEditTool(context: ToolContext(db: harness.pool, translator: translator, deviceZone: fixture.zone)).execute(
             arguments: arguments, invocation: ToolInvocation(uiSink: sink, sessionKey: session))
         let cards = await sink.cards
         #expect(cards.count == 1, "\(entry.scope): no card, so the edit never reached the queue: \(output)")
