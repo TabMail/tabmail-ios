@@ -647,6 +647,20 @@ The owner's rulings of 2026-11-09:
        `backfillComplete`, even when the value is unchanged, and never on an insert (a new folder
        starts at 0)" and "a future whole-record write from a stale record would [write an older
        version back]".
+       - **The walk's own version is recorded when its write commits** (2026-11-12).
+         `writeUIDWalkPosition` still reads back, in its own transaction, the version its write
+         left, but the walk takes it as its own only when that transaction commits
+         (`Database.afterNextTransaction(onCommit:)`). A transaction that rolls back (an error at
+         COMMIT, or a later statement in it failing) puts the row and the counter back, and the
+         next bump in the database then issues that same version again; recorded before the
+         commit, it let the walk's next write match and write over a reset's or a sibling's
+         write. A rolled-back write leaves the walk's version unchanged, and rollback is
+         deliberately not handled: the row is back at the version the walk expects, so the next
+         write lands if nothing else wrote, and any later bump makes it miss. Do not move the
+         record back into the transaction, and do not add a rollback handler that restores or
+         advances it. *Superseded (2026-11-12):* "A write that lands reads the version it left
+         back in its own transaction, so the walk never refuses a position it wrote itself" (the
+         read-back stays; the record moved to the commit).
      - **A failed insert chunk is reported to every IMAP caller** (amendment 2026-11-12). The
        premised `SyncEngine.insertBackfillBatch` returns `.landed(…, allLanded:)`, false when a
        write chunk's transaction threw (the same report the premise-less overload gives as

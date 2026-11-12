@@ -64,14 +64,20 @@ private struct BackfillWorkerOutcome: Sendable {
 /// The IMAP UID walk's hold on its folder's walk position: the
 /// `Folder.backfillVersion` its next bookkeeping write must still find. It
 /// starts as the version the walk read with the folder and moves to the
-/// version each of the walk's OWN writes leaves (read back inside that write's
-/// transaction), so the walk never refuses a position it wrote itself. A write
-/// that finds any other version marks the position lost: something else (a
-/// reset, a second walker, a whole-record folder write) wrote the bookkeeping
-/// meanwhile, and the walk stops, writes nothing more, and leaves the folder to
-/// the next call, which re-reads it. Shared by the walk's parallel workers;
-/// every read and record happens inside a write transaction on the database's
-/// single writer, so the walk's own writes never interleave between a read and
+/// version each of the walk's OWN writes leaves, recorded when that write's
+/// transaction commits (`Database.afterNextTransaction(onCommit:)` in
+/// `SyncEngine.writeUIDWalkPosition`), so the walk never refuses a position it
+/// wrote itself. A write whose transaction rolls back leaves the version
+/// unchanged, and rollback is deliberately not handled: the row is back at the
+/// version the walk expects, and any later bump (which may issue the
+/// rolled-back version again) makes the walk's next write miss. A write that
+/// finds any other version marks the position lost: something else (a reset,
+/// a second walker, a whole-record folder write) wrote the bookkeeping
+/// meanwhile, and the walk stops, writes nothing more, and leaves the folder
+/// to the next call, which re-reads it. Shared by the walk's parallel workers;
+/// every compare-and-set runs in a write transaction on the database's single
+/// writer, and the commit callback records before that writer starts its next
+/// transaction, so the walk's own writes never interleave between a write and
 /// its record.
 final class UIDWalkPosition: Sendable {
     private struct State {
