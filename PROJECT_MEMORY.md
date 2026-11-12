@@ -48,7 +48,7 @@ Search the topic text below as subsystem keywords. Each link is mandatory when i
 | IMAP Message IDs & UID Resolution | [read in full](Companion/Memory/Current/023-imap-message-ids-uid-resolution.md) |
 | iOS Keychain Persistence | [read in full](Companion/Memory/Current/024-ios-keychain-persistence.md) |
 | Persistent Offline Action Queue (ADR-IOS-003, ADR-IOS-018) | [read in full](Companion/Memory/Current/025-persistent-offline-action-queue-adr-ios-003-adr-ios-018.md) |
-| Progressive Backfill & Storage Budget (ADR-IOS-005, ADR-IOS-006) | [read in full](Companion/Memory/Current/026-progressive-backfill-storage-budget-adr-ios-005-adr-ios-006.md) |
+| Progressive Backfill & Storage Budget (ADR-IOS-005, ADR-IOS-006); Gmail/Exchange page walk: refused token restart, page hold bound (`backfillPageHeldSince`), idle delay after a no-work cycle | [read in full](Companion/Memory/Current/026-progressive-backfill-storage-budget-adr-ios-005-adr-ios-006.md) |
 | Backfill diagnostics: `backfill.log` channel (2026-07-02) | [read in full](Companion/Memory/Current/027-backfill-diagnostics-backfill-log-channel-2026-07-02.md) |
 | Backfill stall fixes (2026-07-02) — UID-remap re-key, no fast-sync cursor reset, persisted server limit | [read in full](Companion/Memory/Current/028-backfill-stall-fixes-2026-07-02-uid-remap-re-key-no-fast-sync-cursor-res.md) |
 | `bodyComplete` = FTS-indexed truth; display cache has NO flag (ADR-IOS-050, 2026-07-02) | [read in full](Companion/Memory/Current/029-bodycomplete-fts-indexed-truth-display-cache-has-no-flag-adr-ios-050-202.md) |

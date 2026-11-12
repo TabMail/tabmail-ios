@@ -1483,3 +1483,37 @@ struct FolderCatchUpStateMigrationTests {
         #expect(folders[0].catchUpState == nil)
     }
 }
+
+// MARK: - v99 — folder.backfillPageHeldSince
+
+/// `v99_addFolderBackfillPageHeldSince` adds when the Gmail/Exchange backfill
+/// page walk first held the page its saved token names. Every pre-existing
+/// folder must read NULL ("the current page has not been held"), whatever its
+/// saved page token, and keep that token.
+@Suite("Migration v99 — folder.backfillPageHeldSince")
+struct FolderBackfillPageHeldSinceMigrationTests {
+    @Test("v99 adds a nullable column and leaves every existing folder's page not held")
+    func existingFoldersAreNotHeld() throws {
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let db = try DatabaseQueue(configuration: configuration)
+        var migrator = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &migrator)
+        try migrator.migrate(db, upTo: "v98_addFolderCatchUpState")
+        try TestDatabase.insertAccount(db, id: "acc1", email: "one@example.com")
+        try TestDatabase.insertFolder(db)
+        try db.write { try $0.execute(sql: "UPDATE folder SET backfillPageToken = 'saved-page-token'") }
+
+        try migrator.migrate(db, upTo: "v99_addFolderBackfillPageHeldSince")
+
+        let columns = try db.read { try Row.fetchAll($0, sql: "PRAGMA table_info(folder)") }
+        let column = try #require(columns.first { ($0["name"] as String) == "backfillPageHeldSince" })
+        #expect((column["notnull"] as Int) == 0)
+        #expect((column["type"] as String).uppercased() == "DATETIME")
+        let folders = try db.read { try Folder.fetchAll($0) }
+        #expect(folders.count == 1)
+        guard folders.count == 1 else { return }
+        #expect(folders[0].backfillPageHeldSince == nil)
+        #expect(folders[0].backfillPageToken == "saved-page-token")
+    }
+}

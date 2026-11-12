@@ -605,7 +605,8 @@ struct SettingsView: View {
             backfillComplete = 0,
             oldestSyncedDate = NULL,
             backfillUidCursor = NULL,
-            backfillPageToken = NULL
+            backfillPageToken = NULL,
+            backfillPageHeldSince = NULL
         WHERE path != ''
         """
     ]

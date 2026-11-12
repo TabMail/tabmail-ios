@@ -195,6 +195,41 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         /// spurious `nextPageToken` even though the implied next page is
         /// empty — models a dangling-pagination edge case (SPEC-B3).
         var spuriousNextPageTokenTargets: Set<String> = []
+        /// Largest page the `/messages` listing serves, the rest behind a
+        /// `nextPageToken`. Nil (the default) lists every match on one page
+        /// with no token. See `servePagedListings(pageSize:)`.
+        var listPageSize: Int?
+        /// Page tokens the paged listing handed out and still accepts, each
+        /// mapped to the offset its page starts at.
+        var livePageTokens: [String: Int] = [:]
+        var pageTokenSerial = 0
+        /// While true the paged listing refuses every request carrying a
+        /// page token, the ones it handed out included.
+        var rejectsEveryPageToken = false
+        var rejectedPageTokensServed = 0
+        /// Injected failures of the message GET `GET /messages/{id}` (the
+        /// backfill's full-format fetch included), per provider message id,
+        /// served until `clearGetFailures()`.
+        var getFailureByProviderId: [String: GetFailure] = [:]
+        var getFailuresServedByProviderId: [String: Int] = [:]
+        /// How long an injected message-GET failure is withheld before it is
+        /// answered, per provider message id. See `injectGetFailure(providerMessageId:_:answeredAfter:)`.
+        var getFailureDelayByProviderId: [String: TimeInterval] = [:]
+        /// While true, a forced token refresh (the one a `401` triggers) fails,
+        /// as when the provider refuses the refresh token or the refresh gets
+        /// no answer. The first, unforced token read still succeeds.
+        var failsTokenRefresh = false
+        var failedTokenRefreshes = 0
+        /// Called with the refused token each time the paged listing refuses a
+        /// page token, before the refusal is answered. See `onRejectedPageToken(_:)`.
+        var rejectedPageTokenHook: (@Sendable (String) -> Void)?
+        /// Called each time a message GET of that provider message id is
+        /// served, before it is answered. See `onGet(providerMessageId:_:)`.
+        var getHookByProviderId: [String: @Sendable () -> Void] = [:]
+        /// An injected failure of the `/messages` listing (action lookups
+        /// excluded). See `failListings(status:label:onlyWithPageToken:times:)`.
+        var listingFailure: ListingFailure?
+        var listingFailuresServed = 0
 
         /// Record the label difference between `before` and `after` as history,
         /// as Gmail does for every label change it applies.
@@ -263,9 +298,45 @@ final class StatefulGmailActionServer: @unchecked Sendable {
     func provider() -> GmailProvider {
         GmailProvider(
             userEmail: "user@example.com",
-            accessToken: { _ in "stateful-test-token" },
+            accessToken: { [state] forceRefresh in
+                let refused = forceRefresh && state.value.withLock { model -> Bool in
+                    guard model.failsTokenRefresh else { return false }
+                    model.failedTokenRefreshes += 1
+                    return true
+                }
+                if refused { throw TokenRefreshRefused() }
+                return "stateful-test-token"
+            },
             session: http.session
         )
+    }
+
+    /// What a refused token refresh throws from the access-token closure.
+    struct TokenRefreshRefused: Error {}
+
+    /// Make every forced token refresh fail (`true`) or succeed again (`false`).
+    func failTokenRefresh(_ failing: Bool) {
+        state.value.withLock { $0.failsTokenRefresh = failing }
+    }
+
+    /// How many forced token refreshes were refused.
+    func failedTokenRefreshCount() -> Int {
+        state.value.withLock { $0.failedTokenRefreshes }
+    }
+
+    /// Run `hook` with the refused token whenever the paged listing refuses a
+    /// page token, before the refusal is answered: a stand-in for another
+    /// writer acting on the folder while the walk's request is in flight.
+    func onRejectedPageToken(_ hook: (@Sendable (String) -> Void)?) {
+        state.value.withLock { $0.rejectedPageTokenHook = hook }
+    }
+
+    /// Run `hook` whenever `GET /messages/{providerMessageId}` is served,
+    /// before it is answered (an injected failure included): a stand-in for
+    /// another writer acting on the folder while the walk's fetch of that
+    /// message is in flight. nil removes it.
+    func onGet(providerMessageId: String, _ hook: (@Sendable () -> Void)?) {
+        state.value.withLock { $0.getHookByProviderId[providerMessageId] = hook }
     }
 
     /// Refuse the next `POST /labels` with 409 "Label name exists or
@@ -486,6 +557,113 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         state.value.withLock { $0.unclassified400OnGetServed }
     }
 
+    /// Heal every injected exact-ID GET `400`, leaving the served count intact.
+    func clearUnclassified400sOnGet() {
+        state.value.withLock { $0.unclassified400OnGetProviderIds.removeAll() }
+    }
+
+    /// Page the `/messages` listing as Gmail does: at most `pageSize` ids per
+    /// response (or `maxResults`, if smaller) and a `nextPageToken` while more
+    /// remain. A request whose `pageToken` this listing did not hand out, or
+    /// has since expired, gets a `400`. Gmail documents no wording for a page
+    /// token it no longer accepts, so only the status is modelled.
+    func servePagedListings(pageSize: Int) {
+        state.value.withLock { $0.listPageSize = pageSize }
+    }
+
+    /// Expire every page token handed out so far; tokens handed out later
+    /// are accepted again.
+    func expireIssuedPageTokens() {
+        state.value.withLock { $0.livePageTokens.removeAll() }
+    }
+
+    /// While `rejecting`, refuse every paged listing request that carries a
+    /// page token, including tokens handed out since.
+    func rejectEveryPageToken(_ rejecting: Bool) {
+        state.value.withLock { $0.rejectsEveryPageToken = rejecting }
+    }
+
+    /// How many listing requests were refused for their page token.
+    func rejectedPageTokenCount() -> Int {
+        state.value.withLock { $0.rejectedPageTokensServed }
+    }
+
+    /// A failure the message GET serves instead of the message: a bare HTTP
+    /// status (the server answered), or a transport error (no answer at all).
+    enum GetFailure: Sendable {
+        case status(Int)
+        case transport(URLError.Code)
+    }
+
+    /// Fail every `GET /messages/{providerMessageId}` with `failure` until
+    /// `clearGetFailures()`.
+    /// `answeredAfter` withholds each failure for that long before answering
+    /// it, so a test can order it after another message's answer.
+    func injectGetFailure(providerMessageId: String, _ failure: GetFailure, answeredAfter delay: TimeInterval = 0) {
+        state.value.withLock {
+            $0.getFailureByProviderId[providerMessageId] = failure
+            $0.getFailureDelayByProviderId[providerMessageId] = delay
+        }
+    }
+
+    /// Heal every injected message-GET failure, leaving the served counts intact.
+    func clearGetFailures() {
+        state.value.withLock { $0.getFailureByProviderId.removeAll() }
+    }
+
+    /// Heal the injected message-GET failure of one message only.
+    func clearGetFailure(providerMessageId: String) {
+        state.value.withLock { _ = $0.getFailureByProviderId.removeValue(forKey: providerMessageId) }
+    }
+
+    /// How many GETs of `providerMessageId` were answered with an injected failure.
+    func getFailuresServedCount(providerMessageId: String) -> Int {
+        state.value.withLock { $0.getFailuresServedByProviderId[providerMessageId] ?? 0 }
+    }
+
+    struct ListingFailure: Sendable {
+        let status: Int
+        /// When set, the listing gets no answer at all (this transport error)
+        /// instead of `status`.
+        var transport: URLError.Code?
+        let label: String?
+        let onlyWithPageToken: Bool
+        var remaining: Int?
+    }
+
+    /// Answer `/messages` listings with a bare `status`: only those naming
+    /// `label` when one is given, only those carrying a `pageToken` when
+    /// `onlyWithPageToken`, and for the next `times` matching requests (nil:
+    /// until `clearListingFailures()`). Action lookups are never failed by it.
+    func failListings(status: Int, label: String? = nil, onlyWithPageToken: Bool = false, times: Int? = nil) {
+        state.value.withLock {
+            $0.listingFailure = ListingFailure(
+                status: status, label: label, onlyWithPageToken: onlyWithPageToken, remaining: times)
+        }
+    }
+
+    /// Like `failListings(status:label:onlyWithPageToken:times:)`, but the
+    /// matching listings get no answer at all: the request fails with the
+    /// transport error `code`.
+    func failListings(transport code: URLError.Code, label: String? = nil, onlyWithPageToken: Bool = false, times: Int? = nil) {
+        state.value.withLock {
+            var failure = ListingFailure(
+                status: 0, label: label, onlyWithPageToken: onlyWithPageToken, remaining: times)
+            failure.transport = code
+            $0.listingFailure = failure
+        }
+    }
+
+    /// Stop failing listings, leaving the served count intact.
+    func clearListingFailures() {
+        state.value.withLock { $0.listingFailure = nil }
+    }
+
+    /// How many listing requests were answered with an injected failure.
+    func listingFailuresServedCount() -> Int {
+        state.value.withLock { $0.listingFailuresServed }
+    }
+
     /// Inject Gmail's real "Invalid id value" `400` (structured,
     /// `reason == "invalidArgument"`) for the exact-ID metadata `GET
     /// /messages/{id}` naming `providerMessageId` — models Gmail rejecting a
@@ -524,6 +702,25 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                 "errors": [[
                     "domain": "global",
                     "reason": "failedPrecondition",
+                    "message": message,
+                ]],
+                "code": 400,
+                "message": message,
+            ],
+        ]
+        return (try? JSONSerialization.data(withJSONObject: object)) ?? Data()
+    }
+
+    /// Gmail's structured `400` shape for a page token it does not accept.
+    /// The wording is this fake's: Gmail documents none, and the client reads
+    /// only the status.
+    private static func invalidPageTokenBody() -> Data {
+        let message = "Invalid page token."
+        let object: [String: Any] = [
+            "error": [
+                "errors": [[
+                    "domain": "global",
+                    "reason": "invalidArgument",
                     "message": message,
                 ]],
                 "code": 400,
@@ -702,6 +899,26 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         }
         http.register(path: "/messages/", method: "GET") { [state] request in
             let providerId = request.url.pathComponents.last ?? ""
+            if let hook = state.value.withLock({ $0.getHookByProviderId[providerId] }) {
+                hook()
+            }
+            let injected = state.value.withLock { model -> (failure: GetFailure, delay: TimeInterval)? in
+                guard let failure = model.getFailureByProviderId[providerId] else { return nil }
+                model.getFailuresServedByProviderId[providerId, default: 0] += 1
+                return (failure, model.getFailureDelayByProviderId[providerId] ?? 0)
+            }
+            if let injected {
+                let response: FakeHTTP.CannedResponse
+                switch injected.failure {
+                case .status(let code): response = .status(code)
+                case .transport(let code): response = .transportError(code)
+                }
+                guard injected.delay > 0 else { return response }
+                return .parked {
+                    Thread.sleep(forTimeInterval: injected.delay)
+                    return response
+                }
+            }
             if state.value.withLock({ $0.invalidIdOnGetProviderIds.contains(providerId) }) {
                 return .bytes(Self.invalidIdErrorBody(providerId), contentType: "application/json", statusCode: 400)
             }
@@ -757,7 +974,23 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                state.value.withLock({ $0.deletedLabelIds.contains(label) }) {
                 return .bytes(Self.invalidLabelErrorBody(label), contentType: "application/json", statusCode: 400)
             }
-            let refs = state.value.withLock { model in
+            let pageToken = queryItems.first(where: { $0.name == "pageToken" })?.value
+            let listingFailure = state.value.withLock { model -> ListingFailure? in
+                guard actionRFC == nil, var failure = model.listingFailure else { return nil }
+                if let only = failure.label, only != label { return nil }
+                if failure.onlyWithPageToken && pageToken == nil { return nil }
+                if let remaining = failure.remaining {
+                    failure.remaining = remaining - 1
+                    model.listingFailure = remaining > 1 ? failure : nil
+                }
+                model.listingFailuresServed += 1
+                return failure
+            }
+            if let listingFailure {
+                if let code = listingFailure.transport { return .transportError(code) }
+                return .status(listingFailure.status)
+            }
+            let matches = state.value.withLock { model in
                 model.messagesByProviderId.values
                     .filter { message in
                         // Real Gmail excludes SPAM/TRASH-labeled messages from
@@ -790,10 +1023,41 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                         if lhs != rhs { return lhs > rhs }
                         return $0.providerMessageId < $1.providerMessageId
                     }
-                    .prefix(maxResults)
                     .map { ["id": $0.providerMessageId, "threadId": "thread-\($0.providerMessageId)"] }
             }
-            var responseObject: [String: Any] = ["messages": refs]
+            // Unpaged (the default): every match up to `maxResults`, no token.
+            let page = state.value.withLock { model -> (refs: [[String: String]], nextPageToken: String?)? in
+                guard let pageSize = model.listPageSize else {
+                    return (Array(matches.prefix(maxResults)), nil)
+                }
+                var start = 0
+                if let pageToken {
+                    guard !model.rejectsEveryPageToken, let resume = model.livePageTokens[pageToken] else {
+                        model.rejectedPageTokensServed += 1
+                        return nil
+                    }
+                    start = min(resume, matches.count)
+                }
+                let end = min(matches.count, start + min(pageSize, maxResults))
+                var next: String?
+                if end < matches.count {
+                    model.pageTokenSerial += 1
+                    let token = "page-token-\(model.pageTokenSerial)"
+                    model.livePageTokens[token] = end
+                    next = token
+                }
+                return (Array(matches[start..<end]), next)
+            }
+            guard let page else {
+                if let pageToken, let hook = state.value.withLock({ $0.rejectedPageTokenHook }) {
+                    hook(pageToken)
+                }
+                return .bytes(Self.invalidPageTokenBody(), contentType: "application/json", statusCode: 400)
+            }
+            var responseObject: [String: Any] = ["messages": page.refs]
+            if let next = page.nextPageToken {
+                responseObject["nextPageToken"] = next
+            }
             if let rfc822MessageId = actionRFC,
                state.value.withLock({ $0.spuriousNextPageTokenTargets.contains(rfc822MessageId) }) {
                 responseObject["nextPageToken"] = "spurious-canary-page-2"

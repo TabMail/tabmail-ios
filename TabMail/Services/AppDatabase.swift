@@ -4268,6 +4268,21 @@ final class AppDatabase: Sendable {
                 t.add(column: "catchUpState", .text)
             }
         }
+
+        // Gmail/Exchange backfill page walk: when the page the saved page token
+        // names was first held, so the hold bound counts across relaunches.
+        // Nullable, no default: NULL means "the current page has not been held",
+        // which is the correct start for every existing folder (a relaunch has
+        // always restarted the bound until now). Convergence: a fresh install and
+        // an upgraded DB both end with one nullable DATETIME column and every row
+        // NULL.
+        migrator.registerTimedMigration(
+            "v99_addFolderBackfillPageHeldSince", foreignKeyChecks: .immediate
+        ) { db in
+            try db.alter(table: "folder") { t in
+                t.add(column: "backfillPageHeldSince", .datetime)
+            }
+        }
     }
 
     /// PORT — v2final `AppDatabase.seedDraftLastTouchedSeq`. Extracted to a static

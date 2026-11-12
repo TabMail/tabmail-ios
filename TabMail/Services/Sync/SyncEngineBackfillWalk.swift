@@ -148,6 +148,14 @@ extension SyncEngine {
         }
         if let hook { await hook() }
     }
+
+    /// Test seam: the time the Gmail/Exchange page walk's hold bound reads
+    /// instead of the clock, while set (both when it records a page's first hold
+    /// and when it measures how long the page has been held). It exists because
+    /// that bound is `SyncConfig.backfillPageHoldMinutes` long, which no test can
+    /// wait out; a test moves this past the bound instead. Nil (the default)
+    /// reads the clock.
+    static let backfillPageHoldNowForTesting = Mutex<Date?>(nil)
     #endif
 
     // MARK: - T1.3 anti-brick: the crawl's epoch bootstrap, BOUND to its UIDs
@@ -690,6 +698,135 @@ extension SyncEngine {
         return try Self.bootstrapFolderUidValidity(db, folderId: folderId, observed: epoch)
     }
 
+    // MARK: - Gmail/Exchange page walk: what a failed message fetch means for its page
+
+    /// How one message the page walk asked for failed to load. A page with
+    /// several failures follows the stricter kind on it: one `hold` holds the
+    /// page, whatever else failed on it and in whatever order.
+    enum BackfillFetchFailureKind: Int, Comparable, Sendable {
+        /// The server answered about this one message, and asking again would
+        /// get the same answer: a 4xx other than 401, 403 and 429 (404 and
+        /// 410 included), an answer that did not decode, or an answer the
+        /// provider could not read as a message (no header and no error). The
+        /// walk moves past the message.
+        case perMessage = 0
+        /// Everything else: no answer at all, a 5xx, a 429, a 403, a 401, a
+        /// failed token refresh, cancellation, and any error this rule does not
+        /// name. The page is held while less than
+        /// `SyncConfig.backfillPageHoldMinutes` has passed since its first hold,
+        /// then the walk moves past those messages like a per-message failure.
+        /// That is wall-clock time from the page's first hold, including time
+        /// when no attempt was possible (the app suspended, the device offline,
+        /// sign-in refused), and it is per page, not per message: once the page
+        /// is past it, a message on it is passed over on its first failure.
+        case hold = 1
+
+        static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
+    }
+
+    /// The HTTP statuses that are an answer about the one message asked for:
+    /// the 4xx range, less the three below.
+    private static let perMessageHTTPStatuses = 400..<500
+    /// 4xx statuses that are not about the message: 401 (sign-in), 403 (for
+    /// Gmail, a rate limit the HTTP layer has already retried) and 429 (rate
+    /// limit). They hold the page like a 5xx.
+    private static let holdingClientHTTPStatuses: Set<Int> = [401, 403, 429]
+
+    /// The one rule that classifies a failed backfill message fetch, by error
+    /// kind and status alone, the same for every provider. Per-message is an
+    /// explicit list; every other failure holds.
+    nonisolated static func backfillFetchFailureKind(_ error: Error?) -> BackfillFetchFailureKind {
+        // No header and no error: the provider got an answer it could not read as a message.
+        guard let error else { return .perMessage }
+        if error is DecodingError { return .perMessage }
+        if let status = httpStatus(of: error),
+           perMessageHTTPStatuses.contains(status),
+           !holdingClientHTTPStatuses.contains(status) {
+            return .perMessage
+        }
+        return .hold
+    }
+
+    /// Whether a failed page-LIST request skips the folder for the rest of
+    /// this call. Either way the saved page token is kept: a failed listing
+    /// never moves the walk on, so in the terms of `backfillFetchFailureKind`
+    /// every listing failure is a hold of that page (with no bound, since no
+    /// message was listed that could be passed over). Two failures are left
+    /// to the outer `catch` instead of skipping: cancellation, which ends the
+    /// call, and a connection error (no answer), which keeps that `catch`'s
+    /// exponential backoff and then lists the same page again in this call.
+    /// Everything else would fail the same way at once, and the loop's fresh
+    /// re-read would hand the same folder straight back, so the folder is
+    /// skipped and the next call lists the same page again: a 4xx (a 400 with
+    /// no saved token included), a 5xx, an answer that does not decode, and a
+    /// refused or failed sign-in. For these providers a sign-in failure
+    /// arrives as `AuthError.refreshFailed` (the token refresh a 401 triggers
+    /// failed, or no token could be read); one whose text reads as a
+    /// connection error (the refresh itself got no answer) is treated as one.
+    nonisolated static func pageListFailureSkipsFolder(_ error: Error) -> Bool {
+        if error is CancellationError { return false }
+        return !isConnectionError(error)
+    }
+
+    /// What the page walk does with a page's saved token once the page's
+    /// missing messages have been fetched.
+    enum BackfillPageDecision: Equatable, Sendable {
+        /// Move the token on: nothing failed, or only per-message failures.
+        case advance
+        /// Keep the token: some message failed with a `hold` failure, and the
+        /// page has been held for `heldSeconds` of the bound.
+        case hold(heldSeconds: TimeInterval)
+        /// Move the token on past messages that kept failing with a `hold`
+        /// failure for `heldSeconds`, at least the bound.
+        case passOverAfterHoldBound(heldSeconds: TimeInterval)
+    }
+
+    nonisolated static func backfillPageHoldNow() -> Date {
+        #if DEBUG
+        if let now = backfillPageHoldNowForTesting.withLock({ $0 }) { return now }
+        #endif
+        return Date()
+    }
+
+    /// Decide a page from the strictest failure on it (nil: nothing failed)
+    /// and when the page was first held (`firstHeld`, nil: not held before).
+    /// A page held for the first time is held for `0` seconds.
+    nonisolated static func decideBackfillPage(
+        strictestFailure: BackfillFetchFailureKind?, firstHeld: Date?, now: Date
+    ) -> BackfillPageDecision {
+        guard strictestFailure == .hold else { return .advance }
+        // A clock set back before `firstHeld` gives a negative time, so the page is held longer; the hold still ends once the clock passes the bound again.
+        let heldSeconds = now.timeIntervalSince(firstHeld ?? now)
+        guard heldSeconds < SyncConfig.backfillPageHoldSeconds else {
+            return .passOverAfterHoldBound(heldSeconds: heldSeconds)
+        }
+        return .hold(heldSeconds: heldSeconds)
+    }
+
+    /// Record the first hold of the page `savedToken` names, and return when
+    /// that page was first held. One write: the folder row is read, and
+    /// `backfillPageHeldSince` is set to `now` only while it is NULL and the
+    /// folder's saved token is still `savedToken`, so an earlier first hold of
+    /// the same page is kept (it survives calls and relaunches) and a page
+    /// whose token another writer has moved meanwhile is not stamped. Returns
+    /// nil when the saved token has moved or the folder is gone; the caller
+    /// then holds the page for this call only and decides nothing.
+    nonisolated static func recordBackfillPageHold(
+        folderId: String, savedToken: String?, now: Date
+    ) async throws -> Date? {
+        try await AppDatabase.backgroundPool.write { db -> Date? in
+            guard let row = try Folder.filter(Column("id") == folderId).fetchOne(db),
+                  row.backfillPageToken == savedToken else { return nil }
+            if let firstHeld = row.backfillPageHeldSince { return firstHeld }
+            _ = try Folder
+                .filter(Column("id") == folderId
+                    && Column("backfillPageToken") == savedToken
+                    && Column("backfillPageHeldSince") == nil as Date?)
+                .updateAll(db, Column("backfillPageHeldSince").set(to: now))
+            return now
+        }
+    }
+
     // MARK: - Unified Backfill Walk
 
     /// Crawl folders for this account, inserting headers AND indexing bodies in the same walk.
@@ -767,6 +904,19 @@ extension SyncEngine {
         // into a network-rate spin, which is the very NB3 shape the round-9 audit
         // named elsewhere in this function. A second mismatch declines instead.
         var epochReadoptedFolderIds = Set<String>()
+        // Gmail/Exchange page walk: folders this CALL has stopped walking, so the
+        // loop's fresh re-read does not hand them straight back at network rate.
+        // Three reasons: a page held because some of its messages failed with a
+        // `hold` failure inside the hold bound (see `decideBackfillPage`), a
+        // page-list request that failed for any reason `pageListFailureSkipsFolder`
+        // names, and a second rejected page token in the same call. Held in memory only and
+        // never saved: the next call walks the folder again.
+        var pageWalkSkippedFolderIds = Set<String>()
+        // Gmail/Exchange page walk: folders whose saved page token the provider
+        // rejected in this CALL, and whose walk was started over from the top.
+        // Held in memory only, so each call may restart a folder once: a token a
+        // later call finds rejected again never stalls the folder for good.
+        var pageTokenRestartedFolderIds = Set<String>()
 
         await updateBackfillProgressForAccount(account)
 
@@ -809,6 +959,7 @@ extension SyncEngine {
             let folder = remaining
                 .filter { f in
                     if epochDeclinedFolderIds.contains(f.id) { return false }
+                    if pageWalkSkippedFolderIds.contains(f.id) { return false }
                     if !fastSync && isExpensiveNetwork && !primaryRoles.contains(f.role) { return false }
                     if StorageEstimator.isOverBudget() { return false }
                     return true
@@ -1668,24 +1819,69 @@ extension SyncEngine {
                     // Gmail/Exchange: page-token cursor walk — resumes from stored position.
                     // Each call returns one page of IDs + nextPageToken. No date filter needed;
                     // the token tracks position in the listing (newest→oldest).
+                    let savedToken = folder.backfillPageToken
                     let pageResult: (ids: [String], nextPageToken: String?)
-                    if let gp = provider as? GmailProvider {
-                        pageResult = try await workQueue.execute(priority: .headerFetch) {
-                            try await gp.listMessageIdsPage(
-                                folder: folder.path,
-                                pageToken: folder.backfillPageToken,
-                                pageSize: limit
-                            )
+                    do {
+                        if let gp = provider as? GmailProvider {
+                            pageResult = try await workQueue.execute(priority: .headerFetch) {
+                                try await gp.listMessageIdsPage(
+                                    folder: folder.path,
+                                    pageToken: savedToken,
+                                    pageSize: limit
+                                )
+                            }
+                        } else {
+                            let ep = provider as! ExchangeProvider
+                            pageResult = try await workQueue.execute(priority: .headerFetch) {
+                                try await ep.listMessageIdsPage(
+                                    folder: folder.path,
+                                    pageToken: savedToken,
+                                    pageSize: limit
+                                )
+                            }
                         }
-                    } else {
-                        let ep = provider as! ExchangeProvider
-                        pageResult = try await workQueue.execute(priority: .headerFetch) {
-                            try await ep.listMessageIdsPage(
-                                folder: folder.path,
-                                pageToken: folder.backfillPageToken,
-                                pageSize: limit
-                            )
+                    } catch let error where savedToken != nil && httpStatus(of: error) == 400 {
+                        // A `400` to a request carrying the saved page token is
+                        // TREATED as a refusal of that token. Neither provider
+                        // documents a stale-token response, and a `400` for some
+                        // other reason lands here too; that is why this restarts
+                        // at most once per call. (Exchange pages with
+                        // `$skip=<integer>` nextLinks, so a saved Exchange link
+                        // cannot expire; the rule is the same for both anyway.)
+                        // Drop the token and walk this folder again from the top;
+                        // the pages already walked are deduplicated against the
+                        // database.
+                        //
+                        // Once per folder per call: a second rejection stops this
+                        // folder for the rest of the call (the folders behind it
+                        // still run), and the next call may start it over again.
+                        guard !pageTokenRestartedFolderIds.contains(folder.id) else {
+                            pageWalkSkippedFolderIds.insert(folder.id)
+                            BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) page token rejected again (HTTP 400) — skipping this folder for the rest of this cycle")
+                            continue
                         }
+                        pageTokenRestartedFolderIds.insert(folder.id)
+                        let folderId = folder.id
+                        // Only while the saved token is still the one this
+                        // request was refused for: a token another writer saved
+                        // meanwhile, and its hold time, are kept.
+                        try await AppDatabase.backgroundPool.write { db in
+                            _ = try Folder
+                                .filter(Column("id") == folderId && Column("backfillPageToken") == savedToken)
+                                .updateAll(db,
+                                    Column("backfillPageToken").set(to: nil as String?),
+                                    Column("backfillPageHeldSince").set(to: nil as Date?))
+                        }
+                        BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) saved page token rejected (HTTP 400) — restarting this folder's walk from the top")
+                        continue
+                    } catch let error where Self.pageListFailureSkipsFolder(error) {
+                        // Retrying now would fail the same way, and the loop's
+                        // fresh re-read would hand this folder straight back at
+                        // network rate. The saved token (and the page's hold
+                        // time, if any) is kept as it is.
+                        pageWalkSkippedFolderIds.insert(folder.id)
+                        BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) page list failed: \(error) — keeping the saved page token and skipping this folder for the rest of this cycle; the next cycle lists the same page again")
+                        continue
                     }
                     let (pageIds, nextToken) = pageResult
 
@@ -1695,7 +1891,8 @@ extension SyncEngine {
                             _ = try Folder.filter(Column("id") == folder.id)
                                 .updateAll(db,
                                     Column("backfillComplete").set(to: true),
-                                    Column("backfillPageToken").set(to: nil as String?)
+                                    Column("backfillPageToken").set(to: nil as String?),
+                                    Column("backfillPageHeldSince").set(to: nil as Date?)
                                 )
                         }
                         BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) fully crawled (no more pages)")
@@ -1707,7 +1904,11 @@ extension SyncEngine {
 
                     // Page token is stored AFTER processing (not before) so that
                     // cancellation or failure mid-page causes the same page to be
-                    // re-fetched next cycle. insertBackfillBatch handles dedup.
+                    // re-fetched next cycle. Under cancellation that holds because
+                    // every token write below is an async GRDB write, which checks
+                    // for cancellation first and throws `CancellationError` into
+                    // the outer `catch` without writing. insertBackfillBatch
+                    // handles dedup.
 
                     // Dedup returned IDs against DB
                     let missingIds: [String] = try await dbPool.read { db in
@@ -1745,14 +1946,17 @@ extension SyncEngine {
                         // Safe to advance — all IDs on this page already exist in GRDB
                         try await AppDatabase.backgroundPool.write { db in
                             _ = try Folder.filter(Column("id") == folder.id)
-                                .updateAll(db, Column("backfillPageToken").set(to: nextToken))
+                                .updateAll(db,
+                                    Column("backfillPageToken").set(to: nextToken),
+                                    Column("backfillPageHeldSince").set(to: nil as Date?))
                         }
                         if nextToken == nil {
                             try? await AppDatabase.backgroundPool.write { db in
                                 _ = try Folder.filter(Column("id") == folder.id)
                                     .updateAll(db,
                                         Column("backfillComplete").set(to: true),
-                                        Column("backfillPageToken").set(to: nil as String?)
+                                        Column("backfillPageToken").set(to: nil as String?),
+                                        Column("backfillPageHeldSince").set(to: nil as Date?)
                                     )
                             }
                             BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) fully crawled (last page, all exist)")
@@ -1781,7 +1985,19 @@ extension SyncEngine {
                     // Body data is keyed by messageId for matching after GRDB insert.
                     var bodyData: [String: (htmlBody: String?, textBody: String?)] = [:]
                     var streamInterrupted = false
+                    // The strictest way any message on this page failed to load
+                    // (nil: none failed). It decides the page's token below.
+                    var strictestFailure: BackfillFetchFailureKind?
+                    var failedCount = 0
 
+                    // Cancellation can end this loop two ways: the check below
+                    // sees it between results, or the stream itself ends early
+                    // (a cancelled task's `next()` returns nil and the producer
+                    // is cancelled) with `streamInterrupted` still false. In the
+                    // second case the page is decided below as if complete, but
+                    // the token write that would act on it throws
+                    // `CancellationError` (see "stored AFTER processing" above),
+                    // so the token does not move either way.
                     for await result in stream {
                         if Task.isCancelled {
                             streamInterrupted = true
@@ -1790,10 +2006,10 @@ extension SyncEngine {
                         if let header = result.header {
                             headers.append(header)
                             bodyData[result.id] = (htmlBody: result.htmlBody, textBody: result.textBody)
-                        }
-                        if let error = result.error, case ProviderError.authenticationFailed = error {
-                            await AccountManager.shared.markAuthFailed(account.id)
-                            throw error
+                        } else {
+                            let kind = Self.backfillFetchFailureKind(result.error)
+                            strictestFailure = max(strictestFailure ?? kind, kind)
+                            failedCount += 1
                         }
                     }
 
@@ -1870,30 +2086,78 @@ extension SyncEngine {
                         }
                     }
 
-                    // Only advance page token if the full page was consumed.
-                    // If stream was interrupted (cancellation), don't advance — the
-                    // same page will be re-fetched next cycle (dedup handles duplicates).
-                    if !streamInterrupted {
-                        try await AppDatabase.backgroundPool.write { db in
-                            _ = try Folder.filter(Column("id") == folder.id)
-                                .updateAll(db, Column("backfillPageToken").set(to: nextToken))
-                        }
-                        if nextToken == nil {
-                            isLastPage = true
-                        }
-                    } else {
+                    // The page's token. The messages that loaded are already
+                    // inserted above; this decides only whether the walk moves on.
+                    //  - Interrupted (cancellation seen in the loop): keep the
+                    //    token; the next call lists this page again (dedup handles
+                    //    duplicates).
+                    //  - A message with a `hold` failure, inside the hold bound:
+                    //    HOLD the token (neither advance nor clear) and skip this
+                    //    folder for the rest of the call. The walk never advances
+                    //    the saved token past a held page inside the bound, so the
+                    //    folder cannot complete from that page, and a later call
+                    //    lists only this page again. The guarantee is about the
+                    //    saved token, not the held messages: on Exchange the token
+                    //    is an offset (`$skip`), so a held message that newer
+                    //    removals shift out of the page is passed over like any
+                    //    message the listing no longer returns. The page's first
+                    //    hold is saved on the folder, so the bound counts across
+                    //    calls and relaunches.
+                    //  - Otherwise advance; any message that failed per message,
+                    //    or kept failing past the bound, is passed over.
+                    if streamInterrupted {
                         BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) stream interrupted — NOT advancing page token")
+                    } else {
+                        var decision = BackfillPageDecision.advance
+                        if strictestFailure == .hold {
+                            // Skip first, so a hold write that throws still ends
+                            // this folder's walk for the call.
+                            pageWalkSkippedFolderIds.insert(folder.id)
+                            let now = Self.backfillPageHoldNow()
+                            if let firstHeld = try await Self.recordBackfillPageHold(
+                                folderId: folder.id, savedToken: savedToken, now: now) {
+                                decision = Self.decideBackfillPage(
+                                    strictestFailure: strictestFailure, firstHeld: firstHeld, now: now)
+                            } else {
+                                decision = .hold(heldSeconds: 0)
+                                BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) saved page token moved while this page was being fetched — holding it for this cycle without recording a hold")
+                            }
+                        }
+                        switch decision {
+                        case .hold(let heldSeconds):
+                            BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) \(failedCount) message(s) on this page failed with a failure that is not about that message alone — holding the page token (held \(Int(heldSeconds))s of \(Int(SyncConfig.backfillPageHoldSeconds))s) and skipping this folder for the rest of this cycle; the next cycle lists this page again")
+                        case .advance, .passOverAfterHoldBound:
+                            // A page passed over after the bound walks on in this cycle.
+                            pageWalkSkippedFolderIds.remove(folder.id)
+                            try await AppDatabase.backgroundPool.write { db in
+                                _ = try Folder.filter(Column("id") == folder.id)
+                                    .updateAll(db,
+                                        Column("backfillPageToken").set(to: nextToken),
+                                        Column("backfillPageHeldSince").set(to: nil as Date?))
+                            }
+                            if nextToken == nil {
+                                isLastPage = true
+                            }
+                            if case .passOverAfterHoldBound(let heldSeconds) = decision {
+                                BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) \(failedCount) message(s) on this page failed \(Int(heldSeconds))s (wall-clock, attempts or not) after the page's first hold, past the page's \(Int(SyncConfig.backfillPageHoldSeconds))s hold bound — advancing past them on this failure; this walk does not return to them")
+                            } else if failedCount > 0 {
+                                BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) \(failedCount) message(s) on this page failed for that message alone — advancing past them; this walk does not return to them")
+                            }
+                        }
                     }
                 } else {
                     break
                 }
 
-                if headers.isEmpty {
-                    BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) fetch returned 0 headers — will retry next cycle")
+                // A page that loaded nothing and did not finish the folder: the
+                // decision above has already logged what happens to it.
+                if headers.isEmpty && !isLastPage {
                     continue
                 }
 
-                BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) fetched \(headers.count) older messages")
+                if !headers.isEmpty {
+                    BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) fetched \(headers.count) older messages")
+                }
 
                 // Update oldestSyncedDate from oldest fetched message
                 if let oldest = headers.min(by: { $0.providerOrderDate < $1.providerOrderDate }) {
@@ -1909,7 +2173,8 @@ extension SyncEngine {
                         _ = try Folder.filter(Column("id") == folder.id)
                             .updateAll(db,
                                 Column("backfillComplete").set(to: true),
-                                Column("backfillPageToken").set(to: nil as String?)
+                                Column("backfillPageToken").set(to: nil as String?),
+                                Column("backfillPageHeldSince").set(to: nil as Date?)
                             )
                     }
                     BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) fully crawled (last page processed)")
