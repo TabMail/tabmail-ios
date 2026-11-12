@@ -38,7 +38,7 @@ enum CalendarEventEditExdates {
     /// change this path would not make, so it is refused by name (fails closed). `edit_scope` is
     /// allowed only when it is "all" (`isAllScope`).
     static let allowedKeys: Set<String> = [
-        "event_id", "calendar_id", "exdates_add", "timezone", "send_invitations", "edit_scope",
+        "event_id", "calendar_id", "exdates_add", "timezone", "edit_scope",
     ]
 
     /// Whether `edit_scope` is absent, null or "all": the default, which changes nothing here.

@@ -100,8 +100,8 @@ the popover line pinned by `popoverLineUnchanged`).
 **The delete card also serves `calendar_event_edit`'s `exdates_add` (#694, 2026-11-11).** Before
 #694 no iOS code read `exdates_add`: the edit wrote an unchanged series (or nothing) and answered
 "updated successfully". Now (`CalendarEventEditExdates`) it is a call of its own: any argument outside
-an allow-list (`event_id`, `calendar_id`, `exdates_add`, `timezone`, `send_invitations`, and `edit_scope`
-only as "all") is refused by name, failing closed for keys outside the schema too, and the refusal tells
+an allow-list (`event_id`, `calendar_id`, `exdates_add`, `timezone`, and `edit_scope`
+only as "all"; `send_invitations` was allowed until #778 retired it, guests always being notified) is refused by name, failing closed for keys outside the schema too, and the refusal tells
 the assistant to send the other change FIRST as its own call, then read the event again and send
 `exdates_add` alone, naming the occurrences by their starts as they are then. **The order matters:** on
 Google and Outlook a change to the series (its times, its rule, a split) brings back occurrences deleted
