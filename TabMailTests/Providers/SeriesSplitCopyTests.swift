@@ -1970,3 +1970,89 @@ struct ExchangeNumberedSplitTests {
         #expect(canonical(graph.event("ser-1")?["recurrence"]) == canonical(series["recurrence"]), "\(label): the series was changed")
     }
 }
+
+@Suite("Outlook split copies the series' files onto the new part (#563)", .serialized)
+struct ExchangeSplitAttachmentTests {
+    /// A small file, sent in one POST, and one an upload session takes in more than one range: at
+    /// Graph's own edges (`GraphAttachmentLimits`), never the app's constant.
+    private static let small = Data("Agenda for the series\n".utf8)
+    private static let large = Data((0..<(max(GraphAttachmentLimits.singlePostMaxExclusive, ExchangeDraftConfig.uploadChunkBytes) + 1))
+        .map { UInt8(truncatingIfNeeded: $0 &* 31) })
+
+    /// A calendar holding the numbered series `ser-1` with the files `files` attached.
+    private static func calendar(_ files: [(name: String, bytes: Data)]) -> FakeGraphCalendar {
+        let graph = GraphSplitFixture.calendar(GraphSplitFixture.series(range: GraphSplitFixture.numbered))
+        for file in files {
+            graph.attachFile(file.name, contentType: "application/octet-stream", bytes: file.bytes, to: "ser-1")
+        }
+        return graph
+    }
+
+    private static func split(_ graph: FakeGraphCalendar, _ http: FakeHTTP.Scenario, records: SplitRecordBox) async -> Error? {
+        var patch = GCalEventInput()
+        patch.summary = "Planning (phase 2)"
+        do {
+            _ = try await GraphSplitFixture.provider(http).splitSeries(
+                calendarId: "primary", eventId: "ser-1", recurrenceId: GraphSplitFixture.recurrenceId,
+                recurrenceIdZone: .current, patch: patch, sendUpdates: "all", record: records.recorder)
+            return nil
+        } catch {
+            return error
+        }
+    }
+
+    /// The files an event holds, by name, in name order.
+    private static func files(_ graph: FakeGraphCalendar, _ id: String) -> [String: Data] {
+        Dictionary(graph.files(of: id).map { ($0.name, $0.bytes) }, uniquingKeysWith: { a, _ in a })
+    }
+
+    @Test("the new part holds every file of the series, a small one and one an upload session takes, byte for byte, before the cap")
+    func newPartKeepsTheSeriesFiles() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = Self.calendar([("agenda.txt", Self.small), ("deck.bin", Self.large)])
+        graph.install(on: http)
+        let error = await Self.split(graph, http, records: SplitRecordBox())
+        #expect(error == nil, "\(String(describing: error)); \(http.servedCallSequence())")
+        let partId = try #require(graph.created.first?["id"] as? String, "no new part was created")
+
+        // What Outlook's own split keeps on the new part (measured 2026-11-13): every file.
+        let onPart = Self.files(graph, partId)
+        #expect(onPart.keys.sorted() == ["agenda.txt", "deck.bin"], "the new part holds \(onPart.keys.sorted())")
+        #expect(onPart["agenda.txt"] == Self.small, "the small file changed on the new part")
+        #expect(onPart["deck.bin"] == Self.large, "the large file changed on the new part: \(onPart["deck.bin"]?.count ?? 0) bytes")
+        #expect(graph.attachments(of: partId).count == 2, "a file was added twice: \(graph.attachments(of: partId).count)")
+        // The series keeps its own.
+        #expect(Self.files(graph, "ser-1").keys.sorted() == ["agenda.txt", "deck.bin"])
+        // The upload session's ranges carry no bearer token.
+        #expect(!graph.uploadAuthorizations.isEmpty && graph.uploadAuthorizations.allSatisfy { $0 == nil },
+                "upload ranges: \(graph.uploadAuthorizations)")
+        // Every file lands before the series is capped, so a series capped holds a complete new part.
+        let calls = http.recordedCalls()
+        let lastFile = try #require(calls.lastIndex { $0.url.contains("AttachmentSessions") || ($0.method == "POST" && $0.url.hasSuffix("/attachments")) })
+        let cap = try #require(calls.firstIndex { $0.method == "PATCH" && URL(string: $0.url)?.path.hasSuffix("/events/ser-1") == true },
+                               "the series was not capped")
+        #expect(lastFile < cap, "a file was copied after the cap: \(http.servedCallSequence())")
+    }
+
+    @Test("a file copy that fails stops the split before the cap; the retry (finishSplit) adds only what is missing, then caps")
+    func failedCopyStopsBeforeTheCapAndTheRetryFinishes() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = Self.calendar([("agenda.txt", Self.small), ("deck.bin", Self.large)])
+        graph.install(on: http)
+        graph.failNext("PUT", with: 503)
+        let records = SplitRecordBox()
+        let error = await Self.split(graph, http, records: records)
+        #expect(error != nil, "the failed upload did not stop the split: \(http.servedCallSequence())")
+        #expect(graph.patches("ser-1").isEmpty, "the series was capped though a file was not copied: \(http.servedCallSequence())")
+        let record = try #require(records.records.first, "no record was kept before the copy")
+
+        try await GraphSplitFixture.provider(http).finishSplit(record: record, zone: .current, guests: nil)
+        let onPart = Self.files(graph, record.newPartId)
+        #expect(onPart["agenda.txt"] == Self.small && onPart["deck.bin"] == Self.large, "the retry did not copy every file: \(onPart.keys.sorted())")
+        #expect(graph.attachments(of: record.newPartId).count == 2,
+                "the retry added a file the first attempt had copied: \(graph.attachments(of: record.newPartId).compactMap { $0["name"] as? String })")
+        #expect(!graph.patches("ser-1").isEmpty, "the retry did not cap: \(http.servedCallSequence())")
+    }
+}

@@ -111,6 +111,17 @@ import Synchronization
 /// a UTC instant (`…Z`) when the request names none. The zone is the one Graph
 /// knows by that name: `zones`, else `CalendarTimeZoneResolver`.
 ///
+/// An event's attachments (`/events/{id}/attachments`, Graph's `event: list attachments`, `post
+/// attachments` and `attachment: createUploadSession`, which "can be a message or event"): the list
+/// gives each attachment's `@odata.type` whatever `$select` names; a GET by id gives the whole
+/// attachment with its `contentBytes`; a single POST takes a file under
+/// `GraphAttachmentLimits.singlePostMaxExclusive` bytes (413 from there); an upload session is
+/// refused for a file under `GraphAttachmentLimits.uploadSessionMinimum` bytes (400
+/// `ErrorAttachmentSizeShouldNotBeLessThanMinimumSize`), and its byte ranges, PUT in order to the
+/// session's `outlook.office.com` URL, are answered 200 until the last, 201 once the attachment
+/// exists. A create (`POST /me/events`) carries no attachment. `failNext("ATTACH")` refuses the
+/// next attachment POST, `failNext("PUT")` the next range.
+///
 /// A `POST` carrying a `transactionId` an earlier `POST` carried is answered with the event that one
 /// made while it is still there, and makes a new event once it was deleted (measured 2026-11-10).
 /// `userDeletes` deletes an event as the user does in Outlook: a GET of it is then 404 (measured).
@@ -126,6 +137,45 @@ final class FakeGraphCalendar: Sendable {
 
     /// The user deletes `id` in their calendar app.
     func userDeletes(_ id: String) { events.withLock { $0[id] = nil } }
+
+    /// Each event's attachments, as stored (JSON, each with its `contentBytes`).
+    private let attachmentStore = Mutex<[String: [Data]]>([:])
+    private let attachmentCount = Mutex(0)
+    private struct Upload { let eventId: String; let name: String; let contentType: String; var received: Data }
+    private let uploads = Mutex<[String: Upload]>([:])
+    private let uploadAuthorizationLog = Mutex<[String?]>([])
+
+    /// The attachments of event `id`, as stored (each with its `contentBytes`).
+    func attachments(of id: String) -> [[String: Any]] {
+        attachmentStore.withLock { $0[id] ?? [] }.compactMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
+    }
+
+    /// The bytes of each file attachment of event `id`, by name.
+    func files(of id: String) -> [(name: String, bytes: Data)] {
+        attachments(of: id).compactMap { a in
+            guard let name = a["name"] as? String, let bytes = (a["contentBytes"] as? String).flatMap({ Data(base64Encoded: $0) }) else { return nil }
+            return (name, bytes)
+        }
+    }
+
+    /// Attaches a file named `name` holding `bytes` to event `id`, as the user does in Outlook.
+    func attachFile(_ name: String, contentType: String, bytes: Data, to id: String) {
+        store(attachment: [
+            "@odata.type": "#microsoft.graph.fileAttachment", "name": name, "contentType": contentType,
+            "size": bytes.count, "isInline": false, "contentBytes": bytes.base64EncodedString(),
+        ], on: id)
+    }
+
+    private func store(attachment: [String: Any], on id: String) {
+        var attachment = attachment
+        attachment["id"] = "att-" + String(attachmentCount.withLock { n in n += 1; return n })
+        // swiftlint:disable:next force_try
+        let data = try! JSONSerialization.data(withJSONObject: attachment)
+        attachmentStore.withLock { $0[id, default: []].append(data) }
+    }
+
+    /// The `Authorization` header of every upload-session range PUT, in order (nil: none).
+    var uploadAuthorizations: [String?] { uploadAuthorizationLog.withLock { $0 } }
 
     /// When set, an occurrence moved onto a DAY another occurrence of its series starts on (in the
     /// device's zone) is refused with 400 `ErrorOccurrenceCrossingBoundary`, as Exchange documents
@@ -355,6 +405,16 @@ final class FakeGraphCalendar: Sendable {
                     .filter { Self.isInSeries($0, master: master) }
                 return Self.json(["value": instances.map { Self.only(select, of: Self.rendered($0, in: prefer, named: preferName)) }])
             }
+            if parts.count >= 2, parts[1] == "attachments" {
+                guard event(parts[0]) != nil else { return .status(404) }
+                let held = attachments(of: parts[0])
+                if parts.count == 2 {
+                    // The list names each attachment's kind (`@odata.type`), `$select` or not.
+                    return Self.json(["value": held.map { a in select.map { s in a.filter { s.contains($0.key) || $0.key == "@odata.type" } } ?? a }])
+                }
+                guard parts.count == 3, let one = held.first(where: { $0["id"] as? String == parts[2] }) else { return .status(404) }
+                return Self.json(one)
+            }
             if parts.count == 1 { readLog.withLock { $0.append((id: parts[0], zone: preferName)) } }
             guard parts.count == 1, let stored = event(parts[0]) else { return .status(404) }
             return Self.json(Self.only(select, of: Self.rendered(stored, in: prefer, named: preferName)))
@@ -448,6 +508,51 @@ final class FakeGraphCalendar: Sendable {
             store(created)
             if takeLoss("POST") { return .transportError(.networkConnectionLost) }
             return Self.json(created)
+        }
+        // An attachment added to an event: one POST, or an upload session and its ranges.
+        http.register(path: "/v1.0/me/events/", method: "POST") { [self] request in
+            let parts = Self.pathParts(request.url)
+            if let status = takeFailure("ATTACH") { return .status(status) }
+            guard parts.count >= 2, parts[1] == "attachments", event(parts[0]) != nil else { return .status(404) }
+            guard let body = request.body, let json = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] else { return .status(400) }
+            if parts.count == 3, parts[2] == "createUploadSession" {
+                guard let item = json["AttachmentItem"] as? [String: Any], item["attachmentType"] as? String == "file",
+                      let name = item["name"] as? String, let size = item["size"] as? Int,
+                      size >= GraphAttachmentLimits.uploadSessionMinimum else {
+                    return .json(raw: #"{"error":{"code":"ErrorAttachmentSizeShouldNotBeLessThanMinimumSize"}}"#, statusCode: 400)
+                }
+                let token = "session-" + String(attachmentCount.withLock { n in n += 1; return n })
+                uploads.withLock {
+                    $0[token] = Upload(eventId: parts[0], name: name, contentType: item["contentType"] as? String ?? "", received: Data())
+                }
+                return .json(raw: #"{"uploadUrl":"https://outlook.office.com/AttachmentSessions/\#(token)?authtoken=synthetic-token"}"#,
+                             statusCode: 201)
+            }
+            guard parts.count == 2, json["@odata.type"] as? String == "#microsoft.graph.fileAttachment",
+                  let name = json["name"] as? String, let raw = json["contentBytes"] as? String,
+                  let bytes = Data(base64Encoded: raw) else { return .status(400) }
+            guard bytes.count < GraphAttachmentLimits.singlePostMaxExclusive else { return .status(413) }
+            attachFile(name, contentType: json["contentType"] as? String ?? "", bytes: bytes, to: parts[0])
+            return .json(raw: "{}", statusCode: 201)
+        }
+        http.register(path: "AttachmentSessions", method: "PUT") { [self] request in
+            uploadAuthorizationLog.withLock { $0.append(request.header("Authorization")) }
+            if let status = takeFailure("PUT") { return .status(status) }
+            let token = request.url.lastPathComponent
+            guard let body = request.body, let range = request.header("Content-Range"),
+                  let total = range.split(separator: "/").last.flatMap({ Int($0) }),
+                  let first = range.dropFirst("bytes ".count).split(separator: "-").first.flatMap({ Int($0) })
+            else { return .status(400) }
+            let done: Upload? = uploads.withLock { all in
+                guard var upload = all[token], first == upload.received.count else { return nil }
+                upload.received.append(body)
+                all[token] = upload.received.count == total ? nil : upload
+                return upload
+            }
+            guard let done else { return .status(416) }
+            guard done.received.count == total else { return .json(raw: "{}") }
+            attachFile(done.name, contentType: done.contentType, bytes: done.received, to: done.eventId)
+            return .json(raw: "{}", statusCode: 201)
         }
         // DELETE removes the event: an occurrence leaves its series' instances list and is not
         // found by its id afterwards. An event that is not there is 404.

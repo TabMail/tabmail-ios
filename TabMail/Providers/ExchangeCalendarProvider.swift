@@ -447,7 +447,9 @@ actor ExchangeCalendarProvider: CalendarProvider {
     ///    number, `occurrencesLeft`), with `patch` applied, under a DETERMINISTIC
     ///    `transactionId`, so Graph answers a retried POST with the part it already made.
     /// 2. `record` keeps the `SplitRecord` (the new part's Graph id).
-    /// 3. PATCH the master's recurrence.range to {type: "endDate", endDate: splitDate - 1 day}
+    /// 3. Copy the series' file attachments onto the new part (`copySeriesFiles`), then carry the
+    ///    later changed and deleted occurrences onto it (`writeSplitOccurrences`).
+    /// 4. PATCH the master's recurrence.range to {type: "endDate", endDate: splitDate - 1 day}
     ///    (`splitCapJSON`). The stored pattern is written back exactly.
     /// Nothing is rolled back: a failed cap is rethrown, and the retry finds the record and
     /// writes the cap alone (`finishSplit`). Until then both parts show the occurrences after
@@ -568,14 +570,19 @@ actor ExchangeCalendarProvider: CalendarProvider {
             namedPlace: SplitCarry.key(namedPlace), namedStart: SplitCarry.key(namedStart), edits: SplitCarry.targets(of: edits))
         try await record(splitRecord)
 
-        // 3. Carry onto the new part, and edit the occurrences shown after the one named that stay
+        // 3. Copy the series' files onto the new part, as Outlook's own split keeps them (measured
+        //    2026-11-13), before the carry, so each occurrence carried onto the new part is made
+        //    from a part that holds them. A copy that fails stops the split here, before the cap.
+        try await copySeriesFiles(seriesId: eventId, newPartId: createdId)
+
+        // 4. Carry onto the new part, and edit the occurrences shown after the one named that stay
         //    on the series. A write that fails stops the split here, before the cap: the series is
         //    still whole, and the retry writes again.
         try await writeSplitOccurrences(
             record: splitRecord, cut: splitPlace, exceptions: exceptions, series: master, seriesRaw: snapshot.raw,
             newPart: created, guests: partPatch.attendeeChange, seriesZone: seriesZone)
 
-        // 4. Cap the master. A failure is rethrown; the record is kept.
+        // 5. Cap the master. A failure is rethrown; the record is kept.
 
         try await writeSplitCap(seriesId: eventId, body: cappedBody)
         return created
@@ -620,6 +627,8 @@ actor ExchangeCalendarProvider: CalendarProvider {
         }
         let exceptions = try await seriesExceptions(seriesId: record.seriesId, series: stored.event, seriesZone: seriesZone, cut: split)
         let newPart = try await getEvent(eventId: record.newPartId)
+        // The series' files the first attempt did not copy, before the carry, as `splitSeries`.
+        try await copySeriesFiles(seriesId: record.seriesId, newPartId: record.newPartId)
         try await writeSplitOccurrences(
             record: record, cut: split, exceptions: exceptions, series: stored.event, seriesRaw: stored.raw,
             newPart: newPart, guests: guests, seriesZone: seriesZone)
@@ -1101,6 +1110,74 @@ actor ExchangeCalendarProvider: CalendarProvider {
             ], seriesZone: seriesZone, allDay: false)
         }
         return cappedJSON
+    }
+
+    /// Copies every file attachment of the series `seriesId` onto the split's new part `newPartId`:
+    /// Outlook web's own "this and all following" keeps the series' file attachment on the new
+    /// part (measured 2026-11-13 on a work test account), and a create (`POST /events`) carries
+    /// none, since attachments are a separate endpoint. Each file's bytes are read as a mail
+    /// attachment's are (its `contentBytes`, one GET by id) and added by the same code as an Outlook
+    /// draft's (`ExchangeProvider.addFileAttachment`: one POST under 3 MB, an upload session from
+    /// there).
+    ///
+    /// Only files (`#microsoft.graph.fileAttachment`) are copied; an item or reference attachment
+    /// is left as before, not copied. A file the new part already holds under the same name (one
+    /// to one, as a draft save pairs them) is not added again, so a retry (`finishSplit`) adds only
+    /// what an earlier attempt did not. Any failure throws before the carry and the cap, with the
+    /// record kept: the series is still whole, and the retry copies what is missing.
+    private func copySeriesFiles(seriesId: String, newPartId: String) async throws {
+        let encodedSeries = try Self.encodedGraphPathSegment(seriesId, context: "Graph series master id")
+        let files = try await attachments(of: "/events/\(encodedSeries)").filter(ExchangeProvider.isFileAttachment)
+        guard !files.isEmpty else { return }
+        let encodedPart = try Self.encodedGraphPathSegment(newPartId, context: "Graph event id")
+        var held = try await attachments(of: "/events/\(encodedPart)").map(Self.attachmentName)
+        var added = 0
+        for file in files {
+            let name = Self.attachmentName(file)
+            if let index = held.firstIndex(of: name) {
+                held.remove(at: index)
+                continue
+            }
+            let encodedFile = try Self.encodedGraphPathSegment(file.id, context: "Graph attachment id")
+            let detail = try JSONDecoder().decode(
+                GraphAttachmentDetail.self, from: try await request(path: "/events/\(encodedSeries)/attachments/\(encodedFile)"))
+            guard let base64 = detail.contentBytes, let data = Data(base64Encoded: base64) else {
+                throw CalendarProviderError.notSupported(
+                    "a file attached to this repeating event can't be read, so it can't be copied to the new part")
+            }
+            try await ExchangeProvider.addFileAttachment(
+                DraftAttachment(filename: name, mimeType: file.contentType ?? "application/octet-stream", data: data),
+                itemPath: "/events/\(encodedPart)",
+                post: { path, body in try await self.request(path: path, method: "POST", body: body) },
+                session: testSession ?? sharedEphemeralSession, gate: mailboxGate)
+            added += 1
+        }
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[ExchangeCalendar] split copied \(added) of \(files.count) file attachment(s) onto the new part")
+        }
+    }
+
+    /// Every attachment of the event at `eventPath` (`/events/{id}`), id, name, type and kind,
+    /// following Graph's `@odata.nextLink` within Graph (`graphPath(ofNextLink:)`), at most
+    /// `GraphAPI.maxAttachmentListPages` pages, as a message's list is read.
+    private func attachments(of eventPath: String) async throws -> [GraphAttachmentMeta] {
+        var found: [GraphAttachmentMeta] = []
+        var next: String? = "\(eventPath)/attachments?$select=id,name,contentType"
+        var pages = 0
+        while let path = next {
+            guard pages < GraphAPI.maxAttachmentListPages else { throw ExchangeProvider.GraphAttachmentListIncomplete() }
+            let page = try JSONDecoder().decode(GraphAttachmentListResponse.self, from: try await request(path: path))
+            found += page.value
+            pages += 1
+            next = try page.odataNextLink.map { try graphPath(ofNextLink: $0) }
+        }
+        return found
+    }
+
+    /// The name a split pairs and writes a copied file under: its own, or the name a draft read
+    /// gives a file with none (`DraftReadConfig.unnamedAttachmentFilename`).
+    private static func attachmentName(_ attachment: GraphAttachmentMeta) -> String {
+        attachment.name?.isEmpty == false ? attachment.name ?? "" : DraftReadConfig.unnamedAttachmentFilename
     }
 
     /// The silent cap PATCH of a split (`splitCapJSON`'s body) on the series `seriesId`.

@@ -443,6 +443,29 @@ guests, end only), `CalendarEditToolSeriesScopeTests.renameSplitCarriesLaterExce
 `carryFailureStopsBeforeTheCapAndTheRetryCarries` / `zoneOnlySplitResets` / `outlookResetNoteFollowsTheMode`, the Google/Outlook invariant matrices (moved states now
 split at the place), `CalDAVOccurrenceWireTests.splitIsAtThePlaceInEveryFrame`.
 
+**Amendment (2026-11-13, #563): an Outlook split copies the series' FILE attachments onto the new
+part.** Supersedes "its attachments (a separate endpoint, not copied, as the split's own copy does
+not)" above for the new part (kept as written). Measured on a work test account (2026-11-13): Outlook
+web's own "this and all following" kept a 203-byte file attachment on the new part (it dropped the
+open extension and the single-value extended property, as we do). A create (`POST /events`) carries no
+attachment, so after the record and before the carry and the cap, `ExchangeCalendarProvider.copySeriesFiles`
+lists the series' attachments (`$select=id,name,contentType`, every page within Graph), reads each
+`#microsoft.graph.fileAttachment`'s bytes as a mail attachment's are (`contentBytes`, one GET by id),
+and adds it to the new part through the SAME code as an Outlook draft: `ExchangeProvider.addFileAttachment`
+(moved out of the draft-only `addDraftAttachment`, now parameterized by the item path `/messages/{id}`
+or `/events/{id}`; one POST under `ExchangeDraftConfig.singlePostAttachmentLimitBytes`, else an upload
+session whose ranges are PUT with no `Authorization`). A file the new part already holds by name (one
+to one, as a draft save pairs) is not added again, so `finishSplit` runs the same step and adds only
+what is missing. A failure throws before the carry and the cap with the record kept (the queue's usual
+split semantics: transient errors retry through `finishSplit`, a 4xx the queue retires stops the split
+with the new part made and the series uncapped, the residual of iOS #769). Not copied, open: item and
+reference attachments (left as before); an inline file (`isInline`/`contentId`) is copied as a plain
+file, since the shared add sends neither. Google already copied attachments (`supportsAttachments`);
+CalDAV keeps every `ATTACH` line byte for byte (`newPartKeepsAttachments`). Tests:
+`ExchangeSplitAttachmentTests` (small and upload-session files on the new part before the cap; a failed
+range stops before the cap and the retry adds only the missing file); `FakeGraphCalendar` models event
+attachments, the single POST, the upload session and its ranges.
+
 ## Tests
 
 `CalDAVEventCopiesTests`, `CalDAVSplitRefusedBeforeWriteTests` and `CalDAVSplitRollbackTests`

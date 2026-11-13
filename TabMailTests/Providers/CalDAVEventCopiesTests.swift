@@ -739,6 +739,31 @@ struct CalDAVSeriesSplitCopyTests {
         #expect(capped.contains("RRULE:FREQ=WEEKLY;UNTIL=20990520T165959Z"))
     }
 
+    /// The series' attachments (RFC 5545 §3.8.1.1 `ATTACH`, a link and an inline file folded over
+    /// two physical lines) reach the new part as stored, on a carry and on a reset, and stay on the
+    /// capped series, as Google's and Outlook's own splits keep a series' files (#563).
+    @Test("the new part keeps the series' attachments, a link and an inline file, byte for byte, whether the split carries or resets",
+          arguments: ["rename", "new time"])
+    func newPartKeepsAttachments(_ edit: String) throws {
+        let link = "ATTACH;FMTTYPE=application/pdf:https://files.example.com/agenda.pdf"
+        let inlineHead = "ATTACH;FMTTYPE=text/plain;ENCODING=BASE64;VALUE=BINARY;X-FILENAME=notes.txt:QWdlbmRhOiBwbGFubmluZyw"
+        let inlineTail = " gcmV2aWV3LCBuZXh0IHN0ZXBzLg=="
+        let ics = Fixture.series([
+            "BEGIN:VEVENT", "UID:series-1", "DTSTART:20990506T170000Z", "DTEND:20990506T174500Z",
+            "RRULE:FREQ=WEEKLY", "SUMMARY:Sync", link, inlineHead, inlineTail, "END:VEVENT",
+        ])
+        let patch = edit == "rename"
+            ? Fixture.patch(summary: "Next phase")
+            : Fixture.patch(start: "2099-05-20T18:00:00Z", end: "2099-05-20T18:45:00Z")
+        let out = try Fixture.split(ics, patch: patch)
+        let part = Fixture.master(out.newPart)
+        #expect(part.contains(link), "\(edit): the new part lost the linked file:\n\(part.joined(separator: "\n"))")
+        #expect(part.contains(inlineHead + inlineTail.dropFirst()), "\(edit): the new part lost the inline file:\n\(part.joined(separator: "\n"))")
+        #expect(out.newPart.contains(inlineHead + "\r\n" + inlineTail), "\(edit): the inline file was rewritten:\n\(out.newPart)")
+        let capped = Fixture.master(out.cappedSeries)
+        #expect(capped.contains(link) && capped.contains(inlineHead + inlineTail.dropFirst()), "\(edit): the capped series lost a file")
+    }
+
     @Test("excluded dates, added dates and changed occurrences go with the part they fall in")
     func partitionAtTheSplit() throws {
         let ics = Fixture.series([
