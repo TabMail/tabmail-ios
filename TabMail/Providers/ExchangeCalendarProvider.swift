@@ -511,18 +511,19 @@ actor ExchangeCalendarProvider: CalendarProvider {
         )
         // The occurrences deleted or changed one by one (#563), read before anything is written
         // and sorted around the cut when they are written (`writeSplitOccurrences`).
-        let exceptions = try await seriesExceptions(seriesId: eventId, series: master, seriesZone: seriesZone)
+        let exceptions = try await seriesExceptions(seriesId: eventId, series: master, seriesZone: seriesZone, cut: splitPlace)
         guard let parts = SplitCarry.partition(exceptions.map(\.carried), cut: point.cut, namedStart: namedStart) else {
             throw CalendarProviderError.notSupported("a changed occurrence of this repeating event has a time TabMail can't read, so it was not split")
         }
         // The order the carry and the edits are written in dates their moves, and only their moves,
-        // in the series' zone (`moveOrder`): a timed series with none whose split moves an
-        // occurrence (`movesAnOccurrence`) is refused here, before the new part is created. A
-        // deletion or a rename needs no zone.
-        guard master.isAllDay || master.seriesZone != nil
-              || !Self.movesAnOccurrence(exceptions.map(\.carried), edit: partPatch) else {
-            throw CalendarProviderError.notSupported("an occurrence of this repeating event can't be dated in its time zone, so its change can't be carried")
-        }
+        // in the series' zone (`moveOrder`). They are planned here as they are written, against
+        // the new part's times as the create gives them (`plannedPart`), so a move that can't be
+        // dated (a timed series whose zone is not known) is refused before the new part is
+        // created. A deletion, a rename, or an occurrence that stays where it is needs no date.
+        try Self.dateSplitMoves(
+            parts: parts, mode: mode, namedStart: namedStart, namedPlace: namedPlace, cut: splitPlace, series: master,
+            newPart: Self.plannedPart(master: master, patch: partPatch, place: place, zone: recurrenceIdZone),
+            fields: SplitCarry.fields(of: partPatch))
         let cappedBody = try JSONSerialization.data(withJSONObject: cappedJSON)
 
         // 1. Create the new part. Graph defines `transactionId` as a value "for the server to
@@ -617,7 +618,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         guard let split = Self.splitPlace(naiveISO: record.splitAt, allDay: stored.event.isAllDay, zone: zone) else {
             throw CalendarProviderError.notSupported("Invalid recurrence_id '\(record.splitAt)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
         }
-        let exceptions = try await seriesExceptions(seriesId: record.seriesId, series: stored.event, seriesZone: seriesZone)
+        let exceptions = try await seriesExceptions(seriesId: record.seriesId, series: stored.event, seriesZone: seriesZone, cut: split)
         let newPart = try await getEvent(eventId: record.newPartId)
         try await writeSplitOccurrences(
             record: record, cut: split, exceptions: exceptions, series: stored.event, seriesRaw: stored.raw,
@@ -687,7 +688,11 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// never combined: only a plain `$expand=exceptionOccurrences`, with no `$select` anywhere,
     /// gives each exception's `originalStart` and fields (measured). Both are read with `Prefer`
     /// naming the series' zone, so an all-day place is its date. Nothing is written.
-    private func seriesExceptions(seriesId: String, series: GCalEvent, seriesZone: String?) async throws -> [TailException] {
+    ///
+    /// `cut` is the split's, when there is one: a deletion that can't be placed (a timed series
+    /// whose zone is not known) and whose date is surely before it (`deletedSurelyBefore`) is
+    /// left out, as a split never touches it; any other deletion that can't be placed is refused.
+    private func seriesExceptions(seriesId: String, series: GCalEvent, seriesZone: String?, cut: GCalDateTime?) async throws -> [TailException] {
         let unreadable = CalendarProviderError.notSupported(
             "the occurrences of this repeating event changed or deleted one by one can't be read, so it was not split")
         let zone = seriesZone.flatMap { CalendarTimeZoneResolver.zone(named: $0, in: .none) }
@@ -707,10 +712,36 @@ actor ExchangeCalendarProvider: CalendarProvider {
         for name in cancelledJSON["cancelledOccurrences"] as? [String] ?? [] {
             let date = String(name.suffix(10))
             guard RecurrenceTail.Day(iso: date) != nil else { throw unreadable }
-            guard let place = Self.deletedPlace(date: date, series: series, zone: zone) else { throw unreadable }
+            guard let place = Self.deletedPlace(date: date, series: series, zone: zone) else {
+                if let cut, Self.deletedSurelyBefore(date: date, cut: cut) { continue }
+                throw unreadable
+            }
             found.append(TailException(carried: .deleted(place: place), raw: [:]))
         }
         return found
+    }
+
+    /// How many days before a split's date in UTC a deleted date must be to be surely before the
+    /// split, whatever the series' zone: zones run from 12 hours behind UTC to 14 ahead, so an
+    /// occurrence on a date starts before noon UTC on the day after it, and two days clear that.
+    nonisolated static let deletedDateMarginDays = 2
+
+    /// Whether an occurrence Graph names deleted by its date `date` alone is surely before the
+    /// split at `cut`, in any zone: `date` is at least `deletedDateMarginDays` before `cut`'s date
+    /// in UTC. False when either can't be read.
+    nonisolated static func deletedSurelyBefore(date: String, cut: GCalDateTime) -> Bool {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .gmt
+        let cutDay: Date?
+        if let day = cut.date {
+            cutDay = GoogleCalendarProvider.naiveInstant("\(day.prefix(10))T00:00:00", zone: .gmt)
+        } else {
+            cutDay = cut.dateTime.flatMap(Date.fromISO8601).map { calendar.startOfDay(for: $0) }
+        }
+        guard RecurrenceTail.Day(iso: date) != nil,
+              let deleted = GoogleCalendarProvider.naiveInstant("\(date)T00:00:00", zone: .gmt),
+              let cutDay, let latest = calendar.date(byAdding: .day, value: -deletedDateMarginDays, to: cutDay) else { return false }
+        return deleted <= latest
     }
 
     /// The place of an occurrence Graph names deleted by its date `date` (in the series' zone): the
@@ -740,10 +771,8 @@ actor ExchangeCalendarProvider: CalendarProvider {
         let namedPlace = record.namedPlace.flatMap(SplitCarry.time) ?? cut
         guard let parts = SplitCarry.partition(exceptions.map(\.carried), cut: .at(cut), namedStart: namedStart),
               let shift = SplitCarry.shift(cut: cut, newPart: newPart) else { throw unreadable }
-        let moved = SplitCarry.key(namedStart) != SplitCarry.key(namedPlace)
-        let named = record.mode == .reset && moved ? SplitCarry.named(in: parts, place: namedPlace) : nil
-        guard let plan = SplitCarry.plan(
-            exceptions: record.mode == .carry ? parts.tail : [], kept: parts.kept, named: named, shift: shift,
+        guard let plan = Self.carryPlan(
+            parts: parts, mode: record.mode, namedStart: namedStart, namedPlace: namedPlace, shift: shift,
             series: series, newPart: newPart, fields: record.fields) else { throw unreadable }
         try await carry(
             plan, exceptions: exceptions, series: series, seriesRaw: seriesRaw, newPartId: record.newPartId,
@@ -770,7 +799,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         guard patch.recurrence == nil, patch.ruleDayMove == nil else {
             throw CalendarProviderError.notSupported(SplitCarry.pastEndRuleRefusal)
         }
-        let exceptions = try await seriesExceptions(seriesId: seriesId, series: series, seriesZone: seriesZone)
+        let exceptions = try await seriesExceptions(seriesId: seriesId, series: series, seriesZone: seriesZone, cut: nil)
         guard let shown = SplitCarry.shownEdits(exceptions: exceptions.map(\.carried), named: named, seriesId: seriesId, patch: patch) else {
             throw CalendarProviderError.notSupported(Self.shownEditUnreadable)
         }
@@ -787,7 +816,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
     func finishShownEdit(calendarId: String = "primary", record: SplitRecord, edit: GCalEventInput, guests: AttendeeChange?) async throws {
         let (seriesId, snapshot) = try await resolveToMaster(eventId: record.seriesId, select: Self.splitSelect)
         let seriesZone = snapshot.event.recurrenceTimeZoneName
-        let exceptions = try await seriesExceptions(seriesId: seriesId, series: snapshot.event, seriesZone: seriesZone)
+        let exceptions = try await seriesExceptions(seriesId: seriesId, series: snapshot.event, seriesZone: seriesZone, cut: nil)
         guard let edits = SplitCarry.shownEdits(exceptions: exceptions.map(\.carried), record: record) else {
             throw CalendarProviderError.notSupported(Self.shownEditUnreadable)
         }
@@ -959,17 +988,49 @@ actor ExchangeCalendarProvider: CalendarProvider {
                       to: { $0.start }, zone: zone)
     }
 
-    /// Whether a split with `edit` of a series with `exceptions` moves an occurrence, so its carry
-    /// or its edits date a move in the series' zone (`moveOrder`): an edit that sets a time, with
-    /// any exception, or a changed occurrence that starts away from its place. A deletion or a
-    /// rename moves nothing.
-    nonisolated static func movesAnOccurrence(_ exceptions: [SplitCarry.Exception], edit: GCalEventInput) -> Bool {
-        let setsTime = edit.startDateTime != nil || edit.startDate != nil || edit.endDateTime != nil || edit.endDate != nil
-        return exceptions.contains { exception in
-            guard case .changed(let event) = exception else { return setsTime }
-            guard let start = event.start, let place = event.originalStartTime else { return true }
-            return setsTime || SplitCarry.key(start) != SplitCarry.key(place)
+    /// The carry a split writes onto its new part (`SplitCarry.plan`): on a carry the exceptions
+    /// after the cut, in either mode those shown before the one named (`Parts.kept`), and on a
+    /// reset the one named when it was moved, moved as the edit moves it. Nil when a time can't
+    /// be read.
+    nonisolated static func carryPlan(
+        parts: SplitCarry.Parts, mode: SplitCarry.Mode, namedStart: GCalDateTime, namedPlace: GCalDateTime, shift: TimeInterval,
+        series: GCalEvent, newPart: GCalEvent, fields: Set<SplitCarry.Field>
+    ) -> SplitCarry.Plan? {
+        let moved = SplitCarry.key(namedStart) != SplitCarry.key(namedPlace)
+        let named = mode == .reset && moved ? SplitCarry.named(in: parts, place: namedPlace) : nil
+        return SplitCarry.plan(
+            exceptions: mode == .carry ? parts.tail : [], kept: parts.kept, named: named, shift: shift,
+            series: series, newPart: newPart, fields: fields)
+    }
+
+    /// The new part a split creates, as far as its writes after it need it: its start and end, as
+    /// the create body gives them (`mergeMasterAndPatch`, as `splitNewPartJSON` dates them).
+    nonisolated static func plannedPart(master: GCalEvent, patch: GCalEventInput, place: String, zone: TimeZone) -> GCalEvent {
+        let times = GoogleCalendarProvider.mergeMasterAndPatch(
+            master: master, patch: patch, newStartNaiveISO: place, newStartZone: zone, newRecurrence: [])
+        return GCalEvent(
+            id: nil, summary: nil, location: nil, description: nil,
+            start: GCalDateTime(dateTime: times.startDateTime, date: times.startDate, timeZone: times.startTimeZone),
+            end: GCalDateTime(dateTime: times.endDateTime, date: times.endDate, timeZone: times.endTimeZone),
+            attendees: nil, organizer: nil, recurrence: nil, transparency: nil, status: nil,
+            htmlLink: nil, created: nil, updated: nil, recurringEventId: nil)
+    }
+
+    /// Orders, before anything is written, the moves a split's writes make (`carryPlan` and the
+    /// edits of `Parts.edited`) as `carryOrder` and `editOrder` will: throws when one moves by
+    /// date and can't be dated in the series' zone, or when a time can't be read.
+    nonisolated static func dateSplitMoves(
+        parts: SplitCarry.Parts, mode: SplitCarry.Mode, namedStart: GCalDateTime, namedPlace: GCalDateTime, cut: GCalDateTime,
+        series: GCalEvent, newPart: GCalEvent, fields: Set<SplitCarry.Field>
+    ) throws {
+        guard let shift = SplitCarry.shift(cut: cut, newPart: newPart),
+              let edits = SplitCarry.edits(of: parts.edited, shift: shift, length: SplitCarry.length(of: newPart), fields: fields),
+              let plan = carryPlan(parts: parts, mode: mode, namedStart: namedStart, namedPlace: namedPlace, shift: shift,
+                                   series: series, newPart: newPart, fields: fields) else {
+            throw CalendarProviderError.notSupported("a changed occurrence of this repeating event has a time TabMail can't read, so it was not split")
         }
+        _ = try carryOrder(plan.changed, zone: series.seriesZone)
+        _ = try editOrder(edits, zone: series.seriesZone)
     }
 
     /// `moves` in the order Graph takes them: an occurrence moved to another date goes once no

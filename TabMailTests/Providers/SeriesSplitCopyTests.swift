@@ -595,9 +595,10 @@ struct ExchangeSplitCarryTests {
     }
 
     /// Splits `ser-1` at week 1 with `patch`. `exceptions` are its changed occurrences (as Graph
-    /// expands them), `cancelled` the weeks deleted one by one, `parts` the new part's occurrences.
+    /// expands them), `cancelled` the weeks deleted one by one (and `cancelledOn`, any other days),
+    /// `parts` the new part's occurrences.
     private func split(
-        exceptions: [[String: Any]], cancelled: [Int] = [], parts: [Int], patch: GCalEventInput,
+        exceptions: [[String: Any]], cancelled: [Int] = [], cancelledOn: [Date] = [], parts: [Int], patch: GCalEventInput,
         series: [String: Any] = GraphSplitFixture.series(range: GraphSplitFixture.noEnd),
         configure: (FakeGraphCalendar, FakeHTTP.Scenario) -> Void = { _, _ in }
     ) async throws -> Run {
@@ -610,7 +611,7 @@ struct ExchangeSplitCarryTests {
         expanded["exceptionOccurrences"] = exceptions
         http.register(path: "/v1.0/me/events/ser-1?$expand=exceptionOccurrences", method: "GET",
                       response: .raw(statusCode: 200, headers: ok, body: try JSONSerialization.data(withJSONObject: expanded)))
-        let names = ["cancelledOccurrences": cancelled.map { "OID.ser-1.\(GraphFixture.deviceDay(Self.week($0)))" }]
+        let names = ["cancelledOccurrences": (cancelled.map { Self.week($0) } + cancelledOn).map { "OID.ser-1.\(GraphFixture.deviceDay($0))" }]
         http.register(path: "/v1.0/me/events/ser-1?$select=cancelledOccurrences", method: "GET",
                       response: .raw(statusCode: 200, headers: ok, body: try JSONSerialization.data(withJSONObject: names)))
         configure(graph, http)
@@ -908,17 +909,62 @@ struct ExchangeSplitCarryTests {
         #expect(r.http.recordedCalls().allSatisfy { $0.method == "GET" }, "something was written: \(r.http.servedCallSequence())")
     }
 
-    @Test("a new start for a series with no zone it can date in, that would move a changed occurrence, is refused before the new part is made")
-    func zonelessMoveIsRefusedBeforeThePart() async throws {
-        let series = Self.zoneless(GraphSplitFixture.series(range: GraphSplitFixture.noEnd))
+    /// A new start an hour later than the split's occurrence, given in UTC.
+    private static var hourLater: GCalEventInput {
         var patch = GCalEventInput()
         patch.startDateTime = GraphSplitFixture.occurrence.addingTimeInterval(3_600).iso8601String()
         patch.startTimeZone = "UTC"
+        return patch
+    }
+
+    @Test("a series with no zone it can date in: a new time over a later occurrence that was only renamed is written, the new part at the new time and the series capped")
+    func zonelessTimeChangeOverARenameIsWritten() async throws {
+        let series = Self.zoneless(GraphSplitFixture.series(range: GraphSplitFixture.noEnd))
         let r = try await split(exceptions: [Self.exception(2) { $0["location"] = ["displayName": "Room 9"] }],
-                                parts: [2], patch: patch, series: series)
+                                parts: [2], patch: Self.hourLater, series: series)
         defer { r.http.close() }
-        #expect(r.error != nil, "the move was written: \(r.http.servedCallSequence())")
-        #expect(r.http.recordedCalls().allSatisfy { $0.method == "GET" }, "something was written: \(r.http.servedCallSequence())")
+        #expect(r.error == nil, "\(String(describing: r.error)); \(r.http.servedCallSequence())")
+        #expect(Self.instant(r.graph.event("created-1")?["start"]) == GraphSplitFixture.occurrence.addingTimeInterval(3_600),
+                "the new part is not at the new time: \(r.graph.event("created-1")?["start"] ?? "none")")
+        #expect(!r.graph.patches("ser-1").isEmpty, "the series was not capped: \(r.http.servedCallSequence())")
+    }
+
+    @Test("a series with no zone it can date in: an occurrence deleted a week before the split does not stop a rename from it, and nothing on the new part is deleted")
+    func zonelessEarlierDeletionDoesNotBlock() async throws {
+        let series = Self.zoneless(GraphSplitFixture.series(range: GraphSplitFixture.noEnd))
+        let r = try await split(exceptions: [], cancelled: [0], parts: [2], patch: Self.rename, series: series)
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error)); \(r.http.servedCallSequence())")
+        #expect(r.graph.event("created-1")?["subject"] as? String != nil, "no new part: \(r.http.servedCallSequence())")
+        #expect(!r.graph.patches("ser-1").isEmpty, "the series was not capped: \(r.http.servedCallSequence())")
+        #expect(!r.http.recordedCalls().contains { $0.method == "DELETE" }, "an occurrence was deleted: \(r.http.servedCallSequence())")
+    }
+
+    @Test("a series with no zone it can date in: a deletion on the split's date or the day before it can't be told from one after it, so the split is refused with nothing written")
+    func zonelessDeletionAtTheSplitIsRefused() async throws {
+        for (label, day) in [("the split's date", GraphSplitFixture.occurrence),
+                             ("the day before", GraphSplitFixture.occurrence.addingTimeInterval(-86_400))] {
+            let r = try await split(exceptions: [], cancelledOn: [day], parts: [2], patch: Self.rename,
+                                    series: Self.zoneless(GraphSplitFixture.series(range: GraphSplitFixture.noEnd)))
+            defer { r.http.close() }
+            #expect(r.error != nil, "\(label): the split went on: \(r.http.servedCallSequence())")
+            #expect(r.http.recordedCalls().allSatisfy { $0.method == "GET" }, "\(label): something was written: \(r.http.servedCallSequence())")
+        }
+    }
+
+    @Test("a series with no zone it can date in: a later occurrence moved to another day is refused with nothing written, for a rename and for a new time that shows it before the one named")
+    func zonelessLaterMoveIsRefused() async throws {
+        let series = Self.zoneless(GraphSplitFixture.series(range: GraphSplitFixture.noEnd))
+        let rename = try await split(exceptions: [Self.exception(2, at: Self.week(2, plusDays: 1))], parts: [2], patch: Self.rename, series: series)
+        defer { rename.http.close() }
+        #expect(rename.error != nil, "rename: the split went on: \(rename.http.servedCallSequence())")
+        #expect(rename.http.recordedCalls().allSatisfy { $0.method == "GET" }, "rename: written: \(rename.http.servedCallSequence())")
+        // Week 2's occurrence moved back before week 1's: placed after the cut, shown before the
+        // one named, so it is carried whole at its own time, a move by date.
+        let earlier = try await split(exceptions: [Self.exception(2, at: Self.week(1, hour: 8))], parts: [2], patch: Self.hourLater, series: series)
+        defer { earlier.http.close() }
+        #expect(earlier.error != nil, "new time: the split went on: \(earlier.http.servedCallSequence())")
+        #expect(earlier.http.recordedCalls().allSatisfy { $0.method == "GET" }, "new time: written: \(earlier.http.servedCallSequence())")
     }
 
     @Test("past the end of a series with no zone it can date in, a moved occurrence can't be placed, so a rename is refused with nothing written")
