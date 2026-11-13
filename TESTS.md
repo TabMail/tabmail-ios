@@ -523,7 +523,8 @@ catch-up (#783); a read that needs a listing (refused or no bookmark) lists in t
 the pass's copy of the account said no full sync was due; a folder whose window listing did not finish
 stays untracked and is listed on a later pass; folders left flagged tracked with no bookmark (a reset
 racing a pass) are listed and the pass stores a bookmark; applying the read's folder list bumps no
-backfill version. `ChangeSeamFenceTests` holds four source fences (no provider cast in the engine's change files, no database in a reader, the shields read only inside the
+backfill version; a foreground pass with the full sync due applies the folder list (a new label added, a
+gone one removed) from ONE label request, the full sync reusing the read's list instead of fetching its own. `ChangeSeamFenceTests` holds four source fences (no provider cast in the engine's change files, no database in a reader, the shields read only inside the
 per-folder transaction, no window listing for a tracked folder) and the v102 migration.
 `ChangeApplyFuzzTests` runs seeded interleavings of other-client changes, queued and drained ops and
 completions during a read, checking that queued intentions keep their rows, a completion during a read

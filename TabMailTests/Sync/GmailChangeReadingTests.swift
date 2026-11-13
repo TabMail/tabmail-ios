@@ -419,6 +419,29 @@ struct GmailChangeReadingTests {
         }
     }
 
+    static func labelRequests(_ w: Pins.World) -> Int {
+        w.server.http.recordedCalls().filter { URL(string: $0.url)?.path.hasSuffix("/labels") == true }.count
+    }
+
+    /// The folder list is applied by `applyFolderList`, shared by the change
+    /// read and the full sync. A foreground pass with the full sync due applies
+    /// it once: the read's list, which the full sync takes instead of asking again.
+    @Test("a foreground pass with the full sync due applies the folder list from one label request")
+    func foregroundPassAppliesFolderListOnce() async throws {
+        try await Pins.withWorld(seeds: []) { w in
+            w.server.setUserLabel(id: "Label_3", name: "Travel")
+            w.server.removeUserLabel(id: Pins.userLabelId)
+            let before = Self.labelRequests(w)
+            try await w.foregroundPassWithFullSyncDue()
+            let paths = try await w.pool.read { db in
+                try Folder.filter(Column("accountId") == w.accountId).fetchAll(db).map(\.path)
+            }
+            #expect(paths.contains("Label_3"), "a label created on the server is a folder after the pass")
+            #expect(!paths.contains(Pins.userLabelId), "a label deleted on the server is gone after the pass")
+            #expect(Self.labelRequests(w) - before == 1, "the pass asked for the label list \(Self.labelRequests(w) - before) times")
+        }
+    }
+
     // MARK: - a stale label read during the app's own archive (#735)
 
     @Test("a message archived by the app during a stale label read is listed in All Mail on a later pass (#735)")
