@@ -473,6 +473,11 @@ protocol EmailProvider: Sendable {
     /// result means the attached email has no files.
     func fetchAttachedEmailAttachments(messageId: String, section: String) async throws -> [AttachmentInfo]
 
+    /// Reads what changed since `cursor` (ADR-IOS-111). Never touches the local
+    /// database. `nil` = this provider has no change reader yet (the default in
+    /// `EmailProviderChanges.swift`); the engine then keeps its remaining change path.
+    func fetchChanges(since cursor: ChangeCursor, request: ChangeRequest) async throws -> ChangeSet?
+
     // Incremental sync (optional — Gmail uses history.list, IMAP returns nil)
     func fetchHistory(since historyId: String) async throws -> HistoryResponse?
     func fetchMessageHeaders(ids: [String]) async throws -> [MessageHeaderInfo]

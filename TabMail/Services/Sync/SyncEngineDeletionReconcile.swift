@@ -306,7 +306,32 @@ extension SyncEngine {
         recentlyCompleted: [String: Date],
         db: Database
     ) throws -> [String] {
-        guard !ids.isEmpty else { return [] }
+        try deleteConfirmedGhostHeadersReportingProtected(
+            folderId: folderId, folderPath: folderPath, accountId: accountId, folderRole: folderRole,
+            ids: ids, idsAreUniqueInAccount: false, recentlyCompleted: recentlyCompleted, db: db
+        ).deleted
+    }
+
+    /// The removal core itself. Also reports the provider ids of the rows a
+    /// protection kept, so the change apply can read them again on the next pass
+    /// (ADR-IOS-111).
+    ///
+    /// `idsAreUniqueInAccount`: the provider's ids name one message across the whole
+    /// account (Gmail, Graph), so the user's pending action on the same message
+    /// from ANY folder protects the row here too (the account-wide identity term).
+    /// False for ids that are only unique in their folder (an IMAP UID), where the
+    /// same id in another folder is a different message.
+    nonisolated static func deleteConfirmedGhostHeadersReportingProtected(
+        folderId: String,
+        folderPath: String,
+        accountId: String,
+        folderRole: FolderRole,
+        ids: [String],
+        idsAreUniqueInAccount: Bool,
+        recentlyCompleted: [String: Date],
+        db: Database
+    ) throws -> (deleted: [String], protectedMessageIds: [String]) {
+        guard !ids.isEmpty else { return ([], []) }
 
         // Load candidate rows by EXACT messageId membership (messageId IS the
         // UID for IMAP — pure membership, no UID/date window; ADR-IOS-042-safe).
@@ -319,14 +344,19 @@ extension SyncEngine {
                 .filter(Column("folderId") == folderId && chunk.contains(Column("messageId")))
                 .fetchAll(db)
         }
-        guard !candidates.isEmpty else { return [] }
+        guard !candidates.isEmpty else { return ([], []) }
 
         // SAME protection set as the stale flow (see runSyncMessages).
         let pendingOps = try PendingOperation.fetchAll(db)
         let opsTargetingThisFolder = pendingOps.filter {
             $0.accountId == accountId && ($0.folderPath == folderPath || $0.destinationPath == folderPath)
         }
-        let pendingAllIds = Set(opsTargetingThisFolder.flatMap(\.messageIds))
+        var pendingAllIds = Set(opsTargetingThisFolder.flatMap(\.messageIds))
+        if idsAreUniqueInAccount {
+            // The account-wide identity term: any op of this account on the same
+            // message, whichever folder it was queued from.
+            pendingAllIds.formUnion(pendingOps.filter { $0.accountId == accountId }.flatMap(\.messageIds))
+        }
 
         var outboxProtectedRfc822s = Set<String>()
         if folderRole == .sent {
@@ -353,7 +383,7 @@ extension SyncEngine {
             // behind `messageBody` any more. MessageAICache survives by design.
             try msg.delete(db)
         }
-        return deletable.map(\.id)
+        return (deletable.map(\.id), candidates.filter(isProtected).map(\.messageId))
     }
 
     /// Instance wiring for the shared deletion path: write transaction +

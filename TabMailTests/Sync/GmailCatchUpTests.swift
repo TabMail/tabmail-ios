@@ -3191,7 +3191,7 @@ struct GmailCatchUpTests {
         }
     }
 
-    @Test("G3: a lapse with no full sync due survives a relaunch, and the next due full sync applies the change",
+    @Test("G3: a refusal read in a background pass survives a relaunch, and the next foreground pass re-lists and applies the change",
           .enabled(if: !NetworkMonitor.checkExpensive()))
     func lapseSurvivesRelaunch() async throws {
         let clock = Clock()
@@ -3203,8 +3203,14 @@ struct GmailCatchUpTests {
 
             world.server.applyLabelChange(providerMessageId: "o0", remove: ["UNREAD"])
             world.server.expireHistory()
-            try await Self.syncPass(world)
+            // A background pass reads the refusal; it lists nothing and stores
+            // no new bookmark.
+            let accountId = world.accountId
+            let account = try #require(try await world.pool.read { db in try Account.fetchOne(db, key: accountId) })
+            _ = try await world.engine.performDeltaSync(account: account, provider: world.provider)
             #expect(try Self.cursor(world) == nil, "precondition: the expired history cleared the cursor")
+            #expect(try await world.pool.read { db in try Account.fetchOne(db, key: accountId) }?.lastFullSyncAt == nil,
+                    "the refusal makes the full sync due")
             for path in [inboxPath, allMailPath] {
                 let state = try #require(try Self.state(world, path), "the lapse keeps \(path)'s state")
                 #expect(state.lapsedSinceLastListing && state.lastCompletedAt != nil,
@@ -3215,7 +3221,6 @@ struct GmailCatchUpTests {
             let provider = world.server.provider()
             await relaunched.register(
                 accountId: world.accountId, provider: provider, workQueue: ProviderWorkQueue(provider: provider, maxConcurrency: 1))
-            try Self.setAccount(world, cursor: nil, lastFullSyncAt: nil)
             try await Self.syncPass(world, engine: relaunched)
             await relaunched.remove(accountId: world.accountId)
 
@@ -3224,7 +3229,7 @@ struct GmailCatchUpTests {
         }
     }
 
-    @Test("G4: a change whose GET failed in a pass with a due full sync is applied by a later pass",
+    @Test("G4: a change whose GET keeps failing never holds the bookmark back, and lands on the first pass that reads it",
           .enabled(if: !NetworkMonitor.checkExpensive()))
     func failedDeltaFetchIsCaughtUp() async throws {
         let clock = Clock()
@@ -3239,11 +3244,15 @@ struct GmailCatchUpTests {
             try await Self.syncPass(world)
             #expect(world.server.getFailuresServedCount(providerMessageId: "o0") >= 1, "precondition: the delta's GET of the change failed")
             #expect(try Self.cursor(world) == world.server.currentHistoryId(),
-                    "precondition: the full sync's capture moved the cursor past the change")
+                    "the bookmark moves past the change it could not read")
+            #expect(try Self.rows(world, inboxPath)["o0"]?.isRead == false, "precondition: the change has not landed")
 
-            try Self.setAccount(world, cursor: try Self.cursor(world), lastFullSyncAt: nil)
             try await Self.syncPass(world)
-            #expect(try Self.rows(world, inboxPath)["o0"]?.isRead == true, "a later pass applies the change")
+            #expect(try Self.rows(world, inboxPath)["o0"]?.isRead == false, "still unreadable: still waiting")
+
+            world.server.clearGetFailures()
+            try await Self.syncPass(world)
+            #expect(try Self.rows(world, inboxPath)["o0"]?.isRead == true, "the first pass that reads it applies the change")
         }
     }
 }

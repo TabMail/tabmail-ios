@@ -387,7 +387,7 @@ struct SearchView: View {
     ///     arms) · `AccountManager.queueDraftSave` ×1 ·
     ///     `MessageHeaderRekey.finishMove` ×1 (its no-proven-epoch else arm) ·
     ///     `BackfillBodyQueue.rekeyRemappedHeader` ×1 ·
-    ///     `SyncEngine.gmailDeltaSync` ×2 ·
+    ///     `SyncEngine.insertChangeRecord` ×1 (the orphan reclaim) ·
     ///     `SyncEngine.exchangeDeltaSync` ×3 ·
     ///     `SyncEngine.canonicalizeLocalRows` ×2 ·
     ///     `SyncEngine.runSyncMessages` ×6.
@@ -448,7 +448,8 @@ struct SearchView: View {
     ///     (`GmailParse` derives it from `header("Message-Id")`, `GraphParse` from
     ///     `internetMessageId`; both are `.map`-over-Optional). **FIVE** production
     ///     statements then assign that Optional STRAIGHT ONTO A STORED ROW without a
-    ///     nil check — `SyncEngine.gmailDeltaSync` ×2 and
+    ///     nil check — `SyncEngine.gmailDeltaSync` ×2 (since replaced by the change
+    ///     apply, whose merge writes a present value only) and
     ///     `SyncEngine.exchangeDeltaSync` ×3, in `SyncEngineDeltaSync.swift`, in
     ///     **TWO different shapes**:
     ///       • `existing.rfc822MessageId = info.rfc822MessageId` … `existing.update(db)`

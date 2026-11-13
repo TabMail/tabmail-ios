@@ -1675,6 +1675,12 @@ struct FolderBackfillVersionNeverRepeatsMigrationTests {
     @Test("A folder inserted with a version written by hand gets a fresh one")
     func insertedVersionIsSeeded() throws {
         let (db, id) = try Self.migrated(bumpsBefore: 3)
+        // The insert below writes the CURRENT `Folder` record, so the schema must
+        // carry every later column; the rest of the chain adds columns only and
+        // leaves the v101 version trigger under test in place.
+        var migrator = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &migrator)
+        try migrator.migrate(db)
         let existing = try Self.version(db, id)
         var other = Folder(name: "Other", path: "Other", role: .custom, accountId: "acc1")
         other.backfillVersion = existing

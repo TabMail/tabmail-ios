@@ -84,164 +84,216 @@ extension SyncEngine {
 
     // MARK: - Full Sync
 
-    func fullSync(account: Account, provider: any EmailProvider) async throws {
+    /// What one full sync is told by the change read that ran before it in the
+    /// same pass (ADR-IOS-111).
+    struct FullSyncPlan: Sendable {
+        /// Non-nil = the change read carried the folder list and it was applied;
+        /// the value is `applyFolderList`'s MODSEQ-skippable set.
+        var appliedFolderList: Set<String>?
+
+        init(appliedFolderList: Set<String>? = nil) {
+            self.appliedFolderList = appliedFolderList
+        }
+    }
+
+    /// What one full sync's window listings did.
+    struct FullSyncListing: Sendable {
+        /// The folders whose window listing finished in this pass.
+        var listedFolderIds: Set<String> = []
+        /// A folder the full sync meant to list went unlisted after a failure:
+        /// a lost connection (that folder and every later one), a retry that
+        /// failed otherwise, or a failed SELECT.
+        var droppedFolder = false
+    }
+
+    /// Apply the provider's folder list: upsert name, counts and the IMAP status
+    /// values, bootstrap epochs, insert new folders, remove vanished ones, and (Gmail)
+    /// sync the user-label rows. Runs inside one write transaction.
+    ///
+    /// Fix B task 4: folders whose CONDSTORE HIGHESTMODSEQ is unchanged since last sync
+    /// — RFC 7162 guarantees nothing changed (add/delete/flag), so the per-folder fetch
+    /// below is skipped. Computed HERE, before the cursor overwrite destroys the cached
+    /// modseq. NEVER includes the inbox or a deep pass (see shouldSkipFolderFetch); the
+    /// deletion-reconcile check still runs for skipped folders (safety net).
+    ///
+    /// - Returns: the paths whose fetch the full sync may skip (MODSEQ-unchanged).
+    nonisolated static func applyFolderList(_ remoteFolders: [FolderInfo], account: Account, db: Database) throws -> Set<String> {
+        var skippable: Set<String> = []
+        let localFolders = try Folder.filter(Column("accountId") == account.id).fetchAll(db)
+
+        for info in remoteFolders {
+            if var existing = localFolders.first(where: { $0.path == info.path }) {
+                // Written back column by column (`updateChanges`): a whole-record
+                // update names the backfill walk's columns, which fires
+                // `folder_bumpBackfillVersion` and fails a page walk's compare-and-set,
+                // and this runs on every change read with a folder list (ADR-IOS-111).
+                let original = existing
+                // Unconditional — it advances the per-folder deep-pass streak counter.
+                let deep = Self.fullSyncIsDeepPass(
+                    folderId: existing.id, everyN: SyncConfig.fullSyncDeepEveryN)
+                // NOTE (T1.2): an epoch-aware term was tried here and REMOVED. Making a
+                // UIDVALIDITY turnover block this skip forces the folder down
+                // `runSyncMessages`, whose windowed stale sweep has NO epoch guard — so
+                // "more fetching" is NOT the conservative direction here: it converts a
+                // skipped folder into a swept one and DELETES the old-epoch mail that
+                // HEAD leaves alone. The sweep needs the guard first (see
+                // `runSyncMessages`); until then this gate stays exactly as it was.
+                if Self.shouldSkipFolderFetch(
+                    role: existing.role, freshModSeq: info.highestModSeq,
+                    cachedModSeq: existing.lastKnownHighestModSeq, isDeepSync: deep) {
+                    skippable.insert(info.path)
+                }
+                existing.name = info.name
+                existing.totalCount = info.totalCount
+                if let uidNext = info.uidNext { existing.lastKnownUidNext = uidNext }
+                if let modseq = info.highestModSeq { existing.lastKnownHighestModSeq = modseq }
+                // BOOTSTRAP the epoch for a folder the deletion-reconcile walk has
+                // never visited (it was previously the only writer) — and ONLY
+                // bootstrap. `uidValidityBootstrapWrite` writes nothing once the column
+                // holds a value, so a nil/0 observation cannot erase it and a turnover
+                // cannot overwrite it (which would disarm the walk's abort guard —
+                // ADR-IOS-051; see the helper's doc comment). `localFolders` is read
+                // inside THIS write transaction, so `existing` is not a stale snapshot.
+                //
+                // T4.S6b — the header-existence term. This site is the FIRST stamper on
+                // an upgrade for a UIDPLUS server: it runs before any per-folder SELECT,
+                // so gating only `runSyncMessages` would leave it stamping every folder
+                // by assertion. It cannot route through `bootstrapFolderUidValidity`
+                // (which carries the term in its statement) because it sets the field on
+                // a record it is already updating, so it discharges the same term in
+                // Swift — sound HERE and only here, because the count is read inside
+                // THIS write transaction with no suspension before the `update`.
+                // `isEmpty` compiles to `SELECT EXISTS(SELECT … LIMIT 1)`, which
+                // stops at the first index entry. `fetchCount` walks every entry
+                // for a folder — pure waste for a question that is answered by
+                // one row, inside the single GRDB writer. Same shape as the
+                // `NOT EXISTS (SELECT 1 FROM messageHeader WHERE folderId = …)`
+                // term already inside `bootstrapFolderUidValidity`'s statement;
+                // this site must stay in Swift (see the note above), so it ports
+                // the predicate's SHAPE rather than its location.
+                let existingHoldsRows = try !MessageHeader
+                    .filter(Column("folderId") == existing.id).isEmpty(db)
+                if let bootstrap = Self.uidValidityBootstrapWrite(
+                    observed: info.uidValidity, stored: existing.lastKnownUidValidity,
+                    folderHoldsRows: existingHoldsRows) {
+                    existing.lastKnownUidValidity = bootstrap
+                }
+                _ = try existing.updateChanges(db, from: original)
+            } else {
+                var folder = Folder(name: info.name, path: info.path, role: info.role, accountId: account.id)
+                folder.totalCount = info.totalCount
+                folder.lastKnownUidNext = info.uidNext
+                // This STATUS is the folder's first: the catch-up's first listing
+                // stamps itself with it (ADR-IOS-107).
+                folder.lastKnownHighestModSeq = info.highestModSeq
+                // A brand-new row is by definition a first observation — the same
+                // bootstrap rule, which here also filters the `0` = "not reported"
+                // sentinel out of the column.
+                //
+                // ⚠ T4.S6b — "a new row is by definition an empty folder" is FALSE, and
+                // that is residual path (b) in `UidValidityTurnoverDeletionGuardTests`:
+                // `Folder.id` is the deterministic `"\(accountId):\(path)"` and the
+                // vanished-folder cleanup below deletes the ROW while migration `v2`
+                // leaves its headers orphaned, so a re-created path RE-ADOPTS old-epoch
+                // rows the instant this insert lands. The term is therefore required on
+                // BOTH arms.
+                // Existence test, not a count — see the sibling arm above.
+                let recreatedHoldsRows = try !MessageHeader
+                    .filter(Column("folderId") == folder.id).isEmpty(db)
+                folder.lastKnownUidValidity = Self.uidValidityBootstrapWrite(
+                    observed: info.uidValidity, stored: nil,
+                    folderHoldsRows: recreatedHoldsRows)
+                try folder.insert(db)
+            }
+        }
+
+        // Remove local folders that no longer exist remotely
+        let remotePaths = Set(remoteFolders.map(\.path))
+        for folder in localFolders where !remotePaths.contains(folder.path) {
+            // NOTE: this used to say "CASCADE handles messageHeader deletion
+            // automatically". That is FALSE — migration `v2_dropMessageHeaderFolderFK`
+            // made `messageHeader.folderId` a plain column with NO foreign key to
+            // `folder` (only `accountId` cascades). Deleting the folder row therefore
+            // leaves its headers ORPHANED: they survive, still pointing at a
+            // `folderId`/`folderPath` that now has no metadata. Because `Folder.id` is
+            // the deterministic `"\(accountId):\(path)"`, a later re-appearance of the
+            // same path re-adopts those orphans under a BRAND-NEW row whose
+            // `lastKnownUidValidity` is nil — old-epoch mail under an unknown epoch.
+            // See `Folder.lastKnownUidValidity`'s doc comment for why that is an open
+            // hazard rather than a benign one.
+            try folder.delete(db)
+        }
+
+        // Sync user labels from the folder list (Gmail: user labels appear as custom folders).
+        // One UserLabel per Gmail label. Nested labels (e.g., "Work/Projects/Alpha") are stored
+        // with their full name — splitting into segments happens at display time in the chip view.
+        if account.provider == .gmail {
+            let existingLabelIds = try String.fetchSet(db,
+                UserLabel.select(Column("id")).filter(Column("accountId") == account.id)
+            )
+            var seenLabelIds: Set<String> = []
+
+            for info in remoteFolders {
+                let labelId = info.path
+                // Skip tm_* labels (handled by ActionTag) and system/auto-created labels
+                if UserLabelStore.isExcludedKeyword(info.name) { continue }
+
+                let isSystem = UserLabelStore.isGmailSystemLabel(id: labelId, name: info.name)
+                let row = UserLabel(
+                    accountId: account.id, providerLabelId: labelId,
+                    name: info.name, isSystem: isSystem
+                )
+                try row.save(db) // upsert
+                // 🚨 THE SWEEP BELOW COMPARES DB IDS, SO THIS MUST BE THE DB ID.
+                // `existingLabelIds` is read from `userLabel.id`, which is the
+                // account-prefixed surrogate (D10 / `IOS-LABEL-001`). Recording the
+                // BARE `labelId` here would make `staleLabelIds` the whole existing
+                // set on every single sync — i.e. delete every label row this account
+                // has, and (via `messageUserLabel`'s `onDelete: .cascade`) every
+                // association with it. This is the most dangerous consumer of the
+                // surrogate, which is why the row is bound to a local and its own id
+                // reused rather than the mint being repeated.
+                seenLabelIds.insert(row.id)
+            }
+
+            // Remove user labels that no longer exist on server
+            let staleLabelIds = existingLabelIds.subtracting(seenLabelIds)
+            if !staleLabelIds.isEmpty {
+                try UserLabel
+                    .filter(staleLabelIds.contains(Column("id")) && Column("accountId") == account.id)
+                    .deleteAll(db)
+            }
+        }
+        return skippable
+    }
+
+
+    /// - Parameter plan: what this pass's change read already did
+    ///   (ADR-IOS-111). `appliedFolderList` = the read carried the folder list and
+    ///   the engine applied it, so the discovery request is skipped. A folder whose
+    ///   change bookmark covers it (`FolderChangeState.tracking`) gets no window
+    ///   listing: its changes arrive through the reader.
+    /// - Returns: the folders whose window listing finished in this pass, and
+    ///   whether a folder it meant to list went unlisted after a failure.
+    @discardableResult
+    func fullSync(account: Account, provider: any EmailProvider, plan: FullSyncPlan = FullSyncPlan()) async throws -> FullSyncListing {
         let fs0 = CFAbsoluteTimeGetCurrent()
         let acctTag = "\(account.provider):\(account.id.prefix(6))"
         BootProfiler.mark("fullSync[\(acctTag)] START (network — fetch folders + inbox headers → populates inbox)")
-        // Sync folder list
-        let remoteFolders = try await provider.fetchFolders()
-        BackgroundSyncLogger.logDebug("[FullSync] \(account.emailAddress) fetchFolders: \(Int((CFAbsoluteTimeGetCurrent() - fs0) * 1000))ms (\(remoteFolders.count) folders)")
-        BootProfiler.mark("fullSync[\(acctTag)]: fetchFolders done in \(Int((CFAbsoluteTimeGetCurrent() - fs0) * 1000))ms (\(remoteFolders.count) folders)")
-
         let pool = dbPool
-        // Fix B task 4: folders whose CONDSTORE HIGHESTMODSEQ is unchanged since last sync
-        // — RFC 7162 guarantees nothing changed (add/delete/flag), so the per-folder fetch
-        // below is skipped. Computed HERE, before the cursor overwrite destroys the cached
-        // modseq. NEVER includes the inbox or a deep pass (see shouldSkipFolderFetch); the
-        // deletion-reconcile check still runs for skipped folders (safety net).
-        let skippablePaths: Set<String> = try await pool.write { db in
-            var skippable: Set<String> = []
-            let localFolders = try Folder.filter(Column("accountId") == account.id).fetchAll(db)
-
-            for info in remoteFolders {
-                if var existing = localFolders.first(where: { $0.path == info.path }) {
-                    // Unconditional — it advances the per-folder deep-pass streak counter.
-                    let deep = Self.fullSyncIsDeepPass(
-                        folderId: existing.id, everyN: SyncConfig.fullSyncDeepEveryN)
-                    // NOTE (T1.2): an epoch-aware term was tried here and REMOVED. Making a
-                    // UIDVALIDITY turnover block this skip forces the folder down
-                    // `runSyncMessages`, whose windowed stale sweep has NO epoch guard — so
-                    // "more fetching" is NOT the conservative direction here: it converts a
-                    // skipped folder into a swept one and DELETES the old-epoch mail that
-                    // HEAD leaves alone. The sweep needs the guard first (see
-                    // `runSyncMessages`); until then this gate stays exactly as it was.
-                    if Self.shouldSkipFolderFetch(
-                        role: existing.role, freshModSeq: info.highestModSeq,
-                        cachedModSeq: existing.lastKnownHighestModSeq, isDeepSync: deep) {
-                        skippable.insert(info.path)
-                    }
-                    existing.name = info.name
-                    existing.totalCount = info.totalCount
-                    if let uidNext = info.uidNext { existing.lastKnownUidNext = uidNext }
-                    if let modseq = info.highestModSeq { existing.lastKnownHighestModSeq = modseq }
-                    // BOOTSTRAP the epoch for a folder the deletion-reconcile walk has
-                    // never visited (it was previously the only writer) — and ONLY
-                    // bootstrap. `uidValidityBootstrapWrite` writes nothing once the column
-                    // holds a value, so a nil/0 observation cannot erase it and a turnover
-                    // cannot overwrite it (which would disarm the walk's abort guard —
-                    // ADR-IOS-051; see the helper's doc comment). `localFolders` is read
-                    // inside THIS write transaction, so `existing` is not a stale snapshot.
-                    //
-                    // T4.S6b — the header-existence term. This site is the FIRST stamper on
-                    // an upgrade for a UIDPLUS server: it runs before any per-folder SELECT,
-                    // so gating only `runSyncMessages` would leave it stamping every folder
-                    // by assertion. It cannot route through `bootstrapFolderUidValidity`
-                    // (which carries the term in its statement) because it sets the field on
-                    // a record it is already updating, so it discharges the same term in
-                    // Swift — sound HERE and only here, because the count is read inside
-                    // THIS write transaction with no suspension before the `update`.
-                    // `isEmpty` compiles to `SELECT EXISTS(SELECT … LIMIT 1)`, which
-                    // stops at the first index entry. `fetchCount` walks every entry
-                    // for a folder — pure waste for a question that is answered by
-                    // one row, inside the single GRDB writer. Same shape as the
-                    // `NOT EXISTS (SELECT 1 FROM messageHeader WHERE folderId = …)`
-                    // term already inside `bootstrapFolderUidValidity`'s statement;
-                    // this site must stay in Swift (see the note above), so it ports
-                    // the predicate's SHAPE rather than its location.
-                    let existingHoldsRows = try !MessageHeader
-                        .filter(Column("folderId") == existing.id).isEmpty(db)
-                    if let bootstrap = Self.uidValidityBootstrapWrite(
-                        observed: info.uidValidity, stored: existing.lastKnownUidValidity,
-                        folderHoldsRows: existingHoldsRows) {
-                        existing.lastKnownUidValidity = bootstrap
-                    }
-                    try existing.update(db)
-                } else {
-                    var folder = Folder(name: info.name, path: info.path, role: info.role, accountId: account.id)
-                    folder.totalCount = info.totalCount
-                    folder.lastKnownUidNext = info.uidNext
-                    // This STATUS is the folder's first: the catch-up's first listing
-                    // stamps itself with it (ADR-IOS-107).
-                    folder.lastKnownHighestModSeq = info.highestModSeq
-                    // A brand-new row is by definition a first observation — the same
-                    // bootstrap rule, which here also filters the `0` = "not reported"
-                    // sentinel out of the column.
-                    //
-                    // ⚠ T4.S6b — "a new row is by definition an empty folder" is FALSE, and
-                    // that is residual path (b) in `UidValidityTurnoverDeletionGuardTests`:
-                    // `Folder.id` is the deterministic `"\(accountId):\(path)"` and the
-                    // vanished-folder cleanup below deletes the ROW while migration `v2`
-                    // leaves its headers orphaned, so a re-created path RE-ADOPTS old-epoch
-                    // rows the instant this insert lands. The term is therefore required on
-                    // BOTH arms.
-                    // Existence test, not a count — see the sibling arm above.
-                    let recreatedHoldsRows = try !MessageHeader
-                        .filter(Column("folderId") == folder.id).isEmpty(db)
-                    folder.lastKnownUidValidity = Self.uidValidityBootstrapWrite(
-                        observed: info.uidValidity, stored: nil,
-                        folderHoldsRows: recreatedHoldsRows)
-                    try folder.insert(db)
-                }
+        let skippablePaths: Set<String>
+        if let applied = plan.appliedFolderList {
+            // This pass's change read carried the folder list and it is applied.
+            skippablePaths = applied
+            BackgroundSyncLogger.logDebug("[FullSync] \(account.emailAddress) folder list from this pass's change read")
+        } else {
+            // Sync folder list
+            let remoteFolders = try await provider.fetchFolders()
+            BackgroundSyncLogger.logDebug("[FullSync] \(account.emailAddress) fetchFolders: \(Int((CFAbsoluteTimeGetCurrent() - fs0) * 1000))ms (\(remoteFolders.count) folders)")
+            BootProfiler.mark("fullSync[\(acctTag)]: fetchFolders done in \(Int((CFAbsoluteTimeGetCurrent() - fs0) * 1000))ms (\(remoteFolders.count) folders)")
+            skippablePaths = try await pool.write { db in
+                try Self.applyFolderList(remoteFolders, account: account, db: db)
             }
-
-            // Remove local folders that no longer exist remotely
-            let remotePaths = Set(remoteFolders.map(\.path))
-            for folder in localFolders where !remotePaths.contains(folder.path) {
-                // NOTE: this used to say "CASCADE handles messageHeader deletion
-                // automatically". That is FALSE — migration `v2_dropMessageHeaderFolderFK`
-                // made `messageHeader.folderId` a plain column with NO foreign key to
-                // `folder` (only `accountId` cascades). Deleting the folder row therefore
-                // leaves its headers ORPHANED: they survive, still pointing at a
-                // `folderId`/`folderPath` that now has no metadata. Because `Folder.id` is
-                // the deterministic `"\(accountId):\(path)"`, a later re-appearance of the
-                // same path re-adopts those orphans under a BRAND-NEW row whose
-                // `lastKnownUidValidity` is nil — old-epoch mail under an unknown epoch.
-                // See `Folder.lastKnownUidValidity`'s doc comment for why that is an open
-                // hazard rather than a benign one.
-                try folder.delete(db)
-            }
-
-            // Sync user labels from the folder list (Gmail: user labels appear as custom folders).
-            // One UserLabel per Gmail label. Nested labels (e.g., "Work/Projects/Alpha") are stored
-            // with their full name — splitting into segments happens at display time in the chip view.
-            if account.provider == .gmail {
-                let existingLabelIds = try String.fetchSet(db,
-                    UserLabel.select(Column("id")).filter(Column("accountId") == account.id)
-                )
-                var seenLabelIds: Set<String> = []
-
-                for info in remoteFolders {
-                    let labelId = info.path
-                    // Skip tm_* labels (handled by ActionTag) and system/auto-created labels
-                    if UserLabelStore.isExcludedKeyword(info.name) { continue }
-
-                    let isSystem = UserLabelStore.isGmailSystemLabel(id: labelId, name: info.name)
-                    let row = UserLabel(
-                        accountId: account.id, providerLabelId: labelId,
-                        name: info.name, isSystem: isSystem
-                    )
-                    try row.save(db) // upsert
-                    // 🚨 THE SWEEP BELOW COMPARES DB IDS, SO THIS MUST BE THE DB ID.
-                    // `existingLabelIds` is read from `userLabel.id`, which is the
-                    // account-prefixed surrogate (D10 / `IOS-LABEL-001`). Recording the
-                    // BARE `labelId` here would make `staleLabelIds` the whole existing
-                    // set on every single sync — i.e. delete every label row this account
-                    // has, and (via `messageUserLabel`'s `onDelete: .cascade`) every
-                    // association with it. This is the most dangerous consumer of the
-                    // surrogate, which is why the row is bound to a local and its own id
-                    // reused rather than the mint being repeated.
-                    seenLabelIds.insert(row.id)
-                }
-
-                // Remove user labels that no longer exist on server
-                let staleLabelIds = existingLabelIds.subtracting(seenLabelIds)
-                if !staleLabelIds.isEmpty {
-                    try UserLabel
-                        .filter(staleLabelIds.contains(Column("id")) && Column("accountId") == account.id)
-                        .deleteAll(db)
-                }
-            }
-            return skippable
         }
 
         if !skippablePaths.isEmpty {
@@ -250,9 +302,11 @@ extension SyncEngine {
 
         BackgroundSyncLogger.logDebug("[FullSync] \(account.emailAddress) folder upsert: \(Int((CFAbsoluteTimeGetCurrent() - fs0) * 1000))ms")
 
-        // Fetch fresh folder list after upsert
-        let folders = try await pool.read { db in
-            try Folder.filter(Column("accountId") == account.id).fetchAll(db)
+        // Fetch fresh folder list after upsert, with whether the account holds a
+        // change bookmark in the same read (the tracked skip below needs both).
+        let (folders, holdsChangeBookmark) = try await pool.read { db in
+            (try Folder.filter(Column("accountId") == account.id).fetchAll(db),
+             try Account.fetchOne(db, key: account.id)?.lastHistoryId != nil)
         }
 
         // Sync messages for main roles + favorited folders, prioritized:
@@ -283,6 +337,12 @@ extension SyncEngine {
         // Extracted to avoid duplication between initial sync and connection-error retry.
         @Sendable func processSyncResult(_ result: SyncMessagesResult, folder: Folder) async -> [String] {
             await Self.publishHeaderRekeys(result.headerRekeys)
+            // Recount right after the folder's rows are committed, as the
+            // `syncMessages` wrapper does: `runSyncMessages` inserts and removes
+            // rows and changes their read state, and does not recount. A change
+            // read recounts only when it writes rows, so nothing later in the
+            // pass counts a listing's new unread mail.
+            await UnreadCountManager.shared.requestRecount(folderId: folder.id)
             // Yield to a privileged merge before this folder's FTS writes (rekey /
             // remove / index). SearchIndex is a separate pool with sync `@noasync`
             // writes, so the async caller yields on its behalf.
@@ -340,12 +400,27 @@ extension SyncEngine {
             return result.uidMigratedOldIds
         }
 
-        let uidMigratedOldIds: [String] = try await Task.detached {
+        // ADR-IOS-111: a folder the provider's change bookmark covers gets no
+        // window listing. Its changes arrive through the change read; read here
+        // from the folder row this full sync just loaded. With no bookmark in the
+        // row nothing covers a folder, whatever its flag says (a reset that lands
+        // while a pass runs can leave a flag behind), so every folder is listed:
+        // the pass that does so stores a bookmark and the account never stalls.
+        let trackedFolderIds = holdsChangeBookmark
+            ? Set(syncableFolders.filter { FolderChangeState(raw: $0.changeState).tracking }.map(\.id))
+            : []
+        if !trackedFolderIds.isEmpty {
+            BackgroundSyncLogger.logDebug("[FullSync] \(account.emailAddress) \(trackedFolderIds.count) tracked folder(s): no window listing")
+        }
+
+        let (uidMigratedOldIds, listing): ([String], FullSyncListing) = try await Task.detached {
             var allMigratedIds: [String] = []
+            var listing = FullSyncListing()
             // `!skippablePaths.contains` — Fix B task 4: a CONDSTORE-unchanged non-inbox
             // folder is not re-fetched (its HIGHESTMODSEQ proves nothing changed). The
             // reconcile loop below still visits it, so external deletions are never missed.
-            for folder in syncableFolders where !folder.path.isEmpty && !skippablePaths.contains(folder.path) {
+            for folder in syncableFolders where !folder.path.isEmpty && !skippablePaths.contains(folder.path)
+                && !trackedFolderIds.contains(folder.id) {
                 // T4.S6 re-drive. A folder left quarantined by an interrupted
                 // reaction (crash, transient step failure) BRANCHES INTO the
                 // reaction instead of a normal sync — never a plain skip. The flag
@@ -372,9 +447,11 @@ extension SyncEngine {
                     )
                     BackgroundSyncLogger.logDebug("[FullSync] \(account.emailAddress) \(folder.name): \(Int((CFAbsoluteTimeGetCurrent() - ft0) * 1000))ms")
                     allMigratedIds.append(contentsOf: await processSyncResult(result, folder: folder))
+                    listing.listedFolderIds.insert(folder.id)
                 } catch {
                     if Self.isSelectFailedError(error) {
                         BackgroundSyncLogger.logDebug("[FullSync] SELECT failed for \(folder.name) (\(folder.path)) — skipping: \(error)")
+                        listing.droppedFolder = true
                         continue
                     }
                     if Self.isConnectionError(error) {
@@ -388,7 +465,9 @@ extension SyncEngine {
                                 dbPool: pool
                             )
                             allMigratedIds.append(contentsOf: await processSyncResult(retryResult, folder: folder))
+                            listing.listedFolderIds.insert(folder.id)
                         } catch {
+                            listing.droppedFolder = true
                             if Self.isConnectionError(error) {
                                 // Retry also hit connection error — server unreachable. Skip remaining folders.
                                 BackgroundSyncLogger.logDebug("[FullSync] Retry failed for \(folder.name): \(error) — skipping remaining folders")
@@ -429,7 +508,7 @@ extension SyncEngine {
                 }
 
             }
-            return allMigratedIds
+            return (allMigratedIds, listing)
         }.value
 
         // Clear undo protection for migrated UIDs
@@ -505,7 +584,8 @@ extension SyncEngine {
 
         // Body fetching happens during backfill (startBackfill called after fullSync).
         // Running it inline here would block sync and explode memory for large folders.
-        // Unread recount is now handled per-folder inside syncMessages, immediately after header commit.
+        // Unread recount is handled per folder in `processSyncResult`, right after its listing commits.
+        return listing
     }
 
     // MARK: - Message Sync

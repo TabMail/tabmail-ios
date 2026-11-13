@@ -16,7 +16,7 @@ Root [`../CLAUDE.md`](../CLAUDE.md) is normative; the [full pre-pass iOS routing
 - [Slow email rendering: lazy-attribute regex quadratic whitespace retries, premature empty-view reveal, native/WebKit timing diagnostics](Companion/Memory/Current/render-timing-diagnostics.md).
 
 - [HTML-to-text Markdown links, href destinations in FTS and agent reads (#100); `snippetLinkScanChars`, linear `unwrapMarkdownLinks` (#162), draft `keepingSpacing` (#217), `HTMLText`/`HTMLTextStyle` (#251)](Companion/Memory/Current/125-html-links-in-converted-text.md).
-- 🚨 [Archived mail "comes back" on a weak connection = the #106 ghost re-insert, NOT a queue drop; `recentlyCompleted` is read inside every sync write transaction (`liveRecentlyCompleted()`)](Companion/Memory/Current/127-sync-protection-set-is-read-inside-the-write-transaction.md).
+- 🚨 [Archived mail "comes back" on a weak connection = the #106 ghost re-insert, NOT a queue drop; `recentlyCompleted` is read inside every sync write transaction (`liveRecentlyCompleted()`; the change apply reads it per folder transaction, ADR-IOS-111)](Companion/Memory/Current/127-sync-protection-set-is-read-inside-the-write-transaction.md).
 
 Search the topic text below as subsystem keywords. Each link is mandatory when its row matches the task.
 

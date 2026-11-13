@@ -392,12 +392,12 @@ struct GmailReceivedDateBoundaryTests {
         #expect(folder.oldestSyncedDate == clock.daysAgo(Double(n)), "Nth providerDate, not the Nth Received stamp")
     }
 
-    // MARK: - SyncEngine.gmailDeltaSync (history → new row)
+    // MARK: - The Gmail change read (history → new row)
 
-    /// The delta arm's own `MessageHeader` constructor: a `messagesAdded`
+    /// The change apply's `MessageHeader` constructor: a `messagesAdded`
     /// history record for a message whose Received stamp is recent and whose
     /// internalDate is old must land with both keys split.
-    @Test("gmailDeltaSync materializes a history-added row with split dates")
+    @Test("the Gmail change read materializes a history-added row with split dates")
     func gmailDeltaSyncNewRowCarriesSplitDates() async throws {
         let clock = FixtureClock()
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
@@ -411,13 +411,16 @@ struct GmailReceivedDateBoundaryTests {
         try FolderEpochTestFixture.insertFolder(accountId: accountId, path: "INBOX", role: .inbox, pool: pool)
         try FolderEpochTestFixture.insertFolder(accountId: accountId, path: "ARCHIVE", role: .archive, pool: pool)
         // An orphan of the INBOX canonical id parked under the ARCHIVE folderId
-        // (a no-op optimistic move): the delta arm's orphan-reclaim writer must
+        // (a no-op optimistic move): the change apply's orphan-reclaim writer must
         // update it in place with the fetched split dates, not its own 20d/20d.
         try Self.insertLocal(pool: pool, accountId: accountId, messageId: "orphan", date: clock.daysAgo(20), providerDate: clock.daysAgo(20),
                              folderId: "\(accountId):ARCHIVE")
 
         // Both arrive after the account's cursor; the fake's `/history` reports them.
-        let server = StatefulGmailActionServer(messages: [])
+        // `/labels` names both folders (ARCHIVE as a label no message carries):
+        // the change read applies it as the folder list, which removes a folder
+        // it does not name.
+        let server = StatefulGmailActionServer(messages: [], userLabels: ["ARCHIVE": "ARCHIVE"], systemLabels: ["INBOX"])
         defer { server.close() }
         #expect(account.lastHistoryId == String(StatefulGmailActionServer.initialHistoryId))
         server.addMessage(seed("pushed", internalDate: clock.daysAgo(30), received: clock.daysAgo(0.5)))

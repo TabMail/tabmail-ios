@@ -13,12 +13,14 @@ import Testing
 /// that clears. Only a 404 (the message is gone) may be skipped; any other
 /// failure leaves the cursor where it was, so the next pass fetches the same
 /// change again and applies it once the fetch succeeds. And a message whose
-/// fetch never succeeds does not stop the account's sync: the full sync
-/// completes past it and moves the cursor, so later changes land.
+/// fetch never succeeds does not stop the account's sync: on Gmail its own
+/// unusable answer puts it on the folder's re-read list and the rest of the
+/// pass lands with the bookmark moved; on Outlook the full sync's cursor
+/// capture moves past it, so later changes land.
 ///
-/// These drive production `SyncEngine.performDeltaSync` (and, for the bound,
-/// the foreground poll `SyncEngine.sync(account:)`, which runs the delta, the
-/// due full sync and the cursor capture) end to end on `FakeHTTP` with a real
+/// These drive production `SyncEngine.performDeltaSync` (and, for the Outlook
+/// bound, the foreground poll `SyncEngine.sync(account:)`, which runs the
+/// delta, the due full sync and the cursor capture) end to end on `FakeHTTP` with a real
 /// provider and a real `DatabasePool`, for both providers whose delta fetches
 /// messages by id (Gmail and Outlook).
 @Suite("A delta never loses a change whose message fetch failed", .serialized, .processGlobalState)
@@ -82,6 +84,21 @@ struct DeltaDetailFetchFailureTests {
         try pool.read { db in try Account.fetchOne(db, key: accountId) }?.lastHistoryId
     }
 
+    /// The folder's re-read list (`Folder.changeState.recheck`).
+    private static func recheck(accountId: String, folderPath: String, pool: DatabasePool) throws -> [String] {
+        let folder = try pool.read { db in try Folder.fetchOne(db, key: "\(accountId):\(folderPath)") }
+        return FolderChangeState(raw: folder?.changeState).recheck
+    }
+
+    /// History from 1000 is `page`; from any later id, no change.
+    private static func registerHistory(_ page: String, on scenario: FakeHTTP.Scenario) {
+        scenario.register(path: "/history", method: "GET") { request in
+            let start = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?
+                .queryItems?.first { $0.name == "startHistoryId" }?.value
+            return .json(raw: start == "1000" ? page : #"{ "historyId": "\#(start ?? "1000")" }"#)
+        }
+    }
+
     /// One foreground poll, as the app runs it: the account is read afresh and
     /// `SyncEngine.sync(account:)` runs on the provider's registered work queue.
     private static func foregroundPoll(engine: SyncEngine, accountId: String, pool: DatabasePool) async throws {
@@ -134,20 +151,25 @@ struct DeltaDetailFetchFailureTests {
         """
     }
 
-    /// RED before the fix: the failed fetch was taken for a deleted message,
-    /// the pass succeeded, the cursor moved past the change and the message was
-    /// never fetched again.
-    @Test("A Gmail message whose fetch fails keeps the cursor and lands on the next pass",
-          arguments: Failure.allCases)
-    func gmailFailedFetchIsRetried(failure: Failure) async throws {
+    /// RED before #444: the failed fetch was taken for a deleted message, the
+    /// pass succeeded, the cursor moved past the change and the message was
+    /// never fetched again. Now the message's own unusable answer puts it on the
+    /// re-read list: the rest of the pass lands and the bookmark moves at once,
+    /// and the message lands on the first pass that reads it, with no new history.
+    /// `alone`: the history names only that message, so its folder has no record
+    /// and no removal and the re-read list is the folder's only write (RED while
+    /// such a folder was skipped: the bookmark moved and the change was lost).
+    @Test("A Gmail message whose own answer is unusable is read again until it lands, and the rest of the pass lands at once",
+          arguments: Failure.answers, [false, true])
+    func gmailUnreadableMessageIsReadAgain(failure: Failure, alone: Bool) async throws {
         try await Self.withAppDB { pool in
             let account = try Self.makeAccount(
                 id: Self.gmailAccountId, provider: .gmail, cursor: "1000", folderPath: "INBOX", role: .inbox, pool: pool)
             let failing = Mutex(true)
             let scenario = FakeHTTP.Scenario()
             defer { scenario.close() }
-            scenario.register(path: "/history", method: "GET",
-                              response: .json(raw: Self.gmailHistoryPage(addedIds: ["steady-1", "flaky-1"])))
+            FolderEpochTestFixture.registerGmailLabels(on: scenario, listingFoldersOf: Self.gmailAccountId, pool: pool)
+            Self.registerHistory(Self.gmailHistoryPage(addedIds: alone ? ["flaky-1"] : ["steady-1", "flaky-1"]), on: scenario)
             scenario.register(path: "/messages/steady-1", method: "GET",
                               response: .json(raw: Self.gmailMessageJSON(id: "steady-1")))
             scenario.register(path: "/messages/flaky-1", method: "GET") { _ in
@@ -156,7 +178,49 @@ struct DeltaDetailFetchFailureTests {
             let provider = GmailProvider(
                 userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: scenario.session)
 
-            await #expect(throws: (any Error).self, "a failed message fetch must fail the delta") {
+            let first = try await SyncEngine().performDeltaSync(account: account, provider: provider)
+            #expect(first.succeeded)
+            #expect(try Self.headerExists(accountId: Self.gmailAccountId, folderPath: "INBOX", messageId: "steady-1", pool: pool) == !alone)
+            #expect(try !Self.headerExists(accountId: Self.gmailAccountId, folderPath: "INBOX", messageId: "flaky-1", pool: pool),
+                    "an unread message must not be taken for anything")
+            #expect(try Self.cursor(accountId: Self.gmailAccountId, pool: pool) == "1002",
+                    "one unreadable message must not hold the bookmark back")
+            #expect(try Self.recheck(accountId: Self.gmailAccountId, folderPath: "INBOX", pool: pool) == ["flaky-1"],
+                    "the unreadable message is to be read again")
+
+            failing.withLock { $0 = false }
+            let stored = try #require(try Self.storedAccount(id: Self.gmailAccountId, pool: pool))
+            let second = try await SyncEngine().performDeltaSync(account: stored, provider: provider)
+
+            #expect(second.succeeded)
+            #expect(try Self.headerExists(accountId: Self.gmailAccountId, folderPath: "INBOX", messageId: "flaky-1", pool: pool),
+                    "the message lands on the first pass that reads it, with no new history")
+            #expect(try Self.recheck(accountId: Self.gmailAccountId, folderPath: "INBOX", pool: pool).isEmpty)
+            #expect(try Self.cursor(accountId: Self.gmailAccountId, pool: pool) == "1002")
+        }
+    }
+
+    /// A failure that is about the account, not the one message (a dropped
+    /// connection), fails the pass and keeps the bookmark; the next pass lands it.
+    @Test("A Gmail detail fetch that loses the connection fails the pass, keeps the cursor and lands on the next pass")
+    func gmailFailedFetchIsRetried() async throws {
+        try await Self.withAppDB { pool in
+            let account = try Self.makeAccount(
+                id: Self.gmailAccountId, provider: .gmail, cursor: "1000", folderPath: "INBOX", role: .inbox, pool: pool)
+            let failing = Mutex(true)
+            let scenario = FakeHTTP.Scenario()
+            defer { scenario.close() }
+            FolderEpochTestFixture.registerGmailLabels(on: scenario, listingFoldersOf: Self.gmailAccountId, pool: pool)
+            Self.registerHistory(Self.gmailHistoryPage(addedIds: ["steady-1", "flaky-1"]), on: scenario)
+            scenario.register(path: "/messages/steady-1", method: "GET",
+                              response: .json(raw: Self.gmailMessageJSON(id: "steady-1")))
+            scenario.register(path: "/messages/flaky-1", method: "GET") { _ in
+                failing.withLock { $0 } ? Failure.transportError.response(id: "flaky-1", provider: .gmail) : .json(raw: Self.gmailMessageJSON(id: "flaky-1"))
+            }
+            let provider = GmailProvider(
+                userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: scenario.session)
+
+            await #expect(throws: (any Error).self, "a lost connection must fail the pass") {
                 _ = try await SyncEngine().performDeltaSync(account: account, provider: provider)
             }
             #expect(try Self.cursor(accountId: Self.gmailAccountId, pool: pool) == "1000",
@@ -183,6 +247,7 @@ struct DeltaDetailFetchFailureTests {
                 id: Self.gmailAccountId, provider: .gmail, cursor: "1000", folderPath: "INBOX", role: .inbox, pool: pool)
             let scenario = FakeHTTP.Scenario()
             defer { scenario.close() }
+            FolderEpochTestFixture.registerGmailLabels(on: scenario, listingFoldersOf: Self.gmailAccountId, pool: pool)
             scenario.register(path: "/history", method: "GET",
                               response: .json(raw: Self.gmailHistoryPage(addedIds: ["steady-1", "gone-1"])))
             scenario.register(path: "/messages/steady-1", method: "GET",
@@ -206,9 +271,9 @@ struct DeltaDetailFetchFailureTests {
     private static let gmailStuckId = "301"
     private static let gmailBoundAccountId = "gmail-delta-detail-bound"
 
-    /// One scenario for the delta, the full sync and the capture. The INBOX
-    /// list names the stuck message and `ok-1`; every other label is empty.
-    /// History from 1000 adds both; history from the captured 2000 adds `ok-2`.
+    /// One scenario for the change reads and the folder page. The INBOX list
+    /// names the stuck message and `ok-1`; every other label is empty. History
+    /// from 1000 adds both; from 1002 it adds `ok-2`; after that, nothing.
     private static func gmailBoundScenario(stuck: FakeHTTP.CannedResponse) -> FakeHTTP.Scenario {
         let scenario = FakeHTTP.Scenario()
         scenario.register(path: "/labels", method: "GET", response: .json(
@@ -216,11 +281,14 @@ struct DeltaDetailFetchFailureTests {
         scenario.register(path: "/profile", method: "GET", response: .json(
             raw: #"{ "emailAddress": "gmail-delta-detail-bound@example.com", "historyId": "2000" }"#))
         scenario.register(path: "/history", method: "GET") { request in
-            let query = request.url.query ?? ""
-            if query.contains("startHistoryId=2000") {
-                return .json(raw: #"{ "historyId": "2001", "history": [ { "id": "2001", "messagesAdded": [ { "message": { "id": "ok-2", "labelIds": ["INBOX"] } } ] } ] }"#)
+            let start = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?
+                .queryItems?.first { $0.name == "startHistoryId" }?.value
+            switch start {
+            case "1000": return .json(raw: Self.gmailHistoryPage(addedIds: [Self.gmailStuckId, "ok-1"]))
+            case "1002":
+                return .json(raw: #"{ "historyId": "1003", "history": [ { "id": "1003", "messagesAdded": [ { "message": { "id": "ok-2", "labelIds": ["INBOX"] } } ] } ] }"#)
+            default: return .json(raw: #"{ "historyId": "\#(start ?? "1003")" }"#)
             }
-            return .json(raw: Self.gmailHistoryPage(addedIds: [Self.gmailStuckId, "ok-1"]))
         }
         scenario.register(path: "/messages", method: "GET") { request in
             let last = request.url.lastPathComponent
@@ -235,52 +303,103 @@ struct DeltaDetailFetchFailureTests {
         return scenario
     }
 
-    /// RED before the full sync learned to finish past an unreadable message:
-    /// the delta failed on the stuck message every pass, the full sync aborted
-    /// on the same message, the capture never ran, and no later change for the
-    /// account ever landed.
-    @Test("A Gmail message whose fetch never succeeds does not stop sync: the full sync completes past it and later changes land",
+    /// THE invariant (#444): one message whose
+    /// fetch never succeeds never stops the account's sync. RED on the first
+    /// change-reader commit: the reader failed the whole pass on that message
+    /// and kept the bookmark, a tracked folder gets no window listing, and no
+    /// new mail landed until Gmail's history expired.
+    @Test("A Gmail message whose fetch never succeeds does not stop sync: new mail lands on the same pass and later changes keep landing",
           arguments: Failure.answers)
     func gmailStuckMessageDoesNotStopSync(failure: Failure) async throws {
         try await Self.withAppDB { pool in
+            let accountId = Self.gmailBoundAccountId
             let account = try Self.makeAccount(
-                id: Self.gmailBoundAccountId, provider: .gmail, cursor: "1000", folderPath: "INBOX", role: .inbox, pool: pool)
+                id: accountId, provider: .gmail, cursor: "1000", folderPath: "INBOX", role: .inbox, pool: pool)
             try FolderEpochTestFixture.insertHeaders(
-                accountId: Self.gmailBoundAccountId, path: "INBOX", uids: [Int(Self.gmailStuckId)!], pool: pool)
+                accountId: accountId, path: "INBOX", uids: [Int(Self.gmailStuckId)!], pool: pool)
+            // The Inbox is tracked: no window listing would fill in for the read.
+            try await pool.write { db in
+                try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?",
+                               arguments: [FolderChangeState(tracking: true, recheck: []).encoded, "\(accountId):INBOX"])
+            }
             let scenario = Self.gmailBoundScenario(stuck: failure.response(id: Self.gmailStuckId, provider: .gmail))
             defer { scenario.close() }
             let provider = GmailProvider(
                 userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: scenario.session)
-            let engine = SyncEngine()
-            await engine.register(
-                accountId: Self.gmailBoundAccountId, provider: provider,
-                workQueue: ProviderWorkQueue(provider: provider, maxConcurrency: 1))
 
-            await #expect(throws: (any Error).self, "the stuck message must fail the delta, not be taken for deleted") {
-                _ = try await engine.performDeltaSync(account: account, provider: provider)
-            }
-            #expect(try Self.cursor(accountId: Self.gmailBoundAccountId, pool: pool) == "1000")
-
-            // A foreground poll with a full sync due: its delta fails on the
-            // stuck message again, and its full sync and capture bound that.
-            try await Self.foregroundPoll(engine: engine, accountId: Self.gmailBoundAccountId, pool: pool)
-            #expect(try Self.storedAccount(id: Self.gmailBoundAccountId, pool: pool)?.lastFullSyncAt != nil,
-                    "precondition: the poll ran its due full sync")
-            #expect(try Self.headerExists(accountId: Self.gmailBoundAccountId, folderPath: "INBOX", messageId: "ok-1", pool: pool),
-                    "the full sync must still sync the rest of the folder")
-            #expect(try Self.headerExists(accountId: Self.gmailBoundAccountId, folderPath: "INBOX", messageId: Self.gmailStuckId, pool: pool),
+            let first = try await SyncEngine().performDeltaSync(account: account, provider: provider)
+            #expect(first.succeeded, "one unreadable message must not fail the pass")
+            #expect(try Self.headerExists(accountId: accountId, folderPath: "INBOX", messageId: "ok-1", pool: pool),
+                    "new mail lands on the same pass")
+            #expect(try Self.headerExists(accountId: accountId, folderPath: "INBOX", messageId: Self.gmailStuckId, pool: pool),
                     "a message the server still holds must keep its row")
-            #expect(try Self.cursor(accountId: Self.gmailBoundAccountId, pool: pool) == "2000",
-                    "the poll must bound the failed delta by moving the cursor")
+            #expect(try Self.cursor(accountId: accountId, pool: pool) == "1002",
+                    "the bookmark moves past the unreadable message")
+            #expect(try Self.recheck(accountId: accountId, folderPath: "INBOX", pool: pool) == [Self.gmailStuckId])
 
-            // The next ordinary poll, with no full sync due: the delta alone
-            // lands a change made after the stuck one.
-            try Self.lastPolledOneIntervalAgo(accountId: Self.gmailBoundAccountId, pool: pool)
-            try await Self.foregroundPoll(engine: engine, accountId: Self.gmailBoundAccountId, pool: pool)
-            #expect(try Self.headerExists(accountId: Self.gmailBoundAccountId, folderPath: "INBOX", messageId: "ok-2", pool: pool),
+            // The next pass: still unreadable, and a later change lands anyway.
+            let stored = try #require(try Self.storedAccount(id: accountId, pool: pool))
+            let second = try await SyncEngine().performDeltaSync(account: stored, provider: provider)
+            #expect(second.succeeded)
+            #expect(try Self.headerExists(accountId: accountId, folderPath: "INBOX", messageId: "ok-2", pool: pool),
                     "a change made after the stuck one must land")
-            #expect(try Self.cursor(accountId: Self.gmailBoundAccountId, pool: pool) == "2001")
-            await engine.remove(accountId: Self.gmailBoundAccountId)
+            #expect(try Self.cursor(accountId: accountId, pool: pool) == "1003")
+            #expect(try Self.headerExists(accountId: accountId, folderPath: "INBOX", messageId: Self.gmailStuckId, pool: pool))
+            #expect(try Self.recheck(accountId: accountId, folderPath: "INBOX", pool: pool) == [Self.gmailStuckId],
+                    "still unreadable: still to be read again")
+        }
+    }
+
+    /// A message on the re-read list that Gmail then answers is gone (404/410)
+    /// is removed from every folder and leaves every list.
+    @Test("A Gmail message on the re-read list that is then gone is removed from every folder",
+          arguments: [404, 410])
+    func gmailUnreadableThenGoneIsRemovedEverywhere(status: Int) async throws {
+        try await Self.withAppDB { pool in
+            let accountId = Self.gmailBoundAccountId
+            let account = try Self.makeAccount(
+                id: accountId, provider: .gmail, cursor: "1000", folderPath: "INBOX", role: .inbox, pool: pool)
+            try await pool.write { db in
+                try Folder(name: "Label", path: "Label_1", role: .custom, accountId: accountId).insert(db)
+            }
+            for path in ["INBOX", "Label_1"] {
+                try FolderEpochTestFixture.insertHeaders(
+                    accountId: accountId, path: path, uids: [Int(Self.gmailStuckId)!], pool: pool)
+            }
+            let gone = Mutex(false)
+            let scenario = FakeHTTP.Scenario()
+            defer { scenario.close() }
+            // A user label with a display name: a label NAMED like Gmail's
+            // internal `Label_N` ids is left out of the folder list.
+            scenario.register(path: "/labels", method: "GET", response: .json(raw: #"""
+                { "labels": [ { "id": "INBOX", "name": "INBOX", "type": "system" },
+                              { "id": "Label_1", "name": "Label", "type": "user" } ] }
+                """#))
+            Self.registerHistory(Self.gmailHistoryPage(addedIds: [Self.gmailStuckId, "ok-1"]), on: scenario)
+            scenario.register(path: "/messages", method: "GET") { request in
+                let last = request.url.lastPathComponent
+                guard last == Self.gmailStuckId else { return .json(raw: Self.gmailMessageJSON(id: last)) }
+                return gone.withLock { $0 } ? .status(status) : .status(503)
+            }
+            let provider = GmailProvider(
+                userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: scenario.session)
+
+            _ = try await SyncEngine().performDeltaSync(account: account, provider: provider)
+            for path in ["INBOX", "Label_1"] {
+                #expect(try Self.headerExists(accountId: accountId, folderPath: path, messageId: Self.gmailStuckId, pool: pool),
+                        "precondition: an unreadable message keeps its row in \(path)")
+                #expect(try Self.recheck(accountId: accountId, folderPath: path, pool: pool) == [Self.gmailStuckId])
+            }
+
+            gone.withLock { $0 = true }
+            let stored = try #require(try Self.storedAccount(id: accountId, pool: pool))
+            let second = try await SyncEngine().performDeltaSync(account: stored, provider: provider)
+            #expect(second.succeeded)
+            for path in ["INBOX", "Label_1"] {
+                #expect(try !Self.headerExists(accountId: accountId, folderPath: path, messageId: Self.gmailStuckId, pool: pool),
+                        "a gone message is removed from \(path)")
+                #expect(try Self.recheck(accountId: accountId, folderPath: path, pool: pool).isEmpty)
+            }
         }
     }
 
@@ -369,7 +488,7 @@ struct DeltaDetailFetchFailureTests {
         let provider = GmailProvider(
             userEmail: "gmail-delta-detail@example.com", accessToken: { _ in "fake-access-token" }, session: scenario.session)
 
-        let details = try await provider.fetchMessageDetails(ids: ["gone-1", "steady-1"])
+        let details = try await provider.fetchMessageDetails(ids: ["gone-1", "steady-1"]).details
 
         #expect(details.map(\.header.messageId) == ["steady-1"])
     }
@@ -416,7 +535,7 @@ struct DeltaDetailFetchFailureTests {
         let reachedWidth = await Self.waitUntil { scenario.recordedCalls().count >= width }
         let inFlight = scenario.recordedCalls().count
         for _ in ids { release.signal() }
-        let details = try await fetch.value
+        let details = try await fetch.value.details
 
         #expect(reachedWidth, "only \(inFlight) of \(width) gets were in flight together")
         #expect(inFlight == width, "the gate allows \(width) gets at once, saw \(inFlight)")
@@ -483,7 +602,7 @@ struct DeltaDetailFetchFailureTests {
         let sequence = scenario.servedCallSequence()
         for _ in ids { release.signal() }
         let historyId = try await other.value
-        let details = try await fetch.value
+        let details = try await fetch.value.details
 
         #expect(windowHeld, "the detail fetch never had \(width) gets in flight")
         #expect(otherQueued, "the other request never ran on the provider")
@@ -529,8 +648,8 @@ struct DeltaDetailFetchFailureTests {
 
         #expect(refilled, "the answered get was not replaced in the window before the cancel")
         switch result {
-        case .success(let details):
-            Issue.record("a cancelled detail fetch returned \(details.count) of \(ids.count) messages as if complete")
+        case .success(let batch):
+            Issue.record("a cancelled detail fetch returned \(batch.details.count) of \(ids.count) messages as if complete")
         case .failure(let error):
             #expect(Self.isCancellation(error), "a cancelled detail fetch threw \(error) instead of its cancellation")
         }
@@ -550,13 +669,13 @@ struct DeltaDetailFetchFailureTests {
         }
         let inFlight = scenario.recordedCalls().filter { $0.url.contains("/messages/after-") }.count
         for _ in wave { release.signal() }
-        let details = try await next.value
+        let details = try await next.value.details
 
         #expect(fullWidth, "after the cancelled fetch only \(inFlight) of \(width) gets could be in flight")
         #expect(Set(details.map(\.header.messageId)) == Set(wave))
     }
 
-    @Test("A Gmail detail fetch larger than its window still fails on one message's failure")
+    @Test("A Gmail detail fetch larger than its window still fails when one get loses the connection")
     func gmailDetailFetchFailsOnOneFailureInALargeBatch() async throws {
         let scenario = FakeHTTP.Scenario()
         defer { scenario.close() }
@@ -565,13 +684,35 @@ struct DeltaDetailFetchFailureTests {
         for id in ids where id != failing {
             scenario.register(path: "/messages/\(id)", method: "GET", response: .json(raw: Self.gmailMessageJSON(id: id)))
         }
-        scenario.register(path: "/messages/\(failing)", method: "GET", response: .status(503))
+        scenario.register(path: "/messages/\(failing)", method: "GET", response: .transportError(.networkConnectionLost))
         let provider = GmailProvider(
             userEmail: "gmail-delta-detail@example.com", accessToken: { _ in "fake-access-token" }, session: scenario.session)
 
         await #expect(throws: (any Error).self) {
             _ = try await provider.fetchMessageDetails(ids: ids)
         }
+    }
+
+    /// The other side: one message whose own answer cannot be used, anywhere in
+    /// a batch larger than the window, is named and every other message loads.
+    @Test("A Gmail detail fetch names one message whose answer is unusable and loads every other",
+          arguments: Failure.answers)
+    func gmailDetailFetchNamesOneUnreadableMessage(failure: Failure) async throws {
+        let scenario = FakeHTTP.Scenario()
+        defer { scenario.close() }
+        let ids = (0..<(GmailAPI.maxConcurrentRequests * 3)).map { String(format: "many-%03d", $0) }
+        let failing = ids[ids.count - 2]
+        for id in ids where id != failing {
+            scenario.register(path: "/messages/\(id)", method: "GET", response: .json(raw: Self.gmailMessageJSON(id: id)))
+        }
+        scenario.register(path: "/messages/\(failing)", method: "GET", response: failure.response(id: failing, provider: .gmail))
+        let provider = GmailProvider(
+            userEmail: "gmail-delta-detail@example.com", accessToken: { _ in "fake-access-token" }, session: scenario.session)
+
+        let batch = try await provider.fetchMessageDetails(ids: ids)
+
+        #expect(batch.unreadable == [failing])
+        #expect(Set(batch.details.map(\.header.messageId)) == Set(ids).subtracting([failing]))
     }
 
     /// A gone message's answer frees its place in the window like any other.
@@ -595,7 +736,7 @@ struct DeltaDetailFetchFailureTests {
         let provider = GmailProvider(
             userEmail: "gmail-delta-detail@example.com", accessToken: { _ in "fake-access-token" }, session: scenario.session)
 
-        let details = try await provider.fetchMessageDetails(ids: gone + readable)
+        let details = try await provider.fetchMessageDetails(ids: gone + readable).details
 
         #expect(details.count == readable.count)
         #expect(Set(details.map(\.header.messageId)) == Set(readable),

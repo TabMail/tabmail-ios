@@ -429,12 +429,15 @@ actor SyncEngine {
                 return (false, "noCursor")
             }
         } catch {
-            if Self.isConnectionError(error) {
+            // The failed attempt may have written the bookmark already (a refusal
+            // clears it before the same pass reads again), so the retry reads
+            // from the account row as it is now.
+            if Self.isConnectionError(error), let current = try await accountAtTurnStart(account.id) {
                 // Pool self-heals: dead connections discarded on checkin(healthy: false),
                 // next checkout creates a fresh one. Retry without disconnect/reconnect.
                 BackgroundSyncLogger.logDebug("[Sync:bg] Connection error for \(account.emailAddress): \(error) — retrying")
                 let retry = try await queue.execute(priority: .headerFetch) {
-                    try await self.performDeltaSync(account: account, provider: provider, inboxOnly: inboxOnly)
+                    try await self.performDeltaSync(account: current, provider: provider, inboxOnly: inboxOnly)
                 }
                 if retry.succeeded {
                     try await dbPool.write { db in
@@ -504,10 +507,15 @@ actor SyncEngine {
         var hadChanges = false
         var deltaSyncSucceeded = false
         var deltaSyncError: (any Error)?
+        // What the change read did (ADR-IOS-111): a refused or a new bookmark
+        // makes the full sync due in this pass, and its listings decide which
+        // folders become tracked and whether a candidate bookmark is stored.
+        var changePass: ChangePassOutcome?
         do {
             let deltaResult = try await queue.execute(priority: .headerFetch) {
-                try await self.performDeltaSync(account: account, provider: provider)
+                try await self.performChangePass(account: account, provider: provider)
             }
+            changePass = deltaResult
             if deltaResult.succeeded {
                 deltaSyncSucceeded = true
                 try await dbPool.write { db in
@@ -524,9 +532,14 @@ actor SyncEngine {
                 // next checkout creates a fresh one. Retry without disconnect/reconnect.
                 BackgroundSyncLogger.logDebug("[Sync] Delta sync connection error for \(account.emailAddress): \(error) — retrying")
                 do {
+                    // The failed attempt may have written the bookmark already (a
+                    // refusal clears it before the same pass reads again), so the
+                    // retry reads from the account row as it is now.
+                    guard let current = try await accountAtTurnStart(account.id) else { throw error }
                     let retryResult = try await queue.execute(priority: .headerFetch) {
-                        try await self.performDeltaSync(account: account, provider: provider)
+                        try await self.performChangePass(account: current, provider: provider)
                     }
+                    changePass = retryResult
                     if retryResult.succeeded {
                         deltaSyncSucceeded = true
                         deltaSyncError = nil
@@ -552,22 +565,31 @@ actor SyncEngine {
             }
         }
 
-        // 2. Full sync runs separately on its own schedule (~15 min) as a self-healing safety net.
-        //    NOT a fallback from delta — runs independently regardless of delta success/failure.
+        // 2. Full sync runs on its own schedule (~15 min), regardless of the delta's
+        //    success or failure, and in this pass when the change read needs a listing
+        //    (a new or refused bookmark). The account was read before the read, so the
+        //    due time the read wrote is not in `account`: `listingNeeded` carries it.
+        //    A folder a reader tracks gets no window listing in it (ADR-IOS-111); one
+        //    message the reader cannot read is re-read on later passes and never fails
+        //    the read, so it does not hold back the rest of the account.
         let timeSinceFullSync = account.lastFullSyncAt.map { Date().timeIntervalSince($0) } ?? .infinity
-        if timeSinceFullSync >= fullSyncInterval {
-            BackgroundSyncLogger.logDebug("[Sync] Full sync due for \(account.emailAddress) (last: \(timeSinceFullSync.isFinite ? "\(Int(timeSinceFullSync))s" : "never"))...")
+        let listingNeeded = changePass?.needsListing ?? false
+        let fullSyncDue = timeSinceFullSync >= fullSyncInterval || listingNeeded
+        if fullSyncDue {
+            BackgroundSyncLogger.logDebug("[Sync] Full sync due for \(account.emailAddress) (last: \(timeSinceFullSync.isFinite ? "\(Int(timeSinceFullSync))s" : "never"), new bookmark: \(listingNeeded))...")
+            let plan = FullSyncPlan(appliedFolderList: changePass?.appliedFolderList)
+            let listing: FullSyncListing
             do {
-                try await queue.execute(priority: .headerFetch) {
-                    try await self.fullSync(account: account, provider: provider)
+                listing = try await queue.execute(priority: .headerFetch) {
+                    try await self.fullSync(account: account, provider: provider, plan: plan)
                 }
             } catch {
                 if Self.isConnectionError(error) {
                     // Pool self-heals: dead connections discarded on checkin(healthy: false),
                     // next checkout creates a fresh one. Retry without disconnect/reconnect.
                     BackgroundSyncLogger.logDebug("[Sync] Connection lost during full sync, retrying...")
-                    try await queue.execute(priority: .headerFetch) {
-                        try await self.fullSync(account: account, provider: provider)
+                    listing = try await queue.execute(priority: .headerFetch) {
+                        try await self.fullSync(account: account, provider: provider, plan: plan)
                     }
                 } else {
                     if !(error is CancellationError) {
@@ -577,19 +599,32 @@ actor SyncEngine {
                 }
             }
 
-            let deltaReachedCursor = deltaSyncSucceeded
-            await queue.execute(priority: .headerFetch) {
-                await self.captureSyncCursors(
-                    account: account, provider: provider, deltaReachedCursor: deltaReachedCursor)
+            // A reader pass whose listing dropped a folder keeps the full sync
+            // due: the next foreground pass lists the folders still untracked
+            // (tracked ones get no window listing) instead of waiting for the
+            // next scheduled full sync.
+            var listingDone = true
+            if let changePass, changePass.fromReader {
+                // The reader's bookmark was read BEFORE these listings; store a
+                // candidate and turn tracking on only now that they are done.
+                try await commitChangeBaseline(
+                    account: account, outcome: changePass, listedFolderIds: listing.listedFolderIds)
+                listingDone = !listing.droppedFolder
+            } else {
+                await queue.execute(priority: .headerFetch) {
+                    await self.captureSyncCursors(account: account, provider: provider)
+                }
             }
 
             let now = Date()
+            let fullSyncDone = listingDone
             try await dbPool.write { db in
                 _ = try Account.filter(Column("id") == account.id)
-                    .updateAll(db,
-                        Column("lastSyncedAt").set(to: now),
-                        Column("lastFullSyncAt").set(to: now)
-                    )
+                    .updateAll(db, Column("lastSyncedAt").set(to: now))
+                if fullSyncDone {
+                    _ = try Account.filter(Column("id") == account.id)
+                        .updateAll(db, Column("lastFullSyncAt").set(to: now))
+                }
             }
             BackgroundSyncLogger.logDebug("[Sync] Full sync completed for \(account.emailAddress)")
             hadChanges = true
@@ -606,8 +641,9 @@ actor SyncEngine {
         // If delta sync failed and full sync didn't run (not due yet), no server contact
         // succeeded — propagate the error so the caller knows sync failed. Without this,
         // the caller reports success and updates lastSyncCompletedAt, showing "Updated less
-        // than a minute ago" even when offline.
-        if !deltaSyncSucceeded, timeSinceFullSync < fullSyncInterval, let error = deltaSyncError {
+        // than a minute ago" even when offline. A full sync the read's need for a listing
+        // ran (after a retry that read a new candidate) did reach the server.
+        if !deltaSyncSucceeded, !fullSyncDue, let error = deltaSyncError {
             throw error
         }
 

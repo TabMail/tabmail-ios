@@ -616,11 +616,14 @@ struct AccountDetailView: View {
             arguments: [accountId + ":%"]
         )
         try db.execute(
-            sql: "UPDATE account SET lastFullSyncAt = NULL WHERE id = ?",
+            sql: "UPDATE account SET lastFullSyncAt = NULL, lastHistoryId = NULL WHERE id = ?",
             arguments: [accountId]
         )
+        // The change bookmark and the folders' change state go with the rows:
+        // a tracked folder gets no window listing, so a kept bookmark would leave
+        // it empty until the backfill reached the newest mail (ADR-IOS-111).
         try db.execute(
-            sql: "UPDATE folder SET backfillComplete = 0, oldestSyncedDate = NULL, lastKnownUidNext = NULL, backfillUidCursor = NULL, backfillPageToken = NULL, backfillPageHeldSince = NULL WHERE accountId = ?",
+            sql: "UPDATE folder SET backfillComplete = 0, oldestSyncedDate = NULL, lastKnownUidNext = NULL, backfillUidCursor = NULL, backfillPageToken = NULL, backfillPageHeldSince = NULL, changeState = NULL WHERE accountId = ?",
             arguments: [accountId]
         )
     }

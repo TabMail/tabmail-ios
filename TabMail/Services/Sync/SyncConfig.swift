@@ -812,4 +812,22 @@ enum SyncConfig {
     /// truncation — the rule it would violate is the one about hardcoding a bare
     /// numeric literal at the site, which is why it lives here.
     static let upsertInsertedIdLogCap = 20
+
+    // MARK: - Change reading (ADR-IOS-111)
+
+    /// Most message ids one folder keeps on its re-read list
+    /// (`FolderChangeState.recheck`): changes the apply declined because the
+    /// user's own action on the message was in flight. Each id is read again on
+    /// later passes, in turn within `changeRereadBudgetPerPass`, until it
+    /// applies. Over this many, the extra ids are not kept and
+    /// the folder's catch-up is armed instead, so a whole-folder check finds them.
+    static let changeRecheckLimit = 200
+    /// Most distinct message ids one change pass reads again from the folders'
+    /// re-read lists; the rest stay listed for later passes. Sized so the re-reads
+    /// alone take a small part of the background pass's deadline
+    /// (`backgroundPerAccountTimeoutSeconds`) at `GmailAPI.maxConcurrentRequests`
+    /// gets at a time and typical latency; full lists (`changeRecheckLimit` per
+    /// folder) would overrun it. The history's own changed messages are bounded
+    /// separately (`GmailAPI.historyMaxChanges`).
+    static let changeRereadBudgetPerPass = 50
 }

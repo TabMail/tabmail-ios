@@ -498,20 +498,69 @@ the synthetic All Mail marker is sent as typed: `GmailProviderMockTests.syntheti
 asserts the guard refuses the marker in the path and in folder parameters such as
 `labelIds`, and never in `q`.
 
+## Change reading — one generic apply under the seam (ADR-IOS-111)
+
+`ChangeApplyTests` drives `SyncEngine.performDeltaSync` / `performChangePass` with a scripted
+`MockEmailProvider.changeReader`, so each apply rule is checked without any provider's reader: a full
+record inserts the row with references and user labels and the cursor is stored last; a partial record
+writes only its present fields; a replay leaves the same rows; a flag change, an insert and a removal kept
+back under a shield (pending flag op, pending destructive op, recent completion, the user's op on the same
+message in ANOTHER folder when ids are stable) go on the folder's re-read list and land once the shield is
+gone, and the next read is asked to re-read them; with an address epoch the identity term stays
+folder-scoped; over `SyncConfig.changeRecheckLimit` the folder's catch-up is armed; a Drafts insert
+replaces its placeholder and carries the body; a failed read applies its removals, keeps the cursor and
+throws; a refusal clears the bookmark, untracks every folder, marks one lapse, makes the full sync due and
+reads again with no bookmark in the same pass; a candidate is stored after the listings with no lapse
+mark, also when a folder was not listed, and only the folders listed become tracked; one pass asks for
+at most `SyncConfig.changeRereadBudgetPerPass` re-read ids, taking the folders' lists in turn, and the ids
+not asked for stay listed; a re-read id kept back again goes to the back of its list; the read's folder
+list is applied; a provider with no reader keeps its old path. `GmailChangeReadingTests` checks Gmail's reader against
+`StatefulGmailActionServer` (folder list per scope, a candidate before any listing, refusal, zero change,
+re-reads, one message whose own answer is unusable named in every folder for a later re-read with the bookmark moving, a failure about the account kept as a failure with the bookmark kept) and, end to end: a change to older mail made during a new bookmark's
+listing reaches the next pass; a kept-back change on older mail lands once its op is gone; a tracked
+account's full sync sends no window listing; a refusal re-lists in the same pass with ONE catch-up check and
+none later, also eight days on; a label created, renamed or deleted shows on the next pass; a stale read
+during the app's own archive heals into All Mail (#735); a new account lists each folder once for the
+catch-up (#783); a read that needs a listing (refused or no bookmark) lists in the same pass even when
+the pass's copy of the account said no full sync was due; a folder whose window listing did not finish
+stays untracked and is listed on a later pass; folders left flagged tracked with no bookmark (a reset
+racing a pass) are listed and the pass stores a bookmark; applying the read's folder list bumps no
+backfill version; a foreground pass with the full sync due applies the folder list (a new label added, a
+gone one removed) from ONE label request, the full sync reusing the read's list instead of fetching its own;
+a refusal whose re-read loses the connection marks ONE lapse and reads the history once (the retry starts
+from the account row, not the pass's copy), in a foreground pass (which also does not report the lost
+connection once it has listed) and in a background pass; a refusal whose re-read and retry both lose the
+connection fails the foreground pass, marks ONE lapse and stores nothing, and the next pass lists and
+stores a bookmark; a reader pass that drops a folder keeps the full sync due; a folder whose listing retry
+gets an HTTP status is dropped while the folders after it are still listed, and the next pass lists only
+it; a first sync whose listing loses the connection
+at one folder stores the bookmark, keeps the full sync due, and on the next foreground pass lists only the
+folders still untracked, a change to their mail during the failure arriving by the read, and once the
+listing works they are tracked and the full sync is done; with full re-read lists and a slow server a
+background pass re-reads exactly the budget, lands new mail and moves the bookmark inside its deadline,
+and every id it did not read stays listed. `ChangeSeamFenceTests` holds four source fences (no provider cast in the engine's change files, no database in a reader, the shields read only inside the
+per-folder transaction, no window listing for a tracked folder) and the v102 migration.
+`ChangeApplyFuzzTests` runs seeded interleavings of other-client changes, queued and drained ops and
+completions during a read, checking that queued intentions keep their rows, a completion during a read
+stops that pass's insert, and every reported message converges after quiescence.
+
 ## Delta detail fetches — a failed fetch is never taken for a deleted message
 
 `DeltaDetailFetchFailureTests` drives production `SyncEngine.performDeltaSync` end to end on
-`FakeHTTP` for Gmail and Outlook, whose deltas fetch each changed message by id. A message whose
-fetch fails (a 5xx, a non-gone 4xx, a transport failure, a body that does not decode, a 200 whose
-record has no usable date) fails the delta and keeps the cursor (the Gmail history id, the Outlook delta link); on the next pass the
-fetch succeeds and the change lands. A message that answers 404 is gone and is skipped: the rest of
-the delta is applied and the cursor moves. A Graph refusal on the detail fetch is still logged with
-its error code and message. Called directly with the gone message first (404 or 410), the detail fetch still
-returns the readable one. Through the foreground poll `SyncEngine.sync(account:)` on a registered
-work queue, with a full sync due, a Gmail message whose fetch never succeeds does not stop sync: the
-full sync completes past it (its row kept), the capture moves the cursor, and on the next ordinary
-poll (no full sync due) the delta lands later changes. A dropped connection, a 401 the token refresh does not cure, or a cancellation
-during the rate-limit backoff still fails that folder's fetch. On Outlook, a message whose fetch
+`FakeHTTP` for Gmail and Outlook, whose deltas fetch each changed message by id. On Outlook a message
+whose fetch fails (a 5xx, a non-gone 4xx, a transport failure, a body that does not decode, a 200 whose
+record has no usable date) fails the delta and keeps the delta link; on the next pass the fetch
+succeeds and the change lands. On Gmail the same per-message answers (`isUnreadableAnswerForOneMessage`)
+name the message for a later re-read instead: the rest of the delta lands on the SAME pass, the history
+id moves, the message goes on each folder's re-read list (also when it is the pass's only change), and it
+lands once readable with no new history; a transport failure is about the account and still fails the delta with the history id
+kept. A Gmail message that stays unreadable never stops sync: other changes keep landing pass after
+pass while it stays on the re-read list. One that later answers 404 or 410 is removed from every
+folder. A message that answers 404 is gone and is skipped: the rest of the delta is applied and the
+cursor moves. A Graph refusal on the detail fetch is still logged with its error code and message.
+Called directly with the gone message first (404 or 410), the detail fetch still returns the readable
+one, and an unreadable message is named in the batch's `unreadable`. A dropped connection, a 401 the
+token refresh does not cure, or a cancellation during the rate-limit backoff still fails that folder's fetch. On Outlook, a message whose fetch
 never succeeds is bounded by the poll's cursor capture after its full sync, which walks the inbox's
 delta pages to the final link; the next ordinary poll's delta from that link lands what changed after
 it.
@@ -519,14 +568,14 @@ The Gmail detail fetch keeps the request gate's full width of gets in flight (so
 dozen messages fits the background deadline), never more: a later request on the same account waits
 behind at most one window of gets, not the whole delta: with the first window held, a request waiting
 at the gate takes the first slot one answer frees, ahead of any further get. A fetch larger than its window still fails on
-one message's failure, and gone messages filling the whole first window do not end it early: every
+one transport failure, and gone messages filling the whole first window do not end it early: every
 readable message after them is still fetched. Cancelled while its gets wait out a 429 backoff, the fetch
 throws the cancellation (never a partial list), sends nothing more, and a full window can run after it.
-`GmailDetailWindowFuzzTests` runs seeded schedules (latency; readable, gone, failing, dropped and
+`GmailDetailWindowFuzzTests` runs seeded schedules (latency; readable, gone, unreadable, dropped and
 rate-limited answers; a request joining the full gate; a cancel while a get awaits its answer or its
 backoff) and checks the first window is all on the wire before any answer, the first freed slot,
-the returned multiset, throw semantics, termination and gate reuse
-(`GMAIL_DETAIL_FUZZ_ITERATIONS`, `GMAIL_DETAIL_FUZZ_SEED`, `TEST_RUNNER_` prefix on the CLI).
+the returned multiset and the named unreadable ids, throw semantics, termination and gate reuse
+(`GMAIL_DETAIL_FUZZ_ITERATIONS`, `GMAIL_DETAIL_FUZZ_SEED`, `TEST_RUNNER_` prefix on the CLI). The first failing plain-schedule iteration starts with a dropped connection, so the default run reaches the throw checker; the later ones keep their drawn answers.
 
 ## Calendar chat tools — the resolved calendar account
 

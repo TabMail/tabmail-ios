@@ -21,7 +21,7 @@ import Testing
 /// `SyncEngine.backgroundDeltaSync(account:)` end to end on `FakeHTTP` with a
 /// real `GmailProvider`, a real `DatabasePool` and Gmail's real work-queue width,
 /// so the work queue's own slots cannot serialize anything. The delta's
-/// `history` request and the full sync's `labels` request are parked so that,
+/// `history` request and the full sync's Inbox window listing are parked so that,
 /// without the semaphore, the first pass reaches its full sync while the second
 /// pass's delta is still waiting for its answer. The last two drive the turn
 /// itself (`SyncEngine.oneSyncAtATime`) with passes that hold it until released.
@@ -32,21 +32,23 @@ struct OneSyncAtATimeTests {
     private static let parkCap: DispatchTimeInterval = .seconds(1)
 
     /// What the fake server saw: requests of each kind in flight, and whether a
-    /// request of one kind arrived while the other kind was in flight.
+    /// request of one kind arrived while the other kind was in flight. A full
+    /// sync is seen by its Inbox window listing (`isWindowListing`): the change
+    /// read also asks for the label list, so `labels` no longer marks one.
     final class Wire: Sendable {
         struct State {
             var historyRequests = 0
-            var labelsRequests = 0
+            var listingRequests = 0
             var historyInFlight = 0
-            var labelsInFlight = 0
+            var listingsInFlight = 0
             var overlapped = false
-            var historyAfterFirstLabels = false
+            var historyAfterFirstListing = false
         }
         let state = Mutex(State())
         /// Signalled when the second `history` request arrives.
         let secondHistory = DispatchSemaphore(value: 0)
-        /// Signalled when a `labels` request arrives.
-        let labels = DispatchSemaphore(value: 0)
+        /// Signalled when a window listing (a full sync) arrives.
+        let listing = DispatchSemaphore(value: 0)
 
         var snapshot: State { state.withLock { $0 } }
     }
@@ -78,42 +80,55 @@ struct OneSyncAtATimeTests {
         return account
     }
 
+    /// The full sync's window listing of the Inbox: an unbounded first page of
+    /// the window's size (a catch-up list carries a query, a later page a token,
+    /// and the backfill walk's id pages are its own chunk size).
+    static func isWindowListing(_ url: URL) -> Bool {
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        return url.lastPathComponent == "messages"
+            && items.contains { $0.name == "labelIds" && $0.value == "INBOX" }
+            && items.contains { $0.name == "maxResults" && $0.value == String(SyncConfig.syncMessageLimit) }
+            && !items.contains { $0.name == "q" || $0.name == "pageToken" }
+    }
+
     /// The first `history` request waits for a second one (another pass's delta)
-    /// before it answers; every later one waits for a `labels` request (a full
-    /// sync). Each wait ends at `parkCap`. `labelsStatus` answers the full sync's
-    /// folder list.
-    private static func scenario(wire: Wire, labelsStatus: Int = 200) -> FakeHTTP.Scenario {
+    /// before it answers; every later one waits for a window listing (a full
+    /// sync). Each wait ends at `parkCap`. `listingStatus` answers the full
+    /// sync's Inbox listing.
+    private static func scenario(wire: Wire, listingStatus: Int = 200) -> FakeHTTP.Scenario {
         let scenario = FakeHTTP.Scenario()
         scenario.register(path: "/history", method: "GET") { _ in
             let order: Int = wire.state.withLock { state in
                 state.historyRequests += 1
-                if state.labelsInFlight > 0 { state.overlapped = true }
-                if state.labelsRequests > 0 { state.historyAfterFirstLabels = true }
+                if state.listingsInFlight > 0 { state.overlapped = true }
+                if state.listingRequests > 0 { state.historyAfterFirstListing = true }
                 state.historyInFlight += 1
                 return state.historyRequests
             }
             if order == 2 { wire.secondHistory.signal() }
             return .parked {
-                _ = (order == 1 ? wire.secondHistory : wire.labels).wait(timeout: .now() + parkCap)
+                _ = (order == 1 ? wire.secondHistory : wire.listing).wait(timeout: .now() + parkCap)
                 wire.state.withLock { $0.historyInFlight -= 1 }
                 return .json(raw: #"{ "historyId": "1000" }"#)
             }
         }
-        scenario.register(path: "/labels", method: "GET") { _ in
+        scenario.register(path: "/labels", method: "GET", response: .json(
+            raw: #"{ "labels": [ { "id": "INBOX", "name": "INBOX", "type": "system" } ] }"#))
+        scenario.register(path: "/messages", method: "GET") { request in
+            guard Self.isWindowListing(request.url) else { return .json(raw: #"{ "resultSizeEstimate": 0 }"#) }
             wire.state.withLock { state in
-                state.labelsRequests += 1
+                state.listingRequests += 1
                 if state.historyInFlight > 0 { state.overlapped = true }
-                state.labelsInFlight += 1
+                state.listingsInFlight += 1
             }
-            wire.labels.signal()
+            wire.listing.signal()
             return .parked {
                 Thread.sleep(forTimeInterval: 0.1)
-                wire.state.withLock { $0.labelsInFlight -= 1 }
-                guard labelsStatus == 200 else { return .status(labelsStatus) }
-                return .json(raw: #"{ "labels": [ { "id": "INBOX", "name": "INBOX", "type": "system" } ] }"#)
+                wire.state.withLock { $0.listingsInFlight -= 1 }
+                guard listingStatus == 200 else { return .status(listingStatus) }
+                return .json(raw: #"{ "resultSizeEstimate": 0 }"#)
             }
         }
-        scenario.register(path: "/messages", method: "GET", response: .json(raw: #"{ "resultSizeEstimate": 0 }"#))
         scenario.register(path: "/profile", method: "GET", response: .json(
             raw: #"{ "emailAddress": "one-sync-gmail@example.com", "historyId": "2000" }"#))
         return scenario
@@ -186,11 +201,11 @@ struct OneSyncAtATimeTests {
 
             let seen = wire.snapshot
             #expect(!seen.overlapped, "a delta and a full sync of one account were in flight together")
-            #expect(seen.labelsRequests == 1, "the first pass ran the full sync, and only it")
+            #expect(seen.listingRequests == 1, "the first pass ran the full sync, and only it")
             switch second {
             case .backgroundDelta:
                 #expect(seen.historyRequests == 2, "both passes must run their delta (none is skipped or joined)")
-                #expect(seen.historyAfterFirstLabels, "the second pass's delta must start after the first pass's full sync")
+                #expect(seen.historyAfterFirstListing, "the second pass's delta must start after the first pass's full sync")
             case .foreground:
                 #expect(seen.historyRequests == 1, "a pass that waited behind a pass that has just synced syncs again")
             }
@@ -205,7 +220,7 @@ struct OneSyncAtATimeTests {
         try await Self.withAppDB { pool in
             let account = try Self.makeAccount(pool: pool)
             let wire = Wire()
-            let scenario = Self.scenario(wire: wire, labelsStatus: 400)
+            let scenario = Self.scenario(wire: wire, listingStatus: 400)
             defer { scenario.close() }
             let provider = GmailProvider(
                 userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: scenario.session)
@@ -227,25 +242,25 @@ struct OneSyncAtATimeTests {
     }
 
     /// What the fake server saw for the cursor tests below: the `startHistoryId`
-    /// of every `history` request, in order, and how many `labels` requests (full
+    /// of every `history` request, in order, and how many window listings (full
     /// syncs) arrived.
     final class CursorWire: Sendable {
         struct State {
             var historyStarts: [String] = []
-            var labelsRequests = 0
+            var listingRequests = 0
         }
         let state = Mutex(State())
-        /// Released by the test to answer the first `labels` request.
-        let releaseFirstLabels = DispatchSemaphore(value: 0)
+        /// Released by the test to answer the first window listing.
+        let releaseFirstListing = DispatchSemaphore(value: 0)
 
         var snapshot: State { state.withLock { $0 } }
     }
 
     /// The server has expired cursor `1000` (its `history` answers 404) and is
     /// at `2000` now (`profile`); a `history` from any other cursor answers
-    /// `2001` with no changes. With `parkFirstLabels`, the first full sync's
-    /// `labels` request waits for the test to release it.
-    private static func cursorScenario(wire: CursorWire, parkFirstLabels: Bool) -> FakeHTTP.Scenario {
+    /// `2001` with no changes. With `parkFirstListing`, the first full sync's
+    /// window listing waits for the test to release it.
+    private static func cursorScenario(wire: CursorWire, parkFirstListing: Bool) -> FakeHTTP.Scenario {
         let scenario = FakeHTTP.Scenario()
         scenario.register(path: "/history", method: "GET") { request in
             let start = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?
@@ -253,19 +268,21 @@ struct OneSyncAtATimeTests {
             wire.state.withLock { $0.historyStarts.append(start) }
             return start == "1000" ? .status(404) : .json(raw: #"{ "historyId": "2001" }"#)
         }
-        scenario.register(path: "/labels", method: "GET") { _ in
+        scenario.register(path: "/labels", method: "GET", response: .json(
+            raw: #"{ "labels": [ { "id": "INBOX", "name": "INBOX", "type": "system" } ] }"#))
+        scenario.register(path: "/messages", method: "GET") { request in
+            let empty = #"{ "resultSizeEstimate": 0 }"#
+            guard Self.isWindowListing(request.url) else { return .json(raw: empty) }
             let order: Int = wire.state.withLock { state in
-                state.labelsRequests += 1
-                return state.labelsRequests
+                state.listingRequests += 1
+                return state.listingRequests
             }
-            let labels = #"{ "labels": [ { "id": "INBOX", "name": "INBOX", "type": "system" } ] }"#
-            guard parkFirstLabels, order == 1 else { return .json(raw: labels) }
+            guard parkFirstListing, order == 1 else { return .json(raw: empty) }
             return .parked {
-                _ = wire.releaseFirstLabels.wait(timeout: .now() + .seconds(10))
-                return .json(raw: labels)
+                _ = wire.releaseFirstListing.wait(timeout: .now() + .seconds(10))
+                return .json(raw: empty)
             }
         }
-        scenario.register(path: "/messages", method: "GET", response: .json(raw: #"{ "resultSizeEstimate": 0 }"#))
         scenario.register(path: "/profile", method: "GET", response: .json(
             raw: #"{ "emailAddress": "one-sync-gmail@example.com", "historyId": "2000" }"#))
         return scenario
@@ -284,20 +301,20 @@ struct OneSyncAtATimeTests {
         try await Self.withAppDB { pool in
             let account = try Self.makeAccount(pool: pool)
             let wire = CursorWire()
-            let scenario = Self.cursorScenario(wire: wire, parkFirstLabels: true)
+            let scenario = Self.cursorScenario(wire: wire, parkFirstListing: true)
             defer { scenario.close() }
             let provider = GmailProvider(
                 userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: scenario.session)
             let engine = await Self.engine(provider: provider)
 
             let first = Task { try await engine.sync(account: account) }
-            #expect(await Self.eventually { wire.snapshot.labelsRequests == 1 },
+            #expect(await Self.eventually { wire.snapshot.listingRequests == 1 },
                     "precondition: the first pass reached its full sync")
             // The caller's copy still names the expired cursor.
             let second = Task { _ = try await engine.backgroundDeltaSync(account: account) }
             #expect(await Self.eventually { await engine.syncPassWaiters[Self.accountId]?.count == 1 },
                     "precondition: the delta waits its turn behind the full sync")
-            wire.releaseFirstLabels.signal()
+            wire.releaseFirstListing.signal()
 
             _ = try await first.value
             try await second.value
@@ -323,7 +340,7 @@ struct OneSyncAtATimeTests {
                     .updateAll(db, Column("lastHistoryId").set(to: "1500"), Column("lastFullSyncAt").set(to: nil as Date?))
             }
             let wire = CursorWire()
-            let scenario = Self.cursorScenario(wire: wire, parkFirstLabels: false)
+            let scenario = Self.cursorScenario(wire: wire, parkFirstListing: false)
             defer { scenario.close() }
             let provider = GmailProvider(
                 userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: scenario.session)
@@ -332,7 +349,7 @@ struct OneSyncAtATimeTests {
             _ = try await engine.sync(account: account)
 
             #expect(wire.snapshot.historyStarts == ["1500"], "the delta must run from the stored cursor")
-            #expect(wire.snapshot.labelsRequests == 1, "the full sync the row says is due did not run")
+            #expect(wire.snapshot.listingRequests == 1, "the full sync the row says is due did not run")
             await engine.remove(accountId: Self.accountId)
         }
     }
@@ -348,7 +365,7 @@ struct OneSyncAtATimeTests {
         try await Self.withAppDB { pool in
             let account = try Self.makeAccount(pool: pool)
             let wire = CursorWire()
-            let scenario = Self.cursorScenario(wire: wire, parkFirstLabels: false)
+            let scenario = Self.cursorScenario(wire: wire, parkFirstListing: false)
             defer { scenario.close() }
             let provider = GmailProvider(
                 userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: scenario.session)
@@ -375,8 +392,7 @@ struct OneSyncAtATimeTests {
                 #expect(!changed, "a pass whose account is gone reported a change")
                 #expect(deltaResult.changed == false && deltaResult.reason == "noAccount",
                         "a delta whose account is gone must report no change, for the removed account")
-                #expect(wire.snapshot.historyStarts.isEmpty && wire.snapshot.labelsRequests == 0,
-                        "a pass whose account is gone made a request")
+                #expect(scenario.recordedCalls().isEmpty, "a pass whose account is gone made a request")
                 #expect(try await pool.read { db in try Account.fetchOne(db, key: Self.accountId) } == nil,
                         "a pass whose account is gone wrote its row back")
             } else {
