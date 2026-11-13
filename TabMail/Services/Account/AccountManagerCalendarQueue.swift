@@ -49,13 +49,17 @@ extension AccountManager {
             // First result wins — cancel the rest. Cleanup of any leftover
             // continuation is handled in `signalCalendarOpOutcome` (defensive
             // discard if already resumed).
-            let outcome = await group.next() ?? .timedOut
-            group.cancelAll()
+            var outcome = await group.next() ?? .timedOut
             // If the timeout fired first, drop the still-pending continuation
-            // so the drain doesn't try to resume a stale waiter.
-            if case .timedOut = outcome {
-                self.dropCalendarOpAwaiter(opId: opId)
+            // so the drain doesn't try to resume a stale waiter. When the drain
+            // took it first (it signalled between the timeout and this line), its
+            // outcome is the answer: `signalCalendarOpOutcome` has already told the
+            // drain this caller heard it, and a failure the drain counts as seen
+            // must reach the card (`retireAndAnnounce`).
+            if case .timedOut = outcome, !self.dropCalendarOpAwaiter(opId: opId) {
+                outcome = await group.next() ?? .timedOut
             }
+            group.cancelAll()
             return outcome
         }
     }
@@ -127,8 +131,12 @@ extension AccountManager {
     /// it would not have prevented this defect at all — the bug was a discarded
     /// return value, not a missing lock. Same invariant (exactly-once resume),
     /// enforced by the mechanism this file already has.
-    private func dropCalendarOpAwaiter(opId: String) {
-        calendarOpAwaiters.removeValue(forKey: opId)?.resume(returning: .timedOut)
+    ///
+    /// Returns whether it found the continuation; `false` means a signal took it first.
+    private func dropCalendarOpAwaiter(opId: String) -> Bool {
+        guard let cont = calendarOpAwaiters.removeValue(forKey: opId) else { return false }
+        cont.resume(returning: .timedOut)
+        return true
     }
 
     /// Drain-side notification: resolve any pending awaiter for `opId` with
@@ -236,7 +244,8 @@ extension AccountManager {
     /// `CalDAVReauthWedgeTests` for the pin.
     private func retireCalendarOperation(
         _ op: PendingCalendarOperation,
-        reason: String
+        reason: String,
+        kind: CalendarFailureKind
     ) async -> Bool {
         BackgroundSyncLogger.logError(
             "[CalendarQueue] TERMINAL \(op.operationType) op=\(op.id) account=\(op.accountId) event=\(op.eventId ?? "new"): \(reason)",
@@ -246,6 +255,7 @@ extension AccountManager {
                 guard var row = try PendingCalendarOperation.fetchOne(db, key: op.id) else { return }
                 row.status = PendingStatus.failed.rawValue
                 row.failureReason = reason
+                row.setReservedArguments([PendingCalendarOperation.failureKindKey: .string(kind.rawValue)])
                 try row.update(db)
             }
             return true
@@ -286,14 +296,40 @@ extension AccountManager {
     /// bookkeeping are separate questions; this gate answers only the first.
     /// The second is discharged at the success arm itself and registered as
     /// `IOS-CAL-008`.
+    ///
+    /// A committed retirement then goes to exactly one place the user sees it. When the
+    /// tool that queued it was still waiting, it got `.permanentFailure` and turned its
+    /// card red, so the row is marked seen (`PendingCalendarOperation.failureSeenKey`) and
+    /// stays `failed` as the record of the failure. When nobody was waiting (the chat turn
+    /// had ended, or another trigger ran the drain), the inbox shows it until the user
+    /// dismisses it (`LateCalendarFailureStore`).
     private func retireAndAnnounce(
         _ op: PendingCalendarOperation,
-        reason: String
+        reason: String,
+        kind: CalendarFailureKind
     ) async {
-        let retired = await retireCalendarOperation(op, reason: reason)
-        signalCalendarOpOutcome(
+        let retired = await retireCalendarOperation(op, reason: reason, kind: kind)
+        let told = signalCalendarOpOutcome(
             opId: op.id,
             outcome: retired ? .permanentFailure(reason: reason) : .stillQueued)
+        guard retired else { return }
+        if told {
+            do {
+                try await retryWrite(dbPool, label: "CalendarQueue") { db in
+                    guard var row = try PendingCalendarOperation.fetchOne(db, key: op.id) else { return }
+                    row.setReservedArguments([PendingCalendarOperation.failureSeenKey: .bool(true)])
+                    try row.update(db, columns: ["argumentsJSON"])
+                }
+            } catch {
+                // The row stays unseen, so the inbox also shows a failure the card
+                // already showed: shown twice, never lost.
+                BackgroundSyncLogger.logError(
+                    "[CalendarQueue] failed to mark op \(op.id) seen after its card showed the failure — the inbox will show it too: \(error)",
+                    source: "CalendarQueue")
+            }
+        } else {
+            await LateCalendarFailureStore.shared.reload()
+        }
     }
 
     /// Keep a split's `SplitRecord` on its queued operation (#601): `splitSeries` calls it once
@@ -365,13 +401,15 @@ extension AccountManager {
     /// Persists the operation to GRDB before returning — survives crashes/kills.
     /// `SplitRecord.argumentKey` and `SplitRecord.partNotFoundSinceKey` are reserved for the
     /// queue (`recordSplit`, `noteSplitPartNotFound`); a tool call that carries them has them
-    /// removed here.
+    /// removed here. `eventTitle` is the title the confirmation card showed; it names the
+    /// event if the change fails after the chat turn (`LateCalendarFailureStore`).
     func queueCalendarOperation(
         type: CalendarOperationType,
         accountId: String,
         eventId: String? = nil,
         calendarId: String? = nil,
-        arguments: [String: JSONValue]
+        arguments: [String: JSONValue],
+        eventTitle: String
     ) async throws -> PendingCalendarOperation {
         var arguments = arguments
         arguments.removeValue(forKey: SplitRecord.argumentKey)
@@ -381,7 +419,8 @@ extension AccountManager {
             accountId: accountId,
             eventId: eventId,
             calendarId: calendarId,
-            arguments: arguments
+            arguments: arguments,
+            eventTitle: eventTitle
         )
         try await queueCalendarOperations([op])
         return op
@@ -573,7 +612,7 @@ extension AccountManager {
                     if Self.isCalendarNotFoundError(error) {
                         BackgroundSyncLogger.logDebug("[CalendarQueue] Event not found for \(opType) — retiring (server wins)")
                         let reason = "event not found on server"
-                        await retireAndAnnounce(currentOp, reason: reason)
+                        await retireAndAnnounce(currentOp, reason: reason, kind: .notFound)
                         executedAny = true
                         continue
                     }
@@ -596,7 +635,7 @@ extension AccountManager {
                         // rather than a signal (see the auth arm below).
                         markAuthFailed(currentOp.accountId)
                         let reason = "calendar permission missing — user must re-authenticate in Settings"
-                        await retireAndAnnounce(currentOp, reason: reason)
+                        await retireAndAnnounce(currentOp, reason: reason, kind: .missingPermission)
                         executedAny = true
                         failedAccounts.insert(currentOp.accountId)
                         continue
@@ -629,12 +668,15 @@ extension AccountManager {
                     // only works because the provider still exists. That gap is
                     // registered as `KNOWN_ISSUES.md` `IOS-CAL-007`, which round 18
                     // widened to cover the CalDAV auth class it previously carved
-                    // out on the strength of that false sentence.
+                    // out on the strength of that false sentence. Its retirement
+                    // itself now reaches the user like every terminal failure: on the
+                    // waiting card, or else as an inbox banner
+                    // (`LateCalendarFailureStore`).
                     if Self.isCalendarAuthError(error) {
                         let isCalDAV = Self.isCalDAVAuthError(error)
                         BackgroundSyncLogger.logDebug("[CalendarQueue] Auth failed for \(opType) (\(isCalDAV ? "CalDAV" : "OAuth")) — stopping retries, user must re-authenticate")
                         let reason = Self.calendarAuthFailureReason(error)
-                        await retireAndAnnounce(currentOp, reason: reason)
+                        await retireAndAnnounce(currentOp, reason: reason, kind: .signInFailed)
                         executedAny = true
                         failedAccounts.insert(currentOp.accountId)
                         continue
@@ -647,7 +689,7 @@ extension AccountManager {
                     if Self.isCalendarUnsupportedError(error) {
                         let reason = unsupportedReason(error)
                         BackgroundSyncLogger.logDebug("[CalendarQueue] Unsupported \(opType) (\(reason)) — retiring (no retry)")
-                        await retireAndAnnounce(currentOp, reason: reason)
+                        await retireAndAnnounce(currentOp, reason: reason, kind: .unsupported)
                         executedAny = true
                         continue
                     }
@@ -660,7 +702,7 @@ extension AccountManager {
                     if Self.isCalendarBadRequestError(error) {
                         BackgroundSyncLogger.logDebug("[CalendarQueue] Bad request for \(opType) (\(error)) — retiring (will not retry)")
                         let reason = badRequestReason(error)
-                        await retireAndAnnounce(currentOp, reason: reason)
+                        await retireAndAnnounce(currentOp, reason: reason, kind: .refused)
                         executedAny = true
                         continue
                     }
@@ -1329,8 +1371,8 @@ extension AccountManager {
     /// 🚨 **DELIBERATELY EXACT-MATCH AND DELIBERATELY THREE.** This predicate is the
     /// gate on a TERMINAL arm, and a terminal arm RETIRES the user's queued calendar
     /// operation — `status = 'failed'` with a reason since R16-1, not the delete this
-    /// sentence asserted until R17-7. The row survives for diagnostics and is
-    /// reclaimed after `SyncConfig.retiredCalendarOpRetentionDays`; what does NOT
+    /// sentence asserted until R17-7. The row survives (as an inbox banner when no
+    /// card showed the failure, `LateCalendarFailureStore`) and is reclaimed after `SyncConfig.retiredCalendarOpRetentionDays`; what does NOT
     /// survive is the work, which never executes. So every value added here is still
     /// an intention that leaves the queue unexecuted — the harm the sentence was
     /// written to guard is unchanged, only its mechanism was.
@@ -1373,7 +1415,9 @@ extension AccountManager {
     ///     It has been removed. The bullet's SET MEMBERSHIP is unchanged and still
     ///     correct; only its justification was wrong. A CalDAV auth failure now
     ///     raises no persistent signal at all, which is registered as
-    ///     `KNOWN_ISSUES.md` `IOS-CAL-007` rather than papered over here.
+    ///     `KNOWN_ISSUES.md` `IOS-CAL-007` rather than papered over here. (The
+    ///     retirement it causes is now shown, on the card or as an inbox banner;
+    ///     no re-authentication prompt is raised.)
     /// Both halves shared: the two raw 401s and the three grant-level OAuth codes.
     /// The behaviour is correct; the SENTENCE was the problem, and it was copied
     /// verbatim into `KNOWN_ISSUES.md`, where a reviewer read it as evidence that

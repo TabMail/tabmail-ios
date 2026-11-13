@@ -4,6 +4,35 @@
 
 - Register classification: `accepted`
 - Original row SHA-256: `956667f2ea152472db0fcda431e7328bde10d4f235e2f40dbc46c178fd907aa7`
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+- Current register classification: `resolved` (2026-11-13, tabmail-ios #600 and #535), as in the base-register override row in `KNOWN_ISSUES.md`. The `accepted` line above is the frozen 2026-08-09 classification, kept as history.
+
+> **Amendment (2026-11-13): the persistent surface this row said was absent now exists.** A queued
+> calendar change that fails for good is told to the user exactly once. When the tool that queued it is
+> still waiting, it gets `.permanentFailure` and its confirmation card turns red; the retired row stays
+> `failed` (the record R16-1 wanted) and is marked seen (`PendingCalendarOperation.failureSeenKey`), by
+> `AccountManager.retireAndAnnounce`, which now reads the Bool `signalCalendarOpOutcome` returns. When
+> nobody is waiting (the turn timed out, another session, or a drain no chat turn started), the inbox
+> shows one banner per unseen row, laid out like the inbox error banner, with Dismiss as its only button
+> (`LateCalendarFailureBanner`, `LateCalendarFailureStore`). Dismiss deletes the row, so it does not
+> come back after a reload or relaunch. There is no retry.
+>
+> The banner reads *"A calendar change couldn't be made: <title>. <reason>"*. `<title>` is the title the
+> confirmation card showed, stored under the reserved argument key `_event_title`. `<reason>` is a fixed
+> plain line per failure kind, never the stored `failureReason` (that text is for the assistant). The
+> retirement records the kind under the reserved key `_failure_kind` (`CalendarFailureKind`), one per
+> terminal arm: not found "The event no longer exists."; missing scope "TabMail doesn't have permission
+> to change this calendar."; auth "The calendar account needs you to sign in again."; unsupported "This
+> calendar can't make this kind of change."; bad request "The calendar refused the change." Reserved
+> keys are stripped from a tool call's arguments; no migration. A row retired by an earlier version has
+> no kind and is not shown. `awaitCalendarOpOutcome` now returns a signal that took the continuation
+> between its timeout and the drop, so "told" matches what the tool received.
+>
+> Still true: a `failed` row is reclaimed after `SyncConfig.retiredCalendarOpRetentionDays` (30 days from
+> `createdAt`), so an undismissed banner goes with it (accepted as harmless). The OAuth/CalDAV auth notes
+> above are unchanged; a CalDAV auth retirement now reaches the user like any other terminal failure,
+> but no re-authentication prompt is raised. Tests: `LateCalendarFailureBannerTests`.
+<!-- KNOWN-ISSUES-AMENDMENT-END -->
 
 ## Status
 

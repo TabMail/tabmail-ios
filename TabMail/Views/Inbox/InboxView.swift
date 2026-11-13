@@ -444,6 +444,16 @@ struct InboxView: View {
                     .foregroundStyle(Theme.errorFg)
                 }
 
+                // Calendar changes that failed after their chat turn ended, one banner
+                // each, until dismissed (`LateCalendarFailureStore`). Inbox only.
+                if isInboxView {
+                    ForEach(LateCalendarFailureStore.shared.failures) { failure in
+                        LateCalendarFailureBanner(failure: failure) {
+                            Task { await LateCalendarFailureStore.shared.dismiss(failure) }
+                        }
+                    }
+                }
+
                 // Usage-throttle banner — surfaces when background AI
                 // processing is being throttled (monthly budget exhausted /
                 // BYOK on the shared queue). Subtle, non-dismissible; tapping
@@ -1007,6 +1017,9 @@ struct InboxView: View {
             viewModel.startSync()
             if isInboxView {
                 Task { await viewModel.checkLargeInbox() }
+                // Read the failed calendar changes from the database, so the banners
+                // come back after a relaunch.
+                Task { await LateCalendarFailureStore.shared.reload() }
                 // Refresh push-enabled parameter so the tip's display rule
                 // reflects the current UserDefaults value. Written here (not
                 // @AppStorage) to keep the tip gate centralized — the Settings

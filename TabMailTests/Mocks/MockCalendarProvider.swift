@@ -127,6 +127,7 @@ actor MockCalendarProvider: CalendarProvider {
         if let error = deleteEventThrows { throw error }
     }
 
+    func setDeleteEventThrows(_ error: Error?) { deleteEventThrows = error }
     func setOccurrenceStartDayResult(_ day: String?) { occurrenceStartDayResult = day }
     func setOccurrenceStartDayThrows(_ error: Error?) { occurrenceStartDayThrows = error }
 

@@ -202,16 +202,17 @@ struct CalendarEventCreateTool: AgentTool, Sendable {
             queuedArgs["end_iso"] = .string(isoFmt.string(from: endDate))
         }
 
+        let title = CalendarToolHelpers.stringArg(arguments, "title")
+        let eventTitle = title.isEmpty ? "(No title)" : title
         let op = try await manager.queueCalendarOperation(
             type: .create,
             accountId: accountId,
             eventId: generatedEventId,
             calendarId: calendarId,
-            arguments: queuedArgs
+            arguments: queuedArgs,
+            eventTitle: eventTitle
         )
 
-        let title = CalendarToolHelpers.stringArg(arguments, "title")
-        let eventTitle = title.isEmpty ? "(No title)" : title
         BackgroundSyncLogger.logDebug("[CalendarEventCreateTool] Queued create (op: \(op.id))")
 
         // Wait briefly for the drain to surface a terminal outcome so the LLM
