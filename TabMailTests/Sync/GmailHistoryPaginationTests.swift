@@ -17,7 +17,7 @@ import Testing
 /// These drive production `SyncEngine.performDeltaSync` end to end (`FakeHTTP`,
 /// a real `GmailProvider` and a real `DatabasePool`), so they hold for the
 /// whole path: `GmailAPI.historyList` → `GmailProvider.fetchHistory` →
-/// `gmailDeltaSync`'s cursor write.
+/// Gmail's change reader → the engine's bookmark write.
 @Suite("Gmail delta sync reads every history page before its cursor moves", .serialized, .processGlobalState)
 struct GmailHistoryPaginationTests {
     private static let accountId = "gmail-history-pages"

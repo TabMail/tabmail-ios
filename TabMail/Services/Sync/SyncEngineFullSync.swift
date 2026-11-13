@@ -498,7 +498,6 @@ extension SyncEngine {
             return (allMigratedIds, listed)
         }.value
 
-
         // Clear undo protection for migrated UIDs
         // UID migration tracking — logged for diagnostics but no longer clears undoProtectedIds
         // (pending-op check in sync transaction handles undo protection now)
@@ -572,7 +571,7 @@ extension SyncEngine {
 
         // Body fetching happens during backfill (startBackfill called after fullSync).
         // Running it inline here would block sync and explode memory for large folders.
-        // Unread recount is now handled per-folder inside syncMessages, immediately after header commit.
+        // Unread recount is handled per folder in `processSyncResult`, right after its listing commits.
         return listedFolderIds
     }
 

@@ -560,7 +560,7 @@ throws the cancellation (never a partial list), sends nothing more, and a full w
 rate-limited answers; a request joining the full gate; a cancel while a get awaits its answer or its
 backoff) and checks the first window is all on the wire before any answer, the first freed slot,
 the returned multiset and the named unreadable ids, throw semantics, termination and gate reuse
-(`GMAIL_DETAIL_FUZZ_ITERATIONS`, `GMAIL_DETAIL_FUZZ_SEED`, `TEST_RUNNER_` prefix on the CLI). A failing plain-schedule iteration always starts with a dropped connection, so the default run reaches the throw checker.
+(`GMAIL_DETAIL_FUZZ_ITERATIONS`, `GMAIL_DETAIL_FUZZ_SEED`, `TEST_RUNNER_` prefix on the CLI). The first failing plain-schedule iteration starts with a dropped connection, so the default run reaches the throw checker; the later ones keep their drawn answers.
 
 ## Calendar chat tools — the resolved calendar account
 

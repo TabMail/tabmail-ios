@@ -181,9 +181,10 @@ struct GmailDetailWindowFuzzTests {
         }
         // Only a failure about the account (a dropped connection) throws; a
         // message's own bad answer is named unreadable. One kind in five is too
-        // rare for the default run to be sure of a throw, so a failing plain
-        // iteration starts with one.
-        if failuresAllowed, schedule == .plain, let first = ids.first {
+        // rare for the default run to be sure of a throw, so the first failing
+        // plain iteration starts with one. The later ones keep their drawn
+        // answers, so an unreadable message and a 429 retry still meet in one batch.
+        if failuresAllowed, schedule == .plain, iteration < Schedule.allCases.count * 2, let first = ids.first {
             answers[first] = .failed(.transportError)
         }
         if schedule == .plain, rng.pick(100) < FuzzConfig.rateLimitPercent,
