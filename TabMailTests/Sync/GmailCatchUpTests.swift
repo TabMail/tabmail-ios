@@ -12,14 +12,17 @@ private let inboxPath = "INBOX"
 private let allMailPath = GmailProvider.archivePath
 private let labelPath = "Label_7"
 
-/// ADR-IOS-107 for Gmail: the full sync's catch-up of server-side changes to OLDER
-/// mail (a read or starred change, or a message leaving a folder) that no sync
-/// window and no delta reaches.
+/// ADR-IOS-107 for Gmail: the catch-up of server-side changes to OLDER mail (a
+/// read or starred change, or a message leaving a folder) that no sync window and
+/// no delta reaches. Since #766 the backfill worker runs it after the folders'
+/// walk, in slices (`SyncEngine.runBackfill` → `runCatchUpRun`); before, the full
+/// sync ran it.
 ///
 /// Every case drives the real `GmailProvider.catchUp` against
 /// `StatefulGmailActionServer` (the REST oracle) and applies through the real
-/// `SyncEngine.runCatchUp`, or runs the whole foreground poll
-/// (`SyncEngine.sync(account:)`: delta, due full sync, cursor capture), then asserts
+/// `SyncEngine.runCatchUp`, or runs the real run of slices or backfill cycle, or
+/// the whole foreground poll (`SyncEngine.sync(account:)`: delta, due full sync,
+/// cursor capture) followed by the worker's cycles, then asserts
 /// what the user would see: the local rows' read/starred state, which rows exist,
 /// and which missing messages the check loaded. The wire is asserted only where
 /// the invariant IS about the wire (bounds, budget, no request when nothing is due).
@@ -73,13 +76,17 @@ struct GmailCatchUpTests {
     private static let syncFolders: [(path: String, role: FolderRole)] = [(inboxPath, .inbox), (allMailPath, .archive)]
 
     /// One prepared world. Every folder starts with its backfill complete, so no
-    /// background walk runs unless a test starts one.
+    /// background walk runs unless a test starts one. `concurrency` is the work
+    /// queue's width: 1 by default; a test of the one-sync-at-a-time turn passes
+    /// production's (`SyncConfig.imapMaxConnectionCeiling`), so that a width-1
+    /// queue cannot serialize a delta behind a slice in the lock's place.
     private static func withWorld(
         _ name: String,
         seeds: [StatefulGmailActionServer.Seed],
         local: [Local],
         folders: [(path: String, role: FolderRole)] = GmailCatchUpTests.catchUpFolders,
         userLabels: [String: String] = [labelPath: "Projects"],
+        concurrency: Int = 1,
         _ body: (World) async throws -> Void
     ) async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
@@ -99,7 +106,7 @@ struct GmailCatchUpTests {
         let provider = server.provider()
         let engine = SyncEngine()
         await engine.register(
-            accountId: name, provider: provider, workQueue: ProviderWorkQueue(provider: provider, maxConcurrency: 1))
+            accountId: name, provider: provider, workQueue: ProviderWorkQueue(provider: provider, maxConcurrency: concurrency))
         let world = World(server: server, provider: provider, engine: engine, pool: pool, accountId: name)
         do {
             try await body(world)
@@ -1210,7 +1217,9 @@ struct GmailCatchUpTests {
         #expect(!gmail.contains("StorageEstimator"), "the storage limit comes only from the CatchUpContext snapshot")
         let engine = try source("TabMail/Services/Sync/SyncEngineCatchUp.swift")
         #expect(engine.components(separatedBy: "StorageEstimator").count == 2,
-                "the engine reads the storage limit once, in runCatchUp's snapshot")
+                "the engine reads the storage limit once, in the run's snapshot (CatchUpRun.snapshot)")
+        #expect(engine.components(separatedBy: "NetworkMonitor").count == 2,
+                "the engine reads the network state once, in the run's snapshot (CatchUpRun.snapshot); no slice re-reads it")
         #expect(!gmail.contains("UserDefaults"), "no setting is read mid-pass: what the pass needs comes from the CatchUpContext snapshot")
     }
 
@@ -2367,8 +2376,10 @@ struct GmailCatchUpTests {
         }
     }
 
-    /// The production snapshot (`runCatchUp` with no context) takes the storage
-    /// limit from the user's Email Index Limit when the step starts.
+    /// The production snapshot (`CatchUpRun.snapshot`, taken by a backfill cycle)
+    /// takes the storage limit from the user's Email Index Limit when the run
+    /// starts. *Superseded (#766):* "(`runCatchUp` with no context) [...] when the
+    /// step starts".
     @Test("The production snapshot takes the storage limit from the Email Index Limit",
           .enabled(if: !NetworkMonitor.checkExpensive()))
     func productionSnapshotTakesTheStorageLimit() async throws {
@@ -2379,7 +2390,7 @@ struct GmailCatchUpTests {
         // Finite, and far above anything a test store reaches: no prune runs.
         StorageEstimator.budgetMB = 1_000_000
         try await Self.withWorld("gcu-pruned-snapshot", seeds: seeds, local: local) { world async throws in
-            await world.engine.runCatchUp(provider: world.provider, folderIds: [world.folderId(inboxPath)])
+            try await Self.backfillCycles(world)
             #expect(try Self.state(world, inboxPath)?.lastCompletedAt != nil, "precondition: the check completed")
             let oldestKept = Int(clock.daysAgo(33).timeIntervalSince1970) - SyncConfig.catchUpGmailRangeSlackSeconds
             let lowest = try #require(world.server.listRequests().compactMap { $0.bound("after") }.min())
@@ -3107,6 +3118,346 @@ struct GmailCatchUpTests {
         }
     }
 
+    // MARK: - In the backfill worker, in slices (#766)
+
+    private static let inboxOnly: [(path: String, role: FolderRole)] = [(inboxPath, .inbox)]
+
+    private static func account(_ world: World) async throws -> Account {
+        let accountId = world.accountId
+        return try #require(try await world.pool.read { db in try Account.fetchOne(db, key: accountId) })
+    }
+
+    /// A run whose slices are `slice` requests long: its clock advances one second
+    /// per request the server has seen since the run began, from `base`. The run
+    /// ends after `deadline` requests, or never when nil (a background job whose
+    /// deadline is far away).
+    private static func requestRun(
+        _ server: StatefulGmailActionServer, slice: Int, deadline: Int?, at base: Date = Date()
+    ) -> SyncEngine.CatchUpRun {
+        let before = server.http.recordedCalls().count
+        return SyncEngine.CatchUpRun(
+            isExpensiveNetwork: false, storageLimitInForce: false,
+            deadline: deadline.map { base.addingTimeInterval(TimeInterval($0)) } ?? .distantFuture,
+            sliceSeconds: TimeInterval(slice),
+            clock: { base.addingTimeInterval(TimeInterval(server.http.recordedCalls().count - before)) })
+    }
+
+    private static func eventually(
+        seconds: Double, poll: Duration = .milliseconds(10), _ condition: () throws -> Bool
+    ) async rethrows -> Bool {
+        let end = Date().addingTimeInterval(seconds)
+        while Date() < end {
+            if try condition() { return true }
+            try? await Task.sleep(for: poll)
+        }
+        return try condition()
+    }
+
+    /// The catch-up takes the account's one-sync-at-a-time turn one slice at a
+    /// time: a silent-push delta that arrives while a slice is running starts as
+    /// soon as that slice ends, and the run goes on after it.
+    @Test("A catch-up slice hands the turn on: a delta that arrives during the catch-up waits at most one slice")
+    func sliceHandsTheTurnOn() async throws {
+        let clock = Clock()
+        let count = 8
+        let slice = 3
+        let (seeds, local) = Self.rangesWorld(clock, count: count)
+        try await Self.withWorld(
+            "gcu-slice-turn", seeds: seeds, local: local, folders: Self.inboxOnly,
+            concurrency: SyncConfig.imapMaxConnectionCeiling
+        ) { world async throws in
+            world.server.serveProfile()
+            try Self.setAccount(world, cursor: world.server.currentHistoryId(), lastFullSyncAt: Date())
+            world.server.holdEveryList(forSeconds: 0.2)
+            let account = try await Self.account(world)
+            let engine = world.engine
+            let server = world.server
+            let run = Self.requestRun(server, slice: slice, deadline: nil)
+            let catchUp = Task { await engine.runCatchUpRun(account: account, run: run) }
+
+            // The delta arrives while the third slice's first list is in flight.
+            let inThirdSlice = await Self.eventually(seconds: 30) { server.listRequests().count >= 2 * slice + 1 }
+            #expect(inThirdSlice, "precondition: the catch-up reached its third slice")
+            let arrival = server.http.recordedCalls().count
+            _ = try await engine.backgroundDeltaSync(account: account)
+
+            let calls = server.http.recordedCalls()
+            let history = try #require(
+                calls.indices.first { $0 >= arrival && calls[$0].url.contains("/history") }, "precondition: the delta ran")
+            let waited = calls[arrival..<history].filter { $0.url.contains("/messages") }.count
+            #expect(waited <= slice, "the delta waited for \(waited) catch-up requests; a slice is \(slice)")
+            // Every slice here is one range's three lists, so a delta that runs
+            // between slices finds a whole number of slices before it.
+            let before = calls[..<history].filter { $0.url.contains("/messages") }.count
+            #expect(before % slice == 0, "the delta ran inside a slice, after \(before) catch-up requests")
+
+            #expect(await catchUp.value, "the run made progress")
+            #expect(try Self.state(world, inboxPath)?.lastCompletedAt != nil,
+                    "the run goes on after the delta and completes the listing")
+            #expect(server.listRequests().filter { $0.labelId == inboxPath }.count == count, "no range is listed twice")
+        }
+    }
+
+    /// The same through the production entry: the background processing job
+    /// (`performBackfill`, real clock and the job's deadline) releases the
+    /// account's turn between its slices, so a delta that arrives while the job
+    /// runs waits at most one slice plus one request timeout, never the job.
+    @Test("The background job hands the turn on between slices: a delta that arrives during it waits at most one slice",
+          .enabled(if: !NetworkMonitor.checkExpensive()))
+    func jobHandsTheTurnOnBetweenSlices() async throws {
+        let clock = Clock()
+        let count = 20
+        let roundTrip = SyncConfig.catchUpSliceSeconds / 10
+        let (seeds, local) = Self.rangesWorld(clock, count: count)
+        try await Self.withWorld(
+            "gcu-job-turn", seeds: seeds, local: local, folders: Self.inboxOnly,
+            concurrency: SyncConfig.imapMaxConnectionCeiling
+        ) { world async throws in
+            world.server.serveProfile()
+            try Self.setAccount(world, cursor: world.server.currentHistoryId(), lastFullSyncAt: Date())
+            world.server.holdEveryList(forSeconds: roundTrip)
+            #expect(Double(count * 3) * roundTrip > 2 * (SyncConfig.catchUpSliceSeconds + SyncConfig.catchUpRequestTimeoutSeconds),
+                    "precondition: the job's lists take far longer than one slice")
+            let account = try await Self.account(world)
+            let engine = world.engine
+            let server = world.server
+            let deadline = Date().addingTimeInterval(SyncConfig.backgroundBackfillDeadlineSeconds)
+            let job = Task { await engine.performBackfill(account: account, deadline: deadline) }
+
+            let started = await Self.eventually(seconds: 30) { server.listRequests().count >= 2 }
+            #expect(started, "precondition: the job's catch-up is listing")
+            let arrival = Date()
+            _ = try await engine.backgroundDeltaSync(account: account)
+            let waited = Date().timeIntervalSince(arrival)
+            let listingOpen = try Self.state(world, inboxPath)?.listing != nil
+
+            #expect(listingOpen, "precondition: the delta ran while the job's listing was in progress")
+            #expect(waited <= SyncConfig.catchUpSliceSeconds + SyncConfig.catchUpRequestTimeoutSeconds,
+                    "the delta waited \(waited) s; one slice is at most \(SyncConfig.catchUpSliceSeconds) s plus one request timeout")
+            #expect(await job.value, "the job made progress")
+            #expect(try Self.state(world, inboxPath)?.lastCompletedAt != nil, "the job goes on after the delta and completes the listing")
+        }
+    }
+
+    /// A deadline that falls inside a slice cuts that slice short: the slice
+    /// ends at the job's deadline, not one slice length after it started.
+    @Test("A job's deadline that falls inside a slice ends the slice at the deadline",
+          .enabled(if: !NetworkMonitor.checkExpensive()))
+    func deadlineCutsTheSliceShort() async throws {
+        let clock = Clock()
+        let slice = SyncConfig.catchUpSliceSeconds
+        let roundTrip = slice / 20
+        let (seeds, local) = Self.rangesWorld(clock, count: 12)
+        try await Self.withWorld("gcu-deadline-in-slice", seeds: seeds, local: local, folders: Self.inboxOnly) { world async throws in
+            world.server.holdEveryList(forSeconds: roundTrip)
+            let account = try await Self.account(world)
+            let start = Date()
+            let deadline = start.addingTimeInterval(slice / 2)
+            #expect(await world.engine.performBackfill(account: account, deadline: deadline))
+            let end = Date()
+            #expect(try Self.state(world, inboxPath)?.listing != nil, "precondition: the listing needs more than the job")
+            #expect(end <= deadline.addingTimeInterval(slice / 4),
+                    "the job ran \(end.timeIntervalSince(start)) s; its deadline was \(slice / 2) s")
+        }
+    }
+
+    /// A background job's deadline that comes mid-listing ends the run there; the
+    /// listing is saved and the next run resumes it, so no range is listed twice
+    /// and every change arrives.
+    @Test("A run that reaches its deadline mid-listing stops there, and the next run resumes from the saved range")
+    func deadlineMidListingResumes() async throws {
+        let clock = Clock()
+        let count = 5
+        let slice = 3
+        let deadline = 7
+        let (seeds, local) = Self.rangesWorld(clock, count: count)
+        try await Self.withWorld("gcu-run-deadline", seeds: seeds, local: local, folders: Self.inboxOnly) { world async throws in
+            world.server.applyLabelChange(providerMessageId: "g0", add: ["UNREAD"])
+            world.server.applyLabelChange(providerMessageId: "g\(count - 1)", add: ["STARRED"])
+            let account = try await Self.account(world)
+
+            #expect(await world.engine.runCatchUpRun(
+                account: account, run: Self.requestRun(world.server, slice: slice, deadline: deadline)))
+            #expect(world.server.http.recordedCalls().count <= deadline, "no request starts past the deadline")
+            #expect(try Self.state(world, inboxPath)?.listing != nil, "precondition: the deadline came mid-listing")
+            #expect(try Self.rows(world, inboxPath)["g\(count - 1)"]?.isFlagged == true,
+                    "what the run listed before its deadline is applied")
+            #expect(try Self.rows(world, inboxPath)["g0"]?.isRead == true, "precondition: the oldest range was not reached")
+
+            #expect(await world.engine.runCatchUpRun(
+                account: account, run: Self.requestRun(world.server, slice: slice, deadline: nil)))
+            #expect(try Self.state(world, inboxPath)?.lastCompletedAt != nil, "the next run completes the listing")
+            #expect(world.server.listRequests().filter { $0.labelId == inboxPath }.count == count,
+                    "each range's membership list ran once: the next run resumed where the first stopped")
+            #expect(try Self.rows(world, inboxPath)["g0"]?.isRead == false, "the oldest range's change arrives")
+        }
+    }
+
+    /// A run stops after a slice that moved nothing forward, so a folder whose
+    /// requests keep failing is tried again at the worker's next cycle, never at
+    /// network rate until the deadline.
+    @Test("A run stops after a slice that made no progress; it does not retry a failing folder until its deadline")
+    func runStopsWithoutProgress() async throws {
+        let clock = Clock()
+        let (seeds, local) = Self.rangesWorld(clock, count: 3)
+        try await Self.withWorld("gcu-run-stuck", seeds: seeds, local: local, folders: Self.inboxOnly) { world async throws in
+            world.server.failListings(status: 503)
+            let account = try await Self.account(world)
+            let deadline = 40
+            _ = await world.engine.runCatchUpRun(
+                account: account, run: Self.requestRun(world.server, slice: 3, deadline: deadline))
+            let lists = world.server.listRequests().count
+            #expect(lists >= 1, "precondition: the folder was tried")
+            #expect(lists <= 2, "the run stopped once a slice made no progress: \(lists) list requests")
+            #expect(try Self.state(world, inboxPath)?.lastCompletedAt == nil)
+        }
+    }
+
+    /// One foreground backfill cycle (`runBackfill`, no deadline: the production
+    /// snapshot and slice) moves the listing forward by one slice, newest range
+    /// first, and the worker's next cycles complete it.
+    @Test("A foreground backfill cycle makes catch-up progress, one slice per cycle, and the worker completes the listing",
+          .enabled(if: !NetworkMonitor.checkExpensive()))
+    func foregroundCycleMakesProgress() async throws {
+        let clock = Clock()
+        let count = 3
+        let (seeds, local) = Self.rangesWorld(clock, count: count)
+        try await Self.withWorld("gcu-fg-cycle", seeds: seeds, local: local, folders: Self.inboxOnly) { world async throws in
+            // A round trip long enough that one slice cannot list every range.
+            let roundTrip = SyncConfig.catchUpSliceSeconds / 4
+            world.server.holdEveryList(forSeconds: roundTrip)
+            #expect(Double(count * 3) * roundTrip > SyncConfig.catchUpSliceSeconds, "precondition: one slice cannot list the folder")
+            world.server.applyLabelChange(providerMessageId: "g0", add: ["UNREAD"])
+            world.server.applyLabelChange(providerMessageId: "g\(count - 1)", add: ["UNREAD"])
+            let account = try await Self.account(world)
+
+            #expect(await world.engine.runBackfill(account: account), "the cycle reports work, so the worker keeps cycling")
+            #expect(try Self.rows(world, inboxPath)["g\(count - 1)"]?.isRead == false, "the newest range's change arrives in the first cycle")
+            #expect(try Self.state(world, inboxPath)?.listing != nil, "one cycle runs one slice; the listing is saved")
+
+            await world.engine.startBackfill(account: account)
+            let completed = try await Self.eventually(seconds: 60, poll: .milliseconds(100)) {
+                try Self.state(world, inboxPath)?.lastCompletedAt != nil
+            }
+            #expect(completed, "the worker's cycles complete the listing")
+            #expect(try Self.rows(world, inboxPath)["g0"]?.isRead == false, "the oldest range's change arrives")
+        }
+    }
+
+    /// The background processing job (`performBackfill` with the job's deadline,
+    /// `SyncConfig.backgroundBackfillDeadlineSeconds`) runs the catch-up after the
+    /// walk, slice after slice, until the listing is done.
+    @Test("The background processing job runs the catch-up in slices until the listing completes",
+          .enabled(if: !NetworkMonitor.checkExpensive()))
+    func backgroundJobRunsTheCatchUp() async throws {
+        let clock = Clock()
+        let count = 3
+        let (seeds, local) = Self.rangesWorld(clock, count: count)
+        try await Self.withWorld("gcu-bg-job", seeds: seeds, local: local, folders: Self.inboxOnly) { world async throws in
+            let roundTrip = SyncConfig.catchUpSliceSeconds / 4
+            world.server.holdEveryList(forSeconds: roundTrip)
+            #expect(Double(count * 3) * roundTrip > SyncConfig.catchUpSliceSeconds, "precondition: one slice cannot list the folder")
+            world.server.applyLabelChange(providerMessageId: "g0", add: ["UNREAD"])
+            let account = try await Self.account(world)
+
+            let deadline = Date().addingTimeInterval(SyncConfig.backgroundBackfillDeadlineSeconds)
+            #expect(await world.engine.performBackfill(account: account, deadline: deadline))
+            #expect(try Self.state(world, inboxPath)?.lastCompletedAt != nil, "one job completes the listing")
+            #expect(try Self.rows(world, inboxPath)["g0"]?.isRead == false, "the oldest range's change arrives")
+        }
+    }
+
+    /// A slice's request count is charged before each request goes out, and a
+    /// batch of concurrent loads is charged its whole width first: a batch that
+    /// does not fit in what is left of the count is not sent, not even in part,
+    /// so no slice passes its cap. The loads it held back come in a later call.
+    @Test("A batch of loads that does not fit in the slice's request count is not sent; no slice passes its cap")
+    func loadBatchIsChargedItsWidthFirst() async throws {
+        let clock = Clock()
+        let width = BackfillProfile.normal.gmailBodyConcurrency
+        let missing = (0..<(width + 2)).map { "x\($0)" }
+        let seeds = [Self.seed("a", clock.daysAgo(30), [inboxPath]), Self.seed("z", clock.daysAgo(31), [inboxPath])]
+            + missing.enumerated().map { Self.seed($0.element, clock.daysAgo(30.1 + 0.05 * Double($0.offset)), [inboxPath]) }
+        let local = [Local(id: "a", path: inboxPath, date: clock.daysAgo(30)), Local(id: "z", path: inboxPath, date: clock.daysAgo(31))]
+        let cap = width / 2
+        try await Self.withWorld("gcu-batch-charge", seeds: seeds, local: local, folders: Self.inboxOnly) { world async throws in
+            var capped = Self.unlimited()
+            capped.maxRequests = cap
+            await Self.pass(world, [inboxPath], context: capped)
+            let sent = world.server.http.recordedCalls().count
+            #expect(sent >= 1, "precondition: the folder was listed")
+            #expect(sent <= cap, "a slice capped at \(cap) requests sent \(sent)")
+            #expect(world.server.fullMessageGets().isEmpty, "a batch wider than what is left is not sent in part")
+
+            await Self.pass(world, [inboxPath])
+            #expect(Set(try Self.rows(world, inboxPath).keys) == Set(["a", "z"] + missing),
+                    "the loads held back by the cap come in a later call")
+        }
+    }
+
+    /// The background processing job runs slices back to back. Each slice sends
+    /// at most `SyncConfig.catchUpSliceMaxRequests`, and the next one waits for
+    /// the previous slice's window, so the job's request rate stays within
+    /// `SyncConfig.catchUpMaxRequestsPerSecond` (half of Gmail's per-user quota),
+    /// however fast the link.
+    @Test("Back-to-back slices of the background job stay within the catch-up's request rate on a fast link",
+          .enabled(if: !NetworkMonitor.checkExpensive()))
+    func backToBackSlicesStayWithinTheRate() async throws {
+        let clock = Clock()
+        let cap = SyncConfig.catchUpSliceMaxRequests
+        let slice = SyncConfig.catchUpSliceSeconds
+        // One message every eight days: a range each, three lists each, far more
+        // than three slices can send.
+        let count = 2 * cap
+        let days = (0..<count).map { 8 * Double($0 + 1) }
+        let seeds = days.enumerated().map { Self.seed("r\($0.offset)", clock.daysAgo($0.element), [inboxPath]) }
+        let local = days.enumerated().map { Local(id: "r\($0.offset)", path: inboxPath, date: clock.daysAgo($0.element)) }
+        try await Self.withWorld("gcu-rate", seeds: seeds, local: local, folders: Self.inboxOnly) { world async throws in
+            let account = try await Self.account(world)
+            let start = Date()
+            // The deadline falls inside the third window; a fourth could not start before it.
+            let deadline = start.addingTimeInterval(2.25 * slice)
+            #expect(await world.engine.performBackfill(account: account, deadline: deadline))
+            let elapsed = Date().timeIntervalSince(start)
+            let sent = world.server.http.recordedCalls().count
+            let windows = Int((elapsed / slice).rounded(.down)) + 1
+            #expect(sent > cap, "precondition: the job ran more than one slice (\(sent) requests)")
+            #expect(sent <= cap * windows, "\(sent) requests in \(windows) slice windows of at most \(cap)")
+            #expect(Double(sent) <= SyncConfig.catchUpMaxRequestsPerSecond * elapsed + Double(cap),
+                    "\(sent) requests in \(elapsed) s pass the catch-up's rate")
+            #expect(try Self.state(world, inboxPath)?.listing != nil, "precondition: the listing needs more slices")
+            #expect(Date() <= deadline.addingTimeInterval(slice / 4),
+                    "the job never waits for a slice window past its deadline")
+        }
+    }
+
+    /// Not a check: the #766 measurement. Wall time of the real foreground worker
+    /// (`startBackfill`) for one full listing of a 10-year Inbox (one message every
+    /// two days), with each list request held for `roundTrip` seconds. Runs only
+    /// when the test runner's environment sets `TABMAIL_CATCHUP_MEASURE`.
+    @Test("Measurement: foreground time for one full listing of a 10-year Inbox",
+          .enabled(if: ProcessInfo.processInfo.environment["TABMAIL_CATCHUP_MEASURE"] != nil),
+          arguments: [0.0, 0.2])
+    func measureForegroundListing(roundTrip: Double) async throws {
+        let clock = Clock()
+        let days = Array(stride(from: 3650.0, to: 0, by: -2))
+        let seeds = days.enumerated().map { Self.seed("m\($0.offset)", clock.daysAgo($0.element), [inboxPath]) }
+        let local = days.enumerated().map { Local(id: "m\($0.offset)", path: inboxPath, date: clock.daysAgo($0.element)) }
+        try await Self.withWorld("gcu-measure-\(Int(roundTrip * 1000))", seeds: seeds, local: local, folders: Self.inboxOnly) { world async throws in
+            world.server.holdEveryList(forSeconds: roundTrip)
+            let account = try await Self.account(world)
+            let profile = await world.engine.getBackfillProfile()
+            let start = Date()
+            await world.engine.startBackfill(account: account)
+            let completed = try await Self.eventually(seconds: 3600, poll: .milliseconds(250)) {
+                try Self.state(world, inboxPath)?.lastCompletedAt != nil
+            }
+            let elapsed = Date().timeIntervalSince(start)
+            print("[766-measure] roundTrip=\(roundTrip)s messages=\(days.count) listRequests=\(world.server.listRequests().count) profile=\(profile) seconds=\(String(format: "%.1f", elapsed)) completed=\(completed)")
+            #expect(completed)
+        }
+    }
+
     // MARK: - Through the foreground poll
 
     /// The sync world: a full window of recent mail in Inbox and All Mail, and
@@ -3145,6 +3496,18 @@ struct GmailCatchUpTests {
         _ = try await (engine ?? world.engine).sync(account: account)
     }
 
+    /// The backfill worker's cycles (`runBackfill` with no deadline: the walk, then
+    /// one catch-up slice), until one does no work, as the worker every poll starts
+    /// runs them (#766).
+    private static func backfillCycles(_ world: World, engine: SyncEngine? = nil) async throws {
+        let accountId = world.accountId
+        let account = try #require(try await world.pool.read { db in try Account.fetchOne(db, key: accountId) })
+        for _ in 0..<20 {
+            if !(await (engine ?? world.engine).runBackfill(account: account)) { return }
+        }
+        Issue.record("the backfill cycles kept working")
+    }
+
     /// Every folder's catch-up completed at `at`.
     private static func completeCatchUp(_ world: World, at: Date) async throws {
         await Self.pass(world, [inboxPath, allMailPath], context: Self.unlimited(at: { at }))
@@ -3169,6 +3532,7 @@ struct GmailCatchUpTests {
             world.server.answerHistoryTooLong(true)
 
             try await Self.syncPass(world)
+            try await Self.backfillCycles(world)
 
             let inbox = try Self.rows(world, inboxPath)
             #expect(inbox["o0"]?.isRead == true, "the read change")
@@ -3191,7 +3555,14 @@ struct GmailCatchUpTests {
         }
     }
 
-    @Test("G3: a refusal read in a background pass survives a relaunch, and the next foreground pass re-lists and applies the change",
+    /// The relaunched app's foreground pass lists the window, and its backfill
+    /// cycles run the catch-up that applies the change to older mail. The
+    /// background pass that reads the refusal starts no backfill worker, so
+    /// nothing lists before the relaunch. *Superseded (#766):* the relaunched
+    /// app's next foreground pass applied the change through the full sync's
+    /// catch-up; the catch-up now runs in the backfill worker, which every poll
+    /// starts.
+    @Test("G3: a refusal read in a background pass survives a relaunch, and the relaunched app's foreground pass and backfill cycles re-list and apply the change",
           .enabled(if: !NetworkMonitor.checkExpensive()))
     func lapseSurvivesRelaunch() async throws {
         let clock = Clock()
@@ -3222,6 +3593,7 @@ struct GmailCatchUpTests {
             await relaunched.register(
                 accountId: world.accountId, provider: provider, workQueue: ProviderWorkQueue(provider: provider, maxConcurrency: 1))
             try await Self.syncPass(world, engine: relaunched)
+            try await Self.backfillCycles(world, engine: relaunched)
             await relaunched.remove(accountId: world.accountId)
 
             #expect(try Self.rows(world, inboxPath)["o0"]?.isRead == true, "the change in the lost history is applied")

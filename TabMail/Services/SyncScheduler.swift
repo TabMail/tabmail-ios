@@ -549,7 +549,7 @@ final class SyncScheduler {
                 let accounts = (try? await dbPool.read { db in
                     try Account.filter(Column("isActive") == true).fetchAll(db)
                 }) ?? []
-                let backfillDeadline = Date(timeIntervalSinceNow: 5 * 60)
+                let backfillDeadline = Date(timeIntervalSinceNow: SyncConfig.backgroundBackfillDeadlineSeconds)
                 await withTaskGroup(of: Void.self) { group in
                     for account in accounts {
                         group.addTask { _ = await self.manager.runBackfill(account: account, deadline: backfillDeadline) }

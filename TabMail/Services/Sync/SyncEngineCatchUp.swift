@@ -7,7 +7,9 @@ import GRDB
 
 // MARK: - Catch-up of older mail: the generic apply path (ADR-IOS-107)
 //
-// The full sync's end-of-pass step. It asks the provider ONCE for every syncable
+// The backfill worker's step after the folders' walk (#766; before it, the full
+// sync's end-of-pass step), run in slices under the account's one-sync-at-a-time
+// turn (`runCatchUpRun`). Each slice asks the provider ONCE for every syncable
 // folder's catch-up (`EmailProvider.catchUp`) and applies the provider-blind results
 // through the paths the rest of sync already uses:
 //   - read/flag updates: the merge rule of `runSyncMessages` (provider-address
@@ -134,17 +136,143 @@ struct SyncEngineCatchUpRowReader: CatchUpLocalRowReader {
 
 extension SyncEngine {
 
-    /// The full sync's catch-up step. `folderIds` are the pass's syncable folders,
-    /// re-read here so the provider sees this pass's STATUS values and epochs.
-    /// Never throws: a failure costs this pass's catch-up, never the full sync, and
-    /// it cannot trigger the full sync's connection-error retry (which would double
-    /// the hold). `context` defaults to the production snapshot taken right now,
-    /// first, before anything else: the network state and whether a storage limit
-    /// is in force are read once and hold for the whole step.
-    func runCatchUp(provider: any EmailProvider, folderIds: [String], context: CatchUpContext? = nil) async {
-        let context = context ?? .forPass(
-            isExpensiveNetwork: NetworkMonitor.checkExpensive(),
-            storageLimitInForce: StorageEstimator.budgetMB != Int.max)
+    /// One catch-up run's snapshot (#766): everything the run reads that can
+    /// change while it runs, taken once as the run's first step (root rule:
+    /// snapshot settings at operation start). Every slice reads only this.
+    struct CatchUpRun: Sendable {
+        /// Whether the network was expensive (cellular, a hotspot) when the run
+        /// started.
+        let isExpensiveNetwork: Bool
+        /// Whether the Email Index Limit (the storage budget) was finite when the
+        /// run started.
+        let storageLimitInForce: Bool
+        /// The background processing job's deadline: slices run until it. Nil for
+        /// a foreground backfill cycle, which runs exactly one slice.
+        let deadline: Date?
+        /// How long one slice may spend (`SyncConfig.catchUpSliceSeconds`), and the
+        /// window the next slice of the account waits for.
+        let sliceSeconds: TimeInterval
+        /// Most requests one slice may send (`SyncConfig.catchUpSliceMaxRequests`).
+        var sliceMaxRequests = SyncConfig.catchUpSliceMaxRequests
+        /// The clock the slices and the deadline are measured on. Injectable so a
+        /// test can spend a slice deterministically; production passes `Date.init`.
+        let clock: @Sendable () -> Date
+
+        /// The production snapshot, taken now.
+        static func snapshot(deadline: Date?) -> CatchUpRun {
+            CatchUpRun(
+                isExpensiveNetwork: NetworkMonitor.checkExpensive(),
+                storageLimitInForce: StorageEstimator.budgetMB != Int.max,
+                deadline: deadline, sliceSeconds: SyncConfig.catchUpSliceSeconds, clock: { Date() })
+        }
+
+        /// The context of a slice that starts now: it ends one slice from now, or
+        /// at the run's deadline if that comes first. Nil once the deadline has
+        /// passed.
+        func sliceStartingNow() -> CatchUpContext? {
+            let now = clock()
+            var end = now.addingTimeInterval(sliceSeconds)
+            if let deadline {
+                guard now < deadline else { return nil }
+                end = min(end, deadline)
+            }
+            return CatchUpContext(
+                isExpensiveNetwork: isExpensiveNetwork, deadline: end, clock: clock,
+                storageLimitInForce: storageLimitInForce, maxRequests: sliceMaxRequests)
+        }
+    }
+
+    /// The catch-up of older mail, run by the backfill worker after the folders'
+    /// walk (ADR-IOS-107, #766), in slices. Each slice takes the account's
+    /// one-sync-at-a-time turn (`oneSyncAtATime`, ADR-IOS-104), so it never runs
+    /// beside a delta, a full sync or a lapse, and releases it at the slice's end,
+    /// so a push or silent-push delta that arrives meanwhile waits at most one
+    /// slice. The slice's clock starts when its turn starts, never while it waits.
+    /// A foreground cycle (`run.deadline == nil`) runs one slice; the background
+    /// processing job runs slices until its deadline. Either stops after a slice
+    /// that made no progress, so a folder whose requests keep failing is retried at
+    /// the next cycle, not at network rate. Generic: a provider without catch-up
+    /// returns nothing, and the run stops after one slice. True when a slice made
+    /// progress (the worker's `didWork`).
+    ///
+    /// The request rate: a slice sends at most `run.sliceMaxRequests`, and opens a
+    /// window of `run.sliceSeconds` (real time) in `catchUpSliceWindowEnds`; no
+    /// slice of the account, from this run or another, starts before the window
+    /// ends. The wait happens outside the turn, so a delta is never held by it,
+    /// and never reaches past the run's deadline: a window that ends at or after
+    /// the deadline ends the run.
+    func runCatchUpRun(account: Account, run: CatchUpRun) async -> Bool {
+        guard let queue = workQueues[account.id] else { return false }
+        let provider = queue.provider
+        let accountId = account.id
+        var madeProgress = false
+        runLoop: while !Task.isCancelled {
+            let slice: CatchUpSliceOutcome = await oneSyncAtATime(accountId: accountId) {
+                if let end = self.catchUpSliceWindowEnds[accountId], end > Date() {
+                    // No slice can start before the run's deadline: the run ends
+                    // now rather than wait past it.
+                    if let deadline = run.deadline, run.clock().addingTimeInterval(end.timeIntervalSinceNow) >= deadline {
+                        return .runOver
+                    }
+                    return .windowOpen(until: end)
+                }
+                guard let context = run.sliceStartingNow() else { return .runOver }
+                self.catchUpSliceWindowEnds[accountId] = Date().addingTimeInterval(run.sliceSeconds)
+                let folderIds: [String]
+                do {
+                    folderIds = try await self.syncableFolderIds(accountId: accountId)
+                } catch {
+                    BackgroundSyncLogger.logDebug("[CatchUp] folder read failed: \(error)")
+                    return .ran(progressed: false)
+                }
+                let progressed = (try? await queue.execute(priority: .headerFetch) {
+                    await self.runCatchUp(provider: provider, folderIds: folderIds, context: context)
+                }) ?? false
+                return .ran(progressed: progressed)
+            }
+            switch slice {
+            case .windowOpen(until: let end):
+                try? await Task.sleep(for: .seconds(max(0, end.timeIntervalSinceNow)))
+            case .runOver:
+                break runLoop
+            case .ran(let progressed):
+                madeProgress = madeProgress || progressed
+                guard progressed, run.deadline != nil else { break runLoop }
+            }
+        }
+        return madeProgress
+    }
+
+    /// What one turn of `runCatchUpRun` did.
+    private enum CatchUpSliceOutcome {
+        /// The account's previous slice window is still open: nothing was sent.
+        case windowOpen(until: Date)
+        /// The run's deadline has passed, or the account's open window ends at
+        /// or after it.
+        case runOver
+        /// A slice ran; whether an applied result made progress.
+        case ran(progressed: Bool)
+    }
+
+    /// The account's syncable folders as they are now (`syncableFoldersInOrder`,
+    /// the folders the full sync syncs), in the full sync's order.
+    private func syncableFolderIds(accountId: String) async throws -> [String] {
+        let folders = try await dbPool.read { db in
+            try Folder.filter(Column("accountId") == accountId).fetchAll(db)
+        }
+        return syncableFoldersInOrder(folders).map(\.id)
+    }
+
+    /// One slice of the catch-up. `folderIds` are the syncable folders, re-read
+    /// here so the provider sees their latest STATUS values and epochs. Never
+    /// throws: a failure costs this slice. `context` comes from the run's snapshot
+    /// (`CatchUpRun`): the network state and whether a storage limit is in force
+    /// were read once, when the run started. True when a folder's applied result
+    /// made progress (`CatchUpFolderResult.madeProgress`).
+    /// *Superseded (#766):* "The full sync's catch-up step [...] `context` defaults
+    /// to the production snapshot taken right now".
+    @discardableResult
+    func runCatchUp(provider: any EmailProvider, folderIds: [String], context: CatchUpContext) async -> Bool {
         let ids = folderIds
         let folders: [Folder]
         do {
@@ -153,16 +281,19 @@ extension SyncEngine {
             folders = ids.compactMap { byId[$0] }
         } catch {
             BackgroundSyncLogger.logDebug("[CatchUp] folder read failed: \(error)")
-            return
+            return false
         }
-        guard !folders.isEmpty else { return }
+        guard !folders.isEmpty else { return false }
 
         let results = await provider.catchUp(
             folders: folders, localRows: SyncEngineCatchUpRowReader(pool: dbPool), context: context)
         let windowMode = provider.staleWindowMode
+        var madeProgress = false
         for result in results {
-            await applyCatchUpResult(result, windowMode: windowMode)
+            let outcome = await applyCatchUpResult(result, windowMode: windowMode)
+            if result.madeProgress, case .applied = outcome { madeProgress = true }
         }
+        return madeProgress
     }
 
     /// Apply one folder's catch-up result: first the messages the provider loaded

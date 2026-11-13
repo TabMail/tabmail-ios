@@ -37,6 +37,12 @@ of rolling back the chunk; the load hold clock is per page, cleared whenever the
 stop on the pass budget with nothing loaded hold the page like a held load, so the hold bound also
 ends a page a slow link never finishes; loads that stop on the budget after loading some clear the
 page's hold clock).
+**Amended 2026-11-12: the catch-up runs in the backfill worker (#766)** (decisions 1, 2 and 3, the
+lapse marker, and the consequences: the full sync no longer runs the catch-up. The backfill worker
+runs it after the folders' walk, in slices under the one-sync-at-a-time lock, released between
+slices: one slice per foreground backfill cycle, and slices until the deadline in the background
+processing job. The run snapshots the network state, the storage-limit flag and the deadline when
+it starts. The title's "full sync" is historical.)
 
 **Context.** Every sync path windows its work, and changes to older mail fall outside every window:
 
@@ -64,6 +70,11 @@ The owner's rulings of 2026-11-09:
    `catchUp(folders:localRows:context:) async -> [CatchUpFolderResult]`. It is called ONCE per full
    sync pass with all of the pass's syncable folders, re-read after the folder upsert. Each folder's
    `catchUpState` is the provider's own opaque state.
+   - *Amended 2026-11-12 (#766):* it is called ONCE per slice of the backfill worker's catch-up run
+     (decision 2), with the account's syncable folders as they are when the slice starts: the
+     folders the full sync syncs (`SyncEngine.syncableFoldersInOrder`, main roles and favourites, in
+     the full sync's order), re-read at every slice. The sentence above ("ONCE per full sync pass
+     [...] re-read after the folder upsert") is superseded.
    - The provider reads local rows through `CatchUpLocalRowReader`. It gets ids and the read and
      flagged state, never content (ADR-004), and reads by numeric range, by first id, by an id list,
      or as an ordered scan. Nothing loads a whole folder.
@@ -107,17 +118,89 @@ The owner's rulings of 2026-11-09:
      double the hold.
    - `CatchUpContext` is a value snapshot taken when the step starts: `NetworkMonitor.checkExpensive()`,
      the budget deadline and the clock.
+   - *Superseded 2026-11-12 (#766):* the placement above. A full sync runs at most every 15 minutes
+     and gave the catch-up 2 s, so one listing of a ten-year folder (about 1,570 list requests) took
+     about 56 hours of app-open time, and the overnight background processing job never ran it.
+   - **Placement since #766.** The backfill worker runs the catch-up: `SyncEngine.runBackfill` is the
+     folders' walk (`runBackfillWalk`) followed by the catch-up run (`runCatchUpRun`), for every
+     provider (one without catch-up returns `[]` from the default, so its run ends after one empty
+     slice). It is the only caller. Both callers of `runBackfill` run it: the foreground worker
+     (`startBackfill`, which every foreground poll starts) and the background processing job
+     (`SyncScheduler`'s BGProcessing drain, through `performBackfill`). No cast or switch names a
+     provider above the boundary (ADR-IOS-060).
+     - **Run-start snapshot.** When the run starts, after the walk, `SyncEngine.CatchUpRun.snapshot`
+       reads `NetworkMonitor.checkExpensive()`, whether a storage limit is in force
+       (`StorageEstimator.budgetMB != Int.max`) and the deadline (the job's, or none for a foreground
+       cycle). Every slice's `CatchUpContext` comes from that snapshot only (root rule: snapshot
+       settings at operation start). It is taken after the walk, not before it, so a long walk never
+       hands the catch-up a network state from before the walk.
+     - **Slices under the lock.** Each slice takes the account's `oneSyncAtATime` turn (ADR-IOS-104),
+       runs inside `queue.execute(.headerFetch)`, and releases the turn when it ends. The slice's clock
+       starts when its turn starts, not while it waits. A push or silent-push delta (or a foreground
+       pass) that arrives during the catch-up therefore waits at most one slice, and the turn is FIFO,
+       so it runs before the run's next slice. A slice never throws.
+     - **How many slices.** A foreground cycle (no deadline) runs ONE slice. The background job runs
+       slices until its deadline (`SyncConfig.backgroundBackfillDeadlineSeconds`, 5 minutes, which
+       also bounds the walk; formerly the literal `5 * 60` in `SyncScheduler`). Either stops after a
+       slice in which no applied result made progress (`CatchUpFolderResult.madeProgress`, set below
+       the boundary: the listing moved or completed, or something loaded or applies), so a folder
+       whose requests keep failing is tried again at the next cycle, never at network rate.
+     - **The worker's cycle.** `runBackfill` returns true when the walk did work or the catch-up made
+       progress, so the foreground worker keeps cycling (the profile's active delay between cycles:
+       3 s, or 0.5 s on power) until the listing completes; then a cycle does no work and, with the
+       walk done, the worker exits until the next poll starts it.
+     - **The worker's gates now gate the catch-up.** The worker pauses while the battery is below 20%
+       and not charging, and while the Wi-Fi-only setting (`backgroundSyncWiFiOnly`, default on) is
+       on and the network is expensive; the background job does not run in Low Power Mode or, with
+       Wi-Fi-only on, on an expensive network. The catch-up waits for the same conditions as the walk
+       (see the consequences).
+     - Tests: `GmailCatchUpTests.sliceHandsTheTurnOn` (a delta that arrives during the run waits at
+       most one slice), `jobHandsTheTurnOnBetweenSlices` (the same through the background job's
+       production entry, `performBackfill`), both on a work queue of production's width so the queue
+       cannot serialize the delta in the lock's place, `deadlineMidListingResumes` (a deadline
+       mid-listing stops the run and the next run resumes from the saved range),
+       `deadlineCutsTheSliceShort` (a deadline inside a slice ends that slice), `runStopsWithoutProgress`, `foregroundCycleMakesProgress`
+       (one cycle, one slice, and the worker completes the listing), `backgroundJobRunsTheCatchUp`,
+       and `IMAPCatchUpTests.backfillCycleRunsTheCatchUp`.
 3. **The bounded hold.** `SyncConfig.catchUpPassBudgetSeconds = 2` covers the whole step across all
    folders and is checked before EVERY request. Each request runs under
    `SyncConfig.catchUpRequestTimeoutSeconds = 3`; a timeout or any failure ends that folder's work
    for the pass. **The added hold is typically about 2 s, and at most about 5 s** (the budget plus
    one request that started just inside it).
+   - *Amended 2026-11-12 (#766):* the budget is per SLICE: `SyncConfig.catchUpSliceSeconds = 2`
+     (formerly `catchUpPassBudgetSeconds`), checked before every request, with the same request
+     timeout. A slice holds the lock for about 2 s typically and about 5 s at most, and the lock is
+     released between slices. "For the pass" above reads "for the slice". It no longer adds to a full
+     sync's hold: the full sync runs no catch-up.
    - *Amended 2026-11-12 (the direct load):* the Gmail catch-up's loads run in batches of
      `BackfillProfile.normal.gmailBodyConcurrency` (10) concurrent `format=full` GETs, the width the
      provider uses for every body fetch. The budget is checked before every request OR every batch,
      and one batch is bounded as a whole by `catchUpRequestTimeoutSeconds`, so the added hold is
      still at most the budget plus one timeout; the request count may pass the budget check by at
      most one batch less one (the seeded direct-load property checks this).
+   - *Superseded 2026-11-12 (#766, the request cap below):* the slice was bounded by time only, so the
+     number of requests one slice sends was whatever a fast link answered in 2 s, and back-to-back
+     slices of the background job had no rate bound.
+   - *Amended 2026-11-12 (#766): a request cap per slice and a pacing window.* A slice is bounded by
+     time AND by a request count, `SyncConfig.catchUpSliceMaxRequests`. `CatchUpContext` counts
+     the requests it allows: `hasBudget(cost:)` is false once the slice's time or its count is
+     spent, and a provider charges every request before sending it. A batch of concurrent loads is
+     charged its whole width before any of it is sent, so a batch that does not fit in what is left
+     is not sent at all and no slice ever passes the cap (this replaces the "one batch less one"
+     overshoot above). The cap is derived, not chosen: back-to-back slices must keep the sustained
+     rate at no more than half of Gmail's documented per-user quota. That quota is 250 units/s, a
+     list or a get costs 5 units, so half the quota is 250 × 0.5 ÷ 5 = 25 requests/s
+     (`catchUpMaxRequestsPerSecond`), and one 2 s slice may send 25 × 2 = 50 requests. The rate
+     holds across slices because each slice opens a window of `catchUpSliceSeconds` (real time,
+     per account, in `SyncEngine.catchUpSliceWindowEnds`): no slice of the account, from the same
+     run or another (a foreground cycle and the background job), starts before the previous window
+     ends. The wait happens outside the lock, so a delta never waits for it, and never reaches past
+     the run's deadline: a window that ends at or after the deadline ends the run. IMAP charges the
+     same count (one per UID SEARCH or FETCH); the cap is generic and sits below the boundary only
+     where requests are sent. Tests: `GmailCatchUpTests.loadBatchIsChargedItsWidthFirst`,
+     `backToBackSlicesStayWithinTheRate`, and
+     `BackfillPageWalkHoldBoundTests.heldPageWorkerWaitsTheIdleDelay` (counts every request of the
+     worker's cycles, walk and catch-up, against the walk's budget plus the slice cap).
 4. **The generic apply** (`SyncEngineCatchUp.swift`) uses the existing paths only.
    1. Nothing is inserted (decision 1). *Amended 2026-11-12 (the direct load):* except the result's
       `loaded` messages, which go in first, through the backfill page walk's insert tail, read with
@@ -695,7 +778,9 @@ The owner's rulings of 2026-11-09:
        after it started (`GmailCatchUpState.lapsedSinceLastListing`), a new listing starts at once,
        in the same pass (on an expensive network it waits like any listing), because a change the
        lost history held may sit in a range that listing had already passed. With no listing in
-       progress, the plan starts one at the next full sync. So a change is repaired within at most
+       progress, the plan starts one at the next full sync. *Amended 2026-11-12 (#766):* at the
+       backfill worker's next slice, which the next poll's worker (or the background job) runs; no
+       full sync is needed. So a change is repaired within at most
        two listings' worth of ranges: the rest of the listing in progress, then the new one, newest
        first, however often lapses come. The lapse runs under the account's one-sync-at-a-time
        lock, as the catch-up does, so no catch-up reads a state before a lapse and writes it after.
@@ -734,6 +819,26 @@ The owner's rulings of 2026-11-09:
 
 **Consequences.**
 
+- *Amended 2026-11-12 (#766), the schedule:*
+  - A Gmail listing gets one 2 s slice per foreground backfill cycle (a cycle every 3 s while it
+    makes progress, 0.5 s on power) and slices for up to 5 minutes in every background processing
+    job, instead of 2 s per full sync. Measured in the simulator against the REST fake, for a
+    ten-year Inbox (1,825 messages, one every two days; 1,371 list requests), the foreground worker
+    alone (the normal profile, no background job) completes one listing in about 90 s when a request
+    takes no time (the slice cap and window bound it: 50 requests per slice) and in about 12 minutes
+    (712 s) when every list request takes 0.2 s. Before, the same listing took about 56 hours of
+    app-open time. (`GmailCatchUpTests.measureForegroundListing`, run only when the test runner's
+    environment sets `TABMAIL_CATCHUP_MEASURE`.)
+  - **The 7-day bound below now holds only when the worker may run.** With the Wi-Fi-only setting on
+    (the default), the catch-up, like the walk, does not run on an expensive network, so a device
+    that is always on cellular or a hotspot gets no catch-up. With the setting off, the 7-day
+    expensive-network bound holds as before. The battery gate (below 20%, not charging) and Low Power
+    Mode (background job) pause it too.
+  - **An IMAP folder whose HIGHESTMODSEQ moves is relisted at the next worker cycle**, which every
+    poll starts, instead of at the next full sync: an active IMAP Inbox may be relisted about once a
+    minute in the foreground (about 50 bytes per message per listing), one slice at a time.
+  - The bullets below that speak of a pass or of "the hold under the sync lock" read per slice; a
+    full sync's hold no longer includes the catch-up.
 - An older-mail read or flag change reaches the device within one pass if the server supports
   CONDSTORE (a large folder may take several passes), otherwise within the full-check interval.
 - A removal in a folder that is not fully backfilled is applied within the full-check interval.
@@ -752,6 +857,10 @@ The owner's rulings of 2026-11-09:
 **Alternatives rejected.**
 
 - A per-folder provider call: it would put the budget and the ordering above the boundary.
+- (#766) Keeping the catch-up in the full sync with a longer budget: it lengthens the hold of every
+  full sync and still leaves the overnight job without it. A separate catch-up worker beside the
+  backfill worker: a second loop with its own gates and schedule, where the backfill worker already
+  has both.
 - `UID SEARCH MODSEQ` plus a FETCH of the changed UIDs: it needs NIOIMAPCore's
   `SearchModificationSequence`, and the agreed shape is a listing.
 - `CHANGEDSINCE`: the SwiftMail fork has no FETCH modifier for it.

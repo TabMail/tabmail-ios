@@ -616,7 +616,17 @@ struct BackfillPageWalkHoldBoundTests {
     /// work. The worker then waits the profile's idle delay before listing
     /// the held page again, instead of listing it at network rate; and it
     /// does list it again once that delay has passed.
-    @Test("On the fast-sync profile the backfill worker lists a held page again only after the idle delay")
+    ///
+    /// The load on Gmail is counted in full (#766): every request the worker
+    /// sends in those two calls, the walk's and the catch-up's that each backfill
+    /// call now runs after it, extra GETs included, stays within the named
+    /// limits: per call, one page list and one GET per message on the page
+    /// (`F.pageSize`) for the walk, and `SyncConfig.catchUpSliceMaxRequests` for
+    /// the catch-up slice; plus the one progress read of the account's total. A
+    /// walk call is told by its GET of m1, the held message, which every walk
+    /// call that lists the held page sends once. *Superseded (#766):* the pace was
+    /// read from the INBOX list requests, which now include the catch-up's.
+    @Test("On the fast-sync profile the backfill worker lists a held page again only after the idle delay, within the request budget")
     func heldPageWorkerWaitsTheIdleDelay() async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
@@ -628,27 +638,38 @@ struct BackfillPageWalkHoldBoundTests {
         let accountId = "gm-held-worker-pace"
         let (server, account) = try Self.gmailInbox(accountId, pool: pool)
         defer { server.close() }
+        // The account's total is read once and kept, so the progress reads are one request.
+        server.serveProfile()
         server.injectGetFailure(providerMessageId: "m1", .status(503))
         let engine = await F.registeredEngine(accountId: accountId, provider: server.provider())
         let wasFastSync = await MainActor.run { AccountManagerState.shared.fastSyncModeActive }
         await MainActor.run { AccountManagerState.shared.fastSyncModeActive = true }
         let profile = await engine.getBackfillProfile()
         let idleDelay = profile.interCycleIdleDelay
-        let listings = { F.gmailListRequests(server, label: "INBOX") }
+        let walkCalls = { server.getFailuresServedCount(providerMessageId: "m1") }
+        let requests = { server.http.recordedCalls().count }
+        let progressReads = 1
+        let walkCallBudget = 1 + F.pageSize
+        let callBudget = walkCallBudget + SyncConfig.catchUpSliceMaxRequests
 
         await engine.startBackfill(account: account)
-        let heldTwice = await Self.eventually(within: F.safetySeconds) { listings() >= 2 }
-        try? await Task.sleep(for: .seconds(idleDelay / 2))
-        let listedInsideTheIdleDelay = listings()
-        let listedAgainAfterIt = await Self.eventually(within: idleDelay + F.safetySeconds) { listings() >= 3 }
+        let heldTwice = await Self.eventually(within: F.safetySeconds) { walkCalls() >= 2 }
+        // The third walk call may come no sooner than one idle delay after the
+        // second call ended, so nothing may start inside nine tenths of it.
+        try? await Task.sleep(for: .seconds(idleDelay * 0.9))
+        let walkCallsInsideTheIdleDelay = walkCalls()
+        let requestsInsideTheIdleDelay = requests()
+        let listedAgainAfterIt = await Self.eventually(within: idleDelay + F.safetySeconds) { walkCalls() >= 3 }
         await engine.remove(accountId: accountId)
         await MainActor.run { AccountManagerState.shared.fastSyncModeActive = wasFastSync }
 
         #expect(profile == .turbo, "precondition: the worker ran on the fast-sync profile")
         #expect(profile.interCycleActiveDelay == 0, "precondition: the fast-sync profile does not wait between productive calls")
-        #expect(heldTwice, "precondition: the worker listed the held page twice; listings: \(listings())")
-        #expect(listedInsideTheIdleDelay <= 2,
-                "the worker listed a held page again without waiting the idle delay: \(listedInsideTheIdleDelay) listings within \(idleDelay / 2)s")
+        #expect(heldTwice, "precondition: the worker listed the held page twice; walk calls: \(walkCalls())")
+        #expect(walkCallsInsideTheIdleDelay <= 2,
+                "the worker listed a held page again without waiting the idle delay: \(walkCallsInsideTheIdleDelay) walk calls")
+        #expect(requestsInsideTheIdleDelay <= progressReads + 2 * callBudget,
+                "two backfill calls sent \(requestsInsideTheIdleDelay) requests; the budget is \(progressReads) + 2 × \(callBudget): \(server.http.recordedCalls().map(\.url))")
         #expect(listedAgainAfterIt, "the worker stopped instead of listing the held page again after the idle delay")
         #expect(try !Self.isComplete(accountId, "INBOX", pool: pool), "a held page was passed over")
         #expect(try F.messageIds(accountId, "INBOX", pool: pool) == ["m2"])

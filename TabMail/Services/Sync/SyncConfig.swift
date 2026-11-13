@@ -277,6 +277,10 @@ enum SyncConfig {
     static let backfillPageHoldMinutes: Double = 60
     /// `backfillPageHoldMinutes` in seconds, for comparing against elapsed time.
     static var backfillPageHoldSeconds: TimeInterval { backfillPageHoldMinutes * 60 }
+    /// How long one background processing job (`SyncScheduler`'s BGProcessing drain)
+    /// gives the backfill worker of every account (seconds): the folders' walk, then
+    /// the catch-up of older mail in slices (ADR-IOS-107), until this deadline.
+    static let backgroundBackfillDeadlineSeconds: TimeInterval = 5 * 60
     /// Pruning batch size — how many messages to process per iteration when over budget.
     static let pruneChunkSize = 50
     /// FTS bulk-index batch size — headers indexed per folder page.
@@ -709,15 +713,43 @@ enum SyncConfig {
 
     // MARK: - Catch-up of older mail (ADR-IOS-107)
 
-    /// Time budget for the whole catch-up step of one full-sync pass, across every
-    /// folder (seconds). Checked before EVERY provider request, so the step stops
-    /// issuing requests once it is spent. It runs under the one-sync-at-a-time lock
-    /// (ADR-IOS-104), so this is the typical added hold of a pass.
-    static let catchUpPassBudgetSeconds: TimeInterval = 2
+    /// Length of one catch-up slice, across every folder (seconds). The backfill
+    /// worker runs the catch-up in slices, each under the account's
+    /// one-sync-at-a-time lock (ADR-IOS-104), released between slices: one slice per
+    /// foreground backfill cycle, and slices until the job's deadline in the
+    /// background processing job. Checked before EVERY provider request, so a slice
+    /// stops issuing requests once it is spent, and a delta that arrives meanwhile
+    /// waits at most one slice. *Was* `catchUpPassBudgetSeconds`, the budget of the
+    /// full sync's catch-up step (before #766).
+    static let catchUpSliceSeconds: TimeInterval = 2
+    /// Gmail's documented per-user request quota (quota units per second) and the
+    /// cost of one `messages.list` or `messages.get` (quota units). The catch-up's
+    /// request cap is derived from them.
+    static let gmailPerUserQuotaUnitsPerSecond: Double = 250
+    static let gmailUnitsPerListOrGet: Double = 5
+    /// The share of that quota the catch-up may use while its slices run back to
+    /// back (the background processing job), so the rest of the app always has the
+    /// other half.
+    static let catchUpQuotaShare: Double = 0.5
+    /// The catch-up's sustained request rate (requests per second):
+    /// 250 units/s × 0.5 ÷ 5 units per request = 25 requests/s.
+    static let catchUpMaxRequestsPerSecond: Double =
+        gmailPerUserQuotaUnitsPerSecond * catchUpQuotaShare / gmailUnitsPerListOrGet
+    /// Most provider requests one catch-up slice may send, across every folder:
+    /// 25 requests/s × the 2 s slice = 50. Charged before each request is sent
+    /// (a batch of concurrent loads is charged its whole width first, so it never
+    /// takes the count past the cap). A slice ends when either its time or this
+    /// count is spent, and the next slice of the same account never starts before
+    /// the previous one's `catchUpSliceSeconds` window has ended, so slices that
+    /// run back to back send at most this many requests per window: at most
+    /// `catchUpMaxRequestsPerSecond`. *Superseded (#766, before this cap):* the
+    /// slice was bounded by time only, so on a fast link its request count was set
+    /// by the round-trip time alone.
+    static let catchUpSliceMaxRequests = Int((catchUpMaxRequestsPerSecond * catchUpSliceSeconds).rounded(.down))
     /// Timeout for ONE catch-up request (seconds). A request that starts just inside
-    /// the budget can run this long, so the worst-case added hold is
-    /// `catchUpPassBudgetSeconds + catchUpRequestTimeoutSeconds` (about 5 s). A
-    /// timeout ends the step for the pass; the state written so far resumes it.
+    /// the slice can run this long, so the worst-case hold of a slice is
+    /// `catchUpSliceSeconds + catchUpRequestTimeoutSeconds` (about 5 s). A
+    /// timeout ends the folder's work for the slice; the state written so far resumes it.
     static let catchUpRequestTimeoutSeconds: TimeInterval = 3
     /// How often an IMAP folder gets a full listing even when nothing signals a
     /// change (seconds). Runs only on a non-expensive network, oldest folder first.
@@ -728,7 +760,7 @@ enum SyncConfig {
     /// The longest a folder's full listing waits for a non-expensive network
     /// (seconds), counted from its last completed listing, or from the catch-up's
     /// first sight of the folder. After that it runs on any network, inside the
-    /// same pass budget, so a device that is always on cellular or a hotspot still
+    /// same slices, so a device that is always on cellular or a hotspot still
     /// gets a full catch-up. About 50 bytes per message.
     static let catchUpExpensiveNetworkMaxWaitSeconds: TimeInterval = 7 * 86_400
     /// Width of one IMAP listing range, in UIDs (`UID FETCH lo:hi (UID FLAGS)`).

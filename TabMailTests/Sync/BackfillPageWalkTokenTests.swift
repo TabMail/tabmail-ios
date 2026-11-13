@@ -191,4 +191,37 @@ struct BackfillPageWalkTokenTests {
         #expect(Self.graphListRequests(server, folderId: folderId) == 3,
                 "listing requests: \(Self.graphListRequests(server, folderId: folderId))")
     }
+
+    // MARK: - The walk sends no after: bound
+
+    /// The page-walk suites leave the catch-up's range lists out of their count
+    /// of the walk's lists by their `after:` bound
+    /// (`BackfillPageWalkFixture.gmailListRequestURLs`; a backfill call runs the
+    /// catch-up after the walk since #766). That count is exact only while the walk
+    /// never sends one: no `after:` in the walk's sources, its list calls pass no
+    /// `window` (the only way `GmailProvider.messageListPath` adds one), and a list
+    /// path without a window holds none.
+    @Test("The page walk never sends an after: bound, so the walk suites' count of its lists is exact")
+    func walkNeverSendsAnAfterBound() throws {
+        let walkFiles = try DiagnosticPrintGateTests.appTargetSources()
+            .filter { $0.relativePath.hasPrefix("TabMail/Services/Sync/SyncEngineBackfill") }
+        #expect(!walkFiles.isEmpty, "precondition: the walk's sources were found")
+        var listCalls = 0
+        for file in walkFiles {
+            #expect(!file.source.contains("after:"), "\(file.relativePath) names an after: bound")
+            var rest = Substring(file.source)
+            while let call = rest.range(of: "listMessageIdsPage(") {
+                listCalls += 1
+                let tail = rest[call.upperBound...]
+                let arguments = tail.prefix { $0 != ")" }
+                #expect(!arguments.contains("window"), "\(file.relativePath) passes a window to a walk list: \(arguments)")
+                rest = tail
+            }
+        }
+        #expect(listCalls >= 1, "precondition: the walk's list calls were found")
+        for folder in ["INBOX", GmailProvider.archivePath] {
+            let path = GmailProvider.messageListPath(folder: folder, window: nil, pageToken: "t", pageSize: F.pageSize)
+            #expect(!path.contains("after"), "a list without a window sends an after: bound: \(path)")
+        }
+    }
 }

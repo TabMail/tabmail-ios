@@ -269,11 +269,12 @@ extension GmailProvider {
         var load = MissingLoad()
         let batchSize = BackfillProfile.normal.gmailBodyConcurrency
         for start in stride(from: 0, to: ids.count, by: batchSize) {
-            guard context.hasBudget() else {
+            let batch = Array(ids[start..<min(start + batchSize, ids.count)])
+            // The whole batch is charged before any of it is sent.
+            guard context.hasBudget(cost: batch.count) else {
                 load.complete = false
                 break
             }
-            let batch = Array(ids[start..<min(start + batchSize, ids.count)])
             let answered = OSAllocatedUnfairLock<[BackfillResult]>(initialState: [])
             do {
                 try await withTimeout(seconds: SyncConfig.catchUpRequestTimeoutSeconds) {
@@ -306,7 +307,7 @@ extension GmailProvider {
         context: CatchUpContext, token: String?,
         page: @escaping @Sendable (_ token: String?) async throws -> (ids: [String], nextPageToken: String?)
     ) async throws(RangeStop) -> (ids: [String], nextPageToken: String?) {
-        guard context.hasBudget() else { throw .budget }
+        guard context.hasBudget(cost: 1) else { throw .budget }
         do {
             return try await withTimeout(seconds: SyncConfig.catchUpRequestTimeoutSeconds) {
                 try await page(token)
@@ -362,7 +363,7 @@ extension GmailProvider {
             // on a failure that is no answer, the rest wait in the state for the
             // next pass.
             while let id = listing.pendingCandidates.first {
-                guard context.hasBudget() else { break rangeLoop }
+                guard context.hasBudget(cost: 1) else { break rangeLoop }
                 let labels: [String]?
                 do {
                     labels = try await withTimeout(seconds: SyncConfig.catchUpRequestTimeoutSeconds) {
@@ -623,6 +624,12 @@ extension GmailProvider {
         newState.lastAttemptAt = context.clock()
         newState.listing = listingDone ? nil : listing
         result.newState = newState.encoded()
+        // Progress: the listing moved (a page, a range, a candidate answered, a
+        // hold clock started) or completed, or something loaded or applies. A
+        // request that failed before anything moved, or a page still held, is no
+        // progress, so the worker does not list it again at once.
+        result.madeProgress = listingDone || listing != state?.listing
+            || !result.loaded.isEmpty || !result.removedIds.isEmpty || !result.flagUpdates.isEmpty
         if DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[CatchUp] \(path): flags=\(result.flagUpdates.count) removed=\(result.removedIds.count) loaded=\(result.loaded.count) failed=\(result.loadFailures.count) \(listingDone ? "listing complete" : "resumes before \(listing.nextBeforeSecond.map(String.init) ?? "the newest row")")")
         }

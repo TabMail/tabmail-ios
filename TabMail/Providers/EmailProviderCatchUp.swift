@@ -3,14 +3,16 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import os
 
 // MARK: - Catch-up of older mail (ADR-IOS-107)
 //
-// The provider-blind seam through which a full-sync pass learns about server-side
+// The provider-blind seam through which the backfill worker learns about server-side
 // changes to mail no other sync path looks at again: a read or flag change, or a
-// removal, on a message older than every sync window. The full sync calls
-// `EmailProvider.catchUp` ONCE per pass with all of the pass's syncable folders and
-// applies whatever comes back through its existing paths. Everything provider-specific
+// removal, on a message older than every sync window. The worker calls
+// `EmailProvider.catchUp` ONCE per slice with all of the account's syncable folders
+// and applies whatever comes back through the existing paths (`SyncEngine.runCatchUpRun`;
+// before #766 the full sync called it once per pass). Everything provider-specific
 // (whether a folder needs a listing, how a listing resumes, what proves a removal)
 // lives below this seam, encoded in an opaque per-folder state string only the
 // provider reads.
@@ -51,12 +53,13 @@ protocol CatchUpLocalRowReader: Sendable {
     func newestRows(folderId: String, orderDatesBefore upper: Date?, limit: Int) async throws -> [CatchUpLocalRow]
 }
 
-/// What one catch-up call may spend and on what kind of network. A value snapshot
-/// taken by the caller at the start of the operation (root rule: snapshot settings
-/// at operation start); neither the provider nor the apply re-reads the network
-/// state or the storage limit itself.
+/// What one catch-up call (one slice) may spend and on what kind of network. Its
+/// network state and storage-limit flag come from the run's snapshot, taken when the
+/// run started (`SyncEngine.CatchUpRun`; root rule: snapshot settings at operation
+/// start); neither the provider nor the apply re-reads the network state or the
+/// storage limit itself.
 struct CatchUpContext: Sendable {
-    /// `NetworkMonitor.checkExpensive()` as it stood when the pass began.
+    /// `NetworkMonitor.checkExpensive()` as it stood when the run began.
     let isExpensiveNetwork: Bool
     /// No request may START at or after this instant.
     let deadline: Date
@@ -64,24 +67,37 @@ struct CatchUpContext: Sendable {
     /// budget deterministically; production passes `Date.init`.
     let clock: @Sendable () -> Date
     /// Whether the user's Email Index Limit (`StorageEstimator.budgetMB`) was a
-    /// finite limit when the pass began. The limit means old mail is not kept:
+    /// finite limit when the run began. The limit means old mail is not kept:
     /// the storage prune deletes the oldest rows once the store passes it
     /// (ADR-IOS-006). So while it holds, a provider lists no mail older than the
     /// folder's oldest local row, and so loads none back (ADR-IOS-107 decision 8).
     var storageLimitInForce = false
+    /// Most requests this call may send (`SyncConfig.catchUpSliceMaxRequests` for a
+    /// slice of the backfill worker's catch-up). `Int.max` bounds it by time only.
+    var maxRequests = Int.max
+    /// Requests charged so far, shared by every copy of this context.
+    private let charged = OSAllocatedUnfairLock<Int>(initialState: 0)
 
-    /// The production snapshot: the budget starts now.
-    static func forPass(isExpensiveNetwork: Bool, storageLimitInForce: Bool) -> CatchUpContext {
-        let now = Date()
-        return CatchUpContext(
-            isExpensiveNetwork: isExpensiveNetwork,
-            deadline: now.addingTimeInterval(SyncConfig.catchUpPassBudgetSeconds),
-            clock: { Date() },
-            storageLimitInForce: storageLimitInForce)
+    /// Whether the call may go on: time is left and the request count is not
+    /// spent. Charges nothing; a provider asks it before starting a folder.
+    /// *Superseded:* "Checked before EVERY request: false once the slice is spent"
+    /// (now `hasBudget(cost:)`, which also counts).
+    func hasBudget() -> Bool {
+        clock() < deadline && charged.withLock { $0 < maxRequests }
     }
 
-    /// Checked before EVERY request: false once the pass budget is spent.
-    func hasBudget() -> Bool { clock() < deadline }
+    /// Checked before EVERY request, with `cost` the requests about to be sent (the
+    /// whole width of a batch of concurrent loads). True, and `cost` charged,
+    /// only when time is left and the count stays within `maxRequests`; false
+    /// otherwise, and nothing is charged.
+    func hasBudget(cost: Int) -> Bool {
+        guard clock() < deadline else { return false }
+        return charged.withLock { spent in
+            guard cost <= maxRequests - spent else { return false }
+            spent += cost
+            return true
+        }
+    }
 }
 
 /// A read/flag state the server reported for one existing message.
@@ -91,13 +107,13 @@ struct CatchUpFlagUpdate: Sendable, Equatable {
     let isFlagged: Bool
 }
 
-/// The provider-blind result for one folder. The full sync applies it in one write
-/// transaction together with `newState`.
+/// The provider-blind result for one folder. The apply (`SyncEngine.applyCatchUpResult`)
+/// writes it in one write transaction together with `newState`.
 struct CatchUpFolderResult: Sendable {
     let folderId: String
     /// The id epoch every id below belongs to (IMAP: the UIDVALIDITY of the SELECTs
-    /// that produced them), or nil for a provider whose ids carry no epoch. The full
-    /// sync applies nothing unless this equals the folder's stored known epoch; a
+    /// that produced them), or nil for a provider whose ids carry no epoch. The apply
+    /// writes nothing unless this equals the folder's stored known epoch; a
     /// result whose epoch DIFFERS from a known stored one reports a turnover.
     let epoch: UInt32?
     /// Changes to rows the device already holds.
@@ -119,6 +135,14 @@ struct CatchUpFolderResult: Sendable {
     /// The missing ids that did not load, each with the page walk's own
     /// classification of its failure (`SyncEngine.backfillFetchFailureKind`).
     var loadFailures: [String: SyncEngine.BackfillFetchFailureKind] = [:]
+    /// The folder's catch-up moved forward in this call: its listing advanced or
+    /// completed, or it found something to apply. False when the call only recorded
+    /// an attempt (a request that failed or timed out before anything moved, a page
+    /// still held) or a first sight on an expensive network. The backfill worker
+    /// runs another slice only after one in which an applied result made progress,
+    /// so a folder whose requests keep failing is tried again at the worker's next
+    /// cycle, never at network rate (#766).
+    var madeProgress = false
 }
 
 /// The delta-cursor lapse marker every provider's catch-up state may carry
@@ -156,7 +180,7 @@ enum CatchUpSchedule {
         return now.timeIntervalSince(since) >= SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds
     }
 
-    /// `folders` in the order a pass works them: never-tried first, then by the
+    /// `folders` in the order a slice works them: never-tried first, then by the
     /// last try (a completion is a try), so a folder whose requests keep failing
     /// goes behind the others and cannot hold their catch-up past its bound.
     /// Stable on the caller's order for ties.
@@ -170,8 +194,8 @@ enum CatchUpSchedule {
 
 extension EmailProvider {
     /// Default: no catch-up. A provider without support (Exchange and Demo until
-    /// their own catch-up lands) returns nothing, and the full sync then writes
-    /// nothing.
+    /// their own catch-up lands) returns nothing, and the backfill worker then writes
+    /// nothing and runs no further slice.
     func catchUp(
         folders: [Folder], localRows: any CatchUpLocalRowReader, context: CatchUpContext
     ) async -> [CatchUpFolderResult] {

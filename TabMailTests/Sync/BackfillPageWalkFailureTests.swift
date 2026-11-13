@@ -339,7 +339,10 @@ struct BackfillPageWalkFailureTests {
         server.injectUnclassified400OnGet(providerMessageId: "m3")
         let engine = await F.registeredEngine(accountId: accountId, provider: server.provider())
 
-        _ = await engine.runBackfill(account: account, deadline: F.deadline())
+        // The walk alone: a whole backfill call (`runBackfill`) then runs the
+        // catch-up, whose check of the completed folder asks for m3 again (a fetch
+        // the walk passed over loads at the next check, ADR-IOS-107; #766).
+        _ = await engine.runBackfillWalk(account: account, deadline: F.deadline())
 
         #expect(try Self.isComplete(accountId, "INBOX", pool: pool), "a per-message failure kept the folder from completing")
         #expect(try F.messageIds(accountId, "INBOX", pool: pool) == ["m1", "m2"])

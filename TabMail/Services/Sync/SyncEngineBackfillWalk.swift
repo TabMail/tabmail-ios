@@ -1037,12 +1037,28 @@ extension SyncEngine {
 
     // MARK: - Unified Backfill Walk
 
+    /// One backfill call for this account: the folders' walk (`runBackfillWalk`),
+    /// then the catch-up of older mail (ADR-IOS-107, #766) for every provider; one
+    /// without catch-up returns nothing. `deadline` is the background processing
+    /// job's: the walk stops at it and the catch-up runs slices until it. With no
+    /// deadline (a foreground cycle of `startBackfill`) the catch-up runs one slice.
+    /// The catch-up's snapshot (`CatchUpRun`) is taken when the catch-up starts,
+    /// after the walk, so a long foreground walk never hands it a network state
+    /// from before the walk. Returns true if the walk did work or the catch-up made
+    /// progress, so the worker keeps cycling while either has more to do.
+    func runBackfill(account: Account, deadline: Date? = nil) async -> Bool {
+        let walked = await runBackfillWalk(account: account, deadline: deadline)
+        guard !Task.isCancelled else { return walked }
+        let caughtUp = await runCatchUpRun(account: account, run: .snapshot(deadline: deadline))
+        return walked || caughtUp
+    }
+
     /// Crawl folders for this account, inserting headers AND indexing bodies in the same walk.
     /// Gmail/Exchange: single API call per message (format=full) — headers + body together.
     /// IMAP: header fetch then body fetch in the same iteration (protocol limitation).
     /// After walking all folders, runs a cleanup pass for any remaining empty bodies.
     /// Returns true if any work was done.
-    func runBackfill(account: Account, deadline: Date? = nil) async -> Bool {
+    func runBackfillWalk(account: Account, deadline: Date? = nil) async -> Bool {
         var didWork = false
         let fastSync = await getIsFastSync()
         let isPastDeadline: () -> Bool = {
