@@ -1492,4 +1492,129 @@ struct CalendarScopedDeleteTests {
             #expect(r.queued.isEmpty, "the delete did not complete: \(summary(r))")
         }
     }
+
+    @Test("Google: every occurrence, named by one occurrence's id, deletes the series, not that occurrence alone")
+    func googleAllFromAnOccurrence() async throws {
+        let slot = try #require(LateSeries.at(day(7)))
+        let (device, _, _) = try deleteZones(at: slot)
+        try await withGoogle("del-g-all-occ", seed: LateSeries.calendar(rule: "RRULE:FREQ=WEEKLY")) { calendar, pool in
+            let r = try await runDelete(["delete_scope": .string("all")], eventId: LateSeries.instanceId(day(7)),
+                                        calendarId: "primary", account: "del-g-all-occ", pool: pool, deviceZone: device)
+            let card = try #require(r.card, "\(r.cards.count) cards: \(summary(r))")
+            #expect(card.changes == [CalendarToolHelpers.seriesDeleteNote, "Repeats weekly"], "card \(card.changes)")
+            #expect(calendar.writes == ["DELETE \(LateSeries.id)"], "writes \(calendar.writes); \(summary(r))")
+            #expect(calendar.event(LateSeries.id) == nil, "the series is still there: \(calendar.event(LateSeries.id) ?? [:])")
+            #expect(calendar.deleteSendUpdates == ["all"], "guests: \(calendar.deleteSendUpdates)")
+            #expect(r.queued.isEmpty, "the delete did not complete: \(summary(r))")
+            #expect(r.out.contains("every occurrence"), "\(r.out)")
+        }
+    }
+
+    @Test("CalDAV: every occurrence, named by one occurrence's id, deletes the series, not that occurrence alone")
+    func calDAVAllFromAnOccurrence() async throws {
+        let fixture = try OccurrenceWireFixture.make()
+        let slot = try fixture.occurrence(2)
+        let (device, _) = try deviceAndEditZones(at: slot)
+        try await withCalDAV("del-c-all-occ", fixture: fixture) { harness, pool in
+            let r = try await runDelete(["delete_scope": .string("all")], eventId: try fixture.occurrenceId(2),
+                                        calendarId: OccurrenceWireFixture.calendarId, account: "del-c-all-occ", pool: pool, deviceZone: device)
+            let card = try #require(r.card, "\(r.cards.count) cards: \(summary(r))")
+            #expect(card.changes == [CalendarToolHelpers.seriesDeleteNote, "Repeats weekly"], "card \(card.changes)")
+            #expect(CalDAVToolWire.deletes(harness.http).count == 1, "DELETEs: \(CalDAVToolWire.deletes(harness.http)); \(summary(r))")
+            #expect(harness.store.storedICS(path: OccurrenceWireFixture.seriesPath) == nil, "the series is still on the server")
+            #expect(harness.store.recordedPuts().isEmpty, "the series was rewritten: \(harness.store.recordedPuts().map(\.path))")
+            #expect(r.queued.isEmpty, "the delete did not complete: \(summary(r))")
+        }
+    }
+
+    /// A delete of a repeating event the tool refuses before its card, and what the refusal says.
+    struct RefusedScope: Sendable, CustomTestStringConvertible {
+        let scope: String
+        let namesOccurrence: Bool
+        let says: String
+        var testDescription: String { "\(scope)\(namesOccurrence ? " with recurrence_id" : " without recurrence_id")" }
+    }
+
+    static let refusedScopes = [
+        RefusedScope(scope: "next_ones", namesOccurrence: true,
+                     says: "delete_scope 'next_ones' is not one of 'this_only', 'this_and_following' or 'all'."),
+        RefusedScope(scope: "this_only", namesOccurrence: false, says: "delete_scope 'this_only' needs recurrence_id"),
+        RefusedScope(scope: "this_and_following", namesOccurrence: false, says: "delete_scope 'this_and_following' needs recurrence_id"),
+    ]
+
+    @Test("Google: an unknown delete_scope, or a scope of occurrences on the series' id with no recurrence_id, is refused before the card, nothing written or queued",
+          arguments: refusedScopes)
+    func googleRefusedBeforeTheCard(_ refused: RefusedScope) async throws {
+        let slot = try #require(LateSeries.at(day(7)))
+        let (device, delete, _) = try deleteZones(at: slot)
+        try await withGoogle("del-g-refused", seed: LateSeries.calendar(rule: "RRULE:FREQ=WEEKLY")) { calendar, pool in
+            var arguments: [String: JSONValue] = ["delete_scope": .string(refused.scope), "timezone": .string(delete.identifier)]
+            if refused.namesOccurrence { arguments["recurrence_id"] = .string(naive(slot, device)) }
+            let r = try await runDelete(arguments, eventId: LateSeries.id, calendarId: "primary", account: "del-g-refused",
+                                        pool: pool, deviceZone: device)
+            #expect(r.cards.isEmpty, "a card was shown: \(r.cards.map(\.changes))")
+            #expect(calendar.writes.isEmpty, "written \(calendar.writes)")
+            #expect(r.queued.isEmpty, "queued \(summary(r))")
+            #expect(r.out.contains(refused.says), "\(r.out)")
+            #expect(r.out.contains("The event was NOT deleted."), "\(r.out)")
+        }
+    }
+
+    @Test("A queued delete of an occurrence and every later one that names no place or zone to end the series is retired as failed, and nothing is sent")
+    func queuedFollowingDeleteWithNoCutIsRetired() async throws {
+        let slot = try #require(LateSeries.at(day(7)))
+        let (device, _, _) = try deleteZones(at: slot)
+        let malformed: [[String: JSONValue]] = [
+            ["delete_scope": .string("this_and_following")],
+            ["delete_scope": .string("this_and_following"), CalendarToolHelpers.deleteCutKey: .string(naive(slot, device))],
+            ["delete_scope": .string("this_and_following"), CalendarToolHelpers.recurrenceIdZoneKey: .string(device.identifier)],
+        ]
+        for arguments in malformed {
+            try await withGoogle("del-g-no-cut", seed: LateSeries.calendar(rule: "RRULE:FREQ=WEEKLY")) { calendar, pool in
+                // Inserted directly: `queueCalendarOperation` starts a drain of its own, which this
+                // test's drain would then skip as "already draining", reading the row mid-flight.
+                let op = PendingCalendarOperation(
+                    operationType: .delete, accountId: "del-g-no-cut", eventId: LateSeries.id, calendarId: "primary",
+                    arguments: arguments)
+                try await pool.write { db in try op.insert(db) }
+                await AccountManager.shared.drainCalendarQueue()
+                let rows = try await pool.read { try PendingCalendarOperation.fetchAll($0) }
+                #expect(rows.count == 1, "\(arguments.keys.sorted()): rows \(rows.map(\.status))")
+                guard rows.count == 1 else { return }
+                #expect(rows[0].id == op.id && rows[0].status == PendingStatus.failed.rawValue,
+                        "\(arguments.keys.sorted()): \(rows[0].status) \(rows[0].failureReason ?? "")")
+                #expect(rows[0].failureReason?.contains("names no place to end the series") == true,
+                        "\(arguments.keys.sorted()): \(rows[0].failureReason ?? "nil")")
+                #expect(calendar.writes.isEmpty, "\(arguments.keys.sorted()): written \(calendar.writes)")
+                #expect(calendar.event(LateSeries.id)?["recurrence"] as? [String] == ["RRULE:FREQ=WEEKLY"],
+                        "\(arguments.keys.sorted()): the series changed: \(calendar.event(LateSeries.id) ?? [:])")
+            }
+        }
+    }
+
+    @Test("Google: an event that does not repeat, given any delete_scope, is deleted as it is: the scope is dropped")
+    func googleNonRepeatingDropsTheScope() async throws {
+        let at = try #require(LateSeries.at(day(7)))
+        let (device, delete, _) = try deleteZones(at: at)
+        let single: [String: Any] = [
+            "id": "one-off", "summary": "Review", "status": "confirmed",
+            "start": ["dateTime": "\(day(7))T20:00:00Z", "timeZone": "UTC"],
+            "end": ["dateTime": "\(day(7))T20:30:00Z", "timeZone": "UTC"],
+        ]
+        for scope in CalendarEventDeleteTool.scopes {
+            try await withGoogle("del-g-single", seed: [single]) { calendar, pool in
+                let r = try await runDelete([
+                    "delete_scope": .string(scope), "recurrence_id": .string(naive(at, device)),
+                    "timezone": .string(delete.identifier),
+                ], eventId: "one-off", calendarId: "primary", account: "del-g-single", pool: pool, deviceZone: device)
+                let card = try #require(r.card, "\(scope): \(r.cards.count) cards: \(summary(r))")
+                #expect(card.changes.isEmpty, "\(scope): card \(card.changes)")
+                #expect(calendar.writes == ["DELETE one-off"], "\(scope): writes \(calendar.writes); \(summary(r))")
+                #expect(calendar.deleteSendUpdates == ["all"], "\(scope): guests \(calendar.deleteSendUpdates)")
+                #expect(r.queued.isEmpty, "\(scope): the delete did not complete: \(summary(r))")
+                #expect(r.out.hasPrefix("Calendar event deleted successfully."), "\(scope): \(r.out)")
+                #expect(!r.out.contains("delete_scope"), "\(scope): \(r.out)")
+            }
+        }
+    }
 }

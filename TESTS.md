@@ -1165,7 +1165,12 @@ host's zone, and compares the write on the fake with the card.
   `delete_scope` (refused before any card, the assistant told to ask, nothing written); Outlook
   `this_and_following` (the range ends before the occurrence's day, the first stays); CalDAV
   `this_only` by the series id (one `EXDATE`) and `this_and_following` (the `UNTIL` between the
-  previous occurrence and the named one).
+  previous occurrence and the named one). `all` named by one occurrence's id deletes the series on
+  Google (one `DELETE` of the series) and CalDAV (one `DELETE`, no `PUT`), with the whole-series card.
+  Refused before the card, nothing written or queued (parameterized): an unknown `delete_scope`, and
+  `this_only` / `this_and_following` on the series' id with no `recurrence_id`. A queued
+  `this_and_following` delete with no cut or no zone is retired as failed with nothing sent. An event
+  that does not repeat, given any `delete_scope`, is deleted as it is (the scope dropped).
 
 ## CalDAV organizer — every event with guests names its organizer
 
