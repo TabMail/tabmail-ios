@@ -59,10 +59,13 @@ actor ExchangeCalendarProvider: CalendarProvider {
 
     func listCalendars() async throws -> [GCalCalendar] {
         BackgroundSyncLogger.logDebug("[ExchangeCalendar] listCalendars starting...")
-        let data = try await request(path: "/calendars?$select=id,name,isDefaultCalendar,color")
-        BackgroundSyncLogger.logDebug("[ExchangeCalendar] listCalendars raw: \(String(data: data, encoding: .utf8)?.prefix(500) ?? "nil")")
-        let response = try JSONDecoder().decode(MSCalendarListResponse.self, from: data)
-        return response.value.map { cal in
+        var listed: [MSCalendar] = []
+        try await readPages(path: "/calendars?$select=id,name,isDefaultCalendar,color", logLabel: "listCalendars raw") { (page: [MSCalendar]) in
+            listed += page
+            return false
+        }
+        BackgroundSyncLogger.logDebug("[ExchangeCalendar] listCalendars listed \(listed.count)")
+        return listed.map { cal in
             GCalCalendar(
                 id: cal.id,
                 summary: cal.name,
@@ -93,7 +96,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         orderBy: String = "startTime"
     ) async throws -> [GCalEvent] {
         var queryItems: [String] = []
-        queryItems.append("$top=\(maxResults)")
+        queryItems.append("$top=\(ExchangeCalendarConfig.listPageSize)")
         queryItems.append("$orderby=start/dateTime")
         queryItems.append("$select=\(Self.eventSelect)")
 
@@ -123,40 +126,73 @@ actor ExchangeCalendarProvider: CalendarProvider {
             endpoint = "\(calPath)/events?\(queryItems.joined(separator: "&"))"
         }
 
-        // Apply query filter client-side if provided (Graph calendarView doesn't support $search)
+        // The query filter is applied client-side (Graph calendarView doesn't support $search),
+        // to each page as it is read, so `maxResults` counts matching events, never the rows
+        // a page happened to hold. Reading stops once `maxResults` events are listed.
         BackgroundSyncLogger.logDebug("[ExchangeCalendar] listEvents endpoint: \(endpoint)")
-        let data = try await request(path: endpoint)
-        BackgroundSyncLogger.logDebug("[ExchangeCalendar] listEvents response: \(String(data: data, encoding: .utf8)?.prefix(500) ?? "nil")")
-        let response = try JSONDecoder().decode(MSEventListResponse.self, from: data)
-
-        var events = response.value
-            .filter { $0.isCancelled != true }
-            .filter { e in
-                if isEmptySurfaceEvent(e) {
-                    BackgroundSyncLogger.logDebug("[ExchangeCalendar] dropping empty event id=\(e.id ?? "nil")")
-                    return false
+        let lower = query.flatMap { $0.isEmpty ? nil : $0.lowercased() }
+        var events: [GCalEvent] = []
+        try await readPages(path: endpoint, logLabel: "listEvents response") { (page: [MSEvent]) in
+            events += page
+                .filter { $0.isCancelled != true }
+                .filter { e in
+                    if isEmptySurfaceEvent(e) {
+                        BackgroundSyncLogger.logDebug("[ExchangeCalendar] dropping empty event id=\(e.id ?? "nil")")
+                        return false
+                    }
+                    return true
                 }
-                return true
-            }
-            .map { toGCalEvent($0) }
-
-        if let query, !query.isEmpty {
-            let lower = query.lowercased()
-            events = events.filter { event in
-                (event.summary ?? "").lowercased().contains(lower) ||
-                (event.location ?? "").lowercased().contains(lower) ||
-                (event.description ?? "").lowercased().contains(lower)
-            }
+                .map { toGCalEvent($0) }
+                .filter { event in
+                    guard let lower else { return true }
+                    return (event.summary ?? "").lowercased().contains(lower) ||
+                        (event.location ?? "").lowercased().contains(lower) ||
+                        (event.description ?? "").lowercased().contains(lower)
+                }
+            return events.count >= maxResults
         }
+        BackgroundSyncLogger.logDebug("[ExchangeCalendar] listEvents listed \(events.count)")
+        return Array(events.prefix(maxResults))
+    }
 
-        return events
+    /// Reads a Graph collection page by page, following `@odata.nextLink` until Graph
+    /// returns none: "To read all results, you must continue to call Microsoft Graph with
+    /// the @odata.nextLink property returned in each response until the @odata.nextLink
+    /// property is no longer returned" (learn.microsoft.com/graph/paging). `take` gets each
+    /// page's items in order and returns true when the caller has what it asked for, which
+    /// ends the walk there. Every page is read through `request`, so each carries the same
+    /// `Prefer: outlook.timezone` and every listed time is in one zone.
+    ///
+    /// A next link that is not a Graph page link (`GraphAPI.isGraphPageLink`) throws
+    /// `ExchangeCalendarError.invalidPageLink` before any request is sent to it, and a
+    /// collection that has not ended within `ExchangeCalendarConfig.maxListPages` pages
+    /// throws `ExchangeCalendarError.listingIncomplete`: neither returns part of the listing.
+    /// `logLabel` names each page's debug log.
+    private func readPages<Item: Decodable>(
+        path: String, logLabel: String, _ take: ([Item]) -> Bool
+    ) async throws {
+        var data = try await request(path: path)
+        var pages = 1
+        while true {
+            BackgroundSyncLogger.logDebug("[ExchangeCalendar] \(logLabel) page \(pages): \(String(data: data, encoding: .utf8)?.prefix(500) ?? "nil")")
+            let page = try JSONDecoder().decode(MSPage<Item>.self, from: data)
+            if take(page.value) { return }
+            guard let link = page.nextLink else { return }
+            guard GraphAPI.isGraphPageLink(link) else { throw ExchangeCalendarError.invalidPageLink }
+            guard pages < ExchangeCalendarConfig.maxListPages else { throw ExchangeCalendarError.listingIncomplete }
+            data = try await request(url: link)
+            pages += 1
+        }
     }
 
     /// What an event read selects (`listEvents`, `getEvent`, and an edit's
     /// `fetchForEdit`). `body` and `onlineMeeting` give the description and the
     /// join link (`notes(of:)`), and the stored body an edit keeps (#511).
     /// `originalStart` gives an occurrence's place in its series (`originalStartTime`).
-    private static let eventSelect = "id,subject,location,body,bodyPreview,onlineMeeting,start,end,attendees,organizer,recurrence,showAs,isCancelled,webLink,createdDateTime,lastModifiedDateTime,isAllDay,seriesMasterId,originalStart"
+    /// Only properties calendarView can select: "The createdDateTime and lastModifiedDateTime
+    /// properties of event don't support $select" (learn.microsoft.com/graph/api/user-list-calendarview),
+    /// so neither is read and an Outlook event carries no `created` or `updated`.
+    private static let eventSelect = "id,subject,location,body,bodyPreview,onlineMeeting,start,end,attendees,organizer,recurrence,showAs,isCancelled,webLink,isAllDay,seriesMasterId,originalStart"
 
     /// What a split reads from the stored series: what `getEvent` reads, and every property the
     /// new part copies (`splitCopiedKeys`).
@@ -1504,6 +1540,12 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// `timeZoneName`: the zone `Prefer: outlook.timezone` names, exactly as given; the device's
     /// when nil (see below).
     private func request(path: String, method: String = "GET", body: Data? = nil, timeZoneName: String? = nil) async throws -> Data {
+        try await request(url: baseURL + path, method: method, body: body, timeZoneName: timeZoneName)
+    }
+
+    /// `request(path:)` by a whole URL: the base URL plus a path, or a page link Graph returned
+    /// (`readPages`, which checks it is one first).
+    private func request(url: String, method: String = "GET", body: Data? = nil, timeZoneName: String? = nil) async throws -> Data {
         let token = try await accessToken(false)
         // `Prefer: outlook.timezone` controls the timezone Graph uses in the
         // response's `start.timeZone` / `end.timeZone`. Without it Graph
@@ -1522,7 +1564,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // mail provider's requests (#426).
         let policy = HTTPRetryPolicy.graph
         let result = try await performHTTPRequestWithRetry(
-            url: baseURL + path, method: method, body: body, token: token, extraHeaders: headers,
+            url: url, method: method, body: body, token: token, extraHeaders: headers,
             retryableStatusCodes: policy.retryableStatusCodes, maxAttempts: policy.maxAttempts,
             initialDelay: policy.initialDelay, session: testSession, logLabel: "ExchangeCalendar", gate: mailboxGate)
 
@@ -1534,7 +1576,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         if result.statusCode == 401 {
             BackgroundSyncLogger.logDebug("[ExchangeCalendar] Token expired, refreshing...")
             let freshToken = try await accessToken(true)
-            let retry = try await performHTTPRequest(url: baseURL + path, method: method, body: body, token: freshToken, extraHeaders: headers, session: testSession, logLabel: "ExchangeCalendar", gate: mailboxGate)
+            let retry = try await performHTTPRequest(url: url, method: method, body: body, token: freshToken, extraHeaders: headers, session: testSession, logLabel: "ExchangeCalendar", gate: mailboxGate)
             // `headers` already carries the local-tz Prefer from the first attempt above.
             if let data = retry.data {
                 return data
@@ -1683,8 +1725,8 @@ actor ExchangeCalendarProvider: CalendarProvider {
             transparency: transparency,
             status: e.isCancelled == true ? "cancelled" : "confirmed",
             htmlLink: e.webLink,
-            created: e.createdDateTime,
-            updated: e.lastModifiedDateTime,
+            created: nil,
+            updated: nil,
             // Graph's seriesMasterId → our recurringEventId, so calendar_search
             // enrichment can fetch the master's rule for Exchange instances too.
             recurringEventId: e.seriesMasterId,
@@ -2269,13 +2311,30 @@ enum ExchangeCalendarError: Error {
     /// The associated value names which id, matching `ProviderError.invalidURL`'s
     /// contract on the mail side.
     case invalidPathSegment(String)
+    /// A collection's `@odata.nextLink` is not a Graph page link (`GraphAPI.isGraphPageLink`),
+    /// so it is not followed and the listing is not returned.
+    case invalidPageLink
+    /// A collection did not end within `ExchangeCalendarConfig.maxListPages` pages.
+    case listingIncomplete
+}
+
+/// Paging of the Outlook calendar listings (`ExchangeCalendarProvider.readPages`).
+enum ExchangeCalendarConfig {
+    /// Events asked for per page (`$top`) of an event listing. The `$top` every event listing
+    /// sent before it read further pages (the search tool's `maxResults`), so Graph takes it
+    /// and a search's usual window is still one request. The calendar list sends no `$top`
+    /// and reads Graph's own pages.
+    static let listPageSize = 250
+    /// Pages of one listing read before giving up. A window the read tool asks for
+    /// (`maxResults` 2,500 per calendar) is 10 pages; the rest is room for the cancelled,
+    /// empty and non-matching rows a page also holds. The cap bounds the walk at 10,000 rows
+    /// (`listPageSize` times this). A listing can reach it: a search with explicit dates years
+    /// apart on a very busy calendar. It then throws `listingIncomplete`, the assistant's tools
+    /// skip that calendar, and a narrower window lists it.
+    static let maxListPages = 40
 }
 
 // MARK: - Microsoft Graph Calendar Response Models
-
-private struct MSCalendarListResponse: Decodable {
-    let value: [MSCalendar]
-}
 
 private struct MSCalendar: Decodable {
     let id: String
@@ -2287,8 +2346,16 @@ private struct MSCalendar: Decodable {
 // Decodable shapes for Microsoft Graph calendar payloads. Internal (not private)
 // so unit tests in `TabMailTests/Providers/ExchangeCalendarTests.swift` can decode
 // JSON fixtures into `MSEvent` to exercise `toGCalEvent`.
-struct MSEventListResponse: Decodable {
-    let value: [MSEvent]
+/// One page of a Graph collection: its items, and the link to the next page when there is one
+/// (learn.microsoft.com/graph/paging).
+struct MSPage<Item: Decodable>: Decodable {
+    let value: [Item]
+    let nextLink: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case value
+        case nextLink = "@odata.nextLink"
+    }
 }
 
 struct MSEvent: Decodable {
@@ -2307,8 +2374,6 @@ struct MSEvent: Decodable {
     let isCancelled: Bool?
     let isAllDay: Bool?
     let webLink: String?
-    let createdDateTime: String?
-    let lastModifiedDateTime: String?
     /// Set on `occurrence`/`exception` rows (calendarView expansion) — points
     /// to the series master. Graph's analogue of Google's `recurringEventId`.
     /// We map it onto `GCalEvent.recurringEventId` so the calendar_search
