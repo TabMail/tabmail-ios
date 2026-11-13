@@ -2370,8 +2370,9 @@ struct GCalEvent: Codable, Sendable {
     /// an occurrence is NOW is its `start`, the start the read tools show and a `recurrence_id` names.
     var originalStartTime: GCalDateTime? = nil
     /// Whether `start.timeZone` is only the zone the read asked for, not the event's own (Outlook:
-    /// `Prefer: outlook.timezone`), so `seriesZone` never reads a date in it. In memory only.
-    var startZoneIsDisplay = false
+    /// `Prefer: outlook.timezone`), so `seriesZone` never reads a date in it. Optional so a
+    /// decoded event without it (every Google and cached one) reads as the event's own. In memory only.
+    var startZoneIsDisplay: Bool? = nil
 
     /// The zone a series' rule repeats in, where its dates are read: the zone its calendar keeps
     /// the rule in (`recurrenceTimeZoneName`, Outlook's), else its start's (Google's and CalDAV's
@@ -2379,7 +2380,7 @@ struct GCalEvent: Codable, Sendable {
     /// `CalendarTimeZoneResolver` alone. Nil when the resolver recognizes none, or none is named
     /// (a CalDAV time in UTC or floating, which the parser gives no zone name).
     var seriesZone: TimeZone? {
-        (recurrenceTimeZoneName ?? (startZoneIsDisplay ? nil : start?.timeZone))
+        (recurrenceTimeZoneName ?? (startZoneIsDisplay == true ? nil : start?.timeZone))
             .flatMap { CalendarTimeZoneResolver.zone(named: $0, in: .none) }
     }
 }
