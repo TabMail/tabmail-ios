@@ -1490,12 +1490,14 @@ actor ExchangeProvider: EmailProvider {
     /// - `gone`: 404 or 410, the message is deleted or was moved (a move gives it
     ///   a new id);
     /// - `unreadable`: the answer for that ONE message cannot be used (a body that
-    ///   does not decode, a record `parseGraphMessage` refuses, or a 4xx that is
-    ///   about the message: anything but 401, 403, 408 and 429), so the caller
-    ///   reads it again later instead of holding back the rest;
+    ///   does not decode, a record `parseGraphMessage` refuses, a server error for
+    ///   that item, or a 4xx that is about the message: anything but 401, 403, 408
+    ///   and 429), so the caller reads it again later instead of holding back the
+    ///   rest, as Gmail's reader does with a message whose fetch keeps failing
+    ///   (ADR-IOS-111 decision 7);
     /// - `unanswered`: no usable answer this time (a throttle, a timeout, an
-    ///   authorization failure, a server error, or no answer in the batch), with
-    ///   its status (0 when the batch had none); the caller asks again.
+    ///   authorization failure, or no answer in the batch), with its status (0
+    ///   when the batch had none); the caller asks again.
     /// A failure of the batch request itself throws.
     func fetchMessageDetails(ids: [String]) async throws -> ExchangeDetailBatch {
         let selection = ExchangeGraphMessageRequest.fetchMessageDetails.selection
@@ -1542,7 +1544,7 @@ actor ExchangeProvider: EmailProvider {
                     result.details.append(ExchangeMessageDetail(header: header, parentFolderId: msg.parentFolderId ?? ""))
                 case 404, 410:
                     result.gone.append(id)
-                case 401, 403, 408, 429, 500...:
+                case 401, 403, 408, 429:
                     result.unanswered[id] = item.status
                 default:
                     result.unreadable.append(id)

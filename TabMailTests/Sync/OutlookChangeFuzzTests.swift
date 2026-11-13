@@ -9,6 +9,11 @@ import Testing
 
 /// Seeded adversarial schedules for Outlook's change reader against
 /// `StatefulExchangeActionServer`, each read applied by the engine's own apply.
+/// A round reads in one of three ways, drawn from the seed: a bare read with a
+/// frozen clock (where a budget cut can land), the engine's change pass (the
+/// folder-list apply and the pass's success or failure), or a foreground pass
+/// (the full sync, which lists every folder not tracked and commits its
+/// bookmark).
 ///
 /// Each iteration starts with an Inbox and an Archive, mail inside and below
 /// the held range, and reads until both folders track. A round then draws, from
@@ -26,8 +31,12 @@ import Testing
 ///    held in that folder at some point.
 /// 3. **Convergence**: after quiescence (every read completed, faults cleared,
 ///    reads until every folder tracks and no re-read list is left), each
-///    folder's rows equal the server's messages within the held range plus every
-///    message that arrived in it after its baseline, with the server's flags.
+///    folder's rows equal the server's messages within that folder's held range
+///    plus every message that arrived in it after its baseline, with the
+///    server's flags. A foreground pass lists the newest messages of a folder
+///    it does not track whatever their age, so a row below the held range is
+///    allowed when it is still in the folder and was there when a foreground
+///    pass ran.
 ///
 /// Knobs (`TEST_RUNNER_` prefix on the CLI): `OUTLOOK_CHANGE_FUZZ_ITERATIONS`
 /// (default `FuzzConfig.defaultIterations`) and `OUTLOOK_CHANGE_FUZZ_SEED`
@@ -75,6 +84,10 @@ struct OutlookChangeFuzzTests {
         static let faultPercent = 30
         /// Seeded latency bound for pages and batches.
         static let latencyMaxMilliseconds = 5
+        /// Percent chance a round runs the engine's change pass instead of a bare read.
+        static let enginePassPercent = 30
+        /// Percent chance a round runs a foreground pass instead of a bare read.
+        static let foregroundPassPercent = 10
         /// Reads allowed for quiescence.
         static let quiescenceReads = 8
     }
@@ -111,12 +124,17 @@ struct OutlookChangeFuzzTests {
             var everIn: [String: Set<String>] = [:]
             for folder in Self.folders { everIn[folder] = w.server.messageIds(inFolder: folder) }
             var arrivedAfterBaseline: [String: Set<String>] = [:]
+            // Messages in each folder when a foreground pass ran.
+            var listable: [String: Set<String>] = [:]
             var openReads: [String: (opId: String, folder: String)] = [:]
             var nextId = 0
+            // What each round did, reported with a failure so its schedule reads directly.
+            var trace: [String] = []
 
             for round in 0..<FuzzConfig.rounds {
                 let where_ = "\(label) round=\(round)"
                 now = now.addingTimeInterval(60)
+                var did: [String] = []
 
                 // Other clients.
                 let changes = Int(localRng.next() % UInt64(FuzzConfig.maxServerChangesPerRound + 1))
@@ -129,27 +147,34 @@ struct OutlookChangeFuzzTests {
                         nextId += 1
                         w.server.deliver(Reader.seed(id, in: folder, daysAgo: Double(localRng.next() % 3)))
                         arrivedAfterBaseline[folder, default: []].insert(id)
+                        did.append("deliver \(id) to \(folder)")
                     case 1:
                         if let id = Self.pick(ids, &localRng) {
                             let read = w.server.snapshot(providerMessageId: id)?.isRead ?? false
                             w.server.setReadFromOtherClient(providerMessageId: id, isRead: !read)
+                            did.append("read \(id)=\(!read)")
                         }
                     case 2:
                         if let id = Self.pick(ids, &localRng) {
                             let flagged = w.server.snapshot(providerMessageId: id)?.isFlagged ?? false
                             w.server.setFlagFromOtherClient(providerMessageId: id, isFlagged: !flagged)
+                            did.append("flag \(id)=\(!flagged)")
                             // A flag record carries the message's date, so a message the
                             // phone does not hold gets its headers and appears, whatever
                             // its age (a read-only record carries no date and inserts nothing).
                             arrivedAfterBaseline[folder, default: []].insert(id)
                         }
                     case 3:
-                        if let id = Self.pick(ids, &localRng) { w.server.deleteFromOtherClient(providerMessageId: id) }
+                        if let id = Self.pick(ids, &localRng) {
+                            w.server.deleteFromOtherClient(providerMessageId: id)
+                            did.append("delete \(id)")
+                        }
                     default:
                         let destination = folder == Reader.inbox ? Reader.archive : Reader.inbox
                         if let id = Self.pick(ids, &localRng),
                            let moved = w.server.moveFromOtherClient(providerMessageId: id, to: destination) {
                             arrivedAfterBaseline[destination, default: []].insert(moved)
+                            did.append("move \(id) to \(destination) as \(moved)")
                         }
                     }
                 }
@@ -160,6 +185,7 @@ struct OutlookChangeFuzzTests {
                     w.server.setReadFromOtherClient(providerMessageId: id, isRead: true)
                     try await w.pool.write { db in _ = try PendingOperation.deleteOne(db, key: open.opId) }
                     openReads[id] = nil
+                    did.append("queued read on \(id) completes")
                 }
                 if Int(localRng.next() % 100) < FuzzConfig.pendingReadPercent {
                     let folder = Self.folders[Int(localRng.next() % 2)]
@@ -177,6 +203,7 @@ struct OutlookChangeFuzzTests {
                             try row.insert(db)
                         }
                         openReads[id] = (op.id, folder)
+                        did.append("user reads \(id)")
                     }
                 }
 
@@ -187,19 +214,36 @@ struct OutlookChangeFuzzTests {
                     let faults: [FakeHTTP.CannedResponse] = [.status(500), .status(429), .status(503), .transportError(.networkConnectionLost)]
                     let fault = faults[Int(localRng.next() % UInt64(faults.count))]
                     if localRng.next() % 2 == 0 { w.server.failDeltaPages([fault]) } else { w.server.failBatches([fault]) }
+                    did.append("fault \(fault)")
                 }
                 w.server.clearBatchItemAnswers()
                 if Int(localRng.next() % 100) < FuzzConfig.faultPercent,
                    let id = Self.pick(arrivedAfterBaseline.values.flatMap { $0 }.sorted(), &localRng) {
-                    w.server.answerBatchItem(providerMessageId: id, status: localRng.next() % 2 == 0 ? 503 : 400, body: nil)
+                    let status = localRng.next() % 2 == 0 ? 503 : 400
+                    w.server.answerBatchItem(providerMessageId: id, status: status, body: nil)
+                    did.append("item \(id) answers \(status)")
                 }
                 let requests: Int? = Int(localRng.next() % 100) < FuzzConfig.budgetCutPercent
                     ? 1 + Int(localRng.next() % UInt64(FuzzConfig.budgetCutMaxRequests)) : nil
                 let expensive = localRng.next() % 5 == 0
 
-                try await w.read(now: now, requests: requests, expensive: expensive)
+                let driver = Int(localRng.next() % 100)
+                if driver < FuzzConfig.foregroundPassPercent {
+                    for folder in Self.folders { listable[folder, default: []].formUnion(w.server.messageIds(inFolder: folder)) }
+                    // A pass the faults made fail is an outcome, not a finding: the
+                    // invariants below judge what it left.
+                    do { try await w.foregroundPass(); did.append("foreground pass") } catch { did.append("foreground pass failed: \(error)") }
+                } else if driver < FuzzConfig.foregroundPassPercent + FuzzConfig.enginePassPercent {
+                    do { try await w.delta(); did.append("change pass") } catch { did.append("change pass failed: \(error)") }
+                } else {
+                    try await w.read(now: now, requests: requests, expensive: expensive)
+                    did.append("read requests=\(requests.map(String.init) ?? "all") expensive=\(expensive)")
+                }
+                let differs = try Self.differences(w).joined(separator: ", ")
+                trace.append("round \(round): \(did.joined(separator: "; ")); differs: \(differs)")
 
                 if try !Self.checkInvariants(w, openReads: openReads, everIn: everIn, where: where_) {
+                    Issue.record("[\(where_)] schedule:\n\(trace.joined(separator: "\n"))")
                     failed = true
                     return
                 }
@@ -217,12 +261,16 @@ struct OutlookChangeFuzzTests {
             for _ in 0..<FuzzConfig.quiescenceReads {
                 now = now.addingTimeInterval(60)
                 try await w.read(now: now)
+                let differs = try Self.differences(w).joined(separator: ", ")
+                trace.append("quiescence read; differs: \(differs)")
                 let settled = try Self.folders.allSatisfy { folder in
                     try w.cursor(folder)?.phase == .tracking && w.recheck(folder).isEmpty
                 }
                 if settled { break }
             }
-            if try !Self.checkConvergence(w, arrivedAfterBaseline: arrivedAfterBaseline, where: "\(label) quiescence") {
+            if try !Self.checkConvergence(
+                w, arrivedAfterBaseline: arrivedAfterBaseline, listable: listable, where: "\(label) quiescence") {
+                Issue.record("[\(label)] schedule:\n\(trace.joined(separator: "\n"))")
                 failed = true
             }
         }
@@ -259,12 +307,12 @@ struct OutlookChangeFuzzTests {
 
     /// 3. Each folder's rows and flags equal what the server holds and the phone keeps.
     private static func checkConvergence(
-        _ w: Reader.World, arrivedAfterBaseline: [String: Set<String>], where: String
+        _ w: Reader.World, arrivedAfterBaseline: [String: Set<String>], listable: [String: Set<String>], where: String
     ) throws -> Bool {
         var ok = true
-        let heldSince = try #require(try w.folder(Reader.inbox).oldestSyncedDate)
         let server = w.server.state.value.withLock { Array($0.messagesByProviderId.values) }
         for folder in folders {
+            let heldSince = try #require(try w.folder(folder).oldestSyncedDate)
             if try w.cursor(folder)?.phase != .tracking || !w.recheck(folder).isEmpty {
                 Issue.record("[\(`where`)] \(folder) did not settle"); ok = false
             }
@@ -273,8 +321,11 @@ struct OutlookChangeFuzzTests {
                 $0.receivedAt >= heldSince || (arrivedAfterBaseline[folder] ?? []).contains($0.providerMessageId)
             }.map(\.providerMessageId))
             let local = try w.rowIds(in: folder)
-            if local != expected {
-                Issue.record("[\(`where`)] \(folder) rows: missing \(expected.subtracting(local).sorted()), extra \(local.subtracting(expected).sorted())")
+            let listed = (listable[folder] ?? []).intersection(inFolder.map(\.providerMessageId))
+            let missing = expected.subtracting(local)
+            let extra = local.subtracting(expected).subtracting(listed)
+            if !missing.isEmpty || !extra.isEmpty {
+                Issue.record("[\(`where`)] \(folder) rows: missing \(missing.sorted()), extra \(extra.sorted())")
                 ok = false
             }
             for message in inFolder where local.contains(message.providerMessageId) {
@@ -286,6 +337,21 @@ struct OutlookChangeFuzzTests {
             }
         }
         return ok
+    }
+
+    /// Rows whose read or flag state differs from the server's, for the trace.
+    private static func differences(_ w: Reader.World) throws -> [String] {
+        let server = w.server.state.value.withLock { $0.messagesByProviderId }
+        var out: [String] = []
+        for folder in folders {
+            for id in try w.rowIds(in: folder).sorted() {
+                guard let row = try w.row(id, in: folder), let message = server[id], message.folderId == folder else { continue }
+                if row.isRead != message.isRead || row.isFlagged != message.isFlagged {
+                    out.append("\(id) local r=\(row.isRead) f=\(row.isFlagged) server r=\(message.isRead) f=\(message.isFlagged)")
+                }
+            }
+        }
+        return out
     }
 
     private static func pick(_ ids: [String], _ rng: inout SplitMix64) -> String? {

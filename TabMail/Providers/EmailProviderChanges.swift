@@ -211,6 +211,13 @@ struct ChangeRecord: Sendable {
     init(messageId: String) {
         self.messageId = messageId
     }
+
+    /// The record carries the message's read state AND its flag. Only such a
+    /// record settles a message on the folder's re-read list
+    /// (`FolderChangeState.recheck`): a change kept back there may be to either
+    /// field, and a record without one says nothing about it, so the re-read
+    /// reads the message in full.
+    var carriesReadAndFlag: Bool { isRead != nil && isFlagged != nil }
 }
 
 struct FolderChanges: Sendable {

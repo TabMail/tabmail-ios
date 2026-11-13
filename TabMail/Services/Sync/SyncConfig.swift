@@ -915,12 +915,8 @@ enum SyncConfig {
     // its turn reads for 5 - W s; at W >= 5 it reads nothing and keeps its
     // bookmark. Foreground pass (60 s): min(20, 60 - W - 5).
     /// How long a folder's change reads may keep failing on answers from the
-    /// server (5xx, a page that cannot be read, a round that does not end) before
+    /// server (5xx, a page that cannot be read, a next link that repeats) before
     /// the reader starts the folder again from a new baseline. A connection loss,
     /// a cancellation, an authorization failure or a throttle never counts.
     static let changeReadFailureLapseSeconds: TimeInterval = 3_600
-    /// Most pages one change round of one folder may have before the reader
-    /// counts it as a failure (a round that never ends): 2,000 pages of
-    /// `graphChangeReadPageSize` = 200,000 messages.
-    static let changeReadMaxRoundPages = 2_000
 }

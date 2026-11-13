@@ -185,7 +185,8 @@ window never appeared (#722, #536), and changes to older mail were lost (#464, #
      is in, read as gone (404/410, or now in another folder: that folder's round reports it), or reported
      unreadable for that one message (`rereadLater`). A page cut short by the budget is read again on the
      next pass, which fetches only what is still missing. A 5xx item holds the page and counts towards the
-     failure lapse; a throttle, timeout or authorization answer holds it without counting.
+     failure lapse; a throttle, timeout or authorization answer holds it without counting. (Superseded
+     2026-11-13, see the amendment below: a 5xx item is unreadable for that one message.)
    - **Request rate.** One read sends at most `SyncConfig.graphChangeReadRequestsPerSecond` (half of
      Graph's documented 10,000 requests per 10 minutes per mailbox, about 8.3 per second) times its read
      budget; every request is charged before it is sent, a `$batch` its width (Graph counts each request
@@ -199,7 +200,8 @@ window never appeared (#722, #536), and changes to older mail were lost (#464, #
      `.refused(.rejected(status))`; a refused saved baseline continuation restarts the baseline from page 1
      once per pass first. A 5xx, a page that cannot be decoded, a repeating next link or a round longer
      than `changeReadMaxRoundPages` counts towards `changeReadFailureLapseSeconds`, after which the folder
-     is `.refused(.failingTooLong)` and starts a new baseline. A baseline that read something before a
+     is `.refused(.failingTooLong)` and starts a new baseline. (Superseded 2026-11-13, see the amendment
+     below: a round's length is never a failure, and `changeReadMaxRoundPages` is deleted.) A baseline that read something before a
      failure reports `.baselining`, so its records stay baseline records.
    - **Folder list** (scope `.all`): the mail-folder delta is a change signal. Records for folders already
      stored update their name and count in place (`.updated`); a new folder, a removed one or a record
@@ -233,3 +235,36 @@ OutlookFolderCursor, OutlookAccountCursor, folder refusal, baselining, baseline 
 caller deadline, read budget, state selection, stateSelection, headerOnlySelection, ids only, delta chain
 $select, $batch, graphBatchMaxRequests, graphChangeReadRequestsPerSecond, expensive network wait,
 mail-folder delta, FolderListUpdate, hidden folders, failingTooLong, #722, #536, #450, #458, #548.
+
+### Amendment 2026-11-13: a round's length is never a failure; one message's 5xx is unreadable
+
+**Context.** Two rules of decision 5 above failed in ways a user sees. (a) A round longer than
+`changeReadMaxRoundPages` counted towards the failure lapse: a folder of more than about 200,000 messages
+(or any folder Graph serves in pages smaller than asked for) could never finish its first round, so it
+started its baseline again every lapse, forever. (b) A 5xx answer for one message's header fetch held the
+page: every later change in that folder stayed hidden until the lapse, then the folder started again,
+met the same message and looped.
+
+**Decision.**
+1. **A round's length is never a failure.** `changeReadMaxRoundPages` and the cursor's round page count
+   are deleted. A round that moves page after page is saved page by page; each pass is bounded by its
+   read budget and request allowance, and a next link that repeats still counts as a failure.
+2. **One message's server error is about that message**, as Gmail's reader already rules (decision 7,
+   #444): `fetchMessageDetails` classes a 5xx item as unreadable, it goes on the folder's re-read list
+   (`rereadLater`) and the page passes. A throttle (429), a timeout (408) and an authorization answer
+   (401, 403) for an item still hold the page without counting; a failure of the whole `$batch` request
+   still holds it, a 5xx counting towards the lapse.
+3. **A record carries only what Graph sent.** A full Inbox record takes `isRead` and `isFlagged` from the
+   delta record (absent = not written, never the parser's default), and no Graph record carries a
+   References chain, so a stored chain stays (`ChangeRecord.references` nil).
+4. **A partial record never settles a message on the re-read list** (`ChangeRecord.carriesReadAndFlag`).
+   A change kept back under the user's pending action may be to the read state or the flag; a later record
+   that lacks either (Outlook's read-state-only record) applies what it carries and the message stays
+   listed. The reader counts such a message as unanswered, so the re-read reads it in full in the same
+   pass when the allowance has room, otherwise on a later pass. Before this, the read-state-only record
+   that follows the user's completed read removed the message from the list, and a flag change another
+   client made meanwhile was lost in a tracked folder (found by the Outlook fuzzer through the engine).
+
+Keywords: changeReadMaxRoundPages deleted, round length, long round, per-item 5xx, unreadable header,
+rereadLater, page hold, absent field, references kept, partial record, carriesReadAndFlag, kept-back flag
+change, #444.

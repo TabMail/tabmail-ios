@@ -25,8 +25,11 @@ import GRDB
 //   inserts nothing, and mail older than the range is the backfill's;
 // - every change kept back is put on the folder's re-read list
 //   (`FolderChangeState.recheck`), read again on later passes (in turn, within
-//   `SyncConfig.changeRereadBudgetPerPass`) until it applies,
-//   and so is every message the provider could not read (`rereadLater`).
+//   `SyncConfig.changeRereadBudgetPerPass`) until a record carrying its read
+//   state and flag applies (`ChangeRecord.carriesReadAndFlag`; a partial record
+//   applies what it carries and settles nothing, and the reader reads a listed
+//   message in full), and so is every message the provider could not read
+//   (`rereadLater`).
 //   Over `SyncConfig.changeRecheckLimit` ids, the folder's catch-up is armed;
 // - the folder's own bookmark (`Folder.changeCursor`) is written in the same
 //   transaction. A refused one is cleared with the folder's coverage, a lapse
@@ -80,7 +83,14 @@ extension SyncEngine {
             let applied = try applyChangeRecord(
                 record, folder: folder, addressEpoch: changes.addressEpoch, fromBaseline: changes.status.isBaseline,
                 snapshot: snapshot, recentlyCompleted: recentlyCompleted, result: &result, db: db)
-            if applied { settled.insert(record.messageId) } else { declined.insert(record.messageId) }
+            if !applied {
+                declined.insert(record.messageId)
+            } else if record.carriesReadAndFlag {
+                // A record without the read state or the flag applied what it
+                // carries but settles nothing: a listed message stays listed
+                // until it is read again in full.
+                settled.insert(record.messageId)
+            }
         }
 
         // A message the provider could not read this pass is read again too.

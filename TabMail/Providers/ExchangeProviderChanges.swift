@@ -46,11 +46,14 @@ import Foundation
 /// **Failures.** A refused folder bookmark (`graphRefusedDeltaToken`) is that
 /// folder's `.refused(.rejected(status))`; a refused saved baseline continuation
 /// first restarts the baseline at page 1, once per pass. A server error, a page
-/// that cannot be decoded, a next link that repeats or a round longer than
-/// `SyncConfig.changeReadMaxRoundPages` counts towards
+/// that cannot be decoded or a next link that repeats counts towards
 /// `SyncConfig.changeReadFailureLapseSeconds`, after which the folder is
 /// `.refused(.failingTooLong)`. A throttle, a timeout, an authorization failure
-/// or a dropped connection keeps the bookmark and counts nothing.
+/// or a dropped connection keeps the bookmark and counts nothing. A round's
+/// length is never a failure: a round that moves page after page is saved page
+/// by page, and every pass is bounded by its budget and request allowance.
+/// One message whose header fetch cannot be used (a server error or a 4xx about
+/// that message) goes on the folder's re-read list and the page moves on.
 extension ExchangeProvider {
 
     func fetchChanges(since cursor: ChangeCursor, request: ChangeRequest) async throws -> ChangeSet? {
@@ -215,14 +218,17 @@ extension ExchangeProvider {
                     continue
                 }
                 for detail in batch.details where detail.parentFolderId == folder.path {
-                    collected.add(ChangeRecord(header: detail.header))
+                    collected.add(Self.fullRecord(detail.header))
                 }
                 // Gone, or now in another folder: that folder's own round reports
-                // it. Nothing is inserted here and the page may pass.
+                // it. Nothing is inserted here and the page may pass. A message
+                // whose own answer cannot be used is read again later from the
+                // re-read list, so it never holds back the folder's later changes.
                 changes.rereadLater += batch.unreadable
                 if !batch.unanswered.isEmpty {
+                    // A throttle, a timeout, an authorization failure or no answer:
+                    // the page is read again next pass; nothing counts as a failure.
                     pageHeld = true
-                    heldCounted = heldCounted || batch.unanswered.values.contains { $0 >= 500 }
                     heldError = heldError ?? ProviderError.networkError(
                         underlying: HTTPError.networkError(statusCode: batch.unanswered.values.max() ?? 0))
                 }
@@ -241,15 +247,9 @@ extension ExchangeProvider {
                 ending = .failed(Self.unreadablePage("next link repeats"), counted: true)
                 break
             }
-            state.roundPages += 1
-            if state.roundPages > SyncConfig.changeReadMaxRoundPages {
-                ending = .failed(Self.unreadablePage("round longer than the page limit"), counted: true)
-                break
-            }
             state.next = next
             state.failingSince = nil
             if page.deltaLink != nil {
-                state.roundPages = 0
                 if state.phase == .baseline {
                     state.phase = .tracking
                     ending = .baselineDone
@@ -349,7 +349,7 @@ extension ExchangeProvider {
             }
             for detail in batch.details {
                 if detail.parentFolderId == folder.path {
-                    collected.add(ChangeRecord(header: detail.header))
+                    collected.add(Self.fullRecord(detail.header))
                 } else {
                     collected.remove(detail.header.messageId)
                 }
@@ -361,11 +361,27 @@ extension ExchangeProvider {
 
     // MARK: - Records
 
+    /// A record from a whole Graph message. No selection asks Graph for a
+    /// References header, so the record carries none and a stored chain stays.
+    private nonisolated static func fullRecord(_ header: MessageHeaderInfo) -> ChangeRecord {
+        var change = ChangeRecord(header: header)
+        change.references = nil
+        return change
+    }
+
     /// The record for a message the apply can take as it is: a full record when
     /// the page carried its header fields (the Inbox's selection), otherwise the
-    /// state fields present (absent ones are left out and never overwrite).
+    /// state fields present. Either way the fields the merge writes into a stored
+    /// row come only from what the record carries: Graph may leave a field out,
+    /// and the parser's default for an absent one (unread, not flagged) is not
+    /// the message's value. An absent field never overwrites a stored one.
     private nonisolated static func changeRecord(_ record: GraphDeltaMessage, header: MessageHeaderInfo?) -> ChangeRecord {
-        if let header { return ChangeRecord(header: header) }
+        if let header {
+            var change = fullRecord(header)
+            change.isRead = record.isRead
+            change.isFlagged = record.flag.map { $0.flagStatus == "flagged" }
+            return change
+        }
         var change = ChangeRecord(messageId: record.id)
         change.isRead = record.isRead
         if let flag = record.flag { change.isFlagged = flag.flagStatus == "flagged" }
@@ -610,8 +626,6 @@ struct OutlookFolderCursor: Codable, Equatable, Sendable {
     /// The link to read next: a baseline's next page, a round's next page, or the
     /// delta link of the last completed round. Nil = page 1 of a new chain.
     var next: String?
-    /// Pages read in the current round.
-    var roundPages = 0
     /// The first counted failure since the folder's last good page.
     var failingSince: Date?
     /// When the folder first needed this baseline; an expensive network holds a
@@ -623,12 +637,11 @@ struct OutlookFolderCursor: Codable, Equatable, Sendable {
         OutlookFolderCursor(phase: .baseline, select: role == .inbox ? .header : .state, baselineSince: now)
     }
 
-    init(phase: Phase, select: Selection, next: String? = nil, roundPages: Int = 0,
+    init(phase: Phase, select: Selection, next: String? = nil,
          failingSince: Date? = nil, baselineSince: Date) {
         self.phase = phase
         self.select = select
         self.next = next
-        self.roundPages = roundPages
         self.failingSince = failingSince
         self.baselineSince = baselineSince
     }
@@ -652,7 +665,6 @@ struct OutlookFolderCursor: Codable, Equatable, Sendable {
     /// Page 1 of the same baseline, keeping when it was first needed.
     mutating func restartBaseline() {
         next = nil
-        roundPages = 0
     }
 }
 
@@ -699,7 +711,12 @@ struct CollectedChanges {
 
     var records: [ChangeRecord] { order.compactMap { recordsById[$0] } }
     var removals: [String] { order.filter { removed.contains($0) } }
-    var answeredIds: Set<String> { Set(recordsById.keys).union(removed) }
+    /// Messages this read has answered for the re-read list: removed, or with a
+    /// record carrying the read state and the flag. A message with only a
+    /// partial record is still read again in full.
+    var answeredIds: Set<String> {
+        Set(recordsById.filter { $0.value.carriesReadAndFlag }.keys).union(removed)
+    }
 }
 
 private enum FolderReadEnding {

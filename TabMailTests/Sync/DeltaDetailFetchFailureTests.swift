@@ -798,12 +798,11 @@ struct DeltaDetailFetchFailureTests {
         }
     }
 
-    /// An answer about the one message that cannot be used puts it on the
-    /// folder's re-read list; the page is passed, so a change made after it
-    /// lands. A server error is the exception: it holds the page, bounded by
-    /// the folder's failure lapse (`OutlookChangeReadingTests`).
+    /// An answer about the one message that cannot be used, a server error
+    /// included, puts it on the folder's re-read list; the page is passed, so a
+    /// change made after it lands.
     @Test("An Outlook message whose header fetch never succeeds does not stop sync",
-          arguments: Failure.answers.filter { $0 != .serverError })
+          arguments: Failure.answers)
     func outlookStuckMessageDoesNotStopSync(failure: Failure) async throws {
         try await OutlookChangeReadingTests.withWorld { w in
             try await w.baselineAll()

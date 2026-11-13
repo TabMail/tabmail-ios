@@ -246,7 +246,7 @@ struct OutlookChangeReadingTests {
         await UnreadCountManager.shared.awaitIdleForTesting()
     }
 
-    // MARK: - J10: the state set for every folder but the Inbox
+    // MARK: - The state set for every folder but the Inbox
 
     @Test("A read or flag change on a held Archive message lands from the delta record, with no message fetch")
     func stateChangeLandsWithoutAFetch() async throws {
@@ -360,7 +360,7 @@ struct OutlookChangeReadingTests {
         }
     }
 
-    /// J10 (1): the bookmark never passes a page until the page's missing
+    /// The bookmark never passes a page until the page's missing
     /// headers are in, also when the read budget ends inside the page; the next
     /// read fetches only what is still missing.
     @Test("The bookmark never passes a page until its missing headers are in, across a budget cut")
@@ -385,7 +385,7 @@ struct OutlookChangeReadingTests {
         }
     }
 
-    /// J10 (5): a large burst of missing messages is fetched in batches charged
+    /// A large burst of missing messages is fetched in batches charged
     /// their width, every read within its allowance, and none is dropped.
     @Test("A burst of moved-in messages is paced under the request allowance and none is dropped")
     func burstIsPacedAndKept() async throws {
@@ -416,7 +416,45 @@ struct OutlookChangeReadingTests {
         }
     }
 
-    // MARK: - J10 (4): the expensive-network wait
+    /// A round longer than one pass's allowance lands in parts: each pass
+    /// applies the pages it read and saves its place inside the round, and the
+    /// next pass goes on from there, so no page is read twice and no pass
+    /// exceeds its allowance.
+    @Test("A long round lands in parts, each page read once and every pass within its allowance")
+    func longRoundLandsInParts() async throws {
+        let ids = (0..<250).map { String(format: "h-%03d", $0) }
+        try await Self.withWorld(seeds: ids.map { Self.seed($0, in: Self.archive) }) { w in
+            for id in ids { try w.insertRow(id, in: w.archive) }
+            try await w.baselineAll()
+            for id in ids { w.server.setReadFromOtherClient(providerMessageId: id, isRead: true) }
+            let tracked = try #require(try w.cursor(w.archive))
+            let pageSize = SyncConfig.graphChangeReadPageSize
+            let pages = (ids.count + pageSize - 1) / pageSize
+            #expect(pages > 1, "precondition: the round is longer than one page")
+            func landed() throws -> Set<String> {
+                Set(try ids.filter { try w.row($0, in: w.archive)?.isRead == true })
+            }
+            // Allowance: the folder-list page, the Inbox's page and one Archive page.
+            let allowance = 3
+            let pagesBefore = w.deltaPageRequests(Self.archive)
+            var now = Date()
+            try await w.read(now: now, requests: allowance)
+            #expect(try landed() == Set(ids.prefix(pageSize)), "the first page's changes landed, and nothing more")
+            #expect(try w.cursor(w.archive)?.next != tracked.next, "the bookmark is saved inside the round")
+            #expect(try w.cursor(w.archive)?.phase == .tracking)
+
+            for _ in 1..<pages {
+                now = now.addingTimeInterval(60)
+                let before = w.server.http.recordedCalls().count
+                try await w.read(now: now, requests: allowance)
+                #expect(w.server.http.recordedCalls().count - before <= allowance, "a pass sends at most its allowance")
+            }
+            #expect(try landed() == Set(ids), "every change landed")
+            #expect(w.deltaPageRequests(Self.archive) - pagesBefore == pages, "each page was read once")
+        }
+    }
+
+    // MARK: - The expensive-network wait
 
     @Test("A non-Inbox baseline waits on an expensive network for at most the bound, counted from first sight; the Inbox does not wait")
     func expensiveNetworkWaitIsBounded() async throws {
@@ -452,7 +490,7 @@ struct OutlookChangeReadingTests {
         }
     }
 
-    // MARK: - J8: the caller's deadline
+    // MARK: - The caller's deadline
 
     @Test("A pass whose turn leaves too little of the caller's deadline reads nothing, and the next pass lands the change")
     func tooLittleTimeReadsNothing() async throws {
@@ -563,8 +601,11 @@ struct OutlookChangeReadingTests {
         }
     }
 
-    @Test("A message whose header fetch keeps failing with a server error holds its page until the lapse, then the folder starts again")
-    func serverErrorOnAHeaderHoldsThePage() async throws {
+    /// One message's server error is about that message: it goes on the
+    /// folder's re-read list and the page is passed, so the folder's later
+    /// changes keep landing and nothing counts towards the folder's lapse.
+    @Test("A message whose header fetch answers a server error goes on the re-read list; the folder's later changes land")
+    func serverErrorOnAHeaderDoesNotHoldTheFolder() async throws {
         try await Self.withWorld { w in
             try await w.baselineAll()
             w.server.deliver(Self.seed("s-1", in: Self.archive, daysAgo: 1))
@@ -572,13 +613,39 @@ struct OutlookChangeReadingTests {
             let tracked = try #require(try w.cursor(w.archive))
             let start = Date()
             try await w.read(now: start)
-            #expect(try w.cursor(w.archive)?.next == tracked.next, "the page is held")
-            #expect(try w.recheck(w.archive).isEmpty, "and the message waits on the page, not the re-read list")
+            #expect(try w.cursor(w.archive)?.next != tracked.next, "the page is passed")
+            #expect(try w.recheck(w.archive) == ["s-1"], "the message waits on the re-read list")
+            #expect(try w.cursor(w.archive)?.failingSince == nil, "nothing counts as the folder failing")
+
+            // Past the lapse, with the server still failing that one message.
+            w.server.deliver(Self.seed("s-2", in: Self.archive, daysAgo: 0))
             try await w.read(now: start.addingTimeInterval(SyncConfig.changeReadFailureLapseSeconds))
-            #expect(try w.folder(w.archive).changeCursor == nil)
+            #expect(try w.row("s-2", in: w.archive) != nil, "a later message lands")
+            #expect(try w.cursor(w.archive)?.phase == .tracking, "the folder keeps its bookmark")
+            #expect(try w.cursor(w.archive)?.failingSince == nil)
+            #expect(try w.recheck(w.archive) == ["s-1"], "the message stays listed while the server fails it")
+
             w.server.clearBatchItemAnswers()
-            try await w.baselineAll(now: start.addingTimeInterval(SyncConfig.changeReadFailureLapseSeconds + 60))
+            try await w.read(now: start.addingTimeInterval(SyncConfig.changeReadFailureLapseSeconds + 60))
             #expect(try w.row("s-1", in: w.archive) != nil, "it lands once the server answers")
+            #expect(try w.recheck(w.archive).isEmpty)
+        }
+    }
+
+    /// Graph may serve fewer records per page than asked for, so a first round
+    /// can run to any number of pages. Its length is never a failure: the round
+    /// completes, page by page, within the pass's allowance.
+    @Test("A first round of more pages than any fixed count completes and counts no failure")
+    func longFirstRoundCountsNoFailure() async throws {
+        let count = 2_001
+        let ids = (0..<count).map { String(format: "l-%04d", $0) }
+        try await Self.withWorld(seeds: ids.map { Self.seed($0, in: Self.archive) }, heldSince: nil) { w in
+            w.server.setDeltaMaxPageSize(1)
+            try await w.read(now: Date(), requests: count + 100)
+            let cursor = try #require(try w.cursor(w.archive))
+            #expect(cursor.phase == .tracking, "the round completed")
+            #expect(cursor.failingSince == nil, "its length counted as no failure")
+            #expect(w.deltaPageRequests(Self.archive) == count, "each page read once")
         }
     }
 
@@ -600,6 +667,53 @@ struct OutlookChangeReadingTests {
             let left = try w.recheck(w.archive)
             #expect(left.count == ids.count - SyncConfig.graphBatchMaxRequests, "the ids not read stay listed")
             #expect(Set(left).isSubset(of: Set(ids)))
+        }
+    }
+
+    /// A change kept back while the user's action is pending is re-read in
+    /// full, even when every later record for that message is partial: a
+    /// record without the flag never settles it. `cutAfterKeptBack`: the read
+    /// after the user's action completes has no allowance left for the re-read,
+    /// so it lands on the next read.
+    @Test("A kept-back flag change converges through the re-read when only partial records follow",
+          arguments: [false, true])
+    func keptBackChangeConvergesThroughTheReread(cutAfterKeptBack: Bool) async throws {
+        try await Self.withWorld(seeds: [Self.seed("k-1", in: Self.archive)]) { w in
+            try w.insertRow("k-1", in: w.archive)
+            try await w.baselineAll()
+            // The user reads the message: shown read, the read queued.
+            try await w.pool.write { db in
+                _ = try MessageHeader.filter(Column("folderId") == w.folderId(Self.archive) && Column("messageId") == "k-1")
+                    .updateAll(db, Column("isRead").set(to: true))
+            }
+            let op = PendingOperation(type: .markRead, messageIds: ["k-1"], accountId: w.accountId, folderPath: Self.archive)
+            try await w.pool.write { db in
+                var row = op
+                try row.insert(db)
+            }
+            // Every record for the message leaves its read state out: each is partial.
+            w.server.omitDeltaFields(["isRead"], providerMessageId: "k-1")
+            w.server.setFlagFromOtherClient(providerMessageId: "k-1", isFlagged: true)
+            var now = Date()
+            try await w.read(now: now)
+            #expect(try w.row("k-1", in: w.archive)?.isFlagged == false, "precondition: the flag change is kept back")
+            #expect(try w.recheck(w.archive) == ["k-1"], "precondition: the message is listed")
+
+            // The user's read completes; the next record carries only the id.
+            try await w.pool.write { db in _ = try PendingOperation.deleteOne(db, key: op.id) }
+            w.server.setReadFromOtherClient(providerMessageId: "k-1", isRead: true)
+            now = now.addingTimeInterval(60)
+            if cutAfterKeptBack {
+                // Allowance: the folder-list page, the Inbox's page and the Archive's page.
+                try await w.read(now: now, requests: 3)
+                #expect(try w.recheck(w.archive) == ["k-1"], "a partial record settles nothing")
+                now = now.addingTimeInterval(60)
+            }
+            try await w.read(now: now)
+            let row = try #require(try w.row("k-1", in: w.archive))
+            let server = try #require(w.server.snapshot(providerMessageId: "k-1"))
+            #expect(row.isRead == server.isRead && row.isFlagged == server.isFlagged, "the stored state equals the server's")
+            #expect(try w.recheck(w.archive).isEmpty)
         }
     }
 
@@ -684,6 +798,106 @@ struct OutlookChangeReadingTests {
         }
     }
 
+    @Test("A pass fails only when every folder it read failed; one folder's failure holds back no other")
+    func passFailsOnlyWhenEveryFolderFailed() async throws {
+        try await Self.withWorld { w in
+            try await w.baselineAll()
+            let inbox = try #require(try w.cursor(w.inbox))
+            w.server.deliver(Self.seed("ok-1", in: Self.archive, daysAgo: 0))
+            // The Inbox is read first: its page fails, the Archive's does not.
+            w.server.failDeltaPages([.status(500)])
+            let outcome = try await w.delta()
+            #expect(outcome.succeeded, "the pass succeeds")
+            #expect(try w.row("ok-1", in: w.archive) != nil, "the Archive's change landed")
+            #expect(try w.cursor(w.inbox)?.next == inbox.next, "the Inbox keeps its bookmark")
+            #expect(try w.cursor(w.inbox)?.failingSince != nil, "and counts the failure")
+
+            // Every folder's page fails.
+            w.server.failDeltaPages(Array(repeating: .status(500), count: 20))
+            await #expect(throws: (any Error).self, "a pass whose every folder failed fails") {
+                try await w.delta()
+            }
+        }
+    }
+
+    @Test("A refused folder-list link is minted again with a complete listing, and the message bookmarks keep reading")
+    func refusedFolderListLinkIsMintedAgain() async throws {
+        try await Self.withWorld { w in
+            // Two foreground passes: the folder-list link is stored and the folders track.
+            try await w.foregroundPass()
+            try await w.foregroundPass()
+            for path in [Self.inbox, Self.archive] {
+                #expect(try FolderChangeState(raw: w.folder(path).changeState).tracking, "precondition: \(path) tracks")
+            }
+            let link = try #require(OutlookAccountCursor(raw: try w.account().lastHistoryId)?.folders)
+            w.server.refuseFolderDeltaLinks(status: 410)
+            defer { w.server.refuseFolderDeltaLinks(status: nil) }
+            // A folder the mail-folder delta does not list: only a complete listing finds it.
+            w.server.setFolderDeltaListsHidden(false)
+            w.server.addFolder(id: "fld-hidden", name: "Hidden", hidden: true)
+            w.server.deliver(Self.seed("during", in: Self.inbox, daysAgo: 0))
+            #expect(try await w.delta().succeeded)
+
+            let minted = try #require(OutlookAccountCursor(raw: try w.account().lastHistoryId)?.folders)
+            #expect(minted != link, "a new folder-list link is stored")
+            let hidden = try await w.pool.read { db in try Folder.fetchOne(db, key: w.folderId("fld-hidden")) }
+            #expect(hidden != nil, "the complete listing stored the folder")
+            #expect(try w.row("during", in: w.inbox) != nil, "the Inbox read on")
+            for path in [Self.inbox, Self.archive] {
+                #expect(try FolderChangeState(raw: w.folder(path).changeState).tracking, "\(path) stays tracked")
+            }
+        }
+    }
+
+    @Test("A new hidden folder the mail-folder delta lists is stored on the next pass")
+    func newHiddenFolderInTheDeltaIsStored() async throws {
+        try await Self.withWorld { w in
+            w.server.setFolderDeltaListsHidden(true)
+            try await w.delta()
+            try await w.delta()
+            w.server.addFolder(id: "fld-hidden", name: "Hidden", hidden: true)
+            try await w.delta()
+            let hidden = try await w.pool.read { db in try Folder.fetchOne(db, key: w.folderId("fld-hidden")) }
+            #expect(hidden != nil)
+        }
+    }
+
+    /// A message sent from the phone shows in Sent at once (an optimistic row
+    /// under a placeholder id). Once Sent is tracked, the foreground full sync
+    /// does not list it, so nothing removes that row before the server's copy
+    /// arrives; the server's copy then replaces it and keeps its body.
+    @Test("A sent message's optimistic Sent row stays until the server's copy replaces it, with its body")
+    func optimisticSentRowIsReplacedByTheServerCopy() async throws {
+        try await Self.withWorld { w in
+            try await w.foregroundPass()
+            try await w.foregroundPass()
+            #expect(try FolderChangeState(raw: w.folder(Self.sent).changeState).tracking, "precondition: Sent is tracked")
+
+            let placeholder = "sent-\(UUID().uuidString)"
+            let rfc822 = "sent-\(UUID().uuidString.prefix(8))@example.com"
+            try w.insertRow(placeholder, in: Self.sent, date: Date())
+            let placeholderRow = try #require(try w.row(placeholder, in: Self.sent))
+            try await w.pool.write { db in
+                var row = placeholderRow
+                row.rfc822MessageId = EmailFilter.normalizeMessageId("<\(rfc822)>")
+                try row.update(db)
+                try MessageBody(contentKey: ContentKey(rawValue: row.id), htmlContent: "<p>sent body</p>").save(db)
+            }
+
+            try await w.foregroundPass()
+            #expect(try w.rowIds(in: Self.sent) == [placeholder], "the foreground pass keeps the optimistic row")
+
+            w.server.deliver(StatefulExchangeActionServer.Seed(
+                rfc822MessageId: rfc822, providerMessageId: "srv-sent", folderId: Self.sent,
+                isRead: true, isFlagged: false, receivedAt: Date()))
+            try await w.read()
+            #expect(try w.rowIds(in: Self.sent) == ["srv-sent"], "one Sent row, the server's")
+            let serverRow = try #require(try w.row("srv-sent", in: Self.sent))
+            let body = try await w.pool.read { db in try MessageBody.fetchOne(db, key: ContentKey(rawValue: serverRow.id)) }
+            #expect(body != nil, "the body was carried")
+        }
+    }
+
     @Test("The legacy category strip finds the Inbox in a process whose full sync skipped discovery")
     func inboxIdComesFromTheRequest() async throws {
         try await Self.withWorld(seeds: [Self.seed("tagged", in: Self.inbox)]) { w in
@@ -696,6 +910,62 @@ struct OutlookChangeReadingTests {
     }
 
     // MARK: - Partial records
+
+    /// Every field each selection asks for (`ExchangeGraphMessageRequest.readChanges`
+    /// for the Inbox, `GraphAPI.stateSelection` for every other folder), except the id.
+    static let selectedFields: [(folder: String, field: String)] =
+        ExchangeGraphMessageRequest.readChanges.selection.fields.filter { $0 != "id" }.map { (inbox, $0) }
+        + GraphAPI.stateSelection.fields.filter { $0 != "id" }.map { (archive, $0) }
+
+    /// Graph may leave any selected field out of a record. A held message whose
+    /// record leaves field F out changes only what the record does carry: every
+    /// other stored field, its References chain and its labels stay as they are.
+    @Test("A record that leaves out one selected field changes only what it carries", arguments: Self.selectedFields)
+    func recordWithoutOneFieldChangesOnlyWhatItCarries(folder path: String, field: String) async throws {
+        let omitsFlag = field == "flag"
+        // Leaving out the flag, the change carried is a read change; otherwise a flag change.
+        let seed = Self.seed("o-1", in: path, isRead: !omitsFlag, isFlagged: omitsFlag)
+        try await Self.withWorld(seeds: [seed]) { w in
+            try w.insertRow("o-1", in: path, isRead: !omitsFlag, isFlagged: omitsFlag)
+            try await w.baselineAll()
+            let held = try #require(try w.row("o-1", in: path))
+            try await w.pool.write { db in
+                var row = held
+                row.referencesJSON = MessageHeader.encodeReferences(["<root-1@example.com>"])
+                try row.update(db)
+                let label = UserLabel(accountId: w.accountId, providerLabelId: "Project", name: "Project", isSystem: false)
+                try label.insert(db)
+                try MessageUserLabel(messageId: row.id, userLabelId: label.id).insert(db)
+            }
+            func snapshot() throws -> [String: String] {
+                let row = try #require(try w.row("o-1", in: path))
+                var fields: [String: String] = [:]
+                for child in Mirror(reflecting: row).children {
+                    if let label = child.label { fields[label] = String(describing: child.value) }
+                }
+                fields["userLabels"] = try w.pool.read { db in
+                    try MessageUserLabel.filter(Column("messageId") == row.id).fetchAll(db).map(\.userLabelId).sorted()
+                }.description
+                return fields
+            }
+            let before = try snapshot()
+
+            w.server.omitDeltaFields([field], providerMessageId: "o-1")
+            if omitsFlag {
+                w.server.setReadFromOtherClient(providerMessageId: "o-1", isRead: true)
+                // The same flag again: the record carries every selected field.
+                w.server.setFlagFromOtherClient(providerMessageId: "o-1", isFlagged: true)
+            } else {
+                w.server.setFlagFromOtherClient(providerMessageId: "o-1", isFlagged: true)
+            }
+            try await w.read()
+
+            let after = try snapshot()
+            let changed = Set(before.keys.filter { before[$0] != after[$0] })
+            #expect(changed == [omitsFlag ? "isRead" : "isFlagged"],
+                    "without \(field): \(changed.sorted().map { "\($0) \(before[$0] ?? "nil") -> \(after[$0] ?? "nil")" })")
+        }
+    }
 
     @Test("A partial record never overwrites a field it does not carry")
     func absentFieldKeepsStored() async throws {

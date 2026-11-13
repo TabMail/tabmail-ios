@@ -77,6 +77,12 @@ struct DeltaModel: Sendable {
     /// Per message id, the answer its `$batch` item gets instead of the message:
     /// a status and a raw JSON body (any JSON value), served until cleared.
     var batchItemAnswers: [String: (status: Int, body: String?)] = [:]
+    /// Per message id, selected fields its delta records leave out (Graph may
+    /// leave out any field).
+    var omittedFields: [String: Set<String>] = [:]
+    /// A page size below the requested one (Graph may serve fewer records per
+    /// page than `Prefer: odata.maxpagesize` asks for); nil = as requested.
+    var maxPageSize: Int?
 
     // Folder tree
     var folders: [String: FakeFolder] = [:]
@@ -239,6 +245,17 @@ extension StatefulExchangeActionServer {
         state.value.withLock { $0.delta.pageFailuresServed }
     }
 
+    /// The delta records of `providerMessageId` leave `fields` out.
+    func omitDeltaFields(_ fields: Set<String>, providerMessageId: String) {
+        state.value.withLock { $0.delta.omittedFields[providerMessageId] = fields }
+    }
+
+    /// Message delta pages hold at most `size` records, whatever the request
+    /// asks for; nil = as requested.
+    func setDeltaMaxPageSize(_ size: Int?) {
+        state.value.withLock { $0.delta.maxPageSize = size }
+    }
+
     func setDeltaPageLatency(_ seconds: TimeInterval) {
         state.value.withLock { $0.delta.pageLatency = seconds }
     }
@@ -303,7 +320,7 @@ extension StatefulExchangeActionServer {
     }
 
     private static func serveMessageDelta(_ request: FakeHTTP.Request, state: StateBox) -> FakeHTTP.CannedResponse {
-        let pageSize = request.header("Prefer")
+        let askedPageSize = request.header("Prefer")
             .flatMap { $0.components(separatedBy: "odata.maxpagesize=").last }
             .flatMap { Int($0) } ?? 10
         let query = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?.queryItems ?? []
@@ -331,12 +348,11 @@ extension StatefulExchangeActionServer {
                 token = DeltaModel.Token(folderId: folderId, select: select, from: nil, end: model.delta.seq,
                                          after: nil, isDeltaLink: false)
             }
-            let items = deltaItems(token, model: model)
-            let remaining = items.filter { token.after == nil || $0.id > token.after! }
-            let page = Array(remaining.prefix(pageSize))
+            let pageSize = min(askedPageSize, model.delta.maxPageSize ?? askedPageSize)
+            let (page, more) = deltaPage(token, model: model, size: pageSize)
             var object: [String: Any] = ["value": page.map(\.row)]
             let base = "\(graphRoot)/mailFolders/\(token.folderId)/messages/delta"
-            if remaining.count > page.count, let last = page.last {
+            if more, let last = page.last {
                 let next = model.delta.issue(DeltaModel.Token(
                     folderId: token.folderId, select: token.select, from: token.from, end: token.end,
                     after: last.id, isDeltaLink: false))
@@ -352,27 +368,36 @@ extension StatefulExchangeActionServer {
         }
     }
 
-    /// The round's records, by id.
-    private static func deltaItems(_ token: DeltaModel.Token, model: State) -> [(id: String, row: [String: Any])] {
+    /// The page of the round's records after the token's keyset position, by
+    /// id, and whether more follow. Only the page's rows are rendered.
+    private static func deltaPage(
+        _ token: DeltaModel.Token, model: State, size: Int
+    ) -> (page: [(id: String, row: [String: Any])], more: Bool) {
         let inFolder = model.messagesByProviderId.values.filter { $0.folderId == token.folderId }
         func selected(_ message: Message) -> [String: Any] {
             let row = graphRow(message)
-            guard let select = token.select else { return row }
-            return row.filter { $0.key == "id" || select.contains($0.key) }
+            let omitted = model.delta.omittedFields[message.providerMessageId] ?? []
+            return row.filter {
+                $0.key == "id" || ((token.select?.contains($0.key) ?? true) && !omitted.contains($0.key))
+            }
         }
+        func isAfter(_ id: String) -> Bool { token.after.map { id > $0 } ?? true }
         guard let from = token.from else {
-            return inFolder.sorted { $0.providerMessageId < $1.providerMessageId }
-                .map { ($0.providerMessageId, selected($0)) }
+            let remaining = inFolder.filter { isAfter($0.providerMessageId) }
+                .sorted { $0.providerMessageId < $1.providerMessageId }
+            return (remaining.prefix(size).map { ($0.providerMessageId, selected($0)) }, remaining.count > size)
         }
         var kinds: [String: [DeltaModel.Kind]] = [:]
         for entry in model.delta.entries where entry.folderId == token.folderId && entry.seq > from && entry.seq <= token.end {
             kinds[entry.messageId, default: []].append(entry.kind)
         }
         var items: [(id: String, row: [String: Any])] = []
-        for (id, changes) in kinds {
+        for (id, changes) in kinds where isAfter(id) {
             if let message = inFolder.first(where: { $0.providerMessageId == id }) {
                 if changes.allSatisfy({ $0 == .read }) {
-                    items.append((id, ["id": id, "isRead": message.isRead]))
+                    var row: [String: Any] = ["id": id]
+                    if !(model.delta.omittedFields[id] ?? []).contains("isRead") { row["isRead"] = message.isRead }
+                    items.append((id, row))
                 } else {
                     items.append((id, selected(message)))
                 }
@@ -380,7 +405,8 @@ extension StatefulExchangeActionServer {
                 items.append((id, ["id": id, "@removed": ["reason": "deleted"]]))
             }
         }
-        return items.sorted { $0.id < $1.id }
+        let remaining = items.sorted { $0.id < $1.id }
+        return (Array(remaining.prefix(size)), remaining.count > size)
     }
 
     private static func folderId(fromDeltaURL url: URL) -> String? {
