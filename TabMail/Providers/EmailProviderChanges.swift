@@ -216,7 +216,8 @@ struct ChangeRecord: Sendable {
     /// record settles a message on the folder's re-read list
     /// (`FolderChangeState.recheck`): a change kept back there may be to either
     /// field, and a record without one says nothing about it, so the re-read
-    /// reads the message in full.
+    /// reads the message in full. Only such a record inserts a message the
+    /// folder does not hold; any other lists it for that re-read.
     var carriesReadAndFlag: Bool { isRead != nil && isFlagged != nil }
 }
 

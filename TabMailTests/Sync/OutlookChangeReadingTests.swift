@@ -290,6 +290,29 @@ struct OutlookChangeReadingTests {
         }
     }
 
+    /// Graph may leave the read state or the flag out of a new message's record.
+    /// The message still ends with the server's read state and flag, never a
+    /// default for the field the record left out.
+    @Test("A new Inbox message whose record leaves out its read state or flag ends with the server's",
+          arguments: ["isRead", "flag"])
+    func newInboxMessageWithoutReadOrFlagEndsWithTheServers(omitted field: String) async throws {
+        try await Self.withWorld { w in
+            try await w.baselineAll()
+            w.server.omitDeltaFields([field], providerMessageId: "new-2")
+            w.server.deliver(Self.seed("new-2", in: Self.inbox, daysAgo: 0, isRead: true, isFlagged: true))
+            var now = Date()
+            try await w.read(now: now)
+            now = now.addingTimeInterval(60)
+            try await w.read(now: now)
+
+            let row = try #require(try w.row("new-2", in: w.inbox), "the new message is stored")
+            let server = try #require(w.server.snapshot(providerMessageId: "new-2"))
+            #expect(row.isRead == server.isRead && row.isFlagged == server.isFlagged,
+                    "without \(field): stored read \(row.isRead) flag \(row.isFlagged), server read \(server.isRead) flag \(server.isFlagged)")
+            #expect(try w.recheck(w.inbox).isEmpty)
+        }
+    }
+
     @Test("An in-step folder's baseline costs its pages only")
     func inStepBaselineCostsPagesOnly() async throws {
         let ids = (0..<250).map { String(format: "s-%03d", $0) }

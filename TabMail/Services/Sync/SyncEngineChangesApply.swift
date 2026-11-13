@@ -15,7 +15,9 @@ import GRDB
 // - removals go through the ONE removal core (`deleteConfirmedGhostHeaders…`),
 //   with the account-wide identity term when the ids are stable (no address epoch);
 // - a record for a message the folder does not hold inserts it, unless the user's
-//   own destructive action on it is pending or just completed;
+//   own destructive action on it is pending or just completed, or the record
+//   leaves out the read state or the flag (then the message is listed and read
+//   again in full, never stored with a default);
 // - a record for a message the folder holds merges its PRESENT fields; flags and
 //   the server tag are kept back while the user's flag action is pending or just
 //   completed;
@@ -177,6 +179,10 @@ extension SyncEngine {
         if fromBaseline {
             guard let heldSince = folder.oldestSyncedDate, info.providerOrderDate >= heldSince else { return true }
         }
+        // A record without the read state or the flag would store a default for
+        // the one it leaves out: the message is listed instead and read again in
+        // full, and the full record inserts it.
+        guard record.carriesReadAndFlag else { return false }
         if snapshot.destructive.containsAnyKey(messageId: info.messageId, rfc822MessageId: rfc822) {
             // A pending destructive op owns this identity.
             return false

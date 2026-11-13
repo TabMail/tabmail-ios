@@ -264,7 +264,16 @@ met the same message and looped.
    pass when the allowance has room, otherwise on a later pass. Before this, the read-state-only record
    that follows the user's completed read removed the message from the list, and a flag change another
    client made meanwhile was lost in a tracked folder (found by the Outlook fuzzer through the engine).
+   The settle set is the read state and the flag, not the server tag the apply also holds back: no reader
+   carries a server tag today (Gmail and Graph tags are local-only, ADR-IOS-036; their records' `serverTag`
+   is always nil), so no tag change can be held back. When the IMAP reader carries the tag keyword, its
+   records need a "no tag" value distinct from "not sent", and the settle set then includes the tag.
+5. **A partial record never inserts a message.** A record for a message the folder does not hold that
+   lacks the read state or the flag (an Inbox record Graph sent without `isRead` or `flag`) is declined:
+   the message goes on the re-read list and the full re-read inserts it. Before this, it was stored with
+   the parser's default (unread, unflagged) and never listed, so it kept the wrong state until the next
+   change to it.
 
-Keywords: changeReadMaxRoundPages deleted, round length, long round, per-item 5xx, unreadable header,
+Keywords: partial record insert, new message default read state, settle set, server tag not carried, no-tag value, changeReadMaxRoundPages deleted, round length, long round, per-item 5xx, unreadable header,
 rereadLater, page hold, absent field, references kept, partial record, carriesReadAndFlag, kept-back flag
 change, #444.
