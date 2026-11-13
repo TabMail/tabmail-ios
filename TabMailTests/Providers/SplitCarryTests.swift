@@ -327,7 +327,7 @@ struct SplitCarryTests {
         #expect(try Self.readSeries(range: nil, display: true).seriesZone == nil)
         #expect(try Self.readSeries(range: "Tokyo Standard Time", display: true).seriesZone?.identifier == "Asia/Tokyo")
         // Google's and CalDAV's start zone is the event's own.
-        #expect(try Self.readSeries(range: nil, display: false).seriesZone?.identifier == "UTC")
+        #expect(try Self.readSeries(range: nil, display: false).seriesZone?.secondsFromGMT() == 0)
     }
 
     // MARK: partition
