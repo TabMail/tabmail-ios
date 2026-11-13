@@ -504,6 +504,25 @@ struct ExchangeCalendarSeriesScopeTests {
         #expect(rows.first?.failureReason?.contains(CalendarSeriesScope.askWhichOccurrences) == true, "rows: \(reasons(rows))")
     }
 
+    @Test("a new time of a series whose zone TabMail can't read, no occurrence named, is refused with nothing written, and the user is told it is the time zone, not a date")
+    func unreadableZoneTimeChangeNamesTheZone() async throws {
+        var series = GraphSeries.series()
+        var recurrence = try #require(series["recurrence"] as? [String: Any])
+        var range = try #require(recurrence["range"] as? [String: Any])
+        range.removeValue(forKey: "recurrenceTimeZone")
+        recurrence["range"] = range
+        series["recurrence"] = recurrence
+        let graph = FakeGraphCalendar([series, GraphSeries.occurrence(id: GraphSeries.first, at: GraphFixture.start)])
+        // The same date, one hour later: a plain new time of day.
+        let rows = try await outlook(graph, eventId: "ser-1", [
+            "start_iso": .string(GraphFixture.naive(GraphFixture.start.addingTimeInterval(3_600))), "timezone": .string("UTC"),
+        ], account: "series-x-unreadable-zone")
+        #expect(graph.created.isEmpty && graph.patches("ser-1").isEmpty && graph.patches(GraphSeries.first).isEmpty,
+                "written: \(graph.patches("ser-1"))")
+        let reason = rows.first?.failureReason ?? ""
+        #expect(reason.contains("time zone isn't one TabMail can read") && !reason.contains("another date"), "rows: \(reasons(rows))")
+    }
+
     @Test("a moved occurrence named by its id and a time where it is not now is refused, with nothing written")
     func movedOccurrenceAtNoOccurrenceIsRefused() async throws {
         let place = GraphFixture.occurrenceStart
@@ -2422,13 +2441,14 @@ struct CalendarSeriesScopeRouteTests {
         #expect(Self.zonelessSeries.seriesZone == nil)
     }
 
-    @Test("a series whose zone is not known: a later occurrence's new time is taken to be on another date, and a new time with no occurrence named asks")
+    @Test("a series whose zone is not known: a later occurrence's new time is taken to be on another date, and a new time with no occurrence named is refused for its zone")
     func unknownZoneTakesTheRefusingSide() throws {
         let later = Self.named(Self.zonelessSeries, occurrence: Self.occurrence(timed(day(7))))
         #expect(try route(["start_iso": .string("\(day(7))T11:00:00")], later)
                 == Went(scope: "this_and_following", recurrenceId: "\(day(7))T09:00:00", start: "\(day(7))T11:00:00", eventId: "ser_occ"))
-        #expect(refusal(["start_iso": .string("\(day(0))T11:00:00")], Self.named(Self.zonelessSeries))?
-            .contains(CalendarSeriesScope.askWhichOccurrences) == true)
+        let refused = refusal(["start_iso": .string("\(day(0))T11:00:00")], Self.named(Self.zonelessSeries))
+        #expect(refused?.contains("time zone isn't one TabMail can read") == true && refused?.contains("another date") == false,
+                "\(refused ?? "not refused")")
         let first = Self.named(Self.zonelessSeries, occurrence: Self.occurrence(timed(day(0))))
         #expect(try route(["start_iso": .string("\(day(0))T11:00:00")], first)
                 == Went(scope: "all", recurrenceId: "\(day(0))T09:00:00", start: "\(day(0))T11:00:00", eventId: "ser_occ"))

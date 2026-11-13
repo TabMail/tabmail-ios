@@ -229,8 +229,16 @@ enum CalendarSeriesScope {
                 // the series' own date is a move of the series; another date is a question for the user.
                 let start = CalendarToolHelpers.stringArgOpt(args, "start_iso")
                 let given = start ?? CalendarToolHelpers.stringArgOpt(args, "end_iso") ?? ""
-                guard let own = place(start != nil ? series.start : series.end),
-                      sameDate(given, as: own, series: series, zone: zone) else {
+                guard let own = place(start != nil ? series.start : series.end) else {
+                    throw CalendarProviderError.notSupported(
+                        "the new time of this repeating event is on another date than its first occurrence (\(shown(first, zone: zone))); " + askWhichOccurrences)
+                }
+                // A timed series whose zone TabMail can't read: whether the new time is on its date
+                // can't be told, and the user is told that, not that the date differs.
+                if case .instant = own, series.seriesZone == nil {
+                    throw CalendarProviderError.notSupported(unreadableSeriesZone)
+                }
+                guard sameDate(given, as: own, series: series, zone: zone) else {
                     throw CalendarProviderError.notSupported(
                         "the new time of this repeating event is on another date than its first occurrence (\(shown(first, zone: zone))); " + askWhichOccurrences)
                 }
@@ -278,6 +286,11 @@ enum CalendarSeriesScope {
         written.removeValue(forKey: "recurrence_id")
         return Routed(scope: "all", args: written, eventId: named.seriesId)
     }
+
+    /// Why a time change of every occurrence, no occurrence named, is refused on a timed series
+    /// whose zone TabMail can't read (`GCalEvent.seriesZone` nil).
+    static let unreadableSeriesZone =
+        "This series' time zone isn't one TabMail can read, so its time can't be changed for the whole series."
 
     /// What the assistant is told when an edit of every occurrence gives a new date but names no
     /// occurrence. The words of the Thunderbird add-on's `ASK_WHICH_OCCURRENCES`; both scopes it names
