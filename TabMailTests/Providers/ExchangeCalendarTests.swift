@@ -306,23 +306,83 @@ struct ExchangeCalendarRecurringTests {
         #expect(gcal.recurringEventId == nil)
     }
 
-    @Test("graphEndDateBefore returns the local DATE of (split − 1 day) — Graph endDate is inclusive")
-    func graphEndDateBeforeDayBefore() {
-        // MS Graph recurrenceRange.endDate is DATE-inclusive, so to EXCLUDE the
-        // 2026-05-20 occurrence the cap endDate must be 2026-05-19.
-        #expect(ExchangeCalendarProvider.graphEndDateBefore(naiveISO: "2026-05-20T17:00:00", allDay: false, zone: .current) == "2026-05-19")
-        // Date-only recurrence_id form also parses.
-        #expect(ExchangeCalendarProvider.graphEndDateBefore(naiveISO: "2026-05-20", allDay: true, zone: .current) == "2026-05-19")
-        // Malformed input → nil (caller surfaces an error rather than guessing).
-        #expect(ExchangeCalendarProvider.graphEndDateBefore(naiveISO: "garbage", allDay: false, zone: .current) == nil)
+    /// A stored series as a split reads it: timed and kept in `keptIn` (its range's
+    /// `recurrenceTimeZone`, nil for none), or all day.
+    private func capSeries(keptIn zone: String? = "UTC", allDay: Bool = false) -> ExchangeCalendarProvider.EditSnapshot {
+        let start = allDay ? GCalDateTime(dateTime: nil, date: "2099-01-01", timeZone: nil)
+            : GCalDateTime(dateTime: "2099-01-01T17:00:00", date: nil, timeZone: "UTC")
+        var series = GCalEvent(id: "series", summary: nil, location: nil, description: nil, start: start, end: nil,
+                               attendees: nil, organizer: nil, recurrence: ["RRULE:FREQ=DAILY"], transparency: nil,
+                               status: nil, htmlLink: nil, created: nil, updated: nil)
+        series.recurrenceTimeZoneName = zone
+        return ExchangeCalendarProvider.EditSnapshot(event: series, raw: [:])
     }
 
-    @Test("graphEndDateBefore rolls month/year boundaries (Calendar arithmetic, not flat 86400s)")
-    func graphEndDateBeforeBoundaries() {
-        #expect(ExchangeCalendarProvider.graphEndDateBefore(naiveISO: "2026-03-01T09:00:00", allDay: false, zone: .current) == "2026-02-28")
-        #expect(ExchangeCalendarProvider.graphEndDateBefore(naiveISO: "2026-01-01T09:00:00", allDay: false, zone: .current) == "2025-12-31")
+    private func tz(_ name: String) throws -> TimeZone { try #require(CalendarTimeZoneResolver.zone(named: name, in: .none)) }
+
+    @Test("splitCapEndDate returns the DATE of (split − 1 day) — Graph endDate is inclusive")
+    func splitCapEndDateDayBefore() throws {
+        // MS Graph recurrenceRange.endDate is DATE-inclusive, so to EXCLUDE the
+        // 2099-05-20 occurrence the cap endDate must be 2099-05-19.
+        #expect(try ExchangeCalendarProvider.splitCapEndDate(
+            stored: capSeries(), splitNaiveISO: "2099-05-20T17:00:00", splitZone: tz("UTC")) == "2099-05-19")
+        // An all-day split names a date.
+        #expect(try ExchangeCalendarProvider.splitCapEndDate(
+            stored: capSeries(allDay: true), splitNaiveISO: "2099-05-20", splitZone: tz("UTC")) == "2099-05-19")
+        // Malformed input is refused (the caller surfaces an error rather than guessing).
+        #expect(throws: CalendarProviderError.self) {
+            _ = try ExchangeCalendarProvider.splitCapEndDate(stored: self.capSeries(), splitNaiveISO: "garbage", splitZone: self.tz("UTC"))
+        }
+        #expect(throws: CalendarProviderError.self) {
+            _ = try ExchangeCalendarProvider.splitCapEndDate(
+                stored: self.capSeries(allDay: true), splitNaiveISO: "garbage", splitZone: self.tz("UTC"))
+        }
+    }
+
+    @Test("splitCapEndDate rolls month/year boundaries (date arithmetic, not flat 86400s)")
+    func splitCapEndDateBoundaries() throws {
+        let utc = try tz("UTC")
+        #expect(try ExchangeCalendarProvider.splitCapEndDate(stored: capSeries(), splitNaiveISO: "2100-03-01T09:00:00", splitZone: utc) == "2100-02-28")
+        #expect(try ExchangeCalendarProvider.splitCapEndDate(stored: capSeries(), splitNaiveISO: "2100-01-01T09:00:00", splitZone: utc) == "2099-12-31")
         // Leap year.
-        #expect(ExchangeCalendarProvider.graphEndDateBefore(naiveISO: "2028-03-01T09:00:00", allDay: false, zone: .current) == "2028-02-29")
+        #expect(try ExchangeCalendarProvider.splitCapEndDate(stored: capSeries(), splitNaiveISO: "2104-03-01T09:00:00", splitZone: utc) == "2104-02-29")
+    }
+
+    @Test("splitCapEndDate dates the split occurrence in the series' zone, not the operation's (#681)")
+    func splitCapEndDateInTheSeriesZone() throws {
+        // Thursday 2099-11-19 17:00 in Pacific time is Friday 10:00 in Tokyo: the cap ends on the
+        // Wednesday, the day before the occurrence's day where Graph reads the range.
+        #expect(try ExchangeCalendarProvider.splitCapEndDate(
+            stored: capSeries(keptIn: "Pacific Standard Time"), splitNaiveISO: "2099-11-20T10:00:00",
+            splitZone: tz("Asia/Tokyo")) == "2099-11-18")
+        // 2099-11-20 10:00 in Tokyo is 2099-11-19 17:00 in Pacific time: the cap keeps the 19th.
+        #expect(try ExchangeCalendarProvider.splitCapEndDate(
+            stored: capSeries(keptIn: "Tokyo Standard Time"), splitNaiveISO: "2099-11-19T17:00:00",
+            splitZone: tz("America/Los_Angeles")) == "2099-11-19")
+        // An all-day split is a date: no zone is read, the series' or the operation's.
+        #expect(try ExchangeCalendarProvider.splitCapEndDate(
+            stored: capSeries(keptIn: "Tokyo Standard Time", allDay: true), splitNaiveISO: "2099-11-20",
+            splitZone: tz("America/Los_Angeles")) == "2099-11-19")
+        #expect(try ExchangeCalendarProvider.splitCapEndDate(
+            stored: capSeries(keptIn: "Customized Time Zone", allDay: true), splitNaiveISO: "2099-11-20",
+            splitZone: tz("America/Los_Angeles")) == "2099-11-19")
+    }
+
+    @Test("splitCapEndDate refuses a timed series whose zone is not given or not recognized, naming it (#746)")
+    func splitCapEndDateUnknownZone() throws {
+        let custom = "Customized Time Zone"
+        #expect(CalendarTimeZoneResolver.zone(named: custom, in: .none) == nil, "non-vacuity: the zone is not recognized")
+        for zone in [custom, nil] as [String?] {
+            var reason: String?
+            do {
+                _ = try ExchangeCalendarProvider.splitCapEndDate(
+                    stored: capSeries(keptIn: zone), splitNaiveISO: "2099-11-20T10:00:00", splitZone: tz("Asia/Tokyo"))
+            } catch let error as CalendarProviderError {
+                reason = error.reason
+            }
+            #expect(reason != nil, "\(zone ?? "no zone"): not refused")
+            if let zone { #expect(reason?.contains(zone) == true, "the refusal does not name the zone: \(reason ?? "")") }
+        }
     }
 
     /// 2026-05-14 is a Thursday — used to verify DTSTART-implied fields.

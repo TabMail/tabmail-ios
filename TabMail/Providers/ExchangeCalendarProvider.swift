@@ -198,7 +198,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// What a split reads from the stored series: what `getEvent` reads, and every property the
     /// new part copies (`splitCopiedKeys`).
     private static let splitSelect = eventSelect
-        + ",importance,sensitivity,categories,isReminderOn,reminderMinutesBeforeStart,locations,responseRequested,allowNewTimeProposals,hideAttendees"
+        + ",originalStartTimeZone,importance,sensitivity,categories,isReminderOn,reminderMinutesBeforeStart,locations,responseRequested,allowNewTimeProposals,hideAttendees"
 
     /// The stored series' properties a split's new part copies as they are; Graph accepts each on a
     /// create. Attendees, start, end and recurrence are written by `splitNewPartJSON` itself.
@@ -506,8 +506,9 @@ actor ExchangeCalendarProvider: CalendarProvider {
         else {
             throw CalendarProviderError.notSupported("Event \(eventId) is not recurring; can't split.")
         }
-        guard let capEndDate = Self.graphEndDateBefore(naiveISO: recurrenceId, allDay: master.isAllDay, zone: recurrenceIdZone),
-              let cappedJSON = Self.splitCapJSON(master: master, storedRecurrence: storedRecurrence, capEndDate: capEndDate) else {
+        // Dated in the series' own zone before anything is written (#681).
+        let capEndDate = try Self.splitCapEndDate(stored: snapshot, splitNaiveISO: recurrenceId, splitZone: recurrenceIdZone)
+        guard let cappedJSON = Self.splitCapJSON(master: master, storedRecurrence: storedRecurrence, capEndDate: capEndDate) else {
             throw CalendarProviderError.notSupported("Invalid recurrence_id '\(recurrenceId)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
         }
         // The split is at an occurrence that starts at `recurrenceId` now, the one `occurrence`
@@ -584,7 +585,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// The cap of the split `record` names, written alone (`CalendarProvider.finishSplit`): the
     /// cap `splitSeries` writes (`endSeries`).
     func finishSplit(calendarId: String = "primary", record: SplitRecord, zone: TimeZone) async throws {
-        try await endSeries(calendarId: calendarId, seriesId: record.seriesId, before: record.splitAt, zone: zone, sendUpdates: "none")
+        try await endSeries(seriesId: record.seriesId, before: record.splitAt, zone: zone, refusal: .change)
     }
 
     /// End the series `seriesId` just before `slot` (`CalendarProvider.endSeries`): the cap
@@ -592,13 +593,20 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// already ends before `slot` (`splitAlreadyEnded`). Graph's PATCH has no `sendUpdates`, so it
     /// is unused here, as in every write of this provider.
     func endSeries(calendarId: String = "primary", seriesId: String, before slot: String, zone: TimeZone, sendUpdates: String) async throws {
+        try await endSeries(seriesId: seriesId, before: slot, zone: zone, refusal: .followingDelete)
+    }
+
+    /// `endSeries` for a split's finish (`refusal` `.change`) and for a delete of an occurrence
+    /// and every later one (`.followingDelete`): the same cap, refused for a zone TabMail does not
+    /// recognize in the words that fit what the user asked for.
+    private func endSeries(seriesId: String, before slot: String, zone: TimeZone, refusal: ZoneRefusal) async throws {
         let stored = try await fetchForEdit(eventId: seriesId, select: Self.splitSelect)
         guard let storedRecurrence = stored.raw["recurrence"] as? [String: Any],
               let storedRange = storedRecurrence["range"] as? [String: Any] else {
             throw CalendarProviderError.notSupported("Can't finish this change to the repeating event: it no longer repeats. Check the event in your calendar app.")
         }
-        guard let capEndDate = Self.graphEndDateBefore(naiveISO: slot, allDay: stored.event.isAllDay, zone: zone),
-              let cappedJSON = Self.splitCapJSON(master: stored.event, storedRecurrence: storedRecurrence, capEndDate: capEndDate) else {
+        let capEndDate = try Self.splitCapEndDate(stored: stored, splitNaiveISO: slot, splitZone: zone, refusal: refusal)
+        guard let cappedJSON = Self.splitCapJSON(master: stored.event, storedRecurrence: storedRecurrence, capEndDate: capEndDate) else {
             throw CalendarProviderError.notSupported("Invalid recurrence_id '\(slot)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
         }
         if try Self.splitAlreadyEnded(
@@ -631,9 +639,9 @@ actor ExchangeCalendarProvider: CalendarProvider {
             return endDate <= capEndDate
         case "numbered":
             let counted = try numberedRange(stored: stored, storedRange: storedRange, splitNaiveISO: splitNaiveISO, splitZone: splitZone)
-            guard let seriesStart = counted.seriesStart, let split = counted.split,
+            guard let seriesStart = counted.seriesStart,
                   let before = RecurrenceTail.occurrences(
-                      of: counted.rule, seriesStart: seriesStart, before: split, anchor: .patternStart, missingDay: .lastDay)
+                      of: counted.rule, seriesStart: seriesStart, before: counted.split, anchor: .patternStart, missingDay: .lastDay)
             else {
                 throw CalendarProviderError.notSupported("Can't finish this change to the repeating event: its occurrences can't be counted. Check the event's later occurrences in your calendar app.")
             }
@@ -650,9 +658,9 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// between startDate and endDate inclusive"). We therefore can NOT round-trip through an
     /// RRULE `UNTIL` instant — its precision is lost when collapsed to a whole date, and the
     /// naive date-part of (split − 1s) is still the split day, which Graph would keep on the
-    /// master. So the cap is computed directly: endDate = local date of (split occurrence − 1
-    /// day) (`graphEndDateBefore`). The stored pattern and the rest of the stored range (its
-    /// `startDate`, which Graph requires, and its zone) are written back as they are.
+    /// master. So the cap is computed directly: endDate = the day before the split occurrence's
+    /// day in the series' zone (`splitCapEndDate`). The stored pattern and the rest of the stored
+    /// range (its `startDate`, which Graph requires, and its zone) are written back as they are.
     ///
     /// CRITICAL: the master's existing start/end go on the cap PATCH. If we send ONLY
     /// `recurrence`, Graph silently rewrites the master's `start.dateTime`/`start.timeZone` to
@@ -708,29 +716,78 @@ actor ExchangeCalendarProvider: CalendarProvider {
         }
     }
 
-    /// Graph `recurrenceRange.endDate` for capping a series so the occurrence
-    /// at `naiveISO` and everything after is excluded. Graph's endDate is
-    /// DATE-inclusive, so this is the local date of (split occurrence − 1 day).
-    /// `allDay` doesn't change the math here (the result is a date either way)
-    /// but is accepted for signature symmetry with the Google helper.
-    /// `naiveISO` is read in `zone` — the operation's declared timezone (see the
-    /// invariant on `RecurrenceOccurrenceResolver`), which is the device zone
-    /// unless the caller supplied `timezone`.
-    /// Returns nil if `naiveISO` can't be parsed.
-    static func graphEndDateBefore(naiveISO: String, allDay: Bool, zone: TimeZone) -> String? {
-        let dtFmt = FixedDateFormat.formatter("yyyy-MM-dd'T'HH:mm:ss", timeZone: zone)
-        let dateFmt = FixedDateFormat.formatter("yyyy-MM-dd", timeZone: zone)
-        let parsed = dtFmt.date(from: naiveISO)
-            ?? dateFmt.date(from: String(naiveISO.prefix(10)))
-        guard let date = parsed else { return nil }
-        // Calendar arithmetic, not a flat 86400s — a DST-transition day is 23h
-        // or 25h of local time, so `addingTimeInterval(-86400)` can land on the
-        // wrong calendar day and cap the series a day early/late.
-        var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = zone
-        guard let dayBefore = cal.date(byAdding: .day, value: -1, to: date) else { return nil }
-        let out = FixedDateFormat.formatter("yyyy-MM-dd", timeZone: zone)
-        return out.string(from: dayBefore)
+    /// Graph `recurrenceRange.endDate` for capping the stored series `stored` so the occurrence at
+    /// `splitNaiveISO` (read in `splitZone`) and every later one are excluded: the day before the
+    /// split occurrence's day in the series' zone (`splitDay`). Graph's `endDate` is
+    /// date-inclusive and read in the range's `recurrenceTimeZone`, whatever zone the request
+    /// names (measured 2026-11-11), so a day worked out in the `recurrence_id`'s zone capped the series
+    /// a day off whenever the two zones date the split occurrence differently (#681): the split
+    /// occurrence stayed on the old part too, or the one before it fell out of both parts. The day
+    /// before is date arithmetic, so a clock change can't move it. Throws as `splitDay` does.
+    nonisolated static func splitCapEndDate(
+        stored: EditSnapshot, splitNaiveISO: String, splitZone: TimeZone, refusal: ZoneRefusal = .change
+    ) throws -> String {
+        try splitDay(stored: stored, splitNaiveISO: splitNaiveISO, splitZone: splitZone, refusal: refusal).adding(days: -1).description
+    }
+
+    /// What a refusal of a series' zone TabMail does not recognize tells the user
+    /// (`CalendarProviderError.unrecognizedTimeZone`): what was not done, and what to do instead.
+    struct ZoneRefusal: Sendable {
+        let consequence: String
+        let remedy: String
+
+        /// A change of the series: a split, and its finish.
+        static let change = ZoneRefusal(consequence: "it did not change the event", remedy: "Make the change in your calendar app instead.")
+        /// A delete of an occurrence and every later one (`endSeries`).
+        static let followingDelete = ZoneRefusal(
+            consequence: "it did not delete these occurrences", remedy: "Delete them in your calendar app instead.")
+    }
+
+    /// The day the split occurrence at `splitNaiveISO` falls on in the stored series' own zone, the
+    /// zone Graph reads the series' range dates in: the date given for an all-day series (its
+    /// places are dates, no zone is read); for a timed one, the wall time read in `splitZone` (the
+    /// zone the `recurrence_id` is read in) dated in the zone the series' range dates are read in
+    /// (`seriesZoneName`: the range's `recurrenceTimeZone`, else the event's `originalStartTimeZone`; `day(of:in:seriesZone:)`; a `recurrence_id` that is a date alone names the
+    /// occurrence on that date and is taken as written). The split's cap, its retry (`finishSplit`,
+    /// `splitAlreadyEnded`) and a numbered range's count (`numberedRange`) all read the split's day
+    /// here, so they agree with each other and with the new part's `startDate` (`seriesDay`).
+    ///
+    /// Throws `notSupported`, before anything is written, when the split time can't be read, and
+    /// for a timed series that names no zone (neither the range nor the event) or one TabMail does not recognize
+    /// (`CalendarTimeZoneResolver`; the message in `refusal`'s words, a change's or a delete's): its day can't be worked out, and one dated in another zone
+    /// may be a day off (a timed series' day in an unknown zone is refused, never guessed; #746).
+    nonisolated static func splitDay(
+        stored: EditSnapshot, splitNaiveISO: String, splitZone: TimeZone, refusal: ZoneRefusal = .change
+    ) throws -> RecurrenceTail.Day {
+        let unreadable = CalendarProviderError.notSupported(
+            "Invalid recurrence_id '\(splitNaiveISO)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
+        if stored.event.isAllDay {
+            guard let day = RecurrenceTail.Day(iso: splitNaiveISO) else { throw unreadable }
+            return day
+        }
+        guard let zoneName = seriesZoneName(stored) else {
+            throw CalendarProviderError.notSupported(
+                "Outlook gives no time zone for this repeating event, so the day of the occurrence named can't be worked out and the occurrences from it on can't be split off. Make the change in your calendar app instead.")
+        }
+        guard let seriesZone = CalendarTimeZoneResolver.zone(named: zoneName, in: .none) else {
+            throw CalendarProviderError.unrecognizedTimeZone(zoneName, consequence: refusal.consequence, remedy: refusal.remedy)
+        }
+        guard let day = day(of: splitNaiveISO, in: splitZone, seriesZone: seriesZone).flatMap({ RecurrenceTail.Day(iso: $0) }) else {
+            throw unreadable
+        }
+        return day
+    }
+
+    /// The name of the zone Graph reads a series' range dates in: its range's `recurrenceTimeZone`,
+    /// else the event's own zone, `originalStartTimeZone` (read with `splitSelect`). Graph's
+    /// recurrenceRange: "recurrenceTimeZone: Time zone for the startDate and endDate properties.
+    /// Optional. If not specified, the time zone of the event is used."
+    /// (https://learn.microsoft.com/graph/api/resources/recurrencerange). Not the read `start`'s
+    /// zone: that is the zone `Prefer` names, the device's. A Windows or IANA name, or a custom
+    /// zone, read by `CalendarTimeZoneResolver` like the range's. Nil when neither is given.
+    nonisolated static func seriesZoneName(_ stored: EditSnapshot) -> String? {
+        stored.event.recurrenceTimeZoneName
+            ?? (stored.raw["originalStartTimeZone"] as? String).flatMap { $0.isEmpty ? nil : $0 }
     }
 
     /// If `eventId` points to an OCCURRENCE of a recurring series, fetch the
@@ -950,14 +1007,14 @@ actor ExchangeCalendarProvider: CalendarProvider {
 
     /// A numbered range as `occurrencesLeft` and `splitAlreadyEnded` count it: the stored count,
     /// the series' rule with the pattern's `firstDayOfWeek` as its `WKST`, the range's
-    /// `startDate`, and the split occurrence's day in the series' zone (nil when one can't be
-    /// placed). Throws `notSupported` when the range gives no count.
+    /// `startDate`, and the split occurrence's day in the series' zone (`splitDay`). Throws
+    /// `notSupported` when the range gives no count, or as `splitDay` does.
     nonisolated static func numberedRange(
         stored: EditSnapshot,
         storedRange: [String: Any],
         splitNaiveISO: String,
         splitZone: TimeZone
-    ) throws -> (count: Int, rule: String, seriesStart: RecurrenceTail.Day?, split: RecurrenceTail.Day?) {
+    ) throws -> (count: Int, rule: String, seriesStart: RecurrenceTail.Day?, split: RecurrenceTail.Day) {
         guard let count = storedRange["numberOfOccurrences"] as? Int, count >= 1,
               let rrule = stored.event.recurrence?.first(where: { $0.uppercased().hasPrefix("RRULE:") }) else {
             throw CalendarProviderError.notSupported(
@@ -968,14 +1025,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         let wkst = stored.event.recurrenceFirstDayOfWeek.flatMap { weekStarts[$0.lowercased()] }
         let rule = rrule + (wkst.map { ";WKST=\($0)" } ?? "")
         let seriesStart = (storedRange["startDate"] as? String).flatMap { RecurrenceTail.Day(iso: $0) }
-        let split: RecurrenceTail.Day?
-        if stored.event.isAllDay {
-            split = RecurrenceTail.Day(iso: splitNaiveISO)
-        } else {
-            split = stored.event.seriesZone
-                .flatMap { RecurrenceOccurrenceResolver.renderNaive(splitNaiveISO, from: splitZone, to: $0) }
-                .flatMap { RecurrenceTail.Day(iso: $0) }
-        }
+        let split = try splitDay(stored: stored, splitNaiveISO: splitNaiveISO, splitZone: splitZone)
         return (count, rule, seriesStart, split)
     }
 
@@ -1390,7 +1440,15 @@ actor ExchangeCalendarProvider: CalendarProvider {
         guard let dateTime, let seriesZone, let series = CalendarTimeZoneResolver.zone(named: seriesZone, in: .none),
               let given = CalendarTimeZoneResolver.zone(named: timeZone ?? TimeZone.current.identifier, in: .none)
         else { return day(date, dateTime, in: timeZone) }
-        return RecurrenceOccurrenceResolver.renderNaive(String(graphNaiveDateTime(dateTime).prefix(19)), from: given, to: series)
+        return day(of: dateTime, in: given, seriesZone: series)
+    }
+
+    /// The day, `yyyy-MM-dd`, the wall time `dateTime` read in `given` falls on in `seriesZone`.
+    /// The one place a time is dated in a series' zone: the series' start and range (`seriesDay`)
+    /// and a split's day (`splitDay`). A value shorter than a wall time (a date) is dated as
+    /// written (`renderNaive`); nil when a wall time can't be read.
+    nonisolated static func day(of dateTime: String, in given: TimeZone, seriesZone: TimeZone) -> String? {
+        RecurrenceOccurrenceResolver.renderNaive(String(graphNaiveDateTime(dateTime).prefix(19)), from: given, to: seriesZone)
             .map { String($0.prefix(10)) }
     }
 
@@ -2189,7 +2247,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         } else if let until, let endDate = Self.graphEndDate(until: until, in: timeZone, startWallTime: startWallTime) {
             // NOTE: callers that need a precise split should NOT route through
             // here (Graph's date-inclusive endDate loses the instant). See
-            // `splitSeries` / `graphEndDateBefore`. This path exists for plain
+            // `splitSeries` / `splitCapEndDate`. This path exists for plain
             // create/update of an already-date-bounded series.
             // If `graphEndDate` can't recover 8 date digits, the range stays
             // noEnd rather than a malformed endDate that Graph would reject.

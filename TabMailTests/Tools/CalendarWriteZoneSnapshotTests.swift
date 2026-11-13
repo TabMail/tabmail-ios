@@ -257,10 +257,12 @@ private enum GraphSeries {
     }
 }
 
-private func withOutlook(_ account: String, _ body: (FakeGraphCalendar, DatabasePool) async throws -> Void) async throws {
+private func withOutlook(
+    _ account: String, graph given: FakeGraphCalendar? = nil, _ body: (FakeGraphCalendar, DatabasePool) async throws -> Void
+) async throws {
     let http = FakeHTTP.Scenario()
     defer { http.close() }
-    let graph = GraphSeries.calendar()
+    let graph = given ?? GraphSeries.calendar()
     graph.install(on: http)
     let provider = ExchangeCalendarProvider(mailbox: "calendar@example.com", accessToken: { _ in "test-token" }, session: http.session)
     try await withCalendar(account: account, kind: .outlook, provider: provider) { pool in try await body(graph, pool) }
@@ -1255,6 +1257,13 @@ struct CalDAVFloatingOccurrenceMatchTests {
 // the delete's, and the series start late in the UTC day, so a cut read in the wrong zone lands
 // on another date.
 
+/// An event's stored recurrence range, as sorted JSON, to tell whether it changed.
+private func canonicalRange(_ event: [String: Any]?) -> String {
+    guard let range = (event?["recurrence"] as? [String: Any])?["range"],
+          let data = try? JSONSerialization.data(withJSONObject: range, options: [.sortedKeys]) else { return "null" }
+    return String(decoding: data, as: UTF8.self)
+}
+
 /// `calendar_event_delete` of `eventId` in `calendarId`, named by the number the chat translator
 /// gives the model, confirmed, with the device in `deviceZone`; then the queue drains.
 private func runDelete(
@@ -1450,6 +1459,104 @@ struct CalendarScopedDeleteTests {
             #expect(!days.isEmpty && days.allSatisfy { $0 < named }, "the series repeats on \(days), not only before \(named)")
             #expect(days.first == EKEventStoreHelper.dayKey(GraphFixture.start, timeZone: rangeZone), "the first occurrence went: \(days)")
             #expect(r.queued.isEmpty, "the delete did not complete: \(summary(r))")
+        }
+    }
+
+    @Test("Outlook: an occurrence and every later one, named on a device in another zone, leave exactly the earlier occurrences, read in the series' zone (#681)",
+          arguments: CrossZoneSeries.all)
+    func outlookThisAndFollowingKeepsTheOccurrenceBefore(_ fixture: CrossZoneSeries) async throws {
+        let stored = try #require(CalendarTimeZoneResolver.zone(named: fixture.stored, in: .none))
+        let device = try #require(CalendarTimeZoneResolver.zone(named: fixture.device, in: .none))
+        let named = EKEventStoreHelper.dayKey(fixture.split, timeZone: stored)
+        #expect(EKEventStoreHelper.dayKey(fixture.split, timeZone: device) != named,
+                "non-vacuity: the device and the series date the occurrence named alike")
+        let graph = fixture.calendar()
+        let days = try #require(graph.rangeDays(of: CrossZoneSeries.id))
+        let account = "del-x-681-" + fixture.name.filter { $0.isLetter || $0.isNumber }
+        try await withOutlook(account, graph: graph) { graph, pool in
+            let r = try await runDelete([
+                "delete_scope": .string("this_and_following"), "recurrence_id": .string(naive(fixture.split, device)),
+                "timezone": .string(device.identifier),
+            ], eventId: CrossZoneSeries.id, calendarId: "primary", account: account, pool: pool, deviceZone: device)
+            _ = try #require(r.card, "\(r.cards.count) cards: \(summary(r))")
+            #expect(r.queued.isEmpty, "the delete did not complete: \(summary(r))")
+            let kept = graph.rangeDays(of: CrossZoneSeries.id) ?? []
+            #expect(kept == days.filter { $0 < named },
+                    "the series repeats on \(kept); it held \(days) and the occurrence named is on \(named) in its zone")
+            #expect(graph.created.isEmpty, "a new part was written: \(graph.created.count)")
+        }
+    }
+
+    @Test("Outlook: an occurrence and every later one of a series whose range names no zone leave exactly the earlier occurrences, read in the event's own zone",
+          arguments: [CrossZoneSeries.pacificFromTokyo, CrossZoneSeries.tokyoFromPacific])
+    func outlookThisAndFollowingInTheEventsZone(_ fixture: CrossZoneSeries) async throws {
+        let stored = try #require(CalendarTimeZoneResolver.zone(named: fixture.stored, in: .none))
+        let device = try #require(CalendarTimeZoneResolver.zone(named: fixture.device, in: .none))
+        let named = EKEventStoreHelper.dayKey(fixture.split, timeZone: stored)
+        #expect(EKEventStoreHelper.dayKey(fixture.split, timeZone: device) != named,
+                "non-vacuity: the device and the series date the occurrence named alike")
+        let graph = fixture.calendar(eventZone: fixture.stored)
+        let days = try #require(graph.rangeDays(of: CrossZoneSeries.id))
+        let account = "del-x-681-ez-" + fixture.name.filter { $0.isLetter || $0.isNumber }
+        try await withOutlook(account, graph: graph) { graph, pool in
+            let r = try await runDelete([
+                "delete_scope": .string("this_and_following"), "recurrence_id": .string(naive(fixture.split, device)),
+                "timezone": .string(device.identifier),
+            ], eventId: CrossZoneSeries.id, calendarId: "primary", account: account, pool: pool, deviceZone: device)
+            _ = try #require(r.card, "\(r.cards.count) cards: \(summary(r))")
+            #expect(r.queued.isEmpty, "the delete did not complete: \(summary(r))")
+            let kept = graph.rangeDays(of: CrossZoneSeries.id) ?? []
+            #expect(kept == days.filter { $0 < named },
+                    "the series repeats on \(kept); it held \(days) and the occurrence named is on \(named) in the event's zone")
+        }
+    }
+
+    @Test("Outlook: an occurrence and every later one of a timed series in a zone TabMail does not recognize are not deleted: nothing written, the delete failed, in a delete's words (#746)")
+    func outlookThisAndFollowingInAnUnrecognizedZoneIsRefused() async throws {
+        let custom = "Customized Time Zone"
+        #expect(CalendarTimeZoneResolver.zone(named: custom, in: .none) == nil, "non-vacuity: the zone is not recognized")
+        let fixture = CrossZoneSeries.pacificFromTokyo
+        let device = try #require(CalendarTimeZoneResolver.zone(named: fixture.device, in: .none))
+        let graph = fixture.calendar(storedName: custom)
+        let range = canonicalRange(graph.event(CrossZoneSeries.id))
+        let account = "del-x-746"
+        try await withOutlook(account, graph: graph) { graph, pool in
+            let r = try await runDelete([
+                "delete_scope": .string("this_and_following"), "recurrence_id": .string(naive(fixture.split, device)),
+                "timezone": .string(device.identifier),
+            ], eventId: CrossZoneSeries.id, calendarId: "primary", account: account, pool: pool, deviceZone: device)
+            _ = try #require(r.card, "\(r.cards.count) cards: \(summary(r))")
+            #expect(graph.writes.isEmpty, "written: \(graph.writes)")
+            #expect(canonicalRange(graph.event(CrossZoneSeries.id)) == range, "the series' range changed")
+            #expect(r.queued.count == 1, "rows: \(summary(r))")
+            guard r.queued.count == 1 else { return }
+            #expect(r.queued[0].status == PendingStatus.failed.rawValue, "\(r.queued[0].status) \(r.queued[0].failureReason ?? "")")
+            #expect(r.queued[0].failureReason == "This event uses the time zone \"\(custom)\", which TabMail does not recognize, so it did not delete these occurrences. Delete them in your calendar app instead.",
+                    "the user is told: \(r.queued[0].failureReason ?? "nil")")
+        }
+    }
+
+    @Test("Outlook: an occurrence and every later one of a series whose range names no zone and whose own zone TabMail does not recognize are not deleted: nothing written, the delete failed, in a delete's words (#746)")
+    func outlookThisAndFollowingInAnUnrecognizedEventZoneIsRefused() async throws {
+        let custom = "Customized Time Zone"
+        let fixture = CrossZoneSeries.pacificFromTokyo
+        let device = try #require(CalendarTimeZoneResolver.zone(named: fixture.device, in: .none))
+        let graph = fixture.calendar(eventZone: custom)
+        let range = canonicalRange(graph.event(CrossZoneSeries.id))
+        let account = "del-x-746-ez"
+        try await withOutlook(account, graph: graph) { graph, pool in
+            let r = try await runDelete([
+                "delete_scope": .string("this_and_following"), "recurrence_id": .string(naive(fixture.split, device)),
+                "timezone": .string(device.identifier),
+            ], eventId: CrossZoneSeries.id, calendarId: "primary", account: account, pool: pool, deviceZone: device)
+            _ = try #require(r.card, "\(r.cards.count) cards: \(summary(r))")
+            #expect(graph.writes.isEmpty, "written: \(graph.writes)")
+            #expect(canonicalRange(graph.event(CrossZoneSeries.id)) == range, "the series' range changed")
+            #expect(r.queued.count == 1, "rows: \(summary(r))")
+            guard r.queued.count == 1 else { return }
+            #expect(r.queued[0].status == PendingStatus.failed.rawValue, "\(r.queued[0].status) \(r.queued[0].failureReason ?? "")")
+            #expect(r.queued[0].failureReason == "This event uses the time zone \"\(custom)\", which TabMail does not recognize, so it did not delete these occurrences. Delete them in your calendar app instead.",
+                    "the user is told: \(r.queued[0].failureReason ?? "nil")")
         }
     }
 

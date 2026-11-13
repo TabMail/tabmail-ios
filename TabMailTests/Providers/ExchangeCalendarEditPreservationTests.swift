@@ -96,7 +96,7 @@ import Synchronization
 /// A timed event's starts and ends are returned as stored, whatever zone `Prefer` names: a
 /// fixture stores them as Graph renders them for the device. The one exception is a series' start
 /// and end stored labelled with the series' own zone (its range's `recurrenceTimeZone`, as the app
-/// writes them since #719): those are returned in the zone `Prefer` names, labelled with that name,
+/// writes them since #719, else the event's `originalStartTimeZone` when the range names none): those are returned in the zone `Prefer` names, labelled with that name,
 /// at the stored instant (Graph's documented `outlook.timezone`), as Graph renders them for the
 /// device. An all-day event's `start` and `end`
 /// are returned on every read (`/calendarView`, `/events/{id}`, `/instances`) as Graph returns them
@@ -495,7 +495,7 @@ final class FakeGraphCalendar: Sendable {
                 out[key] = ["dateTime": String(dateTime.prefix(10)) + "T00:00:00.0000000", "timeZone": name ?? "UTC"]
             }
         } else if let zone, let name,
-                  let seriesZone = ((event["recurrence"] as? [String: Any])?["range"] as? [String: Any])?["recurrenceTimeZone"] as? String {
+                  let seriesZone = Self.seriesZoneName(event) {
             for key in ["start", "end"] {
                 guard let side = event[key] as? [String: Any], let label = side["timeZone"] as? String, label == seriesZone,
                       let storedZone = CalendarTimeZoneResolver.zone(named: label, in: .none),
@@ -511,12 +511,20 @@ final class FakeGraphCalendar: Sendable {
         return out
     }
 
+    /// The zone a series' range dates are read in: its range's `recurrenceTimeZone`, else the
+    /// event's own zone, `originalStartTimeZone` (Graph: "If not specified, the time zone of the
+    /// event is used"). Nil when neither is given.
+    static func seriesZoneName(_ event: [String: Any]) -> String? {
+        (((event["recurrence"] as? [String: Any])?["range"] as? [String: Any])?["recurrenceTimeZone"] as? String)
+            .flatMap { $0.isEmpty ? nil : $0 } ?? (event["originalStartTimeZone"] as? String)
+    }
+
     /// Whether `occurrence`'s place in the series (`originalStart`, else its start) is on or before
     /// the end of `master`'s range when it ends on a date, that date read in the range's zone.
     private static func isInSeries(_ occurrence: [String: Any], master: [String: Any]?) -> Bool {
         guard let range = (master?["recurrence"] as? [String: Any])?["range"] as? [String: Any],
               range["type"] as? String == "endDate", let end = range["endDate"] as? String,
-              let zoneName = range["recurrenceTimeZone"] as? String,
+              let zoneName = master.flatMap(Self.seriesZoneName),
               let zone = CalendarTimeZoneResolver.zone(named: zoneName, in: .none),
               let place = (occurrence["originalStart"] as? String).flatMap({ Date.fromISO8601($0) }) ?? instant(occurrence["start"])
         else { return true }
@@ -845,6 +853,26 @@ enum GraphFixture {
         if let instant = fmt.date(from: String(wall.prefix(19))) { return deviceDay(instant) }
         fmt.dateFormat = "yyyy-MM-dd'T'HH:mm"
         return fmt.date(from: String(wall.prefix(16))).map(deviceDay)
+    }
+
+    /// The cap `endDate` a split at `naive`, a wall time in `zone`, must write on a timed series
+    /// kept in `keptIn` (its range's `recurrenceTimeZone`): the day before the split occurrence's
+    /// day in `keptIn`, where Graph reads a range's dates (measured 2026-11-11, #681). Worked out
+    /// here, apart from the app. Nil when the time or a zone can't be read.
+    static func capEndDate(_ naive: String, zone: TimeZone, keptIn: String) -> String? {
+        guard let series = CalendarTimeZoneResolver.zone(named: keptIn, in: .none) else { return nil }
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.timeZone = zone
+        fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        guard let instant = fmt.date(from: String(naive.prefix(19))) else { return nil }
+        var inSeries = Calendar(identifier: .gregorian)
+        inSeries.timeZone = series
+        var plain = Calendar(identifier: .gregorian)
+        plain.timeZone = utc
+        guard let day = plain.date(from: inSeries.dateComponents([.year, .month, .day], from: instant)),
+              let before = plain.date(byAdding: .day, value: -1, to: day) else { return nil }
+        return utcDay(before)
     }
 
     /// The instant a stored Graph `start` or `end` names: its wall time read in its label.

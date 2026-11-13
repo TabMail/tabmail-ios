@@ -109,6 +109,8 @@ that aren't included in the request body maintain their previous values".
   part are all dated in the series' zone (`ExchangeCalendarProvider.seriesDay`), so the start and
   its range always name the same day; before, they were dated on the device, which named another
   day whenever the device and the series disagreed on the date (pinned by `ExchangeSeriesDayTests`).
+  A split's cap `endDate` is dated the same way since #681 (`splitCapEndDate`, `splitDay`, through the
+  shared `day(of:in:seriesZone:)`; memory 142).
   Reads still ask for the device's zone, so a write no longer echoes
   the read's label. Pinned by `ExchangeSeriesZoneLabelTests` (through the queue, on
   `FakeGraphCalendar`'s measured refusal) and `ExchangeSeriesZoneHelperTests`.
