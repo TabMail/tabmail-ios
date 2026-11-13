@@ -167,6 +167,10 @@ regenerated from it; their detail files live in
 
 ### Base-register current disposition overrides
 
+Each row here is the current entry for its id and supersedes that id's row in the frozen issue index
+above, whose bytes cannot change. For example `IOS-OUTBOX-007` still reads `accepted` there and is
+`resolved` here.
+
 | ID | Class | Current disposition |
 |---|---|---|
 | [IOS-BODY-003](Companion/Process/Current/KnownIssues/ios-body-003.md) | `accepted` | 📋 **PARTIALLY RESOLVED (2026-08-17).** `ActiveBodyQueue` no longer grants a retry-exhausted row a fresh budget during the same drain, so the foreground reader can stop polling and use its on-demand fetch path. Explicit later recovery grants one fresh attempt. The Backfill/move-address residual remains accepted; see the routed amendment. |
