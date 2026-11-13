@@ -154,7 +154,50 @@ response was lost, the series it reads is already capped.
   gave the leap day, then February 28 twice. RFC 5545 skips such a month and does not count it
   (`.skip`, the default), and Google and CalDAV keep that. An unrecognized range zone or an
   uncountable pattern is refused before the cap. The cap's own date is still worked out in the operation's
-  zone (#681).
+  zone (#681). [Superseded 2026-11-13 by #681, below.]
+- **The Outlook split's cap is dated in the series' zone (#681, 2026-11-13).** Graph reads a range's
+  `endDate` (date-inclusive) in its `recurrenceTimeZone`, whatever `Prefer` names (measured 2026-11-11:
+  `Prefer` Pacific, a Tokyo range ending on the 19th kept the 19th 10:00 Tokyo and nothing on the 20th).
+  The cap was the day before the split's date in the zone the `recurrence_id` is read in (the device's
+  at the tool, stamped on the row since #794), so whenever the two zones dated the split occurrence differently (for zones far apart, most
+  of the day) the split occurrence stayed on the old part as well as starting the new one, or the
+  occurrence before it fell out of both. Now `splitCapEndDate` is the day before `splitDay`: the split's
+  wall time read in the `recurrence_id`'s zone and dated in the zone the range names
+  (`ExchangeCalendarProvider.day(of:in:seriesZone:)`, the helper `seriesDay` uses for the new part's
+  `startDate`); an all-day split is its date. `splitSeries`, its retry (`finishSplit`,
+  `splitAlreadyEnded`) and the numbered count (`numberedRange`) all read the split's day there, so a
+  retry finds a cap already written and writes nothing. A timed series whose range names no zone, or one
+  TabMail does not recognize (`Customized Time Zone`, #746), is refused before anything is written, with
+  the zone named (`CalendarProviderError.unrecognizedTimeZone`): its day can't be worked out, and a day
+  dated elsewhere may be off (memory 146: a timed series' day in an unknown zone is refused, never
+  guessed). Before, an unknown zone's numbered range was refused as uncountable and an end-dated or
+  open one was capped on the device's day. A `recurrence_id` that is a date alone (`select` Rule 2) is
+  taken as written. Pinned by `ExchangeSplitCapSeriesDayTests` (each direction, 26-hour and
+  quarter-hour pairs, the retry, an unrecognized zone, all-day from a far zone, a property test across a
+  clock change, against `FakeGraphCalendar.rangeDays`) and the `splitCapEndDate` unit tests in
+  `ExchangeCalendarTests`.
+- **The split and the following-delete share one cap and one zone refusal (Outlook, #681 with #695,
+  2026-11-13).** A delete of an occurrence and every later one (`endSeries`, ADR-IOS-112) caps the series
+  through the same `splitCapEndDate`, so it ends on the day before the occurrence named in the series'
+  zone, and a timed series in a zone TabMail does not recognize is refused there as the split is
+  (decided 2026-11-13: one rule for both). The delete is refused at the drain, after its card,
+  writes nothing and is retired as failed, in a delete's words (`ZoneRefusal.followingDelete`: "...so
+  it did not delete these occurrences. Delete them in your calendar app instead."); the split keeps
+  `.change`. A check before the card is #718's. #746 (recognizing more zones) lifts both refusals.
+  A split recorded before this change on a series in such a zone and cut off between its writes can't
+  be finished (`finishSplit` is refused the same way), leaving the new part and the uncapped old one
+  both in place; no real user is known to have one, so it is accepted. Pinned by
+  `CalendarScopedDeleteTests` (the following-delete in the five zone pairs keeps exactly the earlier
+  occurrences; the unrecognized zone writes nothing, fails, in the delete's words).
+- **A range with no zone is read in the event's own zone (Outlook, 2026-11-13).** Graph's
+  recurrenceRange: "If not specified, the time zone of the event is used." The event's zone is its
+  `originalStartTimeZone`, read with `splitSelect`; the read `start`'s zone is the one `Prefer` names
+  (the device's), so it must not stand in. `ExchangeCalendarProvider.seriesZoneName` gives the range's
+  `recurrenceTimeZone`, else `originalStartTimeZone`, through the same `CalendarTimeZoneResolver`; a
+  zone TabMail does not recognize there is refused as above (#746), and a series naming neither is
+  refused as before. Pinned by `ExchangeSplitCapSeriesDayTests` (split in the event's zone, both
+  directions; an unrecognized event zone writes nothing) and `CalendarScopedDeleteTests` (the
+  following-delete in the event's zone).
 - **A split that moves the start (CalDAV):** the edit lands on the new part through
   `CalDAVProvider.mergePatchIntoICS`, the same merge as a whole-series edit, so its start shift
   (`shiftSeriesAnchoredValues`, #558) also moves the new part's EXDATE and RDATE, its UNTIL (unless

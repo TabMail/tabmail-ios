@@ -3382,7 +3382,7 @@ final class SplitHarness: @unchecked Sendable {
             let rule = (google?.event(seriesId)?["recurrence"] as? [String])?.first { $0.uppercased().hasPrefix("RRULE:") }
             return rule?.uppercased().contains("UNTIL=\(cap)") == true
         case .outlook:
-            let cap = ExchangeCalendarProvider.graphEndDateBefore(naiveISO: recurrenceId, allDay: false, zone: tz)
+            let cap = GraphFixture.capEndDate(recurrenceId, zone: tz, keptIn: "Pacific Standard Time")
             let range = (graph?.event(seriesId)?["recurrence"] as? [String: Any])?["range"] as? [String: Any]
             return range?["type"] as? String == "endDate" && range?["endDate"] as? String == cap
         case .calDAV:

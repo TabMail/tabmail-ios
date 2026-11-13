@@ -56,6 +56,13 @@ iOS was out of parity (ADR-IOS-008).
   after the `UNTIL` cap a moved occurrence past the new end is kept but cancelled (gone from the
   instances list, a GET by its id returns `status` cancelled), so a "this and following" delete at a
   moved occurrence needs nothing more. Outlook's handling is not measured.
+- Outlook dates the cut in the series' own zone, through the split's `splitCapEndDate` (#681): the
+  series ends on the day before the occurrence named, read in its range's `recurrenceTimeZone`. A timed
+  series in a zone TabMail does not recognize is refused, one rule with the split (decided
+  2026-11-13): at the drain, after the card, nothing written, the op retired as failed, in a delete's
+  words ("...so it did not delete these occurrences. Delete them in your calendar app instead.").
+  #746 lifts the refusal for both; a check before the card is #718's. A split recorded earlier on such
+  a series and cut off midway can't be finished either; no real user is known to have one (memory 142).
 - A series changed between the card and the drain is still cut at the confirmed place (Google's and
   Outlook's `PATCH` carry no precondition; CalDAV's `PUT` is conditional on its own GET).
 

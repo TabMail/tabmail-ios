@@ -646,8 +646,7 @@ struct ExchangeSeriesSplitCopyTests {
         // series that already ends before the split has nothing to split.
         let http = FakeHTTP.Scenario()
         defer { http.close() }
-        let cap = try #require(ExchangeCalendarProvider.graphEndDateBefore(
-            naiveISO: GraphSplitFixture.recurrenceId, allDay: false, zone: .current))
+        let cap = try #require(GraphFixture.capEndDate(GraphSplitFixture.recurrenceId, zone: .current, keptIn: "Pacific Standard Time"))
         let series = GraphSplitFixture.series(range: ["type": "endDate", "endDate": cap, "numberOfOccurrences": 0])
         let graph = GraphSplitFixture.calendar(series, listed: listed)
         graph.install(on: http)
@@ -731,7 +730,9 @@ struct ExchangeSeriesSplitCopyTests {
         #expect(canonical(recurrence["pattern"]) == canonical(storedRecurrence["pattern"]), "the cap changed the pattern")
         let range = try #require(recurrence["range"] as? [String: Any])
         #expect(range["type"] as? String == "endDate", "\(rangeType)")
-        #expect(range["endDate"] as? String == GraphFixture.deviceDay(GraphFixture.onDevice(days: 6, hour: 10)), "\(rangeType): \(canonical(range))")
+        // The day before the split occurrence's day in the series' zone, where Graph reads it (#681).
+        #expect(range["endDate"] as? String == GraphFixture.capEndDate(GraphSplitFixture.recurrenceId, zone: .current, keptIn: "Pacific Standard Time"),
+                "\(rangeType): \(canonical(range))")
         #expect(range["startDate"] as? String == GraphFixture.deviceDay(GraphSplitFixture.start))
         #expect(range["recurrenceTimeZone"] as? String == "Pacific Standard Time")
         for key in GraphSplitFixture.keptKeys + ["subject", "attendees", "organizer"] {
