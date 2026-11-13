@@ -1837,7 +1837,14 @@ actor GoogleCalendarProvider: CalendarProvider {
             }
             return e.timeIntervalSince(s)
         }()
-        if master.isAllDay {
+        // The new series is in the kind the edit asks for: a patch that carries a start or end in
+        // one form changes the series between timed and all-day; otherwise it keeps the master's.
+        let allDay: Bool = {
+            if patch.startDate != nil || patch.endDate != nil { return true }
+            if patch.startDateTime != nil || patch.endDateTime != nil { return false }
+            return master.isAllDay
+        }()
+        if allDay {
             // All-day: emit date-only start/end. Google's all-day `end.date` is
             // EXCLUSIVE, so a 1-day event is start=D, end=D+1 (durationSec≈86400).
             var cal = Calendar(identifier: .gregorian)
