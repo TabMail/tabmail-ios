@@ -607,7 +607,8 @@ struct SettingsView: View {
             backfillUidCursor = NULL,
             backfillPageToken = NULL,
             backfillPageHeldSince = NULL,
-            changeState = NULL
+            changeState = NULL,
+            changeCursor = NULL
         WHERE path != ''
         """,
         // The change bookmarks go with the rows (ADR-IOS-111): a tracked folder

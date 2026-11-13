@@ -4397,6 +4397,19 @@ final class AppDatabase: Sendable {
                 t.add(column: "changeState", .text)
             }
         }
+
+        // ADR-IOS-111: a provider that reads changes folder by folder keeps each
+        // folder's bookmark here, opaque and provider-owned, written by the change
+        // apply in the folder's own transaction. NULL means "no bookmark yet", the
+        // right start for every existing folder: its next read starts a baseline.
+        // No data conversion.
+        migrator.registerTimedMigration(
+            "v103_addFolderChangeCursor", foreignKeyChecks: .immediate
+        ) { db in
+            try db.alter(table: "folder") { t in
+                t.add(column: "changeCursor", .text)
+            }
+        }
     }
 
     /// PORT — v2final `AppDatabase.seedDraftLastTouchedSeq`. Extracted to a static

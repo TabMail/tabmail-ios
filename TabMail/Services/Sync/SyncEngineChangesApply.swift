@@ -15,15 +15,28 @@ import GRDB
 // - removals go through the ONE removal core (`deleteConfirmedGhostHeaders…`),
 //   with the account-wide identity term when the ids are stable (no address epoch);
 // - a record for a message the folder does not hold inserts it, unless the user's
-//   own destructive action on it is pending or just completed;
+//   own destructive action on it is pending or just completed, or the record
+//   leaves out the read state or the flag (then the message is listed and read
+//   again in full, never stored with a default);
 // - a record for a message the folder holds merges its PRESENT fields; flags and
 //   the server tag are kept back while the user's flag action is pending or just
 //   completed;
+// - a record from a baseline (`FolderChangeStatus.isBaseline`: the folder's
+//   messages as they are, not changes) inserts only a message dated within the
+//   folder's held range (`Folder.oldestSyncedDate`); with no held range yet it
+//   inserts nothing, and mail older than the range is the backfill's;
 // - every change kept back is put on the folder's re-read list
 //   (`FolderChangeState.recheck`), read again on later passes (in turn, within
-//   `SyncConfig.changeRereadBudgetPerPass`) until it applies,
-//   and so is every message the provider could not read (`rereadLater`).
-//   Over `SyncConfig.changeRecheckLimit` ids, the folder's catch-up is armed.
+//   `SyncConfig.changeRereadBudgetPerPass`) until a record carrying its read
+//   state and flag applies (`ChangeRecord.carriesReadAndFlag`; a partial record
+//   applies what it carries and settles nothing, and the reader reads a listed
+//   message in full), and so is every message the provider could not read
+//   (`rereadLater`).
+//   Over `SyncConfig.changeRecheckLimit` ids, the folder's catch-up is armed;
+// - the folder's own bookmark (`Folder.changeCursor`) is written in the same
+//   transaction. A refused one is cleared with the folder's coverage, a lapse
+//   mark for its catch-up and the account's full sync made due; a folder whose
+//   baseline is in progress or just completed is not covered yet.
 
 /// What one folder transaction wrote.
 struct FolderChangeApplyResult {
@@ -70,9 +83,16 @@ extension SyncEngine {
 
         for record in changes.records {
             let applied = try applyChangeRecord(
-                record, folder: folder, addressEpoch: changes.addressEpoch,
+                record, folder: folder, addressEpoch: changes.addressEpoch, fromBaseline: changes.status.isBaseline,
                 snapshot: snapshot, recentlyCompleted: recentlyCompleted, result: &result, db: db)
-            if applied { settled.insert(record.messageId) } else { declined.insert(record.messageId) }
+            if !applied {
+                declined.insert(record.messageId)
+            } else if record.carriesReadAndFlag {
+                // A record without the read state or the flag applied what it
+                // carries but settles nothing: a listed message stays listed
+                // until it is read again in full.
+                settled.insert(record.messageId)
+            }
         }
 
         // A message the provider could not read this pass is read again too.
@@ -92,6 +112,31 @@ extension SyncEngine {
             result.armedCatchUp = true
         }
         state.recheck = recheck
+
+        // The folder's own bookmark and coverage.
+        var cursor = changes.cursor ?? folder.changeCursor
+        switch changes.status {
+        case .refused:
+            // This folder only: its bookmark is gone, so it is not covered, its
+            // catch-up gets one whole-folder check, and the account's full sync
+            // lists it. Its next read starts a new baseline.
+            cursor = nil
+            state.tracking = false
+            try markCatchUpLapse(folderId: folder.id, db: db)
+            try db.execute(sql: "UPDATE account SET lastFullSyncAt = NULL WHERE id = ?", arguments: [accountId])
+        case .baselining:
+            state.tracking = false
+        case .baselineReady:
+            // Covered only after a window listing in a pass whose read covered it
+            // (`commitChangeBaseline`); make that listing due.
+            state.tracking = false
+            try db.execute(sql: "UPDATE account SET lastFullSyncAt = NULL WHERE id = ?", arguments: [accountId])
+        case .tracked, .failed, .notRun:
+            break
+        }
+        if cursor != folder.changeCursor {
+            try db.execute(sql: "UPDATE folder SET changeCursor = ? WHERE id = ?", arguments: [cursor, folder.id])
+        }
         if state != before {
             try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [state.encoded, folder.id])
         }
@@ -114,7 +159,7 @@ extension SyncEngine {
 
     /// One record in one folder. Returns false when a shield kept the change back.
     private nonisolated static func applyChangeRecord(
-        _ record: ChangeRecord, folder: Folder, addressEpoch: Int?,
+        _ record: ChangeRecord, folder: Folder, addressEpoch: Int?, fromBaseline: Bool,
         snapshot: PendingOperationSnapshot, recentlyCompleted: [String: Date],
         result: inout FolderChangeApplyResult, db: Database
     ) throws -> Bool {
@@ -128,6 +173,16 @@ extension SyncEngine {
         }
         // A partial record for a message this folder does not hold: nothing to update.
         guard let info = record.header else { return true }
+        // A baseline lists the folder as it is: a message older than the held
+        // range, or any message before the folder has one, is not inserted (the
+        // window listing sets the range, the backfill takes older mail).
+        if fromBaseline {
+            guard let heldSince = folder.oldestSyncedDate, info.providerOrderDate >= heldSince else { return true }
+        }
+        // A record without the read state or the flag would store a default for
+        // the one it leaves out: the message is listed instead and read again in
+        // full, and the full record inserts it.
+        guard record.carriesReadAndFlag else { return false }
         if snapshot.destructive.containsAnyKey(messageId: info.messageId, rfc822MessageId: rfc822) {
             // A pending destructive op owns this identity.
             return false

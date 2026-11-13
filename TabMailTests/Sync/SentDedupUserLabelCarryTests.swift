@@ -297,12 +297,11 @@ struct SentDedupUserLabelCarryTests {
         let sentPath = "sentitems-r18"
         let serverMessageId = "ex-r18-carry-1"
         let rfc822Raw = "<r18-exchange-carry@example.com>"
-        let deltaLink = "https://graph.microsoft.com/v1.0/me/mailFolders/sentitems/messages/delta?$deltatoken=r18"
 
         let seeded = try Self.seed(
             accountId: accountId,
             provider: .outlook,
-            historyCursor: deltaLink,
+            historyCursor: "",
             sentPath: sentPath,
             optimisticMessageId: "optimistic-outbox-2",
             rfc822Raw: rfc822Raw,
@@ -315,35 +314,25 @@ struct SentDedupUserLabelCarryTests {
         #expect(try Self.labelIds(forHeader: seeded.decoyHeaderId, pool: pool) == [seeded.decoyLabelId],
                 "precondition: the decoy label must be on the higher-id optimistic header")
 
-        let scenario = FakeHTTP.Scenario()
-        defer { scenario.close() }
+        // Graph as the change reader sees it: the Sent folder in the folder tree,
+        // its message delta and header fetches.
+        let server = StatefulExchangeActionServer(messages: [])
+        defer { server.close() }
+        server.addFolder(id: "inbox-r18", name: "Inbox", wellKnownName: "inbox")
+        server.addFolder(id: sentPath, name: "Sent Items", wellKnownName: "sentitems")
+        server.addFolder(id: "drafts-r18", name: "Drafts", wellKnownName: "drafts")
+        server.addFolder(id: "deleted-r18", name: "Deleted Items", wellKnownName: "deleteditems")
+        server.addFolder(id: "archive-r18", name: "Archive", wellKnownName: "archive")
+        let provider = server.provider()
 
-        scenario.register(path: "/messages/delta", method: "GET", response: .json(raw: """
-        {
-          "value": [ { "id": "\(serverMessageId)" } ],
-          "@odata.deltaLink": "\(deltaLink)"
-        }
-        """))
-        scenario.register(path: "/messages/\(serverMessageId)", method: "GET", response: .json(raw: """
-        {
-          "id": "\(serverMessageId)",
-          "subject": "R18 carry fixture",
-          "receivedDateTime": "2026-01-14T12:00:00Z",
-          "isRead": true,
-          "hasAttachments": false,
-          "internetMessageId": "\(rfc822Raw)",
-          "categories": ["Work"],
-          "parentFolderId": "\(sentPath)"
-        }
-        """))
-
-        let provider = ExchangeProvider(
-            userEmail: "\(accountId)@example.com",
-            accessToken: { _ in "fake-access-token" },
-            session: scenario.session
-        )
-
-        let outcome = try await SyncEngine().performDeltaSync(account: seeded.account, provider: provider)
+        // The first pass reads Sent's first round (empty), so the server's copy
+        // arrives as a change in the next one.
+        _ = try await SyncEngine().performDeltaSync(account: seeded.account, provider: provider)
+        server.deliver(StatefulExchangeActionServer.Seed(
+            rfc822MessageId: String(rfc822Raw.dropFirst().dropLast()), providerMessageId: serverMessageId,
+            folderId: sentPath, isRead: true, receivedAt: Date(), categories: ["Work"]))
+        let account = try #require(try await pool.read { db in try Account.fetchOne(db, key: accountId) })
+        let outcome = try await SyncEngine().performDeltaSync(account: account, provider: provider)
         #expect(outcome.succeeded, "precondition: the delta pass must have run")
 
         let newHeaderId = MessageIdentity.headerId(

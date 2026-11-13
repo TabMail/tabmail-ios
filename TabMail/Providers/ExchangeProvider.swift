@@ -18,10 +18,14 @@ enum ExchangeGraphMessageRequest: CaseIterable, Hashable, Sendable {
     case fetchMessageHeaders
     case fetchOlderMessages
     case fetchMessageDetails
+    /// The Inbox's message delta (`ExchangeProviderChanges.swift`): its pages
+    /// carry the header fields. Other folders' deltas select
+    /// `GraphAPI.stateSelection` and never reach the parser.
+    case readChanges
 
     var selection: GraphMessageSelection {
         switch self {
-        case .fetchMessages, .search, .fetchMessageHeaders, .fetchOlderMessages:
+        case .fetchMessages, .search, .fetchMessageHeaders, .fetchOlderMessages, .readChanges:
             GraphAPI.headerOnlySelection
         case .fetchSingleBackfill:
             GraphAPI.backfillSelection
@@ -43,18 +47,12 @@ actor ExchangeProvider: EmailProvider {
     private let baseURL = "https://graph.microsoft.com/v1.0/me"
 
     /// Well-known folder IDs resolved during fetchFolders (used for archive/delete).
-    private var archiveFolderId: String?
-    private var deletedItemsFolderId: String?
-    private var inboxFolderId: String?
-
-    /// Where an unfinished `getCurrentDeltaLink` walk stopped: the folder it walks
-    /// and the `@odata.nextLink` of its next page. The walk runs inside a sync pass
-    /// that a deadline can cut, and a large folder can need more pages than one
-    /// pass has time for; the next call resumes here instead of at page 1, so the
-    /// walk finishes within a bounded number of passes. Recorded after every page,
-    /// so a cut keeps the pages already walked. In memory only: a new provider
-    /// starts the walk again.
-    private var deltaWalkContinuation: (folderId: String, nextLink: String)?
+    /// The change reader also sets them from the stored folders' roles on every
+    /// read (`ExchangeProviderChanges.swift`), so a process whose full sync skipped
+    /// discovery still has them.
+    var archiveFolderId: String?
+    var deletedItemsFolderId: String?
+    var inboxFolderId: String?
 
     /// Test-only session override. Production call sites omit; tests register
     /// `FakeHTTP` URLProtocol on this session to intercept Graph API calls.
@@ -185,7 +183,7 @@ actor ExchangeProvider: EmailProvider {
     /// The server listed a folder twice or sent a next-page link already followed.
     struct GraphFolderTreeCycle: Error {}
 
-    private static let mailSearchFolderType = "#microsoft.graph.mailSearchFolder"
+    static let mailSearchFolderType = "#microsoft.graph.mailSearchFolder"
 
     // MARK: - Messages
 
@@ -1460,69 +1458,7 @@ actor ExchangeProvider: EmailProvider {
             unmaterialisedIds: parsed.unmaterialisedIds))
     }
 
-    // MARK: - Incremental Sync (Delta)
-
-    func fetchHistory(since historyId: String) async throws -> HistoryResponse? {
-        // historyId is the deltaLink URL for Exchange
-        guard !historyId.isEmpty else {
-            BackgroundSyncLogger.log("exchange.fetchHistory: empty deltaToken")
-            return nil
-        }
-
-        BackgroundSyncLogger.log("exchange.fetchHistory: START email=\(userEmail)")
-        var added: [HistoryMessageRef] = []
-        var deleted: [HistoryMessageRef] = []
-        var nextLink: String? = historyId
-        var finalDeltaLink: String?
-
-        // Paginate through all delta pages
-        while let link = nextLink {
-            let data: Data
-            do {
-                data = try await requestAbsolute(url: link)
-            } catch {
-                // Graph can refuse the round on any page (a reset is `410 Gone` wherever it
-                // lands), and a refused round needs a full sync from a new cursor.
-                if Self.graphRefusedDeltaToken(error) {
-                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] Delta link refused — need full sync") }
-                    BackgroundSyncLogger.log("exchange.fetchHistory: delta link refused (\(link == historyId ? "first" : "later") request failed: \(error.localizedDescription))")
-                    return nil
-                }
-                BackgroundSyncLogger.log("exchange.fetchHistory: page request failed: \(error.localizedDescription)")
-                throw error
-            }
-
-            let response = try JSONDecoder().decode(GraphDeltaResponse.self, from: data)
-
-            for msg in response.value {
-                if msg.removed != nil {
-                    deleted.append(HistoryMessageRef(messageId: msg.id, labelIds: []))
-                } else {
-                    added.append(HistoryMessageRef(messageId: msg.id, labelIds: []))
-                }
-            }
-
-            if let deltaLink = response.odataDeltaLink {
-                finalDeltaLink = deltaLink
-                nextLink = nil // Done — got final delta link
-            } else {
-                nextLink = response.odataNextLink // More pages
-            }
-        }
-
-        let newDeltaLink = finalDeltaLink ?? historyId
-
-        BackgroundSyncLogger.log("exchange.fetchHistory: done +\(added.count) -\(deleted.count) newToken=\(finalDeltaLink != nil)")
-        if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] Delta: +\(added.count) added/changed, -\(deleted.count) deleted") }
-
-        return HistoryResponse(
-            newHistoryId: newDeltaLink,
-            messagesAdded: added,
-            messagesDeleted: deleted,
-            labelsAdded: [],
-            labelsRemoved: []
-        )
-    }
+    // MARK: - Change reading support
 
     /// Whether a failed delta request, on any page, means Graph refused the round,
     /// so the cursor is discarded and the next full sync takes a new one. Graph
@@ -1531,7 +1467,7 @@ actor ExchangeProvider: EmailProvider {
     /// An authorization failure (401, 403), a timeout (408), a throttle (429), a
     /// server error (5xx) or a dropped connection says nothing about the token, so
     /// the error is rethrown and the cursor kept for the next delta pass.
-    private static func graphRefusedDeltaToken(_ error: Error) -> Bool {
+    static func graphRefusedDeltaToken(_ error: Error) -> Bool {
         guard case ProviderError.networkError(let underlying) = error,
               case HTTPError.networkError(let status) = underlying else { return false }
         return (400..<500).contains(status) && ![401, 403, 408, 429].contains(status)
@@ -1542,101 +1478,83 @@ actor ExchangeProvider: EmailProvider {
         try await fetchMessageHeaders(ids: ids, batchSize: 50, interBatchDelay: 0.5)
     }
 
-    /// Fetch message details including parent folder for delta sync folder assignment.
+    /// Message details (headers and parent folder) for the change reader: the
+    /// headers of messages a folder does not hold yet, and the messages it is
+    /// asked to read again. Sent as Graph `$batch` requests of at most
+    /// `SyncConfig.graphBatchMaxRequests` messages; the caller charges each batch
+    /// its width before calling, so it passes at most that many ids to keep one
+    /// call one batch.
     ///
-    /// Skips a message only when Graph answers that it is gone (404/410): it
-    /// was deleted, or moved (a move gives it a new id), between the delta
-    /// listing and this fetch. Any other failure (a 5xx, a 4xx such as a 429
-    /// past the retry budget, a dropped connection, cancellation, an
-    /// unreadable body, a record `parseGraphMessage` refuses) throws, so the
-    /// delta fails without moving its link and
-    /// a later pass asks again. A failure that never clears is bounded by the
-    /// next foreground full sync, which captures a fresh link. A change in the
-    /// failed batch that no full-sync window covers is not recovered once
-    /// that happens.
-    func fetchMessageDetails(ids: [String]) async throws -> [ExchangeMessageDetail] {
+    /// Every id gets exactly one answer in the result:
+    /// - `details`: the message, with its parent folder;
+    /// - `gone`: 404 or 410, the message is deleted or was moved (a move gives it
+    ///   a new id);
+    /// - `unreadable`: the answer for that ONE message cannot be used (a body that
+    ///   does not decode, a record `parseGraphMessage` refuses, a server error for
+    ///   that item, or a 4xx that is about the message: anything but 401, 403, 408
+    ///   and 429), so the caller reads it again later instead of holding back the
+    ///   rest, as Gmail's reader does with a message whose fetch keeps failing
+    ///   (ADR-IOS-111 decision 7);
+    /// - `unanswered`: no usable answer this time (a throttle, a timeout, an
+    ///   authorization failure, or no answer in the batch), with its status (0
+    ///   when the batch had none); the caller asks again.
+    /// A failure of the batch request itself throws.
+    func fetchMessageDetails(ids: [String]) async throws -> ExchangeDetailBatch {
         let selection = ExchangeGraphMessageRequest.fetchMessageDetails.selection
-        var results: [ExchangeMessageDetail] = []
-        for id in ids {
-            let encodedId = try Self.encodedGraphPathSegment(id, context: "Graph message id")
+        var result = ExchangeDetailBatch()
+        var start = 0
+        while start < ids.count {
+            try Task.checkCancellation()
+            let chunk = Array(ids[start..<min(start + SyncConfig.graphBatchMaxRequests, ids.count)])
+            start += chunk.count
+            var requests: [[String: Any]] = []
+            for (index, id) in chunk.enumerated() {
+                let encodedId = try Self.encodedGraphPathSegment(id, context: "Graph message id")
+                requests.append([
+                    "id": String(index), "method": "GET",
+                    "url": "\(GraphAPI.batchItemPathPrefix)/messages/\(encodedId)?\(selection.queryParameter)",
+                ])
+            }
+            let body = try JSONSerialization.data(withJSONObject: ["requests": requests])
             let data: Data
             do {
-                data = try await request(path: "/messages/\(encodedId)?\(selection.queryParameter)")
-            } catch where isHttpGoneStatus(error) {
-                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] fetchMessageDetails: skipping \(id) — gone (\(error))") }
-                continue
+                data = try await authedHTTP.post(GraphAPI.batchURL, body: body)
+            } catch let e as HTTPError {
+                throw ProviderError.networkError(underlying: e)
             }
-            let msg = try JSONDecoder().decode(GraphMessage.self, from: data)
-            // A record the parser refuses (no usable date) is a failed fetch,
-            // not a gone message: it fails the delta like an unreadable body.
-            guard let header = parseGraphMessage(msg, selection: selection) else {
-                throw DecodingError.dataCorrupted(.init(
-                    codingPath: [], debugDescription: "Graph message \(id) has no usable header"))
-            }
-            results.append(ExchangeMessageDetail(header: header, parentFolderId: msg.parentFolderId ?? ""))
-        }
-        return results
-    }
-
-    /// Get the current delta link for a folder (used to initialize the incremental sync cursor).
-    ///
-    /// The initial delta round returns every message in the folder, so this walks
-    /// the whole folder. Pages are sized with `Prefer: odata.maxpagesize`, the
-    /// documented control, sent on every page as Graph's examples do; the round
-    /// asks for ids only.
-    ///
-    /// A walk that was cut (see `deltaWalkContinuation`) resumes from its next
-    /// page when it is the same folder. If Graph refuses any page of a resumed
-    /// walk (its round is gone), the walk starts again at page 1 once, in the
-    /// same call; a refusal of a walk that started at page 1 throws.
-    func getCurrentDeltaLink(folderId: String) async throws -> String? {
-        let encodedFolderId = try Self.encodedGraphPathSegment(folderId, context: "Graph folder id")
-        let firstPage = "/mailFolders/\(encodedFolderId)/messages/delta?$select=id"
-        let pageSize = ["Prefer": "odata.maxpagesize=\(SyncConfig.graphDeltaCursorWalkPageSize)"]
-
-        var resumed = false
-        var nextLink: String? = firstPage
-        if let kept = deltaWalkContinuation {
-            if kept.folderId == folderId {
-                nextLink = kept.nextLink
-                resumed = true
-            } else {
-                deltaWalkContinuation = nil
-            }
-        }
-        BackgroundSyncLogger.logDebug("[Exchange] Delta cursor walk: \(resumed ? "resuming" : "starting")")
-
-        // Walk through all pages to get the final deltaLink
-        while let link = nextLink {
-            let data: Data
-            do {
-                if link.hasPrefix("http") {
-                    data = try await requestAbsolute(url: link, extraHeaders: pageSize)
-                } else {
-                    data = try await request(path: link, extraHeaders: pageSize)
+            let responses = try GraphBatchItem.decodeAll(data)
+            var byIndex: [String: GraphBatchItem] = [:]
+            for item in responses { byIndex[item.id] = item }
+            for (index, id) in chunk.enumerated() {
+                guard let item = byIndex[String(index)] else {
+                    result.unanswered[id] = 0
+                    continue
                 }
-            } catch {
-                if Self.graphRefusedDeltaToken(error) {
-                    deltaWalkContinuation = nil
-                    if resumed {
-                        BackgroundSyncLogger.logDebug("[Exchange] Delta cursor walk: resumed walk refused, starting again")
-                        resumed = false
-                        nextLink = firstPage
+                if !(200..<300).contains(item.status) {
+                    Self.logGraphFailure(method: "GET", statusCode: item.status, errorBody: item.body)
+                }
+                switch item.status {
+                case 200..<300:
+                    guard let raw = item.body,
+                          let msg = try? JSONDecoder().decode(GraphMessage.self, from: raw),
+                          let header = parseGraphMessage(msg, selection: selection) else {
+                        result.unreadable.append(id)
                         continue
                     }
+                    result.details.append(ExchangeMessageDetail(header: header, parentFolderId: msg.parentFolderId ?? ""))
+                case 404, 410:
+                    result.gone.append(id)
+                case 401, 403, 408, 429:
+                    result.unanswered[id] = item.status
+                default:
+                    result.unreadable.append(id)
                 }
-                throw error
             }
-            let response = try JSONDecoder().decode(GraphDeltaResponse.self, from: data)
-            if let deltaLink = response.odataDeltaLink {
-                deltaWalkContinuation = nil
-                return deltaLink
-            }
-            nextLink = response.odataNextLink
-            deltaWalkContinuation = nextLink.map { (folderId: folderId, nextLink: $0) }
         }
-
-        return nil
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[Exchange] fetchMessageDetails: \(ids.count) asked, \(result.details.count) read, \(result.gone.count) gone, \(result.unreadable.count) unreadable, \(result.unanswered.count) unanswered")
+        }
+        return result
     }
 
     // MARK: - HTTP
@@ -1698,7 +1616,7 @@ actor ExchangeProvider: EmailProvider {
     /// widened into a runtime trap for conditions that are genuinely reachable —
     /// server-, network- or user-driven — and it must not be copied into any other
     /// switch on that reasoning alone.
-    private func request(
+    func request(
         path: String, method: String = "GET", body: Data? = nil, extraHeaders: [String: String] = [:]
     ) async throws -> Data {
         let url = baseURL + path
@@ -1716,7 +1634,7 @@ actor ExchangeProvider: EmailProvider {
     }
 
     /// Used by delta pagination — the next/delta links are absolute URLs.
-    private func requestAbsolute(url: String, extraHeaders: [String: String] = [:]) async throws -> Data {
+    func requestAbsolute(url: String, extraHeaders: [String: String] = [:]) async throws -> Data {
         guard GraphAPI.isGraphPageLink(url) else { throw ProviderError.invalidURL("Graph pagination") }
 
         do {
@@ -1740,7 +1658,7 @@ actor ExchangeProvider: EmailProvider {
     /// `TabMail/Providers/EmailProvider.swift` and is not visible from `Shared`,
     /// and every `ExchangeProvider` caller's disposition on an unencodable id is
     /// unchanged by the move.
-    private static func encodedGraphPathSegment(
+    static func encodedGraphPathSegment(
         _ value: String,
         context: String
     ) throws -> String {
@@ -1989,10 +1907,20 @@ actor ExchangeProvider: EmailProvider {
     private var orderByReceived: String { "$orderby=receivedDateTime desc" }
 }
 
-/// Message header with Exchange parent folder ID — used by delta sync for folder assignment.
+/// Message header with Exchange parent folder ID — used by the change reader to
+/// tell whether a message is still in the folder it reads.
 struct ExchangeMessageDetail: Sendable {
     let header: MessageHeaderInfo
     let parentFolderId: String
+}
+
+/// `ExchangeProvider.fetchMessageDetails`: one answer per id asked for.
+struct ExchangeDetailBatch: Sendable {
+    var details: [ExchangeMessageDetail] = []
+    var gone: [String] = []
+    var unreadable: [String] = []
+    /// Id -> the status Graph answered it with (0: no answer in the batch).
+    var unanswered: [String: Int] = [:]
 }
 
 // MARK: - Microsoft Graph API Response Models
@@ -2181,8 +2109,9 @@ private struct GraphAttachedEmailFiles: Decodable {
     }
 }
 
-private struct GraphDeltaResponse: Decodable {
-    let value: [GraphDeltaMessage]
+/// One page of a Graph delta round (messages or mail folders).
+struct GraphDeltaResponse<Record: Decodable>: Decodable {
+    let value: [Record]
     let odataDeltaLink: String?
     let odataNextLink: String?
 
@@ -2193,18 +2122,68 @@ private struct GraphDeltaResponse: Decodable {
     }
 }
 
-private struct GraphDeltaMessage: Decodable {
+/// One record of a message delta page. Only `id` is always present: a new
+/// message carries every selected field, an updated one "at least the updated
+/// properties", a removed one `@removed`. The selected fields are decoded where
+/// the reader needs them (`ExchangeProviderChanges.swift`).
+struct GraphDeltaMessage: Decodable {
     let id: String
     let removed: GraphRemoved?
+    let receivedDateTime: String?
+    let isRead: Bool?
+    let flag: GraphFlag?
+    let categories: [String]?
 
     enum CodingKeys: String, CodingKey {
-        case id
+        case id, receivedDateTime, isRead, flag, categories
         case removed = "@removed"
     }
 }
 
-private struct GraphRemoved: Decodable {
+/// One record of a mail-folder delta page.
+struct GraphDeltaFolder: Decodable {
+    let id: String
+    let removed: GraphRemoved?
+    let displayName: String?
+    let unreadItemCount: Int?
+    let totalItemCount: Int?
+    /// Present for a derived type only, such as `#microsoft.graph.mailSearchFolder`.
+    let odataType: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, displayName, unreadItemCount, totalItemCount
+        case removed = "@removed"
+        case odataType = "@odata.type"
+    }
+}
+
+struct GraphRemoved: Decodable {
     let reason: String?
+}
+
+/// One item of a Graph `$batch` answer (`{"responses": [{"id", "status",
+/// "body"}]}`), matched to its request by `id`. The body is kept as JSON bytes
+/// for a second decode as the type its request asked for.
+struct GraphBatchItem: Sendable {
+    let id: String
+    let status: Int
+    let body: Data?
+
+    /// The items of one `$batch` answer; throws when it is not one.
+    static func decodeAll(_ data: Data) throws -> [GraphBatchItem] {
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let responses = root["responses"] as? [[String: Any]] else {
+            throw DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "Graph $batch answer has no responses"))
+        }
+        return responses.compactMap { item in
+            guard let id = item["id"] as? String, let status = item["status"] as? Int else { return nil }
+            let body = item["body"].flatMap { value -> Data? in
+                guard JSONSerialization.isValidJSONObject(value) else { return nil }
+                return try? JSONSerialization.data(withJSONObject: value)
+            }
+            return GraphBatchItem(id: id, status: status, body: body)
+        }
+    }
 }
 
 /// #217: Outlook draft attachment upload (Graph "Attach large files to Outlook

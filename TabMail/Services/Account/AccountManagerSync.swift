@@ -53,9 +53,12 @@ extension AccountManager {
             Task { @MainActor in AccountManagerState.shared.setSyncPhase(nil, forAccount: accountId) }
         }
         do {
+            // The pass is told the timeout's own deadline, so it reads only what it
+            // can apply before the timeout gives up on it (ADR-IOS-104).
+            let deadline = Date().addingTimeInterval(SyncConfig.backgroundPerAccountTimeoutSeconds)
             let (changed, reason) = try await withTimeout(seconds: SyncConfig.backgroundPerAccountTimeoutSeconds) {
                 try await self.ensureConnected(account)
-                return try await self.syncEngine.backgroundDeltaSync(account: account, inboxOnly: inboxOnly)
+                return try await self.syncEngine.backgroundDeltaSync(account: account, inboxOnly: inboxOnly, deadline: deadline)
             }
             let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
             BackgroundSyncLogger.log("bgSync: END \(account.emailAddress): \(elapsed)ms, changes=\(changed), reason=\(reason)")
@@ -118,8 +121,10 @@ extension AccountManager {
             // Foreground inbox catch-up. Its writes run at `.normal` via
             // `SyncEngine.dbPool` = `AppDatabase.syncPool` — beats deep backfill in the
             // write scheduler but yields to the merge / a live user action.
+            // The pass is told the timeout's own deadline (ADR-IOS-104).
+            let deadline = Date().addingTimeInterval(SyncConfig.perAccountSyncTimeoutSeconds)
             let changed = try await withTimeout(seconds: SyncConfig.perAccountSyncTimeoutSeconds) {
-                try await self.syncEngine.sync(account: account)
+                try await self.syncEngine.sync(account: account, deadline: deadline)
             }
             return SyncResult(hadChanges: changed, failed: false)
         } catch let error as TimeoutError {

@@ -269,11 +269,6 @@ actor DemoProvider: EmailProvider {
 
     // MARK: - Sync stubs
 
-    func fetchHistory(since historyId: String) async throws -> HistoryResponse? {
-        // Demo doesn't simulate inbound mail; sync is a no-op.
-        nil
-    }
-
     func fetchMessageHeaders(ids: [String]) async throws -> [MessageHeaderInfo] {
         guard let db = AppDatabase.shared.withLock({ $0 }) else { return [] }
         return try await db.dbPool.read { conn in

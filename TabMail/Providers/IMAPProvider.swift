@@ -6572,12 +6572,6 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         }
     }
 
-    func fetchHistory(since historyId: String) async throws -> HistoryResponse? {
-        // IMAP doesn't have a history API like Gmail.
-        // Return nil to signal SyncEngine should use full sync.
-        return nil
-    }
-
     func fetchMessageHeaders(ids: [String]) async throws -> [MessageHeaderInfo] {
         // Not used for IMAP (no incremental sync path yet)
         return []

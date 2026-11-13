@@ -228,6 +228,10 @@ consumers, and every one is accounted for (`MIS-006`):
    `IMAPProvider.mapMessageInfo` ever sets `isDeletedOnServer`, and `IMAPProvider.fetchHistory`
    returns nil, so IMAP never reaches the delta path. Structurally cannot carry the flag.
 7. `SyncEngineDeltaSync`'s Exchange arm — same, **LEFT ALONE**.
+   *Superseded 2026-11-12 (ADR-IOS-111, Outlook amendment):* the Exchange arm (`exchangeDeltaSync`)
+   is deleted. Outlook's change reader (`ExchangeProviderChanges.swift`) materialises headers from its
+   delta pages and `ExchangeProvider.fetchMessageDetails`, through the generic change apply; it still
+   cannot carry the flag, because only `IMAPProvider.mapMessageInfo` sets `isDeletedOnServer`.
 8. `SyncEngineEpochVerify.classifyEpochVerificationSample` — compares rfc822 ids for epoch
    verification; materialises nothing, presents nothing. **LEFT ALONE.**
 

@@ -11,6 +11,13 @@
 > "the delta-cursor lapse clears every folder's catch-up state, so the next full sync lists every
 > folder in full". Exchange has the same
 > exposure and still uses the seam's do-nothing default. The original text below is kept as written.
+>
+> **Amended 2026-11-12 (ADR-IOS-111, Outlook amendment).** Exchange's exposure is narrower: each synced
+> Outlook folder now reads its own Graph message delta, which reports deletions and moves of any age while
+> the folder's link is valid, and no full sync replaces that link. A refused link, or a folder whose reads
+> keep failing past `SyncConfig.changeReadFailureLapseSeconds`, starts that folder's baseline again, and a
+> change to older mail in that gap is still lost until Outlook's own catch-up exists (it still uses the
+> seam's do-nothing default). The sentence above is kept as written.
 
 **Context:** The 2026-07-02 audit (PROJECT_MEMORY "IMAP external-deletion blind spot") confirmed that raw-IMAP/iCloud accounts never remove an externally-deleted message once it falls below the newest-`syncMessageLimit`(=50)-UID stale window: `selectStaleHeaders` is windowed, backfill is insert-only, `selfHealRecentMessages` is add-only, and the complete-knowledge branch is capped to tiny folders. Ghost rows persisted in GRDB + FTS + search indefinitely (Gmail/Exchange are immune — provider deltas carry deletions of any age). Two free signals were being wasted: `imapDeltaSync` observed `status.messageCount != folder.totalCount` but only ran the windowed sync and then OVERWROTE `totalCount` (evidence consumed, ghost survived), and IDLE `VANISHED(UIDSet)` — the server literally naming the deleted UIDs — was discarded into a generic poll.
 

@@ -11,24 +11,32 @@ extension SyncEngine {
 
     /// Attempt a delta sync. Returns (succeeded, hadChanges).
     /// succeeded=false means full sync needed. hadChanges=true means data was written.
-    /// - Parameter inboxOnly: When true, IMAP delta sync only checks inbox folder (BGAppRefresh path).
-    ///   Gmail/Exchange ignore this flag — their delta APIs return changes across all folders implicitly.
-    func performDeltaSync(account: Account, provider: any EmailProvider, inboxOnly: Bool = false) async throws -> (succeeded: Bool, hadChanges: Bool) {
-        let outcome = try await performChangePass(account: account, provider: provider, inboxOnly: inboxOnly)
+    /// - Parameter inboxOnly: a push or background pass. IMAP checks only the inbox
+    ///   folder; a change reader skips the folder list, and a reader that reads
+    ///   folder by folder reads only the inbox (ADR-IOS-111).
+    /// - Parameter deadline: the caller's own deadline for the pass, or nil.
+    func performDeltaSync(
+        account: Account, provider: any EmailProvider, inboxOnly: Bool = false, deadline: Date? = nil
+    ) async throws -> (succeeded: Bool, hadChanges: Bool) {
+        let outcome = try await performChangePass(
+            account: account, provider: provider, inboxOnly: inboxOnly, deadline: deadline)
         return (outcome.succeeded, outcome.hadChanges)
     }
 
     /// One change pass: the provider's change reader under the generic apply
     /// (ADR-IOS-111) when it has one, otherwise that provider's remaining delta.
-    func performChangePass(account: Account, provider: any EmailProvider, inboxOnly: Bool = false) async throws -> ChangePassOutcome {
+    /// - Parameter deadline: the caller's own deadline for the pass (its
+    ///   timeout), or nil when it sets none. A reader's read budget ends early
+    ///   enough for what it read to be applied before it (`changeReadEnd`).
+    func performChangePass(
+        account: Account, provider: any EmailProvider, inboxOnly: Bool = false, deadline: Date? = nil
+    ) async throws -> ChangePassOutcome {
         if let outcome = try await readAndApplyChanges(
-            account: account, provider: provider, scope: inboxOnly ? .inboxOnly : .all) {
+            account: account, provider: provider, scope: inboxOnly ? .inboxOnly : .all, deadline: deadline) {
             return outcome
         }
         let result: (succeeded: Bool, hadChanges: Bool)
-        if account.provider == .outlook, let exchangeProvider = provider as? ExchangeProvider {
-            result = try await exchangeDeltaSync(account: account, provider: exchangeProvider)
-        } else if (account.provider == .imap || account.provider == .icloud), let imapProvider = provider as? IMAPProvider {
+        if (account.provider == .imap || account.provider == .icloud), let imapProvider = provider as? IMAPProvider {
             result = try await imapDeltaSync(account: account, provider: imapProvider, inboxOnly: inboxOnly)
         } else {
             result = (false, false)
@@ -41,378 +49,6 @@ extension SyncEngine {
         Task { @MainActor in
             AccountManagerState.shared.setSyncPhase(.downloading(count), forAccount: accountId)
         }
-    }
-
-    /// Exchange delta sync using Graph delta API.
-    /// Fetches only what changed since lastHistoryId (deltaLink token).
-    private func exchangeDeltaSync(account: Account, provider: ExchangeProvider) async throws -> (succeeded: Bool, hadChanges: Bool) {
-        guard let deltaToken = account.lastHistoryId else {
-            BackgroundSyncLogger.logDebug("[Sync] Exchange delta: no deltaToken for \(account.emailAddress) — skipping (needs full sync)")
-            BackgroundSyncLogger.log("exchangeDelta: \(account.emailAddress) noToken")
-            return (false, false)
-        }
-
-        guard let history = try await provider.fetchHistory(since: deltaToken) else {
-            // Delta expired — clear cursor so next sync does full
-            BackgroundSyncLogger.logDebug("[Sync] Exchange delta: token expired for \(account.emailAddress) — clearing cursor")
-            BackgroundSyncLogger.log("exchangeDelta: \(account.emailAddress) tokenExpired")
-            try await dbPool.write { db in
-                _ = try Account.filter(Column("id") == account.id)
-                    .updateAll(db, Column("lastHistoryId").set(to: nil as String?))
-            }
-            return (false, false)
-        }
-
-        let totalChanges = history.messagesAdded.count + history.messagesDeleted.count +
-            history.labelsAdded.count + history.labelsRemoved.count
-        let exDeltaLog = "exchangeDelta: \(account.emailAddress) +\(history.messagesAdded.count) -\(history.messagesDeleted.count) ~\(history.labelsAdded.count + history.labelsRemoved.count)"
-        BackgroundSyncLogger.logDebug("[Sync] \(exDeltaLog)")
-        BackgroundSyncLogger.log(exDeltaLog)
-
-        // deltaToken is advanced AFTER processing completes successfully (at end of method).
-        // Same rationale as Gmail: advancing before processing risks losing messages
-        // if interrupted. Re-processing is idempotent and harmless.
-        let newDeltaToken = history.newHistoryId
-
-        let folders = try await dbPool.read { db in
-            try Folder.filter(Column("accountId") == account.id).fetchAll(db)
-        }
-
-        if totalChanges == 0 {
-            // No changes — safe to advance cursor immediately
-            try await dbPool.write { db in
-                _ = try Account.filter(Column("id") == account.id)
-                    .updateAll(db, Column("lastHistoryId").set(to: newDeltaToken))
-            }
-            BackgroundSyncLogger.logDebug("[Sync] Exchange delta: no changes")
-            return (true, false)
-        }
-
-        BackgroundSyncLogger.logDebug("[Sync] Exchange delta: +\(history.messagesAdded.count) added, -\(history.messagesDeleted.count) deleted, \(history.labelsAdded.count + history.labelsRemoved.count) label changes")
-
-        // Collect all affected message IDs
-        var toFetch = Set<String>()
-        var toDelete = Set<String>()
-
-        for msg in history.messagesAdded { toFetch.insert(msg.messageId) }
-        for msg in history.messagesDeleted { toDelete.insert(msg.messageId) }
-        for change in history.labelsAdded { toFetch.insert(change.messageId) }
-        for change in history.labelsRemoved { toFetch.insert(change.messageId) }
-
-        // Don't re-fetch deleted messages
-        toFetch.subtract(toDelete)
-
-        if !toFetch.isEmpty { publishDownloading(toFetch.count, forAccount: account.id) }
-
-        // `recentlyCompleted` — same guard as Gmail delta — is read inside the
-        // write transaction below, not captured here before the fetch.
-
-        // Delete removed messages — skip messages with pending operations.
-        if !toDelete.isEmpty {
-            let deleteSet = toDelete
-            let exchangeAccountId = account.id
-            let removedIds: [String] = try await dbPool.write { db in
-                let snapshot = try PendingOperationSnapshot.load(accountId: exchangeAccountId, db: db)
-                var ids: [String] = []
-                for deleteId in deleteSet {
-                    let matches = try MessageHeader
-                        .filter(Column("messageId") == deleteId)
-                        .limit(10)
-                        .fetchAll(db)
-                    for msg in matches {
-                        if snapshot.all.containsAnyKey(messageId: msg.messageId, rfc822MessageId: msg.rfc822MessageId) {
-                            continue
-                        }
-                        ids.append(msg.id)
-                        try msg.delete(db)
-                    }
-                }
-                return ids
-            }
-            if !removedIds.isEmpty {
-                removeHeadersFromFTS(removedIds)
-                BackgroundSyncLogger.logDebug("[Sync] Exchange delta: removed \(removedIds.count) messages")
-            }
-        }
-
-        // Fetch current state of all changed messages and upsert
-        var exNewHeaders: [MessageHeader] = []
-        if !toFetch.isEmpty {
-            let details = try await provider.fetchMessageDetails(ids: Array(toFetch))
-
-            let exchangeAccountId = account.id
-            let writeResult: (headers: [MessageHeader], discoveredParents: [String], removedIds: [String]) = try await dbPool.write { db in
-                let snapshot = try PendingOperationSnapshot.load(accountId: exchangeAccountId, db: db)
-                let exRecentlyCompleted = AccountManager.shared.liveRecentlyCompleted()
-                var headers: [MessageHeader] = []
-                var discoveredParents: [String] = []
-                // Header ids deleted by sent-dedup — must be pulled from FTS too,
-                // or the optimistic entry survives as a stale orphan.
-                var removedIds: [String] = []
-                for detail in details {
-                    let info = detail.header
-                    let folderId = detail.parentFolderId
-
-                    // Find matching local folder
-                    guard let folder = folders.first(where: { $0.id == folderId || $0.path == folderId }) else {
-                        continue
-                    }
-
-                    let existing = try MessageHeader
-                        .filter(Column("messageId") == info.messageId && Column("folderId") == folder.id)
-                        .fetchOne(db)
-                    let existsLocally = existing != nil
-                    let isPendingDestructive = snapshot.destructive.containsAnyKey(messageId: info.messageId, rfc822MessageId: info.rfc822MessageId)
-                    let isPendingFlag = snapshot.flag.containsAnyKey(messageId: info.messageId, rfc822MessageId: info.rfc822MessageId)
-
-                    let isRecentlyDone = exRecentlyCompleted[info.messageId] != nil
-
-                    if existsLocally && (isPendingFlag || isRecentlyDone) {
-                        // Has pending or recently completed flag ops — only update non-flag fields
-                        if var existing {
-                            existing.observedUidValidity = nil
-                            existing.rfc822MessageId = info.rfc822MessageId
-                            existing.referencesJSON = MessageHeader.encodeReferences(info.references)
-                            try existing.update(db)
-                        }
-                    } else if existsLocally {
-                        // Update flags on existing message
-                        if var existing {
-                            existing.observedUidValidity = nil
-                            existing.isRead = info.isRead
-                            existing.isFlagged = info.isFlagged
-                            if let serverTag = info.actionTag {
-                                if existing.actionTag != serverTag {
-                                    if DebugModeManager.isLoggingEnabled() {
-                                        print("[Sync] Exchange delta: remote tag change for \(info.messageId): \(existing.actionTag?.rawValue ?? "nil") -> \(serverTag.rawValue)")
-                                    }
-                                    try MessageAICache.writeThrough(
-                                        accountId: account.id,
-                                        folderPath: folder.path,
-                                        rfc822MessageId: existing.rfc822MessageId,
-                                        actionTag: serverTag,
-                                        db: db
-                                    )
-                                }
-                                existing.actionTag = serverTag
-                                existing.tagSortOrder = serverTag.sortOrder
-                            }
-                            existing.rfc822MessageId = info.rfc822MessageId
-                            existing.referencesJSON = MessageHeader.encodeReferences(info.references)
-                            try existing.update(db)
-                        }
-                    } else if isPendingDestructive || isRecentlyDone {
-                        // Skip — pending destructive op or recently completed
-                        if DebugModeManager.isLoggingEnabled() {
-                            print("[MoveTrace] exchangeDelta — SKIPPING insert of \(info.messageId) into \(folder.name) — has pending destructive op or recent completion")
-                        }
-                    } else {
-                        // New message
-                        if DebugModeManager.isLoggingEnabled() {
-                            print("[MoveTrace] exchangeDelta — inserting \(info.messageId) into \(folder.name)(\(folder.id))")
-                        }
-                        var header = MessageHeader(
-                            messageId: info.messageId,
-                            subject: info.subject,
-                            from: info.from,
-                            fromAddress: info.fromAddress,
-                            to: info.to,
-                            date: info.date,
-                            snippet: EmailFilter.cleanSnippet(info.snippet),
-                            folderId: folder.id,
-                            accountId: folder.accountId,
-                            folderPath: folder.path,
-                            isInInbox: folder.role == .inbox,
-                            providerDate: info.providerOrderDate
-                        )
-                        header.rfc822MessageId = info.rfc822MessageId
-                        header.referencesJSON = MessageHeader.encodeReferences(info.references)
-                        header.threadId = info.threadId ?? ThreadUtils.computeSubjectThreadId(accountId: folder.accountId, subject: header.subject)
-                        try ThreadUtils.assignComputedThreadId(to: &header, nativeThreadId: info.threadId, db: db)
-                        header.replyTo = info.replyTo
-                        header.cc = info.cc
-                        header.bcc = info.bcc
-                        header.isRead = info.isRead
-                        header.isFlagged = info.isFlagged
-                        header.hasAttachments = info.hasAttachments
-                        header.isReplied = info.isReplied
-                        header.isForwarded = info.isForwarded
-                        header.actionTag = info.actionTag
-                        header.tagSortOrder = info.actionTag?.sortOrder ?? 99
-                        try MessageAICache.restoreIfCached(
-                            into: &header,
-                            accountId: account.id,
-                            folderPath: folder.path,
-                            db: db
-                        )
-                        if header.isReplied && header.actionTag == .reply {
-                            header.actionTag = ActionTag.none
-                            header.tagSortOrder = ActionTag.none.sortOrder
-                            var tagOp = PendingOperation(
-                                type: .setTag,
-                                messageIds: [header.stableId],
-                                accountId: account.id,
-                                folderPath: folder.path,
-                                tagValue: ActionTag.none.rawValue
-                            )
-                            try tagOp.insert(db)
-                            if DebugModeManager.isLoggingEnabled() {
-                                print("[ReplyDetect] Delta insert: reply→none for \(header.messageId) (already replied)")
-                            }
-                        }
-                        // Check for orphaned row with same id but wrong folderId.
-                        if var orphaned = try MessageHeader.fetchOne(db, key: header.id) {
-                            let orphanIsPending = snapshot.destructive.containsAnyKey(
-                                messageId: orphaned.messageId,
-                                rfc822MessageId: orphaned.rfc822MessageId
-                            )
-                            if orphanIsPending {
-                                if DebugModeManager.isLoggingEnabled() {
-                                    print("[MoveTrace] exchangeDelta — SKIPPING orphan reclaim for \(orphaned.id) — pending destructive op (server folder=\(folder.name) but user moved locally)")
-                                }
-                                continue
-                            }
-                            if DebugModeManager.isLoggingEnabled() {
-                                print("[Sync] exchangeDelta reclaiming orphaned row \(header.id): folderId \(orphaned.folderId) → \(folder.id)")
-                            }
-                            orphaned.folderId = folder.id
-                            orphaned.folderPath = folder.path
-                            orphaned.observedUidValidity = nil
-                            orphaned.isInInbox = folder.role == .inbox
-                            orphaned.messageId = header.messageId
-                            orphaned.isRead = header.isRead
-                            orphaned.isFlagged = header.isFlagged
-                            orphaned.date = header.date
-                            orphaned.providerDate = header.providerDate
-                            orphaned.from = header.from
-                            orphaned.fromAddress = header.fromAddress
-                            orphaned.to = header.to
-                            orphaned.cc = header.cc
-                            orphaned.bcc = header.bcc
-                            orphaned.replyTo = header.replyTo
-                            orphaned.rfc822MessageId = header.rfc822MessageId
-                            orphaned.isReplied = orphaned.isReplied || header.isReplied
-                            orphaned.isForwarded = orphaned.isForwarded || header.isForwarded
-                            orphaned.subject = header.subject
-                            orphaned.snippet = header.snippet
-                            orphaned.hasAttachments = header.hasAttachments
-                            orphaned.actionTag = header.actionTag
-                            orphaned.tagSortOrder = header.tagSortOrder
-                            try orphaned.update(db)
-                            headers.append(orphaned)
-                        } else {
-                            // Dedup optimistic sent headers by rfc822MessageId.
-                            // Defer body insert until after header insert (FK constraint).
-                            var deferredSentBody: MessageBody?
-                            var carriedUserLabelIds: [String] = []
-                            if folder.role == .sent,
-                               let rfc822 = header.rfc822MessageId, !rfc822.isEmpty,
-                               let optimistic = try MessageHeader.fetchOne(
-                                db, sql: Self.optimisticDedupSQL,
-                                arguments: [folder.id, rfc822, header.messageId]) {
-                                let oldId = optimistic.id
-                                // 🚨 CARRY THE USER-APPLIED LABEL MEMBERSHIP — see the identical
-                                // block on the Gmail delta path above for the full reasoning.
-                                // `messageUserLabel.messageId` cascades on `messageHeader` delete,
-                                // so `optimistic.delete(db)` erases it, and the rebuild below is
-                                // driven by the INCOMING set only. On Exchange `info.userLabelIds`
-                                // is `msg.categories` and IS authoritative, but it still cannot
-                                // contain a category the user applied locally whose
-                                // `.addUserLabel` op has not yet drained to Graph.
-                                carriedUserLabelIds = try MessageUserLabel
-                                    .filter(Column("messageId") == oldId)
-                                    .fetchAll(db)
-                                    .map(\.userLabelId)
-                                if let body = try MessageBody.fetchOne(db, key: ContentKey(rawValue: oldId)) {
-                                    var newBody = body
-                                    newBody.id = ContentKey(rawValue: header.id)
-                                    try MessageBody.deleteOne(db, key: ContentKey(rawValue: oldId))
-                                    deferredSentBody = newBody
-                                }
-                                removedIds.append(oldId)
-                                try optimistic.delete(db)
-                                if DebugModeManager.isLoggingEnabled() {
-                                    print("[Sync] Exchange delta dedup: replaced optimistic sent header \(oldId) with \(header.id)")
-                                }
-                            }
-                            // Same invariant as the Gmail arm's insert above: the orphan check
-                            // established `header.id`'s absence inside THIS transaction, the
-                            // only `messageHeader` write since is the Sent-dedup DELETE, and no
-                            // other writer can interleave. The post-snapshot re-read guard that
-                            // sat here was unreachable and was removed 2026-09-04
-                            // (`IOS-LABEL-004`). A colliding insert throws UNIQUE and rolls the
-                            // batch back; the deltaToken (`lastHistoryId`) advance is a SEPARATE
-                            // `dbPool.write` at the end of this method, so the cursor stays put
-                            // and the next pass re-fetches the same delta and reclaims the row
-                            // via the orphan check. No retry.
-                            try header.insert(db)
-                            if let sentBody = deferredSentBody { try sentBody.insert(db) }
-                            try ThreadUtils.insertMessageReferences(for: header, db: db)
-
-                            // Insert user label associations. ⚠️ This said "(Exchange: empty
-                            // for now)" until round 18 and was FALSE at this candidate:
-                            // `ExchangeProvider.parseGraphMessage` maps `msg.categories` into
-                            // `userLabelIds` (filtered only for legacy `tm_*`). Its label set
-                            // is authoritative only when the request selected `categories`
-                            // AND decoding observed the field; this insertion path does not
-                            // consume that future reconciliation guard. A stale comment that
-                            // CONFIRMS a hypothesis is the expensive kind — this one nearly
-                            // produced a false HIGH in the round-18 audit.
-                            for labelId in info.userLabelIds {
-                                let labelRow = UserLabel(accountId: account.id, providerLabelId: labelId, name: labelId, isSystem: false)
-                                try labelRow.insert(db, onConflict: .ignore)
-                                // The join FK is `userLabel.id` — the account-prefixed SURROGATE, never
-                                // the bare provider value (D10 / `IOS-LABEL-001`).
-                                try MessageUserLabel(messageId: header.id, userLabelId: labelRow.id)
-                                    .insert(db, onConflict: .ignore)
-                            }
-                            // Re-attach the membership the Sent dedup above carried off the
-                            // replaced header — see the Gmail path for the full reasoning.
-                            for carriedUserLabelId in carriedUserLabelIds {
-                                try MessageUserLabel(messageId: header.id, userLabelId: carriedUserLabelId)
-                                    .insert(db, onConflict: .ignore)
-                            }
-
-                            headers.append(header)
-
-                            // Sent-folder reply discovery — no-op when folder.role != .sent.
-                            let parents = try ReplyParentResolver.markParentsReplied(
-                                inReplyTos: [info.inReplyTo],
-                                folderRole: folder.role,
-                                accountId: account.id,
-                                db: db
-                            )
-                            discoveredParents.append(contentsOf: parents)
-                        }
-                    }
-                }
-                return (headers, discoveredParents, removedIds)
-            }
-            exNewHeaders = writeResult.headers
-            ReplyParentResolver.postParentNotifications(writeResult.discoveredParents)
-            // Keep FTS aligned with GRDB: drop entries for sent-dedup-replaced headers.
-            if !writeResult.removedIds.isEmpty {
-                removeHeadersFromFTS(writeResult.removedIds)
-            }
-
-        }
-
-        // Recount unread once after ALL header mutations (deletes + upserts + flag changes)
-        // are committed to GRDB — before FTS/body queue which can take seconds.
-        await UnreadCountManager.shared.requestRecount(folderIds: Set(folders.map(\.id)))
-
-        if !exNewHeaders.isEmpty {
-            await indexHeadersForFTS(exNewHeaders)
-            BackgroundSyncLogger.logDebug("[Sync] Exchange delta: +\(exNewHeaders.count) new messages")
-            await ActiveBodyQueue.shared.enqueueBatch(exNewHeaders)
-        }
-
-        // Advance deltaToken AFTER all processing completed successfully.
-        try await dbPool.write { db in
-            _ = try Account.filter(Column("id") == account.id)
-                .updateAll(db, Column("lastHistoryId").set(to: newDeltaToken))
-        }
-        return (true, true)
     }
 
     /// CONDSTORE (RFC 7162) flag-change signal for IMAP delta: does the server's
@@ -899,33 +535,5 @@ extension SyncEngine {
         }
 
         return (true, anyChanged)
-    }
-
-    /// Capture the change cursor after a full sync, for a provider that has no
-    /// change reader yet (ADR-IOS-111: a reader takes its bookmark before the
-    /// listings instead). Outlook: the Inbox delta link.
-    func captureSyncCursors(account: Account, provider: any EmailProvider) async {
-        if account.provider == .outlook, let exchangeProvider = provider as? ExchangeProvider {
-            do {
-                // Capture delta link for inbox folder
-                let inboxFolder = try await dbPool.read { db in
-                    try Folder.filter(Column("accountId") == account.id && Column("role") == FolderRole.inbox.rawValue).fetchOne(db)
-                }
-                guard let inboxFolder else {
-                    BackgroundSyncLogger.logDebug("[Sync] No inbox folder found for Exchange account — skipping delta capture")
-                    return
-                }
-                let deltaLink = try await exchangeProvider.getCurrentDeltaLink(folderId: inboxFolder.path)
-                try await dbPool.write { db in
-                    _ = try Account.filter(Column("id") == account.id)
-                        .updateAll(db, Column("lastHistoryId").set(to: deltaLink))
-                }
-                BackgroundSyncLogger.logDebug("[Sync] Captured Exchange deltaLink: \(deltaLink != nil ? "present" : "nil")")
-            } catch {
-                BackgroundSyncLogger.logDebug("[Sync] Failed to capture Exchange deltaLink: \(error)")
-            }
-        } else if account.provider == .imap || account.provider == .icloud {
-            // uidNext is set during fullSync → fetchFolders via FolderInfo.uidNext
-        }
     }
 }

@@ -757,11 +757,20 @@ struct ExchangeProviderSelectionWiringTests {
             response: .json(raw: messageJSON(
                 id: "headers-route", category: "category-headers"))
         )
+        // The Inbox's message delta carries the header fields on its page.
         http.register(
-            path: "/messages/details-route?",
-            response: .json(raw: messageJSON(
-                id: "details-route", category: "category-details",
-                parentFolderId: "folder-details"))
+            path: "/mailFolders/delta-route/messages/delta",
+            response: .json(raw: "{\"value\":[\(messageJSON(id: "delta-route", category: "category-delta"))],"
+                + "\"@odata.deltaLink\":\"https://graph.microsoft.com/v1.0/me/mailFolders/delta-route/messages/delta?$deltatoken=t1\"}")
+        )
+        // Message details go out as one Graph `$batch`; its item answers the
+        // single GET it carries.
+        let detailsBody = messageJSON(
+            id: "details-route", category: "category-details",
+            parentFolderId: "folder-details")
+        http.register(
+            path: "/$batch", method: "POST",
+            response: .json(raw: "{\"responses\":[{\"id\":\"0\",\"status\":200,\"body\":\(detailsBody)}]}")
         )
     }
 
@@ -811,11 +820,21 @@ struct ExchangeProviderSelectionWiringTests {
         let olderHeader = try #require(older.first)
         parsed[.fetchOlderMessages] = olderHeader
 
-        let details = try await exchange.fetchMessageDetails(ids: ["details-route"])
+        let details = try await exchange.fetchMessageDetails(ids: ["details-route"]).details
         #expect(details.count == 1)
+        guard details.count == 1 else { return parsed }
         let detail = try #require(details.first)
         #expect(detail.parentFolderId == "folder-details")
         parsed[.fetchMessageDetails] = detail.header
+
+        let inbox = ChangeFolder(id: "acc:delta-route", path: "delta-route", role: .inbox, isSynced: true)
+        let changes = try #require(try await exchange.fetchChanges(
+            since: ChangeCursor(account: nil),
+            request: ChangeRequest(folders: [inbox], scope: .inboxOnly, recheck: [:],
+                                   context: ChangeContext(onProgress: { _ in }))))
+        let deltaRecords = changes.folders.first?.records ?? []
+        #expect(deltaRecords.count == 1)
+        parsed[.readChanges] = try #require(deltaRecords.first?.header)
 
         return parsed
     }
@@ -845,10 +864,18 @@ struct ExchangeProviderSelectionWiringTests {
                 "\(Self.graphBase)/mailFolders/older-route/messages?$select=\(h)"
                     + "&$filter=receivedDateTime lt 2020-09-13T12:26:40Z"
                     + "&$top=10&$orderby=receivedDateTime desc"),
-            normalizedURL(
-                "\(Self.graphBase)/messages/details-route?$select=\(Self.metadataFields)")
+            normalizedURL(GraphAPI.batchURL),
+            normalizedURL("\(Self.graphBase)/mailFolders/delta-route/messages/delta?$select=\(h)")
         ]
         #expect(http.recordedCalls().map { $0.url } == expected)
+        // The batch carries exactly the details GET, with its selection.
+        let batchBody = try #require(http.recordedCalls().first { $0.url == GraphAPI.batchURL }?.body)
+        let batch = try #require(try JSONSerialization.jsonObject(with: batchBody) as? [String: Any])
+        let items = try #require(batch["requests"] as? [[String: Any]])
+        #expect(items.count == 1)
+        guard items.count == 1 else { return }
+        #expect(items[0]["method"] as? String == "GET")
+        #expect(items[0]["url"] as? String == "/me/messages/details-route?$select=\(Self.metadataFields)")
     }
 
     /// The user's search text must reach Graph as exactly what they typed.
@@ -920,7 +947,8 @@ struct ExchangeProviderSelectionWiringTests {
             .search: "category-search",
             .fetchMessageHeaders: "category-headers",
             .fetchOlderMessages: "category-older",
-            .fetchMessageDetails: "category-details"
+            .fetchMessageDetails: "category-details",
+            .readChanges: "category-delta"
         ]
 
         #expect(parsed.count == ExchangeGraphMessageRequest.allCases.count)

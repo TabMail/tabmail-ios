@@ -258,6 +258,14 @@ struct Folder: Codable, FetchableRecord, PersistableRecord, Identifiable, Hashab
     /// declined for under the user's own action, to read again on later passes.
     /// Message ids only, never content (ADR-004). Nil means "not tracked".
     var changeState: String?
+    /// The provider's OPAQUE change bookmark for this folder (ADR-IOS-111), for a
+    /// provider that reads changes folder by folder (Outlook: the folder's message
+    /// delta position). Only the provider reads it; the change apply writes what
+    /// the reader returns in the same transaction as the changes it covers, so a
+    /// crash resumes from the last applied page. A link and counters, never message
+    /// content (ADR-004). Nil means "no bookmark yet": the next read starts the
+    /// folder's baseline.
+    var changeCursor: String?
 
     init(name: String, path: String, role: FolderRole, accountId: String) {
         self.id = "\(accountId):\(path)"

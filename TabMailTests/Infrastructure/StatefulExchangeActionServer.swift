@@ -55,7 +55,7 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         let isFlagged: Bool
     }
 
-    private struct Message: Sendable {
+    struct Message: Sendable {
         let rfc822MessageId: String
         let providerMessageId: String
         var folderId: String
@@ -65,7 +65,7 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         var categories: [String] = []
     }
 
-    private struct State: Sendable {
+    struct State: Sendable {
         var messagesByProviderId: [String: Message]
         var nextMoveGeneration = 1
         var lookupFailuresRemaining = 0
@@ -139,9 +139,12 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         /// provider message id, served until `clearGetFailures()`.
         var getFailureStatusByProviderId: [String: Int] = [:]
         var getFailuresServedByProviderId: [String: Int] = [:]
+        /// Graph's change model for the delta routes
+        /// (`StatefulExchangeActionServer+Delta.swift`).
+        var delta = DeltaModel()
     }
 
-    private final class StateBox: Sendable {
+    final class StateBox: Sendable {
         let value: Mutex<State>
 
         init(_ state: State) {
@@ -150,7 +153,7 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
     }
 
     let http = FakeHTTP.Scenario()
-    private let state: StateBox
+    let state: StateBox
     /// Whether `/move` REALLOCATES the resource id, which is what Graph does on
     /// the default mutable-id scheme and therefore the default here.
     ///
@@ -177,6 +180,7 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
             }
         )))
         registerRoutes()
+        registerDeltaRoutes()
     }
 
     func close() {
@@ -500,6 +504,7 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
 
     private func registerRoutes() {
         http.register(path: "/mailFolders/", method: "GET") { [state] request in
+            if let response = Self.serveFolderResource(request, state: state) { return response }
             guard let folderId = Self.folderId(fromLookupURL: request.url) else {
                 return .status(404)
             }
@@ -630,10 +635,12 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
                 guard var message = model.messagesByProviderId[providerId] else { return false }
                 if let isRead = body["isRead"] as? Bool {
                     message.isRead = isRead
+                    model.delta.log(folderId: message.folderId, messageId: providerId, kind: .read)
                 }
                 if let flag = body["flag"] as? [String: Any],
                    let status = flag["flagStatus"] as? String {
                     message.isFlagged = status == "flagged"
+                    model.delta.log(folderId: message.folderId, messageId: providerId, kind: .flag)
                 }
                 // Graph REPLACES the whole `categories` array on PATCH — it is
                 // not a merge. Modeling the replacement is the entire point:
@@ -641,6 +648,7 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
                 // category this fixture was seeded with.
                 if let categories = body["categories"] as? [String] {
                     message.categories = categories
+                    model.delta.log(folderId: message.folderId, messageId: providerId, kind: .categories)
                 }
                 model.messagesByProviderId[providerId] = message
                 return true
@@ -665,7 +673,9 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
                 return .status(404)
             }
             let removed = state.value.withLock { model in
-                model.messagesByProviderId.removeValue(forKey: providerId) != nil
+                guard let gone = model.messagesByProviderId.removeValue(forKey: providerId) else { return false }
+                model.delta.log(folderId: gone.folderId, messageId: providerId, kind: .removed)
+                return true
             }
             return removed ? .status(204) : .status(404)
         }
@@ -758,6 +768,8 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
                 categories: prior.categories
             )
             model.messagesByProviderId[movedId] = next
+            model.delta.log(folderId: prior.folderId, messageId: providerId, kind: .removed)
+            model.delta.log(folderId: destination, messageId: movedId, kind: .created)
             return next
         }
         guard let moved else { return .status(404) }
@@ -803,7 +815,7 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
     /// Decode exactly one Graph message resource path segment. Reserved
     /// characters inside the opaque ID must remain percent-encoded on the wire;
     /// a raw slash therefore fails this route instead of being misread as shape.
-    private static func messageId(from url: URL, move: Bool) -> String? {
+    static func messageId(from url: URL, move: Bool) -> String? {
         guard let path = URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedPath
         else { return nil }
         let segments = path.split(separator: "/", omittingEmptySubsequences: true)
@@ -836,7 +848,7 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
             .replacingOccurrences(of: "''", with: "'")
     }
 
-    private static func graphRow(_ message: Message) -> [String: Any] {
+    static func graphRow(_ message: Message) -> [String: Any] {
         [
             "id": message.providerMessageId,
             "subject": "Stateful action message",

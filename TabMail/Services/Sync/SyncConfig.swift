@@ -615,12 +615,34 @@ enum SyncConfig {
     static let gmailWorkQueueConcurrency: Int = 10
     /// Max concurrent operations for Exchange/Graph API providers.
     static let exchangeWorkQueueConcurrency: Int = 10
-    /// Messages per page asked for (`Prefer: odata.maxpagesize`) while walking an
-    /// Outlook folder's initial delta round for a new cursor (every full sync takes one). The round
-    /// returns every message in the folder, so the page size sets the request count.
-    /// Graph documents no default page size for message delta; without this header
-    /// it has been observed to return 10 (observed, not documented).
-    static let graphDeltaCursorWalkPageSize: Int = 100
+    /// Messages per page the Outlook change reader asks for
+    /// (`Prefer: odata.maxpagesize`, sent on every page of a folder's message
+    /// delta). A folder's first round (its baseline) returns every message in the
+    /// folder, so the page size sets its request count. Graph documents no default
+    /// or largest page size for message delta; without this header it has been
+    /// observed to return 10 (observed, not documented).
+    static let graphChangeReadPageSize: Int = 100
+    /// Requests Graph allows one app per mailbox in `graphMailboxRequestWindowSeconds`
+    /// ("10,000 API requests in a 10-minute period", Graph throttling limits,
+    /// Outlook service limits).
+    static let graphMailboxRequestLimit: Double = 10_000
+    static let graphMailboxRequestWindowSeconds: Double = 600
+    /// The share of that limit one change read may use, leaving the rest to the
+    /// user's own actions, the full sync, the backfill and the calendar, which
+    /// count against the same mailbox limit.
+    static let graphChangeReadRequestShare: Double = 0.5
+    /// The Outlook change reader's request rate: 10,000 / 600 s x 0.5 = about 8.3
+    /// requests per second. A read may send at most this rate times its read
+    /// budget (`SyncEngine.changeReadEnd`): about 41 requests for a background
+    /// pass's 5 s and 166 for a foreground pass's 20 s. Every request is charged
+    /// before it is sent; a `$batch` is charged its width, because Graph evaluates
+    /// each request in a batch against the throttling limits on its own.
+    static let graphChangeReadRequestsPerSecond: Double =
+        graphMailboxRequestLimit / graphMailboxRequestWindowSeconds * graphChangeReadRequestShare
+    /// Requests one Graph `$batch` carries at most (JSON batching: "limited to 20
+    /// individual requests"). A batch of 20 is charged 20, which fits the smallest
+    /// read's allowance above (41), so missing headers are fetched in batches.
+    static let graphBatchMaxRequests: Int = 20
 
     // MARK: - Outbox Send Throttle
 
@@ -873,4 +895,28 @@ enum SyncConfig {
     /// folder) would overrun it. The history's own changed messages are bounded
     /// separately (`GmailAPI.historyMaxChanges`).
     static let changeRereadBudgetPerPass = 50
+    /// Longest a change read may read for in one pass, from the start of its turn.
+    /// Leaves the foreground pass's `perAccountSyncTimeoutSeconds` (60 s) room for
+    /// the full sync after the read.
+    static let changeReadBudgetSeconds: TimeInterval = 20
+    /// Longest one read request may take before the reader gives it up (a
+    /// transient failure; the bookmark stays where it was).
+    static let changeReadRequestTimeoutSeconds: TimeInterval = 3
+    /// Time kept back after the last read request for the apply of what was read.
+    static let changeReadApplyMarginSeconds: TimeInterval = 2
+    // The read budget (`SyncEngine.changeReadEnd`), counted from the start of the
+    // pass's turn: the smaller of `changeReadBudgetSeconds` and
+    //   caller's deadline - now - changeReadRequestTimeoutSeconds - changeReadApplyMarginSeconds.
+    // A request may START only before the budget ends and is given up after
+    // `changeReadRequestTimeoutSeconds`, so the last one ends by
+    // deadline - changeReadApplyMarginSeconds, and the apply has the margin.
+    // Background pass (`backgroundPerAccountTimeoutSeconds` = 10 s): a turn that
+    // starts at once reads for at most 10 - 3 - 2 = 5 s; one that waited W s for
+    // its turn reads for 5 - W s; at W >= 5 it reads nothing and keeps its
+    // bookmark. Foreground pass (60 s): min(20, 60 - W - 5).
+    /// How long a folder's change reads may keep failing on answers from the
+    /// server (5xx, a page that cannot be read, a next link that repeats) before
+    /// the reader starts the folder again from a new baseline. A connection loss,
+    /// a cancellation, an authorization failure or a throttle never counts.
+    static let changeReadFailureLapseSeconds: TimeInterval = 3_600
 }
