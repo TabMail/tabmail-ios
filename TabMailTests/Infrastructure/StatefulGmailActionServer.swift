@@ -846,6 +846,9 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         let label: String?
         let onlyWithPageToken: Bool
         var remaining: Int?
+        /// When set, once `remaining` runs out the next matching listing gets
+        /// this bare status (once), then listings work again.
+        var thenStatus: Int?
     }
 
     /// Answer `/messages` listings with a bare `status`: only those naming
@@ -861,12 +864,14 @@ final class StatefulGmailActionServer: @unchecked Sendable {
 
     /// Like `failListings(status:label:onlyWithPageToken:times:)`, but the
     /// matching listings get no answer at all: the request fails with the
-    /// transport error `code`.
-    func failListings(transport code: URLError.Code, label: String? = nil, onlyWithPageToken: Bool = false, times: Int? = nil) {
+    /// transport error `code`. With `thenStatus` (and `times`), the next
+    /// matching listing after those gets that bare status once.
+    func failListings(transport code: URLError.Code, label: String? = nil, onlyWithPageToken: Bool = false, times: Int? = nil, thenStatus: Int? = nil) {
         state.value.withLock {
             var failure = ListingFailure(
                 status: 0, label: label, onlyWithPageToken: onlyWithPageToken, remaining: times)
             failure.transport = code
+            failure.thenStatus = thenStatus
             $0.listingFailure = failure
         }
     }
@@ -1301,7 +1306,9 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                 if failure.onlyWithPageToken && pageToken == nil { return nil }
                 if let remaining = failure.remaining {
                     failure.remaining = remaining - 1
-                    model.listingFailure = remaining > 1 ? failure : nil
+                    model.listingFailure = remaining > 1 ? failure : failure.thenStatus.map {
+                        ListingFailure(status: $0, label: failure.label, onlyWithPageToken: failure.onlyWithPageToken, remaining: 1)
+                    }
                 }
                 model.listingFailuresServed += 1
                 return failure

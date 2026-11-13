@@ -255,7 +255,7 @@ struct Folder: Codable, FetchableRecord, PersistableRecord, Identifiable, Hashab
     /// `FolderChangeState` in JSON. Engine-owned and provider-blind: it says
     /// whether the provider's change bookmark covers the folder (then the full
     /// sync's window listing skips it) and which message ids a change was
-    /// declined for under the user's own action, to read again on the next pass.
+    /// declined for under the user's own action, to read again on later passes.
     /// Message ids only, never content (ADR-004). Nil means "not tracked".
     var changeState: String?
 

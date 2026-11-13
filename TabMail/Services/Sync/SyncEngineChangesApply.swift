@@ -20,7 +20,8 @@ import GRDB
 //   the server tag are kept back while the user's flag action is pending or just
 //   completed;
 // - every change kept back is put on the folder's re-read list
-//   (`FolderChangeState.recheck`), read again on the next pass until it applies,
+//   (`FolderChangeState.recheck`), read again on later passes (in turn, within
+//   `SyncConfig.changeRereadBudgetPerPass`) until it applies,
 //   and so is every message the provider could not read (`rereadLater`).
 //   Over `SyncConfig.changeRecheckLimit` ids, the folder's catch-up is armed.
 

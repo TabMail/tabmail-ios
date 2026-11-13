@@ -529,7 +529,11 @@ backfill version; a foreground pass with the full sync due applies the folder li
 gone one removed) from ONE label request, the full sync reusing the read's list instead of fetching its own;
 a refusal whose re-read loses the connection marks ONE lapse and reads the history once (the retry starts
 from the account row, not the pass's copy), in a foreground pass (which also does not report the lost
-connection once it has listed) and in a background pass; a first sync whose listing loses the connection
+connection once it has listed) and in a background pass; a refusal whose re-read and retry both lose the
+connection fails the foreground pass, marks ONE lapse and stores nothing, and the next pass lists and
+stores a bookmark; a reader pass that drops a folder keeps the full sync due; a folder whose listing retry
+gets an HTTP status is dropped while the folders after it are still listed, and the next pass lists only
+it; a first sync whose listing loses the connection
 at one folder stores the bookmark, keeps the full sync due, and on the next foreground pass lists only the
 folders still untracked, a change to their mail during the failure arriving by the read, and once the
 listing works they are tracked and the full sync is done; with full re-read lists and a slow server a

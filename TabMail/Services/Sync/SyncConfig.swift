@@ -818,7 +818,8 @@ enum SyncConfig {
     /// Most message ids one folder keeps on its re-read list
     /// (`FolderChangeState.recheck`): changes the apply declined because the
     /// user's own action on the message was in flight. Each id is read again on
-    /// every pass until it applies. Over this many, the extra ids are not kept and
+    /// later passes, in turn within `changeRereadBudgetPerPass`, until it
+    /// applies. Over this many, the extra ids are not kept and
     /// the folder's catch-up is armed instead, so a whole-folder check finds them.
     static let changeRecheckLimit = 200
     /// Most distinct message ids one change pass reads again from the folders'
