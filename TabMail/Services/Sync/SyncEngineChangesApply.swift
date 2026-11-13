@@ -58,10 +58,14 @@ extension SyncEngine {
         result.wroteRows = !removal.deleted.isEmpty
         declined.formUnion(removal.protectedMessageIds)
         settled.formUnion(Set(changes.removals).subtracting(removal.protectedMessageIds))
-        if DebugModeManager.isLoggingEnabled(), folder.role == .drafts, !removal.deleted.isEmpty {
+        if folder.role == .drafts, !removal.deleted.isEmpty {
             // Draft rekey visibility: Gmail mints a new message id on every draft
             // push, so the old one is reported removed (the matching insert below).
-            print("[DraftRekey] change apply: removed drafts-folder rows \(removal.deleted) from \(folder.name)")
+            // Inside the write transaction, so a console-only print behind the
+            // canonical gate, not `BackgroundSyncLogger.logDebug` (rule 12 addendum).
+            if DebugModeManager.isLoggingEnabled() {
+                print("[DraftRekey] change apply: removed drafts-folder rows \(removal.deleted) from \(folder.name)")
+            }
         }
 
         for record in changes.records {
@@ -184,8 +188,10 @@ extension SyncEngine {
         result: inout FolderChangeApplyResult, db: Database
     ) throws -> Bool {
         let accountId = folder.accountId
-        if folder.role == .drafts, DebugModeManager.isLoggingEnabled() {
-            print("[DraftRekey] change apply: inserting drafts-folder header messageId=\(info.messageId) into \(folder.name)")
+        if folder.role == .drafts {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[DraftRekey] change apply: inserting drafts-folder header messageId=\(info.messageId) into \(folder.name)")
+            }
         }
         var header = MessageHeader(
             messageId: info.messageId,
