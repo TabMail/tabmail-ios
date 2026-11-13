@@ -429,12 +429,15 @@ actor SyncEngine {
                 return (false, "noCursor")
             }
         } catch {
-            if Self.isConnectionError(error) {
+            // The failed attempt may have written the bookmark already (a refusal
+            // clears it before the same pass reads again), so the retry reads
+            // from the account row as it is now.
+            if Self.isConnectionError(error), let current = try await accountAtTurnStart(account.id) {
                 // Pool self-heals: dead connections discarded on checkin(healthy: false),
                 // next checkout creates a fresh one. Retry without disconnect/reconnect.
                 BackgroundSyncLogger.logDebug("[Sync:bg] Connection error for \(account.emailAddress): \(error) — retrying")
                 let retry = try await queue.execute(priority: .headerFetch) {
-                    try await self.performDeltaSync(account: account, provider: provider, inboxOnly: inboxOnly)
+                    try await self.performDeltaSync(account: current, provider: provider, inboxOnly: inboxOnly)
                 }
                 if retry.succeeded {
                     try await dbPool.write { db in
@@ -529,8 +532,12 @@ actor SyncEngine {
                 // next checkout creates a fresh one. Retry without disconnect/reconnect.
                 BackgroundSyncLogger.logDebug("[Sync] Delta sync connection error for \(account.emailAddress): \(error) — retrying")
                 do {
+                    // The failed attempt may have written the bookmark already (a
+                    // refusal clears it before the same pass reads again), so the
+                    // retry reads from the account row as it is now.
+                    guard let current = try await accountAtTurnStart(account.id) else { throw error }
                     let retryResult = try await queue.execute(priority: .headerFetch) {
-                        try await self.performChangePass(account: account, provider: provider)
+                        try await self.performChangePass(account: current, provider: provider)
                     }
                     changePass = retryResult
                     if retryResult.succeeded {
@@ -594,10 +601,8 @@ actor SyncEngine {
             if let changePass, changePass.fromReader {
                 // The reader's bookmark was read BEFORE these listings; store a
                 // candidate and turn tracking on only now that they are done.
-                let syncable = try await syncableFolderIds(accountId: account.id)
                 try await commitChangeBaseline(
-                    account: account, outcome: changePass, listedFolderIds: listedFolderIds,
-                    syncableFolderIds: syncable)
+                    account: account, outcome: changePass, listedFolderIds: listedFolderIds)
             } else {
                 await queue.execute(priority: .headerFetch) {
                     await self.captureSyncCursors(account: account, provider: provider)

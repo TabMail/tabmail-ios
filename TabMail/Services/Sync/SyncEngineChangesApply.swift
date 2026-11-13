@@ -73,10 +73,13 @@ extension SyncEngine {
         // A message the provider could not read this pass is read again too.
         declined.formUnion(changes.rereadLater)
 
-        // The re-read list: drop what applied, add what was kept back.
+        // The re-read list: drop what applied; what was kept back goes to the
+        // back, behind the ids this pass did not read, so with more ids than one
+        // pass reads (`SyncConfig.changeRereadBudgetPerPass`) every id gets its turn.
         var state = FolderChangeState(raw: folder.changeState)
         let before = state
-        var recheck = state.recheck.filter { declined.contains($0) || !settled.contains($0) }
+        var recheck = state.recheck.filter { !declined.contains($0) && !settled.contains($0) }
+        recheck += state.recheck.filter { declined.contains($0) }
         for id in declined.sorted() where !recheck.contains(id) { recheck.append(id) }
         if recheck.count > SyncConfig.changeRecheckLimit {
             recheck = Array(recheck.prefix(SyncConfig.changeRecheckLimit))

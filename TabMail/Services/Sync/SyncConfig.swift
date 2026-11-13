@@ -821,4 +821,10 @@ enum SyncConfig {
     /// every pass until it applies. Over this many, the extra ids are not kept and
     /// the folder's catch-up is armed instead, so a whole-folder check finds them.
     static let changeRecheckLimit = 200
+    /// Most distinct message ids one change pass reads again from the folders'
+    /// re-read lists; the rest stay listed for later passes. Sized so the re-reads
+    /// fit the background pass's deadline (`backgroundPerAccountTimeoutSeconds`)
+    /// at `GmailAPI.maxConcurrentRequests` gets at a time next to the history's
+    /// own changed messages: full lists (`changeRecheckLimit` per folder) would not.
+    static let changeRereadBudgetPerPass = 50
 }

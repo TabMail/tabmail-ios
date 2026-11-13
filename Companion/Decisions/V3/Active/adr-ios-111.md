@@ -34,7 +34,12 @@ and that capture was a lapse, so a new account listed every folder twice for the
    `Folder.changeState.recheck` (v102, engine-owned JSON, message ids only); a folder whose only change is
    such an id is still written, or the bookmark would move past a change kept nowhere. The next request passes it; the
    reader reads those messages again and returns ordinary records or removals; an id leaves the list once it
-   applies. Over `SyncConfig.changeRecheckLimit`, the extra ids are dropped and the folder's catch-up is
+   applies. One pass asks for at most `SyncConfig.changeRereadBudgetPerPass` distinct ids, taking the
+   folders' lists in turn from the front (`SyncEngine.rereadIdsWithinBudget`); the ids not asked for stay
+   listed, and an id kept back again goes to the back of its list, so every id gets its turn. Full lists
+   would otherwise make every background pass overrun its deadline (`backgroundPerAccountTimeoutSeconds`),
+   which applies nothing, so new mail would wait for the app to be opened. Over
+   `SyncConfig.changeRecheckLimit`, the extra ids are dropped and the folder's catch-up is
    armed (the lapse mark, `SyncEngine.markCatchUpLapse`).
 4. **Tracking.** `Folder.changeState.tracking` turns on for a folder only after a window listing that
    finished in a foreground pass whose read covered it (`commitChangeBaseline`). A tracked folder gets no
@@ -46,11 +51,22 @@ and that capture was a lapse, so a new account listed every folder twice for the
    bumps no backfill version (ADR-IOS-107).
 5. **The bookmark is read before the listings.** With no bookmark the reader returns a candidate (Gmail:
    the profile's history id) and every folder `.baselineReady`. The engine makes the full sync due, the same
-   foreground pass lists, runs the catch-up, and only then stores the candidate, if every waiting syncable
-   folder was listed, WITHOUT a lapse mark (#783). Background passes never store a candidate.
+   foreground pass lists, runs the catch-up, and only then stores the candidate, WITHOUT a lapse mark (#783).
+   Background passes never store a candidate. The candidate is stored even when a folder's listing failed:
+   that folder stays untracked, so every later full sync lists it until a listing finishes, and nothing is
+   lost meanwhile. A change to its mail after the candidate is in the history the next reads take from the
+   bookmark; an account-wide reader names every folder, and a full record inserts a message the folder does
+   not hold yet. Its mail as it stood before is taken by its later window listing, and older mail by its
+   catch-up, which runs for every syncable folder whether or not the window listing finished and keeps a
+   lapse mark until that folder's check is done. (Superseded: the candidate waited for every syncable
+   folder, so one folder that could not be listed kept the account with no bookmark, and every foreground
+   pass listed every folder again while changes to older mail went unread.)
 6. **Refusal.** One transaction clears the bookmark, untracks every folder, marks one lapse for each
    folder's catch-up and makes the full sync due (`applyChangeRefusal`); the same pass then reads again with
    no bookmark, so the re-list and the new candidate happen in that pass and exactly one catch-up check runs.
+   A pass's retry after a lost connection reads the account row again first: the failed attempt may already
+   have applied a refusal, and retrying from the pass's own copy would be refused a second time and mark a
+   second lapse.
 7. **Gmail's reader** (`GmailProviderChanges.swift`): `labels.list` as the folder list on `.all` passes (a
    label created, renamed or deleted shows on the next pass), the history read as before, a deleted message
    a removal in every folder, every changed or re-read message fetched once and a record in each folder its
@@ -76,9 +92,10 @@ over-long one, so Gmail reports both as `.refused(.expired)`.
 **Trade-offs:** No cross-check: a reader bug is no longer corrected by the 15-minute listing for a tracked
 folder; the guards are the pinned tests, the fuzz and the fences, and "Reset message data" clears the
 bookmark. A genuine server change that races the user's own action lands one pass later (the re-read).
-A message that never reads costs one GET per pass while on the re-read list; a 429 or 5xx storm across a
+A message that never reads costs at most one GET per pass while on the re-read list (within the per-pass budget); a 429 or 5xx storm across a
 large change batch puts many ids there, and past `changeRecheckLimit` the folder's catch-up is armed.
 
 Keywords: change reader, ChangeSet, fetchChanges, ChangeCursor, ChangeRequest, recheck, re-read list,
 tracking, changeState, v102, baseline, candidate bookmark, refusal, lapse, applyFolderList, window listing
-off, labels.list, rereadLater, unreadable message, GmailDetailBatch, #444, #783, #735, #715, #464, #460.
+off, labels.list, rereadLater, unreadable message, GmailDetailBatch, re-read budget, changeRereadBudgetPerPass,
+background deadline, unlistable folder, retry account row, #444, #783, #735, #715, #464, #460.

@@ -252,6 +252,10 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         /// excluded). See `failListings(status:label:onlyWithPageToken:times:)`.
         var listingFailure: ListingFailure?
         var listingFailuresServed = 0
+        /// The next `/profile` requests get no answer at all: the transport
+        /// error and how many requests are left to fail. See `failNextProfile`.
+        var profileFailure: (code: URLError.Code, remaining: Int)?
+        var profileFailuresServed = 0
         /// Seconds every `GET /messages/{id}` naming a provider id is withheld for.
         var getLatencyByProviderId: [String: TimeInterval] = [:]
         /// Seconds every account-wide `is:unread` / `is:starred` list is withheld for.
@@ -526,9 +530,27 @@ final class StatefulGmailActionServer: @unchecked Sendable {
     /// no cursor, as before. `/history` is always served.
     func serveProfile() {
         http.register(path: "/profile", method: "GET") { [state] _ in
+            let failure = state.value.withLock { model -> URLError.Code? in
+                guard let failure = model.profileFailure else { return nil }
+                model.profileFailure = failure.remaining > 1 ? (failure.code, failure.remaining - 1) : nil
+                model.profileFailuresServed += 1
+                return failure.code
+            }
+            if let failure { return .transportError(failure) }
             let (historyId, total) = state.value.withLock { ($0.historyId, $0.messagesByProviderId.count) }
             return .json(raw: #"{ "emailAddress": "user@example.com", "historyId": "\#(historyId)", "messagesTotal": \#(total) }"#)
         }
+    }
+
+    /// The next `times` `/profile` requests get no answer: each fails with the
+    /// transport error `code` (a connection lost while reading the profile).
+    func failNextProfile(transport code: URLError.Code, times: Int = 1) {
+        state.value.withLock { $0.profileFailure = (code, times) }
+    }
+
+    /// How many `/profile` requests were answered with an injected failure.
+    func profileFailuresServedCount() -> Int {
+        state.value.withLock { $0.profileFailuresServed }
     }
 
     /// Make every `GET /messages/{providerMessageId}` take `seconds` to answer

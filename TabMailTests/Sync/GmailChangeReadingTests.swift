@@ -442,6 +442,171 @@ struct GmailChangeReadingTests {
         }
     }
 
+    // MARK: - a refusal whose re-read loses the connection
+
+    /// Each folder's lapse count (`CatchUpLapse.countKey`, absent = 0), for the
+    /// folders that hold a catch-up state.
+    static func lapseCounts(_ w: Pins.World) throws -> [String: Int] {
+        try w.pool.read { db in
+            var counts: [String: Int] = [:]
+            for row in try Row.fetchAll(db, sql: """
+                SELECT id, COALESCE(json_extract(catchUpState, '$.' || ?), 0) AS n
+                FROM folder WHERE accountId = ? AND catchUpState IS NOT NULL
+                """, arguments: [CatchUpLapse.countKey, w.accountId]) {
+                counts[row["id"] as String] = row["n"] as Int
+            }
+            return counts
+        }
+    }
+
+    /// The refusal is applied (bookmark cleared, one lapse) before the same pass
+    /// reads again with no bookmark. When that re-read loses the connection, the
+    /// pass's retry must start from the account as it is now (no bookmark), not
+    /// from the pass's copy: that copy's bookmark is refused a second time.
+    @Test("a refusal whose re-read loses the connection marks ONE lapse and reads the history once")
+    func refusalThenLostConnectionMarksOneLapse() async throws {
+        try await Pins.withWorld(seeds: [
+            Pins.seed("lapse-once", labels: ["INBOX"], date: Pins.daysAgo(40)),
+        ]) { w in
+            try await w.foregroundPassWithFullSyncDue()
+            let before = try Self.lapseCounts(w)
+            #expect(!before.isEmpty, "precondition: the folders hold a catch-up state")
+
+            w.server.applyLabelChange(providerMessageId: "lapse-once", add: ["STARRED"])
+            w.server.expireHistory()
+            w.server.failNextProfile(transport: .networkConnectionLost)
+            let historyBefore = w.historyRequestCount()
+            try await w.foregroundPassWithFullSyncDue()
+
+            #expect(w.server.profileFailuresServedCount() == 1, "precondition: the re-read after the refusal lost its connection")
+            #expect(w.historyRequestCount() - historyBefore == 1, "the retry read the refused bookmark's history again")
+            let after = try Self.lapseCounts(w)
+            for (folderId, count) in before {
+                #expect(after[folderId] == count + 1, "folder \(folderId.suffix(12)): lapse count \(count) -> \(after[folderId] ?? -1), not one lapse")
+            }
+            #expect(try w.account().lastHistoryId == w.server.currentHistoryId(), "the pass stores a new bookmark")
+            #expect(try w.row("lapse-once", in: w.inbox)?.isFlagged == true, "the change behind the refusal lands")
+        }
+    }
+
+    // MARK: - a folder whose listing keeps failing
+
+    /// One foreground pass with the full sync NOT forced due.
+    static func foregroundPassFullSyncNotForced(_ w: Pins.World) async throws {
+        try await w.pool.write { db in
+            _ = try Account.filter(Column("id") == w.accountId).updateAll(db, Column("lastSyncedAt").set(to: nil as Date?))
+        }
+        let engine = SyncEngine()
+        await engine.register(
+            accountId: w.accountId, provider: w.provider,
+            workQueue: ProviderWorkQueue(provider: w.provider, maxConcurrency: 1))
+        _ = try await engine.sync(account: try w.account())
+    }
+
+    /// The label ids of the full sync's window listings so far, in order (nil:
+    /// All Mail, listed by query).
+    static func windowListingLabels(_ w: Pins.World) -> [String?] {
+        w.server.http.recordedCalls().compactMap { call -> String?? in
+            guard let components = URLComponents(string: call.url), components.path.hasSuffix("/messages") else { return nil }
+            let items = components.queryItems ?? []
+            let q = items.first { $0.name == "q" }?.value ?? ""
+            guard items.first(where: { $0.name == "maxResults" })?.value == String(SyncConfig.syncMessageLimit),
+                  !items.contains(where: { $0.name == "pageToken" }),
+                  !q.contains("after:"), !q.contains("before:") else { return nil }
+            return .some(items.first { $0.name == "labelIds" }?.value)
+        }
+    }
+
+    /// The candidate is read before the listings, so a folder whose listing
+    /// fails does not hold it back: the folder stays untracked, every later full
+    /// sync lists it, and its changes after the candidate arrive by the reads.
+    @Test("a folder whose listing keeps failing does not hold the bookmark back; the others are not listed again, and it is listed with its changes once it recovers")
+    func failingFolderDoesNotHoldTheBookmark() async throws {
+        try await Pins.withWorld(seeds: [
+            Pins.seed("failing-changed", labels: [Pins.userLabelId], date: Pins.daysAgo(2)),
+            Pins.seed("failing-quiet", labels: [Pins.userLabelId], date: Pins.daysAgo(2)),
+            Pins.seed("failing-inbox", labels: ["INBOX"], date: Pins.daysAgo(2)),
+        ]) { w in
+            // A new account: no bookmark, nothing tracked.
+            try await Self.clearBookmark(w)
+            w.server.failListings(status: 500, label: Pins.userLabelId)
+            try await w.foregroundPassWithFullSyncDue()
+            #expect(w.server.listingFailuresServedCount() > 0, "precondition: the label's listing failed")
+            #expect(try w.account().lastHistoryId != nil, "the bookmark is stored though one folder's listing failed")
+            #expect(try Self.isTracking(w, w.inbox), "a listed folder is tracked")
+            #expect(try !Self.isTracking(w, w.label), "the folder not listed stays untracked")
+            #expect(try w.row("failing-inbox", in: w.inbox) != nil)
+
+            // During the failure another client changes a message in that folder.
+            w.server.applyLabelChange(providerMessageId: "failing-changed", add: ["STARRED"])
+            let windowBefore = Self.windowListingLabels(w).count
+            try await Self.foregroundPassFullSyncNotForced(w)
+            try await Self.foregroundPassFullSyncNotForced(w)
+            #expect(Self.windowListingLabels(w).count == windowBefore, "the folders are listed again on every pass")
+            #expect(try w.row("failing-changed", in: w.label)?.isFlagged == true,
+                    "a change to a message the failing folder does not hold yet arrives by the read")
+
+            // A due full sync while the folder still fails lists only that folder.
+            let dueBefore = Self.windowListingLabels(w).count
+            try await w.foregroundPassWithFullSyncDue()
+            let listedInDuePass = Self.windowListingLabels(w).dropFirst(dueBefore)
+            #expect(!listedInDuePass.isEmpty && Set(listedInDuePass) == [Pins.userLabelId],
+                    "a due full sync lists the untracked folder and no tracked one: \(Array(listedInDuePass))")
+
+            w.server.clearListingFailures()
+            try await w.foregroundPassWithFullSyncDue()
+            #expect(try Self.isTracking(w, w.label), "listed once it recovers, and tracked")
+            #expect(try w.row("failing-changed", in: w.label)?.isFlagged == true, "the change made during the failure is there")
+            #expect(try w.row("failing-quiet", in: w.label) != nil, "a message no change named arrives by the listing")
+        }
+    }
+
+    // MARK: - full re-read lists and the background deadline
+
+    /// One background pass as the app runs it: the delta only, under the
+    /// per-account deadline.
+    static func backgroundPass(_ w: Pins.World) async throws {
+        let engine = SyncEngine()
+        await engine.register(
+            accountId: w.accountId, provider: w.provider,
+            workQueue: ProviderWorkQueue(provider: w.provider, maxConcurrency: 1))
+        let account = try w.account()
+        _ = try await withTimeout(seconds: SyncConfig.backgroundPerAccountTimeoutSeconds) {
+            try await engine.backgroundDeltaSync(account: account, inboxOnly: true)
+        }
+    }
+
+    /// Full re-read lists on a slow server: reading every listed id would take
+    /// half again the background deadline. The pass must still land new mail and
+    /// move the bookmark inside it, and drop no id it did not read.
+    @Test("with full re-read lists and a slow server, a background pass lands new mail and moves the bookmark inside its deadline; the ids it did not read stay listed")
+    func fullRereadListsFitTheBackgroundDeadline() async throws {
+        let ids = (0..<SyncConfig.changeRecheckLimit).map { "slow-reread-\($0)" }
+        try await Pins.withWorld(seeds: ids.map { Pins.seed($0, labels: ["INBOX"], date: Pins.daysAgo(30)) }) { w in
+            let rounds = (Double(ids.count) / Double(GmailAPI.maxConcurrentRequests)).rounded(.up)
+            let latency = SyncConfig.backgroundPerAccountTimeoutSeconds * 1.5 / rounds
+            for id in ids { w.server.holdGet(providerMessageId: id, forSeconds: latency) }
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?",
+                               arguments: [FolderChangeState(tracking: true, recheck: ids).encoded, w.inbox.id])
+            }
+            w.server.addMessage(Pins.seed("slow-new-mail", labels: ["INBOX", "UNREAD"], date: Pins.daysAgo(0)))
+
+            try await Self.backgroundPass(w)
+
+            #expect(try w.row("slow-new-mail", in: w.inbox) != nil, "new mail landed")
+            #expect(try w.account().lastHistoryId == w.server.currentHistoryId(), "the bookmark moved")
+            let read = Set(w.server.messageGets()).intersection(ids)
+            let inboxId = w.inbox.id
+            let left = try await w.pool.read { db in
+                FolderChangeState(raw: try Folder.fetchOne(db, key: inboxId)?.changeState).recheck
+            }
+            #expect(!left.isEmpty, "precondition: the pass did not read every listed id")
+            #expect(Set(left) == Set(ids).subtracting(read),
+                    "every id the pass did not read stays listed, and every id it read and applied leaves")
+        }
+    }
+
     // MARK: - a stale label read during the app's own archive (#735)
 
     @Test("a message archived by the app during a stale label read is listed in All Mail on a later pass (#735)")

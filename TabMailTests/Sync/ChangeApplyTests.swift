@@ -373,7 +373,7 @@ struct ChangeApplyTests {
         }
     }
 
-    @Test("A candidate is stored only after every waiting folder is listed, with no lapse mark, and tracking turns on")
+    @Test("A candidate is stored after the listings with no lapse mark, and only the folders listed become tracked")
     func candidateCommitsAfterListings() async throws {
         try await Self.withWorld { w in
             try await w.pool.write { db in
@@ -384,22 +384,77 @@ struct ChangeApplyTests {
             let outcome = try await w.outcome()
             #expect(try w.account().lastHistoryId == nil, "a candidate is not stored by the read")
             #expect(try w.account().lastFullSyncAt == nil, "the full sync is due")
-            let engine = SyncEngine()
-            let syncable = try await engine.syncableFolderIds(accountId: w.accountId)
 
-            try await engine.commitChangeBaseline(
-                account: try w.account(), outcome: outcome, listedFolderIds: [w.inboxId], syncableFolderIds: syncable)
-            #expect(try w.account().lastHistoryId == nil, "not stored while a waiting folder is unlisted")
-
-            try await engine.commitChangeBaseline(
-                account: try w.account(), outcome: outcome, listedFolderIds: syncable, syncableFolderIds: syncable)
-            #expect(try w.account().lastHistoryId == "400")
+            // Only the Inbox's listing finished: Archive's and Drafts' failed.
+            try await SyncEngine().commitChangeBaseline(account: try w.account(), outcome: outcome, listedFolderIds: [w.inboxId])
+            #expect(try w.account().lastHistoryId == "400", "a folder whose listing failed does not hold the bookmark back")
             #expect(try w.state(w.inboxId).tracking)
+            #expect(try !w.state(w.archiveId).tracking && !w.state(w.draftsId).tracking,
+                    "a folder not listed stays untracked, so a later full sync lists it")
             let lapses = try await w.pool.read { db in
                 try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM folder WHERE accountId = ? AND json_extract(catchUpState, '$.' || ?) IS NOT NULL",
                                  arguments: [w.accountId, CatchUpLapse.countKey])
             }
             #expect(lapses == 0, "no lapse mark (#783)")
+        }
+    }
+
+    // MARK: - The re-read budget
+
+    @Test("One pass asks for at most the re-read budget, taking the folders' lists in turn; the ids not asked for stay listed")
+    func rereadBudgetPerPass() async throws {
+        try await Self.withWorld { w in
+            let budget = SyncConfig.changeRereadBudgetPerPass
+            let inboxIds = (0..<(budget + 10)).map { "rb-inbox-\($0)" }
+            let archiveIds = (0..<5).map { "rb-archive-\($0)" }
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?",
+                               arguments: [FolderChangeState(recheck: inboxIds).encoded, w.inboxId])
+                try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?",
+                               arguments: [FolderChangeState(recheck: archiveIds).encoded, w.archiveId])
+            }
+            let asked = Mutex<[String: [String]]>([:])
+            await w.script([{ _, request in
+                asked.withLock { $0 = request.recheck }
+                return Self.tracked(request)
+            }])
+            try await w.pass()
+            let request = asked.withLock { $0 }
+            #expect(Set(request.values.flatMap { $0 }).count == budget, "one pass asks for the budget, no more")
+            #expect(request[w.archiveId] == archiveIds, "a short list is not starved by a long one")
+            #expect(request[w.inboxId] == Array(inboxIds.prefix(budget - archiveIds.count)), "a list is asked for from its front")
+            #expect(try w.state(w.inboxId).recheck == inboxIds, "no id is dropped: the ids not asked for, and those not answered, stay")
+            #expect(try w.state(w.archiveId).recheck == archiveIds)
+        }
+    }
+
+    @Test("The re-read budget counts distinct ids and takes the lists position by position")
+    func rereadIdsWithinBudgetTakesListsInTurn() {
+        let chosen = SyncEngine.rereadIdsWithinBudget([["a1", "a2", "a3"], ["b1"], ["a1", "c2"]], budget: 3)
+        #expect(chosen == ["a1", "b1", "a2"])
+        #expect(SyncEngine.rereadIdsWithinBudget([["a1"], ["a1"]], budget: 3) == ["a1"])
+    }
+
+    @Test("A re-read id kept back again goes to the back of its list, behind the ids the pass did not read")
+    func keptBackAgainGoesToTheBack() async throws {
+        try await Self.withWorld { w in
+            try w.insertRow("rot-a", in: w.inboxId, path: "INBOX")
+            try w.insertRow("rot-b", in: w.inboxId, path: "INBOX")
+            try w.insertOp(.markRead, ids: ["rot-a"], path: "INBOX")
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?",
+                               arguments: [FolderChangeState(recheck: ["rot-a", "rot-b", "rot-c"]).encoded, w.inboxId])
+            }
+            let inboxId = w.inboxId
+            await w.script([{ _, request in
+                Self.tracked(request, records: [inboxId: [
+                    ChangeRecord(header: Self.info("rot-a", isRead: true)),
+                    ChangeRecord(header: Self.info("rot-b", isRead: true)),
+                ]])
+            }])
+            try await w.pass()
+            #expect(try w.state(w.inboxId).recheck == ["rot-c", "rot-a"],
+                    "rot-b applied and left; rot-a was kept back again and waits behind rot-c")
         }
     }
 

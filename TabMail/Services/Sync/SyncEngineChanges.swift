@@ -14,7 +14,8 @@ import GRDB
 // the account's provider (source fence in `ChangeSeamFenceTests`).
 //
 // Order of one pass:
-// 1. the request: every folder of the account, the scope, the re-read lists;
+// 1. the request: every folder of the account, the scope, the re-read lists
+//    (at most `SyncConfig.changeRereadBudgetPerPass` distinct ids);
 // 2. the read;
 // 3. a refused bookmark: one transaction clears it, marks every folder untracked,
 //    marks a lapse for the catch-up and makes the full sync due; then the SAME pass
@@ -25,7 +26,8 @@ import GRDB
 // 7. the bookmark, last, in its own transaction (a crash before it replays the
 //    same changes, which the apply takes idempotently).
 // A candidate bookmark (`.candidate`) is not stored here: the foreground pass
-// stores it once the folders are listed (`commitChangeBaseline`).
+// stores it after its listings (`commitChangeBaseline`); a folder whose listing
+// failed stays untracked and is listed by a later full sync.
 
 /// The engine-owned, provider-blind change state of one folder
 /// (`Folder.changeState`). Message ids only (ADR-004).
@@ -38,7 +40,8 @@ struct FolderChangeState: Codable, Equatable, Sendable {
     /// a pass whose read covered the folder; turned off by a refusal.
     var tracking: Bool = false
     /// Message ids a change was declined for under the user's own action, read
-    /// again on every pass until the change applies (cap
+    /// again on later passes, at most `SyncConfig.changeRereadBudgetPerPass` per
+    /// pass and in turn, until the change applies (cap
     /// `SyncConfig.changeRecheckLimit`).
     var recheck: [String] = []
 
@@ -123,10 +126,16 @@ extension SyncEngine {
         let folders = try await dbPool.read { db in
             try Folder.filter(Column("accountId") == accountId).fetchAll(db)
         }
+        // At most `SyncConfig.changeRereadBudgetPerPass` distinct ids are read
+        // again in one pass, so full re-read lists never push a pass past the
+        // background deadline. The ids not asked for stay on their lists for a
+        // later pass (the apply drops only ids that applied).
+        let lists = folders.map { FolderChangeState(raw: $0.changeState).recheck }
+        let chosen = Self.rereadIdsWithinBudget(lists, budget: SyncConfig.changeRereadBudgetPerPass)
         var recheck: [String: [String]] = [:]
-        for folder in folders {
-            let ids = FolderChangeState(raw: folder.changeState).recheck
-            if !ids.isEmpty { recheck[folder.id] = ids }
+        for (folder, ids) in zip(folders, lists) {
+            let asked = ids.filter(chosen.contains)
+            if !asked.isEmpty { recheck[folder.id] = asked }
         }
         let context = ChangeContext(onProgress: { count in
             guard count > 0 else { return }
@@ -137,6 +146,23 @@ extension SyncEngine {
         return ChangeRequest(
             folders: folders.map { ChangeFolder(id: $0.id, path: $0.path, role: $0.role) },
             scope: scope, recheck: recheck, context: context)
+    }
+
+    /// The distinct ids one pass reads again: the folders' lists taken in turn,
+    /// position by position from the front, until `budget` ids are chosen, so no
+    /// folder's list starves another's. With the apply putting an id it keeps back
+    /// again at the back of its list, every id gets its turn.
+    nonisolated static func rereadIdsWithinBudget(_ lists: [[String]], budget: Int) -> Set<String> {
+        var chosen = Set<String>()
+        var position = 0
+        while chosen.count < budget, lists.contains(where: { $0.count > position }) {
+            for list in lists where list.count > position {
+                chosen.insert(list[position])
+                if chosen.count == budget { return chosen }
+            }
+            position += 1
+        }
+        return chosen
     }
 
     /// The refusal handler, ONE transaction: the bookmark cleared, every folder
@@ -230,17 +256,15 @@ extension SyncEngine {
     /// After the foreground pass's full sync (its listings and its catch-up):
     /// - every folder whose window listing finished in this pass, and which this
     ///   pass's read covered, becomes tracked;
-    /// - a candidate bookmark is stored only when every folder that waited for it
-    ///   was listed in full. It is stored WITHOUT a lapse mark: it was read before
+    /// - a candidate bookmark is stored, WITHOUT a lapse mark: it was read before
     ///   the listings, so nothing between them is lost, and the catch-up is not
-    ///   asked to list again (#783).
-    func commitChangeBaseline(account: Account, outcome: ChangePassOutcome, listedFolderIds: Set<String>, syncableFolderIds: Set<String>) async throws {
+    ///   asked to list again (#783). It is stored even when a folder's listing
+    ///   failed: that folder stays untracked, so every later full sync lists it
+    ///   until a listing finishes, and its changes after the candidate arrive by
+    ///   the reads from the bookmark (an account-wide reader names every folder,
+    ///   and a full record inserts a message the folder does not hold yet).
+    func commitChangeBaseline(account: Account, outcome: ChangePassOutcome, listedFolderIds: Set<String>) async throws {
         let accountId = account.id
-        let waiting = outcome.trackableFolderIds.intersection(syncableFolderIds)
-        if outcome.candidate != nil, !waiting.isSubset(of: listedFolderIds) {
-            BackgroundSyncLogger.logDebug("[Sync] Candidate bookmark for \(account.emailAddress) not stored: \(waiting.subtracting(listedFolderIds).count) folder(s) not listed")
-            return
-        }
         let nowTracked = outcome.trackableFolderIds.intersection(listedFolderIds)
         try await dbPool.write { db in
             if let candidate = outcome.candidate {
@@ -255,17 +279,8 @@ extension SyncEngine {
                 try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [state.encoded, folderId])
             }
         }
-    }
-
-    /// The syncable set the full sync lists (primary, secondary and favourite folders).
-    func syncableFolderIds(accountId: String) async throws -> Set<String> {
-        let primary = primaryRoles
-        let secondary = secondaryRoles
-        return try await dbPool.read { db in
-            Set(try Folder.filter(Column("accountId") == accountId).fetchAll(db)
-                .filter { primary.contains($0.role) || secondary.contains($0.role) || $0.isFavorite }
-                .filter { !$0.path.isEmpty }
-                .map(\.id))
+        if outcome.candidate != nil {
+            BackgroundSyncLogger.logDebug("[Sync] Candidate bookmark stored for \(account.emailAddress); \(nowTracked.count) listed folder(s) now tracked")
         }
     }
 }
