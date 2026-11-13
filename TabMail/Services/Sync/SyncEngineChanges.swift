@@ -11,7 +11,7 @@ import GRDB
 // (`EmailProvider.fetchChanges`), apply the answer with one generic apply
 // (`SyncEngineChangesApply.swift`), then store the bookmark. Nothing in this file
 // knows which provider it talks to: no cast to a concrete provider and no test of
-// the account's provider (source fence F1).
+// the account's provider (source fence in `ChangeSeamFenceTests`).
 //
 // Order of one pass:
 // 1. the request: every folder of the account, the scope, the re-read lists;

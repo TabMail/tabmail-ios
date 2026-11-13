@@ -26,15 +26,21 @@ and that capture was a lapse, so a new account listed every folder twice for the
    with the union of every shield, plus the account-wide identity term when the ids are stable
    (`addressEpoch == nil`). Inserts carry today's header builder, AI-cache restore, reply-detect, orphan
    reclaim, the Drafts AND Sent placeholder dedup with label and body carry, references and user labels,
-   and the Sent reply-parent mark. No provider cast and no provider test in those two files (fence F1).
-3. **The re-read list.** Every change the apply keeps back under a shield is put on the folder's
+   and the Sent reply-parent mark. No provider cast and no provider test in those two files (pinned by `ChangeSeamFenceTests`).
+3. **The re-read list.** Every change the apply keeps back under a shield, and every message the reader
+   names in a folder's `FolderChanges.rereadLater` (one it could not read this pass), is put on the folder's
    `Folder.changeState.recheck` (v102, engine-owned JSON, message ids only). The next request passes it; the
    reader reads those messages again and returns ordinary records or removals; an id leaves the list once it
    applies. Over `SyncConfig.changeRecheckLimit`, the extra ids are dropped and the folder's catch-up is
    armed (the lapse mark, `SyncEngine.markCatchUpLapse`).
 4. **Tracking.** `Folder.changeState.tracking` turns on for a folder only after a window listing that
    finished in a foreground pass whose read covered it (`commitChangeBaseline`). A tracked folder gets no
-   window listing (ADR-IOS-009 amended); a refusal turns it off.
+   window listing (ADR-IOS-009 amended) while the account holds a bookmark, read with the folder rows; a
+   refusal turns it off. With no bookmark every folder is listed whatever its flag says: a reset runs
+   outside the sync turn, so a pass already past its read can set the flag again after the reset, and
+   skipping those folders would leave the account with no bookmark and nothing listed for good.
+   The folder list is written column by column (`updateChanges`), so applying it on every `.all` read
+   bumps no backfill version (ADR-IOS-107).
 5. **The bookmark is read before the listings.** With no bookmark the reader returns a candidate (Gmail:
    the profile's history id) and every folder `.baselineReady`. The engine makes the full sync due, the same
    foreground pass lists, runs the catch-up, and only then stores the candidate, if every waiting syncable
@@ -45,8 +51,14 @@ and that capture was a lapse, so a new account listed every folder twice for the
 7. **Gmail's reader** (`GmailProviderChanges.swift`): `labels.list` as the folder list on `.all` passes (a
    label created, renamed or deleted shows on the next pass), the history read as before, a deleted message
    a removal in every folder, every changed or re-read message fetched once and a record in each folder its
-   labels put it in and a removal elsewhere, a re-read message that is gone a removal everywhere, a failed
-   fetch `.failed` with the removals kept and the bookmark kept.
+   labels put it in and a removal elsewhere, a re-read message that is gone a removal everywhere. **One
+   unreadable message never stops the account (#444):** a message whose own answer cannot be used
+   (`isUnreadableAnswerForOneMessage`: a 5xx, a non-gone 4xx past the retries, a body or record that does not
+   decode) is named in `GmailDetailBatch.unreadable`, put in every folder's `rereadLater`, and the rest of the
+   pass lands with the bookmark moved; it is read again on each later pass until it reads (it lands) or
+   answers 404/410 (a removal everywhere). A failure about the account (a dropped connection, a 401 after
+   the refresh, cancellation) is `.failed` with the removals kept and the bookmark kept. (Superseded: any
+   failed detail fetch was `.failed`, which with the capture gone held new mail back until a refusal.)
 8. **Deleted:** the Gmail arm of `performDeltaSync`, `gmailDeltaSync`, the Gmail arm of
    `captureSyncCursors` and its `deltaReachedCursor` parameter.
 
@@ -61,7 +73,9 @@ over-long one, so Gmail reports both as `.refused(.expired)`.
 **Trade-offs:** No cross-check: a reader bug is no longer corrected by the 15-minute listing for a tracked
 folder; the guards are the pinned tests, the fuzz and the fences, and "Reset message data" clears the
 bookmark. A genuine server change that races the user's own action lands one pass later (the re-read).
+A message that never reads costs one GET per pass while on the re-read list; a 429 or 5xx storm across a
+large change batch puts many ids there, and past `changeRecheckLimit` the folder's catch-up is armed.
 
 Keywords: change reader, ChangeSet, fetchChanges, ChangeCursor, ChangeRequest, recheck, re-read list,
 tracking, changeState, v102, baseline, candidate bookmark, refusal, lapse, applyFolderList, window listing
-off, labels.list, #783, #735, #715, #464, #460.
+off, labels.list, rereadLater, unreadable message, GmailDetailBatch, #444, #783, #735, #715, #464, #460.

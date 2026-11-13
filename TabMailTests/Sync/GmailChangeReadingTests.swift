@@ -144,14 +144,14 @@ struct GmailChangeReadingTests {
         }
     }
 
-    // MARK: - R2-1: the bookmark is read before the listing
+    // MARK: - the bookmark is read before the listing
 
-    @Test("R2-1: a change made to older mail during a new bookmark's listing arrives on the next pass (#464, #460)")
+    @Test("a change made to older mail during a new bookmark's listing arrives on the next pass (#464, #460)")
     func changeDuringBaselineListingArrives() async throws {
         try await Pins.withWorld(seeds: [
-            Pins.seed("r21-old", labels: ["INBOX", "UNREAD"], date: Pins.daysAgo(60)),
+            Pins.seed("during-listing-old", labels: ["INBOX", "UNREAD"], date: Pins.daysAgo(60)),
         ]) { w in
-            try w.insertRow("r21-old", in: w.inbox, date: Pins.daysAgo(60), isRead: false)
+            try w.insertRow("during-listing-old", in: w.inbox, date: Pins.daysAgo(60), isRead: false)
             // A pass that completes the catch-up's first look, so no catch-up
             // listing runs in the pass under test.
             try await w.foregroundPassWithFullSyncDue()
@@ -160,45 +160,45 @@ struct GmailChangeReadingTests {
             // All Mail is listed after the Inbox; reading this new archived
             // message's details is the moment another client marks the old
             // Inbox message read.
-            w.server.addMessage(Pins.seed("r21-archived", labels: [], date: Pins.daysAgo(0.1)))
+            w.server.addMessage(Pins.seed("during-listing-archived", labels: [], date: Pins.daysAgo(0.1)))
             let fired = Mutex(false)
             let server = w.server
-            w.server.onGet(providerMessageId: "r21-archived") {
+            w.server.onGet(providerMessageId: "during-listing-archived") {
                 guard fired.withLock({ was in defer { was = true }; return !was }) else { return }
-                server.applyLabelChange(providerMessageId: "r21-old", remove: ["UNREAD"])
+                server.applyLabelChange(providerMessageId: "during-listing-old", remove: ["UNREAD"])
             }
             try await w.foregroundPassWithFullSyncDue()
             #expect(fired.withLock { $0 }, "precondition: the change was made during the listing")
 
             try await w.completedDelta()
-            #expect(try w.row("r21-old", in: w.inbox)?.isRead == true, "the next pass reads the change")
+            #expect(try w.row("during-listing-old", in: w.inbox)?.isRead == true, "the next pass reads the change")
         }
     }
 
-    // MARK: - R2-2: a kept-back change on older mail converges (R33)
+    // MARK: - a kept-back change on older mail converges
 
-    @Test("R2-2: a flag change on older mail kept back under a pending op lands once the op is gone")
+    @Test("a flag change on older mail kept back under a pending op lands once the op is gone")
     func shieldedOlderFlagConverges() async throws {
         try await Pins.withWorld(seeds: [
-            Pins.seed("r22-old", labels: ["INBOX", "UNREAD"], date: Pins.daysAgo(90)),
+            Pins.seed("kept-back-old", labels: ["INBOX", "UNREAD"], date: Pins.daysAgo(90)),
         ]) { w in
-            try w.insertRow("r22-old", in: w.inbox, date: Pins.daysAgo(90), isRead: false)
-            let op = try w.insertOp(.markUnread, key: "r22-old", folder: w.inbox)
-            w.server.applyLabelChange(providerMessageId: "r22-old", add: ["STARRED"])
+            try w.insertRow("kept-back-old", in: w.inbox, date: Pins.daysAgo(90), isRead: false)
+            let op = try w.insertOp(.markUnread, key: "kept-back-old", folder: w.inbox)
+            w.server.applyLabelChange(providerMessageId: "kept-back-old", add: ["STARRED"])
             try await w.completedDelta()
-            #expect(try w.row("r22-old", in: w.inbox)?.isFlagged == false, "precondition: kept back")
+            #expect(try w.row("kept-back-old", in: w.inbox)?.isFlagged == false, "precondition: kept back")
 
             try await w.pool.write { db in _ = try PendingOperation.deleteOne(db, key: op.id) }
             try await w.completedDelta()
-            #expect(try w.row("r22-old", in: w.inbox)?.isFlagged == true, "the next pass lands it, with no new history")
+            #expect(try w.row("kept-back-old", in: w.inbox)?.isFlagged == true, "the next pass lands it, with no new history")
         }
     }
 
-    // MARK: - R2-3: a tracked folder gets no window listing
+    // MARK: - a tracked folder gets no window listing
 
-    @Test("R2-3: a full sync of a tracked Gmail account sends no window listing")
+    @Test("a full sync of a tracked Gmail account sends no window listing")
     func trackedFoldersAreNotListed() async throws {
-        try await Pins.withWorld(seeds: [Pins.seed("r23-1", labels: ["INBOX"])]) { w in
+        try await Pins.withWorld(seeds: [Pins.seed("tracked-1", labels: ["INBOX"])]) { w in
             try await w.foregroundPassWithFullSyncDue()
             let before = Self.windowListings(w)
             #expect(before > 0, "precondition: the first pass listed the untracked folders")
@@ -207,16 +207,16 @@ struct GmailChangeReadingTests {
         }
     }
 
-    // MARK: - R2-4, R2-7: a refusal re-lists once; no scheduled check while tracked
+    // MARK: - a refusal re-lists once; no scheduled check while tracked
 
-    @Test("R2-4/R2-7: a refusal re-lists in the same pass, stores a new bookmark, runs ONE catch-up check, and none later while tracked")
+    @Test("a refusal re-lists in the same pass, stores a new bookmark, runs ONE catch-up check, and none later while tracked")
     func refusalRelistsOnce() async throws {
         try await Pins.withWorld(seeds: [
-            Pins.seed("r24-1", labels: ["INBOX"], date: Pins.daysAgo(40)),
-            Pins.seed("r24-2", labels: ["INBOX"], date: Pins.daysAgo(1)),
+            Pins.seed("refused-1", labels: ["INBOX"], date: Pins.daysAgo(40)),
+            Pins.seed("refused-2", labels: ["INBOX"], date: Pins.daysAgo(1)),
         ]) { w in
             try await w.foregroundPassWithFullSyncDue()
-            w.server.applyLabelChange(providerMessageId: "r24-1", add: ["STARRED"])
+            w.server.applyLabelChange(providerMessageId: "refused-1", add: ["STARRED"])
             w.server.expireHistory()
 
             let catchUpBefore = Self.catchUpListings(w).count
@@ -226,7 +226,7 @@ struct GmailChangeReadingTests {
             #expect(try w.account().lastHistoryId == w.server.currentHistoryId(), "and stores a new bookmark")
             let catchUpAfterRefusal = Self.catchUpListings(w).count
             #expect(catchUpAfterRefusal > catchUpBefore, "one catch-up check runs")
-            #expect(try w.row("r24-1", in: w.inbox)?.isFlagged == true)
+            #expect(try w.row("refused-1", in: w.inbox)?.isFlagged == true)
 
             try await w.foregroundPassWithFullSyncDue()
             #expect(Self.catchUpListings(w).count == catchUpAfterRefusal, "no second check")
@@ -245,9 +245,134 @@ struct GmailChangeReadingTests {
         }
     }
 
-    // MARK: - R2-5: label changes show on the next pass
+    enum NeedsListing: String, CaseIterable, Sendable {
+        /// The server refuses the bookmark (history expired).
+        case refused
+        /// The account has no bookmark (a reset).
+        case noBookmark
+    }
 
-    @Test("R2-5: a label created, renamed or deleted on the server shows on the next pass")
+    /// The pass reads the account before its change read, so the full sync due
+    /// time that read writes is not in the pass's copy. With the full sync NOT
+    /// due on that copy, the read's need for a listing alone must still run the
+    /// listing and store the new bookmark in the same pass.
+    @Test("a read that needs a listing lists in the same pass even when the full sync was not due", arguments: NeedsListing.allCases)
+    func listingNeededRunsTheFullSync(reason: NeedsListing) async throws {
+        try await Pins.withWorld(seeds: [
+            Pins.seed("not-due-1", labels: ["INBOX"], date: Pins.daysAgo(40)),
+        ]) { w in
+            try await w.foregroundPassWithFullSyncDue()
+            #expect(try w.account().lastHistoryId == w.server.currentHistoryId(), "precondition: a bookmark is stored")
+            switch reason {
+            case .refused: w.server.expireHistory()
+            case .noBookmark: try await Self.clearBookmark(w)
+            }
+            try await w.pool.write { db in
+                _ = try Account.filter(Column("id") == w.accountId).updateAll(db,
+                    Column("lastSyncedAt").set(to: nil as Date?),
+                    Column("lastFullSyncAt").set(to: Date().addingTimeInterval(-60)))
+            }
+            let windowBefore = Self.windowListings(w)
+            let engine = SyncEngine()
+            await engine.register(
+                accountId: w.accountId, provider: w.provider,
+                workQueue: ProviderWorkQueue(provider: w.provider, maxConcurrency: 1))
+            _ = try await engine.sync(account: try w.account())
+
+            #expect(Self.windowListings(w) > windowBefore, "the read needed a listing and the pass did not list")
+            #expect(try w.account().lastHistoryId == w.server.currentHistoryId(), "the new bookmark was not stored in the same pass")
+        }
+    }
+
+    static func isTracking(_ w: Pins.World, _ folder: Folder) throws -> Bool {
+        try w.pool.read { db in
+            FolderChangeState(raw: try Folder.fetchOne(db, key: folder.id)?.changeState).tracking
+        }
+    }
+
+    /// A folder is tracked only after a window listing of it finished: a folder
+    /// the read covered but the full sync did not list (its listing lost the
+    /// connection twice) stays untracked, so the next full sync lists it.
+    @Test("a folder whose window listing did not finish is not tracked, and a later pass lists it")
+    func unlistedFolderStaysUntracked() async throws {
+        try await Pins.withWorld(seeds: [
+            Pins.seed("unlisted-1", labels: [Pins.userLabelId], date: Pins.daysAgo(1)),
+        ]) { w in
+            try await w.foregroundPassWithFullSyncDue()
+            #expect(try Self.isTracking(w, w.label), "precondition: the label folder is tracked")
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET changeState = NULL WHERE id = ?", arguments: [w.label.id])
+            }
+
+            w.server.failListings(transport: .networkConnectionLost, label: Pins.userLabelId)
+            try await w.foregroundPassWithFullSyncDue()
+            w.server.clearListingFailures()
+            #expect(w.server.listingFailuresServedCount() > 0, "precondition: the label's window listing failed")
+            #expect(try w.account().lastFullSyncAt != nil, "precondition: the full sync finished past the failed folder")
+            #expect(try !Self.isTracking(w, w.label), "a folder the full sync did not list must not be tracked")
+            #expect(try Self.isTracking(w, w.inbox), "non-vacuity: a listed folder stays tracked")
+
+            let before = Self.windowListings(w)
+            try await w.foregroundPassWithFullSyncDue()
+            #expect(Self.windowListings(w) > before, "the untracked folder is listed once its listing works")
+            #expect(try Self.isTracking(w, w.label), "and tracked after that listing")
+        }
+    }
+
+    /// A message-data reset clears the bookmark and every folder's change state
+    /// outside the account's sync turn, so a pass already past its change read
+    /// can turn tracking back on after the reset: folders flagged tracked with
+    /// no bookmark. The account must still converge: with no bookmark nothing
+    /// covers a folder, so the next pass lists every folder and stores one.
+    @Test("folders left flagged tracked with no bookmark are listed, and the pass stores a bookmark")
+    func trackedFoldersWithNoBookmarkAreListed() async throws {
+        try await Pins.withWorld(seeds: [
+            Pins.seed("no-bookmark-1", labels: ["INBOX"], date: Pins.daysAgo(1)),
+        ]) { w in
+            try await w.foregroundPassWithFullSyncDue()
+            #expect(try Self.isTracking(w, w.inbox), "precondition: the folders are tracked")
+            // The state a reset racing a pass leaves: the bookmark is gone, the flags are back.
+            try await w.pool.write { db in
+                _ = try Account.filter(Column("id") == w.accountId).updateAll(db, Column("lastHistoryId").set(to: nil as String?))
+            }
+            w.server.addMessage(Pins.seed("no-bookmark-new", labels: ["INBOX"], date: Pins.daysAgo(0)))
+
+            let before = Self.windowListings(w)
+            try await w.foregroundPassWithFullSyncDue()
+            #expect(Self.windowListings(w) > before, "a folder flagged tracked was skipped with no bookmark to cover it")
+            #expect(try w.account().lastHistoryId == w.server.currentHistoryId(), "the pass did not store a bookmark")
+            #expect(try w.row("no-bookmark-new", in: w.inbox) != nil, "new mail did not land")
+        }
+    }
+
+    /// The folder list is applied on every change read with scope `.all` (each
+    /// poll and push wake). Its write must leave the backfill walk's version
+    /// alone, or a page walk in progress fails its compare-and-set on every poll.
+    @Test("applying the read's folder list leaves the backfill walk's version unchanged")
+    func folderListKeepsBackfillVersion() async throws {
+        try await Pins.withWorld(seeds: [
+            Pins.seed("version-1", labels: ["INBOX"], date: Pins.daysAgo(1)),
+        ]) { w in
+            // Delta passes only: a foreground pass would start the backfill walk,
+            // which bumps the version itself.
+            try await w.completedDelta()
+            let versions = { try w.pool.read { db in
+                try Dictionary(uniqueKeysWithValues: Folder.filter(Column("accountId") == w.accountId).fetchAll(db)
+                    .map { ($0.id, $0.backfillVersion) })
+            } }
+            let before = try versions()
+            #expect(!before.isEmpty, "precondition: the account has folders")
+            w.server.setUserLabel(id: Pins.userLabelId, name: "Renamed")
+            try await w.completedDelta()
+            let labelName = { try w.pool.read { db in try Folder.fetchOne(db, key: w.label.id)?.name } }
+            #expect(try labelName() == "Renamed", "precondition: the read's folder list was applied")
+            #expect(try versions() == before, "a folder list write bumped the backfill version")
+        }
+    }
+
+    // MARK: - label changes show on the next pass
+
+    @Test("a label created, renamed or deleted on the server shows on the next pass")
     func labelChangesShowNextPass() async throws {
         try await Pins.withWorld(seeds: []) { w in
             w.server.setUserLabel(id: "Label_2", name: "Receipts")
@@ -268,48 +393,48 @@ struct GmailChangeReadingTests {
         }
     }
 
-    // MARK: - R2-6: a stale label read during the app's own archive (#735)
+    // MARK: - a stale label read during the app's own archive (#735)
 
-    @Test("R2-6: a message archived by the app during a stale label read is listed in All Mail on a later pass (#735)")
+    @Test("a message archived by the app during a stale label read is listed in All Mail on a later pass (#735)")
     func staleReadDuringArchiveHeals() async throws {
         try await Pins.withWorld(seeds: [
-            Pins.seed("r26-msg", labels: ["INBOX"], date: Pins.daysAgo(120)),
+            Pins.seed("stale-read-msg", labels: ["INBOX"], date: Pins.daysAgo(120)),
         ]) { w in
             // The app's archive is queued: the Inbox row is gone optimistically.
-            let op = try w.insertOp(.archive, key: "r26-msg", folder: w.inbox)
+            let op = try w.insertOp(.archive, key: "stale-read-msg", folder: w.inbox)
             // A change read while the archive is still in flight sees the old labels.
-            w.server.applyLabelChange(providerMessageId: "r26-msg", add: ["STARRED"])
+            w.server.applyLabelChange(providerMessageId: "stale-read-msg", add: ["STARRED"])
             try await w.completedDelta()
-            #expect(try w.rows("r26-msg").isEmpty, "precondition: the stale read inserted nothing")
+            #expect(try w.rows("stale-read-msg").isEmpty, "precondition: the stale read inserted nothing")
 
             // The archive completes.
-            w.server.applyLabelChange(providerMessageId: "r26-msg", remove: ["INBOX"])
+            w.server.applyLabelChange(providerMessageId: "stale-read-msg", remove: ["INBOX"])
             try await w.pool.write { db in _ = try PendingOperation.deleteOne(db, key: op.id) }
-            await AccountManager.shared.recordRecentlyCompleted(messageIds: ["r26-msg"])
+            await AccountManager.shared.recordRecentlyCompleted(messageIds: ["stale-read-msg"])
             try await w.completedDelta()
-            #expect(try w.row("r26-msg", in: w.allMail) == nil, "precondition: held back by the just-completed archive")
+            #expect(try w.row("stale-read-msg", in: w.allMail) == nil, "precondition: held back by the just-completed archive")
 
             // The protection lifts; no new history touches the message.
             await AccountManager.shared.clearRecentlyCompletedForTesting()
             try await w.completedDelta()
-            #expect(try w.row("r26-msg", in: w.allMail) != nil, "listed in All Mail")
+            #expect(try w.row("stale-read-msg", in: w.allMail) != nil, "listed in All Mail")
         }
     }
 
-    // MARK: - R2-8: a new account lists each folder once (#783)
+    // MARK: - a new account lists each folder once (#783)
 
-    @Test("R2-8: a new account's first sync lists each folder once for the catch-up, and a change during it reaches the next pass (#783)")
+    @Test("a new account's first sync lists each folder once for the catch-up, and a change during it reaches the next pass (#783)")
     func newAccountListsEachFolderOnce() async throws {
         try await Pins.withWorld(seeds: [
-            Pins.seed("r28-old", labels: ["INBOX", "UNREAD"], date: Pins.daysAgo(30)),
-            Pins.seed("r28-new", labels: ["INBOX"], date: Pins.daysAgo(0.2)),
+            Pins.seed("new-account-old", labels: ["INBOX", "UNREAD"], date: Pins.daysAgo(30)),
+            Pins.seed("new-account-new", labels: ["INBOX"], date: Pins.daysAgo(0.2)),
         ]) { w in
             try await Self.clearBookmark(w)
             let fired = Mutex(false)
             let server = w.server
-            w.server.onGet(providerMessageId: "r28-new") {
+            w.server.onGet(providerMessageId: "new-account-new") {
                 guard fired.withLock({ was in defer { was = true }; return !was }) else { return }
-                server.applyLabelChange(providerMessageId: "r28-old", remove: ["UNREAD"])
+                server.applyLabelChange(providerMessageId: "new-account-old", remove: ["UNREAD"])
             }
             try await w.foregroundPassWithFullSyncDue()
             let first = Self.catchUpListings(w)
@@ -320,7 +445,7 @@ struct GmailChangeReadingTests {
             #expect(Self.catchUpListings(w).count == first.count, "no folder is listed a second time")
 
             try await w.completedDelta()
-            #expect(try w.row("r28-old", in: w.inbox)?.isRead == true, "the change made during the first sync arrives")
+            #expect(try w.row("new-account-old", in: w.inbox)?.isRead == true, "the change made during the first sync arrives")
         }
     }
 }

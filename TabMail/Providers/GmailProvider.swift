@@ -308,8 +308,7 @@ actor GmailProvider: EmailProvider {
                         // is unusable. The message stays NAMED (unmaterialised), so
                         // its row is kept, and the rest of the folder still syncs:
                         // one message that keeps failing must not stop the full
-                        // sync, because the full sync is what bounds a delta that
-                        // cannot fetch a changed message (`fetchMessageDetails`).
+                        // sync (the change reader's rule too, `fetchMessageDetails`).
                         if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Gmail] fetchMessages: \(ref.id) unreadable (\(error)) — kept as unmaterialised") }
                         return (ref.id, nil)
                     }
@@ -1482,20 +1481,20 @@ actor GmailProvider: EmailProvider {
         return headers
     }
 
-    /// Fetch message details including label IDs for delta sync folder assignment.
+    /// Fetch message details including label IDs for the change reader's folder
+    /// assignment (ADR-IOS-111).
     ///
-    /// Skips a message only when Gmail answers that it is gone (404/410): it
-    /// was deleted between the history listing and this fetch, which is normal,
-    /// and skipping it lets the cursor move instead of asking for the same gone
-    /// message forever. Any other failure (a 5xx, a 4xx such as a 429 past the
-    /// retry budget, a dropped connection, cancellation, an unreadable body, a
-    /// record `parseGmailMessage` refuses) throws, so the delta fails without
-    /// moving its cursor and a later pass asks again. A failure that never
-    /// clears is bounded by the full sync:
-    /// it completes past one message it cannot read (see
-    /// `fetchMessagesWithObservedEpoch`) and then moves the cursor forward. A
-    /// change in the failed batch that no full-sync window covers is not
-    /// recovered once that happens.
+    /// A message Gmail answers is gone (404/410) is left out: it was deleted
+    /// between the history listing and this fetch, which is normal. A message
+    /// whose own answer cannot be used (`isUnreadableAnswerForOneMessage`: a
+    /// 5xx, a 4xx such as a 429 past the retry budget, an unreadable body, a
+    /// record `parseGmailMessage` refuses) is named in `unreadable` and the
+    /// rest of the batch still loads, the folder page's rule
+    /// (`fetchMessagesWithObservedEpoch`): the reader asks for it again on the
+    /// next pass, so one message that keeps failing never holds back the
+    /// account's other changes. Anything else (a dropped connection, a 401
+    /// after the token refresh, cancellation) is about the account, not the
+    /// message, and throws, so the pass fails and keeps its bookmark.
     ///
     /// The gets run concurrently, `GmailAPI.maxConcurrentRequests` at a time,
     /// so a delta naming a few dozen messages fits the background sync's
@@ -1503,28 +1502,51 @@ actor GmailProvider: EmailProvider {
     /// The window is the size of the `request()` gate rather than the whole
     /// batch: the gate queues FIFO, so adding every id at once would put a
     /// large delta's whole batch ahead of any later request on this account.
-    /// The first failure ends the call; the gets still running are cancelled.
-    /// Results are in no particular order, as the callers pass a set's ids.
-    func fetchMessageDetails(ids: [String]) async throws -> [GmailMessageDetail] {
-        try await withThrowingTaskGroup(of: GmailMessageDetail?.self) { group in
+    /// A throw ends the call; the gets still running are cancelled. Results
+    /// are in no particular order, as the callers pass a set's ids.
+    func fetchMessageDetails(ids: [String]) async throws -> GmailDetailBatch {
+        try await withThrowingTaskGroup(of: DetailAnswer.self) { group in
             var pending = ids.makeIterator()
             for _ in 0..<GmailAPI.maxConcurrentRequests {
                 guard let id = pending.next() else { break }
-                group.addTask { try await self.fetchMessageDetail(id: id) }
+                group.addTask { try await self.detailAnswer(id: id) }
             }
-            var results: [GmailMessageDetail] = []
-            for try await detail in group {
-                if let detail { results.append(detail) }
+            var batch = GmailDetailBatch()
+            for try await answer in group {
+                switch answer {
+                case .read(let detail): batch.details.append(detail)
+                case .gone: break
+                case .unreadable(let id): batch.unreadable.append(id)
+                }
                 if let id = pending.next() {
-                    group.addTask { try await self.fetchMessageDetail(id: id) }
+                    group.addTask { try await self.detailAnswer(id: id) }
                 }
             }
-            return results
+            // A cancelled fetch never returns as if complete, even when every
+            // get it started had already answered.
+            try Task.checkCancellation()
+            return batch
+        }
+    }
+
+    private enum DetailAnswer: Sendable {
+        case read(GmailMessageDetail)
+        case gone
+        case unreadable(String)
+    }
+
+    private func detailAnswer(id: String) async throws -> DetailAnswer {
+        do {
+            return try await fetchMessageDetail(id: id).map(DetailAnswer.read) ?? .gone
+        } catch where Self.isUnreadableAnswerForOneMessage(error) {
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Gmail] fetchMessageDetails: \(id) unreadable (\(error)), read again next pass") }
+            return .unreadable(id)
         }
     }
 
     /// One message for `fetchMessageDetails`: nil when Gmail answers that it
-    /// is gone (404/410), and a throw for any other failure.
+    /// is gone (404/410), and a throw for any other failure, classified by
+    /// `detailAnswer`.
     private func fetchMessageDetail(id: String) async throws -> GmailMessageDetail? {
         let msgData: Data
         do {
@@ -1536,7 +1558,7 @@ actor GmailProvider: EmailProvider {
         let msg = try JSONDecoder().decode(GmailMessage.self, from: msgData)
         // A record the parser refuses (no usable date) is a failed fetch,
         // not a gone message: it says nothing about deletion and is often
-        // transient, so it fails the delta like an unreadable body would.
+        // transient, so it is unreadable like a body that does not decode.
         guard let header = parseGmailMessage(msg) else {
             throw DecodingError.dataCorrupted(.init(
                 codingPath: [], debugDescription: "Gmail message \(id) has no usable header"))
@@ -2587,6 +2609,13 @@ actor GmailProvider: EmailProvider {
 struct GmailMessageDetail: Sendable {
     let header: MessageHeaderInfo
     let labelIds: [String]
+}
+
+/// What `GmailProvider.fetchMessageDetails` read: the messages it loaded, and
+/// the ids whose own answer could not be used this time.
+struct GmailDetailBatch: Sendable {
+    var details: [GmailMessageDetail] = []
+    var unreadable: [String] = []
 }
 
 // MARK: - Gmail API Response Models

@@ -205,6 +205,7 @@ struct GmailDeltaMoveTraceLogTests {
         // Phase OPEN
         DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = true }
         let openScenario = FakeHTTP.Scenario()
+        FolderEpochTestFixture.registerGmailLabels(on: openScenario, listingFoldersOf: accountId, pool: pool)
         openScenario.register(path: "/history", method: "GET", response: .json(raw: Self.historyJSON(newHistoryId: "1001", messageId: msgOpen)))
         openScenario.register(path: "/messages/\(msgOpen)", method: "GET", response: .json(raw: Self.messageDetailJSON(id: msgOpen, labelIds: [], rfc822: "<\(msgOpen)@example.com>", subject: "site1 open")))
         let openProvider = GmailProvider(userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: openScenario.session)
@@ -221,6 +222,7 @@ struct GmailDeltaMoveTraceLogTests {
         // Phase CLOSED
         DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = false }
         let closedScenario = FakeHTTP.Scenario()
+        FolderEpochTestFixture.registerGmailLabels(on: closedScenario, listingFoldersOf: accountId, pool: pool)
         closedScenario.register(path: "/history", method: "GET", response: .json(raw: Self.historyJSON(newHistoryId: "1002", messageId: msgClosed)))
         closedScenario.register(path: "/messages/\(msgClosed)", method: "GET", response: .json(raw: Self.messageDetailJSON(id: msgClosed, labelIds: [], rfc822: "<\(msgClosed)@example.com>", subject: "site1 closed")))
         let closedProvider = GmailProvider(userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: closedScenario.session)
@@ -276,6 +278,7 @@ struct GmailDeltaMoveTraceLogTests {
         // Phase OPEN
         DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = true }
         let openScenario = FakeHTTP.Scenario()
+        FolderEpochTestFixture.registerGmailLabels(on: openScenario, listingFoldersOf: accountId, pool: pool)
         openScenario.register(path: "/history", method: "GET", response: .json(raw: Self.historyJSON(newHistoryId: "1001", messageId: msgOpen)))
         openScenario.register(path: "/messages/\(msgOpen)", method: "GET", response: .json(raw: Self.messageDetailJSON(id: msgOpen, labelIds: [], rfc822: "<\(msgOpen)@example.com>", subject: "site2 open")))
         let openProvider = GmailProvider(userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: openScenario.session)
@@ -292,6 +295,7 @@ struct GmailDeltaMoveTraceLogTests {
         // Phase CLOSED
         DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = false }
         let closedScenario = FakeHTTP.Scenario()
+        FolderEpochTestFixture.registerGmailLabels(on: closedScenario, listingFoldersOf: accountId, pool: pool)
         closedScenario.register(path: "/history", method: "GET", response: .json(raw: Self.historyJSON(newHistoryId: "1002", messageId: msgClosed)))
         closedScenario.register(path: "/messages/\(msgClosed)", method: "GET", response: .json(raw: Self.messageDetailJSON(id: msgClosed, labelIds: [], rfc822: "<\(msgClosed)@example.com>", subject: "site2 closed")))
         let closedProvider = GmailProvider(userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: closedScenario.session)
@@ -345,6 +349,7 @@ struct GmailDeltaMoveTraceLogTests {
         // Phase OPEN
         DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = true }
         let openScenario = FakeHTTP.Scenario()
+        FolderEpochTestFixture.registerGmailLabels(on: openScenario, listingFoldersOf: accountId, pool: pool)
         openScenario.register(path: "/history", method: "GET", response: .json(raw: Self.historyJSON(newHistoryId: "1001", messageId: msgOpen)))
         openScenario.register(path: "/messages/\(msgOpen)", method: "GET", response: .json(raw: Self.messageDetailJSON(id: msgOpen, labelIds: ["INBOX"], rfc822: "<\(msgOpen)@example.com>", subject: "site3 open")))
         let openProvider = GmailProvider(userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: openScenario.session)
@@ -361,6 +366,7 @@ struct GmailDeltaMoveTraceLogTests {
         // Phase CLOSED
         DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = false }
         let closedScenario = FakeHTTP.Scenario()
+        FolderEpochTestFixture.registerGmailLabels(on: closedScenario, listingFoldersOf: accountId, pool: pool)
         closedScenario.register(path: "/history", method: "GET", response: .json(raw: Self.historyJSON(newHistoryId: "1002", messageId: msgClosed)))
         closedScenario.register(path: "/messages/\(msgClosed)", method: "GET", response: .json(raw: Self.messageDetailJSON(id: msgClosed, labelIds: ["INBOX"], rfc822: "<\(msgClosed)@example.com>", subject: "site3 closed")))
         let closedProvider = GmailProvider(userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: closedScenario.session)
@@ -409,6 +415,7 @@ struct GmailDeltaMoveTraceLogTests {
         // Phase OPEN
         DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = true }
         let openScenario = FakeHTTP.Scenario()
+        FolderEpochTestFixture.registerGmailLabels(on: openScenario, listingFoldersOf: accountId, pool: pool)
         openScenario.register(path: "/history", method: "GET", response: .json(raw: Self.historyJSON(newHistoryId: "1001", messageId: msgOpen)))
         openScenario.register(path: "/messages/\(msgOpen)", method: "GET", response: .json(raw: Self.messageDetailJSON(id: msgOpen, labelIds: ["INBOX"], rfc822: "<\(msgOpen)@example.com>", subject: "site4 open")))
         let openProvider = GmailProvider(userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: openScenario.session)
@@ -425,6 +432,7 @@ struct GmailDeltaMoveTraceLogTests {
         // Phase CLOSED
         DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = false }
         let closedScenario = FakeHTTP.Scenario()
+        FolderEpochTestFixture.registerGmailLabels(on: closedScenario, listingFoldersOf: accountId, pool: pool)
         closedScenario.register(path: "/history", method: "GET", response: .json(raw: Self.historyJSON(newHistoryId: "1002", messageId: msgClosed)))
         closedScenario.register(path: "/messages/\(msgClosed)", method: "GET", response: .json(raw: Self.messageDetailJSON(id: msgClosed, labelIds: ["INBOX"], rfc822: "<\(msgClosed)@example.com>", subject: "site4 closed")))
         let closedProvider = GmailProvider(userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: closedScenario.session)
@@ -470,6 +478,7 @@ struct GmailDeltaMoveTraceLogTests {
         // Phase OPEN
         DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = true }
         let openScenario = FakeHTTP.Scenario()
+        FolderEpochTestFixture.registerGmailLabels(on: openScenario, listingFoldersOf: accountId, pool: pool)
         openScenario.register(path: "/history", method: "GET", response: .json(raw: Self.historyJSON(newHistoryId: "1001", messageId: msgOpen)))
         openScenario.register(path: "/messages/\(msgOpen)", method: "GET", response: .json(raw: Self.messageDetailJSON(id: msgOpen, labelIds: ["INBOX"], rfc822: "<\(msgOpen)@example.com>", subject: "site5 open")))
         let openProvider = GmailProvider(userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: openScenario.session)
@@ -486,6 +495,7 @@ struct GmailDeltaMoveTraceLogTests {
         // Phase CLOSED
         DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = false }
         let closedScenario = FakeHTTP.Scenario()
+        FolderEpochTestFixture.registerGmailLabels(on: closedScenario, listingFoldersOf: accountId, pool: pool)
         closedScenario.register(path: "/history", method: "GET", response: .json(raw: Self.historyJSON(newHistoryId: "1002", messageId: msgClosed)))
         closedScenario.register(path: "/messages/\(msgClosed)", method: "GET", response: .json(raw: Self.messageDetailJSON(id: msgClosed, labelIds: ["INBOX"], rfc822: "<\(msgClosed)@example.com>", subject: "site5 closed")))
         let closedProvider = GmailProvider(userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: closedScenario.session)
@@ -571,6 +581,7 @@ struct GmailDeltaMoveTraceLogTests {
         // Phase OPEN
         DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = true }
         let openScenario = FakeHTTP.Scenario()
+        FolderEpochTestFixture.registerGmailLabels(on: openScenario, listingFoldersOf: accountId, pool: pool)
         openScenario.register(path: "/history", method: "GET", response: .json(raw: Self.historyJSON(newHistoryId: "1001", messageId: msgOpen)))
         openScenario.register(path: "/messages/\(msgOpen)", method: "GET", response: .json(raw: Self.messageDetailJSON(id: msgOpen, labelIds: ["INBOX"], rfc822: "<\(msgOpen)@example.com>", subject: "site6 open")))
         let openProvider = GmailProvider(userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: openScenario.session)
@@ -589,6 +600,7 @@ struct GmailDeltaMoveTraceLogTests {
         // Phase CLOSED
         DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = false }
         let closedScenario = FakeHTTP.Scenario()
+        FolderEpochTestFixture.registerGmailLabels(on: closedScenario, listingFoldersOf: accountId, pool: pool)
         closedScenario.register(path: "/history", method: "GET", response: .json(raw: Self.historyJSON(newHistoryId: "1002", messageId: msgClosed)))
         closedScenario.register(path: "/messages/\(msgClosed)", method: "GET", response: .json(raw: Self.messageDetailJSON(id: msgClosed, labelIds: ["INBOX"], rfc822: "<\(msgClosed)@example.com>", subject: "site6 closed")))
         let closedProvider = GmailProvider(userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: closedScenario.session)

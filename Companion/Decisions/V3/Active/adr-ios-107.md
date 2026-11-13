@@ -224,6 +224,10 @@ The owner's rulings of 2026-11-09:
      one All Mail membership rule; the catch-up's removal proof asks the same rule). So while the
      cursor is valid every change reaches the device through the delta, All Mail included, and the
      catch-up is the safety net for the gaps above.
+     *Amended 2026-11-12 (ADR-IOS-111):* the Gmail delta and the Gmail capture are deleted. The gaps
+     are now a change-bookmark refusal (history expired or too long, `applyChangeRefusal`) and a
+     re-read list over `changeRecheckLimit`; a message whose GET fails is put on the folder's re-read
+     list and read again on later passes, so it opens no gap.
    - **Schedule** (amended 2026-11-12: no periodic check). `GmailProvider.catchUpPlan` lists a
      folder in exactly three cases: it continues a listing in progress (a lapse never interrupts
      one); it starts the folder's FIRST listing (no listing has completed yet: no state at all, or
@@ -238,7 +242,8 @@ The owner's rulings of 2026-11-09:
        follows every folder, All Mail included (#731), and every lapse lists every folder again, so
        the weekly check only backed up what neither reveals: a change whose delta GET failed while
        the capture kept the cursor (#464). The owner dropped it. Cost accepted: such a change waits
-       for the next lapse. Test: `GmailCatchUpTests.gmailHasNoPeriodicCheckAndIMAPIsDaily` (a tracked,
+       for the next lapse. *Amended 2026-11-12 (ADR-IOS-111):* that case is gone for Gmail; such a
+       message is re-read on later passes from the folder's re-read list. Test: `GmailCatchUpTests.gmailHasNoPeriodicCheckAndIMAPIsDaily` (a tracked,
        completed folder with no lapse makes no request 8 days later; a lapse lists it).
      - *Superseded (2026-11-12, the weekly schedule):* "`CatchUpSchedule` (shared with IMAP): a full
      check every `gmailCatchUpFullCheckIntervalSeconds` (WEEKLY, amended 2026-11-11), and a new listing after
@@ -610,6 +615,9 @@ The owner's rulings of 2026-11-09:
      row read in the same transaction: it names both columns with their values unchanged, so every
      existing folder's version moves once per full sync, and a walk iteration in flight then misses
      its compare-and-set and lists the same saved page once more (one extra list request, bounded).
+     *Amended 2026-11-12 (ADR-IOS-111):* the upsert (`applyFolderList`) now runs on every change read
+     with a folder list too (each Gmail poll and push wake), so it writes the row column by column
+     (`updateChanges(db, from:)`): it names neither backfill column and bumps no version.
      Every whole-record writer reads its row in the same transaction, so none writes an older
      version back; a future whole-record write from a stale record would. The check is the version ALONE, not the
      token and completion it read: a re-arm of a folder whose walk is at its top (no token, not
@@ -678,6 +686,9 @@ The owner's rulings of 2026-11-09:
      expired or too long) and by `captureSyncCursors` when it replaces a cursor this pass's delta did
      not reach. A cursor the pass's delta DID reach is now kept (`deltaReachedCursor`), so the next
      delta reads every change made since, including those made during the full sync.
+     *Amended 2026-11-12 (ADR-IOS-111):* for Gmail both callers are deleted; `applyChangeRefusal`
+     (a refused change bookmark) is the Gmail caller now, and a new bookmark is stored with no lapse
+     mark. The Exchange arm of `captureSyncCursors` is unchanged.
      - **What Gmail does with the marker.** A listing in progress goes on from its place; nothing
        about it is lost. Each listing records the count when it started (`lapseCountAtStart`), and a
        completed listing stores it (`listedLapseCount`). When a listing completes and a lapse came
@@ -718,7 +729,8 @@ The owner's rulings of 2026-11-09:
      first cursor through `lapseDeltaCursor`, after the same full sync's catch-up has started each
      folder's first listing, so that first cursor counts as a lapse and a new Gmail account's first
      sync lists each folder twice until the cursor is captured before the catch-up lists
-     (tabmail-ios #783).
+     (tabmail-ios #783). *Fixed 2026-11-12 (ADR-IOS-111):* the bookmark is read before the listings
+     and stored after them with no lapse mark, so each folder is listed once.
 
 **Consequences.**
 

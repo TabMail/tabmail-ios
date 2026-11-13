@@ -134,14 +134,21 @@ struct FolderChanges: Sendable {
     var records: [ChangeRecord]
     /// "This folder no longer holds that message."
     var removals: [String]
+    /// Messages the provider could not read this pass because the server's
+    /// answer for that ONE message was unusable. The engine puts them on the
+    /// folder's re-read list, so one such message never holds back the rest of
+    /// the pass or the bookmark. A failure about the account (connection,
+    /// credentials) is `.failed`, never this.
+    var rereadLater: [String]
 
     init(folderId: String, status: FolderChangeStatus, addressEpoch: Int? = nil,
-         records: [ChangeRecord] = [], removals: [String] = []) {
+         records: [ChangeRecord] = [], removals: [String] = [], rereadLater: [String] = []) {
         self.folderId = folderId
         self.status = status
         self.addressEpoch = addressEpoch
         self.records = records
         self.removals = removals
+        self.rereadLater = rereadLater
     }
 }
 

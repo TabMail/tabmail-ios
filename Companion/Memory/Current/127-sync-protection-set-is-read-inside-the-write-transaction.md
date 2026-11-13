@@ -59,5 +59,5 @@ for the same UID before suspecting the queue. Any NEW sync consumer of the prote
 **Note (2026-11-12, ADR-IOS-111):** the change apply reads both shields (the pending-operation snapshot
 and `liveRecentlyCompleted()`) INSIDE each folder's own write transaction (`SyncEngine.applyFolderChanges`),
 never once per pass: the folders are applied one transaction each with awaits between them, so a
-completion that lands while an earlier folder is applied is honoured by the later folders. Fence F3
-(`ChangeSeamFenceTests`) pins that the pass file never reads them.
+completion that lands while an earlier folder is applied is honoured by the later folders. A source
+fence in `ChangeSeamFenceTests` pins that the pass file never reads them.

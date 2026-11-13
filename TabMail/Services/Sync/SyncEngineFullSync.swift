@@ -113,6 +113,11 @@ extension SyncEngine {
 
         for info in remoteFolders {
             if var existing = localFolders.first(where: { $0.path == info.path }) {
+                // Written back column by column (`updateChanges`): a whole-record
+                // update names the backfill walk's columns, which fires
+                // `folder_bumpBackfillVersion` and fails a page walk's compare-and-set,
+                // and this runs on every change read with a folder list (ADR-IOS-111).
+                let original = existing
                 // Unconditional — it advances the per-folder deep-pass streak counter.
                 let deep = Self.fullSyncIsDeepPass(
                     folderId: existing.id, everyN: SyncConfig.fullSyncDeepEveryN)
@@ -163,7 +168,7 @@ extension SyncEngine {
                     folderHoldsRows: existingHoldsRows) {
                     existing.lastKnownUidValidity = bootstrap
                 }
-                try existing.update(db)
+                _ = try existing.updateChanges(db, from: original)
             } else {
                 var folder = Folder(name: info.name, path: info.path, role: info.role, accountId: account.id)
                 folder.totalCount = info.totalCount
@@ -286,9 +291,11 @@ extension SyncEngine {
 
         BackgroundSyncLogger.logDebug("[FullSync] \(account.emailAddress) folder upsert: \(Int((CFAbsoluteTimeGetCurrent() - fs0) * 1000))ms")
 
-        // Fetch fresh folder list after upsert
-        let folders = try await pool.read { db in
-            try Folder.filter(Column("accountId") == account.id).fetchAll(db)
+        // Fetch fresh folder list after upsert, with whether the account holds a
+        // change bookmark in the same read (the tracked skip below needs both).
+        let (folders, holdsChangeBookmark) = try await pool.read { db in
+            (try Folder.filter(Column("accountId") == account.id).fetchAll(db),
+             try Account.fetchOne(db, key: account.id)?.lastHistoryId != nil)
         }
 
         // Sync messages for main roles + favorited folders, prioritized:
@@ -378,8 +385,13 @@ extension SyncEngine {
 
         // ADR-IOS-111: a folder the provider's change bookmark covers gets no
         // window listing. Its changes arrive through the change read; read here
-        // from the folder row this full sync just loaded.
-        let trackedFolderIds = Set(syncableFolders.filter { FolderChangeState(raw: $0.changeState).tracking }.map(\.id))
+        // from the folder row this full sync just loaded. With no bookmark in the
+        // row nothing covers a folder, whatever its flag says (a reset that lands
+        // while a pass runs can leave a flag behind), so every folder is listed:
+        // the pass that does so stores a bookmark and the account never stalls.
+        let trackedFolderIds = holdsChangeBookmark
+            ? Set(syncableFolders.filter { FolderChangeState(raw: $0.changeState).tracking }.map(\.id))
+            : []
         if !trackedFolderIds.isEmpty {
             BackgroundSyncLogger.logDebug("[FullSync] \(account.emailAddress) \(trackedFolderIds.count) tracked folder(s): no window listing")
         }

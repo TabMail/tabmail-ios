@@ -186,6 +186,23 @@ enum FolderEpochTestFixture {
         try pool.read { db in try Folder.fetchOne(db, key: "\(accountId):\(path)") }
     }
 
+    /// Gmail's `labels.list` on `scenario`, naming every folder the account
+    /// holds in `pool` when it is asked (upper-case ids as system labels,
+    /// anything else as a user label; the synthetic All Mail is the provider's
+    /// own). A Gmail change pass that covers all folders reads it as the folder
+    /// list (ADR-IOS-111), and a folder it does not name is removed.
+    static func registerGmailLabels(on scenario: FakeHTTP.Scenario, listingFoldersOf accountId: String, pool: DatabasePool) {
+        scenario.register(path: "/labels", method: "GET") { _ in
+            let paths = (try? pool.read { db in
+                try Folder.filter(Column("accountId") == accountId).fetchAll(db).map(\.path)
+            }) ?? []
+            let labels = paths.filter { $0 != GmailProvider.archivePath }.sorted().map { path in
+                #"{ "id": "\#(path)", "name": "\#(path)", "type": "\#(path == path.uppercased() ? "system" : "user")" }"#
+            }
+            return .json(raw: #"{ "labels": [ \#(labels.joined(separator: ", ")) ] }"#)
+        }
+    }
+
     /// Seed real `messageHeader` rows so a test can assert on MAIL SURVIVING a
     /// sync pass rather than on which provider calls the pass happened to make.
     /// `messageId` IS the IMAP UID.

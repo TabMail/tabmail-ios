@@ -187,7 +187,7 @@ struct ChangeApplyTests {
         }
     }
 
-    // MARK: - Shields and the re-read list (R33)
+    // MARK: - Shields and the re-read list
 
     @Test("A flag change kept back under a pending flag op is re-read and lands once the op is gone")
     func flagShieldRechecks() async throws {
@@ -298,7 +298,7 @@ struct ChangeApplyTests {
         }
     }
 
-    // MARK: - Drafts and Sent placeholders (R19)
+    // MARK: - Drafts and Sent placeholders
 
     @Test("A Drafts insert replaces the placeholder with the same rfc822 and carries its body")
     func draftsPlaceholderDedup() async throws {

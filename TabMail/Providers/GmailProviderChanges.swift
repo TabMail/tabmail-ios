@@ -20,8 +20,10 @@ import Foundation
 ///   changed message, and every message the engine asks to re-read, is fetched
 ///   once and is a record in each folder its labels put it in and a removal in
 ///   every other folder. A message that is asked to be re-read and is gone is a
-///   removal everywhere. A failed fetch keeps the removals, reports `.failed` and
-///   keeps the bookmark.
+///   removal everywhere. A message whose own answer cannot be used is put on
+///   every folder's `rereadLater` and the rest of the pass lands, bookmark
+///   included. A failure about the account (connection, credentials) keeps the
+///   removals, reports `.failed` and keeps the bookmark.
 ///
 /// `inboxOnly` changes nothing but the folder list: the history is one call for
 /// the whole account.
@@ -65,24 +67,28 @@ extension GmailProvider {
             return .uniform(request, account: .set(history.newHistoryId), status: .tracked, folderList: folderList)
         }
 
-        var details: [GmailMessageDetail] = []
+        var batch = GmailDetailBatch()
         var failure: (any Error)?
         if !toFetch.isEmpty {
             request.context.onProgress(toFetch.count)
             do {
-                details = try await fetchMessageDetails(ids: Array(toFetch))
+                batch = try await fetchMessageDetails(ids: Array(toFetch))
             } catch {
                 failure = error
             }
         }
+        let details = batch.details
 
-        // A message that is gone (404/410) is left out of `details`. For a
-        // re-read message that is the answer: it is gone everywhere. For a
-        // history entry it is skipped, as the history's own delete reports it.
+        // A message that is gone (404/410) is left out of `details` and of
+        // `unreadable`. For a re-read message that is the answer: it is gone
+        // everywhere. For a history entry it is skipped, as the history's own
+        // delete reports it. A message whose answer could not be used is read
+        // again next pass, in whichever folders its labels then put it.
         var removedEverywhere = deleted
+        let unreadable = Set(batch.unreadable).sorted()
         if failure == nil {
-            let fetched = Set(details.map(\.header.messageId))
-            removedEverywhere.formUnion(recheck.subtracting(fetched))
+            let answered = Set(details.map(\.header.messageId)).union(unreadable)
+            removedEverywhere.formUnion(recheck.subtracting(answered))
         }
 
         let folders = request.folders.map { folder -> FolderChanges in
@@ -90,6 +96,7 @@ extension GmailProvider {
                 folderId: folder.id, status: failure.map { .failed($0) } ?? .tracked,
                 removals: removedEverywhere.sorted())
             guard failure == nil else { return changes }
+            changes.rereadLater = unreadable
             for detail in details {
                 if Self.folder(folder.path, containsMessageWithLabels: detail.labelIds) {
                     changes.records.append(ChangeRecord(header: detail.header))

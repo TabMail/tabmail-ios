@@ -31,12 +31,14 @@ import Testing
 ///    waits for each get fails this, and so misses the background deadline.
 /// 2. **First freed slot**: a request that joined the gate while the window was
 ///    full reaches the server before any further get of the fetch.
-/// 3. **Results**: a fetch with every id readable or gone returns exactly the
-///    readable ones (as a multiset), having asked for each id once (plus each
-///    429's retry), never more than the gate's width at once.
-/// 4. **Throw semantics**: a fetch with any failing id throws that failure,
-///    never a cancellation; a cancelled fetch never returns success, and with
-///    no failing id it throws its cancellation.
+/// 3. **Results**: a fetch with no dropped connection returns exactly the
+///    readable ones (as a multiset) and names exactly the ones whose own answer
+///    was unusable (a server or client error, an unreadable or undated record),
+///    having asked for each id once (plus each 429's retry), never more than
+///    the gate's width at once.
+/// 4. **Throw semantics**: a fetch with a dropped connection throws that
+///    failure, never a cancellation; a cancelled fetch never returns success,
+///    and with no dropped connection it throws its cancellation.
 /// 5. **Termination**: the fetch returns within a bound, nothing it started
 ///    is still in flight afterwards, and nothing more reaches the server
 ///    (after a failure or a cancellation, at most the gate's width of gets
@@ -103,7 +105,10 @@ struct GmailDetailWindowFuzzTests {
         case readable, gone(Int), failed(Failure), rateLimitedOnce
 
         var isReadable: Bool { self == .readable || self == .rateLimitedOnce }
-        var isFailure: Bool { if case .failed = self { return true }; return false }
+        /// A failure about the request, not the message: it fails the fetch.
+        var isFailure: Bool { self == .failed(.transportError) }
+        /// The server's answer for the one message is unusable: it is named.
+        var isUnreadable: Bool { if case .failed = self { return !isFailure }; return false }
     }
 
     struct Plan: Sendable {
@@ -120,6 +125,7 @@ struct GmailDetailWindowFuzzTests {
         var firstWindow: Int { min(width, ids.count) }
         var expectsFailure: Bool { ids.contains { answers[$0]!.isFailure } }
         var readable: [String] { ids.filter { answers[$0]!.isReadable }.sorted() }
+        var unreadable: [String] { ids.filter { answers[$0]!.isUnreadable }.sorted() }
         var retries: Int { Set(ids).filter { answers[$0] == .rateLimitedOnce }.count }
 
         func latency(arrival: Int) -> Int { latencies[arrival % latencies.count] }
@@ -139,7 +145,7 @@ struct GmailDetailWindowFuzzTests {
         }
 
         var summary: String {
-            let failing = ids.filter { answers[$0]!.isFailure }.count
+            let failing = ids.filter { answers[$0]!.isFailure || answers[$0]!.isUnreadable }.count
             let gone = ids.filter { if case .gone = answers[$0]! { return true }; return false }.count
             let cancel = cancelAt.map { ", cancel at get \($0) \(cancelPoint)" } ?? ""
             return "\(schedule), \(ids.count) ids (\(Set(ids).count) distinct), \(failing) failing, \(gone) gone, \(retries) rate-limited\(cancel)"
@@ -251,6 +257,7 @@ struct GmailDetailWindowFuzzTests {
         var otherRequestChecked = false
         var threwFailure = false
         var succeeded = false
+        var namedUnreadable = false
     }
 
     static let profileCall = "GET /gmail/v1/users/me/profile"
@@ -393,9 +400,10 @@ struct GmailDetailWindowFuzzTests {
 
         // 3 and 4. Results and throw semantics.
         switch result {
-        case .success(let details):
+        case .success(let batch):
             report.succeeded = true
-            let received = details.map(\.header.messageId).sorted()
+            if !batch.unreadable.isEmpty { report.namedUnreadable = true }
+            let received = batch.details.map(\.header.messageId).sorted()
             if report.cancelApplied {
                 report.violations.append("a cancelled fetch returned \(received.count) messages as if complete")
             } else if plan.expectsFailure {
@@ -403,6 +411,9 @@ struct GmailDetailWindowFuzzTests {
             } else {
                 if received != plan.readable {
                     report.violations.append("returned \(received.count) messages, expected the \(plan.readable.count) readable ones; missing \(Set(plan.readable).subtracting(received).sorted())")
+                }
+                if batch.unreadable.sorted() != plan.unreadable {
+                    report.violations.append("named \(batch.unreadable.sorted()) unreadable, expected \(plan.unreadable)")
                 }
                 if arrivalsAtReturn != plan.ids.count + plan.retries {
                     report.violations.append("asked \(arrivalsAtReturn) times for \(plan.ids.count) ids and \(plan.retries) retries")
@@ -436,7 +447,7 @@ struct GmailDetailWindowFuzzTests {
         }
         reuseWindow.releaseAll()
         let reused = try? await wave.value
-        if Set(reused?.map(\.header.messageId) ?? []) != Set(reuseIds) {
+        if Set(reused?.details.map(\.header.messageId) ?? []) != Set(reuseIds) {
             report.violations.append("the full-width fetch after it did not return every message")
         }
         return report
@@ -450,6 +461,7 @@ struct GmailDetailWindowFuzzTests {
         var otherRequests = 0
         var failures = 0
         var successes = 0
+        var namedUnreadable = 0
         for iteration in 0..<iterations {
             var rng = SplitMix64(seed: seed &+ UInt64(iteration) &* 0x9E37_79B9_7F4A_7C15)
             let plan = Self.makePlan(iteration: iteration, rng: &rng)
@@ -462,6 +474,7 @@ struct GmailDetailWindowFuzzTests {
             if report.otherRequestChecked { otherRequests += 1 }
             if report.threwFailure { failures += 1 }
             if report.succeeded { successes += 1 }
+            if report.namedUnreadable { namedUnreadable += 1 }
         }
         // The default run must reach every checker, or it proves nothing.
         if iterations >= FuzzConfig.defaultIterations {
@@ -469,6 +482,7 @@ struct GmailDetailWindowFuzzTests {
             #expect(otherRequests > 0, "no iteration checked the first freed slot")
             #expect(failures > 0, "no iteration threw a message's failure")
             #expect(successes > 0, "no iteration completed")
+            #expect(namedUnreadable > 0, "no iteration named an unreadable message")
         }
     }
 }

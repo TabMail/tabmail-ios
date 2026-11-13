@@ -209,6 +209,7 @@ struct SentDedupUserLabelCarryTests {
                 "precondition: the decoy label must be on the higher-id optimistic header")
 
         let scenario = FakeHTTP.Scenario()
+        FolderEpochTestFixture.registerGmailLabels(on: scenario, listingFoldersOf: accountId, pool: pool)
         defer { scenario.close() }
 
         scenario.register(path: "/history", method: "GET", response: .json(raw: """

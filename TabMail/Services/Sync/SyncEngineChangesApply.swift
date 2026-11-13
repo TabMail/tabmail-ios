@@ -9,7 +9,7 @@ import GRDB
 //
 // Everything the apply decides on is read INSIDE the folder's write transaction:
 // the folder row, the pending-operation snapshot and the recent completions
-// (#106, Memory 127; source fence F3). No logging but debug-gated `print` inside.
+// (#106, Memory 127; source fence in `ChangeSeamFenceTests`). No logging but debug-gated `print` inside.
 //
 // Per folder:
 // - removals go through the ONE removal core (`deleteConfirmedGhostHeaders…`),
@@ -20,7 +20,8 @@ import GRDB
 //   the server tag are kept back while the user's flag action is pending or just
 //   completed;
 // - every change kept back is put on the folder's re-read list
-//   (`FolderChangeState.recheck`), read again on the next pass until it applies.
+//   (`FolderChangeState.recheck`), read again on the next pass until it applies,
+//   and so is every message the provider could not read (`rereadLater`).
 //   Over `SyncConfig.changeRecheckLimit` ids, the folder's catch-up is armed.
 
 /// What one folder transaction wrote.
@@ -68,6 +69,9 @@ extension SyncEngine {
                 snapshot: snapshot, recentlyCompleted: recentlyCompleted, result: &result, db: db)
             if applied { settled.insert(record.messageId) } else { declined.insert(record.messageId) }
         }
+
+        // A message the provider could not read this pass is read again too.
+        declined.formUnion(changes.rereadLater)
 
         // The re-read list: drop what applied, add what was kept back.
         var state = FolderChangeState(raw: folder.changeState)

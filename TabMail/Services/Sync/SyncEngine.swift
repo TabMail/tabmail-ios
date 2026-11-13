@@ -558,8 +558,13 @@ actor SyncEngine {
             }
         }
 
-        // 2. Full sync runs separately on its own schedule (~15 min) as a self-healing safety net.
-        //    NOT a fallback from delta — runs independently regardless of delta success/failure.
+        // 2. Full sync runs on its own schedule (~15 min), regardless of the delta's
+        //    success or failure, and in this pass when the change read needs a listing
+        //    (a new or refused bookmark). The account was read before the read, so the
+        //    due time the read wrote is not in `account`: `listingNeeded` carries it.
+        //    A folder a reader tracks gets no window listing in it (ADR-IOS-111); one
+        //    message the reader cannot read is re-read on later passes and never fails
+        //    the read, so it does not hold back the rest of the account.
         let timeSinceFullSync = account.lastFullSyncAt.map { Date().timeIntervalSince($0) } ?? .infinity
         let listingNeeded = changePass?.needsListing ?? false
         if timeSinceFullSync >= fullSyncInterval || listingNeeded {
