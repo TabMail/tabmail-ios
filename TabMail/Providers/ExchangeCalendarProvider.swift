@@ -189,9 +189,10 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// `fetchForEdit`). `body` and `onlineMeeting` give the description and the
     /// join link (`notes(of:)`), and the stored body an edit keeps (#511).
     /// `originalStart` gives an occurrence's place in its series (`originalStartTime`).
-    /// Only properties calendarView can select: "The createdDateTime and lastModifiedDateTime
-    /// properties of event don't support $select" (learn.microsoft.com/graph/api/user-list-calendarview),
-    /// so neither is read and an Outlook event carries no `created` or `updated`.
+    /// Graph's calendarView page says "The createdDateTime and lastModifiedDateTime properties of
+    /// event don't support $select" (learn.microsoft.com/graph/api/user-list-calendarview). A personal
+    /// account was measured selecting both on 2026-11-13, but nothing here uses them, so neither is
+    /// read and an Outlook event carries no `created` or `updated`.
     private static let eventSelect = "id,subject,location,body,bodyPreview,onlineMeeting,start,end,attendees,organizer,recurrence,showAs,isCancelled,webLink,isAllDay,seriesMasterId,originalStart"
 
     /// What a split reads from the stored series: what `getEvent` reads, and every property the
