@@ -503,3 +503,27 @@ skip.
 changed on its own keeps its status, alert, categories, link, revision, `X-` line and attendees
 through a rename, an attendee added and a move.
 See `TESTS.md`, "Repeating events — copies keep the series' properties".
+
+**Amendment (2026-11-13, #563, third): attached Outlook items are copied too; a linked file refuses the split.**
+Supersedes "Still not copied: item and reference attachments" above for items (kept as written). Owner
+decision: an attached Outlook item (`#microsoft.graph.itemAttachment`) is copied onto the new part, as
+Outlook web's own split keeps a fresh copy there (measured live 2026-11-13: v1.0 `POST /events/{id}/attachments`
+with an inline item returns 201; `GET .../attachments/{id}?$expand=microsoft.graph.itemattachment/item`
+returns the whole item). The same `copyFiles(from:to:)` step does it, by kind: it reads the item with that
+`$expand` and re-adds it in one POST as an itemAttachment, the item's server-owned properties (`id`,
+`changeKey`, `createdDateTime`, `lastModifiedDateTime`, OData annotations but `@odata.type`) left out
+(`copiedItemJSON`; this round trip of an expanded item was not measured live, only a hand-built item).
+It runs before the cap, pairs by name on a retry, and covers a carried occurrence's own items. Graph
+documents the item route "under 3 MB" and an upload session for files only (`attachmentItem`'s minimum is
+`attachmentType: file`; every example is a file), so an item of
+`ExchangeDraftConfig.singlePostAttachmentLimitBytes` or more is NOT copied and nothing of it is written;
+the split completes and the old part keeps it (owner decision 2026-11-13, option A, #835). Reference
+attachments (linked OneDrive/SharePoint files): Graph v1.0 can't create one on an event (no `sourceUrl` in
+the v1.0 schema, live 400), so a split of a series holding one is REFUSED before any write (no new part,
+no record, no copy, no cap): `splitSeries` checks the series' attachment list right before the create and
+throws `linkedFileRefusal` ("...has a linked file TabMail can't copy to the new part, so it was not changed.
+Make the change in your calendar app."; owner decision 2026-11-13, #834). Moving that refusal before the
+confirmation card is #718's. A linked file on a single changed occurrence (not the series) is not checked:
+it is not copied onto the new part's instance. Tests: `itemAttachmentIsCopied`,
+`failedItemCopyRetriesOnce`, `largeItemIsSkipped`, `linkedFileRefusesTheSplitUnwritten`,
+`carriedOccurrenceKeepsItsOwnItem`.

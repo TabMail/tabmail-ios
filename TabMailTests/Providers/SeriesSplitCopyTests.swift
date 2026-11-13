@@ -899,6 +899,22 @@ struct ExchangeSplitCarryTests {
         #expect(copy < cap, "the occurrence's file was copied after the cap: \(r.http.servedCallSequence())")
     }
 
+    @Test("a changed later occurrence carried onto the new part keeps its own attached Outlook item")
+    func carriedOccurrenceKeepsItsOwnItem() async throws {
+        let r = try await split(exceptions: [Self.exception(2) { $0["location"] = ["displayName": "Room 9"] }],
+                                parts: [2, 3], patch: Self.rename) { graph, _ in
+            graph.attachItem("Week 2 notes", item: ExchangeSplitAttachmentTests.embedded, to: "ser-1-occ-2")
+        }
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error)); \(r.http.servedCallSequence())")
+        let held = r.graph.attachments(of: "created-1-w2")
+        #expect(held.compactMap { $0["name"] as? String } == ["Week 2 notes"]
+                && (held.first?["item"] as? [String: Any])?["subject"] as? String == "Embedded review",
+                "the carried occurrence holds \(held)")
+        #expect(r.graph.attachments(of: "created-1-w3").isEmpty, "an occurrence that was not changed got an item")
+        #expect(!r.graph.patches("ser-1").isEmpty, "the series was not capped")
+    }
+
     /// `series` kept in a zone the app does not recognize, with no range zone: no series zone to
     /// date a move in.
     private static func zoneless(_ series: [String: Any]) -> [String: Any] {
@@ -2103,20 +2119,110 @@ struct ExchangeSplitAttachmentTests {
                 "an ordinary file became inline: \(byName["agenda.txt"] ?? [:])")
     }
 
-    @Test("a series holding a file, a cloud link and an attached Outlook item splits, and only the file is copied")
-    func onlyFilesAreCopied() async throws {
+    /// An event attached as an Outlook item, as Graph's `$expand=microsoft.graph.itemattachment/item`
+    /// reads it: its own properties and what the server owns.
+    static var embedded: [String: Any] { [
+        "@odata.type": "#microsoft.graph.event", "@odata.etag": "W/\"etag-1\"", "id": "embedded-1", "changeKey": "ck-1",
+        "createdDateTime": "2099-01-01T00:00:00Z", "lastModifiedDateTime": "2099-01-02T00:00:00Z",
+        "subject": "Embedded review", "body": ["contentType": "text", "content": "Embedded probe"],
+        "start": ["dateTime": "2099-06-01T17:00:00.0000000", "timeZone": "UTC"],
+        "end": ["dateTime": "2099-06-01T17:30:00.0000000", "timeZone": "UTC"],
+    ] }
+
+    /// The item attachments an event holds: name and item.
+    private static func items(_ graph: FakeGraphCalendar, _ id: String) -> [(name: String, item: [String: Any])] {
+        graph.attachments(of: id).compactMap { a in
+            guard a["@odata.type"] as? String == "#microsoft.graph.itemAttachment", let name = a["name"] as? String,
+                  let item = a["item"] as? [String: Any] else { return nil }
+            return (name, item)
+        }
+    }
+
+    @Test("an attached Outlook item reaches the new part whole, as a new item with its own properties and none the server owns, before the cap")
+    func itemAttachmentIsCopied() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = Self.calendar([])
+        graph.attachItem("Review invite", item: Self.embedded, to: "ser-1")
+        graph.install(on: http)
+        let error = await Self.split(graph, http, records: SplitRecordBox())
+        #expect(error == nil, "\(String(describing: error)); \(http.servedCallSequence())")
+        let partId = try #require(graph.created.first?["id"] as? String, "no new part was created")
+        let copied = Self.items(graph, partId)
+        #expect(copied.map(\.name) == ["Review invite"], "the new part holds \(copied.map(\.name))")
+        let item = copied.first?.item ?? [:]
+        #expect(item["subject"] as? String == "Embedded review" && item["@odata.type"] as? String == "#microsoft.graph.event",
+                "the item changed: \(item)")
+        #expect((item["body"] as? [String: Any])?["content"] as? String == "Embedded probe", "the item's body changed: \(item)")
+        #expect(item["id"] as? String != "embedded-1" && item["changeKey"] == nil && item["createdDateTime"] == nil
+                && item["lastModifiedDateTime"] == nil && item["@odata.etag"] == nil, "a server-owned property was written: \(item)")
+        #expect(Self.items(graph, "ser-1").count == 1, "the series lost its item")
+        let calls = http.recordedCalls()
+        let post = try #require(calls.lastIndex { $0.method == "POST" && $0.url.contains("/events/\(partId)/attachments") })
+        let cap = try #require(calls.firstIndex { $0.method == "PATCH" && URL(string: $0.url)?.path.hasSuffix("/events/ser-1") == true })
+        #expect(post < cap, "the item was copied after the cap")
+    }
+
+    @Test("an item copy that fails stops the split before the cap; the retry adds the item once, then caps")
+    func failedItemCopyRetriesOnce() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = Self.calendar([])
+        graph.attachItem("Review invite", item: Self.embedded, to: "ser-1")
+        graph.install(on: http)
+        graph.failNext("ATTACH", with: 400)
+        let records = SplitRecordBox()
+        let error = await Self.split(graph, http, records: records)
+        #expect(error != nil, "the failed item copy did not stop the split")
+        #expect(graph.patches("ser-1").isEmpty, "the series was capped though the item was not copied")
+        let record = try #require(records.records.first, "no record was kept")
+        try await GraphSplitFixture.provider(http).finishSplit(record: record, zone: .current, guests: nil)
+        try await GraphSplitFixture.provider(http).finishSplit(record: record, zone: .current, guests: nil)
+        #expect(Self.items(graph, record.newPartId).map(\.name) == ["Review invite"],
+                "the new part holds \(Self.items(graph, record.newPartId).map(\.name))")
+        #expect(!graph.patches("ser-1").isEmpty, "the retry did not cap")
+    }
+
+    @Test("an attached item of 3 MB or more is not copied and nothing of it is written; the split completes with the file, and the series keeps the item")
+    func largeItemIsSkipped() async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
         let graph = Self.calendar([("agenda.txt", Self.small)])
-        graph.attachOther("#microsoft.graph.referenceAttachment", name: "Shared deck", to: "ser-1")
-        graph.attachOther("#microsoft.graph.itemAttachment", name: "Forwarded invite", to: "ser-1")
+        graph.attachItem("Big thread", item: Self.embedded, to: "ser-1", size: ExchangeDraftConfig.singlePostAttachmentLimitBytes)
+        let before = graph.attachments(of: "ser-1").count
         graph.install(on: http)
         let error = await Self.split(graph, http, records: SplitRecordBox())
         #expect(error == nil, "\(String(describing: error)); \(http.servedCallSequence())")
         let partId = try #require(graph.created.first?["id"] as? String, "no new part was created")
         #expect(graph.attachments(of: partId).compactMap { $0["name"] as? String } == ["agenda.txt"],
                 "the new part holds \(graph.attachments(of: partId).compactMap { $0["name"] as? String })")
+        let attachmentWrites = http.recordedCalls().filter { $0.method == "POST" && $0.url.contains("/attachments") }
+        #expect(attachmentWrites.count == 1 && !http.recordedCalls().contains { $0.url.contains("createUploadSession") || $0.url.contains("AttachmentSessions") },
+                "a write was attempted for the item: \(attachmentWrites.map(\.url))")
+        #expect(graph.attachments(of: "ser-1").count == before && !http.recordedCalls().contains { $0.method == "DELETE" },
+                "something was deleted from the series")
         #expect(!graph.patches("ser-1").isEmpty, "the series was not capped")
+    }
+
+    @Test("a series holding a linked file is refused before any write: no new part, no copy, no change, no cap, with the calendar-app message")
+    func linkedFileRefusesTheSplitUnwritten() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = Self.calendar([("agenda.txt", Self.small)])
+        graph.attachItem("Review invite", item: Self.embedded, to: "ser-1")
+        graph.attachOther("#microsoft.graph.referenceAttachment", name: "Shared deck", to: "ser-1")
+        let before = graph.attachments(of: "ser-1").count
+        graph.install(on: http)
+        let records = SplitRecordBox()
+        let error = await Self.split(graph, http, records: records)
+        let writes = http.recordedCalls().filter { $0.method != "GET" }
+        #expect(writes.isEmpty, "a write was sent: \(writes.map { "\($0.method) \($0.url)" })")
+        #expect(graph.created.isEmpty && records.records.isEmpty, "a new part or a record was made")
+        #expect(graph.attachments(of: "ser-1").count == before, "the series' attachments changed")
+        var message: String?
+        if case .notSupported(let said)? = error as? CalendarProviderError { message = said }
+        #expect(message == "This repeating event has a linked file TabMail can't copy to the new part, so it was not changed. Make the change in your calendar app.",
+                "the refusal: \(String(describing: error))")
     }
 
     @Test("a retry keeps two files of the same name and a file with no name: each is added once, the unnamed one as a draft names it")

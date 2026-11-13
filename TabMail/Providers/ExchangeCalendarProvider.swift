@@ -526,6 +526,13 @@ actor ExchangeCalendarProvider: CalendarProvider {
             parts: parts, mode: mode, namedStart: namedStart, namedPlace: namedPlace, cut: splitPlace, series: master,
             newPart: Self.plannedPart(master: master, patch: partPatch, place: place, zone: recurrenceIdZone),
             fields: SplitCarry.fields(of: partPatch))
+        // A linked file (a reference attachment: a OneDrive or SharePoint link) can't be copied
+        // onto the new part (Graph v1.0 can't create one on an event), so a series holding one is
+        // refused here, before anything is written (owner decision 2026-11-13, #834).
+        let encodedSeries = try Self.encodedGraphPathSegment(eventId, context: "Graph series master id")
+        if try await attachments(of: "/events/\(encodedSeries)").contains(where: Self.isReferenceAttachment) {
+            throw CalendarProviderError.notSupported(Self.linkedFileRefusal)
+        }
         let cappedBody = try JSONSerialization.data(withJSONObject: cappedJSON)
 
         // 1. Create the new part. Graph defines `transactionId` as a value "for the server to
@@ -1133,25 +1140,53 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// with its inline placement (`isInline`, `contentId`), so a picture placed in the body stays
     /// placed there and the body's `cid:` link still finds it.
     ///
-    /// Only files (`#microsoft.graph.fileAttachment`) are copied; an item or reference attachment
-    /// is left as before, not copied. A file the target already holds under the same name (one
-    /// to one, as a draft save pairs them) is not added again, so a retry (`finishSplit`) adds only
-    /// what an earlier attempt did not. Any failure throws before the cap, with the record kept:
-    /// the series is still whole, and the retry copies what is missing.
+    /// An attached Outlook item (`#microsoft.graph.itemAttachment`: a message, event or contact)
+    /// is copied too, as Outlook web's own split keeps a copy on the new part (measured
+    /// 2026-11-13): it is read whole (`$expand=microsoft.graph.itemattachment/item`, Graph's
+    /// `attachment: get`) and added in one POST (`event: post attachments`, "under 3 MB"; Graph
+    /// documents an upload session for files only), with the item's server-owned properties left
+    /// out (`copiedItemJSON`). An item of `ExchangeDraftConfig.singlePostAttachmentLimitBytes` or
+    /// more is not copied, and nothing of it is written: the old part keeps it (owner decision
+    /// 2026-11-13, #835). A series holding a reference attachment (a linked file) never reaches
+    /// here: `splitSeries` refuses it before any write (`linkedFileRefusal`, #834).
+    ///
+    /// A file or item the target already holds under the same name (one to one, as a draft save
+    /// pairs them) is not added again, so a retry (`finishSplit`) adds only what an earlier attempt
+    /// did not. Any failure throws before the cap, with the record kept: the series is still whole,
+    /// and the retry copies what is missing.
     private func copyFiles(from sourceId: String, to targetId: String, context: String) async throws {
         let encodedSource = try Self.encodedGraphPathSegment(sourceId, context: context)
-        let files = try await attachments(of: "/events/\(encodedSource)").filter(ExchangeProvider.isFileAttachment)
-        guard !files.isEmpty else { return }
+        let copied = try await attachments(of: "/events/\(encodedSource)").filter { attachment in
+            ExchangeProvider.isFileAttachment(attachment)
+                || (Self.isItemAttachment(attachment) && (attachment.size ?? 0) < ExchangeDraftConfig.singlePostAttachmentLimitBytes)
+        }
+        guard !copied.isEmpty else { return }
         let encodedTarget = try Self.encodedGraphPathSegment(targetId, context: "Graph event id")
         var held = try await attachments(of: "/events/\(encodedTarget)").map(Self.attachmentName)
         var added = 0
-        for file in files {
+        for file in copied {
             let name = Self.attachmentName(file)
             if let index = held.firstIndex(of: name) {
                 held.remove(at: index)
                 continue
             }
             let encodedFile = try Self.encodedGraphPathSegment(file.id, context: "Graph attachment id")
+            if Self.isItemAttachment(file) {
+                let read = try await request(
+                    path: "/events/\(encodedSource)/attachments/\(encodedFile)?$expand=\(ExchangeProvider.attachedEmailPlainExpand)")
+                guard let whole = try JSONSerialization.jsonObject(with: read) as? [String: Any],
+                      let item = whole["item"] as? [String: Any] else {
+                    throw CalendarProviderError.notSupported(
+                        "an Outlook item attached to this repeating event can't be read, so it can't be copied to the new part")
+                }
+                let body: [String: Any] = [
+                    "@odata.type": "#microsoft.graph.itemAttachment", "name": name, "item": Self.copiedItemJSON(item),
+                ]
+                _ = try await request(path: "/events/\(encodedTarget)/attachments", method: "POST",
+                                      body: try JSONSerialization.data(withJSONObject: body))
+                added += 1
+                continue
+            }
             let detail = try JSONDecoder().decode(
                 GraphAttachmentDetail.self, from: try await request(path: "/events/\(encodedSource)/attachments/\(encodedFile)"))
             guard let base64 = detail.contentBytes, let data = Data(base64Encoded: base64) else {
@@ -1167,7 +1202,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
             added += 1
         }
         if DebugModeManager.isLoggingEnabled() {
-            BackgroundSyncLogger.logDebug("[ExchangeCalendar] split copied \(added) of \(files.count) file attachment(s) onto \(targetId)")
+            BackgroundSyncLogger.logDebug("[ExchangeCalendar] split copied \(added) of \(copied.count) attachment(s) onto \(targetId)")
         }
     }
 
@@ -1176,7 +1211,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// `GraphAPI.maxAttachmentListPages` pages, as a message's list is read.
     private func attachments(of eventPath: String) async throws -> [GraphAttachmentMeta] {
         var found: [GraphAttachmentMeta] = []
-        var next: String? = "\(eventPath)/attachments?$select=id,name,contentType,isInline"
+        var next: String? = "\(eventPath)/attachments?$select=id,name,contentType,size,isInline"
         var pages = 0
         while let path = next {
             guard pages < GraphAPI.maxAttachmentListPages else { throw ExchangeProvider.GraphAttachmentListIncomplete() }
@@ -1187,6 +1222,33 @@ actor ExchangeCalendarProvider: CalendarProvider {
         }
         return found
     }
+
+    /// Whether a Graph attachment is a linked file (`#microsoft.graph.referenceAttachment`).
+    nonisolated static func isReferenceAttachment(_ attachment: GraphAttachmentMeta) -> Bool {
+        (attachment.odataType ?? "").lowercased().contains("referenceattachment")
+    }
+
+    /// The refusal of a split of a series that holds a linked file (`isReferenceAttachment`).
+    static let linkedFileRefusal =
+        "This repeating event has a linked file TabMail can't copy to the new part, so it was not changed. Make the change in your calendar app."
+
+    /// Whether a Graph attachment is an attached Outlook item (`#microsoft.graph.itemAttachment`),
+    /// named by its `@odata.type` as a file is (`ExchangeProvider.isFileAttachment`).
+    nonisolated static func isItemAttachment(_ attachment: GraphAttachmentMeta) -> Bool {
+        (attachment.odataType ?? "").lowercased().contains("itemattachment")
+    }
+
+    /// The attached item `item` (as `$expand` reads it) as a new item attachment is written: the
+    /// item's own properties, without what the server owns and assigns to the new copy (its
+    /// `id`, `changeKey`, creation and change times) and without the OData annotations but its
+    /// type (`@odata.type`, which names the kind of item).
+    nonisolated static func copiedItemJSON(_ item: [String: Any]) -> [String: Any] {
+        item.filter { key, _ in
+            !serverOwnedItemKeys.contains(key) && (!key.hasPrefix("@odata.") || key == "@odata.type")
+        }
+    }
+
+    private static let serverOwnedItemKeys: Set<String> = ["id", "changeKey", "createdDateTime", "lastModifiedDateTime"]
 
     /// The name a split pairs and writes a copied file under: its own, or the name a draft read
     /// gives a file with none (`DraftReadConfig.unnamedAttachmentFilename`).

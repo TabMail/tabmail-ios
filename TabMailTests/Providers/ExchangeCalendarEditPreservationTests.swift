@@ -178,6 +178,15 @@ final class FakeGraphCalendar: Sendable {
         store(attachment: ["@odata.type": odataType, "name": name, "contentType": NSNull(), "size": 0, "isInline": false], on: id)
     }
 
+    /// Attaches the Outlook item `item` (an event or message, as Graph's `$expand` reads it) named
+    /// `name` to event `id`, as the user does in Outlook. Its `size` is `size`, else its JSON's.
+    func attachItem(_ name: String, item: [String: Any], to id: String, size: Int? = nil) {
+        // swiftlint:disable:next force_try
+        let measured = try! JSONSerialization.data(withJSONObject: item).count
+        store(attachment: ["@odata.type": "#microsoft.graph.itemAttachment", "name": name, "contentType": NSNull(),
+                           "size": size ?? measured, "isInline": false, "item": item], on: id)
+    }
+
     /// The number of attachments one list page holds; Graph follows with `@odata.nextLink`.
     let attachmentPageSize = Mutex(Int.max)
 
@@ -441,7 +450,10 @@ final class FakeGraphCalendar: Sendable {
                     }
                     return Self.json(body)
                 }
-                guard parts.count == 3, let one = held.first(where: { $0["id"] as? String == parts[2] }) else { return .status(404) }
+                guard parts.count == 3, var one = held.first(where: { $0["id"] as? String == parts[2] }) else { return .status(404) }
+                // An attached item's own properties come back only with Graph's `$expand`.
+                let expand = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "$expand" }?.value
+                if expand?.lowercased() != "microsoft.graph.itemattachment/item" { one["item"] = nil }
                 return Self.json(one)
             }
             if parts.count == 1 { readLog.withLock { $0.append((id: parts[0], zone: preferName)) } }
@@ -557,6 +569,17 @@ final class FakeGraphCalendar: Sendable {
                 }
                 return .json(raw: #"{"uploadUrl":"https://outlook.office.com/AttachmentSessions/\#(token)?authtoken=synthetic-token"}"#,
                              statusCode: 201)
+            }
+            // An item attachment: one POST carrying the whole item, under the single-POST limit
+            // (Graph documents no upload session for an item); a fresh id and stamps on the copy.
+            if parts.count == 2, json["@odata.type"] as? String == "#microsoft.graph.itemAttachment" {
+                guard let name = json["name"] as? String, var item = json["item"] as? [String: Any], item["@odata.type"] != nil else {
+                    return .status(400)
+                }
+                guard body.count < GraphAttachmentLimits.singlePostMaxExclusive else { return .status(413) }
+                item["id"] = "item-" + String(attachmentCount.withLock { n in n += 1; return n })
+                attachItem(name, item: item, to: parts[0])
+                return .json(raw: "{}", statusCode: 201)
             }
             guard parts.count == 2, json["@odata.type"] as? String == "#microsoft.graph.fileAttachment",
                   let name = json["name"] as? String, let raw = json["contentBytes"] as? String,
