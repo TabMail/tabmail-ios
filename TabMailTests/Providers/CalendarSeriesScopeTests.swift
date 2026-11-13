@@ -3870,10 +3870,16 @@ struct SplitRecordIsReservedTests {
                         // not-found answer, with no grace.
                         SplitRecord.partNotFoundSinceKey: .double(Date().addingTimeInterval(-86_400).timeIntervalSince1970),
                         // A forged card title would name a different event in a late failure.
-                        PendingCalendarOperation.eventTitleKey: .string("Forged title")],
+                        PendingCalendarOperation.eventTitleKey: .string("Forged title"),
+                        // A forged seen mark would hide the inbox banner of a failure nobody saw,
+                        // and a forged kind would give it another reason.
+                        PendingCalendarOperation.failureSeenKey: .bool(true),
+                        PendingCalendarOperation.failureKindKey: .string(CalendarFailureKind.refused.rawValue)],
             eventTitle: "Card title")
         let stored = try #require(try await pool.read { db in try PendingCalendarOperation.fetchOne(db, key: op.id) })
         #expect(stored.eventTitle == "Card title", "the queued title is not the card's: \(stored.argumentsJSON)")
+        #expect(!stored.failureSeen, "the forged seen mark was queued: \(stored.argumentsJSON)")
+        #expect(stored.failureKind == nil, "the forged failure kind was queued: \(stored.argumentsJSON)")
         #expect(SplitRecord(stored.arguments) == nil, "the forged record was queued: \(stored.argumentsJSON)")
         #expect(stored.arguments[SplitRecord.partNotFoundSinceKey] == nil,
                 "the forged first not-found time was queued: \(stored.argumentsJSON)")

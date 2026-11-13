@@ -136,6 +136,39 @@ struct LateCalendarFailureBannerTests {
                 "the failure the card showed must stay recorded as failed with its reason; got \(String(describing: shown?.status))")
     }
 
+    /// The drain counts a failure as seen exactly when its signal reaches a waiting tool, and then
+    /// no banner shows it. So a signal that takes the waiting tool's awaiter must reach that tool
+    /// even when the wait's timeout fired first: here the signal runs after the timeout returned
+    /// and before the wait gives the awaiter up.
+    @Test("A failure signalled after the wait timed out, but before it gave up, still reaches the waiting card")
+    func signalInsideTheTimeoutGapReachesTheCard() async throws {
+        let opId = "late-cal-gap-\(UUID().uuidString)"
+        let timeout = 0.2
+        let start = ContinuousClock.now
+        async let outcome = AccountManager.shared.awaitCalendarOpOutcome(opId: opId, timeoutSeconds: timeout)
+
+        let registrationDeadline = start + .seconds(timeout / 2)
+        var registered = false
+        while !registered, ContinuousClock.now < registrationDeadline {
+            registered = await AccountManager.shared.hasCalendarOpAwaiter(opId: opId)
+            if !registered { await Task.yield() }
+        }
+        #expect(registered, "fixture check: the wait must register before its timeout")
+
+        // One job on the manager: the timeout fires while it holds the manager, so the wait
+        // can only resume after the signal below has taken its awaiter.
+        let told = await AccountManager.shared.signalAfterHolding(
+            until: start + .seconds(timeout + 1), opId: opId,
+            outcome: .permanentFailure(reason: "event not found on server"))
+        let result = await outcome
+
+        #expect(told, "fixture check: the signal must find the awaiter the timed-out wait had not given up yet")
+        guard case .permanentFailure = result else {
+            #expect(Bool(false), "the drain counted the failure as seen, so it shows no banner, but the waiting card got \(result): the failure is shown nowhere")
+            return
+        }
+    }
+
     /// The error each terminal arm of the drain claims, as a provider throws it from a delete.
     private func providerError(for kind: CalendarFailureKind) -> any Error {
         switch kind {
@@ -218,5 +251,16 @@ struct LateCalendarFailureBannerTests {
         #expect(afterRelaunch.isEmpty, "the dismissed banner came back after a relaunch")
         let row = try await pool.read { db in try PendingCalendarOperation.fetchOne(db, key: op.id) }
         #expect(row == nil, "a dismissed failure must leave no row behind")
+    }
+}
+
+extension AccountManager {
+    func hasCalendarOpAwaiter(opId: String) -> Bool { calendarOpAwaiters[opId] != nil }
+
+    /// Holds the manager until `deadline`, then signals `opId`, all as one job: nothing else on
+    /// the manager (such as a wait whose timeout fired meanwhile) runs before the signal.
+    func signalAfterHolding(until deadline: ContinuousClock.Instant, opId: String, outcome: CalendarOpOutcome) -> Bool {
+        while ContinuousClock.now < deadline { Thread.sleep(forTimeInterval: 0.005) }
+        return signalCalendarOpOutcome(opId: opId, outcome: outcome)
     }
 }
