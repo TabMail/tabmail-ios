@@ -58,18 +58,21 @@ struct ExchangeCalendarErrorTests {
         }
     }
 
-    @Test("All four cases are distinguishable")
+    @Test("All six cases are distinguishable")
     func allCasesDistinguishable() {
         // The switch below is deliberately EXHAUSTIVE (no `default`): adding a case
         // to `ExchangeCalendarError` must break this test, which is how the new
         // case gets a distinguishability assertion instead of being silently
         // absorbed. `invalidPathSegment` was added 2026-08-05 with the strict
-        // Graph path-segment encoder.
+        // Graph path-segment encoder; `invalidPageLink` and `listingIncomplete`
+        // with paged listings (#435).
         let cases: [ExchangeCalendarError] = [
             .missingScope,
             .httpError(404, nil),
             .eventNotFound,
             .invalidPathSegment("Graph event id"),
+            .invalidPageLink,
+            .listingIncomplete,
         ]
 
         for (i, error) in cases.enumerated() {
@@ -84,6 +87,10 @@ struct ExchangeCalendarErrorTests {
                 #expect(i == 3)
                 #expect(context == "Graph event id",
                         "the case must carry WHICH id failed — a bare failure is unactionable")
+            case .invalidPageLink:
+                #expect(i == 4)
+            case .listingIncomplete:
+                #expect(i == 5)
             }
         }
     }
