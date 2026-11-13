@@ -13,12 +13,14 @@ import Testing
 /// that clears. Only a 404 (the message is gone) may be skipped; any other
 /// failure leaves the cursor where it was, so the next pass fetches the same
 /// change again and applies it once the fetch succeeds. And a message whose
-/// fetch never succeeds does not stop the account's sync: the full sync
-/// completes past it and moves the cursor, so later changes land.
+/// fetch never succeeds does not stop the account's sync: on Gmail its own
+/// unusable answer puts it on the folder's re-read list and the rest of the
+/// pass lands with the bookmark moved; on Outlook the full sync's cursor
+/// capture moves past it, so later changes land.
 ///
-/// These drive production `SyncEngine.performDeltaSync` (and, for the bound,
-/// the foreground poll `SyncEngine.sync(account:)`, which runs the delta, the
-/// due full sync and the cursor capture) end to end on `FakeHTTP` with a real
+/// These drive production `SyncEngine.performDeltaSync` (and, for the Outlook
+/// bound, the foreground poll `SyncEngine.sync(account:)`, which runs the
+/// delta, the due full sync and the cursor capture) end to end on `FakeHTTP` with a real
 /// provider and a real `DatabasePool`, for both providers whose delta fetches
 /// messages by id (Gmail and Outlook).
 @Suite("A delta never loses a change whose message fetch failed", .serialized, .processGlobalState)
@@ -154,9 +156,12 @@ struct DeltaDetailFetchFailureTests {
     /// never fetched again. Now the message's own unusable answer puts it on the
     /// re-read list: the rest of the pass lands and the bookmark moves at once,
     /// and the message lands on the first pass that reads it, with no new history.
+    /// `alone`: the history names only that message, so its folder has no record
+    /// and no removal and the re-read list is the folder's only write (RED while
+    /// such a folder was skipped: the bookmark moved and the change was lost).
     @Test("A Gmail message whose own answer is unusable is read again until it lands, and the rest of the pass lands at once",
-          arguments: Failure.answers)
-    func gmailUnreadableMessageIsReadAgain(failure: Failure) async throws {
+          arguments: Failure.answers, [false, true])
+    func gmailUnreadableMessageIsReadAgain(failure: Failure, alone: Bool) async throws {
         try await Self.withAppDB { pool in
             let account = try Self.makeAccount(
                 id: Self.gmailAccountId, provider: .gmail, cursor: "1000", folderPath: "INBOX", role: .inbox, pool: pool)
@@ -164,7 +169,7 @@ struct DeltaDetailFetchFailureTests {
             let scenario = FakeHTTP.Scenario()
             defer { scenario.close() }
             FolderEpochTestFixture.registerGmailLabels(on: scenario, listingFoldersOf: Self.gmailAccountId, pool: pool)
-            Self.registerHistory(Self.gmailHistoryPage(addedIds: ["steady-1", "flaky-1"]), on: scenario)
+            Self.registerHistory(Self.gmailHistoryPage(addedIds: alone ? ["flaky-1"] : ["steady-1", "flaky-1"]), on: scenario)
             scenario.register(path: "/messages/steady-1", method: "GET",
                               response: .json(raw: Self.gmailMessageJSON(id: "steady-1")))
             scenario.register(path: "/messages/flaky-1", method: "GET") { _ in
@@ -175,7 +180,7 @@ struct DeltaDetailFetchFailureTests {
 
             let first = try await SyncEngine().performDeltaSync(account: account, provider: provider)
             #expect(first.succeeded)
-            #expect(try Self.headerExists(accountId: Self.gmailAccountId, folderPath: "INBOX", messageId: "steady-1", pool: pool))
+            #expect(try Self.headerExists(accountId: Self.gmailAccountId, folderPath: "INBOX", messageId: "steady-1", pool: pool) == !alone)
             #expect(try !Self.headerExists(accountId: Self.gmailAccountId, folderPath: "INBOX", messageId: "flaky-1", pool: pool),
                     "an unread message must not be taken for anything")
             #expect(try Self.cursor(accountId: Self.gmailAccountId, pool: pool) == "1002",

@@ -59,7 +59,10 @@ struct GmailDeltaAllMailMembershipTests {
     private static func makeFixture(
         pool: DatabasePool, seeds: [StatefulGmailActionServer.Seed]
     ) throws -> Fixture {
-        let server = StatefulGmailActionServer(messages: seeds)
+        // `/labels` names every seeded folder: the change read applies it as the
+        // folder list (ADR-IOS-111), which removes a folder it does not name.
+        let server = StatefulGmailActionServer(
+            messages: seeds, userLabels: [userLabelId: "Label"], systemLabels: ["INBOX", "SENT", "TRASH"])
         var account = Account(
             emailAddress: "\(accountId)@example.com",
             displayName: "All Mail delta fixture",

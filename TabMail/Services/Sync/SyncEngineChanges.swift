@@ -173,7 +173,9 @@ extension SyncEngine {
         for changes in changeSet.folders {
             if changes.status.isTrackable { outcome.trackableFolderIds.insert(changes.folderId) }
             if case .failed(let error) = changes.status, failure == nil { failure = error }
-            guard !changes.records.isEmpty || !changes.removals.isEmpty else { continue }
+            // A folder with only a message to read later still writes: its re-read
+            // list is the only place that message's change survives the bookmark move.
+            guard !changes.records.isEmpty || !changes.removals.isEmpty || !changes.rereadLater.isEmpty else { continue }
             let applied = try await dbPool.write { db in try Self.applyFolderChanges(changes, db: db) }
             newHeaders += applied.newHeaders
             removedIds += applied.removedIds

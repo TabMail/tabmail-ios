@@ -29,7 +29,8 @@ and that capture was a lapse, so a new account listed every folder twice for the
    and the Sent reply-parent mark. No provider cast and no provider test in those two files (pinned by `ChangeSeamFenceTests`).
 3. **The re-read list.** Every change the apply keeps back under a shield, and every message the reader
    names in a folder's `FolderChanges.rereadLater` (one it could not read this pass), is put on the folder's
-   `Folder.changeState.recheck` (v102, engine-owned JSON, message ids only). The next request passes it; the
+   `Folder.changeState.recheck` (v102, engine-owned JSON, message ids only); a folder whose only change is
+   such an id is still written, or the bookmark would move past a change kept nowhere. The next request passes it; the
    reader reads those messages again and returns ordinary records or removals; an id leaves the list once it
    applies. Over `SyncConfig.changeRecheckLimit`, the extra ids are dropped and the folder's catch-up is
    armed (the lapse mark, `SyncEngine.markCatchUpLapse`).

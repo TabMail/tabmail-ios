@@ -172,11 +172,11 @@ struct SentDedupUserLabelCarryTests {
     // MARK: - Gmail
 
     /// Gmail's incoming set is empty here for the reason it is empty in the
-    /// field: `fetchFolders` never ran, so `GmailUserLabelCatalogState` is not
-    /// authoritative and `extractUserLabelIds` filters every label out. That is
-    /// the harshest form of the invariant — the rebuild after the insert has
-    /// literally nothing to restore, so the ONLY thing that can preserve the
-    /// user's label is the carry.
+    /// field: the server's record carries no user label yet (the user's label
+    /// op has not drained), and the change read's `labels.list` makes that
+    /// empty set authoritative. That is the harshest form of the invariant —
+    /// the rebuild after the insert has literally nothing to restore, so the
+    /// ONLY thing that can preserve the user's label is the carry.
     @Test("Gmail delta dedup keeps a user-applied label when the incoming set is empty")
     func gmailSentDedupCarriesUserLabelAcrossReplacement() async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()

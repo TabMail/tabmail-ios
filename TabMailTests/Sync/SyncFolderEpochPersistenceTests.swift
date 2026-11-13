@@ -189,15 +189,21 @@ enum FolderEpochTestFixture {
     /// Gmail's `labels.list` on `scenario`, naming every folder the account
     /// holds in `pool` when it is asked (upper-case ids as system labels,
     /// anything else as a user label; the synthetic All Mail is the provider's
-    /// own). A Gmail change pass that covers all folders reads it as the folder
-    /// list (ADR-IOS-111), and a folder it does not name is removed.
+    /// own), and every user label row the account holds as a user label. A
+    /// Gmail change pass that covers all folders reads it as the folder list
+    /// and the label catalog (ADR-IOS-111): a folder or user label it does not
+    /// name is removed.
     static func registerGmailLabels(on scenario: FakeHTTP.Scenario, listingFoldersOf accountId: String, pool: DatabasePool) {
         scenario.register(path: "/labels", method: "GET") { _ in
-            let paths = (try? pool.read { db in
-                try Folder.filter(Column("accountId") == accountId).fetchAll(db).map(\.path)
-            }) ?? []
-            let labels = paths.filter { $0 != GmailProvider.archivePath }.sorted().map { path in
+            let (paths, userLabels) = (try? pool.read { db in
+                (try Folder.filter(Column("accountId") == accountId).fetchAll(db).map(\.path),
+                 try UserLabel.filter(Column("accountId") == accountId).fetchAll(db).map { ($0.providerLabelId, $0.name) })
+            }) ?? ([], [])
+            var labels = paths.filter { $0 != GmailProvider.archivePath }.sorted().map { path in
                 #"{ "id": "\#(path)", "name": "\#(path)", "type": "\#(path == path.uppercased() ? "system" : "user")" }"#
+            }
+            for (id, name) in userLabels.sorted(by: { $0.0 < $1.0 }) where !paths.contains(id) {
+                labels.append(#"{ "id": "\#(id)", "name": "\#(name)", "type": "user" }"#)
             }
             return .json(raw: #"{ "labels": [ \#(labels.joined(separator: ", ")) ] }"#)
         }

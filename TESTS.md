@@ -537,8 +537,8 @@ whose fetch fails (a 5xx, a non-gone 4xx, a transport failure, a body that does 
 record has no usable date) fails the delta and keeps the delta link; on the next pass the fetch
 succeeds and the change lands. On Gmail the same per-message answers (`isUnreadableAnswerForOneMessage`)
 name the message for a later re-read instead: the rest of the delta lands on the SAME pass, the history
-id moves, the message goes on each folder's re-read list, and it lands once readable with no new
-history; a transport failure is about the account and still fails the delta with the history id
+id moves, the message goes on each folder's re-read list (also when it is the pass's only change), and it
+lands once readable with no new history; a transport failure is about the account and still fails the delta with the history id
 kept. A Gmail message that stays unreadable never stops sync: other changes keep landing pass after
 pass while it stays on the re-read list. One that later answers 404 or 410 is removed from every
 folder. A message that answers 404 is gone and is skipped: the rest of the delta is applied and the

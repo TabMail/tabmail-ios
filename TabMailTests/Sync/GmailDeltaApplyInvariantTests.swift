@@ -729,7 +729,7 @@ struct GmailDeltaApplyInvariantTests {
 
     // MARK: - P17, P18: cursor recovery (#456)
 
-    @Test("P17: an expired cursor recovers end to end: cleared, deltas wait, the full pass takes a new cursor, the next delta reads from it")
+    @Test("P17: an expired bookmark recovers end to end: cleared, background reads wait, the foreground pass lists and stores a new bookmark, the next read reads from it")
     func expiredCursorRecovers() async throws {
         try await Self.withWorld(seeds: [Self.seed("p17-msg", labels: ["INBOX", "UNREAD"])]) { w in
             try w.insertRow("p17-msg", in: w.inbox, isRead: false)
@@ -743,7 +743,7 @@ struct GmailDeltaApplyInvariantTests {
             let waiting = try await w.delta()
             #expect(waiting.succeeded == false)
             #expect(w.historyRequestCount() == historyAfterRefusal,
-                    "with no cursor the next delta waits for the full sync instead of asking again")
+                    "with no bookmark a background read waits for the foreground pass instead of asking again")
 
             try await w.foregroundPassWithFullSyncDue()
             let resumeId = w.server.currentHistoryId()
@@ -751,12 +751,12 @@ struct GmailDeltaApplyInvariantTests {
 
             w.server.applyLabelChange(providerMessageId: "p17-msg", remove: ["UNREAD"])
             try await w.completedDelta()
-            #expect(w.historyStartIds().last == resumeId, "the next delta reads from the cursor the full pass took")
+            #expect(w.historyStartIds().last == resumeId, "the next read reads from the bookmark the foreground pass stored")
             #expect(try w.row("p17-msg", in: w.inbox)?.isRead == true, "and applies what changed after it")
         }
     }
 
-    @Test("P18: a history longer than one delta takes is handled like an expired one")
+    @Test("P18: a history longer than one read takes is refused like an expired one")
     func overLongHistoryRecovers() async throws {
         try await Self.withWorld(seeds: [Self.seed("p18-msg", labels: ["INBOX", "UNREAD"])]) { w in
             try w.insertRow("p18-msg", in: w.inbox, isRead: false)
@@ -771,11 +771,11 @@ struct GmailDeltaApplyInvariantTests {
             let historyAfterRefusal = w.historyRequestCount()
             let waiting = try await w.delta()
             #expect(waiting.succeeded == false)
-            #expect(w.historyRequestCount() == historyAfterRefusal, "deltas wait for the full sync")
+            #expect(w.historyRequestCount() == historyAfterRefusal, "background reads wait for the foreground pass")
 
             try await w.foregroundPassWithFullSyncDue()
             #expect(try w.row("p18-msg", in: w.inbox)?.isRead == true, "the full pass shows the server's state")
-            #expect(try w.account().lastHistoryId == w.server.currentHistoryId(), "and takes a cursor deltas can read")
+            #expect(try w.account().lastHistoryId == w.server.currentHistoryId(), "and stores a bookmark the next read can use")
         }
     }
 
