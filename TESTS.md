@@ -1154,6 +1154,18 @@ host's zone, and compares the write on the fake with the card.
 - `CalDAVWholeSeriesEditTests.floatingWholeEventNeedsTheEditsZone`: `mergePatchIntoICS` writes a
   floating time at the wall clock of the zone the patch names, and refuses an unlabelled one
   (`floatingWriteNeedsZoneMessage`).
+- `CalendarScopedDeleteTests` (same file, ADR-IOS-112, #695): a delete of a repeating event deletes
+  exactly the occurrences its `delete_scope` names, at the `recurrence_id` the read tools printed, with
+  the device, the read's `timezone` and the delete's `timezone` all different and the drain in the
+  host's zone. Google `this_only` (that instance cancelled, the series and the other instance as
+  they were, guests told); Google `this_and_following` by an occurrence id (the series' `UNTIL` just
+  before the occurrence, after the earlier one, the series kept, the `PATCH` sent with
+  `sendUpdates=all`); from the first occurrence (the series deleted, its card the whole-series
+  card); a moved occurrence (cut at its original place, the card "from X, originally Y"); no
+  `delete_scope` (refused before any card, the assistant told to ask, nothing written); Outlook
+  `this_and_following` (the range ends before the occurrence's day, the first stays); CalDAV
+  `this_only` by the series id (one `EXDATE`) and `this_and_following` (the `UNTIL` between the
+  previous occurrence and the named one).
 
 ## CalDAV organizer — every event with guests names its organizer
 

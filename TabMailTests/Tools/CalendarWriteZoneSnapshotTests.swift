@@ -1240,3 +1240,256 @@ struct CalDAVFloatingOccurrenceMatchTests {
         #expect(resolved.identifier == zone.identifier)
     }
 }
+
+// MARK: - A delete of a repeating event deletes exactly the occurrences its scope names (#695)
+//
+// INVARIANT (system property): `calendar_event_delete` on a repeating event removes exactly the
+// occurrences `delete_scope` names, at the occurrence the read tools printed, whatever zone the
+// device, the read and the delete's `timezone` are in, and wherever the drain runs: "this_only"
+// that occurrence alone; "this_and_following" that occurrence and every later one, the earlier
+// ones staying (the series ends just before the occurrence's place in the series, also for one
+// moved from it, and guests are told); "this_and_following" at the series' first occurrence, the
+// whole series. A repeating event with no scope is never deleted: the assistant is told to ask the
+// user, before any card. The queue drains in the host's zone, which is neither the device's nor
+// the delete's, and the series start late in the UTC day, so a cut read in the wrong zone lands
+// on another date.
+
+/// `calendar_event_delete` of `eventId` in `calendarId`, named by the number the chat translator
+/// gives the model, confirmed, with the device in `deviceZone`; then the queue drains.
+private func runDelete(
+    _ arguments: [String: JSONValue], eventId: String, calendarId: String, account: String,
+    pool: DatabasePool, deviceZone: TimeZone, translator given: ChatIdTranslator? = nil
+) async throws -> Run {
+    let translator = given ?? ChatIdTranslator.createIsolated()
+    let compound = CompoundEventId.make(accountId: account, eventId: eventId)
+    let forModel = await translator.processToolOutputForLLM("event_id: \(compound)")
+    let numericId = try #require(CalDAVToolWire.eventIds(in: forModel).first.flatMap { Int($0) }, "no numeric id: \(forModel)")
+    await translator.cacheEventDetail(
+        realId: eventId, accountId: account, calendarId: calendarId, calendarName: "Work",
+        title: "Standup", startDate: nil, endDate: nil, isAllDay: false,
+        location: nil, notes: nil, attendees: [], isRecurring: true, recurrenceRule: nil,
+        availability: "busy", htmlLink: nil, eventTimeZone: nil)
+    var args = arguments
+    args["event_id"] = .string(String(numericId))
+    let sink = ConfirmingCards()
+    let out = try await CalendarEventDeleteTool(context: ToolContext(db: pool, translator: translator, deviceZone: deviceZone))
+        .execute(arguments: args, invocation: ToolInvocation(uiSink: sink, sessionKey: "delete-\(account)"))
+    await AccountManager.shared.drainCalendarQueue()
+    let queued = try await pool.read { try PendingCalendarOperation.fetchAll($0) }
+    return Run(out: out, cards: await sink.cards, queued: queued)
+}
+
+/// The instant a stored repeat rule's `UNTIL` names (`yyyyMMddTHHmmssZ`), nil when it has none.
+private func untilInstant(_ recurrence: [String]?) -> Date? {
+    guard let rule = recurrence?.first(where: { $0.uppercased().hasPrefix("RRULE:") }),
+          let part = rule.split(separator: ";").first(where: { $0.uppercased().hasPrefix("UNTIL=") }) else { return nil }
+    let fmt = DateFormatter()
+    fmt.locale = Locale(identifier: "en_US_POSIX")
+    fmt.timeZone = .gmt
+    fmt.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+    return fmt.date(from: String(part.dropFirst("UNTIL=".count)))
+}
+
+/// The device's zone, the delete's `timezone` and the zone a read names: three zones that differ
+/// from each other and from the host's at `at`.
+private func deleteZones(at: Date) throws -> (device: TimeZone, delete: TimeZone, read: TimeZone) {
+    let (device, delete) = try fixedZones(at: at)
+    let read = try #require(TimeZone(identifier: "Pacific/Chatham"))
+    try #require(read.secondsFromGMT(for: at) != TimeZone.current.secondsFromGMT(for: at), "the host is in the read zone")
+    return (device, delete, read)
+}
+
+/// The occurrence's `start_iso` as `calendar_event_read` prints it, read by its id with `timezone`
+/// set to `zone`.
+private func printedStart(eventId: String, account: String, pool: DatabasePool, translator: ChatIdTranslator,
+                          deviceZone: TimeZone, zone: TimeZone) async throws -> String {
+    let compound = CompoundEventId.make(accountId: account, eventId: eventId)
+    let forModel = await translator.processToolOutputForLLM("event_id: \(compound)")
+    let numericId = try #require(CalDAVToolWire.eventIds(in: forModel).first, "no numeric id: \(forModel)")
+    await translator.cacheEventDetail(
+        realId: eventId, accountId: account, calendarId: "primary", calendarName: "Work",
+        title: "Standup", startDate: nil, endDate: nil, isAllDay: false,
+        location: nil, notes: nil, attendees: [], isRecurring: true, recurrenceRule: nil,
+        availability: "busy", htmlLink: nil, eventTimeZone: nil)
+    let printed = try await CalendarEventReadTool(context: ToolContext(db: pool, translator: translator, deviceZone: deviceZone))
+        .execute(arguments: ["event_id": .string(numericId), "timezone": .string(zone.identifier)])
+    let line = try #require(printed.split(separator: "\n").first { $0.hasPrefix("start_iso: ") }, "no start_iso: \(printed)")
+    return String(line.dropFirst("start_iso: ".count).prefix(19))
+}
+
+@Suite("calendar_event_delete: a delete_scope deletes exactly the occurrences it names (#695)", .serialized, .processGlobalState)
+struct CalendarScopedDeleteTests {
+
+    @Test("Google: one occurrence read by its id in another zone, deleted with the recurrence_id printed, is the only one deleted")
+    func googleThisOnlyAsPrinted() async throws {
+        let slot = try #require(LateSeries.at(day(7)))
+        let (device, delete, read) = try deleteZones(at: slot)
+        let account = "del-g-one"
+        try await withGoogle(account, seed: LateSeries.calendar(rule: "RRULE:FREQ=WEEKLY")) { calendar, pool in
+            let translator = ChatIdTranslator.createIsolated()
+            let rid = try await printedStart(eventId: LateSeries.instanceId(day(7)), account: account, pool: pool,
+                                             translator: translator, deviceZone: device, zone: read)
+            let r = try await runDelete([
+                "delete_scope": .string("this_only"), "recurrence_id": .string(rid), "timezone": .string(delete.identifier),
+            ], eventId: LateSeries.id, calendarId: "primary", account: account, pool: pool, deviceZone: device, translator: translator)
+            let card = try #require(r.card, "\(r.cards.count) cards: \(summary(r))")
+            #expect(card.startDate == slot, "the card shows \(card.startDate), not the occurrence named")
+            #expect(card.changes == [CalendarToolHelpers.occurrenceDeleteNote], "card \(card.changes)")
+            #expect(calendar.event(LateSeries.instanceId(day(7)))?["status"] as? String == "cancelled",
+                    "the occurrence named was not deleted; writes \(calendar.writes); \(summary(r))")
+            #expect(calendar.event(LateSeries.instanceId(day(0)))?["status"] as? String == "confirmed",
+                    "another occurrence was deleted; writes \(calendar.writes)")
+            #expect(calendar.event(LateSeries.id)?["recurrence"] as? [String] == ["RRULE:FREQ=WEEKLY"],
+                    "the series changed: \(calendar.event(LateSeries.id) ?? [:])")
+            #expect(calendar.deleteSendUpdates == ["all"], "guests: \(calendar.deleteSendUpdates)")
+            #expect(r.out.contains("the rest of the series stays"), "\(r.out)")
+        }
+    }
+
+    @Test("Google: an occurrence and every later one, named as printed, end the series just before it; earlier ones stay and guests are told")
+    func googleThisAndFollowingAsPrinted() async throws {
+        let slot = try #require(LateSeries.at(day(7)))
+        let first = try #require(LateSeries.at(day(0)))
+        let (device, delete, read) = try deleteZones(at: slot)
+        let account = "del-g-following"
+        try await withGoogle(account, seed: LateSeries.calendar(rule: "RRULE:FREQ=WEEKLY")) { calendar, pool in
+            let translator = ChatIdTranslator.createIsolated()
+            let rid = try await printedStart(eventId: LateSeries.instanceId(day(7)), account: account, pool: pool,
+                                             translator: translator, deviceZone: device, zone: read)
+            let r = try await runDelete([
+                "delete_scope": .string("this_and_following"), "recurrence_id": .string(rid), "timezone": .string(delete.identifier),
+            ], eventId: LateSeries.instanceId(day(7)), calendarId: "primary", account: account, pool: pool,
+               deviceZone: device, translator: translator)
+            let card = try #require(r.card, "\(r.cards.count) cards: \(summary(r))")
+            #expect(card.startDate == slot, "the card shows \(card.startDate), not the occurrence named")
+            #expect(card.changes == ["This and every later occurrence will be deleted; earlier ones stay.", "Repeats weekly"],
+                    "card \(card.changes)")
+            let series = calendar.event(LateSeries.id)
+            let until = try #require(untilInstant(series?["recurrence"] as? [String]),
+                                     "the series was not ended: \(series ?? [:]); writes \(calendar.writes); \(summary(r))")
+            #expect(until < slot && until >= first, "the series now ends at \(until): not just before the occurrence named (\(slot))")
+            #expect(series?["status"] as? String == "confirmed", "the series was deleted: \(series ?? [:])")
+            #expect(calendar.patchSendUpdates == ["all"], "guests: \(calendar.patchSendUpdates)")
+            #expect(calendar.deleteSendUpdates.isEmpty, "an event was deleted: \(calendar.writes)")
+            #expect(r.queued.isEmpty, "the delete did not complete: \(summary(r))")
+            #expect(r.out.contains("This and every later occurrence deleted successfully; earlier ones stay."), "\(r.out)")
+        }
+    }
+
+    @Test("Google: from the series' first occurrence on, named by that occurrence, is the whole series, deleted with every occurrence")
+    func googleFollowingFromTheFirstIsTheSeries() async throws {
+        let first = try #require(LateSeries.at(day(0)))
+        let (device, delete, _) = try deleteZones(at: first)
+        try await withGoogle("del-g-first", seed: LateSeries.calendar(rule: "RRULE:FREQ=WEEKLY")) { calendar, pool in
+            let r = try await runDelete([
+                "delete_scope": .string("this_and_following"), "recurrence_id": .string(naive(first, device)),
+                "timezone": .string(delete.identifier),
+            ], eventId: LateSeries.instanceId(day(0)), calendarId: "primary", account: "del-g-first", pool: pool, deviceZone: device)
+            let card = try #require(r.card, "\(r.cards.count) cards: \(summary(r))")
+            #expect(card.changes == [CalendarToolHelpers.seriesDeleteNote, "Repeats weekly"], "card \(card.changes)")
+            #expect(calendar.event(LateSeries.id) == nil, "the series is still there; writes \(calendar.writes); \(summary(r))")
+            #expect(calendar.deleteSendUpdates == ["all"], "guests: \(calendar.deleteSendUpdates)")
+            #expect(r.out.contains("every occurrence"), "\(r.out)")
+        }
+    }
+
+    @Test("Google: an occurrence moved to another day is cut at its place in the series, and the card shows both times")
+    func googleMovedOccurrenceIsCutAtItsPlace() async throws {
+        let slot = try #require(LateSeries.at(day(7)))
+        let first = try #require(LateSeries.at(day(0)))
+        let now = try #require(LateSeries.at(day(9)))
+        let (device, delete, _) = try deleteZones(at: slot)
+        var seed = LateSeries.calendar(rule: "RRULE:FREQ=WEEKLY")
+        let index = try #require(seed.firstIndex { $0["id"] as? String == LateSeries.instanceId(day(7)) })
+        seed[index]["start"] = ["dateTime": "\(day(9))T20:00:00Z", "timeZone": "UTC"]
+        seed[index]["end"] = ["dateTime": "\(day(9))T20:30:00Z", "timeZone": "UTC"]
+        try await withGoogle("del-g-moved", seed: seed) { calendar, pool in
+            let r = try await runDelete([
+                "delete_scope": .string("this_and_following"), "recurrence_id": .string(naive(now, device)),
+                "timezone": .string(delete.identifier),
+            ], eventId: LateSeries.id, calendarId: "primary", account: "del-g-moved", pool: pool, deviceZone: device)
+            let card = try #require(r.card, "\(r.cards.count) cards: \(summary(r))")
+            #expect(card.startDate == now, "the card shows \(card.startDate), not the occurrence where it is now")
+            #expect(card.changes.first == "This and every later occurrence will be deleted (from \(naive(now, device)), originally \(naive(slot, device))); earlier ones stay.",
+                    "card \(card.changes)")
+            let until = try #require(untilInstant(calendar.event(LateSeries.id)?["recurrence"] as? [String]),
+                                     "the series was not ended: writes \(calendar.writes); \(summary(r))")
+            #expect(until < slot && until >= first, "the series now ends at \(until), not just before the moved occurrence's place (\(slot))")
+        }
+    }
+
+    @Test("Google: a repeating event with no delete_scope is refused before the card, the assistant told to ask, nothing written")
+    func googleNoScopeIsAsked() async throws {
+        let slot = try #require(LateSeries.at(day(7)))
+        let (device, _, _) = try deleteZones(at: slot)
+        for eventId in [LateSeries.id, LateSeries.instanceId(day(7))] {
+            try await withGoogle("del-g-ask", seed: LateSeries.calendar(rule: "RRULE:FREQ=WEEKLY")) { calendar, pool in
+                let r = try await runDelete([:], eventId: eventId, calendarId: "primary", account: "del-g-ask", pool: pool, deviceZone: device)
+                #expect(r.cards.isEmpty, "a card was shown for \(eventId): \(r.cards.map(\.changes))")
+                #expect(calendar.writes.isEmpty, "\(eventId): written \(calendar.writes)")
+                #expect(r.queued.isEmpty, "\(eventId): queued \(summary(r))")
+                #expect(r.out.contains("Just this one, this and following, or all of them?"), "\(eventId): \(r.out)")
+            }
+        }
+    }
+
+    @Test("Outlook: an occurrence and every later one, named as printed in another zone, end the series before it; the first stays")
+    func outlookThisAndFollowing() async throws {
+        let slot = GraphFixture.occurrenceStart
+        let (device, delete) = try deviceAndEditZones(at: slot)
+        try await withOutlook("del-x-following") { graph, pool in
+            let r = try await runDelete([
+                "delete_scope": .string("this_and_following"), "recurrence_id": .string(naive(slot, device)),
+                "timezone": .string(delete.identifier),
+            ], eventId: "ser-1", calendarId: "primary", account: "del-x-following", pool: pool, deviceZone: device)
+            _ = try #require(r.card, "\(r.cards.count) cards: \(summary(r))")
+            let rangeZone = try #require(TimeZone(identifier: "America/Los_Angeles"))
+            let days = try #require(graph.rangeDays(of: "ser-1"), "the series was not ended: writes \(graph.writes); \(summary(r))")
+            let named = EKEventStoreHelper.dayKey(slot, timeZone: rangeZone)
+            #expect(!days.isEmpty && days.allSatisfy { $0 < named }, "the series repeats on \(days), not only before \(named)")
+            #expect(days.first == EKEventStoreHelper.dayKey(GraphFixture.start, timeZone: rangeZone), "the first occurrence went: \(days)")
+            #expect(r.queued.isEmpty, "the delete did not complete: \(summary(r))")
+        }
+    }
+
+    @Test("CalDAV: one occurrence named as printed by the series' id is the only one excluded")
+    func calDAVThisOnlyBySeriesId() async throws {
+        let fixture = try OccurrenceWireFixture.make()
+        let slot = try fixture.occurrence(2)
+        let (device, delete) = try deviceAndEditZones(at: slot)
+        try await withCalDAV("del-c-one", fixture: fixture) { harness, pool in
+            let r = try await runDelete([
+                "delete_scope": .string("this_only"), "recurrence_id": .string(naive(slot, device)),
+                "timezone": .string(delete.identifier),
+            ], eventId: OccurrenceWireFixture.seriesPath, calendarId: OccurrenceWireFixture.calendarId,
+               account: "del-c-one", pool: pool, deviceZone: device)
+            _ = try #require(r.card, "\(r.cards.count) cards: \(summary(r))")
+            let lines = CalDAVProvider.icsLines(harness.store.storedICS(path: OccurrenceWireFixture.seriesPath) ?? "")
+            #expect(lines.filter { $0.hasPrefix("EXDATE") } == ["EXDATE;TZID=America/New_York:\(OccurrenceFixture.wall(slot, fixture.zone))"],
+                    "excluded \(lines.filter { $0.hasPrefix("EXDATE") }); \(summary(r))")
+            #expect(CalDAVToolWire.deletes(harness.http).isEmpty, "a DELETE reached the server")
+        }
+    }
+
+    @Test("CalDAV: an occurrence and every later one, named as printed in another zone, end the series before it; earlier ones stay")
+    func calDAVThisAndFollowing() async throws {
+        let fixture = try OccurrenceWireFixture.make()
+        let slot = try fixture.occurrence(2)
+        let earlier = try fixture.occurrence(1)
+        let (device, delete) = try deviceAndEditZones(at: slot)
+        try await withCalDAV("del-c-following", fixture: fixture) { harness, pool in
+            let r = try await runDelete([
+                "delete_scope": .string("this_and_following"), "recurrence_id": .string(naive(slot, device)),
+                "timezone": .string(delete.identifier),
+            ], eventId: OccurrenceWireFixture.seriesPath, calendarId: OccurrenceWireFixture.calendarId,
+               account: "del-c-following", pool: pool, deviceZone: device)
+            _ = try #require(r.card, "\(r.cards.count) cards: \(summary(r))")
+            let lines = CalDAVProvider.icsLines(harness.store.storedICS(path: OccurrenceWireFixture.seriesPath) ?? "")
+            let until = try #require(untilInstant(lines.filter { $0.hasPrefix("RRULE:") }),
+                                     "the series was not ended: \(lines.filter { $0.hasPrefix("RRULE") }); \(summary(r))")
+            #expect(until < slot && until >= earlier, "the series now ends at \(until), not just before \(slot)")
+            #expect(CalDAVToolWire.deletes(harness.http).isEmpty, "a DELETE reached the server")
+            #expect(r.queued.isEmpty, "the delete did not complete: \(summary(r))")
+        }
+    }
+}

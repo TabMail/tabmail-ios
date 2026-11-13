@@ -1143,6 +1143,23 @@ extension AccountManager {
                 throw CalendarProviderError.notSupported(
                     "the queued calendar delete carries no event id and can never be executed")
             }
+            // A delete of an occurrence and every later one ends the series just before the
+            // occurrence's place (#695), worked out by the delete tool before its card
+            // (`CalendarSeriesScope.followingDelete`) and read here in the zone the tool read it in.
+            // Nothing is deleted: the series is capped, from the series as it is now, and a retry
+            // after the cap landed writes nothing (`endSeries` never lengthens a series). Guests
+            // are told, as for any delete (`sendUpdates` "all").
+            if CalendarToolHelpers.stringArgOpt(args, "delete_scope") == "this_and_following" {
+                guard let cut = CalendarToolHelpers.stringArgOpt(args, CalendarToolHelpers.deleteCutKey), !cut.isEmpty,
+                      let zoneId = CalendarToolHelpers.stringArgOpt(args, CalendarToolHelpers.recurrenceIdZoneKey),
+                      let zone = CalendarTimeZoneResolver.zone(named: zoneId, in: .none) else {
+                    throw CalendarProviderError.notSupported(
+                        "the queued delete of an occurrence and every later one names no place to end the series, and can never be executed")
+                }
+                try await provider.endSeries(calendarId: calId, seriesId: eventId, before: cut, zone: zone, sendUpdates: "all")
+                BackgroundSyncLogger.logDebug("[CalendarQueue] Ended series id=\(eventId) before \(cut)")
+                return (nil, nil)
+            }
             try await provider.deleteEvent(calendarId: calId, eventId: eventId, sendUpdates: "all")
             BackgroundSyncLogger.logDebug("[CalendarQueue] Deleted event id=\(eventId)")
         }

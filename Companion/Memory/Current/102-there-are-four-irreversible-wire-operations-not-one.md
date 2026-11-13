@@ -619,3 +619,30 @@ census. The census greps were re-run and are unchanged (8 / 3 / 5 / 3 / 2). Item
 unchanged: the organizer step runs after `requireDeletedAlone` and before the PUT, and it only
 inserts ORGANIZER lines (it never removes or rewrites a VEVENT, so no VEVENT's identity changes),
 and a lookup that fails throws before the PUT, so nothing is written then.
+
+**Amended 2026-11-13 (#695): the count is NINE. A "this and following" delete was added, and the
+falsification clause (d) above fired.** `calendar_event_delete` with `delete_scope`
+`this_and_following` ends the series just before the occurrence's place: the queue's `.delete`
+calls `CalendarProvider.endSeries` with `sendUpdates` "all". On Google that is the cap `PATCH` of the
+series' RRULE (`UNTIL`), on Outlook the `PATCH` of the range's end; every occurrence from the cut on,
+and every change made to one of them, is gone from the server. Google documents a "this and
+following" delete as not trashed, and Outlook's range end is no item in Recoverable Items (no
+positive evidence of a per-item recovery), so **(9) is `endSeries` reached by a delete, on Google
+and Outlook**. On CalDAV the same call is the series cap `PUT` already counted as (6): `endSeries`
+holds the cap `PUT` that `finishSplit` used to write (the split's finish calls it), and a delete now
+reaches it too. The callers of `putEvent(` are 7 (create, whole-event edit, one-occurrence edit,
+one-occurrence delete, the split's new part and cap, and `endSeries`); the census greps are unchanged.
+
+The guards, all before or inside the write: the cut is the occurrence's place in the series, read
+through the provider's own occurrence lookup before the card (`CalendarSeriesScope.followingDelete`),
+and the card states what goes (for a moved occurrence both times, "from X, originally Y"); at the
+series' first occurrence it is a delete of the whole series, and before it the delete is refused;
+the cap is worked out from the series as it is at the write, and nothing is written when the series
+already ends before the cut (`RecurrenceTail.endsBeforeSplit`, Outlook's `splitAlreadyEnded`), so a
+replay or a series the user already ended earlier is never lengthened or written again; CalDAV's
+`PUT` is conditional on the GET's ETag. **Accepted:** Google's and Outlook's `PATCH` carries no
+precondition, so a series changed between the card and the drain is still cut at the confirmed place
+(the user's intent is a place in time, which the change does not move).
+
+**Negative case.** Re-adjudicate if a delete ever cuts at a place it did not show on the card, writes
+the cap without reading the series at the write, or lengthens a series that already ends earlier.

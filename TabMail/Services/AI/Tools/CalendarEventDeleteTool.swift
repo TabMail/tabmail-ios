@@ -22,6 +22,9 @@ struct CalendarEventDeleteTool: AgentTool, Sendable {
     /// ADR-IOS-053: real entry point — delivers the confirmation card to the
     /// invoking session via `invocation.uiSink` (nil sink → declined fast-fail).
     func execute(arguments: [String: JSONValue], invocation: ToolInvocation) async throws -> String {
+        // The device's zone, read once: a `recurrence_id` is read in it, where the read tools print
+        // an occurrence's start, whatever `timezone` names (#794), and the card shows its times in it.
+        let deviceZone = ctx.deviceZone
         guard case .string(let rawEventId) = arguments["event_id"],
               !rawEventId.trimmingCharacters(in: .whitespaces).isEmpty else {
             return #"{"error": "missing event_id — use calendar_event_read or calendar_search to look up the event first"}"#
@@ -82,7 +85,9 @@ struct CalendarEventDeleteTool: AgentTool, Sendable {
             provider = await CalendarProviderDispatch.resolve(db: ctx.db)?.provider
         }
 
+        var lookupCalendarId: String?
         if let provider, let calId = calendarId {
+            lookupCalendarId = calId
             fetchedEvent = try? await provider.getEvent(calendarId: calId, eventId: eventId)
             if let event = fetchedEvent {
                 Task {
@@ -94,6 +99,7 @@ struct CalendarEventDeleteTool: AgentTool, Sendable {
             }
         } else if let provider {
             let defaultCalId = await CalendarProviderDispatch.defaultCalendarIdForCreation(for: provider)
+            lookupCalendarId = defaultCalId
             fetchedEvent = try? await provider.getEvent(calendarId: defaultCalId, eventId: eventId)
             if let event = fetchedEvent {
                 // Update cache with discovered calendarId for this session
@@ -130,7 +136,7 @@ struct CalendarEventDeleteTool: AgentTool, Sendable {
         // ordinary gesture (ask again once the provider answers). Its opposite,
         // deleting the wrong or an already-replaced event, is not recoverable at
         // all. Fail closed.
-        guard let resolvedEvent = fetchedEvent else {
+        guard let resolvedEvent = fetchedEvent, let provider, let lookupCalendarId else {
             BackgroundSyncLogger.logDebug("[CalendarEventDeleteTool] Could not dereference event_id='\(eventId.prefix(50))' (compound='\(compoundId.prefix(50))') — refusing delete")
             return ToolJSON.string(from: [
                 "ok": false,
@@ -139,21 +145,37 @@ struct CalendarEventDeleteTool: AgentTool, Sendable {
             ] as [String: Any])
         }
 
-        let confirmTitle = (resolvedEvent.summary ?? "").isEmpty ? "(No title)" : resolvedEvent.summary!
-        let confirmStart = resolvedEvent.startDate ?? Date()
-        let confirmEnd = resolvedEvent.endDate ?? Date()
-        let confirmIsAllDay = resolvedEvent.isAllDay
-        let confirmNotes = resolvedEvent.description
-        // A repeating series is deleted with every occurrence, so its card says so and names the
-        // rule, as Google Calendar does; one occurrence's card says the rest of the series stays (#639).
-        // The event read above decides, on every provider.
-        let seriesLines = CalendarToolHelpers.seriesDeleteLines(resolvedEvent)
+        // A repeating event is deleted by the scope the assistant names (`delete_scope`), worked
+        // out here, before the card, so the card, the queued delete and the result say the same.
+        let target: Target
+        switch await Self.target(
+            arguments, event: resolvedEvent, eventId: eventId, calendarId: lookupCalendarId,
+            deviceZone: deviceZone, provider: provider) {
+        case .success(let found): target = found
+        case .failure(let refusal):
+            BackgroundSyncLogger.logDebug("[CalendarEventDeleteTool] Refused before the card for event_id=\(eventId.prefix(50)): \(refusal.reason)")
+            return ToolJSON.string(from: [
+                "ok": false,
+                "error": "calendar_event_delete failed: \(refusal.reason) The event was NOT deleted.",
+                "event_id": compoundId,
+            ] as [String: Any])
+        }
+
+        let shownEvent = target.cardEvent
+        let confirmTitle = [shownEvent.summary, resolvedEvent.summary].compactMap { $0 }.first { !$0.isEmpty } ?? "(No title)"
+        let confirmStart = shownEvent.startDate ?? Date()
+        let confirmEnd = shownEvent.endDate ?? Date()
+        let confirmIsAllDay = shownEvent.isAllDay
+        let confirmNotes = shownEvent.description ?? resolvedEvent.description
+        // The card says which occurrences go, as Google Calendar does (#639): the whole series with
+        // its rule, one occurrence and the rest staying, or one and every later one (#695).
+        let seriesLines = target.lines
 
         // ADR-IOS-024: Show confirmation card and await user response
         let (confirmed, cardState) = await AgentToolRouter.ActionConfirmation.awaitConfirmation(
             action: .calendarEventDelete,
             calendarEvents: [.init(
-                eventId: eventId,
+                eventId: target.eventId,
                 calendarId: calendarName ?? "",
                 title: confirmTitle,
                 startDate: confirmStart,
@@ -176,12 +198,137 @@ struct CalendarEventDeleteTool: AgentTool, Sendable {
         guard !resolvedAccountId.isEmpty else {
             return CalendarProviderDispatch.notAvailableMessage
         }
-        return try await queueCalendarDelete(accountId: resolvedAccountId, calendarId: calendarId, eventId: eventId, compoundId: compoundId, arguments: arguments, cardState: cardState)
+        return try await queueCalendarDelete(accountId: resolvedAccountId, calendarId: calendarId, target: target, compoundId: compoundId, arguments: target.queuedArguments(arguments, deviceZone: deviceZone), cardState: cardState)
     }
+
+    // MARK: - Scope (#695)
+
+    /// What a delete removes, worked out before the card: the event id the queue deletes, the
+    /// event the card shows, its lines, and the scope written (`delete_scope`, nil for an event
+    /// that does not repeat). A delete of an occurrence and every later one ends the series
+    /// before `cut` (`CalendarProvider.endSeries`) instead of deleting an event.
+    struct Target: Sendable {
+        let eventId: String
+        let cardEvent: GCalEvent
+        let lines: [String]
+        let scope: String?
+        let cut: String?
+
+        /// The arguments queued with the delete: the scope as decided here, and for a cut, where
+        /// and in which zone (`deleteCutKey`, `recurrenceIdZoneKey`). An event that does not
+        /// repeat drops a scope it was given: it is deleted as it is.
+        func queuedArguments(_ arguments: [String: JSONValue], deviceZone: TimeZone) -> [String: JSONValue] {
+            var queued = arguments
+            queued.removeValue(forKey: CalendarToolHelpers.deleteCutKey)
+            if let scope { queued["delete_scope"] = .string(scope) } else { queued.removeValue(forKey: "delete_scope") }
+            if let cut {
+                queued[CalendarToolHelpers.deleteCutKey] = .string(cut)
+                queued = CalendarToolHelpers.stampingRecurrenceIdZone(queued, deviceZone)
+            }
+            return queued
+        }
+    }
+
+    struct Refusal: Error {
+        let reason: String
+    }
+
+    static let scopes = ["this_only", "this_and_following", "all"]
+
+    /// What the assistant is told when a repeating event is to be deleted and no scope was named:
+    /// the Thunderbird add-on's `ASK_DELETE_SCOPE`.
+    static let askDeleteScope =
+        "This event repeats. Ask the user \"Just this one, this and following, or all of them?\" (unless their words already said which), then call calendar_event_delete again with delete_scope 'this_only', 'this_and_following' or 'all', and for 'this_only' or 'this_and_following' with recurrence_id (the occurrence's start_iso as calendar_event_read shows it)."
+
+    /// What is deleted for `arguments`, `event` being what `eventId` names (read from `calendarId`).
+    ///
+    /// - An event that does not repeat: itself, whatever scope was given.
+    /// - A repeating event: the scope must be named (there is no default; the assistant is told to
+    ///   ask the user), and a scope of occurrences names its occurrence, by `recurrence_id` (read in
+    ///   `deviceZone`) or by the occurrence's own id.
+    ///   - "all": the series, from any of its occurrences.
+    ///   - "this_only": the occurrence, by the provider's own lookup when a `recurrence_id` names
+    ///     it (`CalendarSeriesScope.read`); an occurrence id alone is deleted as it is.
+    ///   - "this_and_following": the series ended before the occurrence's place
+    ///     (`CalendarSeriesScope.followingDelete`); at the series' first occurrence, the series.
+    ///
+    /// Refused, before the card and with nothing queued: no scope, an unknown scope, a scope of
+    /// occurrences with a series id and no `recurrence_id`, an occurrence that can't be found or is
+    /// before the series' first, and a series that can't be read.
+    static func target(
+        _ arguments: [String: JSONValue], event: GCalEvent, eventId: String, calendarId: String,
+        deviceZone: TimeZone, provider: any CalendarProvider
+    ) async -> Result<Target, Refusal> {
+        let seriesOf = event.recurringEventId.flatMap { $0.isEmpty || $0 == eventId ? nil : $0 }
+        guard seriesOf != nil || !(event.recurrence ?? []).isEmpty else {
+            return .success(Target(eventId: eventId, cardEvent: event, lines: [], scope: nil, cut: nil))
+        }
+        guard let scope = CalendarToolHelpers.stringArgOpt(arguments, "delete_scope")?.lowercased(), !scope.isEmpty else {
+            return .failure(Refusal(reason: askDeleteScope))
+        }
+        guard scopes.contains(scope) else {
+            return .failure(Refusal(reason: "delete_scope '\(scope)' is not one of 'this_only', 'this_and_following' or 'all'. \(askDeleteScope)"))
+        }
+        let recurrenceId = CalendarToolHelpers.stringArgOpt(arguments, "recurrence_id").flatMap { $0.isEmpty ? nil : $0 }
+        if scope != "all", seriesOf == nil, recurrenceId == nil {
+            return .failure(Refusal(reason: "delete_scope '\(scope)' needs recurrence_id: the occurrence's start_iso as calendar_event_read or calendar_read shows it, with the series' event_id, or the event_id listed for that occurrence."))
+        }
+        do {
+            switch scope {
+            case "all":
+                // From an occurrence, its series, read for the card.
+                guard let seriesOf else { return .success(wholeSeries(event, id: eventId)) }
+                return .success(wholeSeries(try await provider.getEvent(calendarId: calendarId, eventId: seriesOf), id: seriesOf))
+            case "this_only":
+                // An occurrence id alone names the occurrence it was read as.
+                guard let recurrenceId else {
+                    return .success(Target(eventId: eventId, cardEvent: event, lines: [CalendarToolHelpers.occurrenceDeleteNote], scope: scope, cut: nil))
+                }
+                let named = try await CalendarSeriesScope.read(
+                    event: event, eventId: eventId, recurrenceId: recurrenceId, scope: scope,
+                    calendarId: calendarId, zone: deviceZone, provider: provider)
+                guard let occurrence = named.occurrence, let occurrenceId = occurrence.id, !occurrenceId.isEmpty else {
+                    return .failure(Refusal(reason: CalendarSeriesScope.namesNoOccurrence(recurrenceId) + "."))
+                }
+                return .success(Target(eventId: occurrenceId, cardEvent: occurrence, lines: [CalendarToolHelpers.occurrenceDeleteNote], scope: scope, cut: nil))
+            default:
+                let named = try await CalendarSeriesScope.read(
+                    event: event, eventId: eventId, recurrenceId: recurrenceId, scope: scope,
+                    calendarId: calendarId, zone: deviceZone, provider: provider)
+                let series = try named.readSeries()
+                let following = try CalendarSeriesScope.followingDelete(named: named, recurrenceId: recurrenceId, recurrenceIdZone: deviceZone)
+                // From the first occurrence on is every occurrence: the whole series.
+                if following.isFirst { return .success(wholeSeries(series, id: named.seriesId)) }
+                return .success(Target(
+                    eventId: named.seriesId, cardEvent: named.occurrence ?? event,
+                    lines: CalendarToolHelpers.followingDeleteLines(series: series, moved: following.moved),
+                    scope: scope, cut: following.cut))
+            }
+        } catch CalendarProviderError.seriesNotInThisCalendar {
+            return .failure(Refusal(reason: seriesNotInThisCalendarReason))
+        } catch let refused as CalendarProviderError {
+            return .failure(Refusal(reason: refused.reason.hasSuffix(".") ? refused.reason : refused.reason + "."))
+        } catch where AccountManager.isCalendarNotFoundError(error) {
+            return .failure(Refusal(reason: CalendarSeriesScope.namesNoOccurrence(recurrenceId) + "."))
+        } catch {
+            return .failure(Refusal(reason: "could not read the repeating event this delete names (\(error.localizedDescription)). Check event_id and recurrence_id with calendar_event_read, then retry."))
+        }
+    }
+
+    /// The whole series `id`, `series` as read: the card says every occurrence goes, with its rule.
+    private static func wholeSeries(_ series: GCalEvent, id: String) -> Target {
+        Target(eventId: id, cardEvent: series, lines: CalendarToolHelpers.seriesDeleteLines(series), scope: "all", cut: nil)
+    }
+
+    /// What a delete of the whole series, or from one occurrence on, is told when the calendar holds
+    /// only changed occurrences of it (`CalendarProviderError.seriesNotInThisCalendar`).
+    static let seriesNotInThisCalendarReason =
+        "The series of this repeating event is not in this calendar, which holds only changed occurrences of it (an invitation to single occurrences of someone else's series), so it can't be deleted as a whole or from one occurrence on here. One of those occurrences can be deleted on its own: delete_scope 'this_only', with the event_id listed for it."
 
     // MARK: - Calendar (Queued)
 
-    private func queueCalendarDelete(accountId: String, calendarId: String?, eventId: String, compoundId: String, arguments: [String: JSONValue], cardState: AgentToolRouter.ActionConfirmation.ResponseState) async throws -> String {
+    private func queueCalendarDelete(accountId: String, calendarId: String?, target: Target, compoundId: String, arguments: [String: JSONValue], cardState: AgentToolRouter.ActionConfirmation.ResponseState) async throws -> String {
+        let eventId = target.eventId
         let manager = AccountManager.shared
         let op = try await manager.queueCalendarOperation(
             type: .delete,
@@ -209,8 +356,16 @@ struct CalendarEventDeleteTool: AgentTool, Sendable {
             ] as [String: Any])
         }
         let confirmedSync: Bool = if case .success = outcome { true } else { false }
+        // What went, by the scope written, in the Thunderbird add-on's words.
+        let deleted = switch target.scope {
+        case "this_only": "Occurrence deleted successfully; the rest of the series stays."
+        case "this_and_following": "This and every later occurrence deleted successfully; earlier ones stay."
+        case "all": "Repeating event deleted successfully: every occurrence."
+        default: "Calendar event deleted successfully."
+        }
         return [
-            confirmedSync ? "Calendar event deleted successfully." : "Calendar event deletion queued successfully.",
+            confirmedSync ? deleted : "Calendar event deletion queued successfully.",
+            target.scope.map { "delete_scope: \($0)" },
             "event_id: \(compoundId)",
             confirmedSync ? nil : "The event will be removed from the calendar shortly. Cancellation notices will be sent to attendees.",
         ].compactMap { $0 }.joined(separator: "\n")

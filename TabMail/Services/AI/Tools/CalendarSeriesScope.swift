@@ -279,6 +279,71 @@ enum CalendarSeriesScope {
         return Routed(scope: "all", args: written, eventId: named.seriesId)
     }
 
+    /// Where a delete of an occurrence and every later one (`delete_scope` "this_and_following")
+    /// cuts the series, as Google Calendar and the Thunderbird add-on cut it.
+    struct FollowingDelete: Sendable, Equatable {
+        /// The occurrence named is the series' first: every occurrence goes, a delete of the whole
+        /// series.
+        let isFirst: Bool
+        /// The occurrence's place in the series (`originalStartTime`), as a `recurrence_id` gives
+        /// it in the zone `followingDelete` was given: the series is ended just before it
+        /// (`CalendarProvider.endSeries`). An occurrence moved from its place is cut at the place,
+        /// so it goes with the later ones and every earlier one stays.
+        let cut: String
+        /// For an occurrence moved from its place: where it is now and its place, as the card
+        /// shows them ("from X, originally Y"); nil for one at its place.
+        let moved: Moved?
+
+        struct Moved: Sendable, Equatable {
+            let now: String
+            let originally: String
+        }
+    }
+
+    /// Where a delete of `named`'s occurrence and every later one cuts its series. Judged on the
+    /// occurrence's place in the series (`originalStartTime`), as `route` judges a split: at the
+    /// series' first occurrence it is a delete of the whole series (`isFirst`); before it, refused;
+    /// at a later one, the series is ended just before that place (`cut`). An occurrence moved from
+    /// its place is cut at the place, not where it is now. The cut, and the card's times, are
+    /// shown in `recurrenceIdZone` (the device's, where the read tools print a start); an
+    /// occurrence at its place named by `recurrenceId` is cut at that `recurrence_id`, as a split
+    /// at it is.
+    ///
+    /// Throws `notSupported`, with nothing written: no occurrence named, a series not read
+    /// (`Named.readSeries`), an occurrence before the series' first, and a place or start that
+    /// can't be read or compared.
+    static func followingDelete(named: Named, recurrenceId: String?, recurrenceIdZone: TimeZone) throws -> FollowingDelete {
+        let series = try named.readSeries()
+        guard let occurrence = named.occurrence else {
+            throw CalendarProviderError.notSupported(
+                "this delete names no occurrence of the repeating event; pass recurrence_id (the occurrence's start_iso as calendar_event_read shows it)")
+        }
+        let first = try firstPlace(series)
+        let slot = try slotPlace(occurrence)
+        let isFirst: Bool
+        switch try order(slot, first) {
+        case .orderedAscending: throw beforeFirst(shown(slot, zone: recurrenceIdZone), first: first, zone: recurrenceIdZone)
+        case .orderedSame: isFirst = true
+        case .orderedDescending: isFirst = false
+        }
+        let now = try currentPlace(occurrence)
+        guard now != slot else {
+            return FollowingDelete(isFirst: isFirst, cut: recurrenceId ?? shown(slot, zone: recurrenceIdZone), moved: nil)
+        }
+        return FollowingDelete(
+            isFirst: isFirst, cut: shown(slot, zone: recurrenceIdZone),
+            moved: .init(now: cardShown(now, zone: recurrenceIdZone), originally: cardShown(slot, zone: recurrenceIdZone)))
+    }
+
+    /// A place as the delete card shows it: a date alone for an all-day one, a time as its wall time
+    /// in `zone`.
+    private static func cardShown(_ place: Place, zone: TimeZone) -> String {
+        switch place {
+        case .date(let date): return date
+        case .instant(let instant): return EKEventStoreHelper.toNaiveISO(instant, timeZone: zone)
+        }
+    }
+
     /// What the assistant is told when an edit of every occurrence gives a new date but names no
     /// occurrence. The words of the Thunderbird add-on's `ASK_WHICH_OCCURRENCES`; both scopes it names
     /// take a `recurrence_id`.
