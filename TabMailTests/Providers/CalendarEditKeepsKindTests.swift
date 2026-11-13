@@ -678,6 +678,55 @@ struct GoogleCalendarEditKeepsKindTests {
                 "end is \(end(after) ?? [:])")
     }
 
+    // INVARIANT: a this-and-following change of kind writes the new series in the kind the edit
+    // asks for, with one consistent start/end form, and the capped series keeps its own kind.
+    // Mutant: in `GoogleCalendarProvider.mergeMasterAndPatch`, choose the form by `master.isAllDay`
+    // alone (ignore the patch's form); both directions turn red.
+
+    @Test("a this-and-following all_day: true makes the new part of a timed series all-day")
+    func splitExplicitTrueMakesNewPartAllDay() async throws {
+        var series = FakeGoogleCalendar.timed(id: "tm-split", day: day(0))
+        series["recurrence"] = ["RRULE:FREQ=WEEKLY"]
+        let rid = "\(day(7))T09:00:00"
+        let r = try await run([series, Self.timedOccurrence(id: "tm-split_occ", master: "tm-split", day: day(7))],
+                              eventId: "tm-split", [
+            "edit_scope": .string("this_and_following"), "recurrence_id": .string(rid),
+            "all_day": .bool(true), "start_iso": .string(day(7)), "end_iso": .string(day(8)),
+            "timezone": .string("UTC"),
+        ], account: "kind-g-split-true")
+        #expect(r.rows.isEmpty, "the change was refused: \(r.rows.map { $0.failureReason ?? $0.status })")
+        let successor = r.calendar.event(GoogleCalendarProvider.deterministicSplitEventId(masterId: "tm-split", recurrenceId: rid))
+        #expect(successor != nil, "no new series; writes: \(r.calendar.writes)")
+        #expect(start(successor)?["date"] as? String == day(7) && end(successor)?["date"] as? String == day(8),
+                "the new series is \(start(successor) ?? [:]) to \(end(successor) ?? [:])")
+        #expect(start(successor)?["dateTime"] == nil && end(successor)?["dateTime"] == nil,
+                "the new series kept a time: \(start(successor) ?? [:]) to \(end(successor) ?? [:])")
+        #expect(start(r.calendar.event("tm-split"))?["dateTime"] != nil, "the capped series lost its time")
+    }
+
+    @Test("a this-and-following all_day: false makes the new part of an all-day series timed")
+    func splitExplicitFalseMakesNewPartTimed() async throws {
+        let rid = "\(day(7))T00:00:00"
+        let r = try await run([FakeGoogleCalendar.allDay(id: "ad-split", start: day(0), end: day(1), recurring: true),
+                               FakeGoogleCalendar.allDay(id: "ad-split_occ", start: day(7), end: day(8), master: "ad-split")],
+                              eventId: "ad-split", [
+            "edit_scope": .string("this_and_following"), "recurrence_id": .string(rid),
+            "all_day": .bool(false), "start_iso": .string("\(day(7))T09:00:00"),
+            "end_iso": .string("\(day(7))T10:00:00"), "timezone": .string("UTC"),
+        ], account: "kind-g-split-false")
+        #expect(r.rows.isEmpty, "the change was refused: \(r.rows.map { $0.failureReason ?? $0.status })")
+        let successor = r.calendar.event(GoogleCalendarProvider.deterministicSplitEventId(masterId: "ad-split", recurrenceId: rid))
+        #expect(successor != nil, "no new series; writes: \(r.calendar.writes)")
+        #expect(start(successor)?["date"] == nil && end(successor)?["date"] == nil,
+                "the new series kept a date: \(start(successor) ?? [:]) to \(end(successor) ?? [:])")
+        let s = (start(successor)?["dateTime"] as? String).flatMap(Date.fromISO8601)
+        let e = (end(successor)?["dateTime"] as? String).flatMap(Date.fromISO8601)
+        #expect(s != nil && s == Date.fromISO8601("\(day(7))T09:00:00Z"), "start is \(start(successor) ?? [:])")
+        #expect(e != nil && e == Date.fromISO8601("\(day(7))T10:00:00Z"), "end is \(end(successor) ?? [:])")
+        #expect(start(successor)?["timeZone"] != nil, "the timed series has no named zone")
+        #expect(start(r.calendar.event("ad-split"))?["date"] as? String == day(0), "the capped series lost its date")
+    }
+
     /// One occurrence of a timed weekly series, as `events.instances` gives it: its place in the
     /// series and where it is now, `day` at 09:00-09:30 UTC.
     private static func timedOccurrence(id: String, master: String, day: String) -> [String: Any] {
