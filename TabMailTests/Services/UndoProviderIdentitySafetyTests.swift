@@ -1007,6 +1007,49 @@ struct UndoProviderIdentitySafetyTests {
                 "a refused move Undo must tell the user it did not take")
     }
 
+    /// Why `undoMove` refuses, for `refusedMoveUndoRaisesTheNoticeForEveryReason`.
+    enum MoveUndoRefusal: String, CaseIterable, Sendable {
+        /// The forward move was refused, so the row never left its source folder.
+        case forwardMoveNeverHappened
+        /// The row is gone by the time the Undo runs.
+        case rowGone
+        /// The account was removed before the Undo ran.
+        case accountGone
+    }
+
+    @Test("A refused move Undo raises the same notice whatever the refusal reason, on any provider",
+          arguments: MoveUndoRefusal.allCases)
+    @MainActor
+    func refusedMoveUndoRaisesTheNoticeForEveryReason(reason: MoveUndoRefusal) async throws {
+        let fixture = try install(provider: .gmail, accountId: "undo-refusal-\(reason.rawValue)")
+        UndoService.shared.dismissUndoFailure()
+        defer {
+            UndoService.shared.dismissAll()
+            UndoService.shared.dismissUndoFailure()
+            uninstall(fixture)
+        }
+        let original = sourceHeader(
+            fixture, providerId: "gmail-\(reason.rawValue)", rfc: "\(reason.rawValue)@example.com",
+            sourceEpoch: nil)
+        switch reason {
+        case .forwardMoveNeverHappened:
+            try await fixture.pool.write { db in try original.insert(db) }
+        case .rowGone:
+            break
+        case .accountGone:
+            try installOptimisticallyMoved(original, pool: fixture.pool)
+            try await fixture.pool.write { db in _ = try Account.deleteOne(db, key: fixture.accountId) }
+        }
+
+        let row = try await undoThroughTheControl(original, fixture: fixture)
+
+        if reason == .forwardMoveNeverHappened {
+            #expect(row?.folderPath == "INBOX", "the refused Undo moves nothing")
+        }
+        #expect(UndoService.shared.undoFailureMessage == UndoService.moveUndoRefusedMessage,
+                "every refused move Undo must tell the user it did not take")
+    }
+
     @Test("A move Undo that restores raises no notice")
     @MainActor
     func restoringMoveUndoRaisesNoNotice() async throws {
