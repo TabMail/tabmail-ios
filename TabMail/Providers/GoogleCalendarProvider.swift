@@ -2369,22 +2369,13 @@ struct GCalEvent: Codable, Sendable {
     /// `CalendarSeriesScope` reads it to tell the series' first occurrence from a later one; where
     /// an occurrence is NOW is its `start`, the start the read tools show and a `recurrence_id` names.
     var originalStartTime: GCalDateTime? = nil
-    /// Outlook: the zone the event was created in (Graph's `originalStartTimeZone`), "" when Graph
-    /// gave none. Set only by a calendar whose read's `start.timeZone` is the zone the read asked
-    /// for, not the event's own, so `seriesZone` never falls back to that. In memory only.
-    var ownZoneName: String? = nil
 
-    /// The zone a series' rule repeats in, where its dates are read, through
-    /// `CalendarTimeZoneResolver` alone: the zone its calendar keeps the rule in
-    /// (`recurrenceTimeZoneName`, Outlook's) when it is recognized, else the event's own zone:
-    /// Outlook's `ownZoneName`, never the zone its read was given in; Google's and CalDAV's start
-    /// zone. Nil when none of those is recognized, or none is named (a CalDAV time in UTC or
-    /// floating, which the parser gives no zone name).
+    /// The zone a series' rule repeats in, where its dates are read: the zone its calendar keeps
+    /// the rule in (`recurrenceTimeZoneName`, Outlook's), else its start's (Google's and CalDAV's
+    /// own zone), through `CalendarTimeZoneResolver` alone. Nil when the resolver recognizes none,
+    /// or none is named (a CalDAV time in UTC or floating, which the parser gives no zone name).
     var seriesZone: TimeZone? {
-        let resolve = { (name: String) in CalendarTimeZoneResolver.zone(named: name, in: .none) }
-        if let zone = recurrenceTimeZoneName.flatMap(resolve) { return zone }
-        if let own = ownZoneName { return resolve(own) }
-        return start?.timeZone.flatMap(resolve)
+        (recurrenceTimeZoneName ?? start?.timeZone).flatMap { CalendarTimeZoneResolver.zone(named: $0, in: .none) }
     }
 }
 

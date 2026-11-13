@@ -310,28 +310,6 @@ struct SplitCarryTests {
         }
     }
 
-    /// An Outlook series as its read gives it: `start` in the zone the read asked for, its range
-    /// kept in `range`, created in `own`.
-    private static func outlookSeries(allDay: Bool, range: String, own: String) throws -> GCalEvent {
-        let start: [String: Any] = allDay ? ["date": "2099-03-02"] : ["dateTime": "2099-03-02T10:00:00Z", "timeZone": "UTC"]
-        var event = try JSONDecoder().decode(
-            GCalEvent.self, from: JSONSerialization.data(withJSONObject: ["id": "ser", "start": start, "end": start]))
-        event.recurrenceTimeZoneName = range
-        event.ownZoneName = own
-        return event
-    }
-
-    @Test("Outlook reads an all-day series in its range's stored zone even when unrecognized, so a place is the date Graph keeps it on; a timed one only in a zone it recognizes, the event's own")
-    func outlookReadZone() throws {
-        let custom = "tzone://Microsoft/Custom"
-        #expect(ExchangeCalendarProvider.readZoneName(of: try Self.outlookSeries(allDay: true, range: custom, own: "Tokyo Standard Time")) == custom)
-        #expect(ExchangeCalendarProvider.readZoneName(of: try Self.outlookSeries(allDay: false, range: custom, own: "Tokyo Standard Time")) == "Tokyo Standard Time")
-        #expect(ExchangeCalendarProvider.readZoneName(of: try Self.outlookSeries(allDay: false, range: custom, own: custom)) == nil)
-        // The zone the read was given in (`start.timeZone`) never stands in for the event's own.
-        #expect(try Self.outlookSeries(allDay: false, range: custom, own: "").seriesZone == nil)
-        #expect(try Self.outlookSeries(allDay: false, range: custom, own: "Tokyo Standard Time").seriesZone?.identifier == "Asia/Tokyo")
-    }
-
     // MARK: partition
 
     @Test("exceptions sort into four groups by place against the cut and start against the named one; a deleted one goes by its place")
