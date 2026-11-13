@@ -1153,17 +1153,10 @@ actor GoogleCalendarProvider: CalendarProvider {
             return digits.count == 8 ? "EXDATE;VALUE=DATE:\(digits)" : nil
         }
         guard let instant = place.dateTime.flatMap(Date.fromISO8601) else { return nil }
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.calendar = Calendar(identifier: .gregorian)
         if let tzid = master.start?.timeZone, let zone = CalendarTimeZoneResolver.zone(named: tzid, in: .none) {
-            formatter.timeZone = zone
-            formatter.dateFormat = "yyyyMMdd'T'HHmmss"
-            return "EXDATE;TZID=\(tzid):\(formatter.string(from: instant))"
+            return "EXDATE;TZID=\(tzid):\(FixedDateFormat.formatter("yyyyMMdd'T'HHmmss", timeZone: zone).string(from: instant))"
         }
-        formatter.timeZone = .gmt
-        formatter.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
-        return "EXDATE:\(formatter.string(from: instant))"
+        return "EXDATE:\(FixedDateFormat.formatter("yyyyMMdd'T'HHmmss'Z'", timeZone: .gmt).string(from: instant))"
     }
 
     /// The id Google gives the occurrence of the series `seriesId` at `place`: the series id, `_`,
@@ -1175,12 +1168,7 @@ actor GoogleCalendarProvider: CalendarProvider {
             return digits.count == 8 ? "\(seriesId)_\(digits)" : nil
         }
         guard let instant = place.dateTime.flatMap(Date.fromISO8601) else { return nil }
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.calendar = Calendar(identifier: .gregorian)
-        formatter.timeZone = .gmt
-        formatter.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
-        return "\(seriesId)_\(formatter.string(from: instant))"
+        return "\(seriesId)_\(FixedDateFormat.formatter("yyyyMMdd'T'HHmmss'Z'", timeZone: .gmt).string(from: instant))"
     }
 
     /// What a split writes after its record and before its cap, in `splitSeries` and again in

@@ -104,12 +104,7 @@ enum SplitCarry {
 
     /// `instant` as a naive `yyyy-MM-dd'T'HH:mm:ss` wall clock in `zone`.
     static func naive(_ instant: Date, in zone: TimeZone) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.calendar = Calendar(identifier: .gregorian)
-        formatter.timeZone = zone
-        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        return formatter.string(from: instant)
+        FixedDateFormat.formatter("yyyy-MM-dd'T'HH:mm:ss", timeZone: zone).string(from: instant)
     }
 
     /// The edit the new part is written with, the new part starting at `cut`. Each time the edit
@@ -395,12 +390,7 @@ enum SplitCarry {
     /// date `UNTIL` takes in its whole day). Nil when unreadable.
     private static func endsBefore(_ place: GCalDateTime, until: String, zone: TimeZone?) -> Bool? {
         if until.hasSuffix("Z"), until.count == 16, let instant = place.dateTime.flatMap(Date.fromISO8601) {
-            let formatter = DateFormatter()
-            formatter.locale = Locale(identifier: "en_US_POSIX")
-            formatter.calendar = gregorianUTC
-            formatter.timeZone = .gmt
-            formatter.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
-            guard let end = formatter.date(from: until) else { return nil }
+            guard let end = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss'Z'", timeZone: .gmt).date(from: until) else { return nil }
             return end < instant
         }
         guard let untilDay = RecurrenceTail.Day(ical: until) else { return nil }
@@ -702,20 +692,10 @@ enum SplitCarry {
     }()
 
     private static func day(_ text: String) -> Date? {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.calendar = gregorianUTC
-        formatter.timeZone = .gmt
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter.date(from: String(text.prefix(10)))
+        FixedDateFormat.formatter("yyyy-MM-dd", timeZone: .gmt).date(from: String(text.prefix(10)))
     }
 
     private static func dayString(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.calendar = gregorianUTC
-        formatter.timeZone = .gmt
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter.string(from: date)
+        FixedDateFormat.formatter("yyyy-MM-dd", timeZone: .gmt).string(from: date)
     }
 }
