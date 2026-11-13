@@ -514,7 +514,7 @@ reads again with no bookmark in the same pass; a candidate is stored only once e
 listed, with no lapse mark, and turns tracking on; the read's folder list is applied; a provider with no
 reader keeps its old path. `GmailChangeReadingTests` checks Gmail's reader against
 `StatefulGmailActionServer` (folder list per scope, a candidate before any listing, refusal, zero change,
-re-reads, a failed detail read, one unreadable message named for a later re-read) and, end to end: a change to older mail made during a new bookmark's
+re-reads, one message whose own answer is unusable named in every folder for a later re-read with the bookmark moving, a failure about the account kept as a failure with the bookmark kept) and, end to end: a change to older mail made during a new bookmark's
 listing reaches the next pass; a kept-back change on older mail lands once its op is gone; a tracked
 account's full sync sends no window listing; a refusal re-lists in the same pass with ONE catch-up check and
 none later, also eight days on; a label created, renamed or deleted shows on the next pass; a stale read
@@ -560,7 +560,7 @@ throws the cancellation (never a partial list), sends nothing more, and a full w
 rate-limited answers; a request joining the full gate; a cancel while a get awaits its answer or its
 backoff) and checks the first window is all on the wire before any answer, the first freed slot,
 the returned multiset and the named unreadable ids, throw semantics, termination and gate reuse
-(`GMAIL_DETAIL_FUZZ_ITERATIONS`, `GMAIL_DETAIL_FUZZ_SEED`, `TEST_RUNNER_` prefix on the CLI).
+(`GMAIL_DETAIL_FUZZ_ITERATIONS`, `GMAIL_DETAIL_FUZZ_SEED`, `TEST_RUNNER_` prefix on the CLI). A failing plain-schedule iteration always starts with a dropped connection, so the default run reaches the throw checker.
 
 ## Calendar chat tools — the resolved calendar account
 

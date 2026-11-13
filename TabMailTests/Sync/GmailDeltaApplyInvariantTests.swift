@@ -647,6 +647,24 @@ struct GmailDeltaApplyInvariantTests {
         }
     }
 
+    /// The full sync's window listing writes rows itself, and a change read
+    /// with nothing to write does not recount, so the listing must count what
+    /// it wrote.
+    @Test("P14: after a pass whose full sync lists unread mail the Inbox count matches the rows")
+    func unreadCountsMatchRowsAfterListing() async throws {
+        try await Self.withWorld(seeds: [
+            Self.seed("p14-list-a", labels: ["INBOX", "UNREAD"]),
+            Self.seed("p14-list-b", labels: ["INBOX", "UNREAD"]),
+            Self.seed("p14-list-c", labels: ["INBOX"]),
+        ]) { w in
+            try await w.foregroundPassWithFullSyncDue()
+            await UnreadCountManager.shared.awaitIdleForTesting()
+
+            #expect(try w.unreadRows(in: w.inbox) == 2, "precondition: the listing wrote two unread rows")
+            #expect(try w.unreadCount(of: w.inbox) == 2, "the Inbox count the badge sums equals its unread rows")
+        }
+    }
+
     // MARK: - P15: replay
 
     /// Everything the user can see of the account's mail, in a stable order.

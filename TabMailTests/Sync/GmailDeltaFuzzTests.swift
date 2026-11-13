@@ -150,6 +150,10 @@ struct GmailDeltaFuzzTests {
                     // The app's move carries the search entry to the new row.
                     try await SearchIndex.shared.removeMessages(contentKeys: [ContentKey(rawValue: row.id)])
                     _ = try await SearchIndex.shared.indexHeaders([Self.record(moved)])
+                    // And recounts both folders (`AccountManager`'s move does): a
+                    // pass whose every change is shielded writes no row and so
+                    // does not recount.
+                    await UnreadCountManager.shared.requestRecount(folderIds: [w.inbox.id, w.allMail.id])
                     removedHeaderIds.insert(row.id)
                     let op = try w.insertOp(.move, key: id, folder: w.inbox)
                     openOps[id] = op.id

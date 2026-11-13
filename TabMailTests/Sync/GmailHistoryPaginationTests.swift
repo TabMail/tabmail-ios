@@ -128,6 +128,16 @@ struct GmailHistoryPaginationTests {
         URLComponents(url: request.url, resolvingAgainstBaseURL: false)?.percentEncodedQuery ?? ""
     }
 
+    /// The account-level routes every pass may call: the label list (a `.all`
+    /// read starts with it) and the profile (a refused history is read again in
+    /// the same pass with no bookmark, which takes the current history id as a
+    /// candidate). Gmail's current id is far past every history page here.
+    private static func registerAccountRoutes(on scenario: FakeHTTP.Scenario, pool: DatabasePool) {
+        FolderEpochTestFixture.registerGmailLabels(on: scenario, listingFoldersOf: accountId, pool: pool)
+        scenario.register(path: "/profile", method: "GET", response: .json(
+            raw: #"{ "emailAddress": "\#(accountId)@example.com", "historyId": "9000" }"#))
+    }
+
     /// Detail GETs (`users.messages.get`) the provider issued in this scenario.
     private static func detailGETs(_ scenario: FakeHTTP.Scenario) -> Int {
         scenario.recordedCalls().filter { $0.method == "GET" && $0.url.contains("/messages/") }.count
@@ -167,7 +177,7 @@ struct GmailHistoryPaginationTests {
         let tokensSeen = Mutex<[String?]>([])
         let secondPageQuery = Mutex<String?>(nil)
         let scenario = FakeHTTP.Scenario()
-        FolderEpochTestFixture.registerGmailLabels(on: scenario, listingFoldersOf: Self.accountId, pool: pool)
+        Self.registerAccountRoutes(on: scenario, pool: pool)
         defer { scenario.close() }
         scenario.register(path: "/history", method: "GET") { request in
             let token = Self.pageToken(of: request)
@@ -217,7 +227,7 @@ struct GmailHistoryPaginationTests {
             let account = try Self.makeAccount(pool: pool)
             let reachedPage2 = Mutex(false)
             let scenario = FakeHTTP.Scenario()
-            FolderEpochTestFixture.registerGmailLabels(on: scenario, listingFoldersOf: Self.accountId, pool: pool)
+            Self.registerAccountRoutes(on: scenario, pool: pool)
             defer { scenario.close() }
             scenario.register(path: "/history", method: "GET") { request in
                 if Self.pageToken(of: request) == "page-2" {
@@ -252,7 +262,7 @@ struct GmailHistoryPaginationTests {
         try await Self.withAppDB { pool in
             let account = try Self.makeAccount(pool: pool)
             let scenario = FakeHTTP.Scenario()
-            FolderEpochTestFixture.registerGmailLabels(on: scenario, listingFoldersOf: Self.accountId, pool: pool)
+            Self.registerAccountRoutes(on: scenario, pool: pool)
             defer { scenario.close() }
             scenario.register(path: "/history", method: "GET") { request in
                 if Self.pageToken(of: request) == "page-2" { return .status(404) }
@@ -288,7 +298,7 @@ struct GmailHistoryPaginationTests {
             let secondPage = (0..<perPage).map { "budget-b\($0)" }
             let tokensSeen = Mutex<[String?]>([])
             let scenario = FakeHTTP.Scenario()
-            FolderEpochTestFixture.registerGmailLabels(on: scenario, listingFoldersOf: Self.accountId, pool: pool)
+            Self.registerAccountRoutes(on: scenario, pool: pool)
             defer { scenario.close() }
             scenario.register(path: "/history", method: "GET") { request in
                 let token = Self.pageToken(of: request)
@@ -359,7 +369,7 @@ struct GmailHistoryPaginationTests {
                              "fixture: no single page crosses the budget")
             }
             let scenario = FakeHTTP.Scenario()
-            FolderEpochTestFixture.registerGmailLabels(on: scenario, listingFoldersOf: Self.accountId, pool: pool)
+            Self.registerAccountRoutes(on: scenario, pool: pool)
             defer { scenario.close() }
             scenario.register(path: "/history", method: "GET") { request in
                 let index = Self.pageToken(of: request).flatMap { Int($0.dropFirst("page-".count)) } ?? 0
@@ -399,7 +409,7 @@ struct GmailHistoryPaginationTests {
             let account = try Self.makeAccount(pool: pool)
             let recordCount = GmailAPI.historyMaxChanges + overBudget
             let scenario = FakeHTTP.Scenario()
-            FolderEpochTestFixture.registerGmailLabels(on: scenario, listingFoldersOf: Self.accountId, pool: pool)
+            Self.registerAccountRoutes(on: scenario, pool: pool)
             defer { scenario.close() }
             scenario.register(path: "/history", method: "GET", response: .json(raw: Self.deletionPage(
                 historyId: "1002", deletedIds: (0..<recordCount).map { "deleted-\($0)" })))
@@ -427,7 +437,7 @@ struct GmailHistoryPaginationTests {
         try await Self.withAppDB { pool in
             let account = try Self.makeAccount(pool: pool)
             let scenario = FakeHTTP.Scenario()
-            FolderEpochTestFixture.registerGmailLabels(on: scenario, listingFoldersOf: Self.accountId, pool: pool)
+            Self.registerAccountRoutes(on: scenario, pool: pool)
             defer { scenario.close() }
             scenario.register(path: "/history", method: "GET", response: .json(raw: #"{ "historyId": "1009" }"#))
             let provider = GmailProvider(
@@ -457,7 +467,7 @@ struct GmailHistoryPaginationTests {
         try #require(GmailAPI.historyMaxPages <= GmailAPI.historyMaxChanges, "fixture: page limit must bind first")
         let pagesServed = Mutex(0)
         let scenario = FakeHTTP.Scenario()
-        FolderEpochTestFixture.registerGmailLabels(on: scenario, listingFoldersOf: Self.accountId, pool: pool)
+        Self.registerAccountRoutes(on: scenario, pool: pool)
         defer { scenario.close() }
         scenario.register(path: "/history", method: "GET") { _ in
             let page = pagesServed.withLock { count -> Int in
@@ -489,7 +499,7 @@ struct GmailHistoryPaginationTests {
             try FolderEpochTestFixture.insertHeaders(accountId: Self.accountId, path: "INBOX", uids: [501, 502], pool: pool)
             try #require(try Self.headerExists("501", pool: pool), "fixture: the message to delete exists locally")
             let scenario = FakeHTTP.Scenario()
-            FolderEpochTestFixture.registerGmailLabels(on: scenario, listingFoldersOf: Self.accountId, pool: pool)
+            Self.registerAccountRoutes(on: scenario, pool: pool)
             defer { scenario.close() }
             scenario.register(path: "/history", method: "GET") { request in
                 if Self.pageToken(of: request) == "page-2" {
@@ -529,7 +539,7 @@ struct GmailHistoryPaginationTests {
             let conversations = stride(from: 0, to: ids.count, by: 4).map { Array(ids[$0..<min($0 + 4, ids.count)]) }
             try #require(conversations.count * 2 <= GmailAPI.historyMaxChanges, "fixture: within the record budget")
             let scenario = FakeHTTP.Scenario()
-            FolderEpochTestFixture.registerGmailLabels(on: scenario, listingFoldersOf: Self.accountId, pool: pool)
+            Self.registerAccountRoutes(on: scenario, pool: pool)
             defer { scenario.close() }
             scenario.register(path: "/history", method: "GET") { request in
                 if Self.pageToken(of: request) == "page-2" {
@@ -565,7 +575,7 @@ struct GmailHistoryPaginationTests {
             let account = try Self.makeAccount(pool: pool)
             let queries = Mutex<[String]>([])
             let scenario = FakeHTTP.Scenario()
-            FolderEpochTestFixture.registerGmailLabels(on: scenario, listingFoldersOf: Self.accountId, pool: pool)
+            Self.registerAccountRoutes(on: scenario, pool: pool)
             defer { scenario.close() }
             scenario.register(path: "/history", method: "GET") { request in
                 queries.withLock { $0.append(Self.wireQuery(of: request)) }

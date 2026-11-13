@@ -360,7 +360,7 @@ struct DeltaDetailFetchFailureTests {
             let account = try Self.makeAccount(
                 id: accountId, provider: .gmail, cursor: "1000", folderPath: "INBOX", role: .inbox, pool: pool)
             try await pool.write { db in
-                try Folder(name: "Label_1", path: "Label_1", role: .custom, accountId: accountId).insert(db)
+                try Folder(name: "Label", path: "Label_1", role: .custom, accountId: accountId).insert(db)
             }
             for path in ["INBOX", "Label_1"] {
                 try FolderEpochTestFixture.insertHeaders(
@@ -369,7 +369,12 @@ struct DeltaDetailFetchFailureTests {
             let gone = Mutex(false)
             let scenario = FakeHTTP.Scenario()
             defer { scenario.close() }
-            FolderEpochTestFixture.registerGmailLabels(on: scenario, listingFoldersOf: accountId, pool: pool)
+            // A user label with a display name: a label NAMED like Gmail's
+            // internal `Label_N` ids is left out of the folder list.
+            scenario.register(path: "/labels", method: "GET", response: .json(raw: #"""
+                { "labels": [ { "id": "INBOX", "name": "INBOX", "type": "system" },
+                              { "id": "Label_1", "name": "Label", "type": "user" } ] }
+                """#))
             Self.registerHistory(Self.gmailHistoryPage(addedIds: [Self.gmailStuckId, "ok-1"]), on: scenario)
             scenario.register(path: "/messages", method: "GET") { request in
                 let last = request.url.lastPathComponent

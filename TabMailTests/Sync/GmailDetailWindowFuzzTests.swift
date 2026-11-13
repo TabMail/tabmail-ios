@@ -179,6 +179,13 @@ struct GmailDetailWindowFuzzTests {
                 answers[id] = .readable
             }
         }
+        // Only a failure about the account (a dropped connection) throws; a
+        // message's own bad answer is named unreadable. One kind in five is too
+        // rare for the default run to be sure of a throw, so a failing plain
+        // iteration starts with one.
+        if failuresAllowed, schedule == .plain, let first = ids.first {
+            answers[first] = .failed(.transportError)
+        }
         if schedule == .plain, rng.pick(100) < FuzzConfig.rateLimitPercent,
            let id = Array(Set(ids)).sorted().filter({ answers[$0] == .readable }).first {
             answers[id] = .rateLimitedOnce

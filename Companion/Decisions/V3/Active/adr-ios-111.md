@@ -22,7 +22,9 @@ and that capture was a lapse, so a new account listed every folder twice for the
    (`SyncEngine.applyFolderList`, extracted from `fullSync`), then one write transaction per folder with
    the shields read inside it (pending-operation snapshot, `liveRecentlyCompleted()`; Memory 127), then
    reply-parent notifications, search, body queue and one unread recount, then the bookmark in its own
-   transaction. Removals go through the one removal core (`deleteConfirmedGhostHeadersReportingProtected`)
+   transaction. The recount runs only when the apply wrote rows (the old Gmail delta recounted after every
+   non-empty history), so every other row writer counts what it wrote: the full sync's window listing
+   recounts each folder it listed (`processSyncResult`), which the old unconditional recount had hidden. Removals go through the one removal core (`deleteConfirmedGhostHeadersReportingProtected`)
    with the union of every shield, plus the account-wide identity term when the ids are stable
    (`addressEpoch == nil`). Inserts carry today's header builder, AI-cache restore, reply-detect, orphan
    reclaim, the Drafts AND Sent placeholder dedup with label and body carry, references and user labels,

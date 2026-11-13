@@ -326,6 +326,12 @@ extension SyncEngine {
         // Extracted to avoid duplication between initial sync and connection-error retry.
         @Sendable func processSyncResult(_ result: SyncMessagesResult, folder: Folder) async -> [String] {
             await Self.publishHeaderRekeys(result.headerRekeys)
+            // Recount right after the folder's rows are committed, as the
+            // `syncMessages` wrapper does: `runSyncMessages` inserts and removes
+            // rows and changes their read state, and does not recount. A change
+            // read recounts only when it writes rows, so nothing later in the
+            // pass counts a listing's new unread mail.
+            await UnreadCountManager.shared.requestRecount(folderId: folder.id)
             // Yield to a privileged merge before this folder's FTS writes (rekey /
             // remove / index). SearchIndex is a separate pool with sync `@noasync`
             // writes, so the async caller yields on its behalf.
@@ -491,6 +497,7 @@ extension SyncEngine {
             }
             return (allMigratedIds, listed)
         }.value
+
 
         // Clear undo protection for migrated UIDs
         // UID migration tracking — logged for diagnostics but no longer clears undoProtectedIds

@@ -127,8 +127,8 @@ struct GmailChangeReadingTests {
         }
     }
 
-    @Test("Reader: a failed detail read keeps the history's removals, reports the failure and keeps the bookmark")
-    func readerDetailFailure() async throws {
+    @Test("Reader: a message whose own answer is unusable is read again later; the rest of the pass lands and the bookmark moves")
+    func readerUnreadableMessage() async throws {
         try await Pins.withWorld(seeds: [
             Pins.seed("rf-del", labels: ["INBOX"]), Pins.seed("rf-chg", labels: ["INBOX"]),
         ]) { w in
@@ -137,9 +137,31 @@ struct GmailChangeReadingTests {
             w.server.applyLabelChange(providerMessageId: "rf-chg", add: ["STARRED"])
             w.server.injectGetFailure(providerMessageId: "rf-chg", .status(500))
             let set = try await Self.read(w, cursor: cursor)
+            #expect(set.account == .set(w.server.currentHistoryId()))
+            for folder in [w.inbox, w.allMail, w.label] {
+                let changes = try #require(Self.changes(set, folder))
+                #expect(changes.removals == ["rf-del"], "\(folder.path)")
+                #expect(changes.rereadLater == ["rf-chg"], "every folder reads it again: \(folder.path)")
+                #expect(changes.records.isEmpty, "\(folder.path)")
+                guard case .tracked = changes.status else { Issue.record("expected .tracked in \(folder.path), got \(changes.status)"); return }
+            }
+        }
+    }
+
+    @Test("Reader: a failure about the account keeps the history's removals, reports the failure and keeps the bookmark")
+    func readerAccountFailure() async throws {
+        try await Pins.withWorld(seeds: [
+            Pins.seed("rf-del", labels: ["INBOX"]), Pins.seed("rf-chg", labels: ["INBOX"]),
+        ]) { w in
+            let cursor = w.server.currentHistoryId()
+            w.server.removeMessage(providerMessageId: "rf-del")
+            w.server.applyLabelChange(providerMessageId: "rf-chg", add: ["STARRED"])
+            w.server.injectGetFailure(providerMessageId: "rf-chg", .transport(.networkConnectionLost))
+            let set = try await Self.read(w, cursor: cursor)
             #expect(set.account == .keep)
             let inbox = try #require(Self.changes(set, w.inbox))
             #expect(inbox.removals == ["rf-del"])
+            #expect(inbox.rereadLater.isEmpty)
             guard case .failed = inbox.status else { Issue.record("expected .failed, got \(inbox.status)"); return }
         }
     }
@@ -264,7 +286,11 @@ struct GmailChangeReadingTests {
             try await w.foregroundPassWithFullSyncDue()
             #expect(try w.account().lastHistoryId == w.server.currentHistoryId(), "precondition: a bookmark is stored")
             switch reason {
-            case .refused: w.server.expireHistory()
+            case .refused:
+                // A change past the stored bookmark, then the history expires
+                // below it: the read is answered 404.
+                w.server.applyLabelChange(providerMessageId: "not-due-1", add: ["STARRED"])
+                w.server.expireHistory()
             case .noBookmark: try await Self.clearBookmark(w)
             }
             try await w.pool.write { db in
