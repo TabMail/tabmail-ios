@@ -924,9 +924,44 @@ struct ExchangeSplitCarryTests {
                                 parts: [2], patch: Self.hourLater, series: series)
         defer { r.http.close() }
         #expect(r.error == nil, "\(String(describing: r.error)); \(r.http.servedCallSequence())")
-        #expect(Self.instant(r.graph.event("created-1")?["start"]) == GraphSplitFixture.occurrence.addingTimeInterval(3_600),
-                "the new part is not at the new time: \(r.graph.event("created-1")?["start"] ?? "none")")
+        // The new part is written in the series' own (unrecognized) zone label at the device's wall
+        // time, which is how the provider reads a zone it can't name.
+        let written = (r.graph.event("created-1")?["start"] as? [String: Any])?["dateTime"] as? String
+        #expect(written.map { String($0.prefix(19)) } == GraphFixture.wall(GraphSplitFixture.occurrence.addingTimeInterval(3_600), in: TimeZone.current.identifier),
+                "the new part is not at the new time: \(written ?? "none")")
         #expect(!r.graph.patches("ser-1").isEmpty, "the series was not capped: \(r.http.servedCallSequence())")
+        // A new time resets the later one-off changes, as Google does: the room is not carried.
+        #expect(r.graph.patches("created-1-w2").isEmpty, "a later change was carried over a reset: \(r.graph.patches("created-1-w2"))")
+    }
+
+    @Test("a series with no zone it can date in: a new time over a later occurrence moved to another day is written, and the moved occurrence is reset, as Google resets it")
+    func zonelessTimeChangeOverALaterMoveResets() async throws {
+        let series = Self.zoneless(GraphSplitFixture.series(range: GraphSplitFixture.noEnd))
+        let r = try await split(exceptions: [Self.exception(2, at: Self.week(2, plusDays: 1))], parts: [2], patch: Self.hourLater, series: series)
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error)); \(r.http.servedCallSequence())")
+        #expect(r.graph.patches("created-1-w2").isEmpty, "the moved occurrence was carried over a reset: \(r.graph.patches("created-1-w2"))")
+        #expect(!r.graph.patches("ser-1").isEmpty, "the series was not capped: \(r.http.servedCallSequence())")
+    }
+
+    @Test("a series with no zone it can date in: a rename over an earlier occurrence moved to after the one named renames it where it is, with no date needed")
+    func zonelessRenameOverAnOccurrenceMovedAfterIsWritten() async throws {
+        let series = Self.zoneless(GraphSplitFixture.series(range: GraphSplitFixture.noEnd))
+        let r = try await split(exceptions: [Self.exception(0, at: Self.week(1, plusDays: 1))], parts: [2], patch: Self.rename, series: series)
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error)); \(r.http.servedCallSequence())")
+        #expect(r.graph.patches("ser-1-occ-0").contains { $0["subject"] != nil }, "the occurrence shown after was not renamed: \(r.graph.patches("ser-1-occ-0"))")
+        #expect(r.graph.patches("ser-1-occ-0").allSatisfy { $0["start"] == nil }, "it was moved: \(r.graph.patches("ser-1-occ-0"))")
+    }
+
+    @Test("a series with no zone it can date in: a new time that would move an earlier occurrence shown after the one named is refused with nothing written and no record kept")
+    func zonelessTimeChangeMovingAnOccurrenceWhereItIsIsRefused() async throws {
+        let series = Self.zoneless(GraphSplitFixture.series(range: GraphSplitFixture.noEnd))
+        let r = try await split(exceptions: [Self.exception(0, at: Self.week(1, plusDays: 1))], parts: [2], patch: Self.hourLater, series: series)
+        defer { r.http.close() }
+        #expect(r.error != nil, "the split went on: \(r.http.servedCallSequence())")
+        #expect(r.http.recordedCalls().allSatisfy { $0.method == "GET" }, "something was written: \(r.http.servedCallSequence())")
+        #expect(r.records.records.isEmpty, "a record was kept")
     }
 
     @Test("a series with no zone it can date in: an occurrence deleted a week before the split does not stop a rename from it, and nothing on the new part is deleted")
@@ -950,6 +985,24 @@ struct ExchangeSplitCarryTests {
             #expect(r.error != nil, "\(label): the split went on: \(r.http.servedCallSequence())")
             #expect(r.http.recordedCalls().allSatisfy { $0.method == "GET" }, "\(label): something was written: \(r.http.servedCallSequence())")
         }
+    }
+
+    @Test("a deleted date is surely before a split only two or more days before the split's date in UTC, whatever the hour or the device")
+    func deletedSurelyBeforeHoldsItsMargin() {
+        // 2099 dates: fixed, never stale. Late on the split's UTC day and just after its midnight.
+        for cut in ["2099-03-10T23:30:00Z", "2099-03-10T00:00:00Z", "2099-03-11T07:30:00+08:00"] {
+            let at = GCalDateTime(dateTime: cut, date: nil, timeZone: "UTC")
+            #expect(ExchangeCalendarProvider.deletedSurelyBefore(date: "2099-03-08", cut: at), "\(cut): two days before")
+            #expect(ExchangeCalendarProvider.deletedSurelyBefore(date: "2099-02-28", cut: at), "\(cut): across a month")
+            #expect(!ExchangeCalendarProvider.deletedSurelyBefore(date: "2099-03-09", cut: at), "\(cut): the day before")
+            #expect(!ExchangeCalendarProvider.deletedSurelyBefore(date: "2099-03-10", cut: at), "\(cut): the split's date")
+            #expect(!ExchangeCalendarProvider.deletedSurelyBefore(date: "2099-03-12", cut: at), "\(cut): after")
+        }
+        let allDay = GCalDateTime(dateTime: nil, date: "2099-03-10", timeZone: nil)
+        #expect(ExchangeCalendarProvider.deletedSurelyBefore(date: "2099-03-08", cut: allDay))
+        #expect(!ExchangeCalendarProvider.deletedSurelyBefore(date: "2099-03-09", cut: allDay))
+        #expect(!ExchangeCalendarProvider.deletedSurelyBefore(date: "not a date", cut: allDay))
+        #expect(!ExchangeCalendarProvider.deletedSurelyBefore(date: "2099-03-01", cut: GCalDateTime(dateTime: "garbled", date: nil, timeZone: nil)))
     }
 
     @Test("a series with no zone it can date in: a later occurrence moved to another day is refused with nothing written, for a rename and for a new time that shows it before the one named")

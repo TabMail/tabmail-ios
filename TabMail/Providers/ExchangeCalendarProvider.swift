@@ -730,18 +730,12 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// split at `cut`, in any zone: `date` is at least `deletedDateMarginDays` before `cut`'s date
     /// in UTC. False when either can't be read.
     nonisolated static func deletedSurelyBefore(date: String, cut: GCalDateTime) -> Bool {
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = .gmt
-        let cutDay: Date?
-        if let day = cut.date {
-            cutDay = GoogleCalendarProvider.naiveInstant("\(day.prefix(10))T00:00:00", zone: .gmt)
-        } else {
-            cutDay = cut.dateTime.flatMap(Date.fromISO8601).map { calendar.startOfDay(for: $0) }
-        }
-        guard RecurrenceTail.Day(iso: date) != nil,
-              let deleted = GoogleCalendarProvider.naiveInstant("\(date)T00:00:00", zone: .gmt),
-              let cutDay, let latest = calendar.date(byAdding: .day, value: -deletedDateMarginDays, to: cutDay) else { return false }
-        return deleted <= latest
+        // Whole days on the Gregorian calendar (`RecurrenceTail.Day`), the cut's date read in UTC
+        // by a Gregorian formatter (`SplitCarry.naive`), so no device calendar enters.
+        let cutDate = cut.date.map { String($0.prefix(10)) }
+            ?? cut.dateTime.flatMap(Date.fromISO8601).map { String(SplitCarry.naive($0, in: .gmt).prefix(10)) }
+        guard let deleted = RecurrenceTail.Day(iso: date), let cutDay = cutDate.flatMap({ RecurrenceTail.Day(iso: $0) }) else { return false }
+        return cutDay.days(since: deleted) >= deletedDateMarginDays
     }
 
     /// The place of an occurrence Graph names deleted by its date `date` (in the series' zone): the
@@ -1027,7 +1021,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
               let edits = SplitCarry.edits(of: parts.edited, shift: shift, length: SplitCarry.length(of: newPart), fields: fields),
               let plan = carryPlan(parts: parts, mode: mode, namedStart: namedStart, namedPlace: namedPlace, shift: shift,
                                    series: series, newPart: newPart, fields: fields) else {
-            throw CalendarProviderError.notSupported("a changed occurrence of this repeating event has a time TabMail can't read, so it was not split")
+            throw CalendarProviderError.notSupported("a time of this repeating event, its new part or a changed occurrence can't be read, so it was not split")
         }
         _ = try carryOrder(plan.changed, zone: series.seriesZone)
         _ = try editOrder(edits, zone: series.seriesZone)
