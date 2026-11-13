@@ -219,7 +219,8 @@ struct GraphParseTests {
             .search: false,
             .fetchMessageHeaders: false,
             .fetchOlderMessages: false,
-            .fetchMessageDetails: true
+            .fetchMessageDetails: true,
+            .readChanges: false
         ]
 
         #expect(ExchangeGraphMessageRequest.allCases.count == expected.count)
@@ -229,7 +230,7 @@ struct GraphParseTests {
         }
 
         #expect(expected.values.filter { $0 }.count == 2)
-        #expect(expected.values.filter { !$0 }.count == 5)
+        #expect(expected.values.filter { !$0 }.count == 6)
     }
 
     @Test("Direct GraphAPI parser routes select parentFolderId")

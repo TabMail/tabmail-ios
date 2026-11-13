@@ -33,6 +33,16 @@ pass's full sync while another pass's delta was in flight, and both write the ac
    a foreground pass's full sync is in flight is stamped over by that pass's end write: a pre-existing
    race, tabmail-ios #572. This is live sync state, not a setting, so the
    snapshot-at-operation-start rule does not apply to it ("settings versus the world").
+
+   **Amended 2026-11-12:** a pass also takes the caller's deadline (`deadline:` on `sync(account:)`,
+   `backgroundDeltaSync` and `performDeltaSync`). It is not account sync state: it is when the caller stops
+   waiting, fixed before the turn. A change reader's budget is measured from it at the start of the turn
+   (ADR-IOS-111, `SyncEngine.changeReadEnd`), so a pass that waited for its turn reads for less, and one
+   left with too little time reads nothing and keeps its bookmark, rather than reading what it cannot apply
+   before the caller gives up. Without it, a pass that waited could start a full read budget near the
+   caller's timeout and have its applied work cut off. Superseded wording, kept: "the pass bodies
+   (`foregroundPass`, `backgroundDeltaPass`) take only the account id" (they now take the account id and
+   the caller's deadline, and still no copy of the account).
 3. **Nothing else changes** (owner: "the full sync and delta sync work the same as right now ... If one
    is running, the other just waits. It's a simple semaphore. Do not change anything of the timing
    logic"). There is no joining, no coalescing and no new trigger. The 15-minute full-sync interval, the

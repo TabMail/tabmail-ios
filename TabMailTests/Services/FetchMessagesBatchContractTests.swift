@@ -71,7 +71,6 @@ struct FetchMessagesBatchContractTests {
         func move(ids: [String], from: String, to: String) async throws {}
         func send(draft: DraftMessage) async throws {}
         func appendToSentFolder(draft: DraftMessage, sentFolderPath: String?, messageId: String) async throws -> Bool { true }
-        func fetchHistory(since historyId: String) async throws -> HistoryResponse? { nil }
         func fetchMessageHeaders(ids: [String]) async throws -> [MessageHeaderInfo] { [] }
         func fetchTextBodies(ids: [String], folder: String) async throws -> [TextBodyFetchResult] { [] }
 

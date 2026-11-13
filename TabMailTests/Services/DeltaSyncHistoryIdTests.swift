@@ -52,25 +52,6 @@ struct DeltaSyncHistoryIdTests {
         let fetched = try db.read { try Account.fetchOne($0, key: "acc1") }
         #expect(fetched?.lastHistoryId == "550")
     }
-
-    @Test("Exchange deltaToken advances before change processing")
-    func exchangeDeltaTokenAdvancesWithChanges() throws {
-        let db = try TestDatabase.make()
-        var account = try TestDatabase.insertAccount(db, id: "acc1", email: "test@outlook.com", provider: .outlook)
-        account.lastHistoryId = "token-old"
-        try db.write { try account.update($0) }
-        try TestDatabase.insertFolder(db, name: "Inbox", path: "Inbox", role: .inbox, accountId: "acc1")
-
-        // Simulate advance before processing
-        let newDeltaToken = "token-new"
-        try db.write { dbConn in
-            _ = try Account.filter(Column("id") == "acc1")
-                .updateAll(dbConn, Column("lastHistoryId").set(to: newDeltaToken))
-        }
-
-        let fetched = try db.read { try Account.fetchOne($0, key: "acc1") }
-        #expect(fetched?.lastHistoryId == "token-new")
-    }
 }
 
 // MARK: - Suite: Idempotent change processing safety

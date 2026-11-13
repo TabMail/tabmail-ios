@@ -571,10 +571,10 @@ extension SyncEngine {
         return listing
     }
 
-    /// The folders the full sync syncs, and the backfill worker's catch-up lists:
-    /// main roles and favourites, inbox first, then favourites, then secondary
-    /// roles. Custom non-favourite folders sync on demand when the user navigates
-    /// to them.
+    /// The folders the full sync syncs, the backfill worker's catch-up lists,
+    /// and a per-folder change reader reads (`ChangeFolder.isSynced`): main roles
+    /// and favourites, inbox first, then favourites, then secondary roles. Custom
+    /// non-favourite folders sync on demand when the user navigates to them.
     nonisolated func syncableFoldersInOrder(_ folders: [Folder]) -> [Folder] {
         let primary = self.primaryRoles
         let secondary = self.secondaryRoles

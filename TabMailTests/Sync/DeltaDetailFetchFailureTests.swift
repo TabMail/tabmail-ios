@@ -10,19 +10,16 @@ import Testing
 
 /// A delta lists what changed, then fetches each changed message by id.
 /// THE PROPERTY: a change the delta could not fetch is never lost to a failure
-/// that clears. Only a 404 (the message is gone) may be skipped; any other
-/// failure leaves the cursor where it was, so the next pass fetches the same
-/// change again and applies it once the fetch succeeds. And a message whose
-/// fetch never succeeds does not stop the account's sync: on Gmail its own
-/// unusable answer puts it on the folder's re-read list and the rest of the
-/// pass lands with the bookmark moved; on Outlook the full sync's cursor
-/// capture moves past it, so later changes land.
+/// that clears. Only a gone message may be skipped; any other failure keeps the
+/// change, so a later pass fetches it again and applies it once the fetch
+/// succeeds. And a message whose fetch never succeeds does not stop the
+/// account's sync: its own unusable answer puts it on the folder's re-read list
+/// and the rest of the pass lands with the bookmark moved.
 ///
-/// These drive production `SyncEngine.performDeltaSync` (and, for the Outlook
-/// bound, the foreground poll `SyncEngine.sync(account:)`, which runs the
-/// delta, the due full sync and the cursor capture) end to end on `FakeHTTP` with a real
-/// provider and a real `DatabasePool`, for both providers whose delta fetches
-/// messages by id (Gmail and Outlook).
+/// Gmail: production `SyncEngine.performDeltaSync` end to end on `FakeHTTP` with
+/// a real provider and a real `DatabasePool`. Outlook: its change reader on the
+/// stateful Graph fake, where a header is fetched (in a `$batch`) only for a
+/// message a folder other than the Inbox does not hold.
 @Suite("A delta never loses a change whose message fetch failed", .serialized, .processGlobalState)
 struct DeltaDetailFetchFailureTests {
     enum Failure: String, Sendable, CaseIterable {
@@ -30,16 +27,25 @@ struct DeltaDetailFetchFailureTests {
         /// (no usable date): a failed fetch, not a gone message.
         case serverError, clientError, unreadableBody, undatedRecord, transportError
 
-        func response(id: String, provider: AccountProvider) -> FakeHTTP.CannedResponse {
+        func response(id: String) -> FakeHTTP.CannedResponse {
             switch self {
             case .serverError: return .status(503)
             case .clientError: return .status(400)
             case .unreadableBody: return .json(raw: "not a message")
-            case .undatedRecord:
-                return .json(raw: provider == .gmail
-                    ? DeltaDetailFetchFailureTests.gmailMessageJSON(id: id, dated: false)
-                    : DeltaDetailFetchFailureTests.outlookMessageJSON(id: id, dated: false))
+            case .undatedRecord: return .json(raw: DeltaDetailFetchFailureTests.gmailMessageJSON(id: id, dated: false))
             case .transportError: return .transportError(.networkConnectionLost)
+            }
+        }
+
+        /// The same failure as one Outlook `$batch` item's answer, or nil for a
+        /// transport failure, which fails the whole batch request.
+        func outlookBatchAnswer(id: String) -> (status: Int, body: String?)? {
+            switch self {
+            case .serverError: return (503, nil)
+            case .clientError: return (400, nil)
+            case .unreadableBody: return (200, #""not a message""#)
+            case .undatedRecord: return (200, #"{"id":"\#(id)","subject":"undated","isRead":false}"#)
+            case .transportError: return nil
             }
         }
 
@@ -99,25 +105,6 @@ struct DeltaDetailFetchFailureTests {
         }
     }
 
-    /// One foreground poll, as the app runs it: the account is read afresh and
-    /// `SyncEngine.sync(account:)` runs on the provider's registered work queue.
-    private static func foregroundPoll(engine: SyncEngine, accountId: String, pool: DatabasePool) async throws {
-        let account = try #require(try storedAccount(id: accountId, pool: pool))
-        _ = try await engine.sync(account: account)
-    }
-
-    /// Moves the account's last poll and last full sync one poll interval back,
-    /// so the next poll runs (past the recent-sync guard) without a full sync
-    /// being due: only the delta can land what changed.
-    private static func lastPolledOneIntervalAgo(accountId: String, pool: DatabasePool) throws {
-        let earlier = Date().addingTimeInterval(-SyncConfig.foregroundPollIntervalSeconds)
-        try pool.write { db in
-            _ = try Account.filter(Column("id") == accountId).updateAll(db,
-                Column("lastSyncedAt").set(to: earlier),
-                Column("lastFullSyncAt").set(to: earlier))
-        }
-    }
-
     // MARK: - Gmail
 
     private static let gmailAccountId = "gmail-delta-detail"
@@ -173,7 +160,7 @@ struct DeltaDetailFetchFailureTests {
             scenario.register(path: "/messages/steady-1", method: "GET",
                               response: .json(raw: Self.gmailMessageJSON(id: "steady-1")))
             scenario.register(path: "/messages/flaky-1", method: "GET") { _ in
-                failing.withLock { $0 } ? failure.response(id: "flaky-1", provider: .gmail) : .json(raw: Self.gmailMessageJSON(id: "flaky-1"))
+                failing.withLock { $0 } ? failure.response(id: "flaky-1") : .json(raw: Self.gmailMessageJSON(id: "flaky-1"))
             }
             let provider = GmailProvider(
                 userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: scenario.session)
@@ -215,7 +202,7 @@ struct DeltaDetailFetchFailureTests {
             scenario.register(path: "/messages/steady-1", method: "GET",
                               response: .json(raw: Self.gmailMessageJSON(id: "steady-1")))
             scenario.register(path: "/messages/flaky-1", method: "GET") { _ in
-                failing.withLock { $0 } ? Failure.transportError.response(id: "flaky-1", provider: .gmail) : .json(raw: Self.gmailMessageJSON(id: "flaky-1"))
+                failing.withLock { $0 } ? Failure.transportError.response(id: "flaky-1") : .json(raw: Self.gmailMessageJSON(id: "flaky-1"))
             }
             let provider = GmailProvider(
                 userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: scenario.session)
@@ -322,7 +309,7 @@ struct DeltaDetailFetchFailureTests {
                 try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?",
                                arguments: [FolderChangeState(tracking: true, recheck: []).encoded, "\(accountId):INBOX"])
             }
-            let scenario = Self.gmailBoundScenario(stuck: failure.response(id: Self.gmailStuckId, provider: .gmail))
+            let scenario = Self.gmailBoundScenario(stuck: failure.response(id: Self.gmailStuckId))
             defer { scenario.close() }
             let provider = GmailProvider(
                 userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: scenario.session)
@@ -705,7 +692,7 @@ struct DeltaDetailFetchFailureTests {
         for id in ids where id != failing {
             scenario.register(path: "/messages/\(id)", method: "GET", response: .json(raw: Self.gmailMessageJSON(id: id)))
         }
-        scenario.register(path: "/messages/\(failing)", method: "GET", response: failure.response(id: failing, provider: .gmail))
+        scenario.register(path: "/messages/\(failing)", method: "GET", response: failure.response(id: failing))
         let provider = GmailProvider(
             userEmail: "gmail-delta-detail@example.com", accessToken: { _ in "fake-access-token" }, session: scenario.session)
 
@@ -743,105 +730,42 @@ struct DeltaDetailFetchFailureTests {
                 "every readable message after the gone ones must be fetched")
     }
 
+
     // MARK: - Outlook
 
-    private static let outlookAccountId = "outlook-delta-detail"
-    private static let outlookFolder = "inbox-delta-detail"
-    private static let startLink = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages/delta?$deltatoken=start"
-    private static let nextLink = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages/delta?$deltatoken=next"
+    private typealias OutlookWorld = OutlookChangeReadingTests.World
 
-    private static func outlookDeltaPage(ids: [String]) -> String {
-        let values = ids.map { #"{ "id": "\#($0)" }"# }
-        return #"{ "value": [ \#(values.joined(separator: ", ")) ], "@odata.deltaLink": "\#(nextLink)" }"#
-    }
-
-    private static func outlookMessageJSON(id: String, dated: Bool = true) -> String {
-        let received = dated ? #""receivedDateTime": "\#(ISO8601DateFormatter().string(from: Date()))","# : ""
-        return """
-        {
-          "id": "\(id)",
-          "subject": "delta \(id)",
-          \(received)
-          "isRead": false,
-          "hasAttachments": false,
-          "internetMessageId": "<\(id)@example.com>",
-          "parentFolderId": "\(outlookFolder)"
+    /// Makes `failure` the answer to the header fetch of `id`.
+    private static func injectOutlook(_ failure: Failure, id: String, on w: OutlookWorld) {
+        if let answer = failure.outlookBatchAnswer(id: id) {
+            w.server.answerBatchItem(providerMessageId: id, status: answer.status, body: answer.body)
+        } else {
+            w.server.failBatches([.transportError(.networkConnectionLost)])
         }
-        """
     }
 
-    /// RED before the fix, the same way as on Gmail: the failed fetch was
-    /// skipped and the delta link moved past the change.
-    @Test("An Outlook message whose fetch fails keeps the delta link and lands on the next pass",
-          arguments: Failure.allCases)
+    @Test("An Outlook message whose header fetch fails lands on a later pass", arguments: Failure.allCases)
     func outlookFailedFetchIsRetried(failure: Failure) async throws {
-        try await Self.withAppDB { pool in
-            let account = try Self.makeAccount(
-                id: Self.outlookAccountId, provider: .outlook, cursor: Self.startLink,
-                folderPath: Self.outlookFolder, role: .inbox, pool: pool)
-            let failing = Mutex(true)
-            let scenario = FakeHTTP.Scenario()
-            defer { scenario.close() }
-            scenario.register(path: "/messages/delta", method: "GET",
-                              response: .json(raw: Self.outlookDeltaPage(ids: ["steady-1", "flaky-1"])))
-            scenario.register(path: "/messages/steady-1", method: "GET",
-                              response: .json(raw: Self.outlookMessageJSON(id: "steady-1")))
-            scenario.register(path: "/messages/flaky-1", method: "GET") { _ in
-                failing.withLock { $0 } ? failure.response(id: "flaky-1", provider: .outlook) : .json(raw: Self.outlookMessageJSON(id: "flaky-1"))
-            }
-            let provider = ExchangeProvider(
-                userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: scenario.session)
+        try await OutlookChangeReadingTests.withWorld { w in
+            try await w.baselineAll()
+            w.server.deliver(OutlookChangeReadingTests.seed("steady-1", in: OutlookChangeReadingTests.archive, daysAgo: 1))
+            w.server.deliver(OutlookChangeReadingTests.seed("flaky-1", in: OutlookChangeReadingTests.archive, daysAgo: 1))
+            Self.injectOutlook(failure, id: "flaky-1", on: w)
 
-            await #expect(throws: (any Error).self, "a failed message fetch must fail the delta") {
-                _ = try await SyncEngine().performDeltaSync(account: account, provider: provider)
-            }
-            #expect(try Self.cursor(accountId: Self.outlookAccountId, pool: pool) == Self.startLink,
-                    "the delta link moved past a change that was never fetched")
+            try await w.read()
+            #expect(try w.row("flaky-1", in: w.archive) == nil, "precondition: the fetch failed")
 
-            failing.withLock { $0 = false }
-            let retried = try await SyncEngine().performDeltaSync(account: account, provider: provider)
-
-            #expect(retried.succeeded)
-            #expect(try Self.headerExists(
-                accountId: Self.outlookAccountId, folderPath: Self.outlookFolder, messageId: "flaky-1", pool: pool),
-                    "the change whose fetch failed was lost")
-            #expect(try Self.headerExists(
-                accountId: Self.outlookAccountId, folderPath: Self.outlookFolder, messageId: "steady-1", pool: pool))
-            #expect(try Self.cursor(accountId: Self.outlookAccountId, pool: pool) == Self.nextLink)
+            w.server.clearBatchItemAnswers()
+            try await w.read(now: Date().addingTimeInterval(60))
+            #expect(try w.row("flaky-1", in: w.archive) != nil, "the change whose fetch failed was lost")
+            #expect(try w.row("steady-1", in: w.archive) != nil)
+            #expect(try w.recheck(w.archive).isEmpty)
         }
     }
 
-    @Test("An Outlook message that is gone (404) is skipped and the rest of the delta lands")
-    func outlookGoneMessageIsSkipped() async throws {
-        try await Self.withAppDB { pool in
-            let account = try Self.makeAccount(
-                id: Self.outlookAccountId, provider: .outlook, cursor: Self.startLink,
-                folderPath: Self.outlookFolder, role: .inbox, pool: pool)
-            let scenario = FakeHTTP.Scenario()
-            defer { scenario.close() }
-            scenario.register(path: "/messages/delta", method: "GET",
-                              response: .json(raw: Self.outlookDeltaPage(ids: ["steady-1", "gone-1"])))
-            scenario.register(path: "/messages/steady-1", method: "GET",
-                              response: .json(raw: Self.outlookMessageJSON(id: "steady-1")))
-            scenario.register(path: "/messages/gone-1", method: "GET", response: .status(404))
-            let provider = ExchangeProvider(
-                userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: scenario.session)
-
-            let outcome = try await SyncEngine().performDeltaSync(account: account, provider: provider)
-
-            #expect(outcome.succeeded)
-            #expect(try Self.headerExists(
-                accountId: Self.outlookAccountId, folderPath: Self.outlookFolder, messageId: "steady-1", pool: pool))
-            #expect(try !Self.headerExists(
-                accountId: Self.outlookAccountId, folderPath: Self.outlookFolder, messageId: "gone-1", pool: pool))
-            #expect(try Self.cursor(accountId: Self.outlookAccountId, pool: pool) == Self.nextLink,
-                    "a gone message must not hold the delta link back")
-        }
-    }
-
-    /// The detail fetch goes through the provider's ordinary request, so a
-    /// Graph refusal still names Graph's error in the debug log.
-    @Test("An Outlook detail fetch refused by Graph names Graph's error in the debug log")
+    /// The header fetch goes through the provider's ordinary Graph failure log,
+    /// so a refused item still names Graph's error in the debug log.
+    @Test("An Outlook header fetch refused by Graph names Graph's error in the debug log")
     func outlookRefusalIsLogged() async throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("deltadetaillog_\(UUID().uuidString).log")
@@ -852,126 +776,46 @@ struct DeltaDetailFetchFailureTests {
             AppLogStore._resetForTesting()
             try? FileManager.default.removeItem(at: url)
         }
-        try await Self.withAppDB { pool in
-            let account = try Self.makeAccount(
-                id: Self.outlookAccountId, provider: .outlook, cursor: Self.startLink,
-                folderPath: Self.outlookFolder, role: .inbox, pool: pool)
-            let scenario = FakeHTTP.Scenario()
-            defer { scenario.close() }
-            scenario.register(path: "/messages/delta", method: "GET",
-                              response: .json(raw: Self.outlookDeltaPage(ids: ["refused-1"])))
-            scenario.register(path: "/messages/refused-1", method: "GET", response: .json(
-                raw: #"{"error":{"code":"SomeCode","message":"Some message"}}"#, statusCode: 400))
-            let provider = ExchangeProvider(
-                userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: scenario.session)
-
-            await #expect(throws: (any Error).self) {
-                _ = try await SyncEngine().performDeltaSync(account: account, provider: provider)
-            }
+        try await OutlookChangeReadingTests.withWorld { w in
+            try await w.baselineAll()
+            w.server.deliver(OutlookChangeReadingTests.seed("refused-1", in: OutlookChangeReadingTests.archive, daysAgo: 1))
+            w.server.answerBatchItem(providerMessageId: "refused-1", status: 400,
+                                     body: #"{"error":{"code":"SomeCode","message":"Some message"}}"#)
+            try await w.read()
             #expect(AppLogStore.read(channel: .debug).contains("SomeCode: Some message"))
         }
     }
 
-    @Test("A gone Outlook message ahead of a readable one does not stop the detail fetch",
-          arguments: [404, 410])
+    @Test("A gone Outlook message ahead of a readable one does not stop the header fetch", arguments: [404, 410])
     func outlookGoneMessageFirstIsSkipped(status: Int) async throws {
-        let scenario = FakeHTTP.Scenario()
-        defer { scenario.close() }
-        scenario.register(path: "/messages/gone-1", method: "GET", response: .status(status))
-        scenario.register(path: "/messages/steady-1", method: "GET",
-                          response: .json(raw: Self.outlookMessageJSON(id: "steady-1")))
-        let provider = ExchangeProvider(
-            userEmail: "outlook-delta-detail@example.com", accessToken: { _ in "fake-access-token" }, session: scenario.session)
-
-        let details = try await provider.fetchMessageDetails(ids: ["gone-1", "steady-1"])
-
-        #expect(details.map(\.header.messageId) == ["steady-1"])
+        try await OutlookChangeReadingTests.withWorld(
+            seeds: [OutlookChangeReadingTests.seed("steady-1", in: OutlookChangeReadingTests.archive)]
+        ) { w in
+            w.server.answerBatchItem(providerMessageId: "gone-1", status: status, body: nil)
+            let batch = try await w.provider.fetchMessageDetails(ids: ["gone-1", "steady-1"])
+            #expect(batch.details.map(\.header.messageId) == ["steady-1"])
+            #expect(batch.gone == ["gone-1"])
+        }
     }
 
-    // MARK: - Outlook: a fetch that never succeeds does not stop sync
-
-    private static let capturedLink = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages/delta?$deltatoken=captured"
-    private static let afterCaptureLink = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages/delta?$deltatoken=after"
-
-    /// The bound on Outlook is the cursor capture the foreground poll runs after
-    /// its due full sync. Outlook's full sync lists each folder's messages in one
-    /// request and never fetches the stuck message by id, so it cannot fail on
-    /// it. The capture walks the inbox's delta pages to the end and stores the
-    /// final link; the next poll's delta from that link lands what changed
-    /// after it.
-    @Test("An Outlook message whose fetch never succeeds does not stop sync: the capture moves the delta link and later changes land",
-          arguments: Failure.answers)
+    /// An answer about the one message that cannot be used puts it on the
+    /// folder's re-read list; the page is passed, so a change made after it
+    /// lands. A server error is the exception: it holds the page, bounded by
+    /// the folder's failure lapse (`OutlookChangeReadingTests`).
+    @Test("An Outlook message whose header fetch never succeeds does not stop sync",
+          arguments: Failure.answers.filter { $0 != .serverError })
     func outlookStuckMessageDoesNotStopSync(failure: Failure) async throws {
-        try await Self.withAppDB { pool in
-            let account = try Self.makeAccount(
-                id: Self.outlookAccountId, provider: .outlook, cursor: Self.startLink,
-                folderPath: Self.outlookFolder, role: .inbox, pool: pool)
-            let scenario = FakeHTTP.Scenario()
-            defer { scenario.close() }
-            // The full sync: the folder list, the inbox by its well-known name,
-            // and the inbox's messages in one listing.
-            scenario.register(path: "/mailFolders", method: "GET", response: .json(
-                raw: #"{ "value": [ { "id": "\#(Self.outlookFolder)", "displayName": "Inbox", "totalItemCount": 2, "unreadItemCount": 0, "childFolderCount": 0 } ] }"#))
-            scenario.register(path: "/mailFolders/inbox", method: "GET", response: .json(
-                raw: #"{ "id": "\#(Self.outlookFolder)", "displayName": "Inbox" }"#))
-            scenario.register(path: "/mailFolders/\(Self.outlookFolder)/messages", method: "GET", response: .json(
-                raw: #"{ "value": [ \#(Self.outlookMessageJSON(id: "stuck-1")), \#(Self.outlookMessageJSON(id: "ok-1")) ] }"#))
-            // Every delta page, under each path it is requested by (the stored
-            // links name the inbox by its well-known name, the capture by id),
-            // so no shorter folder fixture above answers a delta request.
-            let delta: @Sendable (FakeHTTP.Request) -> FakeHTTP.CannedResponse = { request in
-                let url = request.url.absoluteString
-                if url.contains("deltatoken=start") {
-                    return .json(raw: Self.outlookDeltaPage(ids: ["stuck-1", "ok-1"]))
-                }
-                if url.contains("deltatoken=captured") {
-                    return .json(raw: #"{ "value": [ { "id": "ok-2" } ], "@odata.deltaLink": "\#(Self.afterCaptureLink)" }"#)
-                }
-                if url.contains("skiptoken=page-2") {
-                    return .json(raw: #"{ "value": [ { "id": "ok-1" } ], "@odata.deltaLink": "\#(Self.capturedLink)" }"#)
-                }
-                // The capture's first page, for the inbox folder by id.
-                return .json(raw: #"{ "value": [ { "id": "stuck-1" } ], "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages/delta?$skiptoken=page-2" }"#)
-            }
-            scenario.register(path: "/mailFolders/inbox/messages/delta", method: "GET", handler: delta)
-            scenario.register(path: "/mailFolders/\(Self.outlookFolder)/messages/delta", method: "GET", handler: delta)
-            scenario.register(path: "/messages/stuck-1", method: "GET",
-                              response: failure.response(id: "stuck-1", provider: .outlook))
-            for id in ["ok-1", "ok-2"] {
-                scenario.register(path: "/messages/\(id)", method: "GET", response: .json(raw: Self.outlookMessageJSON(id: id)))
-            }
-            let provider = ExchangeProvider(
-                userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: scenario.session)
-            let engine = SyncEngine()
-            await engine.register(
-                accountId: Self.outlookAccountId, provider: provider,
-                workQueue: ProviderWorkQueue(provider: provider, maxConcurrency: 1))
+        try await OutlookChangeReadingTests.withWorld { w in
+            try await w.baselineAll()
+            w.server.deliver(OutlookChangeReadingTests.seed("stuck-1", in: OutlookChangeReadingTests.archive, daysAgo: 1))
+            Self.injectOutlook(failure, id: "stuck-1", on: w)
+            try await w.read()
+            #expect(try w.recheck(w.archive) == ["stuck-1"], "the stuck message waits on the re-read list")
 
-            await #expect(throws: (any Error).self, "the stuck message must fail the delta, not be taken for deleted") {
-                _ = try await engine.performDeltaSync(account: account, provider: provider)
-            }
-            #expect(try Self.cursor(accountId: Self.outlookAccountId, pool: pool) == Self.startLink)
-
-            // A foreground poll with a full sync due: its delta fails on the
-            // stuck message again, and the capture after its full sync bounds that.
-            try await Self.foregroundPoll(engine: engine, accountId: Self.outlookAccountId, pool: pool)
-            #expect(try Self.storedAccount(id: Self.outlookAccountId, pool: pool)?.lastFullSyncAt != nil,
-                    "precondition: the poll ran its due full sync")
-            #expect(try Self.headerExists(
-                accountId: Self.outlookAccountId, folderPath: Self.outlookFolder, messageId: "stuck-1", pool: pool),
-                    "a message the server still holds must keep its row")
-            #expect(try Self.cursor(accountId: Self.outlookAccountId, pool: pool) == Self.capturedLink,
-                    "the poll must bound the failed delta by storing the inbox's current delta link")
-
-            // The next ordinary poll, with no full sync due: the delta alone
-            // lands a change made after the stuck one.
-            try Self.lastPolledOneIntervalAgo(accountId: Self.outlookAccountId, pool: pool)
-            try await Self.foregroundPoll(engine: engine, accountId: Self.outlookAccountId, pool: pool)
-            #expect(try Self.headerExists(
-                accountId: Self.outlookAccountId, folderPath: Self.outlookFolder, messageId: "ok-2", pool: pool),
-                    "a change made after the stuck one must land")
-            #expect(try Self.cursor(accountId: Self.outlookAccountId, pool: pool) == Self.afterCaptureLink)
-            await engine.remove(accountId: Self.outlookAccountId)
+            w.server.deliver(OutlookChangeReadingTests.seed("ok-2", in: OutlookChangeReadingTests.archive, daysAgo: 0))
+            try await w.read(now: Date().addingTimeInterval(60))
+            #expect(try w.row("ok-2", in: w.archive) != nil, "a change made after the stuck one must land")
+            #expect(try w.recheck(w.archive) == ["stuck-1"], "and the stuck message stays listed")
         }
     }
 }

@@ -26,10 +26,15 @@ import Foundation
 ///   removals, reports `.failed` and keeps the bookmark.
 ///
 /// `inboxOnly` changes nothing but the folder list: the history is one call for
-/// the whole account.
+/// the whole account. A turn that starts with no read budget left reads nothing.
 extension GmailProvider {
     func fetchChanges(since cursor: ChangeCursor, request: ChangeRequest) async throws -> ChangeSet? {
-        let folderList: [FolderInfo]? = request.scope == .all ? try await fetchFolders() : nil
+        // A pass whose turn started with no read budget left reads nothing and
+        // keeps its bookmark (`SyncEngine.changeReadEnd`).
+        guard request.context.hasBudget() else {
+            return .uniform(request, account: .keep, status: .notRun)
+        }
+        let folderList: FolderListUpdate? = request.scope == .all ? .complete(try await fetchFolders()) : nil
 
         guard let historyId = cursor.account else {
             BackgroundSyncLogger.log("gmailDelta: \(userEmail) noHistoryId")

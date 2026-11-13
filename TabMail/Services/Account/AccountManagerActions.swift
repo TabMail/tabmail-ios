@@ -213,7 +213,7 @@ struct ExpectedMessageIdentity: Sendable, Equatable {
     /// statements assign that Optional straight onto an EXISTING row with no nil
     /// check — `SyncEngine.gmailDeltaSync` ×2 (since replaced by the change apply,
     /// whose merge writes a present value only) and `SyncEngine.exchangeDeltaSync`
-    /// ×3, i.e. FIVE when written — so a stored identity can go from present to absent by PROPAGATION
+    /// ×3 (since replaced the same way, ADR-IOS-111), i.e. FIVE when written — so a stored identity can go from present to absent by PROPAGATION
     /// even though nothing nulls it literally. **The failure direction is why
     /// this stays as-is rather than being tightened:** this type is a VETO only,
     /// so a propagated nil causes a spurious refusal, which one ordinary gesture

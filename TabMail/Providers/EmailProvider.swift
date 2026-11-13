@@ -478,8 +478,6 @@ protocol EmailProvider: Sendable {
     /// `EmailProviderChanges.swift`); the engine then keeps its remaining change path.
     func fetchChanges(since cursor: ChangeCursor, request: ChangeRequest) async throws -> ChangeSet?
 
-    // Incremental sync (optional — Gmail uses history.list, IMAP returns nil)
-    func fetchHistory(since historyId: String) async throws -> HistoryResponse?
     func fetchMessageHeaders(ids: [String]) async throws -> [MessageHeaderInfo]
 
     /// Batch fetch text bodies (HTML + text/plain) for FTS indexing.

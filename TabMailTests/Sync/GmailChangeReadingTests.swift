@@ -65,7 +65,7 @@ struct GmailChangeReadingTests {
     func readerFolderList() async throws {
         try await Pins.withWorld(seeds: []) { w in
             let all = try await Self.read(w, cursor: w.server.currentHistoryId())
-            let paths = Set(all.folderList?.map(\.path) ?? [])
+            let paths = Set(all.folderList?.infos.map(\.path) ?? [])
             #expect(paths.isSuperset(of: ["INBOX", Pins.userLabelId]))
             let push = try await Self.read(w, cursor: w.server.currentHistoryId(), scope: .inboxOnly)
             #expect(push.folderList == nil)

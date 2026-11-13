@@ -374,8 +374,11 @@ actor SyncEngine {
     /// Does NOT start backfill, bulk index, embedding rebuild, or full sync fallback.
     /// Designed to complete well within iOS's ~30s background budget.
     /// Returns (changed, reason) where reason describes what happened for diagnostics.
+    /// - Parameter deadline: the caller's own deadline for this call (its timeout),
+    ///   or nil when it sets none. The pass reads only what it can apply before it,
+    ///   whatever its wait for its turn (ADR-IOS-104 decision 2, amended).
     @discardableResult
-    func backgroundDeltaSync(account: Account, inboxOnly: Bool = false) async throws -> (changed: Bool, reason: String) {
+    func backgroundDeltaSync(account: Account, inboxOnly: Bool = false, deadline: Date? = nil) async throws -> (changed: Bool, reason: String) {
         guard let queue = workQueues[account.id] else {
             BackgroundSyncLogger.logDebug("[Sync:bg] No provider for \(account.emailAddress) — skipping")
             BackgroundSyncLogger.log("bgDelta: \(account.emailAddress) noProvider")
@@ -387,12 +390,13 @@ actor SyncEngine {
         // (`oneSyncAtATime`); then this delta runs, on the account's row as it is
         // when its turn starts.
         return try await oneSyncAtATime(accountId: account.id) {
-            try await self.backgroundDeltaPass(accountId: account.id, queue: queue, provider: provider, inboxOnly: inboxOnly)
+            try await self.backgroundDeltaPass(
+                accountId: account.id, queue: queue, provider: provider, inboxOnly: inboxOnly, deadline: deadline)
         }
     }
 
     private func backgroundDeltaPass(
-        accountId: String, queue: ProviderWorkQueue, provider: any EmailProvider, inboxOnly: Bool
+        accountId: String, queue: ProviderWorkQueue, provider: any EmailProvider, inboxOnly: Bool, deadline: Date?
     ) async throws -> (changed: Bool, reason: String) {
         guard let account = try await accountAtTurnStart(accountId) else {
             BackgroundSyncLogger.logDebug("[Sync:bg] Account \(accountId.prefix(8)) was removed before its turn — skipping")
@@ -404,11 +408,13 @@ actor SyncEngine {
 
         // Only attempt delta — never fall through to full sync in background.
         // Full sync is too heavy for the 30s budget and will run on next foreground poll.
-        // Each provider's delta sync already checks its own cursor validity:
-        // - Gmail: returns (false, false) if lastHistoryId is nil
-        // - Outlook: returns (false, false) if delta token is missing
+        // Each provider's change read already checks its own bookmarks:
+        // - Gmail: no account bookmark reads a candidate only, which is stored
+        //   after a foreground pass's listings, so the pass reports no cursor
+        // - Outlook: the inbox's own bookmark; with none, its baseline starts
         // - IMAP/iCloud: stateless STATUS commands, always works
-        // No time-based guard needed here.
+        // The read budget ends early enough for the apply to land before
+        // `deadline` (`changeReadEnd`); a turn that starts too late reads nothing.
 
         // Publish sync phase so push-triggered/background syncs show "Checking..."
         // in the subtitle, not just the foreground path. Defer clears on return.
@@ -419,7 +425,11 @@ actor SyncEngine {
 
         do {
             let result = try await queue.execute(priority: .headerFetch) {
-                try await self.performDeltaSync(account: account, provider: provider, inboxOnly: inboxOnly)
+                try await self.performChangePass(account: account, provider: provider, inboxOnly: inboxOnly, deadline: deadline)
+            }
+            if result.outOfTime {
+                BackgroundSyncLogger.log("bgDelta: \(account.emailAddress) noTime")
+                return (false, "noTime")
             }
             if result.succeeded {
                 try await dbPool.write { db in
@@ -443,7 +453,7 @@ actor SyncEngine {
                 // next checkout creates a fresh one. Retry without disconnect/reconnect.
                 BackgroundSyncLogger.logDebug("[Sync:bg] Connection error for \(account.emailAddress): \(error) — retrying")
                 let retry = try await queue.execute(priority: .headerFetch) {
-                    try await self.performDeltaSync(account: current, provider: provider, inboxOnly: inboxOnly)
+                    try await self.performDeltaSync(account: current, provider: provider, inboxOnly: inboxOnly, deadline: deadline)
                 }
                 if retry.succeeded {
                     try await dbPool.write { db in
@@ -471,8 +481,11 @@ actor SyncEngine {
     /// Foreground sync: always tries delta first, then runs full sync separately
     /// if it's been >15 min since the last one (self-healing safety net).
     /// Delta is always the fast path.
+    /// - Parameter deadline: the caller's own deadline for this call (its timeout),
+    ///   or nil when it sets none; the change read ends early enough for its apply
+    ///   to land before it (ADR-IOS-104 decision 2, amended).
     @discardableResult
-    func sync(account: Account) async throws -> Bool {
+    func sync(account: Account, deadline: Date? = nil) async throws -> Bool {
         guard let queue = workQueues[account.id] else {
             BackgroundSyncLogger.logDebug("[Sync] No provider registered for \(account.emailAddress) — skipping")
             return false
@@ -482,11 +495,13 @@ actor SyncEngine {
         // The work queue has several slots and does not serialize passes: a pass
         // of the same account running now finishes first (`oneSyncAtATime`).
         return try await oneSyncAtATime(accountId: account.id) {
-            try await self.foregroundPass(accountId: account.id, queue: queue, provider: provider)
+            try await self.foregroundPass(accountId: account.id, queue: queue, provider: provider, deadline: deadline)
         }
     }
 
-    private func foregroundPass(accountId: String, queue: ProviderWorkQueue, provider: any EmailProvider) async throws -> Bool {
+    private func foregroundPass(
+        accountId: String, queue: ProviderWorkQueue, provider: any EmailProvider, deadline: Date?
+    ) async throws -> Bool {
         guard let account = try await accountAtTurnStart(accountId) else {
             BackgroundSyncLogger.logDebug("[Sync] Account \(accountId.prefix(8)) was removed before its turn — skipping")
             return false
@@ -519,7 +534,7 @@ actor SyncEngine {
         var changePass: ChangePassOutcome?
         do {
             let deltaResult = try await queue.execute(priority: .headerFetch) {
-                try await self.performChangePass(account: account, provider: provider)
+                try await self.performChangePass(account: account, provider: provider, deadline: deadline)
             }
             changePass = deltaResult
             if deltaResult.succeeded {
@@ -543,7 +558,7 @@ actor SyncEngine {
                     // retry reads from the account row as it is now.
                     guard let current = try await accountAtTurnStart(account.id) else { throw error }
                     let retryResult = try await queue.execute(priority: .headerFetch) {
-                        try await self.performChangePass(account: current, provider: provider)
+                        try await self.performChangePass(account: current, provider: provider, deadline: deadline)
                     }
                     changePass = retryResult
                     if retryResult.succeeded {
@@ -616,10 +631,6 @@ actor SyncEngine {
                 try await commitChangeBaseline(
                     account: account, outcome: changePass, listedFolderIds: listing.listedFolderIds)
                 listingDone = !listing.droppedFolder
-            } else {
-                await queue.execute(priority: .headerFetch) {
-                    await self.captureSyncCursors(account: account, provider: provider)
-                }
             }
 
             let now = Date()

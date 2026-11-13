@@ -123,3 +123,17 @@ required a line.
 
 Search terms: zero `[MoveTrace] deltaSync` sites; `deltaMoveTraceLog` deleted; emission inside a
 write survives rollback; deletion-first; PR #113 round 6b; `ios-queue-008.md` 2026-09-05.
+
+## 2026-11-12 — the Exchange arm is gone; Outlook inserts through the generic change apply
+
+`exchangeDeltaSync`, the Exchange arm this row and the amendments above call "the Exchange twins", is
+deleted with Outlook's move to the provider-neutral change reader (ADR-IOS-111, Outlook amendment).
+Its Sent dedup, its `[Sync] Exchange delta dedup:` `print` lines and its remaining bare `print`s went
+with it. Outlook's change records now insert through the one generic apply
+(`SyncEngineChangesApply.swift`), which carries the Sent and Drafts placeholder dedup with label and
+body carry for every reader; that path is the Gmail reader's since 2026-11-12 and is not the guard this
+row registered. The statements above about the Exchange twins are kept as history, not as a description
+of the current tree.
+
+Search terms: `exchangeDeltaSync` deleted; Exchange delta dedup print removed; Outlook change reader;
+generic change apply Sent dedup; ADR-IOS-111 Outlook amendment.

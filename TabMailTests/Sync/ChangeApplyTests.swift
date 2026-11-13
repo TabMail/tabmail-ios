@@ -463,11 +463,11 @@ struct ChangeApplyTests {
         try await Self.withWorld { w in
             await w.script([{ _, request in
                 var set = Self.tracked(request)
-                set.folderList = [
+                set.folderList = .complete([
                     FolderInfo(name: "INBOX", path: "INBOX", role: .inbox, unreadCount: 0, totalCount: 0),
                     FolderInfo(name: "Archive", path: "Archive", role: .archive, unreadCount: 0, totalCount: 0),
                     FolderInfo(name: "Projects", path: "Label_9", role: .custom, unreadCount: 0, totalCount: 0),
-                ]
+                ])
                 return set
             }])
             let outcome = try await w.outcome()

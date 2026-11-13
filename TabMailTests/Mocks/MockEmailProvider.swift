@@ -214,8 +214,6 @@ actor MockEmailProvider: EmailProvider {
     var sendThrows: Error?
     var appendToSentResult: Bool = true
     var appendToSentThrows: Error?
-    var fetchHistoryResult: HistoryResponse?
-    var fetchHistoryThrows: Error?
     var fetchMessageHeadersResult: [MessageHeaderInfo] = []
     var fetchMessageHeadersThrows: Error?
 
@@ -407,12 +405,6 @@ actor MockEmailProvider: EmailProvider {
         changeRequests.append((cursor, request))
         guard let changeReader else { return nil }
         return try await changeReader(cursor, request)
-    }
-
-    func fetchHistory(since historyId: String) async throws -> HistoryResponse? {
-        callLog.append("fetchHistory(since:\(historyId))")
-        if let error = fetchHistoryThrows { throw error }
-        return fetchHistoryResult
     }
 
     func fetchMessageHeaders(ids: [String]) async throws -> [MessageHeaderInfo] {

@@ -42,7 +42,7 @@ struct ChangeSeamFenceTests {
     @Test("the change readers only read: no database in a reader file")
     func readersOnlyRead() throws {
         let files = try Self.sources().filter { $0.relativePath.hasSuffix("ProviderChanges.swift") }
-        #expect(files.count >= 2, "precondition: the seam and Gmail's reader were read")
+        #expect(files.count >= 3, "precondition: the seam and the Gmail and Outlook readers were read")
         for file in files {
             for term in ["dbPool", "Database", "import GRDB", ".write {", ".read {"] {
                 #expect(!file.source.contains(term), "\(file.relativePath) names \(term)")
@@ -108,5 +108,29 @@ struct FolderChangeStateMigrationTests {
         #expect(FolderChangeState(raw: state.encoded) == state)
         #expect(FolderChangeState().encoded == nil)
         #expect(FolderChangeState(raw: "not json") == FolderChangeState())
+    }
+}
+
+/// `v103_addFolderChangeCursor` adds a folder's own change bookmark, for a
+/// provider that reads changes folder by folder.
+@Suite("Migration v103 — folder.changeCursor")
+struct FolderChangeCursorMigrationTests {
+    @Test("v103 adds a nullable changeCursor and leaves every existing folder without a bookmark")
+    func addsNullableColumn() throws {
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let db = try DatabaseQueue(configuration: configuration)
+        var migrator = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &migrator)
+        try migrator.migrate(db, upTo: "v102_addFolderChangeState")
+        try TestDatabase.insertAccount(db, id: "acc1", email: "one@example.com")
+        try TestDatabase.insertFolder(db)
+        try migrator.migrate(db, upTo: "v103_addFolderChangeCursor")
+        let columns = try db.read { try Row.fetchAll($0, sql: "PRAGMA table_info(folder)") }
+        let column = try #require(columns.first { ($0["name"] as String) == "changeCursor" })
+        #expect((column["notnull"] as Int) == 0)
+        let folder = try #require(try db.read { try Folder.fetchOne($0) })
+        #expect(folder.changeCursor == nil)
+        #expect(OutlookFolderCursor(raw: folder.changeCursor) == nil)
     }
 }

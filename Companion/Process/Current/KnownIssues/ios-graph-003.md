@@ -33,6 +33,16 @@
 > retirement**, which was the largest producer of this arm's input. The date-windowed recovery gap
 > this row shares with `IOS-GRAPH-002` is unchanged in mechanism; it is simply reached far less often.
 <!-- KNOWN-ISSUES-AMENDMENT-END -->
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+> **Amendment (2026-11-12, ADR-IOS-111 Outlook amendment): the recovery mechanism changed.** The
+> recovery paragraph below names `exchangeDeltaSync`'s `messagesAdded` → `fetchMessageDetails` for the
+> Inbox-scoped delta; that arm is deleted. Outlook's change reader now reads a Graph message delta for
+> every synced folder, so the folder the message is actually in reports it under its current id and the
+> reader inserts it at any age once that folder is tracking (a non-Inbox folder fetches its headers in a
+> `$batch` through `fetchMessageDetails`). The date-window gap named below therefore no longer applies to
+> a folder whose own bookmark is tracking; it still applies to a folder in its first round (its baseline
+> inserts only within the held range) and to one that is not synced. The text below is kept as written.
+<!-- KNOWN-ISSUES-AMENDMENT-END -->
 # IOS-GRAPH-003
 
 > Routed from `KNOWN_ISSUES.md` line 648 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 dfa31256dfc43d25d741408ed6e33e2e58ae9984d7cc825a2d59c6c1ae1b6535`).

@@ -88,6 +88,23 @@ enum GraphAPI {
     /// message full fetches (main-app `fetchMessage`, NSE `messageFull`).
     static let fullSelection = headerOnlySelection.appending("body", "parentFolderId")
 
+    /// The state of a message, without its header fields: what the change
+    /// reader's message delta selects for every folder but the Inbox. Applying a
+    /// change to a message the phone holds needs nothing else (read state, flag);
+    /// `receivedDateTime` tells a new or moved-in message apart from a bare
+    /// update, and the headers of a message the phone does not hold are fetched
+    /// separately (`metadataSelection`). A delta round keeps the `$select` it
+    /// started with, so this is chosen when a folder's round chain starts.
+    static let stateSelection = GraphMessageSelection(fields: [
+        "id", "isRead", "flag", "receivedDateTime", "categories"
+    ])
+
+    /// Graph JSON batching endpoint. Each request in a batch names its URL
+    /// relative to the version root, so a mailbox request starts with
+    /// `batchItemPathPrefix`.
+    static let batchURL = "https://graph.microsoft.com/v1.0/$batch"
+    static let batchItemPathPrefix = "/me"
+
     /// Attachment metadata, without the bytes. Listed without `$select`, Graph
     /// returns every file attachment's bytes (`contentBytes`, base64) with the
     /// list; learn.microsoft.com/graph/outlook-large-attachments (Step 4) asks

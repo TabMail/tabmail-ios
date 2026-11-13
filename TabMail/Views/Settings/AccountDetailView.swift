@@ -623,7 +623,7 @@ struct AccountDetailView: View {
         // a tracked folder gets no window listing, so a kept bookmark would leave
         // it empty until the backfill reached the newest mail (ADR-IOS-111).
         try db.execute(
-            sql: "UPDATE folder SET backfillComplete = 0, oldestSyncedDate = NULL, lastKnownUidNext = NULL, backfillUidCursor = NULL, backfillPageToken = NULL, backfillPageHeldSince = NULL, changeState = NULL WHERE accountId = ?",
+            sql: "UPDATE folder SET backfillComplete = 0, oldestSyncedDate = NULL, lastKnownUidNext = NULL, backfillUidCursor = NULL, backfillPageToken = NULL, backfillPageHeldSince = NULL, changeState = NULL, changeCursor = NULL WHERE accountId = ?",
             arguments: [accountId]
         )
     }

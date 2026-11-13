@@ -1,6 +1,7 @@
 <!-- COMPANION-CURRENT-NOTE-BEGIN -->
 > **Current routing note (2026-11-08, tabmail-ios #429): `fetchHistory` also returns nil for a history too long for one delta.** Besides the 404 expiry below, `GmailAPI.historyList` returns nil when the history holds more than `GmailAPI.historyMaxChanges` records or changed messages, or runs past `GmailAPI.historyMaxPages` pages; the caller handles both the same way (clear the cursor, full sync when next due). Detail: memory topic 041.
 > **Current routing note (2026-11-12, ADR-IOS-111): a tracked folder gets no window listing.** A folder whose change bookmark covers it (`Folder.changeState.tracking`) is skipped by the full sync's per-folder listing; its changes arrive through the provider's change reader. The full sync still runs for untracked folders, the catch-up and the maintenance. Gmail's cursor is no longer captured after the full sync: the reader reads a candidate before the listings and the engine stores it after them.
+> **Current routing note (2026-11-12, ADR-IOS-111 Outlook amendment): Outlook's cursor is no longer captured after the full sync either.** Each synced Outlook folder keeps its own Graph delta link (`Folder.changeCursor`), kept until Graph refuses it or the folder's reads fail on server answers for an hour; the account part (`Account.lastHistoryId`) holds the mail-folder delta link. "Also captures fresh sync cursors" in decision 2 below no longer applies to Gmail or Outlook; it still describes IMAP.
 <!-- COMPANION-CURRENT-NOTE-END -->
 
 ## ADR-IOS-009: Two-Tier Delta + Full Sync

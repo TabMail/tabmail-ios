@@ -388,7 +388,8 @@ struct SearchView: View {
     ///     `MessageHeaderRekey.finishMove` ×1 (its no-proven-epoch else arm) ·
     ///     `BackfillBodyQueue.rekeyRemappedHeader` ×1 ·
     ///     `SyncEngine.insertChangeRecord` ×1 (the orphan reclaim) ·
-    ///     `SyncEngine.exchangeDeltaSync` ×3 ·
+    ///     `SyncEngine.exchangeDeltaSync` ×3 (since deleted: Outlook changes go
+    ///     through the change apply, ADR-IOS-111) ·
     ///     `SyncEngine.canonicalizeLocalRows` ×2 ·
     ///     `SyncEngine.runSyncMessages` ×6.
     ///
@@ -450,7 +451,8 @@ struct SearchView: View {
     ///     statements then assign that Optional STRAIGHT ONTO A STORED ROW without a
     ///     nil check — `SyncEngine.gmailDeltaSync` ×2 (since replaced by the change
     ///     apply, whose merge writes a present value only) and
-    ///     `SyncEngine.exchangeDeltaSync` ×3, in `SyncEngineDeltaSync.swift`, in
+    ///     `SyncEngine.exchangeDeltaSync` ×3 (since replaced the same way), in
+    ///     `SyncEngineDeltaSync.swift`, in
     ///     **TWO different shapes**:
     ///       • `existing.rfc822MessageId = info.rfc822MessageId` … `existing.update(db)`
     ///         — the in-place merge arm (gmail ×1, exchange ×2); and

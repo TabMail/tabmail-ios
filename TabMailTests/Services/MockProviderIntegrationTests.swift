@@ -808,42 +808,10 @@ struct ReconnectionTests {
     }
 }
 
-// MARK: - Suite: fetchHistory & fetchMessageHeaders
+// MARK: - Suite: fetchMessageHeaders
 
 @Suite("MockProvider Integration - History & Header Fetch")
 struct HistoryAndHeaderFetchTests {
-
-    @Test("fetchHistory returns configured HistoryResponse")
-    func fetchHistoryReturnsResult() async throws {
-        let mock = MockEmailProvider()
-        let response = HistoryResponse(
-            newHistoryId: "h500",
-            messagesAdded: [HistoryMessageRef(messageId: "new-1", labelIds: ["INBOX"])],
-            messagesDeleted: [HistoryMessageRef(messageId: "del-1", labelIds: ["INBOX"])],
-            labelsAdded: [HistoryLabelChange(messageId: "chg-1", labelIds: ["STARRED"])],
-            labelsRemoved: []
-        )
-        await mock.setFetchHistoryResult(response)
-
-        let result = try await mock.fetchHistory(since: "h400")
-        #expect(result != nil)
-        #expect(result?.newHistoryId == "h500")
-        #expect(result?.messagesAdded.count == 1)
-        #expect(result?.messagesDeleted.count == 1)
-        #expect(result?.labelsAdded.count == 1)
-
-        let log = await mock.callLog
-        #expect(log.contains("fetchHistory(since:h400)"))
-    }
-
-    @Test("fetchHistory returns nil for IMAP providers")
-    func fetchHistoryReturnsNil() async throws {
-        let mock = MockEmailProvider()
-        // fetchHistoryResult is nil by default
-
-        let result = try await mock.fetchHistory(since: "any")
-        #expect(result == nil)
-    }
 
     @Test("fetchMessageHeaders returns configured headers by ID")
     func fetchMessageHeaders() async throws {
@@ -989,6 +957,5 @@ extension MockEmailProvider {
     func setDisconnectThrows(_ error: Error?) { disconnectThrows = error }
     func setMarkReadThrows(_ error: Error?) { markReadThrows = error }
     func setAppendToSentResult(_ result: Bool) { appendToSentResult = result }
-    func setFetchHistoryResult(_ result: HistoryResponse?) { fetchHistoryResult = result }
     func setFetchMessageHeadersResult(_ result: [MessageHeaderInfo]) { fetchMessageHeadersResult = result }
 }
