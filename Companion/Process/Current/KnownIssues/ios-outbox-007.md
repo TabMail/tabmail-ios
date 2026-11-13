@@ -4,6 +4,9 @@
 
 - Register classification: `accepted`
 - Original row SHA-256: `79965140076d67172cbe0da43624e5765ba824b941cf2dae49f9ef313e2dee7f`
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+- Current register classification: `resolved` (2026-11-12, tabmail-ios #533), as in the base-register override row in `KNOWN_ISSUES.md`. The `accepted` line above is the frozen 2026-08-09 classification, kept as history.
+<!-- KNOWN-ISSUES-AMENDMENT-END -->
 
 ## Status
 
