@@ -545,26 +545,33 @@ actor ExchangeCalendarProvider: CalendarProvider {
     }
 
     /// The cap of the split `record` names, written alone (`CalendarProvider.finishSplit`): the
-    /// cap `splitSeries` writes, worked out from the series as it is now, and nothing when the
-    /// series already ends before the split (`splitAlreadyEnded`).
+    /// cap `splitSeries` writes (`endSeries`).
     func finishSplit(calendarId: String = "primary", record: SplitRecord, zone: TimeZone) async throws {
-        let stored = try await fetchForEdit(eventId: record.seriesId, select: Self.splitSelect)
+        try await endSeries(calendarId: calendarId, seriesId: record.seriesId, before: record.splitAt, zone: zone, sendUpdates: "none")
+    }
+
+    /// End the series `seriesId` just before `slot` (`CalendarProvider.endSeries`): the cap
+    /// `splitSeries` writes, worked out from the series as it is now, and nothing when the series
+    /// already ends before `slot` (`splitAlreadyEnded`). Graph's PATCH has no `sendUpdates`, so it
+    /// is unused here, as in every write of this provider.
+    func endSeries(calendarId: String = "primary", seriesId: String, before slot: String, zone: TimeZone, sendUpdates: String) async throws {
+        let stored = try await fetchForEdit(eventId: seriesId, select: Self.splitSelect)
         guard let storedRecurrence = stored.raw["recurrence"] as? [String: Any],
               let storedRange = storedRecurrence["range"] as? [String: Any] else {
             throw CalendarProviderError.notSupported("Can't finish this change to the repeating event: it no longer repeats. Check the event in your calendar app.")
         }
-        guard let capEndDate = Self.graphEndDateBefore(naiveISO: record.splitAt, allDay: stored.event.isAllDay, zone: zone),
+        guard let capEndDate = Self.graphEndDateBefore(naiveISO: slot, allDay: stored.event.isAllDay, zone: zone),
               let cappedJSON = Self.splitCapJSON(master: stored.event, storedRecurrence: storedRecurrence, capEndDate: capEndDate) else {
-            throw CalendarProviderError.notSupported("Invalid recurrence_id '\(record.splitAt)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
+            throw CalendarProviderError.notSupported("Invalid recurrence_id '\(slot)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
         }
         if try Self.splitAlreadyEnded(
-            stored: stored, storedRange: storedRange, capEndDate: capEndDate, splitNaiveISO: record.splitAt, splitZone: zone) {
+            stored: stored, storedRange: storedRange, capEndDate: capEndDate, splitNaiveISO: slot, splitZone: zone) {
             if DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[ExchangeCalendar] finishSplit: series \(record.seriesId) already ends before \(record.splitAt) — nothing to write")
+                BackgroundSyncLogger.logDebug("[ExchangeCalendar] endSeries: series \(seriesId) already ends before \(slot) — nothing to write")
             }
             return
         }
-        try await writeSplitCap(seriesId: record.seriesId, body: try JSONSerialization.data(withJSONObject: cappedJSON))
+        try await writeSplitCap(seriesId: seriesId, body: try JSONSerialization.data(withJSONObject: cappedJSON))
     }
 
     /// Whether the stored series already ends before the split, so `finishSplit` writes no cap:
