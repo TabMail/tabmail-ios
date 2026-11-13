@@ -38,7 +38,51 @@ struct PendingCalendarOperation: Codable, FetchableRecord, PersistableRecord, Id
     /// appear on the calendar shortly"* left no record anywhere. Writing the reason
     /// in the SAME write that retires the row is what makes the outcome outlive the
     /// waiter.
+    ///
+    /// This text is for the assistant and the logs, never for the user. The inbox banner
+    /// for a failure nobody saw (`LateCalendarFailureStore`) reads `failureKind` instead.
     var failureReason: String?
+
+    /// The reserved key in `argumentsJSON` for the event's title as the confirmation card
+    /// showed it, so a late failure can name the event (an edit or delete carries no title
+    /// of its own). Only `init` writes it, from its `eventTitle`; a tool call that carries
+    /// it in its arguments has it removed there. No provider reads it.
+    static let eventTitleKey = "_event_title"
+
+    /// The event's title as the card showed it, or nil when the row has none.
+    var eventTitle: String? {
+        guard case .string(let title)? = arguments[Self.eventTitleKey], !title.isEmpty else { return nil }
+        return title
+    }
+
+    /// The reserved key in `argumentsJSON` for the kind of a terminal failure
+    /// (`CalendarFailureKind`), written with the retirement (`retireCalendarOperation`).
+    static let failureKindKey = "_failure_kind"
+
+    /// The reserved key in `argumentsJSON` marking a failure as seen: the tool that queued it
+    /// was still waiting and its card showed it (`retireAndAnnounce`), so the inbox does not.
+    static let failureSeenKey = "_failure_seen"
+
+    /// The kind of this row's terminal failure, or nil when it has none (not retired, or
+    /// retired by an app version that did not record it).
+    var failureKind: CalendarFailureKind? {
+        guard case .string(let raw)? = arguments[Self.failureKindKey] else { return nil }
+        return CalendarFailureKind(rawValue: raw)
+    }
+
+    /// Whether this row's failure was already shown on its card.
+    var failureSeen: Bool {
+        if case .bool(true)? = arguments[Self.failureSeenKey] { return true }
+        return false
+    }
+
+    /// The keys only the queue writes. A tool call that carries one has it removed in `init`.
+    static let reservedKeys = [eventTitleKey, failureKindKey, failureSeenKey]
+
+    /// Set reserved keys in `argumentsJSON`, keeping every other argument.
+    mutating func setReservedArguments(_ values: [String: JSONValue]) {
+        argumentsJSON = Self.encode(arguments.merging(values) { _, new in new })
+    }
 
     /// Decoded arguments from JSON storage
     var arguments: [String: JSONValue] {
@@ -52,24 +96,31 @@ struct PendingCalendarOperation: Codable, FetchableRecord, PersistableRecord, Id
         accountId: String,
         eventId: String? = nil,
         calendarId: String? = nil,
-        arguments: [String: JSONValue]
+        arguments: [String: JSONValue],
+        eventTitle: String? = nil
     ) {
         self.id = UUID().uuidString
         self.operationType = operationType.rawValue
         self.accountId = accountId
         self.eventId = eventId
         self.calendarId = calendarId
-        // Serialize arguments via JSONEncoder (JSONValue is Encodable)
-        if let data = try? JSONEncoder().encode(arguments),
-           let str = String(data: data, encoding: .utf8) {
-            self.argumentsJSON = str
-        } else {
-            self.argumentsJSON = "{}"
-        }
+        var arguments = arguments
+        for key in Self.reservedKeys { arguments.removeValue(forKey: key) }
+        if let eventTitle { arguments[Self.eventTitleKey] = .string(eventTitle) }
+        self.argumentsJSON = Self.encode(arguments)
         self.status = PendingStatus.queued.rawValue
         self.createdAt = Date()
         self.retryCount = 0
         self.failureReason = nil
+    }
+
+    /// Serialize arguments via JSONEncoder (JSONValue is Encodable).
+    private static func encode(_ arguments: [String: JSONValue]) -> String {
+        if let data = try? JSONEncoder().encode(arguments),
+           let str = String(data: data, encoding: .utf8) {
+            return str
+        }
+        return "{}"
     }
 
     /// Convert Foundation Any to JSONValue for argument replay.

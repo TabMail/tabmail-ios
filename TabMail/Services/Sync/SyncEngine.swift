@@ -262,8 +262,8 @@ actor SyncEngine {
         let t3b = CFAbsoluteTimeGetCurrent()
         if shouldRun() {
             // R17-3 — reclaim terminally-retired calendar ops. Same reclaim class
-            // as the three steps above: bounded, chunked, dropping only rows no
-            // production reader can reach. It rides here rather than in a
+            // as the three steps above: bounded, chunked, dropping only rows the
+            // drain can never claim (an old one's inbox banner goes with it). It rides here rather than in a
             // migration because the table it bounds is what `drainCalendarQueue`
             // full-scans, and the owner's directive keeps non-blocking work off
             // the launch chain. See `runReclaimRetiredCalendarOps`.

@@ -341,10 +341,12 @@ enum SyncConfig {
     /// monotonically and `drainCalendarQueue`'s
     /// `filter(status == queued).order(createdAt)` full-scan-plus-temp-sort (the
     /// table has no index on `status`) got slower forever. The window is a
-    /// retention period for a diagnostic record, not a correctness bound: a
-    /// `failed` row is invisible to the drain, to reconciliation and to every
-    /// production reader, so reclaiming it can neither drop nor revive an
-    /// intention.
+    /// retention period, not a correctness bound: a `failed` row is invisible to
+    /// the drain and to reconciliation, so reclaiming it can neither drop nor
+    /// revive an intention. Its one reader is the inbox banner
+    /// (`LateCalendarFailureStore`), which shows a failure nobody saw until the
+    /// user dismisses it; a banner left undismissed for the whole window goes
+    /// with its row.
     static let retiredCalendarOpRetentionDays = 30
     /// How long a split keeps retrying after Google first answers "not found" (404 or 410) for
     /// a new part it has just reported as already created (a duplicate-id 409), in minutes.

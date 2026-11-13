@@ -493,19 +493,20 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         }
         // Queued with the id `route` gives: the series' for a new time of every occurrence named from
         // one of them, which the queue reads as a move of the series on its own date.
-        return try await queueCalendarEdit(accountId: resolvedAccountId, calendarId: calendarId, calendarName: calendarName, eventId: eventId, queuedEventId: queuedEventId, compoundId: compoundId, arguments: arguments, resolvedScope: resolvedScope, recurrenceId: recurrenceIdArg, zone: tz, cardState: cardState, eventTitle: proposedTitle, translator: ctx.translator)
+        return try await queueCalendarEdit(accountId: resolvedAccountId, calendarId: calendarId, calendarName: calendarName, eventId: eventId, queuedEventId: queuedEventId, compoundId: compoundId, arguments: arguments, resolvedScope: resolvedScope, recurrenceId: recurrenceIdArg, zone: tz, cardState: cardState, eventTitle: proposedTitle, cardTitle: currentTitle, translator: ctx.translator)
     }
 
     // MARK: - Calendar (Queued)
 
-    private func queueCalendarEdit(accountId: String, calendarId: String?, calendarName: String?, eventId: String, queuedEventId: String, compoundId: String, arguments: [String: JSONValue], resolvedScope: String, recurrenceId: String?, zone resolvedTz: TimeZone, cardState: AgentToolRouter.ActionConfirmation.ResponseState, eventTitle: String, translator: any ChatIdTranslating) async throws -> String {
+    private func queueCalendarEdit(accountId: String, calendarId: String?, calendarName: String?, eventId: String, queuedEventId: String, compoundId: String, arguments: [String: JSONValue], resolvedScope: String, recurrenceId: String?, zone resolvedTz: TimeZone, cardState: AgentToolRouter.ActionConfirmation.ResponseState, eventTitle: String, cardTitle: String, translator: any ChatIdTranslating) async throws -> String {
         let manager = AccountManager.shared
         let op = try await manager.queueCalendarOperation(
             type: .edit,
             accountId: accountId,
             eventId: queuedEventId,
             calendarId: calendarId,
-            arguments: arguments
+            arguments: arguments,
+            eventTitle: cardTitle
         )
 
         // Prefer the LLM's new title when changing it; otherwise the

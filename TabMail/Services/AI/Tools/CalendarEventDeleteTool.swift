@@ -198,7 +198,7 @@ struct CalendarEventDeleteTool: AgentTool, Sendable {
         guard !resolvedAccountId.isEmpty else {
             return CalendarProviderDispatch.notAvailableMessage
         }
-        return try await queueCalendarDelete(accountId: resolvedAccountId, calendarId: calendarId, target: target, compoundId: compoundId, arguments: target.queuedArguments(arguments, deviceZone: deviceZone), cardState: cardState)
+        return try await queueCalendarDelete(accountId: resolvedAccountId, calendarId: calendarId, target: target, compoundId: compoundId, arguments: target.queuedArguments(arguments, deviceZone: deviceZone), eventTitle: confirmTitle, cardState: cardState)
     }
 
     // MARK: - Scope (#695)
@@ -327,7 +327,7 @@ struct CalendarEventDeleteTool: AgentTool, Sendable {
 
     // MARK: - Calendar (Queued)
 
-    private func queueCalendarDelete(accountId: String, calendarId: String?, target: Target, compoundId: String, arguments: [String: JSONValue], cardState: AgentToolRouter.ActionConfirmation.ResponseState) async throws -> String {
+    private func queueCalendarDelete(accountId: String, calendarId: String?, target: Target, compoundId: String, arguments: [String: JSONValue], eventTitle: String, cardState: AgentToolRouter.ActionConfirmation.ResponseState) async throws -> String {
         let eventId = target.eventId
         let manager = AccountManager.shared
         let op = try await manager.queueCalendarOperation(
@@ -335,7 +335,8 @@ struct CalendarEventDeleteTool: AgentTool, Sendable {
             accountId: accountId,
             eventId: eventId,
             calendarId: calendarId,
-            arguments: arguments
+            arguments: arguments,
+            eventTitle: eventTitle
         )
 
         // Evict cached details — event is being deleted

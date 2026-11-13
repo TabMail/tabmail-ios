@@ -202,14 +202,18 @@ enum CalendarEventEditExdates {
         }
         BackgroundSyncLogger.logDebug("[CalendarEventEditExdates] \(dates.count) date(s) name \(occurrences.count) occurrence(s) of \(seriesId.prefix(50))")
 
+        // The title each occurrence's card shows; a late failure names it the same way.
+        func cardTitle(_ event: GCalEvent) -> String {
+            let title = event.summary ?? target.event.summary ?? ""
+            return title.isEmpty ? "(No title)" : title
+        }
         let (confirmed, cardState) = await AgentToolRouter.ActionConfirmation.awaitConfirmation(
             action: .calendarEventDelete,
             calendarEvents: occurrences.map { entry in
-                let title = entry.event.summary ?? target.event.summary ?? ""
-                return .init(
+                .init(
                     eventId: entry.id,
                     calendarId: target.calendarName ?? "",
-                    title: title.isEmpty ? "(No title)" : title,
+                    title: cardTitle(entry.event),
                     startDate: entry.event.startDate ?? Date(),
                     endDate: entry.event.endDate ?? entry.event.startDate ?? Date(),
                     isAllDay: entry.event.isAllDay,
@@ -236,7 +240,8 @@ enum CalendarEventEditExdates {
             if let calendarId = target.calendarId { arguments["calendar_id"] = .string(calendarId) }
             return PendingCalendarOperation(
                 operationType: .delete, accountId: target.accountId, eventId: entry.id,
-                calendarId: target.calendarId, arguments: arguments)
+                calendarId: target.calendarId, arguments: arguments,
+                eventTitle: cardTitle(entry.event))
         }
         let manager = AccountManager.shared
         try await manager.queueCalendarOperations(ops)

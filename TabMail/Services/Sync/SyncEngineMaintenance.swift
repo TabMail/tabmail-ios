@@ -406,8 +406,9 @@ extension SyncEngine {
     /// existed. That asymmetry is acceptable precisely because a `failed` row is
     /// inert: it is outside `drainCalendarQueue`'s `status == queued` filter and
     /// outside `AppDatabase.init`'s `inFlight` reset, so it can never be
-    /// re-executed and can never starve a later op. Reclaiming one drops a
-    /// diagnostic record, never a user intention.
+    /// re-executed and can never starve a later op. Reclaiming one drops the
+    /// record of a failure and its inbox banner (`LateCalendarFailureStore`), never
+    /// a user intention.
     nonisolated static func runReclaimRetiredCalendarOps(dbPool: PrioritizedDatabase) {
         let cutoff = Calendar.current.date(
             byAdding: .day, value: -SyncConfig.retiredCalendarOpRetentionDays, to: Date()
