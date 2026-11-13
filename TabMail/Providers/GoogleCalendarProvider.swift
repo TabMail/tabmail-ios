@@ -1538,8 +1538,26 @@ actor GoogleCalendarProvider: CalendarProvider {
     /// guests (an occurrence kept the guest it held on its own) and for a series list written back
     /// unchanged (an occurrence that had dropped a guest stayed without them). This is the rule
     /// every provider follows (`AttendeeChange.seriesDifference`).
+    ///
+    /// A PATCH keeps every field it is not sent, inside `start` and `end` too, so each side it sends
+    /// clears the other form's fields with JSON null: an all-day side nulls `dateTime` and
+    /// `timeZone`, a timed side nulls `date`. Otherwise a change between timed and all-day leaves
+    /// the stored form beside the new one, which Google refuses with 400 "Invalid start time"
+    /// (measured 2026-11-12, single events and series, both directions). Every Google PATCH that
+    /// writes a start or end goes through here: the edit, the split's or series end's cap, and the
+    /// one-occurrence edit.
     static func editJSON(_ merged: GCalEventInput, stored: [String: Any]) -> [String: Any] {
         var json = merged.toJSON()
+        for key in ["start", "end"] {
+            guard var side = json[key] as? [String: Any] else { continue }
+            if side["date"] != nil {
+                side["dateTime"] = NSNull()
+                side["timeZone"] = NSNull()
+            } else if side["dateTime"] != nil {
+                side["date"] = NSNull()
+            }
+            json[key] = side
+        }
         if let change = merged.attendeeChange {
             let own = stored["attendees"] as? [[String: Any]] ?? []
             let after = applied(change, to: own)

@@ -67,8 +67,9 @@ private let kindChangeTimesHint = "to change this event between all-day and time
 /// occurrences stored with its `recurringEventId` that overlap, where they are now, the window the
 /// request names, as Google filters them; a deleted one, kept with `status` "cancelled", is left out
 /// of the list while GET by its id still returns it), `PATCH`
-/// replaces each top-level property the body names (Google's patch semantics: a supplied `start`
-/// replaces the stored `start` whole), and `POST` stores a new event under the `id` it carries.
+/// applies Google's patch semantics (`patched`: a field left out is kept, a JSON null clears it, an
+/// object such as `start` is merged field by field) and refuses with 400 a `start` or `end` left
+/// holding both `date` and `dateTime`, as Google does, and `POST` stores a new event under the `id` it carries.
 /// A PATCH of a series that changes its `recurrence`, or its start or end (another date or
 /// instant, or another zone, `sameTime`), resets the series: its stored occurrences, the ones changed one by
 /// one, are dropped, as Google did when a series was moved from 08:00 to 13:00 (measured on a
@@ -197,9 +198,18 @@ final class FakeGoogleCalendar: Sendable {
             guard parts.count == 1, var stored = event(parts[0]), let body = request.body,
                   let patch = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any]
             else { return .status(400) }
+            let merged = Self.patched(stored, with: patch)
+            // Google refuses a start or end that ends up holding both forms (measured 2026-11-12:
+            // 400 "Invalid start time" when a kind change left the stored other form in place).
+            for key in ["start", "end"] {
+                if let side = merged[key] as? [String: Any], side["date"] != nil, side["dateTime"] != nil {
+                    return .json(raw: #"{"error":{"code":400,"message":"Invalid start time.","errors":[{"domain":"global","reason":"invalid","message":"Invalid start time."}]}}"#,
+                                 statusCode: 400)
+                }
+            }
             let isSeries = (stored["recurrence"] as? [String])?.isEmpty == false
             let changesRule = patch["recurrence"].map { ($0 as? [String]) != (stored["recurrence"] as? [String]) } ?? false
-            let movesTime = ["start", "end"].contains { key in patch[key].map { !Self.sameTime($0, stored[key]) } ?? false }
+            let movesTime = ["start", "end"].contains { key in patch[key].map { _ in !Self.sameTime(merged[key] as Any, stored[key]) } ?? false }
             if isSeries, changesRule || movesTime {
                 resets.withLock { $0 += 1 }
                 events.withLock { all in
@@ -228,7 +238,7 @@ final class FakeGoogleCalendar: Sendable {
                     }
                 }
             }
-            for (key, value) in patch { stored[key] = value }
+            stored = merged
             store(stored)
             patchNotices.withLock { $0.append(Self.sendUpdates(request.url)) }
             writeLog.withLock { $0.append("PATCH \(parts[0])") }
@@ -333,6 +343,24 @@ final class FakeGoogleCalendar: Sendable {
             && instant(written) == instant(stored)
             && (written["dateTime"] == nil) == (stored["dateTime"] == nil)
             && zone(written) == zone(stored)
+    }
+
+    /// `stored` with `patch` applied as Google applies a PATCH: a field the body leaves out is
+    /// kept, a JSON null clears it, an object is merged field by field (so a `start` sent with
+    /// `date` alone keeps a stored `dateTime` and `timeZone`), and any other value replaces the
+    /// stored one whole (an array included).
+    static func patched(_ stored: [String: Any], with patch: [String: Any]) -> [String: Any] {
+        var result = stored
+        for (key, value) in patch {
+            if value is NSNull {
+                result[key] = nil
+            } else if let object = value as? [String: Any] {
+                result[key] = patched(result[key] as? [String: Any] ?? [:], with: object)
+            } else {
+                result[key] = value
+            }
+        }
+        return result
     }
 
     private static func pathParts(_ url: URL) -> [String] {
@@ -596,6 +624,9 @@ struct GoogleCalendarEditKeepsKindTests {
         let after = r.calendar.event("tm-2")
         #expect(start(after)?["date"] as? String == day(7), "start is \(start(after) ?? [:])")
         #expect(end(after)?["date"] as? String == day(8), "end is \(end(after) ?? [:])")
+        #expect(start(after)?["dateTime"] == nil && end(after)?["dateTime"] == nil,
+                "the stored time stayed beside the date: \(start(after) ?? [:]) to \(end(after) ?? [:])")
+        #expect(r.rows.isEmpty, "the change was refused: \(r.rows.map { $0.failureReason ?? $0.status })")
     }
 
     @Test("an explicit all_day: false makes an all-day event timed")
@@ -605,9 +636,46 @@ struct GoogleCalendarEditKeepsKindTests {
             "end_iso": .string("\(day(7))T10:00:00"), "timezone": .string("UTC"),
         ], account: "kind-g-false")
         let after = r.calendar.event("ad-4")
-        #expect(start(after)?["date"] == nil, "still all-day: \(start(after) ?? [:])")
+        #expect(start(after)?["date"] == nil && end(after)?["date"] == nil, "still all-day: \(start(after) ?? [:])")
         #expect((start(after)?["dateTime"] as? String)?.hasPrefix("\(day(7))T09:00:00") == true,
                 "start is \(start(after) ?? [:])")
+        #expect((end(after)?["dateTime"] as? String)?.hasPrefix("\(day(7))T10:00:00") == true,
+                "end is \(end(after) ?? [:])")
+        #expect(r.rows.isEmpty, "the change was refused: \(r.rows.map { $0.failureReason ?? $0.status })")
+    }
+
+    @Test("an explicit all_day: true makes a timed series all-day")
+    func explicitTrueConvertsTimedSeries() async throws {
+        var series = FakeGoogleCalendar.timed(id: "tm-ser", day: day(0))
+        series["recurrence"] = ["RRULE:FREQ=WEEKLY"]
+        let r = try await run([series], eventId: "tm-ser", [
+            "edit_scope": .string("all"), "all_day": .bool(true),
+            "start_iso": .string(day(0)), "end_iso": .string(day(1)),
+        ], account: "kind-g-true-series")
+        let after = r.calendar.event("tm-ser")
+        #expect(r.rows.isEmpty, "the change was refused: \(r.rows.map { $0.failureReason ?? $0.status })")
+        #expect(start(after)?["date"] as? String == day(0) && end(after)?["date"] as? String == day(1),
+                "the series is \(start(after) ?? [:]) to \(end(after) ?? [:])")
+        #expect(start(after)?["dateTime"] == nil && end(after)?["dateTime"] == nil,
+                "the stored time stayed beside the date: \(start(after) ?? [:]) to \(end(after) ?? [:])")
+    }
+
+    @Test("an explicit all_day: false makes an all-day series timed")
+    func explicitFalseConvertsAllDaySeries() async throws {
+        let r = try await run([FakeGoogleCalendar.allDay(id: "ad-ser", start: day(0), end: day(1), recurring: true)],
+                              eventId: "ad-ser", [
+            "edit_scope": .string("all"), "all_day": .bool(false),
+            "start_iso": .string("\(day(0))T09:00:00"), "end_iso": .string("\(day(0))T10:00:00"),
+            "timezone": .string("UTC"),
+        ], account: "kind-g-false-series")
+        let after = r.calendar.event("ad-ser")
+        #expect(r.rows.isEmpty, "the change was refused: \(r.rows.map { $0.failureReason ?? $0.status })")
+        #expect(start(after)?["date"] == nil && end(after)?["date"] == nil,
+                "the stored date stayed beside the time: \(start(after) ?? [:]) to \(end(after) ?? [:])")
+        #expect((start(after)?["dateTime"] as? String)?.hasPrefix("\(day(0))T09:00:00") == true,
+                "start is \(start(after) ?? [:])")
+        #expect((end(after)?["dateTime"] as? String)?.hasPrefix("\(day(0))T10:00:00") == true,
+                "end is \(end(after) ?? [:])")
     }
 
     // The all-day end refusal, on the wire.
