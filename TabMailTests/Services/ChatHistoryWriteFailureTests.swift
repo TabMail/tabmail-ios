@@ -131,6 +131,49 @@ struct ChatHistoryWriteFailureTests {
         #expect(stored == nil)
     }
 
+    @Test("Retrying a failed send after its save failed shows the message once and sends it once")
+    func retryAfterFailedSaveShowsTheMessageOnce() async throws {
+        let (pool, dir, previous) = try installTempDB()
+        defer { tearDown(pool: pool, dir: dir, previous: previous) }
+        await MemoryIndex.shared._testReset()
+
+        let session = ChatPillState.Session()
+        session.chatMessages.append(ChatMessage(role: .user, content: "Earlier question", timestamp: Date()))
+        session.chatMessages.append(ChatMessage(role: .agent, content: "Earlier answer", timestamp: Date()))
+
+        // The send: the message is shown, its save fails, then the request fails.
+        try await pool.write { db in
+            try db.execute(sql: "CREATE TRIGGER refuse_turn BEFORE INSERT ON chatTurn BEGIN SELECT RAISE(ABORT, 'refused'); END")
+        }
+        session.chatMessages.append(ChatMessage(role: .user, content: "Hello", timestamp: Date()))
+        await session.appendTurn(turn(), admission: nil)
+        session.lastFailedMessage = "Hello"
+        session.chatMessages.append(ChatMessage(role: .agent, content: "Couldn't connect.", timestamp: Date()))
+        #expect(warnings(session) == [ChatPillState.Session.historySaveFailedWarning])
+
+        // The retry takes the failed send once; the re-send shows the message again.
+        let retried = session.takeFailedSendForRetry()
+        #expect(retried == "Hello")
+        #expect(session.takeFailedSendForRetry() == nil)
+        session.chatMessages.append(ChatMessage(role: .user, content: "Hello", timestamp: Date()))
+
+        #expect(session.chatMessages.filter { $0.role == .user && $0.content == "Hello" }.count == 1)
+        #expect(session.chatMessages.map(\.content) == ["Earlier question", "Earlier answer", "Hello"])
+    }
+
+    /// The retry button is private to the pill view, so this pins that it takes
+    /// the failed send through the session method above.
+    @Test("The chat pill's retry takes the failed send from its session")
+    func pillRetryTakesFailedSendFromSession() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let source = try String(
+            contentsOf: root.appendingPathComponent("TabMail/Views/Inbox/DynamicIslandChatButton.swift"),
+            encoding: .utf8)
+        #expect(source.contains("session.takeFailedSendForRetry()"))
+        #expect(!source.contains("chatMessages.removeLast("))
+    }
+
     /// The pill's send, resume, resend and rewind paths are private to the
     /// view, so this pins that every chat history write and delete in it goes
     /// through the session methods above, which show the failure.

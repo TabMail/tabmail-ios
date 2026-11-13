@@ -187,6 +187,19 @@ final class ChatPillState {
             }
         }
 
+        /// Takes the failed send for the retry button: returns its text and removes
+        /// that send from the chat, from its user message down, so the re-send shows
+        /// it once. The send is found by its user message, not by counting from the
+        /// end, because a warning can sit between the user message and the error.
+        func takeFailedSendForRetry() -> String? {
+            guard let text = lastFailedMessage else { return nil }
+            lastFailedMessage = nil
+            if let userIndex = chatMessages.lastIndex(where: { $0.role == .user }) {
+                chatMessages.removeSubrange(userIndex...)
+            }
+            return text
+        }
+
         /// Observe inbox message reminder count changes via GRDB ValueObservation.
         /// First emission populates activeReminders (initial load). Subsequent changes
         /// rebuild Buffer 2. The view handles propagation to Buffer 1 based on visibility.

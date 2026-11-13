@@ -875,14 +875,8 @@ struct DynamicIslandChat: View {
                         // Connection-lost: resume the interrupted turn (no re-execution
                         // of completed tools). Same action as the inline affordance.
                         resumeAgentChat()
-                    } else if let msg = lastFailedMessage {
-                        lastFailedMessage = nil
-                        // Remove error bubble + user bubble, then re-send (matches TB retry)
-                        if chatMessages.count >= 2 {
-                            chatMessages.removeLast(2)
-                        } else {
-                            chatMessages.removeLast()
-                        }
+                    } else if let msg = session.takeFailedSendForRetry() {
+                        // The failed send leaves the chat, then is sent again (matches TB retry).
                         sendAgentChat(msg)
                     }
                 } label: {
