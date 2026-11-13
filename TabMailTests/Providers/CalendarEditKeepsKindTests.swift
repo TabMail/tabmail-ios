@@ -678,6 +678,53 @@ struct GoogleCalendarEditKeepsKindTests {
                 "end is \(end(after) ?? [:])")
     }
 
+    /// One occurrence of a timed weekly series, as `events.instances` gives it: its place in the
+    /// series and where it is now, `day` at 09:00-09:30 UTC.
+    private static func timedOccurrence(id: String, master: String, day: String) -> [String: Any] {
+        var e = FakeGoogleCalendar.timed(id: id, day: day)
+        e["recurringEventId"] = master
+        e["originalStartTime"] = ["dateTime": "\(day)T09:00:00Z", "timeZone": "UTC"]
+        return e
+    }
+
+    @Test("an explicit all_day: true makes one occurrence of a timed series all-day")
+    func explicitTrueConvertsTimedOccurrence() async throws {
+        var series = FakeGoogleCalendar.timed(id: "tm-oser", day: day(0))
+        series["recurrence"] = ["RRULE:FREQ=WEEKLY"]
+        let r = try await run([series, Self.timedOccurrence(id: "tm-oser_occ", master: "tm-oser", day: day(7))],
+                              eventId: "tm-oser", [
+            "edit_scope": .string("this_only"), "recurrence_id": .string("\(day(7))T09:00:00"),
+            "all_day": .bool(true), "start_iso": .string(day(7)), "end_iso": .string(day(8)),
+            "timezone": .string("UTC"),
+        ], account: "kind-g-true-occ")
+        let occ = r.calendar.event("tm-oser_occ")
+        #expect(r.rows.isEmpty, "the change was refused: \(r.rows.map { $0.failureReason ?? $0.status })")
+        #expect(r.calendar.writes == ["PATCH tm-oser_occ"], "writes: \(r.calendar.writes)")
+        #expect(start(occ)?["date"] as? String == day(7) && end(occ)?["date"] as? String == day(8),
+                "the occurrence is \(start(occ) ?? [:]) to \(end(occ) ?? [:])")
+        #expect(start(occ)?["dateTime"] == nil && end(occ)?["dateTime"] == nil,
+                "the stored time stayed beside the date: \(start(occ) ?? [:]) to \(end(occ) ?? [:])")
+    }
+
+    @Test("an explicit all_day: false makes one occurrence of an all-day series timed")
+    func explicitFalseConvertsAllDayOccurrence() async throws {
+        let r = try await run([
+            FakeGoogleCalendar.allDay(id: "ad-oser", start: day(0), end: day(1), recurring: true),
+            FakeGoogleCalendar.allDay(id: "ad-oser_occ", start: day(7), end: day(8), master: "ad-oser"),
+        ], eventId: "ad-oser", [
+            "edit_scope": .string("this_only"), "recurrence_id": .string("\(day(7))T00:00:00"),
+            "all_day": .bool(false), "start_iso": .string("\(day(7))T09:00:00"),
+            "end_iso": .string("\(day(7))T10:00:00"), "timezone": .string("UTC"),
+        ], account: "kind-g-false-occ")
+        let occ = r.calendar.event("ad-oser_occ")
+        #expect(r.rows.isEmpty, "the change was refused: \(r.rows.map { $0.failureReason ?? $0.status })")
+        #expect(r.calendar.writes == ["PATCH ad-oser_occ"], "writes: \(r.calendar.writes)")
+        #expect(start(occ)?["date"] == nil && end(occ)?["date"] == nil,
+                "the stored date stayed beside the time: \(start(occ) ?? [:]) to \(end(occ) ?? [:])")
+        #expect((start(occ)?["dateTime"] as? String)?.hasPrefix("\(day(7))T09:00:00") == true,
+                "start is \(start(occ) ?? [:])")
+    }
+
     // The all-day end refusal, on the wire.
 
     @Test("an all-day event given dates of one day, without all_day, is refused with nothing written")
