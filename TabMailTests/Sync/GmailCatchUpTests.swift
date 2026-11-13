@@ -1021,8 +1021,8 @@ struct GmailCatchUpTests {
         let base = Int(Clock().daysAgo(100).timeIntervalSince1970)
         let at = { (second: Int) in Date(timeIntervalSince1970: TimeInterval(second)) }
         let week = SyncConfig.catchUpGmailRangeMaxSpanSeconds
-        func range(_ before: Int?, _ head: [Int], limit: Int = 500, toEpoch: Bool = false) -> GmailProvider.CatchUpRange {
-            GmailProvider.catchUpRange(
+        func range(_ before: Int?, _ head: [Int], limit: Int = 500, toEpoch: Bool = false) -> CatchUpRange {
+            CatchUpRange.cut(
                 nextBeforeSecond: before, head: head.map(at), rowLimit: limit, maxSpanSeconds: week, toEpoch: toEpoch)
         }
 
@@ -1039,7 +1039,7 @@ struct GmailCatchUpTests {
         // A later range ends where the previous (newer) one started, even past its newest row.
         #expect(range(base + 50, [base]) == .init(from: base, firstLocal: base, localEnd: base + 1, upTo: base + 50))
         // A fractional order date belongs to its whole second.
-        #expect(GmailProvider.catchUpRange(
+        #expect(CatchUpRange.cut(
             nextBeforeSecond: nil, head: [Date(timeIntervalSince1970: TimeInterval(base) + 0.5)], rowLimit: 500,
             maxSpanSeconds: week, toEpoch: false) == .init(from: base, firstLocal: base, localEnd: base + 1, upTo: base + 1))
         // Reaching the epoch: only the range that holds every remaining row starts at 0.
@@ -2634,7 +2634,7 @@ struct GmailCatchUpTests {
     func idWhereTwoRangesMeetLoadsOnce() async throws {
         let clock = Clock()
         let (l0, l1) = (clock.daysAgo(1), clock.daysAgo(30))
-        let newer = GmailProvider.catchUpRange(
+        let newer = CatchUpRange.cut(
             nextBeforeSecond: nil, head: [l0, l1], rowLimit: SyncConfig.catchUpGmailRangeRowLimit,
             maxSpanSeconds: SyncConfig.catchUpGmailRangeMaxSpanSeconds, toEpoch: true)
         let seam = Date(timeIntervalSince1970: TimeInterval(newer.from))
