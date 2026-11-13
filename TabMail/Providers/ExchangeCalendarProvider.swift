@@ -675,11 +675,13 @@ actor ExchangeCalendarProvider: CalendarProvider {
 
     /// The date `time` starts on in the series' zone `seriesZone`: an all-day date as written, a
     /// timed instant dated there. Nil when it can't be read.
-    /// The name a series' times are read in (`Prefer: outlook.timezone`), the one its
-    /// `seriesZone` was recognized by: the range's zone when recognized, else the zone the event
-    /// was created in. Nil when neither is: the read is then given in the device's zone, which no
-    /// date is placed in.
+    /// The name a series' times are read in (`Prefer: outlook.timezone`). All day: the range's
+    /// stored name as it is, recognized or not, so an all-day place reads as the date Graph keeps
+    /// it on (measured, see `allDayOccurrence`). Timed: the one its `seriesZone` was recognized by, the
+    /// range's zone when recognized, else the zone the event was created in; nil when neither is,
+    /// and no timed date is then placed (`deletedPlace`).
     nonisolated static func readZoneName(of series: GCalEvent) -> String? {
+        if series.isAllDay { return series.recurrenceTimeZoneName }
         let recognized = { (name: String?) in name.flatMap { CalendarTimeZoneResolver.zone(named: $0, in: .none) } != nil ? name : nil }
         return recognized(series.recurrenceTimeZoneName) ?? recognized(series.ownZoneName)
     }
