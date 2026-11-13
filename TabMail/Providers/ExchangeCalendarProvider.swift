@@ -2118,6 +2118,9 @@ actor ExchangeCalendarProvider: CalendarProvider {
         event.recurrenceTimeZoneName = e.recurrence?.range?.recurrenceTimeZone.flatMap { $0.isEmpty ? nil : $0 }
         event.recurrenceFirstDayOfWeek = e.recurrence?.pattern?.firstDayOfWeek.flatMap { $0.isEmpty ? nil : $0 }
         event.originalStartTime = Self.originalStartTime(e.originalStart)
+        // The read's start is in the zone the read asked for (`request`'s `Prefer`), not the
+        // event's own: no date is read in it (`seriesZone`).
+        event.startZoneIsDisplay = true
         return event
     }
 

@@ -310,6 +310,26 @@ struct SplitCarryTests {
         }
     }
 
+    /// A series as a read gives it: `start` in UTC, its range kept in `range`; `display` when the
+    /// start's zone is only the one the read asked for (Outlook).
+    private static func readSeries(range: String?, display: Bool) throws -> GCalEvent {
+        let start: [String: Any] = ["dateTime": "2099-03-02T10:00:00Z", "timeZone": "UTC"]
+        var event = try JSONDecoder().decode(
+            GCalEvent.self, from: JSONSerialization.data(withJSONObject: ["id": "ser", "start": start, "end": start]))
+        event.recurrenceTimeZoneName = range
+        event.startZoneIsDisplay = display
+        return event
+    }
+
+    @Test("a timed series' zone is never the zone its read was only given in: an Outlook series with a custom or no range zone has none, so its dates are refused")
+    func displayZoneNeverStandsIn() throws {
+        #expect(try Self.readSeries(range: "tzone://Microsoft/Custom", display: true).seriesZone == nil)
+        #expect(try Self.readSeries(range: nil, display: true).seriesZone == nil)
+        #expect(try Self.readSeries(range: "Tokyo Standard Time", display: true).seriesZone?.identifier == "Asia/Tokyo")
+        // Google's and CalDAV's start zone is the event's own.
+        #expect(try Self.readSeries(range: nil, display: false).seriesZone?.identifier == "UTC")
+    }
+
     // MARK: partition
 
     @Test("exceptions sort into four groups by place against the cut and start against the named one; a deleted one goes by its place")
