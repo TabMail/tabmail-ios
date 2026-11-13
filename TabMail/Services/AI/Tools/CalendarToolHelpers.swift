@@ -1264,6 +1264,11 @@ enum CalendarToolHelpers {
     /// rule's days: the calendar resets every exception there, as Google Calendar and Outlook do
     /// (measured).
     static let dayMoveResetNote = "Occurrences you changed or deleted individually are reset: a deleted one comes back on the new day, and a changed one loses its change."
+    /// The confirmation-card line for a change between all-day and timed of a repeating series, or
+    /// of a split's new part: the series changes kind as a whole, so every occurrence changed or
+    /// deleted on its own there is reset, as Google Calendar's "All events" and the Thunderbird
+    /// add-on reset them.
+    static let kindChangeResetNote = "Occurrences you changed or deleted individually are reset: a deleted one comes back, and a changed one loses its change."
     /// The days a rule's day parts name, in words for the confirmation card: `on Monday, Wednesday`,
     /// `on the first Monday`, `on day 1, day 15`, `on the last day`, `in March`, `week starts Monday`. Nil when there are none.
     private static func recurrenceDaysText(_ parts: [String]) -> String? {
@@ -1381,15 +1386,22 @@ enum CalendarToolHelpers {
     /// when the occurrence was moved on its own and which the caller reads when
     /// `needsOccurrenceStartDay` says the rule depends on it.
     ///
-    /// First, a stated `all_day` of the other kind than the stored event's, with neither `start_iso`
-    /// nor `end_iso`, is refused: the patch carries the kind only in its start and end, so no
-    /// provider would change anything and the edit would report success with the event as it was.
-    /// Only a known stored kind is compared; with `storedStart` nil (the queue made no read) this
-    /// check does not guess.
-    static func allDayEditRefusal(_ arguments: [String: JSONValue], storedStart: GCalDateTime?, scope: String, recurrenceId: String?, occurrenceStartDay: String? = nil) -> String? {
+    /// First, a change between all-day and timed needs both a start and an end: a stated `all_day`
+    /// of the other kind than the stored event's, or than the occurrence the edit names
+    /// (`namedOccurrenceStart`, one changed on its own to the other kind), without both `start_iso`
+    /// and `end_iso`, is refused. The patch carries the kind only in its start and end, so with
+    /// neither no provider would change anything and the edit would report success with the event
+    /// as it was; with one, the side left out would keep the old kind, which no provider can write
+    /// as one event. The dates are not derived from the stored ones: a timed event made all-day can
+    /// span other days, and one made timed needs the time and length the user wants, so the
+    /// assistant asks. The Thunderbird add-on refuses the same edits (`kindChangeTimesError`). On
+    /// `this_only` the caller passes the occurrence's own start as `storedStart`, since the edit
+    /// changes that occurrence's kind. Only a known kind is compared; with both nil this check
+    /// does not guess.
+    static func allDayEditRefusal(_ arguments: [String: JSONValue], storedStart: GCalDateTime?, scope: String, recurrenceId: String?, occurrenceStartDay: String? = nil, namedOccurrenceStart: GCalDateTime? = nil) -> String? {
         let stated = boolArg(arguments, "all_day")
-        if let stated, let storedStart, stated != (storedStart.date != nil),
-           stringArgOpt(arguments, "start_iso") == nil, stringArgOpt(arguments, "end_iso") == nil {
+        if let stated, [storedStart, namedOccurrenceStart].contains(where: { $0.map { stated != ($0.date != nil) } ?? false }),
+           stringArgOpt(arguments, "start_iso") == nil || stringArgOpt(arguments, "end_iso") == nil {
             return allDayKindChangeNeedsTimesRefusal
         }
         guard stated ?? (storedStart?.date != nil) else { return nil }
@@ -1428,9 +1440,9 @@ enum CalendarToolHelpers {
         return "this is an all-day event, and the edit gives a time of day without all_day. Ask the user whether it should stay all-day (dates only, with end_iso the day after its last day) or \(allDayOrTimedQuestion)"
     }
 
-    /// Why an edit that states `all_day` of the other kind, with no start or end, cannot be written.
+    /// Why an edit that states `all_day` of the other kind, without both a start and an end, cannot be written.
     private static let allDayKindChangeNeedsTimesRefusal =
-        "to change this event between all-day and timed, give its new start_iso and end_iso as well as all_day (for all-day, start_iso is the first day and end_iso the day after the last day), then retry. If you are not sure of the times or dates, ask the user"
+        "to change this event between all-day and timed, give its new start_iso and end_iso as well as all_day: the change needs both times (for all-day, start_iso is the first day and end_iso the day after the last day), then retry. If you are not sure of the times or dates, ask the user"
 
     /// The second half of both all-day refusals: the timed alternative the assistant offers the user.
     private static let allDayOrTimedQuestion =

@@ -297,9 +297,16 @@ extension CalDAVProvider {
             throw CalendarProviderError.notSupported("A changed occurrence of the repeating event can't be read, so it can't be changed again.")
         }
         block = insertAfterUID(block, ridUnit)
-        return spliceOrReplaceOverride(
+        let spliced = spliceOrReplaceOverride(
             ics: storedICS, recurrenceId: recurrenceIdNaive, kind: kind,
             newOverrideBlock: block.flatMap(\.physical).joined(separator: "\r\n"))
+        // An all-day occurrence made timed is written in a zone (`kindToWrite`) whose VTIMEZONE the
+        // merge added to the override's own calendar; the resource needs it too (RFC 5545 §3.2.19).
+        if masterDTStartKind(from: wrapped) != masterDTStartKind(from: answered),
+           case .zoned(let tzid) = masterDTStartKind(from: answered) {
+            return try addingVTimeZone(named: tzid, to: spliced)
+        }
+        return spliced
     }
 
     /// A line naming one occurrence's place in the series (`RECURRENCE-ID`, `EXDATE`): RFC 5545
@@ -358,14 +365,15 @@ extension CalDAVProvider {
     /// zoned copy stays in its own zone, so the patch's zones are dropped (`Date.fromISO8601` has
     /// already resolved its times). A floating copy keeps them: its wall clock is the patch's time
     /// in the zone the patch names (`formatDTLine`, #753), and a derived end is named in the
-    /// start's zone. A new start with no end keeps the copy's `length`; an end replaces a
-    /// `DURATION`, since RFC 5545 forbids both in one VEVENT.
+    /// start's zone. An all-day copy has no zone of its own and keeps them too: times given for it
+    /// make it timed (`kindToWrite`), in the zone the edit names. A new start with no end keeps
+    /// the copy's `length`; an end replaces a `DURATION`, since RFC 5545 forbids both in one VEVENT.
     private static func mergePatchKeepingLength(
         _ patch: GCalEventInput, into ics: String, length: TimeInterval, zones: CalendarTimeZoneContext
     ) throws -> String {
         var effective = patch
         let kind = masterDTStartKind(from: ics)
-        if kind != .floating {
+        if kind != .floating, kind != .allDay {
             effective.startTimeZone = nil
             effective.endTimeZone = nil
         }

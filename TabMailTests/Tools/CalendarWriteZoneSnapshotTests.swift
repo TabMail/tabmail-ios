@@ -983,8 +983,8 @@ struct CalendarRecurrenceIdZoneTests {
         }
     }
 
-    @Test("CalDAV: a timed occurrence given all_day with only a new end, named as printed in another zone, is found and shown on the card")
-    func calDAVTimedToAllDayEndOnlyAcrossZones() async throws {
+    @Test("CalDAV: a timed occurrence given all_day with new dates, named as printed in another zone, is found and shown on the card")
+    func calDAVTimedToAllDayAcrossZones() async throws {
         let fixture = try OccurrenceWireFixture.make()
         let slot = try fixture.occurrence(2)
         let (device, edit) = try deviceAndEditZones(at: slot)
@@ -992,15 +992,16 @@ struct CalendarRecurrenceIdZoneTests {
         fmt.locale = Locale(identifier: "en_US_POSIX")
         fmt.timeZone = device
         fmt.dateFormat = "yyyy-MM-dd"
+        let start = fmt.string(from: slot)
         let end = fmt.string(from: slot.addingTimeInterval(2 * 86_400))
         try await withCalDAV("rid-c-allday-end", fixture: fixture) { harness, pool in
             let r = try await runEdit([
                 "edit_scope": .string("this_only"), "recurrence_id": .string(naive(slot, device)),
-                "timezone": .string(edit.identifier), "all_day": .bool(true), "end_iso": .string(end),
+                "timezone": .string(edit.identifier), "all_day": .bool(true), "start_iso": .string(start),
+                "end_iso": .string(end),
             ], eventId: OccurrenceWireFixture.seriesPath, calendarId: OccurrenceWireFixture.calendarId,
                account: "rid-c-allday-end", pool: pool, deviceZone: device)
-            // The occurrence is found and its card shown; this calendar then refuses to change a repeating
-            // occurrence's kind at the write, with nothing written, which is not what this test is about.
+            // The occurrence is found and its card shown; a change of kind gives both dates, as it must.
             let card = try #require(r.card, "\(r.cards.count) cards: \(summary(r))")
             #expect(card.startDate == slot, "the card shows \(card.startDate), not the occurrence named")
             _ = harness

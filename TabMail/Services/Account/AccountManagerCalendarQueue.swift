@@ -1003,7 +1003,9 @@ extension AccountManager {
             // It is resolved here, once, before the scope switch, so every provider's edit and every
             // `edit_scope` gets its kind from the same place. The event is the one
             // `CalendarSeriesScope.read` read above: the series for an edit of every occurrence, which
-            // is what is written, else the event the edit names (an occurrence has its series' kind).
+            // is what is written; the occurrence for an edit of one, since one changed on its own can
+            // be of the other kind than its series (its kind is kept, never guessed from the series',
+            // as in the Thunderbird add-on); else the event the edit names.
             //
             // A failed fetch does NOT guess: the throw propagates and the drain classifies it —
             // transient ⇒ retried, permanent ⇒ retired with a reason. Fail closed, per THE MANTRA; a
@@ -1011,7 +1013,8 @@ extension AccountManager {
             // model.
             let movesTime = CalendarToolHelpers.stringArgOpt(routed.args, "start_iso") != nil
                 || CalendarToolHelpers.stringArgOpt(routed.args, "end_iso") != nil
-            let written = routed.scope == "all" ? try named.readSeries() : named.event
+            let written = routed.scope == "all" ? try named.readSeries()
+                : routed.scope == "this_only" ? named.occurrence ?? named.event : named.event
             var stored: GCalEvent? = nil
             if resolvedAllDay == nil,
                movesTime || CalendarToolHelpers.recurrenceUntilIsAtStake(routed.args) {
@@ -1038,18 +1041,12 @@ extension AccountManager {
             // series keeps), with no read; on `this_only` it is the day the occurrence starts on now,
             // which the provider answers below (`occurrenceStartDay`) for an end given alone on an
             // all-day occurrence, and otherwise `recurrence_id`'s date; on `all` it is the
-            // event's stored start, taken from the read above when there was one. The master's start
+            // event's stored start, the series read above (`written`). The master's start
             // is earlier than any later occurrence's, so a scoped edit compared with it would pass an
-            // end on the occurrence's own start. On `all` the series read above is the target only when
-            // the refusal below needs it (an explicit `all_day: true` skipped the kind above and the
-            // edit gives an end but no start); otherwise the value stays nil. The KIND still comes from
-            // the stored event above, on every scope: an occurrence has its series' kind.
-            let movesEndOnly = CalendarToolHelpers.stringArgOpt(routed.args, "end_iso") != nil
-                && CalendarToolHelpers.stringArgOpt(routed.args, "start_iso") == nil
-            var target = stored
-            if scope == "all", target == nil, resolvedAllDay == true, movesEndOnly {
-                target = written
-            }
+            // end on the occurrence's own start. The KIND a stated `all_day` is compared with is
+            // `written`'s and, when the edit names an occurrence, that occurrence's: an occurrence
+            // changed on its own can be of the other kind, and a change of either kind needs both a
+            // start and an end (`allDayEditRefusal`).
 
             // An all-day end is the day after the last day, so an all-day edit whose end is on or
             // before its start would write a zero-length event (an all-day event given times of one
@@ -1065,8 +1062,9 @@ extension AccountManager {
             // Before it, the same place refuses an all-day event given a time of day with `all_day`
             // left out: the user may want a timed event or that date all day, and dropping the time
             // (`buildGCalEventInput`'s `prefix(10)`) would choose for them. Only the kind resolved
-            // from the stored event is checked; a stated `all_day` is taken at its word. Both
-            // refusals tell the assistant to ask the user. The edit tool applies the same rule
+            // from the stored event is checked; a stated `all_day` is taken at its word, except
+            // that one of the other kind needs both `start_iso` and `end_iso`, as in the Thunderbird
+            // add-on. Every refusal tells the assistant to ask the user. The edit tool applies the same rule
             // (`allDayEditRefusal`) before its confirmation card; it is applied again here because
             // the event can change between the card and the drain.
             //
@@ -1083,8 +1081,8 @@ extension AccountManager {
                     calendarId: calId, eventId: writeId, recurrenceId: rid, recurrenceIdZone: recurrenceIdZone)
             }
             if let reason = CalendarToolHelpers.allDayEditRefusal(
-                routed.args, storedStart: target?.start, scope: scope, recurrenceId: recurrenceId,
-                occurrenceStartDay: occurrenceStartDay) {
+                routed.args, storedStart: written.start, scope: scope, recurrenceId: recurrenceId,
+                occurrenceStartDay: occurrenceStartDay, namedOccurrenceStart: named.occurrence?.start) {
                 throw CalendarProviderError.notSupported(reason)
             }
             var input = try CalendarToolHelpers.buildGCalEventInput(routed.args, isAllDay: resolvedAllDay)
