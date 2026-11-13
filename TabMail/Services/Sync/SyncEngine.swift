@@ -574,12 +574,13 @@ actor SyncEngine {
         //    the read, so it does not hold back the rest of the account.
         let timeSinceFullSync = account.lastFullSyncAt.map { Date().timeIntervalSince($0) } ?? .infinity
         let listingNeeded = changePass?.needsListing ?? false
-        if timeSinceFullSync >= fullSyncInterval || listingNeeded {
+        let fullSyncDue = timeSinceFullSync >= fullSyncInterval || listingNeeded
+        if fullSyncDue {
             BackgroundSyncLogger.logDebug("[Sync] Full sync due for \(account.emailAddress) (last: \(timeSinceFullSync.isFinite ? "\(Int(timeSinceFullSync))s" : "never"), new bookmark: \(listingNeeded))...")
             let plan = FullSyncPlan(appliedFolderList: changePass?.appliedFolderList)
-            let listedFolderIds: Set<String>
+            let listing: FullSyncListing
             do {
-                listedFolderIds = try await queue.execute(priority: .headerFetch) {
+                listing = try await queue.execute(priority: .headerFetch) {
                     try await self.fullSync(account: account, provider: provider, plan: plan)
                 }
             } catch {
@@ -587,7 +588,7 @@ actor SyncEngine {
                     // Pool self-heals: dead connections discarded on checkin(healthy: false),
                     // next checkout creates a fresh one. Retry without disconnect/reconnect.
                     BackgroundSyncLogger.logDebug("[Sync] Connection lost during full sync, retrying...")
-                    listedFolderIds = try await queue.execute(priority: .headerFetch) {
+                    listing = try await queue.execute(priority: .headerFetch) {
                         try await self.fullSync(account: account, provider: provider, plan: plan)
                     }
                 } else {
@@ -598,11 +599,17 @@ actor SyncEngine {
                 }
             }
 
+            // A reader pass whose listing dropped a folder keeps the full sync
+            // due: the next foreground pass lists the folders still untracked
+            // (tracked ones get no window listing) instead of waiting for the
+            // next scheduled full sync.
+            var listingDone = true
             if let changePass, changePass.fromReader {
                 // The reader's bookmark was read BEFORE these listings; store a
                 // candidate and turn tracking on only now that they are done.
                 try await commitChangeBaseline(
-                    account: account, outcome: changePass, listedFolderIds: listedFolderIds)
+                    account: account, outcome: changePass, listedFolderIds: listing.listedFolderIds)
+                listingDone = !listing.droppedFolder
             } else {
                 await queue.execute(priority: .headerFetch) {
                     await self.captureSyncCursors(account: account, provider: provider)
@@ -610,12 +617,14 @@ actor SyncEngine {
             }
 
             let now = Date()
+            let fullSyncDone = listingDone
             try await dbPool.write { db in
                 _ = try Account.filter(Column("id") == account.id)
-                    .updateAll(db,
-                        Column("lastSyncedAt").set(to: now),
-                        Column("lastFullSyncAt").set(to: now)
-                    )
+                    .updateAll(db, Column("lastSyncedAt").set(to: now))
+                if fullSyncDone {
+                    _ = try Account.filter(Column("id") == account.id)
+                        .updateAll(db, Column("lastFullSyncAt").set(to: now))
+                }
             }
             BackgroundSyncLogger.logDebug("[Sync] Full sync completed for \(account.emailAddress)")
             hadChanges = true
@@ -632,8 +641,9 @@ actor SyncEngine {
         // If delta sync failed and full sync didn't run (not due yet), no server contact
         // succeeded — propagate the error so the caller knows sync failed. Without this,
         // the caller reports success and updates lastSyncCompletedAt, showing "Updated less
-        // than a minute ago" even when offline.
-        if !deltaSyncSucceeded, timeSinceFullSync < fullSyncInterval, let error = deltaSyncError {
+        // than a minute ago" even when offline. A full sync the read's need for a listing
+        // ran (after a retry that read a new candidate) did reach the server.
+        if !deltaSyncSucceeded, !fullSyncDue, let error = deltaSyncError {
             throw error
         }
 

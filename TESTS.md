@@ -511,7 +511,7 @@ folder-scoped; over `SyncConfig.changeRecheckLimit` the folder's catch-up is arm
 replaces its placeholder and carries the body; a failed read applies its removals, keeps the cursor and
 throws; a refusal clears the bookmark, untracks every folder, marks one lapse, makes the full sync due and
 reads again with no bookmark in the same pass; a candidate is stored after the listings with no lapse
-mark, also when a folder's listing failed, and only the folders listed become tracked; one pass asks for
+mark, also when a folder was not listed, and only the folders listed become tracked; one pass asks for
 at most `SyncConfig.changeRereadBudgetPerPass` re-read ids, taking the folders' lists in turn, and the ids
 not asked for stay listed; a re-read id kept back again goes to the back of its list; the read's folder
 list is applied; a provider with no reader keeps its old path. `GmailChangeReadingTests` checks Gmail's reader against
@@ -528,11 +528,13 @@ racing a pass) are listed and the pass stores a bookmark; applying the read's fo
 backfill version; a foreground pass with the full sync due applies the folder list (a new label added, a
 gone one removed) from ONE label request, the full sync reusing the read's list instead of fetching its own;
 a refusal whose re-read loses the connection marks ONE lapse and reads the history once (the retry starts
-from the account row, not the pass's copy); a folder whose listing keeps failing does not hold the
-bookmark back, the other folders are not listed again on every pass, a change to its mail during the
-failure arrives by the read, and the folder is listed and tracked once it recovers; with full re-read
-lists and a slow server a background pass lands new mail and moves the bookmark inside its deadline, and
-every id it did not read stays listed. `ChangeSeamFenceTests` holds four source fences (no provider cast in the engine's change files, no database in a reader, the shields read only inside the
+from the account row, not the pass's copy), in a foreground pass (which also does not report the lost
+connection once it has listed) and in a background pass; a first sync whose listing loses the connection
+at one folder stores the bookmark, keeps the full sync due, and on the next foreground pass lists only the
+folders still untracked, a change to their mail during the failure arriving by the read, and once the
+listing works they are tracked and the full sync is done; with full re-read lists and a slow server a
+background pass re-reads exactly the budget, lands new mail and moves the bookmark inside its deadline,
+and every id it did not read stays listed. `ChangeSeamFenceTests` holds four source fences (no provider cast in the engine's change files, no database in a reader, the shields read only inside the
 per-folder transaction, no window listing for a tracked folder) and the v102 migration.
 `ChangeApplyFuzzTests` runs seeded interleavings of other-client changes, queued and drained ops and
 completions during a read, checking that queued intentions keep their rows, a completion during a read

@@ -27,7 +27,8 @@ extension SyncEngine {
     }
 
     /// The account's row as it is now, read as a pass's first step inside its
-    /// turn; `nil` once the account has been removed. A pass never acts on sync
+    /// turn (and again before a pass retries its change read, which the failed
+    /// attempt may have moved); `nil` once the account has been removed. A pass never acts on sync
     /// state its caller read before the turn: a pass ahead of it may have moved
     /// the delta cursor (`Account.lastHistoryId`) or run the full sync
     /// (`lastFullSyncAt`, `lastSyncedAt`) meanwhile, and a pass that waited and

@@ -462,8 +462,10 @@ struct GmailChangeReadingTests {
     /// The refusal is applied (bookmark cleared, one lapse) before the same pass
     /// reads again with no bookmark. When that re-read loses the connection, the
     /// pass's retry must start from the account as it is now (no bookmark), not
-    /// from the pass's copy: that copy's bookmark is refused a second time.
-    @Test("a refusal whose re-read loses the connection marks ONE lapse and reads the history once")
+    /// from the pass's copy: that copy's bookmark is refused a second time. The
+    /// full sync is not forced due, so the pass lists only because the read
+    /// needs it, and having listed it must not report the lost connection.
+    @Test("a refusal whose re-read loses the connection marks ONE lapse, reads the history once, and the pass that lists does not fail")
     func refusalThenLostConnectionMarksOneLapse() async throws {
         try await Pins.withWorld(seeds: [
             Pins.seed("lapse-once", labels: ["INBOX"], date: Pins.daysAgo(40)),
@@ -476,7 +478,8 @@ struct GmailChangeReadingTests {
             w.server.expireHistory()
             w.server.failNextProfile(transport: .networkConnectionLost)
             let historyBefore = w.historyRequestCount()
-            try await w.foregroundPassWithFullSyncDue()
+            #expect(try w.account().lastFullSyncAt != nil, "precondition: the full sync is not due by time")
+            try await Self.foregroundPassFullSyncNotForced(w)
 
             #expect(w.server.profileFailuresServedCount() == 1, "precondition: the re-read after the refusal lost its connection")
             #expect(w.historyRequestCount() - historyBefore == 1, "the retry read the refused bookmark's history again")
@@ -489,7 +492,33 @@ struct GmailChangeReadingTests {
         }
     }
 
-    // MARK: - a folder whose listing keeps failing
+    /// The background twin: its retry must start from the account row too.
+    @Test("a background pass whose re-read after a refusal loses the connection marks ONE lapse and reads the history once")
+    func backgroundRefusalThenLostConnectionMarksOneLapse() async throws {
+        try await Pins.withWorld(seeds: [
+            Pins.seed("bg-lapse-once", labels: ["INBOX"], date: Pins.daysAgo(40)),
+        ]) { w in
+            try await w.foregroundPassWithFullSyncDue()
+            let before = try Self.lapseCounts(w)
+            #expect(!before.isEmpty, "precondition: the folders hold a catch-up state")
+
+            w.server.applyLabelChange(providerMessageId: "bg-lapse-once", add: ["STARRED"])
+            w.server.expireHistory()
+            w.server.failNextProfile(transport: .networkConnectionLost)
+            let historyBefore = w.historyRequestCount()
+            try await Self.backgroundPass(w)
+
+            #expect(w.server.profileFailuresServedCount() == 1, "precondition: the re-read after the refusal lost its connection")
+            #expect(w.historyRequestCount() - historyBefore == 1, "the retry read the refused bookmark's history again")
+            let after = try Self.lapseCounts(w)
+            for (folderId, count) in before {
+                #expect(after[folderId] == count + 1, "folder \(folderId.suffix(12)): lapse count \(count) -> \(after[folderId] ?? -1), not one lapse")
+            }
+            #expect(try w.account().lastHistoryId == nil, "a background pass stores no candidate; the next foreground pass lists")
+        }
+    }
+
+    // MARK: - a folder the full sync drops
 
     /// One foreground pass with the full sync NOT forced due.
     static func foregroundPassFullSyncNotForced(_ w: Pins.World) async throws {
@@ -517,47 +546,53 @@ struct GmailChangeReadingTests {
         }
     }
 
-    /// The candidate is read before the listings, so a folder whose listing
-    /// fails does not hold it back: the folder stays untracked, every later full
-    /// sync lists it, and its changes after the candidate arrive by the reads.
-    @Test("a folder whose listing keeps failing does not hold the bookmark back; the others are not listed again, and it is listed with its changes once it recovers")
-    func failingFolderDoesNotHoldTheBookmark() async throws {
+    /// The candidate is read before the listings, so a folder the full sync
+    /// drops does not hold it back: the dropped folders stay untracked, the full
+    /// sync stays due, and the next foreground pass lists only them. Their
+    /// changes after the candidate arrive by the reads. A lost connection stops
+    /// the listing at that folder, so every later folder is dropped too.
+    @Test("a first sync whose listing loses the connection stores the bookmark, and the next pass lists only the folders not yet listed, with their changes")
+    func droppedFolderDoesNotHoldTheBookmark() async throws {
         try await Pins.withWorld(seeds: [
-            Pins.seed("failing-changed", labels: [Pins.userLabelId], date: Pins.daysAgo(2)),
-            Pins.seed("failing-quiet", labels: [Pins.userLabelId], date: Pins.daysAgo(2)),
-            Pins.seed("failing-inbox", labels: ["INBOX"], date: Pins.daysAgo(2)),
+            Pins.seed("dropped-changed", labels: [Pins.userLabelId], date: Pins.daysAgo(2)),
+            Pins.seed("dropped-quiet", labels: [Pins.userLabelId], date: Pins.daysAgo(2)),
+            Pins.seed("dropped-inbox", labels: ["INBOX"], date: Pins.daysAgo(2)),
         ]) { w in
             // A new account: no bookmark, nothing tracked.
             try await Self.clearBookmark(w)
-            w.server.failListings(status: 500, label: Pins.userLabelId)
+            w.server.failListings(transport: .networkConnectionLost, label: Pins.userLabelId)
             try await w.foregroundPassWithFullSyncDue()
-            #expect(w.server.listingFailuresServedCount() > 0, "precondition: the label's listing failed")
-            #expect(try w.account().lastHistoryId != nil, "the bookmark is stored though one folder's listing failed")
+            #expect(w.server.listingFailuresServedCount() > 0, "precondition: the label's listing lost the connection")
+            #expect(try w.account().lastHistoryId != nil, "the bookmark is stored though the listing dropped folders")
             #expect(try Self.isTracking(w, w.inbox), "a listed folder is tracked")
-            #expect(try !Self.isTracking(w, w.label), "the folder not listed stays untracked")
-            #expect(try w.row("failing-inbox", in: w.inbox) != nil)
+            #expect(try !Self.isTracking(w, w.label), "a dropped folder stays untracked")
+            #expect(try w.account().lastFullSyncAt == nil, "the full sync stays due")
+            #expect(try w.row("dropped-inbox", in: w.inbox) != nil)
 
-            // During the failure another client changes a message in that folder.
-            w.server.applyLabelChange(providerMessageId: "failing-changed", add: ["STARRED"])
-            let windowBefore = Self.windowListingLabels(w).count
+            // During the failure another client changes a message in the dropped folder.
+            w.server.applyLabelChange(providerMessageId: "dropped-changed", add: ["STARRED"])
+            let beforeRetry = Self.windowListingLabels(w).count
             try await Self.foregroundPassFullSyncNotForced(w)
-            try await Self.foregroundPassFullSyncNotForced(w)
-            #expect(Self.windowListingLabels(w).count == windowBefore, "the folders are listed again on every pass")
-            #expect(try w.row("failing-changed", in: w.label)?.isFlagged == true,
-                    "a change to a message the failing folder does not hold yet arrives by the read")
-
-            // A due full sync while the folder still fails lists only that folder.
-            let dueBefore = Self.windowListingLabels(w).count
-            try await w.foregroundPassWithFullSyncDue()
-            let listedInDuePass = Self.windowListingLabels(w).dropFirst(dueBefore)
-            #expect(!listedInDuePass.isEmpty && Set(listedInDuePass) == [Pins.userLabelId],
-                    "a due full sync lists the untracked folder and no tracked one: \(Array(listedInDuePass))")
+            let retried = Array(Self.windowListingLabels(w).dropFirst(beforeRetry))
+            #expect(retried.contains(Pins.userLabelId), "the next pass lists the dropped folder again: \(retried)")
+            #expect(!retried.contains("INBOX"), "a tracked folder is not listed again: \(retried)")
+            #expect(try w.row("dropped-changed", in: w.label)?.isFlagged == true,
+                    "a change to a message the dropped folder does not hold yet arrives by the read")
 
             w.server.clearListingFailures()
-            try await w.foregroundPassWithFullSyncDue()
-            #expect(try Self.isTracking(w, w.label), "listed once it recovers, and tracked")
-            #expect(try w.row("failing-changed", in: w.label)?.isFlagged == true, "the change made during the failure is there")
-            #expect(try w.row("failing-quiet", in: w.label) != nil, "a message no change named arrives by the listing")
+            let beforeRecovery = Self.windowListingLabels(w).count
+            try await Self.foregroundPassFullSyncNotForced(w)
+            let recovered = Array(Self.windowListingLabels(w).dropFirst(beforeRecovery))
+            #expect(recovered.contains(Pins.userLabelId) && !recovered.contains("INBOX"),
+                    "once the listing works the pass lists only the folders not yet listed: \(recovered)")
+            #expect(try Self.isTracking(w, w.label), "and tracks them")
+            #expect(try w.account().lastFullSyncAt != nil, "and the full sync is done")
+            #expect(try w.row("dropped-changed", in: w.label)?.isFlagged == true, "the change made during the failure is there")
+            #expect(try w.row("dropped-quiet", in: w.label) != nil, "a message no change named arrives by the listing")
+
+            let afterDone = Self.windowListingLabels(w).count
+            try await Self.foregroundPassFullSyncNotForced(w)
+            #expect(Self.windowListingLabels(w).count == afterDone, "with the full sync done, the next pass lists nothing")
         }
     }
 
@@ -601,6 +636,7 @@ struct GmailChangeReadingTests {
             let left = try await w.pool.read { db in
                 FolderChangeState(raw: try Folder.fetchOne(db, key: inboxId)?.changeState).recheck
             }
+            #expect(read.count == SyncConfig.changeRereadBudgetPerPass, "the pass re-read \(read.count) ids, not the budget")
             #expect(!left.isEmpty, "precondition: the pass did not read every listed id")
             #expect(Set(left) == Set(ids).subtracting(read),
                     "every id the pass did not read stays listed, and every id it read and applied leaves")

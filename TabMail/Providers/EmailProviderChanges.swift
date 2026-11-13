@@ -61,8 +61,9 @@ enum AccountCursorUpdate: Sendable, Equatable {
     case set(String)
     /// The stored bookmark can no longer be read from; drop it.
     case clear
-    /// A new bookmark read BEFORE any listing. The engine stores it only after
-    /// the folders marked `.baselineReady` have been listed in full.
+    /// A new bookmark read BEFORE any listing. The engine stores it after the
+    /// foreground pass's listings; only the folders those listings finished
+    /// become tracked.
     case candidate(String)
 }
 

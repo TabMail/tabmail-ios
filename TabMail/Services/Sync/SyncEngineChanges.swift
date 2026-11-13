@@ -26,8 +26,9 @@ import GRDB
 // 7. the bookmark, last, in its own transaction (a crash before it replays the
 //    same changes, which the apply takes idempotently).
 // A candidate bookmark (`.candidate`) is not stored here: the foreground pass
-// stores it after its listings (`commitChangeBaseline`); a folder whose listing
-// failed stays untracked and is listed by a later full sync.
+// stores it after its listings (`commitChangeBaseline`); a folder the full sync
+// dropped stays untracked and the full sync stays due, so the next foreground
+// pass lists it.
 
 /// The engine-owned, provider-blind change state of one folder
 /// (`Folder.changeState`). Message ids only (ADR-004).
@@ -80,7 +81,7 @@ struct ChangePassOutcome: Sendable {
     /// The read carried the folder list and it was applied (the MODSEQ-skippable
     /// paths), so the full sync skips its own discovery.
     var appliedFolderList: Set<String>?
-    /// A candidate bookmark, stored once the folders are listed.
+    /// A candidate bookmark, stored after the foreground pass's listings.
     var candidate: String?
     /// Folders the read covered (`.tracked` or `.baselineReady`).
     var trackableFolderIds: Set<String> = []
@@ -258,11 +259,16 @@ extension SyncEngine {
     ///   pass's read covered, becomes tracked;
     /// - a candidate bookmark is stored, WITHOUT a lapse mark: it was read before
     ///   the listings, so nothing between them is lost, and the catch-up is not
-    ///   asked to list again (#783). It is stored even when a folder's listing
-    ///   failed: that folder stays untracked, so every later full sync lists it
-    ///   until a listing finishes, and its changes after the candidate arrive by
-    ///   the reads from the bookmark (an account-wide reader names every folder,
-    ///   and a full record inserts a message the folder does not hold yet).
+    ///   asked to list again (#783). It is stored also when the full sync
+    ///   dropped a folder (`FullSyncListing.droppedFolder`: a lost connection
+    ///   stops the listing there, so that folder and every later one; a failed
+    ///   retry or SELECT, that folder). Those folders stay untracked and the
+    ///   caller keeps the full sync due, so the next foreground pass lists them;
+    ///   their changes after the candidate arrive by the reads from the bookmark
+    ///   (an account-wide reader names every folder, and a full record inserts a
+    ///   message the folder does not hold yet). A listing that fails any other
+    ///   way (an HTTP status, an answer that cannot be decoded) fails the whole
+    ///   pass before this runs, and nothing is stored.
     func commitChangeBaseline(account: Account, outcome: ChangePassOutcome, listedFolderIds: Set<String>) async throws {
         let accountId = account.id
         let nowTracked = outcome.trackableFolderIds.intersection(listedFolderIds)

@@ -52,21 +52,28 @@ and that capture was a lapse, so a new account listed every folder twice for the
 5. **The bookmark is read before the listings.** With no bookmark the reader returns a candidate (Gmail:
    the profile's history id) and every folder `.baselineReady`. The engine makes the full sync due, the same
    foreground pass lists, runs the catch-up, and only then stores the candidate, WITHOUT a lapse mark (#783).
-   Background passes never store a candidate. The candidate is stored even when a folder's listing failed:
-   that folder stays untracked, so every later full sync lists it until a listing finishes, and nothing is
-   lost meanwhile. A change to its mail after the candidate is in the history the next reads take from the
-   bookmark; an account-wide reader names every folder, and a full record inserts a message the folder does
-   not hold yet. Its mail as it stood before is taken by its later window listing, and older mail by its
-   catch-up, which runs for every syncable folder whether or not the window listing finished and keeps a
-   lapse mark until that folder's check is done. (Superseded: the candidate waited for every syncable
-   folder, so one folder that could not be listed kept the account with no bookmark, and every foreground
-   pass listed every folder again while changes to older mail went unread.)
+   Background passes never store a candidate. The candidate is stored also when the full sync dropped a
+   folder (`FullSyncListing.droppedFolder`). The full sync's per-folder failure handling decides which:
+   a lost connection is retried once, and a second loss stops the listing, so that folder and every later
+   one go unlisted; any other error on that retry, or (IMAP) a failed SELECT, drops that folder only; any
+   other first failure (an HTTP status, an answer that cannot be decoded) fails the whole pass, and then
+   nothing is stored. Dropped folders stay untracked, and a reader pass that dropped a folder leaves
+   `lastFullSyncAt` unwritten, so the next foreground pass runs the full sync again and lists only the
+   untracked folders (tracked ones get no window listing). Nothing is lost meanwhile: a change to their
+   mail after the candidate is in the history the next reads take from the bookmark; an account-wide
+   reader names every folder, and a full record inserts a message the folder does not hold yet. Their mail
+   as it stood before is taken by the later window listing, and older mail by the catch-up, which runs for
+   every syncable folder whether or not the window listing finished and keeps a lapse mark until that
+   folder's check is done. (Superseded: the candidate waited for every syncable folder, so a dropped folder
+   kept the account with no bookmark, and every foreground pass listed every folder again while changes to
+   older mail went unread.)
 6. **Refusal.** One transaction clears the bookmark, untracks every folder, marks one lapse for each
    folder's catch-up and makes the full sync due (`applyChangeRefusal`); the same pass then reads again with
    no bookmark, so the re-list and the new candidate happen in that pass and exactly one catch-up check runs.
    A pass's retry after a lost connection reads the account row again first: the failed attempt may already
    have applied a refusal, and retrying from the pass's own copy would be refused a second time and mark a
-   second lapse.
+   second lapse. When that retry reads a new candidate and the pass lists, the pass does not report the
+   first attempt's lost connection as its failure: a full sync that ran reached the server.
 7. **Gmail's reader** (`GmailProviderChanges.swift`): `labels.list` as the folder list on `.all` passes (a
    label created, renamed or deleted shows on the next pass), the history read as before, a deleted message
    a removal in every folder, every changed or re-read message fetched once and a record in each folder its

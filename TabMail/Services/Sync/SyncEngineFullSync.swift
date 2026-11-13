@@ -96,6 +96,16 @@ extension SyncEngine {
         }
     }
 
+    /// What one full sync's window listings did.
+    struct FullSyncListing: Sendable {
+        /// The folders whose window listing finished in this pass.
+        var listedFolderIds: Set<String> = []
+        /// A folder the full sync meant to list went unlisted after a failure:
+        /// a lost connection (that folder and every later one), a retry that
+        /// failed otherwise, or a failed SELECT.
+        var droppedFolder = false
+    }
+
     /// Apply the provider's folder list: upsert name, counts and the IMAP status
     /// values, bootstrap epochs, insert new folders, remove vanished ones, and (Gmail)
     /// sync the user-label rows. Runs inside one write transaction.
@@ -263,9 +273,10 @@ extension SyncEngine {
     ///   the engine applied it, so the discovery request is skipped. A folder whose
     ///   change bookmark covers it (`FolderChangeState.tracking`) gets no window
     ///   listing: its changes arrive through the reader.
-    /// - Returns: the ids of the folders whose window listing finished in this pass.
+    /// - Returns: the folders whose window listing finished in this pass, and
+    ///   whether a folder it meant to list went unlisted after a failure.
     @discardableResult
-    func fullSync(account: Account, provider: any EmailProvider, plan: FullSyncPlan = FullSyncPlan()) async throws -> Set<String> {
+    func fullSync(account: Account, provider: any EmailProvider, plan: FullSyncPlan = FullSyncPlan()) async throws -> FullSyncListing {
         let fs0 = CFAbsoluteTimeGetCurrent()
         let acctTag = "\(account.provider):\(account.id.prefix(6))"
         BootProfiler.mark("fullSync[\(acctTag)] START (network — fetch folders + inbox headers → populates inbox)")
@@ -402,9 +413,9 @@ extension SyncEngine {
             BackgroundSyncLogger.logDebug("[FullSync] \(account.emailAddress) \(trackedFolderIds.count) tracked folder(s): no window listing")
         }
 
-        let (uidMigratedOldIds, listedFolderIds): ([String], Set<String>) = try await Task.detached {
+        let (uidMigratedOldIds, listing): ([String], FullSyncListing) = try await Task.detached {
             var allMigratedIds: [String] = []
-            var listed: Set<String> = []
+            var listing = FullSyncListing()
             // `!skippablePaths.contains` — Fix B task 4: a CONDSTORE-unchanged non-inbox
             // folder is not re-fetched (its HIGHESTMODSEQ proves nothing changed). The
             // reconcile loop below still visits it, so external deletions are never missed.
@@ -436,10 +447,11 @@ extension SyncEngine {
                     )
                     BackgroundSyncLogger.logDebug("[FullSync] \(account.emailAddress) \(folder.name): \(Int((CFAbsoluteTimeGetCurrent() - ft0) * 1000))ms")
                     allMigratedIds.append(contentsOf: await processSyncResult(result, folder: folder))
-                    listed.insert(folder.id)
+                    listing.listedFolderIds.insert(folder.id)
                 } catch {
                     if Self.isSelectFailedError(error) {
                         BackgroundSyncLogger.logDebug("[FullSync] SELECT failed for \(folder.name) (\(folder.path)) — skipping: \(error)")
+                        listing.droppedFolder = true
                         continue
                     }
                     if Self.isConnectionError(error) {
@@ -453,8 +465,9 @@ extension SyncEngine {
                                 dbPool: pool
                             )
                             allMigratedIds.append(contentsOf: await processSyncResult(retryResult, folder: folder))
-                            listed.insert(folder.id)
+                            listing.listedFolderIds.insert(folder.id)
                         } catch {
+                            listing.droppedFolder = true
                             if Self.isConnectionError(error) {
                                 // Retry also hit connection error — server unreachable. Skip remaining folders.
                                 BackgroundSyncLogger.logDebug("[FullSync] Retry failed for \(folder.name): \(error) — skipping remaining folders")
@@ -495,7 +508,7 @@ extension SyncEngine {
                 }
 
             }
-            return (allMigratedIds, listed)
+            return (allMigratedIds, listing)
         }.value
 
         // Clear undo protection for migrated UIDs
@@ -572,7 +585,7 @@ extension SyncEngine {
         // Body fetching happens during backfill (startBackfill called after fullSync).
         // Running it inline here would block sync and explode memory for large folders.
         // Unread recount is handled per folder in `processSyncResult`, right after its listing commits.
-        return listedFolderIds
+        return listing
     }
 
     // MARK: - Message Sync
