@@ -947,6 +947,22 @@ struct ExchangeSplitCarryTests {
         #expect(r.http.recordedCalls().allSatisfy { $0.method == "GET" }, "something was written: \(r.http.servedCallSequence())")
     }
 
+    @Test("a series whose range names no zone is refused with nothing written: a deleted date is never placed in the zone the read was given in")
+    func noRangeZoneIsNotReadInTheDisplayZone() async throws {
+        var series = GraphSplitFixture.series(range: GraphSplitFixture.noEnd)
+        var recurrence = try #require(series["recurrence"] as? [String: Any])
+        var range = try #require(recurrence["range"] as? [String: Any])
+        range.removeValue(forKey: "recurrenceTimeZone")
+        recurrence["range"] = range
+        series["recurrence"] = recurrence
+        // Non-vacuity: the start is labelled with a zone TabMail recognizes, the one the read asked for.
+        #expect(CalendarTimeZoneResolver.zone(named: GraphSplitFixture.zone, in: .none) != nil)
+        let r = try await split(exceptions: [], cancelled: [3], parts: [2, 3], patch: Self.rename, series: series)
+        defer { r.http.close() }
+        #expect(r.error != nil, "the split went on: \(r.http.servedCallSequence())")
+        #expect(r.http.recordedCalls().allSatisfy { $0.method == "GET" }, "something was written: \(r.http.servedCallSequence())")
+    }
+
     @Test("a changed occurrence is carried WHOLE: its own importance, categories and reminder survive a rename")
     func carryCopiesTheWholeException() async throws {
         let r = try await split(exceptions: [Self.exception(2) { e in
