@@ -690,6 +690,41 @@ struct IMAPCatchUpTests {
         }
     }
 
+    /// The catch-up ignores the Wi-Fi-only setting but keeps IMAP's own network
+    /// rule (ADR-IOS-107 decision 2, 2026-11-12): on a cellular network with
+    /// Wi-Fi-only on, the backfill call the worker and the background job make
+    /// (walk held back) runs no daily full listing; a non-expensive network does.
+    @Test("With Wi-Fi-only on and only cellular, a backfill cycle runs no IMAP daily listing; a non-expensive network does")
+    func wifiOnlyCellularKeepsTheDailyRule() async throws {
+        try await Self.withWorld("cu-wifi-only-cellular", serverUIDs: [1, 2], localUIDs: [1, 2]) { world in
+            let accountId = world.accountId
+            let account = try #require(try await world.pool.read { db in try Account.fetchOne(db, key: accountId) })
+            await world.engine.register(
+                accountId: world.accountId, provider: world.provider,
+                workQueue: ProviderWorkQueue(provider: world.provider, maxConcurrency: 1))
+            world.server.setFlags(["\\Seen"], in: Self.path, uid: 2)
+            let modseq = try #require(try Self.storedModSeq(world))
+            // Daily check overdue, nothing else signals a change.
+            let overdue = IMAPCatchUpState(
+                epoch: Self.epoch, completionStamp: modseq,
+                lastCompletedAt: Date().addingTimeInterval(-2 * SyncConfig.catchUpFullCheckIntervalSeconds),
+                listing: nil)
+            try Self.setState(overdue, world)
+
+            try await GmailCatchUpTests.withCellularAndWiFiOnly { () async throws in
+                _ = await world.engine.runBackfill(account: account, walkAllowed: false)
+                #expect(Self.fetchCount(world.server) == 0, "no daily listing on cellular")
+                #expect(try Self.rows(world)["2"]?.isRead == false)
+                #expect(try Self.state(world) == overdue, "the daily check is still due")
+            }
+            if !NetworkMonitor.checkExpensive() {
+                _ = await world.engine.runBackfill(account: account)
+                #expect(try Self.rows(world)["2"]?.isRead == true, "the daily listing runs on a non-expensive network")
+            }
+            await world.engine.remove(accountId: world.accountId)
+        }
+    }
+
     /// A device that is always on an expensive network (cellular, a hotspot, Low
     /// Data Mode) must still get a full catch-up.
     @Test("A folder never listed lists on an expensive network once it has waited long enough")

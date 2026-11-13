@@ -152,6 +152,9 @@ extension SyncEngine {
         /// How long one slice may spend (`SyncConfig.catchUpSliceSeconds`), and the
         /// window the next slice of the account waits for.
         let sliceSeconds: TimeInterval
+        /// The gap between the starts of two slices of the account, the pacing
+        /// window (`SyncConfig.catchUpSliceIntervalSeconds`, real time).
+        let intervalSeconds: TimeInterval
         /// Most requests one slice may send (`SyncConfig.catchUpSliceMaxRequests`).
         var sliceMaxRequests = SyncConfig.catchUpSliceMaxRequests
         /// The clock the slices and the deadline are measured on. Injectable so a
@@ -163,7 +166,8 @@ extension SyncEngine {
             CatchUpRun(
                 isExpensiveNetwork: NetworkMonitor.checkExpensive(),
                 storageLimitInForce: StorageEstimator.budgetMB != Int.max,
-                deadline: deadline, sliceSeconds: SyncConfig.catchUpSliceSeconds, clock: { Date() })
+                deadline: deadline, sliceSeconds: SyncConfig.catchUpSliceSeconds,
+                intervalSeconds: SyncConfig.catchUpSliceIntervalSeconds, clock: { Date() })
         }
 
         /// The context of a slice that starts now: it ends one slice from now, or
@@ -196,7 +200,7 @@ extension SyncEngine {
     /// progress (the worker's `didWork`).
     ///
     /// The request rate: a slice sends at most `run.sliceMaxRequests`, and opens a
-    /// window of `run.sliceSeconds` (real time) in `catchUpSliceWindowEnds`; no
+    /// window of `run.intervalSeconds` (real time) in `catchUpSliceWindowEnds`; no
     /// slice of the account, from this run or another, starts before the window
     /// ends. The wait happens outside the turn, so a delta is never held by it,
     /// and never reaches past the run's deadline: a window that ends at or after
@@ -217,7 +221,7 @@ extension SyncEngine {
                     return .windowOpen(until: end)
                 }
                 guard let context = run.sliceStartingNow() else { return .runOver }
-                self.catchUpSliceWindowEnds[accountId] = Date().addingTimeInterval(run.sliceSeconds)
+                self.catchUpSliceWindowEnds[accountId] = Date().addingTimeInterval(run.intervalSeconds)
                 let folderIds: [String]
                 do {
                     folderIds = try await self.syncableFolderIds(accountId: accountId)

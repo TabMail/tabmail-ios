@@ -38,6 +38,12 @@ final class NetworkMonitor {
     nonisolated static func setConnectedForTesting(_ connected: Bool) {
         connectedMutex.withLock { $0 = connected }
     }
+
+    /// Scoped fixtures set an expensive (cellular) network and restore the prior
+    /// cached value when they end.
+    nonisolated static func setExpensiveForTesting(_ expensive: Bool) {
+        expensiveMutex.withLock { $0 = expensive }
+    }
     #endif
 
     /// Read expensive-network flag from any isolation context without MainActor hop.

@@ -203,12 +203,22 @@ extension SyncEngine {
     /// Respects battery/idle/cellular gates. Progress is reported per cycle.
     static let backfillDisabled = false
 
-    /// How long the backfill worker sleeps after a `runBackfill` call. A call
-    /// that did no work (every remaining folder held, skipped or declined, or
+    /// How long the backfill worker sleeps after a backfill call. A call whose
+    /// walk did no work (every remaining folder held, skipped or declined, or
     /// nothing left to do) waits the profile's idle delay, so a page held for
-    /// minutes is not re-listed at the pace of a productive walk.
-    nonisolated static func backfillInterCycleDelay(didWork: Bool, profile: BackfillProfile) -> TimeInterval {
-        didWork ? profile.interCycleActiveDelay : profile.interCycleIdleDelay
+    /// minutes is not re-listed at the pace of a productive walk. Catch-up
+    /// progress shortens the wait only once every walk of the account is complete
+    /// (`walkComplete`): then no page can be held, and the catch-up's slices keep
+    /// the active pace (the slice gap, `SyncConfig.catchUpSliceIntervalSeconds`,
+    /// paces their requests). While a walk is unfinished, only the walk's own work
+    /// decides (ADR-IOS-107, #766). The worker is per account, so another
+    /// account's progress never enters this. *Superseded (#766):* any work of the
+    /// call, the catch-up's progress included, chose the active delay.
+    nonisolated static func backfillInterCycleDelay(
+        cycle: BackfillCycle, walkComplete: Bool, profile: BackfillProfile
+    ) -> TimeInterval {
+        let active = cycle.walked || (walkComplete && cycle.caughtUp)
+        return active ? profile.interCycleActiveDelay : profile.interCycleIdleDelay
     }
 
     func startBackfill(account: Account) {
@@ -250,15 +260,17 @@ extension SyncEngine {
                     // No-op when nothing privileged is active.
                     await PriorityGate.shared.yield("backfill-walk")
 
-                    // Pause backfill when user has WiFi-only setting enabled and we're on cellular.
+                    // Pause the WALK when user has WiFi-only setting enabled and we're on cellular.
                     // Uses checkExpensive() (Mutex-backed) as WiFi proxy — on iOS, expensive == cellular/hotspot.
-                    // Pauses (not stops) so backfill resumes instantly when WiFi returns or setting is toggled.
+                    // Pauses (not stops) so the walk resumes instantly when WiFi returns or setting is toggled.
+                    // The catch-up ignores the setting (ADR-IOS-107 decision 2, 2026-11-12): it lists ids and
+                    // labels under its own network rules, and its repairs must not wait for a Wi-Fi network
+                    // that may never come. *Superseded:* the setting paused the whole cycle.
                     let wifiOnly = UserDefaults.standard.object(forKey: "backgroundSyncWiFiOnly") as? Bool ?? true
-                    if wifiOnly && NetworkMonitor.checkExpensive() {
-                        BackgroundSyncLogger.logDebug("[Backfill] \(account.emailAddress) paused — WiFi-only enabled, on cellular")
-                        BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress) PAUSED — WiFi-only enabled, on cellular (retry in 30s)")
-                        try? await Task.sleep(for: .seconds(30))
-                        continue
+                    let walkAllowed = !(wifiOnly && NetworkMonitor.checkExpensive())
+                    if !walkAllowed {
+                        BackgroundSyncLogger.logDebug("[Backfill] \(account.emailAddress) walk paused — WiFi-only enabled, on cellular")
+                        BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress) walk PAUSED — WiFi-only enabled, on cellular (the catch-up still runs)")
                     }
 
                     guard !Task.isCancelled else { BackgroundSyncLogger.logDebug("[Backfill] \(account.emailAddress) cancelled"); break }
@@ -266,15 +278,19 @@ extension SyncEngine {
                     let profile = await self?.getBackfillProfile() ?? .low
                     BackgroundSyncLogger.logDebug("[Backfill] \(account.emailAddress) cycle start (profile=\(profile))")
                     BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress) cycle start (profile=\(profile))")
-                    let didWork = await self?.runBackfill(account: account) ?? false
+                    let cycle = await self?.runBackfillCycle(account: account, walkAllowed: walkAllowed)
+                        ?? BackfillCycle(walked: false, caughtUp: false)
                     await self?.updateBackfillProgressForAccount(account)
+                    let walkDone = await self?.isFolderWalkComplete(account: account) ?? false
 
-                    if !didWork {
-                        let walkDone = await self?.isFolderWalkComplete(account: account) ?? false
+                    if !cycle.didWork {
                         BackgroundSyncLogger.logDebug("[Backfill] \(account.emailAddress) no work, walkDone=\(walkDone)")
                         BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress) cycle no work, walkDone=\(walkDone)")
                         guard walkDone else {
-                            let sleepDelay = Self.backfillInterCycleDelay(didWork: didWork, profile: profile)
+                            // A walk held back by Wi-Fi-only retries after the setting's pause.
+                            let sleepDelay = walkAllowed
+                                ? Self.backfillInterCycleDelay(cycle: cycle, walkComplete: walkDone, profile: profile)
+                                : 30
                             try? await Task.sleep(for: .seconds(sleepDelay))
                             continue
                         }
@@ -289,7 +305,7 @@ extension SyncEngine {
                         break
                     }
 
-                    let sleepSeconds = Self.backfillInterCycleDelay(didWork: didWork, profile: profile)
+                    let sleepSeconds = Self.backfillInterCycleDelay(cycle: cycle, walkComplete: walkDone, profile: profile)
                     try? await Task.sleep(for: .seconds(sleepSeconds))
                 }
 

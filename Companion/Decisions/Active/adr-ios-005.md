@@ -6,6 +6,9 @@
 > the catch-up run (`runCatchUpRun`), one slice per foreground cycle and slices until the deadline in
 > the background processing job (`SyncConfig.backgroundBackfillDeadlineSeconds`, formerly the literal
 > `5 * 60` in `SyncScheduler`). The worker's gates (battery, Wi-Fi-only, Low Power Mode) gate both.
+> *Amended 2026-11-12:* Wi-Fi-only holds back the walk only; the catch-up ignores it and keeps its own
+> network rules (ADR-IOS-107 decision 2). Battery and Low Power Mode still delay both. Catch-up progress
+> picks the worker's active delay only once every walk of the account is complete.
 > The notes below say "the full sync's catch-up"; read "the catch-up".
 >
 > **Current note (2026-11-12).** The full sync's catch-up never re-arms or otherwise writes the walk:

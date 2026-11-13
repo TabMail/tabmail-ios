@@ -20,7 +20,7 @@ actor SyncEngine {
     /// When the account's current catch-up slice window ends (ADR-IOS-107, #766):
     /// no catch-up slice of the account, from any run, starts before it, so slices
     /// run back to back send at most `SyncConfig.catchUpSliceMaxRequests` per
-    /// `SyncConfig.catchUpSliceSeconds`. In memory only; a relaunch starts afresh.
+    /// `SyncConfig.catchUpSliceIntervalSeconds`. In memory only; a relaunch starts afresh.
     var catchUpSliceWindowEnds: [String: Date] = [:]
 
     /// Cached server-reported total message count for Gmail/Exchange accounts.

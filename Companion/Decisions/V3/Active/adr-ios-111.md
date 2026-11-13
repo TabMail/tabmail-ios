@@ -67,6 +67,10 @@ and that capture was a lapse, so a new account listed every folder twice for the
    folder's check is done. (Superseded: the candidate waited for every syncable folder, so a dropped folder
    kept the account with no bookmark, and every foreground pass listed every folder again while changes to
    older mail went unread.)
+   *Amended 2026-11-12 (ADR-IOS-107, #766):* the catch-up no longer runs in the pass; the backfill worker
+   runs it after the pass, in slices. The pass lists and then stores the candidate; the catch-up's listing
+   comes later. The candidate was still read before every listing, so a change made during the catch-up's
+   listing is in the history the next read takes. "runs the catch-up" above is superseded.
 6. **Refusal.** One transaction clears the bookmark, untracks every folder, marks one lapse for each
    folder's catch-up and makes the full sync due (`applyChangeRefusal`); the same pass then reads again with
    no bookmark, so the re-list and the new candidate happen in that pass and exactly one catch-up check runs.
@@ -74,6 +78,9 @@ and that capture was a lapse, so a new account listed every folder twice for the
    have applied a refusal, and retrying from the pass's own copy would be refused a second time and mark a
    second lapse. When that retry reads a new candidate and the pass lists, the pass does not report the
    first attempt's lost connection as its failure: a full sync that ran reached the server.
+   *Amended 2026-11-12 (ADR-IOS-107, #766):* the one catch-up check the lapse calls for runs in the
+   backfill worker (which every foreground poll starts) or the background processing job, not in the
+   pass itself.
 7. **Gmail's reader** (`GmailProviderChanges.swift`): `labels.list` as the folder list on `.all` passes (a
    label created, renamed or deleted shows on the next pass), the history read as before, a deleted message
    a removal in every folder, every changed or re-read message fetched once and a record in each folder its

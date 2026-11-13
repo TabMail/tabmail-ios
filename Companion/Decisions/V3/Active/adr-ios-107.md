@@ -149,11 +149,57 @@ The owner's rulings of 2026-11-09:
        progress, so the foreground worker keeps cycling (the profile's active delay between cycles:
        3 s, or 0.5 s on power) until the listing completes; then a cycle does no work and, with the
        walk done, the worker exits until the next poll starts it.
+       - *Amended 2026-11-12 (#766): only the walk's own work decides the delay while a walk is
+         unfinished.* A call returns what each part did (`SyncEngine.BackfillCycle`: `walked`,
+         `caughtUp`). The worker waits the profile's ACTIVE delay after a call whose walk did work, or
+         whose catch-up made progress once every walk of the account is complete
+         (`isFolderWalkComplete`); after any other call it waits the IDLE delay
+         (`SyncEngine.backfillInterCycleDelay`). Reason: a page the walk holds (a message that keeps
+         failing transiently) waits the idle delay between listings (#757); a catch-up that makes
+         progress in the same call must not turn that wait into the active delay and re-list the
+         held page at the active pace. Once every walk is complete no page can be held, and the
+         catch-up keeps the active pace; its requests are paced by the slice gap
+         (`SyncConfig.catchUpSliceIntervalSeconds`), not by the worker's delay. The worker and its
+         delay are per account, so another account's progress never shortens an account's wait.
+         *Superseded:* "returns true when the walk did work or the catch-up made progress, so the
+         foreground worker keeps cycling (the profile's active delay between cycles [...])" as the
+         rule for the delay; the return value of `runBackfill` (either part did something) still
+         keeps the worker cycling. Test: `BackfillPageWalkHoldBoundTests.heldPageWaitsWhileCatchUpProgresses`
+         (three accounts on one engine: an account holding a page while its own catch-up progresses,
+         and one holding a page while another account's catch-up progresses; neither held page is
+         listed again inside the idle delay).
      - **The worker's gates now gate the catch-up.** The worker pauses while the battery is below 20%
        and not charging, and while the Wi-Fi-only setting (`backgroundSyncWiFiOnly`, default on) is
        on and the network is expensive; the background job does not run in Low Power Mode or, with
        Wi-Fi-only on, on an expensive network. The catch-up waits for the same conditions as the walk
        (see the consequences).
+       - *Superseded 2026-11-12 (#766, the Wi-Fi-only ruling below):* the Wi-Fi-only half of the bullet
+         above. The battery gate and Low Power Mode still delay the catch-up as stated.
+     - **Wi-Fi-only holds back the walk, not the catch-up (amended 2026-11-12, #766).** The catch-up
+       ignores the Wi-Fi-only setting and keeps its own network rules, unchanged: a Gmail listing on
+       an expensive network (cellular or a hotspot) waits at most
+       `SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds` (7 days) since the last completed listing
+       and then lists on any network; an IMAP folder on an expensive network lists only on a MODSEQ
+       change, and its daily full check waits for a non-expensive network for at most the same 7 days.
+       The walk keeps honouring Wi-Fi-only exactly as before. Reason: the catch-up lists ids and
+       labels only (bodies are loaded only for a message that is missing locally): one full listing
+       of a ten-year Gmail Inbox (1,825 messages, 1,371 list requests) is about 1.4 MB. Its repairs
+       (a read or flag change, a removal, a message archived on the web older than every sync window)
+       reach the device through nothing else, so they must not wait for a Wi-Fi network that may
+       never come; a device that is always on cellular with the default setting would otherwise
+       never be repaired. The battery gate (below 20%, not charging) and Low Power Mode may still
+       delay it, since both lift on their own. Mechanism, generic above the boundary (ADR-IOS-060): the
+       caller decides `walkAllowed` (`runBackfillCycle(account:deadline:walkAllowed:)`); false skips
+       the walk only. The foreground worker sets it from the setting and
+       `NetworkMonitor.checkExpensive()` and no longer pauses the whole cycle (a cycle with nothing to
+       do while the walk is held back still waits the setting's 30 s pause); the background job
+       decides with `SyncScheduler.backgroundBackfillPlan` (Low Power Mode skips the backfill;
+       Wi-Fi-only off Wi-Fi runs it with the walk held back). Tests:
+       `GmailCatchUpTests.wifiOnlyHoldsTheWorkerWalkNotTheCatchUp` and
+       `wifiOnlyHoldsTheJobWalkNotTheCatchUp` (Wi-Fi-only on, only cellular: a lapsed Gmail folder past
+       the 7-day wait is listed, in the foreground worker and in the background job, and the walk
+       sends nothing), and `IMAPCatchUpTests.wifiOnlyCellularKeepsTheDailyRule` (the same setup keeps
+       IMAP's non-expensive-network rule for the daily listing).
      - Tests: `GmailCatchUpTests.sliceHandsTheTurnOn` (a delta that arrives during the run waits at
        most one slice), `jobHandsTheTurnOnBetweenSlices` (the same through the background job's
        production entry, `performBackfill`), both on a work queue of production's width so the queue
@@ -191,8 +237,10 @@ The owner's rulings of 2026-11-09:
      rate at no more than half of Gmail's documented per-user quota. That quota is 250 units/s, a
      list or a get costs 5 units, so half the quota is 250 × 0.5 ÷ 5 = 25 requests/s
      (`catchUpMaxRequestsPerSecond`), and one 2 s slice may send 25 × 2 = 50 requests. The rate
-     holds across slices because each slice opens a window of `catchUpSliceSeconds` (real time,
-     per account, in `SyncEngine.catchUpSliceWindowEnds`): no slice of the account, from the same
+     holds across slices because each slice opens a window of `catchUpSliceIntervalSeconds` (real time,
+     per account, in `SyncEngine.catchUpSliceWindowEnds`; *amended 2026-11-12:* a named constant of its
+     own, 2 s, equal to the slice length, so the cap is 25 requests/s × 2 s; formerly the window
+     reused `catchUpSliceSeconds`): no slice of the account, from the same
      run or another (a foreground cycle and the background job), starts before the previous window
      ends. The wait happens outside the lock, so a delta never waits for it, and never reaches past
      the run's deadline: a window that ends at or after the deadline ends the run. IMAP charges the
@@ -829,6 +877,9 @@ The owner's rulings of 2026-11-09:
     (712 s) when every list request takes 0.2 s. Before, the same listing took about 56 hours of
     app-open time. (`GmailCatchUpTests.measureForegroundListing`, run only when the test runner's
     environment sets `TABMAIL_CATCHUP_MEASURE`.)
+  - *Superseded 2026-11-12 (#766, the Wi-Fi-only ruling): the next bullet.* The catch-up ignores the
+    Wi-Fi-only setting, so the 7-day expensive-network bound holds whatever the setting; only the
+    battery gate and Low Power Mode delay it, and both lift on their own.
   - **The 7-day bound below now holds only when the worker may run.** With the Wi-Fi-only setting on
     (the default), the catch-up, like the walk, does not run on an expensive network, so a device
     that is always on cellular or a hotspot gets no catch-up. With the setting off, the 7-day

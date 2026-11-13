@@ -722,6 +722,16 @@ enum SyncConfig {
     /// waits at most one slice. *Was* `catchUpPassBudgetSeconds`, the budget of the
     /// full sync's catch-up step (before #766).
     static let catchUpSliceSeconds: TimeInterval = 2
+    /// The gap between the starts of two catch-up slices of the same account
+    /// (seconds): the pacing window. A slice opens it when it starts, and no slice
+    /// of the account, from the same run or another (a foreground cycle, the
+    /// background processing job), starts before it ends. The reason: a slice is
+    /// capped at `catchUpSliceMaxRequests`, and only this gap turns that per-slice
+    /// cap into a sustained rate. Without it, slices that run back to back (the
+    /// background job) or a fast worker cycle would send a new cap's worth of
+    /// requests as soon as the last one finished. Equal to the slice length, so a
+    /// slice that runs its full time is followed at once by the next.
+    static let catchUpSliceIntervalSeconds: TimeInterval = 2
     /// Gmail's documented per-user request quota (quota units per second) and the
     /// cost of one `messages.list` or `messages.get` (quota units). The catch-up's
     /// request cap is derived from them.
@@ -736,16 +746,17 @@ enum SyncConfig {
     static let catchUpMaxRequestsPerSecond: Double =
         gmailPerUserQuotaUnitsPerSecond * catchUpQuotaShare / gmailUnitsPerListOrGet
     /// Most provider requests one catch-up slice may send, across every folder:
-    /// 25 requests/s × the 2 s slice = 50. Charged before each request is sent
+    /// 25 requests/s × the 2 s gap between slice starts
+    /// (`catchUpSliceIntervalSeconds`) = 50. Charged before each request is sent
     /// (a batch of concurrent loads is charged its whole width first, so it never
     /// takes the count past the cap). A slice ends when either its time or this
     /// count is spent, and the next slice of the same account never starts before
-    /// the previous one's `catchUpSliceSeconds` window has ended, so slices that
+    /// the previous one's `catchUpSliceIntervalSeconds` window has ended, so slices that
     /// run back to back send at most this many requests per window: at most
     /// `catchUpMaxRequestsPerSecond`. *Superseded (#766, before this cap):* the
     /// slice was bounded by time only, so on a fast link its request count was set
     /// by the round-trip time alone.
-    static let catchUpSliceMaxRequests = Int((catchUpMaxRequestsPerSecond * catchUpSliceSeconds).rounded(.down))
+    static let catchUpSliceMaxRequests = Int((catchUpMaxRequestsPerSecond * catchUpSliceIntervalSeconds).rounded(.down))
     /// Timeout for ONE catch-up request (seconds). A request that starts just inside
     /// the slice can run this long, so the worst-case hold of a slice is
     /// `catchUpSliceSeconds + catchUpRequestTimeoutSeconds` (about 5 s). A

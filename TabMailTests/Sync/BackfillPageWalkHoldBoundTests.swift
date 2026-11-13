@@ -674,4 +674,127 @@ struct BackfillPageWalkHoldBoundTests {
         #expect(try !Self.isComplete(accountId, "INBOX", pool: pool), "a held page was passed over")
         #expect(try F.messageIds(accountId, "INBOX", pool: pool) == ["m2"])
     }
+
+    /// Old Inbox mail, one message every eight days from 30 days ago: wider apart
+    /// than a catch-up range may span, so each is a range of its own and a listing
+    /// of them takes many slices.
+    private static func oldInboxMail(_ count: Int) -> [(seed: StatefulGmailActionServer.Seed, date: Date)] {
+        (0..<count).map { index in
+            let days = 30 + 8 * Double(index)
+            return (F.gmailSeed("o\(index)", label: "INBOX", daysAgo: days), F.daysAgo(days))
+        }
+    }
+
+    private static func insertLocal(
+        _ mail: [(seed: StatefulGmailActionServer.Seed, date: Date)], accountId: String, pool: DatabasePool
+    ) throws {
+        try pool.write { db in
+            for (seed, date) in mail {
+                let id = seed.providerMessageId
+                var header = MessageHeader(
+                    messageId: id, subject: "old \(id)", from: "Sender", fromAddress: "sender@example.com",
+                    to: "recipient@example.com", date: date, snippet: "",
+                    folderId: "\(accountId):INBOX", accountId: accountId, folderPath: "INBOX", isInInbox: true,
+                    providerDate: date)
+                header.rfc822MessageId = seed.rfc822MessageId
+                header.headerComplete = true
+                try header.insert(db)
+            }
+        }
+    }
+
+    /// Only the walk's own work shortens the worker's wait while a page is held
+    /// (ADR-IOS-107, amended 2026-11-12): catch-up progress counts toward the
+    /// active delay only once every walk of the account is complete. Three Gmail
+    /// accounts on one engine, each with its own worker, on the fast-sync
+    /// profile (no delay at all after a productive call):
+    /// - A holds a page, and its own catch-up keeps making progress (a listing of
+    ///   many ranges, one slice per call);
+    /// - C holds a page, and its catch-up has nothing to do;
+    /// - B's walk is complete, and its catch-up keeps making progress meanwhile.
+    /// Neither A's nor C's held page is listed again inside the idle delay.
+    @Test("A held page waits the idle delay while its own account's catch-up, or another account's, keeps making progress")
+    func heldPageWaitsWhileCatchUpProgresses() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        Self.setHoldClock(nil)
+        let wifiOnlyKey = "backgroundSyncWiFiOnly"
+        let savedWifiOnly = UserDefaults.standard.object(forKey: wifiOnlyKey)
+        defer { UserDefaults.standard.set(savedWifiOnly, forKey: wifiOnlyKey) }
+        UserDefaults.standard.set(false, forKey: wifiOnlyKey)
+
+        // Enough ranges that neither listing completes inside the test: each
+        // slice lists at most `catchUpSliceMaxRequests` requests, three per range.
+        let old = Self.oldInboxMail(150)
+        // A: a held page, and a catch-up listing of the old mail.
+        let (serverA, accountA) = try Self.gmailInbox("gm-held-own-progress", pool: pool)
+        defer { serverA.close() }
+        // C: a held page, and a catch-up with nothing to do (listed just now).
+        let (serverC, accountC) = try Self.gmailInbox("gm-held-no-progress", pool: pool)
+        defer { serverC.close() }
+        for server in [serverA, serverC] {
+            server.serveProfile()
+            server.injectGetFailure(providerMessageId: "m1", .status(503))
+        }
+        for mail in old { serverA.addMessage(mail.seed) }
+        try Self.insertLocal(old, accountId: accountA.id, pool: pool)
+        let listedJustNow = GmailCatchUpState(lastCompletedAt: Date()).encoded()
+        try await pool.write { db in
+            try db.execute(sql: "UPDATE folder SET catchUpState = ? WHERE accountId = ?", arguments: [listedJustNow, accountC.id])
+        }
+        // B: walk complete, and a catch-up listing of the old mail.
+        let serverB = StatefulGmailActionServer(messages: old.map(\.seed))
+        defer { serverB.close() }
+        serverB.serveProfile()
+        let accountB = try FolderEpochTestFixture.makeAccount(id: "gm-catch-up-progress", provider: .gmail, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: accountB.id, path: "INBOX", role: .inbox, pool: pool)
+        try Self.insertLocal(old, accountId: accountB.id, pool: pool)
+        try await pool.write { db in
+            try db.execute(sql: "UPDATE folder SET backfillComplete = 1 WHERE accountId = ?", arguments: [accountB.id])
+        }
+
+        let engine = SyncEngine()
+        for (account, server) in [(accountA, serverA), (accountB, serverB), (accountC, serverC)] {
+            let provider = server.provider()
+            await engine.register(
+                accountId: account.id, provider: provider,
+                workQueue: ProviderWorkQueue(provider: provider, maxConcurrency: SyncConfig.imapMaxConnectionCeiling))
+        }
+        let wasFastSync = await MainActor.run { AccountManagerState.shared.fastSyncModeActive }
+        await MainActor.run { AccountManagerState.shared.fastSyncModeActive = true }
+        let profile = await engine.getBackfillProfile()
+        let idleDelay = profile.interCycleIdleDelay
+        let walkCallsA = { serverA.getFailuresServedCount(providerMessageId: "m1") }
+        let walkCallsC = { serverC.getFailuresServedCount(providerMessageId: "m1") }
+        let catchUpLists = { (server: StatefulGmailActionServer) in
+            server.http.recordedCalls().filter { $0.url.contains("after") }.count
+        }
+
+        for account in [accountA, accountB, accountC] { await engine.startBackfill(account: account) }
+        let heldTwice = await Self.eventually(within: F.safetySeconds) { walkCallsA() >= 2 && walkCallsC() >= 2 }
+        let catchUpListsAAtStart = catchUpLists(serverA)
+        let catchUpListsBAtStart = catchUpLists(serverB)
+        // The next walk call of A or C may come no sooner than one idle delay
+        // after its second call ended, so none may start inside nine tenths of it.
+        try? await Task.sleep(for: .seconds(idleDelay * 0.9))
+        let walkCallsAInside = walkCallsA()
+        let walkCallsCInside = walkCallsC()
+        let catchUpListsBInside = catchUpLists(serverB) - catchUpListsBAtStart
+        let listingA = GmailCatchUpState.decode(try F.folder(accountA.id, "INBOX", pool: pool)?.catchUpState)?.listing
+        let listingB = GmailCatchUpState.decode(try F.folder(accountB.id, "INBOX", pool: pool)?.catchUpState)?.listing
+        for account in [accountA, accountB, accountC] { await engine.remove(accountId: account.id) }
+        await MainActor.run { AccountManagerState.shared.fastSyncModeActive = wasFastSync }
+
+        #expect(profile == .turbo, "precondition: the workers ran on the fast-sync profile")
+        #expect(profile.interCycleActiveDelay == 0, "precondition: the fast-sync profile does not wait between productive calls")
+        #expect(heldTwice, "precondition: both workers listed their held page twice (A \(walkCallsA()), C \(walkCallsC()))")
+        #expect(catchUpListsAAtStart >= 1, "precondition: A's own catch-up made progress before the wait")
+        #expect(listingA != nil, "precondition: A's catch-up listing still had progress to make")
+        #expect(catchUpListsBInside >= 1, "precondition: B's catch-up kept making progress during the wait")
+        #expect(listingB != nil, "precondition: B's catch-up listing still had progress to make")
+        #expect(walkCallsAInside <= 2,
+                "A listed its held page again inside the idle delay while its own catch-up progressed: \(walkCallsAInside) walk calls")
+        #expect(walkCallsCInside <= 2,
+                "C listed its held page again inside the idle delay while B's catch-up progressed: \(walkCallsCInside) walk calls")
+    }
 }
