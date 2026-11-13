@@ -68,6 +68,11 @@
 > the gesture because gestures queue after they return and deferred successors are decided
 > later. The role-folder path (`moveToRoleFolderPerAccount`) is not reported: only
 > `performCoordinatedRoleMove` reaches it, and that path never touches the View's hide sets.
+>
+> **AMENDMENT (2026-11-13, tabmail-ios #485) — a refused Undo on these rows is no longer silent.**
+> An Undo naming a row this record refuses now shows the "Couldn't undo" alert ("Nothing was moved
+> back."), like every other refused move Undo. The refusal itself is unchanged, and
+> `IOS-EPOCH-001` D6(a) (no dialog, no toast) still holds for new gestures.
 <!-- KNOWN-ISSUES-AMENDMENT-END -->
 # IOS-MOVE-002
 
