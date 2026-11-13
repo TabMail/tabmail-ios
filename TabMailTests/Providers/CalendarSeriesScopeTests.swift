@@ -1699,6 +1699,23 @@ struct CalendarEditToolSeriesScopeTests {
                 "card: \(r.cards.first?.changes ?? [])")
     }
 
+    @Test("Outlook: a single event made all-day resets nothing, and the card says nothing of it")
+    func outlookSingleEventKindChangeHasNoNote() async throws {
+        let graph = FakeGraphCalendar([GraphSeries.onDevice(GraphFixture.event(id: "one-x", start: GraphFixture.start),
+                                                            start: GraphFixture.start)])
+        let zone = TimeZone.current
+        let first = String(GraphFixture.wall(GraphFixture.start, in: zone.identifier).prefix(10))
+        let next = String(GraphFixture.wall(GraphFixture.start.addingTimeInterval(86_400), in: zone.identifier).prefix(10))
+        let r = try await outlookTool(graph, [
+            "all_day": .bool(true), "timezone": .string(zone.identifier),
+            "start_iso": .string(first), "end_iso": .string(next),
+        ], eventId: "one-x", account: "series-note-x-kind-single")
+        #expect(graph.seriesResets == 0, "the write reset the event; \(r.out)")
+        #expect(graph.patches("one-x").count == 1, "not written; \(r.out)")
+        let changes = try #require(r.cards.first?.changes, "no card: \(r.out)")
+        #expect(!changes.contains(CalendarToolHelpers.kindChangeResetNote), "card: \(changes)")
+    }
+
     @Test("CalDAV: a single event made all-day resets nothing, and the card says nothing of it")
     func calDAVSingleEventKindChangeHasNoNote() async throws {
         let store = FakeCalDAVStore(servesETags: true)

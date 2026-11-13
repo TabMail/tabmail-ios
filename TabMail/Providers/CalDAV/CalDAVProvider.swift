@@ -1346,7 +1346,10 @@ actor CalDAVProvider: CalendarProvider {
         // The date a timed value falls on in the series' own zone, as `YYYYMMDD`.
         func day(of value: String, params: String) throws -> String {
             let upper = value.uppercased()
-            if upper.count == 8 { return upper }
+            if upper.count == 8 {
+                guard let date = storedDate(upper) else { throw unreadable }
+                return date
+            }
             guard upper.count >= 15, upper.dropFirst(8).first == "T" else { throw unreadable }
             let digits = String(upper.prefix(8))
             let tzid = ICSParser.extractTZID(params)
@@ -1406,8 +1409,7 @@ actor CalDAVProvider: CalendarProvider {
                         return ["RRULE:\(GoogleCalendarProvider.replaceOrAppendUntil(in: property.value, untilValue: timed))"]
                     case "RDATE":
                         let starts = try property.value.split(separator: ",").map { value in
-                            let date = value.prefix(8)
-                            guard date.count == 8, date.allSatisfy({ $0.isASCII && $0.isNumber }) else { throw unreadable }
+                            guard let date = storedDate(String(value)) else { throw unreadable }
                             return "\(date)\(timeOfDay)\(suffix)"
                         }
                         return ["RDATE\(params):\(starts.joined(separator: ","))"]
@@ -1419,6 +1421,16 @@ actor CalDAVProvider: CalendarProvider {
         case .floating:
             return ics
         }
+    }
+
+    /// A stored RFC 5545 DATE value (§3.3.4) as written, or nil when it is not one: exactly eight
+    /// ASCII digits naming a real day, `yyyyMMdd` in the Gregorian calendar. The one reader of an
+    /// added date (RDATE) a series changed between all-day and timed keeps, in either direction.
+    static func storedDate(_ value: String) -> String? {
+        guard value.count == 8, value.allSatisfy({ $0.isASCII && $0.isNumber }) else { return nil }
+        let format = FixedDateFormat.formatter("yyyyMMdd", timeZone: .gmt)
+        guard let day = format.date(from: value), format.string(from: day) == value else { return nil }
+        return value
     }
 
     /// The UNTIL value of an RRULE value, or nil when it has none.

@@ -2398,8 +2398,39 @@ struct CalDAVKindChangeSeriesValuesTests {
                 zones: CalendarTimeZoneContext(calendarText: ics))
         }
         #expect(try madeTimed("RDATE;VALUE=DATE:20990110").contains("RDATE;TZID=Asia/Tokyo:20990110T080000"))
-        for bad in ["RDATE;VALUE=DATE:2099AB10", "RDATE;VALUE=DATE:2099", "RDATE;VALUE=DATE:20990110,X"] {
+        for bad in ["RDATE;VALUE=DATE:2099AB10", "RDATE;VALUE=DATE:2099", "RDATE;VALUE=DATE:20990110,X",
+                    "RDATE;VALUE=DATE:20990110XYZ", "RDATE;VALUE=DATE:20991345"] {
             #expect(throws: CalendarProviderError.self, "\(bad)") { try madeTimed(bad) }
+        }
+    }
+
+    @Test("made all-day, an added date that is not a real date is refused; a real one is kept")
+    func unreadableAddedDateIsRefusedMadeAllDay() throws {
+        #expect(try Self.madeAllDay(Self.series("DTSTART;TZID=Asia/Tokyo:20990105T080000", ["RDATE;VALUE=DATE:20990110"]))
+            .contains("RDATE;VALUE=DATE:20990110"))
+        for bad in ["RDATE;VALUE=DATE:20991345", "RDATE;VALUE=DATE:2099AB10", "RDATE;VALUE=DATE:20990230"] {
+            #expect(throws: CalendarProviderError.self, "\(bad)") {
+                try Self.madeAllDay(Self.series("DTSTART;TZID=Asia/Tokyo:20990105T080000", [bad]))
+            }
+        }
+    }
+
+    /// The one decision whether a change of kind resets changed occurrences, for an edit that gives
+    /// only one side: an end alone changes the kind as a start does, and only on a series.
+    @Test("the change-of-kind decision: an end alone changes the kind, and resets only a series")
+    func kindChangeDecisionTable() {
+        var endTime = GCalEventInput(); endTime.endDateTime = "2099-01-05T10:00:00Z"
+        var endDate = GCalEventInput(); endDate.endDate = "2099-01-06"
+        var title = GCalEventInput(); title.summary = "Renamed"
+        let rows: [(GCalEventInput, Bool, Bool, Bool)] = [
+            // edit, stored all-day, holds a series, resets
+            (endTime, true, true, true), (endTime, true, false, false), (endTime, false, true, false),
+            (endDate, false, true, true), (endDate, false, false, false), (endDate, true, true, false),
+            (title, true, true, false), (title, false, true, false),
+        ]
+        for (i, row) in rows.enumerated() {
+            #expect(CalDAVProvider.kindChangeResetsChangedOccurrences(
+                storedIsAllDay: row.1, holdsSeries: row.2, edit: row.0) == row.3, "row \(i)")
         }
     }
 
