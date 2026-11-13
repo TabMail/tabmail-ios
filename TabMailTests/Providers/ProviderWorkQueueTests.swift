@@ -346,6 +346,90 @@ struct ProviderWorkQueueCancellationTests {
         #expect(await order.sequence.isEmpty)
     }
 
+    /// Holds the only slot until `release()`; `waitUntilHeld()` returns once the
+    /// holder is inside its work closure.
+    private actor SlotGate {
+        private var held = false
+        private var released = false
+        private var releaseWaiter: CheckedContinuation<Void, Never>?
+        func hold() async {
+            held = true
+            if released { return }
+            await withCheckedContinuation { releaseWaiter = $0 }
+        }
+        func isHeld() -> Bool { held }
+        func release() {
+            released = true
+            releaseWaiter?.resume()
+            releaseWaiter = nil
+        }
+    }
+
+    private static func waitFor(_ condition: () async -> Bool) async {
+        for _ in 0..<500 {
+            if await condition() { return }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    /// A throwing waiter that is handed the slot after the queue was invalidated
+    /// (fence set while it waited) never runs its work and gives the slot back.
+    @Test("A throwing waiter handed a slot after invalidation never runs and frees the slot")
+    func throwingWaiterHandedSlotAfterInvalidationNeverRuns() async throws {
+        let queue = ProviderWorkQueue(provider: WorkQueueMockProvider(), maxConcurrency: 1)
+        let order = OrderTracker()
+        let gate = SlotGate()
+        let holder = Task { await queue.execute(priority: .bodyFetch) { await gate.hold() } }
+        await Self.waitFor { await gate.isHeld() }
+
+        let waiter = Task { () -> String in
+            do {
+                let _: Int = try await queue.execute(priority: .userAction) {
+                    await order.record("waiter-work")
+                    return 1
+                }
+                return "completed"
+            } catch ProviderError.notConnected {
+                return "notConnected"
+            } catch {
+                return "other: \(error)"
+            }
+        }
+        await Self.waitFor { await queue.waitingCount == 1 }
+        #expect(await queue.waitingCount == 1, "precondition: the waiter is queued behind the holder")
+
+        // Fence only: the waiter stays queued and is handed the slot on release.
+        queue.markInvalidated()
+        await gate.release()
+        await holder.value
+
+        #expect(await waiter.value == "notConnected")
+        #expect(await order.sequence.isEmpty, "the waiter's work never ran")
+        #expect(await queue.activeOperations == 0, "the handed-off slot was released")
+    }
+
+    /// Same as above for the non-throwing (fire-and-forget) variant.
+    @Test("A fire-and-forget waiter handed a slot after invalidation never runs and frees the slot")
+    func fireAndForgetWaiterHandedSlotAfterInvalidationNeverRuns() async throws {
+        let queue = ProviderWorkQueue(provider: WorkQueueMockProvider(), maxConcurrency: 1)
+        let order = OrderTracker()
+        let gate = SlotGate()
+        let holder = Task { await queue.execute(priority: .bodyFetch) { await gate.hold() } }
+        await Self.waitFor { await gate.isHeld() }
+
+        let waiter = Task { await queue.execute(priority: .userAction) { await order.record("waiter-work") } }
+        await Self.waitFor { await queue.waitingCount == 1 }
+        #expect(await queue.waitingCount == 1, "precondition: the waiter is queued behind the holder")
+
+        queue.markInvalidated()
+        await gate.release()
+        await holder.value
+        await waiter.value
+
+        #expect(await order.sequence.isEmpty, "the waiter's work never ran")
+        #expect(await queue.activeOperations == 0, "the handed-off slot was released")
+    }
+
     @Test("Cancelled waiter throws CancellationError without running work")
     func cancelledWaiterThrows() async throws {
         let provider = WorkQueueMockProvider()

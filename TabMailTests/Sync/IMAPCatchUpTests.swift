@@ -120,6 +120,16 @@ struct IMAPCatchUpTests {
             clock: { start.addingTimeInterval(Double(fetchCount(server) - fetchesBefore)) })
     }
 
+    /// Runs `body` with NetworkMonitor's cached expensive flag set to `expensive`
+    /// (its debug-only test hook), restoring the prior value afterwards, so a test
+    /// never depends on the network of the machine it runs on.
+    private static func withNetwork(expensive: Bool, _ body: () async throws -> Void) async throws {
+        let saved = NetworkMonitor.checkExpensive()
+        NetworkMonitor.setExpensiveForTesting(expensive)
+        defer { NetworkMonitor.setExpensiveForTesting(saved) }
+        try await body()
+    }
+
     private static func fetchCount(_ server: FakeIMAPServer) -> Int {
         server.recordedCommands().filter { $0.uppercased().hasPrefix("UID FETCH") }.count
     }
@@ -164,47 +174,50 @@ struct IMAPCatchUpTests {
     /// only on a non-expensive network, because the first listing of a folder is a
     /// full check, which waits for one. *Superseded:* "The step sits at the end of
     /// the real full sync: after one `fullSync`, every syncable folder [...]".
-    @Test("A backfill cycle after the full sync runs the catch-up", .enabled(if: !NetworkMonitor.checkExpensive()))
+    @Test("A backfill cycle after the full sync runs the catch-up")
     func backfillCycleRunsTheCatchUp() async throws {
-        try await Self.withWorld("cu-wiring", serverUIDs: [1, 2, 3], localUIDs: [1, 2, 3]) { world in
-            let accountId = world.accountId
-            let account = try #require(try await world.pool.read { db in try Account.fetchOne(db, key: accountId) })
-            await world.engine.register(
-                accountId: world.accountId, provider: world.provider,
-                workQueue: ProviderWorkQueue(provider: world.provider, maxConcurrency: 1))
-            try await world.engine.fullSync(account: account, provider: world.provider)
-            _ = await world.engine.runBackfill(account: account)
+        try await Self.withNetwork(expensive: false) { () async throws in
+            try await Self.withWorld("cu-wiring", serverUIDs: [1, 2, 3], localUIDs: [1, 2, 3]) { world in
+                let accountId = world.accountId
+                let account = try #require(try await world.pool.read { db in try Account.fetchOne(db, key: accountId) })
+                await world.engine.register(
+                    accountId: world.accountId, provider: world.provider,
+                    workQueue: ProviderWorkQueue(provider: world.provider, maxConcurrency: 1))
+                try await world.engine.fullSync(account: account, provider: world.provider)
+                _ = await world.engine.runBackfill(account: account)
 
-            let state = try #require(try Self.state(world), "the backfill cycle wrote the folder's catch-up state")
-            #expect(state.epoch == Self.epoch && state.listing == nil && state.lastCompletedAt != nil)
-            #expect(try Self.rows(world).count == 3, "every message is still on the server; nothing is removed")
+                let state = try #require(try Self.state(world), "the backfill cycle wrote the folder's catch-up state")
+                #expect(state.epoch == Self.epoch && state.listing == nil && state.lastCompletedAt != nil)
+                #expect(try Self.rows(world).count == 3, "every message is still on the server; nothing is removed")
+            }
         }
     }
 
     /// A folder the full sync itself creates (here INBOX, which no fixture
     /// pre-inserts) must be on the cheap check from its first listing.
-    @Test("A folder the full sync created follows an older-mail change on the next pass",
-          .enabled(if: !NetworkMonitor.checkExpensive()))
+    @Test("A folder the full sync created follows an older-mail change on the next pass")
     func newFolderIsOnTheCheapCheck() async throws {
-        try await Self.withWorld("cu-new-folder", serverUIDs: [1], localUIDs: [1], otherMailboxes: ["INBOX": [1, 2, 3]]) { world in
-            let accountId = world.accountId
-            let account = try #require(try await world.pool.read { db in try Account.fetchOne(db, key: accountId) })
-            await world.engine.register(
-                accountId: world.accountId, provider: world.provider,
-                workQueue: ProviderWorkQueue(provider: world.provider, maxConcurrency: 1))
-            try await world.engine.fullSync(account: account, provider: world.provider)
-            _ = await world.engine.runBackfill(account: account)
-            #expect(try Self.rows(world, path: "INBOX")["1"]?.isRead == false, "precondition: the full sync brought INBOX in, unread")
-            let inboxId = "\(accountId):INBOX"
-            let inboxState = IMAPCatchUpState.decode(try await world.pool.read { db in try Folder.fetchOne(db, key: inboxId)?.catchUpState })
-            #expect(inboxState?.lastCompletedAt != nil, "precondition: the backfill cycle completed INBOX's first listing")
+        try await Self.withNetwork(expensive: false) { () async throws in
+            try await Self.withWorld("cu-new-folder", serverUIDs: [1], localUIDs: [1], otherMailboxes: ["INBOX": [1, 2, 3]]) { world in
+                let accountId = world.accountId
+                let account = try #require(try await world.pool.read { db in try Account.fetchOne(db, key: accountId) })
+                await world.engine.register(
+                    accountId: world.accountId, provider: world.provider,
+                    workQueue: ProviderWorkQueue(provider: world.provider, maxConcurrency: 1))
+                try await world.engine.fullSync(account: account, provider: world.provider)
+                _ = await world.engine.runBackfill(account: account)
+                #expect(try Self.rows(world, path: "INBOX")["1"]?.isRead == false, "precondition: the full sync brought INBOX in, unread")
+                let inboxId = "\(accountId):INBOX"
+                let inboxState = IMAPCatchUpState.decode(try await world.pool.read { db in try Folder.fetchOne(db, key: inboxId)?.catchUpState })
+                #expect(inboxState?.lastCompletedAt != nil, "precondition: the backfill cycle completed INBOX's first listing")
 
-            world.server.setFlags(["\\Seen"], in: "INBOX", uid: 1)
-            try await Self.refreshModSeq(world, path: "INBOX")
-            await world.engine.runCatchUp(provider: world.provider, folderIds: ["\(accountId):INBOX"], context: Self.unlimited())
+                world.server.setFlags(["\\Seen"], in: "INBOX", uid: 1)
+                try await Self.refreshModSeq(world, path: "INBOX")
+                await world.engine.runCatchUp(provider: world.provider, folderIds: ["\(accountId):INBOX"], context: Self.unlimited())
 
-            #expect(try Self.rows(world, path: "INBOX")["1"]?.isRead == true,
-                    "the change moved HIGHESTMODSEQ past the first listing's stamp, so the folder is listed again")
+                #expect(try Self.rows(world, path: "INBOX")["1"]?.isRead == true,
+                        "the change moved HIGHESTMODSEQ past the first listing's stamp, so the folder is listed again")
+            }
         }
     }
 
@@ -717,11 +730,59 @@ struct IMAPCatchUpTests {
                 #expect(try Self.rows(world)["2"]?.isRead == false)
                 #expect(try Self.state(world) == overdue, "the daily check is still due")
             }
-            if !NetworkMonitor.checkExpensive() {
+            try await Self.withNetwork(expensive: false) { () async throws in
                 _ = await world.engine.runBackfill(account: account)
                 #expect(try Self.rows(world)["2"]?.isRead == true, "the daily listing runs on a non-expensive network")
             }
             await world.engine.remove(accountId: world.accountId)
+        }
+    }
+
+    /// Account removal invalidates the account's work queue. A catch-up run that
+    /// is waiting between two slices when that happens ends without sending
+    /// another request.
+    @Test("A catch-up run stops when its account is removed between two slices")
+    func runStopsWhenTheAccountIsRemoved() async throws {
+        // Two listing ranges: [1, 1000] and [2001, 3000]; each slice lists one.
+        try await Self.withWorld("cu-removed-mid-run", serverUIDs: [1, 2001], localUIDs: [1, 2001]) { world in
+            let accountId = world.accountId
+            let account = try #require(try await world.pool.read { db in try Account.fetchOne(db, key: accountId) })
+            let queue = ProviderWorkQueue(provider: world.provider, maxConcurrency: 1)
+            await world.engine.register(accountId: accountId, provider: world.provider, workQueue: queue)
+            let server = world.server
+            let fetchesBefore = Self.fetchCount(server)
+            let base = Date()
+            // Long enough that the removal always lands before the second slice;
+            // the run exits on its next wake, so this does not slow the test.
+            let interval: TimeInterval = 30
+            // One second per UID FETCH: a slice lists one range. The deadline is far
+            // away, so only the removal can end the run before the second range.
+            let run = SyncEngine.CatchUpRun(
+                isExpensiveNetwork: false, storageLimitInForce: false,
+                deadline: base.addingTimeInterval(1_000), sliceSeconds: 1, intervalSeconds: interval,
+                clock: { base.addingTimeInterval(Double(Self.fetchCount(server) - fetchesBefore)) })
+            let engine = world.engine
+            let catchUp = Task { await engine.runCatchUpRun(account: account, run: run) }
+
+            // Wait for the first slice to save its listing; the run is then waiting
+            // out the slice window before the second.
+            let end = Date().addingTimeInterval(interval)
+            var midway = false
+            while Date() < end, !midway {
+                midway = (try Self.state(world)?.listing) != nil
+                if !midway { try? await Task.sleep(for: .milliseconds(10)) }
+            }
+            #expect(midway, "precondition: the first slice listed one range and saved the listing")
+            let fetchesAtRemoval = Self.fetchCount(server)
+
+            // What account removal does to the sync engine.
+            await queue.invalidate()
+            await engine.remove(accountId: accountId)
+
+            _ = await catchUp.value
+            #expect(Self.fetchCount(server) == fetchesAtRemoval, "no request is sent after the account's queue is invalidated")
+            let after = try Self.state(world)
+            #expect(after?.listing != nil && after?.lastCompletedAt == nil, "the second range was never listed")
         }
     }
 
