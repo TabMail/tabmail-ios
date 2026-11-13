@@ -206,7 +206,7 @@ of the resource, which holds every occurrence (irreversible wire operation #5, n
   the occurrences that actually move (`moveOrder`; a stay, at the instant it is at, is not dated) in
   the series' zone (`GCalEvent.seriesZone`), dates the carry's listing window in UTC, and refuses a
   timed series with no zone it can read only when the split moves an occurrence
-  (`movesAnOccurrence`), before the new part is created; a rename needs no zone. A deleted occurrence (Graph names it by date only) or a moved named occurrence still needs it, and is refused before anything is written.
+  (`movesAnOccurrence`), before the new part is created; a rename needs no zone. A deleted occurrence (Graph names it by date only) or a moved named occurrence still needs it, and is refused before anything is written. The series' zone is the range's when recognized, else the zone the event was created in (Graph's `originalStartTimeZone`, `GCalEvent.ownZoneName`), and the series is read in that zone's name (`readZoneName`); never the zone a read was given in, which is only a display zone. A series whose range and creation zones are both unrecognized (a desktop Outlook custom zone) is refused before anything is written.
 - The series id with a moved occurrence's new time edits that occurrence in place, and with its old
   place is not found, the same as on Google, whose resolver finds no instance there.
 - A retry after a lost response is reported not found, with nothing written, when the first attempt
