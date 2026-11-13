@@ -931,6 +931,41 @@ struct ExchangeSplitCarryTests {
         #expect(r.records.records.isEmpty && r.http.recordedCalls().allSatisfy { $0.method == "GET" }, "\(r.http.servedCallSequence())")
     }
 
+    /// `series` whose range is kept in a custom zone (desktop Outlook's), created in `own`.
+    private static func customRange(_ series: [String: Any], own: String) -> [String: Any] {
+        var e = series
+        if var recurrence = e["recurrence"] as? [String: Any], var range = recurrence["range"] as? [String: Any] {
+            range["recurrenceTimeZone"] = "tzone://Microsoft/Custom"
+            recurrence["range"] = range
+            e["recurrence"] = recurrence
+        }
+        e["originalStartTimeZone"] = own
+        return e
+    }
+
+    @Test("a series whose range zone is custom is read in the zone it was created in: a rename carries a deleted and a changed later occurrence")
+    func customRangeReadsInTheEventsOwnZone() async throws {
+        #expect(CalendarTimeZoneResolver.zone(named: "tzone://Microsoft/Custom", in: .none) == nil, "non-vacuity: the custom zone is recognized")
+        let series = Self.customRange(GraphSplitFixture.series(range: GraphSplitFixture.noEnd), own: GraphSplitFixture.zone)
+        let r = try await split(exceptions: [Self.exception(2) { $0["location"] = ["displayName": "Room 9"] }],
+                                cancelled: [3], parts: [2, 3], patch: Self.rename, series: series)
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error)); \(r.http.servedCallSequence())")
+        #expect(r.graph.event("created-1-w3") == nil, "the deleted occurrence came back: \(r.http.servedCallSequence())")
+        #expect(Self.displayName(r.graph.event("created-1-w2")?["location"]) == "Room 9", "\(r.http.servedCallSequence())")
+        #expect(!r.graph.patches("ser-1").isEmpty, "the series was not capped: \(r.http.servedCallSequence())")
+    }
+
+    @Test("a series whose range zone and creation zone are both custom is refused with nothing written: no date is placed in the zone the read was given in")
+    func customRangeAndOwnZoneIsRefused() async throws {
+        let series = Self.customRange(GraphSplitFixture.series(range: GraphSplitFixture.noEnd), own: "tzone://Microsoft/Custom")
+        let r = try await split(exceptions: [Self.exception(2) { $0["location"] = ["displayName": "Room 9"] }],
+                                cancelled: [3], parts: [2, 3], patch: Self.rename, series: series)
+        defer { r.http.close() }
+        #expect(r.error != nil, "the split went on: \(r.http.servedCallSequence())")
+        #expect(r.http.recordedCalls().allSatisfy { $0.method == "GET" }, "something was written: \(r.http.servedCallSequence())")
+    }
+
     @Test("a changed occurrence is carried WHOLE: its own importance, categories and reminder survive a rename")
     func carryCopiesTheWholeException() async throws {
         let r = try await split(exceptions: [Self.exception(2) { e in

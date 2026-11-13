@@ -156,7 +156,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// `fetchForEdit`). `body` and `onlineMeeting` give the description and the
     /// join link (`notes(of:)`), and the stored body an edit keeps (#511).
     /// `originalStart` gives an occurrence's place in its series (`originalStartTime`).
-    private static let eventSelect = "id,subject,location,body,bodyPreview,onlineMeeting,start,end,attendees,organizer,recurrence,showAs,isCancelled,webLink,createdDateTime,lastModifiedDateTime,isAllDay,seriesMasterId,originalStart"
+    private static let eventSelect = "id,subject,location,body,bodyPreview,onlineMeeting,start,end,attendees,organizer,recurrence,showAs,isCancelled,webLink,createdDateTime,lastModifiedDateTime,isAllDay,seriesMasterId,originalStart,originalStartTimeZone"
 
     /// What a split reads from the stored series: what `getEvent` reads, and every property the
     /// new part copies (`splitCopiedKeys`).
@@ -486,7 +486,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         let found = point.found, namedStart = point.namedStart, namedPlace = point.namedPlace
         let seriesZone = master.recurrenceTimeZoneName
         guard let place = point.place, case .at(let splitPlace) = point.cut else {
-            _ = try await editShown(seriesId: eventId, series: master, named: found, patch: patch, seriesZone: seriesZone, record: record)
+            _ = try await editShown(seriesId: eventId, series: master, named: found, patch: patch, record: record)
             return nil
         }
         guard let partPatch = SplitCarry.partEdit(patch, namedStart: namedStart, cut: splitPlace) else {
@@ -511,7 +511,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         )
         // The occurrences deleted or changed one by one (#563), read before anything is written
         // and sorted around the cut when they are written (`writeSplitOccurrences`).
-        let exceptions = try await seriesExceptions(seriesId: eventId, series: master, seriesZone: seriesZone)
+        let exceptions = try await seriesExceptions(seriesId: eventId, series: master)
         guard let parts = SplitCarry.partition(exceptions.map(\.carried), cut: point.cut, namedStart: namedStart) else {
             throw CalendarProviderError.notSupported("a changed occurrence of this repeating event has a time TabMail can't read, so it was not split")
         }
@@ -617,7 +617,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         guard let split = Self.splitPlace(naiveISO: record.splitAt, allDay: stored.event.isAllDay, zone: zone) else {
             throw CalendarProviderError.notSupported("Invalid recurrence_id '\(record.splitAt)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
         }
-        let exceptions = try await seriesExceptions(seriesId: record.seriesId, series: stored.event, seriesZone: seriesZone)
+        let exceptions = try await seriesExceptions(seriesId: record.seriesId, series: stored.event)
         let newPart = try await getEvent(eventId: record.newPartId)
         try await writeSplitOccurrences(
             record: record, cut: split, exceptions: exceptions, series: stored.event, seriesRaw: stored.raw,
@@ -675,6 +675,15 @@ actor ExchangeCalendarProvider: CalendarProvider {
 
     /// The date `time` starts on in the series' zone `seriesZone`: an all-day date as written, a
     /// timed instant dated there. Nil when it can't be read.
+    /// The name a series' times are read in (`Prefer: outlook.timezone`), the one its
+    /// `seriesZone` was recognized by: the range's zone when recognized, else the zone the event
+    /// was created in. Nil when neither is: the read is then given in the device's zone, which no
+    /// date is placed in.
+    nonisolated static func readZoneName(of series: GCalEvent) -> String? {
+        let recognized = { (name: String?) in name.flatMap { CalendarTimeZoneResolver.zone(named: $0, in: .none) } != nil ? name : nil }
+        return recognized(series.recurrenceTimeZoneName) ?? recognized(series.ownZoneName)
+    }
+
     nonisolated static func seriesDate(of time: GCalDateTime, seriesZone: TimeZone?) -> String? {
         if let date = time.date { return String(date.prefix(10)) }
         guard let seriesZone, let instant = time.dateTime.flatMap(Date.fromISO8601) else { return nil }
@@ -687,10 +696,11 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// never combined: only a plain `$expand=exceptionOccurrences`, with no `$select` anywhere,
     /// gives each exception's `originalStart` and fields (measured). Both are read with `Prefer`
     /// naming the series' zone, so an all-day place is its date. Nothing is written.
-    private func seriesExceptions(seriesId: String, series: GCalEvent, seriesZone: String?) async throws -> [TailException] {
+    private func seriesExceptions(seriesId: String, series: GCalEvent) async throws -> [TailException] {
         let unreadable = CalendarProviderError.notSupported(
             "the occurrences of this repeating event changed or deleted one by one can't be read, so it was not split")
-        let zone = seriesZone.flatMap { CalendarTimeZoneResolver.zone(named: $0, in: .none) }
+        let seriesZone = Self.readZoneName(of: series)
+        let zone = series.seriesZone
         let encodedId = try Self.encodedGraphPathSegment(seriesId, context: "Graph series master id")
         let expanded = try await request(path: "/events/\(encodedId)?$expand=exceptionOccurrences", timeZoneName: seriesZone)
         guard let expandedJSON = try JSONSerialization.jsonObject(with: expanded) as? [String: Any] else { throw unreadable }
@@ -765,12 +775,12 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// (`finishShownEdit`) never moves one twice. An edit of the rule is refused: no part is left
     /// to take it.
     private func editShown(
-        seriesId: String, series: GCalEvent, named: GCalEvent, patch: GCalEventInput, seriesZone: String?, record: SplitRecorder
+        seriesId: String, series: GCalEvent, named: GCalEvent, patch: GCalEventInput, record: SplitRecorder
     ) async throws -> GCalEvent {
         guard patch.recurrence == nil, patch.ruleDayMove == nil else {
             throw CalendarProviderError.notSupported(SplitCarry.pastEndRuleRefusal)
         }
-        let exceptions = try await seriesExceptions(seriesId: seriesId, series: series, seriesZone: seriesZone)
+        let exceptions = try await seriesExceptions(seriesId: seriesId, series: series)
         guard let shown = SplitCarry.shownEdits(exceptions: exceptions.map(\.carried), named: named, seriesId: seriesId, patch: patch) else {
             throw CalendarProviderError.notSupported(Self.shownEditUnreadable)
         }
@@ -786,8 +796,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// exceptions as they are now (`SplitCarry.shownEdits(exceptions:record:)`).
     func finishShownEdit(calendarId: String = "primary", record: SplitRecord, edit: GCalEventInput, guests: AttendeeChange?) async throws {
         let (seriesId, snapshot) = try await resolveToMaster(eventId: record.seriesId, select: Self.splitSelect)
-        let seriesZone = snapshot.event.recurrenceTimeZoneName
-        let exceptions = try await seriesExceptions(seriesId: seriesId, series: snapshot.event, seriesZone: seriesZone)
+        let exceptions = try await seriesExceptions(seriesId: seriesId, series: snapshot.event)
         guard let edits = SplitCarry.shownEdits(exceptions: exceptions.map(\.carried), record: record) else {
             throw CalendarProviderError.notSupported(Self.shownEditUnreadable)
         }
@@ -850,7 +859,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         var instances: [[String: Any]] = []
         var next: String? = "/events/\(encodedPart)/instances?startDateTime=\(from.iso8601String())&endDateTime=\(to.iso8601String())&$top=1000"
         while let path = next {
-            let listed = try await request(path: path, timeZoneName: seriesZone)
+            let listed = try await request(path: path, timeZoneName: Self.readZoneName(of: series))
             guard let page = try JSONSerialization.jsonObject(with: listed) as? [String: Any] else {
                 throw CalendarProviderError.notSupported("the new part's occurrences can't be read, so the changed ones can't be carried")
             }
@@ -2118,6 +2127,9 @@ actor ExchangeCalendarProvider: CalendarProvider {
         event.recurrenceTimeZoneName = e.recurrence?.range?.recurrenceTimeZone.flatMap { $0.isEmpty ? nil : $0 }
         event.recurrenceFirstDayOfWeek = e.recurrence?.pattern?.firstDayOfWeek.flatMap { $0.isEmpty ? nil : $0 }
         event.originalStartTime = Self.originalStartTime(e.originalStart)
+        // The read's start is in the zone the read asked for (`request`'s `Prefer`), not the
+        // event's own: `seriesZone` falls back only to the zone the event was created in.
+        event.ownZoneName = e.originalStartTimeZone ?? ""
         return event
     }
 
@@ -2742,6 +2754,9 @@ struct MSEvent: Decodable {
     /// Set on `occurrence`/`exception` rows: the start the series gives the occurrence, which a
     /// moved one keeps (`ExchangeCalendarProvider.originalStartTime`).
     let originalStart: String?
+    /// The zone the event was created in, as Graph keeps it (a Windows or IANA name, or a custom
+    /// zone's), whatever zone the read asked for.
+    let originalStartTimeZone: String?
 }
 
 struct MSLocation: Decodable {
