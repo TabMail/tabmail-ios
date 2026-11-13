@@ -989,6 +989,8 @@ struct UndoProviderIdentitySafetyTests {
           arguments: [UndoInvocationSource.compactToast, .shakeAlert, .programmatic])
     @MainActor
     func refusedMoveUndoRaisesTheNotice(source: UndoInvocationSource) async throws {
+        let restoreLogging = try enableNoticeDiagnostics()
+        defer { restoreLogging() }
         let fixture = try install(provider: .imap)
         UndoService.shared.dismissUndoFailure()
         defer {
@@ -1005,6 +1007,9 @@ struct UndoProviderIdentitySafetyTests {
         #expect(row?.folderPath == "Archive", "the refused Undo moves nothing back")
         #expect(UndoService.shared.undoFailureMessage == UndoService.moveUndoRefusedMessage,
                 "a refused move Undo must tell the user it did not take")
+        // The notice was set and is cleared within moments: its alert, if it
+        // started to show, must still leave the window.
+        await clearNoticesAndSettle(after: "a refused move Undo whose notice was cleared at once")
     }
 
     /// Why `undoMove` refuses, for `refusedMoveUndoRaisesTheNoticeForEveryReason`.
@@ -1021,6 +1026,8 @@ struct UndoProviderIdentitySafetyTests {
           arguments: MoveUndoRefusal.allCases)
     @MainActor
     func refusedMoveUndoRaisesTheNoticeForEveryReason(reason: MoveUndoRefusal) async throws {
+        let restoreLogging = try enableNoticeDiagnostics()
+        defer { restoreLogging() }
         let fixture = try install(provider: .gmail, accountId: "undo-refusal-\(reason.rawValue)")
         UndoService.shared.dismissUndoFailure()
         defer {
@@ -1048,6 +1055,9 @@ struct UndoProviderIdentitySafetyTests {
         }
         #expect(UndoService.shared.undoFailureMessage == UndoService.moveUndoRefusedMessage,
                 "every refused move Undo must tell the user it did not take")
+        // The notice was set and is cleared within moments: its alert, if it
+        // started to show, must still leave the window.
+        await clearNoticesAndSettle(after: "a refused move Undo whose notice was cleared at once")
     }
 
     @Test("A move Undo that restores raises no notice")
@@ -1100,11 +1110,61 @@ struct UndoProviderIdentitySafetyTests {
         let window = try #require(scene.windows.first { $0.isKeyWindow } ?? scene.windows.first)
         // An earlier test's notice may still be closing: its alert leaves the
         // window a moment after the notice ends.
+        await clearNoticesAndSettle(after: "an earlier test, before a hosted case")
+        return window
+    }
+
+    /// The test host's key window, if its scene is connected.
+    @MainActor
+    private func hostWindow() -> UIWindow? {
+        let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+        return scene?.windows.first { $0.isKeyWindow } ?? scene?.windows.first
+    }
+
+    /// One line describing an alert left up, for matching against UIKit's
+    /// `[Presentation]` lines and the app's `[UndoNotice]` lines.
+    @MainActor
+    private func noticeAlertDiagnostic(_ alert: UIAlertController, _ context: String) -> String {
+        "[UndoNoticeTest] alert left up after \(context): "
+            + "alert=\(Unmanaged.passUnretained(alert).toOpaque()) "
+            + "message=\(alert.message ?? "nil") "
+            + "isBeingPresented=\(alert.isBeingPresented) isBeingDismissed=\(alert.isBeingDismissed) "
+            + "currentIsNil=\(UndoFailureNotice.current == nil)"
+    }
+
+    /// Clears both notices and waits for the "Couldn't undo" alert to leave the
+    /// window. An alert that stays up is a failure of the test that calls this,
+    /// recorded with a diagnostic line; it is then dismissed, so one leftover
+    /// fails one test and the next test starts clean.
+    @MainActor
+    private func clearNoticesAndSettle(after context: String) async {
         UndoService.shared.dismissUndoFailure()
         PendingSendService.shared.dismiss()
-        let noNoticeUp = await eventually { presentedUndoFailureAlert(in: window) == nil }
-        try #require(noNoticeUp, "precondition: no notice is up")
-        return window
+        guard let window = hostWindow() else { return }
+        let settled = await eventually { presentedUndoFailureAlert(in: window) == nil }
+        if !settled, let leftover = presentedUndoFailureAlert(in: window) {
+            print(noticeAlertDiagnostic(leftover, context))
+            leftover.dismiss(animated: false)
+            _ = await eventually { presentedUndoFailureAlert(in: window) == nil }
+        }
+        #expect(settled, "no Couldn't undo alert may stay up once its notice is cleared (\(context))")
+    }
+
+    /// Turns debug logging on, into a temporary log, so the app's `[UndoNotice]`
+    /// diagnostics print while a notice test runs. Returns the restore, which
+    /// the caller runs in `defer` (the same process-global seams as
+    /// `queuedInverseDiagnosticCorrelatesWithTheInsertedRow`).
+    private func enableNoticeDiagnostics() throws -> () -> Void {
+        let logDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("undonoticelog_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
+        AppLogStore.fileURLOverride.withLock { $0 = logDir.appendingPathComponent("tabmail.log") }
+        DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = true }
+        return {
+            DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = nil }
+            AppLogStore._resetForTesting()
+            try? FileManager.default.removeItem(at: logDir)
+        }
     }
 
     /// Taps the alert's OK as the user does: UIKit dismisses the alert, then
@@ -1180,6 +1240,8 @@ struct UndoProviderIdentitySafetyTests {
     @Test("A refused Send Undo shows the Couldn't undo alert, and OK ends that notice and keeps the Send")
     @MainActor
     func refusedSendUndoAlertIsShownAndDismissed() async throws {
+        let restoreLogging = try enableNoticeDiagnostics()
+        defer { restoreLogging() }
         let window = try await activeHostWindow()
         let fixture = try install(provider: .imap)
         defer {
@@ -1210,6 +1272,8 @@ struct UndoProviderIdentitySafetyTests {
     @Test("A move Undo refused while the Send notice is up is shown once that notice is dismissed")
     @MainActor
     func moveRefusalDuringTheSendNoticeIsShownNext() async throws {
+        let restoreLogging = try enableNoticeDiagnostics()
+        defer { restoreLogging() }
         let window = try await activeHostWindow()
         let fixture = try install(provider: .imap)
         defer {
@@ -1249,17 +1313,28 @@ struct UndoProviderIdentitySafetyTests {
         // Both notices are set now; the alert must still name the one OK dismisses.
         try? await Task.sleep(for: .milliseconds(500))
         #expect(sendAlert.message == send.text, "the alert names the Send notice, the one OK ends first")
+        let sendNotice = try #require(UndoFailureNotice.current, "precondition: a notice is presented")
+        #expect(sendNotice.message == send.text, "the presented notice is the Send one")
 
         try tapOK(on: sendAlert)
         let sendCleared = await eventually { PendingSendService.shared.undoFailureMessage == nil }
         #expect(sendCleared, "OK ends the Send notice")
         #expect(UndoService.shared.undoFailureMessage == UndoService.moveUndoRefusedMessage,
                 "dismissing the Send notice must not end the move notice the user has not seen")
+        // The move notice must be a NEW notice, not the Send one carried over:
+        // an alert that stays "shown" across the handover is never presented
+        // again, so the user would never see it.
+        let moveNotice = try #require(UndoFailureNotice.current, "the move notice is presented next")
+        #expect(moveNotice.message == UndoService.moveUndoRefusedMessage)
+        #expect(moveNotice.id != sendNotice.id,
+                "the move notice has its own identity, so the alert is presented again for it")
         let moveShown = await eventually {
             presentedUndoFailureAlert(in: window)?.message == UndoService.moveUndoRefusedMessage
         }
         #expect(moveShown, "the move notice is shown once the Send notice is dismissed")
         let moveAlert = try #require(presentedUndoFailureAlert(in: window))
+        #expect(moveAlert !== sendAlert, "the Send notice and the move notice never share one alert")
+        #expect(moveAlert.message == UndoService.moveUndoRefusedMessage, "the new alert shows the move notice's text")
         #expect(UndoService.shared.undoFailureMessage == UndoService.moveUndoRefusedMessage,
                 "precondition: the move notice is still set when its alert is up")
 
@@ -1277,6 +1352,8 @@ struct UndoProviderIdentitySafetyTests {
     @Test("A refused move Undo shows the Couldn't undo alert, and dismissing the alert ends the notice")
     @MainActor
     func refusedMoveUndoAlertIsShownAndDismissed() async throws {
+        let restoreLogging = try enableNoticeDiagnostics()
+        defer { restoreLogging() }
         let window = try await activeHostWindow()
 
         let fixture = try install(provider: .imap)
@@ -1304,6 +1381,91 @@ struct UndoProviderIdentitySafetyTests {
         #expect(cleared, "dismissing the alert must end the notice")
         try? await Task.sleep(for: .milliseconds(1_500))
         #expect(presentedUndoFailureAlert(in: window) == nil, "a dismissed notice must not come back")
+    }
+
+    /// Which service's notice a hosted case raises and clears in code.
+    enum NoticeKind: String, CaseIterable, Sendable {
+        case send
+        case move
+    }
+
+    /// Raises a notice of `kind` through its real producer: a refused Send Undo,
+    /// or a refused move Undo (a completed IMAP move with no proven destination).
+    @MainActor
+    private func raiseNotice(_ kind: NoticeKind, _ fixture: Fixture, providerId: String) async throws {
+        switch kind {
+        case .send:
+            _ = try raiseSendUndoFailure(fixture)
+        case .move:
+            let original = sourceHeader(fixture, providerId: providerId, rfc: "\(providerId)@example.com")
+            try installOptimisticallyMoved(original, pool: fixture.pool)
+            _ = try await undoThroughTheControl(original, fixture: fixture)
+        }
+    }
+
+    @MainActor
+    private func clearNotice(_ kind: NoticeKind) {
+        switch kind {
+        case .send: PendingSendService.shared.dismissUndoFailure()
+        case .move: UndoService.shared.dismissUndoFailure()
+        }
+    }
+
+    @Test("A notice set and cleared back to back leaves no Couldn't undo alert up once things settle",
+          arguments: NoticeKind.allCases)
+    @MainActor
+    func noticeSetAndClearedBackToBackLeavesNoAlert(kind: NoticeKind) async throws {
+        let restoreLogging = try enableNoticeDiagnostics()
+        defer { restoreLogging() }
+        let window = try await activeHostWindow()
+        let fixture = try install(provider: .imap)
+        defer {
+            UndoService.shared.dismissAll()
+            UndoService.shared.dismissUndoFailure()
+            PendingSendService.shared.dismiss()
+            uninstall(fixture)
+        }
+        try await raiseNotice(kind, fixture, providerId: "715")
+        clearNotice(kind)
+
+        try? await Task.sleep(for: .milliseconds(1_500))
+        let leftover = presentedUndoFailureAlert(in: window)
+        if let leftover { print(noticeAlertDiagnostic(leftover, "a \(kind.rawValue) notice set and cleared back to back")) }
+        #expect(leftover == nil, "a notice cleared at once must not leave its alert up")
+        await clearNoticesAndSettle(after: "the back-to-back case's own cleanup")
+    }
+
+    @Test("A notice cleared in code takes its Couldn't undo alert down at once",
+          arguments: NoticeKind.allCases, [false, true])
+    @MainActor
+    func noticeClearedInCodeTakesItsAlertDown(source: NoticeKind, onceFullyUp: Bool) async throws {
+        let restoreLogging = try enableNoticeDiagnostics()
+        defer { restoreLogging() }
+        let window = try await activeHostWindow()
+        let fixture = try install(provider: .imap)
+        defer {
+            presentedUndoFailureAlert(in: window)?.dismiss(animated: false)
+            UndoService.shared.dismissAll()
+            UndoService.shared.dismissUndoFailure()
+            PendingSendService.shared.dismiss()
+            uninstall(fixture)
+        }
+        try await raiseNotice(source, fixture, providerId: "714")
+        // Cleared as soon as the alert is in the window (possibly mid-animation),
+        // or only once it is fully up.
+        let shown = await eventually {
+            guard let alert = presentedUndoFailureAlert(in: window) else { return false }
+            return !onceFullyUp || !alert.isBeingPresented
+        }
+        try #require(shown, "precondition: the notice's alert is up")
+
+        clearNotice(source)
+
+        let gone = await eventually(within: 2) { presentedUndoFailureAlert(in: window) == nil }
+        if !gone, let leftover = presentedUndoFailureAlert(in: window) {
+            print(noticeAlertDiagnostic(leftover, "a \(source.rawValue) notice cleared in code"))
+        }
+        #expect(gone, "an alert whose notice was cleared in code must not stay up")
     }
 
     @Test("Completed IMAP Undo without a proven destination UID and epoch fails closed with zero local or provider mutation")

@@ -202,7 +202,12 @@ final class UndoService {
     /// Set when `AccountManager.undoMove` refused a move Undo, whatever the
     /// reason: the messages stay where the move put them. RootView shows it as
     /// one short "Couldn't undo" notice; `dismissUndoFailure()` clears it.
-    private(set) var undoFailureMessage: String?
+    private(set) var undoFailureMessage: String? {
+        didSet {
+            BackgroundSyncLogger.logDebug(
+                "[UndoNotice] move notice \(oldValue ?? "nil") -> \(undoFailureMessage ?? "nil")")
+        }
+    }
 
     static let moveUndoRefusedMessage = "Nothing was moved back."
 

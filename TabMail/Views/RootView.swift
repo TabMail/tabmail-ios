@@ -60,7 +60,6 @@ struct RootView: View {
     /// retained Draft without accepting a replacement owner or generation.
     @State private var reopenSnapshot: PendingSendService.ReopenSnapshot?
     private var pendingSendService: PendingSendService { PendingSendService.shared }
-    private var undoService: UndoService { UndoService.shared }
 
     /// Sync status values — observed once here and published to descendants via
     /// Environment. Centralising here keeps the observer alive across sidebar
@@ -275,19 +274,13 @@ struct RootView: View {
         if !tutorial.isRunning { requestPushPermissionAfterTutorial() }
     }
 
-    /// Clears the "Couldn't undo" notice the alert was showing, and only that
-    /// one: the Send notice when there is one (the alert shows it first),
-    /// otherwise the move notice. A move refusal that arrived while the Send
-    /// notice was up stays set, so the alert comes back with it. (A Send notice
-    /// cannot arrive while the move notice is up: its only producer is the
-    /// Send toast's Undo, which the alert covers.) Only the
-    /// alert's binding calls this, once per dismissal: a second call would
-    /// clear the notice still waiting to be shown.
-    private func dismissShownUndoFailure() {
-        if pendingSendService.undoFailureMessage != nil {
-            pendingSendService.dismissUndoFailure()
-        } else {
-            undoService.dismissUndoFailure()
+    /// The "Couldn't undo" alerts, one fixed host per source
+    /// (`UndoFailureAlertHost`): a move notice that waited behind the Send
+    /// notice gets an alert of its own once the Send one is dismissed.
+    private var undoFailureAlertHosts: some View {
+        ZStack {
+            UndoFailureAlertHost(source: .send)
+            UndoFailureAlertHost(source: .move)
         }
     }
 
@@ -413,17 +406,8 @@ struct RootView: View {
         // still be queued or may already be sending, so this alert says only that
         // the Undo attempt did not take; it never promises the message was stopped.
         // A refused move Undo (`UndoService.undoFailureMessage`) shows the same
-        // notice: nothing was moved back. Each notice is shown before it is
-        // cleared (`dismissShownUndoFailure`). OK has no action of its own:
-        // tapping it dismisses through the binding.
-        .alert("Couldn't undo", isPresented: Binding(
-            get: { pendingSendService.undoFailureMessage != nil || undoService.undoFailureMessage != nil },
-            set: { if !$0 { dismissShownUndoFailure() } }
-        )) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(pendingSendService.undoFailureMessage ?? undoService.undoFailureMessage ?? "")
-        }
+        // notice: nothing was moved back. See `undoFailureAlertHosts`.
+        .background(undoFailureAlertHosts)
         .onReceive(NotificationCenter.default.publisher(for: .demoModeDidExit)) { _ in
             demoSeedingComplete = false
             tutorial.demoDidExit()

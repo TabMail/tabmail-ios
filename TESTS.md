@@ -1256,3 +1256,13 @@ clears it and does not come back; a refused Send Undo (its cancellation commit r
 text, and tapping OK clears only it and leaves the Send queued; and a move Undo refused while the Send
 notice is up keeps its notice when the Send one is dismissed, is shown next, and clears on its own
 OK. The OK taps run the button's own handler after UIKit dismisses the alert, as a real tap does.
+That last case also checks that the move notice gets a new alert, not the Send one's, showing the
+move text, and that the presented notice (`UndoFailureNotice.current`) is the Send one first, then
+the move one with a different identity. A further hosted case clears each notice in code (Send and
+move), once as soon as its alert is in the window and once when it is fully up, and expects the alert
+gone at once; another sets and clears each notice back to back and expects no alert up once things
+settle. Every hosted case starts by clearing any notice an earlier test left and waiting until no
+alert is up, and the two notice-only cases end the same way: an alert left up fails the test that
+left it, with a diagnostic line, and is then dismissed so the next test starts clean. A further case refuses the Undo for other reasons on a Gmail
+account (the forward move never happened, the row is gone, the account is gone) and expects the same
+notice for each.
