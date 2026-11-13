@@ -309,7 +309,7 @@ struct CalendarEventEditTool: AgentTool, Sendable {
             // write's words, before the user confirms.
             if resolvedScope == "this_and_following", let rid = recurrenceIdArg,
                let occurrence = named.occurrence, RecurrenceOccurrenceResolver.wasMoved(occurrence),
-               case .pastEnd = try await provider.splitCut(calendarId: lookupCalId, eventId: queuedEventId, recurrenceId: rid, zone: tz) {
+               case .pastEnd = try await provider.splitCut(calendarId: lookupCalId, eventId: queuedEventId, recurrenceId: rid, zone: ridZone) {
                 pastEnd = true
                 let changesRule = try CalendarToolHelpers.buildGCalEventInput(arguments, isAllDay: occurrence.isAllDay).recurrence != nil
                 if try changesRule || (CalendarSeriesScope.dayMove(arguments, named: named, scope: resolvedScope, zone: tz)) != nil {
