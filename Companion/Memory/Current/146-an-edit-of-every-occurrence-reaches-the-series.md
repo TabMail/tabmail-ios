@@ -492,3 +492,11 @@ and `CalendarSeriesScopeRouteTests.mintedRecurrenceIdIsInTheRecurrenceIdZone`; g
 series given `all_day` with an end alone, where the occurrence is looked up by its time in that zone;
 `calDAVTimedToAllDayEndOnlyAcrossZones` pins that path. A read by `start_iso` keeping its `timezone`
 is pinned by `readByStartKeepsItsTimezone`.
+
+**2026-11-13 (#695, ADR-IOS-112): the delete reads `recurrence_id` the same way.** `calendar_event_delete`
+snapshots `ToolContext.deviceZone` at its start and reads `recurrence_id` there whatever `timezone`
+says (backend `calendar_event_delete-v1.10.3`), and a "this and following" delete is judged on the
+occurrence's place in the series as `route` judges a split: at the series' first occurrence it is the
+whole series, before it refused. Unlike the split, a moved occurrence is cut at its place rather than
+refused. Pinned by `CalendarScopedDeleteTests` (device, delete and read zones all different, the drain
+in the host's).

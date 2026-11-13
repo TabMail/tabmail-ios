@@ -182,7 +182,7 @@ struct CalDAVOccurrenceDeleteToolToWireTests {
         // 3. The user asks to delete it and confirms the card.
         let sink = ConfirmingSink()
         let output = try await CalendarEventDeleteTool(context: ToolContext(db: harness.pool, translator: translator)).execute(
-            arguments: ["event_id": .string(String(numericId))],
+            arguments: ["event_id": .string(String(numericId)), "delete_scope": .string("this_only")],
             invocation: ToolInvocation(uiSink: sink, sessionKey: "caldav-one-day-delete"))
         // A later drain must not send it either.
         await AccountManager.shared.drainCalendarQueue()
@@ -242,7 +242,7 @@ struct CalDAVOccurrenceDeleteToolToWireTests {
 
         let sink = ConfirmingSink(http: harness.http)
         let output = try await CalendarEventDeleteTool(context: ToolContext(db: harness.pool, translator: translator)).execute(
-            arguments: ["event_id": .string(String(seriesNumber))],
+            arguments: ["event_id": .string(String(seriesNumber)), "delete_scope": .string("all")],
             invocation: ToolInvocation(uiSink: sink, sessionKey: "caldav-series-delete-control"))
 
         #expect(H.deletes(harness.http).count == 1,
@@ -276,7 +276,7 @@ struct CalDAVOccurrenceDeleteToolToWireTests {
 
         let sink = ConfirmingSink()
         let output = try await CalendarEventDeleteTool(context: ToolContext(db: harness.pool, translator: translator)).execute(
-            arguments: ["event_id": .string(String(number))],
+            arguments: ["event_id": .string(String(number)), "delete_scope": .string("this_only")],
             invocation: ToolInvocation(uiSink: sink, sessionKey: "caldav-changed-only-occurrence-delete"))
         await AccountManager.shared.drainCalendarQueue()
 

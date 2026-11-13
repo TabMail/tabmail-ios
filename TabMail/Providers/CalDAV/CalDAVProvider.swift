@@ -740,33 +740,43 @@ actor CalDAVProvider: CalendarProvider {
     /// series' half `seriesSplitResources` builds (`cappedSeriesResource`), worked out from the
     /// series as it is now and PUT under its ETag, and nothing when the series already ends
     /// before the split. `record.splitAt` is the checked slot `splitSeries` split at, read in
-    /// `zone`.
+    /// `zone`. Written by `endSeries`; CalDAV has no `sendUpdates`.
     func finishSplit(calendarId: String, record: SplitRecord, zone: TimeZone) async throws {
-        let eventURL = try resolveEventURL(record.seriesId, calendarId: calendarId)
+        try await endSeries(calendarId: calendarId, seriesId: record.seriesId, before: record.splitAt, zone: zone, sendUpdates: "none")
+    }
+
+    /// End the series `seriesId` just before `slot` (`CalendarProvider.endSeries`), its place in
+    /// the series read in `zone`: the series' half `seriesSplitResources` builds
+    /// (`cappedSeriesResource`: its changed occurrences and excluded or added dates before `slot`
+    /// kept, those at or after it dropped), worked out from the series as it is now and PUT under
+    /// its ETag, and nothing when the series already ends before `slot`. The PUT is irreversible
+    /// (memory 102). CalDAV has no `sendUpdates`, so it is unused.
+    func endSeries(calendarId: String, seriesId: String, before slot: String, zone: TimeZone, sendUpdates: String) async throws {
+        let eventURL = try resolveEventURL(seriesId, calendarId: calendarId)
         let (data, getResponse) = try await client.get(url: eventURL)
         guard let storedICS = String(data: data, encoding: .utf8), !storedICS.isEmpty else {
-            throw CalDAVError.parseError("Empty response for event \(record.seriesId)")
+            throw CalDAVError.parseError("Empty response for event \(seriesId)")
         }
         let etag = getResponse.value(forHTTPHeaderField: "ETag")
         guard let originalRRule = Self.extractRRule(from: storedICS) else {
             throw CalendarProviderError.notSupported("Can't finish this change to the repeating event: it no longer repeats. Check the event in your calendar app.")
         }
         guard let untilValue = GoogleCalendarProvider.googleUntilString(
-            beforeNaiveISO: record.splitAt, allDay: Self.icsIsAllDay(storedICS), zone: zone) else {
-            throw CalendarProviderError.notSupported("Invalid recurrence_id '\(record.splitAt)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
+            beforeNaiveISO: slot, allDay: Self.icsIsAllDay(storedICS), zone: zone) else {
+            throw CalendarProviderError.notSupported("Invalid recurrence_id '\(slot)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
         }
         let zones = CalendarTimeZoneContext(calendarText: storedICS)
         guard let masterFrameSlot = try Self.recurrenceIdInMasterFrame(
-            record.splitAt, declaredZone: zone, kind: Self.masterDTStartKind(from: storedICS), zones: zones
+            slot, declaredZone: zone, kind: Self.masterDTStartKind(from: storedICS), zones: zones
         ) else {
             throw CalendarProviderError.notSupported(
-                "Could not express recurrence_id '\(record.splitAt)' (\(zone.identifier)) in this event's timezone — refusing to finish a split at an occurrence we cannot name.")
+                "Could not express recurrence_id '\(slot)' (\(zone.identifier)) in this event's timezone — refusing to finish a split at an occurrence we cannot name.")
         }
         if try RecurrenceTail.endsBeforeSplit(
             originalRRule, seriesStart: Self.masterDTStartDay(from: storedICS),
             split: RecurrenceTail.Day(iso: masterFrameSlot), capUntil: untilValue) {
             if DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[CalDAV] finishSplit: series \(record.seriesId) already ends before \(record.splitAt) — nothing to write")
+                BackgroundSyncLogger.logDebug("[CalDAV] endSeries: series \(seriesId) already ends before \(slot) — nothing to write")
             }
             return
         }
@@ -774,7 +784,7 @@ actor CalDAVProvider: CalendarProvider {
         let slotInstant = try Self.splitSlot(storedICS: storedICS, slotNaiveISO: masterFrameSlot, zones: zones).instant
         let cappedSeries = try Self.cappedSeriesResource(
             storedICS: storedICS, slotInstant: slotInstant, cappedRRule: cappedRRule, zones: zones)
-        etagCache.removeValue(forKey: record.seriesId)
+        etagCache.removeValue(forKey: seriesId)
         try await putEvent(
             url: eventURL, body: cappedSeries,
             precondition: etag.map(CalDAVPutPrecondition.ifMatch) ?? .unconditional)

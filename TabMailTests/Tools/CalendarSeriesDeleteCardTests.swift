@@ -46,7 +46,7 @@ struct CalendarSeriesDeleteCardTests {
 
     /// The lines on the card `calendar_event_delete` shows for `event`, read through a mock
     /// provider; the card is declined, and the test checks that no delete was sent.
-    private func cardLines(for event: GCalEvent, accountId: String) async throws -> [String] {
+    private func cardLines(for event: GCalEvent, accountId: String, scope: String? = nil) async throws -> [String] {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         var config = Configuration()
@@ -70,10 +70,12 @@ struct CalendarSeriesDeleteCardTests {
         }
 
         let compound = CompoundEventId.make(accountId: accountId, eventId: event.id ?? "")
+        var arguments: [String: JSONValue] = ["event_id": .string(compound)]
+        if let scope { arguments["delete_scope"] = .string(scope) }
         let sink = DecliningSink()
         await #expect(throws: ToolDeclinedError.self) {
             _ = try await CalendarEventDeleteTool(context: ToolContext(db: pool, translator: MockChatIdTranslator())).execute(
-                arguments: ["event_id": .string(compound)],
+                arguments: arguments,
                 invocation: ToolInvocation(uiSink: sink, sessionKey: accountId))
         }
         let deleted = await mock.deletedEvents
@@ -87,7 +89,7 @@ struct CalendarSeriesDeleteCardTests {
     func seriesCardSaysItRepeats() async throws {
         let series = Self.event(
             id: "series-1", recurrence: ["RRULE:FREQ=WEEKLY;BYDAY=MO,WE;COUNT=10"], recurringEventId: nil)
-        let lines = try await cardLines(for: series, accountId: "series-delete-card")
+        let lines = try await cardLines(for: series, accountId: "series-delete-card", scope: "all")
         #expect(lines == [CalendarToolHelpers.seriesDeleteNote, "Repeats weekly on Monday, Wednesday (10 times)"],
                 "the card for deleting a repeating series does not say it repeats: \(lines)")
     }
@@ -108,7 +110,7 @@ struct CalendarSeriesDeleteCardTests {
                 recurrence: nil, recurringEventId: "/cal/invite.ics")),
         ]
         for (name, event) in shapes {
-            let lines = try await cardLines(for: event, accountId: "occurrence-delete-card-\(name)")
+            let lines = try await cardLines(for: event, accountId: "occurrence-delete-card-\(name)", scope: "this_only")
             #expect(lines == [Self.occurrenceLine], "the \(name) card does not say only one occurrence is meant: \(lines)")
         }
     }

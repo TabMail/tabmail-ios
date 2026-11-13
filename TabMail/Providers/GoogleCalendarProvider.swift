@@ -92,8 +92,17 @@ protocol CalendarProvider: Sendable {
     /// with the series as it is now (read in `zone`, the operation's `recurrenceIdZone`), and
     /// nothing else. Writes nothing when the series already ends before `record.splitAt` (its
     /// cap landed and only the answer was lost, or the user ended it earlier). Default:
-    /// refused, as `splitSeries` is.
+    /// refused, as `splitSeries` is. Written by `endSeries`, silently (`sendUpdates` "none").
     func finishSplit(calendarId: String, record: SplitRecord, zone: TimeZone) async throws
+
+    /// End the repeating event `seriesId` (the series' own id) just before the occurrence whose
+    /// place in the series is `slot` (naive ISO, read in `zone`): the cap `splitSeries` writes,
+    /// worked out from the series as it is now (its rule ended the day or second before, its
+    /// excluded, added and changed occurrences before `slot` kept and those at or after it
+    /// dropped). The occurrences from `slot` on are gone; the earlier ones stay. Writes nothing
+    /// when the series already ends before `slot`, so it never lengthens a series. `sendUpdates`
+    /// is passed to a calendar that takes it (Google). Default: refused, as `splitSeries` is.
+    func endSeries(calendarId: String, seriesId: String, before slot: String, zone: TimeZone, sendUpdates: String) async throws
 
     /// Every repeat rule, as an RRULE, that this calendar writes when a move to another day turns
     /// the days of `series` (`GCalEventInput.ruleDayMove`): the whole series' rules for scope "all",
@@ -189,6 +198,9 @@ extension CalendarProvider {
         throw CalendarProviderError.notSupported(Self.splitNotSupported)
     }
     func finishSplit(calendarId: String, record: SplitRecord, zone: TimeZone) async throws {
+        throw CalendarProviderError.notSupported(Self.splitNotSupported)
+    }
+    func endSeries(calendarId: String, seriesId: String, before slot: String, zone: TimeZone, sendUpdates: String) async throws {
         throw CalendarProviderError.notSupported(Self.splitNotSupported)
     }
     func dayMovedRules(calendarId: String, eventId: String, series: GCalEvent, scope: String, recurrenceId: String?,
@@ -1038,33 +1050,39 @@ actor GoogleCalendarProvider: CalendarProvider {
     }
 
     /// The cap of the split `record` names, written alone (`CalendarProvider.finishSplit`): the
-    /// cap `splitSeries` writes, worked out from the series as it is now, and nothing when the
-    /// series already ends before the split.
+    /// cap `splitSeries` writes, silently (`endSeries` with `sendUpdates` "none").
     func finishSplit(calendarId: String = "primary", record: SplitRecord, zone: TimeZone) async throws {
-        let master = try await getEvent(calendarId: calendarId, eventId: record.seriesId)
+        try await endSeries(calendarId: calendarId, seriesId: record.seriesId, before: record.splitAt, zone: zone, sendUpdates: "none")
+    }
+
+    /// End the series `seriesId` just before `slot` (`CalendarProvider.endSeries`): the cap
+    /// `splitSeries` writes, worked out from the series as it is now, and nothing when the series
+    /// already ends before `slot`.
+    func endSeries(calendarId: String = "primary", seriesId: String, before slot: String, zone: TimeZone, sendUpdates: String) async throws {
+        let master = try await getEvent(calendarId: calendarId, eventId: seriesId)
         guard let recurrence = master.recurrence,
               let rule = recurrence.first(where: { $0.uppercased().hasPrefix("RRULE:") }) else {
             throw CalendarProviderError.notSupported("Can't finish this change to the repeating event: it no longer repeats. Check the event in your calendar app.")
         }
-        guard let untilValue = Self.googleUntilString(beforeNaiveISO: record.splitAt, allDay: master.isAllDay, zone: zone),
-              let slot = Self.splitInstant(naiveISO: record.splitAt, allDay: master.isAllDay, zone: zone) else {
-            throw CalendarProviderError.notSupported("Invalid recurrence_id '\(record.splitAt)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
+        guard let untilValue = Self.googleUntilString(beforeNaiveISO: slot, allDay: master.isAllDay, zone: zone),
+              let slotInstant = Self.splitInstant(naiveISO: slot, allDay: master.isAllDay, zone: zone) else {
+            throw CalendarProviderError.notSupported("Invalid recurrence_id '\(slot)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
         }
-        let days = Self.splitDaysInMasterFrame(master: master, recurrenceId: record.splitAt, recurrenceIdZone: zone)
+        let days = Self.splitDaysInMasterFrame(master: master, recurrenceId: slot, recurrenceIdZone: zone)
         if try RecurrenceTail.endsBeforeSplit(rule, seriesStart: days.seriesStart, split: days.split, capUntil: untilValue) {
             if DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[GoogleCalendar] finishSplit: series \(record.seriesId) already ends before \(record.splitAt) — nothing to write")
+                BackgroundSyncLogger.logDebug("[GoogleCalendar] endSeries: series \(seriesId) already ends before \(slot) — nothing to write")
             }
             return
         }
         // Only the series' half is written; the new part's rule is not needed here.
         let cappedRRule = Self.replaceOrAppendUntil(in: rule, untilValue: untilValue)
-        let capped = try Self.splitRecurrence(recurrence, cappedRRule: cappedRRule, tailRRule: cappedRRule, slot: slot).capped
+        let capped = try Self.splitRecurrence(recurrence, cappedRRule: cappedRRule, tailRRule: cappedRRule, slot: slotInstant).capped
         let _: GCalEvent = try await patchEvent(
             calendarId: calendarId,
-            eventId: record.seriesId,
+            eventId: seriesId,
             event: Self.splitCapInput(master: master, cappedRecurrence: capped),
-            sendUpdates: "none",
+            sendUpdates: sendUpdates,
             keepStoredDates: false
         )
     }

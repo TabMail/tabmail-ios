@@ -230,6 +230,7 @@ final class FakeGoogleCalendar: Sendable {
             }
             for (key, value) in patch { stored[key] = value }
             store(stored)
+            patchNotices.withLock { $0.append(Self.sendUpdates(request.url)) }
             writeLog.withLock { $0.append("PATCH \(parts[0])") }
             patchLog.withLock { $0.append((parts[0], body)) }
             if takeLoss("PATCH") { return .transportError(.networkConnectionLost) }
@@ -258,9 +259,7 @@ final class FakeGoogleCalendar: Sendable {
             let parts = Self.pathParts(request.url)
             guard parts.count == 1, var stored = event(parts[0]) else { return .status(404) }
             if stored["status"] as? String == "cancelled" { return .status(410) }
-            let sendUpdates = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?
-                .queryItems?.first { $0.name == "sendUpdates" }?.value ?? "none given"
-            deleteNotices.withLock { $0.append(sendUpdates) }
+            deleteNotices.withLock { $0.append(Self.sendUpdates(request.url)) }
             if stored["recurringEventId"] is String {
                 stored["status"] = "cancelled"
                 store(stored)
@@ -275,6 +274,16 @@ final class FakeGoogleCalendar: Sendable {
     /// The `sendUpdates` each DELETE that landed was sent with, in order.
     var deleteSendUpdates: [String] { deleteNotices.withLock { $0 } }
     private let deleteNotices = Mutex<[String]>([])
+
+    /// The `sendUpdates` each PATCH that landed was sent with, in order.
+    var patchSendUpdates: [String] { patchNotices.withLock { $0 } }
+    private let patchNotices = Mutex<[String]>([])
+
+    /// A request's `sendUpdates`, or "none given".
+    private static func sendUpdates(_ url: URL) -> String {
+        URLComponents(url: url, resolvingAgainstBaseURL: false)?
+            .queryItems?.first { $0.name == "sendUpdates" }?.value ?? "none given"
+    }
 
     /// Takes `id` out of the calendar: another client's delete, which leaves nothing behind.
     func remove(_ id: String) { events.withLock { _ = $0.removeValue(forKey: id) } }

@@ -1225,6 +1225,24 @@ enum CalendarToolHelpers {
     /// deleted, so either way the rest of the series stays.
     static let occurrenceDeleteNote = "One occurrence of a repeating event; the rest of the series stays."
 
+    /// The delete card's lines for an occurrence of `series` and every later one
+    /// (`delete_scope` "this_and_following"), in the Thunderbird add-on's words: the series is cut
+    /// at the occurrence's place, so one moved from it shows both times (`moved`), then the
+    /// series' rule in words when it can be stated.
+    static func followingDeleteLines(series: GCalEvent, moved: CalendarSeriesScope.FollowingDelete.Moved?) -> [String] {
+        let note = moved.map {
+            "This and every later occurrence will be deleted (from \($0.now), originally \($0.originally)); earlier ones stay."
+        } ?? "This and every later occurrence will be deleted; earlier ones stay."
+        guard let rule = storedRecurrenceSummary(series.recurrence ?? []) else { return [note] }
+        return [note, "Repeats \(rule)"]
+    }
+
+    /// The queued argument naming where a delete of an occurrence and every later one ends the
+    /// series (`CalendarSeriesScope.FollowingDelete.cut`), read in the zone `recurrenceIdZoneKey`
+    /// names. Set by the delete tool before its card; the drain ends the series there
+    /// (`CalendarProvider.endSeries`) and reads nothing else of the delete.
+    static let deleteCutKey = "delete_cut_at"
+
     /// The delete card's lines for `event`, read before the card. An occurrence names its series in
     /// `recurringEventId` on every provider (a CalDAV occurrence may also carry the series' rule),
     /// and deleting it by its own id does not delete the series: `occurrenceDeleteNote`. A repeating
