@@ -141,6 +141,52 @@ final class ChatPillState {
         /// Prevents UUID regeneration on every render which causes flicker.
         var cachedSessionMessages: [String: [ChatMessage]] = [:]
 
+        // --- Local chat history writes ---
+
+        /// Shown in this chat when a turn could not be written to the local chat
+        /// history. The live conversation keeps going; only the saved copy differs.
+        nonisolated static let historySaveFailedWarning =
+            "This message couldn't be saved to your chat history. You can keep chatting, but it may be missing when you reopen this chat."
+
+        /// Shown in this chat when removed turns could not be deleted from the local
+        /// chat history, so they can come back when the chat is reopened.
+        nonisolated static let historyDeleteFailedWarning =
+            "The removed messages couldn't be deleted from your chat history. They may come back when you reopen this chat."
+
+        /// The pill's one way to write a turn to the local chat history. Returns
+        /// the turns evicted by the budget, or nil when the write failed. A failure
+        /// does not stop the conversation; it is shown in this chat as a warning,
+        /// because the saved history now differs from what is on screen.
+        ///
+        /// A demo turn refused after its demo ended (`ChatStore.DemoTurnRefused`)
+        /// is not a failure: that history is discarded on purpose.
+        @discardableResult
+        func appendTurn(_ turn: ChatTurn, admission: DemoModeStore.Admission?) async -> [ChatTurn]? {
+            do {
+                return try await ChatStore.shared.appendTurn(turn, admission: admission)
+            } catch is ChatStore.DemoTurnRefused {
+                BackgroundSyncLogger.logDebug("[ChatPillState] Demo turn refused after its demo ended: \(turn.role)")
+                return nil
+            } catch {
+                BackgroundSyncLogger.logDebug("[ChatPillState] Failed to persist \(turn.role) turn: \(error)")
+                chatMessages.append(ChatMessage(
+                    role: .warning, content: Self.historySaveFailedWarning, timestamp: Date()))
+                return nil
+            }
+        }
+
+        /// The pill's one way to delete turns it has already removed from the
+        /// screen (resend, rewind). A failure is shown in this chat as a warning.
+        func deleteTurns(ids: [String]) async {
+            do {
+                try await ChatStore.shared.deleteTurns(ids: ids)
+            } catch {
+                BackgroundSyncLogger.logDebug("[ChatPillState] Failed to delete \(ids.count) turns: \(error)")
+                chatMessages.append(ChatMessage(
+                    role: .warning, content: Self.historyDeleteFailedWarning, timestamp: Date()))
+            }
+        }
+
         /// Observe inbox message reminder count changes via GRDB ValueObservation.
         /// First emission populates activeReminders (initial load). Subsequent changes
         /// rebuild Buffer 2. The view handles propagation to Buffer 1 based on visibility.

@@ -1577,8 +1577,7 @@ struct DynamicIslandChat: View {
             thinkingContent: nil
         )
         let userTurnPersistence = Task {
-            do { try await ChatStore.shared.appendTurn(userTurn, admission: admission) }
-            catch { BackgroundSyncLogger.logDebug("[DynamicIslandChat] Failed to persist compose edit user turn: \(error)") }
+            await session.appendTurn(userTurn, admission: admission)
         }
         sessionTurns.append(userTurn)
 
@@ -1604,7 +1603,7 @@ struct DynamicIslandChat: View {
 
         activeChatTask = Task {
             defer { composeAgentSendFence?.finishAgent() }
-            await userTurnPersistence.value
+            _ = await userTurnPersistence.value
             do {
                 let result = try await editTask.value
                 timeoutTask.cancel()
@@ -1669,8 +1668,7 @@ struct DynamicIslandChat: View {
                     emailContextJSON: nil,
                     thinkingContent: nil
                 )
-                do { try await ChatStore.shared.appendTurn(assistantTurn, admission: admission) }
-                catch { BackgroundSyncLogger.logDebug("[DynamicIslandChat] Failed to persist compose edit assistant turn: \(error)") }
+                await session.appendTurn(assistantTurn, admission: admission)
                 sessionTurns.append(assistantTurn)
 
                 // Auto-save draft to GRDB (state after edit applied).
@@ -2282,8 +2280,6 @@ struct DynamicIslandChat: View {
         let capturedSessionKey = sessionKey
 
         activeChatTask = Task {
-            let chatStore = ChatStore.shared
-
             // Ensure email context is registered before building enrichedText.
             // Covers three cases:
             // 1. Live message-detail session — message is non-nil, register from it
@@ -2338,15 +2334,12 @@ struct DynamicIslandChat: View {
                 emailContextJSON: emailContextJSON,
                 thinkingContent: nil
             )
-            do {
-                let evicted = try await chatStore.appendTurn(userTurn, admission: admission)
+            if let evicted = await session.appendTurn(userTurn, admission: admission) {
                 let userRefs = ChatIdTranslator.collectRefsFromTurn(userTurn)
                 await ChatIdTranslator.shared.registerTurnRefs(userRefs)
                 if !evicted.isEmpty {
                     await ChatIdTranslator.shared.cleanupEvictedIds(evictedTurns: evicted)
                 }
-            } catch {
-                BackgroundSyncLogger.logDebug("[DynamicIslandChat] Failed to persist user turn: \(error)")
             }
 
             // Step 2: Send via completions API with current session turns as history.
@@ -2414,16 +2407,13 @@ struct DynamicIslandChat: View {
                     sessionTurns.append(assistantTurn)
 
                     BackgroundSyncLogger.logDebug("[AIChatRender] step 3/5: persisting turn to chatStore...")
-                    do {
-                        let evicted = try await chatStore.appendTurn(assistantTurn, admission: admission)
+                    if let evicted = await session.appendTurn(assistantTurn, admission: admission) {
                         BackgroundSyncLogger.logDebug("[AIChatRender] step 3a: appendTurn done, evicted=\(evicted.count)")
                         let assistantRefs = ChatIdTranslator.collectRefsFromTurn(assistantTurn)
                         await ChatIdTranslator.shared.registerTurnRefs(assistantRefs)
                         if !evicted.isEmpty {
                             await ChatIdTranslator.shared.cleanupEvictedIds(evictedTurns: evicted)
                         }
-                    } catch {
-                        BackgroundSyncLogger.logDebug("[DynamicIslandChat] Failed to persist assistant turn: \(error)")
                     }
                     BackgroundSyncLogger.logDebug("[AIChatRender] step 4/5: persistence complete")
                 }
@@ -2529,7 +2519,6 @@ struct DynamicIslandChat: View {
         let capturedSessionKey = sessionKey
 
         activeChatTask = Task {
-            let chatStore = ChatStore.shared
             do {
                 let response = try await AIService.shared.resumeChatMessage(
                     request: request,
@@ -2562,15 +2551,12 @@ struct DynamicIslandChat: View {
                         thinkingContent: response?.thinking
                     )
                     sessionTurns.append(assistantTurn)
-                    do {
-                        let evicted = try await chatStore.appendTurn(assistantTurn, admission: admission)
+                    if let evicted = await session.appendTurn(assistantTurn, admission: admission) {
                         let assistantRefs = ChatIdTranslator.collectRefsFromTurn(assistantTurn)
                         await ChatIdTranslator.shared.registerTurnRefs(assistantRefs)
                         if !evicted.isEmpty {
                             await ChatIdTranslator.shared.cleanupEvictedIds(evictedTurns: evicted)
                         }
-                    } catch {
-                        BackgroundSyncLogger.logDebug("[DynamicIslandChat] Failed to persist resumed assistant turn: \(error)")
                     }
                 }
 
@@ -2642,7 +2628,7 @@ struct DynamicIslandChat: View {
             sessionTurns.removeLast()
         }
         if !turnIdsToDelete.isEmpty {
-            Task { try? await ChatStore.shared.deleteTurns(ids: turnIdsToDelete) }
+            Task { await session.deleteTurns(ids: turnIdsToDelete) }
         }
     }
 
@@ -2660,7 +2646,7 @@ struct DynamicIslandChat: View {
         let turnsToDelete = Array(sessionTurns.suffix(from: turnsCutoff))
         if !turnsToDelete.isEmpty {
             let idsToDelete = turnsToDelete.map(\.id)
-            Task { try? await ChatStore.shared.deleteTurns(ids: idsToDelete) }
+            Task { await session.deleteTurns(ids: idsToDelete) }
         }
         sessionTurns = Array(sessionTurns.prefix(turnsCutoff))
         return userMessagesBefore
