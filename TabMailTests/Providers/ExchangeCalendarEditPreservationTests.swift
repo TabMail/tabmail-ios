@@ -141,7 +141,7 @@ final class FakeGraphCalendar: Sendable {
     /// Each event's attachments, as stored (JSON, each with its `contentBytes`).
     private let attachmentStore = Mutex<[String: [Data]]>([:])
     private let attachmentCount = Mutex(0)
-    private struct Upload { let eventId: String; let name: String; let contentType: String; var received: Data }
+    private struct Upload { let eventId: String; let name: String; let contentType: String; let isInline: Bool; let contentId: String?; var received: Data }
     private let uploads = Mutex<[String: Upload]>([:])
     private let uploadAuthorizationLog = Mutex<[String?]>([])
 
@@ -159,12 +159,27 @@ final class FakeGraphCalendar: Sendable {
     }
 
     /// Attaches a file named `name` holding `bytes` to event `id`, as the user does in Outlook.
-    func attachFile(_ name: String, contentType: String, bytes: Data, to id: String) {
-        store(attachment: [
-            "@odata.type": "#microsoft.graph.fileAttachment", "name": name, "contentType": contentType,
-            "size": bytes.count, "isInline": false, "contentBytes": bytes.base64EncodedString(),
-        ], on: id)
+    /// `isInline` and `contentId` place it in the body, as a picture is; a file stored without
+    /// a `contentId` has none (Graph returns null).
+    func attachFile(_ name: String?, contentType: String, bytes: Data, to id: String, isInline: Bool = false, contentId: String? = nil) {
+        var file: [String: Any] = [
+            "@odata.type": "#microsoft.graph.fileAttachment", "contentType": contentType,
+            "size": bytes.count, "isInline": isInline, "contentBytes": bytes.base64EncodedString(),
+        ]
+        file["name"] = name
+        file["contentId"] = contentId
+        store(attachment: file, on: id)
     }
+
+    /// Attaches a non-file attachment of `odataType` (`#microsoft.graph.referenceAttachment`, a
+    /// cloud link, or `#microsoft.graph.itemAttachment`, an Outlook item) named `name` to event
+    /// `id`. A GET of it by id carries no `contentBytes`.
+    func attachOther(_ odataType: String, name: String, to id: String) {
+        store(attachment: ["@odata.type": odataType, "name": name, "contentType": NSNull(), "size": 0, "isInline": false], on: id)
+    }
+
+    /// The number of attachments one list page holds; Graph follows with `@odata.nextLink`.
+    let attachmentPageSize = Mutex(Int.max)
 
     private func store(attachment: [String: Any], on id: String) {
         var attachment = attachment
@@ -409,8 +424,22 @@ final class FakeGraphCalendar: Sendable {
                 guard event(parts[0]) != nil else { return .status(404) }
                 let held = attachments(of: parts[0])
                 if parts.count == 2 {
-                    // The list names each attachment's kind (`@odata.type`), `$select` or not.
-                    return Self.json(["value": held.map { a in select.map { s in a.filter { s.contains($0.key) || $0.key == "@odata.type" } } ?? a }])
+                    // The list names each attachment's kind (`@odata.type`), `$select` or not; a
+                    // page holds `attachmentPageSize`, the next named by `@odata.nextLink`
+                    // (`$skip`, as Graph pages it).
+                    let listed = held.map { a in select.map { s in a.filter { s.contains($0.key) || $0.key == "@odata.type" } } ?? a }
+                    let skip = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?.queryItems?
+                        .first { $0.name == "$skip" }?.value.flatMap { Int($0) } ?? 0
+                    let size = attachmentPageSize.withLock { $0 }
+                    let page = Array(listed.dropFirst(skip).prefix(size))
+                    var body: [String: Any] = ["value": page]
+                    if skip + page.count < listed.count {
+                        var next = URLComponents(url: request.url, resolvingAgainstBaseURL: false)
+                        let kept = (next?.queryItems ?? []).filter { $0.name != "$skip" }
+                        next?.queryItems = kept + [URLQueryItem(name: "$skip", value: String(skip + page.count))]
+                        body["@odata.nextLink"] = next?.url?.absoluteString
+                    }
+                    return Self.json(body)
                 }
                 guard parts.count == 3, let one = held.first(where: { $0["id"] as? String == parts[2] }) else { return .status(404) }
                 return Self.json(one)
@@ -523,7 +552,8 @@ final class FakeGraphCalendar: Sendable {
                 }
                 let token = "session-" + String(attachmentCount.withLock { n in n += 1; return n })
                 uploads.withLock {
-                    $0[token] = Upload(eventId: parts[0], name: name, contentType: item["contentType"] as? String ?? "", received: Data())
+                    $0[token] = Upload(eventId: parts[0], name: name, contentType: item["contentType"] as? String ?? "",
+                                       isInline: item["isInline"] as? Bool ?? false, contentId: item["contentId"] as? String, received: Data())
                 }
                 return .json(raw: #"{"uploadUrl":"https://outlook.office.com/AttachmentSessions/\#(token)?authtoken=synthetic-token"}"#,
                              statusCode: 201)
@@ -532,7 +562,8 @@ final class FakeGraphCalendar: Sendable {
                   let name = json["name"] as? String, let raw = json["contentBytes"] as? String,
                   let bytes = Data(base64Encoded: raw) else { return .status(400) }
             guard bytes.count < GraphAttachmentLimits.singlePostMaxExclusive else { return .status(413) }
-            attachFile(name, contentType: json["contentType"] as? String ?? "", bytes: bytes, to: parts[0])
+            attachFile(name, contentType: json["contentType"] as? String ?? "", bytes: bytes, to: parts[0],
+                       isInline: json["isInline"] as? Bool ?? false, contentId: json["contentId"] as? String)
             return .json(raw: "{}", statusCode: 201)
         }
         http.register(path: "AttachmentSessions", method: "PUT") { [self] request in
@@ -551,7 +582,8 @@ final class FakeGraphCalendar: Sendable {
             }
             guard let done else { return .status(416) }
             guard done.received.count == total else { return .json(raw: "{}") }
-            attachFile(done.name, contentType: done.contentType, bytes: done.received, to: done.eventId)
+            attachFile(done.name, contentType: done.contentType, bytes: done.received, to: done.eventId,
+                       isInline: done.isInline, contentId: done.contentId)
             return .json(raw: "{}", statusCode: 201)
         }
         // DELETE removes the event: an occurrence leaves its series' instances list and is not

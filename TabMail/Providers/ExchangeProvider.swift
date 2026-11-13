@@ -1236,27 +1236,33 @@ actor ExchangeProvider: EmailProvider {
     /// the range PUTs go through `session` and the mailbox's `gate`. Any failure throws;
     /// nothing is deleted on this path. One place for the per-file size rule: an Outlook
     /// draft save, an Outlook send and an Outlook split's new part (#563) all add files here.
+    ///
+    /// `inline` names a picture placed in the item's body (`isInline` and the `contentId` its
+    /// `cid:` link names), written on the single POST (`fileAttachment`) and on the upload
+    /// session's `attachmentItem`, which both document the two properties; nil (a draft) writes
+    /// neither, as before.
     nonisolated static func addFileAttachment(
         _ attachment: DraftAttachment,
         itemPath: String,
+        inline: GraphInlinePlacement? = nil,
         post: @Sendable (_ path: String, _ body: Data) async throws -> Data,
         session: URLSession,
         gate: HTTPConcurrencyGate
     ) async throws {
         let total = attachment.data.count
         if total < ExchangeDraftConfig.singlePostAttachmentLimitBytes {
-            let body = try JSONSerialization.data(withJSONObject: Self.graphFileAttachment(attachment))
+            let body = try JSONSerialization.data(withJSONObject: Self.graphFileAttachment(attachment, inline: inline))
             _ = try await post("\(itemPath)/attachments", body)
             return
         }
-        let sessionBody = try JSONSerialization.data(withJSONObject: [
-            "AttachmentItem": [
-                "attachmentType": "file",
-                "name": attachment.filename,
-                "contentType": attachment.mimeType,
-                "size": total,
-            ] as [String: Any],
-        ])
+        var item: [String: Any] = [
+            "attachmentType": "file",
+            "name": attachment.filename,
+            "contentType": attachment.mimeType,
+            "size": total,
+        ]
+        inline?.write(into: &item)
+        let sessionBody = try JSONSerialization.data(withJSONObject: ["AttachmentItem": item])
         let sessionData = try await post("\(itemPath)/attachments/createUploadSession", sessionBody)
         let uploadURL = try Self.validatedUploadURL(
             (try? JSONSerialization.jsonObject(with: sessionData) as? [String: Any])?["uploadUrl"] as? String)
@@ -1988,12 +1994,19 @@ actor ExchangeProvider: EmailProvider {
     }
 
     nonisolated static func graphFileAttachment(_ attachment: DraftAttachment) -> [String: Any] {
-        [
+        graphFileAttachment(attachment, inline: nil)
+    }
+
+    /// `graphFileAttachment` with the inline placement `inline` written when there is one.
+    nonisolated static func graphFileAttachment(_ attachment: DraftAttachment, inline: GraphInlinePlacement?) -> [String: Any] {
+        var json: [String: Any] = [
             "@odata.type": "#microsoft.graph.fileAttachment",
             "name": attachment.filename,
             "contentType": attachment.mimeType,
             "contentBytes": attachment.data.base64EncodedString(),
         ]
+        inline?.write(into: &json)
+        return json
     }
 
     // MARK: - Query Helpers
@@ -2141,6 +2154,27 @@ struct GraphAttachmentMeta: Decodable {
     enum CodingKeys: String, CodingKey {
         case id, name, contentType, size, isInline
         case odataType = "@odata.type"
+    }
+}
+
+/// How a file sits in its item's body: `isInline` and the `contentId` the body's `cid:` link
+/// names (Graph `fileAttachment` and `attachmentItem`, both optional properties). A file that
+/// names neither is not given one.
+struct GraphInlinePlacement: Sendable, Equatable {
+    let isInline: Bool?
+    let contentId: String?
+
+    /// Nil when the attachment names neither, so nothing is written for it.
+    init?(isInline: Bool?, contentId: String?) {
+        let id = contentId?.isEmpty == false ? contentId : nil
+        guard isInline != nil || id != nil else { return nil }
+        self.isInline = isInline
+        self.contentId = id
+    }
+
+    func write(into json: inout [String: Any]) {
+        if let isInline { json["isInline"] = isInline }
+        if let contentId { json["contentId"] = contentId }
     }
 }
 

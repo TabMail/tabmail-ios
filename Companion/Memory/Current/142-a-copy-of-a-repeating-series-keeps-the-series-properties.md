@@ -466,6 +466,25 @@ CalDAV keeps every `ATTACH` line byte for byte (`newPartKeepsAttachments`). Test
 range stops before the cap and the retry adds only the missing file); `FakeGraphCalendar` models event
 attachments, the single POST, the upload session and its ranges.
 
+**Amendment (2026-11-13, #563, second): inline pictures and a carried occurrence's own files.**
+Supersedes the "Not copied, open" sentence above for inline files and per-occurrence files (kept as
+written). (1) A copied file keeps its inline placement: the list now selects `isInline`
+(`$select=id,name,contentType,isInline`, measured valid, memory 147), the GET by id gives its
+`contentId`, and `ExchangeProvider.addFileAttachment(_:itemPath:inline:)` writes both
+(`GraphInlinePlacement`) on the single POST (`fileAttachment`) and on the upload session's
+`attachmentItem`; both resources document `isInline` and `contentId` as optional properties (Microsoft
+Learn, checked 2026-11-13). The draft path passes no placement and sends exactly what it sent before.
+So the body's `cid:` link on the new part still finds its picture. (2) Each changed occurrence the carry
+writes onto the new part (`carry`, `plan.changed`) also gets that occurrence's own file attachments
+copied onto the matching instance of the new part, by the same step (`copyFiles(from:to:)`, the
+generalized `copySeriesFiles`), right after its PATCH and before the cap; pairing by name makes a retry
+add only what is missing (a file the instance already holds, inherited or copied, is not added again).
+Still not copied: item and reference attachments (cloud links). Tests (`ExchangeSplitAttachmentTests`,
+`ExchangeSplitCarryTests.carriedOccurrenceKeepsItsOwnFile`): an inline picture by POST and by upload
+session keeps `isInline` and its `contentId`; a carried occurrence's file lands before the cap and once
+after a retry; a file plus a reference and an item attachment splits and copies only the file; two
+same-named files and an unnamed one survive a retry; a paged attachment list is read to its end.
+
 ## Tests
 
 `CalDAVEventCopiesTests`, `CalDAVSplitRefusedBeforeWriteTests` and `CalDAVSplitRollbackTests`

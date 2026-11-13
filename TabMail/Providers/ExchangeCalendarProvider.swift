@@ -945,6 +945,11 @@ actor ExchangeCalendarProvider: CalendarProvider {
             }
             let encoded = try Self.encodedGraphPathSegment(id, context: "Graph event instance id")
             _ = try await request(path: "/events/\(encoded)", method: "PATCH", body: try JSONSerialization.data(withJSONObject: json))
+            // The occurrence's own files, as the series' are copied onto the new part: a retry
+            // adds only what is missing.
+            if let source = change.exception.id {
+                try await copyFiles(from: source, to: id, context: "Graph event instance id")
+            }
             if DebugModeManager.isLoggingEnabled() {
                 BackgroundSyncLogger.logDebug("[ExchangeCalendar] split carried a changed occurrence onto \(id): keys=\(json.keys.sorted()) times=\(change.start != nil)")
             }
@@ -1115,22 +1120,30 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// Copies every file attachment of the series `seriesId` onto the split's new part `newPartId`:
     /// Outlook web's own "this and all following" keeps the series' file attachment on the new
     /// part (measured 2026-11-13 on a work test account), and a create (`POST /events`) carries
-    /// none, since attachments are a separate endpoint. Each file's bytes are read as a mail
-    /// attachment's are (its `contentBytes`, one GET by id) and added by the same code as an Outlook
-    /// draft's (`ExchangeProvider.addFileAttachment`: one POST under 3 MB, an upload session from
-    /// there).
+    /// none, since attachments are a separate endpoint (`copyFiles`).
+    private func copySeriesFiles(seriesId: String, newPartId: String) async throws {
+        try await copyFiles(from: seriesId, to: newPartId, context: "Graph series master id")
+    }
+
+    /// Copies every file attachment of the event `sourceId` (a series, or a changed occurrence a
+    /// split carries) onto the event `targetId` (the new part, or its occurrence at that place).
+    /// Each file's bytes are read as a mail attachment's are (its `contentBytes` and `contentId`,
+    /// one GET by id) and added by the same code as an Outlook draft's
+    /// (`ExchangeProvider.addFileAttachment`: one POST under 3 MB, an upload session from there),
+    /// with its inline placement (`isInline`, `contentId`), so a picture placed in the body stays
+    /// placed there and the body's `cid:` link still finds it.
     ///
     /// Only files (`#microsoft.graph.fileAttachment`) are copied; an item or reference attachment
-    /// is left as before, not copied. A file the new part already holds under the same name (one
+    /// is left as before, not copied. A file the target already holds under the same name (one
     /// to one, as a draft save pairs them) is not added again, so a retry (`finishSplit`) adds only
-    /// what an earlier attempt did not. Any failure throws before the carry and the cap, with the
-    /// record kept: the series is still whole, and the retry copies what is missing.
-    private func copySeriesFiles(seriesId: String, newPartId: String) async throws {
-        let encodedSeries = try Self.encodedGraphPathSegment(seriesId, context: "Graph series master id")
-        let files = try await attachments(of: "/events/\(encodedSeries)").filter(ExchangeProvider.isFileAttachment)
+    /// what an earlier attempt did not. Any failure throws before the cap, with the record kept:
+    /// the series is still whole, and the retry copies what is missing.
+    private func copyFiles(from sourceId: String, to targetId: String, context: String) async throws {
+        let encodedSource = try Self.encodedGraphPathSegment(sourceId, context: context)
+        let files = try await attachments(of: "/events/\(encodedSource)").filter(ExchangeProvider.isFileAttachment)
         guard !files.isEmpty else { return }
-        let encodedPart = try Self.encodedGraphPathSegment(newPartId, context: "Graph event id")
-        var held = try await attachments(of: "/events/\(encodedPart)").map(Self.attachmentName)
+        let encodedTarget = try Self.encodedGraphPathSegment(targetId, context: "Graph event id")
+        var held = try await attachments(of: "/events/\(encodedTarget)").map(Self.attachmentName)
         var added = 0
         for file in files {
             let name = Self.attachmentName(file)
@@ -1140,20 +1153,21 @@ actor ExchangeCalendarProvider: CalendarProvider {
             }
             let encodedFile = try Self.encodedGraphPathSegment(file.id, context: "Graph attachment id")
             let detail = try JSONDecoder().decode(
-                GraphAttachmentDetail.self, from: try await request(path: "/events/\(encodedSeries)/attachments/\(encodedFile)"))
+                GraphAttachmentDetail.self, from: try await request(path: "/events/\(encodedSource)/attachments/\(encodedFile)"))
             guard let base64 = detail.contentBytes, let data = Data(base64Encoded: base64) else {
                 throw CalendarProviderError.notSupported(
                     "a file attached to this repeating event can't be read, so it can't be copied to the new part")
             }
             try await ExchangeProvider.addFileAttachment(
                 DraftAttachment(filename: name, mimeType: file.contentType ?? "application/octet-stream", data: data),
-                itemPath: "/events/\(encodedPart)",
+                itemPath: "/events/\(encodedTarget)",
+                inline: GraphInlinePlacement(isInline: file.isInline, contentId: detail.contentId),
                 post: { path, body in try await self.request(path: path, method: "POST", body: body) },
                 session: testSession ?? sharedEphemeralSession, gate: mailboxGate)
             added += 1
         }
         if DebugModeManager.isLoggingEnabled() {
-            BackgroundSyncLogger.logDebug("[ExchangeCalendar] split copied \(added) of \(files.count) file attachment(s) onto the new part")
+            BackgroundSyncLogger.logDebug("[ExchangeCalendar] split copied \(added) of \(files.count) file attachment(s) onto \(targetId)")
         }
     }
 
@@ -1162,7 +1176,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// `GraphAPI.maxAttachmentListPages` pages, as a message's list is read.
     private func attachments(of eventPath: String) async throws -> [GraphAttachmentMeta] {
         var found: [GraphAttachmentMeta] = []
-        var next: String? = "\(eventPath)/attachments?$select=id,name,contentType"
+        var next: String? = "\(eventPath)/attachments?$select=id,name,contentType,isInline"
         var pages = 0
         while let path = next {
             guard pages < GraphAPI.maxAttachmentListPages else { throw ExchangeProvider.GraphAttachmentListIncomplete() }

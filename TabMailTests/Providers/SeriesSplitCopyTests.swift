@@ -873,6 +873,32 @@ struct ExchangeSplitCarryTests {
         #expect(!r.graph.patches("ser-1").isEmpty, "the series was not capped: \(r.http.servedCallSequence())")
     }
 
+    @Test("a changed later occurrence carried onto the new part keeps its own file, before the cap; a retry after a failed copy adds it once")
+    func carriedOccurrenceKeepsItsOwnFile() async throws {
+        let minutes = Data("Minutes of week 2\n".utf8)
+        let r = try await split(exceptions: [Self.exception(2) { $0["location"] = ["displayName": "Room 9"] }],
+                                parts: [2, 3], patch: Self.rename) { graph, _ in
+            graph.attachFile("minutes.txt", contentType: "text/plain", bytes: minutes, to: "ser-1-occ-2")
+            graph.failNext("ATTACH", with: 400)
+        }
+        defer { r.http.close() }
+        #expect(r.error != nil, "the failed copy did not stop the split: \(r.http.servedCallSequence())")
+        #expect(r.graph.patches("ser-1").isEmpty, "the series was capped though the occurrence's file was not copied")
+        let record = try #require(r.records.records.first, "no record was kept")
+        try await r.provider.finishSplit(record: record, zone: .current, guests: nil)
+        let held = r.graph.files(of: "created-1-w2")
+        #expect(held.map(\.name) == ["minutes.txt"] && held.first?.bytes == minutes,
+                "the carried occurrence holds \(held.map(\.name)): \(r.http.servedCallSequence())")
+        #expect(r.graph.files(of: "created-1-w3").isEmpty, "an occurrence that was not changed got a file")
+        #expect(r.graph.files(of: "ser-1-occ-2").map(\.name) == ["minutes.txt"], "the series' occurrence lost its file")
+        // The copy lands before the cap.
+        let calls = r.http.recordedCalls()
+        let copy = try #require(calls.lastIndex { $0.method == "POST" && $0.url.contains("/events/created-1-w2/attachments") })
+        let cap = try #require(calls.lastIndex { $0.method == "PATCH" && URL(string: $0.url)?.path.hasSuffix("/events/ser-1") == true },
+                               "the retry did not cap")
+        #expect(copy < cap, "the occurrence's file was copied after the cap: \(r.http.servedCallSequence())")
+    }
+
     /// `series` kept in a zone the app does not recognize, with no range zone: no series zone to
     /// date a move in.
     private static func zoneless(_ series: [String: Any]) -> [String: Any] {
@@ -2054,5 +2080,95 @@ struct ExchangeSplitAttachmentTests {
         #expect(graph.attachments(of: record.newPartId).count == 2,
                 "the retry added a file the first attempt had copied: \(graph.attachments(of: record.newPartId).compactMap { $0["name"] as? String })")
         #expect(!graph.patches("ser-1").isEmpty, "the retry did not cap: \(http.servedCallSequence())")
+    }
+
+    @Test("an inline picture of the series reaches the new part placed inline under the same contentId, by a single POST and by an upload session")
+    func inlinePictureStaysInline() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = GraphSplitFixture.calendar(GraphSplitFixture.series(range: GraphSplitFixture.numbered))
+        graph.attachFile("logo.png", contentType: "image/png", bytes: Self.small, to: "ser-1", isInline: true, contentId: "logo@series.example.com")
+        graph.attachFile("banner.png", contentType: "image/png", bytes: Self.large, to: "ser-1", isInline: true, contentId: "banner@series.example.com")
+        graph.attachFile("agenda.txt", contentType: "text/plain", bytes: Self.small, to: "ser-1")
+        graph.install(on: http)
+        let error = await Self.split(graph, http, records: SplitRecordBox())
+        #expect(error == nil, "\(String(describing: error)); \(http.servedCallSequence())")
+        let partId = try #require(graph.created.first?["id"] as? String, "no new part was created")
+        let byName = Dictionary(graph.attachments(of: partId).compactMap { a in (a["name"] as? String).map { ($0, a) } }, uniquingKeysWith: { a, _ in a })
+        for (name, cid) in [("logo.png", "logo@series.example.com"), ("banner.png", "banner@series.example.com")] {
+            #expect(byName[name]?["isInline"] as? Bool == true, "\(name) is not inline on the new part: \(byName[name] ?? [:])")
+            #expect(byName[name]?["contentId"] as? String == cid, "\(name) lost its contentId: \(byName[name]?["contentId"] ?? "none")")
+        }
+        #expect(byName["agenda.txt"]?["isInline"] as? Bool == false && byName["agenda.txt"]?["contentId"] == nil,
+                "an ordinary file became inline: \(byName["agenda.txt"] ?? [:])")
+    }
+
+    @Test("a series holding a file, a cloud link and an attached Outlook item splits, and only the file is copied")
+    func onlyFilesAreCopied() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = Self.calendar([("agenda.txt", Self.small)])
+        graph.attachOther("#microsoft.graph.referenceAttachment", name: "Shared deck", to: "ser-1")
+        graph.attachOther("#microsoft.graph.itemAttachment", name: "Forwarded invite", to: "ser-1")
+        graph.install(on: http)
+        let error = await Self.split(graph, http, records: SplitRecordBox())
+        #expect(error == nil, "\(String(describing: error)); \(http.servedCallSequence())")
+        let partId = try #require(graph.created.first?["id"] as? String, "no new part was created")
+        #expect(graph.attachments(of: partId).compactMap { $0["name"] as? String } == ["agenda.txt"],
+                "the new part holds \(graph.attachments(of: partId).compactMap { $0["name"] as? String })")
+        #expect(!graph.patches("ser-1").isEmpty, "the series was not capped")
+    }
+
+    @Test("a retry keeps two files of the same name and a file with no name: each is added once, the unnamed one as a draft names it")
+    func retryKeepsSameNamedAndUnnamedFiles() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let other = Data("A second picture, same name\n".utf8)
+        let graph = Self.calendar([("image.png", Self.small), ("image.png", Self.large)])
+        graph.attachFile(nil, contentType: "text/plain", bytes: other, to: "ser-1")
+        graph.install(on: http)
+        // The first image.png lands by a single POST; the second's upload range fails.
+        graph.failNext("PUT", with: 503)
+        let records = SplitRecordBox()
+        let error = await Self.split(graph, http, records: records)
+        #expect(error != nil, "the failed upload did not stop the split")
+        let record = try #require(records.records.first, "no record was kept")
+        #expect(graph.attachments(of: record.newPartId).count == 1, "non-vacuity: the first attempt copied \(graph.attachments(of: record.newPartId).count)")
+        try await GraphSplitFixture.provider(http).finishSplit(record: record, zone: .current, guests: nil)
+        let held = graph.files(of: record.newPartId)
+        #expect(held.filter { $0.name == "image.png" }.map(\.bytes).sorted { $0.count < $1.count } == [Self.small, Self.large],
+                "the same-named files on the new part: \(held.map { ($0.name, $0.bytes.count) })")
+        #expect(held.filter { $0.name == DraftReadConfig.unnamedAttachmentFilename }.map(\.bytes) == [other],
+                "the unnamed file: \(held.map { ($0.name, $0.bytes.count) })")
+        #expect(held.count == 3, "a file was added twice or lost: \(held.map(\.name))")
+        #expect(!graph.patches("ser-1").isEmpty, "the retry did not cap")
+    }
+
+    @Test("an attachment list Graph pages is read to its end on the series and on the new part")
+    func pagedAttachmentListIsReadToTheEnd() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = Self.calendar([("a.txt", Self.small), ("b.txt", Self.small), ("c.txt", Self.small)])
+        graph.attachmentPageSize.withLock { $0 = 1 }
+        graph.install(on: http)
+        let records = SplitRecordBox()
+        graph.failNext("PATCH", with: 503)   // the cap fails; the retry reads the new part's three pages
+        _ = await Self.split(graph, http, records: records)
+        let record = try #require(records.records.first, "no record was kept")
+        #expect(graph.files(of: record.newPartId).map(\.name).sorted() == ["a.txt", "b.txt", "c.txt"],
+                "the new part holds \(graph.files(of: record.newPartId).map(\.name))")
+        try await GraphSplitFixture.provider(http).finishSplit(record: record, zone: .current, guests: nil)
+        #expect(graph.files(of: record.newPartId).map(\.name).sorted() == ["a.txt", "b.txt", "c.txt"],
+                "the retry added a file again: \(graph.files(of: record.newPartId).map(\.name))")
+        #expect(http.recordedCalls().contains { $0.url.contains("skip=2") }, "non-vacuity: no third page was read")
+    }
+
+    @Test("a draft's file is written with no inline placement, exactly the four keys it had; a split's inline picture adds isInline and contentId")
+    func draftWireIsUnchanged() {
+        let file = DraftAttachment(filename: "a.txt", mimeType: "text/plain", data: Self.small)
+        #expect(Set(ExchangeProvider.graphFileAttachment(file).keys) == ["@odata.type", "name", "contentType", "contentBytes"])
+        #expect(GraphInlinePlacement(isInline: nil, contentId: nil) == nil && GraphInlinePlacement(isInline: nil, contentId: "") == nil)
+        let placed = ExchangeProvider.graphFileAttachment(file, inline: GraphInlinePlacement(isInline: true, contentId: "logo@example.com"))
+        #expect(placed["isInline"] as? Bool == true && placed["contentId"] as? String == "logo@example.com")
     }
 }

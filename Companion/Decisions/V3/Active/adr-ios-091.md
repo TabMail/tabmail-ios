@@ -755,3 +755,8 @@ is `ExchangeCalendarProvider.copySeriesFiles`, which copies a series' file attac
 part (memory 142, amendment of 2026-11-13). Graph documents the same two routes for an event
 (`attachment: createUploadSession`: "The item can be a message or event"). No wire change for drafts or
 sends.
+
+Amendment (#563, 2026-11-13): `addFileAttachment` takes an optional inline placement
+(`GraphInlinePlacement`: `isInline`, `contentId`), written on the single POST and on the upload
+session's `attachmentItem` (both documented optional properties). The split copy passes each file's own;
+the draft path passes none, so its wire bytes are unchanged.
