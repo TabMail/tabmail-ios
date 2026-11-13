@@ -398,12 +398,15 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         //
         // A change between all-day and timed of every occurrence, or of a split's new part, changes
         // the series as a whole, and every occurrence changed or deleted on its own there is reset,
-        // on every calendar, as the Thunderbird add-on resets it. The series' kind is the one the
-        // edit's `all_day` is compared with.
+        // as the Thunderbird add-on resets it. The series' kind is the one the edit's `all_day` is
+        // compared with, and the series' calendar answers whether its write resets anything
+        // (`editResetsChangedOccurrences`), from what it holds: no line for a single event.
         if turnsDays {
             changes.append(CalendarToolHelpers.dayMoveResetNote)
         } else if resolvedScope != "this_only", let stated = CalendarToolHelpers.boolArg(arguments, "all_day"),
-                  let series = named.series, series.recurrence?.isEmpty == false, stated != series.isAllDay {
+                  let series = named.series, stated != series.isAllDay,
+                  let edit = try? CalendarToolHelpers.buildGCalEventInput(arguments, isAllDay: stated),
+                  provider.editResetsChangedOccurrences(series, edit: edit) {
             changes.append(CalendarToolHelpers.kindChangeResetNote)
         } else if resolvedScope == "all", shown.recurrence?.isEmpty == false,
            let edit = try? CalendarToolHelpers.buildGCalEventInput(

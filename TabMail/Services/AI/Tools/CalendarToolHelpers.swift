@@ -1268,6 +1268,13 @@ enum CalendarToolHelpers {
     /// of a split's new part: the series changes kind as a whole, so every occurrence changed or
     /// deleted on its own there is reset, as Google Calendar's "All events" and the Thunderbird
     /// add-on reset them.
+    /// Whether `edit` changes an event between all-day and timed: a time for an all-day event, or a
+    /// date for a timed one. Each calendar's write and its card answer from this.
+    static func editChangesKind(_ edit: GCalEventInput, storedIsAllDay: Bool) -> Bool {
+        storedIsAllDay
+            ? edit.startDateTime != nil || edit.endDateTime != nil
+            : edit.startDate != nil || edit.endDate != nil
+    }
     static let kindChangeResetNote = "Occurrences you changed or deleted individually are reset: a deleted one comes back, and a changed one loses its change."
     /// The days a rule's day parts name, in words for the confirmation card: `on Monday, Wednesday`,
     /// `on the first Monday`, `on day 1, day 15`, `on the last day`, `in March`, `week starts Monday`. Nil when there are none.

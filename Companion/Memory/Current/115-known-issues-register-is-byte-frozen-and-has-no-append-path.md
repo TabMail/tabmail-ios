@@ -269,6 +269,13 @@ a series change of kind, all at the drain (TB checks before the card; moving the
 before-the-card series check): `kindChangeNeedsBothMessage`, `kindChangeNeedsZoneMessage`, an UNTIL, RDATE or
 series zone that can't be read (`convertingSeriesValues`), and a zone `addingVTimeZone` can't write.
 
+**Correction, 2026-11-13 (#640, third pass). The paragraph above is kept as written; where they differ,
+this one holds.** The reset of changed occurrences and excluded dates matches Google Calendar's "All events"
+and the TB add-on, but the UNTIL and RDATE conversion does NOT match TB: iOS converts them, and Thunderbird
+refuses them today (`kindChangeError`: an RDATE, or an UNTIL the edit does not give again; see
+tabmail-thunderbird #442). A stored RDATE value made timed must start with 8 ASCII digits, else
+`convertingSeriesValues` refuses it as unreadable.
+
 **Also corrected at the code on 2026-08-12 (R3), recorded here because the argument is not needed at the
 call site.** `validatedRRuleUntil`'s note claimed the pre-fix alternative on the split path was "a capped
 master plus a failed successor create under a best-effort rollback, i.e. destroyed occurrences".

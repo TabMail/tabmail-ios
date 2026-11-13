@@ -10,7 +10,14 @@ actor CalDAVProvider: CalendarProvider {
     /// A CalDAV edit replaces only the master's RRULE line, with the edit's own, and keeps the
     /// rest of the series as stored; so the rule changes when the edit's RRULE differs from the
     /// stored one (`GoogleCalendarProvider.canonicalRRULE`), and an edit with none changes nothing.
+    /// A change between all-day and timed resets the changed occurrences when the resource holds
+    /// a series (`kindChangeResetsChangedOccurrences`, the write's own decision), read from the
+    /// resource with the event (`GCalEvent.holdsSeries`).
     nonisolated func editResetsChangedOccurrences(_ event: GCalEvent, edit: GCalEventInput) -> Bool {
+        if CalendarToolHelpers.editChangesKind(edit, storedIsAllDay: event.start?.date != nil) {
+            return Self.kindChangeResetsChangedOccurrences(
+                storedIsAllDay: event.start?.date != nil, holdsSeries: event.holdsSeries == true, edit: edit)
+        }
         func rule(_ lines: [String]?) -> String? {
             lines?.first { $0.uppercased().hasPrefix("RRULE:") }.map(GoogleCalendarProvider.canonicalRRULE)
         }
@@ -278,12 +285,14 @@ actor CalDAVProvider: CalendarProvider {
             return occurrence
         }
         let events = ICSParser.parse(icsText: icsText, resourceHref: seriesHref, etag: etag)
-        guard let event = events.first else {
+        guard var event = events.first else {
             if CalDAVOccurrences.holdsOnlyChangedOccurrences(icsText: icsText, href: seriesHref) {
                 throw CalendarProviderError.seriesNotInThisCalendar
             }
             throw CalDAVError.parseError("No VEVENT found in \(eventId)")
         }
+        // What the write decides a change of kind from (`kindChangeResetsChangedOccurrences`).
+        event.holdsSeries = Self.holdsSeries(icsText)
         return event
     }
 
@@ -1223,7 +1232,10 @@ actor CalDAVProvider: CalendarProvider {
             // Thunderbird add-on change it: every occurrence changed or deleted on its own is
             // reset (the edit's card says so), and what stays tied to the start's value type
             // (RFC 5545 §3.3.10 UNTIL, §3.8.5.2 RDATE) is written in the new one.
-            if holdsSeries(result) {
+            // iOS converts UNTIL and RDATE, and Thunderbird refuses them today (see
+            // tabmail-thunderbird #442); only the reset matches the add-on.
+            if kindChangeResetsChangedOccurrences(
+                storedIsAllDay: storedKind == .allDay, holdsSeries: holdsSeries(result), edit: patch) {
                 result = rewriteVEvents(in: result) { block, isSeries in
                     isSeries ? rewriteTopLevel(block) { _, name in name == "EXDATE" ? [] : nil } : nil
                 }
@@ -1275,18 +1287,24 @@ actor CalDAVProvider: CalendarProvider {
     /// start and the queue keeps, `stampingZone`): a series keeps its time of
     /// day across that zone's clock changes. UTC itself is written as UTC.
     static func kindToWrite(stored: MasterDTStartKind, patch: GCalEventInput) throws -> MasterDTStartKind {
-        let givesTime = patch.startDateTime != nil || patch.endDateTime != nil
-        let givesDate = patch.startDate != nil || patch.endDate != nil
-        let toTimed = stored == .allDay && givesTime
-        let toAllDay = stored != .allDay && givesDate
-        guard toTimed || toAllDay else { return stored }
-        if toAllDay { return .allDay }
+        guard CalendarToolHelpers.editChangesKind(patch, storedIsAllDay: stored == .allDay) else { return stored }
+        if stored != .allDay { return .allDay }
         guard let name = patch.startTimeZone ?? patch.endTimeZone, !name.isEmpty,
               let zone = CalendarTimeZoneResolver.zone(named: name, in: .none) else {
             throw CalendarProviderError.notSupported(kindChangeNeedsZoneMessage)
         }
         return zone.secondsFromGMT() == 0 && zone.nextDaylightSavingTimeTransition == nil
             && ["UTC", "GMT", "Etc/UTC", "Etc/GMT"].contains(zone.identifier) ? .utc : .zoned(zone.identifier)
+    }
+
+    /// THE decision whether a change between all-day and timed resets the occurrences changed or
+    /// deleted on their own: it does when the edit changes the kind and the resource holds a series
+    /// (`holdsSeries`). The write (`mergePatchIntoICS`) and the edit's card
+    /// (`editResetsChangedOccurrences`) both take it here, so the two cannot differ.
+    nonisolated static func kindChangeResetsChangedOccurrences(
+        storedIsAllDay: Bool, holdsSeries: Bool, edit: GCalEventInput
+    ) -> Bool {
+        holdsSeries && CalendarToolHelpers.editChangesKind(edit, storedIsAllDay: storedIsAllDay)
     }
 
     /// Whether the resource holds a series: its VEVENT has a rule, added or deleted dates, or
@@ -1387,8 +1405,10 @@ actor CalDAVProvider: CalendarProvider {
                         guard let timed = CalendarToolHelpers.validatedRRuleUntil(until, allDay: false, zone: zone) else { throw unreadable }
                         return ["RRULE:\(GoogleCalendarProvider.replaceOrAppendUntil(in: property.value, untilValue: timed))"]
                     case "RDATE":
-                        let starts = property.value.split(separator: ",").map { value in
-                            "\(value.uppercased().prefix(8))\(timeOfDay)\(suffix)"
+                        let starts = try property.value.split(separator: ",").map { value in
+                            let date = value.prefix(8)
+                            guard date.count == 8, date.allSatisfy({ $0.isASCII && $0.isNumber }) else { throw unreadable }
+                            return "\(date)\(timeOfDay)\(suffix)"
                         }
                         return ["RDATE\(params):\(starts.joined(separator: ","))"]
                     default:

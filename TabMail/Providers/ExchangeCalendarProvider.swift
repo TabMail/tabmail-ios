@@ -1222,6 +1222,11 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// recognize (the write refuses that edit), and when its Graph pattern does not come back
     /// the same through an RRULE (`rrule(_:)`), so its RRULE does not say what is stored.
     nonisolated func editResetsChangedOccurrences(_ event: GCalEvent, edit: GCalEventInput) -> Bool {
+        // A change between all-day and timed changes the event as a whole: a series' changed
+        // occurrences are reset, and a single event has none.
+        if CalendarToolHelpers.editChangesKind(edit, storedIsAllDay: event.start?.date != nil) {
+            return !(event.recurrence ?? []).isEmpty
+        }
         if movesSeriesTime(edit, existing: event) { return true }
         guard edit.recurrence != nil else { return false }
         guard let baseline = storedRuleBaseline(event) else { return true }

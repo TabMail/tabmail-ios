@@ -2356,3 +2356,69 @@ struct CalendarEditToolAllDayEndTests {
         #expect(reason(["end_iso": .string(day(0))], allDay: true, stored: nil) == nil, "no start to compare")
     }
 }
+
+/// A series changed between all-day and timed keeps its added dates (RDATE) on the days they fall
+/// on, writes one VTIMEZONE per zone, and refuses an added date it can't read, with nothing written.
+@Suite("A CalDAV series changed between all-day and timed keeps its added dates")
+struct CalDAVKindChangeSeriesValuesTests {
+    private static func series(_ start: String, _ extra: [String], zone: String? = nil) -> String {
+        var lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//TabMail//Test//EN"]
+        if let zone { lines += ["BEGIN:VTIMEZONE", "TZID:\(zone)", "END:VTIMEZONE"] }
+        lines += ["BEGIN:VEVENT", "UID:ser-1", "DTSTAMP:20990101T000000Z", start, "RRULE:FREQ=WEEKLY;COUNT=4"]
+        return (lines + extra + ["SUMMARY:Standup", "END:VEVENT", "END:VCALENDAR"]).joined(separator: "\r\n")
+    }
+
+    private static func madeAllDay(_ ics: String) throws -> [String] {
+        try CalDAVProvider.convertingSeriesValues(
+            in: ics, from: .zoned("Asia/Tokyo"), to: .allDay, newStart: "DTSTART;VALUE=DATE:20990105",
+            zones: CalendarTimeZoneContext(calendarText: ics)
+        ).components(separatedBy: "\r\n")
+    }
+
+    @Test("made all-day, an added time takes the date it starts on in the series' zone, not its UTC date")
+    func addedTimeTakesTheSeriesDate() throws {
+        // 2099-01-09 23:00 UTC is 2099-01-10 08:00 in Tokyo, the series' zone.
+        let lines = try Self.madeAllDay(Self.series("DTSTART;TZID=Asia/Tokyo:20990105T080000", ["RDATE:20990109T230000Z"]))
+        #expect(lines.contains("RDATE;VALUE=DATE:20990110"), "\(lines)")
+    }
+
+    @Test("made all-day, an added period takes the date its start falls on in the series' zone")
+    func addedPeriodTakesItsStartDate() throws {
+        let lines = try Self.madeAllDay(Self.series(
+            "DTSTART;TZID=Asia/Tokyo:20990105T080000", ["RDATE;VALUE=PERIOD:20990109T230000Z/PT1H"]))
+        #expect(lines.contains("RDATE;VALUE=DATE:20990110"), "\(lines)")
+    }
+
+    @Test("made timed, an added date that is not a date is refused; a readable one starts at the new time")
+    func unreadableAddedDateIsRefused() throws {
+        func madeTimed(_ rdate: String) throws -> String {
+            let ics = Self.series("DTSTART;VALUE=DATE:20990105", [rdate])
+            return try CalDAVProvider.convertingSeriesValues(
+                in: ics, from: .allDay, to: .zoned("Asia/Tokyo"), newStart: "DTSTART;TZID=Asia/Tokyo:20990105T080000",
+                zones: CalendarTimeZoneContext(calendarText: ics))
+        }
+        #expect(try madeTimed("RDATE;VALUE=DATE:20990110").contains("RDATE;TZID=Asia/Tokyo:20990110T080000"))
+        for bad in ["RDATE;VALUE=DATE:2099AB10", "RDATE;VALUE=DATE:2099", "RDATE;VALUE=DATE:20990110,X"] {
+            #expect(throws: CalendarProviderError.self, "\(bad)") { try madeTimed(bad) }
+        }
+    }
+
+    @Test("what a calendar holds an event as is kept in memory only: an encoded event does not carry it")
+    func holdsSeriesIsNotEncoded() throws {
+        var event = try JSONDecoder().decode(GCalEvent.self, from: Data(#"{"id":"ev-1","summary":"Standup"}"#.utf8))
+        event.holdsSeries = true
+        let data = try JSONEncoder().encode(event)
+        #expect(!String(decoding: data, as: UTF8.self).contains("holdsSeries"))
+        #expect(try JSONDecoder().decode(GCalEvent.self, from: data).holdsSeries == nil)
+        #expect(try JSONDecoder().decode(GCalEvent.self, from: data).summary == "Standup")
+    }
+
+    @Test("a zone the calendar already defines is not defined twice; one it lacks is added once")
+    func vtimezoneIsAddedOnce() throws {
+        func count(_ ics: String) -> Int { ics.components(separatedBy: "\r\n").filter { $0 == "BEGIN:VTIMEZONE" }.count }
+        let defined = Self.series("DTSTART;TZID=Asia/Tokyo:20990105T080000", [], zone: "Asia/Tokyo")
+        #expect(count(try CalDAVProvider.addingVTimeZone(named: "Asia/Tokyo", to: defined)) == 1)
+        let lacking = Self.series("DTSTART;VALUE=DATE:20990105", [])
+        #expect(count(try CalDAVProvider.addingVTimeZone(named: "Asia/Tokyo", to: lacking)) == 1)
+    }
+}
