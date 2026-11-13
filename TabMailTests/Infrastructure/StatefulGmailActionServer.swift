@@ -260,6 +260,8 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         var getLatencyByProviderId: [String: TimeInterval] = [:]
         /// Seconds every account-wide `is:unread` / `is:starred` list is withheld for.
         var searchListLatency: TimeInterval = 0
+        /// Added to every list request (`GET /messages`), the search lists included.
+        var listLatency: TimeInterval = 0
         /// At most this many ids per page of an account-wide `is:unread` /
         /// `is:starred` list, whatever `maxResults` asks for (Gmail may answer a
         /// page with fewer than `maxResults`). Nil: `maxResults` alone decides.
@@ -562,6 +564,12 @@ final class StatefulGmailActionServer: @unchecked Sendable {
     /// Make every account-wide `is:unread` / `is:starred` list take `seconds`.
     func holdSearchLists(forSeconds seconds: TimeInterval) {
         state.value.withLock { $0.searchListLatency = seconds }
+    }
+
+    /// Make every list request (`GET /messages`: folder lists, the walk's pages,
+    /// the account-wide searches) take `seconds` more, as a real round trip does.
+    func holdEveryList(forSeconds seconds: TimeInterval) {
+        state.value.withLock { $0.listLatency = seconds }
     }
 
     /// One held backfill-walk list request: `reached` is signalled when the request
@@ -1414,7 +1422,9 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                     return .bytes(body, contentType: "application/json")
                 }
             }
-            let latency = (wantsUnread || wantsStarred) ? state.value.withLock { $0.searchListLatency } : 0
+            let latency = state.value.withLock { model in
+                model.listLatency + ((wantsUnread || wantsStarred) ? model.searchListLatency : 0)
+            }
             guard latency > 0 else { return .bytes(body, contentType: "application/json") }
             return .parked { Thread.sleep(forTimeInterval: latency); return .bytes(body, contentType: "application/json") }
         }

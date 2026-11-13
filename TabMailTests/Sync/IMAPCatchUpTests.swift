@@ -8,7 +8,8 @@ import GRDB
 import Synchronization
 @testable import TabMail
 
-/// ADR-IOS-107: the full sync's catch-up of server-side changes to OLDER mail —
+/// ADR-IOS-107: the catch-up of server-side changes to OLDER mail (run by the
+/// backfill worker after the folders' walk since #766; before it, by the full sync) —
 /// a read/flag change or a removal on a message no sync window reaches again.
 ///
 /// Every case drives the real `IMAPProvider.catchUp` against `FakeIMAPServer` (the
@@ -157,12 +158,14 @@ struct IMAPCatchUpTests {
 
     // MARK: - Wiring
 
-    /// The step sits at the end of the real full sync: after one `fullSync`, every
-    /// syncable folder with a known epoch has a completed catch-up state. Enabled
+    /// The step runs in the backfill worker (#766): after one `fullSync`, a
+    /// foreground backfill call (`runBackfill`, the worker's cycle) leaves every
+    /// syncable folder with a known epoch with a completed catch-up state. Enabled
     /// only on a non-expensive network, because the first listing of a folder is a
-    /// full check, which waits for one.
-    @Test("The full sync runs the catch-up", .enabled(if: !NetworkMonitor.checkExpensive()))
-    func fullSyncRunsTheCatchUp() async throws {
+    /// full check, which waits for one. *Superseded:* "The step sits at the end of
+    /// the real full sync: after one `fullSync`, every syncable folder [...]".
+    @Test("A backfill cycle after the full sync runs the catch-up", .enabled(if: !NetworkMonitor.checkExpensive()))
+    func backfillCycleRunsTheCatchUp() async throws {
         try await Self.withWorld("cu-wiring", serverUIDs: [1, 2, 3], localUIDs: [1, 2, 3]) { world in
             let accountId = world.accountId
             let account = try #require(try await world.pool.read { db in try Account.fetchOne(db, key: accountId) })
@@ -170,8 +173,9 @@ struct IMAPCatchUpTests {
                 accountId: world.accountId, provider: world.provider,
                 workQueue: ProviderWorkQueue(provider: world.provider, maxConcurrency: 1))
             try await world.engine.fullSync(account: account, provider: world.provider)
+            _ = await world.engine.runBackfill(account: account)
 
-            let state = try #require(try Self.state(world), "the full sync wrote the folder's catch-up state")
+            let state = try #require(try Self.state(world), "the backfill cycle wrote the folder's catch-up state")
             #expect(state.epoch == Self.epoch && state.listing == nil && state.lastCompletedAt != nil)
             #expect(try Self.rows(world).count == 3, "every message is still on the server; nothing is removed")
         }
@@ -189,7 +193,11 @@ struct IMAPCatchUpTests {
                 accountId: world.accountId, provider: world.provider,
                 workQueue: ProviderWorkQueue(provider: world.provider, maxConcurrency: 1))
             try await world.engine.fullSync(account: account, provider: world.provider)
+            _ = await world.engine.runBackfill(account: account)
             #expect(try Self.rows(world, path: "INBOX")["1"]?.isRead == false, "precondition: the full sync brought INBOX in, unread")
+            let inboxId = "\(accountId):INBOX"
+            let inboxState = IMAPCatchUpState.decode(try await world.pool.read { db in try Folder.fetchOne(db, key: inboxId)?.catchUpState })
+            #expect(inboxState?.lastCompletedAt != nil, "precondition: the backfill cycle completed INBOX's first listing")
 
             world.server.setFlags(["\\Seen"], in: "INBOX", uid: 1)
             try await Self.refreshModSeq(world, path: "INBOX")
@@ -682,6 +690,41 @@ struct IMAPCatchUpTests {
         }
     }
 
+    /// The catch-up ignores the Wi-Fi-only setting but keeps IMAP's own network
+    /// rule (ADR-IOS-107 decision 2, 2026-11-12): on a cellular network with
+    /// Wi-Fi-only on, the backfill call the worker and the background job make
+    /// (walk held back) runs no daily full listing; a non-expensive network does.
+    @Test("With Wi-Fi-only on and only cellular, a backfill cycle runs no IMAP daily listing; a non-expensive network does")
+    func wifiOnlyCellularKeepsTheDailyRule() async throws {
+        try await Self.withWorld("cu-wifi-only-cellular", serverUIDs: [1, 2], localUIDs: [1, 2]) { world in
+            let accountId = world.accountId
+            let account = try #require(try await world.pool.read { db in try Account.fetchOne(db, key: accountId) })
+            await world.engine.register(
+                accountId: world.accountId, provider: world.provider,
+                workQueue: ProviderWorkQueue(provider: world.provider, maxConcurrency: 1))
+            world.server.setFlags(["\\Seen"], in: Self.path, uid: 2)
+            let modseq = try #require(try Self.storedModSeq(world))
+            // Daily check overdue, nothing else signals a change.
+            let overdue = IMAPCatchUpState(
+                epoch: Self.epoch, completionStamp: modseq,
+                lastCompletedAt: Date().addingTimeInterval(-2 * SyncConfig.catchUpFullCheckIntervalSeconds),
+                listing: nil)
+            try Self.setState(overdue, world)
+
+            try await GmailCatchUpTests.withCellularAndWiFiOnly { () async throws in
+                _ = await world.engine.runBackfill(account: account, walkAllowed: false)
+                #expect(Self.fetchCount(world.server) == 0, "no daily listing on cellular")
+                #expect(try Self.rows(world)["2"]?.isRead == false)
+                #expect(try Self.state(world) == overdue, "the daily check is still due")
+            }
+            if !NetworkMonitor.checkExpensive() {
+                _ = await world.engine.runBackfill(account: account)
+                #expect(try Self.rows(world)["2"]?.isRead == true, "the daily listing runs on a non-expensive network")
+            }
+            await world.engine.remove(accountId: world.accountId)
+        }
+    }
+
     /// A device that is always on an expensive network (cellular, a hotspot, Low
     /// Data Mode) must still get a full catch-up.
     @Test("A folder never listed lists on an expensive network once it has waited long enough")
@@ -858,7 +901,9 @@ struct CatchUpApplyTests {
             folders: [folder], localRows: SyncEngineCatchUpRowReader(pool: AppDatabase.syncPool),
             context: CatchUpContext(isExpensiveNetwork: false, deadline: .distantFuture, clock: { Date() }))
         #expect(results.isEmpty)
-        await SyncEngine().runCatchUp(provider: provider, folderIds: [w.folderId])
+        await SyncEngine().runCatchUp(
+            provider: provider, folderIds: [w.folderId],
+            context: CatchUpContext(isExpensiveNetwork: false, deadline: .distantFuture, clock: { Date() }))
         #expect(try Self.catchUpState(w.pool, w.folderId) == nil)
         #expect(try FolderEpochTestFixture.headerCount(accountId: "cua-default", path: "Archive", pool: w.pool) == 3)
     }

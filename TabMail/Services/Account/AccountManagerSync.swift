@@ -290,9 +290,10 @@ extension AccountManager {
     }
 
     /// Run one cycle of backfill for the given account, optionally constrained by a deadline.
-    /// Used by SyncScheduler for time-budgeted background backfill.
-    func runBackfill(account: Account, deadline: Date? = nil) async -> Bool {
-        return await syncEngine.performBackfill(account: account, deadline: deadline)
+    /// Used by SyncScheduler for time-budgeted background backfill. `walkAllowed`
+    /// false (Wi-Fi-only on, off Wi-Fi) holds back the walk only.
+    func runBackfill(account: Account, deadline: Date? = nil, walkAllowed: Bool = true) async -> Bool {
+        return await syncEngine.performBackfill(account: account, deadline: deadline, walkAllowed: walkAllowed)
     }
 
     /// Re-queue all inbox messages for AI processing.

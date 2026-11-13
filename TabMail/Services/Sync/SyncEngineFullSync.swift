@@ -312,21 +312,7 @@ extension SyncEngine {
         // Sync messages for main roles + favorited folders, prioritized:
         // inbox first, then favorites, then secondary roles, then custom.
         // Custom non-favorited folders sync on-demand when the user navigates to them.
-        let primary = self.primaryRoles
-        let secondary = self.secondaryRoles
-        let syncableFolders = folders.filter { folder in
-            primary.contains(folder.role) ||
-            secondary.contains(folder.role) ||
-            folder.isFavorite
-        }.sorted { a, b in
-            func priority(_ f: Folder) -> Int {
-                if primary.contains(f.role) { return 0 }
-                if f.isFavorite { return 1 }
-                if secondary.contains(f.role) { return 2 }
-                return 3
-            }
-            return priority(a) < priority(b)
-        }
+        let syncableFolders = syncableFoldersInOrder(folders)
 
         BackgroundSyncLogger.logDebug("[FullSync] \(account.emailAddress) syncing \(syncableFolders.count) folders: \(syncableFolders.map(\.name).joined(separator: ", "))")
 
@@ -574,18 +560,37 @@ extension SyncEngine {
             }
         }
 
-        // ADR-IOS-107: catch up server-side changes to older mail that no window above
-        // reaches (a read/flag change or a removal on an old message). One provider
-        // call for every syncable folder, applied through the paths above, inside this
-        // pass's lock and bounded by `SyncConfig.catchUpPassBudgetSeconds` plus one
-        // `catchUpRequestTimeoutSeconds`. Generic: a provider without catch-up returns
-        // nothing. Never throws, so it cannot trigger the caller's retry.
-        await runCatchUp(provider: provider, folderIds: syncableFolders.map(\.id))
+        // ADR-IOS-107: the catch-up of server-side changes to older mail runs in the
+        // backfill worker after the folders' walk (`runBackfill` → `runCatchUpRun`),
+        // in slices under the one-sync-at-a-time turn, not here (#766). *Superseded:*
+        // it ran here, at the end of every full sync, one 2 s budget per pass.
 
         // Body fetching happens during backfill (startBackfill called after fullSync).
         // Running it inline here would block sync and explode memory for large folders.
         // Unread recount is handled per folder in `processSyncResult`, right after its listing commits.
         return listing
+    }
+
+    /// The folders the full sync syncs, and the backfill worker's catch-up lists:
+    /// main roles and favourites, inbox first, then favourites, then secondary
+    /// roles. Custom non-favourite folders sync on demand when the user navigates
+    /// to them.
+    nonisolated func syncableFoldersInOrder(_ folders: [Folder]) -> [Folder] {
+        let primary = self.primaryRoles
+        let secondary = self.secondaryRoles
+        return folders.filter { folder in
+            primary.contains(folder.role) ||
+            secondary.contains(folder.role) ||
+            folder.isFavorite
+        }.sorted { a, b in
+            func priority(_ f: Folder) -> Int {
+                if primary.contains(f.role) { return 0 }
+                if f.isFavorite { return 1 }
+                if secondary.contains(f.role) { return 2 }
+                return 3
+            }
+            return priority(a) < priority(b)
+        }
     }
 
     // MARK: - Message Sync

@@ -237,20 +237,20 @@ struct GmailChangeReadingTests {
             Pins.seed("refused-1", labels: ["INBOX"], date: Pins.daysAgo(40)),
             Pins.seed("refused-2", labels: ["INBOX"], date: Pins.daysAgo(1)),
         ]) { w in
-            try await w.foregroundPassWithFullSyncDue()
+            try await Self.foregroundPassThenBackfill(w, fullSyncDue: true)
             w.server.applyLabelChange(providerMessageId: "refused-1", add: ["STARRED"])
             w.server.expireHistory()
 
             let catchUpBefore = Self.catchUpListings(w).count
             let windowBefore = Self.windowListings(w)
-            try await w.foregroundPassWithFullSyncDue()
+            try await Self.foregroundPassThenBackfill(w, fullSyncDue: true)
             #expect(Self.windowListings(w) > windowBefore, "the refusal re-lists in the same pass")
             #expect(try w.account().lastHistoryId == w.server.currentHistoryId(), "and stores a new bookmark")
             let catchUpAfterRefusal = Self.catchUpListings(w).count
             #expect(catchUpAfterRefusal > catchUpBefore, "one catch-up check runs")
             #expect(try w.row("refused-1", in: w.inbox)?.isFlagged == true)
 
-            try await w.foregroundPassWithFullSyncDue()
+            try await Self.foregroundPassThenBackfill(w, fullSyncDue: true)
             #expect(Self.catchUpListings(w).count == catchUpAfterRefusal, "no second check")
 
             // Eight days on: every stored catch-up time moved back.
@@ -471,7 +471,7 @@ struct GmailChangeReadingTests {
         try await Pins.withWorld(seeds: [
             Pins.seed("lapse-once", labels: ["INBOX"], date: Pins.daysAgo(40)),
         ]) { w in
-            try await w.foregroundPassWithFullSyncDue()
+            try await Self.foregroundPassThenBackfill(w, fullSyncDue: true)
             let before = try Self.lapseCounts(w)
             #expect(!before.isEmpty, "precondition: the folders hold a catch-up state")
 
@@ -480,7 +480,7 @@ struct GmailChangeReadingTests {
             w.server.failNextProfile(transport: .networkConnectionLost)
             let historyBefore = w.historyRequestCount()
             #expect(try w.account().lastFullSyncAt != nil, "precondition: the full sync is not due by time")
-            try await Self.foregroundPassFullSyncNotForced(w)
+            try await Self.foregroundPassThenBackfill(w, fullSyncDue: false)
 
             #expect(w.server.profileFailuresServedCount() == 1, "precondition: the re-read after the refusal lost its connection")
             #expect(w.historyRequestCount() - historyBefore == 1, "the retry read the refused bookmark's history again")
@@ -502,7 +502,7 @@ struct GmailChangeReadingTests {
         try await Pins.withWorld(seeds: [
             Pins.seed("offline-lapse", labels: ["INBOX"], date: Pins.daysAgo(40)),
         ]) { w in
-            try await w.foregroundPassWithFullSyncDue()
+            try await Self.foregroundPassThenBackfill(w, fullSyncDue: true)
             let before = try Self.lapseCounts(w)
             #expect(!before.isEmpty, "precondition: the folders hold a catch-up state")
 
@@ -512,7 +512,7 @@ struct GmailChangeReadingTests {
             let historyBefore = w.historyRequestCount()
             #expect(try w.account().lastFullSyncAt != nil, "precondition: the full sync is not due by time")
             await #expect(throws: (any Error).self, "a pass that read and listed nothing must fail") {
-                try await Self.foregroundPassFullSyncNotForced(w)
+                try await Self.foregroundPassThenBackfill(w, fullSyncDue: false)
             }
 
             #expect(w.server.profileFailuresServedCount() == 2, "precondition: the re-read and its retry both lost the connection")
@@ -524,7 +524,7 @@ struct GmailChangeReadingTests {
             #expect(try w.account().lastHistoryId == nil, "no bookmark is stored")
             #expect(try w.account().lastFullSyncAt == nil, "the full sync stays due")
 
-            try await Self.foregroundPassFullSyncNotForced(w)
+            try await Self.foregroundPassThenBackfill(w, fullSyncDue: false)
             #expect(try w.account().lastHistoryId == w.server.currentHistoryId(), "the next pass stores a bookmark")
             #expect(try w.row("offline-lapse", in: w.inbox)?.isFlagged == true, "the change behind the refusal lands")
         }
@@ -536,7 +536,7 @@ struct GmailChangeReadingTests {
         try await Pins.withWorld(seeds: [
             Pins.seed("bg-lapse-once", labels: ["INBOX"], date: Pins.daysAgo(40)),
         ]) { w in
-            try await w.foregroundPassWithFullSyncDue()
+            try await Self.foregroundPassThenBackfill(w, fullSyncDue: true)
             let before = try Self.lapseCounts(w)
             #expect(!before.isEmpty, "precondition: the folders hold a catch-up state")
 
@@ -569,6 +569,48 @@ struct GmailChangeReadingTests {
             workQueue: ProviderWorkQueue(provider: w.provider, maxConcurrency: 1))
         _ = try await engine.sync(account: try w.account())
     }
+
+    /// One production foreground pass (`SyncEngine.sync(account:)`), then the
+    /// account's backfill cycles run to completion on the same engine: the
+    /// older-mail catch-up runs in those cycles, not in the pass (ADR-IOS-107,
+    /// #766). `fullSyncDue` forces the full sync due, as
+    /// `foregroundPassWithFullSyncDue` does; otherwise only the last sync time is
+    /// cleared, as `foregroundPassFullSyncNotForced` does. The worker the pass
+    /// starts is stopped and awaited first, the cycles then run one at a time,
+    /// and the engine is removed at the end, so no worker outlives the call and
+    /// skews a later count. A pass that throws starts no worker, so no cycles
+    /// run after it, as in the app.
+    static func foregroundPassThenBackfill(_ w: Pins.World, fullSyncDue: Bool) async throws {
+        try await w.pool.write { db in
+            _ = try Account.filter(Column("id") == w.accountId).updateAll(db, Column("lastSyncedAt").set(to: nil as Date?))
+            if fullSyncDue {
+                _ = try Account.filter(Column("id") == w.accountId).updateAll(db, Column("lastFullSyncAt").set(to: nil as Date?))
+            }
+        }
+        let engine = SyncEngine()
+        let queue = ProviderWorkQueue(provider: w.provider, maxConcurrency: 1)
+        await engine.register(accountId: w.accountId, provider: w.provider, workQueue: queue)
+        do {
+            _ = try await engine.sync(account: try w.account())
+        } catch {
+            await engine.remove(accountId: w.accountId)
+            throw error
+        }
+        // Stop the worker the pass started (awaited), then run its cycles here.
+        await engine.remove(accountId: w.accountId)
+        await engine.register(accountId: w.accountId, provider: w.provider, workQueue: queue)
+        let account = try w.account()
+        var finished = false
+        for _ in 0..<backfillCycleLimit {
+            if !(await engine.runBackfill(account: account)) { finished = true; break }
+        }
+        await engine.remove(accountId: w.accountId)
+        if !finished { Issue.record("the backfill cycles kept working after \(backfillCycleLimit) cycles") }
+    }
+
+    /// Bound on the backfill cycles one pass is followed by; only a regression
+    /// that keeps every cycle working reaches it.
+    static let backfillCycleLimit = 50
 
     /// The label ids of the full sync's window listings so far, in order (nil:
     /// All Mail, listed by query).
@@ -762,12 +804,12 @@ struct GmailChangeReadingTests {
                 guard fired.withLock({ was in defer { was = true }; return !was }) else { return }
                 server.applyLabelChange(providerMessageId: "new-account-old", remove: ["UNREAD"])
             }
-            try await w.foregroundPassWithFullSyncDue()
+            try await Self.foregroundPassThenBackfill(w, fullSyncDue: true)
             let first = Self.catchUpListings(w)
             #expect(!first.isEmpty, "precondition: the first sync ran the catch-up")
             #expect(try w.account().lastHistoryId != nil, "the first sync stored a bookmark")
 
-            try await w.foregroundPassWithFullSyncDue()
+            try await Self.foregroundPassThenBackfill(w, fullSyncDue: true)
             #expect(Self.catchUpListings(w).count == first.count, "no folder is listed a second time")
 
             try await w.completedDelta()

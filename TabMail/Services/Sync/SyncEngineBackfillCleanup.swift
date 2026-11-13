@@ -11,9 +11,10 @@ extension SyncEngine {
 
     /// Thin wrapper for BGTask execution (SyncScheduler).
     /// Runs the walk within the time budget.
-    /// Returns true if any work was done.
-    func performBackfill(account: Account, deadline: Date? = nil) async -> Bool {
-        let didWork = await runBackfill(account: account, deadline: deadline)
+    /// Returns true if any work was done. `walkAllowed` false (Wi-Fi-only on, off
+    /// Wi-Fi) holds back the walk only; the catch-up runs (`runBackfillCycle`).
+    func performBackfill(account: Account, deadline: Date? = nil, walkAllowed: Bool = true) async -> Bool {
+        let didWork = await runBackfill(account: account, deadline: deadline, walkAllowed: walkAllowed)
         await updateBackfillProgressForAccount(account)
         return didWork
     }

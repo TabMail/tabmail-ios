@@ -1037,12 +1037,46 @@ extension SyncEngine {
 
     // MARK: - Unified Backfill Walk
 
+    /// What one backfill call did: whether the folders' walk did work, and
+    /// whether the catch-up made progress.
+    struct BackfillCycle: Sendable, Equatable {
+        let walked: Bool
+        let caughtUp: Bool
+        /// Either did something, so the worker keeps cycling.
+        var didWork: Bool { walked || caughtUp }
+    }
+
+    /// One backfill call for this account (`runBackfillCycle`). True if the walk
+    /// did work or the catch-up made progress.
+    func runBackfill(account: Account, deadline: Date? = nil, walkAllowed: Bool = true) async -> Bool {
+        await runBackfillCycle(account: account, deadline: deadline, walkAllowed: walkAllowed).didWork
+    }
+
+    /// One backfill call for this account: the folders' walk (`runBackfillWalk`),
+    /// then the catch-up of older mail (ADR-IOS-107, #766) for every provider; one
+    /// without catch-up returns nothing. `deadline` is the background processing
+    /// job's: the walk stops at it and the catch-up runs slices until it. With no
+    /// deadline (a foreground cycle of `startBackfill`) the catch-up runs one slice.
+    /// The catch-up's snapshot (`CatchUpRun`) is taken when the catch-up starts,
+    /// after the walk, so a long foreground walk never hands it a network state
+    /// from before the walk. `walkAllowed` false (the Wi-Fi-only setting on an
+    /// expensive network, decided by the caller) skips the walk only: the catch-up
+    /// ignores Wi-Fi-only and keeps its own network rules (ADR-IOS-107 decision 2,
+    /// 2026-11-12), because it lists ids and labels and its repairs must not wait
+    /// for a Wi-Fi network that may never come.
+    func runBackfillCycle(account: Account, deadline: Date? = nil, walkAllowed: Bool) async -> BackfillCycle {
+        let walked = walkAllowed ? await runBackfillWalk(account: account, deadline: deadline) : false
+        guard !Task.isCancelled else { return BackfillCycle(walked: walked, caughtUp: false) }
+        let caughtUp = await runCatchUpRun(account: account, run: .snapshot(deadline: deadline))
+        return BackfillCycle(walked: walked, caughtUp: caughtUp)
+    }
+
     /// Crawl folders for this account, inserting headers AND indexing bodies in the same walk.
     /// Gmail/Exchange: single API call per message (format=full) — headers + body together.
     /// IMAP: header fetch then body fetch in the same iteration (protocol limitation).
     /// After walking all folders, runs a cleanup pass for any remaining empty bodies.
     /// Returns true if any work was done.
-    func runBackfill(account: Account, deadline: Date? = nil) async -> Bool {
+    func runBackfillWalk(account: Account, deadline: Date? = nil) async -> Bool {
         var didWork = false
         let fastSync = await getIsFastSync()
         let isPastDeadline: () -> Bool = {

@@ -76,7 +76,10 @@ enum BackfillPageWalkFixture {
         }
     }
 
-    /// Gmail `messages.list` requests naming `label`, failed and refused ones included.
+    /// The page walk's Gmail `messages.list` requests naming `label`, failed and
+    /// refused ones included. A backfill call (`runBackfill`) runs the catch-up of
+    /// older mail after the walk (ADR-IOS-107, #766); its range lists name the
+    /// label too, with an `after:` bound the walk never sends, and are left out.
     static func gmailListRequests(_ server: StatefulGmailActionServer, label: String) -> Int {
         gmailListRequestURLs(server, label: label).count
     }
@@ -93,7 +96,10 @@ enum BackfillPageWalkFixture {
     private static func gmailListRequestURLs(_ server: StatefulGmailActionServer, label: String) -> [URL] {
         server.http.recordedCalls().compactMap { call in
             guard call.method == "GET", let url = URL(string: call.url) else { return nil }
-            return url.path.hasSuffix("/messages") && call.url.contains("labelIds=\(label)") ? url : nil
+            guard url.path.hasSuffix("/messages"), call.url.contains("labelIds=\(label)") else { return nil }
+            let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?.first(where: { $0.name == "q" })?.value ?? ""
+            return query.contains("after:") ? nil : url
         }
     }
 

@@ -60,9 +60,10 @@ extension IMAPProvider {
     }
 
     /// The per-folder decision.
-    /// - `freshModSeq` is this pass's HIGHESTMODSEQ (`Folder.lastKnownHighestModSeq`,
-    ///   written by the folder upsert from STATUS before any range runs), nil on a
-    ///   server without CONDSTORE.
+    /// - `freshModSeq` is the folder's latest STATUS HIGHESTMODSEQ
+    ///   (`Folder.lastKnownHighestModSeq`, written by the full sync's folder upsert
+    ///   and by the delta from STATUS before any range runs), nil on a server
+    ///   without CONDSTORE.
     /// - On an expensive network only a MODSEQ change may list: that is evidence of
     ///   a change, whereas the full check (and continuing one) waits for a
     ///   non-expensive network — but for no longer than
@@ -92,7 +93,7 @@ extension IMAPProvider {
     }
 
     /// `EmailProvider.catchUp` for IMAP (ADR-IOS-107). For each folder whose epoch is
-    /// known: the cheap check (this pass's HIGHESTMODSEQ against the stored
+    /// known: the cheap check (the latest STATUS HIGHESTMODSEQ against the stored
     /// completion stamp, no request), and when that or the full-check interval
     /// calls for it, a flags-only listing by UID ranges that resumes across passes.
     /// Least recently attempted folder first. Every request is preceded by a budget check
@@ -161,7 +162,7 @@ extension IMAPProvider {
                 break rangeLoop
             }
             let hi = min(lo + span - 1, Int(UInt32.max))
-            guard context.hasBudget() else { break rangeLoop }
+            guard context.hasBudget(cost: 1) else { break rangeLoop }
 
             let listed: (flags: [UInt32: (isRead: Bool, isFlagged: Bool)], uidValidity: UInt32)
             let local: [CatchUpLocalRow]
@@ -181,7 +182,7 @@ extension IMAPProvider {
             }
             guard listed.uidValidity == epoch else {
                 // The server is serving another numbering (or none): nothing listed
-                // here may be applied. Report what was observed so the full sync can
+                // here may be applied. Report what was observed so the apply can
                 // run the turnover reaction; the state is left as it was.
                 if DebugModeManager.isLoggingEnabled() {
                     BackgroundSyncLogger.logDebug("[CatchUp] \(path): SELECT reported UIDVALIDITY \(listed.uidValidity), folder holds \(epoch) — applying nothing")
@@ -207,7 +208,7 @@ extension IMAPProvider {
                 // real server shape. The walk's own absence proof decides, under the
                 // same epoch. Without the budget for it, the range's flags still
                 // count, but the cursor stays so the next pass re-lists it.
-                guard context.hasBudget() else { break rangeLoop }
+                guard context.hasBudget(cost: 1) else { break rangeLoop }
                 let confirmed: UIDExistenceResult
                 do {
                     let toConfirm = candidates
@@ -235,6 +236,11 @@ extension IMAPProvider {
             newState.listing = listing
         }
         result.newState = newState.encoded()
+        // Progress: the listing moved or completed, or something applies. A range
+        // whose request failed before anything moved is no progress, so the
+        // worker does not list it again at once.
+        result.madeProgress = completed || listing != state?.listing
+            || !result.flagUpdates.isEmpty || !result.removedIds.isEmpty
         if DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[CatchUp] \(path): flags=\(result.flagUpdates.count) removed=\(result.removedIds.count) \(completed ? "listing complete" : "resumes at UID \(listing.nextUid)")")
         }
