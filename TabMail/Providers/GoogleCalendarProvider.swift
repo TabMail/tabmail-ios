@@ -1613,6 +1613,11 @@ actor GoogleCalendarProvider: CalendarProvider {
     /// rule. A Google edit writes the `recurrence` it is given in place of the stored one
     /// (`mergeExistingEventWithPatch`), so the rule changes unless the two hold the same lines.
     nonisolated func editResetsChangedOccurrences(_ event: GCalEvent, edit: GCalEventInput) -> Bool {
+        // A change between all-day and timed changes the event as a whole: a series' changed
+        // occurrences are reset, and a single event has none.
+        if CalendarToolHelpers.editChangesKind(edit, storedIsAllDay: event.start?.date != nil) {
+            return !(event.recurrence ?? []).isEmpty
+        }
         if Self.movesSeriesTime(edit, existing: event, as: Self.googleTimes) { return true }
         guard let rule = edit.recurrence else { return false }
         return Self.recurrenceLinesDiffer(event.recurrence ?? [], rule)
@@ -2049,6 +2054,20 @@ struct GCalEvent: Codable, Sendable {
     /// `CalendarSeriesScope` reads it to tell the series' first occurrence from a later one; where
     /// an occurrence is NOW is its `start`, the start the read tools show and a `recurrence_id` names.
     var originalStartTime: GCalDateTime? = nil
+    /// Whether the event's own calendar holds it as a series: a rule, added or excluded dates, or
+    /// an occurrence changed on its own, even with no rule (a CalDAV resource holding a master and a
+    /// changed occurrence). Set where a calendar's read sees more than `recurrence` says
+    /// (`CalDAVProvider.holdsSeries`), and read by that calendar's
+    /// `CalendarProvider.editResetsChangedOccurrences`. Nil elsewhere. In memory only: left out of
+    /// the encoding (`CodingKeys`), never stored.
+    var holdsSeries: Bool? = nil
+
+    private enum CodingKeys: String, CodingKey {
+        case id, summary, location, description, start, end, attendees, organizer, recurrence
+        case transparency, status, htmlLink, created, updated, eventType, iCalUID, kind, visibility
+        case recurringEventId, conferenceUrl, recurrenceTimeZoneName, recurrenceFirstDayOfWeek
+        case occurrencesNotListed, originalStartTime
+    }
 
     /// The zone a series' rule repeats in, where its dates are read: the zone its calendar keeps
     /// the rule in (`recurrenceTimeZoneName`, Outlook's), else its start's (Google's and CalDAV's

@@ -644,7 +644,7 @@ struct CalDAVOccurrenceOverrideTests {
         #expect(block.contains(dtstart), Comment(rawValue: block.joined(separator: "\n")))
     }
 
-    @Test("an occurrence moved takes the series' value type for its new times; times on an all-day occurrence are refused")
+    @Test("an occurrence moved takes the series' value type for its new times; times on an all-day occurrence make it timed, its RECURRENCE-ID kept a date")
     func movedOccurrenceTimes() throws {
         let zoned = Fixture.series([
             "BEGIN:VEVENT", "UID:series-5", "DTSTART;TZID=America/Vancouver:20990506T170000",
@@ -667,14 +667,31 @@ struct CalDAVOccurrenceOverrideTests {
         let byDateBlock = try #require(Fixture.overrides(byDateOut).first)
         #expect(byDateBlock.contains("DTSTART;VALUE=DATE:20990521") && byDateBlock.contains("DTEND;VALUE=DATE:20990522"),
                 Comment(rawValue: byDateBlock.joined(separator: "\n")))
-        // Times on an all-day occurrence would make it timed, which a copy of the series never is:
-        // refused, never written as the dates with the times dropped.
+        // Times on an all-day occurrence make that occurrence timed at those times in the edit's zone,
+        // never the dates with the times dropped, and never in another zone. Its RECURRENCE-ID still
+        // names the series' slot in the series' type (RFC 5545 §3.8.4.4), the resource defines the
+        // zone it now names (§3.2.19), and the series stays all-day.
+        var timedPatch = Fixture.patch(start: "2099-05-21T09:30:00-07:00", end: "2099-05-21T10:45:00-07:00")
+        timedPatch.startTimeZone = "America/Vancouver"
+        timedPatch.endTimeZone = "America/Vancouver"
+        let timedOut = try Fixture.overrideEdit(allDay, recurrenceId: "2099-05-20", patch: timedPatch)
+        let timedBlock = try #require(Fixture.overrides(timedOut).first)
+        let shown = Comment(rawValue: timedBlock.joined(separator: "\n"))
+        #expect(timedBlock.contains("RECURRENCE-ID;VALUE=DATE:20990520"), shown)
+        #expect(timedBlock.contains("DTSTART;TZID=America/Vancouver:20990521T093000")
+                && timedBlock.contains("DTEND;TZID=America/Vancouver:20990521T104500"), shown)
+        #expect(timedOut.components(separatedBy: "\r\n").contains("TZID:America/Vancouver"),
+                "the zone the occurrence names is not defined: \(timedOut)")
+        #expect(!timedBlock.contains { $0.hasPrefix("DURATION") }, shown)
+        #expect(timedOut.contains("DTSTART;VALUE=DATE:20990506") && timedOut.contains("RRULE:FREQ=WEEKLY"),
+                "the series itself changed: \(timedOut)")
+        // Times with no zone are refused, never written in a zone the edit did not give.
         #expect {
             _ = try Fixture.overrideEdit(allDay, recurrenceId: "2099-05-20",
-                                         patch: Fixture.patch(start: "2099-05-21T09:30:00", end: "2099-05-22T09:30:00"))
+                                         patch: Fixture.patch(start: "2099-05-21T09:30:00-07:00", end: "2099-05-21T10:45:00-07:00"))
         } throws: { error in
             if case CalendarProviderError.notSupported(let reason) = error {
-                return reason == CalDAVProvider.kindChangeOnRepeatingMessage
+                return reason == CalDAVProvider.kindChangeNeedsZoneMessage
             }
             return false
         }

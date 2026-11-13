@@ -900,13 +900,15 @@ struct CalendarQueueUntilValueTypeTests {
 
     @Test("an explicitly stated all_day is still honoured, and costs no fetch of its own")
     func explicitAllDayIsStillHonoured() async throws {
-        // The agent converting a timed series to all-day states `all_day` AND a date. Overriding it
+        // The agent converting a timed series to all-day states `all_day` AND both dates (a change of
+        // kind needs both times). Overriding it
         // from the (still timed) resource would break the conversion.
         let r = try await drainOneEdit(
             accountId: "cal-until-explicit",
             arguments: [
                 "all_day": .bool(true),
                 "start_iso": .string("2026-06-01"),
+                "end_iso": .string("2026-06-02"),
                 "recurrence": .dictionary([
                     "freq": .string("DAILY"),
                     "until": .string("2027-01-01"),

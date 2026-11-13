@@ -10,7 +10,14 @@ actor CalDAVProvider: CalendarProvider {
     /// A CalDAV edit replaces only the master's RRULE line, with the edit's own, and keeps the
     /// rest of the series as stored; so the rule changes when the edit's RRULE differs from the
     /// stored one (`GoogleCalendarProvider.canonicalRRULE`), and an edit with none changes nothing.
+    /// A change between all-day and timed resets the changed occurrences when the resource holds
+    /// a series (`kindChangeResetsChangedOccurrences`, the write's own decision), read from the
+    /// resource with the event (`GCalEvent.holdsSeries`).
     nonisolated func editResetsChangedOccurrences(_ event: GCalEvent, edit: GCalEventInput) -> Bool {
+        if CalendarToolHelpers.editChangesKind(edit, storedIsAllDay: event.start?.date != nil) {
+            return Self.kindChangeResetsChangedOccurrences(
+                storedIsAllDay: event.start?.date != nil, holdsSeries: event.holdsSeries == true, edit: edit)
+        }
         func rule(_ lines: [String]?) -> String? {
             lines?.first { $0.uppercased().hasPrefix("RRULE:") }.map(GoogleCalendarProvider.canonicalRRULE)
         }
@@ -278,12 +285,14 @@ actor CalDAVProvider: CalendarProvider {
             return occurrence
         }
         let events = ICSParser.parse(icsText: icsText, resourceHref: seriesHref, etag: etag)
-        guard let event = events.first else {
+        guard var event = events.first else {
             if CalDAVOccurrences.holdsOnlyChangedOccurrences(icsText: icsText, href: seriesHref) {
                 throw CalendarProviderError.seriesNotInThisCalendar
             }
             throw CalDAVError.parseError("No VEVENT found in \(eventId)")
         }
+        // What the write decides a change of kind from (`kindChangeResetsChangedOccurrences`).
+        event.holdsSeries = Self.holdsSeries(icsText)
         return event
     }
 
@@ -356,7 +365,7 @@ actor CalDAVProvider: CalendarProvider {
 
         // The stored resource's zone context, read once for every zone this write resolves.
         let zones = CalendarTimeZoneContext(calendarText: existingICS)
-        let mergedICS = try Self.mergePatchIntoICS(existingICS, patch: event, zones: zones, mayChangeKind: true)
+        let mergedICS = try Self.mergePatchIntoICS(existingICS, patch: event, zones: zones)
         // No ETag ⇒ `.unconditional`, NEVER `.ifNoneMatchAny`. The GET above
         // returned a non-empty body for this exact URL, so the resource
         // PROVABLY exists; `If-None-Match: *` asserts it does NOT, which
@@ -1135,7 +1144,7 @@ actor CalDAVProvider: CalendarProvider {
     /// the event into the other kind. It is either written in full or refused,
     /// never dropped: see `kindToWrite`.
     static func mergePatchIntoICS(
-        _ ics: String, patch: GCalEventInput, zones: CalendarTimeZoneContext, mayChangeKind: Bool = false
+        _ ics: String, patch: GCalEventInput, zones: CalendarTimeZoneContext
     ) throws -> String {
         var result = ics
 
@@ -1201,18 +1210,37 @@ actor CalDAVProvider: CalendarProvider {
         // (all-day / zoned / utc / floating) so RFC 5545 §3.8.4.4 is preserved,
         // unless the patch turns the event into the other kind.
         let storedKind = masterDTStartKind(from: result)
-        let kind = try kindToWrite(in: result, stored: storedKind, patch: patch, mayChangeKind: mayChangeKind)
-        let patchedEnd = try formatDTLine(name: "DTEND", patch: patch, isStart: false, kind: kind, zones: zones)
+        let kind = try kindToWrite(stored: storedKind, patch: patch)
+        // An event made timed is written in one zone, the start's: its end is the same
+        // instant read in that zone, so the resource needs one VTIMEZONE.
+        var times = patch
+        if kind != storedKind, kind != .allDay { times.endTimeZone = times.startTimeZone }
+        let patchedEnd = try formatDTLine(name: "DTEND", patch: times, isStart: false, kind: kind, zones: zones)
         if kind != storedKind {
             // The event changes kind: both lines are written in the new kind (the
-            // end below), and a DURATION, which is in the old one, goes.
-            // `kindToWrite` allowed this only for an event that does not repeat, so
-            // nothing else is tied to the start. One line of each kind is not a
-            // valid event, so a start or end missing, or not readable in the new
-            // kind, refuses the edit.
-            guard let dtstart = try formatDTLine(name: "DTSTART", patch: patch, isStart: true, kind: kind, zones: zones),
+            // end below), and a DURATION, which is in the old one, goes. One line
+            // of each kind is not a valid event, so a start or end missing, or not
+            // readable in the new kind, refuses the edit.
+            guard let dtstart = try formatDTLine(name: "DTSTART", patch: times, isStart: true, kind: kind, zones: zones),
                   patchedEnd != nil else {
                 throw CalendarProviderError.notSupported(Self.kindChangeNeedsBothMessage)
+            }
+            if case .zoned(let tzid) = kind {
+                result = try addingVTimeZone(named: tzid, to: result)
+            }
+            // A series changes kind as a whole, as Google Calendar's "All events" and the
+            // Thunderbird add-on change it: every occurrence changed or deleted on its own is
+            // reset (the edit's card says so), and what stays tied to the start's value type
+            // (RFC 5545 §3.3.10 UNTIL, §3.8.5.2 RDATE) is written in the new one.
+            // iOS converts UNTIL and RDATE, and Thunderbird refuses them today (see
+            // tabmail-thunderbird #442); only the reset matches the add-on.
+            if kindChangeResetsChangedOccurrences(
+                storedIsAllDay: storedKind == .allDay, holdsSeries: holdsSeries(result), edit: patch) {
+                result = rewriteVEvents(in: result) { block, isSeries in
+                    isSeries ? rewriteTopLevel(block) { _, name in name == "EXDATE" ? [] : nil } : nil
+                }
+                result = try convertingSeriesValues(
+                    in: result, from: storedKind, to: kind, newStart: dtstart, zones: zones)
             }
             result = removeFromMasterVEvent(in: result, propertyKey: "DURATION")
             result = replaceOrAppendInMasterVEvent(in: result, propertyKey: "DTSTART", newLine: dtstart)
@@ -1241,40 +1269,199 @@ actor CalDAVProvider: CalendarProvider {
 
     static let kindChangeNeedsBothMessage =
         "To change this event between all-day and timed, give both its new start and its new end, each as a date or a date and time. Nothing was changed."
-    static let kindChangeOnRepeatingMessage =
-        "This edit gives the start or end as all-day where this event or occurrence is timed, or the other way round, and on this calendar TabMail can't change that for an event that repeats. Nothing was changed. If the user did not ask to change between all-day and timed, retry with all_day matching how this occurrence is shown; otherwise the user can change it in their calendar app."
+    static let kindChangeNeedsZoneMessage =
+        "To make this event timed, its new times need a time zone, and none was given. Nothing was changed."
 
     /// The value type the merge writes `DTSTART` / `DTEND` in. It is the stored
     /// event's, unless the patch gives a start or end of the other kind: a time
     /// for an all-day event (the user is making it timed) or a date for a timed
     /// one (making it all-day). `formatDTLine` cannot express such a value in
     /// the stored kind, so writing in it would leave the event as it was while
-    /// the edit reported success.
+    /// the edit reported success. The merge then writes both the start and the
+    /// end in the new kind, and refuses when the patch does not give both: one
+    /// line of each kind is not a valid event.
     ///
-    /// The change is made only on a whole event that does not repeat
-    /// (`mayChangeKind`, no rule, no extra or excluded dates, no changed
-    /// occurrence). The merge then writes both the start and the end in the new
-    /// kind, and refuses when the patch does not give both: one line of each
-    /// kind is not a valid event. Every other case throws before anything is
-    /// written. A newly timed event is written in UTC, which names the same
-    /// instants and needs no VTIMEZONE. The series is read as the writer sees
-    /// it (`masterTopLevelLines`), so the two never disagree on what repeats.
-    static func kindToWrite(
-        in ics: String, stored: MasterDTStartKind, patch: GCalEventInput, mayChangeKind: Bool
-    ) throws -> MasterDTStartKind {
-        let givesTime = patch.startDateTime != nil || patch.endDateTime != nil
-        let givesDate = patch.startDate != nil || patch.endDate != nil
-        let toTimed = stored == .allDay && givesTime
-        let toAllDay = stored != .allDay && givesDate
-        guard toTimed || toAllDay else { return stored }
-        let repeats = masterTopLevelLines(ics).contains { line in
-            guard let name = icsProperty(line)?.name else { return false }
-            return ["RRULE", "RDATE", "EXDATE"].contains(name)
-        } || icsUnits(ics).contains { icsProperty($0.text)?.name == "RECURRENCE-ID" }
-        guard mayChangeKind, !repeats else {
-            throw CalendarProviderError.notSupported(kindChangeOnRepeatingMessage)
+    /// An event made timed is written in the zone of the edit's times, as its
+    /// create would be and as the Thunderbird add-on writes it (the zone the
+    /// edit names, else the user's own, which the edit tool snapshots at its
+    /// start and the queue keeps, `stampingZone`): a series keeps its time of
+    /// day across that zone's clock changes. UTC itself is written as UTC.
+    static func kindToWrite(stored: MasterDTStartKind, patch: GCalEventInput) throws -> MasterDTStartKind {
+        guard CalendarToolHelpers.editChangesKind(patch, storedIsAllDay: stored == .allDay) else { return stored }
+        if stored != .allDay { return .allDay }
+        guard let name = patch.startTimeZone ?? patch.endTimeZone, !name.isEmpty,
+              let zone = CalendarTimeZoneResolver.zone(named: name, in: .none) else {
+            throw CalendarProviderError.notSupported(kindChangeNeedsZoneMessage)
         }
-        return toTimed ? .utc : .allDay
+        return zone.secondsFromGMT() == 0 && zone.nextDaylightSavingTimeTransition == nil
+            && ["UTC", "GMT", "Etc/UTC", "Etc/GMT"].contains(zone.identifier) ? .utc : .zoned(zone.identifier)
+    }
+
+    /// THE decision whether a change between all-day and timed resets the occurrences changed or
+    /// deleted on their own: it does when the edit changes the kind and the resource holds a series
+    /// (`holdsSeries`). The write (`mergePatchIntoICS`) and the edit's card
+    /// (`editResetsChangedOccurrences`) both take it here, so the two cannot differ.
+    nonisolated static func kindChangeResetsChangedOccurrences(
+        storedIsAllDay: Bool, holdsSeries: Bool, edit: GCalEventInput
+    ) -> Bool {
+        holdsSeries && CalendarToolHelpers.editChangesKind(edit, storedIsAllDay: storedIsAllDay)
+    }
+
+    /// Whether the resource holds a series: its VEVENT has a rule, added or deleted dates, or
+    /// the resource holds an occurrence changed on its own (a VEVENT with a RECURRENCE-ID).
+    static func holdsSeries(_ ics: String) -> Bool {
+        masterTopLevelLines(ics).contains { ["RRULE", "RDATE", "EXDATE"].contains(icsProperty($0)?.name ?? "") }
+            || veventBlocks(icsUnits(ics)).contains(where: isOverride)
+    }
+
+    /// `ics` with its series' UNTIL and added dates (RDATE) in the value type of `new`, the kind
+    /// the series is changing to from `old` (RFC 5545 §3.3.10: UNTIL takes DTSTART's value type;
+    /// §3.8.5.2: an RDATE names an occurrence's start). The series keeps its last day and each
+    /// added date:
+    /// - made all-day, an UNTIL time becomes the date it falls on in the series' own zone (the
+    ///   zone its occurrences are listed in), and an added time becomes the date it starts on
+    ///   there; an added period becomes the date it starts on, and takes the series' length, as
+    ///   every reset occurrence does;
+    /// - made timed, an UNTIL date becomes the end of that day in the series' new zone, in UTC
+    ///   (`CalendarToolHelpers.validatedRRuleUntil`, the edit's own UNTIL), and an added date
+    ///   starts at the new start's time of day in that zone (`newStart`, its DTSTART line).
+    /// A value already of the new type (an UNTIL the edit wrote with its rule) is kept. A value
+    /// that can't be read throws, before anything is written.
+    static func convertingSeriesValues(
+        in ics: String, from old: MasterDTStartKind, to new: MasterDTStartKind, newStart: String,
+        zones: CalendarTimeZoneContext
+    ) throws -> String {
+        let unreadable = CalendarProviderError.notSupported(
+            "The repeating event's end date or added dates can't be read, so it can't be changed between all-day and timed. Nothing was changed.")
+        // The zone the series' occurrences are listed in before the change: a floating series'
+        // wall times are their own dates.
+        let oldZone: TimeZone?
+        switch old {
+        case .zoned(let tzid):
+            guard let zone = CalendarTimeZoneResolver.zone(named: tzid, in: zones) else { throw unreadable }
+            oldZone = zone
+        case .utc: oldZone = .gmt
+        case .floating, .allDay: oldZone = nil
+        }
+        // The date a timed value falls on in the series' own zone, as `YYYYMMDD`.
+        func day(of value: String, params: String) throws -> String {
+            let upper = value.uppercased()
+            if upper.count == 8 {
+                guard let date = storedDate(upper) else { throw unreadable }
+                return date
+            }
+            guard upper.count >= 15, upper.dropFirst(8).first == "T" else { throw unreadable }
+            let digits = String(upper.prefix(8))
+            let tzid = ICSParser.extractTZID(params)
+            let valueZone: TimeZone?
+            if upper.hasSuffix("Z") {
+                valueZone = .gmt
+            } else if let tzid {
+                guard let zone = CalendarTimeZoneResolver.zone(named: tzid, in: zones) else { throw unreadable }
+                valueZone = zone
+            } else {
+                valueZone = nil
+            }
+            guard let valueZone, let target = oldZone, valueZone.identifier != target.identifier else { return digits }
+            let inFmt = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss", timeZone: valueZone)
+            guard let instant = inFmt.date(from: String(upper.prefix(15))) else { throw unreadable }
+            return FixedDateFormat.formatter("yyyyMMdd", timeZone: target).string(from: instant)
+        }
+
+        switch new {
+        case .allDay:
+            return try rewriteVEvents(in: ics) { block, isSeries in
+                guard isSeries else { return block }
+                return try rewriteTopLevel(block) { unit, name in
+                    guard let property = icsProperty(unit.text) else { return nil }
+                    switch name {
+                    case "RRULE":
+                        guard let until = untilValue(of: property.value), until.count != 8 else { return nil }
+                        let date = try day(of: until, params: "")
+                        return ["RRULE:\(GoogleCalendarProvider.replaceOrAppendUntil(in: property.value, untilValue: date))"]
+                    case "RDATE":
+                        let dates = try property.value.split(separator: ",").map { value in
+                            try day(of: String(value.split(separator: "/").first ?? value), params: property.params)
+                        }
+                        return ["RDATE;VALUE=DATE:\(dates.joined(separator: ","))"]
+                    default:
+                        return nil
+                    }
+                }
+            }
+        case .zoned, .utc:
+            guard let start = icsProperty(newStart), start.value.count >= 15,
+                  let zone = CalendarTimeZoneResolver.zone(named: ICSParser.extractTZID(start.params) ?? "UTC", in: .none) else {
+                throw unreadable
+            }
+            let timeOfDay = String(start.value.uppercased().dropFirst(8).prefix(7))
+            let suffix = start.value.uppercased().hasSuffix("Z") ? "Z" : ""
+            let params = start.params.split(separator: ";").filter { $0.uppercased().hasPrefix("TZID=") }
+                .map { ";\($0)" }.joined()
+            return try rewriteVEvents(in: ics) { block, isSeries in
+                guard isSeries else { return block }
+                return try rewriteTopLevel(block) { unit, name in
+                    guard let property = icsProperty(unit.text) else { return nil }
+                    switch name {
+                    case "RRULE":
+                        guard let until = untilValue(of: property.value), until.count == 8 else { return nil }
+                        guard let timed = CalendarToolHelpers.validatedRRuleUntil(until, allDay: false, zone: zone) else { throw unreadable }
+                        return ["RRULE:\(GoogleCalendarProvider.replaceOrAppendUntil(in: property.value, untilValue: timed))"]
+                    case "RDATE":
+                        let starts = try property.value.split(separator: ",").map { value in
+                            guard let date = storedDate(String(value)) else { throw unreadable }
+                            return "\(date)\(timeOfDay)\(suffix)"
+                        }
+                        return ["RDATE\(params):\(starts.joined(separator: ","))"]
+                    default:
+                        return nil
+                    }
+                }
+            }
+        case .floating:
+            return ics
+        }
+    }
+
+    /// A stored RFC 5545 DATE value (§3.3.4) as written, or nil when it is not one: exactly eight
+    /// ASCII digits naming a real day, `yyyyMMdd` in the Gregorian calendar. The one reader of an
+    /// added date (RDATE) a series changed between all-day and timed keeps, in either direction.
+    static func storedDate(_ value: String) -> String? {
+        guard value.count == 8, value.allSatisfy({ $0.isASCII && $0.isNumber }) else { return nil }
+        let format = FixedDateFormat.formatter("yyyyMMdd", timeZone: .gmt)
+        guard let day = format.date(from: value), format.string(from: day) == value else { return nil }
+        return value
+    }
+
+    /// The UNTIL value of an RRULE value, or nil when it has none.
+    private static func untilValue(of rule: String) -> String? {
+        rule.split(separator: ";").first { $0.trimmingCharacters(in: .whitespaces).uppercased().hasPrefix("UNTIL=") }
+            .map { String($0.trimmingCharacters(in: .whitespaces).dropFirst("UNTIL=".count)) }
+    }
+
+    /// `ics` with a VTIMEZONE for `tzid` ahead of its first VEVENT, unless one of its
+    /// VTIMEZONEs already defines that TZID. RFC 5545 §3.2.19: a TZID parameter names a
+    /// VTIMEZONE of the same calendar.
+    static func addingVTimeZone(named tzid: String, to ics: String) throws -> String {
+        var inZone = false
+        for line in icsLines(ics) {
+            let upper = line.uppercased().trimmingCharacters(in: .whitespaces)
+            if upper == "BEGIN:VTIMEZONE" { inZone = true } else if upper == "END:VTIMEZONE" { inZone = false }
+            if inZone, let property = icsProperty(line), property.name == "TZID",
+               property.value.trimmingCharacters(in: .whitespaces) == tzid {
+                return ics
+            }
+        }
+        guard let zone = CalendarTimeZoneResolver.zone(named: tzid, in: .none),
+              let block = VTimeZoneBuilder.vtimezone(for: zone) else {
+            throw CalendarProviderError.notSupported(
+                "The time zone \(tzid) can't be written to this calendar. Nothing was changed.")
+        }
+        let physical = physicalICSLines(ics)
+        guard let at = physical.firstIndex(where: { isMarker($0, "BEGIN:VEVENT") }) else { return ics }
+        var out = physical
+        out.insert(contentsOf: block, at: at)
+        return out.joined(separator: "\r\n")
     }
 
     /// Replace the MASTER VEVENT's own property named `propertyKey` (the first one, with its folded

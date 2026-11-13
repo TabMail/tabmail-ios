@@ -1569,10 +1569,11 @@ struct CalendarEditToolSeriesScopeTests {
 
     /// A CalDAV series repeating by `rule` from day 0, its occurrence on day 14 deleted (an EXDATE),
     /// the one on day 21 changed to an hour later (an override) and an extra one added on day 17
-    /// (an RDATE), moved as a whole a day on through the edit tool: the resource's lines after the
-    /// write, and the run.
+    /// (an RDATE), moved as a whole a day on through the edit tool, or edited by `arguments` when
+    /// given: the resource's lines after the write, and the run.
     private func calDAVMoveWithExceptions(rule: String, account: String, split: Bool = false,
-                                          splitTo: String = "\(day(8))T09:00:00") async throws -> (lines: [String], run: ToolRun) {
+                                          splitTo: String = "\(day(8))T09:00:00",
+                                          arguments: [String: JSONValue]? = nil) async throws -> (lines: [String], run: ToolRun) {
         let series = calDAVSeries(uid: "wk-x", rule: rule, tzid: "Etc/UTC")
             .replacingOccurrences(of: "SUMMARY:Standup\r\nEND:VEVENT",
                                   with: "EXDATE;TZID=Etc/UTC:\(compact(day(14)))T090000\r\n"
@@ -1587,13 +1588,13 @@ struct CalendarEditToolSeriesScopeTests {
         store.seed(path: "/cal/wk-x.ics", ics: series)
         // A split is made at day 7 and moved to day 8; its new part is the resource the split PUT
         // besides the series.
-        let r = try await calDAVTool(store, split ? [
+        let r = try await calDAVTool(store, arguments ?? (split ? [
             "edit_scope": .string("this_and_following"), "recurrence_id": .string("\(day(7))T09:00:00"),
             "start_iso": .string(splitTo), "timezone": .string("UTC"),
         ] : [
             "edit_scope": .string("all"), "recurrence_id": .string("\(day(0))T09:00:00"),
             "start_iso": .string("\(day(1))T09:00:00"), "timezone": .string("UTC"),
-        ], eventId: "/cal/wk-x.ics", account: account)
+        ]), eventId: "/cal/wk-x.ics", account: account)
         let path = split ? store.recordedPuts().first { $0.path != "/cal/wk-x.ics" }?.path : "/cal/wk-x.ics"
         return (path.flatMap { store.storedICS(path: $0) }?.components(separatedBy: "\r\n") ?? [], r)
     }
@@ -1612,6 +1613,125 @@ struct CalendarEditToolSeriesScopeTests {
                 "the added date was dropped: \(lines)")
         #expect(r.cards.first?.changes.contains(CalendarToolHelpers.dayMoveResetNote) == true,
                 "card: \(r.cards.first?.changes ?? [])")
+    }
+
+    @Test("CalDAV: a whole series made all-day resets every occurrence changed or deleted on its own, keeps its added date, and the card says so")
+    func calDAVKindChangeResetsExceptions() async throws {
+        let (lines, r) = try await calDAVMoveWithExceptions(
+            rule: "RRULE:FREQ=WEEKLY", account: "series-tool-c-kind-resets", arguments: [
+                "edit_scope": .string("all"), "all_day": .bool(true),
+                "start_iso": .string(day(0)), "end_iso": .string(day(1)), "timezone": .string("UTC"),
+            ])
+        #expect(lines.contains("DTSTART;VALUE=DATE:\(compact(day(0)))"), "not made all-day: \(lines); \(r.out)")
+        #expect(!lines.contains { $0.hasPrefix("EXDATE") || $0.hasPrefix("RECURRENCE-ID") },
+                "an occurrence changed or deleted on its own was kept: \(lines)")
+        #expect(lines.contains("RDATE;VALUE=DATE:\(compact(day(17)))"), "the added date was not kept as a date: \(lines)")
+        #expect(r.cards.first?.changes.contains(CalendarToolHelpers.kindChangeResetNote) == true,
+                "card: \(r.cards.first?.changes ?? [])")
+    }
+
+    @Test("CalDAV: an event with no rule holding only a changed occurrence, made all-day, is reset by the write and the card says so")
+    func calDAVKindChangeOfRulelessResourceWithChangedOccurrence() async throws {
+        let ics = [
+            "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//TabMail//Test//EN",
+            "BEGIN:VEVENT", "UID:nr-x", "DTSTAMP:\(compact(day(-14)))T000000Z",
+            "DTSTART;TZID=Etc/UTC:\(compact(day(0)))T090000", "DTEND;TZID=Etc/UTC:\(compact(day(0)))T093000",
+            "SUMMARY:Standup", "END:VEVENT",
+            "BEGIN:VEVENT", "UID:nr-x", "DTSTAMP:\(compact(day(-14)))T000000Z",
+            "RECURRENCE-ID;TZID=Etc/UTC:\(compact(day(7)))T090000",
+            "DTSTART;TZID=Etc/UTC:\(compact(day(7)))T100000", "DTEND;TZID=Etc/UTC:\(compact(day(7)))T103000",
+            "SUMMARY:Standup (changed)", "END:VEVENT", "END:VCALENDAR",
+        ].joined(separator: "\r\n")
+        let store = FakeCalDAVStore(servesETags: true)
+        store.seed(path: "/cal/nr-x.ics", ics: ics)
+        let r = try await calDAVTool(store, [
+            "edit_scope": .string("all"), "all_day": .bool(true),
+            "start_iso": .string(day(0)), "end_iso": .string(day(1)), "timezone": .string("UTC"),
+        ], eventId: "/cal/nr-x.ics", account: "series-tool-c-kind-ruleless")
+        let lines = store.storedICS(path: "/cal/nr-x.ics")?.components(separatedBy: "\r\n") ?? []
+        #expect(lines.contains("DTSTART;VALUE=DATE:\(compact(day(0)))"), "not made all-day: \(lines); \(r.out)")
+        let reset = !lines.contains { $0.hasPrefix("RECURRENCE-ID") }
+        #expect(reset, "the changed occurrence was kept: \(lines)")
+        #expect(r.cards.first?.changes.contains(CalendarToolHelpers.kindChangeResetNote) == reset,
+                "the write \(reset ? "reset" : "kept") the changed occurrence; card: \(r.cards.first?.changes ?? [])")
+    }
+
+    /// The card shows the change-of-kind reset note exactly when the write resets the series' changed
+    /// occurrences, on every calendar: a series resets, a single event has nothing to reset.
+    @Test("Google: a series made all-day is reset by the write, and the card says so")
+    func googleKindChangeCardAgreesWithWrite() async throws {
+        let r = try await googleTool([
+            "edit_scope": .string("all"), "all_day": .bool(true), "timezone": .string("UTC"),
+            "start_iso": .string(day(0)), "end_iso": .string(day(1)),
+        ], eventId: GoogleSeries.first, account: "series-note-g-kind-agrees")
+        let reset = r.calendar.seriesResets > 0
+        #expect(reset, "the write did not reset the series: \(r.calendar.writes); \(r.run.out)")
+        #expect(r.run.cards.first?.changes.contains(CalendarToolHelpers.kindChangeResetNote) == reset,
+                "card: \(r.run.cards.first?.changes ?? [])")
+    }
+
+    @Test("Google: a single event made all-day resets nothing, and the card says nothing of it")
+    func googleSingleEventKindChangeHasNoNote() async throws {
+        let r = try await googleTool([
+            "all_day": .bool(true), "timezone": .string("UTC"),
+            "start_iso": .string(day(0)), "end_iso": .string(day(1)),
+        ], eventId: "one-g", account: "series-note-g-kind-single",
+           seed: [FakeGoogleCalendar.timed(id: "one-g", day: day(0))])
+        #expect(r.calendar.seriesResets == 0, "writes: \(r.calendar.writes)")
+        let changes = try #require(r.run.cards.first?.changes, "no card: \(r.run.out)")
+        #expect(!changes.contains(CalendarToolHelpers.kindChangeResetNote), "card: \(changes)")
+    }
+
+    @Test("Outlook: a series made all-day is reset by the write, and the card says so")
+    func outlookKindChangeCardAgreesWithWrite() async throws {
+        let graph = GraphSeries.calendar()
+        // The series' own first day, in the zone its rule repeats in, so the edit changes only the kind.
+        let zone = GraphSeries.eventZone
+        let first = String(GraphFixture.wall(GraphFixture.start, in: zone.identifier).prefix(10))
+        let next = String(GraphFixture.wall(GraphFixture.start.addingTimeInterval(86_400), in: zone.identifier).prefix(10))
+        let r = try await outlookTool(graph, [
+            "edit_scope": .string("all"), "all_day": .bool(true), "timezone": .string(zone.identifier),
+            "start_iso": .string(first), "end_iso": .string(next),
+        ], eventId: GraphSeries.first, account: "series-note-x-kind-agrees")
+        let reset = graph.seriesResets > 0
+        #expect(reset, "the write did not reset the series; \(r.out)")
+        #expect(r.cards.first?.changes.contains(CalendarToolHelpers.kindChangeResetNote) == reset,
+                "card: \(r.cards.first?.changes ?? [])")
+    }
+
+    @Test("Outlook: a single event made all-day resets nothing, and the card says nothing of it")
+    func outlookSingleEventKindChangeHasNoNote() async throws {
+        let graph = FakeGraphCalendar([GraphSeries.onDevice(GraphFixture.event(id: "one-x", start: GraphFixture.start),
+                                                            start: GraphFixture.start)])
+        let zone = TimeZone.current
+        let first = String(GraphFixture.wall(GraphFixture.start, in: zone.identifier).prefix(10))
+        let next = String(GraphFixture.wall(GraphFixture.start.addingTimeInterval(86_400), in: zone.identifier).prefix(10))
+        let r = try await outlookTool(graph, [
+            "all_day": .bool(true), "timezone": .string(zone.identifier),
+            "start_iso": .string(first), "end_iso": .string(next),
+        ], eventId: "one-x", account: "series-note-x-kind-single")
+        #expect(graph.seriesResets == 0, "the write reset the event; \(r.out)")
+        #expect(graph.patches("one-x").count == 1, "not written; \(r.out)")
+        let changes = try #require(r.cards.first?.changes, "no card: \(r.out)")
+        #expect(!changes.contains(CalendarToolHelpers.kindChangeResetNote), "card: \(changes)")
+    }
+
+    @Test("CalDAV: a single event made all-day resets nothing, and the card says nothing of it")
+    func calDAVSingleEventKindChangeHasNoNote() async throws {
+        let store = FakeCalDAVStore(servesETags: true)
+        store.seed(path: "/cal/one-c.ics", ics: [
+            "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//TabMail//Test//EN",
+            "BEGIN:VEVENT", "UID:one-c", "DTSTAMP:\(compact(day(-14)))T000000Z",
+            "DTSTART;TZID=Etc/UTC:\(compact(day(0)))T090000", "DTEND;TZID=Etc/UTC:\(compact(day(0)))T093000",
+            "SUMMARY:Offsite", "END:VEVENT", "END:VCALENDAR",
+        ].joined(separator: "\r\n"))
+        let r = try await calDAVTool(store, [
+            "all_day": .bool(true), "start_iso": .string(day(0)), "end_iso": .string(day(1)), "timezone": .string("UTC"),
+        ], eventId: "/cal/one-c.ics", account: "series-tool-c-kind-single")
+        let lines = store.storedICS(path: "/cal/one-c.ics")?.components(separatedBy: "\r\n") ?? []
+        #expect(lines.contains("DTSTART;VALUE=DATE:\(compact(day(0)))"), "not made all-day: \(lines); \(r.out)")
+        let changes = try #require(r.cards.first?.changes, "no card: \(r.out)")
+        #expect(!changes.contains(CalendarToolHelpers.kindChangeResetNote), "card: \(changes)")
     }
 
     @Test("CalDAV: a split onto another day that turns its rule drops the new part's exceptions, and the card says so")
@@ -1836,6 +1956,23 @@ struct CalendarSeriesScopeResetNoteTests {
         #expect(r.cards.first?.changes.contains(CalendarToolHelpers.ruleChangeResetNote) == true,
                 "card: \(r.cards.first?.changes ?? [])")
         #expect(graph.seriesResets == 1, "the write did not reset the series: \(graph.patches("ser-1").count) PATCHes")
+    }
+
+    /// A change between all-day and timed of every occurrence, or of a split's new part, changes the
+    /// series as a whole and resets its occurrences changed or deleted on their own; one occurrence's
+    /// own change of kind resets nothing.
+    @Test("Google: a change of kind warns on the card on every occurrence and on a split, never on one occurrence",
+          arguments: ["all", "this_and_following", "this_only"])
+    func googleKindChangeWarns(_ scope: String) async throws {
+        var arguments: [String: JSONValue] = [
+            "edit_scope": .string(scope), "all_day": .bool(true), "timezone": .string("UTC"),
+            "start_iso": .string(day(scope == "all" ? 0 : 7)), "end_iso": .string(day(scope == "all" ? 1 : 8)),
+        ]
+        if scope != "all" { arguments["recurrence_id"] = .string("\(day(7))T09:00:00") }
+        let r = try await googleTool(arguments, eventId: scope == "all" ? GoogleSeries.first : GoogleSeries.later,
+                                     account: "series-note-g-kind-\(scope)")
+        let changes = try #require(r.run.cards.first?.changes, "no card: \(r.run.out)")
+        #expect(changes.contains(CalendarToolHelpers.kindChangeResetNote) == (scope != "this_only"), "\(scope): card: \(changes)")
     }
 }
 

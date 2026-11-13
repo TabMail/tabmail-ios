@@ -225,6 +225,57 @@ give the new `start_iso` and `end_iso` (for all-day, the first day and the day a
 user if unsure. The edit tool always has the stored event, so the refusal comes before its card. The queue
 reads no event for such an edit and so does not apply it; it does not guess the kind.
 
+**A change of kind needs both times on every provider, and CalDAV converts a series, since 2026-11-13
+(#640). The two paragraphs above are kept as written; where they differ, this one holds.** As in the
+Thunderbird add-on (`kindChangeTimesError`, `resolveEditTimes`), a stated `all_day` of the other kind
+needs BOTH `start_iso` and `end_iso`: one alone is refused by `allDayEditRefusal` with the same "give its
+new start_iso and end_iso" message, before the card and again in the queue, which now passes the event it
+read (`written`). The kind is read against the event AND the named occurrence (`namedOccurrenceStart`): an
+occurrence changed on its own can be of the other kind, and a change of either needs both times. On
+`this_only` the tool and the queue read the kind from the named occurrence (`named.occurrence`), so an
+all-day changed occurrence of a timed series given times with `all_day` left out is asked about
+(`allDayEditTimeRefusal`), never made timed; that keeps #633's protection now that copies can change kind.
+`kindToWrite` lost `mayChangeKind`: a series (scope `all`, a split's new part) changes kind when nothing in
+it is tied to the start's value type (RFC 5545 §3.3.10 UNTIL, §3.8.4.4 RECURRENCE-ID, §3.8.5 EXDATE/RDATE):
+no EXDATE, RDATE or changed occurrence (`kindChangeOnRepeatingMessage`), and no UNTIL unless the edit gives
+the rule again (`kindChangeKeepsUntilMessage`; the edit builds its UNTIL in the new kind). A series made
+timed is written in the edit's zone with its VTIMEZONE (`addingVTimeZone`, `VTimeZoneBuilder`), else UTC;
+a one-off event and a `this_only` override are made timed in UTC, the override's RECURRENCE-ID kept in
+the series' type. Differences from TB, still open: TB resets excluded dates and changed
+occurrences on a new series start and refuses RDATE and UNTIL-without-rule; iOS refuses all of them, and
+TB checks a series refusal before the card where iOS refuses these at the drain.
+
+**CalDAV resets and converts a series on a change of kind, and a timed write takes the user's zone, since
+2026-11-13 (#640, second pass). The paragraph above is kept as written; where they differ, this one
+holds.** A change of kind of every occurrence or of a split's new part now changes the series as a whole,
+as Google Calendar's "All events" and the TB add-on (`resetChangedOccurrences`, `asAllDayItem`) do:
+`kindChangeOnRepeatingMessage` and `kindChangeKeepsUntilMessage` are gone. When the resource holds a series
+(`holdsSeries`: an RRULE, RDATE or EXDATE, or a VEVENT with RECURRENCE-ID), `mergePatchIntoICS` drops every
+EXDATE and every override (a deleted occurrence comes back, a changed one loses its change), and
+`convertingSeriesValues` writes what stays tied to the start's value type in the new one: made all-day, an
+UNTIL time becomes the date it falls on in the series' own zone (a Tokyo 08:00 series' last occurrence is on
+the UTC day before; reading the UTC digits would lose it), and an added time or period becomes its start
+date; made timed, an UNTIL date becomes the end of that day in the new zone, in UTC
+(`validatedRRuleUntil`), and an added date takes the new start's time of day. An UNTIL already of the new
+type (the edit gave the rule again) is kept. The card says so on every provider
+(`CalendarToolHelpers.kindChangeResetNote`, on scope `all` and `this_and_following` of a repeating series,
+never on `this_only`). A one-off event, a series and a `this_only` override made timed are written in the
+zone of the edit's times, which the edit tool stamps from the device zone snapshotted at its start when the
+edit names none: TB does the same (`toCalIDateTime` uses `tzService.defaultTimezone`;
+`toCalIDateTimeInFrameOf` takes an all-day-to-timed edit as given). A zone that resolves to UTC is written as
+UTC (`Z`); a missing zone is refused (`kindChangeNeedsZoneMessage`), never replaced. An override made timed
+in a zone gets that zone's VTIMEZONE in the resource (`occurrenceOverrideResource`). Refusals still left on
+a series change of kind, all at the drain (TB checks before the card; moving them waits for the
+before-the-card series check): `kindChangeNeedsBothMessage`, `kindChangeNeedsZoneMessage`, an UNTIL, RDATE or
+series zone that can't be read (`convertingSeriesValues`), and a zone `addingVTimeZone` can't write.
+
+**Correction, 2026-11-13 (#640, third pass). The paragraph above is kept as written; where they differ,
+this one holds.** The reset of changed occurrences and excluded dates matches Google Calendar's "All events"
+and the TB add-on, but the UNTIL and RDATE conversion does NOT match TB: iOS converts them, and Thunderbird
+refuses them today (`kindChangeError`: an RDATE, or an UNTIL the edit does not give again; see
+tabmail-thunderbird #442). A stored RDATE value made timed must start with 8 ASCII digits, else
+`convertingSeriesValues` refuses it as unreadable.
+
 **Also corrected at the code on 2026-08-12 (R3), recorded here because the argument is not needed at the
 call site.** `validatedRRuleUntil`'s note claimed the pre-fix alternative on the split path was "a capped
 master plus a failed successor create under a best-effort rollback, i.e. destroyed occurrences".

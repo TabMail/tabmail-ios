@@ -343,7 +343,8 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         let shown = resolvedScope == "all" ? try named.readSeries() : fetchedEvent
 
         // An all-day event given a time of day without `all_day`, an all-day end on or before
-        // its start, or a stated `all_day` of the other kind with no start or end, is refused
+        // its start, or a stated `all_day` of the other kind (the event's, or the named
+        // occurrence's when it was changed on its own) without both a start and an end, is refused
         // here, before the card, now that the stored kind is known: the
         // assistant asks the user instead of the user confirming an edit that is then refused.
         // The queue applies the same rule again before the write.
@@ -352,9 +353,13 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         // which is not `recurrence_id`'s date when the occurrence was moved on its own. It is read
         // from the provider; when that read fails the edit is not offered, since the card would
         // show an end that may be refused.
+        //
+        // An edit of one occurrence is read with that occurrence's kind, as the queue reads it: one
+        // changed on its own can be of the other kind than its series.
+        let kindSource = resolvedScope == "this_only" ? named.occurrence ?? shown : shown
         var occurrenceStartDay: String?
         if let rid = recurrenceIdArg,
-           CalendarToolHelpers.needsOccurrenceStartDay(arguments, storedStart: shown.start, scope: resolvedScope) {
+           CalendarToolHelpers.needsOccurrenceStartDay(arguments, storedStart: kindSource.start, scope: resolvedScope) {
             do {
                 occurrenceStartDay = try await provider.occurrenceStartDay(
                     calendarId: lookupCalId, eventId: eventId, recurrenceId: rid,
@@ -368,8 +373,8 @@ struct CalendarEventEditTool: AgentTool, Sendable {
             }
         }
         if let reason = CalendarToolHelpers.allDayEditRefusal(
-            arguments, storedStart: shown.start, scope: resolvedScope, recurrenceId: recurrenceIdArg,
-            occurrenceStartDay: occurrenceStartDay) {
+            arguments, storedStart: kindSource.start, scope: resolvedScope, recurrenceId: recurrenceIdArg,
+            occurrenceStartDay: occurrenceStartDay, namedOccurrenceStart: named.occurrence?.start) {
             return ToolJSON.string(from: [
                 "ok": false,
                 "error": "calendar_event_edit failed: \(reason). The event was NOT changed.",
@@ -390,8 +395,19 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         // (`shown`, the series read above) and the edit as routed, which is what the queue writes; a
         // rename, or a rule equal to the stored one, which the assistant re-sends with other edits,
         // gets no line.
+        //
+        // A change between all-day and timed of every occurrence, or of a split's new part, changes
+        // the series as a whole, and every occurrence changed or deleted on its own there is reset,
+        // as the Thunderbird add-on resets it. The series' kind is the one the edit's `all_day` is
+        // compared with, and the series' calendar answers whether its write resets anything
+        // (`editResetsChangedOccurrences`), from what it holds: no line for a single event.
         if turnsDays {
             changes.append(CalendarToolHelpers.dayMoveResetNote)
+        } else if resolvedScope != "this_only", let stated = CalendarToolHelpers.boolArg(arguments, "all_day"),
+                  let series = named.series, stated != series.isAllDay,
+                  let edit = try? CalendarToolHelpers.buildGCalEventInput(arguments, isAllDay: stated),
+                  provider.editResetsChangedOccurrences(series, edit: edit) {
+            changes.append(CalendarToolHelpers.kindChangeResetNote)
         } else if resolvedScope == "all", shown.recurrence?.isEmpty == false,
            let edit = try? CalendarToolHelpers.buildGCalEventInput(
                arguments, isAllDay: CalendarToolHelpers.boolArg(arguments, "all_day") ?? shown.isAllDay),
