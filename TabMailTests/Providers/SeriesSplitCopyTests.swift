@@ -947,7 +947,7 @@ struct ExchangeSplitCarryTests {
         #expect(r.http.recordedCalls().allSatisfy { $0.method == "GET" }, "something was written: \(r.http.servedCallSequence())")
     }
 
-    @Test("a series whose range names no zone is refused with nothing written: a deleted date is never placed in the zone the read was given in")
+    @Test("a series whose range names no zone is refused with nothing written: a deleted date or a moved occurrence is never placed in the zone the read was given in")
     func noRangeZoneIsNotReadInTheDisplayZone() async throws {
         var series = GraphSplitFixture.series(range: GraphSplitFixture.noEnd)
         var recurrence = try #require(series["recurrence"] as? [String: Any])
@@ -961,6 +961,11 @@ struct ExchangeSplitCarryTests {
         defer { r.http.close() }
         #expect(r.error != nil, "the split went on: \(r.http.servedCallSequence())")
         #expect(r.http.recordedCalls().allSatisfy { $0.method == "GET" }, "something was written: \(r.http.servedCallSequence())")
+        // A moved occurrence is dated in the series' zone too: the start's zone, only the one the read was given in, never stands in.
+        let moved = try await split(exceptions: [Self.exception(2, at: Self.week(2, plusDays: 1))], parts: [2], patch: Self.rename, series: series)
+        defer { moved.http.close() }
+        #expect(moved.error != nil, "the split went on: \(moved.http.servedCallSequence())")
+        #expect(moved.http.recordedCalls().allSatisfy { $0.method == "GET" }, "something was written: \(moved.http.servedCallSequence())")
     }
 
     @Test("a changed occurrence is carried WHOLE: its own importance, categories and reminder survive a rename")
