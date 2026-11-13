@@ -1242,3 +1242,27 @@ rule-day and split-count suites of a later slice; nothing reads them yet.
   skipped, and across 1996-2004, where 2000 is listed).
 - Parked cases (fail on `main`, kept out of the run under their issue, `CalendarOracle.parked`):
   none in these families.
+
+## Refused move Undo notice
+
+`UndoProviderIdentitySafetyTests` drives a move Undo through `UndoService.undo`, the path the Undo
+control and shake take, passing each source (toast, shake and programmatic); no branch reads the
+source, so these show the notice does not depend on it. When
+`AccountManager.undoMove` refuses it (here an IMAP move with no proven destination UID), the message
+stays where the move put it and `UndoService.undoFailureMessage` is set, which RootView shows as the
+"Couldn't undo" notice. An Undo that restores the message sets no notice. Hosted cases check the
+notice the user sees in the test host's RootView: the move notice's alert, dismissed through UIKit,
+clears it and does not come back; a refused Send Undo (its cancellation commit refused) shows its own
+text, and tapping OK clears only it and leaves the Send queued; and a move Undo refused while the Send
+notice is up keeps its notice when the Send one is dismissed, is shown next, and clears on its own
+OK. The OK taps run the button's own handler after UIKit dismisses the alert, as a real tap does.
+That last case also checks that the move notice gets a new alert, not the Send one's, showing the
+move text, and that the presented notice (`UndoFailureNotice.current`) is the Send one first, then
+the move one with a different identity. A further hosted case clears each notice in code (Send and
+move), once as soon as its alert is in the window and once when it is fully up, and expects the alert
+gone at once; another sets and clears each notice back to back and expects no alert up once things
+settle. Every hosted case starts by clearing any notice an earlier test left and waiting until no
+alert is up, and the two notice-only cases end the same way: an alert left up fails the test that
+left it, with a diagnostic line, and is then dismissed so the next test starts clean. A further case refuses the Undo for other reasons on a Gmail
+account (the forward move never happened, the row is gone, the account is gone) and expects the same
+notice for each.

@@ -198,6 +198,22 @@ final class UndoService {
     /// instead of leaving the queued closure with a deleted primary key.
     private var undoInProgressAction: UndoableAction?
     private var undoInProgressRemainingCommands = 0
+
+    /// Set when `AccountManager.undoMove` refused a move Undo, whatever the
+    /// reason: the messages stay where the move put them. RootView shows it as
+    /// one short "Couldn't undo" notice; `dismissUndoFailure()` clears it.
+    private(set) var undoFailureMessage: String? {
+        didSet {
+            BackgroundSyncLogger.logDebug(
+                "[UndoNotice] move notice \(oldValue ?? "nil") -> \(undoFailureMessage ?? "nil")")
+        }
+    }
+
+    static let moveUndoRefusedMessage = "Nothing was moved back."
+
+    func dismissUndoFailure() {
+        undoFailureMessage = nil
+    }
     private var dbPool: PrioritizedDatabase { AppDatabase.dbPool }
 
     private init() {}
@@ -396,6 +412,10 @@ final class UndoService {
                     + "top=\(top.id.uuidString) ageMs=\(ageMilliseconds)"
             )
         }
+        // A tap refused here (a stale control, or another Undo still running)
+        // raises no "Couldn't undo" notice. On a double-tap the second tap lands
+        // here while the first one is moving the message back, so a notice
+        // saying nothing was moved back would be false.
         if let expectedActionID, top.id != expectedActionID {
             if DebugModeManager.isLoggingEnabled() {
                 BackgroundSyncLogger.logDebug("[UndoStack] Refusing stale Undo control — displayed action changed")
@@ -403,6 +423,7 @@ final class UndoService {
             hideToast()
             return
         }
+        // No notice here either: see the comment above.
         guard undoInProgressAction == nil else { return }
         let actionID = top.id
 
@@ -501,6 +522,7 @@ final class UndoService {
                         NotificationCenter.default.post(
                             name: .inboxDataDidChange,
                             object: command.members.map(\.originalHeaderId))
+                        UndoService.shared.undoFailureMessage = UndoService.moveUndoRefusedMessage
                     }
                 }
                 await MainActor.run {

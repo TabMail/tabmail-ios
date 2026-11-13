@@ -191,7 +191,12 @@ final class PendingSendService {
     /// and the toast was deliberately left up. The view renders this and clears it.
     /// It states only the observed fact and never claims anything about what
     /// happened to the message — at this point we genuinely do not know.
-    private(set) var undoFailureMessage: String?
+    private(set) var undoFailureMessage: String? {
+        didSet {
+            BackgroundSyncLogger.logDebug(
+                "[UndoNotice] send notice \(oldValue ?? "nil") -> \(undoFailureMessage ?? "nil")")
+        }
+    }
 
     private var dismissTask: Task<Void, Never>?
 

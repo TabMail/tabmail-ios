@@ -274,6 +274,16 @@ struct RootView: View {
         if !tutorial.isRunning { requestPushPermissionAfterTutorial() }
     }
 
+    /// The "Couldn't undo" alerts, one fixed host per source
+    /// (`UndoFailureAlertHost`): a move notice that waited behind the Send
+    /// notice gets an alert of its own once the Send one is dismissed.
+    private var undoFailureAlertHosts: some View {
+        ZStack {
+            UndoFailureAlertHost(source: .send)
+            UndoFailureAlertHost(source: .move)
+        }
+    }
+
     /// The launch-time notification request (TabMailApp.init) waits while the
     /// first-launch welcome or the tutorial is up: no permission prompt
     /// during them. Asked here once they are done.
@@ -395,14 +405,9 @@ struct RootView: View {
         // cancellation change and left the toast in place. The durable Send may
         // still be queued or may already be sending, so this alert says only that
         // the Undo attempt did not take; it never promises the message was stopped.
-        .alert("Couldn't undo", isPresented: Binding(
-            get: { pendingSendService.undoFailureMessage != nil },
-            set: { if !$0 { pendingSendService.dismissUndoFailure() } }
-        )) {
-            Button("OK", role: .cancel) { pendingSendService.dismissUndoFailure() }
-        } message: {
-            Text(pendingSendService.undoFailureMessage ?? "")
-        }
+        // A refused move Undo (`UndoService.undoFailureMessage`) shows the same
+        // notice: nothing was moved back. See `undoFailureAlertHosts`.
+        .background(undoFailureAlertHosts)
         .onReceive(NotificationCenter.default.publisher(for: .demoModeDidExit)) { _ in
             demoSeedingComplete = false
             tutorial.demoDidExit()
