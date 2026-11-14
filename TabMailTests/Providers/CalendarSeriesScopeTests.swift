@@ -2830,16 +2830,151 @@ struct CalendarSeriesScopeRouteTests {
                 == Went(scope: "this_and_following", recurrenceId: day(14), start: "\(day(15))T09:00:00"))
     }
 
-    @Test("with no occurrence named, an end on the series' own end date moves the series and another date asks")
-    func endOnlyComparesTheEnd() throws {
+    @Test("with no occurrence named, an end given alone is a new length from the series' start, whatever date it is on, and one not after the start is refused (#718)")
+    func endOnlyIsALengthFromTheSeriesStart() throws {
         #expect(try route(["end_iso": .string("\(day(0))T10:00:00")], Self.named(Self.timedSeries))
                 == Went(scope: "all", end: "\(day(0))T10:00:00"))
-        #expect(refusal(["end_iso": .string("\(day(1))T10:00:00")], Self.named(Self.timedSeries))?
-            .contains(CalendarSeriesScope.askWhichOccurrences) == true)
+        // Past midnight: 25 hours long, as given.
+        #expect(try route(["end_iso": .string("\(day(1))T10:00:00")], Self.named(Self.timedSeries))
+                == Went(scope: "all", end: "\(day(1))T10:00:00"))
         #expect(try route(["end_iso": .string("\(day(1))T00:00:00")], Self.named(Self.allDaySeries))
                 == Went(scope: "all", end: "\(day(1))T00:00:00"))
-        #expect(refusal(["end_iso": .string("\(day(3))T00:00:00")], Self.named(Self.allDaySeries))?
-            .contains(CalendarSeriesScope.askWhichOccurrences) == true)
+        // An all-day series made three days long.
+        #expect(try route(["end_iso": .string("\(day(3))T00:00:00")], Self.named(Self.allDaySeries))
+                == Went(scope: "all", end: "\(day(3))T00:00:00"))
+        // A timed series whose zone is not known: no date is compared, so it is a length too.
+        #expect(try route(["end_iso": .string("\(day(1))T10:00:00")], Self.named(Self.zonelessSeries))
+                == Went(scope: "all", end: "\(day(1))T10:00:00"))
+        for (end, series) in [("\(day(0))T09:00:00", Self.timedSeries), ("\(day(0))T08:00:00", Self.timedSeries),
+                              ("\(day(0))T00:00:00", Self.allDaySeries)] {
+            #expect(refusal(["end_iso": .string(end)], Self.named(series))?
+                .contains("is not after the start of the occurrence named") == true, "\(end)")
+        }
+    }
+
+    @Test("an end given alone from an occurrence is a new length counted from where it starts now, as Google Calendar counts it (#718)")
+    func endAloneIsALengthFromTheNamedOccurrence() throws {
+        // Day 7's occurrence moved on its own to 08:00: an end at 12:00 makes it four hours long,
+        // so every occurrence is, the series' first from its own 09:00.
+        let moved = Self.named(Self.timedSeries, occurrence: Self.occurrence(timed(day(7)), now: timed(day(7), "08:00:00")))
+        #expect(try route(["end_iso": .string("\(day(7))T12:00:00")], moved) == Went(scope: "all", end: "\(day(0))T13:00:00"))
+        // Moved to another day (day 9, 13:00): counted from there.
+        let movedDay = Self.named(Self.timedSeries, occurrence: Self.occurrence(timed(day(7)), now: timed(day(9), "13:00:00")))
+        #expect(try route(["end_iso": .string("\(day(9))T14:30:00")], movedDay) == Went(scope: "all", end: "\(day(0))T10:30:00"))
+        // Never moved: the same end as its time of day moved to the first's date.
+        let later = Self.named(Self.timedSeries, occurrence: Self.occurrence(timed(day(7))))
+        #expect(try route(["end_iso": .string("\(day(7))T10:15:00")], later) == Went(scope: "all", end: "\(day(0))T10:15:00"))
+        // Past midnight from a later occurrence: 25 hours.
+        #expect(try route(["end_iso": .string("\(day(8))T10:00:00")], later) == Went(scope: "all", end: "\(day(1))T10:00:00"))
+        // An all-day one moved to day 9: whole days from there, its one day kept.
+        let allDay = Self.named(Self.allDaySeries, occurrence: Self.occurrence(
+            GCalDateTime(dateTime: nil, date: day(7), timeZone: nil), now: GCalDateTime(dateTime: nil, date: day(9), timeZone: nil)))
+        #expect(try route(["end_iso": .string("\(day(10))T00:00:00")], allDay) == Went(scope: "all", end: "\(day(1))T00:00:00"))
+        // A timed series whose zone is not known, from a later occurrence: a length too, not a split.
+        let zoneless = Self.named(Self.zonelessSeries, occurrence: Self.occurrence(timed(day(7))))
+        #expect(try route(["end_iso": .string("\(day(7))T10:00:00")], zoneless) == Went(scope: "all", end: "\(day(0))T10:00:00"))
+    }
+
+    @Test("an end given alone that is not after the start of the occurrence named is refused, nothing written (#718)")
+    func endAloneBeforeTheNamedOccurrenceIsRefused() {
+        let moved = Self.named(Self.timedSeries, occurrence: Self.occurrence(timed(day(7)), now: timed(day(7), "08:00:00")))
+        for end in ["\(day(7))T07:00:00", "\(day(7))T08:00:00"] {
+            let refused = refusal(["end_iso": .string(end)], moved)
+            #expect(refused?.contains("is not after the start of the occurrence named") == true, "\(end): \(refused ?? "not refused")")
+        }
+        let allDay = Self.named(Self.allDaySeries, occurrence: Self.occurrence(
+            GCalDateTime(dateTime: nil, date: day(7), timeZone: nil), now: GCalDateTime(dateTime: nil, date: day(9), timeZone: nil)))
+        for end in ["\(day(8))T00:00:00", "\(day(9))T00:00:00"] {
+            #expect(refusal(["end_iso": .string(end)], allDay)?.contains("is not after the start of the occurrence named") == true, "\(end)")
+        }
+    }
+
+    /// INVARIANT (#718): the length form an end given alone is routed to (the series' id, no
+    /// occurrence, its end the series' start plus the new length) routes to itself in the queue's
+    /// pass, so a card shown is never refused at the drain; and the series ends as long after its
+    /// start as the end given is after the start counted from.
+    @Test("the length form of an end given alone routes to itself, over a seeded table of series, occurrences named and lengths (#718)")
+    func lengthFormRoutesToItself() throws {
+        var rng = SplitMix64(seed: 718)
+        let tokyo = try #require(TimeZone(identifier: "Asia/Tokyo"))
+        for _ in 0..<200 {
+            let allDay = Bool.random(using: &rng)
+            let series: GCalEvent = allDay ? Self.allDaySeries : (Bool.random(using: &rng) ? Self.timedSeries : Self.zonelessSeries)
+            let zone = Bool.random(using: &rng) ? utc : tokyo
+            // The occurrence named: none, the first, a later one, or a later one moved.
+            let week = Int.random(in: 0...4, using: &rng) * 7
+            let moveDays = Int.random(in: -2...2, using: &rng)
+            let moveHours = allDay ? 0 : Int.random(in: -5...5, using: &rng)
+            let kind = Int.random(in: 0...3, using: &rng)
+            let named: CalendarSeriesScope.Named
+            let countedFrom: Date
+            let seriesStart: Date
+            if allDay {
+                seriesStart = try #require(EKEventStoreHelper.parseNaiveISO(day(0), timeZone: .gmt))
+                let place = GCalDateTime(dateTime: nil, date: day(week), timeZone: nil)
+                let now = GCalDateTime(dateTime: nil, date: day(week + moveDays), timeZone: nil)
+                switch kind {
+                case 0: named = Self.named(series); countedFrom = seriesStart
+                case 1: named = Self.named(series, occurrence: Self.occurrence(GCalDateTime(dateTime: nil, date: day(0), timeZone: nil)))
+                    countedFrom = seriesStart
+                case 2: named = Self.named(series, occurrence: Self.occurrence(place))
+                    countedFrom = try #require(EKEventStoreHelper.parseNaiveISO(day(week), timeZone: .gmt))
+                default: named = Self.named(series, occurrence: Self.occurrence(place, now: now))
+                    countedFrom = try #require(EKEventStoreHelper.parseNaiveISO(day(week + moveDays), timeZone: .gmt))
+                }
+            } else {
+                seriesStart = try #require(Date.fromISO8601("\(day(0))T09:00:00Z"))
+                let place = timed(day(week))
+                let movedAt = seriesStart.addingTimeInterval(TimeInterval((week + moveDays) * 86_400 + moveHours * 3_600))
+                let now = GCalDateTime(dateTime: movedAt.iso8601String(), date: nil, timeZone: "UTC")
+                switch kind {
+                case 0: named = Self.named(series); countedFrom = seriesStart
+                case 1: named = Self.named(series, occurrence: Self.occurrence(timed(day(0)))); countedFrom = seriesStart
+                case 2: named = Self.named(series, occurrence: Self.occurrence(place))
+                    countedFrom = seriesStart.addingTimeInterval(TimeInterval(week * 86_400))
+                default: named = Self.named(series, occurrence: Self.occurrence(place, now: now)); countedFrom = movedAt
+                }
+            }
+            // The new length: up to three days, crossing midnight in either zone, sometimes none.
+            let units = Int.random(in: -1...(allDay ? 3 : 72), using: &rng)
+            let length = TimeInterval(units) * (allDay ? 86_400 : 1_800)
+            let endInstant = countedFrom.addingTimeInterval(length)
+            let end = allDay ? EKEventStoreHelper.dayKey(endInstant, timeZone: .gmt) + "T00:00:00"
+                : EKEventStoreHelper.toNaiveISO(endInstant, timeZone: zone)
+            let context = "allDay \(allDay) zoneless \(series.seriesZone == nil) kind \(kind) week \(week) moved \(moveDays)d\(moveHours)h length \(length) zone \(zone.identifier)"
+            guard length > 0 else {
+                #expect(refusal(["end_iso": .string(end)], named, zone: zone)?.contains("is not after the start") == true, "\(context)")
+                continue
+            }
+            // `route` (the helper) routes the routed edit again, as the queue does, and expects it to
+            // route to itself.
+            let went = try route(["end_iso": .string(end)], named, zone: zone)
+            #expect(went.scope == "all" && went.recurrenceId == nil, "\(context): \(went)")
+            #expect(went.eventId == "ser", "\(context): queued with the series' id")
+            let written = try #require(went.end)
+            let writtenEnd = allDay ? EKEventStoreHelper.parseNaiveISO(String(written.prefix(10)), timeZone: .gmt)
+                : CalendarToolHelpers.toolInstant(written, timeZone: zone)
+            #expect(writtenEnd.map { $0.timeIntervalSince(seriesStart) } == length, "\(context): the series lasts the new length")
+        }
+    }
+
+    @Test("an end given alone for every occurrence at the first gives the length a split there would give (#718)")
+    func lengthMatchesTheSplitsAtTheFirst() throws {
+        // Named at a moved first occurrence (moved to 07:30): "all" and "this_and_following" at the
+        // first occurrence measure the same length from where it starts now.
+        let first = Self.occurrence(timed(day(0)), now: timed(day(0), "07:30:00"))
+        let named = Self.named(Self.timedSeries, occurrence: first)
+        let end = "\(day(0))T11:00:00"
+        let all = try route(["end_iso": .string(end)], named)
+        let following = try route(["end_iso": .string(end)], named, scope: "this_and_following")
+        #expect(all == following, "\(all) vs \(following)")
+        let edit = try CalendarToolHelpers.buildGCalEventInput(["end_iso": .string(end), "timezone": .string("UTC")], isAllDay: false)
+        let namedStart = try #require(first.start)
+        let cut = try #require(Self.timedSeries.start)
+        let part = try #require(SplitCarry.partEdit(edit, namedStart: namedStart, cut: cut, zone: utc))
+        let partEnd = try #require(part.endDateTime.flatMap(Date.fromISO8601))
+        let routedEnd = try #require(all.end.flatMap { CalendarToolHelpers.toolInstant($0, timeZone: utc) })
+        #expect(partEnd == routedEnd, "split end \(partEnd) vs routed end \(routedEnd)")
     }
 
     @Test("an occurrence whose place is not given, and a series whose start can't be read, are refused")
@@ -4553,5 +4688,76 @@ struct SplitRecordIsReservedTests {
         var old = whole
         for key in optional { old[key] = nil }
         #expect(SplitRecord([SplitRecord.argumentKey: .dictionary(old)]) == record, "a row queued before the named fields was not read")
+    }
+}
+
+// MARK: - A new length of every occurrence (#718)
+//
+// **INVARIANT (#718).** *An edit of every occurrence that gives its end alone is a new length, as
+// Google Calendar counts it,* the new end less where the occurrence named starts now (the series'
+// start when none is named), *and once the queue has drained the series starts where it did and
+// ends that long after it;* never a card the drain then refuses. Asserted on what each calendar
+// ends up holding, from the tool through its card and the drain.
+
+@Suite("A new length of every occurrence reaches the series as its card showed (#718)", .serialized, .processGlobalState)
+struct SeriesLengthEndToEndTests {
+
+    @Test("Google: an end past midnight given from a later occurrence makes every occurrence that long, the series' start kept")
+    func googleLengthPastMidnight() async throws {
+        let r = try await googleTool([
+            "end_iso": .string("\(day(8))T10:00:00"), "timezone": .string("UTC"),
+        ], eventId: GoogleSeries.later, account: "length-g-midnight")
+        let series = r.calendar.event(GoogleSeries.id)
+        #expect(r.run.cards.count == 1, "\(r.run.out)")
+        #expect(instant(series?["start"]) == utcAt("\(day(0))T09:00:00"), "start: \(series?["start"] ?? "none")")
+        #expect(instant(series?["end"]) == utcAt("\(day(1))T10:00:00"), "end: \(series?["end"] ?? "none"); \(r.run.out)")
+        #expect(r.run.queued.isEmpty, "the drain did not write it: \(reasons(r.run.queued))")
+    }
+
+    @Test("Outlook: an end past midnight given from a later occurrence makes every occurrence that long, the series' start kept")
+    func outlookLengthPastMidnight() async throws {
+        let graph = GraphSeries.calendar()
+        let length: TimeInterval = 25 * 3_600
+        let run = try await outlookTool(graph, [
+            "end_iso": .string(GraphFixture.naive(GraphFixture.occurrenceStart.addingTimeInterval(length))), "timezone": .string("UTC"),
+        ], eventId: GraphSeries.later, account: "length-o-midnight")
+        let series = graph.event("ser-1")
+        #expect(run.cards.count == 1, "\(run.out)")
+        #expect(instant(series?["start"]) == GraphFixture.start, "start: \(series?["start"] ?? "none")")
+        #expect(instant(series?["end"]) == GraphFixture.start.addingTimeInterval(length), "end: \(series?["end"] ?? "none"); \(run.out)")
+        #expect(run.queued.isEmpty, "the drain did not write it: \(reasons(run.queued))")
+    }
+
+    @Test("CalDAV: an end past midnight given from a later occurrence makes every occurrence that long, the series' start kept")
+    func calDAVLengthPastMidnight() async throws {
+        let store = FakeCalDAVStore(servesETags: true)
+        store.seed(path: "/cal/len-c.ics", ics: calDAVSeries(uid: "len-c", rule: "RRULE:FREQ=WEEKLY", tzid: "Etc/UTC"))
+        let run = try await calDAVTool(store, [
+            "edit_scope": .string("all"), "recurrence_id": .string("\(day(7))T09:00:00"),
+            "end_iso": .string("\(day(8))T10:00:00"), "timezone": .string("UTC"),
+        ], eventId: "/cal/len-c.ics", account: "length-c-midnight")
+        let lines = (store.storedICS(path: "/cal/len-c.ics") ?? "").components(separatedBy: "\r\n")
+        #expect(run.cards.count == 1, "\(run.out)")
+        #expect(lines.contains("DTSTART;TZID=Etc/UTC:\(compact(day(0)))T090000"), "\(lines)")
+        #expect(lines.contains("DTEND;TZID=Etc/UTC:\(compact(day(1)))T100000"), "\(lines); \(run.out)")
+        #expect(run.queued.isEmpty, "the drain did not write it: \(reasons(run.queued))")
+    }
+
+    @Test("Google: an all-day series made a day longer from a later occurrence is written as its card showed")
+    func googleAllDayDayLonger() async throws {
+        let seed: [[String: Any]] = [
+            ["id": "ser-ad", "summary": "Offsite", "status": "confirmed", "recurrence": ["RRULE:FREQ=WEEKLY"],
+             "start": ["date": day(0)], "end": ["date": day(1)]],
+            ["id": "ser-ad_\(compact(day(7)))", "summary": "Offsite", "status": "confirmed", "recurringEventId": "ser-ad",
+             "start": ["date": day(7)], "end": ["date": day(8)], "originalStartTime": ["date": day(7)]],
+        ]
+        let r = try await googleTool([
+            "end_iso": .string("\(day(9))T00:00:00"), "timezone": .string("UTC"),
+        ], eventId: "ser-ad_\(compact(day(7)))", account: "length-g-allday", seed: seed)
+        let series = r.calendar.event("ser-ad")
+        #expect(r.run.cards.count == 1, "\(r.run.out)")
+        #expect((series?["start"] as? [String: Any])?["date"] as? String == day(0), "start: \(series?["start"] ?? "none")")
+        #expect((series?["end"] as? [String: Any])?["date"] as? String == day(2), "end: \(series?["end"] ?? "none"); \(r.run.out)")
+        #expect(r.run.queued.isEmpty, "the drain did not write it: \(reasons(r.run.queued))")
     }
 }

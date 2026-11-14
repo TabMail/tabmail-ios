@@ -194,10 +194,14 @@ enum CalendarSeriesScope {
     ///   start and end moved back to the first occurrence's date with their times of day kept
     ///   (`movedToFirst`), queued with the series' id and no `recurrence_id`, so the queue's pass
     ///   reads it as a move of the series on its own date;
-    /// - none, and the new start (the new end, for an edit giving only an end) on the date of the
-    ///   series' own start (end): as given;
+    /// - an end given alone, from any occurrence named: a new length, as Google Calendar counts it
+    ///   (#718): the new end less where that occurrence starts now. The whole series keeps its start
+    ///   and ends that long after it (`lengthEnd`), queued as above;
+    /// - none, and an end given alone: a new length counted from the series' start, as given;
+    /// - none, and the new start on the date of the series' own start: as given;
     /// - none, and another date: refused, telling the assistant to ask the user which occurrences
     ///   they mean.
+    /// An end given alone that is not after the start it is counted from is refused.
     ///
     /// Refused, with nothing written: an occurrence before the series' first, one whose place in
     /// the series can't be read, a series whose start can't be read, and an edit of every
@@ -225,20 +229,22 @@ enum CalendarSeriesScope {
             guard movesTime(args) else { return asGiven }
             let first = try firstPlace(series)
             guard let occurrence = named.occurrence else {
-                // No occurrence named: the new start, or the new end of an edit giving only an end, on
-                // the series' own date is a move of the series; another date is a question for the user.
+                // No occurrence named: an end given alone is a new length counted from the series'
+                // start (`lengthEnd`), whatever date it is on (#718); the new start on the series'
+                // own date is a move of the series; another date is a question for the user.
                 let start = CalendarToolHelpers.stringArgOpt(args, "start_iso")
-                let given = start ?? CalendarToolHelpers.stringArgOpt(args, "end_iso") ?? ""
-                guard let own = place(start != nil ? series.start : series.end) else {
-                    throw CalendarProviderError.notSupported(
-                        "the new time of this repeating event is on another date than its first occurrence (\(shown(first, zone: zone))); " + askWhichOccurrences)
+                if start == nil, let end = CalendarToolHelpers.stringArgOpt(args, "end_iso") {
+                    guard try lengthEnd(end, from: first, to: first, zone: zone) != nil else {
+                        throw CalendarProviderError.notSupported(unreadableEnd(end))
+                    }
+                    return asGiven
                 }
                 // A timed series whose zone TabMail can't read: whether the new time is on its date
                 // can't be told, and the user is told that, not that the date differs.
-                if case .instant = own, series.seriesZone == nil {
+                if case .instant = first, series.seriesZone == nil {
                     throw CalendarProviderError.notSupported(unreadableSeriesZone)
                 }
-                guard sameDate(given, as: own, series: series, zone: zone) else {
+                guard sameDate(start ?? "", as: first, series: series, zone: zone) else {
                     throw CalendarProviderError.notSupported(
                         "the new time of this repeating event is on another date than its first occurrence (\(shown(first, zone: zone))); " + askWhichOccurrences)
                 }
@@ -275,13 +281,25 @@ enum CalendarSeriesScope {
            !sameDate(start, as: now, series: series, zone: zone) {
             return fromHere()
         }
-        // A new time of day on the date the occurrence is on now: the whole series' new time, on its
-        // own date. When the days between can't be counted, the cautious side: a split from a later
-        // occurrence, the edit as given from the first.
-        guard let moved = movedToFirst(args, from: now, to: first, series: series, zone: zone) else {
-            return fromHere()
+        // An end given alone is a new length, counted from where the occurrence named starts now, as
+        // Google Calendar counts it (#718): the series keeps its start and ends that long after it
+        // (`lengthEnd`), whatever date the end is on, so the routed edit routes to itself.
+        var written: [String: JSONValue]
+        if CalendarToolHelpers.stringArgOpt(args, "start_iso") == nil, let end = CalendarToolHelpers.stringArgOpt(args, "end_iso") {
+            guard let seriesEnd = try lengthEnd(end, from: now, to: first, zone: zone) else {
+                throw CalendarProviderError.notSupported(unreadableEnd(end))
+            }
+            written = args
+            written["end_iso"] = .string(seriesEnd)
+        } else {
+            // A new time of day on the date the occurrence is on now: the whole series' new time, on
+            // its own date. When the days between can't be counted, the cautious side: a split from a
+            // later occurrence, the edit as given from the first.
+            guard let moved = movedToFirst(args, from: now, to: first, series: series, zone: zone) else {
+                return fromHere()
+            }
+            written = moved
         }
-        var written = moved
         written["edit_scope"] = .string("all")
         written.removeValue(forKey: "recurrence_id")
         return Routed(scope: "all", args: written, eventId: named.seriesId)
@@ -565,6 +583,47 @@ enum CalendarSeriesScope {
             }
         }
         return moved
+    }
+
+    /// The series' new end for an end given alone for every occurrence (#718), as Google Calendar
+    /// counts it: the new length L is `end` (read in `zone`) less `occurrence`, where the occurrence
+    /// named starts now (a moved one counts from where it is shown), or the series' start when none
+    /// is named; the series keeps its start (`first`) and ends L after it. Timed: instants, so no
+    /// zone of the series is needed; all-day: whole days (as `SplitCarry.length(of:)` counts them,
+    /// the end exclusive), the end's own text after its date kept. Nil when a time can't be read.
+    /// Throws, nothing written, when L is zero or less: there is no length to give.
+    private static func lengthEnd(_ end: String, from occurrence: Place, to first: Place, zone: TimeZone) throws -> String? {
+        switch (occurrence, first) {
+        case (.date(let a), .date(let b)):
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = .gmt
+            guard let from = EKEventStoreHelper.parseNaiveISO(a, timeZone: .gmt),
+                  let to = EKEventStoreHelper.parseNaiveISO(b, timeZone: .gmt),
+                  let given = EKEventStoreHelper.parseNaiveISO(String(end.prefix(10)), timeZone: .gmt),
+                  let days = calendar.dateComponents([.day], from: from, to: given).day else { return nil }
+            guard days > 0 else { throw endBeforeOccurrence(end, start: shown(occurrence, zone: zone)) }
+            guard let written = calendar.date(byAdding: .day, value: days, to: to) else { return nil }
+            return EKEventStoreHelper.dayKey(written, timeZone: .gmt) + end.dropFirst(10)
+        case (.instant(let a), .instant(let b)):
+            guard let given = instant(end, zone: zone) else { return nil }
+            let length = given.timeIntervalSince(a)
+            guard length > 0 else { throw endBeforeOccurrence(end, start: shown(occurrence, zone: zone)) }
+            return EKEventStoreHelper.toNaiveISO(b.addingTimeInterval(length), timeZone: zone)
+        default:
+            return nil
+        }
+    }
+
+    /// Why an end given alone for every occurrence is refused when it is not after the start of the
+    /// occurrence named (the series' start when none is named).
+    private static func endBeforeOccurrence(_ end: String, start: String) -> Error {
+        CalendarProviderError.notSupported(
+            "the new end (\(end)) is not after the start of the occurrence named (\(start)), so it gives the repeating event no length; give an end after its start, or a new start with it")
+    }
+
+    /// Why an end given alone for every occurrence is refused when it can't be read.
+    private static func unreadableEnd(_ end: String) -> String {
+        "the new end of this repeating event (\(end)) can't be read, so it was not changed"
     }
 
     /// `args` written in `scope` at `recurrenceId`, queued with `eventId`.

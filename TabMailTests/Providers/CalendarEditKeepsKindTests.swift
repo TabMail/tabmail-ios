@@ -70,10 +70,13 @@ private let kindChangeTimesHint = "to change this event between all-day and time
 /// applies Google's patch semantics (`patched`: a field left out is kept, a JSON null clears it, an
 /// object such as `start` is merged field by field) and refuses with 400 a `start` or `end` left
 /// holding both `date` and `dateTime`, as Google does, and `POST` stores a new event under the `id` it carries.
-/// A PATCH of a series that changes its `recurrence`, or its start or end (another date or
-/// instant, or another zone, `sameTime`), resets the series: its stored occurrences, the ones changed one by
+/// A PATCH of a series that changes its `recurrence`, or its start (another date or instant, or
+/// another zone, `sameTime`), resets the series: its stored occurrences, the ones changed one by
 /// one, are dropped, as Google did when a series was moved from 08:00 to 13:00 (measured on a
-/// personal account, 2026-11-10).
+/// personal account, 2026-11-10). A PATCH that changes its end alone keeps them: each one ends at
+/// its own start plus the series' new length, whatever length it had of its own, and a deleted one
+/// stays deleted (measured on a test account, 2026-11-11); a new title written with it replaces
+/// every exception's own title (measured on a test account, 2026-11-13).
 ///
 /// A PATCH of a series' `attendees` reaches every stored occurrence of the series as the
 /// difference between the series' stored list and the written one, applied on top of that
@@ -230,7 +233,9 @@ final class FakeGoogleCalendar: Sendable {
             }
             let isSeries = (stored["recurrence"] as? [String])?.isEmpty == false
             let changesRule = patch["recurrence"].map { ($0 as? [String]) != (stored["recurrence"] as? [String]) } ?? false
-            let movesTime = ["start", "end"].contains { key in patch[key].map { _ in !Self.sameTime(merged[key] as Any, stored[key]) } ?? false }
+            let movesStart = patch["start"].map { _ in !Self.sameTime(merged["start"] as Any, stored["start"]) } ?? false
+            let movesEnd = patch["end"].map { _ in !Self.sameTime(merged["end"] as Any, stored["end"]) } ?? false
+            let movesTime = movesStart || movesEnd
             if isSeries, !movesTime, let until = Self.capUntil(patch["recurrence"], stored: stored["recurrence"]) {
                 // A cap (only the rule's end changes): the exceptions before it stay, those at or
                 // after it are left `cancelled` (measured).
@@ -244,11 +249,31 @@ final class FakeGoogleCalendar: Sendable {
                         all[id] = try! JSONSerialization.data(withJSONObject: occurrence)
                     }
                 }
-            } else if isSeries, changesRule || movesTime {
+            } else if isSeries, changesRule || movesStart {
                 resets.withLock { $0 += 1 }
                 events.withLock { all in
                     all = all.filter { _, data in
                         ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["recurringEventId"] as? String != parts[0]
+                    }
+                }
+            } else if isSeries, movesEnd {
+                // A new length alone: every exception ends at its own start plus the series' new
+                // length, its own length and start whatever they were, and a deleted one stays
+                // deleted; a new title in the same PATCH replaces every exception's title, its own
+                // changed title included (measured on a test account, 2026-11-11 and 2026-11-13).
+                guard let start = merged["start"] as? [String: Any], let end = merged["end"] as? [String: Any],
+                      let length = Self.length(from: start, to: end) else { return .status(400) }
+                let retitled = (patch["summary"] as? String).flatMap { $0 == stored["summary"] as? String ? nil : $0 }
+                events.withLock { all in
+                    for (id, data) in all {
+                        guard var occurrence = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                              occurrence["recurringEventId"] as? String == parts[0] else { continue }
+                        if let retitled { occurrence["summary"] = retitled }
+                        if let own = occurrence["start"] as? [String: Any], let ends = Self.adding(length, to: own) {
+                            occurrence["end"] = ends
+                        }
+                        // swiftlint:disable:next force_try
+                        all[id] = try! JSONSerialization.data(withJSONObject: occurrence)
                     }
                 }
             }
@@ -458,6 +483,31 @@ final class FakeGoogleCalendar: Sendable {
         fmt.timeZone = .gmt
         fmt.dateFormat = until.count == 8 ? "yyyyMMdd" : "yyyyMMdd'T'HHmmss'Z'"
         return fmt.date(from: String(until)).map { until.count == 8 ? $0.addingTimeInterval(86_400) : $0.addingTimeInterval(1) }
+    }
+
+    /// A length from a start to an end as Google stores them: seconds for a time, days for a date.
+    private enum Length { case seconds(TimeInterval), days(Int) }
+
+    private static func length(from start: [String: Any], to end: [String: Any]) -> Length? {
+        if let s = (start["dateTime"] as? String).flatMap({ Date.fromISO8601($0) }),
+           let e = (end["dateTime"] as? String).flatMap({ Date.fromISO8601($0) }) { return .seconds(e.timeIntervalSince(s)) }
+        guard let s = (start["date"] as? String).flatMap({ EKEventStoreHelper.parseNaiveISO($0, timeZone: .gmt) }),
+              let e = (end["date"] as? String).flatMap({ EKEventStoreHelper.parseNaiveISO($0, timeZone: .gmt) }) else { return nil }
+        return .days(Int((e.timeIntervalSince(s) / 86_400).rounded()))
+    }
+
+    /// The end `length` after `start`, in `start`'s form (its zone kept).
+    private static func adding(_ length: Length, to start: [String: Any]) -> [String: Any]? {
+        switch length {
+        case .seconds(let seconds):
+            guard let s = (start["dateTime"] as? String).flatMap({ Date.fromISO8601($0) }) else { return nil }
+            var end: [String: Any] = ["dateTime": s.addingTimeInterval(seconds).iso8601String()]
+            end["timeZone"] = start["timeZone"]
+            return end
+        case .days(let days):
+            guard let s = (start["date"] as? String).flatMap({ EKEventStoreHelper.parseNaiveISO($0, timeZone: .gmt) }) else { return nil }
+            return ["date": EKEventStoreHelper.dayKey(s.addingTimeInterval(Double(days) * 86_400), timeZone: .gmt)]
+        }
     }
 
     /// An exception's place (`originalStartTime`) as an instant; an all-day date from UTC midnight.

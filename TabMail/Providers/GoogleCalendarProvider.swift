@@ -1993,13 +1993,18 @@ actor GoogleCalendarProvider: CalendarProvider {
     /// the new time, with the recurrence unchanged) and, as assumed before, when it changes the
     /// rule. A Google edit writes the `recurrence` it is given in place of the stored one
     /// (`mergeExistingEventWithPatch`), so the rule changes unless the two hold the same lines.
+    /// A move of the end alone, with or without the start restated, is no reset (#718, measured
+    /// 2026-11-11 and 2026-11-13, through the API and on the web): every changed occurrence keeps
+    /// its own start and takes the new length, and deleted ones stay deleted. So the time asked
+    /// about is the start alone, read as Google reads it (`googleStart`): a start restated in a
+    /// zone Google keys apart (`googleZone`, a zone name TabMail can't resolve included) is a move.
     nonisolated func editResetsChangedOccurrences(_ event: GCalEvent, edit: GCalEventInput) -> Bool {
         // A change between all-day and timed changes the event as a whole: a series' changed
         // occurrences are reset, and a single event has none.
         if CalendarToolHelpers.editChangesKind(edit, storedIsAllDay: event.start?.date != nil) {
             return !(event.recurrence ?? []).isEmpty
         }
-        if Self.movesSeriesTime(edit, existing: event, as: Self.googleTimes) { return true }
+        if Self.movesSeriesTime(edit, existing: event, as: Self.googleStart) { return true }
         guard let rule = edit.recurrence else { return false }
         return Self.recurrenceLinesDiffer(event.recurrence ?? [], rule)
     }
@@ -2016,6 +2021,11 @@ actor GoogleCalendarProvider: CalendarProvider {
         else { return false }
         let moved = times(mergeExistingEventWithPatch(existing: existing, patch: patch))
         return !moved.isEqual(times(mergeExistingEventWithPatch(existing: existing, patch: GCalEventInput())))
+    }
+
+    /// `googleTimes`' start alone: what a Google series edit resets its changed occurrences on.
+    nonisolated static func googleStart(_ merged: GCalEventInput) -> NSDictionary {
+        NSDictionary(dictionary: ["start": googleTimes(merged)["start"] ?? [:]])
     }
 
     /// A Google write's start and end as Google reads them: an all-day date, or a timed one's
