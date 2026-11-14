@@ -181,7 +181,16 @@ its card.
    a `RECURRENCE-ID` VEVENT whose status is `CANCELLED`). A changed occurrence counts at its place,
    however far it was moved; no listing, no calendar lookup. Fails closed, never a silent 0: a stored
    rule, zone, first date or end that can't be read or expanded, an `RDATE`, or a failed deletions read
-   shows no card and the "could not read the repeating event ... Retry." error. An edit whose end the
+   shows no card and the "could not read the repeating event ... Retry." error. **Amended 2026-11-14
+   (#880, owner ruling):** the `RDATE` case is not a read that can succeed later, so it has its own
+   error at its source (`CalendarSeriesEndRemoval.AddedDates`, thrown where the count meets an `RDATE`;
+   no string match) and the edit tool answers it, before the card as before, with "calendar_event_edit
+   failed: this repeating event has extra dates added outside its repeat pattern, and TabMail can't
+   change the repeat pattern of such an event yet. The event was NOT changed." (no "Retry"). Every other reason
+   keeps the generic text. It is the only path that reaches the case (the count runs only in
+   `CalendarEventEditTool`, before the card; the queued write does not run it), on Google and CalDAV
+   (Outlook has no `RDATE`). Pinned by `googleAddedDatesRefusedPlainly`, `calDAVAddedDatesRefusedPlainly`
+   and `googleOtherUnreadableKeepsTheGenericMessage`. Counting added dates is #881. An edit whose end the
    two rules alone show is no earlier (`CalendarSeriesEndRemoval.mayEndEarlier`: the stored pattern
    kept, as a set of parts, and the same end, a `COUNT` no smaller, an `UNTIL` no earlier in the same
    form, or a UTC `UNTIL` past a stored date's end in every zone) shows no line and reads nothing, so a
