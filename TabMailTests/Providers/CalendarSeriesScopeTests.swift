@@ -6648,7 +6648,7 @@ struct SeriesEndRemovalCardTests {
     /// The whole refusal a series with dates added to it on their own (`RDATE`) gets for a new rule
     /// that keeps an end (#880): it says plainly the change can't be made yet, and asks for no retry,
     /// as a retry fails the same way every time. Full support is #881.
-    static let addedDatesRefusal = "calendar_event_edit failed: this repeating event has dates added to it on their own, and a repeating event with added dates can't be changed this way yet. The event was NOT changed."
+    static let addedDatesRefusal = "calendar_event_edit failed: this repeating event has extra dates added outside its repeat pattern, and TabMail can't change the repeat pattern of such an event yet. The event was NOT changed."
 
     /// The tool's error text in `out`, "" when there is none.
     private static func error(in out: String) throws -> String {

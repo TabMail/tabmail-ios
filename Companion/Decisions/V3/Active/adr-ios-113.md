@@ -185,8 +185,8 @@ its card.
    (#880, owner ruling):** the `RDATE` case is not a read that can succeed later, so it has its own
    error at its source (`CalendarSeriesEndRemoval.AddedDates`, thrown where the count meets an `RDATE`;
    no string match) and the edit tool answers it, before the card as before, with "calendar_event_edit
-   failed: this repeating event has dates added to it on their own, and a repeating event with added
-   dates can't be changed this way yet. The event was NOT changed." (no "Retry"). Every other reason
+   failed: this repeating event has extra dates added outside its repeat pattern, and TabMail can't
+   change the repeat pattern of such an event yet. The event was NOT changed." (no "Retry"). Every other reason
    keeps the generic text. It is the only path that reaches the case (the count runs only in
    `CalendarEventEditTool`, before the card; the queued write does not run it), on Google and CalDAV
    (Outlook has no `RDATE`). Pinned by `googleAddedDatesRefusedPlainly`, `calDAVAddedDatesRefusedPlainly`

@@ -32,7 +32,7 @@ enum CalendarSeriesEndRemoval {
     /// plainly the change can't be made yet and asks for no retry (#880).
     struct AddedDates: LocalizedError {
         var errorDescription: String? {
-            "this repeating event has dates added to it on their own, and a repeating event with added dates can't be changed this way yet"
+            "this repeating event has extra dates added outside its repeat pattern, and TabMail can't change the repeat pattern of such an event yet"
         }
     }
 

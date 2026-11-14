@@ -558,7 +558,7 @@ source check that the count names no provider and lists nothing).
 own message, not the generic retry.** A retry of an `RDATE` series always fails the same way, so the
 count throws `CalendarSeriesEndRemoval.AddedDates` at its source (not `Unreadable`, no string match),
 and `CalendarEventEditTool` answers, before the card as before: "calendar_event_edit failed: this
-repeating event has dates added to it on their own, and a repeating event with added dates can't be
-changed this way yet. The event was NOT changed." Other unreadable reasons keep "could not read the
+repeating event has extra dates added outside its repeat pattern, and TabMail can't change the repeat
+pattern of such an event yet. The event was NOT changed." Other unreadable reasons keep "could not read the
 repeating event ... Retry.". The count's one call site is the edit tool before the card (Google and
 CalDAV reach it; Outlook has no `RDATE`). Counting added dates is #881. ADR-IOS-113 decision 8.
