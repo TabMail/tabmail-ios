@@ -547,6 +547,21 @@ final class FakeGraphCalendar: Sendable {
         return true
     }
 
+    /// Another app writes `values` to the series `seriesId` (`modelsExceptions`), as a rename or a
+    /// new room in Outlook: the series holds them, and so does each plain occurrence of it (`type`
+    /// "occurrence"), which shows its series' properties. An exception is left as it is (what
+    /// Graph does to an exception's copy is not modelled). A write in the series: its etag moves.
+    func otherAppWritesSeries(_ seriesId: String, _ values: [String: Any]) {
+        guard var series = event(seriesId) else { return }
+        series.merge(values) { _, new in new }
+        store(series)
+        for var occurrence in occurrences(of: seriesId) where occurrence["type"] as? String == "occurrence" {
+            occurrence.merge(values) { _, new in new }
+            store(occurrence)
+        }
+        touchSeries(of: seriesId)
+    }
+
     /// Runs once a reset is applied (`modelsExceptions`), as another client's change right after it.
     func afterReset(_ hook: @escaping @Sendable () -> Void) { resetHook.withLock { $0 = hook } }
     private let resetHook = Mutex<(@Sendable () -> Void)?>(nil)

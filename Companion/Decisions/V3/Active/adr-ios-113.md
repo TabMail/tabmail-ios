@@ -33,8 +33,28 @@ its card.
    through the reset): the instances read lists by each occurrence's start now, so one moved since out
    of the window is missing, and only Graph's 404 or 410 for its id proves it deleted (its files are
    then released).
-3. **The record (C3).** What the put-back needs (the changed occurrences' times, titles, notes,
-   places and guests) is kept on the queued operation (`SeriesEditRecord`) from before the `PATCH`
+   **Only what it changed on its own (2026-11-14, #878).** The put-back writes a changed occurrence's
+   start and end (as the carry's plan gives them: a moved one at its own start lasting the new length;
+   an unmoved one gets the series' own from the reset) and only those of the other properties it
+   writes (the split's `splitCopiedKeys` but `isAllDay`, and its guests) that it held differently
+   from the series when read. Each is compared with the series' master as the SAME `$expand` read gave
+   it (`seriesExceptionsRead`, `ExchangeCalendarProvider.ownChanges`): exact JSON, the place
+   (`location`, `locations`) as one, guests by address in any case, name and type (answers are
+   read-only, not restored either way); a property the series does not hold is kept. What it held as
+   the series did is left out of the capture and of the record, so it follows the series as it is
+   when the put-back runs: a rename or new room another app gives the series in between stays on the
+   occurrence (first build: every captured property was written back, so the old title came back).
+   An occurrence with nothing of its own left to write is not `PATCH`ed (`guardedPatch` answers
+   `restored`). That holds too when someone changed it after the reset (it reads as an exception):
+   it is counted as restored, not as left and counted, since the put-back has nothing of it to write
+   and the other change stays as it is (review r1 L1, accepted). A split is unchanged: its new part is a new series, with nothing to follow, so its
+   carry writes each changed occurrence whole (`seriesExceptions` keeps every property;
+   `carriedWrite` writes guests only when the occurrence's JSON holds them, which a split's read
+   always does). A record kept by the first build holds each occurrence whole and is put back whole,
+   as before; no record format change (version 3 either way).
+3. **The record (C3).** What the put-back needs (the changed occurrences' times, and the titles,
+   notes, places and guests they held differently from the series, #878) is kept on the queued
+   operation (`SeriesEditRecord`) from before the `PATCH`
    until the operation completes, so a retry after a lost answer puts back what the first attempt
    read. It is event content, not email content (ADR-004 covers email content), pending-operation
    scope, and is cleared with the operation.

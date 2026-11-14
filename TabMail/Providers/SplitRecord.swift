@@ -213,7 +213,9 @@ struct SplitRecorder: Sendable {
 ///   puts back what the user has changed since. Nil in a record of an earlier version.
 ///
 /// Unlike `SplitRecord`, it holds event content: the changed occurrences' own titles, notes,
-/// places and guests, which the write erases on the server and only this copy can put back. It
+/// places and guests, which the write erases on the server and only this copy can put back (only
+/// those an occurrence differed from its series in, #878; a record of an earlier build holds them
+/// all, read the same way). It
 /// lives on the operation's row until the operation completes, beside the edit's own fields the row
 /// already holds; ADR-004 covers email content only.
 ///

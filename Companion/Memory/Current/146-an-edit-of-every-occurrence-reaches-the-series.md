@@ -534,6 +534,20 @@ then counts the files again in its delete transaction and refuses when there are
 id: the window lists by start now, so only a 404 or 410 proves it deleted (`GuardedPatch.gone`).
 Pinned by the file cases of `SeriesLengthKeepsExceptionsTests` and by `CalendarPutBackFilesTests`.
 
+**2026-11-14 (#878, ADR-IOS-113 decision 2): the put-back writes only an occurrence's own changes.**
+`lengthChangeExceptions` reads the series' master beside its exceptions in one `$expand`
+(`seriesExceptionsRead`) and drops from each changed occurrence every written property it holds as the
+master does (`ownChanges`: exact JSON; `location`+`locations` as one; guests by address, name, type,
+answers ignored as read-only), before the record is kept. So the record holds less event content, a
+capture re-read after a refused write (`stillCaptured`) is still judged against its own series, and the
+put-back leaves those properties to follow the series as it is then: a rename or new room another app
+gives the series between the reset and the put-back stays on the occurrence. Times are always the
+plan's. An occurrence left with nothing to write is not `PATCH`ed. The split's carry still writes each
+changed occurrence whole (new series, nothing to follow; memory 142). A record kept by the first build
+holds whole occurrences and is put back whole. Pinned by
+`outlookPutBackKeepsASeriesRenameMadeMeanwhile`, `outlookPutBackKeepsASeriesRoomChangeMadeMeanwhile`
+(`FakeGraphCalendar.otherAppWritesSeries`) and `ExchangeSplitCarryTests.splitCarryWritesTheOccurrenceWhole`.
+
 **2026-11-14 (#718, ADR-IOS-113 decision 7): a new last date alone keeps them on Outlook.** A rule that
 changes only where the series ends (Graph range `endDate` to `endDate`) resets nothing (measured on a
 work account), so the card's reset note is not shown for it (`newRangeEnd`) when the write restates the
