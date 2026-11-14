@@ -24,7 +24,9 @@
 > one after its backfill walk completes remove rows proven gone and load missing mail. The apply skips
 > a read or flag update for a message whose user action completed at or after the read began (an
 > in-memory log, kept one hour), and a read older than that applies no read or flag update. "Still uses
-> the seam's do-nothing default" above is superseded and kept as written.
+> the seam's do-nothing default" above is superseded and kept as written. *Later the same day:* the
+> direct load's insert follows the same rule, so a message the user moved out after the read began is
+> not put back, and an over-age read inserts no load (ADR-IOS-107, "Loads too").
 
 **Context:** The 2026-07-02 audit (PROJECT_MEMORY "IMAP external-deletion blind spot") confirmed that raw-IMAP/iCloud accounts never remove an externally-deleted message once it falls below the newest-`syncMessageLimit`(=50)-UID stale window: `selectStaleHeaders` is windowed, backfill is insert-only, `selfHealRecentMessages` is add-only, and the complete-knowledge branch is capped to tiny folders. Ghost rows persisted in GRDB + FTS + search indefinitely (Gmail/Exchange are immune — provider deltas carry deletions of any age). Two free signals were being wasted: `imapDeltaSync` observed `status.messageCount != folder.totalCount` but only ran the windowed sync and then OVERWROTE `totalCount` (evidence consumed, ghost survived), and IDLE `VANISHED(UIDSet)` — the server literally naming the deleted UIDs — was discarded into a generic poll.
 

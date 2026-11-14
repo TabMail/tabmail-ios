@@ -405,11 +405,12 @@ enum SyncConfig {
     /// How long the catch-up's log of completed actions keeps an entry
     /// (`AccountManager.recordActionCompleted`, ADR-IOS-107). A catch-up read
     /// that began before a user action completed never overwrites that action's
-    /// read or flag state, however long the read takes to reach the apply; a read
-    /// older than this may predate an entry already dropped, so it applies no
-    /// read or flag update at all (its removals, loads and state still apply).
-    /// An hour: only a slice suspended for that long in the middle loses its
-    /// flag repairs, which the next listing makes.
+    /// read or flag state, and never puts back a message the user moved out of
+    /// the folder after the read listed it, however long the read takes to reach
+    /// the apply; a read older than this may predate an entry already dropped, so
+    /// it applies no read or flag update and inserts no load at all (its removals
+    /// and state still apply). An hour: only a slice suspended for that long in
+    /// the middle loses its flag repairs and loads, which the next listing makes.
     static let catchUpCompletionLogRetentionSeconds: TimeInterval = 3_600
 
     /// TTL for NSE push-merge arrival stale-protection (NSEDataBridge). A message that

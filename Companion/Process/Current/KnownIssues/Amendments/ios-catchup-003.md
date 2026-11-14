@@ -26,7 +26,16 @@ The apply then works like this:
   result's removals and loads and writes the folder's state, so the check never stalls on one
   slice.
 
-The skipped flag corrections wait for the folder's next listing. On Outlook and Gmail that is the
+*Amended later the same day (2026-11-13):* loads follow the same rule. On Gmail and Outlook (the
+providers whose check loads missing mail), the insert skips a loaded message the user's own newer
+action stands on (`SyncEngine.catchUpReadPredatesAction`, read inside each insert chunk's
+transaction), so a message moved out of the folder after the read began is not put back. A read 1
+hour or more old inserts **no** load at all. "and loads" in the bullet above is superseded and kept as
+written; the removals and the state still apply. A skipped load is not a failure and marks nothing:
+if the server still lists the message in the folder, the next listing finds it missing again and
+loads it.
+
+The skipped flag corrections (and, since the amendment above, the skipped loads) wait for the folder's next listing. On Outlook and Gmail that is the
 next lapse (see `IOS-CATCHUP-001`); on IMAP it is the daily full check
 (`SyncConfig.catchUpFullCheckIntervalSeconds`).
 

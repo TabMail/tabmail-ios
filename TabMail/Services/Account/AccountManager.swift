@@ -728,12 +728,14 @@ actor AccountManager {
     /// When each completed action completed, by account and message key
     /// (`actionCompletionKey`), on the catch-up's wall clock (`CatchUpWallClock`).
     /// The catch-up apply (`SyncEngine.applyCatchUpTransaction`) skips a read or
-    /// flag update for a message whose action completed at or after the moment
-    /// the catch-up read began: that read is older than the user's change, and
-    /// the shared `recentlyCompleted` protection (30 s) can run out before a slow
-    /// read is applied. Entries older than
-    /// `SyncConfig.catchUpCompletionLogRetentionSeconds` are dropped; a read older
-    /// than that applies no read or flag update at all. Ids and times only, in
+    /// flag update, and its direct load's insert (`insertBackfillBatch`) skips a
+    /// load, for a message whose action completed at or after the moment the
+    /// catch-up read began (`SyncEngine.catchUpReadPredatesAction`): that read is
+    /// older than the user's change, and the shared `recentlyCompleted`
+    /// protection (30 s) can run out before a slow read is applied. Entries older
+    /// than `SyncConfig.catchUpCompletionLogRetentionSeconds` are dropped; a read
+    /// older than that applies no read or flag update and inserts no load at all.
+    /// Ids and times only, in
     /// memory only (a relaunch also ends every read in flight); never message
     /// content (ADR-004).
     nonisolated private let actionCompletedAtStore = Mutex<[String: Date]>([:])

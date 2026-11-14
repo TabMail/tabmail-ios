@@ -50,7 +50,9 @@ moved below the seam into `TabMail/Providers/CatchUpListing.swift` and are share
 Outlook: `CatchUpRange` (`cut`, `listsToEpoch`) and `CatchUpDirectLoad` (`load`, `pageVerdict`).
 `GmailProvider.loadMissing` is gone; where this ADR names it, read `CatchUpDirectLoad.load`. The
 apply (every provider) skips a read or flag update for a message whose user action completed at or
-after the moment the read began, and an over-age read applies no read or flag update.
+after the moment the read began, and an over-age read applies no read or flag update. *Later the same
+day:* the direct load's insert follows the same rule (a load the user's newer action stands on is not
+inserted, and an over-age read inserts no load); see "Loads too" below.
 
 **Context.** Every sync path windows its work, and changes to older mail fall outside every window:
 
@@ -987,6 +989,19 @@ skips a read or flag update for a message whose action completed at or after `re
 at least the retention old applies no read or flag update at all; its removals, loads and state still
 apply, so a listing always moves on. All three times are on one wall clock (`CatchUpWallClock`),
 never `CatchUpContext.clock`. Nothing is persisted and no content is kept.
+
+**Loads too (2026-11-13, later the same day).** The rule above guarded only read and flag updates,
+so a move that completed after a read listed and loaded a message, and before its apply, put the old
+id back in the source folder (the #106 ghost; Memory 127). The direct load's insert now applies the
+same rule inside each insert chunk's transaction (`insertBackfillBatch` with `catchUpReadStartedAt`,
+from `SyncEngine.applyCatchUpResult`): it skips a message the shared 30 s protection still holds or
+whose completion-log time is at or after `readStartedAt` (`SyncEngine.catchUpReadPredatesAction`, the
+one check the flag path also uses), and an over-age read (`SyncEngine.catchUpReadIsOverAge`) inserts
+no load at all. A skipped load is not a failure and marks nothing: the state is written, and a
+message the server still lists in the folder is missing again at the next listing. The sentence above
+that counts loads among what an over-age read still applies is superseded and kept as written.
+Gmail's and Outlook's direct loads share the insert, so both are covered; the page walk passes no read
+start and is unchanged.
 
 Tests: `OutlookCatchUpTests` (removals, loads, lapses, bounds, paging, same-second groups, the gate's
 timing, completed actions), `OutlookChangeFuzzTests` (catch-up schedules with faults, lapses, clock

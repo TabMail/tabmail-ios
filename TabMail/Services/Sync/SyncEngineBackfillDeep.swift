@@ -119,7 +119,7 @@ extension SyncEngine {
         let result = await insertBackfillBatchGuardable(
             headers, folderId: folderId, accountId: accountId, folderPath: folderPath,
             folderRole: folderRole, isInInbox: isInInbox, epochPremise: epochPremise,
-            observedEpoch: observedEpoch
+            observedEpoch: observedEpoch, catchUpReadStartedAt: nil
         )
         guard !result.refused else { return .refused }
         return .landed(
@@ -143,6 +143,15 @@ extension SyncEngine {
     /// `failed` is true when a chunk's write transaction threw: its rows did
     /// not land (it rolled back as a whole). A caller must not move its
     /// bookkeeping past them.
+    ///
+    /// `catchUpReadStartedAt` is set only by the catch-up's direct load
+    /// (`SyncEngine.applyCatchUpResult`): when the read that listed `headers`
+    /// began, on `CatchUpWallClock`. Each chunk then skips a message the user's
+    /// own action stands on (`catchUpReadPredatesAction`), and inserts nothing
+    /// for a read as old as the completion log's retention
+    /// (`catchUpReadIsOverAge`). A skipped message is not a failure and marks
+    /// nothing: the folder still lacks it, so the next listing finds it missing
+    /// again if the server still lists it there.
     func insertBackfillBatch(
         _ headers: [MessageHeaderInfo],
         folderId: String,
@@ -150,12 +159,13 @@ extension SyncEngine {
         folderPath: String,
         folderRole: FolderRole,
         isInInbox: Bool,
-        observedEpoch: UInt32?
+        observedEpoch: UInt32?,
+        catchUpReadStartedAt: Date? = nil
     ) async -> (inserted: Int, ftsRecords: [FTSHeaderRecord], ccBccFtsUpdates: [(contentKey: ContentKey, cc: String, bcc: String)], failed: Bool) {
         let result = await insertBackfillBatchGuardable(
             headers, folderId: folderId, accountId: accountId, folderPath: folderPath,
             folderRole: folderRole, isInInbox: isInInbox, epochPremise: nil,
-            observedEpoch: observedEpoch
+            observedEpoch: observedEpoch, catchUpReadStartedAt: catchUpReadStartedAt
         )
         return (result.inserted, result.ftsRecords, result.ccBccFtsUpdates, result.failed)
     }
@@ -168,7 +178,8 @@ extension SyncEngine {
         folderRole: FolderRole,
         isInInbox: Bool,
         epochPremise: SyncEngine.CrawlEpochPremise?,
-        observedEpoch: UInt32?
+        observedEpoch: UInt32?,
+        catchUpReadStartedAt: Date?
     ) async -> (inserted: Int, ftsRecords: [FTSHeaderRecord], ccBccFtsUpdates: [(contentKey: ContentKey, cc: String, bcc: String)], refused: Bool, failed: Bool) {
         guard !headers.isEmpty else { return (0, [], [], false, false) }
 
@@ -218,6 +229,18 @@ extension SyncEngine {
                             .filter(Column("accountId") == accountId && Column("folderPath") == folderPath)
                             .fetchAll(db)
                         let snapshot = PendingOperationSnapshot(ops: scopedOps)
+                        // The catch-up's direct load only: a user action that
+                        // completed after the read that listed these messages
+                        // began is newer than that listing. A message the user
+                        // moved out of this folder meanwhile must not come back
+                        // under its old id (#106's ghost). Both shields are read
+                        // HERE, inside the chunk's transaction, never before it
+                        // (Memory 127).
+                        let catchUpShield = catchUpReadStartedAt.map { readStartedAt in
+                            (readStartedAt: readStartedAt,
+                             recentlyCompleted: AccountManager.shared.liveRecentlyCompleted(),
+                             overAge: SyncEngine.catchUpReadIsOverAge(readStartedAt: readStartedAt, now: CatchUpWallClock.now()))
+                        }
 
                         // Existence check — one IN query (chunk <= chunkSize < SQLite's
                         // ~999 bound-variable limit, so no sub-chunking needed).
@@ -281,6 +304,14 @@ extension SyncEngine {
                                                   cc: info.cc, bcc: info.bcc))
                                 }
                                 continue
+                            }
+                            if let catchUpShield {
+                                if catchUpShield.overAge { continue }
+                                if SyncEngine.catchUpReadPredatesAction(
+                                    accountId: accountId, messageId: info.messageId,
+                                    rfc822MessageId: info.rfc822MessageId,
+                                    readStartedAt: catchUpShield.readStartedAt,
+                                    recentlyCompleted: catchUpShield.recentlyCompleted) { continue }
                             }
                             guard insertedIds.insert(info.messageId).inserted else { continue }
 

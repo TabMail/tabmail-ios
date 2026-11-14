@@ -19,8 +19,10 @@ import Testing
 // completion time (`AccountManager.recordActionCompleted`) with the moment the
 // read began (`SyncEngine.runCatchUp` stamps it just before the provider call),
 // both on one wall clock (`CatchUpWallClock`). A read older than the completion
-// log's retention applies no flag update at all, and still applies its
-// removals, loads and state, so a listing always moves on.
+// log's retention applies no flag update and inserts no load at all, and still
+// applies its removals and state, so a listing always moves on. The direct
+// load's insert follows the same rule: a message the user moved out of the
+// folder after the read began is not put back.
 extension OutlookCatchUpTests {
 
     /// Every call reads the wall clock from `clock`.
@@ -349,9 +351,11 @@ extension OutlookCatchUpTests {
     /// with every listing page, so every slice's read spans more than the 30 s
     /// protection (29a) or the completion log's retention (29b), and the user's
     /// flag completes during the first page's read. The listing still completes
-    /// within a slice ceiling, its removal and load land, and the user's flag
-    /// stays. With reads under the retention (29a) the stale flags heal; past it
-    /// (29b) no flag update applies, so they wait for the next listing.
+    /// within a slice ceiling, its removal lands, and the user's flag stays.
+    /// With reads under the retention (29a) the stale flags heal and the load
+    /// lands; past it (29b) no flag update and no load applies, so they wait for
+    /// the next listing, which loads the skipped message. *Was (before loads
+    /// were shielded):* the load landed in 29b too.
     @Test("29: with every page's read slower than the protection (31 s) or the retention (3,601 s), the listing completes and keeps the user's flag",
           arguments: [31.0, 3_601.0])
     func slowReadsStillComplete(jump: TimeInterval) async throws {
@@ -395,10 +399,64 @@ extension OutlookCatchUpTests {
 
             #expect(try Self.state(w, w.archive)?.lastCompletedAt != nil, "the listing did not complete within \(ceiling) slices")
             #expect(try w.row("gone", in: w.archive) == nil, "the removal did not land")
-            #expect(try w.row("old", in: w.archive) != nil, "the load did not land")
+            #expect((try w.row("old", in: w.archive) != nil) == !overAge,
+                    overAge ? "an over-age read inserted a load" : "the load did not land")
             #expect(try w.row("u", in: w.archive)?.isFlagged == true, "a slow read overwrote the user's flag")
             #expect(try w.row("s-1", in: w.archive)?.isRead == !overAge)
             #expect(try w.row("s-2", in: w.archive)?.isFlagged == !overAge)
+
+            // A load an over-age read skipped stays retryable: the next listing,
+            // with reads that are not slow, finds it missing again and loads it.
+            if overAge {
+                server.afterCatchUpListingPage(nil)
+                let previous = try Self.state(w, w.archive)?.lastCompletedAt
+                let folderId = w.folderId(w.archive)
+                try await w.pool.write { db in try SyncEngine.markCatchUpLapse(folderId: folderId, db: db) }
+                let relisted = try await Self.withWallClock(wall) {
+                    try await Self.untilListed(w, engine, w.archive, after: previous)
+                }
+                #expect(relisted != nil, "no new listing after the lapse")
+                #expect(try w.row("old", in: w.archive) != nil, "a load an over-age read skipped never loaded")
+            }
+        }
+    }
+
+    /// The user moves a message out of a folder while a catch-up read is
+    /// loading it (the folder lacked it locally once the move was made on the
+    /// phone): the move completes after the load read the message and before
+    /// the apply. The apply never puts the old id back in the source folder,
+    /// whether the completion is still under the shared 30 s protection or only
+    /// in the completion log. Another missing message in the same insert still
+    /// loads.
+    @Test("A message moved out while a catch-up read was loading it is not put back in the source folder; another missing message still loads",
+          arguments: [false, true])
+    func moveDuringTheLoadLeavesNoGhost(liveProtection: Bool) async throws {
+        let c = Clock()
+        try await Self.withWorld(seeds: [
+            Self.seed("r-1", in: Self.archive, at: c.daysAgo(2)),
+            Self.seed("m", in: Self.archive, at: c.daysAgo(10)),
+            Self.seed("x", in: Self.archive, at: c.daysAgo(12)),
+        ], heldSince: c.daysAgo(0.5)) { w, engine in
+            try w.insertRow("r-1", in: w.archive, date: c.daysAgo(2))
+            try await w.baselineAll()
+            #expect(try w.row("m", in: w.archive) == nil, "precondition: the moved message is missing")
+            #expect(try w.row("x", in: w.archive) == nil, "precondition: the other message is missing")
+            if liveProtection {
+                await AccountManager.shared.recordRecentlyCompleted(messageIds: ["m", "m@example.com"])
+            }
+            let (server, accountId) = (w.server, w.accountId)
+            server.afterGetAnswered(providerMessageId: "m") {
+                server.moveFromOtherClient(providerMessageId: "m", to: OutlookCatchUpTests.inbox)
+                if !liveProtection {
+                    AccountManager.shared.recordActionCompleted(accountId: accountId, messageKeys: ["m", "m@example.com"])
+                }
+            }
+
+            #expect(try await Self.untilListed(w, engine, w.archive) != nil, "the listing did not complete")
+
+            #expect(Self.messageGets(w, "m") >= 1, "precondition: the read loaded the moved message")
+            #expect(try w.row("m", in: w.archive) == nil, "the apply put the moved message back in the source folder")
+            #expect(try w.row("x", in: w.archive) != nil, "another missing message did not load")
         }
     }
 }

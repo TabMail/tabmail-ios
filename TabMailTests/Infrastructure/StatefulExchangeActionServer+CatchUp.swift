@@ -32,6 +32,10 @@ struct CatchUpListingModel: Sendable {
     /// with that page's serial (1 for the first): the place a test changes the
     /// mail between two pages.
     var afterPage: (@Sendable (Int) -> Void)?
+    /// Called after an exact `GET /messages/{id}` has its answer built, outside
+    /// the lock, per provider message id: the place a test changes the mail
+    /// once the direct load has read a message.
+    var afterGet: [String: @Sendable () -> Void] = [:]
 }
 
 extension StatefulExchangeActionServer {
@@ -55,6 +59,12 @@ extension StatefulExchangeActionServer {
     /// Leave `ids` out of every listing, filtered or not.
     func hideFromListings(_ ids: Set<String>) {
         state.value.withLock { $0.catchUp.hiddenIds = ids }
+    }
+
+    /// Run `hook` once `GET /messages/{providerMessageId}` has its answer built
+    /// (the answer carries the message as it was before `hook` ran). nil removes it.
+    func afterGetAnswered(providerMessageId: String, _ hook: (@Sendable () -> Void)?) {
+        state.value.withLock { $0.catchUp.afterGet[providerMessageId] = hook }
     }
 
     /// Run `hook` after every date-filtered page, with the page's serial.

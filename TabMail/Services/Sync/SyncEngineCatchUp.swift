@@ -313,7 +313,11 @@ extension SyncEngine {
     /// failed, or the folder could take nothing) writes nothing at all, the
     /// state included: the listing stays where it was and the provider lists
     /// those ranges again on a later pass. `readStartedAt` is when the read that
-    /// produced `result` began, on `CatchUpWallClock`.
+    /// produced `result` began, on `CatchUpWallClock`. A load the user's own
+    /// newer action stands on (`catchUpReadPredatesAction`), and every load of an
+    /// over-age read (`catchUpReadIsOverAge`), is not inserted. That is not a
+    /// failure: the state is written, and the message, if the server still lists
+    /// it in the folder, is missing again at the next listing.
     @discardableResult
     func applyCatchUpResult(
         _ result: CatchUpFolderResult, windowMode: StaleWindowMode, readStartedAt: Date
@@ -322,7 +326,7 @@ extension SyncEngine {
         if !result.loadFailures.isEmpty && DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): \(result.loadFailures.count) missing id(s) did not load: \(result.loadFailures.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: ", "))")
         }
-        if !result.loaded.isEmpty, !(await insertCatchUpLoads(result)) {
+        if !result.loaded.isEmpty, !(await insertCatchUpLoads(result, readStartedAt: readStartedAt)) {
             BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): \(result.loaded.count) loaded message(s) did not all land — nothing written, the listing stays where it was")
             return .skipped
         }
@@ -342,8 +346,9 @@ extension SyncEngine {
         switch outcome {
         case .applied(let updatedFlags, let removedIds):
             let readAge = appliedAt.timeIntervalSince(readStartedAt)
-            if readAge >= SyncConfig.catchUpCompletionLogRetentionSeconds && !result.flagUpdates.isEmpty && DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): read began \(Int(readAge)) s ago — \(result.flagUpdates.count) read/flag update(s) not applied")
+            if Self.catchUpReadIsOverAge(readStartedAt: readStartedAt, now: appliedAt)
+                && !(result.flagUpdates.isEmpty && result.loaded.isEmpty) && DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): read began \(Int(readAge)) s ago — \(result.flagUpdates.count) read/flag update(s) and \(result.loaded.count) load(s) not applied")
             }
             if !removedIds.isEmpty { removeHeadersFromFTS(removedIds) }
             if updatedFlags > 0 || !removedIds.isEmpty {
@@ -365,8 +370,9 @@ extension SyncEngine {
     /// page walk's own insert tail, read with the folder as it is now. A folder
     /// that is gone or quarantined gets nothing; its transaction below writes
     /// nothing either, so the provider lists the same ids again later. True only
-    /// when every write chunk landed.
-    private func insertCatchUpLoads(_ result: CatchUpFolderResult) async -> Bool {
+    /// when every write chunk landed. `readStartedAt` makes the insert skip what
+    /// the user's own newer action stands on (`insertBackfillBatch`).
+    private func insertCatchUpLoads(_ result: CatchUpFolderResult, readStartedAt: Date) async -> Bool {
         let folderId = result.folderId
         guard let folder = try? await dbPool.read({ db in try Folder.fetchOne(db, key: folderId) }),
               folder.uidValidityResetPendingAt == nil else { return false }
@@ -374,7 +380,8 @@ extension SyncEngine {
         let bodies = Dictionary(
             result.loaded.map { ($0.id, (htmlBody: $0.htmlBody, textBody: $0.textBody)) },
             uniquingKeysWith: { first, _ in first })
-        let insert = await insertFetchedBackfillMessages(headers, bodies: bodies, folder: folder)
+        let insert = await insertFetchedBackfillMessages(
+            headers, bodies: bodies, folder: folder, catchUpReadStartedAt: readStartedAt)
         BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): loaded \(headers.count) missing message(s), inserted \(insert.inserted)")
         return insert.allLanded
     }
@@ -406,6 +413,34 @@ extension SyncEngine {
                 ELSE NULL END
             WHERE accountId = ? AND catchUpState IS NOT NULL
             """, arguments: [CatchUpLapse.countKey, CatchUpLapse.countKey, accountId])
+    }
+
+    /// A user action on this message is newer than a catch-up read that began at
+    /// `readStartedAt`: the shared 30 s protection still holds one of its keys
+    /// (`recentlyCompleted`, which the caller reads inside its write transaction,
+    /// Memory 127), or the completion log (`AccountManager.actionCompletedAt`) has
+    /// an action on one of them completing at or after the read began. The keys
+    /// are the provider message id and the RFC Message-ID, as the queue records
+    /// them. What the read carries for the message is then older than the user's
+    /// change: its read or flag state is not applied, and a message it loaded is
+    /// not inserted (the user moved it out of the folder after the read listed it).
+    nonisolated static func catchUpReadPredatesAction(
+        accountId: String, messageId: String, rfc822MessageId: String?,
+        readStartedAt: Date, recentlyCompleted: [String: Date]
+    ) -> Bool {
+        let keys = [messageId] + (rfc822MessageId.map { [$0] } ?? [])
+        return keys.contains { key in
+            recentlyCompleted[key] != nil
+                || (AccountManager.shared.actionCompletedAt(accountId: accountId, messageKey: key).map { $0 >= readStartedAt } ?? false)
+        }
+    }
+
+    /// A catch-up read at least as old as the completion log's retention may
+    /// predate an entry the log already dropped, so nothing it carries per
+    /// message (a read or flag update, a load) applies; its removals and its
+    /// state do, so the listing always moves on. `now` is on `CatchUpWallClock`.
+    nonisolated static func catchUpReadIsOverAge(readStartedAt: Date, now: Date) -> Bool {
+        now.timeIntervalSince(readStartedAt) >= SyncConfig.catchUpCompletionLogRetentionSeconds
     }
 
     /// The transaction itself. Everything it decides on is read INSIDE it: the folder
@@ -440,10 +475,7 @@ extension SyncEngine {
         // the completion log's retention may predate an entry already dropped, so
         // it applies no read or flag update at all; its removals and state still
         // apply, so the listing moves on.
-        let readIsOverAge = now.timeIntervalSince(readStartedAt) >= SyncConfig.catchUpCompletionLogRetentionSeconds
-        let completedSinceRead = { (key: String) -> Bool in
-            AccountManager.shared.actionCompletedAt(accountId: folder.accountId, messageKey: key).map { $0 >= readStartedAt } ?? false
-        }
+        let readIsOverAge = catchUpReadIsOverAge(readStartedAt: readStartedAt, now: now)
 
         var updatedFlags = 0
         for update in result.flagUpdates where !readIsOverAge {
@@ -455,9 +487,9 @@ extension SyncEngine {
                     folderId: folder.id, messageId: update.messageId, canonicalId: canonicalId,
                     windowMode: windowMode, sourceBoundEpoch: sourceBoundEpoch) else { continue }
             if pendingFlags.containsAnyKey(messageId: row.messageId, rfc822MessageId: row.rfc822MessageId) { continue }
-            if recentlyCompleted[row.messageId] != nil
-                || (row.rfc822MessageId.map { recentlyCompleted[$0] != nil } ?? false) { continue }
-            if completedSinceRead(row.messageId) || (row.rfc822MessageId.map(completedSinceRead) ?? false) { continue }
+            if catchUpReadPredatesAction(
+                accountId: folder.accountId, messageId: row.messageId, rfc822MessageId: row.rfc822MessageId,
+                readStartedAt: readStartedAt, recentlyCompleted: recentlyCompleted) { continue }
             let original = row
             row.isRead = update.isRead
             row.isFlagged = update.isFlagged

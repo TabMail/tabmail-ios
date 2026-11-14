@@ -957,11 +957,15 @@ extension SyncEngine {
     /// were inserted, and whether every write chunk landed: `allLanded` is
     /// false when a chunk's transaction failed, so some of `headers` have no
     /// row. Neither caller moves its bookkeeping past them then: the walk keeps
-    /// its page token, the catch-up writes no state.
+    /// its page token, the catch-up writes no state. Only the catch-up sets
+    /// `catchUpReadStartedAt` (when its read began): the insert then skips a
+    /// message the user's own newer action stands on, which is not a failure
+    /// (`insertBackfillBatch`).
     func insertFetchedBackfillMessages(
         _ headers: [MessageHeaderInfo],
         bodies bodyData: [String: (htmlBody: String?, textBody: String?)],
-        folder: Folder
+        folder: Folder,
+        catchUpReadStartedAt: Date? = nil
     ) async -> (inserted: Int, allLanded: Bool) {
         // Step 1: Insert headers to GRDB (batch dedup).
         // The premise-LESS overload, deliberately: this is the
@@ -973,7 +977,7 @@ extension SyncEngine {
         let (inserted, ftsRecords, ccBccUpdates, chunkFailed) = await insertBackfillBatch(
             headers, folderId: folder.id, accountId: folder.accountId,
             folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox,
-            observedEpoch: nil
+            observedEpoch: nil, catchUpReadStartedAt: catchUpReadStartedAt
         )
         if !ftsRecords.isEmpty { await indexHeadersForFTS(ftsRecords) }
         if !ccBccUpdates.isEmpty { try? await SearchIndex.shared.updateCcBcc(ccBccUpdates) }

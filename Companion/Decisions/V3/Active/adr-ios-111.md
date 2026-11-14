@@ -288,4 +288,5 @@ lapse. It starts a folder's listing only while the folder's bookmark is tracking
 which sees it, or after the first read began, which the delta reports. It pages by received-date
 keyset, takes a quarter of the mailbox request rate, and lists a folder once more after its backfill
 walk completes. Its apply never lets a read that began before a user action completed overwrite
-that action's read or flag state (ADR-IOS-107, completed actions).
+that action's read or flag state (ADR-IOS-107, completed actions), nor put back a message the user
+moved out of the folder after that read began (ADR-IOS-107, "Loads too", later the same day).

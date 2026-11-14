@@ -617,6 +617,7 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
             let message = state.value.withLock { $0.messagesByProviderId[providerId] }
             guard let message else { return .status(404) }
             let body = (try? JSONSerialization.data(withJSONObject: Self.graphRow(message))) ?? Data()
+            if let hook = state.value.withLock({ $0.catchUp.afterGet[providerId] }) { hook() }
             return .bytes(body, contentType: "application/json")
         }
         let servePatch: @Sendable (FakeHTTP.Request) -> FakeHTTP.CannedResponse = { [state] request in

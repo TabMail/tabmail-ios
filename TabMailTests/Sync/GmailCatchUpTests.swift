@@ -1719,6 +1719,48 @@ struct GmailCatchUpTests {
         }
     }
 
+    /// The user moves a message out of a label while the check is loading it
+    /// (the label lacked it locally once the move was made on the phone): the
+    /// move completes after the check fetched the message and before the apply.
+    /// The apply never puts the message back in the label, whether the
+    /// completion is still under the shared 30 s protection or only in the
+    /// completion log. Another missing message in the same insert still loads.
+    @Test("A message moved out of a label while the check was loading it is not put back; another missing message still loads",
+          .enabled(if: !NetworkMonitor.checkExpensive()), arguments: [false, true])
+    func moveDuringTheLoadLeavesNoGhost(liveProtection: Bool) async throws {
+        let clock = Clock()
+        let seeds = [
+            Self.seed("l1", clock.daysAgo(30), [labelPath]),
+            Self.seed("m", clock.daysAgo(35), [labelPath]),
+            Self.seed("o", clock.daysAgo(37), [labelPath]),
+            Self.seed("l3", clock.daysAgo(40), [labelPath]),
+        ]
+        let local = [
+            Local(id: "m", path: inboxPath, date: clock.daysAgo(35)),
+            Local(id: "l1", path: labelPath, date: clock.daysAgo(30)),
+            Local(id: "l3", path: labelPath, date: clock.daysAgo(40)),
+        ]
+        try await Self.withWorld("gcu-move-during-load-\(liveProtection)", seeds: seeds, local: local) { world async throws in
+            if liveProtection {
+                await AccountManager.shared.recordRecentlyCompleted(messageIds: ["m", "m@example.com"])
+            }
+            let (server, accountId) = (world.server, world.accountId)
+            server.onGet(providerMessageId: "m") {
+                server.applyLabelChange(providerMessageId: "m", add: [inboxPath], remove: [labelPath])
+                if !liveProtection {
+                    AccountManager.shared.recordActionCompleted(accountId: accountId, messageKeys: ["m", "m@example.com"])
+                }
+            }
+
+            await Self.pass(world, [labelPath])
+
+            #expect(world.server.messageGets().contains("m"), "precondition: the check fetched the moved message")
+            let label = try Self.rows(world, labelPath)
+            #expect(label["m"] == nil, "the apply put the moved message back in the label")
+            #expect(label["o"] != nil, "another missing message did not load")
+        }
+    }
+
     /// The check never writes the walk's bookkeeping: a walk held at a page keeps
     /// its page token and the time that page was first held, while the check
     /// loads the missing message itself. (Replaces "a re-arm clears the page hold
