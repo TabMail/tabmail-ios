@@ -251,12 +251,19 @@ extension AccountManager {
             "[CalendarQueue] TERMINAL \(op.operationType) op=\(op.id) account=\(op.accountId) event=\(op.eventId ?? "new"): \(reason)",
             source: "CalendarQueue")
         do {
-            try await retryWrite(dbPool, label: "CalendarQueue") { db in
-                guard var row = try PendingCalendarOperation.fetchOne(db, key: op.id) else { return }
+            let retired = try await retryWrite(dbPool, label: "CalendarQueue") { db -> PendingCalendarOperation? in
+                guard var row = try PendingCalendarOperation.fetchOne(db, key: op.id) else { return nil }
                 row.status = PendingStatus.failed.rawValue
                 row.failureReason = reason
                 row.setReservedArguments([PendingCalendarOperation.failureKindKey: .string(kind.rawValue)])
                 try row.update(db)
+                return row
+            }
+            // Retired holding no saved files (#718, `CalendarPutBackFiles.held`): its series' write
+            // was never sent or was refused, so the calendar still holds every file its attempts
+            // saved, and the failure is an ordinary one. Their copies go now.
+            if let retired, CalendarPutBackFiles.holdsBytes(retired.id), CalendarPutBackFiles.held(retired).isEmpty {
+                CalendarPutBackFiles.remove(opId: retired.id)
             }
             return true
         } catch {
@@ -347,6 +354,19 @@ extension AccountManager {
         }
     }
 
+    /// Keep an edit of every occurrence's `SeriesEditRecord` on its queued operation (#718): the
+    /// provider calls it before its write, and writes only after it returns. Written as
+    /// `recordSplit` writes its record, under `SeriesEditRecord.argumentKey`, replacing one kept
+    /// before; throws as it does, so nothing is written then.
+    func recordSeriesEdit(opId: String, _ record: SeriesEditRecord) async throws {
+        try await updateSplitArguments(opId: opId) { object in
+            object[SeriesEditRecord.argumentKey] = record.jsonObject
+        }
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[CalendarQueue] Recorded what the edit of series \(record.seriesId) puts back on op \(opId)")
+        }
+    }
+
     /// The split's `SplitRecorder.partNotFound` (#601): the calendar answered "not found" for a
     /// new part it had reported as already created. Keeps the time of the first such answer on
     /// the operation (`SplitRecord.partNotFoundSinceKey`, written the first time only) and
@@ -395,12 +415,27 @@ extension AccountManager {
         }
     }
 
+    /// Removes the saved put-back files of every operation whose row no longer exists
+    /// (`CalendarPutBackFiles.sweep`), keeping every row's, whatever its status. Skipped when the
+    /// rows can't be read.
+    private func sweepCalendarPutBackFiles() async {
+        do {
+            let ids = try await dbPool.read { db in
+                try String.fetchSet(db, sql: "SELECT id FROM pendingCalendarOperation")
+            }
+            CalendarPutBackFiles.sweep(keeping: ids)
+        } catch {
+            BackgroundSyncLogger.logDebug("[CalendarQueue] put-back sweep skipped: \(error)")
+        }
+    }
+
     // MARK: - Calendar Operation Queue
 
     /// Queue a calendar mutation for async execution.
     /// Persists the operation to GRDB before returning — survives crashes/kills.
-    /// `SplitRecord.argumentKey` and `SplitRecord.partNotFoundSinceKey` are reserved for the
-    /// queue (`recordSplit`, `noteSplitPartNotFound`); a tool call that carries them has them
+    /// `SplitRecord.argumentKey`, `SplitRecord.partNotFoundSinceKey` and
+    /// `SeriesEditRecord.argumentKey` are reserved for the queue (`recordSplit`,
+    /// `noteSplitPartNotFound`, `recordSeriesEdit`); a tool call that carries them has them
     /// removed here. `eventTitle` is the title the confirmation card showed; it names the
     /// event if the change fails after the chat turn (`LateCalendarFailureStore`).
     func queueCalendarOperation(
@@ -414,6 +449,7 @@ extension AccountManager {
         var arguments = arguments
         arguments.removeValue(forKey: SplitRecord.argumentKey)
         arguments.removeValue(forKey: SplitRecord.partNotFoundSinceKey)
+        arguments.removeValue(forKey: SeriesEditRecord.argumentKey)
         let op = PendingCalendarOperation(
             operationType: type,
             accountId: accountId,
@@ -455,6 +491,11 @@ extension AccountManager {
         }
         isDrainingCalendar = true
         defer { isDrainingCalendar = false }
+
+        // Saved put-back files whose operation row is gone (#718): a crash between a row's
+        // deletion and its directory's removal. Race-free: only an operation this drain executes
+        // writes saved files, and none is executing yet.
+        await sweepCalendarPutBackFiles()
 
         var failedAccounts = Set<String>()
         // Whether a queued change's wait reason may have been written, cleared, or left the queue
@@ -567,6 +608,9 @@ extension AccountManager {
                         try await retryWrite(dbPool, label: "CalendarQueue") { db in
                             _ = try PendingCalendarOperation.deleteOne(db, key: currentOp.id)
                         }
+                        // Its put-back files' directory, only when empty: every file a put-back
+                        // saved was released once it read back (#718); one still saved stays.
+                        CalendarPutBackFiles.removeEmptyDirectory(of: currentOp.id)
                     } catch {
                         BackgroundSyncLogger.logError(
                             "[CalendarQueue] CRITICAL: failed to delete completed op \(currentOp.id) — it stays inFlight and can re-execute after successful startup recovery: \(error)",
@@ -696,7 +740,11 @@ extension AccountManager {
                     if Self.isCalendarUnsupportedError(error) {
                         let reason = unsupportedReason(error)
                         BackgroundSyncLogger.logDebug("[CalendarQueue] Unsupported \(opType) (\(reason)) — retiring (no retry)")
-                        await retireAndAnnounce(currentOp, reason: reason, kind: .unsupported)
+                        // A put-back left unfinished after the series was written (#718) is told as
+                        // what it is: its reason is written for the user.
+                        let kind: CalendarFailureKind
+                        if case .seriesPutBackIncomplete? = error as? CalendarProviderError { kind = .putBackIncomplete } else { kind = .unsupported }
+                        await retireAndAnnounce(currentOp, reason: reason, kind: kind)
                         executedAny = true
                         continue
                     }
@@ -948,7 +996,6 @@ extension AccountManager {
                 throw CalendarProviderError.notSupported(
                     "the queued calendar edit carries no event id and can never be executed")
             }
-            var resolvedAllDay = CalendarToolHelpers.boolArg(args, "all_day")
             // 🚨 THE OTHER HALF OF THE OCCURRENCE ADDRESS. `recurrence_id` is a
             // naive wall clock with no offset; on its own it does not name an
             // instant. `calendar_event_edit`'s schema already publishes the frame
@@ -1026,8 +1073,6 @@ extension AccountManager {
             // the series' difference, on that occurrence's own guests (`AttendeeChange`, #620).
             // A move to another day of a series whose rule names its days turns those days with it
             // (`CalendarSeriesScope.dayMove`), on the rule each provider writes.
-            let ruleDayMove = try CalendarSeriesScope.dayMove(
-                routed.args, named: named, scope: routed.scope, zone: editZone)
             // 🚨 AN RRULE `UNTIL`'S VALUE TYPE BELONGS TO THE DTSTART, AND ON AN EDIT THE DTSTART
             // BELONGS TO THE RESOURCE. RFC 5545 §3.3.10: "The value of the UNTIL rule part MUST have
             // the same value type as the DTSTART property." `buildGCalEventInput` renders the UNTIL
@@ -1081,24 +1126,11 @@ extension AccountManager {
             // transient ⇒ retried, permanent ⇒ retired with a reason. Fail closed, per THE MANTRA; a
             // defaulted value here would be the same wrong-kind write, chosen by us instead of the
             // model.
-            let movesTime = CalendarToolHelpers.stringArgOpt(routed.args, "start_iso") != nil
-                || CalendarToolHelpers.stringArgOpt(routed.args, "end_iso") != nil
+            //
+            // The kind is resolved, and the edit built, by the one builder the edit tool's check
+            // before its card uses too (`CalendarSeriesScope.writeInput`), below.
             let written = routed.scope == "all" ? try named.readSeries()
                 : routed.scope == "this_only" ? named.occurrence ?? named.event : named.event
-            var stored: GCalEvent? = nil
-            if resolvedAllDay == nil,
-               movesTime || CalendarToolHelpers.recurrenceUntilIsAtStake(routed.args) {
-                stored = written
-                // `GCalDateTime.date` is populated only for an all-day event, on every provider:
-                // `ICSParser.makeGCalDateTime` (CalDAV), `ExchangeCalendarProvider.toGCalDateTime`,
-                // `DemoCalendarProvider`, and Google's own JSON all put the timed form in `dateTime`.
-                resolvedAllDay = (written.start?.date != nil)
-                // Gated per global rule 12 — this is a new diagnostic, and the surrounding ungated
-                // `print`s are the pre-existing corpus registered as `IOS-LOG-003`, not a licence.
-                if DebugModeManager.isLoggingEnabled() {
-                    BackgroundSyncLogger.logDebug("[CalendarQueue] Edit moves the event or sets an RRULE UNTIL with no all_day argument — resolved allDay=\(resolvedAllDay == true) from the resource")
-                }
-            }
             // Route by edit_scope (calendar_event_edit-v1.5.21+). Default: 'all'
             // when no recurrence_id, 'this_only' when recurrence_id is present
             // (back-compat with the earlier schema where recurrence_id alone
@@ -1146,17 +1178,13 @@ extension AccountManager {
             // (the event is gone) retire it with a reason.
             var occurrenceStartDay: String? = nil
             if let rid = recurrenceId,
-               CalendarToolHelpers.needsOccurrenceStartDay(routed.args, storedStart: stored?.start, scope: scope) {
+               CalendarToolHelpers.needsOccurrenceStartDay(routed.args, storedStart: written.start, scope: scope) {
                 occurrenceStartDay = try await provider.occurrenceStartDay(
                     calendarId: calId, eventId: writeId, recurrenceId: rid, recurrenceIdZone: recurrenceIdZone)
             }
-            if let reason = CalendarToolHelpers.allDayEditRefusal(
-                routed.args, storedStart: written.start, scope: scope, recurrenceId: recurrenceId,
-                occurrenceStartDay: occurrenceStartDay, namedOccurrenceStart: named.occurrence?.start) {
-                throw CalendarProviderError.notSupported(reason)
-            }
-            var input = try CalendarToolHelpers.buildGCalEventInput(routed.args, isAllDay: resolvedAllDay)
-            input.ruleDayMove = ruleDayMove
+            let input = try CalendarSeriesScope.writeInput(
+                routed.args, scope: scope, named: named, written: written, recurrenceId: recurrenceId,
+                occurrenceStartDay: occurrenceStartDay, zone: editZone)
 
             switch scope {
             case "this_only":
@@ -1194,7 +1222,19 @@ extension AccountManager {
                 // An edit past the series' last place makes no new part (nil): nothing to surface.
                 return (created?.id, nil)
             case "all":
-                _ = try await provider.updateEvent(calendarId: calId, eventId: writeId, event: input, sendUpdates: "all")
+                // What the write must put back after it (#718) is kept on this operation before the
+                // write (`recordSeriesEdit`), and handed back to a retry; the files it names are
+                // saved beside the database under this operation (`CalendarPutBackFiles`). A record
+                // this build can't read throws here, before anything is written, and no terminal
+                // arm claims it: the operation stays queued as it is.
+                let opId = op.id
+                let kept = try SeriesEditRecord.stored(args)
+                _ = try await provider.updateSeries(
+                    calendarId: calId, eventId: writeId, event: input, sendUpdates: "all",
+                    record: SeriesEditRecorder(
+                        kept: kept,
+                        keep: { record in try await self.recordSeriesEdit(opId: opId, record) },
+                        files: CalendarPutBackFiles.savedFiles(opId: opId)))
                 BackgroundSyncLogger.logDebug("[CalendarQueue] Updated event id=\(writeId) scope=all")
             default:
                 // Unknown edit_scope value — reject rather than silently defaulting

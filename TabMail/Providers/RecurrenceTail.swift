@@ -319,6 +319,89 @@ enum RecurrenceTail {
         return count
     }
 
+    /// The day of the `number`-th occurrence the rule's pattern places, started at `seriesStart`
+    /// (counted as `occurrences` counts, an excluded date included, as RFC 5545 counts COUNT): the
+    /// last occurrence of a series ending after `number` of them. Found by doubling a span from the
+    /// first day until it holds `number` occurrences, then halving it. Nil when the rule is outside
+    /// the subset `occurrences` counts, or places fewer within four-digit years.
+    static func day(
+        ofOccurrence number: Int, of rrule: String, seriesStart: Day, anchor: Anchor = .dtstart, missingDay: MissingMonthDay = .skip
+    ) -> Day? {
+        guard number >= 1 else { return nil }
+        func count(through span: Int) -> Int? {
+            occurrences(of: rrule, seriesStart: seriesStart, before: seriesStart.adding(days: span + 1), anchor: anchor, missingDay: missingDay)
+        }
+        var span = firstDaySearchDays
+        while true {
+            guard let found = count(through: span) else { return nil }
+            if found >= number { break }
+            guard span < maxInterval else { return nil }
+            span = min(span * 2, maxInterval)
+        }
+        var low = 0, high = span
+        while low < high {
+            let mid = (low + high) / 2
+            guard let found = count(through: mid) else { return nil }
+            if found >= number { high = mid } else { low = mid + 1 }
+        }
+        return seriesStart.adding(days: low)
+    }
+
+    /// The day an `UNTIL` value ends on in `zone`, the zone the series repeats in: a date as
+    /// written, a UTC time (`Z`) dated in `zone`, a local time by its own date. Nil when it can't
+    /// be read. The one reading of a new last date for the card's count of the meetings an
+    /// earlier end removes and for the CalDAV write that removes them (#718).
+    static func untilDay(_ value: String, zone: TimeZone) -> Day? {
+        let upper = value.uppercased()
+        if upper.hasSuffix("Z") {
+            guard let instant = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss'Z'", timeZone: .gmt).date(from: upper) else { return nil }
+            return Day(iso: FixedDateFormat.formatter("yyyy-MM-dd", timeZone: zone).string(from: instant))
+        }
+        return Day(ical: upper)
+    }
+
+    /// The day a rule's end makes its last occurrence's, in `zone`: its `UNTIL`'s day
+    /// (`untilDay`), or its `COUNT`-th occurrence's (`day(ofOccurrence:)`) from `seriesStart`.
+    enum LastDay: Equatable, Sendable {
+        case day(Day)
+        /// The rule has no `UNTIL` and no `COUNT`.
+        case none
+        /// The end can't be read, or the rule can't be counted.
+        case unreadable
+    }
+
+    /// `LastDay` of `rrule` (its `RRULE:` line).
+    static func lastDay(
+        of rrule: String, seriesStart: Day, zone: TimeZone, anchor: Anchor = .dtstart, missingDay: MissingMonthDay = .skip
+    ) -> LastDay {
+        var until: String?
+        var count: String?
+        let body = rrule.uppercased().hasPrefix("RRULE:") ? String(rrule.dropFirst("RRULE:".count)) : rrule
+        for part in body.split(separator: ";") {
+            let pair = part.split(separator: "=", maxSplits: 1).map(String.init)
+            guard pair.count == 2 else { continue }
+            switch pair[0].uppercased() {
+            case "UNTIL": until = pair[1]
+            case "COUNT": count = pair[1]
+            default: break
+            }
+        }
+        if let until { return untilDay(until, zone: zone).map(LastDay.day) ?? .unreadable }
+        guard let count else { return .none }
+        guard let n = Int(count),
+              let day = day(ofOccurrence: n, of: "RRULE:" + withoutEnd(body), seriesStart: seriesStart, anchor: anchor, missingDay: missingDay)
+        else { return .unreadable }
+        return .day(day)
+    }
+
+    /// A rule's parts without its `UNTIL` and `COUNT` (no `RRULE:` prefix): its pattern.
+    static func withoutEnd(_ rrule: String) -> String {
+        let body = rrule.uppercased().hasPrefix("RRULE:") ? String(rrule.dropFirst("RRULE:".count)) : rrule
+        return body.split(separator: ";").map(String.init)
+            .filter { !$0.uppercased().hasPrefix("UNTIL=") && !$0.uppercased().hasPrefix("COUNT=") }
+            .joined(separator: ";")
+    }
+
     /// The first day the rule places an occurrence on, on or after a given day.
     enum FirstDay: Equatable, Sendable {
         /// The day.

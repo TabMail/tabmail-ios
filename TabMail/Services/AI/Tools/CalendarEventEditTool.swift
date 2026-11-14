@@ -400,14 +400,50 @@ struct CalendarEventEditTool: AgentTool, Sendable {
                 ] as [String: Any])
             }
         }
-        if let reason = CalendarToolHelpers.allDayEditRefusal(
-            arguments, storedStart: kindSource.start, scope: resolvedScope, recurrenceId: recurrenceIdArg,
-            occurrenceStartDay: occurrenceStartDay, namedOccurrenceStart: named.occurrence?.start) {
+        // The edit as the queue writes it, by the queue's own builder (`writeInput`), which refuses
+        // what `allDayEditRefusal` refuses.
+        let input: GCalEventInput
+        do {
+            input = try CalendarSeriesScope.writeInput(
+                arguments, scope: resolvedScope, named: named, written: kindSource, recurrenceId: recurrenceIdArg,
+                occurrenceStartDay: occurrenceStartDay, zone: tz)
+        } catch let refused as CalendarProviderError {
             return ToolJSON.string(from: [
                 "ok": false,
-                "error": "calendar_event_edit failed: \(reason). The event was NOT changed.",
+                "error": "calendar_event_edit failed: \(refused.reason). The event was NOT changed.",
                 "event_id": compoundId,
             ] as [String: Any])
+        }
+
+        // A series write the calendar's own write would refuse before writing anything is refused
+        // here, before the card, in the write's words (#718): the calendar runs the plan its write
+        // makes (`refuseSeriesWrite`) on the write the queue makes, by the id the queue writes to
+        // (the series' for an edit of every occurrence, `route`'s for a split) and the edit as the
+        // queue builds it (`input`). The write checks again, since the series can change.
+        let seriesWrite: SeriesWrite?
+        if resolvedScope == "all", shown.recurrence?.isEmpty == false {
+            seriesWrite = .everyOccurrence(seriesId: named.seriesId, series: shown, edit: input)
+        } else if resolvedScope == "this_and_following", let rid = recurrenceIdArg {
+            seriesWrite = .split(eventId: queuedEventId, recurrenceId: rid, zone: ridZone, edit: input)
+        } else {
+            seriesWrite = nil
+        }
+        if let seriesWrite {
+            do {
+                try await provider.refuseSeriesWrite(calendarId: lookupCalId, write: seriesWrite)
+            } catch let refused as CalendarProviderError {
+                return ToolJSON.string(from: [
+                    "ok": false,
+                    "error": "calendar_event_edit failed: \(refused.reason). The event was NOT changed.",
+                    "event_id": compoundId,
+                ] as [String: Any])
+            } catch {
+                return ToolJSON.string(from: [
+                    "ok": false,
+                    "error": "calendar_event_edit failed: could not read the repeating event to check this change (\(error.localizedDescription)). The event was NOT changed. Retry.",
+                    "event_id": compoundId,
+                ] as [String: Any])
+            }
         }
 
         // Resolve proposed dates — prefer arguments (new values), fall back to current event state.
@@ -418,7 +454,8 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         // presence, so an `all`-scope edit shows the series it writes.
         //
         // A whole-series edit may reset the occurrences the user changed one by one (#423): on
-        // Outlook any change of the series' rule, start or end does. Say so on the card. The
+        // Outlook any change of the series' rule, start or end does, but for a new length and a
+        // new last date alone (#718). Say so on the card. The
         // series' calendar decides, as its write does, from the series the edit writes
         // (`shown`, the series read above) and the edit as routed, which is what the queue writes; a
         // rename, or a rule equal to the stored one, which the assistant re-sends with other edits,
@@ -455,6 +492,25 @@ struct CalendarEventEditTool: AgentTool, Sendable {
                arguments, isAllDay: CalendarToolHelpers.boolArg(arguments, "all_day") ?? shown.isAllDay),
            provider.editResetsChangedOccurrences(shown, edit: edit) {
             changes.append(CalendarToolHelpers.ruleChangeResetNote)
+        }
+        // A rule that moves the series' last date earlier removes the meetings after it, on every
+        // calendar: the card says how many (#718), counted the same way for each
+        // (`CalendarSeriesEndRemoval`, from the stored rule less the occurrences deleted). A count
+        // that can't be worked out shows no card.
+        if resolvedScope == "all", shown.recurrence?.isEmpty == false, input.recurrence != nil {
+            do {
+                if let removal = try await CalendarSeriesEndRemoval.removal(
+                    series: shown, seriesId: named.seriesId, edit: input, calendarId: lookupCalId, provider: provider),
+                   removal.count.map({ $0 > 0 }) ?? true {
+                    changes.append(CalendarToolHelpers.seriesEndRemovalNote(removal))
+                }
+            } catch {
+                return ToolJSON.string(from: [
+                    "ok": false,
+                    "error": "calendar_event_edit failed: could not read the repeating event to check this change (\(error.localizedDescription)). The event was NOT changed. Retry.",
+                    "event_id": compoundId,
+                ] as [String: Any])
+            }
         }
         let showsOccurrence = resolvedScope != "all"
         let masterDuration: TimeInterval? = {

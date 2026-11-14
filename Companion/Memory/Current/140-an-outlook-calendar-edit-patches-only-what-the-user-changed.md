@@ -217,7 +217,26 @@ that aren't included in the request body maintain their previous values".
   equal re-sent rule is refused too: deciding equality in a guessed zone could drop a real change.
   A changed rule still resets the series' exceptions: that is Graph's behaviour whenever the pattern
   changes (measured above), and reapplying them was not built. So does a moved start or end (measured
-  2026-11-10 above). The confirmation card says so instead: every whole-series (`scope` "all") edit of
+  2026-11-10 above). Except (measured on a work account 2026-11-14, #718, ADR-IOS-113 decision 7): a
+  rule that differs from the stored one only in its range's `endDate`, both ending on a date, written
+  with the stored start and end, resets nothing, earlier or later; an earlier end removes the
+  occurrences placed after it, changed ones too. Outlook's card answers no reset for it
+  (`ExchangeCalendarProvider.newRangeEnd`, `sameRule(_:as:ignoringEnd:)`) only when the start and end
+  the write restates carry the stored labels exactly (`restatesStoredTimes`, `originalStartTimeZone` /
+  `originalEndTimeZone`, now read by `getEvent`); a relabel is unmeasured and stays a reset
+  (`outlookEarlierSeriesEndRelabelledIsAReset`). Google likewise (measured on the Workspace test
+  account 2026-11-14, ADR-IOS-113 decision 7): a recurrence that changes only its rule's `UNTIL`
+  (`GoogleCalendarProvider.changesOnlyUntil`: the stored rule `UNTIL`- or `COUNT`-ended, the edit
+  `UNTIL`-ended, same pattern, `EXDATE`/`RDATE` as stored) with the series' own start and end (`googleTimes`, which the write then does not send)
+  keeps the changed occurrences placed on or before the new end and cancels those after it, by
+  original place; the card answers no reset (`googleCardCountsTheMeetingsRemoved`,
+  `googleCountGivenAnEarlierUntilKeepsThem`), while a new pattern, a new `COUNT`, length or start still warns (`googleEarlierEndWithANewPatternResets`). Every calendar's card shows, for an earlier end,
+  "N meetings after <date> are removed." (`CalendarSeriesEndRemoval`, shared, from the stored rule less
+  `cancelledOccurrences` through `deletedOccurrencePlaces`, ADR-IOS-113 decision 8,
+  `CalendarToolHelpers.seriesEndRemovalNote`). `FakeGraphCalendar` models it (no reset counted; with
+  `modelsExceptions` the occurrences after the new end are gone). Pinned in
+  `SeriesLengthKeepsExceptionsTests` (`outlookEarlierSeriesEndAloneKeepsExceptions`,
+  `outlookLaterSeriesEndAloneKeepsExceptions`). The confirmation card says so instead: every whole-series (`scope` "all") edit of
   an event that has a rule asks the series' calendar, and gets the line
   `CalendarToolHelpers.ruleChangeResetNote` ("Occurrences you changed individually may be reset.") when
   it says the edit resets changed occurrences: `CalendarProvider.editResetsChangedOccurrences(_:edit:)`

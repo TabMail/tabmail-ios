@@ -37,3 +37,22 @@ Routed out of `CLAUDE.md` by the `companion-compact` skill (2026-11-10). A short
 > valid for mail and invalid for drafts and CalDAV events — for those paths, say why the specific
 > loss is acceptable.
 <!-- preserved-block-end -->
+
+### The count now (outside the preserved block)
+
+The block above is preserved as written (seven). The census has since grown, each step adjudicated in
+`Companion/Memory/Current/102-there-are-four-irreversible-wire-operations-not-one.md`, and the inline
+list in `CLAUDE.md` carries all of them. **Eleven** (2026-11-14): (8) the CalDAV one-occurrence
+delete's `EXDATE` `PUT` (#661); (9) a this-and-following delete's series end on Google and Outlook
+(`endSeries`, #695); (10) the Outlook carry's `DELETE` of an occurrence (a split's new part, #563; a
+series after its length change, #718); (11) Outlook's series `PATCH` that moves its time, which resets
+every occurrence changed or deleted on its own (#718). The predicate and the greps are unchanged.
+
+**Twelve** (decided 2026-11-14, #718): (12) a whole-series edit that moves the end earlier
+removes the later occurrences, changed ones included, on all three providers: Google's `patchEvent`
+sending a recurrence whose rule changes only where it ends (to an `UNTIL`), Outlook's
+`graphPatchJSON` sending a range whose `endDate` alone moves, and CalDAV's `updateEvent` `PUT` built
+by `earlierEndResource` (overrides placed after the new last date dropped). Its warning is the card's
+"N meetings after <date> are removed." (`CalendarSeriesEndRemoval`). The predicate and the greps are
+unchanged; re-run over the same roots: A=10, B=3, C=4, D=3, E=2, and `method\s*:\s*"PATCH"` 11 (main
+at `c975c9baf`: 9 / 3 / 4 / 3 / 2, PATCH 10). Adjudication of the differences in the memory file.

@@ -160,7 +160,7 @@ extension MockCalendarProvider {
 /// Whether a whole-series edit resets the occurrences changed one by one, which Google
 /// and CalDAV answer by its rule, as their edits write it: Google replaces the series'
 /// whole `recurrence`, CalDAV only its RRULE line. Google also answers yes for a moved start
-/// or end, pinned against its fake calendar here; Outlook's answer (its rule, start or end)
+/// (not for a new end alone, #718), pinned against its fake calendar here; Outlook's answer (its rule, start or end)
 /// is pinned against its write in `ExchangeCalendarEditPreservationTests`.
 @Suite("CalendarProvider.editResetsChangedOccurrences on Google and CalDAV")
 struct CalendarProviderRuleChangedTests {
@@ -272,13 +272,14 @@ struct CalendarProviderRuleChangedTests {
             return input
         }
 
-        /// A new start or end, or the same instant in another zone, resets the series. A zone name
-        /// that resolves to no zone is the same only as itself.
-        var resets: Bool { [.laterStart, .sameInstantOtherZone, .endOnly, .allDayMovedDate, .unrecognizedZoneOther].contains(self) }
+        /// A new start, or the same instant in another zone, resets the series; a new end alone
+        /// does not (#718, measured). A zone name that resolves to no zone is the same only as itself.
+        var resets: Bool { [.laterStart, .sameInstantOtherZone, .allDayMovedDate, .unrecognizedZoneOther].contains(self) }
     }
 
-    /// Google resets a series' changed occurrences when a whole-series edit moves its start or
-    /// end, even with its rule unchanged (measured), and its edit writes the series' start and
+    /// Google resets a series' changed occurrences when a whole-series edit moves its start, even
+    /// with its rule unchanged (measured), and keeps them when it moves its end alone, each taking
+    /// the new length from its own start (measured, #718); its edit writes the series' start and
     /// end every time. The card's answer is whether the fake calendar, which resets as Google
     /// did, reset the series, and a moved occurrence is gone exactly then.
     @Test("Google: the card's answer to whether a whole-series edit resets changed occurrences is the write's",
@@ -316,6 +317,12 @@ struct CalendarProviderRuleChangedTests {
         #expect(answer == reset, "\(edit): the card says \(answer ? "a reset" : "no reset"), the write \(reset ? "reset" : "did not reset") the series")
         #expect(answer == edit.resets, "\(edit): the card says \(answer ? "a reset" : "no reset")")
         #expect((calendar.event("ser-g_20990112T090000Z") == nil) == edit.resets, "\(edit): the moved occurrence was \(reset ? "dropped" : "kept")")
+        if edit == .endOnly {
+            // Kept where it was moved, an hour long as every occurrence now is.
+            let kept = calendar.event("ser-g_20990112T090000Z")
+            #expect((kept?["start"] as? [String: Any])?["dateTime"] as? String == "2099-01-12T10:00:00Z", "\(String(describing: kept))")
+            #expect((kept?["end"] as? [String: Any])?["dateTime"] as? String == "2099-01-12T11:00:00Z", "\(String(describing: kept))")
+        }
     }
 
     @Test("CalDAV: an edit changes the rule when its RRULE differs from the series' own, however spelled", arguments: Edit.allCases)

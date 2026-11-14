@@ -259,6 +259,54 @@ These tests read what each provider sent, or what the fake server ends up holdin
   the new part, and pairs by kind (a same-name item is no copy; a type name in other case is).
   `FakeGraphCalendar` models Outlook's measured copies: an exception holds its own copies of the
   series' attachments, a plain occurrence reads the series' through.
+- A new length of an Outlook series keeps its changed occurrences' own files (#718,
+  `SeriesLengthKeepsExceptionsTests`, against `FakeGraphCalendar` with `modelsExceptions`: a reset
+  erases an occurrence's attachments, the etag is series-wide and `If-Match` is checked): each file is
+  on its occurrence again once (a same-name replacement and an inline logo included, the series' copies
+  not doubled), after a lost answer too; a linked file or an item of its own is refused at the card and
+  at the drain with nothing written, a series item is not; a file too large retires the operation with
+  its name and date and keeps its bytes; a file not read back keeps it queued, and the retry attaches
+  it; one that never reads back is added on `putBackUnconfirmedAttempts` attempts at most, then retires
+  the operation with it kept; an occurrence changed elsewhere is counted and still gets its files; a stale etag is read again,
+  and `putBackConflictReads` refusals keep the operation queued; a deleted occurrence releases its
+  files; a lost or changed saved copy is counted and dropped; a record of a later version leaves the
+  operation queued with nothing written. The series write's state is kept, never re-read: a retry after
+  a landed write puts back from the record though another client changed the series' time since; a
+  write refused for good before it landed (404, 403) deletes the copies and shows the ordinary failure;
+  files a capture saved before an error of the same plan are released; the put-back's outcome (events,
+  a file too large) is the inbox banner's text; two occurrences with the same bytes, one restored, keep
+  the bytes for the other. The series write is sent on the capture's etag: one sent but not landed (500),
+  then a changed occurrence deleted before the retry, is refused (412), read again, and the occurrence
+  stays deleted with its saved file released; one landed with its answer lost, then overtaken by another
+  client's change, is refused, read again, and still puts back the moved, renamed and deleted occurrences
+  and the file the first attempt kept; the series write's `If-Match` is the record's kept etag (asserted
+  on the request), or the read's when it kept nothing (a change made before the write is refused, read
+  and put back), a saved file is released on its occurrence read back 404 or 410, and a rule is held only when every value sent is (`holdsValues`). A deleted place changed since the reset is skipped
+  and the put-back goes on (a later deleted place deleted again). `CalendarPutBackFilesTests` pins the bytes' lifecycle: the
+  reclaim spares a held failed row, the Settings wipe and a release boundary leave it, the drain-start
+  sweep removes only orphans, the failure banner shows a held row until dismissed and the dismissal
+  deletes its bytes, Save File's names are safe, and a row whose write was never sent holds no files
+  (`CalendarPutBackFiles.held`, the one definition), and a row whose record can't be read holds every
+  file its directory holds through a retirement and the reclaim, offered to save. `SeriesEndRemovalCardTests`
+  pin that a rename re-sending the stored end of an `RDATE` or zoneless series shows its card with no
+  removal line (`mayEndEarlier`, a table of rule pairs).
+- A new last date alone of an Outlook series is no reset (#718, `SeriesLengthKeepsExceptionsTests`,
+  `FakeGraphCalendar` modelling a range-end-only `PATCH` as measured): an earlier end keeps the moved
+  occurrence (time, title, own file) and the deleted one, removes the changed and plain ones after it,
+  and its card shows no reset note and "2 meetings after <date> are removed." (the deleted one after
+  the end not counted); a later end keeps everything and its card shows neither line; a series stored
+  under another name of its zone is warned of as a reset. `SeriesEndRemovalCardTests`: the same line on
+  Google and CalDAV beside their reset note (a moved occurrence counted by its place, one moved 30 days
+  past the stored end counted once, a deleted one, an EXDATE or a cancelled override not; a CalDAV
+  series on a calendar other than the default one), a COUNT-ended series, an edit giving a COUNT, a
+  series with no end ("All meetings after"), a stored rule the expander can't read (no card, retry
+  error), none for a later end, and a source check that the shared count names no provider and lists
+  nothing. `calDAVEarlierEndDropsOverridesPlacedAfterIt`: on CalDAV the one `PUT` drops the overrides
+  placed after the new last date (one moved before it, one not moved) and keeps one placed before it but
+  moved past it, and the card counts by place. On Google an earlier `UNTIL` alone shows the removal line with no reset note
+  (`googleCardCountsTheMeetingsRemoved`), as does a `COUNT=8` series given an earlier `UNTIL`
+  (`googleCountGivenAnEarlierUntilKeepsThem`), and one that also changes the pattern still shows the note
+  (`googleEarlierEndWithANewPatternResets`).
 
 ## Google attendee edits — the others stay as stored
 

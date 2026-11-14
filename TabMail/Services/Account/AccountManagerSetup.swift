@@ -17,6 +17,13 @@ enum AccountRemovalError: LocalizedError {
     }
 }
 
+/// Account removal refused before anything was changed (#718): the account's calendar changes hold
+/// more saved put-back files than the user was warned of (`savedFiles` now). The user is warned
+/// again with the new count, and nothing is removed until they confirm it.
+struct AccountRemovalSavedFilesGrew: Error, Equatable {
+    let savedFiles: Int
+}
+
 extension AccountManager {
 
     // MARK: - Gmail Account Setup
@@ -559,7 +566,12 @@ extension AccountManager {
 
     // MARK: - Account Management
 
-    func removeAccount(_ account: Account) async throws {
+    /// Removes `account` and all its local data. `warnedSavedFiles` is the number of saved put-back
+    /// files (#718) the user's confirmation warned would be deleted
+    /// (`LateCalendarFailureStore.heldFileCount`): it is counted again in the row-delete
+    /// transaction, and when it has grown the removal throws `AccountRemovalSavedFilesGrew`, with
+    /// nothing changed.
+    func removeAccount(_ account: Account, warnedSavedFiles: Int) async throws {
         let acctId = account.id
 
         // Capture every identifier needed for post-commit file/Keychain cleanup
@@ -605,9 +617,20 @@ extension AccountManager {
         // Await any write already admitted to GRDB, fence queued closures, and
         // purge retry/overlay state before the row-delete transaction begins.
         await AccountFieldPersistenceStore.production.discardAccount(acctId)
+        // The account's calendar operations, whose saved put-back files (#718) go with it. They are
+        // counted again inside the delete: a drain may have saved more since the user was warned
+        // (a file is saved before its record is kept, so a record kept before this transaction has
+        // its files on the device already). More than the warning said refuses the removal.
+        let calendarOpIds: [String]
         do {
-            try await dbPool.write { db in
+            calendarOpIds = try await dbPool.write { db -> [String] in
+                let held = try LateCalendarFailureStore.heldFiles(db, accountId: acctId)
+                let count = LateCalendarFailureStore.heldFileCount(held)
+                if count > warnedSavedFiles { throw AccountRemovalSavedFilesGrew(savedFiles: count) }
+                let ids = try String.fetchAll(
+                    db, sql: "SELECT id FROM pendingCalendarOperation WHERE accountId = ?", arguments: [acctId])
                 try Self.removeAccountRowsTxn(db, accountId: acctId, wasPrimary: wasPrimary)
+                return ids
             }
         } catch {
             await AccountFieldPersistenceStore.production.reactivateAccount(acctId)
@@ -673,6 +696,9 @@ extension AccountManager {
         )
         for message in cleanupInventory.1 {
             message.deleteAttachments()
+        }
+        for opId in calendarOpIds {
+            CalendarPutBackFiles.remove(opId: opId)
         }
 
         // The local removal is complete. Remote attempts must not hold Settings

@@ -317,6 +317,18 @@ enum ICSParser {
         return nil
     }
 
+    /// Where a `RECURRENCE-ID` places its occurrence in the series, as `GCalEvent.originalStartTime`
+    /// gives a place: a DATE as its date, a DATE-TIME as its instant (read as `parseICSDate` reads
+    /// one, in the resource's zone context `zones`). Nil when it can't be read.
+    static func occurrencePlace(_ recurrenceId: PropertyValue, zones: CalendarTimeZoneContext) -> GCalDateTime? {
+        let value = recurrenceId.value.trimmingCharacters(in: .whitespaces)
+        if ICSValueType.statesDate(recurrenceId.params ?? "") || (value.count == 8 && !value.contains("T")) {
+            return RecurrenceTail.Day(ical: value).map { GCalDateTime(dateTime: nil, date: $0.description, timeZone: nil) }
+        }
+        return parseICSDate(value, params: recurrenceId.params, zones: zones)
+            .map { GCalDateTime(dateTime: $0.iso8601String(), date: nil, timeZone: nil) }
+    }
+
     private static func parseICSDate(_ value: String, params: String?, zones: CalendarTimeZoneContext) -> Date? {
         let cleaned = value.trimmingCharacters(in: .whitespaces)
         if cleaned.hasSuffix("Z") {

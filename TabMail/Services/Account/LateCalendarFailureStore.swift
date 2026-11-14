@@ -19,9 +19,13 @@ enum CalendarFailureKind: String, Sendable, CaseIterable {
     case unsupported
     /// The calendar refused the request as malformed.
     case refused
+    /// An edit of every occurrence wrote the series but could not put back everything the write
+    /// reset (`CalendarProviderError.seriesPutBackIncomplete`, #718).
+    case putBackIncomplete
 
     /// The plain line the inbox shows for this kind. The stored `failureReason` is text for
-    /// the assistant and is never shown.
+    /// the assistant and is never shown, but for `putBackIncomplete`, whose reason is written for
+    /// the user (`LateCalendarFailure.outcome`).
     var userReason: String {
         switch self {
         case .notFound: return "The event no longer exists."
@@ -29,6 +33,7 @@ enum CalendarFailureKind: String, Sendable, CaseIterable {
         case .signInFailed: return "The calendar account needs you to sign in again."
         case .unsupported: return "This calendar can't make this kind of change."
         case .refused: return "The calendar refused the change."
+        case .putBackIncomplete: return "The series was changed, but not everything it had could be restored. Check it in your calendar."
         }
     }
 }
@@ -75,10 +80,23 @@ struct LateCalendarFailure: Identifiable, Equatable, Sendable {
     let id: String
     let title: String
     let kind: CalendarFailureKind
+    /// The files of changed occurrences the change saved on this device and could not attach
+    /// again (#718, `CalendarPutBackFiles.held`): kept with the row until the user saves or
+    /// dismisses them. Empty for any other failure.
+    var heldFiles: [PutBackFile] = []
+    /// What an edit of every occurrence did not put back after writing the series
+    /// (`CalendarFailureKind.putBackIncomplete`): the stored reason, written for the user (which
+    /// occurrences and files, a file too large for Outlook). Nil for any other failure.
+    var outcome: String?
+
+    /// Whether the row holds saved files, so dismissing it deletes them.
+    var holdsFiles: Bool { !heldFiles.isEmpty }
 
     /// The inbox banner's line.
     var bannerText: String {
-        "A calendar change couldn't be made: \(title). \(kind.userReason)"
+        if let outcome { return "A calendar change wasn't finished: \(title). \(outcome)" }
+        guard holdsFiles else { return "A calendar change couldn't be made: \(title). \(kind.userReason)" }
+        return "A calendar change wasn't finished: \(title). \(PutBackFile.notRestoredMessage(heldFiles.count))"
     }
 }
 
@@ -136,8 +154,12 @@ final class LateCalendarFailureStore {
         }
         guard generation == reloadGeneration else { return }
         failures = rows.compactMap { row in
-            guard let kind = row.failureKind, !row.failureSeen else { return nil }
-            return LateCalendarFailure(id: row.id, title: row.eventTitle ?? "(No title)", kind: kind)
+            // A row holding saved files is shown until the user dismisses it, seen or not: its
+            // files are the only copy (#718).
+            let held = CalendarPutBackFiles.held(row)
+            guard let kind = row.failureKind, !row.failureSeen || !held.isEmpty else { return nil }
+            let outcome = kind == .putBackIncomplete ? row.failureReason.flatMap { $0.isEmpty ? nil : $0 } : nil
+            return LateCalendarFailure(id: row.id, title: row.eventTitle ?? "(No title)", kind: kind, heldFiles: held, outcome: outcome)
         }
         waiting = queued.compactMap { row in
             guard let reason = row.waitReason else { return nil }
@@ -146,7 +168,9 @@ final class LateCalendarFailureStore {
     }
 
     /// Dismiss a failure: its row is deleted, so it is not shown again. When the delete
-    /// fails the banner stays and the user can dismiss it again.
+    /// fails the banner stays and the user can dismiss it again. A failure holding saved files
+    /// (`holdsFiles`) is dismissed only after the user was warned (the banner's confirmation);
+    /// its files are deleted once the row's deletion committed (#718).
     func dismiss(_ failure: LateCalendarFailure) async {
         do {
             try await AppDatabase.dbPool.write { db in
@@ -161,6 +185,46 @@ final class LateCalendarFailureStore {
                 source: "CalendarQueue")
             return
         }
+        if failure.holdsFiles { CalendarPutBackFiles.remove(opId: failure.id) }
         failures.removeAll { $0.id == failure.id }
+    }
+
+    /// The saved files of one calendar operation (#718).
+    struct HeldFiles: Sendable {
+        let opId: String
+        let files: [PutBackFile]
+    }
+
+    /// The saved files of every calendar operation of the account `accountId`, whatever its
+    /// status: what removing the account deletes. Empty when none, or when the rows can't be read.
+    nonisolated static func heldFiles(accountId: String) async -> [HeldFiles] {
+        (try? await AppDatabase.dbPool.read { db in try heldFiles(db, accountId: accountId) }) ?? []
+    }
+
+    /// `heldFiles(accountId:)` read in `db`, so account removal counts them in its own transaction.
+    nonisolated static func heldFiles(_ db: Database, accountId: String) throws -> [HeldFiles] {
+        guard !CalendarPutBackFiles.heldOperationIds().isEmpty else { return [] }
+        let rows = try PendingCalendarOperation.filter(Column("accountId") == accountId).fetchAll(db)
+        return rows.compactMap { row in
+            let files = CalendarPutBackFiles.held(row)
+            return files.isEmpty ? nil : HeldFiles(opId: row.id, files: files)
+        }
+    }
+
+    /// The number of files `held` names: what the user is warned of, and what account removal
+    /// counts again (`AccountManager.removeAccount`).
+    nonisolated static func heldFileCount(_ held: [HeldFiles]) -> Int {
+        held.reduce(0) { $0 + $1.files.count }
+    }
+
+    /// Copies of the saved files `held` under their own names, for the share sheet.
+    nonisolated static func exportFiles(_ held: [HeldFiles]) throws -> [URL] {
+        try held.flatMap { try CalendarPutBackFiles.exportCopies(of: $0.files, opId: $0.opId) }
+    }
+
+    /// Copies of a failure's saved files under their own names, for the share sheet ("Save
+    /// File"). Throws when a copy can't be read or written.
+    func exportFiles(of failure: LateCalendarFailure) throws -> [URL] {
+        try CalendarPutBackFiles.exportCopies(of: failure.heldFiles, opId: failure.id)
     }
 }

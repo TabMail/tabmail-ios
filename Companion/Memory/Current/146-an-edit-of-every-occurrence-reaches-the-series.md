@@ -504,3 +504,52 @@ occurrence's place in the series as `route` judges a split: at the series' first
 whole series, before it refused. Unlike the split, a moved occurrence is cut at its place rather than
 refused. Pinned by `CalendarScopedDeleteTests` (device, delete and read zones all different, the drain
 in the host's).
+
+**2026-11-14 (#718, ADR-IOS-113): a new length, and one check before the card.** An end given alone
+for every occurrence, with no occurrence named, is a length counted from the series' start, refused only
+at zero or less, and routes to the series itself (it lifts the after-card refusal of an end past midnight
+or a longer all-day series). Outlook keeps the occurrences changed or deleted on their own across the
+resetting series `PATCH` (read first, kept on the op as `SeriesEditRecord`, put back with the carry);
+CalDAV gives each override the new length in the same PUT; Google keeps them itself. Every series write
+(edit of every occurrence, split, following delete) is checked before its card by the write's own plan
+(`CalendarProvider.refuseSeriesWrite`), so what the queue's write would refuse before writing is refused
+before the card in the same words (rulings of 2026-11-14 bring Google's and
+CalDAV's split refusals, such as `editedKindRefusal`, before the card too). The tool and the queue build
+the write's input with one function (`CalendarSeriesScope.writeInput`).
+
+**2026-11-14 (#718, ADR-IOS-113 decisions 2 and 6): the files of changed occurrences, and the restore
+guard.** Outlook's reset erases a changed occurrence's own attachments (measured). `ownFiles` (inside
+`lengthChangeExceptions`, so the card's check and the write share it) refuses a linked file or an Outlook
+item the series does not hold, and with the write's `SavedFiles` saves each file of its own under
+`calendar_put_back/<operation id>/<sha256>` (`CalendarPutBackFiles`) before the series `PATCH`, naming
+it in `SeriesEditRecord.files`. The put-back reads each occurrence right before its `PATCH`
+(`guardedPatch`: `type` occurrence only, `If-Match` with the series-wide etag, a 412 read again up to
+`ExchangeCalendarConfig.putBackConflictReads` then `seriesBusy`, queued) and attaches its files again
+add-only (`reattach`), releasing bytes only after a read shows them (`PutBackLedger`). Bytes outlive
+every path but the user's: the reclaim of failed rows spares a row holding bytes
+(`heldOperationIds`), the drain-start sweep removes only orphans, `LateCalendarFailureStore` shows a
+held row until dismissed (Save File, warned delete), and account removal warns and offers Save File,
+then counts the files again in its delete transaction and refuses when there are more than it warned of
+(`AccountRemovalSavedFilesGrew`). A changed occurrence missing from the instances read is read by its own
+id: the window lists by start now, so only a 404 or 410 proves it deleted (`GuardedPatch.gone`).
+Pinned by the file cases of `SeriesLengthKeepsExceptionsTests` and by `CalendarPutBackFilesTests`.
+
+**2026-11-14 (#718, ADR-IOS-113 decision 7): a new last date alone keeps them on Outlook.** A rule that
+changes only where the series ends (Graph range `endDate` to `endDate`) resets nothing (measured on a
+work account), so the card's reset note is not shown for it (`newRangeEnd`) when the write restates the
+stored start and end with their stored zone labels (`restatesStoredTimes`; a relabel stays a reset).
+On EVERY calendar an earlier `UNTIL` gets "N meetings after <date> are removed." (ADR-IOS-113
+decision 8, `CalendarSeriesEndRemoval`, one shared count above the provider boundary, FROM THE STORED
+RULE: `RecurrenceTail` places the occurrences after the new last date up to the stored end, `UNTIL` or
+`COUNT`, in the series' zone, less `EXDATE`s and the calendar's deleted places
+(`CalendarProvider.deletedOccurrencePlaces`); a changed occurrence counts at its place however far it
+moved; a rule with no end gets "All meetings after <date> are removed."; anything unreadable shows no
+card and asks for a retry, never a silent 0). (Superseded same-day first build: a single-events listing
+with a 7-day margin, which undercounted.) On CalDAV the write matches the count (call C1,
+decided 2026-11-14): the same `PUT` drops every override whose `RECURRENCE-ID` is placed after the new last date,
+wherever it was moved, and keeps one placed on or before it even when moved past it
+(`earlierEndResource`, `calDAVEarlierEndDropsOverridesPlacedAfterIt`). Google (`recurrenceLinesDiffer`) and CalDAV (RRULE
+compare) still show the reset note beside it (not measured on either). Pinned by
+`outlookEarlierSeriesEndAloneKeepsExceptions`, `outlookLaterSeriesEndAloneKeepsExceptions`,
+`outlookEarlierSeriesEndRelabelledIsAReset` and `SeriesEndRemovalCardTests` (Google, CalDAV, and the
+source check that the count names no provider and lists nothing).
