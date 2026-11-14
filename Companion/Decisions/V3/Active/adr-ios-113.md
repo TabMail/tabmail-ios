@@ -45,7 +45,9 @@ its card.
    when the put-back runs: a rename or new room another app gives the series in between stays on the
    occurrence (first build: every captured property was written back, so the old title came back).
    An occurrence with nothing of its own left to write is not `PATCH`ed (`guardedPatch` answers
-   `restored`). A split is unchanged: its new part is a new series, with nothing to follow, so its
+   `restored`). That holds too when someone changed it after the reset (it reads as an exception):
+   it is counted as restored, not as left and counted, since the put-back has nothing of it to write
+   and the other change stays as it is (review r1 L1, accepted). A split is unchanged: its new part is a new series, with nothing to follow, so its
    carry writes each changed occurrence whole (`seriesExceptions` keeps every property;
    `carriedWrite` writes guests only when the occurrence's JSON holds them, which a split's read
    always does). A record kept by the first build holds each occurrence whole and is put back whole,

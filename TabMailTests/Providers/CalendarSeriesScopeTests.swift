@@ -4817,6 +4817,34 @@ struct SeriesLengthKeepsExceptionsTests {
         var deleted = false
         /// A room of its own (`location`, and `locations` holding it alone, as Graph writes them).
         var location: String?
+        /// Changed on its own, then set back to the series' values: an exception holding nothing
+        /// of its own.
+        var setBack = false
+        /// Its own guests (`guests(_:)`).
+        var guests: Guests?
+    }
+
+    /// How a changed occurrence's guests differ from the series' (`GraphFixture.attendees`).
+    private enum Guests {
+        /// The series' guests, one address in other letters and answered otherwise: the same
+        /// guests as far as a write can set them.
+        case sameButCaseAndAnswer
+        /// The series' guests and one of its own.
+        case extra(String)
+
+        /// The guests the occurrence holds.
+        var list: [[String: Any]] {
+            var list = GraphFixture.attendees
+            switch self {
+            case .sameButCaseAndAnswer:
+                list[0]["emailAddress"] = ["address": "ANA@Example.com", "name": "Ana"]
+                list[0]["status"] = ["response": "declined", "time": Date().iso8601String()]
+            case .extra(let address):
+                list.append(["emailAddress": ["address": address, "name": "Own guest"], "type": "required",
+                             "status": ["response": "none", "time": "0001-01-01T00:00:00Z"]])
+            }
+            return list
+        }
     }
 
     /// Outlook's series `ser-1` (`GraphSeries`, 30 minutes from `GraphFixture.start`) and its
@@ -4827,8 +4855,10 @@ struct SeriesLengthKeepsExceptionsTests {
         for (n, change) in changes.enumerated() {
             var e = change.hours == 0 ? GraphSeries.occurrence(id: "ser-1-w\(n)", at: week(n))
                 : GraphSeries.moved(id: "ser-1-w\(n)", from: week(n), to: week(n).addingTimeInterval(TimeInterval(change.hours * 3_600)))
-            e["type"] = change.hours == 0 && change.subject == nil && change.location == nil ? "occurrence" : "exception"
+            e["type"] = change.hours == 0 && change.subject == nil && change.location == nil && !change.setBack && change.guests == nil
+                ? "occurrence" : "exception"
             if let subject = change.subject { e["subject"] = subject }
+            if let guests = change.guests { e["attendees"] = guests.list }
             if let location = change.location {
                 e["location"] = ["displayName": location]
                 e["locations"] = [["displayName": location]]
@@ -4952,6 +4982,79 @@ struct SeriesLengthKeepsExceptionsTests {
                 "the put-back wrote the room it read over the series' new one: \(moved ?? [:])")
         let ownRoom = graph.event("ser-1-w2")
         #expect(Self.room(ownRoom) == "Room 9" && Self.rooms(ownRoom) == ["Room 9"], "an occurrence's own room was not put back: \(ownRoom ?? [:])")
+    }
+
+    @Test("Outlook: an occurrence changed on its own and set back to the series' values has nothing of its own to put back: no write reaches it, it shows the series' rename made meanwhile, and the change finishes (#878)")
+    func outlookPutBackWritesNothingForAnOccurrenceWithNothingOfItsOwn() async throws {
+        let changes = [OwnChange(), OwnChange(hours: 2, subject: "Moved"), OwnChange(setBack: true), OwnChange()]
+        let graph = Self.outlookCalendar(changes)
+        Self.otherAppWritesSeriesAfterTheReset(graph) { ["subject": "Roadmap"] }
+        let r = try await outlookTool(graph, Self.newEnd(), eventId: "ser-1", account: "series-length-x-set-back")
+        #expect(r.cards.count == 1 && r.queued.isEmpty, "the change did not finish: cards \(r.cards.count) queued \(reasons(r.queued)); \(r.out)")
+        #expect(graph.seriesResets == 1, "non-vacuity: the series was not reset")
+        #expect(graph.patches("ser-1-w2").isEmpty, "a write reached the occurrence with nothing of its own: \(graph.patches("ser-1-w2"))")
+        #expect(graph.event("ser-1-w2")?["subject"] as? String == "Roadmap", "week 2: \(graph.event("ser-1-w2") ?? [:])")
+        let start = Self.week(2)
+        #expect(instant(graph.event("ser-1-w2")?["start"]) == start && instant(graph.event("ser-1-w2")?["end"]) == start.addingTimeInterval(Self.length),
+                "week 2 does not last the new length at its place: \(graph.event("ser-1-w2") ?? [:])")
+        #expect(graph.event("ser-1-w1")?["subject"] as? String == "Moved", "week 1: \(graph.event("ser-1-w1") ?? [:])")
+    }
+
+    /// The addresses of an Outlook event's guests, in lower case.
+    private static func guestAddresses(_ event: [String: Any]?) -> Set<String> {
+        Set((event?["attendees"] as? [[String: Any]] ?? []).compactMap {
+            (($0["emailAddress"] as? [String: Any])?["address"] as? String)?.lowercased()
+        })
+    }
+
+    @Test("Outlook: guests an occurrence holds as the series does (other letters, other answers) follow a guest the series gains meanwhile; guests of its own are put back (#878)")
+    func outlookPutBackGuestsFollowTheSeriesUnlessTheirOwn() async throws {
+        let changes = [OwnChange(), OwnChange(hours: 2, guests: .sameButCaseAndAnswer), OwnChange(guests: .extra("cy@example.com")), OwnChange()]
+        let graph = Self.outlookCalendar(changes)
+        Self.otherAppWritesSeriesAfterTheReset(graph) {
+            ["attendees": GraphFixture.attendees + [["emailAddress": ["address": "dee@example.com", "name": "Dee"], "type": "required",
+                                                     "status": ["response": "none", "time": "0001-01-01T00:00:00Z"]]]]
+        }
+        let r = try await outlookTool(graph, Self.newEnd(), eventId: "ser-1", account: "series-length-x-guests-meanwhile")
+        #expect(r.cards.count == 1 && r.queued.isEmpty, "cards \(r.cards.count) queued \(reasons(r.queued)); \(r.out)")
+        #expect(Self.guestAddresses(graph.event("ser-1")).contains("dee@example.com"), "non-vacuity: the series gained no guest")
+        let same = graph.event("ser-1-w1")
+        let start = Self.week(1).addingTimeInterval(2 * 3_600)
+        #expect(instant(same?["start"]) == start, "non-vacuity: week 1 was not put back at its own time: \(same ?? [:])")
+        #expect(Self.guestAddresses(same) == ["ana@example.com", "bo@example.com", "room-1@example.com", "dee@example.com"],
+                "the put-back wrote guests the occurrence held as the series did over the series' new guest: \(same ?? [:])")
+        let own = Self.guestAddresses(graph.event("ser-1-w2"))
+        #expect(own.contains("cy@example.com"), "an occurrence's own guest was not put back: \(own)")
+    }
+
+    @Test("Outlook: a record kept by the first build (each changed occurrence whole), resumed, is put back whole: the title it holds as the series did is written over a rename made meanwhile (#878)")
+    func outlookFirstBuildRecordIsPutBackWhole() async throws {
+        let graph = Self.outlookCalendar([OwnChange(), OwnChange(hours: 2), OwnChange()])
+        // The first build's capture: the occurrence's every kept property, the series' guests.
+        let keptKeys: Set<String> = [
+            "subject", "body", "importance", "sensitivity", "showAs", "categories", "isReminderOn", "reminderMinutesBeforeStart",
+            "location", "locations", "isAllDay", "responseRequested", "allowNewTimeProposals", "hideAttendees",
+            "id", "originalStart", "start", "end", "attendees", "type", "seriesMasterId",
+        ]
+        let whole = try #require(graph.event("ser-1-w1")).filter { keptKeys.contains($0.key) }
+        let capture = try JSONSerialization.data(
+            withJSONObject: ["series": ["attendees": GraphFixture.attendees], "changed": [whole], "deleted": [String]()], options: [.sortedKeys])
+        let record = SeriesEditRecord(seriesId: "ser-1", capture: String(decoding: capture, as: UTF8.self), write: .sent,
+                                      seriesEtag: graph.etag(of: "ser-1")).jsonObject
+        var args = Self.newEnd()
+        args.merge(try JSONDecoder().decode([String: JSONValue].self, from: JSONSerialization.data(withJSONObject: [SeriesEditRecord.argumentKey: record]))) { _, new in new }
+        Self.otherAppWritesSeriesAfterTheReset(graph) { ["subject": "Roadmap"] }
+        let rows = try await outlook(graph, eventId: "ser-1", args, account: "series-length-x-first-build-record")
+        #expect(rows.isEmpty, "rows: \(reasons(rows))")
+        #expect(graph.seriesResets == 1 && graph.event("ser-1")?["subject"] as? String == "Roadmap",
+                "non-vacuity: the series was not reset and renamed: \(graph.event("ser-1") ?? [:])")
+        let sent = graph.patches("ser-1-w1")
+        #expect(sent.count == 1, "week 1's writes: \(sent)")
+        guard sent.count == 1 else { return }
+        for key in ["subject", "body", "showAs", "location", "locations", "attendees"] {
+            #expect(sent[0][key] != nil, "\(key) of the first build's record was not put back: \(sent[0].keys.sorted())")
+        }
+        #expect(graph.event("ser-1-w1")?["subject"] as? String == "Planning", "week 1: \(graph.event("ser-1-w1") ?? [:])")
     }
 
     @Test("Outlook: the write's answer lost, the retry puts back what the first attempt kept on the operation")
@@ -7034,5 +7137,74 @@ private final class Tally: Sendable {
             taken += 1
             return true
         }
+    }
+}
+
+// MARK: - What a changed Outlook occurrence holds of its own (#878)
+//
+// **INVARIANT (#878).** *A property leaves the put-back's capture only when the series is shown
+// holding the same value:* a value the occurrence really holds of its own is never dropped (a key
+// the series lacks, a different value, a place differing in either key), and what places and names
+// the occurrence is never dropped.
+
+@Suite("A changed Outlook occurrence keeps only what it holds of its own (#878)")
+struct PutBackOwnChangesTests {
+    private static func guest(_ address: String, name: String, type: String, response: String) -> [String: Any] {
+        ["emailAddress": ["address": address, "name": name], "type": type, "status": ["response": response, "time": Date().iso8601String()]]
+    }
+
+    private static var series: [String: Any] { [
+        "subject": "Planning", "showAs": "busy", "categories": NSNull(), "importance": "normal",
+        "location": ["displayName": "Room A"], "locations": [["displayName": "Room A"], ["displayName": "Room B"]],
+        "attendees": [guest("ana@example.com", name: "Ana", type: "required", response: "accepted")],
+        "start": ["dateTime": "2099-01-05T10:00:00.0000000", "timeZone": "UTC"], "id": "ser-1",
+    ] }
+
+    private static func own(_ edit: (inout [String: Any]) -> Void) -> [String: Any] {
+        var exception = series
+        exception["id"] = "ser-1-w1"
+        exception["originalStart"] = "2099-01-05T10:00:00Z"
+        exception["type"] = "exception"
+        edit(&exception)
+        return ExchangeCalendarProvider.ownChanges(exception, series: series)
+    }
+
+    @Test("what the occurrence holds as the series does is dropped, a null as a null included; what places and names it stays")
+    func sameValuesAreDropped() {
+        let kept = Self.own { _ in }
+        for key in ["subject", "showAs", "categories", "importance", "location", "locations", "attendees"] {
+            #expect(kept[key] == nil, "\(key) held as the series does was kept: \(kept[key] ?? "")")
+        }
+        for key in ["start", "id", "originalStart", "type"] {
+            #expect(kept[key] != nil, "\(key) was dropped")
+        }
+    }
+
+    @Test("the place goes only as a whole: the same room with another list of rooms keeps both")
+    func placeKeysGoTogether() {
+        let kept = Self.own { $0["locations"] = [["displayName": "Room A"]] }
+        #expect(kept["location"] != nil && kept["locations"] != nil, "\(kept)")
+        let other = Self.own { $0["location"] = ["displayName": "Room 9"] }
+        #expect(other["location"] != nil && other["locations"] != nil, "\(other)")
+    }
+
+    @Test("a property the series does not hold is kept; one the occurrence does not hold is not added")
+    func aKeyMissingOnOneSideIsKept() {
+        let kept = Self.own { $0["sensitivity"] = "normal"; $0["hideAttendees"] = NSNull(); $0["importance"] = nil }
+        #expect(kept["sensitivity"] as? String == "normal", "\(kept)")
+        #expect(kept["hideAttendees"] is NSNull, "a null against a property the series does not hold was dropped: \(kept)")
+        #expect(kept["importance"] == nil, "\(kept)")
+        let held = Self.own { $0["categories"] = ["Blue category"] }
+        #expect(held["categories"] != nil, "a value against the series' null was dropped: \(held)")
+    }
+
+    @Test("guests are the same in other letters and with other answers, and differ by name or type")
+    func guestsComparedByWhatAWriteSets() {
+        let same = Self.own { $0["attendees"] = [Self.guest("ANA@Example.COM", name: "Ana", type: "required", response: "declined")] }
+        #expect(same["attendees"] == nil, "\(same)")
+        let named = Self.own { $0["attendees"] = [Self.guest("ana@example.com", name: "Ana B.", type: "required", response: "accepted")] }
+        #expect(named["attendees"] != nil, "another name was dropped: \(named)")
+        let typed = Self.own { $0["attendees"] = [Self.guest("ana@example.com", name: "Ana", type: "optional", response: "accepted")] }
+        #expect(typed["attendees"] != nil, "another type was dropped: \(typed)")
     }
 }
