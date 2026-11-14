@@ -61,7 +61,14 @@ iOS was out of parity (ADR-IOS-008).
   series in a zone TabMail does not recognize is refused, one rule with the split (decided
   2026-11-13): at the drain, after the card, nothing written, the op retired as failed, in a delete's
   words ("...so it did not delete these occurrences. Delete them in your calendar app instead.").
-  #746 lifts the refusal for both; a check before the card is #718's. A split recorded earlier on such
+  #746 lifts the refusal for both; a check before the card is #718's.
+  **Amended 2026-11-14 (#718):** the refusal now comes before the card, in the same words, from the
+  delete's own cap plan (`CalendarProvider.refuseSeriesWrite`, `.followingDelete`; Outlook's
+  `endPlan`, the plan `endSeries` writes); the drain checks again. A series whose range and event name
+  no zone at all is refused in a delete's words too: "Outlook gives no time zone for this repeating
+  event, so it did not delete these occurrences. Delete them in your calendar app instead." (it used
+  the split's sentence). Google and CalDAV make no request for this check (their cap plan has nothing
+  that refuses before writing). A split recorded earlier on such
   a series and cut off midway can't be finished either; no real user is known to have one (memory 142).
 - A series changed between the card and the drain is still cut at the confirmed place (Google's and
   Outlook's `PATCH` carry no precondition; CalDAV's `PUT` is conditional on its own GET).

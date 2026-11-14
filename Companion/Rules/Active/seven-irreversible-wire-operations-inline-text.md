@@ -37,3 +37,13 @@ Routed out of `CLAUDE.md` by the `companion-compact` skill (2026-11-10). A short
 > valid for mail and invalid for drafts and CalDAV events — for those paths, say why the specific
 > loss is acceptable.
 <!-- preserved-block-end -->
+
+### The count now (outside the preserved block)
+
+The block above is preserved as written (seven). The census has since grown, each step adjudicated in
+`Companion/Memory/Current/102-there-are-four-irreversible-wire-operations-not-one.md`, and the inline
+list in `CLAUDE.md` carries all of them. **Eleven** (2026-11-14): (8) the CalDAV one-occurrence
+delete's `EXDATE` `PUT` (#661); (9) a this-and-following delete's series end on Google and Outlook
+(`endSeries`, #695); (10) the Outlook carry's `DELETE` of an occurrence (a split's new part, #563; a
+series after its length change, #718); (11) Outlook's series `PATCH` that moves its time, which resets
+every occurrence changed or deleted on its own (#718). The predicate and the greps are unchanged.

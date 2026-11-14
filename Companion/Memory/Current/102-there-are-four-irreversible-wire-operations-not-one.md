@@ -660,3 +660,45 @@ leaves the series whole. The census count is now ten.
 
 **Negative case.** Re-adjudicate if the carry ever deletes an occurrence of a series it did not just
 create, matches an occurrence by anything other than its place, or deletes outside carry mode.
+
+## Re-derived for #718, a new length of every occurrence of an Outlook series (2026-11-14): ELEVEN
+
+Census greps re-run over `TabMail/ Shared/ TabMailNotificationService/` (the five above plus
+`method\s*:\s*"PATCH"`): no new spelling. The `DELETE` hits in `ExchangeCalendarProvider` are
+`deleteEvent` (excluded: Recoverable Items) and the carry's occurrence `DELETE`, (10). The `PATCH` hits
+there are `updateEvent`'s series write, an occurrence edit, the carry's occurrence writes and the
+split's cap.
+
+**(10) widened, count unchanged.** The same call site (`ExchangeCalendarProvider.carry`) now also
+runs as the put-back after a new length of every occurrence (`updateSeries`, `putBack`). Its negative
+case fired ("deletes an occurrence of a series it did not just create"), so it was re-adjudicated: the
+put-back `DELETE` removes, from the series itself, an occurrence the series' own `PATCH` just brought
+back at a place the user had deleted (Graph brings deleted occurrences back on a time move, measured
+2026-11-14). It holds nothing of the user's own unless it was changed since; the put-back deletes
+only an instance whose `type` is `occurrence` and stops otherwise, with nothing deleted. It is found by
+its place among the series' `/instances` (every page), never by position, and only at places the
+operation's record holds as deleted. (10) now reads: the Outlook carry's `DELETE` of an occurrence (a
+split's new part, #563; a series after its length change, #718).
+
+**(11) Outlook's series `PATCH` that moves the series' time — IN the set (2026-11-14, #718).**
+`ExchangeCalendarProvider.updateEvent`'s `PATCH` of a series' start or end (reached by `updateSeries`
+for an edit of every occurrence). Measured 2026-11-14: Graph resets every occurrence changed on its
+own to a plain occurrence (its own time, title, notes, place and guests, the attendees' answers and its
+own attachments are gone, and nothing on the server holds them) and brings back every occurrence
+deleted on its own; a pattern change also gives every occurrence a new id. Main wrote this `PATCH` for
+every whole-series time move before #718; it is counted now, by the property.
+
+Guards for a new length alone (#718): before the `PATCH` the write reads every changed and deleted
+occurrence (`seriesExceptions`) and keeps them on the queued operation (`SeriesEditRecord`, pending-op
+scope, cleared when the operation completes); after it, the carry puts them back (re-deletes the
+deleted ones, moves and rewrites the changed ones). A put-back that can't be planned (a series zone
+TabMail can't read with an occurrence moved or deleted on its own) is refused before the confirmation
+card and again at the write, with nothing written. Not restored: attendee answers (read-only in
+Graph). A changed occurrence's own attachments are handled by the attachment rule of the same
+release (open at the time of writing; it must land before the release). Any other whole-series time
+move (a start move, a rule change) keeps main's behaviour: the card warns that individually changed
+occurrences may be reset (`ruleChangeResetNote`).
+
+**Negative case.** Re-adjudicate if the series `PATCH` is ever sent for a new length without the
+record kept first, if the put-back deletes an instance that is not a plain occurrence, or if Graph is
+shown to keep an occurrence's own changes across a time move.

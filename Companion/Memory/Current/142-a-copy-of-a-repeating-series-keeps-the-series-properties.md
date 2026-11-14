@@ -183,7 +183,7 @@ response was lost, the series it reads is already capped.
   (decided 2026-11-13: one rule for both). The delete is refused at the drain, after its card,
   writes nothing and is retired as failed, in a delete's words (`ZoneRefusal.followingDelete`: "...so
   it did not delete these occurrences. Delete them in your calendar app instead."); the split keeps
-  `.change`. A check before the card is #718's. #746 (recognizing more zones) lifts both refusals.
+  `.change`. A check before the card is #718's [done 2026-11-14, ADR-IOS-113: both are refused before the card, in the same words, by `refuseSeriesWrite`; a zoneless series' delete now in a delete's words]. #746 (recognizing more zones) lifts both refusals.
   A split recorded before this change on a series in such a zone and cut off between its writes can't
   be finished (`finishSplit` is refused the same way), leaving the new part and the uncapped old one
   both in place; no real user is known to have one, so it is accepted. Pinned by
@@ -566,7 +566,7 @@ the v1.0 schema, live 400), so a split of a series holding one is REFUSED before
 no record, no copy, no cap): `splitSeries` checks the series' attachment list right before the create and
 throws `linkedFileRefusal` ("...has a linked file TabMail can't copy to the new part, so it was not changed.
 Make the change in your calendar app."; owner decision 2026-11-13, #834). Moving that refusal before the
-confirmation card is #718's. A linked file on a single changed occurrence (not the series) is not checked:
+confirmation card is #718's [done 2026-11-14, ADR-IOS-113: the split's pre-write plan, `splitPlan`, runs before the card, so a linked file on the series or on a carried occurrence and an attached item on a carried occurrence are refused there]. A linked file on a single changed occurrence (not the series) is not checked:
 it is not copied onto the new part's instance. Tests: `itemAttachmentIsCopied`,
 `failedItemCopyRetriesOnce`, `largeItemIsSkipped`, `linkedFileRefusesTheSplitUnwritten`,
 `carriedOccurrenceKeepsItsOwnItem`.

@@ -504,3 +504,15 @@ occurrence's place in the series as `route` judges a split: at the series' first
 whole series, before it refused. Unlike the split, a moved occurrence is cut at its place rather than
 refused. Pinned by `CalendarScopedDeleteTests` (device, delete and read zones all different, the drain
 in the host's).
+
+**2026-11-14 (#718, ADR-IOS-113): a new length, and one check before the card.** An end given alone
+for every occurrence, with no occurrence named, is a length counted from the series' start, refused only
+at zero or less, and routes to the series itself (it lifts the after-card refusal of an end past midnight
+or a longer all-day series). Outlook keeps the occurrences changed or deleted on their own across the
+resetting series `PATCH` (read first, kept on the op as `SeriesEditRecord`, put back with the carry);
+CalDAV gives each override the new length in the same PUT; Google keeps them itself. Every series write
+(edit of every occurrence, split, following delete) is checked before its card by the write's own plan
+(`CalendarProvider.refuseSeriesWrite`), so what the queue's write would refuse before writing is refused
+before the card in the same words (rulings of 2026-11-14 bring Google's and
+CalDAV's split refusals, such as `editedKindRefusal`, before the card too). The tool and the queue build
+the write's input with one function (`CalendarSeriesScope.writeInput`).
