@@ -439,7 +439,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
                     let fresh: SeriesEditRecord
                     do {
                         guard let etag = existing.raw["@odata.etag"] as? String, !etag.isEmpty else {
-                            throw CalendarProviderError.notSupported(Self.lengthChangeUnreadable)
+                            throw CalendarProviderError.notSupported(Self.seriesVersionUnreadable)
                         }
                         let carried = sentBefore ? try await stillHeld(held?.files ?? [], besides: read.files) : []
                         fresh = SeriesEditRecord(
@@ -479,7 +479,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
                     ifMatch = kept.seriesEtag
                 } else {
                     guard let etag = existing.raw["@odata.etag"] as? String, !etag.isEmpty else {
-                        throw CalendarProviderError.notSupported(Self.lengthChangeUnreadable)
+                        throw CalendarProviderError.notSupported(Self.seriesVersionUnreadable)
                     }
                     ifMatch = etag
                 }
@@ -789,6 +789,10 @@ actor ExchangeCalendarProvider: CalendarProvider {
 
     static let lengthChangeUnreadable =
         "the occurrences of this repeating event changed or deleted one by one can't be read, so its length was not changed"
+
+    /// What the user is told when the read of a series gives no version (`@odata.etag`) its
+    /// write can be made conditional on: nothing is written.
+    static let seriesVersionUnreadable = "the repeating event's version can't be read, so it was not changed"
 
     /// What the user is told when the put-back after a series' PATCH fails for good
     /// (`putBackFailsForGood`): the series was written, and `remaining` of the occurrences changed

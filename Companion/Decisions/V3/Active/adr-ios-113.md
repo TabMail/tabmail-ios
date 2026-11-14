@@ -58,7 +58,11 @@ its card.
    the master's and an occurrence's etags are the same value, so either serves; the etag in a create's
    201 answer was already stale by the first `GET`). A read that finds nothing changed or deleted
    keeps no record, and its write is sent on that read's etag (review r4): an occurrence the user
-   changes between the read and the write is refused with 412, read and kept, and put back. So a `sent` write that did not land (a 5xx
+   changes between the read and the write is refused with 412, read and kept, and put back. So every
+   Outlook write of an edit of every occurrence (`edit_scope` all, which the queue always sends
+   through `updateSeries`, a change of the length or not) is conditional on the etag of the read it
+   was planned from; a read with no etag refuses it unwritten (`seriesVersionUnreadable`), and
+   IOS-CAL-002 is amended for it. So a `sent` write that did not land (a 5xx
    with nothing written), followed by the user deleting or changing a changed occurrence in Outlook
    before the retry, is refused with 412 and writes nothing: the retry reads the occurrences again and
    keeps a new record, so the stale capture is never put back over the user's newer change. When the
