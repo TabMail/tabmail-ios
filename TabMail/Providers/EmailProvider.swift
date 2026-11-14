@@ -121,7 +121,15 @@ struct MessageHeaderInfo: Sendable {
     /// The `false` default IS the fail-closed direction: a provider that has
     /// not proven its remote set is exact must never be read as one that has.
     ///
-    /// ⚑ CURRENTLY UNCONSUMED ON v3. The reference reads it in
+    /// ⚑ CONSUMED since #882 by `ChangeRecord.init(header:)`: a change record
+    /// carries the header's labels as the message's whole set (which REPLACES a
+    /// stored row's set in the change apply) only when this is true. The
+    /// producers: Gmail from its catalog (the change reader loads it before
+    /// reading a message), Graph from "selected `categories` and saw the field".
+    /// IMAP has no change reader, so its headers never reach that consumer; the
+    /// paragraph below about IMAP holds the day one does.
+    ///
+    /// Earlier text: ⚑ CURRENTLY UNCONSUMED ON v3. The reference reads it in
     /// `SyncEngineFullSync` as `remoteSetIsAuthoritative:`, which gates a
     /// reconcile that REPLACES local membership with the remote set. The flag
     /// lands with the catalog it describes so the guard exists BEFORE a

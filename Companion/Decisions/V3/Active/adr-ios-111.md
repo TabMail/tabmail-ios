@@ -312,3 +312,50 @@ keyset, takes a quarter of the mailbox request rate, and lists a folder once mor
 walk completes. Its apply never lets a read that began before a user action completed overwrite
 that action's read or flag state (ADR-IOS-107, completed actions), nor put back a message the user
 moved out of the folder after that read began (ADR-IOS-107, "Loads too", later the same day).
+
+### Amendment 2026-11-14: the change merge writes user labels; replied and forwarded are not read (#882)
+
+**Context.** The merge wrote only the read state, the flag and the server tag. A Gmail label or Outlook
+category another client added or removed reached a stored message only if the message was inserted
+again, so label chips stayed stale on both providers. The records already carried the label set
+(`ChangeRecord.userLabelIds`), but the merge never read it, Outlook's state-only record dropped the
+`categories` it had decoded, and a Gmail push pass (`.inboxOnly`) in a fresh process read messages
+before the label catalog had loaded, so its label sets were not complete.
+
+**Decision.**
+1. **A record's label set means what it says.** `ChangeRecord.userLabelIds` is nil when the record does
+   not know the labels (the header's `userLabelIdsAreAuthoritative` is false, or Graph did not send
+   `categories`), and a set, empty included, when it does. A set REPLACES the stored labels of the
+   message in the merge (`SyncEngineChangesApply.replaceUserLabels`: junction rows not in the set are
+   deleted, missing labels and junction rows are inserted); nil writes nothing.
+2. **The user's pending label change wins, like read and flag.** `PendingOperationSnapshot.userLabel`
+   (`.addUserLabel`, `.removeUserLabel`) and the completed-action shield (`liveRecentlyCompleted`) hold a
+   label change back; the message goes on the re-read list and the next pass re-reads it.
+3. **The settle set now includes labels.** A record settles a re-read id only when it carries read state,
+   flag and labels (`ChangeRecord.carriesKeptBackFields`); Outlook's `answeredIds` uses the same test.
+   A record without labels applies what it carries and the message stays listed (decision 4 of the
+   2026-11-13 amendment, extended to the label set).
+4. **Outlook's state-only record carries its categories** (filtered by `isLegacyActionTagCategory`,
+   verbatim names), absent = nil.
+5. **Gmail loads the label catalog before it reads any message detail** when the catalog is not loaded
+   (`GmailProvider.isUserLabelCatalogLoaded`); a failed catalog load fails the pass with the bookmark
+   kept, as any account failure does. A label created on the server after the catalog loaded is
+   unknown until the next `.all` pass reloads it; until then the record's label set is still
+   authoritative for the labels it knows.
+6. **Replied and forwarded are not written by the merge.** No reader carries them: Gmail has no such
+   server state, and the Graph records do not select `PidTagLastVerbExecuted`; both providers' records
+   say false by default, and writing that would wipe the marks the outbox and Sent-folder discovery
+   (`ReplyParentResolver`) set. Reading Outlook's last verb is a new feature for a separate issue.
+
+**Not changed.** The full sync's existing-row merge and the catch-up still only insert label rows. The
+release-boundary re-read list does not yet name label or replied kinds; that list is another change, and
+once both are merged the label kind belongs on it.
+
+**Trade-off.** A label change raced by the user's own label action lands one pass later (the re-read),
+as read and flag already do. An Outlook record that keeps omitting `categories` keeps the message on the
+re-read list until a full read answers it.
+
+Keywords: user labels, label merge, replaceUserLabels, Gmail labels, Outlook categories, label shield,
+PendingOperationSnapshot.userLabel, carriesKeptBackFields, settle set labels, userLabelIdsAreAuthoritative,
+label catalog, isUserLabelCatalogLoaded, inboxOnly push pass, replied, forwarded, PidTagLastVerbExecuted,
+ReplyParentResolver, #882.

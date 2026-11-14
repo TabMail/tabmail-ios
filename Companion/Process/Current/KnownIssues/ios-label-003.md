@@ -1,4 +1,19 @@
 <!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+> **AMENDMENT (2026-11-14, tabmail-ios #882) — the flag now has its first production reader, and
+> the reconcile it guarded has landed.** `ChangeRecord.init(header:)` (`EmailProviderChanges.swift`)
+> reads `userLabelIdsAreAuthoritative`: an authoritative header gives the record its label set,
+> which REPLACES the stored set in the change merge (`SyncEngineChangesApply.mergeChangeRecord`,
+> ADR-IOS-111 amendment 2026-11-14); a non-authoritative header gives `nil` (labels unknown, the
+> stored set stays and the message stays on the re-read list). Both producers derive the value from
+> evidence (Gmail: label catalog loaded; Outlook: `categories` selected and decoded), and the Gmail
+> reader now loads the catalog before it reads any message detail, so a push pass in a fresh process
+> is authoritative too. **The IMAP trip-wire below is still live but not tripped:** IMAP has no
+> change reader, so no IMAP header reaches `ChangeRecord.init(header:)`. When an IMAP change reader
+> lands, its keyword FETCH must set the flag in the same change, otherwise every IMAP record carries
+> `nil` labels, never settles a re-read and never updates labels. The other sync paths (full sync's
+> existing-row merge, the catch-up) still only insert label rows and never delete them.
+<!-- KNOWN-ISSUES-AMENDMENT-END -->
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
 > **AMENDMENT (2026-08-21, issue #71) — the zero-reader disposition remains, but Exchange no
 > longer hardcodes this future guard to `true`.** The preserved census and IMAP trip-wire below
 > still govern: there is no production consumer today, and any future reconcile must set IMAP

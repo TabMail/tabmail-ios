@@ -88,6 +88,8 @@ struct ChangeApplyTests {
             isRead: isRead, isFlagged: isFlagged, hasAttachments: false,
             isReplied: false, isForwarded: false, actionTag: nil)
         info.userLabelIds = labels
+        // Both readers send the message's whole label set (#882).
+        info.userLabelIdsAreAuthoritative = true
         return info
     }
 
@@ -211,6 +213,94 @@ struct ChangeApplyTests {
             #expect(row?.isFlagged == true && row?.isRead == true, "the re-read lands once nothing shields it")
             #expect(try w.state(w.inboxId).recheck.isEmpty, "and leaves the list")
             #expect(seen.withLock { $0.last?[inboxId] } == ["f1"], "the next read was asked to re-read it")
+        }
+    }
+
+    // MARK: - User labels and replied/forwarded on a stored row (#882)
+
+    /// The stored row's user labels, as their provider values.
+    static func labels(_ w: World, _ messageId: String, in folderId: String) throws -> Set<String> {
+        let rowId = try #require(try w.row(messageId, in: folderId)).id
+        return try w.pool.read { db in
+            Set(try String.fetchAll(db, sql: """
+                SELECT ul.providerLabelId FROM messageUserLabel mul JOIN userLabel ul ON ul.id = mul.userLabelId
+                WHERE mul.messageId = ?
+                """, arguments: [rowId]))
+        }
+    }
+
+    /// A user label on a stored row, as a sync or the user's own gesture left it.
+    static func addLabel(_ w: World, _ providerLabelId: String, to messageId: String, in folderId: String) throws {
+        let rowId = try #require(try w.row(messageId, in: folderId)).id
+        let label = UserLabel(accountId: w.accountId, providerLabelId: providerLabelId, name: providerLabelId, isSystem: false)
+        try w.pool.write { db in
+            try label.insert(db, onConflict: .ignore)
+            try MessageUserLabel(messageId: rowId, userLabelId: label.id).insert(db)
+        }
+    }
+
+    @Test("A label change kept back under a pending label op is re-read and lands once the op is gone")
+    func labelShieldRechecks() async throws {
+        try await Self.withWorld { w in
+            try w.insertRow("l1", in: w.inboxId, path: "INBOX")
+            // The user's own label, applied locally; its op has not reached the server.
+            try Self.addLabel(w, "Label_mine", to: "l1", in: w.inboxId)
+            try w.insertOp(.addUserLabel, ids: ["l1"], path: "INBOX")
+            let inboxId = w.inboxId
+            let build: @Sendable (ChangeCursor, ChangeRequest) -> ChangeSet = { _, request in
+                Self.tracked(request, records: [inboxId: [ChangeRecord(header: Self.info("l1", isRead: true, labels: ["Label_web"]))]])
+            }
+            await w.script([build, build])
+            try await w.pass()
+            #expect(try Self.labels(w, "l1", in: w.inboxId) == ["Label_mine"], "the queued label is not overwritten by the read")
+            #expect(try w.row("l1", in: w.inboxId)?.isRead == true, "the read state, not shielded, still lands")
+            #expect(try w.state(w.inboxId).recheck == ["l1"], "and the message is put on the re-read list")
+
+            try await w.pool.write { db in _ = try PendingOperation.deleteAll(db) }
+            try await w.pass()
+            #expect(try Self.labels(w, "l1", in: w.inboxId) == ["Label_web"], "the server's set lands once nothing shields it")
+            #expect(try w.state(w.inboxId).recheck.isEmpty, "and leaves the list")
+        }
+    }
+
+    @Test("A record whose label set is not known (the label catalog not loaded) leaves the stored labels and settles nothing")
+    func unknownLabelSetKeepsStoredLabels() async throws {
+        try await Self.withWorld { w in
+            try w.insertRow("l2", in: w.inboxId, path: "INBOX")
+            try Self.addLabel(w, "Label_kept", to: "l2", in: w.inboxId)
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?",
+                               arguments: [FolderChangeState(recheck: ["l2"]).encoded, w.inboxId])
+            }
+            let inboxId = w.inboxId
+            await w.script([{ _, request in
+                // Gmail before its catalog loads: an empty, non-authoritative list.
+                var info = Self.info("l2", isRead: true, labels: [])
+                info.userLabelIdsAreAuthoritative = false
+                return Self.tracked(request, records: [inboxId: [ChangeRecord(header: info)]])
+            }])
+            try await w.pass()
+            #expect(try Self.labels(w, "l2", in: w.inboxId) == ["Label_kept"], "an unknown set never wipes the labels")
+            #expect(try w.row("l2", in: w.inboxId)?.isRead == true)
+            #expect(try w.state(w.inboxId).recheck == ["l2"], "a record without the label set settles nothing")
+        }
+    }
+
+    @Test("A change read keeps a stored replied or forwarded mark: no reader carries one")
+    func repliedAndForwardedMarksStay() async throws {
+        try await Self.withWorld { w in
+            try w.insertRow("rp1", in: w.inboxId, path: "INBOX")
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE messageHeader SET isReplied = 1, isForwarded = 1 WHERE messageId = 'rp1'")
+            }
+            let inboxId = w.inboxId
+            await w.script([{ _, request in
+                Self.tracked(request, records: [inboxId: [ChangeRecord(header: Self.info("rp1", isRead: true))]])
+            }])
+            try await w.pass()
+            let row = try #require(try w.row("rp1", in: w.inboxId))
+            #expect(row.isRead == true, "precondition: the record applied")
+            #expect(row.isReplied && row.isForwarded, "the header's parser default (false) is not the server's state")
         }
     }
 

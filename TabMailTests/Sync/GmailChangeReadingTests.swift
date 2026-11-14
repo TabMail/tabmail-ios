@@ -216,6 +216,66 @@ struct GmailChangeReadingTests {
         }
     }
 
+    // MARK: - user labels on a stored message (#882)
+
+    @Test("a user label added, then removed, on the server reaches the stored message's labels")
+    func serverLabelChangeReachesStoredMessage() async throws {
+        try await Pins.withWorld(seeds: [Pins.seed("lbl-1", labels: ["INBOX"])]) { w in
+            let row = try w.insertRow("lbl-1", in: w.inbox)
+            w.server.applyLabelChange(providerMessageId: "lbl-1", add: [Pins.userLabelId])
+            try await w.completedDelta()
+            #expect(try w.userLabels(ofHeader: row.id) == [Pins.userLabelId], "the label added on the web shows")
+
+            w.server.applyLabelChange(providerMessageId: "lbl-1", remove: [Pins.userLabelId])
+            try await w.completedDelta()
+            #expect(try w.userLabels(ofHeader: row.id).isEmpty, "the label removed on the web goes")
+        }
+    }
+
+    @Test("a push pass in a new process, before any folder refresh, still reads the whole label set")
+    func pushPassLoadsTheLabelCatalog() async throws {
+        try await Pins.withWorld(seeds: [Pins.seed("lbl-2", labels: ["INBOX", Pins.userLabelId])]) { w in
+            let row = try w.insertRow("lbl-2", in: w.inbox)
+            try await w.pool.write { db in
+                let label = UserLabel(accountId: w.accountId, providerLabelId: Pins.userLabelId,
+                                      name: Pins.userLabelName, isSystem: false)
+                try label.insert(db, onConflict: .ignore)
+                try MessageUserLabel(messageId: row.id, userLabelId: label.id).insert(db)
+            }
+            w.server.applyLabelChange(providerMessageId: "lbl-2", remove: [Pins.userLabelId])
+            // A new provider: its label catalog has not loaded.
+            let fresh = w.server.provider()
+            let outcome = try await SyncEngine().performDeltaSync(account: try w.account(), provider: fresh, inboxOnly: true)
+            #expect(outcome.succeeded)
+            #expect(try w.account().lastHistoryId == w.server.currentHistoryId(), "precondition: the pass completed")
+            #expect(try w.userLabels(ofHeader: row.id).isEmpty, "the label removed on the web goes")
+        }
+    }
+
+    @Test("a pending label op keeps the user's label through a read; the server's set lands once the op is gone")
+    func pendingLabelOpIsNotOverwritten() async throws {
+        try await Pins.withWorld(seeds: [Pins.seed("lbl-3", labels: ["INBOX", "UNREAD"])]) { w in
+            let row = try w.insertRow("lbl-3", in: w.inbox)
+            // The user's label, applied locally; its op has not reached the server.
+            try await w.pool.write { db in
+                let label = UserLabel(accountId: w.accountId, providerLabelId: Pins.userLabelId,
+                                      name: Pins.userLabelName, isSystem: false)
+                try label.insert(db, onConflict: .ignore)
+                try MessageUserLabel(messageId: row.id, userLabelId: label.id).insert(db)
+            }
+            let op = try w.insertOp(.addUserLabel, key: "lbl-3", folder: w.inbox)
+            w.server.applyLabelChange(providerMessageId: "lbl-3", remove: ["UNREAD"])
+            try await w.completedDelta()
+            #expect(try w.row("lbl-3", in: w.inbox)?.isRead == true, "precondition: the read applied")
+            #expect(try w.userLabels(ofHeader: row.id) == [Pins.userLabelId], "the queued label stays")
+
+            // The op is gone without reaching the server: the server's set wins.
+            try await w.pool.write { db in _ = try PendingOperation.deleteOne(db, key: op.id) }
+            try await w.completedDelta()
+            #expect(try w.userLabels(ofHeader: row.id).isEmpty, "the re-read lands the server's set, with no new history")
+        }
+    }
+
     // MARK: - a tracked folder gets no window listing
 
     @Test("a full sync of a tracked Gmail account sends no window listing")

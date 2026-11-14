@@ -540,6 +540,10 @@ struct PendingOperationSnapshot: Sendable {
     /// `.markUnflagged`, `.setTag`, `.removeTag`). Used to skip overwriting
     /// flags/tags the user just toggled.
     let flag: Set<String>
+    /// IDs from user-label ops (`.addUserLabel`, `.removeUserLabel`). Used to skip
+    /// overwriting a message's user labels while the user's own label change has
+    /// not reached the server (the change apply, #882).
+    let userLabel: Set<String>
     /// IDs from all queued ops (any type). Used to skip deletions of rows the
     /// user has any pending action against.
     let all: Set<String>
@@ -548,6 +552,7 @@ struct PendingOperationSnapshot: Sendable {
     static let flagTypes: Set<OperationType> = [
         .markRead, .markUnread, .markFlagged, .markUnflagged, .setTag, .removeTag
     ]
+    static let userLabelTypes: Set<OperationType> = [.addUserLabel, .removeUserLabel]
 
     /// Build from a pre-fetched list of ops. Callers load ops once inside the
     /// write transaction and pass them here so the filter classification is
@@ -555,15 +560,18 @@ struct PendingOperationSnapshot: Sendable {
     init(ops: [PendingOperation]) {
         var destructive = Set<String>()
         var flag = Set<String>()
+        var userLabel = Set<String>()
         var all = Set<String>()
         for op in ops {
             let ids = op.messageIds
             all.formUnion(ids)
             if Self.destructiveTypes.contains(op.type) { destructive.formUnion(ids) }
             if Self.flagTypes.contains(op.type) { flag.formUnion(ids) }
+            if Self.userLabelTypes.contains(op.type) { userLabel.formUnion(ids) }
         }
         self.destructive = destructive
         self.flag = flag
+        self.userLabel = userLabel
         self.all = all
     }
 

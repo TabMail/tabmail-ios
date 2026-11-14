@@ -24,6 +24,8 @@ import Foundation
 ///   every folder's `rereadLater` and the rest of the pass lands, bookmark
 ///   included. A failure about the account (connection, credentials) keeps the
 ///   removals, reports `.failed` and keeps the bookmark.
+/// - Every record carries the message's complete user-label set: the label
+///   catalog is loaded before any message is read (#882).
 ///
 /// `inboxOnly` changes nothing but the folder list: the history is one call for
 /// the whole account. A turn that starts with no read budget left reads nothing.
@@ -74,7 +76,20 @@ extension GmailProvider {
 
         var batch = GmailDetailBatch()
         var failure: (any Error)?
-        if !toFetch.isEmpty {
+        // A record's user labels are the message's whole set only once the
+        // label catalog has loaded (`userLabelIdsAreAuthoritative`). A pass with
+        // scope `.all` loaded it above; a push or background pass in a new
+        // process loads it here, so a label change it reads reaches a stored
+        // message. A failed load is a failure about the account: nothing is
+        // fetched and the bookmark stays, so the next pass reads these again.
+        if !toFetch.isEmpty, !isUserLabelCatalogLoaded {
+            do {
+                _ = try await fetchFolders()
+            } catch {
+                failure = error
+            }
+        }
+        if !toFetch.isEmpty, failure == nil {
             request.context.onProgress(toFetch.count)
             do {
                 batch = try await fetchMessageDetails(ids: Array(toFetch))

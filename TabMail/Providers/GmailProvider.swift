@@ -138,6 +138,10 @@ actor GmailProvider: EmailProvider {
     /// only IDs learned from a complete successful catalog response.
     private var userLabelCatalog = GmailUserLabelCatalogState()
 
+    /// The user-label catalog has loaded, so a parsed message's user labels are
+    /// its complete set (`GmailUserLabelCatalogState.isAuthoritative`).
+    var isUserLabelCatalogLoaded: Bool { userLabelCatalog.isAuthoritative }
+
     /// Test-only session override. Production call sites omit; tests register
     /// `FakeHTTP` URLProtocol on this session to intercept Gmail API calls.
     private let testSession: URLSession?

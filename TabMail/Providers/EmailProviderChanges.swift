@@ -192,18 +192,26 @@ struct ChangeRecord: Sendable {
     var isRead: Bool?
     var isFlagged: Bool?
     var serverTag: ActionTag?
+    /// The message's COMPLETE user-label set on the server (Gmail label ids,
+    /// Graph category names), which replaces a stored row's set. Nil = not
+    /// known this read (Graph left `categories` out, or Gmail's label catalog
+    /// has not loaded), and then the stored set stays: an empty array is "no
+    /// labels", never "unknown".
     var userLabelIds: [String]?
     var rfc822MessageId: String?
     var references: [String]?
 
-    /// A full record built from a fetched header.
+    /// A full record built from a fetched header. Its user labels are the
+    /// message's whole set only when the header says so
+    /// (`MessageHeaderInfo.userLabelIdsAreAuthoritative`); otherwise the record
+    /// carries none and an insert takes the header's own list.
     init(header: MessageHeaderInfo) {
         self.messageId = header.messageId
         self.header = header
         self.isRead = header.isRead
         self.isFlagged = header.isFlagged
         self.serverTag = header.actionTag
-        self.userLabelIds = header.userLabelIds
+        self.userLabelIds = header.userLabelIdsAreAuthoritative ? header.userLabelIds : nil
         self.rfc822MessageId = header.rfc822MessageId
         self.references = header.references
     }
@@ -213,12 +221,16 @@ struct ChangeRecord: Sendable {
     }
 
     /// The record carries the message's read state AND its flag. Only such a
-    /// record settles a message on the folder's re-read list
-    /// (`FolderChangeState.recheck`): a change kept back there may be to either
-    /// field, and a record without one says nothing about it, so the re-read
-    /// reads the message in full. Only such a record inserts a message the
-    /// folder does not hold; any other lists it for that re-read.
+    /// record inserts a message the folder does not hold; any other lists it for
+    /// a re-read in full. (Settling the re-read list also needs the user labels:
+    /// `carriesKeptBackFields`.)
     var carriesReadAndFlag: Bool { isRead != nil && isFlagged != nil }
+
+    /// The record carries every field the apply keeps back under the user's own
+    /// pending action: the read state, the flag and the user labels. Only such a
+    /// record settles a message on the folder's re-read list; a record without
+    /// one of them says nothing about a change kept back to it.
+    var carriesKeptBackFields: Bool { carriesReadAndFlag && userLabelIds != nil }
 }
 
 struct FolderChanges: Sendable {

@@ -20,7 +20,11 @@ import GRDB
 //   again in full, never stored with a default);
 // - a record for a message the folder holds merges its PRESENT fields; flags and
 //   the server tag are kept back while the user's flag action is pending or just
-//   completed;
+//   completed; a user-label set (the message's whole set on the server) replaces
+//   the stored one, kept back while the user's label action is pending or just
+//   completed. Replied/forwarded marks are not written: no reader carries them
+//   (Gmail's API and Graph expose no answered state the app maps; a reply sent
+//   elsewhere marks its parent through the Sent folder, `ReplyParentResolver`);
 // - a record from a baseline (`FolderChangeStatus.isBaseline`: the folder's
 //   messages as they are, not changes) inserts only a message dated within the
 //   folder's held range (`Folder.oldestSyncedDate`); with no held range yet it
@@ -28,7 +32,7 @@ import GRDB
 // - every change kept back is put on the folder's re-read list
 //   (`FolderChangeState.recheck`), read again on later passes (in turn, within
 //   `SyncConfig.changeRereadBudgetPerPass`) until a record carrying its read
-//   state and flag applies (`ChangeRecord.carriesReadAndFlag`; a partial record
+//   state, flag and user labels applies (`ChangeRecord.carriesKeptBackFields`; a partial record
 //   applies what it carries and settles nothing, and the reader reads a listed
 //   message in full), and so is every message the provider could not read
 //   (`rereadLater`).
@@ -87,10 +91,10 @@ extension SyncEngine {
                 snapshot: snapshot, recentlyCompleted: recentlyCompleted, result: &result, db: db)
             if !applied {
                 declined.insert(record.messageId)
-            } else if record.carriesReadAndFlag {
-                // A record without the read state or the flag applied what it
-                // carries but settles nothing: a listed message stays listed
-                // until it is read again in full.
+            } else if record.carriesKeptBackFields {
+                // A record without the read state, the flag or the user labels
+                // applied what it carries but settles nothing: a listed message
+                // stays listed until it is read again in full.
                 settled.insert(record.messageId)
             }
         }
@@ -197,7 +201,8 @@ extension SyncEngine {
     }
 
     /// The existing-row merge: PRESENT fields only; flags and the server tag
-    /// under the flag shield; rfc822 and references always.
+    /// under the flag shield; the user-label set under the label shield; rfc822
+    /// and references always.
     private nonisolated static func mergeChangeRecord(
         _ record: ChangeRecord, into existing: inout MessageHeader, folder: Folder, addressEpoch: Int?,
         snapshot: PendingOperationSnapshot, recentlyCompleted: [String: Date],
@@ -228,11 +233,47 @@ extension SyncEngine {
                 existing.tagSortOrder = serverTag.sortOrder
             }
         }
+        // User labels: the record's set replaces the stored one, under the
+        // user's own pending or just-completed label change (a nil set is not
+        // known this read and changes nothing).
+        if let incoming = record.userLabelIds {
+            let labelShielded = snapshot.userLabel.containsAnyKey(messageId: record.messageId, rfc822MessageId: rfc822)
+                || recentlyCompleted[record.messageId] != nil
+            let differs = try replaceUserLabels(
+                of: existing.id, accountId: folder.accountId, with: incoming, write: !labelShielded, db: db)
+            if differs && labelShielded { keptBack = true }
+        }
         if let rfc822 = record.rfc822MessageId { existing.rfc822MessageId = rfc822 }
         if let references = record.references { existing.referencesJSON = MessageHeader.encodeReferences(references) }
         try existing.update(db)
         result.wroteRows = true
         return !keptBack
+    }
+
+    /// Make a stored row's user-label rows the server's set (`providerLabelIds`):
+    /// rows for labels the set leaves out are deleted, missing ones inserted with
+    /// the insert arm's label row. Returns whether the stored set differed; with
+    /// `write` false nothing is written.
+    private nonisolated static func replaceUserLabels(
+        of headerId: String, accountId: String, with providerLabelIds: [String], write: Bool, db: Database
+    ) throws -> Bool {
+        let labels = providerLabelIds.map { UserLabel(accountId: accountId, providerLabelId: $0, name: $0, isSystem: false) }
+        let wanted = Set(labels.map(\.id))
+        let stored = Set(try MessageUserLabel.filter(Column("messageId") == headerId).fetchAll(db).map(\.userLabelId))
+        guard wanted != stored else { return false }
+        guard write else { return true }
+        if DebugModeManager.isLoggingEnabled() {
+            print("[Sync] change apply: user labels of \(headerId): \(stored.sorted()) -> \(wanted.sorted())")
+        }
+        try MessageUserLabel
+            .filter(Column("messageId") == headerId && !wanted.contains(Column("userLabelId")))
+            .deleteAll(db)
+        for label in labels where !stored.contains(label.id) {
+            try label.insert(db, onConflict: .ignore)
+            // The join FK is `userLabel.id`, the account-prefixed surrogate (IOS-LABEL-001).
+            try MessageUserLabel(messageId: headerId, userLabelId: label.id).insert(db, onConflict: .ignore)
+        }
+        return true
     }
 
     /// The insert arm: the header builder, AI-cache restore, reply-detect, orphan
