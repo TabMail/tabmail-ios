@@ -117,24 +117,44 @@ tracks: a tracked folder gets no window listing (ADR-IOS-111 decision 4), so a m
 before an update stayed in the Archive locally while the server still had it in the Inbox. It first
 applies at the update after the one that introduced tracking (no folder is tracked before its first
 listing). In the same transaction, BEFORE the delete, `SyncEngine.recheckRetiredActions`
-(`TabMail/Services/Sync/SyncEngineRetiredActionRecheck.swift`) now reads each retired row for its
-account, folder(s) and message ids ONLY, and for every account that holds a change bookmark
-(`Account.lastHistoryId`, the same test the full sync uses to skip tracked folders):
-- puts the ids on the re-read list (`Folder.changeState.recheck`) of the folder the action was queued
-  on and, for a move (archive, delete, move), of its destination too (Outlook re-reads folder by
-  folder; Gmail places a re-read message by its labels in every folder), for the kinds with an
-  optimistic local effect (move kinds, read/unread, flag/unflag, user labels, replied/forwarded);
-  tags (local-only on Gmail and Outlook) and draft kinds are not listed;
-- keeps each list within `SyncConfig.changeRecheckLimit` and arms the folder's catch-up
-  (`markCatchUpLapse`) on overflow, as the change apply does;
-- for a row the current model cannot decode (unknown kind, ids that are not a JSON list), arms its
+(`TabMail/Services/Sync/SyncEngineRetiredActionRecheck.swift`) now reads each retired row's RAW
+columns only (account, folder path(s), kind, message ids; no model decode, so nothing it reads can
+throw and stop `AppDatabase.init`), and for every account that holds a change bookmark
+(`Account.lastHistoryId`):
+- a move (archive, delete, move) or a read/flag change (read, unread, flag, unflag): its ids go on the
+  re-read list (`Folder.changeState.recheck`) of the folder it was queued on and, for a move, of its
+  destination too (Outlook re-reads folder by folder; Gmail places a re-read message by its labels in
+  every folder), but ONLY of a folder whose change state is tracked. An untracked folder gets nothing:
+  the full sync window-lists every untracked syncable folder, and a folder outside the syncable set
+  (an Outlook custom, non-favourite folder) is listed when it is opened. An id put on such a folder's
+  list would never be read by a per-folder reader, would stick, and would take part of every pass's
+  re-read budget for good;
+- a draft delete arms its folder's catch-up (`markCatchUpLapse`, folder found by the recorded path),
+  which loads the server draft back so the delete can be redone; its address is a draft resource
+  (Gmail) and never goes on a list. Without this the server draft stayed on the server and other
+  devices while the phone never showed it again;
+- each list stays within `SyncConfig.changeRecheckLimit`; overflow arms the folder's catch-up, as the
+  change apply does;
+- a row whose kind or ids do not read (an older release's kind, ids that are not a JSON list) arms its
   folder's catch-up, or every folder's of its account when the folder cannot be resolved by
-  `(accountId, folderPath)`; the same for a decoded row whose folder no longer exists. Such a row is
-  never skipped silently.
+  `(accountId, folderPath)`; the same for a move or read/flag row whose folder no longer exists. Such a
+  row is never skipped silently;
+- tags (local-only on Gmail and Outlook, ADR-IOS-036) and draft saves (re-queued above): nothing.
 Nothing is re-sent or replayed, and no row's meaning decides anything about any operation: the
 boundary is still not an exit. Accounts with no change bookmark (IMAP today) are unchanged: the
 boundary's full sync lists every folder. Once IMAP folders are tracked, the IMAP reader must honour
 the re-read list for these ids too.
+
+**Not corrected, accepted (2026-11-14): a retired user-label change or replied/forwarded mark in a
+tracked folder.** Neither repair path writes these into a stored row: the change apply's merge
+(`mergeChangeRecord`) writes the read state, the flag, the server tag, identity and references only,
+and the catch-up (`applyCatchUpTransaction`) writes the read state and the flag, removes and loads.
+So these kinds are not listed (a re-read would settle the id with nothing corrected) and no catch-up
+is armed for them. Example: on Gmail the user adds label L and updates before the action reaches the
+server; the phone keeps showing L, which the server never got, until the message is next stored again
+(a move, a Settings reset). Recoverable by one ordinary gesture (remove or re-add the label). The
+merge's missing label and answered-state reconciliation for stored rows is an older, separate gap in
+the change apply and is tracked on its own; once it is fixed, these kinds belong on the list.
 
 **Address.** The ids listed are the queue's own: the provider's id for the message in the folder the
 action was queued on. A move that drained re-addresses the queued rows after it to the destination id
@@ -146,7 +166,16 @@ for exactly that id: found in the folder (a record), elsewhere or gone (a remova
 resolved by the path the row recorded, never by role (ADR-IOS-059). Undo is a reverse move, so a
 retired undo is an ordinary retired move.
 
+**Accepted window (Outlook, the IOS-GRAPH-005 crash window, #116/#117):** an attempted Outlook move
+whose 2xx the server applied but whose retirement the app never committed (process death inside that
+one write) still names the dead source id, because Graph ids change on move. Its re-read answers 404
+in both folders, so the optimistic destination row is removed, and the message under its new id comes
+back only through the destination folder's change read (the delta reports it as moved in). Recoverable
+by sync, but for that row the listed id is not one the server can answer for as the message.
+
 User-visible: after the update, an email whose queued action was cleared shows its server state again
 (for example, an email archived just before the update is back in the inbox). Tests:
-`ReleaseBoundaryRecheckTests` (Gmail archive and mark-read, Outlook move, undecodable row, overflow);
+`ReleaseBoundaryRecheckTests` (Gmail archive and mark-read, Outlook move, kinds left out, draft delete,
+no-bookmark account untouched, unreadable kind or ids, a folder that is gone, an untracked folder, no
+duplicate ids, overflow, rollback on a throw);
 `ChangeSeamFenceTests.retiredActionRecheckIsProviderBlind`.

@@ -379,9 +379,11 @@ replied, forwarded, PidTagLastVerbExecuted, ReplyParentResolver, #882.
 
 Decision 4 took the window listing away from tracked folders, and with it the correction the release
 boundary relied on for actions it retires (ADR-IOS-071). The boundary now writes the re-read list
-itself: before its delete it reads each retired row for its account, folder(s) and message ids only
-and appends the ids to `Folder.changeState.recheck` of the source folder and, for a move, the
-destination folder, for every account holding a change bookmark (`SyncEngine.recheckRetiredActions`,
+itself: before its delete it reads each retired row's raw columns only and appends the ids of a move or
+read/flag change to `Folder.changeState.recheck` of the source folder and, for a move, the destination
+folder, only where that folder is tracked (an untracked folder's list would never be read by a
+per-folder reader and would hold part of every pass's re-read budget), for every account holding a
+change bookmark (`SyncEngine.recheckRetiredActions`,
 provider-blind, pinned by `ChangeSeamFenceTests.retiredActionRecheckIsProviderBlind`). The cap and the
 overflow rule are decision 3's. A row the release cannot decode arms its folder's catch-up (the
 account's when the folder is unknown). Readers need nothing new: a re-read id is answered as any other

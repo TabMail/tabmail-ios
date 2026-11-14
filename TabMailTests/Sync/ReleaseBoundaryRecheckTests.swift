@@ -211,4 +211,174 @@ struct ReleaseBoundaryRecheckTests {
             #expect(try Self.lapseCount(w.pool, folderId: w.allMail.id) == nil)
         }
     }
+
+    // MARK: - Which kinds are read again, and where
+
+    static func setTracking(_ pool: DatabasePool, folderIds: [String]) async throws {
+        try await pool.write { db in
+            for folderId in folderIds {
+                try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?",
+                               arguments: [FolderChangeState(tracking: true).encoded, folderId])
+            }
+        }
+    }
+
+    static func allRecheckIds(_ pool: DatabasePool, accountId: String) throws -> [String] {
+        try pool.read { db in
+            try Folder.filter(Column("accountId") == accountId).fetchAll(db)
+                .flatMap { FolderChangeState(raw: $0.changeState).recheck }
+        }
+    }
+
+    static func armedFolderIds(_ pool: DatabasePool, accountId: String) throws -> Set<String> {
+        try pool.read { db in
+            Set(try String.fetchAll(db, sql: """
+                SELECT id FROM folder WHERE accountId = ? AND json_extract(catchUpState, '$.' || ?) IS NOT NULL
+                """, arguments: [accountId, CatchUpLapse.countKey]))
+        }
+    }
+
+    /// Kinds no repair path corrects in a stored row (labels, replied/forwarded),
+    /// local-only tags, and draft saves: nothing is listed and no catch-up armed.
+    @Test("Retired tag, label, replied, forwarded and draft-save actions put nothing on a re-read list and arm no catch-up",
+          arguments: [OperationType.setTag, .removeTag, .addUserLabel, .removeUserLabel, .markReplied, .markForwarded, .saveDraft])
+    func kindsLeftOutAreNotListed(kind: OperationType) async throws {
+        try await Gmail.withWorld(seeds: []) { w in
+            try await Self.seedCatchUpStates(w.pool, accountId: w.accountId)
+            try await Self.setTracking(w.pool, folderIds: w.folders.values.map(\.id))
+            try Self.queue(w.pool, kind, ids: ["left-out"], accountId: w.accountId, from: w.inbox.path)
+            #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: Self.nextRelease()))
+            #expect(try Self.allRecheckIds(w.pool, accountId: w.accountId).isEmpty, "\(kind) is not listed")
+            #expect(try Self.armedFolderIds(w.pool, accountId: w.accountId).isEmpty, "\(kind) arms no catch-up")
+        }
+    }
+
+    @Test("A retired draft delete arms its Drafts folder's catch-up and lists no id")
+    func retiredDraftDeleteArmsTheDraftsCatchUp() async throws {
+        try await Gmail.withWorld(seeds: []) { w in
+            try await Self.seedCatchUpStates(w.pool, accountId: w.accountId)
+            try await Self.setTracking(w.pool, folderIds: w.folders.values.map(\.id))
+            try Self.queue(w.pool, .deleteDraft, ids: ["r-draft-resource"], accountId: w.accountId, from: w.drafts.path)
+            #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: Self.nextRelease()))
+            #expect(try Self.armedFolderIds(w.pool, accountId: w.accountId) == [w.drafts.id],
+                    "the Drafts catch-up loads the server draft back")
+            #expect(try Self.allRecheckIds(w.pool, accountId: w.accountId).isEmpty, "a draft resource id is never listed")
+        }
+    }
+
+    @Test("An account with no change bookmark is left alone: nothing listed, no catch-up armed")
+    func accountWithoutBookmarkIsUntouched() async throws {
+        try await Gmail.withWorld(seeds: []) { w in
+            try await Self.seedCatchUpStates(w.pool, accountId: w.accountId)
+            try await Self.setTracking(w.pool, folderIds: w.folders.values.map(\.id))
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE account SET lastHistoryId = NULL WHERE id = ?", arguments: [w.accountId])
+            }
+            try Self.queue(w.pool, .move, ids: ["nb-move"], accountId: w.accountId, from: w.inbox.path, to: w.allMail.path)
+            try Self.queue(w.pool, .markRead, ids: ["nb-read"], accountId: w.accountId, from: w.inbox.path)
+            try Self.queue(w.pool, .deleteDraft, ids: ["nb-draft"], accountId: w.accountId, from: w.drafts.path)
+            try Self.makeUndecodable(w.pool, accountId: w.accountId, folderPath: w.inbox.path)
+            #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: Self.nextRelease()))
+            #expect(try w.pendingOps().isEmpty)
+            #expect(try Self.allRecheckIds(w.pool, accountId: w.accountId).isEmpty, "the full sync lists every folder of such an account")
+            #expect(try Self.armedFolderIds(w.pool, accountId: w.accountId).isEmpty)
+        }
+    }
+
+    @Test("A retired row with a known kind but ids that are not a JSON list arms its folder's catch-up")
+    func unreadableIdsAloneArmTheCatchUp() async throws {
+        try await Gmail.withWorld(seeds: []) { w in
+            try await Self.seedCatchUpStates(w.pool, accountId: w.accountId)
+            try await Self.setTracking(w.pool, folderIds: [w.inbox.id])
+            let row = PendingOperation(type: .markRead, messageIds: ["placeholder"], accountId: w.accountId, folderPath: w.inbox.path)
+            try await w.pool.write { db in
+                var op = row
+                try op.insert(db)
+                try db.execute(sql: "UPDATE pendingOperation SET messageIdsJSON = '<not json>' WHERE id = ?", arguments: [op.id])
+            }
+            #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: Self.nextRelease()))
+            #expect(try Self.armedFolderIds(w.pool, accountId: w.accountId) == [w.inbox.id])
+            #expect(try Self.allRecheckIds(w.pool, accountId: w.accountId).isEmpty)
+        }
+    }
+
+    @Test("A retired move whose destination folder is gone lists the id at its source and arms the whole account's catch-up")
+    func goneFolderArmsTheAccount() async throws {
+        try await Gmail.withWorld(seeds: []) { w in
+            try await Self.seedCatchUpStates(w.pool, accountId: w.accountId)
+            try await Self.setTracking(w.pool, folderIds: [w.inbox.id])
+            try Self.queue(w.pool, .move, ids: ["gone-1"], accountId: w.accountId, from: w.inbox.path, to: "Label_gone")
+            #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: Self.nextRelease()))
+            #expect(try Self.recheck(w.pool, folderId: w.inbox.id) == ["gone-1"])
+            #expect(try Self.armedFolderIds(w.pool, accountId: w.accountId) == Set(w.folders.values.map(\.id)))
+        }
+    }
+
+    @Test("An id already listed, or named by two retired rows, is listed once")
+    func idsAreListedOnce() async throws {
+        try await Gmail.withWorld(seeds: []) { w in
+            let inboxId = w.inbox.id
+            try await Self.setTracking(w.pool, folderIds: [w.allMail.id])
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?",
+                               arguments: [FolderChangeState(tracking: true, recheck: ["dup"]).encoded, inboxId])
+            }
+            try Self.queue(w.pool, .markRead, ids: ["dup"], accountId: w.accountId, from: w.inbox.path)
+            try Self.queue(w.pool, .move, ids: ["dup", "other"], accountId: w.accountId, from: w.inbox.path, to: w.allMail.path)
+            try Self.queue(w.pool, .markFlagged, ids: ["other"], accountId: w.accountId, from: w.allMail.path)
+            #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: Self.nextRelease()))
+            #expect(try Self.recheck(w.pool, folderId: inboxId) == ["dup", "other"])
+            #expect(try Self.recheck(w.pool, folderId: w.allMail.id) == ["dup", "other"])
+        }
+    }
+
+    @Test("Outlook: a retired move into a folder that is not tracked lists the id at its tracked source only")
+    func untrackedFolderGetsNothing() async throws {
+        try await Outlook.withWorld { w in
+            let custom = Folder(name: "Projects", path: "fld-custom", role: .custom, accountId: w.accountId)
+            try await w.pool.write { db in
+                try custom.insert(db)
+                try db.execute(sql: "UPDATE account SET lastHistoryId = 'bookmark' WHERE id = ?", arguments: [w.accountId])
+                try db.execute(sql: "UPDATE folder SET catchUpState = '{}' WHERE accountId = ?", arguments: [w.accountId])
+            }
+            try await Self.setTracking(w.pool, folderIds: [w.folderId(w.inbox)])
+            try Self.queue(w.pool, .move, ids: ["u-1"], accountId: w.accountId, from: w.inbox, to: custom.path)
+            #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: Self.nextRelease()))
+            #expect(try w.recheck(w.inbox) == ["u-1"])
+            #expect(try w.recheck(custom.path).isEmpty, "a folder no reader reads never gets an id that would stick")
+            #expect(try Self.armedFolderIds(w.pool, accountId: w.accountId).isEmpty)
+        }
+    }
+
+    @Test("A throw inside the re-read step rolls the whole boundary back, and the next launch takes it")
+    func throwRollsTheBoundaryBack() async throws {
+        try await Gmail.withWorld(seeds: []) { w in
+            try await Self.setTracking(w.pool, folderIds: [w.inbox.id])
+            try Self.queue(w.pool, .markRead, ids: ["rb-1"], accountId: w.accountId, from: w.inbox.path)
+            let stampBefore = try await w.pool.read { db in
+                try String.fetchOne(db, sql: "SELECT release FROM appReleaseStamp WHERE id = 1")
+            }
+            try await w.pool.write { db in
+                try db.execute(sql: """
+                    CREATE TRIGGER retired_recheck_fails BEFORE UPDATE OF changeState ON folder
+                    BEGIN SELECT RAISE(ABORT, 'injected'); END
+                    """)
+            }
+            let release = Self.nextRelease()
+            #expect(throws: (any Error).self) {
+                try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: release)
+            }
+            #expect(try w.pendingOps().count == 1, "the queue is kept")
+            #expect(try w.account().lastFullSyncAt != nil, "the full sync is not marked due")
+            #expect(try await w.pool.read { db in
+                try String.fetchOne(db, sql: "SELECT release FROM appReleaseStamp WHERE id = 1")
+            } == stampBefore, "the stamp is not moved, so the next launch retries")
+            #expect(try Self.recheck(w.pool, folderId: w.inbox.id).isEmpty)
+
+            try await w.pool.write { db in try db.execute(sql: "DROP TRIGGER retired_recheck_fails") }
+            #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: release))
+            #expect(try w.pendingOps().isEmpty)
+            #expect(try Self.recheck(w.pool, folderId: w.inbox.id) == ["rb-1"])
+        }
+    }
 }

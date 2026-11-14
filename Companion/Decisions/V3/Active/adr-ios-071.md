@@ -92,12 +92,14 @@ and no owning `outboxMessage`. Selection reads `Draft` state only, never the ret
 **2026-11-14 amendment (owner ruling, GitHub #876): retired actions are read again.** The
 2026-09-06 text relies on the boundary's full sync to restore the server's state; a folder the change
 reader tracks gets no window listing (ADR-IOS-111), so that no longer holds there. In the same
-transaction, before the delete, `SyncEngine.recheckRetiredActions` reads each retired row for its
-account, folder(s) and message ids ONLY and, for every account holding a change bookmark, puts the ids
-on the re-read lists of the source folder and (moves) the destination folder, within
-`SyncConfig.changeRecheckLimit` (overflow arms that folder's catch-up). A row this release cannot
-decode arms its folder's catch-up, or its account's when the folder is unknown; it is never skipped
-silently. Decision 2's "retire without decoding" is narrowed, not dropped: no row is re-sent, replayed
+transaction, before the delete, `SyncEngine.recheckRetiredActions` reads each retired row's raw
+columns ONLY (account, folder path(s), kind, ids; no model decode) and, for every account holding a
+change bookmark, puts the ids of a move or read/flag change on the re-read lists of the source folder
+and (moves) the destination folder when that folder is tracked, within `SyncConfig.changeRecheckLimit`
+(overflow arms that folder's catch-up). A retired draft delete arms its folder's catch-up. A row this
+release cannot decode arms its folder's catch-up, or its account's when the folder is unknown; it is
+never skipped silently. User-label and replied/forwarded changes are not corrected (no repair path
+writes them into a stored row; accepted in `IOS-ACTION-003`). Decision 2's "retire without decoding" is narrowed, not dropped: no row is re-sent, replayed
 or interpreted, nothing about any operation is decided, and an undecodable row is never an error.
 Accounts with no bookmark (IMAP today) are unchanged. Detail and the address reasoning:
 `IOS-ACTION-003` ("Retired actions read again").

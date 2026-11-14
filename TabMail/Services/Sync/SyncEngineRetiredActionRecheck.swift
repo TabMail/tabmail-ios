@@ -15,72 +15,87 @@ import GRDB
 // (ADR-IOS-111 decision 4), so nothing would correct it there.
 //
 // So, inside the boundary's transaction and before its delete, each retired row
-// is read for three things only: its account, its folders and its message ids.
-// Nothing is re-sent or replayed. Each id goes on the re-read list
-// (`FolderChangeState.recheck`) of the folder the action was queued on and, for a
-// move, of its destination too: the change reader reads those messages again on
-// its next pass and the apply writes what the server says (Gmail places a
-// message by its labels in every folder; Outlook reads folder by folder, so a
-// message the server holds elsewhere is a removal in that folder).
+// is read for its raw columns only: account, folder path(s), kind and message
+// ids. Nothing is re-sent or replayed, and no model is decoded: a value that
+// does not read is an undecodable row, never a throw, so this can never stop
+// `AppDatabase.init`.
 //
-// The ids are the queue's own, the provider's id for the message in the folder
-// the action was queued on: a move that drained re-addresses the queued rows that
-// follow it to the destination id the server named
-// (`MessageHeaderRekey.readdressQueuedOperations`), and an unsent Outlook move
-// still names the original id, which is where the server still has the message.
-// That is an id the server can answer for; the local row's address after an
-// optimistic move (the source id under the destination folder) is not used.
+// Per row, for an account that holds a change bookmark (`Account.lastHistoryId`;
+// an account with none, IMAP today, has every folder listed by the full sync and
+// is left alone):
+// - a move (archive, delete, move) or a read/flag change: its ids go on the
+//   re-read list (`FolderChangeState.recheck`) of the folder it was queued on
+//   and, for a move, of its destination, but only of a folder whose change state
+//   is TRACKED. The change reader reads those messages again and the apply
+//   writes what the server says (Gmail places a message by its labels in every
+//   folder; Outlook reads folder by folder, so a message the server holds
+//   elsewhere is a removal there). An untracked folder gets nothing: the full
+//   sync window-lists every untracked syncable folder, and a folder outside the
+//   syncable set is listed when it is opened; listing an id there would only
+//   stick, because a per-folder reader never reads that folder's list.
+// - a draft delete: its folder's catch-up is armed (`markCatchUpLapse`), which
+//   loads the server draft back. Its address is a draft resource, not a message
+//   id, so it never goes on a list.
+// - a user-label change or a replied/forwarded mark: nothing. Neither the re-read
+//   (`mergeChangeRecord` writes read, flag, tag, identity and references into a
+//   stored row) nor the catch-up (read, flag, removals, missing mail) corrects a
+//   stored row's labels or answered state, so listing them would settle the id
+//   with nothing corrected. Registered in IOS-ACTION-003.
+// - tags (local-only on these providers, ADR-IOS-036) and draft saves (re-queued
+//   by the boundary): nothing.
+// - a row whose kind or ids do not read (an older release's kind, ids that are
+//   not a JSON list): its folder's catch-up is armed, or every folder's of the
+//   account when its folder does not resolve. The same for a move or read/flag
+//   row whose folder no longer exists. Never skipped silently.
+// A list over `SyncConfig.changeRecheckLimit` keeps its first ids and arms the
+// folder's catch-up, as the apply does.
 //
-// Scope: accounts that hold a change bookmark (`Account.lastHistoryId`), the same
-// test the full sync uses to skip tracked folders. An account with no bookmark
-// has every folder listed by the boundary's full sync, as before (IMAP today).
-//
-// A row the current model cannot decode (an action kind this release does not
-// know, ids that are not a JSON list) is not skipped: its folder's catch-up is
-// armed (`markCatchUpLapse`, one whole-folder check), or every folder's of its
-// account when its folder is not known. The same for a decoded row whose folder
-// no longer exists. A list over `SyncConfig.changeRecheckLimit` keeps the first
-// ids and arms the folder's catch-up, as the apply does.
+// The ids are the queue's own: the provider's id for the message in the folder
+// the action was queued on. A drained move re-addresses the queued rows after it
+// to the destination id the server named (`MessageHeaderRekey
+// .readdressQueuedOperations`), and an unsent Outlook move still names the
+// original id, which is where the server still has the message. The local row's
+// address after an optimistic move is never used. Folders resolve by the path
+// the row recorded, never by role (ADR-IOS-059).
 
 /// What the boundary did with the retired rows, for its debug log.
 struct RetiredActionRecheckSummary: Sendable, Equatable {
     /// Distinct (folder, id) pairs put on a re-read list.
     var listedIds = 0
-    /// Folders whose catch-up was armed (overflow, undecodable row, unknown folder).
+    /// Folders whose catch-up was armed.
     var armedFolders = 0
-    /// Rows the current model could not decode.
+    /// Rows whose kind or ids did not read.
     var undecodableRows = 0
 }
 
 extension SyncEngine {
 
-    /// The action kinds whose gesture changed local rows before the server heard
-    /// of it. Tags are local-only on the providers with a change reader
-    /// (ADR-IOS-036), and draft saves and deletes are the drafts' own
-    /// (`saveDraft` is re-queued by the boundary).
-    nonisolated static let retiredActionKindsWithLocalEffect: Set<OperationType> = [
+    /// Kinds whose optimistic local effect a re-read corrects: a move's folder
+    /// and a read or flag change.
+    nonisolated static let retiredActionKindsReadAgain: Set<OperationType> = [
         .archive, .delete, .move, .markRead, .markUnread, .markFlagged, .markUnflagged,
-        .addUserLabel, .removeUserLabel, .markReplied, .markForwarded,
     ]
 
     /// Inside the release boundary's transaction, BEFORE its delete: put the
-    /// retired actions' message ids on the re-read lists of the folders they
-    /// named, or arm the catch-up where they cannot be named.
+    /// retired actions' message ids on the re-read lists of the tracked folders
+    /// they named, or arm the catch-up where a re-read cannot name them.
     nonisolated static func recheckRetiredActions(db: Database) throws -> RetiredActionRecheckSummary {
         var summary = RetiredActionRecheckSummary()
-        let bookmarked = Set(try String.fetchAll(
-            db, sql: "SELECT id FROM account WHERE lastHistoryId IS NOT NULL"))
+        let bookmarked = Set(try rawStrings(db, "SELECT id FROM account WHERE lastHistoryId IS NOT NULL"))
         guard !bookmarked.isEmpty else { return summary }
 
-        // Folder rows by (account, path), read once per pair.
-        var foldersByKey: [String: Folder?] = [:]
-        var foldersById: [String: Folder] = [:]
-        func folder(accountId: String, path: String) throws -> Folder? {
+        // Folder (id, change state) by (account, path), read once per pair.
+        var foldersByKey: [String: RetiredActionFolder?] = [:]
+        var foldersById: [String: RetiredActionFolder] = [:]
+        func folder(accountId: String, path: String) throws -> RetiredActionFolder? {
             let key = "\(accountId)\u{1F}\(path)"
             if let cached = foldersByKey[key] { return cached }
-            let found = try Folder
-                .filter(Column("accountId") == accountId && Column("path") == path)
-                .fetchOne(db)
+            let row = try Row.fetchOne(
+                db, sql: "SELECT id, changeState FROM folder WHERE accountId = ? AND path = ?",
+                arguments: [accountId, path])
+            let found = row.flatMap { row in
+                Self.rawString(row, "id").map { RetiredActionFolder(id: $0, changeState: Self.rawString(row, "changeState")) }
+            }
             foldersByKey[key] = found
             if let found { foldersById[found.id] = found }
             return found
@@ -91,23 +106,38 @@ extension SyncEngine {
         var armFolderIds = Set<String>()
         var armAccountIds = Set<String>()
 
-        let rows = try Row.fetchAll(db, sql: "SELECT * FROM pendingOperation ORDER BY queuePosition")
+        let rows = try Row.fetchAll(db, sql: """
+            SELECT accountId, folderPath, destinationPath, type, messageIdsJSON
+            FROM pendingOperation ORDER BY queuePosition
+            """)
         for row in rows {
-            guard let accountId = row["accountId"] as String?, bookmarked.contains(accountId) else { continue }
-            guard let op = try? PendingOperation(row: row),
-                  let data = op.messageIdsJSON.data(using: .utf8),
-                  let ids = try? JSONDecoder().decode([String].self, from: data) else {
+            guard let accountId = rawString(row, "accountId"), bookmarked.contains(accountId) else { continue }
+            let folderPath = rawString(row, "folderPath")
+            let type = rawString(row, "type").flatMap(OperationType.init(rawValue:))
+            let ids = rawString(row, "messageIdsJSON")
+                .flatMap { $0.data(using: .utf8) }
+                .flatMap { try? JSONDecoder().decode([String].self, from: $0) }
+            guard let type, let ids, let folderPath else {
                 summary.undecodableRows += 1
-                if let path = row["folderPath"] as String?, let known = try folder(accountId: accountId, path: path) {
+                if let folderPath, let known = try folder(accountId: accountId, path: folderPath) {
                     armFolderIds.insert(known.id)
                 } else {
                     armAccountIds.insert(accountId)
                 }
                 continue
             }
-            guard retiredActionKindsWithLocalEffect.contains(op.type), !ids.isEmpty else { continue }
-            var paths = [op.folderPath]
-            if PendingOperationSnapshot.destructiveTypes.contains(op.type), let destination = op.destinationPath {
+            if type == .deleteDraft {
+                if let drafts = try folder(accountId: accountId, path: folderPath) {
+                    armFolderIds.insert(drafts.id)
+                } else {
+                    armAccountIds.insert(accountId)
+                }
+                continue
+            }
+            guard retiredActionKindsReadAgain.contains(type), !ids.isEmpty else { continue }
+            var paths = [folderPath]
+            if PendingOperationSnapshot.destructiveTypes.contains(type),
+               let destination = rawString(row, "destinationPath") {
                 paths.append(destination)
             }
             for path in paths {
@@ -115,6 +145,7 @@ extension SyncEngine {
                     armAccountIds.insert(accountId)
                     continue
                 }
+                guard FolderChangeState(raw: named.changeState).tracking else { continue }
                 if idsByFolder[named.id] == nil { folderOrder.append(named.id) }
                 idsByFolder[named.id, default: []].append(contentsOf: ids)
             }
@@ -140,8 +171,7 @@ extension SyncEngine {
         }
 
         for accountId in armAccountIds.sorted() {
-            armFolderIds.formUnion(try String.fetchAll(
-                db, sql: "SELECT id FROM folder WHERE accountId = ?", arguments: [accountId]))
+            armFolderIds.formUnion(try rawStrings(db, "SELECT id FROM folder WHERE accountId = ?", [accountId]))
         }
         for folderId in armFolderIds.sorted() {
             try markCatchUpLapse(folderId: folderId, db: db)
@@ -149,4 +179,22 @@ extension SyncEngine {
         summary.armedFolders = armFolderIds.count
         return summary
     }
+
+    /// A column's text, or nil when it is NULL or not text. Never throws or traps.
+    private nonisolated static func rawString(_ row: Row, _ column: String) -> String? {
+        String.fromDatabaseValue(row[column] as DatabaseValue)
+    }
+
+    /// The text values of a one-column query; values that are not text are left out.
+    private nonisolated static func rawStrings(
+        _ db: Database, _ sql: String, _ arguments: StatementArguments = StatementArguments()
+    ) throws -> [String] {
+        try DatabaseValue.fetchAll(db, sql: sql, arguments: arguments).compactMap(String.fromDatabaseValue)
+    }
+}
+
+/// A folder as the boundary reads it: its id and its raw change state only.
+private struct RetiredActionFolder {
+    let id: String
+    let changeState: String?
 }

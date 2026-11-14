@@ -99,10 +99,10 @@
 > **2026-11-14 amendment (owner ruling, GitHub #876): the boundary has retired actions read again.**
 > A folder the change reader tracks gets no window listing, so the boundary's full sync no longer
 > restores the server's state there. Before the delete, the same transaction reads each retired row
-> for its account, folder(s) and message ids only (`SyncEngine.recheckRetiredActions`) and puts the ids
-> on the folders' re-read lists (source, and destination for a move) of every account holding a change
-> bookmark; a full list or a row this release cannot decode arms the folder's (or the account's)
-> catch-up. It re-sends, replays and decides nothing about any operation, so the carve-out's three
+> for its raw account, folder, kind and id columns only (`SyncEngine.recheckRetiredActions`) and puts
+> the ids of a move or read/flag change on the tracked folders' re-read lists (source, and destination
+> for a move) of every account holding a change bookmark; a full list, a retired draft delete or a row
+> this release cannot decode arms the folder's (or the account's) catch-up. It re-sends, replays and decides nothing about any operation, so the carve-out's three
 > properties still hold and it is still not an exit. Detail: `IOS-ACTION-003`.
 >
 > **2026-09-06 amendment: ordinary message actions have a fifth runtime exit.** This latest
