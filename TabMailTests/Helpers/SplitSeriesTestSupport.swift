@@ -11,7 +11,7 @@ extension CalendarProvider {
     func splitSeries(
         calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone,
         patch: GCalEventInput, sendUpdates: String
-    ) async throws -> GCalEvent {
+    ) async throws -> GCalEvent? {
         try await splitSeries(
             calendarId: calendarId, eventId: eventId, recurrenceId: recurrenceId,
             recurrenceIdZone: recurrenceIdZone, patch: patch, sendUpdates: sendUpdates, record: .unused)
@@ -22,7 +22,7 @@ extension GoogleCalendarProvider {
     func splitSeries(
         calendarId: String = "primary", eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone,
         patch: GCalEventInput, sendUpdates: String = "all"
-    ) async throws -> GCalEvent {
+    ) async throws -> GCalEvent? {
         try await splitSeries(
             calendarId: calendarId, eventId: eventId, recurrenceId: recurrenceId,
             recurrenceIdZone: recurrenceIdZone, patch: patch, sendUpdates: sendUpdates, record: .unused)
@@ -33,7 +33,7 @@ extension ExchangeCalendarProvider {
     func splitSeries(
         calendarId: String = "primary", eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone,
         patch: GCalEventInput, sendUpdates: String = "all"
-    ) async throws -> GCalEvent {
+    ) async throws -> GCalEvent? {
         try await splitSeries(
             calendarId: calendarId, eventId: eventId, recurrenceId: recurrenceId,
             recurrenceIdZone: recurrenceIdZone, patch: patch, sendUpdates: sendUpdates, record: .unused)

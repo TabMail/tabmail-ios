@@ -183,16 +183,27 @@ struct ExchangeSplitCapSeriesDayTests {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
         graph.install(on: http)
-        let record = SplitRecord(seriesId: CrossZoneSeries.id, newPartId: "cz-new", splitAt: wall(fixture.split, in: fixture.device))
+        // The split is interrupted at its cap, its last write, with its new part made and its record kept.
+        graph.failNext("PATCH", with: 400)
+        let records = SplitRecordBox()
+        var patch = GCalEventInput()
+        patch.summary = "Renamed"
+        await #expect(throws: (any Error).self) {
+            _ = try await provider(http).splitSeries(
+                eventId: CrossZoneSeries.id, recurrenceId: wall(fixture.split, in: fixture.device),
+                recurrenceIdZone: zone(fixture.device), patch: patch, record: records.recorder)
+        }
+        #expect(graph.created.count == 1 && graph.patches(CrossZoneSeries.id).isEmpty, "the split was not interrupted at its cap")
+        let record = try #require(records.records.first, "the split kept no record before its cap")
 
-        try await provider(http).finishSplit(calendarId: "primary", record: record, zone: zone(fixture.device))
+        try await provider(http).finishSplit(calendarId: "primary", record: record, zone: zone(fixture.device), guests: nil)
         let kept = graph.rangeDays(of: CrossZoneSeries.id) ?? []
         #expect(kept == days.filter { $0 < splitDay },
                 "the retry's cap leaves \(kept) on the old part (\(canonical(rangeOf(graph.event(CrossZoneSeries.id))))); the series held \(days), split on \(splitDay)")
 
         // Another retry finds the series ending on that cap and writes nothing.
         let written = graph.patches(CrossZoneSeries.id).count
-        try await provider(http).finishSplit(calendarId: "primary", record: record, zone: zone(fixture.device))
+        try await provider(http).finishSplit(calendarId: "primary", record: record, zone: zone(fixture.device), guests: nil)
         #expect(graph.patches(CrossZoneSeries.id).count == written,
                 "a series already capped was capped again: \(graph.patches(CrossZoneSeries.id).map { canonical(rangeOf($0)) })")
         #expect(graph.rangeDays(of: CrossZoneSeries.id) == kept, "the second retry changed the old part")
@@ -222,9 +233,10 @@ struct ExchangeSplitCapSeriesDayTests {
         #expect(graph.created.isEmpty)
 
         // A retry finishing a split of such a series is refused the same way, writing nothing.
-        let record = SplitRecord(seriesId: CrossZoneSeries.id, newPartId: "cz-new", splitAt: wall(fixture.split, in: fixture.device))
+        let record = SplitRecord(
+            seriesId: CrossZoneSeries.id, newPartId: "cz-new", splitAt: wall(fixture.split, in: fixture.device), mode: .carry, fields: [.summary])
         await #expect(throws: CalendarProviderError.self) {
-            try await provider(http).finishSplit(calendarId: "primary", record: record, zone: zone(fixture.device))
+            try await provider(http).finishSplit(calendarId: "primary", record: record, zone: zone(fixture.device), guests: nil)
         }
         #expect(graph.writes.isEmpty, "written: \(graph.writes)")
     }
@@ -249,9 +261,17 @@ struct ExchangeSplitCapSeriesDayTests {
 
         #expect(rows.isEmpty, "the split was not written: \(rows.map { "\($0.status) \($0.failureReason ?? "")" })")
         #expect(graph.created.count == 1, "\(graph.created.count) new parts")
+        guard graph.created.count == 1 else { return }
         let kept = graph.rangeDays(of: CrossZoneSeries.id) ?? []
         #expect(kept == days.filter { $0 < splitDay },
                 "the old part holds \(kept); the series held \(days), split on \(splitDay) in the event's zone (cap \(canonical(rangeOf(graph.event(CrossZoneSeries.id)))))")
+        // The new part is dated in the event's zone too: it holds the split occurrence and every
+        // later one, and starts at the split occurrence.
+        let created = graph.created[0]
+        let following = FakeGraphCalendar.rangeDays(created) ?? []
+        #expect(following == days.filter { $0 >= splitDay }, "the new part holds \(following), from \(canonical(rangeOf(created)))")
+        #expect(GraphFixture.instant(created["start"] as? [String: Any]) == fixture.split,
+                "the new part starts \(canonical(created["start"])), the split occurrence is \(wall(fixture.split, in: fixture.stored)) in the event's zone")
     }
 
     @Test("a series whose range names a zone and whose event names another is split in the range's zone",

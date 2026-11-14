@@ -957,15 +957,28 @@ extension AccountManager {
             let recurrenceIdZone = try CalendarToolHelpers.recurrenceIdZone(args, editZone: editZone)
             // 🚨 A SPLIT WHOSE NEW PART WAS WRITTEN IS NEVER RUN AGAIN (#601). An earlier attempt
             // of this operation created the new part and kept its record (`recordSplit`) before
-            // the cap; its cap failed or its answer was lost. Only the cap is left: it is written
-            // alone, from the series as it is now (`finishSplit`), while the new part is there. A
+            // the carry and the cap; one of them failed or its answer was lost. Only those are
+            // left: they are written from the series as it is now (`finishSplit`), while the new
+            // part is there, the carry from the record's mode and fields and the edit's guest
+            // change read again from the arguments (#563). A
             // new part the user deleted since is not written again, and nor is the cap: the
             // change is refused with the reason, and the user decides.
+            // An edit past the series' last place that an earlier attempt began writes the rest
+            // of its edits to the targets it kept, without looking for the occurrence named where
+            // it was (the first attempt may have moved it).
+            if let record = SplitRecord(args), record.isPastEnd {
+                try await provider.finishShownEdit(
+                    calendarId: calId, record: record,
+                    edit: try CalendarToolHelpers.buildGCalEventInput(args, isAllDay: nil), guests: AttendeeChange(arguments: args))
+                BackgroundSyncLogger.logDebug("[CalendarQueue] Finished the edit past the end of \(record.seriesId)")
+                return (nil, nil)
+            }
             if let record = SplitRecord(args) {
                 guard try await provider.eventExists(calendarId: calId, eventId: record.newPartId) else {
                     throw CalendarProviderError.notSupported(SplitRecord.newPartDeleted)
                 }
-                try await provider.finishSplit(calendarId: calId, record: record, zone: recurrenceIdZone)
+                try await provider.finishSplit(
+                    calendarId: calId, record: record, zone: recurrenceIdZone, guests: AttendeeChange(arguments: args))
                 BackgroundSyncLogger.logDebug("[CalendarQueue] Finished split of \(record.seriesId) at \(record.splitAt) — new series id=\(record.newPartId)")
                 return (record.newPartId, nil)
             }
@@ -1146,8 +1159,8 @@ extension AccountManager {
                     throw CalendarProviderError.notSupported("edit_scope='this_and_following' requires recurrence_id")
                 }
                 // The record is kept on this operation once the new part's create is
-                // confirmed and before the cap (`SplitRecord`), so a retry takes the branch
-                // above. #563 would carry what it needs between the create and the record here.
+                // confirmed and before the carry and the cap (`SplitRecord`), so a retry takes
+                // the branch above.
                 let opId = op.id
                 let created = try await provider.splitSeries(
                     calendarId: calId, eventId: writeId, recurrenceId: rid,
@@ -1157,13 +1170,14 @@ extension AccountManager {
                         keep: { record in try await self.recordSplit(opId: opId, record) },
                         partNotFound: { try await self.noteSplitPartNotFound(opId: opId) })
                 )
-                BackgroundSyncLogger.logDebug("[CalendarQueue] Updated event id=\(eventId) scope=this_and_following at \(rid) (\(recurrenceIdZone.identifier)) — new series id=\(created.id ?? "?")")
+                BackgroundSyncLogger.logDebug("[CalendarQueue] Updated event id=\(eventId) scope=this_and_following at \(rid) (\(recurrenceIdZone.identifier)) — new series id=\(created?.id ?? "none")")
                 // Surface the new series id so `awaitCalendarOpOutcome` can hand
                 // it back to the tool — the LLM needs it to address occurrences
                 // in the split's second half. Without this, follow-up edits
                 // continue to target the master (now truncated) and silently
                 // miss for any occurrence on or after `rid`.
-                return (created.id, nil)
+                // An edit past the series' last place makes no new part (nil): nothing to surface.
+                return (created?.id, nil)
             case "all":
                 _ = try await provider.updateEvent(calendarId: calId, eventId: writeId, event: input, sendUpdates: "all")
                 BackgroundSyncLogger.logDebug("[CalendarQueue] Updated event id=\(writeId) scope=all")

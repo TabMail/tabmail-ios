@@ -319,6 +319,42 @@ enum RecurrenceTail {
         return count
     }
 
+    /// The first day the rule places an occurrence on, on or after a given day.
+    enum FirstDay: Equatable, Sendable {
+        /// The day.
+        case day(Day)
+        /// The pattern places none on or after it (within four-digit years).
+        case none
+        /// The rule is outside the subset `occurrences` expands.
+        case unsupported
+    }
+
+    /// How many days `firstDay` looks ahead at first; it doubles the span until it finds a day or
+    /// passes the last day four-digit years name (`maxInterval`).
+    static let firstDaySearchDays = 32
+
+    /// The first day on or after `from` that the rule's pattern, started at `seriesStart`, places
+    /// an occurrence on: `seriesStart` itself with `anchor` `.dtstart` (RFC 5545), only a day the
+    /// rule's parts name with `.patternStart` (Outlook). COUNT and UNTIL are not read here: the
+    /// caller checks the day against them.
+    static func firstDay(
+        of rrule: String, seriesStart: Day, onOrAfter from: Day, anchor: Anchor = .dtstart, missingDay: MissingMonthDay = .skip
+    ) -> FirstDay {
+        guard let rule = Rule(rrule, missingDay: missingDay) else { return .unsupported }
+        let first = seriesStart.ordinal
+        let floor = max(from.ordinal, first)
+        if anchor == .dtstart, first >= from.ordinal { return .day(seriesStart) }
+        var span = firstDaySearchDays
+        while true {
+            let before = Day(ordinal: floor + span)
+            let days = rule.periods(from: seriesStart, before: before).joined()
+                .filter { $0 >= floor && ($0 > first || anchor == .patternStart) }
+            if let found = days.min() { return .day(Day(ordinal: found)) }
+            guard span < maxInterval else { return .none }
+            span = min(span * 2, maxInterval)
+        }
+    }
+
     // MARK: - Rule
 
     enum Weekday: Int, CaseIterable, Sendable {

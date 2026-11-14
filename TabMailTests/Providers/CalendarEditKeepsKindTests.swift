@@ -188,13 +188,34 @@ final class FakeGoogleCalendar: Sendable {
                 return Self.json(["items": items])
             }
             if parts.count == 1, let code = gone.withLock({ $0[parts[0]] }) { return .status(code) }
-            guard parts.count == 1, let stored = event(parts[0]) else { return .status(404) }
-            return Self.json(stored)
+            guard parts.count == 1, let stored = event(parts[0]) ?? Self.instance(parts[0], of: event) else { return .status(404) }
+            return Self.json(Self.withUID(stored))
+        }
+        // The series and every exception it holds, cancelled ones included, for
+        // `events?iCalUID=…&singleEvents=false&showDeleted=true` (measured): an event's iCalUID is
+        // the one stored, else its id at google.com, as `GET` gives it.
+        http.register(path: prefix, method: "GET") { [self] request in
+            let items = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+            guard let uid = items.first(where: { $0.name == "iCalUID" })?.value else { return .status(400) }
+            let all = events.withLock { Array($0.values) }
+                .compactMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
+            let series = Set(all.filter { Self.uid(of: $0) == uid }.compactMap { $0["id"] as? String })
+            let listed = all.filter { event in
+                (event["id"] as? String).map(series.contains) == true
+                    || (event["recurringEventId"] as? String).map(series.contains) == true
+            }
+            listLog.withLock { $0 += 1 }
+            return Self.json(["items": listed.map(Self.withUID)])
         }
         http.register(path: prefix + "/", method: "PATCH") { [self] request in
             let parts = Self.pathParts(request.url)
             runWriteHook("PATCH", parts.first ?? "")
             if let status = takeFailure("PATCH") { return .status(status) }
+            // An occurrence id off its series' rule, or of no series, is not found (`instance`).
+            if parts.count == 1, event(parts[0]) == nil {
+                guard let occurrence = Self.instance(parts[0], of: event) else { return .status(404) }
+                store(occurrence)
+            }
             guard parts.count == 1, var stored = event(parts[0]), let body = request.body,
                   let patch = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any]
             else { return .status(400) }
@@ -210,7 +231,20 @@ final class FakeGoogleCalendar: Sendable {
             let isSeries = (stored["recurrence"] as? [String])?.isEmpty == false
             let changesRule = patch["recurrence"].map { ($0 as? [String]) != (stored["recurrence"] as? [String]) } ?? false
             let movesTime = ["start", "end"].contains { key in patch[key].map { _ in !Self.sameTime(merged[key] as Any, stored[key]) } ?? false }
-            if isSeries, changesRule || movesTime {
+            if isSeries, !movesTime, let until = Self.capUntil(patch["recurrence"], stored: stored["recurrence"]) {
+                // A cap (only the rule's end changes): the exceptions before it stay, those at or
+                // after it are left `cancelled` (measured).
+                events.withLock { all in
+                    for (id, data) in all {
+                        guard var occurrence = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                              occurrence["recurringEventId"] as? String == parts[0],
+                              let place = Self.placeInstant(occurrence), place >= until else { continue }
+                        occurrence["status"] = "cancelled"
+                        // swiftlint:disable:next force_try
+                        all[id] = try! JSONSerialization.data(withJSONObject: occurrence)
+                    }
+                }
+            } else if isSeries, changesRule || movesTime {
                 resets.withLock { $0 += 1 }
                 events.withLock { all in
                     all = all.filter { _, data in
@@ -279,6 +313,158 @@ final class FakeGoogleCalendar: Sendable {
             writeLog.withLock { $0.append("DELETE \(parts[0])") }
             return .status(204)
         }
+    }
+
+    /// How many times the series-and-exceptions list was read.
+    var listReads: Int { listLog.withLock { $0 } }
+    private let listLog = Mutex(0)
+
+    /// An event's iCalUID: the one stored, else its id at google.com.
+    private static func uid(of event: [String: Any]) -> String? {
+        event["iCalUID"] as? String ?? (event["id"] as? String).map { "\($0)@google.com" }
+    }
+
+    private static func withUID(_ event: [String: Any]) -> [String: Any] {
+        var out = event
+        if out["iCalUID"] == nil, let uid = uid(of: event) { out["iCalUID"] = uid }
+        return out
+    }
+
+    /// The occurrence `id` (`<series id>_<UTC start>Z`, or `<series id>_<date>` for an all-day
+    /// series) of a stored series, as Google gives it before it is changed: the series' fields at
+    /// its place, lasting as long as the series. Nil (a 404) when `id` names no occurrence of a
+    /// stored series: no series, or a start its rule does not place an occurrence at (`onRule`), as
+    /// Google answers an instance id off the rule.
+    private static func instance(_ id: String, of event: (String) -> [String: Any]?) -> [String: Any]? {
+        guard let occurrence = anyInstance(id, of: event), let seriesId = occurrence["recurringEventId"] as? String,
+              let series = event(seriesId), onRule(series, occurrence: occurrence) else { return nil }
+        return occurrence
+    }
+
+    /// Whether the series `series` places an occurrence where `occurrence` (built by `anyInstance`)
+    /// starts: on a day its rule names from its start, at its own time of day in its own zone. Read
+    /// here, apart from the code under test, for `FREQ=DAILY` and `FREQ=WEEKLY` (`INTERVAL`,
+    /// `BYDAY`, weeks from Monday, `UNTIL`, `COUNT`); a rule of any other frequency is not checked.
+    private static func onRule(_ series: [String: Any], occurrence: [String: Any]) -> Bool {
+        guard let rule = (series["recurrence"] as? [String])?.first(where: { $0.uppercased().hasPrefix("RRULE:") }) else { return false }
+        var parts: [String: String] = [:]
+        for part in rule.uppercased().dropFirst("RRULE:".count).split(separator: ";") {
+            let pair = part.split(separator: "=", maxSplits: 1).map(String.init)
+            if pair.count == 2 { parts[pair[0]] = pair[1] }
+        }
+        guard let freq = parts["FREQ"], freq == "DAILY" || freq == "WEEKLY" else { return true }
+        var cal = Calendar(identifier: .gregorian)
+        let start = series["start"] as? [String: Any], at = occurrence["start"] as? [String: Any]
+        let day: (Date) -> Date
+        let first: Date, target: Date
+        if let startDate = start?["date"] as? String {
+            cal.timeZone = .gmt
+            guard let date = at?["date"] as? String,
+                  let s = EKEventStoreHelper.parseNaiveISO(startDate, timeZone: .gmt),
+                  let t = EKEventStoreHelper.parseNaiveISO(date, timeZone: .gmt) else { return false }
+            (first, target) = (s, t)
+        } else {
+            let zone = (start?["timeZone"] as? String).flatMap { CalendarTimeZoneResolver.zone(named: $0, in: .none) } ?? .gmt
+            cal.timeZone = zone
+            guard let s = (start?["dateTime"] as? String).flatMap({ Date.fromISO8601($0) }),
+                  let t = (at?["dateTime"] as? String).flatMap({ Date.fromISO8601($0) }) else { return false }
+            let clock: Set<Calendar.Component> = [.hour, .minute, .second]
+            guard cal.dateComponents(clock, from: s) == cal.dateComponents(clock, from: t) else { return false }
+            (first, target) = (s, t)
+        }
+        day = { cal.startOfDay(for: $0) }
+        guard target >= first, let days = cal.dateComponents([.day], from: day(first), to: day(target)).day else { return false }
+        if let until = parts["UNTIL"] {
+            let fmt = DateFormatter()
+            fmt.locale = Locale(identifier: "en_US_POSIX")
+            fmt.timeZone = .gmt
+            fmt.dateFormat = until.count == 8 ? "yyyyMMdd" : "yyyyMMdd'T'HHmmss'Z'"
+            guard let end = fmt.date(from: until) else { return false }
+            if until.count == 8 ? day(target) > end : target > end { return false }
+        }
+        let interval = Int(parts["INTERVAL"] ?? "1") ?? 1
+        let codes = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"]
+        let weekday = { (date: Date) in codes[cal.component(.weekday, from: date) - 1] }
+        let named = parts["BYDAY"].map { Set($0.split(separator: ",").map(String.init)) } ?? [weekday(first)]
+        // Weeks start on Monday (`WKST` is not read): the week holding the series' start is week 0.
+        let fromMonday = (cal.component(.weekday, from: first) + 5) % 7
+        // Whether the day `offset` days after the start's is one the rule names.
+        func isOn(_ offset: Int) -> Bool {
+            guard freq == "WEEKLY" else { return offset % interval == 0 }
+            guard let date = cal.date(byAdding: .day, value: offset, to: day(first)) else { return false }
+            return named.contains(weekday(date)) && ((offset + fromMonday) / 7) % interval == 0
+        }
+        guard isOn(days) else { return false }
+        // `COUNT`: the start is the first occurrence (RFC 5545), so the target is one more than the
+        // days the rule names between them.
+        if let count = parts["COUNT"].flatMap({ Int($0) }) {
+            return days == 0 || 1 + (1..<days).filter(isOn).count < count
+        }
+        return true
+    }
+
+    /// `instance` before its rule is checked.
+    private static func anyInstance(_ id: String, of event: (String) -> [String: Any]?) -> [String: Any]? {
+        guard let cut = id.lastIndex(of: "_") else { return nil }
+        let seriesId = String(id[..<cut])
+        let suffix = String(id[id.index(after: cut)...])
+        guard let series = event(seriesId), (series["recurrence"] as? [String])?.isEmpty == false else { return nil }
+        var occurrence = series
+        occurrence["id"] = id
+        occurrence["recurrence"] = nil
+        occurrence["recurringEventId"] = seriesId
+        occurrence["iCalUID"] = uid(of: series)
+        if suffix.count == 8, let start = (series["start"] as? [String: Any])?["date"] as? String,
+           let end = (series["end"] as? [String: Any])?["date"] as? String,
+           let s = EKEventStoreHelper.parseNaiveISO(start, timeZone: .gmt), let e = EKEventStoreHelper.parseNaiveISO(end, timeZone: .gmt) {
+            let day = "\(suffix.prefix(4))-\(suffix.dropFirst(4).prefix(2))-\(suffix.suffix(2))"
+            guard let at = EKEventStoreHelper.parseNaiveISO(day, timeZone: .gmt) else { return nil }
+            let fmt = DateFormatter()
+            fmt.locale = Locale(identifier: "en_US_POSIX")
+            fmt.timeZone = .gmt
+            fmt.dateFormat = "yyyy-MM-dd"
+            occurrence["start"] = ["date": day]
+            occurrence["end"] = ["date": fmt.string(from: at.addingTimeInterval(e.timeIntervalSince(s)))]
+            occurrence["originalStartTime"] = ["date": day]
+            return occurrence
+        }
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.timeZone = .gmt
+        fmt.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+        guard let at = fmt.date(from: suffix),
+              let s = ((series["start"] as? [String: Any])?["dateTime"] as? String).flatMap({ Date.fromISO8601($0) }),
+              let e = ((series["end"] as? [String: Any])?["dateTime"] as? String).flatMap({ Date.fromISO8601($0) }) else { return nil }
+        let zone = (series["start"] as? [String: Any])?["timeZone"] as? String ?? "UTC"
+        occurrence["start"] = ["dateTime": at.iso8601String(), "timeZone": zone]
+        occurrence["end"] = ["dateTime": at.addingTimeInterval(e.timeIntervalSince(s)).iso8601String(), "timeZone": zone]
+        occurrence["originalStartTime"] = ["dateTime": at.iso8601String(), "timeZone": zone]
+        return occurrence
+    }
+
+    /// The instant a cap ends a series at: the `UNTIL` of `written`'s rule when its rule is the
+    /// stored one with only its end (`UNTIL`, `COUNT`) changed. Nil for any other write.
+    private static func capUntil(_ written: Any?, stored: Any?) -> Date? {
+        func rule(_ lines: Any?) -> String? { (lines as? [String])?.first { $0.uppercased().hasPrefix("RRULE:") } }
+        func withoutEnd(_ rule: String) -> String {
+            GoogleCalendarProvider.canonicalRRULE(rule).split(separator: ";")
+                .filter { !$0.hasPrefix("UNTIL=") && !$0.hasPrefix("COUNT=") }.joined(separator: ";")
+        }
+        guard let new = rule(written), let old = rule(stored), withoutEnd(new) == withoutEnd(old),
+              let until = new.uppercased().split(separator: ";").first(where: { $0.hasPrefix("UNTIL=") })?.dropFirst("UNTIL=".count)
+        else { return nil }
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.timeZone = .gmt
+        fmt.dateFormat = until.count == 8 ? "yyyyMMdd" : "yyyyMMdd'T'HHmmss'Z'"
+        return fmt.date(from: String(until)).map { until.count == 8 ? $0.addingTimeInterval(86_400) : $0.addingTimeInterval(1) }
+    }
+
+    /// An exception's place (`originalStartTime`) as an instant; an all-day date from UTC midnight.
+    private static func placeInstant(_ event: [String: Any]) -> Date? {
+        guard let place = event["originalStartTime"] as? [String: Any] else { return nil }
+        if let dateTime = place["dateTime"] as? String { return Date.fromISO8601(dateTime) }
+        return (place["date"] as? String).flatMap { EKEventStoreHelper.parseNaiveISO($0, timeZone: .gmt) }
     }
 
     /// The `sendUpdates` each DELETE that landed was sent with, in order.

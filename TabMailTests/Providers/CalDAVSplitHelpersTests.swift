@@ -1488,7 +1488,7 @@ struct CalDAVSplitRollbackTests {
         //    `AccountManager.isCalendarBadRequestError` does not
         //    classify, so the op requeues forever and its account joins
         //    `failedAccounts` — the wedge, which is a dropped user intention.
-        #expect(result.id == successorPath)
+        #expect(result?.id == successorPath)
         // 2. The series is CAPPED, so its later occurrences show once.
         let master = store.storedICS(path: Self.masterPath)
         #expect(master?.contains("UNTIL=") == true,
@@ -1641,11 +1641,71 @@ struct CalDAVSplitRollbackTests {
         let record = try #require(records.records.first, "the split kept no record before its cap")
         let writesBeforeRetry = store.recordedPuts().count
         #expect(try await provider.eventExists(calendarId: Self.calendarId, eventId: record.newPartId))
-        try await provider.finishSplit(calendarId: Self.calendarId, record: record, zone: .current)
+        try await provider.finishSplit(calendarId: Self.calendarId, record: record, zone: .current, guests: nil)
 
         try Self.expectPartition(store, fixture, dated)
         #expect(!store.recordedPuts().dropFirst(writesBeforeRetry).contains { $0.path == Self.newPartPath(fixture) },
                 "the retry wrote the new part again: \(store.recordedPuts().map(\.path))")
+    }
+
+    @Test("""
+    a floating series split at a moved occurrence, its cap refused and finished later while the \
+    device is in another zone: the retry edits the same occurrences shown after the named one
+    """)
+    func floatingSplitRetryEditsTheSameOccurrences() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let store = FakeCalDAVStore(servesETags: true)
+        // The operation's zone, five hours behind the device's.
+        let zone = try #require(TimeZone(secondsFromGMT: TimeZone.current.secondsFromGMT() - 5 * 3600))
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .gmt
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = calendar
+        formatter.timeZone = .gmt
+        formatter.dateFormat = "yyyyMMdd"
+        let today = calendar.startOfDay(for: Date())
+        func day(_ n: Int) -> String { formatter.string(from: calendar.date(byAdding: .day, value: n, to: today) ?? today) }
+        // Weekly at 10:00 floating. Day 7's occurrence moved to day 9 at 10:00 (named); day 0's
+        // moved to day 9 at 12:00: placed before the cut (day 14), shown after the named one.
+        let ics = [
+            "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Example//EN",
+            "BEGIN:VEVENT", "UID:floating-split@example.com", "DTSTAMP:\(day(0))T000000Z",
+            "DTSTART:\(day(0))T100000", "DTEND:\(day(0))T103000", "RRULE:FREQ=WEEKLY", "SUMMARY:Standup", "END:VEVENT",
+            "BEGIN:VEVENT", "UID:floating-split@example.com", "DTSTAMP:\(day(0))T000000Z", "RECURRENCE-ID:\(day(7))T100000",
+            "DTSTART:\(day(9))T100000", "DTEND:\(day(9))T103000", "SUMMARY:Standup", "END:VEVENT",
+            "BEGIN:VEVENT", "UID:floating-split@example.com", "DTSTAMP:\(day(0))T000000Z", "RECURRENCE-ID:\(day(0))T100000",
+            "DTSTART:\(day(9))T120000", "DTEND:\(day(9))T123000", "SUMMARY:Standup", "END:VEVENT",
+            "END:VCALENDAR",
+        ].joined(separator: "\r\n")
+        store.seed(path: Self.masterPath, ics: ics)
+        let refuseNext = Mutex(true)
+        http.register(path: "/cal/", method: "GET") { store.handleGET($0) }
+        http.register(path: "/cal/", method: "PUT") { store.handlePUT($0) }
+        http.register(path: Self.masterPath, method: "PUT") { request in
+            // The first cap is refused and not kept.
+            if refuseNext.withLock({ refuse in defer { refuse = false }; return refuse }) { return .raw(statusCode: 500) }
+            return store.handlePUT(request)
+        }
+        let provider = Self.makeProvider(http)
+        let records = SplitRecordBox()
+        var patch = GCalEventInput()
+        patch.summary = "Renamed"
+        let named = "\(day(9).prefix(4))-\(day(9).dropFirst(4).prefix(2))-\(day(9).suffix(2))T10:00:00"
+        await #expect(throws: (any Error).self) {
+            _ = try await provider.splitSeries(
+                calendarId: Self.calendarId, eventId: Self.masterEventId, recurrenceId: named,
+                recurrenceIdZone: zone, patch: patch, sendUpdates: "none", record: records.recorder)
+        }
+        let record = try #require(records.records.first, "the split kept no record before its cap")
+        try await provider.finishSplit(calendarId: Self.calendarId, record: record, zone: zone, guests: nil)
+        let capped = try #require(store.storedICS(path: Self.masterPath))
+        let blocks = capped.components(separatedBy: "BEGIN:VEVENT")
+        let shownAfter = try #require(blocks.first { $0.contains("RECURRENCE-ID:\(day(0))T100000") }, "\(capped)")
+        #expect(shownAfter.contains("SUMMARY:Renamed"), "the retry skipped an occurrence shown after the named one: \(shownAfter)")
+        let namedBlock = try #require(blocks.first { $0.contains("RECURRENCE-ID:\(day(7))T100000") }, "\(capped)")
+        #expect(namedBlock.contains("SUMMARY:Renamed"), "\(namedBlock)")
     }
 
     @Test("""
@@ -2534,5 +2594,392 @@ struct CalDAVSeriesStartShiftWireTests {
         }
         #expect(store.recordedPuts().isEmpty, "no PUT may carry a series whose tied values were left behind")
         #expect(store.storedICS(path: path) == seed)
+    }
+}
+
+// MARK: - A split's carried overrides name occurrences of the new part (#563)
+
+/// Every override a CalDAV split writes onto its new part names an occurrence the new part has, or
+/// the split is refused (or the override reset) before any PUT. The check is read straight from
+/// RFC 5545 §3.3.10 for the weekly rules these tests write (`FREQ=WEEKLY`, `INTERVAL`, `BYDAY`,
+/// weeks from Monday), independent of the provider's own rule reader.
+@Suite("CalDAV split: carried overrides name occurrences of the new part, or nothing is written (#563)", .serialized)
+struct CalDAVSplitCarrySlotTests {
+
+    /// 2099-01-05 is a Monday; `day(n)` is n days later, `yyyy-MM-dd`.
+    private static func day(_ n: Int) -> String {
+        let base = FixedDateFormat.formatter("yyyy-MM-dd", timeZone: .gmt).date(from: "2099-01-05")!
+        return FixedDateFormat.formatter("yyyy-MM-dd", timeZone: .gmt).string(from: base.addingTimeInterval(Double(n) * 86_400))
+    }
+
+    private static func compact(_ day: String, _ time: String? = nil) -> String {
+        day.replacingOccurrences(of: "-", with: "") + (time.map { "T\($0.replacingOccurrences(of: ":", with: ""))Z" } ?? "")
+    }
+
+    private static func weekdayCode(_ day: String) -> String {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .gmt
+        let date = FixedDateFormat.formatter("yyyy-MM-dd", timeZone: .gmt).date(from: day)!
+        return ["SU", "MO", "TU", "WE", "TH", "FR", "SA"][calendar.component(.weekday, from: date) - 1]
+    }
+
+    /// A series from Monday `day(0)` 09:00 UTC, half an hour long, with `rule` and the override
+    /// VEVENTs `overrides` (each: its place, its start and end as `yyyyMMddTHHmmssZ`, its title).
+    private static func series(rule: String, overrides: [(place: String, start: String, end: String, title: String)]) -> String {
+        var lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//TabMail//Test//EN",
+                     "BEGIN:VEVENT", "UID:carry-slot", "DTSTAMP:20990101T000000Z",
+                     "DTSTART:\(compact(day(0), "09:00:00"))", "DTEND:\(compact(day(0), "09:30:00"))",
+                     "SUMMARY:Standup", rule, "END:VEVENT"]
+        for o in overrides {
+            lines += ["BEGIN:VEVENT", "UID:carry-slot", "DTSTAMP:20990101T000000Z", "RECURRENCE-ID:\(o.place)",
+                      "DTSTART:\(o.start)", "DTEND:\(o.end)", "SUMMARY:\(o.title)", "END:VEVENT"]
+        }
+        lines.append("END:VCALENDAR")
+        return lines.joined(separator: "\r\n")
+    }
+
+    /// A VEVENT time value as an instant and whether it is a date: `yyyyMMdd` or `yyyyMMddTHHmmssZ`.
+    private static func value(_ line: String) -> (instant: Date, date: Bool)? {
+        guard let raw = line.split(separator: ":", maxSplits: 1).last.map(String.init) else { return nil }
+        if raw.count == 8 { return FixedDateFormat.formatter("yyyyMMdd", timeZone: .gmt).date(from: raw).map { ($0, true) } }
+        return FixedDateFormat.formatter("yyyyMMdd'T'HHmmss'Z'", timeZone: .gmt).date(from: raw).map { ($0, false) }
+    }
+
+    /// Whether `rid` is an occurrence of the weekly series that starts at `start` with `rule`
+    /// (RFC 5545 §3.3.10): `DTSTART` itself, or a later day the rule names in a week (from Monday)
+    /// the interval counts, at the start's time of day, in the start's value type, not after its
+    /// `UNTIL` (a UTC time or a date, inclusive) and within its `COUNT` (`DTSTART` the first).
+    static func isOccurrence(_ rid: (instant: Date, date: Bool), start: (instant: Date, date: Bool), rule: String) -> Bool {
+        guard rid.date == start.date else { return false }
+        if rid.instant == start.instant { return true }
+        guard rid.instant > start.instant, onPattern(rid.instant, start: start.instant, rule: rule) else { return false }
+        let parts = ruleParts(rule)
+        if let until = parts["UNTIL"] {
+            let end = until.count == 8 ? FixedDateFormat.formatter("yyyyMMdd", timeZone: .gmt).date(from: until)?.addingTimeInterval(86_399)
+                : FixedDateFormat.formatter("yyyyMMdd'T'HHmmss'Z'", timeZone: .gmt).date(from: until)
+            guard let end, rid.instant <= end else { return false }
+        }
+        if let count = parts["COUNT"].flatMap({ Int($0) }) {
+            // The start, then each day before `rid`'s that the pattern names.
+            var before = 1
+            var day = start.instant.addingTimeInterval(86_400)
+            while day < rid.instant {
+                if onPattern(day, start: start.instant, rule: rule) { before += 1 }
+                day = day.addingTimeInterval(86_400)
+            }
+            guard before < count else { return false }
+        }
+        return true
+    }
+
+    private static func ruleParts(_ rule: String) -> [String: String] {
+        var parts: [String: String] = [:]
+        for part in rule.uppercased().replacingOccurrences(of: "RRULE:", with: "").split(separator: ";") {
+            let kv = part.split(separator: "=", maxSplits: 1).map(String.init)
+            if kv.count == 2 { parts[kv[0]] = kv[1] }
+        }
+        return parts
+    }
+
+    /// Whether the weekly pattern of `rule` from `start` names `at`: its day, its week, its time of day.
+    private static func onPattern(_ at: Date, start: Date, rule: String) -> Bool {
+        let rid = (instant: at, date: false)
+        let start = (instant: start, date: false)
+        let parts = ruleParts(rule)
+        guard parts["FREQ"] == "WEEKLY" else { Issue.record("the oracle reads weekly rules only: \(rule)"); return false }
+        let interval = Int(parts["INTERVAL"] ?? "1") ?? 1
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .gmt
+        let codes = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"]
+        let days = parts["BYDAY"].map { $0.split(separator: ",").map(String.init) } ?? [codes[calendar.component(.weekday, from: start.instant) - 1]]
+        guard days.contains(codes[calendar.component(.weekday, from: rid.instant) - 1]) else { return false }
+        let secondsOfDay = { (d: Date) in Int(d.timeIntervalSince1970) % 86_400 }
+        guard secondsOfDay(rid.instant) == secondsOfDay(start.instant) else { return false }
+        func monday(_ d: Date) -> Int {
+            let dayNumber = Int(d.timeIntervalSince1970) / 86_400
+            return dayNumber - (calendar.component(.weekday, from: d) + 5) % 7
+        }
+        return ((monday(rid.instant) - monday(start.instant)) / 7) % interval == 0
+    }
+
+    private struct Run {
+        let error: Error?
+        let puts: [String]
+        let newPart: String?
+    }
+
+    private static func split(_ ics: String, recurrenceId: String, zone: TimeZone = .gmt, patch: GCalEventInput) async -> Run {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let store = FakeCalDAVStore(servesETags: true)
+        store.seed(path: CalDAVWireFixture.masterPath, ics: ics)
+        http.register(path: "/cal/", method: "GET") { store.handleGET($0) }
+        http.register(path: "/cal/", method: "PUT") { store.handlePUT($0) }
+        var error: Error?
+        do {
+            _ = try await CalDAVWireFixture.makeProvider(http).splitSeries(
+                calendarId: CalDAVWireFixture.calendarId, eventId: CalDAVWireFixture.masterEventId,
+                recurrenceId: recurrenceId, recurrenceIdZone: zone, patch: patch, sendUpdates: "none")
+        } catch let thrown {
+            error = thrown
+        }
+        let puts = store.recordedPuts().map(\.path)
+        let newPath = puts.first { $0 != CalDAVWireFixture.masterPath }
+        return Run(error: error, puts: puts, newPart: newPath.flatMap { store.storedICS(path: $0) })
+    }
+
+    /// The new part's offences: each override whose `RECURRENCE-ID` names no occurrence of it.
+    private static func offRule(_ newPart: String) -> [String] {
+        let lines = newPart.components(separatedBy: "\r\n")
+        guard let startLine = lines.first(where: { $0.hasPrefix("DTSTART") }), let start = value(startLine),
+              let rule = lines.first(where: { $0.hasPrefix("RRULE:") }) else { return ["the new part has no start or rule"] }
+        return lines.filter { $0.hasPrefix("RECURRENCE-ID") }.filter { line in
+            guard let rid = value(line) else { return true }
+            return !isOccurrence(rid, start: start, rule: rule)
+        }
+    }
+
+    @Test("C1 on CalDAV: every carried override names an occurrence of the new part, or the split is refused before any PUT, for every shift, rule, kind, series end and carried occurrence")
+    func carriedOverridesLandOrRefuseBeforeThePut() async throws {
+        enum Shift: String, CaseIterable { case none, typed, dayTurn }
+        enum Carried: String, CaseIterable { case kept, named, namedMovedEarlier, edited }
+        // The series' end: none, an UNTIL at its day-21 occurrence, or a COUNT of four (day 21 the last).
+        enum End: String, CaseIterable { case none, until, count }
+        func rule(_ end: End) -> String {
+            switch end {
+            case .none: return "RRULE:FREQ=WEEKLY"
+            case .until: return "RRULE:FREQ=WEEKLY;UNTIL=\(Self.compact(Self.day(21), "09:00:00"))"
+            case .count: return "RRULE:FREQ=WEEKLY;COUNT=4"
+            }
+        }
+        // Weekly on Mondays at 09:00 from day 0. Each scene: the occurrence named (where it starts
+        // now), the overrides, and a kept one's start.
+        func scene(_ carried: Carried) -> (shown: String, overrides: [(place: String, start: String, end: String, title: String)], kept: String?) {
+            switch carried {
+            case .kept:
+                return (Self.day(14), [(Self.compact(Self.day(21), "09:00:00"), Self.compact(Self.day(13), "12:00:00"), Self.compact(Self.day(13), "12:30:00"), "Moved earlier")],
+                        Self.compact(Self.day(13), "12:00:00"))
+            case .named:
+                return (Self.day(14), [(Self.compact(Self.day(14), "09:00:00"), Self.compact(Self.day(14), "09:00:00"), Self.compact(Self.day(14), "09:30:00"), "Own title")], nil)
+            case .namedMovedEarlier:
+                return (Self.day(18), [(Self.compact(Self.day(21), "09:00:00"), Self.compact(Self.day(18), "09:00:00"), Self.compact(Self.day(18), "09:30:00"), "Moved earlier")], nil)
+            case .edited:
+                return (Self.day(14), [(Self.compact(Self.day(7), "09:00:00"), Self.compact(Self.day(15), "12:00:00"), Self.compact(Self.day(15), "12:30:00"), "Moved later")], nil)
+            }
+        }
+        func next(_ d: String) -> String {
+            let at = FixedDateFormat.formatter("yyyy-MM-dd", timeZone: .gmt).date(from: d)!.addingTimeInterval(86_400)
+            return FixedDateFormat.formatter("yyyy-MM-dd", timeZone: .gmt).string(from: at)
+        }
+        var landed = 0
+        for end in End.allCases {
+        for shift in Shift.allCases {
+            for newRule in [false, true] {
+                for kindChange in [false, true] {
+                    if kindChange, shift == .typed { continue }
+                    for carried in Carried.allCases {
+                        let label = "\(end.rawValue) \(shift.rawValue) newRule=\(newRule) kindChange=\(kindChange) \(carried.rawValue)"
+                        let s = scene(carried)
+                        let targetDay = shift == .dayTurn ? next(s.shown) : s.shown
+                        var patch = GCalEventInput()
+                        patch.summary = "Renamed"
+                        if kindChange {
+                            patch.startDate = targetDay
+                            patch.endDate = next(targetDay)
+                        } else if shift != .none {
+                            patch.startDateTime = "\(targetDay)T\(shift == .typed ? "10" : "09"):00:00Z"
+                            patch.startTimeZone = "UTC"
+                        }
+                        if newRule {
+                            patch.recurrence = ["RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=\(Self.weekdayCode(targetDay))"]
+                        } else if shift == .dayTurn, let from = RecurrenceTail.Day(iso: s.shown), let to = RecurrenceTail.Day(iso: targetDay) {
+                            patch.ruleDayMove = RecurrenceDayShift.Move(from: from, to: to)
+                        }
+                        let r = await Self.split(Self.series(rule: rule(end), overrides: s.overrides),
+                                                 recurrenceId: "\(s.shown)T09:00:00", patch: patch)
+                        // THE property: no override of the new part names an occurrence it does not have.
+                        if let error = r.error {
+                            #expect(r.puts.isEmpty, "\(label): refused AFTER a PUT: \(error); \(r.puts)")
+                        }
+                        // A day turn moves the kept one's slot past an UNTIL at its place (N1); the
+                        // split moves a UTC UNTIL to the new part's time of day, and a COUNT moves
+                        // with the part.
+                        let pastEnd = end == .until && shift == .dayTurn
+                        let refusal: String? = carried == .kept && (newRule || kindChange || pastEnd) ? SplitCarry.keptHasNoSlotRefusal
+                            : carried == .edited && kindChange ? SplitCarry.editedKindRefusal : nil
+                        if let refusal {
+                            guard case CalendarProviderError.notSupported(let message)? = r.error else {
+                                Issue.record("\(label): not refused: \(String(describing: r.error)); \(r.newPart ?? "")")
+                                continue
+                            }
+                            #expect(message == refusal, "\(label): \(message)")
+                            continue
+                        }
+                        // The one named moved earlier onto the series' last place, its new part
+                        // moved past its own UNTIL: THE property above is all that is asked.
+                        if pastEnd, carried == .namedMovedEarlier { continue }
+                        #expect(r.error == nil, "\(label): \(String(describing: r.error))")
+                        guard r.error == nil, let newPart = r.newPart else { continue }
+                        landed += 1
+                        #expect(Self.offRule(newPart).isEmpty, "\(label): overrides off the new part's rule: \(Self.offRule(newPart))\n\(newPart)")
+                        if let shown = s.kept {
+                            // Shown before the one named: it still shows where it did, on the new part.
+                            #expect(newPart.contains("DTSTART:\(shown)"), "\(label): the kept occurrence is gone: \(newPart)")
+                        }
+                    }
+                }
+            }
+        }
+        }
+        #expect(landed >= 60, "non-vacuity: only \(landed) splits were written")
+    }
+
+    @Test("N1 on CalDAV: a kept override at the series' last place, whose slot a day turn moves past the UNTIL, refuses before any PUT")
+    func keptAtTheLastPlaceUnderUntilRefusesBeforeThePut() async throws {
+        // Weekly on Mondays until day 21; the day-21 occurrence moved to Saturday day 13, before the
+        // one named on day 14, which moves to Tuesday with the rule's day: its slot, day 22, is past
+        // the end.
+        let ics = Self.series(rule: "RRULE:FREQ=WEEKLY;UNTIL=\(Self.compact(Self.day(21), "09:00:00"))", overrides: [
+            (Self.compact(Self.day(21), "09:00:00"), Self.compact(Self.day(13), "12:00:00"), Self.compact(Self.day(13), "12:30:00"), "Moved earlier"),
+        ])
+        var patch = GCalEventInput()
+        patch.startDateTime = "\(Self.day(15))T09:00:00Z"
+        patch.startTimeZone = "UTC"
+        patch.ruleDayMove = RecurrenceDayShift.Move(from: try #require(RecurrenceTail.Day(iso: Self.day(14))),
+                                                    to: try #require(RecurrenceTail.Day(iso: Self.day(15))))
+        let r = await Self.split(ics, recurrenceId: "\(Self.day(14))T09:00:00", patch: patch)
+        guard case CalendarProviderError.notSupported(let message)? = r.error else {
+            Issue.record("not refused: \(String(describing: r.error)); \(r.newPart ?? "")")
+            return
+        }
+        #expect(message == SplitCarry.keptHasNoSlotRefusal, "\(message)")
+        #expect(r.puts.isEmpty, "refused after a PUT: \(r.puts)")
+    }
+
+    @Test("N1 on CalDAV, floating: a kept override at the last place of a series with no zone, whose UNTIL is a wall clock, refuses before any PUT when a day turn moves its slot past it")
+    func floatingKeptAtTheLastPlaceUnderUntilRefusesBeforeThePut() async throws {
+        // Weekly on Mondays at 09:00 with no zone, until day 21 at 09:00 (a wall clock, read in the
+        // operation's zone, New York); the day-21 occurrence moved to Saturday day 13, before the one
+        // named on day 14, which moves to Tuesday with the rule's day: its slot, day 22, is past the end.
+        let wall = { (day: String, time: String) in day.replacingOccurrences(of: "-", with: "") + "T" + time }
+        let ics = [
+            "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//TabMail//Test//EN",
+            "BEGIN:VEVENT", "UID:carry-floating", "DTSTAMP:20990101T000000Z",
+            "DTSTART:\(wall(Self.day(0), "090000"))", "DTEND:\(wall(Self.day(0), "093000"))",
+            "SUMMARY:Standup", "RRULE:FREQ=WEEKLY;UNTIL=\(wall(Self.day(21), "090000"))", "END:VEVENT",
+            "BEGIN:VEVENT", "UID:carry-floating", "DTSTAMP:20990101T000000Z", "RECURRENCE-ID:\(wall(Self.day(21), "090000"))",
+            "DTSTART:\(wall(Self.day(13), "120000"))", "DTEND:\(wall(Self.day(13), "123000"))",
+            "SUMMARY:Moved earlier", "END:VEVENT",
+            "END:VCALENDAR",
+        ].joined(separator: "\r\n")
+        let newYork = try #require(TimeZone(identifier: "America/New_York"))
+        let start = try #require(FixedDateFormat.formatter("yyyy-MM-dd'T'HH:mm:ss", timeZone: newYork).date(from: "\(Self.day(15))T09:00:00"))
+        var patch = GCalEventInput()
+        patch.startDateTime = start.iso8601String()
+        patch.startTimeZone = "UTC"
+        patch.ruleDayMove = RecurrenceDayShift.Move(from: try #require(RecurrenceTail.Day(iso: Self.day(14))),
+                                                    to: try #require(RecurrenceTail.Day(iso: Self.day(15))))
+        let r = await Self.split(ics, recurrenceId: "\(Self.day(14))T09:00:00", zone: newYork, patch: patch)
+        guard case CalendarProviderError.notSupported(let message)? = r.error else {
+            Issue.record("not refused: \(String(describing: r.error)); \(r.newPart ?? "")")
+            return
+        }
+        #expect(message == SplitCarry.keptHasNoSlotRefusal, "\(message)")
+        #expect(r.puts.isEmpty, "refused after a PUT: \(r.puts)")
+    }
+
+    @Test("T4 on CalDAV: a kept override between two zones' daylight changes lands on the new part's occurrence; a zoned new part stays in the series' zone even when the edit names another")
+    func keptBetweenTwoZonesDaylightChangesLands() async throws {
+        // Weekly on Mondays at 09:00 London from 2099-03-02 (UK summer time starts 2099-03-29, US
+        // daylight time 2099-03-08). The occurrence placed on 2099-03-16 (09:00 London = 09:00 UTC)
+        // was moved to Sunday 2099-03-01 12:00, before the one named on 2099-03-02. The edit gives
+        // the same instant in New York; a zoned copy keeps its own zone (`mergePatchKeepingLength`),
+        // so the new part repeats at 09:00 London, and its 2099-03-16 occurrence is 09:00 UTC (read
+        // in New York, 04:00 there in daylight time, it would be 08:00 UTC).
+        let ics = [
+            "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//TabMail//Test//EN",
+            "BEGIN:VEVENT", "UID:carry-zones", "DTSTAMP:20990101T000000Z",
+            "DTSTART;TZID=Europe/London:20990302T090000", "DTEND;TZID=Europe/London:20990302T093000",
+            "SUMMARY:Standup", "RRULE:FREQ=WEEKLY", "END:VEVENT",
+            "BEGIN:VEVENT", "UID:carry-zones", "DTSTAMP:20990101T000000Z", "RECURRENCE-ID;TZID=Europe/London:20990316T090000",
+            "DTSTART;TZID=Europe/London:20990301T120000", "DTEND;TZID=Europe/London:20990301T123000",
+            "SUMMARY:Moved earlier", "END:VEVENT",
+            "END:VCALENDAR",
+        ].joined(separator: "\r\n")
+        let london = try #require(TimeZone(identifier: "Europe/London"))
+        var patch = GCalEventInput()
+        patch.summary = "Renamed"
+        patch.startDateTime = "2099-03-02T09:00:00Z"
+        patch.startTimeZone = "America/New_York"
+        let r = await Self.split(ics, recurrenceId: "2099-03-02T09:00:00", zone: london, patch: patch)
+        if let error = r.error {
+            #expect(r.puts.isEmpty, "refused after a PUT: \(error); \(r.puts)")
+            return
+        }
+        let newPart = try #require(r.newPart, "no new part was written: \(r.puts)")
+        #expect(newPart.contains("DTSTART;TZID=Europe/London:20990302T090000"), "the new part does not start at 09:00 London: \(newPart)")
+        #expect(newPart.contains("RECURRENCE-ID;TZID=Europe/London:20990316T090000"), "the kept override is off the new part's occurrence: \(newPart)")
+        #expect(newPart.contains("DTSTART;TZID=Europe/London:20990301T120000"), "the kept occurrence no longer shows where it did: \(newPart)")
+    }
+
+    @Test("a rule change from an earlier occurrence resets a later changed occurrence off the new rule: the new part holds no override off its rule (#610)")
+    func ruleChangeDropsALaterChangedOccurrenceOffTheNewRule() async throws {
+        // Weekly on Monday, Wednesday and Friday; the Wednesday two weeks after the split renamed.
+        let ics = Self.series(rule: "RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR", overrides: [
+            (Self.compact(Self.day(16), "09:00:00"), Self.compact(Self.day(16), "09:00:00"), Self.compact(Self.day(16), "09:30:00"), "Renamed Wednesday"),
+        ])
+        var patch = GCalEventInput()
+        patch.recurrence = ["RRULE:FREQ=WEEKLY;BYDAY=MO"]
+        let r = await Self.split(ics, recurrenceId: "\(Self.day(14))T09:00:00", patch: patch)
+        #expect(r.error == nil, "\(String(describing: r.error))")
+        let newPart = try #require(r.newPart, "no new part was written: \(r.puts)")
+        #expect(Self.offRule(newPart).isEmpty, "overrides off the new rule: \(Self.offRule(newPart))\n\(newPart)")
+        #expect(!newPart.contains("Renamed Wednesday"), "the Wednesday's change was kept off the new rule: \(newPart)")
+    }
+
+    @Test("a kept override carried across a change of offset lands on the new part's occurrence in the series' zone, not at its time of day in UTC")
+    func keptOverrideAcrossAnOffsetChangeLandsInTheSeriesZone() async throws {
+        // Weekly on Mondays at 09:00 New York; US daylight time starts on Sunday 2099-03-08. The
+        // occurrence placed on Monday 2099-03-16 (daylight time) was moved to Sunday 2099-03-01 12:00
+        // (standard time), before the one named on 2099-03-02, so it is kept, whole, on the new part.
+        let ics = [
+            "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//TabMail//Test//EN",
+            "BEGIN:VEVENT", "UID:carry-dst", "DTSTAMP:20990101T000000Z",
+            "DTSTART;TZID=America/New_York:20990216T090000", "DTEND;TZID=America/New_York:20990216T093000",
+            "SUMMARY:Standup", "RRULE:FREQ=WEEKLY", "END:VEVENT",
+            "BEGIN:VEVENT", "UID:carry-dst", "DTSTAMP:20990101T000000Z", "RECURRENCE-ID;TZID=America/New_York:20990316T090000",
+            "DTSTART;TZID=America/New_York:20990301T120000", "DTEND;TZID=America/New_York:20990301T123000",
+            "SUMMARY:Moved earlier", "END:VEVENT",
+            "END:VCALENDAR",
+        ].joined(separator: "\r\n")
+        let newYork = try #require(TimeZone(identifier: "America/New_York"))
+        var patch = GCalEventInput()
+        patch.startDateTime = "2099-03-02T15:00:00Z"
+        patch.startTimeZone = "America/New_York"
+        let r = await Self.split(ics, recurrenceId: "2099-03-02T09:00:00", zone: newYork, patch: patch)
+        #expect(r.error == nil, "\(String(describing: r.error))")
+        let newPart = try #require(r.newPart, "no new part was written: \(r.puts)")
+        #expect(newPart.contains("DTSTART;TZID=America/New_York:20990302T100000"), "the new part does not start at 10:00: \(newPart)")
+        // The new part's occurrence on 2099-03-16 is at 10:00 New York (14:00 UTC), not 15:00 UTC.
+        #expect(newPart.contains("RECURRENCE-ID;TZID=America/New_York:20990316T100000"), "the kept override is off the new part's occurrence: \(newPart)")
+        #expect(newPart.contains("DTSTART;TZID=America/New_York:20990301T120000"), "the kept occurrence no longer shows where it did: \(newPart)")
+    }
+
+    @Test("the RFC 5545 check reads a weekly rule's days, interval and start")
+    func isOccurrenceOracle() {
+        let start = (FixedDateFormat.formatter("yyyyMMdd'T'HHmmss'Z'", timeZone: .gmt).date(from: "20990105T090000Z")!, false)
+        func at(_ text: String) -> (instant: Date, date: Bool) {
+            (FixedDateFormat.formatter("yyyyMMdd'T'HHmmss'Z'", timeZone: .gmt).date(from: text)!, false)
+        }
+        #expect(Self.isOccurrence(at("20990112T090000Z"), start: start, rule: "RRULE:FREQ=WEEKLY"))
+        #expect(!Self.isOccurrence(at("20990112T100000Z"), start: start, rule: "RRULE:FREQ=WEEKLY"))
+        #expect(!Self.isOccurrence(at("20990112T090000Z"), start: start, rule: "RRULE:FREQ=WEEKLY;INTERVAL=2"))
+        #expect(Self.isOccurrence(at("20990119T090000Z"), start: start, rule: "RRULE:FREQ=WEEKLY;INTERVAL=2"))
+        #expect(Self.isOccurrence(at("20990107T090000Z"), start: start, rule: "RRULE:FREQ=WEEKLY;BYDAY=MO,WE"))
+        #expect(!Self.isOccurrence(at("20990108T090000Z"), start: start, rule: "RRULE:FREQ=WEEKLY;BYDAY=MO,WE"))
+        // A Sunday belongs to the week that began the Monday before it (WKST=MO).
+        #expect(Self.isOccurrence(at("20990111T090000Z"), start: start, rule: "RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,SU"))
+        #expect(!Self.isOccurrence(at("20990118T090000Z"), start: start, rule: "RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,SU"))
+        #expect(!Self.isOccurrence((at("20990112T090000Z").instant, true), start: start, rule: "RRULE:FREQ=WEEKLY"))
     }
 }

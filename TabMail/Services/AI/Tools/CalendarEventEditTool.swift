@@ -284,8 +284,10 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         let queuedEventId: String
         // A move to another day that turns the rule's days, of the whole series or a split's new
         // part, which resets every occurrence changed or deleted one by one there
-        // (`CalendarToolHelpers.dayMoveResetNote`).
+        // (`CalendarToolHelpers.exceptionsResetNote`).
         var turnsDays = false
+        // A split named at an occurrence moved past the series' last place (`SplitCarry.Cut.pastEnd`).
+        var pastEnd = false
         do {
             let given = arguments
             let routed = try CalendarSeriesScope.route(arguments, scope: resolvedScope, named: named, zone: tz, recurrenceIdZone: ridZone)
@@ -301,6 +303,19 @@ struct CalendarEventEditTool: AgentTool, Sendable {
                     changes[line] = "\(label) → \(new)"
                 }
             }
+            // A split named at a moved occurrence cuts where the calendar's write cuts
+            // (`splitCut`). Past the series' last place it makes no new part: only the occurrences
+            // shown are edited, nothing is reset, and a change of the repeat is refused here, in the
+            // write's words, before the user confirms.
+            if resolvedScope == "this_and_following", let rid = recurrenceIdArg,
+               let occurrence = named.occurrence, RecurrenceOccurrenceResolver.wasMoved(occurrence),
+               case .pastEnd = try await provider.splitCut(calendarId: lookupCalId, eventId: queuedEventId, recurrenceId: rid, zone: ridZone) {
+                pastEnd = true
+                let changesRule = try CalendarToolHelpers.buildGCalEventInput(arguments, isAllDay: occurrence.isAllDay).recurrence != nil
+                if try changesRule || (CalendarSeriesScope.dayMove(arguments, named: named, scope: resolvedScope, zone: tz)) != nil {
+                    throw CalendarProviderError.notSupported(SplitCarry.pastEndRuleRefusal)
+                }
+            }
             // A move to another day of a series whose rule names its days turns them with it; the
             // card says how the repeat changes.
             // The rules shown are every one the calendar writes (`dayMovedRules`): the whole
@@ -308,6 +323,8 @@ struct CalendarEventEditTool: AgentTool, Sendable {
             // refused here, with nothing queued.
             if let move = try CalendarSeriesScope.dayMove(arguments, named: named, scope: resolvedScope, zone: tz) {
                 let series = try named.readSeries()
+                // A split's rule starts at its cut, which the calendar works out as its write does
+                // (`dayMovedRules`, from the occurrence named at `recurrenceIdArg`).
                 let rules = try await provider.dayMovedRules(
                     calendarId: lookupCalId, eventId: queuedEventId, series: series,
                     scope: resolvedScope, recurrenceId: recurrenceIdArg, zone: ridZone, move: move)
@@ -401,13 +418,27 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         // as the Thunderbird add-on resets it. The series' kind is the one the edit's `all_day` is
         // compared with, and the series' calendar answers whether its write resets anything
         // (`editResetsChangedOccurrences`), from what it holds: no line for a single event.
-        if turnsDays {
-            changes.append(CalendarToolHelpers.dayMoveResetNote)
+        //
+        // A split resets the occurrences after it that were changed or deleted one by one when
+        // its new part's start moves or its rule changes, and carries them otherwise: the one
+        // predicate every calendar's write calls (`SplitCarry.mode`), fed the edit as the queue
+        // builds it, against where the occurrence named starts now (#563): the write checks the
+        // edit moved to its cut (`SplitCarry.partEdit`) against the cut, which is the same check.
+        var splitResets = false
+        if resolvedScope == "this_and_following", !pastEnd, let occurrence = named.occurrence, let start = occurrence.start,
+           var edit = try? CalendarToolHelpers.buildGCalEventInput(
+               arguments, isAllDay: CalendarToolHelpers.boolArg(arguments, "all_day") ?? occurrence.isAllDay) {
+            edit.ruleDayMove = try? CalendarSeriesScope.dayMove(arguments, named: named, scope: resolvedScope, zone: tz)
+            let series = try named.readSeries()
+            splitResets = SplitCarry.mode(edit: edit, place: start, storedRules: series.recurrence ?? [], seriesZone: series.isAllDay ? nil : series.seriesZone) == .reset
+        }
+        if turnsDays || splitResets {
+            changes.append(CalendarToolHelpers.exceptionsResetNote)
         } else if resolvedScope != "this_only", let stated = CalendarToolHelpers.boolArg(arguments, "all_day"),
                   let series = named.series, stated != series.isAllDay,
                   let edit = try? CalendarToolHelpers.buildGCalEventInput(arguments, isAllDay: stated),
                   provider.editResetsChangedOccurrences(series, edit: edit) {
-            changes.append(CalendarToolHelpers.kindChangeResetNote)
+            changes.append(CalendarToolHelpers.exceptionsResetNote)
         } else if resolvedScope == "all", shown.recurrence?.isEmpty == false,
            let edit = try? CalendarToolHelpers.buildGCalEventInput(
                arguments, isAllDay: CalendarToolHelpers.boolArg(arguments, "all_day") ?? shown.isAllDay),

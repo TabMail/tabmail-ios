@@ -178,6 +178,76 @@ of the resource, which holds every occurrence (irreversible wire operation #5, n
   edit of every occurrence before the card, as its series not being in this calendar.
 - "This and following" at a moved occurrence is refused with nothing written; that occurrence can
   still be changed alone, and the split made in the user's calendar app.
+  **Amended 2026-11-12 (#563, #687):** no longer refused. The split is made at the occurrence's place
+  in the series (`CalDAVOccurrences.scopedEdit` gives the slot), and the moved occurrence is carried
+  onto the new part with its own times, as Google Calendar does (memory 142, "Exceptions after the split").
+  **Amended again 2026-11-12 (#687, owner ruling):** the split is made where the occurrence is NOW
+  shown, not at its place: the cut is its current start (the next rule date on or after it, a
+  same-date all-day counts), and the split changes it and every occurrence shown at or after it,
+  leaving those shown before it untouched, on Google, Outlook and CalDAV alike (`SplitCarry.cut`,
+  `SplitCarry.partition`). A start given in the edit moves the later ones by the same amount; a reset
+  leaves those shown before it alone, and deletions between its old and new place stay deleted. Moved
+  past the series' last occurrence, no new part is made: only it is edited, and a rule change there is
+  refused. Memory 142, "Split at a moved occurrence".
+  **Amended again 2026-11-12 (review of #687):** each calendar works the cut out in ONE provider
+  function (`splitPoint`), which both its `splitSeries` and its `dayMovedRules` (the card's repeat
+  line) call, so the card can never cut where the write does not (CalDAV reads the resource's
+  `RDATE` lines there; Outlook places a pattern from its range start and a missing month day on the
+  month's last). A floating CalDAV series is read in the zone the operation was queued with
+  (`CalendarTimeZoneContext.readingFloating(in:)`), never the device's at the drain, by the split
+  and by its retry (`finishSplit`) alike. Past the end,
+  Google and Outlook keep a record (`SplitRecord.pastEnd`) with absolute targets before the first
+  write, and a retry finishes from it (`finishShownEdit`), so no occurrence moves twice.
+  **Amended 2026-11-12 (review rounds 3-4):** the confirmation card asks the calendar where the write
+  cuts (`CalendarProvider.splitCut`, the same `splitPoint`) whenever the occurrence named was moved:
+  past the end it shows no reset note and refuses a change of the repeat or its days before the card,
+  in the write's words (`SplitCarry.pastEndRuleRefusal`). `splitSeries` returns the new part or nil
+  when none is made, so such an edit, and its retry, answer with no new series id. Outlook dates only
+  the occurrences that actually move (`moveOrder`; a stay, at the instant it is at, is not dated) in
+  the series' zone (`GCalEvent.seriesZone`), dates the carry's listing window in UTC, and refuses a
+  timed series with no zone it can read only when one of the split's writes moves an occurrence by date
+  (`dateSplitMoves`), before the new part is created; a rename needs no zone. A deleted occurrence less than two days before the split's date in UTC, or after it (Graph names it by date only) or a moved named occurrence still needs it, and is refused before anything is written. Outlook's read gives `start.timeZone` in the zone it asked for, so it never stands in for the series' zone (`startZoneIsDisplay`). A fallback to the creation zone (`originalStartTimeZone`) was rejected: unmeasured, and it could place a deleted date a day off, a silent wrong write worse than a refusal. A timed series in a custom zone is refused. Accepted limits (owner, 2026-11-12), all on an Outlook series whose range zone is missing or custom, none writing anything wrong; the narrower fix is tabmail-ios #806 (P4): (1) a "this and following" edit is refused when an occurrence was deleted on a date less than two days before the split's date in UTC, or after it, or when one of its writes would move an occurrence to another time (a later moved occurrence carried by an edit that keeps the time, or a time change reaching an occurrence edited where it is; a new time over a later moved occurrence is not refused: it resets it, as Google does); a deletion two or more days before the split's date in UTC, a rename, and a time change over renamed occurrences go through (`deletedSurelyBefore`, `dateSplitMoves`); (2) a whole-series time change with no occurrence named is refused, and the message names the time zone (`CalendarSeriesScope.unreadableSeriesZone`), not a date; (3) a whole-series move named from a later occurrence becomes a split there, so earlier occurrences keep the old time; (4) a "this and following" zone change keeps the later one-off changes, where Google resets them: every timed edit names a zone (`buildGCalEventInput`), so without the series' own zone a real zone change can't be told from a restated one, and resetting on every restated start would drop one-off changes the user never touched. (5) on a series that meets on back-to-back days, an occurrence deleted on the day before the split (or less than two days before the split's date in UTC) is refused for now: without the zone it can't be told from one on or after the split; #806 fixes it. Narrowed (owner, 2026-11-12): the move check is the real move list, planned before any write against the new part's times as the create gives them (`plannedPart`, `carryPlan`, `dateSplitMoves`, the same `carryOrder`/`editOrder` the writes use; `movesAnOccurrence` retired), and a deletion whose date is two or more days before the split's date in UTC (`deletedDateMarginDays`; zones run from UTC-12 to UTC+14) is left out unplaced, as the split never touches it (`deletedSurelyBefore`); a deletion less than two days before the split's UTC date, or after it, still needs the zone and is refused; a time change over a later moved occurrence goes through and resets it, as Google does. Tests: `zonelessEarlierDeletionDoesNotBlock`, `zonelessDeletionAtTheSplitIsRefused`, `zonelessLaterMoveIsRefused`, `zonelessTimeChangeOverARenameIsWritten`, `zonelessTimeChangeOverALaterMoveResets`, `zonelessRenameOverAnOccurrenceMovedAfterIsWritten`, `zonelessTimeChangeMovingAnOccurrenceWhereItIsIsRefused`, `deletedSurelyBeforeHoldsItsMargin`.
+  **Amended 2026-11-13 (#563 rebuilt on #681 and #823; supersedes the zone-less carry above, kept
+  as history):** Outlook dates the split's carry and its moves in the zone its cap is dated in
+  (`ExchangeCalendarProvider.seriesTimeZone`: the range's `recurrenceTimeZone`, else the event's
+  `originalStartTimeZone`, the rule #681 measured and adopted), never `GCalEvent.seriesZone`, which
+  for an Outlook read names the range's zone alone. A timed series that names no zone, or one TabMail
+  does not recognize, is refused before anything is read or written, in #681's words, for a split,
+  its retry (`finishSplit`), and an edit past its end (`finishShownEdit`) alike. So limits (1) and (5)
+  above are now that whole refusal: no zone-less split is written at all, `deletedSurelyBefore` and
+  `deletedDateMarginDays` are deleted, and the "creation zone rejected" sentence is superseded by
+  #681's measurement. Limits (2) to (4) stand: they are the tool's, read from `getEvent`, which names
+  the range's zone alone (`startZoneIsDisplay`, `unreadableSeriesZone`, #806). Tests:
+  `zonelessSeriesIsRefused`, `eventZoneDatesTheCarry`, `customRangeZoneIsRefused`,
+  `noRangeZoneIsNotReadInTheDisplayZone`.
+  **Amended 2026-11-13 (#563, review of the rebuild):** an occurrence carried onto the new part (kept
+  whole, or the named one on a reset) is written at the slot the new part has
+  (`SplitCarry.slot`: its place moved by whole days from the cut to the new part's first day, at the new
+  part's time of day, on the new part's rule), never at its old place, which a shifted or reshaped new
+  part does not have. Decided before the create in one provider-neutral function
+  (`SplitCarry.carryPlan`): an occurrence kept with no slot refuses the split (`keptHasNoSlotRefusal`),
+  a change of all-day/timed with an occurrence moved from before the cut to after it refuses
+  (`editedKindRefusal`), and a reset's named occurrence with no slot is reset with the rest. A change of
+  kind at a moved occurrence moves the new part by whole days to the cut, as Google does. The
+  confirmation card reads the zone the write dates in: Outlook's read carries `originalStartTimeZone`
+  (`GCalEvent.eventZoneName`), and `GCalEvent.seriesZoneName` falls back to it when the range names no
+  zone. Open: CalDAV's split keeps such an override at its old RECURRENCE-ID. Memory 142, ninth
+  amendment.
+  **Amended again 2026-11-13 (#563), closing that open sentence:** CalDAV's split
+  (`CalDAVEventCopies.seriesSplitResources`, `carrySlots`) decides a kept or reset-named override
+  with the same `SplitCarry.partition`/`carryPlan` before any PUT, rewrites its `RECURRENCE-ID` to the
+  slot in the series' `DTSTART` form, refuses X1/X2 with the same constants, and drops a reset's named
+  override with no slot. A new rule resets the later changed occurrences, so none stays off the new
+  rule (an unreleased #610 regression on main). Test: `CalDAVSplitCarrySlotTests`, against an RFC 5545
+  weekly oracle. A floating value is now written in the zone it is read in (the operation's,
+  `zones.floating`), and the slot reads the new part's time of day in the series' zone, not UTC.
+  Memory 142, tenth amendment.
+  **Amended again 2026-11-13 (#563):** a slot past the new part's end (`UNTIL` or `COUNT`,
+  `SplitCarry.slot` via `endsAtOrAfter`) is no slot, so a kept override there refuses before any PUT
+  (X1) and a reset's named one is reset; on CalDAV only a day turn reaches this, since the split moves
+  a UTC `UNTIL` with a typed time of day. A zoned new part keeps the series' zone even when the edit
+  names another (`mergePatchKeepingLength`), so its slots are read in that zone. Memory 142, eleventh
+  amendment.
 - The series id with a moved occurrence's new time edits that occurrence in place, and with its old
   place is not found, the same as on Google, whose resolver finds no instance there.
 - A retry after a lost response is reported not found, with nothing written, when the first attempt

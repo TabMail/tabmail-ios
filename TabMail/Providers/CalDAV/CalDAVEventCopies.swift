@@ -35,6 +35,9 @@ extension CalDAVProvider {
         let cappedSeries: String
         /// The new part's resource.
         let newPart: String
+        /// Whether the new part carries the changed and deleted occurrences after the split or
+        /// resets them (`SplitCarry.mode`).
+        let mode: SplitCarry.Mode
     }
 
     /// Build both resources of a split from the STORED series.
@@ -48,12 +51,25 @@ extension CalDAVProvider {
     ///    what is left of its `COUNT`.
     /// 4. **What belongs to which part.** Excluded dates (`EXDATE`), extra dates (`RDATE`) and changed
     ///    occurrences (override VEVENTs) before the slot stay with the capped series; those at or after
-    ///    it move to the new part, keeping their absolute times. Re-anchoring is not a series move, so
-    ///    nothing is shifted here.
+    ///    it go to the new part as the split's mode says (`SplitCarry.mode`, #563): a split that
+    ///    carries them keeps their absolute times; one that resets them (the edit moves the new
+    ///    part's start or changes its rule, as Google Calendar resets them) drops the changed
+    ///    occurrences and the excluded dates, so they come back plain. Added dates are kept.
+    ///    Whatever the mode, an override placed at or after the slot but shown before the
+    ///    occurrence named keeps what it shows, whole (`named`). Such an override, and on a reset
+    ///    the one named, is written at the new part's occurrence that stands for its place
+    ///    (`SplitCarry.slot`: its `RECURRENCE-ID` rewritten), as Google and Outlook write it, and
+    ///    the same plan refuses before anything is written (`SplitCarry.carryPlan`): one kept with
+    ///    no such occurrence (`keptHasNoSlotRefusal`), and a change of all-day/timed while one
+    ///    shown after the one named stays on the capped series (`editedKindRefusal`). The one
+    ///    named with none is reset with the rest.
     /// 5. **The user's patch**, applied last. A time change in the patch is therefore measured from the
-    ///    slot.
+    ///    slot. On a carry, the fields it sets also overwrite the own of each carried changed
+    ///    occurrence shown from the one named on, and an end it gives makes each of them last as long
+    ///    as the new part from its own start (`editOverrides`), as Google Calendar does.
     ///
-    /// The capped series changes only its `RRULE` (the cap) and drops what moved to the new part, so
+    /// The capped series changes its `RRULE` (the cap), drops what moved to the new part, and has
+    /// the edit written over each override it keeps that is shown from the occurrence named on, so
     /// the two resources together hold exactly the series' occurrences.
     ///
     /// - Parameters:
@@ -66,6 +82,12 @@ extension CalDAVProvider {
     ///   - patch: the user's edit.
     ///   - now: the split's time, written as the new part's `DTSTAMP`.
     ///   - zones: the zone context of `storedICS`.
+    ///   - named: where the occurrence named starts now and its place (`RECURRENCE-ID`), as
+    ///     instants read as `parseICSDateTime` reads them, when it was moved: the overrides are
+    ///     sorted around the split by calendar order (`SplitCarry.partition`'s rule). Those shown
+    ///     before it keep what they show, whole, on the new part; those shown after it but placed
+    ///     before the slot get the edit where they are, on the capped series; on a reset the one
+    ///     named stays on the new part, moved as the edit moves it. Nil: named at the slot.
     static func seriesSplitResources(
         storedICS: String,
         slotNaiveISO: String,
@@ -74,21 +96,34 @@ extension CalDAVProvider {
         newUid: String,
         patch: GCalEventInput,
         now: Date,
-        zones: CalendarTimeZoneContext
+        zones: CalendarTimeZoneContext,
+        named: (start: Date, place: Date)? = nil
     ) throws -> SeriesSplitResources {
         let (slotLine, slotInstant) = try splitSlot(storedICS: storedICS, slotNaiveISO: slotNaiveISO, zones: zones)
+        let place = masterDTStartKind(from: storedICS) == .allDay
+            ? GCalDateTime(dateTime: nil, date: String(slotNaiveISO.prefix(10)), timeZone: nil)
+            : GCalDateTime(dateTime: slotInstant.iso8601String(), date: nil, timeZone: "UTC")
+        let mode = SplitCarry.mode(edit: patch, place: place, storedRules: extractRRule(from: storedICS).map { [$0] } ?? [], seriesZone: try seriesStartZone(slotLine, zones: zones))
         guard let duration = try extractMasterDuration(from: storedICS, zones: zones) else {
             throw CalendarProviderError.notSupported("The repeating event's length can't be read, so it can't be split.")
         }
         let stamp = utcStamp(now)
 
-        // 1. The capped series.
-        let capped = try cappedSeriesResource(storedICS: storedICS, slotInstant: slotInstant, cappedRRule: cappedRRule, zones: zones)
+        let shownFrom = named?.start ?? slotInstant
 
-        // 2. The new part, re-anchored at the slot.
+        // 1. The new part, re-anchored at the slot: the overrides placed at or after it that a
+        //    carry takes (shown from the one named on) stay where they are; those shown before the
+        //    one named, and on a reset the one named, are set aside to be written at their slots
+        //    once the new part is known (5).
+        var setAside: [(place: Date, block: [ICSUnit])] = []
         let anchored = try rewriteVEvents(in: storedICS) { block, isMaster in
+            var place: Date?
             if !isMaster {
-                guard try recurrenceInstant(of: block, zones: zones) >= slotInstant else { return nil }
+                let at = try recurrenceInstant(of: block, zones: zones)
+                guard at >= slotInstant else { return nil }
+                let shownAfter = try startInstant(of: block, zones: zones) >= shownFrom
+                guard mode == .carry || !shownAfter || at == named?.place else { return nil }
+                if !(mode == .carry && shownAfter) { place = at }
             }
             var sawStamp = false
             var out = try rewriteTopLevel(block) { unit, name in
@@ -109,6 +144,8 @@ extension CalDAVProvider {
                     return [end]
                 case "RRULE" where isMaster:
                     return [newRRule]
+                case "EXDATE" where isMaster && mode == .reset:
+                    return []
                 case "EXDATE" where isMaster, "RDATE" where isMaster:
                     return try filterDateList(unit.text, zones: zones, keep: { $0 >= slotInstant })
                 default:
@@ -116,13 +153,237 @@ extension CalDAVProvider {
                 }
             }
             if !sawStamp { out = insertBeforeSubcomponents(out, lines: ["DTSTAMP:\(stamp)"]) }
+            if let place {
+                setAside.append((place, out))
+                return nil
+            }
             return out
         }
 
-        // 3. The user's patch, then 4. attendee answers.
-        let patched = try mergePatchKeepingLength(patch, into: anchored, length: duration, zones: zones)
+        // 2. The user's patch.
+        var patched = try mergePatchKeepingLength(patch, into: anchored, length: duration, zones: zones)
+
+        // 3. The carry, decided before anything is written as Google and Outlook decide it
+        //    (`SplitCarry.carryPlan`), against the new part the patch made: the slot of each
+        //    override set aside, or a refusal.
+        let slots = try carrySlots(
+            storedICS: storedICS, part: patched, slotInstant: slotInstant, shownFrom: shownFrom, namedPlace: named?.place ?? slotInstant,
+            mode: mode, seriesZone: try seriesStartZone(slotLine, zones: zones) ?? zones.floating, fields: SplitCarry.fields(of: patch), zones: zones)
+
+        // 4. Each override set aside, at its slot; the one named with none is reset (left off).
+        var placed: [[ICSUnit]] = []
+        var namedSlot: Date?
+        for (place, block) in setAside {
+            guard let slot = slots[place] else { continue }
+            if place == named?.place { namedSlot = slot }
+            placed.append(try rewriteTopLevel(block) { unit, name in
+                guard name == "RECURRENCE-ID" else { return nil }
+                guard let moved = try formatLike(unit.text, instant: slot, zones: zones) else {
+                    throw CalendarProviderError.notSupported("A changed occurrence of the repeating event can't be read, so it can't be split.")
+                }
+                return [moved]
+            })
+        }
+        patched = appendingVEvents(placed, to: patched)
+
+        // 5. The edit, carried onto the overrides it reaches, then 6. attendee answers.
+        let edit = try occurrenceEdit(fields: SplitCarry.fields(of: patch), from: patched, slotInstant: slotInstant, shownFrom: shownFrom, zones: zones)
+        patched = try editOverrides(patched, edit: mode == .carry ? edit.unmoved : edit, zones: zones) { block in
+            mode == .carry
+                ? try startInstant(of: block, zones: zones) >= shownFrom
+                : try recurrenceInstant(of: block, zones: zones) == namedSlot
+        }
         let newPart = try applyAttendeeRule(before: anchored, after: patched, zones: zones)
-        return SeriesSplitResources(cappedSeries: capped, newPart: newPart)
+
+        // 7. The capped series, the overrides shown after the one named edited where they are.
+        let capped = try cappedSeriesResource(
+            storedICS: storedICS, slotInstant: slotInstant, cappedRRule: cappedRRule, zones: zones, edit: edit)
+        return SeriesSplitResources(cappedSeries: capped, newPart: newPart, mode: mode)
+    }
+
+    /// The slot on a split's new part `part` (its series VEVENT patched) of each override of
+    /// `storedICS` the carry writes there, by its place (`RECURRENCE-ID`), as
+    /// `SplitCarry.carryPlan` decides it for Google and Outlook: the series cut at `slotInstant`,
+    /// the occurrence named shown from `shownFrom` with its place at `namedPlace`, its days read in
+    /// `seriesZone`. Throws its refusals (`keptHasNoSlotRefusal`, `editedKindRefusal`) before
+    /// anything is written. The plan's times are not written here: an override keeps its own, and
+    /// the edit reaches it through `editOverrides`.
+    private static func carrySlots(
+        storedICS: String, part: String, slotInstant: Date, shownFrom: Date, namedPlace: Date, mode: SplitCarry.Mode,
+        seriesZone: TimeZone, fields: Set<SplitCarry.Field>, zones: CalendarTimeZoneContext
+    ) throws -> [Date: Date] {
+        let unreadable = CalendarProviderError.notSupported("A changed occurrence of the repeating event can't be read, so it can't be split.")
+        let seriesAllDay = masterDTStartKind(from: storedICS) == .allDay
+        let partAllDay = masterDTStartKind(from: part) == .allDay
+        // A timed time names the zone its occurrences repeat in (`GCalEvent.seriesZone`, which
+        // `SplitCarry.slot` reads the new part's time of day in): the series', or the new part's own.
+        func time(_ instant: Date, allDay: Bool, zone: TimeZone? = nil) -> GCalDateTime {
+            allDay ? GCalDateTime(dateTime: nil, date: FixedDateFormat.formatter("yyyy-MM-dd", timeZone: .gmt).string(from: instant), timeZone: nil)
+                : GCalDateTime(dateTime: instant.iso8601String(), date: nil, timeZone: (zone ?? seriesZone).identifier)
+        }
+        func event(_ id: String, start: Date, end: Date, allDay: Bool, zone: TimeZone? = nil, rules: [String]? = nil, place: Date? = nil) -> GCalEvent {
+            var event = GCalEvent(id: id, summary: nil, location: nil, description: nil, start: time(start, allDay: allDay, zone: zone),
+                                  end: time(end, allDay: allDay, zone: zone), attendees: nil, organizer: nil, recurrence: rules, transparency: nil,
+                                  status: nil, htmlLink: nil, created: nil, updated: nil)
+            event.originalStartTime = place.map { time($0, allDay: allDay) }
+            return event
+        }
+        func rules(_ ics: String) -> [String] { masterTopLevelLines(ics).filter { icsProperty($0)?.name == "RRULE" } }
+        func startLine(_ ics: String) -> String? { masterTopLevelLines(ics).first(where: { icsProperty($0)?.name == "DTSTART" }) }
+        func start(_ ics: String) throws -> Date? { try startLine(ics).flatMap { try parseICSDateTime($0, zones: zones) } }
+        guard let seriesStart = try start(storedICS), let seriesLength = try extractMasterDuration(from: storedICS, zones: zones),
+              let partStart = try start(part), let partLength = try extractMasterDuration(from: part, zones: zones) else { throw unreadable }
+        var exceptions: [SplitCarry.Exception] = []
+        _ = try rewriteVEvents(in: storedICS) { block, isMaster in
+            guard !isMaster else { return block }
+            let at = try startInstant(of: block, zones: zones)
+            let end = try topLevel(block).first(where: { icsProperty($0.text)?.name == "DTEND" })
+                .flatMap { try parseICSDateTime($0.text, zones: zones) } ?? at.addingTimeInterval(seriesLength)
+            let place = try recurrenceInstant(of: block, zones: zones)
+            exceptions.append(.changed(event("\(place.timeIntervalSince1970)", start: at, end: end, allDay: seriesAllDay, place: place)))
+            return block
+        }
+        let cut = time(slotInstant, allDay: seriesAllDay)
+        guard let parts = SplitCarry.partition(exceptions, cut: .at(cut), namedStart: time(shownFrom, allDay: seriesAllDay)),
+              let plan = try SplitCarry.carryPlan(
+                parts: parts, mode: mode, namedStart: time(shownFrom, allDay: seriesAllDay), namedPlace: time(namedPlace, allDay: seriesAllDay),
+                cut: cut, series: event("series", start: seriesStart, end: seriesStart.addingTimeInterval(seriesLength), allDay: seriesAllDay, rules: rules(storedICS)),
+                zone: seriesAllDay ? nil : seriesZone,
+                newPart: event("part", start: partStart, end: partStart.addingTimeInterval(partLength), allDay: partAllDay,
+                               zone: try startLine(part).flatMap { try seriesStartZone($0, zones: zones) }, rules: rules(part)),
+                fields: fields)
+        else { throw unreadable }
+        var slots: [Date: Date] = [:]
+        for change in plan.changed {
+            guard let place = change.exception.originalStartTime.flatMap(instant),
+                  let slot = instant(change.place) else { throw unreadable }
+            slots[place] = slot
+        }
+        return slots
+    }
+
+    /// The instant a split's time names, as `parseICSDateTime` reads a resource's: a date at its
+    /// UTC midnight, a time as its instant.
+    private static func instant(_ time: GCalDateTime) -> Date? {
+        if let date = time.date { return FixedDateFormat.formatter("yyyy-MM-dd", timeZone: .gmt).date(from: String(date.prefix(10))) }
+        return time.dateTime.flatMap(Date.fromISO8601)
+    }
+
+    /// `ics` with the VEVENT `blocks` added before its `END:VCALENDAR`.
+    private static func appendingVEvents(_ blocks: [[ICSUnit]], to ics: String) -> String {
+        guard !blocks.isEmpty else { return ics }
+        var units = icsUnits(ics)
+        let at = units.lastIndex(where: { $0.isMarker("END:VCALENDAR") }) ?? units.endIndex
+        units.insert(contentsOf: blocks.joined(), at: at)
+        return units.flatMap(\.physical).joined(separator: "\r\n")
+    }
+
+    /// The edit a split writes onto an override where it is (`editOverrides`): the fields it set
+    /// (`set`, their property names) as `lines` hold them (the new part's series VEVENT, or the
+    /// edit itself when no part is written), the new length when it set the end, and how far it
+    /// moves an occurrence (`shift`). It reaches the overrides shown from `shownFrom` on.
+    struct OccurrenceEdit {
+        let shownFrom: Date
+        let set: [String]
+        let lines: [String]
+        let length: TimeInterval?
+        let shift: TimeInterval
+
+        /// The same edit, moving nothing (a carry: its start is the place's).
+        var unmoved: OccurrenceEdit { OccurrenceEdit(shownFrom: shownFrom, set: set, lines: lines, length: length, shift: 0) }
+    }
+
+    /// The property each field an edit sets is written as.
+    private static let fieldProperties: [(SplitCarry.Field, String)] = [
+        (.summary, "SUMMARY"), (.location, "LOCATION"), (.description, "DESCRIPTION"), (.transparency, "TRANSP"),
+    ]
+
+    /// The edit read from a split's new part `part` (its series VEVENT patched), for an edit that
+    /// set `fields`: the shift is from the slot to the part's start.
+    static func occurrenceEdit(
+        fields: Set<SplitCarry.Field>, from part: String, slotInstant: Date, shownFrom: Date, zones: CalendarTimeZoneContext
+    ) throws -> OccurrenceEdit {
+        let set = fieldProperties.filter { fields.contains($0.0) }.map(\.1)
+        let series = masterTopLevelLines(part)
+        let lines = series.filter { line in icsProperty(line).map { set.contains($0.name) } ?? false }
+        let length = fields.contains(.end) ? try extractMasterDuration(from: part, zones: zones) : nil
+        guard let start = series.first(where: { icsProperty($0)?.name == "DTSTART" }),
+              let partStart = try parseICSDateTime(start, zones: zones), !fields.contains(.end) || length != nil else {
+            throw CalendarProviderError.notSupported("The repeating event's new part can't be read, so it can't be split.")
+        }
+        return OccurrenceEdit(shownFrom: shownFrom, set: set, lines: lines, length: length, shift: partStart.timeIntervalSince(slotInstant))
+    }
+
+    /// `ics` with `edit` written over each override VEVENT `picks` picks: the fields it set, as
+    /// `edit.lines` hold them, and its start and end moved by `edit.shift`, or, when it set the
+    /// end, an end at its (moved) start plus `edit.length`. Its other properties stay its own.
+    static func editOverrides(
+        _ ics: String, edit: OccurrenceEdit, zones: CalendarTimeZoneContext, picks: ([ICSUnit]) throws -> Bool
+    ) throws -> String {
+        guard !edit.set.isEmpty || edit.length != nil || edit.shift != 0 else { return ics }
+        let unreadable = CalendarProviderError.notSupported("A changed occurrence of the repeating event can't be read, so it can't be split.")
+        return try rewriteVEvents(in: ics) { block, isMaster in
+            guard !isMaster, try picks(block) else { return block }
+            let start = try startInstant(of: block, zones: zones).addingTimeInterval(edit.shift)
+            var startLine: String?
+            var out = try rewriteTopLevel(block) { unit, name in
+                if edit.set.contains(name) { return [] }
+                switch name {
+                case "DTSTART":
+                    guard let moved = try formatLike(unit.text, instant: start, zones: zones) else { throw unreadable }
+                    startLine = moved
+                    return edit.shift == 0 ? nil : [moved]
+                case "DTEND" where edit.length != nil, "DURATION" where edit.length != nil:
+                    return []
+                case "DTEND" where edit.shift != 0:
+                    guard let end = try parseICSDateTime(unit.text, zones: zones),
+                          let moved = try formatLike(unit.text, instant: end.addingTimeInterval(edit.shift), zones: zones) else { throw unreadable }
+                    return [moved]
+                default:
+                    return nil
+                }
+            }
+            var added = edit.lines
+            if let length = edit.length {
+                guard let startLine,
+                      let end = try formatLike("DTEND" + startLine.dropFirst("DTSTART".count), instant: start.addingTimeInterval(length), zones: zones)
+                else { throw unreadable }
+                added.append(end)
+            }
+            out = insertBeforeSubcomponents(out, lines: added)
+            return out
+        }
+    }
+
+    /// The series' resource of a "this and following" edit at an occurrence moved past its last
+    /// place (`CalDAVProvider.editShown`): the stored series with `patch`'s fields, moved by `shift`
+    /// and lasting `length` when it gives an end, written over each override shown from
+    /// `shownFrom` on. Nothing else changes.
+    static func pastEndResource(
+        storedICS: String, patch: GCalEventInput, shownFrom: Date, shift: TimeInterval, length: TimeInterval?, zones: CalendarTimeZoneContext
+    ) throws -> String {
+        guard let duration = try extractMasterDuration(from: storedICS, zones: zones) else {
+            throw CalendarProviderError.notSupported("The repeating event's length can't be read, so it can't be changed.")
+        }
+        let fields = SplitCarry.fields(of: patch)
+        let values = SplitCarry.values(of: patch, fields: fields)
+        let patched = try mergePatchKeepingLength(values, into: storedICS, length: duration, zones: zones)
+        let set = fieldProperties.filter { fields.contains($0.0) }.map(\.1)
+        let lines = masterTopLevelLines(patched).filter { line in icsProperty(line).map { set.contains($0.name) } ?? false }
+        let edit = OccurrenceEdit(shownFrom: shownFrom, set: set, lines: lines, length: length, shift: shift)
+        return try editOverrides(storedICS, edit: edit, zones: zones) { block in
+            try startInstant(of: block, zones: zones) >= shownFrom
+        }
+    }
+
+    /// The instant an override VEVENT starts at now (its `DTSTART`), read as `parseICSDateTime`
+    /// reads it.
+    private static func startInstant(of block: [ICSUnit], zones: CalendarTimeZoneContext) throws -> Date {
+        guard let unit = topLevel(block).first(where: { icsProperty($0.text)?.name == "DTSTART" }),
+              let instant = try parseICSDateTime(unit.text, zones: zones) else {
+            throw CalendarProviderError.notSupported("A changed occurrence of the repeating event can't be read, so it can't be split.")
+        }
+        return instant
     }
 
     /// The split occurrence's `DTSTART` line in the series' own form (its parameters and value
@@ -145,13 +406,23 @@ extension CalDAVProvider {
         return (slotLine, slotInstant)
     }
 
+    /// The zone the series' start line `line` is kept in: its TZID's zone, UTC for a UTC value,
+    /// nil for a floating or all-day one (no zone of its own).
+    static func seriesStartZone(_ line: String, zones: CalendarTimeZoneContext) throws -> TimeZone? {
+        guard let property = icsProperty(line) else { return nil }
+        if let tzid = ICSParser.extractTZID(property.params) { return try zone(forTZID: tzid, zones: zones) }
+        return line.uppercased().hasSuffix("Z") ? .gmt : nil
+    }
+
     /// The series' half of a split (`seriesSplitResources`, and `finishSplit` on its own): the
     /// stored series with `cappedRRule` as its rule, and nothing at or after `slotInstant` (its
-    /// changed occurrences, excluded and added dates there go to the new part).
+    /// changed occurrences, excluded and added dates there go to the new part). Each override it
+    /// keeps that is shown from the occurrence named on (`edit.shownFrom`) gets `edit` where it is
+    /// (`editOverrides`).
     static func cappedSeriesResource(
-        storedICS: String, slotInstant: Date, cappedRRule: String, zones: CalendarTimeZoneContext
+        storedICS: String, slotInstant: Date, cappedRRule: String, zones: CalendarTimeZoneContext, edit: OccurrenceEdit? = nil
     ) throws -> String {
-        try rewriteVEvents(in: storedICS) { block, isMaster in
+        let capped = try rewriteVEvents(in: storedICS) { block, isMaster in
             if !isMaster {
                 return try recurrenceInstant(of: block, zones: zones) < slotInstant ? block : nil
             }
@@ -165,6 +436,10 @@ extension CalDAVProvider {
                     return nil
                 }
             }
+        }
+        guard let edit else { return capped }
+        return try editOverrides(capped, edit: edit, zones: zones) { block in
+            try startInstant(of: block, zones: zones) >= edit.shownFrom
         }
     }
 
@@ -792,7 +1067,8 @@ extension CalDAVProvider {
             let lineZone = try zone(forTZID: String(tzid.dropFirst("TZID=".count)), zones: zones)
             fmt = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss", timeZone: lineZone)
         } else {
-            fmt = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss", timeZone: .current)
+            // Floating: written in the zone `parseICSDateTime` reads it in, the operation's.
+            fmt = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss", timeZone: zones.floating)
         }
         return "\(p.rawName)\(p.params):\(fmt.string(from: instant))"
     }

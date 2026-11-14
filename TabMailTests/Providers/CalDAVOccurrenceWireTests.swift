@@ -513,11 +513,11 @@ struct CalDAVOccurrenceWireTests {
                 "the edit did not land on the moved occurrence alone: \(after.map { [$0.id, $0.location] })")
     }
 
-    @Test("this_and_following at a moved occurrence, by its id or the series id with the start the listing showed, is refused by name and nothing is written")
-    func splitAtMovedOccurrenceIsRefused() async throws {
-        // A split there would start at the occurrence's place in the series, and change the
-        // occurrences between that place and where the occurrence now is: week 2's moved into
-        // week 5 (weeks 3 and 4 between), and week 3's moved to the next day (none between).
+    @Test("this_and_following at a moved occurrence, by its id or the series id with the start the listing showed, keeps it where it was moved (owner rule)")
+    func splitAtMovedOccurrenceIsAtItsPlace() async throws {
+        // The split cuts at the first place at or after where the occurrence is now, and changes
+        // it and every occurrence shown after it: week 2's moved into week 5 (weeks 3 and 4
+        // between, which stay as they are), and week 3's moved to the next day.
         let movedFar = try W.makeMoved(week: 2, toWeek: 5)
         let movedNear = try W.makeChanged()
         let fixtures: [(label: String, fixture: W, week: Int, shown: Date)] = [
@@ -529,23 +529,20 @@ struct CalDAVOccurrenceWireTests {
                 let (store, http) = W.serve(entry.fixture)
                 defer { http.close() }
                 let label = "\(entry.label), by \(eventId)"
-                await #expect("this_and_following, \(label), was not refused by name") {
-                    _ = try await W.makeProvider(http).splitSeries(
-                        calendarId: W.calendarId, eventId: eventId,
-                        recurrenceId: OccurrenceFixture.naive(entry.shown, entry.fixture.zone),
-                        recurrenceIdZone: entry.fixture.zone, patch: GCalEventInput(), sendUpdates: "all")
-                } throws: { error in
-                    guard case CalendarProviderError.notSupported(let message) = error else { return false }
-                    return message.contains("was moved from its place in the series") && message.contains("this_only")
-                }
-                let writes = http.recordedCalls().filter { $0.method != "GET" }.map { "\($0.method) \($0.url)" }
-                #expect(writes.isEmpty, "\(label): the refused split sent a write: \(writes)")
-                #expect(store.storedICS(path: W.seriesPath) == entry.fixture.ics, "\(label): the series is not on the server as it was")
+                _ = try await W.makeProvider(http).splitSeries(
+                    calendarId: W.calendarId, eventId: eventId,
+                    recurrenceId: OccurrenceFixture.naive(entry.shown, entry.fixture.zone),
+                    recurrenceIdZone: entry.fixture.zone, patch: GCalEventInput(), sendUpdates: "all")
+                #expect(store.recordedPuts().count == 2, "\(label): \(store.recordedPuts().map(\.path))")
+                let listed = try await Self.listWeeks(W.makeProvider(http), entry.fixture, through: 5)
+                let place = try entry.fixture.occurrence(entry.week)
+                #expect(!listed.contains { $0.startDate == place } && listed.contains { $0.startDate == entry.shown },
+                        "\(label): the moved occurrence is not where it was, or its place came back: \(listed.map { $0.start?.dateTime ?? "nil" })")
             }
         }
     }
 
-    /// How a series' DTSTART is written in `splitIsRefusedExactlyAtMovedOccurrencesInEveryFrame`.
+    /// How a series' DTSTART is written in `splitIsAtThePlaceInEveryFrame`.
     enum SeriesFrame: String, CaseIterable {
         case floating, utc, zoned, allDay
 
@@ -570,15 +567,15 @@ struct CalDAVOccurrenceWireTests {
         }
     }
 
-    /// Where `splitIsRefusedExactlyAtMovedOccurrencesInEveryFrame` puts week 2's occurrence.
+    /// Where `splitIsAtThePlaceInEveryFrame` puts week 2's occurrence.
     enum Move: String, CaseIterable {
         /// No change at all, and a change that kept its start (an override at its own slot).
         case none, retitledInPlace, sameDay, nextDay
     }
 
-    @Test("this_and_following is refused exactly at a moved occurrence, in every series frame, from the device's zone or another, by either id",
+    @Test("this_and_following at an occurrence splits at the first place at or after where it is now, in every series frame, from the device's zone or another, by either id (owner rule)",
           arguments: SeriesFrame.allCases, Move.allCases)
-    func splitIsRefusedExactlyAtMovedOccurrencesInEveryFrame(_ frame: SeriesFrame, _ move: Move) async throws {
+    func splitIsAtThePlaceInEveryFrame(_ frame: SeriesFrame, _ move: Move) async throws {
         // An all-day occurrence has no time of day to move within its day.
         if frame == .allDay, move == .sameDay { return }
         let zone = try frame.zone()
@@ -612,8 +609,7 @@ struct CalDAVOccurrenceWireTests {
             seriesHref: W.seriesPath,
             key: frame == .allDay ? OccurrenceFixture.dateValue(slot, .current)
                 : frame == .floating ? OccurrenceFixture.wall(slot, .current) : OccurrenceFixture.utcValue(slot))
-        let moved = move == .sameDay || move == .nextDay
-        // The model may name the occurrence in the device's zone or in another one.
+                // The model may name the occurrence in the device's zone or in another one.
         let device = TimeZone.current
         let other = try #require(TimeZone(identifier: device.identifier == "Asia/Tokyo" ? "Europe/Berlin" : "Asia/Tokyo"))
 
@@ -631,24 +627,20 @@ struct CalDAVOccurrenceWireTests {
                         calendarId: W.calendarId, eventId: eventId, recurrenceId: recurrenceId,
                         recurrenceIdZone: toolZone, patch: GCalEventInput(), sendUpdates: "all")
                 }
-                if moved {
-                    await #expect("\(label): the split was not refused by name") {
-                        try await split()
-                    } throws: { error in
-                        guard case CalendarProviderError.notSupported(let message) = error else { return false }
-                        return message.contains("was moved from its place in the series")
-                    }
-                    let writes = http.recordedCalls().filter { $0.method != "GET" }.map { "\($0.method) \($0.url)" }
-                    #expect(writes.isEmpty, "\(label): the refused split sent a write: \(writes)")
-                    #expect(store.storedICS(path: W.seriesPath) == fixture.ics, "\(label): the series is not on the server as it was")
-                } else {
-                    do {
-                        try await split()
-                    } catch {
-                        Issue.record("\(label): the split at an occurrence that was not moved failed: \(error)")
-                    }
-                    #expect(store.recordedPuts().count == 2, "\(label): the split did not write its new part and the capped series: \(store.recordedPuts().map(\.path))")
+                do {
+                    try await split()
+                } catch {
+                    Issue.record("\(label): the split failed: \(error)")
                 }
+                #expect(store.recordedPuts().count == 2, "\(label): the split did not write its new part and the capped series: \(store.recordedPuts().map(\.path))")
+                // The new part starts at the first place at or after where the occurrence is now: its
+                // own place when it starts there, else the next week's (owner rule, 2026-11-12).
+                let cut = move == .sameDay || move == .nextDay ? try #require(calendar.date(byAdding: .day, value: 7, to: slot)) : slot
+                let part = store.recordedPuts().map(\.path).first { $0 != W.seriesPath }
+                let partICS = part.flatMap { store.storedICS(path: $0) } ?? ""
+                #expect(partICS.contains(try frame.line("DTSTART", cut)), "\(label): the new part does not start at the cut: \(partICS)")
+                // It lasts what the series does, its end written in the frame its start is read in.
+                #expect(partICS.contains(try frame.line("DTEND", cut.addingTimeInterval(length))), "\(label): the new part does not end a length after the cut: \(partICS)")
             }
         }
     }

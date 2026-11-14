@@ -744,3 +744,19 @@ per size on either side of both readings through the first save and the send. A 
 3,000,000 or above 3,145,728 routes one of those sizes to a route that refuses it and fails the
 suite. `ExchangeAttachmentSendTests` keeps its stricter assumption for an inline `sendMail` or draft
 create: 413 at 3,000,000 bytes, the behaviour #422 reported.
+
+### The per-file add is shared with the Outlook calendar split (#563, 2026-11-13)
+
+`addDraftAttachment`'s body moved, unchanged, into `ExchangeProvider.addFileAttachment`, parameterized
+by the Graph item path (`/messages/{id}` or `/events/{id}`), an authenticated POST closure (each caller
+keeps its own error mapping), the URL session and the mailbox gate. `addDraftAttachment` is now a thin
+call to it, so the per-file size rule and the upload session still live in one place. The second caller
+is `ExchangeCalendarProvider.copySeriesFiles`, which copies a series' file attachments onto a split's new
+part (memory 142, amendment of 2026-11-13). Graph documents the same two routes for an event
+(`attachment: createUploadSession`: "The item can be a message or event"). No wire change for drafts or
+sends.
+
+Amendment (#563, 2026-11-13): `addFileAttachment` takes an optional inline placement
+(`GraphInlinePlacement`: `isInline`, `contentId`), written on the single POST and on the upload
+session's `attachmentItem` (both documented optional properties). The split copy passes each file's own;
+the draft path passes none, so its wire bytes are unchanged.
