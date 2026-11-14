@@ -43,6 +43,14 @@ runs it after the folders' walk, in slices under the one-sync-at-a-time lock, re
 slices: one slice per foreground backfill cycle, and slices until the deadline in the background
 processing job. The run snapshots the network state, the storage-limit flag and the deadline when
 it starts. The title's "full sync" is historical.)
+**Amended 2026-11-13: the Outlook catch-up, the shared direct load, completed actions** (decisions
+1, 3, 4 and 8; see the amendment at the end). Exchange implements the seam
+(`ExchangeProvider.catchUp`, `ExchangeProviderCatchUp.swift`). The range cut and the direct load
+moved below the seam into `TabMail/Providers/CatchUpListing.swift` and are shared by Gmail and
+Outlook: `CatchUpRange` (`cut`, `listsToEpoch`) and `CatchUpDirectLoad` (`load`, `pageVerdict`).
+`GmailProvider.loadMissing` is gone; where this ADR names it, read `CatchUpDirectLoad.load`. The
+apply (every provider) skips a read or flag update for a message whose user action completed at or
+after the moment the read began, and an over-age read applies no read or flag update.
 
 **Context.** Every sync path windows its work, and changes to older mail fall outside every window:
 
@@ -543,6 +551,9 @@ The owner's rulings of 2026-11-09:
      missing. Before that page's token moves on, `GmailProvider.loadMissing` fetches the page's
      missing ids, newest first (the list's own order), through the backfill's own fetch
      (`fetchBackfillBatch`: header and body in one `format=full` GET), in batches (decision 3).
+     *(Amended 2026-11-13: `GmailProvider.loadMissing` is gone; the load is the shared
+     `CatchUpDirectLoad.load` in `CatchUpListing.swift`, which Outlook uses too. The sentence is kept
+     as written.)*
      - **A range moves on only once its missing ids are done.** A page's token is saved only after
        every missing id on it has loaded or been classified done. If the budget runs out part way,
        the range keeps the page's token as it was and the next pass lists the same page again, where
@@ -932,3 +943,51 @@ The owner's rulings of 2026-11-09:
   cursor, so a new account's catch-up listed every folder twice). The candidate is read before the
   listings and stored after them with no lapse mark.
 - IMAP's daily check is unchanged until its reader lands.
+
+### Amendment (2026-11-13): the Outlook catch-up, the shared direct load, completed actions
+
+**The shared listing pieces.** The newest-first range cut (`CatchUpRange.cut`, with
+`CatchUpRange.listsToEpoch`) and the direct load (`CatchUpDirectLoad.load`, with
+`CatchUpDirectLoad.pageVerdict` for the page hold) live below the seam in
+`TabMail/Providers/CatchUpListing.swift`. The load takes the fetch as a closure, because
+`fetchBackfillBatch` is not an `EmailProvider` requirement. `GmailProvider.loadMissing` is gone; the
+Gmail behaviour above is unchanged.
+
+**Outlook (`ExchangeProvider.catchUp`).** Per folder, in this order:
+
+- *When a listing starts.* The first listing, a new listing after a lapse, and one listing once the
+  folder's backfill walk completes (the walk's offset paging can leave holes); never a periodic
+  check. A new listing starts only while the folder's change bookmark is tracking (its first
+  change read is complete), the one place this lives being `catchUpTrackingGateOpen`: before that,
+  a message deleted between the listing's pass and the first read's start would be reported by
+  neither. The expensive-network wait counts from first sight, which is recorded even while the
+  gate holds, so the two waits run side by side.
+- *Paging.* Each range is listed with `receivedDateTime ge/lt` filters, newest first, `$top`
+  `SyncConfig.catchUpGraphListPageSize` (250), resuming at a date (keyset), never at a saved
+  `$skip` or link. A page whose oldest second also holds newer messages is listed again from that
+  second; a page of one second follows Graph's own link inside the slice only. Ranges hold at most
+  `SyncConfig.catchUpGraphRangeRowLimit` (500) local rows.
+- *Requests.* A quarter of the mailbox request rate (`SyncConfig.graphCatchUpRequestShare`,
+  `graphCatchUpRequestsPerSecond`), charged before each request; a `$batch` is charged its width.
+  Graph's own 429/503 retries are not charged.
+- *Removals.* A local row no page of its range names is a candidate, removed only when its own
+  `$batch` answer says gone or in another folder; an unusable answer keeps it, held at most the page
+  walk's hold bound. Ids loaded this slice count as named.
+- *Loads.* An id a page names that no local row holds is loaded through `CatchUpDirectLoad.load`,
+  in batches of `GraphConfig.bodyFetchConcurrency`, with the page walk's hold bound.
+- It never throws, writes nothing itself, and reads no setting or device state (the context
+  snapshot carries them). Progress: a range cut whose first page failed is no progress.
+
+**Completed actions against a slow read (every provider's apply).** A read can reach the apply after
+the 30 s `recentlyCompleted` protection ran out. `AccountManager` keeps, in memory only, when each
+action completed (account and message key, the keys `recentlyCompleted` uses), written at both
+completion sites of the action queue and kept for `SyncConfig.catchUpCompletionLogRetentionSeconds`
+(one hour). `SyncEngine.runCatchUp` takes `readStartedAt` just before the provider call. The apply
+skips a read or flag update for a message whose action completed at or after `readStartedAt`. A read
+at least the retention old applies no read or flag update at all; its removals, loads and state still
+apply, so a listing always moves on. All three times are on one wall clock (`CatchUpWallClock`),
+never `CatchUpContext.clock`. Nothing is persisted and no content is kept.
+
+Tests: `OutlookCatchUpTests` (removals, loads, lapses, bounds, paging, same-second groups, the gate's
+timing, completed actions), `OutlookChangeFuzzTests` (catch-up schedules with faults, lapses, clock
+jumps and user actions; the completed-action invariant), `StatefulExchangeActionServerCatchUpTests`.

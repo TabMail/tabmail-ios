@@ -277,3 +277,15 @@ met the same message and looped.
 Keywords: partial record insert, new message default read state, settle set, server tag not carried, no-tag value, changeReadMaxRoundPages deleted, round length, long round, per-item 5xx, unreadable header,
 rereadLater, page hold, absent field, references kept, partial record, carriesReadAndFlag, kept-back flag
 change, #444.
+
+### Amendment 2026-11-13: the Outlook catch-up next to the change reader
+
+The change reader stays the only path that reports changes after a folder's first read. Outlook's
+older-mail catch-up (ADR-IOS-107, amendment 2026-11-13) covers what the reader cannot: messages
+deleted or changed before the folder's first read (a baseline never removes) and changes lost in a
+lapse. It starts a folder's listing only while the folder's bookmark is tracking
+(`ExchangeProvider.catchUpTrackingGateOpen`), so every deletion falls either before the listing,
+which sees it, or after the first read began, which the delta reports. It pages by received-date
+keyset, takes a quarter of the mailbox request rate, and lists a folder once more after its backfill
+walk completes. Its apply never lets a read that began before a user action completed overwrite
+that action's read or flag state (ADR-IOS-107, completed actions).

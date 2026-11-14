@@ -18,6 +18,13 @@
 > keep failing past `SyncConfig.changeReadFailureLapseSeconds`, starts that folder's baseline again, and a
 > change to older mail in that gap is still lost until Outlook's own catch-up exists (it still uses the
 > seam's do-nothing default). The sentence above is kept as written.
+>
+> **Amended 2026-11-13 (ADR-IOS-107, Outlook amendment).** Exchange now has its own catch-up
+> (`ExchangeProvider.catchUp`): once a folder tracks, its first listing, a listing after each lapse and
+> one after its backfill walk completes remove rows proven gone and load missing mail. The apply skips
+> a read or flag update for a message whose user action completed at or after the read began (an
+> in-memory log, kept one hour), and a read older than that applies no read or flag update. "Still uses
+> the seam's do-nothing default" above is superseded and kept as written.
 
 **Context:** The 2026-07-02 audit (PROJECT_MEMORY "IMAP external-deletion blind spot") confirmed that raw-IMAP/iCloud accounts never remove an externally-deleted message once it falls below the newest-`syncMessageLimit`(=50)-UID stale window: `selectStaleHeaders` is windowed, backfill is insert-only, `selfHealRecentMessages` is add-only, and the complete-knowledge branch is capped to tiny folders. Ghost rows persisted in GRDB + FTS + search indefinitely (Gmail/Exchange are immune — provider deltas carry deletions of any age). Two free signals were being wasted: `imapDeltaSync` observed `status.messageCount != folder.totalCount` but only ran the windowed sync and then OVERWROTE `totalCount` (evidence consumed, ghost survived), and IDLE `VANISHED(UIDSet)` — the server literally naming the deleted UIDs — was discarded into a generic poll.
 
