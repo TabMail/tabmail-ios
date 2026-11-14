@@ -364,11 +364,15 @@ struct CalendarEventDeleteTool: AgentTool, Sendable {
         case "all": "Repeating event deleted successfully: every occurrence."
         default: "Calendar event deleted successfully."
         }
+        // Why the change still waits, when the queue stored a reason the user can act on (#865).
+        var waitLine: String?
+        if !confirmedSync { waitLine = await CalendarToolHelpers.waitLine(opId: op.id) }
         return [
             confirmedSync ? deleted : "Calendar event deletion queued successfully.",
             target.scope.map { "delete_scope: \($0)" },
             "event_id: \(compoundId)",
             confirmedSync ? nil : "The event will be removed from the calendar shortly. Cancellation notices will be sent to attendees.",
+            waitLine,
         ].compactMap { $0 }.joined(separator: "\n")
     }
 }

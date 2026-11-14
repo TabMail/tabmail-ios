@@ -5,7 +5,8 @@
 `innerError`; upload session; range PUT; `ExchangeProvider.addFileAttachment` `rangeRefused`;
 calendar queue; transient arm; `CalendarWaitReason`; `PendingCalendarOperation.waitReasonKey`
 (`_wait_reason`); `WaitingCalendarChangeBanner`; `LateCalendarFailureStore.waiting`; sign in again;
-never drop; `IOS-CAL-003` accepted residual reversed.
+never drop; `IOS-CAL-003` accepted residual reversed; chat tool result; `CalendarToolHelpers.waitLine`;
+`AccountManager.calendarWaitReason(opId:)`; `toolClause`; still queued.
 
 ## What was wrong
 
@@ -44,10 +45,18 @@ written before this was seen; for the quota case it is reversed (see the amendme
   it when a later attempt fails for another reason. `LateCalendarFailureStore.reload` also reads every
   `queued` or `inFlight` row with a wait reason into `waiting`, and the inbox shows one
   `WaitingCalendarChangeBanner` per row, laid out like the failure banner, with NO button: *"A calendar
-  change is waiting: <title>. The mailbox is full. It will be made once space is freed."* It goes when the
+  change is waiting: <title>. Your Outlook mailbox is full. Free up space and it will go through."*
+  (wording: master ruling 2026-11-14, review r1). It goes when the
   change is made (the row is deleted) or fails for good. The drain reloads the store when a wait reason was
   written, cleared, or its row left the queue. No column, no migration, nothing new persisted beyond the
   queue row the change already had.
+- **The chat is told why.** A calendar tool whose change did not complete in-turn (create, edit, delete,
+  and each occurrence of an exdate edit) reads the reason the drain stored on the row
+  (`AccountManager.calendarWaitReason(opId:)`) and adds one line, `CalendarToolHelpers.waitLine`:
+  *"This change is waiting because the Outlook mailbox is full."* (per occurrence: `; waiting because …`).
+  The drain signals `.stillQueued` only after the requeue wrote the reason, so the read sees it. A change
+  queued behind another account change that found the mailbox full carries no reason of its own (it was
+  never attempted) and gets no line.
 
 ## Not measured
 
@@ -65,7 +74,8 @@ once `acceptWrites` frees space; a full mailbox seen on the retry after a forced
 prompt), `GraphAPIMailboxFullTests` (`errorCodes` and `isMailboxFull` on the outer code, a nested
 `innerError`, another code and another status), `CalendarBadRequestClassificationTests` (`mailboxFull` in
 the roster and the transient list, not terminal) and `ExchangeCalendarErrorTests` (the exhaustive case
-switch).
+switch). `CalendarToolMailboxFullTests` runs the create, edit and delete tools, confirmed, against the
+real queue with the write refused for a full mailbox (the result says why) and with a 409 (it does not).
 
 Red first on main (the four-write suite, before the fix): the create, PATCH and single attachment POST
 cases were retired as `failed`/`missingPermission` with "sign in again" raised, 24 issues. The

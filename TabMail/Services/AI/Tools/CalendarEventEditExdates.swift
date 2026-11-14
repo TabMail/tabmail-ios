@@ -277,7 +277,10 @@ enum CalendarEventEditExdates {
                 failures.append("\(entry.date): \(reason)")
                 allDeleted = false
             case .stillQueued, .timedOut:
-                lines.append("\(named): queued, will be deleted shortly")
+                // Why it waits, when the queue stored a reason the user can act on (#865).
+                var waiting = ""
+                if let opId, let reason = await manager.calendarWaitReason(opId: opId) { waiting = "; \(reason.toolClause)" }
+                lines.append("\(named): queued, will be deleted shortly\(waiting)")
                 allDeleted = false
             }
         }

@@ -43,7 +43,14 @@ enum CalendarWaitReason: String, Sendable, CaseIterable {
     /// The plain line the inbox shows for this reason.
     var userReason: String {
         switch self {
-        case .mailboxFull: return "The mailbox is full. It will be made once space is freed."
+        case .mailboxFull: return "Your Outlook mailbox is full. Free up space and it will go through."
+        }
+    }
+
+    /// The clause a calendar tool's "queued" result adds, so the model can tell the user why.
+    var toolClause: String {
+        switch self {
+        case .mailboxFull: return "waiting because the Outlook mailbox is full"
         }
     }
 }

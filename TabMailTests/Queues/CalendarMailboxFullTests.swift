@@ -84,22 +84,27 @@ struct CalendarMailboxFullTests {
         }
     }
 
-    /// Whether the change the user asked for is on the server.
+    /// Whether the change the user asked for is on the server, made once: a retry after the refusal
+    /// that made a second event or a second copy of the file is not the change the user asked for.
     private static func landed(_ write: Write, _ graph: FakeGraphCalendar) -> Bool {
         switch write {
         case .create:
-            return graph.created.contains { $0["subject"] as? String == "Planning" }
+            return graph.created.count == 1 && graph.created[0]["subject"] as? String == "Planning"
         case .patch:
             return graph.event("ev-1")?["subject"] as? String == "Planning (moved rooms)"
         case .attachmentPost, .uploadSession:
             let name = write == .attachmentPost ? "agenda.txt" : "deck.bin"
             let bytes = write == .attachmentPost ? small : large
-            guard let part = graph.created.first, let partId = part["id"] as? String else { return false }
-            return part["subject"] as? String == "Planning (phase 2)"
-                && graph.files(of: partId).contains { $0.name == name && $0.bytes == bytes }
+            guard graph.created.count == 1, let partId = graph.created[0]["id"] as? String else { return false }
+            let copies = graph.files(of: partId).filter { $0.name == name }
+            return graph.created[0]["subject"] as? String == "Planning (phase 2)"
+                && copies.count == 1 && copies[0].bytes == bytes
                 && !graph.patches("ser-1").isEmpty
         }
     }
+
+    /// The inbox's banner line for the change these tests queue.
+    private static let waitingBanner = "A calendar change is waiting: Planning. Your Outlook mailbox is full. Free up space and it will go through."
 
     @Test("a change refused for a full mailbox is never dropped and never asks for sign-in; it goes through once space is freed",
           arguments: Write.allCases)
@@ -130,6 +135,10 @@ struct CalendarMailboxFullTests {
                     "drain \(attempt): the change refused for a full mailbox left the queue (\(String(describing: row?.status)), \(row?.failureReason ?? "no reason")); writes: \(graph.writes)")
             #expect(row?.failureKind == nil, "drain \(attempt): it was recorded as a failure of kind \(String(describing: row?.failureKind))")
             #expect(row?.waitReason == .mailboxFull, "drain \(attempt): the queued change does not say why it waits: \(String(describing: row?.waitReason))")
+            // The inbox renders the shared store: the drain itself must have read it again, with no
+            // reload by the test.
+            #expect(LateCalendarFailureStore.shared.waiting.map(\.id) == [op.id],
+                    "drain \(attempt): the inbox's waiting banners were not refreshed by the drain: \(LateCalendarFailureStore.shared.waiting.map(\.bannerText))")
         }
         #expect(!Self.landed(write, graph), "fixture check: the full mailbox did not refuse the change: \(http.servedCallSequence())")
         #expect(await !AccountManager.shared.authFailedAccounts.contains(accountId),
@@ -137,8 +146,7 @@ struct CalendarMailboxFullTests {
         let store = LateCalendarFailureStore()
         await store.reload()
         #expect(store.failures.isEmpty, "a full mailbox showed a failure banner: \(store.failures.map(\.bannerText))")
-        #expect(store.waiting.map(\.bannerText)
-                == ["A calendar change is waiting: Planning. The mailbox is full. It will be made once space is freed."],
+        #expect(store.waiting.map(\.bannerText) == [Self.waitingBanner],
                 "the inbox does not say the change waits for space: \(store.waiting.map(\.bannerText))")
 
         // The user frees space; the next drain makes the change and the row leaves the queue.
@@ -147,6 +155,8 @@ struct CalendarMailboxFullTests {
         let rows = try await db.pool.read { db in try PendingCalendarOperation.fetchAll(db) }
         #expect(rows.isEmpty, "the change did not leave the queue once space was freed: \(rows.map { "\($0.status) \($0.failureReason ?? "")" })")
         #expect(Self.landed(write, graph), "the change was not made once space was freed: \(http.servedCallSequence())")
+        #expect(LateCalendarFailureStore.shared.waiting.isEmpty,
+                "the drain that made the change left its banner up: \(LateCalendarFailureStore.shared.waiting.map(\.bannerText))")
         await store.reload()
         #expect(store.waiting.isEmpty && store.failures.isEmpty,
                 "a banner stayed after the change was made: \(store.waiting.map(\.bannerText)) \(store.failures.map(\.bannerText))")
@@ -226,6 +236,44 @@ struct CalendarMailboxFullTests {
                 "got \(String(describing: row?.status)) \(row?.failureReason ?? "") waiting for \(String(describing: row?.waitReason))")
         #expect(await !AccountManager.shared.authFailedAccounts.contains(queued.accountId),
                 "a full mailbox asked the user to sign in again")
+    }
+
+    @Test("a tool call that carries the wait-reason key has it removed, so it can't put up a mailbox-full banner")
+    func forgedWaitReasonIsRemoved() async throws {
+        let accountId = "mailbox-full-forged"
+        let db = try CalendarQueueTestDatabase(accountId: accountId)
+        defer { db.finish() }
+        let op = PendingCalendarOperation(
+            operationType: .edit, accountId: accountId, eventId: "ev-1", calendarId: "primary",
+            arguments: ["title": .string("Planning (moved rooms)"),
+                        PendingCalendarOperation.waitReasonKey: .string(CalendarWaitReason.mailboxFull.rawValue)],
+            eventTitle: "Planning")
+        try await db.pool.write { db in try op.insert(db) }
+        let stored = try #require(try await db.pool.read { db in try PendingCalendarOperation.fetchOne(db, key: op.id) })
+        #expect(stored.waitReason == nil && stored.arguments[PendingCalendarOperation.waitReasonKey] == nil,
+                "the forged wait reason was queued: \(stored.argumentsJSON)")
+        #expect(stored.arguments["title"] != nil, "the rest of the arguments were not kept: \(stored.argumentsJSON)")
+        let store = LateCalendarFailureStore()
+        await store.reload()
+        #expect(store.waiting.isEmpty, "a forged reason put up a banner: \(store.waiting.map(\.bannerText))")
+    }
+
+    @Test("a change in flight whose last attempt found the mailbox full is still shown as waiting")
+    func inFlightChangeIsShownWaiting() async throws {
+        let accountId = "mailbox-full-in-flight"
+        let db = try CalendarQueueTestDatabase(accountId: accountId)
+        defer { db.finish() }
+        var op = PendingCalendarOperation(
+            operationType: .edit, accountId: accountId, eventId: "ev-1", calendarId: "primary",
+            arguments: ["title": .string("Planning (moved rooms)")], eventTitle: "Planning")
+        op.setWaitReason(.mailboxFull)
+        op.status = PendingStatus.inFlight.rawValue
+        let inFlight = op
+        try await db.pool.write { db in try inFlight.insert(db) }
+        let store = LateCalendarFailureStore()
+        await store.reload()
+        #expect(store.waiting.map(\.id) == [op.id] && store.waiting.map(\.bannerText) == [Self.waitingBanner],
+                "the change being retried lost its banner: \(store.waiting.map(\.bannerText))")
     }
 
     @Test("a 403 for any other reason is still a missing permission: retired and told, as before")

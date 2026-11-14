@@ -8,6 +8,14 @@ import Foundation
 /// and argument parsing. Matches TB addon's calendar output format.
 enum CalendarToolHelpers {
 
+    // MARK: - Queued Changes
+
+    /// The line a calendar tool's "queued" result adds when the queue stored why the change waits,
+    /// such as a full Outlook mailbox (#865), so the model can tell the user. Nil when it stored none.
+    static func waitLine(opId: String) async -> String? {
+        await AccountManager.shared.calendarWaitReason(opId: opId).map { "This change is \($0.toolClause)." }
+    }
+
     // MARK: - Timezone Resolution
 
     /// Resolve the `timezone` argument for a READ (`CalendarTimeZoneResolver`: an IANA or Windows

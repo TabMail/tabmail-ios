@@ -1317,6 +1317,29 @@ extension AccountManager {
         return false
     }
 
+    /// Why a failure that keeps a change queued is one the user can act on, or nil. Only the
+    /// transient arm reads it: no terminal arm claims these errors (#865).
+    ///
+    /// `ExchangeCalendarError.mailboxFull`: Graph refused the write with 403 `ErrorQuotaExceeded`.
+    /// Signing in again can't help and the change must not be dropped, so it stays queued, the
+    /// account's later calendar changes wait behind it for the drain, and the inbox says the
+    /// mailbox is full until a drain after the user freed space makes it.
+    static func calendarWaitReason(_ error: Error) -> CalendarWaitReason? {
+        if case ExchangeCalendarError.mailboxFull = error { return .mailboxFull }
+        return nil
+    }
+
+    /// Why the queued change `opId` waits, as the drain last stored it on its row (#865), or nil:
+    /// read by a calendar tool whose change is still queued, so its result can say why.
+    func calendarWaitReason(opId: String) async -> CalendarWaitReason? {
+        do {
+            return try await dbPool.read { db in try PendingCalendarOperation.fetchOne(db, key: opId) }?.waitReason
+        } catch {
+            BackgroundSyncLogger.logDebug("[CalendarQueue] Could not read the wait reason of \(opId): \(error)")
+            return nil
+        }
+    }
+
     /// ⚠️ THE TYPED `.missingScope` IS NOT THE ONLY SPELLING (R12-T1, 2026-08-06).
     /// `GoogleCalendarProvider.request` / `ExchangeCalendarProvider.request` map a
     /// 403 to the typed case only on the FIRST response. When the first response
@@ -1337,18 +1360,6 @@ extension AccountManager {
     /// threw `result.data`. Which arm carries what, stated so no future reader has
     /// to re-derive it: **first response and refresh-retry both carry the server's
     /// raw body now; neither carries `nil` unless the response body was empty.**
-    /// Why a failure that keeps a change queued is one the user can act on, or nil. Only the
-    /// transient arm reads it: no terminal arm claims these errors (#865).
-    ///
-    /// `ExchangeCalendarError.mailboxFull`: Graph refused the write with 403 `ErrorQuotaExceeded`.
-    /// Signing in again can't help and the change must not be dropped, so it stays queued, the
-    /// account's later calendar changes wait behind it for the drain, and the inbox says the
-    /// mailbox is full until a drain after the user freed space makes it.
-    static func calendarWaitReason(_ error: Error) -> CalendarWaitReason? {
-        if case ExchangeCalendarError.mailboxFull = error { return .mailboxFull }
-        return nil
-    }
-
     static func isCalendarMissingScopeError(_ error: Error) -> Bool {
         if case GoogleCalendarError.missingScope = error { return true }
         if case ExchangeCalendarError.missingScope = error { return true }

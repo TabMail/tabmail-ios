@@ -351,7 +351,7 @@ final class FakeGraphCalendar: Sendable {
     private let standingRefusal = Mutex<(kinds: Set<String>, status: Int, body: String)?>(nil)
 
     /// Until `acceptWrites`, every request of `kinds` (`"POST"` a create, `"PATCH"`, `"ATTACH"` an
-    /// attachment POST or upload session, `"PUT"` an upload range) is refused with `status` and
+    /// attachment POST or upload session, `"PUT"` an upload range, `"DELETE"`) is refused with `status` and
     /// Graph's error body naming `code` (`{"error": {"code", "message"}}`), and does nothing.
     /// A full mailbox is `refuseWrites(kinds, code: Self.mailboxFullCode)`.
     func refuseWrites(_ kinds: Set<String>, status: Int = 403, code: String) {
@@ -726,6 +726,7 @@ final class FakeGraphCalendar: Sendable {
         // found by its id afterwards. An event that is not there is 404.
         http.register(path: "/v1.0/me/events/", method: "DELETE") { [self] request in
             if let status = takeFailure("DELETE") { return .status(status) }
+            if let refused = refusal("DELETE") { return refused }
             let parts = Self.pathParts(request.url)
             guard parts.count == 1, event(parts[0]) != nil else { return .status(404) }
             events.withLock { _ = $0.removeValue(forKey: parts[0]) }

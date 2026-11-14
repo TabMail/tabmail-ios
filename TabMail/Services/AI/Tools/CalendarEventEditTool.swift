@@ -664,6 +664,9 @@ struct CalendarEventEditTool: AgentTool, Sendable {
             lines.append("note: For dates on/after \(recurrenceId ?? "?"), use new_series_event_id — the master event_id above only covers occurrences before that date.")
             return lines.joined(separator: "\n")
         }()
+        // Why the change still waits, when the queue stored a reason the user can act on (#865).
+        var waitLine: String?
+        if !confirmed { waitLine = await CalendarToolHelpers.waitLine(opId: op.id) }
         return [
             confirmed ? "Calendar event updated successfully." : "Calendar event update queued successfully.",
             "event_id: \(compoundId)",
@@ -675,6 +678,7 @@ struct CalendarEventEditTool: AgentTool, Sendable {
             // existing stored timezone).
             touchesDateTime ? "timezone: \(resolvedTz.identifier)" : nil,
             confirmed ? nil : "Changes will be applied shortly.",
+            waitLine,
         ].compactMap { $0 }.joined(separator: "\n")
     }
 }
