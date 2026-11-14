@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import Synchronization
 
 /// Microsoft Graph Calendar API provider for Exchange/Outlook accounts.
 /// Mirrors `GoogleCalendarProvider` actor pattern — same `accessToken` closure, same retry logic.
@@ -1055,8 +1056,10 @@ actor ExchangeCalendarProvider: CalendarProvider {
             }
             let encoded = try Self.encodedGraphPathSegment(id, context: "Graph event instance id")
             _ = try await request(path: "/events/\(encoded)", method: "PATCH", body: try JSONSerialization.data(withJSONObject: json))
-            // The occurrence's own attachments, as the series' are copied onto the new part: a
-            // retry adds only what is missing.
+            // The occurrence's own attachments, as the series' are copied onto the new part. Its
+            // copies of the series' files pair with the copies this instance now holds (name, kind
+            // and content, `copy`), so only its own files are written, and a retry adds only what
+            // is missing.
             if let source = change.exception.id, let planned = copies[source] {
                 try await copy(planned, from: source, to: id, context: "Graph event instance id")
             }
@@ -1276,40 +1279,85 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// upload session from there), with its inline placement (`isInline`, `contentId`), so a
     /// picture placed in the body stays placed there and the body's `cid:` link still finds it.
     ///
-    /// A file the target already holds under the same name (one to one, as a draft save pairs
-    /// them) is not added again, so a retry (`finishSplit`) adds only what an earlier attempt did
-    /// not. Any failure throws before the cap, with the record kept: the series is still whole,
-    /// and the retry copies what is missing.
+    /// Only the files the target does not already hold are added: a file pairs with one the target
+    /// holds by name, kind and content, one to one (`AttachmentPairing.unpaired`), never by id,
+    /// size or timestamp. So a carried occurrence's copies of the series' files (which its
+    /// instance on the new part holds as copies of the new part's) are not written again, while a
+    /// same-name file with other bytes (an edited `agenda.pdf`) is its own and is written (#863);
+    /// and a retry (`finishSplit`) adds only what an earlier attempt did not. Each source file is
+    /// read at most once (a file read to compare is written from those bytes); a target file is
+    /// read only to compare with a source file of its name and kind, since Graph gives no content
+    /// hash. A series copy the user removed or replaced on a carried occurrence still shows on its
+    /// new-part instance, which made its own copies of the new part's files: a known limitation
+    /// (#871); nothing is deleted there. Any failure throws
+    /// before the cap, with the record kept: the series is still whole, and the retry copies what
+    /// is missing.
     private func copy(_ plan: AttachmentCopyPlan, from sourceId: String, to targetId: String, context: String) async throws {
         guard !plan.files.isEmpty else { return }
-        let encodedSource = try Self.encodedGraphPathSegment(sourceId, context: context)
-        let encodedTarget = try Self.encodedGraphPathSegment(targetId, context: "Graph event id")
-        var held = try await attachments(of: "/events/\(encodedTarget)").map(Self.attachmentName)
-        var added = 0
-        for file in plan.files {
-            let name = Self.attachmentName(file)
-            if let index = held.firstIndex(of: name) {
-                held.remove(at: index)
-                continue
-            }
-            let encodedFile = try Self.encodedGraphPathSegment(file.id, context: "Graph attachment id")
-            let detail = try JSONDecoder().decode(
-                GraphAttachmentDetail.self, from: try await request(path: "/events/\(encodedSource)/attachments/\(encodedFile)"))
-            guard let base64 = detail.contentBytes, let data = Data(base64Encoded: base64) else {
-                throw CalendarProviderError.notSupported(
-                    "a file attached to this repeating event can't be read, so it can't be copied to the new part")
-            }
+        let source = try "/events/" + Self.encodedGraphPathSegment(sourceId, context: context)
+        let target = try "/events/" + Self.encodedGraphPathSegment(targetId, context: "Graph event id")
+        let held = try await attachments(of: target).map { EventAttachment(eventPath: target, meta: $0) }
+        // A source file read for its digest is written from those bytes: one GET per file.
+        let sourceReads = SourceFileReads()
+        let missing = try await AttachmentPairing.unpaired(
+            plan.files.map { EventAttachment(eventPath: source, meta: $0) }, against: held,
+            name: { Self.attachmentName($0.meta) }, kind: { Self.attachmentKind($0.meta) },
+            content: { file in
+                let read = try await self.fileBytes(file)
+                if file.eventPath == source { sourceReads.keep(read, for: file.meta.id) }
+                return AttachmentPairing.contentDigest(read.data)
+            })
+        for file in missing {
+            let kept = sourceReads.take(file.meta.id)
+            let bytes = if let kept { kept } else { try await fileBytes(file) }
             try await ExchangeProvider.addFileAttachment(
-                DraftAttachment(filename: name, mimeType: file.contentType ?? "application/octet-stream", data: data),
-                itemPath: "/events/\(encodedTarget)",
-                inline: GraphInlinePlacement(isInline: file.isInline, contentId: detail.contentId),
+                DraftAttachment(filename: Self.attachmentName(file.meta), mimeType: file.meta.contentType ?? "application/octet-stream", data: bytes.data),
+                itemPath: target,
+                inline: GraphInlinePlacement(isInline: file.meta.isInline, contentId: bytes.contentId),
                 post: { path, body in try await self.request(path: path, method: "POST", body: body) },
                 session: testSession ?? sharedEphemeralSession, gate: mailboxGate)
-            added += 1
         }
         if DebugModeManager.isLoggingEnabled() {
-            BackgroundSyncLogger.logDebug("[ExchangeCalendar] split copied \(added) of \(plan.files.count) file(s) onto \(targetId)")
+            BackgroundSyncLogger.logDebug("[ExchangeCalendar] split copied \(missing.count) of \(plan.files.count) file(s) onto \(targetId)")
         }
+    }
+
+    /// An attachment of the event at `eventPath` (`/events/{id}`, encoded), as `copy` pairs it.
+    struct EventAttachment: Sendable {
+        let eventPath: String
+        let meta: GraphAttachmentMeta
+    }
+
+    /// A file's bytes and `contentId`, as `fileBytes` reads them.
+    struct FileContent: Sendable {
+        let data: Data
+        let contentId: String?
+    }
+
+    /// The source files `copy` read for their digest, by attachment id, so each is written from the
+    /// bytes already read; taken once written.
+    final class SourceFileReads: Sendable {
+        private let reads = Mutex<[String: FileContent]>([:])
+        func keep(_ content: FileContent, for id: String) { reads.withLock { $0[id] = content } }
+        func take(_ id: String) -> FileContent? { reads.withLock { $0.removeValue(forKey: id) } }
+    }
+
+    /// A file's bytes and `contentId`, one GET by id (`contentBytes`), as a mail attachment's are
+    /// read. Throws when they can't be read.
+    private func fileBytes(_ file: EventAttachment) async throws -> FileContent {
+        let encodedFile = try Self.encodedGraphPathSegment(file.meta.id, context: "Graph attachment id")
+        let detail = try JSONDecoder().decode(
+            GraphAttachmentDetail.self, from: try await request(path: "\(file.eventPath)/attachments/\(encodedFile)"))
+        guard let base64 = detail.contentBytes, let data = Data(base64Encoded: base64) else {
+            throw CalendarProviderError.notSupported(
+                "a file attached to this repeating event can't be read, so it can't be copied to the new part")
+        }
+        return FileContent(data: data, contentId: detail.contentId)
+    }
+
+    /// The kind a split pairs an attachment by: its Graph `@odata.type`.
+    nonisolated static func attachmentKind(_ attachment: GraphAttachmentMeta) -> String {
+        (attachment.odataType ?? "").lowercased()
     }
 
     /// Every attachment of the event at `eventPath` (`/events/{id}`), id, name, type and kind,

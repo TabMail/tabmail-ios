@@ -122,6 +122,14 @@ import Synchronization
 /// exists. A create (`POST /me/events`) carries no attachment. `failNext("ATTACH")` refuses the
 /// next attachment POST, `failNext("PUT")` the next range.
 ///
+/// An occurrence's attachments, as measured on a work account (2026-11-14): a plain occurrence
+/// lists its series' attachments read through, under ids of its own with the series' sizes and
+/// content. An exception holds its own COPIES of the series' attachments, made when it became one
+/// (its first PATCH or attachment write; an occurrence seeded with `type` `exception`, the first
+/// time its attachments are read or written): same name, kind and content, but new ids, larger
+/// sizes and a new `lastModifiedDateTime`. A series attachment added after that does not reach it.
+/// `removeAttachment` takes one off as the user does in Outlook.
+///
 /// A `POST` carrying a `transactionId` an earlier `POST` carried is answered with the event that one
 /// made while it is still there, and makes a new event once it was deleted (measured 2026-11-10).
 /// `userDeletes` deletes an event as the user does in Outlook: a GET of it is then 404 (measured).
@@ -153,9 +161,69 @@ final class FakeGraphCalendar: Sendable {
     private let uploads = Mutex<[String: Upload]>([:])
     private let uploadAuthorizationLog = Mutex<[String?]>([])
 
-    /// The attachments of event `id`, as stored (each with its `contentBytes`).
+    /// The occurrences that are exceptions and hold their own attachments (see the type's doc), and
+    /// those seeded as exceptions that have not yet copied their series' attachments.
+    private let exceptionIds = Mutex<Set<String>>([])
+    private let seededExceptionIds = Mutex<Set<String>>([])
+    /// How much larger Graph lists an exception's copy of a series attachment (measured: +16 for a
+    /// file and a link, more for an item; one figure is enough, since size is never compared).
+    private static let copySizeGrowth = 16
+
+    /// The attachments of event `id` as Graph lists them (each with its `contentBytes`): a plain
+    /// occurrence's are its series' read through, under ids of its own.
     func attachments(of id: String) -> [[String: Any]] {
-        attachmentStore.withLock { $0[id] ?? [] }.compactMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
+        settleSeededException(id)
+        if let event = event(id), let master = event["seriesMasterId"] as? String, !exceptionIds.withLock({ $0.contains(id) }) {
+            return attachments(of: master).map { attachment in
+                var listed = attachment
+                listed["id"] = "\(id)-reads-\(attachment["id"] as? String ?? "")"
+                return listed
+            }
+        }
+        return attachmentStore.withLock { $0[id] ?? [] }.compactMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
+    }
+
+    /// The occurrence `id` becomes an exception, as an edit or an attachment write makes it in
+    /// Outlook: it copies its series' attachments as they are now (new ids, larger sizes, a new
+    /// `lastModifiedDateTime`, the same name, kind and content). Nothing for a non-occurrence or
+    /// an occurrence that is already one.
+    private func becomeException(_ id: String) {
+        settleSeededException(id)
+        guard let master = event(id)?["seriesMasterId"] as? String,
+              exceptionIds.withLock({ $0.insert(id).inserted }) else { return }
+        copySeriesAttachments(of: master, onto: id)
+    }
+
+    /// An occurrence seeded as an exception copies its series' attachments the first time its own
+    /// are read or written.
+    private func settleSeededException(_ id: String) {
+        guard seededExceptionIds.withLock({ $0.remove(id) != nil }), let master = event(id)?["seriesMasterId"] as? String else { return }
+        exceptionIds.withLock { _ = $0.insert(id) }
+        copySeriesAttachments(of: master, onto: id)
+    }
+
+    private func copySeriesAttachments(of master: String, onto id: String) {
+        let copies = attachments(of: master).map { attachment in
+            var copy = attachment
+            copy["size"] = (attachment["size"] as? Int).map { $0 + Self.copySizeGrowth }
+            copy["lastModifiedDateTime"] = nil
+            return copy
+        }
+        let held = attachmentStore.withLock { $0.removeValue(forKey: id) ?? [] }
+        for copy in copies { store(attachment: copy, on: id) }
+        attachmentStore.withLock { $0[id, default: []] += held }
+    }
+
+    /// The user removes the first attachment named `name` from event `id` in Outlook (an
+    /// occurrence becomes an exception first, so its copy is what is removed).
+    func removeAttachment(named name: String, from id: String) {
+        becomeException(id)
+        attachmentStore.withLock { all in
+            guard let index = all[id]?.firstIndex(where: { data in
+                ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["name"] as? String == name
+            }) else { return }
+            all[id]?.remove(at: index)
+        }
     }
 
     /// The bytes of each file attachment of event `id`, by name.
@@ -169,13 +237,16 @@ final class FakeGraphCalendar: Sendable {
     /// Attaches a file named `name` holding `bytes` to event `id`, as the user does in Outlook.
     /// `isInline` and `contentId` place it in the body, as a picture is; a file stored without
     /// a `contentId` has none (Graph returns null).
-    func attachFile(_ name: String?, contentType: String, bytes: Data, to id: String, isInline: Bool = false, contentId: String? = nil) {
+    /// `odataType` is the kind's spelling in the list; OData type names are case-insensitive.
+    func attachFile(_ name: String?, contentType: String, bytes: Data, to id: String, isInline: Bool = false, contentId: String? = nil,
+                    odataType: String = "#microsoft.graph.fileAttachment") {
         var file: [String: Any] = [
-            "@odata.type": "#microsoft.graph.fileAttachment", "contentType": contentType,
+            "@odata.type": odataType, "contentType": contentType,
             "size": bytes.count, "isInline": isInline, "contentBytes": bytes.base64EncodedString(),
         ]
         file["name"] = name
         file["contentId"] = contentId
+        becomeException(id)
         store(attachment: file, on: id)
     }
 
@@ -183,6 +254,7 @@ final class FakeGraphCalendar: Sendable {
     /// cloud link, or `#microsoft.graph.itemAttachment`, an Outlook item) named `name` to event
     /// `id`. A GET of it by id carries no `contentBytes`.
     func attachOther(_ odataType: String, name: String, to id: String) {
+        becomeException(id)
         store(attachment: ["@odata.type": odataType, "name": name, "contentType": NSNull(), "size": 0, "isInline": false], on: id)
     }
 
@@ -195,6 +267,7 @@ final class FakeGraphCalendar: Sendable {
         var attachment: [String: Any] = ["@odata.type": "#microsoft.graph.itemAttachment", "name": name, "contentType": NSNull(),
                                          "isInline": false, "item": item]
         if listsSize { attachment["size"] = size ?? measured }
+        becomeException(id)
         store(attachment: attachment, on: id)
     }
 
@@ -204,6 +277,7 @@ final class FakeGraphCalendar: Sendable {
     private func store(attachment: [String: Any], on id: String) {
         var attachment = attachment
         attachment["id"] = "att-" + String(attachmentCount.withLock { n in n += 1; return n })
+        attachment["lastModifiedDateTime"] = attachment["lastModifiedDateTime"] ?? Date().iso8601String()
         // swiftlint:disable:next force_try
         let data = try! JSONSerialization.data(withJSONObject: attachment)
         attachmentStore.withLock { $0[id, default: []].append(data) }
@@ -242,12 +316,16 @@ final class FakeGraphCalendar: Sendable {
 
     init(_ seed: [[String: Any]], zones: [String: TimeZone] = [:]) {
         var map: [String: Data] = [:]
+        var seeded: Set<String> = []
         for event in seed {
             // swiftlint:disable:next force_try
             map[event["id"] as! String] = try! JSONSerialization.data(withJSONObject: event)
+            // swiftlint:disable:next force_cast
+            if event["seriesMasterId"] != nil, event["type"] as? String == "exception" { seeded.insert(event["id"] as! String) }
         }
         events = Mutex(map)
         self.zones = zones
+        seededExceptionIds.withLock { $0 = seeded }
     }
 
     func event(_ id: String) -> [String: Any]? {
@@ -538,6 +616,8 @@ final class FakeGraphCalendar: Sendable {
             Self.apply(patch, to: &stored)
             if lengthened { Self.lengthen(&stored, written: patch, storedStart: storedStart) }
             store(stored)
+            // An occurrence written becomes an exception, with its own copies of its series' attachments.
+            becomeException(parts[0])
             if takeLoss("PATCH") { return .transportError(.networkConnectionLost) }
             return Self.json(stored)
         }
