@@ -406,7 +406,9 @@ Series end date (#551): Graph's `recurrence.range.endDate` is an inclusive date 
 zone (a create sends no `recurrenceTimeZone`; since #423 an edit's changed rule carries the stored one, see above). `ExchangeCalendarProvider.graphEndDate(until:in:startWallTime:)`
 dates a UTC-instant `UNTIL` in the event's zone, then applies the time-of-day rule: an `UNTIL` earlier
 in the day than the series' start ends the series the day before, as Google Calendar does. A date-only
-end arrives as 23:59:59 local, so it always stays the day the user named. A bare date or a floating
+end arrives as 23:59:59 on the typed day in the edit's zone, and Outlook stores the range end as the
+matching date in the series' own zone (`recurrenceTimeZone`), so the last meeting is the one shown on
+the typed day; see #868. A bare date or a floating
 value keeps its own date digits; there is no branch for the floating form, since no producer emits it
 for Outlook.
 
