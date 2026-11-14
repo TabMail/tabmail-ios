@@ -259,6 +259,20 @@ These tests read what each provider sent, or what the fake server ends up holdin
   the new part, and pairs by kind (a same-name item is no copy; a type name in other case is).
   `FakeGraphCalendar` models Outlook's measured copies: an exception holds its own copies of the
   series' attachments, a plain occurrence reads the series' through.
+- A new length of an Outlook series keeps its changed occurrences' own files (#718,
+  `SeriesLengthKeepsExceptionsTests`, against `FakeGraphCalendar` with `modelsExceptions`: a reset
+  erases an occurrence's attachments, the etag is series-wide and `If-Match` is checked): each file is
+  on its occurrence again once (a same-name replacement and an inline logo included, the series' copies
+  not doubled), after a lost answer too; a linked file or an item of its own is refused at the card and
+  at the drain with nothing written, a series item is not; a file too large retires the operation with
+  its name and date and keeps its bytes; a file not read back keeps it queued, and the retry attaches
+  it; an occurrence changed elsewhere is counted and still gets its files; a stale etag is read again,
+  and `putBackConflictReads` refusals keep the operation queued; a deleted occurrence releases its
+  files; a lost or changed saved copy is counted and dropped; a record of a later version leaves the
+  operation queued with nothing written. `CalendarPutBackFilesTests` pins the bytes' lifecycle: the
+  reclaim spares a held failed row, the Settings wipe and a release boundary leave it, the drain-start
+  sweep removes only orphans, the failure banner shows a held row until dismissed and the dismissal
+  deletes its bytes, Save File's names are safe.
 
 ## Google attendee edits — the others stay as stored
 

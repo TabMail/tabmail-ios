@@ -516,3 +516,17 @@ CalDAV gives each override the new length in the same PUT; Google keeps them its
 before the card in the same words (rulings of 2026-11-14 bring Google's and
 CalDAV's split refusals, such as `editedKindRefusal`, before the card too). The tool and the queue build
 the write's input with one function (`CalendarSeriesScope.writeInput`).
+
+**2026-11-14 (#718, ADR-IOS-113 decisions 2 and 6): the files of changed occurrences, and the restore
+guard.** Outlook's reset erases a changed occurrence's own attachments (measured). `ownFiles` (inside
+`lengthChangeExceptions`, so the card's check and the write share it) refuses a linked file or an Outlook
+item the series does not hold, and with the write's `SavedFiles` saves each file of its own under
+`calendar_put_back/<operation id>/<sha256>` (`CalendarPutBackFiles`) before the series `PATCH`, naming
+it in `SeriesEditRecord.files`. The put-back reads each occurrence right before its `PATCH`
+(`guardedPatch`: `type` occurrence only, `If-Match` with the series-wide etag, a 412 read again up to
+`ExchangeCalendarConfig.putBackConflictReads` then `seriesBusy`, queued) and attaches its files again
+add-only (`reattach`), releasing bytes only after a read shows them (`PutBackLedger`). Bytes outlive
+every path but the user's: the reclaim of failed rows spares a row holding bytes
+(`heldOperationIds`), the drain-start sweep removes only orphans, `LateCalendarFailureStore` shows a
+held row until dismissed (Save File, warned delete), and account removal warns and offers Save File.
+Pinned by the file cases of `SeriesLengthKeepsExceptionsTests` and by `CalendarPutBackFilesTests`.
