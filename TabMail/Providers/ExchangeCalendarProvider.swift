@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import Synchronization
 
 /// Microsoft Graph Calendar API provider for Exchange/Outlook accounts.
 /// Mirrors `GoogleCalendarProvider` actor pattern — same `accessToken` closure, same retry logic.
@@ -1283,7 +1284,12 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// size or timestamp. So a carried occurrence's copies of the series' files (which its
     /// instance on the new part holds as copies of the new part's) are not written again, while a
     /// same-name file with other bytes (an edited `agenda.pdf`) is its own and is written (#863);
-    /// and a retry (`finishSplit`) adds only what an earlier attempt did not. Any failure throws
+    /// and a retry (`finishSplit`) adds only what an earlier attempt did not. Each source file is
+    /// read at most once (a file read to compare is written from those bytes); a target file is
+    /// read only to compare with a source file of its name and kind, since Graph gives no content
+    /// hash. A series copy the user removed or replaced on a carried occurrence still shows on its
+    /// new-part instance, which made its own copies of the new part's files: a known limitation
+    /// (#871); nothing is deleted there. Any failure throws
     /// before the cap, with the record kept: the series is still whole, and the retry copies what
     /// is missing.
     private func copy(_ plan: AttachmentCopyPlan, from sourceId: String, to targetId: String, context: String) async throws {
@@ -1291,12 +1297,19 @@ actor ExchangeCalendarProvider: CalendarProvider {
         let source = try "/events/" + Self.encodedGraphPathSegment(sourceId, context: context)
         let target = try "/events/" + Self.encodedGraphPathSegment(targetId, context: "Graph event id")
         let held = try await attachments(of: target).map { EventAttachment(eventPath: target, meta: $0) }
+        // A source file read for its digest is written from those bytes: one GET per file.
+        let sourceReads = SourceFileReads()
         let missing = try await AttachmentPairing.unpaired(
             plan.files.map { EventAttachment(eventPath: source, meta: $0) }, against: held,
             name: { Self.attachmentName($0.meta) }, kind: { Self.attachmentKind($0.meta) },
-            content: { try await self.fileDigest($0) })
+            content: { file in
+                let read = try await self.fileBytes(file)
+                if file.eventPath == source { sourceReads.keep(read, for: file.meta.id) }
+                return AttachmentPairing.contentDigest(read.data)
+            })
         for file in missing {
-            let bytes = try await fileBytes(file)
+            let kept = sourceReads.take(file.meta.id)
+            let bytes = if let kept { kept } else { try await fileBytes(file) }
             try await ExchangeProvider.addFileAttachment(
                 DraftAttachment(filename: Self.attachmentName(file.meta), mimeType: file.meta.contentType ?? "application/octet-stream", data: bytes.data),
                 itemPath: target,
@@ -1315,9 +1328,23 @@ actor ExchangeCalendarProvider: CalendarProvider {
         let meta: GraphAttachmentMeta
     }
 
+    /// A file's bytes and `contentId`, as `fileBytes` reads them.
+    struct FileContent: Sendable {
+        let data: Data
+        let contentId: String?
+    }
+
+    /// The source files `copy` read for their digest, by attachment id, so each is written from the
+    /// bytes already read; taken once written.
+    final class SourceFileReads: Sendable {
+        private let reads = Mutex<[String: FileContent]>([:])
+        func keep(_ content: FileContent, for id: String) { reads.withLock { $0[id] = content } }
+        func take(_ id: String) -> FileContent? { reads.withLock { $0.removeValue(forKey: id) } }
+    }
+
     /// A file's bytes and `contentId`, one GET by id (`contentBytes`), as a mail attachment's are
     /// read. Throws when they can't be read.
-    private func fileBytes(_ file: EventAttachment) async throws -> (data: Data, contentId: String?) {
+    private func fileBytes(_ file: EventAttachment) async throws -> FileContent {
         let encodedFile = try Self.encodedGraphPathSegment(file.meta.id, context: "Graph attachment id")
         let detail = try JSONDecoder().decode(
             GraphAttachmentDetail.self, from: try await request(path: "\(file.eventPath)/attachments/\(encodedFile)"))
@@ -1325,12 +1352,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
             throw CalendarProviderError.notSupported(
                 "a file attached to this repeating event can't be read, so it can't be copied to the new part")
         }
-        return (data, detail.contentId)
-    }
-
-    /// The content a file pairs by (`AttachmentPairing.contentDigest` of its bytes).
-    private func fileDigest(_ file: EventAttachment) async throws -> String {
-        AttachmentPairing.contentDigest(try await fileBytes(file).data)
+        return FileContent(data: data, contentId: detail.contentId)
     }
 
     /// The kind a split pairs an attachment by: its Graph `@odata.type`.

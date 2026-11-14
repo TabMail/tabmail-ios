@@ -844,10 +844,15 @@ onto its new-part instance; first attempt and `finishSplit` alike) writes exactl
 again, an extra file or a second equal file is written once, a retry writes only what is still missing. Kind is the Graph
 `@odata.type` (`attachmentKind`). A file whose name and kind meet a partner is read once more (its bytes) for the digest;
 one with no possible partner is not. #718 reuses this function for the exception's own files against its series'.
-Not changed (separate gap, reported, not fixed here): a series copy the user REMOVED from a carried occurrence (or replaced)
-still shows on its new-part instance, which got its own copy of the new part's files when the carry made it an exception.
+Each source file is read (GET by id) at most once: one read to compare is written from the same bytes (`SourceFileReads`); a
+target file is read only to compare with a source file of its name and kind (Graph gives no content hash). Known limitation,
+ruled (#871, P4): a series copy the user REMOVED from a carried occurrence, or replaced, still shows on its new-part instance,
+which made its own copies of the new part's files when the carry made it an exception; so after a replacement the instance
+holds the user's file AND the series' copy. No attachment DELETE is sent to remove it (irreversible, ruled out).
 Tests (`ExchangeSplitCarryTests`): `carriedOccurrenceKeepsASameNameReplacement` (red first on the name pairing),
 `carriedOccurrenceWithOnlyCopiesWritesNoFile`, `carriedOccurrenceExtraFileIsCarried`, `carriedOccurrenceDuplicateIsCarriedOnce`,
-`retryCarriesASameNameReplacementOnce`; `AttachmentPairingTests` (the function alone). `FakeGraphCalendar` now models the
+`retryCarriesASameNameReplacementOnce` (the replacement test pins the exact set of #871 and one read of the edited file);
+`ExchangeSplitAttachmentTests.retryCopiesASeriesFileTheNewPartHoldsOtherBytesOf`, `retryPairsByKind` (a same-name item is no
+copy; a file whose `@odata.type` is in other letter case is); `AttachmentPairingTests` (the function alone). `FakeGraphCalendar` now models the
 measured copies: read-through on a plain occurrence, copies on the first PATCH or attachment write (or, for an occurrence
 seeded with `type` `exception`, the first read), `removeAttachment`.

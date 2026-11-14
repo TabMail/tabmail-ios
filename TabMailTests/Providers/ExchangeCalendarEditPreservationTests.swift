@@ -237,9 +237,11 @@ final class FakeGraphCalendar: Sendable {
     /// Attaches a file named `name` holding `bytes` to event `id`, as the user does in Outlook.
     /// `isInline` and `contentId` place it in the body, as a picture is; a file stored without
     /// a `contentId` has none (Graph returns null).
-    func attachFile(_ name: String?, contentType: String, bytes: Data, to id: String, isInline: Bool = false, contentId: String? = nil) {
+    /// `odataType` is the kind's spelling in the list; OData type names are case-insensitive.
+    func attachFile(_ name: String?, contentType: String, bytes: Data, to id: String, isInline: Bool = false, contentId: String? = nil,
+                    odataType: String = "#microsoft.graph.fileAttachment") {
         var file: [String: Any] = [
-            "@odata.type": "#microsoft.graph.fileAttachment", "contentType": contentType,
+            "@odata.type": odataType, "contentType": contentType,
             "size": bytes.count, "isInline": isInline, "contentBytes": bytes.base64EncodedString(),
         ]
         file["name"] = name
