@@ -1511,7 +1511,7 @@ struct CalendarScopedDeleteTests {
         }
     }
 
-    @Test("Outlook: an occurrence and every later one of a timed series in a zone TabMail does not recognize are not deleted: nothing written, the delete failed, in a delete's words (#746)")
+    @Test("Outlook: an occurrence and every later one of a timed series in a zone TabMail does not recognize are not deleted: refused before the card, nothing queued or written, in a delete's words (#746, #718)")
     func outlookThisAndFollowingInAnUnrecognizedZoneIsRefused() async throws {
         let custom = "Customized Time Zone"
         #expect(CalendarTimeZoneResolver.zone(named: custom, in: .none) == nil, "non-vacuity: the zone is not recognized")
@@ -1525,18 +1525,17 @@ struct CalendarScopedDeleteTests {
                 "delete_scope": .string("this_and_following"), "recurrence_id": .string(naive(fixture.split, device)),
                 "timezone": .string(device.identifier),
             ], eventId: CrossZoneSeries.id, calendarId: "primary", account: account, pool: pool, deviceZone: device)
-            _ = try #require(r.card, "\(r.cards.count) cards: \(summary(r))")
+            // Refused before its card, as its write refuses it (#718): no card, nothing queued.
+            #expect(r.cards.isEmpty && r.queued.isEmpty, "\(r.cards.count) cards: \(summary(r))")
             #expect(graph.writes.isEmpty, "written: \(graph.writes)")
             #expect(canonicalRange(graph.event(CrossZoneSeries.id)) == range, "the series' range changed")
-            #expect(r.queued.count == 1, "rows: \(summary(r))")
-            guard r.queued.count == 1 else { return }
-            #expect(r.queued[0].status == PendingStatus.failed.rawValue, "\(r.queued[0].status) \(r.queued[0].failureReason ?? "")")
-            #expect(r.queued[0].failureReason == "This event uses the time zone \"\(custom)\", which TabMail does not recognize, so it did not delete these occurrences. Delete them in your calendar app instead.",
-                    "the user is told: \(r.queued[0].failureReason ?? "nil")")
+            let answer = try JSONSerialization.jsonObject(with: Data(r.out.utf8)) as? [String: Any]
+            #expect(answer?["error"] as? String == "calendar_event_delete failed: This event uses the time zone \"\(custom)\", which TabMail does not recognize, so it did not delete these occurrences. Delete them in your calendar app instead. The event was NOT deleted.",
+                    "the user is told: \(r.out)")
         }
     }
 
-    @Test("Outlook: an occurrence and every later one of a series whose range names no zone and whose own zone TabMail does not recognize are not deleted: nothing written, the delete failed, in a delete's words (#746)")
+    @Test("Outlook: an occurrence and every later one of a series whose range names no zone and whose own zone TabMail does not recognize are not deleted: refused before the card, nothing queued or written, in a delete's words (#746, #718)")
     func outlookThisAndFollowingInAnUnrecognizedEventZoneIsRefused() async throws {
         let custom = "Customized Time Zone"
         let fixture = CrossZoneSeries.pacificFromTokyo
@@ -1549,14 +1548,13 @@ struct CalendarScopedDeleteTests {
                 "delete_scope": .string("this_and_following"), "recurrence_id": .string(naive(fixture.split, device)),
                 "timezone": .string(device.identifier),
             ], eventId: CrossZoneSeries.id, calendarId: "primary", account: account, pool: pool, deviceZone: device)
-            _ = try #require(r.card, "\(r.cards.count) cards: \(summary(r))")
+            // Refused before its card, as its write refuses it (#718): no card, nothing queued.
+            #expect(r.cards.isEmpty && r.queued.isEmpty, "\(r.cards.count) cards: \(summary(r))")
             #expect(graph.writes.isEmpty, "written: \(graph.writes)")
             #expect(canonicalRange(graph.event(CrossZoneSeries.id)) == range, "the series' range changed")
-            #expect(r.queued.count == 1, "rows: \(summary(r))")
-            guard r.queued.count == 1 else { return }
-            #expect(r.queued[0].status == PendingStatus.failed.rawValue, "\(r.queued[0].status) \(r.queued[0].failureReason ?? "")")
-            #expect(r.queued[0].failureReason == "This event uses the time zone \"\(custom)\", which TabMail does not recognize, so it did not delete these occurrences. Delete them in your calendar app instead.",
-                    "the user is told: \(r.queued[0].failureReason ?? "nil")")
+            let answer = try JSONSerialization.jsonObject(with: Data(r.out.utf8)) as? [String: Any]
+            #expect(answer?["error"] as? String == "calendar_event_delete failed: This event uses the time zone \"\(custom)\", which TabMail does not recognize, so it did not delete these occurrences. Delete them in your calendar app instead. The event was NOT deleted.",
+                    "the user is told: \(r.out)")
         }
     }
 

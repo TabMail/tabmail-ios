@@ -5334,3 +5334,372 @@ struct CalDAVSeriesLengthOverridesTests {
         #expect(lines.contains("EXDATE;TZID=Etc/UTC:\(compact(day(21)))T090000"), "\(lines)")
     }
 }
+
+// MARK: - One check before the card for every series write the queue would refuse (#718)
+//
+// **INVARIANT.** *A series write (an edit of every occurrence, a change of an occurrence and every
+// later one, a delete of an occurrence and every later one) that the queue's write would refuse
+// before writing anything is refused before its card, in the write's own words: no card, nothing
+// queued, nothing written. A write it would not refuse gets its card.* Each row runs twice on a
+// fresh calendar: through the tool, and as the same operation put straight into the queue, which
+// must refuse it in the same words and write nothing, or write it.
+
+/// A calendar a row runs on, fresh each time: its provider, and every request that writes.
+private struct CheckedCalendar {
+    let http: FakeHTTP.Scenario
+    let provider: any CalendarProvider
+
+    func writes() -> [String] {
+        http.recordedCalls().filter { ["POST", "PUT", "PATCH", "DELETE"].contains($0.method) }.map { "\($0.method) \($0.url)" }
+    }
+
+    static func outlook(_ graph: FakeGraphCalendar) -> CheckedCalendar {
+        let http = FakeHTTP.Scenario()
+        graph.install(on: http)
+        return CheckedCalendar(http: http, provider: ExchangeCalendarProvider(
+            mailbox: "calendar@example.com", accessToken: { _ in "test-token" }, session: http.session))
+    }
+
+    static func google(_ seed: [[String: Any]]) -> CheckedCalendar {
+        let http = FakeHTTP.Scenario()
+        FakeGoogleCalendar(seed).install(on: http)
+        return CheckedCalendar(http: http, provider: GoogleCalendarProvider(accessToken: { _ in "test-token" }, session: http.session))
+    }
+
+    static func calDAV(path: String, ics: String) -> CheckedCalendar {
+        let http = FakeHTTP.Scenario()
+        let store = FakeCalDAVStore(servesETags: true)
+        store.seed(path: path, ics: ics)
+        http.register(path: "/cal/", method: "GET") { store.handleGET($0) }
+        http.register(path: "/cal/", method: "PUT") { store.handlePUT($0) }
+        let home = URL(string: "https://caldav.example.com/cal/")!
+        return CheckedCalendar(http: http, provider: CalDAVProvider(
+            client: CalDAVClient(username: "user@example.com", password: "pw", session: http.session),
+            calendarHomeURL: home, serverBaseURL: home))
+    }
+}
+
+/// Runs `calendar_event_delete` for `eventId` on `account` as `runTool` runs an edit, the device in
+/// UTC.
+private func runDeleteTool(_ arguments: [String: JSONValue], eventId: String, account: String,
+                           provider: any CalendarProvider) async throws -> ToolRun {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    var config = Configuration()
+    config.foreignKeysEnabled = true
+    let pool = try DatabasePool(path: dir.appendingPathComponent("test.sqlite").path, configuration: config)
+    let appDb = try AppDatabase(dbPool: pool)
+    let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+        let prev = current; current = appDb; return prev
+    }
+    try await pool.write { db in
+        var acc = Account(emailAddress: "cal@example.com", displayName: "Cal", provider: .gmail)
+        acc.id = account
+        try acc.insert(db)
+    }
+    await AccountManager.shared.registerCalendarProviderForTesting(accountId: account, provider: provider)
+    defer {
+        Task { await AccountManager.shared.unregisterCalendarProviderForTesting(accountId: account) }
+        InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir)
+    }
+    let db = try TestDatabase.make()
+    var args = arguments
+    args["event_id"] = .string(CompoundEventId.make(accountId: account, eventId: eventId))
+    let sink = RecordingCardSink()
+    let out: String
+    var declined = false
+    do {
+        out = try await CalendarEventDeleteTool(context: ToolContext(db: db, translator: MockChatIdTranslator(), deviceZone: utc))
+            .execute(arguments: args, invocation: ToolInvocation(uiSink: sink, sessionKey: "series-delete-\(account)"))
+    } catch let error as ToolDeclinedError {
+        out = error.output
+        declined = true
+    }
+    let queued = try await pool.read { try PendingCalendarOperation.fetchAll($0) }
+    return ToolRun(out: out, cards: await sink.cards, queued: queued, declined: declined)
+}
+
+@Suite("A series write the queue would refuse before writing is refused before its card, in the same words (#718)", .serialized, .processGlobalState)
+struct SeriesWriteCheckedBeforeTheCardTests {
+
+    /// The series' occurrence `n` weeks after its first, as `SeriesLengthKeepsExceptionsTests` has it.
+    private static func week(_ n: Int) -> Date {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = GraphSeries.eventZone
+        return cal.date(byAdding: .day, value: 7 * n, to: GraphFixture.start)!
+    }
+
+    /// The zone an Outlook series names that TabMail can't read: none, or a custom one.
+    enum SeriesZone: String, Sendable {
+        case none, custom
+        static let customName = "Customized Time Zone"
+    }
+
+    /// Outlook's series `ser-1` and its occurrences `ser-1-w<n>` week by week, kept as Graph keeps
+    /// them; `zone` its range's zone when TabMail can't read it; `moved` and `renamed` the weeks
+    /// changed on their own (two hours later; a new title), `deleted` the weeks deleted.
+    private static func outlookCalendar(
+        zone: SeriesZone? = nil, moved: Set<Int> = [], renamed: Set<Int> = [], deleted: Set<Int> = []
+    ) -> FakeGraphCalendar {
+        var series = GraphSeries.series()
+        if let zone, var recurrence = series["recurrence"] as? [String: Any], var range = recurrence["range"] as? [String: Any] {
+            range.removeValue(forKey: "recurrenceTimeZone")
+            if zone == .custom { range["recurrenceTimeZone"] = SeriesZone.customName }
+            recurrence["range"] = range
+            series["recurrence"] = recurrence
+        }
+        var events: [[String: Any]] = [series]
+        for n in 0..<4 {
+            var e = moved.contains(n)
+                ? GraphSeries.moved(id: "ser-1-w\(n)", from: week(n), to: week(n).addingTimeInterval(7_200))
+                : GraphSeries.occurrence(id: "ser-1-w\(n)", at: week(n))
+            e["type"] = moved.contains(n) || renamed.contains(n) ? "exception" : "occurrence"
+            if renamed.contains(n) { e["subject"] = "Renamed on its own" }
+            events.append(e)
+        }
+        let graph = FakeGraphCalendar(events)
+        graph.modelsExceptions.withLock { $0 = true }
+        for n in deleted { graph.userDeletesOccurrence("ser-1-w\(n)") }
+        return graph
+    }
+
+    /// A change of the title of week 1 and every later one.
+    private static let renameFromWeek1: [String: JSONValue] = [
+        "edit_scope": .string("this_and_following"), "recurrence_id": .string(GraphFixture.naive(week(1))),
+        "title": .string("Team standup"), "timezone": .string("UTC"),
+    ]
+
+    /// A new end alone of every occurrence: 45 minutes from the first.
+    private static let newLength: [String: JSONValue] = [
+        "edit_scope": .string("all"), "end_iso": .string(GraphFixture.naive(GraphFixture.start.addingTimeInterval(2_700))),
+        "timezone": .string("UTC"),
+    ]
+
+    /// A delete of week 1 and every later one, as the tool takes it and as it queues it.
+    private static let deleteFromWeek1: [String: JSONValue] = [
+        "delete_scope": .string("this_and_following"), "recurrence_id": .string(GraphFixture.naive(week(1))),
+    ]
+    private static let queuedDeleteFromWeek1: [String: JSONValue] = [
+        "delete_scope": .string("this_and_following"), CalendarToolHelpers.deleteCutKey: .string(GraphFixture.naive(week(1))),
+        CalendarToolHelpers.recurrenceIdZoneKey: .string("UTC"),
+    ]
+
+    /// A change of the Google and CalDAV series' day-14 occurrence and every later one to all-day,
+    /// while day 7's occurrence, moved on its own to day 15, stays on the series.
+    private static let allDayFromDay14: [String: JSONValue] = [
+        "edit_scope": .string("this_and_following"), "recurrence_id": .string("\(day(14))T09:00:00"),
+        "all_day": .bool(true), "start_iso": .string("\(day(14))T00:00:00"), "end_iso": .string("\(day(15))T00:00:00"),
+        "timezone": .string("UTC"),
+    ]
+    private static let renameFromDay14: [String: JSONValue] = [
+        "edit_scope": .string("this_and_following"), "recurrence_id": .string("\(day(14))T09:00:00"),
+        "title": .string("Team standup"), "timezone": .string("UTC"),
+    ]
+
+    /// The Google series with day 7's occurrence moved to day 15.
+    private static var googleSeed: [[String: Any]] {
+        [GoogleSeries.series(rule: GoogleSeries.onItsWeekday), GoogleSeries.instance(day(0)),
+         GoogleSeries.moved(day(7), start: "\(day(15))T12:00:00", end: "\(day(15))T12:30:00"), GoogleSeries.instance(day(14))]
+    }
+
+    /// The CalDAV series with day 7's occurrence moved to day 15.
+    private static let calDAVPath = "/cal/chk-c.ics"
+    private static var calDAVICS: String {
+        calDAVSeries(uid: "chk-c", rule: "RRULE:FREQ=WEEKLY", tzid: "Etc/UTC")
+            .replacingOccurrences(of: "END:VCALENDAR", with: [
+                "BEGIN:VEVENT", "UID:chk-c", "DTSTAMP:\(compact(day(-14)))T000000Z",
+                "RECURRENCE-ID;TZID=Etc/UTC:\(compact(day(7)))T090000",
+                "DTSTART;TZID=Etc/UTC:\(compact(day(15)))T120000", "DTEND;TZID=Etc/UTC:\(compact(day(15)))T123000",
+                "SUMMARY:Standup", "END:VEVENT", "END:VCALENDAR",
+            ].joined(separator: "\r\n"))
+    }
+
+    static let noZoneSplit =
+        "Outlook gives no time zone for this repeating event, so the day of the occurrence named can't be worked out and the occurrences from it on can't be split off. Make the change in your calendar app instead."
+    static let noZoneDelete =
+        "Outlook gives no time zone for this repeating event, so it did not delete these occurrences. Delete them in your calendar app instead."
+    static let noZoneLength =
+        "Outlook gives no time zone for this repeating event, so its occurrences changed or deleted one by one can't be kept, and its length was not changed. Make the change in your calendar app instead."
+    static func customZone(_ consequence: String, _ remedy: String) -> String {
+        "This event uses the time zone \"\(SeriesZone.customName)\", which TabMail does not recognize, so \(consequence). \(remedy)"
+    }
+
+    /// One row of the table.
+    enum Row: String, CaseIterable, Sendable {
+        case zonelessSplit, customZoneSplit, zonelessDelete, customZoneDelete
+        case seriesLinkedFileSplit, carriedItemSplit, carriedLinkedFileSplit
+        case zonelessLengthWithAMove, zonelessLengthWithADeletion, customZoneLengthWithADeletion
+        case googleEditedKindSplit, calDAVEditedKindSplit
+        // Written.
+        case zonedSplit, zonelessLengthWithARenameOnly, zonedDelete, googleSplit, calDAVSplit
+    }
+
+    /// A row's calendar (fresh each call), its tool call, the operation the tool queues, and the
+    /// refusal its write gives (nil: written).
+    private struct Scene {
+        let calendar: () -> CheckedCalendar
+        let delete: Bool
+        let arguments: [String: JSONValue]
+        let eventId: String
+        let queuedArguments: [String: JSONValue]
+        let refusal: String?
+    }
+
+    private static func scene(_ row: Row) -> Scene {
+        let linked = "#microsoft.graph.referenceAttachment"
+        switch row {
+        case .zonelessSplit:
+            return Scene(calendar: { .outlook(outlookCalendar(zone: SeriesZone.none)) }, delete: false, arguments: renameFromWeek1,
+                         eventId: "ser-1", queuedArguments: renameFromWeek1, refusal: noZoneSplit)
+        case .customZoneSplit:
+            return Scene(calendar: { .outlook(outlookCalendar(zone: .custom)) }, delete: false, arguments: renameFromWeek1,
+                         eventId: "ser-1", queuedArguments: renameFromWeek1,
+                         refusal: customZone("it did not change the event", "Make the change in your calendar app instead."))
+        case .zonelessDelete:
+            return Scene(calendar: { .outlook(outlookCalendar(zone: SeriesZone.none)) }, delete: true, arguments: deleteFromWeek1,
+                         eventId: "ser-1", queuedArguments: queuedDeleteFromWeek1, refusal: noZoneDelete)
+        case .customZoneDelete:
+            return Scene(calendar: { .outlook(outlookCalendar(zone: .custom)) }, delete: true, arguments: deleteFromWeek1,
+                         eventId: "ser-1", queuedArguments: queuedDeleteFromWeek1,
+                         refusal: customZone("it did not delete these occurrences", "Delete them in your calendar app instead."))
+        case .seriesLinkedFileSplit:
+            return Scene(calendar: {
+                let graph = outlookCalendar()
+                graph.attachOther(linked, name: "Shared deck", to: "ser-1")
+                return .outlook(graph)
+            }, delete: false, arguments: renameFromWeek1, eventId: "ser-1", queuedArguments: renameFromWeek1,
+                         refusal: ExchangeSplitAttachmentTests.linkedFileMessage)
+        case .carriedItemSplit:
+            return Scene(calendar: {
+                let graph = outlookCalendar(renamed: [2])
+                graph.attachItem("Week 2 contact", item: ExchangeSplitAttachmentTests.item("contact"), to: "ser-1-w2")
+                return .outlook(graph)
+            }, delete: false, arguments: renameFromWeek1, eventId: "ser-1", queuedArguments: renameFromWeek1,
+                         refusal: ExchangeSplitAttachmentTests.uncopiedItemMessage)
+        case .carriedLinkedFileSplit:
+            return Scene(calendar: {
+                let graph = outlookCalendar(renamed: [2])
+                graph.attachOther(linked, name: "Week 2 deck", to: "ser-1-w2")
+                return .outlook(graph)
+            }, delete: false, arguments: renameFromWeek1, eventId: "ser-1", queuedArguments: renameFromWeek1,
+                         refusal: ExchangeSplitAttachmentTests.linkedFileMessage)
+        case .zonelessLengthWithAMove:
+            return Scene(calendar: { .outlook(outlookCalendar(zone: SeriesZone.none, moved: [2])) }, delete: false, arguments: newLength,
+                         eventId: "ser-1", queuedArguments: newLength, refusal: noZoneLength)
+        case .zonelessLengthWithADeletion:
+            return Scene(calendar: { .outlook(outlookCalendar(zone: SeriesZone.none, deleted: [2])) }, delete: false, arguments: newLength,
+                         eventId: "ser-1", queuedArguments: newLength, refusal: noZoneLength)
+        case .customZoneLengthWithADeletion:
+            return Scene(calendar: { .outlook(outlookCalendar(zone: .custom, deleted: [2])) }, delete: false, arguments: newLength,
+                         eventId: "ser-1", queuedArguments: newLength,
+                         refusal: customZone("its occurrences changed or deleted one by one can't be kept, and its length was not changed",
+                                             "Make the change in your calendar app instead."))
+        case .googleEditedKindSplit:
+            return Scene(calendar: { .google(googleSeed) }, delete: false, arguments: allDayFromDay14,
+                         eventId: GoogleSeries.id, queuedArguments: allDayFromDay14, refusal: SplitCarry.editedKindRefusal)
+        case .calDAVEditedKindSplit:
+            return Scene(calendar: { .calDAV(path: calDAVPath, ics: calDAVICS) }, delete: false, arguments: allDayFromDay14,
+                         eventId: calDAVPath, queuedArguments: allDayFromDay14, refusal: SplitCarry.editedKindRefusal)
+        case .zonedSplit:
+            // Nothing to carry: what the fake's new part lists is not this row's question.
+            return Scene(calendar: { .outlook(outlookCalendar()) }, delete: false, arguments: renameFromWeek1,
+                         eventId: "ser-1", queuedArguments: renameFromWeek1, refusal: nil)
+        case .zonelessLengthWithARenameOnly:
+            return Scene(calendar: { .outlook(outlookCalendar(zone: SeriesZone.none, renamed: [2])) }, delete: false, arguments: newLength,
+                         eventId: "ser-1", queuedArguments: newLength, refusal: nil)
+        case .zonedDelete:
+            return Scene(calendar: { .outlook(outlookCalendar()) }, delete: true, arguments: deleteFromWeek1,
+                         eventId: "ser-1", queuedArguments: queuedDeleteFromWeek1, refusal: nil)
+        case .googleSplit:
+            return Scene(calendar: { .google(googleSeed) }, delete: false, arguments: renameFromDay14,
+                         eventId: GoogleSeries.id, queuedArguments: renameFromDay14, refusal: nil)
+        case .calDAVSplit:
+            return Scene(calendar: { .calDAV(path: calDAVPath, ics: calDAVICS) }, delete: false, arguments: renameFromDay14,
+                         eventId: calDAVPath, queuedArguments: renameFromDay14, refusal: nil)
+        }
+    }
+
+    @Test("T5.1: a series write is refused before its card exactly when the queue's write refuses it before writing, in the same words; otherwise it gets its card and is written",
+          arguments: Row.allCases)
+    func cardAgreesWithDrain(_ row: Row) async throws {
+        let s = Self.scene(row)
+        let account = "series-check-\(row.rawValue)"
+
+        // The operation put straight into the queue.
+        let queue = s.calendar()
+        defer { queue.http.close() }
+        let rows = try await drainCalendarOperation(
+            type: s.delete ? .delete : .edit, accountId: "\(account)-queue", eventId: s.eventId,
+            calendarId: s.eventId.hasPrefix("/cal/") ? "/cal/" : "primary", arguments: s.queuedArguments, provider: queue.provider)
+
+        // The same write through the tool.
+        let tool = s.calendar()
+        defer { tool.http.close() }
+        let r = s.delete
+            ? try await runDeleteTool(s.arguments, eventId: s.eventId, account: account, provider: tool.provider)
+            : try await runTool(s.arguments, eventId: s.eventId, account: account, provider: tool.provider)
+
+        guard let refusal = s.refusal else {
+            #expect(rows.isEmpty && !queue.writes().isEmpty, "\(row): the queue did not write it: \(reasons(rows)) \(queue.writes())")
+            #expect(r.cards.count == 1 && r.queued.isEmpty && !tool.writes().isEmpty,
+                    "\(row): cards \(r.cards.count) queued \(reasons(r.queued)) writes \(tool.writes()); \(r.out)")
+            return
+        }
+        #expect(rows.count == 1 && rows.first?.failureReason?.contains(refusal) == true && queue.writes().isEmpty,
+                "\(row): the queue: \(reasons(rows)) writes \(queue.writes())")
+        #expect(r.cards.isEmpty && r.queued.isEmpty && tool.writes().isEmpty,
+                "\(row): cards \(r.cards.count) queued \(reasons(r.queued)) writes \(tool.writes()); \(r.out)")
+        let answer = try JSONSerialization.jsonObject(with: Data(r.out.utf8)) as? [String: Any]
+        let said = s.delete
+            ? "calendar_event_delete failed: \(refusal.hasSuffix(".") ? refusal : refusal + ".") The event was NOT deleted."
+            : "calendar_event_edit failed: \(refusal). The event was NOT changed."
+        #expect(answer?["error"] as? String == said, "\(row): \(r.out)")
+    }
+
+    @Test("T5.2: the check reads nothing on Google and CalDAV for an edit of every occurrence or a delete, nor on Outlook for an edit that keeps the length; on Outlook it reads a length change's occurrences")
+    func checkReadsOnlyWhereTheWriteCanRefuse() async throws {
+        let length = try CalendarToolHelpers.buildGCalEventInput(Self.newLength, isAllDay: false)
+        var rename = GCalEventInput()
+        rename.summary = "Team standup"
+
+        // Outlook: a rename makes no request; a new length reads the occurrences.
+        let outlook = CheckedCalendar.outlook(Self.outlookCalendar(renamed: [2]))
+        defer { outlook.http.close() }
+        let series = try await outlook.provider.getEvent(calendarId: "primary", eventId: "ser-1")
+        let read = outlook.http.recordedCalls().count
+        try await outlook.provider.refuseSeriesWrite(calendarId: "primary", write: .everyOccurrence(seriesId: "ser-1", series: series, edit: rename))
+        #expect(outlook.http.recordedCalls().count == read, "a rename was read: \(outlook.http.recordedCalls().map(\.url))")
+        try await outlook.provider.refuseSeriesWrite(calendarId: "primary", write: .everyOccurrence(seriesId: "ser-1", series: series, edit: length))
+        let reads = outlook.http.recordedCalls().dropFirst(read)
+        #expect(reads.contains { $0.url.contains("exceptionOccurrences") } && reads.allSatisfy { $0.method == "GET" },
+                "a new length's occurrences were not read: \(reads.map(\.url))")
+
+        // Google and CalDAV, given the very series Outlook read: no request.
+        let other = FakeHTTP.Scenario()
+        defer { other.close() }
+        let google = GoogleCalendarProvider(accessToken: { _ in "test-token" }, session: other.session)
+        let home = URL(string: "https://caldav.example.com/cal/")!
+        let calDAV = CalDAVProvider(client: CalDAVClient(username: "user@example.com", password: "pw", session: other.session),
+                                    calendarHomeURL: home, serverBaseURL: home)
+        for provider in [google, calDAV] as [any CalendarProvider] {
+            try await provider.refuseSeriesWrite(calendarId: "primary", write: .everyOccurrence(seriesId: "ser-1", series: series, edit: length))
+            try await provider.refuseSeriesWrite(calendarId: "primary", write: .followingDelete(seriesId: "ser-1", before: GraphFixture.naive(Self.week(1)), zone: utc))
+        }
+        #expect(other.recordedCalls().isEmpty, "requests: \(other.recordedCalls().map(\.url))")
+    }
+
+    @Test("T5.3: when the check's read fails, there is no card, nothing is queued or written, and the assistant is told to retry")
+    func checkReadFailureRefusesUnwritten() async throws {
+        let graph = Self.outlookCalendar(deleted: [2])
+        graph.failNextExpand(with: 400)  // not retried by the transport, as a 503 is
+        let calendar = CheckedCalendar.outlook(graph)
+        defer { calendar.http.close() }
+        let r = try await runTool(Self.newLength, eventId: "ser-1", account: "series-check-read-fails", provider: calendar.provider)
+        #expect(r.cards.isEmpty && r.queued.isEmpty && calendar.writes().isEmpty,
+                "cards \(r.cards.count) queued \(reasons(r.queued)) writes \(calendar.writes()); \(r.out)")
+        let answer = try JSONSerialization.jsonObject(with: Data(r.out.utf8)) as? [String: Any]
+        let error = answer?["error"] as? String ?? ""
+        #expect(error.hasPrefix("calendar_event_edit failed: could not read the repeating event to check this change (")
+                && error.hasSuffix("). The event was NOT changed. Retry."), "\(r.out)")
+    }
+}

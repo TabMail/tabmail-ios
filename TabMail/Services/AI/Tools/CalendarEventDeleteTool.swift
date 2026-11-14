@@ -299,6 +299,12 @@ struct CalendarEventDeleteTool: AgentTool, Sendable {
                 let following = try CalendarSeriesScope.followingDelete(named: named, recurrenceId: recurrenceId, recurrenceIdZone: deviceZone)
                 // From the first occurrence on is every occurrence: the whole series.
                 if following.isFirst { return .success(wholeSeries(series, id: named.seriesId)) }
+                // A cap the calendar's own write would refuse before writing anything is refused
+                // here, before the card, in the write's words (#718): the calendar runs the plan its
+                // write makes (`refuseSeriesWrite`) on the cut the queue writes. The write checks
+                // again, since the series can change.
+                try await provider.refuseSeriesWrite(
+                    calendarId: calendarId, write: .followingDelete(seriesId: named.seriesId, before: following.cut, zone: deviceZone))
                 return .success(Target(
                     eventId: named.seriesId, cardEvent: named.occurrence ?? event,
                     lines: CalendarToolHelpers.followingDeleteLines(series: series, moved: following.moved),

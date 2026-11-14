@@ -963,7 +963,6 @@ extension AccountManager {
                 throw CalendarProviderError.notSupported(
                     "the queued calendar edit carries no event id and can never be executed")
             }
-            var resolvedAllDay = CalendarToolHelpers.boolArg(args, "all_day")
             // 🚨 THE OTHER HALF OF THE OCCURRENCE ADDRESS. `recurrence_id` is a
             // naive wall clock with no offset; on its own it does not name an
             // instant. `calendar_event_edit`'s schema already publishes the frame
@@ -1041,8 +1040,6 @@ extension AccountManager {
             // the series' difference, on that occurrence's own guests (`AttendeeChange`, #620).
             // A move to another day of a series whose rule names its days turns those days with it
             // (`CalendarSeriesScope.dayMove`), on the rule each provider writes.
-            let ruleDayMove = try CalendarSeriesScope.dayMove(
-                routed.args, named: named, scope: routed.scope, zone: editZone)
             // 🚨 AN RRULE `UNTIL`'S VALUE TYPE BELONGS TO THE DTSTART, AND ON AN EDIT THE DTSTART
             // BELONGS TO THE RESOURCE. RFC 5545 §3.3.10: "The value of the UNTIL rule part MUST have
             // the same value type as the DTSTART property." `buildGCalEventInput` renders the UNTIL
@@ -1096,24 +1093,11 @@ extension AccountManager {
             // transient ⇒ retried, permanent ⇒ retired with a reason. Fail closed, per THE MANTRA; a
             // defaulted value here would be the same wrong-kind write, chosen by us instead of the
             // model.
-            let movesTime = CalendarToolHelpers.stringArgOpt(routed.args, "start_iso") != nil
-                || CalendarToolHelpers.stringArgOpt(routed.args, "end_iso") != nil
+            //
+            // The kind is resolved, and the edit built, by the one builder the edit tool's check
+            // before its card uses too (`CalendarSeriesScope.writeInput`), below.
             let written = routed.scope == "all" ? try named.readSeries()
                 : routed.scope == "this_only" ? named.occurrence ?? named.event : named.event
-            var stored: GCalEvent? = nil
-            if resolvedAllDay == nil,
-               movesTime || CalendarToolHelpers.recurrenceUntilIsAtStake(routed.args) {
-                stored = written
-                // `GCalDateTime.date` is populated only for an all-day event, on every provider:
-                // `ICSParser.makeGCalDateTime` (CalDAV), `ExchangeCalendarProvider.toGCalDateTime`,
-                // `DemoCalendarProvider`, and Google's own JSON all put the timed form in `dateTime`.
-                resolvedAllDay = (written.start?.date != nil)
-                // Gated per global rule 12 — this is a new diagnostic, and the surrounding ungated
-                // `print`s are the pre-existing corpus registered as `IOS-LOG-003`, not a licence.
-                if DebugModeManager.isLoggingEnabled() {
-                    BackgroundSyncLogger.logDebug("[CalendarQueue] Edit moves the event or sets an RRULE UNTIL with no all_day argument — resolved allDay=\(resolvedAllDay == true) from the resource")
-                }
-            }
             // Route by edit_scope (calendar_event_edit-v1.5.21+). Default: 'all'
             // when no recurrence_id, 'this_only' when recurrence_id is present
             // (back-compat with the earlier schema where recurrence_id alone
@@ -1161,17 +1145,13 @@ extension AccountManager {
             // (the event is gone) retire it with a reason.
             var occurrenceStartDay: String? = nil
             if let rid = recurrenceId,
-               CalendarToolHelpers.needsOccurrenceStartDay(routed.args, storedStart: stored?.start, scope: scope) {
+               CalendarToolHelpers.needsOccurrenceStartDay(routed.args, storedStart: written.start, scope: scope) {
                 occurrenceStartDay = try await provider.occurrenceStartDay(
                     calendarId: calId, eventId: writeId, recurrenceId: rid, recurrenceIdZone: recurrenceIdZone)
             }
-            if let reason = CalendarToolHelpers.allDayEditRefusal(
-                routed.args, storedStart: written.start, scope: scope, recurrenceId: recurrenceId,
-                occurrenceStartDay: occurrenceStartDay, namedOccurrenceStart: named.occurrence?.start) {
-                throw CalendarProviderError.notSupported(reason)
-            }
-            var input = try CalendarToolHelpers.buildGCalEventInput(routed.args, isAllDay: resolvedAllDay)
-            input.ruleDayMove = ruleDayMove
+            let input = try CalendarSeriesScope.writeInput(
+                routed.args, scope: scope, named: named, written: written, recurrenceId: recurrenceId,
+                occurrenceStartDay: occurrenceStartDay, zone: editZone)
 
             switch scope {
             case "this_only":

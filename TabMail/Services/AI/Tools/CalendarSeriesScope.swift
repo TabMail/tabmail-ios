@@ -448,6 +448,45 @@ enum CalendarSeriesScope {
         return move
     }
 
+    /// The edit as the queue writes it, from `args` as `route` sent it in `scope` (#718): the one
+    /// builder the queue's write and the edit tool's check before its card
+    /// (`CalendarProvider.refuseSeriesWrite`) both use, so the card checks the write the queue
+    /// makes. `written` is the event the edit writes: the series for an edit of every occurrence,
+    /// the occurrence for an edit of one, else the event named.
+    /// - Its kind is `all_day` when the edit states it; otherwise, when the edit gives a start or an
+    ///   end or a rule's end (`recurrenceUntilIsAtStake`), `written`'s own kind (the UNTIL's value
+    ///   type and a move's kind belong to the stored start); otherwise none.
+    /// - An edit `allDayEditRefusal` refuses is thrown as `notSupported`, with `written`'s start
+    ///   and, on `this_only`, `occurrenceStartDay`, the day the occurrence starts on now.
+    /// - A move to another day of a series whose rule names its days turns them (`dayMove`).
+    static func writeInput(
+        _ args: [String: JSONValue], scope: String, named: Named, written: GCalEvent, recurrenceId: String?,
+        occurrenceStartDay: String?, zone: TimeZone
+    ) throws -> GCalEventInput {
+        let ruleDayMove = try dayMove(args, named: named, scope: scope, zone: zone)
+        var allDay = CalendarToolHelpers.boolArg(args, "all_day")
+        let movesTime = CalendarToolHelpers.stringArgOpt(args, "start_iso") != nil
+            || CalendarToolHelpers.stringArgOpt(args, "end_iso") != nil
+        if allDay == nil, movesTime || CalendarToolHelpers.recurrenceUntilIsAtStake(args) {
+            // `GCalDateTime.date` is populated only for an all-day event, on every provider:
+            // `ICSParser.makeGCalDateTime` (CalDAV), `ExchangeCalendarProvider.toGCalDateTime`,
+            // `DemoCalendarProvider`, and Google's own JSON all put the timed form in `dateTime`.
+            allDay = written.start?.date != nil
+            // Gated per global rule 12.
+            if DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[CalendarSeriesScope] Edit moves the event or sets an RRULE UNTIL with no all_day argument — resolved allDay=\(allDay == true) from the resource")
+            }
+        }
+        if let reason = CalendarToolHelpers.allDayEditRefusal(
+            args, storedStart: written.start, scope: scope, recurrenceId: recurrenceId,
+            occurrenceStartDay: occurrenceStartDay, namedOccurrenceStart: named.occurrence?.start) {
+            throw CalendarProviderError.notSupported(reason)
+        }
+        var input = try CalendarToolHelpers.buildGCalEventInput(args, isAllDay: allDay)
+        input.ruleDayMove = ruleDayMove
+        return input
+    }
+
     /// Where an occurrence is, or is placed in its series, as `route` compares it.
     private enum Place: Equatable {
         /// An all-day series' occurrence: its date (`yyyy-MM-dd`).
