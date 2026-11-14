@@ -440,22 +440,18 @@ extension AccountManager {
                 guard connected != nil || account != nil else { continue }
                 let syncEngine = self.syncEngine
                 group.addTask {
-                    let provider: any EmailProvider
-                    if let connected {
-                        provider = connected
-                    } else if let account {
+                    var provider = connected
+                    if provider == nil, let account {
                         do {
                             try await self.connectAccount(account)
                         } catch {
                             BackgroundSyncLogger.logDebug("[SyncFolders] connect failed for account \(accountId.prefix(6)); the other accounts still sync: \(error)")
                             throw error
                         }
-                        // Removed while connecting: nothing left to sync.
-                        guard let registered = await self.provider(accountId: accountId) else { return }
-                        provider = registered
-                    } else {
-                        return
+                        provider = await self.provider(accountId: accountId)
                     }
+                    // Removed while connecting (or connected with no mail provider): nothing to sync.
+                    guard let provider else { return }
                     // Pool creates connections on demand via checkout — no explicit connect needed.
                     for folder in accountFolders where !folder.path.isEmpty {
                         do {
