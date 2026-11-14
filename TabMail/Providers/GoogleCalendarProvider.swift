@@ -158,13 +158,6 @@ protocol CalendarProvider: Sendable {
     /// The edit's confirmation card says so when it does (#423).
     func editResetsChangedOccurrences(_ event: GCalEvent, edit: GCalEventInput) -> Bool
 
-    /// The meetings an edit of every occurrence of the series `seriesId` removes by moving its
-    /// last date earlier, for the confirmation card (#718): nil unless this calendar's write
-    /// changes only where the series ends and keeps its changed occurrences
-    /// (`editResetsChangedOccurrences` false). Read from the series as it is now, with nothing
-    /// written. Default: nil (a calendar that does not count them, or warns of a reset instead).
-    func seriesEndRemoval(calendarId: String, seriesId: String, edit: GCalEventInput) async throws -> SeriesEndRemoval?
-
     /// Why this provider cannot hold a repeat rule, or nil when it can. `rrule` is an RFC 5545
     /// `RRULE:` line whose tokens are already valid (`CalendarToolHelpers.recurrenceDayParts`); the
     /// answer is about what the provider's own recurrence model can express. The calendar tools
@@ -187,15 +180,6 @@ enum SeriesWrite: Sendable {
     /// A delete of an occurrence and every later one (`CalendarProvider.endSeries`): the series
     /// `seriesId` ended just before the place `before`, read in `zone`.
     case followingDelete(seriesId: String, before: String, zone: TimeZone)
-}
-
-/// What an edit of every occurrence that moves a series' last date removes
-/// (`CalendarProvider.seriesEndRemoval`): `count` meetings after `after`, the new last date as the
-/// card shows it. The occurrences after it, plain and changed alike; one deleted already is not
-/// counted. Zero for a later end.
-struct SeriesEndRemoval: Sendable, Equatable {
-    let count: Int
-    let after: String
 }
 
 /// HTTP statuses that mean "come back later", not "the request is wrong": 408 Request Timeout,
@@ -281,7 +265,6 @@ extension CalendarProvider {
         throw CalendarProviderError.notSupported(Self.splitNotSupported)
     }
     func refuseSeriesWrite(calendarId: String, write: SeriesWrite) async throws {}
-    func seriesEndRemoval(calendarId: String, seriesId: String, edit: GCalEventInput) async throws -> SeriesEndRemoval? { nil }
     func dayMovedRules(calendarId: String, eventId: String, series: GCalEvent, scope: String, recurrenceId: String?,
                        zone: TimeZone, move: RecurrenceDayShift.Move) async throws -> [String] {
         throw CalendarProviderError.notSupported("Moving a repeating event's named days to another date is not supported on this calendar provider.")
@@ -2605,6 +2588,9 @@ struct GCalEvent: Codable, Sendable {
     /// (Outlook's `originalStartTimeZone`, read with the event alone, not by a listing): the zone
     /// a series whose rule names none repeats in (`seriesZoneName`). Nil elsewhere; in memory only.
     var eventZoneName: String? = nil
+    /// The zone the event's end was stored in, where its calendar gives it (Outlook's
+    /// `originalEndTimeZone`, read with the event alone). Nil elsewhere; in memory only.
+    var eventEndZoneName: String? = nil
 
     private enum CodingKeys: String, CodingKey {
         case id, summary, location, description, start, end, attendees, organizer, recurrence

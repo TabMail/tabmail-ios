@@ -1283,8 +1283,8 @@ enum CalendarToolHelpers {
     /// calendars may when its rule does.
     static let ruleChangeResetNote = "Occurrences you changed individually may be reset."
     /// The confirmation-card line for an edit of every occurrence that moves the series' last date
-    /// earlier and keeps its changed occurrences (`CalendarProvider.seriesEndRemoval`, #718): how
-    /// many meetings after the new last date it removes.
+    /// earlier (`CalendarSeriesEndRemoval`, #718): how many meetings after the new last date it
+    /// removes. Shown on every calendar, beside a reset note where there is one.
     static func seriesEndRemovalNote(_ removal: SeriesEndRemoval) -> String {
         removal.count == 1
             ? "1 meeting after \(removal.after) is removed."

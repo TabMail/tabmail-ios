@@ -277,7 +277,10 @@ These tests read what each provider sent, or what the fake server ends up holdin
   `FakeGraphCalendar` modelling a range-end-only `PATCH` as measured): an earlier end keeps the moved
   occurrence (time, title, own file) and the deleted one, removes the changed and plain ones after it,
   and its card shows no reset note and "2 meetings after <date> are removed." (the deleted one after
-  the end not counted); a later end keeps everything and its card shows neither line.
+  the end not counted); a later end keeps everything and its card shows neither line; a series stored
+  under another name of its zone is warned of as a reset. `SeriesEndRemovalCardTests`: the same line on
+  Google and CalDAV beside their reset note (a moved occurrence counted by its place, a deleted one or
+  an EXDATE not), none for a later end, and a source check that the shared count names no provider.
 
 ## Google attendee edits — the others stay as stored
 

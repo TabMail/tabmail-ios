@@ -221,8 +221,11 @@ that aren't included in the request body maintain their previous values".
   rule that differs from the stored one only in its range's `endDate`, both ending on a date, written
   with the stored start and end, resets nothing, earlier or later; an earlier end removes the
   occurrences placed after it, changed ones too. Outlook's card answers no reset for it
-  (`ExchangeCalendarProvider.newRangeEnd`, `sameRule(_:as:ignoringEnd:)`) and, for an earlier end,
-  shows "N meetings after <date> are removed." (`CalendarProvider.seriesEndRemoval`,
+  (`ExchangeCalendarProvider.newRangeEnd`, `sameRule(_:as:ignoringEnd:)`) only when the start and end
+  the write restates carry the stored labels exactly (`restatesStoredTimes`, `originalStartTimeZone` /
+  `originalEndTimeZone`, now read by `getEvent`); a relabel is unmeasured and stays a reset
+  (`outlookEarlierSeriesEndRelabelledIsAReset`). Every calendar's card shows, for an earlier end,
+  "N meetings after <date> are removed." (`CalendarSeriesEndRemoval`, shared, ADR-IOS-113 decision 8,
   `CalendarToolHelpers.seriesEndRemovalNote`). `FakeGraphCalendar` models it (no reset counted; with
   `modelsExceptions` the occurrences after the new end are gone). Pinned in
   `SeriesLengthKeepsExceptionsTests` (`outlookEarlierSeriesEndAloneKeepsExceptions`,

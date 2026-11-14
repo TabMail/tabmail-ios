@@ -199,8 +199,10 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// What `getEvent` reads: what a listing reads, and the event's own zone
     /// (`originalStartTimeZone`), the zone a series whose range names none repeats in
     /// (`GCalEvent.seriesZoneName`), so the confirmation card dates a series as its write does.
-    /// A listing does not read it: nothing there needs it.
-    private static let readSelect = eventSelect + ",originalStartTimeZone"
+    /// A listing does not read it: nothing there needs it. With it, the zone the event's end was
+    /// stored in (`originalEndTimeZone`): a new last date alone is no reset only when the write
+    /// restates both as stored (`restatesStoredTimes`).
+    private static let readSelect = eventSelect + ",originalStartTimeZone,originalEndTimeZone"
 
     /// What a split reads from the stored series: what `getEvent` reads, and every property the
     /// new part copies (`splitCopiedKeys`).
@@ -1094,58 +1096,6 @@ actor ExchangeCalendarProvider: CalendarProvider {
         }
     }
 
-    /// The meetings an end-only change of every occurrence removes (`CalendarProvider.seriesEndRemoval`,
-    /// #718): for an edit whose rule changes only the series' last date (`newRangeEnd`), so Graph
-    /// keeps its changed occurrences, the occurrences whose place is after the new last date in the
-    /// range's zone, the set Graph removes (measured on a work account, 2026-11-14): the plain ones
-    /// the series lists up to its stored end (`listInstances`) and the changed ones it holds
-    /// (`seriesExceptions`, wherever each was moved to). A deleted one is not counted. Zero for a
-    /// later end. Nothing is written.
-    func seriesEndRemoval(calendarId: String = "primary", seriesId: String, edit: GCalEventInput) async throws -> SeriesEndRemoval? {
-        guard edit.recurrence != nil else { return nil }
-        let existing = try await fetchForEdit(eventId: seriesId, select: Self.readSelect)
-        let series = existing.event
-        guard series.recurrence?.isEmpty == false, !editResetsChangedOccurrences(series, edit: edit),
-              let stored = existing.raw["recurrence"] as? [String: Any],
-              let storedEnd = (stored["range"] as? [String: Any])?["endDate"] as? String else { return nil }
-        // The range is dated in its own zone, as the write dates it (`graphPatchJSON`).
-        var rangeZone: TimeZone?
-        if let name = ((stored["range"] as? [String: Any])?["recurrenceTimeZone"] as? String).flatMap({ $0.isEmpty ? nil : $0 }) {
-            guard let zone = CalendarTimeZoneResolver.zone(named: name, in: .none) else {
-                throw CalendarProviderError.unrecognizedTimeZone(name, consequence: "it did not change the event")
-            }
-            rangeZone = zone
-        }
-        guard let newEnd = newRangeEnd(edit, existing: series, stored: stored, rangeZone: rangeZone),
-              let last = RecurrenceTail.Day(iso: newEnd), let storedLast = RecurrenceTail.Day(iso: storedEnd) else { return nil }
-        let after = Self.occurrenceDate(GCalDateTime(dateTime: nil, date: newEnd, timeZone: nil), seriesZone: nil)
-        guard newEnd < storedEnd else { return SeriesEndRemoval(count: 0, after: after) }
-        let zone = series.isAllDay ? nil : try rangeZone ?? Self.seriesTimeZone(existing)
-        func removed(_ place: GCalDateTime?) -> Bool {
-            guard let place, let date = Self.seriesDate(of: place, seriesZone: zone) else { return false }
-            return date > newEnd
-        }
-        let seriesZone = series.seriesZoneName
-        let changed = try await seriesExceptions(
-            seriesId: seriesId, series: series, seriesZone: seriesZone, zone: zone, refusal: Self.seriesEndUnreadable)
-            .filter { exception in
-                guard case .changed(let event) = exception.carried else { return false }
-                return removed(event.originalStartTime)
-            }
-        let window = Self.instancesWindow(first: last, last: storedLast)
-        let listed = try await listInstances(of: seriesId, window: window, seriesZone: seriesZone, refusal: Self.seriesEndUnreadable)
-        let plain = listed.filter { instance in
-            guard instance["type"] as? String == "occurrence", let original = instance["originalStart"] as? String else { return false }
-            let place = series.isAllDay
-                ? GCalDateTime(dateTime: nil, date: String(original.prefix(10)), timeZone: nil)
-                : GCalDateTime(dateTime: original, date: nil, timeZone: "UTC")
-            return removed(place)
-        }
-        return SeriesEndRemoval(count: changed.count + plain.count, after: after)
-    }
-
-    private static let seriesEndUnreadable = "the occurrences of this repeating event can't be read, so the meetings its new end removes can't be counted"
-
     func eventExists(calendarId: String = "primary", eventId: String) async throws -> Bool {
         let encodedId = try Self.encodedGraphPathSegment(eventId, context: "Graph event id")
         do {
@@ -1546,40 +1496,20 @@ actor ExchangeCalendarProvider: CalendarProvider {
             dates.append(date)
         }
         guard let first = dates.min().flatMap({ RecurrenceTail.Day(iso: $0) }), let last = dates.max().flatMap({ RecurrenceTail.Day(iso: $0) }),
-              let window = Self.instancesWindow(first: first, last: last) else { throw unplaced }
-        let instances = try await listInstances(
-            of: partId, window: window, seriesZone: seriesZone,
-            refusal: "the new part's occurrences can't be read, so the changed ones can't be carried")
-        return ListedInstances(instances: instances, allDay: series.isAllDay, zone: zone)
-    }
-
-    /// The window an instances list is read in for places dated `first` to `last`: dated in UTC,
-    /// its two days before and three after cover any zone's offset. Nil when a date can't be read.
-    nonisolated static func instancesWindow(first: RecurrenceTail.Day, last: RecurrenceTail.Day) -> (from: Date, to: Date)? {
-        guard let from = GoogleCalendarProvider.naiveInstant(first.description, zone: .gmt)?.addingTimeInterval(-2 * 86_400),
-              let to = GoogleCalendarProvider.naiveInstant(last.description, zone: .gmt)?.addingTimeInterval(3 * 86_400) else { return nil }
-        return (from, to)
-    }
-
-    /// Every occurrence of the series `seriesId` that starts in `window`, as its instances list
-    /// gives them, read with `Prefer` naming `seriesZone`. Every page is read; a page that can't be
-    /// read is refused in the caller's words (`refusal`).
-    private func listInstances(
-        of seriesId: String, window: (from: Date, to: Date)?, seriesZone: String?, refusal: String
-    ) async throws -> [[String: Any]] {
-        guard let window else { throw CalendarProviderError.notSupported(refusal) }
-        let encoded = try Self.encodedGraphPathSegment(seriesId, context: "Graph event id")
+              let from = GoogleCalendarProvider.naiveInstant(first.description, zone: .gmt)?.addingTimeInterval(-2 * 86_400),
+              let to = GoogleCalendarProvider.naiveInstant(last.description, zone: .gmt)?.addingTimeInterval(3 * 86_400) else { throw unplaced }
+        let encodedPart = try Self.encodedGraphPathSegment(partId, context: "Graph event id")
         var instances: [[String: Any]] = []
-        var next: String? = "/events/\(encoded)/instances?startDateTime=\(window.from.iso8601String())&endDateTime=\(window.to.iso8601String())&$top=1000"
+        var next: String? = "/events/\(encodedPart)/instances?startDateTime=\(from.iso8601String())&endDateTime=\(to.iso8601String())&$top=1000"
         while let path = next {
             let listed = try await request(path: path, timeZoneName: seriesZone)
             guard let page = try JSONSerialization.jsonObject(with: listed) as? [String: Any] else {
-                throw CalendarProviderError.notSupported(refusal)
+                throw CalendarProviderError.notSupported("the new part's occurrences can't be read, so the changed ones can't be carried")
             }
             instances += page["value"] as? [[String: Any]] ?? []
             next = try (page["@odata.nextLink"] as? String).map { try graphPath(ofNextLink: $0) }
         }
-        return instances
+        return ListedInstances(instances: instances, allDay: series.isAllDay, zone: zone)
     }
 
     /// A series' occurrences as `instances(around:)` read them, found by place.
@@ -3068,9 +2998,30 @@ actor ExchangeCalendarProvider: CalendarProvider {
         if movesSeriesTime(edit, existing: event), !SplitCarry.lengthChange(edit, series: event) { return true }
         guard edit.recurrence != nil else { return false }
         guard let baseline = storedRuleBaseline(event) else { return true }
-        // A rule that changes only where the series ends keeps them (`newRangeEnd`, #718).
+        // A rule that changes only where the series ends keeps them (`newRangeEnd`, #718), when
+        // the start and end written beside it are the stored ones, zone label included
+        // (`restatesStoredTimes`): a relabelled start was not measured, so it is a reset.
         return seriesRuleToWrite(edit, existing: event, stored: baseline.recurrence, rangeZone: baseline.rangeZone) != nil
-            && newRangeEnd(edit, existing: event, stored: baseline.recurrence, rangeZone: baseline.rangeZone) == nil
+            && !(newRangeEnd(edit, existing: event, stored: baseline.recurrence, rangeZone: baseline.rangeZone) != nil
+                 && restatesStoredTimes(edit, series: event))
+    }
+
+    /// Whether the start and end the write sends beside a rule (`graphPatchJSON`) are the series'
+    /// stored ones exactly (#718): the same instants (`movesSeriesTime` false), each labelled with
+    /// the zone Graph stored it in (`GCalEvent.eventZoneName`, `eventEndZoneName`: its
+    /// `originalStartTimeZone` and `originalEndTimeZone`), the same name, not only the same zone.
+    /// The write labels them with the series' range zone (`inSeriesZone`), else as the merge gives
+    /// them. False when a stored label was not read.
+    nonisolated func restatesStoredTimes(_ edit: GCalEventInput, series: GCalEvent) -> Bool {
+        guard !movesSeriesTime(edit, existing: series),
+              let storedStart = series.eventZoneName, let storedEnd = series.eventEndZoneName else { return false }
+        let merged = GoogleCalendarProvider.mergeExistingEventWithPatch(existing: series, patch: edit)
+        let json = toGraphEventJSON(merged)
+        let allDay = json["isAllDay"] as? Bool ?? (merged.startDate != nil || merged.endDate != nil)
+        func label(_ key: String) -> String? {
+            (json[key] as? [String: Any]).map { Self.inSeriesZone($0, seriesZone: series.recurrenceTimeZoneName, allDay: allDay) }?["timeZone"] as? String
+        }
+        return label("start") == storedStart && label("end") == storedEnd
     }
 
     /// The card's stand-in for the recurrence Graph stores for `event` (#423): its RRULE rebuilt in
@@ -3604,6 +3555,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         event.recurrenceFirstDayOfWeek = e.recurrence?.pattern?.firstDayOfWeek.flatMap { $0.isEmpty ? nil : $0 }
         event.originalStartTime = Self.originalStartTime(e.originalStart)
         event.eventZoneName = e.originalStartTimeZone.flatMap { $0.isEmpty ? nil : $0 }
+        event.eventEndZoneName = e.originalEndTimeZone.flatMap { $0.isEmpty ? nil : $0 }
         // The read's start is in the zone the read asked for (`request`'s `Prefer`), not the
         // event's own: no date is read in it (`seriesZone`).
         event.startZoneIsDisplay = true
@@ -4274,6 +4226,9 @@ struct MSEvent: Decodable {
     /// The zone the event was created in, Graph's `originalStartTimeZone` (read by `getEvent` and a
     /// split, not by a listing): a series whose range names no zone repeats in it.
     let originalStartTimeZone: String?
+    /// The zone the event's end was stored in, Graph's `originalEndTimeZone` (read with
+    /// `originalStartTimeZone`).
+    let originalEndTimeZone: String?
 }
 
 struct MSLocation: Decodable {

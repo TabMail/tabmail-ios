@@ -536,9 +536,13 @@ Pinned by the file cases of `SeriesLengthKeepsExceptionsTests` and by `CalendarP
 
 **2026-11-14 (#718, ADR-IOS-113 decision 7): a new last date alone keeps them on Outlook.** A rule that
 changes only where the series ends (Graph range `endDate` to `endDate`) resets nothing (measured on a
-work account), so the card's reset note is not shown for it (`newRangeEnd`); for an earlier end the card
-says "N meetings after <date> are removed." (`seriesEndRemoval`: the plain occurrences listed after the
-new last date plus the changed ones placed there, deleted ones not counted; read before the card, a
-failed read shows no card). Google (`recurrenceLinesDiffer`) and CalDAV (RRULE compare) still show the
-reset note for an `UNTIL` change alone (not measured on either). Pinned by
-`outlookEarlierSeriesEndAloneKeepsExceptions` and `outlookLaterSeriesEndAloneKeepsExceptions`.
+work account), so the card's reset note is not shown for it (`newRangeEnd`) when the write restates the
+stored start and end with their stored zone labels (`restatesStoredTimes`; a relabel stays a reset).
+On EVERY calendar an earlier `UNTIL` gets "N meetings after <date> are removed." (ADR-IOS-113
+decision 8, `CalendarSeriesEndRemoval`, one shared count above the provider boundary: the calendar's
+single-events listing from the new last date to the stored one, each occurrence by its place, deleted
+ones not listed; a failed listing shows no card). Google (`recurrenceLinesDiffer`) and CalDAV (RRULE
+compare) still show the reset note beside it (not measured on either). Pinned by
+`outlookEarlierSeriesEndAloneKeepsExceptions`, `outlookLaterSeriesEndAloneKeepsExceptions`,
+`outlookEarlierSeriesEndRelabelledIsAReset` and `SeriesEndRemovalCardTests` (Google, CalDAV, and the
+source check that the count names no provider).

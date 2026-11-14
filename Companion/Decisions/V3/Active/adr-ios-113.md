@@ -81,13 +81,27 @@ its card.
    date), with the stored start and end, keeps every changed occurrence (id, time, title, own file)
    and every deleted one deleted, earlier or later; an earlier end removes the occurrences placed after
    it, changed ones with them (404 by id). So `editResetsChangedOccurrences` answers no reset for it
-   (`newRangeEnd`: the edit's rule in Graph's form, `sameRule` with the end left out), and the card
-   gives, for an earlier end, "N meetings after <date> are removed." (`seriesEndRemoval`, counted from
-   the series as it is now: the plain occurrences listed after the new last date and the changed ones
-   placed there; deleted ones are not counted). A later end gets no line. A rule that gains or loses
-   an end, or ends after a count, is still a rule change and warned of as a reset; a new length together
-   with a new last date moves the series' time and resets (no put-back). Google and CalDAV still warn
-   of a reset for any RRULE change, an `UNTIL` alone included (not measured there).
+   (`newRangeEnd`: the edit's rule in Graph's form, `sameRule` with the end left out) only when the
+   start and end the write restates are the stored ones exactly, zone label included
+   (`restatesStoredTimes`, against `originalStartTimeZone` and `originalEndTimeZone`): a start the
+   write would relabel under another name of its zone was not measured, so it stays a reset. A rule
+   that gains or loses an end, or ends after a count, is still a rule change and warned of as a reset;
+   a new length together with a new last date moves the series' time and resets (no put-back).
+   Google and CalDAV still warn of a reset for any RRULE change, an `UNTIL` alone included (not
+   measured there).
+8. **Every calendar: an earlier last date says how many meetings it removes (master-agent,
+   2026-11-14).** The card shows "N meetings after <date> are removed." ("1 meeting ... is removed.")
+   on Google, CalDAV and Outlook alike, beside a reset note where there is one, whenever the edit's
+   `UNTIL` is before the stored rule's. The count is ONE function above the provider boundary
+   (`CalendarSeriesEndRemoval`, ADR-IOS-060): the occurrences the stored rule places after the new last
+   date up to the stored one, as the calendar's own listing gives them (`listEvents`, single events),
+   each counted by its place (`originalStartTime`), so a changed one counts where the series had it and
+   a deleted one is not listed; dates in the series' zone. A source check holds it free of any provider
+   name or cast. Not counted: a stored rule that ends after a count or never; an occurrence moved on its
+   own more than the listing margin away from the dates counted; a series the tool reads by an id
+   that names no calendar (no cached calendar, so the default one is listed) on Outlook or CalDAV,
+   where the read finds it on any calendar but the listing covers only the default one, is counted
+   as 0 and gets no line. A failed listing shows no card.
 
 **Consequences:**
 - Outlook attendees get the series update and then one update or cancellation per put-back write
