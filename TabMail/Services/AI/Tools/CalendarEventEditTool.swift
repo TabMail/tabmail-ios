@@ -504,6 +504,14 @@ struct CalendarEventEditTool: AgentTool, Sendable {
                    removal.count.map({ $0 > 0 }) ?? true {
                     changes.append(CalendarToolHelpers.seriesEndRemovalNote(removal))
                 }
+            } catch let addedDates as CalendarSeriesEndRemoval.AddedDates {
+                // A series with dates added on its own can't be counted yet (#881), and a retry
+                // fails the same way every time: said plainly, with no "Retry" (#880).
+                return ToolJSON.string(from: [
+                    "ok": false,
+                    "error": "calendar_event_edit failed: \(addedDates.localizedDescription). The event was NOT changed.",
+                    "event_id": compoundId,
+                ] as [String: Any])
             } catch {
                 return ToolJSON.string(from: [
                     "ok": false,

@@ -6645,20 +6645,84 @@ struct SeriesEndRemovalCardTests {
         #expect(card.cards == 1 && card.changes.contains(expected), "card: \(card.changes); \(card.out)")
     }
 
+    /// The whole refusal a series with dates added to it on their own (`RDATE`) gets for a new rule
+    /// that keeps an end (#880): it says plainly the change can't be made yet, and asks for no retry,
+    /// as a retry fails the same way every time. Full support is #881.
+    static let addedDatesRefusal = "calendar_event_edit failed: this repeating event has dates added to it on their own, and a repeating event with added dates can't be changed this way yet. The event was NOT changed."
+
+    /// The tool's error text in `out`, "" when there is none.
+    private static func error(in out: String) throws -> String {
+        let answer = try JSONSerialization.jsonObject(with: Data(out.utf8)) as? [String: Any]
+        return answer?["error"] as? String ?? ""
+    }
+
+    struct AddedDatesCase: CustomTestStringConvertible, Sendable {
+        let name: String
+        let stored: String
+        let edited: [String: JSONValue]
+        var testDescription: String { name }
+    }
+
+    /// The three edits of #880 that change the rule and keep an end, on a series with an `RDATE`.
+    static let addedDatesCases: [AddedDatesCase] = [
+        AddedDatesCase(name: "an earlier end", stored: "RRULE:FREQ=WEEKLY;UNTIL=\(compact(day(42)))T090000Z",
+                       edited: ["freq": .string("WEEKLY"), "until": .string(day(21))]),
+        AddedDatesCase(name: "another weekday", stored: "RRULE:FREQ=WEEKLY;UNTIL=\(compact(day(42)))T090000Z",
+                       edited: ["freq": .string("WEEKLY"), "until": .string(day(42)), "byDay": .array([.string(weekdayCode(day(1)))])]),
+        AddedDatesCase(name: "a count turned into a date", stored: "RRULE:FREQ=WEEKLY;COUNT=7",
+                       edited: ["freq": .string("WEEKLY"), "until": .string(day(42))]),
+    ]
+
     /// Every rule part the tool's fields express is one the expander places (a stored rule with any
-    /// other part is refused before this count, `storedOtherRefusal`), so the stored recurrence the
-    /// count can't read here is one with a date added to it (`RDATE`), which the rule does not place.
-    @Test("Google: a stored recurrence the count can't read (a date added with RDATE) shows no card and asks for a retry")
-    func googleUnreadableRuleShowsNoCard() async throws {
-        var series = GoogleSeries.series(rule: "RRULE:FREQ=WEEKLY;UNTIL=\(compact(day(42)))T090000Z")
-        series["recurrence"] = ["RRULE:FREQ=WEEKLY;UNTIL=\(compact(day(42)))T090000Z", "RDATE:\(compact(day(31)))T090000Z"]
+    /// other part is refused before this count, `storedOtherRefusal`), and a date added to the series
+    /// (`RDATE`) is one the rule does not place: refused before the card with its own plain message,
+    /// no "Retry" (#880).
+    @Test("Google: a series with a date added (RDATE) whose rule an edit changes keeping an end shows no card, queues nothing, and says plainly it can't be changed this way yet, with no Retry", arguments: Self.addedDatesCases)
+    func googleAddedDatesRefusedPlainly(_ c: AddedDatesCase) async throws {
+        var series = GoogleSeries.series(rule: c.stored)
+        series["recurrence"] = [c.stored, "RDATE:\(compact(day(31)))T090000Z"]
+        let r = try await googleTool([
+            "edit_scope": .string("all"), "timezone": .string("UTC"), "recurrence": .dictionary(c.edited),
+        ], eventId: GoogleSeries.id, account: "series-end-g-rdate", seed: [series, GoogleSeries.instance(day(0))])
+        let error = try Self.error(in: r.run.out)
+        #expect(r.run.cards.isEmpty && r.run.queued.isEmpty, "cards \(r.run.cards.count) queued \(r.run.queued.count); \(r.run.out)")
+        #expect(error == Self.addedDatesRefusal && !error.contains("Retry"), "\(r.run.out)")
+    }
+
+    @Test("CalDAV: a series with a date added (RDATE) given an earlier end shows no card, writes nothing, and says plainly it can't be changed this way yet, with no Retry")
+    func calDAVAddedDatesRefusedPlainly() async throws {
+        let ics = [
+            "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//TabMail//Test//EN",
+            "BEGIN:VEVENT", "UID:end-r", "DTSTAMP:\(compact(day(-14)))T000000Z",
+            "DTSTART:\(compact(day(0)))T090000Z", "DTEND:\(compact(day(0)))T093000Z",
+            "RRULE:FREQ=WEEKLY;UNTIL=\(compact(day(42)))T235959Z",
+            "RDATE:\(compact(day(31)))T090000Z",
+            "SUMMARY:Standup", "END:VEVENT", "END:VCALENDAR",
+        ].joined(separator: "\r\n")
+        let store = FakeCalDAVStore(servesETags: true)
+        store.seed(path: "/cal/end-r.ics", ics: ics)
+        let r = try await calDAVTool(store, [
+            "edit_scope": .string("all"), "timezone": .string("UTC"),
+            "recurrence": .dictionary(["freq": .string("WEEKLY"), "until": .string(day(21))]),
+        ], eventId: "/cal/end-r.ics", account: "series-end-c-rdate")
+        let error = try Self.error(in: r.out)
+        #expect(r.cards.isEmpty && r.queued.isEmpty && store.recordedPuts().isEmpty, "cards \(r.cards.count) queued \(r.queued.count); \(r.out)")
+        #expect(error == Self.addedDatesRefusal && !error.contains("Retry"), "\(r.out)")
+    }
+
+    /// Only the added-dates case has its own message: any other reason the count can't be worked
+    /// out (here a date excluded from the series that can't be read) still gets the generic one,
+    /// with its reason and the retry.
+    @Test("Google: another reason the count can't be worked out (an unreadable EXDATE) keeps the generic message and its Retry")
+    func googleOtherUnreadableKeepsTheGenericMessage() async throws {
+        let rule = "RRULE:FREQ=WEEKLY;UNTIL=\(compact(day(42)))T090000Z"
+        var series = GoogleSeries.series(rule: rule)
+        series["recurrence"] = [rule, "EXDATE:NOTADATE"]
         let card = try await Self.googleCard([
             series, GoogleSeries.instance(day(0)),
         ], ["freq": .string("WEEKLY"), "until": .string(day(21))], account: "series-end-g-unreadable")
-        let answer = try JSONSerialization.jsonObject(with: Data(card.out.utf8)) as? [String: Any]
-        let error = answer?["error"] as? String ?? ""
-        #expect(card.cards == 0 && error.hasPrefix("calendar_event_edit failed: could not read the repeating event to check this change (")
-                && error.hasSuffix("). The event was NOT changed. Retry."), "\(card.out)")
+        let error = try Self.error(in: card.out)
+        #expect(card.cards == 0 && error == "calendar_event_edit failed: could not read the repeating event to check this change (a date excluded from the repeating event can't be read). The event was NOT changed. Retry.", "\(card.out)")
     }
 
     @Test("Google: a rename that re-sends the stored end of a series with a date added (RDATE) shows its card with no removal line: nothing the count would need is read")

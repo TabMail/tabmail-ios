@@ -553,3 +553,12 @@ compare) still show the reset note beside it (not measured on either). Pinned by
 `outlookEarlierSeriesEndAloneKeepsExceptions`, `outlookLaterSeriesEndAloneKeepsExceptions`,
 `outlookEarlierSeriesEndRelabelledIsAReset` and `SeriesEndRemovalCardTests` (Google, CalDAV, and the
 source check that the count names no provider and lists nothing).
+
+**2026-11-14 (#880, owner ruling): a series with dates added on their own (`RDATE`) is refused with its
+own message, not the generic retry.** A retry of an `RDATE` series always fails the same way, so the
+count throws `CalendarSeriesEndRemoval.AddedDates` at its source (not `Unreadable`, no string match),
+and `CalendarEventEditTool` answers, before the card as before: "calendar_event_edit failed: this
+repeating event has dates added to it on their own, and a repeating event with added dates can't be
+changed this way yet. The event was NOT changed." Other unreadable reasons keep "could not read the
+repeating event ... Retry.". The count's one call site is the edit tool before the card (Google and
+CalDAV reach it; Outlook has no `RDATE`). Counting added dates is #881. ADR-IOS-113 decision 8.

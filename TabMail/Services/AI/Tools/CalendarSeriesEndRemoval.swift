@@ -27,6 +27,15 @@ enum CalendarSeriesEndRemoval {
         var errorDescription: String? { reason }
     }
 
+    /// The series has dates added to it on their own (`RDATE`), which this count does not read
+    /// (#881). Unlike `Unreadable`, a retry fails the same way every time, so the edit tool says
+    /// plainly the change can't be made yet and asks for no retry (#880).
+    struct AddedDates: LocalizedError {
+        var errorDescription: String? {
+            "this repeating event has dates added to it on their own, and a repeating event with added dates can't be changed this way yet"
+        }
+    }
+
     /// What the whole-series edit `edit` of `series` (`seriesId`, read on `calendarId`) removes by
     /// ending the series earlier, nil when it does not end it earlier: the edit's rule ends on a
     /// date (`UNTIL`) or after a number of occurrences (`COUNT`) before the stored rule's last
@@ -38,9 +47,10 @@ enum CalendarSeriesEndRemoval {
     ///
     /// An edit whose end is decided from the two rules alone to be no earlier (`mayEndEarlier`: the
     /// stored end re-sent, or a later one) is nil before anything else is read, so a rename that
-    /// re-sends the rule never fails on what the count would need. Otherwise it throws `Unreadable`
-    /// when the stored rule, the series' first date, its zone or the edit's end can't be read or
-    /// expanded, and rethrows when the deleted occurrences can't be read.
+    /// re-sends the rule never fails on what the count would need. Otherwise it throws `AddedDates`
+    /// for a series with dates added on their own (`RDATE`), `Unreadable` when the stored rule, the
+    /// series' first date, its zone or the edit's end can't be read or expanded, and rethrows when
+    /// the deleted occurrences can't be read.
     static func removal(
         series: GCalEvent, seriesId: String, edit: GCalEventInput, calendarId: String, provider: any CalendarProvider
     ) async throws -> SeriesEndRemoval? {
@@ -52,9 +62,9 @@ enum CalendarSeriesEndRemoval {
         }
         guard mayEndEarlier(stored: storedLine, edited: editedRule) else { return nil }
         // Dates added to the series (`RDATE`) are not counted from the rule: refused rather than
-        // missed.
+        // missed, with its own error, as no retry reads them (#880).
         guard !(series.recurrence ?? []).contains(where: { $0.uppercased().hasPrefix("RDATE") }) else {
-            throw Unreadable(reason: "the repeating event has dates added to its rule, which this count does not read")
+            throw AddedDates()
         }
         let zone: TimeZone
         if series.isAllDay {
