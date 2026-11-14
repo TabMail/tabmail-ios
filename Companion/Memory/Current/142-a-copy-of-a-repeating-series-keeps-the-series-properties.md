@@ -770,3 +770,28 @@ rebuild): a split of a floating series queued in another zone wrote the new part
 override placed across a change of offset landed an hour off its occurrence; its times now name the series' zone, the
 new part its own `DTSTART` zone (`seriesStartZone`, else the series'). Test
 `keptOverrideAcrossAnOffsetChangeLandsInTheSeriesZone` (New York, across the 2099 daylight-time start).
+
+**Amendment (2026-11-13, #563, eleventh): a carried occurrence's slot honours the new part's end; the slot's zone is
+pinned per provider.** Review r2 (test coverage only) found two gaps. N1: `SplitCarry.slot` checked only the rule's
+days (`RecurrenceTail.firstDay` reads no `UNTIL`/`COUNT`), so a kept occurrence at the series' last place whose slot a
+day turn (or, on Google, a typed time) moved past the new part's `UNTIL` passed the plan, and Google's PATCH or
+Outlook's `/instances` lookup missed after the create. `slot` now returns nil past the end (`endsAtOrAfter`: `UNTIL`
+inclusive, a date its whole day, a UTC time an instant, a time with no zone a wall clock in the part's zone; `COUNT`
+by `RecurrenceTail.occurrences` before the slot's day, the start counted first as RFC 5545 counts it, which can only
+refuse one occurrence more than Outlook's numbered range counts). So a kept one refuses before the create (X1) and a
+reset's named one is reset (R). Outlook's `plannedPart` now reads its rule from the create body itself
+(`createJSON["recurrence"]` decoded as `MSPatternedRecurrence`, then `rrule`), so the plan sees the range the part
+is created with (a numbered range with what is left of its number, the end date it keeps), not the series'.
+Observed per provider while testing: CalDAV moves a UTC `UNTIL` with a typed time of day, so only a day turn passes
+it there; Google's and Outlook's matrices refuse as the plan says. T4: the slot's day and time are read in the new
+part's zone (`newPart.seriesZone ?? zone`). That zone differs from the series' only on Outlook with a new rule (the
+part is created in `recurrenceIdZone`); Google's new part always repeats in the series' zone (`mergeMasterAndPatch`
+sets `startTimeZone` from the master) and CalDAV's zoned copy keeps its own zone (`mergePatchKeepingLength` drops the
+patch's zone), so on those two the mutant `partZone = zone` is equivalent and their T4 tests pin the premise instead
+(the edit names New York, the part repeats in London, the kept override lands). Fakes made honest for ends: the
+Google fake's `onRule` reads `COUNT` (start the first), the Outlook test part lists a range's own end or number
+(numbered 60 only for a range with neither), and the CalDAV oracle `isOccurrence` reads `UNTIL` and `COUNT`. Tests:
+an End dimension (none, `UNTIL` at the last place, `COUNT`) in all three matrices (non-vacuity now 60 splits each);
+`keptAtTheLastPlaceUnderAnEndDateRefusesBeforeTheCreate` (Outlook), `keptAtTheLastPlaceUnderUntilRefusesBeforeTheCreate`
+(Google), `keptAtTheLastPlaceUnderUntilRefusesBeforeThePut` (CalDAV); `keptBetweenTwoZonesDaylightChangesLands` on
+each provider (London series, New York edit, 2099 daylight dates differing).

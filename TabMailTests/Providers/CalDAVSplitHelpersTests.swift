@@ -2647,16 +2647,45 @@ struct CalDAVSplitCarrySlotTests {
 
     /// Whether `rid` is an occurrence of the weekly series that starts at `start` with `rule`
     /// (RFC 5545 §3.3.10): `DTSTART` itself, or a later day the rule names in a week (from Monday)
-    /// the interval counts, at the start's time of day, in the start's value type.
+    /// the interval counts, at the start's time of day, in the start's value type, not after its
+    /// `UNTIL` (a UTC time or a date, inclusive) and within its `COUNT` (`DTSTART` the first).
     static func isOccurrence(_ rid: (instant: Date, date: Bool), start: (instant: Date, date: Bool), rule: String) -> Bool {
         guard rid.date == start.date else { return false }
         if rid.instant == start.instant { return true }
-        guard rid.instant > start.instant else { return false }
+        guard rid.instant > start.instant, onPattern(rid.instant, start: start.instant, rule: rule) else { return false }
+        let parts = ruleParts(rule)
+        if let until = parts["UNTIL"] {
+            let end = until.count == 8 ? FixedDateFormat.formatter("yyyyMMdd", timeZone: .gmt).date(from: until)?.addingTimeInterval(86_399)
+                : FixedDateFormat.formatter("yyyyMMdd'T'HHmmss'Z'", timeZone: .gmt).date(from: until)
+            guard let end, rid.instant <= end else { return false }
+        }
+        if let count = parts["COUNT"].flatMap({ Int($0) }) {
+            // The start, then each day before `rid`'s that the pattern names.
+            var before = 1
+            var day = start.instant.addingTimeInterval(86_400)
+            while day < rid.instant {
+                if onPattern(day, start: start.instant, rule: rule) { before += 1 }
+                day = day.addingTimeInterval(86_400)
+            }
+            guard before < count else { return false }
+        }
+        return true
+    }
+
+    private static func ruleParts(_ rule: String) -> [String: String] {
         var parts: [String: String] = [:]
         for part in rule.uppercased().replacingOccurrences(of: "RRULE:", with: "").split(separator: ";") {
             let kv = part.split(separator: "=", maxSplits: 1).map(String.init)
             if kv.count == 2 { parts[kv[0]] = kv[1] }
         }
+        return parts
+    }
+
+    /// Whether the weekly pattern of `rule` from `start` names `at`: its day, its week, its time of day.
+    private static func onPattern(_ at: Date, start: Date, rule: String) -> Bool {
+        let rid = (instant: at, date: false)
+        let start = (instant: start, date: false)
+        let parts = ruleParts(rule)
         guard parts["FREQ"] == "WEEKLY" else { Issue.record("the oracle reads weekly rules only: \(rule)"); return false }
         let interval = Int(parts["INTERVAL"] ?? "1") ?? 1
         var calendar = Calendar(identifier: .gregorian)
@@ -2710,10 +2739,19 @@ struct CalDAVSplitCarrySlotTests {
         }
     }
 
-    @Test("C1 on CalDAV: every carried override names an occurrence of the new part, or the split is refused before any PUT, for every shift, rule, kind and carried occurrence")
+    @Test("C1 on CalDAV: every carried override names an occurrence of the new part, or the split is refused before any PUT, for every shift, rule, kind, series end and carried occurrence")
     func carriedOverridesLandOrRefuseBeforeThePut() async throws {
         enum Shift: String, CaseIterable { case none, typed, dayTurn }
         enum Carried: String, CaseIterable { case kept, named, namedMovedEarlier, edited }
+        // The series' end: none, an UNTIL at its day-21 occurrence, or a COUNT of four (day 21 the last).
+        enum End: String, CaseIterable { case none, until, count }
+        func rule(_ end: End) -> String {
+            switch end {
+            case .none: return "RRULE:FREQ=WEEKLY"
+            case .until: return "RRULE:FREQ=WEEKLY;UNTIL=\(Self.compact(Self.day(21), "09:00:00"))"
+            case .count: return "RRULE:FREQ=WEEKLY;COUNT=4"
+            }
+        }
         // Weekly on Mondays at 09:00 from day 0. Each scene: the occurrence named (where it starts
         // now), the overrides, and a kept one's start.
         func scene(_ carried: Carried) -> (shown: String, overrides: [(place: String, start: String, end: String, title: String)], kept: String?) {
@@ -2734,12 +2772,13 @@ struct CalDAVSplitCarrySlotTests {
             return FixedDateFormat.formatter("yyyy-MM-dd", timeZone: .gmt).string(from: at)
         }
         var landed = 0
+        for end in End.allCases {
         for shift in Shift.allCases {
             for newRule in [false, true] {
                 for kindChange in [false, true] {
                     if kindChange, shift == .typed { continue }
                     for carried in Carried.allCases {
-                        let label = "\(shift.rawValue) newRule=\(newRule) kindChange=\(kindChange) \(carried.rawValue)"
+                        let label = "\(end.rawValue) \(shift.rawValue) newRule=\(newRule) kindChange=\(kindChange) \(carried.rawValue)"
                         let s = scene(carried)
                         let targetDay = shift == .dayTurn ? next(s.shown) : s.shown
                         var patch = GCalEventInput()
@@ -2756,13 +2795,17 @@ struct CalDAVSplitCarrySlotTests {
                         } else if shift == .dayTurn, let from = RecurrenceTail.Day(iso: s.shown), let to = RecurrenceTail.Day(iso: targetDay) {
                             patch.ruleDayMove = RecurrenceDayShift.Move(from: from, to: to)
                         }
-                        let r = await Self.split(Self.series(rule: "RRULE:FREQ=WEEKLY", overrides: s.overrides),
+                        let r = await Self.split(Self.series(rule: rule(end), overrides: s.overrides),
                                                  recurrenceId: "\(s.shown)T09:00:00", patch: patch)
                         // THE property: no override of the new part names an occurrence it does not have.
                         if let error = r.error {
                             #expect(r.puts.isEmpty, "\(label): refused AFTER a PUT: \(error); \(r.puts)")
                         }
-                        let refusal: String? = carried == .kept && (newRule || kindChange) ? SplitCarry.keptHasNoSlotRefusal
+                        // A day turn moves the kept one's slot past an UNTIL at its place (N1); the
+                        // split moves a UTC UNTIL to the new part's time of day, and a COUNT moves
+                        // with the part.
+                        let pastEnd = end == .until && shift == .dayTurn
+                        let refusal: String? = carried == .kept && (newRule || kindChange || pastEnd) ? SplitCarry.keptHasNoSlotRefusal
                             : carried == .edited && kindChange ? SplitCarry.editedKindRefusal : nil
                         if let refusal {
                             guard case CalendarProviderError.notSupported(let message)? = r.error else {
@@ -2772,6 +2815,9 @@ struct CalDAVSplitCarrySlotTests {
                             #expect(message == refusal, "\(label): \(message)")
                             continue
                         }
+                        // The one named moved earlier onto the series' last place, its new part
+                        // moved past its own UNTIL: THE property above is all that is asked.
+                        if pastEnd, carried == .namedMovedEarlier { continue }
                         #expect(r.error == nil, "\(label): \(String(describing: r.error))")
                         guard r.error == nil, let newPart = r.newPart else { continue }
                         landed += 1
@@ -2784,7 +2830,64 @@ struct CalDAVSplitCarrySlotTests {
                 }
             }
         }
-        #expect(landed >= 20, "non-vacuity: only \(landed) splits were written")
+        }
+        #expect(landed >= 60, "non-vacuity: only \(landed) splits were written")
+    }
+
+    @Test("N1 on CalDAV: a kept override at the series' last place, whose slot a day turn moves past the UNTIL, refuses before any PUT")
+    func keptAtTheLastPlaceUnderUntilRefusesBeforeThePut() async throws {
+        // Weekly on Mondays until day 21; the day-21 occurrence moved to Saturday day 13, before the
+        // one named on day 14, which moves to Tuesday with the rule's day: its slot, day 22, is past
+        // the end.
+        let ics = Self.series(rule: "RRULE:FREQ=WEEKLY;UNTIL=\(Self.compact(Self.day(21), "09:00:00"))", overrides: [
+            (Self.compact(Self.day(21), "09:00:00"), Self.compact(Self.day(13), "12:00:00"), Self.compact(Self.day(13), "12:30:00"), "Moved earlier"),
+        ])
+        var patch = GCalEventInput()
+        patch.startDateTime = "\(Self.day(15))T09:00:00Z"
+        patch.startTimeZone = "UTC"
+        patch.ruleDayMove = RecurrenceDayShift.Move(from: try #require(RecurrenceTail.Day(iso: Self.day(14))),
+                                                    to: try #require(RecurrenceTail.Day(iso: Self.day(15))))
+        let r = await Self.split(ics, recurrenceId: "\(Self.day(14))T09:00:00", patch: patch)
+        guard case CalendarProviderError.notSupported(let message)? = r.error else {
+            Issue.record("not refused: \(String(describing: r.error)); \(r.newPart ?? "")")
+            return
+        }
+        #expect(message == SplitCarry.keptHasNoSlotRefusal, "\(message)")
+        #expect(r.puts.isEmpty, "refused after a PUT: \(r.puts)")
+    }
+
+    @Test("T4 on CalDAV: a kept override between two zones' daylight changes lands on the new part's occurrence; a zoned new part stays in the series' zone even when the edit names another")
+    func keptBetweenTwoZonesDaylightChangesLands() async throws {
+        // Weekly on Mondays at 09:00 London from 2099-03-02 (UK summer time starts 2099-03-29, US
+        // daylight time 2099-03-08). The occurrence placed on 2099-03-16 (09:00 London = 09:00 UTC)
+        // was moved to Sunday 2099-03-01 12:00, before the one named on 2099-03-02. The edit gives
+        // the same instant in New York; a zoned copy keeps its own zone (`mergePatchKeepingLength`),
+        // so the new part repeats at 09:00 London, and its 2099-03-16 occurrence is 09:00 UTC (read
+        // in New York, 04:00 there in daylight time, it would be 08:00 UTC).
+        let ics = [
+            "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//TabMail//Test//EN",
+            "BEGIN:VEVENT", "UID:carry-zones", "DTSTAMP:20990101T000000Z",
+            "DTSTART;TZID=Europe/London:20990302T090000", "DTEND;TZID=Europe/London:20990302T093000",
+            "SUMMARY:Standup", "RRULE:FREQ=WEEKLY", "END:VEVENT",
+            "BEGIN:VEVENT", "UID:carry-zones", "DTSTAMP:20990101T000000Z", "RECURRENCE-ID;TZID=Europe/London:20990316T090000",
+            "DTSTART;TZID=Europe/London:20990301T120000", "DTEND;TZID=Europe/London:20990301T123000",
+            "SUMMARY:Moved earlier", "END:VEVENT",
+            "END:VCALENDAR",
+        ].joined(separator: "\r\n")
+        let london = try #require(TimeZone(identifier: "Europe/London"))
+        var patch = GCalEventInput()
+        patch.summary = "Renamed"
+        patch.startDateTime = "2099-03-02T09:00:00Z"
+        patch.startTimeZone = "America/New_York"
+        let r = await Self.split(ics, recurrenceId: "2099-03-02T09:00:00", zone: london, patch: patch)
+        if let error = r.error {
+            #expect(r.puts.isEmpty, "refused after a PUT: \(error); \(r.puts)")
+            return
+        }
+        let newPart = try #require(r.newPart, "no new part was written: \(r.puts)")
+        #expect(newPart.contains("DTSTART;TZID=Europe/London:20990302T090000"), "the new part does not start at 09:00 London: \(newPart)")
+        #expect(newPart.contains("RECURRENCE-ID;TZID=Europe/London:20990316T090000"), "the kept override is off the new part's occurrence: \(newPart)")
+        #expect(newPart.contains("DTSTART;TZID=Europe/London:20990301T120000"), "the kept occurrence no longer shows where it did: \(newPart)")
     }
 
     @Test("a rule change from an earlier occurrence resets a later changed occurrence off the new rule: the new part holds no override off its rule (#610)")

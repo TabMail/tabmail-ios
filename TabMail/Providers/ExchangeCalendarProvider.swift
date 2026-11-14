@@ -574,7 +574,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // can't be read is refused before the new part is created.
         let carriedIds = try Self.dateSplitMoves(
             parts: parts, mode: mode, namedStart: namedStart, namedPlace: namedPlace, cut: splitPlace, series: master, zone: zone,
-            newPart: try Self.plannedPart(master: master, patch: partPatch, place: place, zone: recurrenceIdZone),
+            newPart: try Self.plannedPart(master: master, patch: partPatch, place: place, zone: recurrenceIdZone, createJSON: createJSON),
             fields: SplitCarry.fields(of: partPatch))
         // What the split copies onto the new part and onto each changed occurrence it carries,
         // decided before anything is written (`copyPlan`). A linked file (a reference attachment:
@@ -1107,17 +1107,20 @@ actor ExchangeCalendarProvider: CalendarProvider {
     }
 
     /// The new part a split creates, as far as its writes after it need it: its start and end, as
-    /// the create body gives them (`mergeMasterAndPatch`, as `splitNewPartJSON` dates them), and the
-    /// rule and zone it repeats by: the edit's rule, else the series' with its days turned by a
-    /// move to another day (`newPartRecurrence`), in the series' range zone. Throws as the create
-    /// body does when the days can't be turned.
-    nonisolated static func plannedPart(master: GCalEvent, patch: GCalEventInput, place: String, zone: TimeZone) throws -> GCalEvent {
+    /// the create body gives them (`mergeMasterAndPatch`, as `splitNewPartJSON` dates them), the
+    /// rule it repeats by, read from the create body `createJSON` as a read of the part gives it
+    /// (`rrule`: the edit's rule, else the series' pattern with its days turned by a move to another
+    /// day and its range ending where the new part does, a numbered one with what is left of its
+    /// number, `newPartRecurrence`), and the zone it repeats in: the series' range zone, unless the
+    /// edit gives the rule. Throws when the create body's recurrence can't be read.
+    nonisolated static func plannedPart(
+        master: GCalEvent, patch: GCalEventInput, place: String, zone: TimeZone, createJSON: [String: Any]
+    ) throws -> GCalEvent {
         let times = GoogleCalendarProvider.mergeMasterAndPatch(
             master: master, patch: patch, newStartNaiveISO: place, newStartZone: zone, newRecurrence: [])
         let given = patch.recurrence?.isEmpty == false
-        var rules = given ? patch.recurrence : master.recurrence?.filter { $0.uppercased().hasPrefix("RRULE:") }
-        if !given, let move = patch.ruleDayMove {
-            rules = try rules?.map { try RecurrenceDayShift.shifted($0, by: move) }
+        let rules = try createJSON["recurrence"].map { recurrence in
+            rrule(try JSONDecoder().decode(MSPatternedRecurrence.self, from: try JSONSerialization.data(withJSONObject: recurrence)))
         }
         var part = GCalEvent(
             id: nil, summary: nil, location: nil, description: nil,

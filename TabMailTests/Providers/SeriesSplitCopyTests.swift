@@ -592,14 +592,17 @@ struct ExchangeSplitCarryTests {
     /// The occurrences of the new part `created` (`<id>-w<week>`) at the series' weeks `weeks`
     /// (counted from its first occurrence), where the part as created places them, as Graph lists
     /// them once it is made: its pattern applied from its range's start
-    /// (`FakeGraphCalendar.rangeDays`), at its own time of day in the zone it repeats in (its
-    /// range's, else its start's). A new part moved, repeating on other days, or of the other kind
+    /// (`FakeGraphCalendar.rangeDays`, to the range's end date or number), at its own time of day
+    /// in the zone it repeats in (its range's, else its start's). A new part moved, repeating on other days, or of the other kind
     /// has its occurrences where it says, not at the series' places.
     static func partOccurrences(_ created: [String: Any], weeks: [Int]) -> [[String: Any]] {
         guard let id = created["id"] as? String, var recurrence = created["recurrence"] as? [String: Any],
               var range = recurrence["range"] as? [String: Any] else { return [] }
-        range["type"] = "numbered"
-        range["numberOfOccurrences"] = 60
+        // A range with no end lists as far as the weeks asked for go; one with an end ends there.
+        if range["type"] as? String != "numbered", range["type"] as? String != "endDate" {
+            range["type"] = "numbered"
+            range["numberOfOccurrences"] = 60
+        }
         recurrence["range"] = range
         var counted = created
         counted["recurrence"] = recurrence
@@ -661,10 +664,11 @@ struct ExchangeSplitCarryTests {
     }
 
     /// Splits `ser-1` named at its exception `named` (one of `exceptions`), which starts at `start`
-    /// now.
+    /// now, read in `zone`.
     private func split(
         named: String, start: Date, exceptions: [[String: Any]], parts: [Int], patch: GCalEventInput,
-        series: [String: Any] = GraphSplitFixture.series(range: GraphSplitFixture.noEnd), graph given: FakeGraphCalendar? = nil
+        series: [String: Any] = GraphSplitFixture.series(range: GraphSplitFixture.noEnd), graph given: FakeGraphCalendar? = nil,
+        zone: TimeZone = .current
     ) async throws -> Run {
         let graph = given ?? Self.calendar([series] + exceptions, parts: parts)
         let http = FakeHTTP.Scenario()
@@ -687,7 +691,7 @@ struct ExchangeSplitCarryTests {
         var thrown: Error?
         do {
             _ = try await provider.splitSeries(
-                eventId: named, recurrenceId: GraphFixture.wall(start, in: GraphSplitFixture.zone), recurrenceIdZone: .current,
+                eventId: named, recurrenceId: GraphFixture.wall(start, in: zone.identifier), recurrenceIdZone: zone,
                 patch: patch, record: records.recorder)
         } catch {
             thrown = error
@@ -794,7 +798,20 @@ struct ExchangeSplitCarryTests {
         GraphFixture.wall(date, in: (CalendarTimeZoneResolver.zone(named: "Pacific Standard Time", in: .none) ?? .gmt).identifier).prefix(10).description
     }
 
-    @Test("C1: a carried occurrence lands on an occurrence the new part has, or the split is refused or reset before the create, for every shift, rule, kind and carried occurrence")
+    /// How the series ends (C1, N1): never, or with week 3 (the place the kept occurrence is placed
+    /// at) by an end date or by a number of occurrences.
+    enum End: String, CaseIterable { case none, until, count }
+
+    /// The series' range for `end`: an end date is the day of week 3 in the range's zone.
+    private static func range(_ end: End) -> [String: Any] {
+        switch end {
+        case .none: return GraphSplitFixture.noEnd
+        case .until: return ["type": "endDate", "endDate": seriesDay(week(3)), "numberOfOccurrences": 0]
+        case .count: return ["type": "numbered", "endDate": "0001-01-01", "numberOfOccurrences": 4]
+        }
+    }
+
+    @Test("C1: a carried occurrence lands on an occurrence the new part has, or the split is refused or reset before the create, for every shift, rule, kind, end and carried occurrence")
     func carriedOccurrencesLandOrRefuseBeforeTheCreate() async throws {
         var landed = 0
         for shift in Shift.allCases {
@@ -803,7 +820,8 @@ struct ExchangeSplitCarryTests {
                     // A change of kind moves the new part by whole days: a typed hour is no shift of its own.
                     if kindChange, shift == .typed { continue }
                     for carried in Carried.allCases {
-                        let label = "\(shift.rawValue) newRule=\(newRule) kindChange=\(kindChange) \(carried.rawValue)"
+                    for end in End.allCases {
+                        let label = "\(shift.rawValue) newRule=\(newRule) kindChange=\(kindChange) \(carried.rawValue) end=\(end.rawValue)"
                         let scene = Self.scenario(carried)
                         var target = scene.start
                         if shift == .typed { target = target.addingTimeInterval(3_600) }
@@ -823,16 +841,19 @@ struct ExchangeSplitCarryTests {
                             patch.ruleDayMove = RecurrenceDayShift.Move(from: from, to: to)
                         }
                         let r = try await split(named: scene.named, start: scene.start, exceptions: scene.exceptions,
-                                                parts: Array(0...8), patch: patch)
+                                                parts: Array(0...8), patch: patch, series: GraphSplitFixture.series(range: Self.range(end)))
                         defer { r.http.close() }
                         // THE property: no write of the split fails after the new part is created.
                         if let error = r.error {
                             #expect(r.graph.created.isEmpty, "\(label): refused AFTER the create: \(error); \(r.http.servedCallSequence())")
                         }
                         // What each case comes to (the owner's rules): a kept occurrence with no
-                        // occurrence on the new part refuses; a change of kind with one left on the
-                        // old part refuses; everything else is written.
-                        let refusal: String? = carried == .kept && (newRule || kindChange) ? SplitCarry.keptHasNoSlotRefusal
+                        // occurrence on the new part refuses, a turned day moving it past the end
+                        // date among them (N1: an end date takes its whole day, so a typed hour
+                        // does not; a number moves with the part); a change of kind with one left
+                        // on the old part refuses; everything else is written.
+                        let pastEnd = end == .until && shift == .dayTurn
+                        let refusal: String? = carried == .kept && (newRule || kindChange || pastEnd) ? SplitCarry.keptHasNoSlotRefusal
                             : carried == .edited && kindChange ? SplitCarry.editedKindRefusal : nil
                         if let refusal {
                             guard case CalendarProviderError.notSupported(let message)? = r.error else {
@@ -842,6 +863,9 @@ struct ExchangeSplitCarryTests {
                             #expect(message == refusal, "\(label): \(message)")
                             continue
                         }
+                        // The one named moved earlier onto the series' last week, its new part
+                        // moved a day past the end date: THE property above is all that is asked.
+                        if pastEnd, carried == .namedMovedEarlier { continue }
                         #expect(r.error == nil, "\(label): \(String(describing: r.error)); \(r.http.servedCallSequence())")
                         guard r.error == nil else { continue }
                         landed += 1
@@ -852,10 +876,11 @@ struct ExchangeSplitCarryTests {
                             #expect(Self.instant(kept?["start"]) == shown, "\(label): the kept occurrence: \(kept ?? [:])")
                         }
                     }
+                    }
                 }
             }
         }
-        #expect(landed >= 20, "non-vacuity: only \(landed) splits were written")
+        #expect(landed >= 60, "non-vacuity: only \(landed) splits were written")
     }
 
     @Test("C1: a typed start and a new rule with a kept occurrence and a named one moved earlier: written on the new part's own occurrences, or refused before the create")
@@ -893,6 +918,85 @@ struct ExchangeSplitCarryTests {
         let d = try await split(named: moved.named, start: moved.start, exceptions: moved.exceptions, parts: [3, 4, 5], patch: fortnightly)
         defer { d.http.close() }
         #expect(d.error == nil, "\(String(describing: d.error)); \(d.http.servedCallSequence())")
+    }
+
+    @Test("N1: a kept occurrence at the series' last place, the new part moved a day on past the end date, is refused before the create, not missed after it")
+    func keptAtTheLastPlaceUnderAnEndDateRefusesBeforeTheCreate() async throws {
+        let scene = Self.scenario(.kept)
+        var patch = Self.rename
+        let target = scene.start.addingTimeInterval(86_400)
+        patch.startDateTime = target.iso8601String()
+        patch.startTimeZone = "UTC"
+        if let from = RecurrenceTail.Day(iso: Self.seriesDay(scene.start)), let to = RecurrenceTail.Day(iso: Self.seriesDay(target)) {
+            patch.ruleDayMove = RecurrenceDayShift.Move(from: from, to: to)
+        }
+        let r = try await split(named: scene.named, start: scene.start, exceptions: scene.exceptions, parts: Array(0...8), patch: patch,
+                                series: GraphSplitFixture.series(range: Self.range(.until)))
+        defer { r.http.close() }
+        #expect(r.graph.created.isEmpty, "created after all: \(r.http.servedCallSequence())")
+        guard case CalendarProviderError.notSupported(let message)? = r.error else {
+            Issue.record("not refused: \(String(describing: r.error)); \(r.http.servedCallSequence())")
+            return
+        }
+        #expect(message == SplitCarry.keptHasNoSlotRefusal, "\(message)")
+    }
+
+    @Test("T4: a kept occurrence between two zones' daylight-time changes lands on the new part's occurrence, the new part repeating in the zone the split names, not the series'")
+    func keptBetweenTwoZonesDaylightChangesLands() async throws {
+        // Weekly on Mondays at 09:00 London from 2099-03-02. New York's daylight time starts on
+        // 2099-03-08, London's on 2099-03-29. The occurrence placed on 2099-03-16 was moved to
+        // Sunday 2099-03-01 12:00, before the one named on 2099-03-02: it is kept, whole.
+        let london = try #require(TimeZone(identifier: "Europe/London"))
+        let newYork = try #require(TimeZone(identifier: "America/New_York"))
+        func at(_ wall: String, _ zone: TimeZone) throws -> Date { try #require(EKEventStoreHelper.parseNaiveISO(wall, timeZone: zone)) }
+        var series = GraphSplitFixture.series(range: GraphSplitFixture.noEnd)
+        series["start"] = ["dateTime": "2099-03-02T09:00:00.0000000", "timeZone": "GMT Standard Time"]
+        series["end"] = ["dateTime": "2099-03-02T09:30:00.0000000", "timeZone": "GMT Standard Time"]
+        series["recurrence"] = [
+            "pattern": ["type": "weekly", "interval": 1, "month": 0, "dayOfMonth": 0, "daysOfWeek": ["monday"],
+                        "firstDayOfWeek": "monday", "index": "first"],
+            "range": ["type": "noEnd", "startDate": "2099-03-02", "endDate": "0001-01-01",
+                      "recurrenceTimeZone": "GMT Standard Time", "numberOfOccurrences": 0],
+        ]
+        let shown = try at("2099-03-01T12:00:00", london)
+        var kept = GraphFixture.event(id: "ser-1-occ-k", start: shown, online: false, seriesMasterId: "ser-1")
+        kept["originalStart"] = GraphFixture.rfc3339(try at("2099-03-16T09:00:00", london))
+        // The new part's occurrences, as Graph lists them once it is made: its pattern from its
+        // range's start, at its own time of day in the zone it repeats in.
+        let named = GraphFixture.event(id: "ser-1-occ-n", start: try at("2099-03-02T09:00:00", london), online: false, seriesMasterId: "ser-1")
+        let graph = FakeGraphCalendar([series, named, kept])
+        graph.occurrencesOnCreate { created in
+            guard let id = created["id"] as? String, var recurrence = created["recurrence"] as? [String: Any],
+                  var range = recurrence["range"] as? [String: Any] else { return [] }
+            range["type"] = "numbered"
+            range["numberOfOccurrences"] = 6
+            recurrence["range"] = range
+            var counted = created
+            counted["recurrence"] = recurrence
+            let zoneName = range["recurrenceTimeZone"] as? String ?? (created["start"] as? [String: Any])?["timeZone"] as? String ?? "UTC"
+            guard let days = FakeGraphCalendar.rangeDays(counted), let zone = CalendarTimeZoneResolver.zone(named: zoneName, in: .none),
+                  let start = Self.instant(created["start"]) else { return [] }
+            let time = GraphFixture.wall(start, in: zone.identifier).dropFirst(11)
+            return days.compactMap { day in
+                EKEventStoreHelper.parseNaiveISO("\(day)T\(time)", timeZone: zone).map {
+                    GraphFixture.event(id: "\(id)-\(day)", start: $0, online: false, seriesMasterId: id)
+                }
+            }
+        }
+        // A new rule (the same days), named in New York: the new part is created in New York's zone.
+        var patch = Self.rename
+        patch.recurrence = ["RRULE:FREQ=WEEKLY;BYDAY=MO"]
+        let r = try await split(named: "ser-1-occ-n", start: try at("2099-03-02T09:00:00", london), exceptions: [kept], parts: [],
+                                patch: patch, series: series, graph: graph, zone: newYork)
+        defer { r.http.close() }
+        // THE property: it lands on an occurrence the new part has, or nothing is created.
+        guard r.error == nil else {
+            #expect(r.graph.created.isEmpty, "refused AFTER the create: \(String(describing: r.error)); \(r.http.servedCallSequence())")
+            return
+        }
+        let partId = try #require(r.graph.created.first?["id"] as? String, "no new part: \(r.http.servedCallSequence())")
+        let onPart = r.graph.event("\(partId)-2099-03-16")
+        #expect(Self.instant(onPart?["start"]) == shown, "the kept occurrence is not on the new part where it was shown: \(onPart ?? [:]); \(r.http.servedCallSequence())")
     }
 
     @Test("T3: a carried move that can't be dated is refused while the split is planned, before the create")

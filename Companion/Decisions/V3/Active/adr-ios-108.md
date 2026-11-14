@@ -242,6 +242,12 @@ of the resource, which holds every occurrence (irreversible wire operation #5, n
   weekly oracle. A floating value is now written in the zone it is read in (the operation's,
   `zones.floating`), and the slot reads the new part's time of day in the series' zone, not UTC.
   Memory 142, tenth amendment.
+  **Amended again 2026-11-13 (#563):** a slot past the new part's end (`UNTIL` or `COUNT`,
+  `SplitCarry.slot` via `endsAtOrAfter`) is no slot, so a kept override there refuses before any PUT
+  (X1) and a reset's named one is reset; on CalDAV only a day turn reaches this, since the split moves
+  a UTC `UNTIL` with a typed time of day. A zoned new part keeps the series' zone even when the edit
+  names another (`mergePatchKeepingLength`), so its slots are read in that zone. Memory 142, eleventh
+  amendment.
 - The series id with a moved occurrence's new time edits that occurrence in place, and with its old
   place is not found, the same as on Google, whose resolver finds no instance there.
 - A retry after a lost response is reported not found, with nothing written, when the first attempt

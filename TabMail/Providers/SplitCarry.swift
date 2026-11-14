@@ -359,7 +359,8 @@ enum SplitCarry {
     /// that its rule does not name is never a slot (`.patternStart`): RFC 5545 §3.3.10 leaves such
     /// a recurrence set undefined, so whether the calendar lists an occurrence there is not known.
     /// Nil when there is none: the new part is of the other kind (all-day or timed), its rule
-    /// names no occurrence there, or a time or the rule can't be read.
+    /// names no occurrence there or has ended before it (its `UNTIL` or `COUNT`,
+    /// `endsAtOrAfter`), or a time or the rule can't be read.
     static func slot(
         of place: GCalDateTime, cut: GCalDateTime, newPart: GCalEvent, series: GCalEvent, zone: TimeZone?,
         missingDay: RecurrenceTail.MissingMonthDay = .skip
@@ -393,7 +394,44 @@ enum SplitCarry {
                   RecurrenceTail.firstDay(of: rule, seriesStart: first, onOrAfter: target, anchor: .patternStart, missingDay: missingDay) == .day(target)
             else { return nil }
         }
-        return out(slotDay)
+        guard let slot = out(slotDay),
+              endsAtOrAfter(newPart, slot: slot, slotDay: slotDay, startDay: startDay, zone: zone, missingDay: missingDay) else { return nil }
+        return slot
+    }
+
+    /// Whether the new part `newPart` (starting on `startDay`) has not ended by its occurrence
+    /// `slot` on `slotDay`, a day its rule names: by its rule's `UNTIL` (inclusive; a date names
+    /// its whole day, a UTC time an instant, a time with no zone a wall clock in the zone the part
+    /// repeats in, `zone` when it names none) or its `COUNT` (the occurrences from its start
+    /// before `slotDay` fewer than the count, its start counted as the first as RFC 5545 counts
+    /// it, which can only count one more than Outlook's range does). A rule with neither has not.
+    /// False when the end can't be read: no slot.
+    private static func endsAtOrAfter(
+        _ newPart: GCalEvent, slot: GCalDateTime, slotDay: String, startDay: String, zone: TimeZone?,
+        missingDay: RecurrenceTail.MissingMonthDay
+    ) -> Bool {
+        guard let rule = newPart.recurrence?.first(where: isRule) else { return true }
+        let parts = rule.uppercased().dropFirst("RRULE:".count).split(separator: ";").map(String.init)
+        guard let target = RecurrenceTail.Day(iso: slotDay) else { return false }
+        if let count = parts.first(where: { $0.hasPrefix("COUNT=") }) {
+            guard let total = Int(count.dropFirst("COUNT=".count)), let first = RecurrenceTail.Day(iso: startDay),
+                  let before = RecurrenceTail.occurrences(of: rule, seriesStart: first, before: target, missingDay: missingDay)
+            else { return false }
+            return before < total
+        }
+        guard let until = parts.first(where: { $0.hasPrefix("UNTIL=") }).map({ String($0.dropFirst("UNTIL=".count)) }) else { return true }
+        if until.count == 8 || slot.date != nil {
+            guard let last = RecurrenceTail.Day(ical: until) else { return false }
+            return target <= last
+        }
+        guard let at = slot.dateTime.flatMap(Date.fromISO8601) else { return false }
+        if until.hasSuffix("Z") {
+            guard let end = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss'Z'", timeZone: .gmt).date(from: until) else { return false }
+            return at <= end
+        }
+        guard let zone = newPart.seriesZone ?? zone,
+              let end = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss", timeZone: zone).date(from: until) else { return false }
+        return at <= end
     }
 
     /// Whether two series' rules repeat alike: the same parts but where they end (`UNTIL`,

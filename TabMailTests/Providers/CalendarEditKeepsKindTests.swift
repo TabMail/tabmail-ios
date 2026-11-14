@@ -344,7 +344,7 @@ final class FakeGoogleCalendar: Sendable {
     /// Whether the series `series` places an occurrence where `occurrence` (built by `anyInstance`)
     /// starts: on a day its rule names from its start, at its own time of day in its own zone. Read
     /// here, apart from the code under test, for `FREQ=DAILY` and `FREQ=WEEKLY` (`INTERVAL`,
-    /// `BYDAY`, weeks from Monday, `UNTIL`); a rule of any other frequency is not checked.
+    /// `BYDAY`, weeks from Monday, `UNTIL`, `COUNT`); a rule of any other frequency is not checked.
     private static func onRule(_ series: [String: Any], occurrence: [String: Any]) -> Bool {
         guard let rule = (series["recurrence"] as? [String])?.first(where: { $0.uppercased().hasPrefix("RRULE:") }) else { return false }
         var parts: [String: String] = [:]
@@ -383,13 +383,24 @@ final class FakeGoogleCalendar: Sendable {
             if until.count == 8 ? day(target) > end : target > end { return false }
         }
         let interval = Int(parts["INTERVAL"] ?? "1") ?? 1
-        guard freq == "WEEKLY" else { return days % interval == 0 }
         let codes = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"]
         let weekday = { (date: Date) in codes[cal.component(.weekday, from: date) - 1] }
         let named = parts["BYDAY"].map { Set($0.split(separator: ",").map(String.init)) } ?? [weekday(first)]
         // Weeks start on Monday (`WKST` is not read): the week holding the series' start is week 0.
         let fromMonday = (cal.component(.weekday, from: first) + 5) % 7
-        return named.contains(weekday(target)) && ((days + fromMonday) / 7) % interval == 0
+        // Whether the day `offset` days after the start's is one the rule names.
+        func isOn(_ offset: Int) -> Bool {
+            guard freq == "WEEKLY" else { return offset % interval == 0 }
+            guard let date = cal.date(byAdding: .day, value: offset, to: day(first)) else { return false }
+            return named.contains(weekday(date)) && ((offset + fromMonday) / 7) % interval == 0
+        }
+        guard isOn(days) else { return false }
+        // `COUNT`: the start is the first occurrence (RFC 5545), so the target is one more than the
+        // days the rule names between them.
+        if let count = parts["COUNT"].flatMap({ Int($0) }) {
+            return days == 0 || 1 + (1..<days).filter(isOn).count < count
+        }
+        return true
     }
 
     /// `instance` before its rule is checked.

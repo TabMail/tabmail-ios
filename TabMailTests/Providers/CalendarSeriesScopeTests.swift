@@ -1443,14 +1443,18 @@ struct CalendarEditToolSeriesScopeTests {
         #expect(r.calendar.event("\(partId)_\(compact(day(20)))T090000Z") == nil, "an occurrence at the named start was kept whole")
     }
 
-    @Test("Google C1: a carried occurrence lands on an occurrence the new part has, or the split is refused or reset before the create, for every shift, rule, kind and carried occurrence")
+    @Test("Google C1: a carried occurrence lands on an occurrence the new part has, or the split is refused or reset before the create, for every shift, rule, kind, end and carried occurrence")
     func googleCarriedOccurrencesLandOrRefuseBeforeTheCreate() async throws {
         enum Shift: String, CaseIterable { case none, typed, dayTurn }
         enum Carried: String, CaseIterable { case kept, named, namedMovedEarlier, edited }
+        // How the series ends: never, or on day 21 (its place the kept one is placed at) by UNTIL
+        // or by COUNT.
+        enum End: String, CaseIterable { case none, until, count }
         // Weekly on its weekday at 09:00 UTC from day 0. Each scene: the occurrence named (its
         // place, the day it starts on now), the series' exceptions, and a kept one's start.
-        func scene(_ carried: Carried) -> (place: String, shown: String, seed: [[String: Any]], kept: String?) {
-            let series = GoogleSeries.series(rule: GoogleSeries.onItsWeekday)
+        func scene(_ carried: Carried, _ end: End) -> (place: String, shown: String, seed: [[String: Any]], kept: String?) {
+            let ends = ["none": "", "until": ";UNTIL=\(compact(day(21)))T090000Z", "count": ";COUNT=4"][end.rawValue] ?? ""
+            let series = GoogleSeries.series(rule: GoogleSeries.onItsWeekday + ends)
             switch carried {
             case .kept:
                 return (day(14), day(14), [series, GoogleSeries.instance(day(14)),
@@ -1475,8 +1479,9 @@ struct CalendarEditToolSeriesScopeTests {
                 for kindChange in [false, true] {
                     if kindChange, shift == .typed { continue }
                     for carried in Carried.allCases {
-                        let label = "\(shift.rawValue) newRule=\(newRule) kindChange=\(kindChange) \(carried.rawValue)"
-                        let s = scene(carried)
+                    for end in End.allCases {
+                        let label = "\(shift.rawValue) newRule=\(newRule) kindChange=\(kindChange) \(carried.rawValue) end=\(end.rawValue)"
+                        let s = scene(carried, end)
                         let targetDay = shift == .dayTurn ? next(s.shown) : s.shown
                         var patch = GCalEventInput()
                         patch.summary = "Renamed"
@@ -1499,7 +1504,10 @@ struct CalendarEditToolSeriesScopeTests {
                         if let error = r.error {
                             #expect(!created, "\(label): refused AFTER the create: \(error); \(r.calendar.writes)")
                         }
-                        let refusal: String? = carried == .kept && (newRule || kindChange) ? SplitCarry.keptHasNoSlotRefusal
+                        // A shift moves the kept one's slot past an UNTIL at its place (N1); a COUNT
+                        // moves with it.
+                        let pastEnd = end == .until && shift != .none
+                        let refusal: String? = carried == .kept && (newRule || kindChange || pastEnd) ? SplitCarry.keptHasNoSlotRefusal
                             : carried == .edited && kindChange ? SplitCarry.editedKindRefusal : nil
                         if let refusal {
                             guard case CalendarProviderError.notSupported(let message)? = r.error else {
@@ -1509,6 +1517,9 @@ struct CalendarEditToolSeriesScopeTests {
                             #expect(message == refusal, "\(label): \(message)")
                             continue
                         }
+                        // The one named moved earlier onto the series' last place, its new part
+                        // moved past its own UNTIL: THE property above is all that is asked.
+                        if pastEnd, carried == .namedMovedEarlier { continue }
                         #expect(r.error == nil, "\(label): \(String(describing: r.error)); \(r.calendar.writes)")
                         guard r.error == nil else { continue }
                         landed += 1
@@ -1524,10 +1535,64 @@ struct CalendarEditToolSeriesScopeTests {
                                     "\(label): the kept occurrence is not on the new part where it was shown: \(onPart)")
                         }
                     }
+                    }
                 }
             }
         }
-        #expect(landed >= 20, "non-vacuity: only \(landed) splits were written")
+        #expect(landed >= 60, "non-vacuity: only \(landed) splits were written")
+    }
+
+    @Test("Google N1: a kept occurrence at the series' last place under UNTIL, the new part moved an hour on past it, is refused before the create, not missed after it")
+    func keptAtTheLastPlaceUnderUntilRefusesBeforeTheCreate() async throws {
+        let seed: [[String: Any]] = [
+            GoogleSeries.series(rule: GoogleSeries.onItsWeekday + ";UNTIL=\(compact(day(21)))T090000Z"), GoogleSeries.instance(day(14)),
+            GoogleSeries.moved(day(21), start: "\(day(13))T12:00:00", end: "\(day(13))T12:30:00"),
+        ]
+        var patch = GCalEventInput()
+        patch.startDateTime = "\(day(14))T10:00:00Z"
+        patch.startTimeZone = "UTC"
+        let r = try await googleSplit(seed, place: day(14), start: "\(day(14))T09:00:00", patch: patch)
+        defer { r.http.close() }
+        #expect(!r.calendar.writes.contains { $0.hasPrefix("POST") }, "created after all: \(r.calendar.writes)")
+        guard case CalendarProviderError.notSupported(let message)? = r.error else {
+            Issue.record("not refused: \(String(describing: r.error)); \(r.calendar.writes)")
+            return
+        }
+        #expect(message == SplitCarry.keptHasNoSlotRefusal, "\(message)")
+    }
+
+    @Test("Google T4: a kept occurrence between two zones' daylight-time changes lands on the new part's occurrence; the new part repeats in the series' zone even when the edit names another")
+    func keptBetweenTwoZonesDaylightChangesLands() async throws {
+        // Weekly on Mondays at 09:00 London from 2099-03-02. New York's daylight time starts on
+        // 2099-03-08, London's on 2099-03-29. The occurrence placed on 2099-03-16 was moved to
+        // Sunday 2099-03-01 12:00, before the one named on 2099-03-02: it is kept, whole.
+        var series = GoogleSeries.series(rule: "RRULE:FREQ=WEEKLY;BYDAY=MO")
+        series["start"] = ["dateTime": "2099-03-02T09:00:00Z", "timeZone": "Europe/London"]
+        series["end"] = ["dateTime": "2099-03-02T09:30:00Z", "timeZone": "Europe/London"]
+        let seed = [series] + GoogleSeries.rezoned([
+            GoogleSeries.instance("2099-03-02"),
+            GoogleSeries.moved("2099-03-16", start: "2099-03-01T12:00:00", end: "2099-03-01T12:30:00"),
+        ], "Europe/London")
+        // The same instant, given in New York. Google's new part repeats in the series' zone
+        // (`mergeMasterAndPatch`), London, so its 2099-03-16 occurrence is 09:00 London = 09:00
+        // UTC; read in New York (04:00 there, daylight time from 2099-03-08) it would be 08:00 UTC.
+        var patch = GCalEventInput()
+        patch.startDateTime = "2099-03-02T09:00:00Z"
+        patch.startTimeZone = "America/New_York"
+        let r = try await googleSplit(seed, place: "2099-03-02", start: "2099-03-02T09:00:00", patch: patch)
+        defer { r.http.close() }
+        // THE property: it lands on an occurrence the new part has, or nothing is created.
+        let created = r.calendar.writes.contains { $0.hasPrefix("POST") }
+        guard r.error == nil else {
+            #expect(!created, "refused AFTER the create: \(String(describing: r.error)); \(r.calendar.writes)")
+            return
+        }
+        let partId = GoogleCalendarProvider.deterministicSplitEventId(masterId: GoogleSeries.id, recurrenceId: "2099-03-02T09:00:00")
+        #expect((r.calendar.event(partId)?["start"] as? [String: Any])?["timeZone"] as? String == "Europe/London",
+                "the new part does not repeat in the series' zone: \(r.calendar.event(partId) ?? [:])")
+        let kept = r.calendar.event("\(partId)_20990316T090000Z")
+        #expect(instant(kept?["start"]) == utcAt("2099-03-01T12:00:00"),
+                "the kept occurrence is not on the new part's occurrence where it was shown: \(kept ?? [:]); \(r.calendar.writes)")
     }
 
     @Test("Google C1: a change of kind at an occurrence moved earlier resets it: the new part starts at the cut in the requested kind and nothing is carried (#837)")
