@@ -88,7 +88,19 @@ its card.
    that gains or loses an end, or ends after a count, is still a rule change and warned of as a reset;
    a new length together with a new last date moves the series' time and resets (no put-back).
    Google and CalDAV still warn of a reset for any RRULE change, an `UNTIL` alone included (not
-   measured there).
+   measured there). (Superseded for Google the same day, below.)
+   **Google, measured 2026-11-14 on the Workspace test account (master-agent's call):** a series
+   `PATCH` sending only a recurrence that changes its rule's `UNTIL` keeps every changed occurrence
+   placed on or before the new end (own title and moved time kept), and the ones placed after it are
+   left cancelled, decided by the original place, wherever they were moved (as Graph). So Google's
+   `editResetsChangedOccurrences` answers no reset when the recurrence the write writes
+   (`recurrence(_:withRuleFrom:)`) changes only the `UNTIL` of the stored rule (`changesOnlyUntil`:
+   one `RRULE` each, both ending on a date, otherwise the same rule by `canonicalRRULE`, every
+   `EXDATE`/`RDATE` as stored) and the start and end are the series' own as Google reads them
+   (`googleTimes`, so the write sends neither and nothing is restated). Anything else still warns of a
+   reset: a rule that gains or loses an end or ends after a count (the measured case had a `COUNT`
+   stored; a `COUNT` to `UNTIL` change stays a reset until ruled otherwise), a new pattern, a new length
+   or start, a change of kind. CalDAV still warns for any RRULE change.
 8. **Every calendar: an earlier last date says how many meetings it removes (master-agent,
    2026-11-14).** The card shows "N meetings after <date> are removed." ("1 meeting ... is removed.")
    on Google, CalDAV and Outlook alike, beside a reset note where there is one, whenever the edit's
@@ -108,6 +120,16 @@ its card.
    rule, zone, first date or end that can't be read or expanded, an `RDATE`, or a failed deletions read
    shows no card and the "could not read the repeating event ... Retry." error. A source check holds the
    count free of any provider name, cast or listing.
+   **CalDAV write, master-agent's call C1 (2026-11-14):** an edit of every occurrence whose rule is the
+   stored one with an earlier end also drops, in the same single `PUT` as the rule, every changed
+   occurrence (override VEVENT) whose place (`RECURRENCE-ID`) is on a day after the new last date in
+   the series' zone, wherever it was moved; one placed on or before that date stays, even when moved
+   past it, as Outlook keeps it (`CalDAVProvider.earlierEndResource`; the new last date read by
+   `RecurrenceTail.lastDay`, the reading the count uses, so the card's place-based count is what the
+   write removes). Excluded dates (`EXDATE`) are left; one past the new end is harmless. Before C1 the
+   write kept every override, so one placed after the new end stayed visible at its moved time.
+   Whether this drop is a new irreversible wire operation in the census was put to the coordinator;
+   the census is unchanged until it answers.
    *Superseded first build (5c96b802, 2026-11-14):* the count listed the calendar's occurrences
    (`listEvents`) within a 7-day margin; it undercounted (a default-calendar listing gave a silent 0 for
    a series on another calendar, a far-moved occurrence was missed) and was replaced the same day.

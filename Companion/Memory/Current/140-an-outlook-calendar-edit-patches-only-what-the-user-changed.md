@@ -224,7 +224,13 @@ that aren't included in the request body maintain their previous values".
   (`ExchangeCalendarProvider.newRangeEnd`, `sameRule(_:as:ignoringEnd:)`) only when the start and end
   the write restates carry the stored labels exactly (`restatesStoredTimes`, `originalStartTimeZone` /
   `originalEndTimeZone`, now read by `getEvent`); a relabel is unmeasured and stays a reset
-  (`outlookEarlierSeriesEndRelabelledIsAReset`). Every calendar's card shows, for an earlier end,
+  (`outlookEarlierSeriesEndRelabelledIsAReset`). Google likewise (measured on the Workspace test
+  account 2026-11-14, ADR-IOS-113 decision 7): a recurrence that changes only its rule's `UNTIL`
+  (`GoogleCalendarProvider.changesOnlyUntil`: both `UNTIL`-ended, same pattern, `EXDATE`/`RDATE` as
+  stored) with the series' own start and end (`googleTimes`, which the write then does not send)
+  keeps the changed occurrences placed on or before the new end and cancels those after it, by
+  original place; the card answers no reset (`googleCardCountsTheMeetingsRemoved`), while a new
+  pattern, `COUNT`, length or start still warns (`googleEarlierEndWithANewPatternResets`). Every calendar's card shows, for an earlier end,
   "N meetings after <date> are removed." (`CalendarSeriesEndRemoval`, shared, from the stored rule less
   `cancelledOccurrences` through `deletedOccurrencePlaces`, ADR-IOS-113 decision 8,
   `CalendarToolHelpers.seriesEndRemovalNote`). `FakeGraphCalendar` models it (no reset counted; with

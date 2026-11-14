@@ -545,7 +545,10 @@ RULE: `RecurrenceTail` places the occurrences after the new last date up to the 
 (`CalendarProvider.deletedOccurrencePlaces`); a changed occurrence counts at its place however far it
 moved; a rule with no end gets "All meetings after <date> are removed."; anything unreadable shows no
 card and asks for a retry, never a silent 0). (Superseded same-day first build: a single-events listing
-with a 7-day margin, which undercounted.) Google (`recurrenceLinesDiffer`) and CalDAV (RRULE
+with a 7-day margin, which undercounted.) On CalDAV the write matches the count (master-agent's call
+C1): the same `PUT` drops every override whose `RECURRENCE-ID` is placed after the new last date,
+wherever it was moved, and keeps one placed on or before it even when moved past it
+(`earlierEndResource`, `calDAVEarlierEndDropsOverridesPlacedAfterIt`). Google (`recurrenceLinesDiffer`) and CalDAV (RRULE
 compare) still show the reset note beside it (not measured on either). Pinned by
 `outlookEarlierSeriesEndAloneKeepsExceptions`, `outlookLaterSeriesEndAloneKeepsExceptions`,
 `outlookEarlierSeriesEndRelabelledIsAReset` and `SeriesEndRemovalCardTests` (Google, CalDAV, and the

@@ -397,9 +397,13 @@ actor CalDAVProvider: CalendarProvider {
 
         // The stored resource's zone context, read once for every zone this write resolves.
         let zones = CalendarTimeZoneContext(calendarText: existingICS)
-        // A change of the series' length reaches its changed occurrences too, in the same PUT (#718).
-        let mergedICS = try Self.wholeSeriesResource(
-            storedICS: existingICS, merged: try Self.mergePatchIntoICS(existingICS, patch: event, zones: zones),
+        // A change of the series' length reaches its changed occurrences too, in the same PUT (#718);
+        // so does an earlier end of its rule, which drops those placed after the new last date.
+        let mergedICS = try Self.earlierEndResource(
+            storedICS: existingICS,
+            merged: try Self.wholeSeriesResource(
+                storedICS: existingICS, merged: try Self.mergePatchIntoICS(existingICS, patch: event, zones: zones),
+                patch: event, zones: zones),
             patch: event, zones: zones)
         // No ETag ⇒ `.unconditional`, NEVER `.ifNoneMatchAny`. The GET above
         // returned a non-empty body for this exact URL, so the resource

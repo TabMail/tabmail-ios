@@ -41,9 +41,9 @@ enum CalendarSeriesEndRemoval {
     static func removal(
         series: GCalEvent, seriesId: String, edit: GCalEventInput, calendarId: String, provider: any CalendarProvider
     ) async throws -> SeriesEndRemoval? {
-        guard let editedRule = rule(in: edit.recurrence) else { return nil }
-        let editedEnd = end(of: editedRule)
-        guard editedEnd.until != nil || editedEnd.count != nil else { return nil }
+        // Only a rule that gives an end can end the series earlier.
+        guard let editedRule = rule(in: edit.recurrence),
+              RecurrenceTail.withoutEnd(editedRule) != String(editedRule.dropFirst("RRULE:".count)) else { return nil }
         guard let storedLine = rule(in: series.recurrence) else {
             throw Unreadable(reason: "the repeating event's stored rule can't be read")
         }
@@ -72,18 +72,14 @@ enum CalendarSeriesEndRemoval {
         }
         let counter = Counter(pattern: pattern, firstDay: firstDay, anchor: anchor, missingDay: missingDay)
 
-        // The new last date: the edit's UNTIL, or the day of its COUNT-th occurrence.
+        // The new last date: the edit's UNTIL, or the day of its COUNT-th occurrence
+        // (`RecurrenceTail.lastDay`, the reading the CalDAV write uses too).
         let newLast: RecurrenceTail.Day
-        if let until = editedEnd.until {
-            guard let day = untilDay(until, zone: zone) else {
-                throw Unreadable(reason: "the new last date of the repeating event can't be read")
-            }
-            newLast = day
-        } else if let count = editedEnd.count {
-            guard let day = try counter.day(ofOccurrence: count) else { return nil }
-            newLast = day
-        } else {
-            return nil
+        switch RecurrenceTail.lastDay(of: countedRule(editedRule, series: series), seriesStart: firstDay, zone: zone,
+                                      anchor: anchor, missingDay: missingDay) {
+        case .day(let day): newLast = day
+        case .none: return nil
+        case .unreadable: throw Unreadable(reason: "the new last date of the repeating event can't be read")
         }
         guard let newLastDate = FixedDateFormat.formatter("yyyy-MM-dd", timeZone: .gmt).date(from: newLast.description) else {
             throw Unreadable(reason: "the new last date of the repeating event can't be read")
@@ -91,21 +87,11 @@ enum CalendarSeriesEndRemoval {
         let after = FixedDateFormat.formatter("MMMM d, yyyy", timeZone: .gmt).string(from: newLastDate)
 
         // The stored end: an UNTIL's day, the COUNT-th occurrence's day, or none.
-        let storedEnd = end(of: storedLine)
-        if storedEnd.until == nil, storedEnd.count == nil {
-            return SeriesEndRemoval(count: nil, after: after)
-        }
         let storedLast: RecurrenceTail.Day
-        if let until = storedEnd.until {
-            guard let day = untilDay(until, zone: zone) else {
-                throw Unreadable(reason: "the repeating event's stored last date can't be read")
-            }
-            storedLast = day
-        } else {
-            guard let count = storedEnd.count, let day = try counter.day(ofOccurrence: count) else {
-                throw Unreadable(reason: "the repeating event's stored number of occurrences can't be read")
-            }
-            storedLast = day
+        switch RecurrenceTail.lastDay(of: pattern, seriesStart: firstDay, zone: zone, anchor: anchor, missingDay: missingDay) {
+        case .day(let day): storedLast = day
+        case .none: return SeriesEndRemoval(count: nil, after: after)
+        case .unreadable: throw Unreadable(reason: "the repeating event's stored end can't be read")
         }
         guard newLast < storedLast else { return nil }
 
@@ -141,23 +127,6 @@ enum CalendarSeriesEndRemoval {
             }
             return count
         }
-
-        /// The day of the `number`-th occurrence, nil when the rule places fewer within four-digit
-        /// years. Found by doubling a span from the first day, then halving it.
-        func day(ofOccurrence number: Int) throws -> RecurrenceTail.Day? {
-            guard number >= 1 else { return nil }
-            var span = RecurrenceTail.firstDaySearchDays
-            while try count(before: firstDay.adding(days: span + 1)) < number {
-                guard span < RecurrenceTail.maxInterval else { return nil }
-                span = min(span * 2, RecurrenceTail.maxInterval)
-            }
-            var low = 0, high = span
-            while low < high {
-                let mid = (low + high) / 2
-                if try count(before: firstDay.adding(days: mid + 1)) >= number { high = mid } else { low = mid + 1 }
-            }
-            return firstDay.adding(days: low)
-        }
     }
 
     /// The first `RRULE:` line of `lines`, nil when there is none.
@@ -165,27 +134,11 @@ enum CalendarSeriesEndRemoval {
         lines?.first(where: { $0.uppercased().hasPrefix("RRULE:") })
     }
 
-    /// A rule's `UNTIL` and `COUNT` values.
-    private static func end(of rule: String) -> (until: String?, count: Int?) {
-        var until: String?
-        var count: Int?
-        for part in rule.dropFirst("RRULE:".count).split(separator: ";") {
-            let pair = part.split(separator: "=", maxSplits: 1).map(String.init)
-            guard pair.count == 2 else { continue }
-            switch pair[0].uppercased() {
-            case "UNTIL": until = pair[1]
-            case "COUNT": count = Int(pair[1])
-            default: break
-            }
-        }
-        return (until, count)
-    }
-
-    /// The stored rule as the counter reads it: without its end (the counter places the pattern),
-    /// with the series' first day of the week where its calendar keeps one apart from the rule.
+    /// A rule as the counter reads it: with the series' first day of the week where its calendar
+    /// keeps one apart from the rule (the counter places the pattern and reads no end;
+    /// `RecurrenceTail.lastDay` reads the end).
     private static func countedRule(_ line: String, series: GCalEvent) -> String {
         var parts = line.dropFirst("RRULE:".count).split(separator: ";").map(String.init)
-            .filter { !$0.uppercased().hasPrefix("UNTIL=") && !$0.uppercased().hasPrefix("COUNT=") }
         let weekStarts = ["sunday": "SU", "monday": "MO", "tuesday": "TU", "wednesday": "WE",
                           "thursday": "TH", "friday": "FR", "saturday": "SA"]
         if !parts.contains(where: { $0.uppercased().hasPrefix("WKST=") }),
@@ -195,16 +148,6 @@ enum CalendarSeriesEndRemoval {
         return "RRULE:" + parts.joined(separator: ";")
     }
 
-    /// The day an `UNTIL` value ends on in `zone`: a date as written, a UTC time (`Z`) dated in
-    /// `zone`, a local time by its own date. Nil when it can't be read.
-    static func untilDay(_ value: String, zone: TimeZone) -> RecurrenceTail.Day? {
-        let upper = value.uppercased()
-        if upper.hasSuffix("Z") {
-            guard let instant = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss'Z'", timeZone: .gmt).date(from: upper) else { return nil }
-            return RecurrenceTail.Day(iso: FixedDateFormat.formatter("yyyy-MM-dd", timeZone: zone).string(from: instant))
-        }
-        return RecurrenceTail.Day(ical: upper)
-    }
 
     /// The days the series' `EXDATE` lines take out, in `zone`: a date as written, a UTC time
     /// dated in `zone`, a time in a named zone (`TZID`) dated in `zone`, a floating time by its
@@ -222,7 +165,7 @@ enum CalendarSeriesEndRemoval {
                     guard let day = RecurrenceTail.Day(ical: value) else { throw unreadable }
                     days.insert(day)
                 } else if value.hasSuffix("Z") {
-                    guard let day = untilDay(value, zone: zone) else { throw unreadable }
+                    guard let day = RecurrenceTail.untilDay(value, zone: zone) else { throw unreadable }
                     days.insert(day)
                 } else if let tzid {
                     guard let named = CalendarTimeZoneResolver.zone(named: tzid, in: .none),

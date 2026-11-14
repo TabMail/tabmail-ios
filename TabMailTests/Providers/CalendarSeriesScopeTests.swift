@@ -6291,7 +6291,7 @@ struct SeriesEndRemovalCardTests {
                 && error.hasSuffix("). The event was NOT changed. Retry."), "\(card.out)")
     }
 
-    @Test("Google: an earlier UNTIL counts the occurrences after it by their place, a moved one included and a deleted one not, beside the reset note")
+    @Test("Google: an earlier UNTIL counts the occurrences after it by their place, a moved one included and a deleted one not, with no reset note (an end-only change keeps them)")
     func googleCardCountsTheMeetingsRemoved() async throws {
         let rule = "RRULE:FREQ=WEEKLY;UNTIL=\(compact(day(42)))T090000Z"
         let seed: [[String: Any]] = [
@@ -6308,7 +6308,21 @@ struct SeriesEndRemovalCardTests {
         let changes = r.run.cards.first?.changes ?? []
         let removal = try Self.line(2, after: day(21))
         #expect(r.run.cards.count == 1 && changes.contains(removal)
-                && changes.contains(CalendarToolHelpers.ruleChangeResetNote), "card: \(changes); \(r.run.out)")
+                && !changes.contains(CalendarToolHelpers.ruleChangeResetNote), "card: \(changes); \(r.run.out)")
+    }
+
+    @Test("Google: an earlier UNTIL that also changes the pattern still says changed occurrences may be reset")
+    func googleEarlierEndWithANewPatternResets() async throws {
+        let rule = "RRULE:FREQ=WEEKLY;UNTIL=\(compact(day(42)))T090000Z"
+        let r = try await googleTool([
+            "edit_scope": .string("all"), "timezone": .string("UTC"),
+            "recurrence": .dictionary(["freq": .string("WEEKLY"), "interval": .int(2), "until": .string(day(21))]),
+        ], eventId: GoogleSeries.id, account: "series-end-g-pattern", seed: [
+            GoogleSeries.series(rule: rule), GoogleSeries.instance(day(0)),
+            GoogleSeries.moved(day(7), start: "\(day(7))T11:00:00", end: "\(day(7))T11:30:00"),
+        ])
+        let changes = r.run.cards.first?.changes ?? []
+        #expect(r.run.cards.count == 1 && changes.contains(CalendarToolHelpers.ruleChangeResetNote), "card: \(changes); \(r.run.out)")
     }
 
     @Test("Google: a later UNTIL shows no removal line")
@@ -6359,6 +6373,50 @@ struct SeriesEndRemovalCardTests {
         let removal = try Self.line(1, after: day(21))
         #expect(r.cards.count == 1 && changes.contains(removal)
                 && changes.contains(CalendarToolHelpers.ruleChangeResetNote), "card: \(changes); \(r.out)")
+    }
+
+    @Test("CalDAV: an earlier end drops, in the one PUT, the changed occurrences placed after the new last date, moved before it or not moved, keeps one placed before it but moved past it, and the card counts by place")
+    func calDAVEarlierEndDropsOverridesPlacedAfterIt() async throws {
+        let zone = "America/New_York"
+        func at(_ d: String, _ time: String) -> String { "TZID=\(zone):\(compact(d))T\(time)" }
+        func override(_ slot: String, movedTo: String, title: String) -> [String] { [
+            "BEGIN:VEVENT", "UID:end-x", "DTSTAMP:\(compact(day(-14)))T000000Z",
+            "RECURRENCE-ID;\(at(slot, "090000"))", "DTSTART;\(at(movedTo, "090000"))", "DTEND;\(at(movedTo, "093000"))",
+            "SUMMARY:\(title)", "END:VEVENT",
+        ] }
+        let ics = ([
+            "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//TabMail//Test//EN",
+            "BEGIN:VEVENT", "UID:end-x", "DTSTAMP:\(compact(day(-14)))T000000Z",
+            "DTSTART;\(at(day(0), "090000"))", "DTEND;\(at(day(0), "093000"))",
+            "RRULE:FREQ=WEEKLY;UNTIL=\(compact(day(42)))T235959Z",
+            "SUMMARY:Standup", "END:VEVENT",
+        ]
+            // (a) placed before the new last date (day 21), moved past it: kept, not counted.
+            + override(day(14), movedTo: day(30), title: "Moved past the end")
+            // (b) placed after it, moved before it: dropped, counted.
+            + override(day(28), movedTo: day(18), title: "Moved before the end")
+            // An override placed after it and not moved: dropped, counted.
+            + override(day(35), movedTo: day(35), title: "Renamed")
+            + ["END:VCALENDAR"]).joined(separator: "\r\n")
+        let store = FakeCalDAVStore(servesETags: true)
+        store.seed(path: "/cal/end-x.ics", ics: ics)
+        let r = try await calDAVTool(store, [
+            "edit_scope": .string("all"), "timezone": .string(zone),
+            "recurrence": .dictionary(["freq": .string("WEEKLY"), "until": .string(day(21))]),
+        ], eventId: "/cal/end-x.ics", account: "series-end-c-drop")
+        let changes = r.cards.first?.changes ?? []
+        // Placed after day 21: day 28 (b), day 35 and day 42; day 14 (a) is placed before it.
+        let expected = try Self.line(3, after: day(21))
+        #expect(r.cards.count == 1 && changes.contains(expected), "card: \(changes); \(r.out)")
+        let puts = store.recordedPuts()
+        #expect(puts.count == 1, "one PUT expected, got \(puts.map(\.path))")
+        let lines = (store.storedICS(path: "/cal/end-x.ics") ?? "").components(separatedBy: "\r\n")
+        let places = lines.filter { $0.hasPrefix("RECURRENCE-ID") }
+        #expect(places.contains { $0.contains(compact(day(14))) }, "the override placed before the new end was dropped: \(places)")
+        #expect(!places.contains { $0.contains(compact(day(28))) || $0.contains(compact(day(35))) },
+                "an override placed after the new end is still in the resource: \(places)")
+        #expect(lines.contains("SUMMARY:Moved past the end") && !lines.contains("SUMMARY:Moved before the end")
+                && !lines.contains("SUMMARY:Renamed"), "resource: \(lines)")
     }
 
     /// The count is ONE function above the provider boundary (ADR-IOS-060): its source names no

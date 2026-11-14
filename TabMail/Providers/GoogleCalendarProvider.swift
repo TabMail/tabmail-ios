@@ -152,8 +152,8 @@ protocol CalendarProvider: Sendable {
     /// Whether the whole-series edit `edit` (the input the write is given) resets the
     /// occurrences of `event` changed one by one, as this calendar's write treats them: on
     /// Outlook and Google, any change of the series' rule or start, and of its end but for a new
-    /// length (#718: Google keeps them, Outlook's write puts them back), and on Outlook but for a
-    /// rule that changes only the series' last date (Graph keeps them, measured); on CalDAV, a
+    /// length (#718: Google keeps them, Outlook's write puts them back), and on both but for a
+    /// rule that changes only the series' last date (both keep them, measured); on CalDAV, a
     /// change of its rule. Pure: it reads only `event`, the series as already read, and makes no request.
     /// The edit's confirmation card says so when it does (#423).
     func editResetsChangedOccurrences(_ event: GCalEvent, edit: GCalEventInput) -> Bool
@@ -2138,6 +2138,11 @@ actor GoogleCalendarProvider: CalendarProvider {
     /// its own start and takes the new length, and deleted ones stay deleted. So the time asked
     /// about is the start alone, read as Google reads it (`googleStart`): a start restated in a
     /// zone Google keys apart (`googleZone`, a zone name TabMail can't resolve included) is a move.
+    /// A rule that changes only its `UNTIL` (`changesOnlyUntil`, the recurrence as the write
+    /// writes it), with the start and end the series' own (`googleTimes`: the write then sends
+    /// neither), is no reset either (#718, measured 2026-11-14): changed occurrences placed on or
+    /// before the new end keep their own title and moved time, and the ones placed after it go,
+    /// wherever they were moved.
     nonisolated func editResetsChangedOccurrences(_ event: GCalEvent, edit: GCalEventInput) -> Bool {
         // A change between all-day and timed changes the event as a whole: a series' changed
         // occurrences are reset, and a single event has none.
@@ -2146,7 +2151,34 @@ actor GoogleCalendarProvider: CalendarProvider {
         }
         if Self.movesSeriesTime(edit, existing: event, as: Self.googleStart) { return true }
         guard let rule = edit.recurrence else { return false }
+        if Self.changesOnlyUntil(stored: event.recurrence ?? [], written: Self.recurrence(event.recurrence, withRuleFrom: rule)),
+           !Self.movesSeriesTime(edit, existing: event, as: Self.googleTimes) {
+            return false
+        }
         return Self.recurrenceLinesDiffer(event.recurrence ?? [], rule)
+    }
+
+    /// Whether the recurrence `written` changes only the `UNTIL` of `stored`'s rule (#718): each
+    /// holds one `RRULE`, both end on a date (`UNTIL`), on different ones, and the rules are
+    /// otherwise the same (`canonicalRRULE`), and every other line (`EXDATE`, `RDATE`) is as
+    /// stored. A rule that gains or loses an end, or ends after a count, is another rule.
+    nonisolated static func changesOnlyUntil(stored: [String], written: [String]) -> Bool {
+        func isRule(_ line: String) -> Bool { line.trimmingCharacters(in: .whitespacesAndNewlines).uppercased().hasPrefix("RRULE:") }
+        let storedRules = stored.filter(isRule), writtenRules = written.filter(isRule)
+        guard storedRules.count == 1, writtenRules.count == 1,
+              !recurrenceLinesDiffer(stored.filter { !isRule($0) }, written.filter { !isRule($0) }) else { return false }
+        func parts(_ rule: String) -> [String: String] {
+            var parts: [String: String] = [:]
+            for part in canonicalRRULE(rule).dropFirst("RRULE:".count).split(separator: ";") {
+                let kv = part.split(separator: "=", maxSplits: 1).map(String.init)
+                if kv.count == 2 { parts[kv[0]] = kv[1] }
+            }
+            return parts
+        }
+        var mine = parts(writtenRules[0]), theirs = parts(storedRules[0])
+        guard let newEnd = mine.removeValue(forKey: "UNTIL"), let oldEnd = theirs.removeValue(forKey: "UNTIL"),
+              newEnd != oldEnd else { return false }
+        return mine == theirs
     }
 
     /// Whether the whole-series edit `patch` moves the series `existing`'s start or end, in the

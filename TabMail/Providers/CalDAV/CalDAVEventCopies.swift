@@ -398,6 +398,61 @@ extension CalDAVProvider {
             refusal: "A changed occurrence of the repeating event can't be read, so its length was not changed.") { _ in true }
     }
 
+    /// The resource an edit of every occurrence writes when its rule is the stored one with an
+    /// earlier end (#718, master-agent's call C1): `merged` (the stored resource with the patch in
+    /// its series VEVENT) without every changed occurrence (override VEVENT) whose place in the
+    /// series (`RECURRENCE-ID`) is on a day after the new last date, in the series' zone, wherever
+    /// it was moved to; one placed on or before that date stays, also when it was moved past it
+    /// (as Outlook keeps it, measured). The new last date is the rule's `UNTIL` day, or its
+    /// `COUNT`-th occurrence's (`RecurrenceTail.lastDay`, the reading the card's count uses). The
+    /// excluded dates (`EXDATE`) stay as they are. Written in the same `PUT` as the rule. Any other
+    /// edit: `merged` as it is. Throws, before anything is written, when the series' zone, its first
+    /// date, either end or an override's place can't be read.
+    static func earlierEndResource(
+        storedICS: String, merged: String, patch: GCalEventInput, zones: CalendarTimeZoneContext
+    ) throws -> String {
+        guard let edited = patch.recurrence?.first(where: { $0.uppercased().hasPrefix("RRULE:") }),
+              let stored = extractRRule(from: storedICS),
+              RecurrenceTail.withoutEnd(GoogleCalendarProvider.canonicalRRULE(edited))
+                == RecurrenceTail.withoutEnd(GoogleCalendarProvider.canonicalRRULE(stored)) else { return merged }
+        let unreadable = CalendarProviderError.notSupported(
+            "this repeating event's last date or the places of its changed occurrences can't be read, so its end was not changed")
+        guard let startLine = masterTopLevelLines(merged).first(where: { icsProperty($0)?.name == "DTSTART" }) else { throw unreadable }
+        let zone: TimeZone
+        if masterDTStartKind(from: merged) == .allDay {
+            zone = .gmt
+        } else {
+            guard let seriesZone = try seriesStartZone(startLine, zones: zones) else { throw unreadable }
+            zone = seriesZone
+        }
+        /// The day a DTSTART or RECURRENCE-ID line is on in the series' zone: a date as written.
+        func day(_ line: String) throws -> RecurrenceTail.Day? {
+            guard let value = icsProperty(line)?.value.trimmingCharacters(in: .whitespaces) else { return nil }
+            if value.count == 8 { return RecurrenceTail.Day(ical: value) }
+            guard let instant = try parseICSDateTime(line, zones: zones) else { return nil }
+            return RecurrenceTail.Day(iso: FixedDateFormat.formatter("yyyy-MM-dd", timeZone: zone).string(from: instant))
+        }
+        guard let firstDay = try day(startLine) else { throw unreadable }
+        // An edit naming no end ends nothing earlier; one whose end can't be read is refused.
+        let newLast: RecurrenceTail.Day
+        switch RecurrenceTail.lastDay(of: edited, seriesStart: firstDay, zone: zone) {
+        case .day(let day): newLast = day
+        case .none: return merged
+        case .unreadable: throw unreadable
+        }
+        switch RecurrenceTail.lastDay(of: stored, seriesStart: firstDay, zone: zone) {
+        case .day(let storedLast) where newLast >= storedLast: return merged
+        case .unreadable: throw unreadable
+        case .day, .none: break
+        }
+        return try rewriteVEvents(in: merged) { block, isMaster in
+            guard !isMaster else { return block }
+            guard let rid = topLevel(block).first(where: { icsProperty($0.text)?.name == "RECURRENCE-ID" }),
+                  let slot = try day(rid.text) else { throw unreadable }
+            return slot > newLast ? nil : block
+        }
+    }
+
     /// The series' resource of a "this and following" edit at an occurrence moved past its last
     /// place (`CalDAVProvider.editShown`): the stored series with `patch`'s fields, moved by `shift`
     /// and lasting `length` when it gives an end, written over each override shown from
