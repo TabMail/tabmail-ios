@@ -392,8 +392,9 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// sent again only while the series does not hold it yet (the read shows whether it does), and
     /// on the kept etag: when Graph refuses it (412), the series changed since the capture (the
     /// user deleted or changed an occurrence in another app before the retry), so nothing is
-    /// written and the occurrences are read and kept again (`stillHeld` keeps the files the first
-    /// read saved), at most `ExchangeCalendarConfig.putBackConflictReads` reads, then `seriesBusy`
+    /// written and the occurrences are read and kept again, with what the first read captured at
+    /// the places this read holds nothing at (`stillCaptured`; that write may have landed and reset
+    /// them) and the files it saved (`stillHeld`), at most `ExchangeCalendarConfig.putBackConflictReads` reads, then `seriesBusy`
     /// (the operation stays queued). A record whose write is `notSent` is read and kept again too:
     /// the series still holds its occurrences. Every put-back write is absolute, and a DELETE
     /// answered 404 is done, so one that lands twice changes nothing. A put-back that fails for
@@ -425,13 +426,16 @@ actor ExchangeCalendarProvider: CalendarProvider {
                 kept = earlier
             } else {
                 let read = try await lengthChangeExceptions(eventId: eventId, existing: existing, edit: event, files: record.files)
-                capture = SeriesCapture(seriesRaw: existing.raw, exceptions: read.exceptions)
+                capture = SeriesCapture(
+                    seriesRaw: existing.raw,
+                    exceptions: read.exceptions + (sentBefore ? try stillCaptured(held, besides: read.exceptions, series: existing.event) : []))
                 // A record an earlier read kept is replaced, an empty one included, so a later retry
                 // never puts back what this read no longer holds. The files it saved that this read
                 // does not hold are released once the new record is kept: when its write was never
                 // sent or was refused, nothing of ours removed them from their occurrences. When an
-                // earlier attempt sent it, they are kept (`stillHeld`): it may have landed.
-                if !read.exceptions.isEmpty || held != nil {
+                // earlier attempt sent it, it may have landed and reset them, so what it captured
+                // is kept with this read's (`stillCaptured`, `stillHeld`).
+                if !capture.exceptions.isEmpty || held != nil {
                     let fresh: SeriesEditRecord
                     do {
                         guard let etag = existing.raw["@odata.etag"] as? String, !etag.isEmpty else {
@@ -555,13 +559,28 @@ actor ExchangeCalendarProvider: CalendarProvider {
         }
     }
 
+    /// The occurrences the capture of `earlier` (a record whose write an earlier attempt sent, now
+    /// read again) holds as changed or deleted at a place this read (`besides`) holds none at: that
+    /// write may have landed and reset them, and the record is their only copy, so they are put
+    /// back with this read's. This read's wins at a place both hold: it is the newer. One the user
+    /// changed or deleted since the reset is left as it is by the put-back (`guardedPatch`, and a
+    /// deleted place is deleted only while a plain occurrence), so keeping them is safe where the
+    /// write did not land too.
+    private func stillCaptured(_ earlier: SeriesEditRecord?, besides read: [TailException], series: GCalEvent) throws -> [TailException] {
+        guard let earlier else { return [] }
+        let places = Set(read.compactMap { $0.carried.place.map(SplitCarry.key) })
+        return try seriesCapture(from: earlier.capture, series: series).exceptions
+            .filter { $0.carried.place.map { !places.contains(SplitCarry.key($0)) } ?? false }
+    }
+
     /// The files of `files` (a record whose write an earlier attempt sent, now read again) that a
     /// new read (`besides`) does not name and that are still held: the write may have landed and
     /// erased them, and these are their only copies, so each is kept unless its occurrence is
     /// proven gone (Graph answers its id 404 or 410: deleted since, its files with it). Any other
     /// answer to that read is rethrown (the operation stays queued). Kept, a file whose occurrence
-    /// the new read holds as changed is attached to it again, and one whose occurrence it does not
-    /// is counted as not restored, its bytes kept for the user.
+    /// the new record holds as changed (this read's, or the earlier capture's: `stillCaptured`) is
+    /// attached to it again, and one whose occurrence it does not is counted as not restored, its
+    /// bytes kept for the user.
     private func stillHeld(_ files: [PutBackFile], besides read: [PutBackFile]) async throws -> [PutBackFile] {
         let named = Set(read.map { "\($0.occurrence)\n\($0.sha256)" })
         var gone: [String: Bool] = [:]

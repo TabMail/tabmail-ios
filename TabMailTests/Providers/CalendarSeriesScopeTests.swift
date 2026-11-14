@@ -4955,31 +4955,72 @@ struct SeriesLengthKeepsExceptionsTests {
         #expect(disk.files == 0 && disk.directories == 0, "left on the device: \(disk.counts.withLock { $0 })")
     }
 
-    @Test("Outlook: the series' write landed with its answer lost, then another client changed the series' time before the retry: the retry reads it again, and the saved file is kept for the user, never deleted")
+    @Test("Outlook: the series' write landed with its answer lost, then another client changed the series' time before the retry: the retry, refused by its etag, reads it again and still puts back the moved, renamed and deleted occurrences the first attempt kept, and the saved file")
     func outlookOvertakenWriteKeepsItsFile() async throws {
         let graph = Self.outlookCalendarWithOneFile()
         graph.loseNextResponse("PATCH")
-        // After each reset another client gives the series another end, so a read of it no longer
-        // shows the edit's.
+        // After the first reset another client gives the series another end, so a read of it no
+        // longer shows the edit's and finds every occurrence reset.
         let label = TimeZone.current.identifier
         let otherEnd = GraphFixture.start.addingTimeInterval(3_600)
+        final class Once: Sendable {
+            private let done = Mutex(false)
+            /// True the first time only.
+            func first() -> Bool { done.withLock { done in defer { done = true }; return !done } }
+        }
+        let overtaken = Once()
         graph.afterReset {
-            guard var series = graph.event("ser-1") else { return }
+            guard overtaken.first(), var series = graph.event("ser-1") else { return }
             series["end"] = ["dateTime": GraphFixture.wall(otherEnd, in: label) + ".0000000", "timeZone": label]
             graph.store(series)
         }
         let disk = SavedOnDevice()
         let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-overtaken", drains: 2,
-                                     inspect: {
-                                         disk.read()
-                                         await disk.readBanner()
-                                     })
-        #expect(rows.count == 1 && rows.first?.status == PendingStatus.failed.rawValue && rows.first?.failureKind == .putBackIncomplete,
-                "rows: \(reasons(rows))")
-        #expect(Self.recordFiles(rows.first) == 1 && disk.files == 1, "record \(rows.first?.argumentsJSON ?? "") saved \(disk.counts.withLock { $0 })")
-        let shown = disk.banner.withLock { $0 }
-        #expect(shown.count == 1 && shown.first?.holdsFiles == true && shown.first?.bannerText.contains(PutBackFile.notRestoredMessage(1)) == true,
-                "the banner: \(shown.map(\.bannerText))")
+                                     inspect: { disk.read() })
+        #expect(rows.isEmpty, "rows: \(reasons(rows))")
+        #expect(graph.seriesResets == 2, "the series was reset \(graph.seriesResets) times")
+        Self.expectOutlookKept(graph, length: Self.length, "after an overtaken retry")
+        #expect(Self.fileList(graph, "ser-1-w1") == ["notes.txt:own notes"], "week 1 holds \(Self.fileList(graph, "ser-1-w1"))")
+        #expect(disk.files == 0 && disk.directories == 0, "left on the device: \(disk.counts.withLock { $0 })")
+    }
+
+    @Test("Outlook: the series' write is sent on the etag its capture was read with: a retry after the series changed sends the kept etag, is refused, and the write after the new read is sent on the new one")
+    func outlookSeriesWriteCarriesTheCapturesEtag() async throws {
+        let graph = Self.outlookCalendar()
+        Self.failFirstSeriesWrite(graph, deleting: "ser-1-w4")
+        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-if-match", drains: 2)
+        #expect(rows.isEmpty, "rows: \(reasons(rows))")
+        let sent = graph.patchConditions("ser-1")
+        #expect(sent.count == 3, "the series' writes: \(sent)")
+        guard sent.count == 3 else { return }
+        // The first: on the etag the capture read, then current.
+        #expect(sent[0].ifMatch != nil && sent[0].ifMatch == sent[0].etag, "first: \(sent[0])")
+        // The retry: on the record's kept etag, which the user's deletion moved past (412).
+        #expect(sent[1].ifMatch == sent[0].ifMatch && sent[1].ifMatch != sent[1].etag, "retry: \(sent[1])")
+        // After the new read: on its etag.
+        #expect(sent[2].ifMatch == sent[2].etag && sent[2].ifMatch != sent[0].ifMatch, "after the new read: \(sent[2])")
+    }
+
+    /// A weekly Monday rule as Graph gives it back (its own defaults included), ending `end`.
+    private static func graphRule(end: String, days: [String] = ["monday"]) -> [String: Any] {
+        ["pattern": ["type": "weekly", "interval": 1, "month": 0, "dayOfMonth": 0, "daysOfWeek": days, "firstDayOfWeek": "sunday", "index": "first"],
+         "range": ["type": "endDate", "startDate": "2099-01-05", "endDate": end, "recurrenceTimeZone": "Pacific Standard Time", "numberOfOccurrences": 0]]
+    }
+
+    @Test("a series holds a write's rule when it holds every value of it sent, Graph's own defaults besides, in any case, and not when one differs",
+          arguments: [
+            ("the same rule", "2099-03-02", ["Monday"], true),
+            ("another end", "2099-02-23", ["Monday"], false),
+            ("another day", "2099-03-02", ["Tuesday"], false),
+          ])
+    func seriesHoldsAWritesRule(_ name: String, _ end: String, _ days: [String], _ holds: Bool) {
+        let held = Self.graphRule(end: "2099-03-02")
+        let sent: [String: Any] = [
+            "pattern": ["type": "weekly", "interval": 1, "daysOfWeek": days],
+            "range": ["type": "endDate", "startDate": "2099-01-05", "endDate": end, "recurrenceTimeZone": "Pacific Standard Time"],
+        ]
+        #expect(ExchangeCalendarProvider.holdsValues(["recurrence": held, "subject": "Planning"], ["recurrence": sent, "subject": "Planning"], allDay: false) == holds,
+                "\(name)")
     }
 
     @Test("Outlook: a deleted occurrence changed in Outlook after the reset is left as it is, and the put-back goes on: a later deleted one is deleted again and the changed ones are put back")

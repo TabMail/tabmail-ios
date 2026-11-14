@@ -52,8 +52,11 @@ its card.
    **The write is conditional on the capture's series (review r2 C1, 2026-11-14).** The record
    (version 3) keeps the series' `@odata.etag` the capture's read gave (`SeriesEditRecord.seriesEtag`),
    and the series `PATCH` is sent with `If-Match` on it (`sendPatch`). Graph's etag is series-wide and
-   moves with any write anywhere in the series (measured 2026-11-14, occurrence writes; the master
-   `PATCH` is assumed to honour `If-Match` the same way). So a `sent` write that did not land (a 5xx
+   moves with any write anywhere in the series, and the master `PATCH` honours `If-Match` (measured
+   2026-11-14 on the work test account: the master's current etag gives 200; after an occurrence
+   is deleted or changed, the earlier etag gives 412 `ErrorIrresolvableConflict` and writes nothing;
+   the master's and an occurrence's etags are the same value, so either serves; the etag in a create's
+   201 answer was already stale by the first `GET`). So a `sent` write that did not land (a 5xx
    with nothing written), followed by the user deleting or changing a changed occurrence in Outlook
    before the retry, is refused with 412 and writes nothing: the retry reads the occurrences again and
    keeps a new record, so the stale capture is never put back over the user's newer change. When the
@@ -61,13 +64,20 @@ its card.
    goes on as landed and puts back the kept record, sending no write: the series holds every value of
    the `PATCH` it would send (`holdsValues`, the rule compared by every value sent, since Graph applies
    a `PATCH` whole and gives back its own defaults besides). Without this check the landed write's own
-   etag change would refuse the resend and make the retry re-read a series Graph already reset. The re-reads are bounded by
+   etag change would refuse the resend and make the retry re-read a series Graph already reset.
+   **The new read keeps what the earlier capture held (review r3 C1, 2026-11-14).** When the record's
+   write was `sent` by an earlier attempt and the retry reads again (412), that write may have landed
+   and reset every occurrence, and the record is the only copy of their own values. So the new record
+   holds this read's changed and deleted occurrences plus the earlier capture's at every place this
+   read holds none at (`stillCaptured`); this read's wins at a place both hold. Safe where the write
+   did not land too: the put-back leaves alone an occurrence changed since the reset (`guardedPatch`
+   writes only a plain occurrence) and deletes a place only while it is a plain occurrence. The re-reads are bounded by
    `ExchangeCalendarConfig.putBackConflictReads`, then `seriesBusy` (stays queued). A record of
    version 1 or 2 holds no etag and is read again before its write. Files of a `sent` record that the
    new read does not name are kept in the new record (`stillHeld`), except those whose occurrence Graph
    answers 404/410 (proven gone): the write may have landed and erased them. Kept, one whose occurrence
-   the new read holds as changed is attached again; one whose occurrence it no longer holds as changed
-   is counted as not restored and stays saved for Save File.
+   the new record holds as changed (this read's or the earlier capture's) is attached again; one whose
+   occurrence it no longer holds as changed is counted as not restored and stays saved for Save File.
 4. **CalDAV: the same PUT.** A new length alone gives each override the new length from its own
    start in the same conditional `PUT` of the series resource; a field the edit also sets (a title)
    is set on each override too, as Google retitles them. A deleted occurrence (`EXDATE`) stays deleted.
@@ -199,9 +209,11 @@ its card.
   attachments, not email content: ADR-004), in the app's default protection class and the backup, as
   the database is.
 - Limits of the conditional series write (review r2): a write that landed with its answer lost, then
-  overtaken before the retry by another client's change of the series' time, is read again: the
-  occurrences' own values are not put back (the new read shows them reset), and their saved files are
-  kept and offered to save. A put-back's re-`DELETE` of a deleted place runs on the type read once by
+  overtaken before the retry by another client's change of the series, is read again and sent again,
+  so the edit is written over that client's change (a landed write and one that did not land can't be
+  told apart there, and the unlanded one needs the resend), and the earlier capture's occurrences are
+  put back (r3). An occurrence the user set back to the series' values in another app after a sent
+  write that did not land is changed back to its captured values. A put-back's re-`DELETE` of a deleted place runs on the type read once by
   `instances(around:)`, with no `If-Match` (the rulings ask it only of a `PATCH`): a change the user
   makes to that occurrence between the listing and the `DELETE` is lost; the deletes run first, so the
   window is short. A zoneless or `RDATE` series whose re-sent end is in another form within a day of

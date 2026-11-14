@@ -278,7 +278,9 @@ These tests read what each provider sent, or what the fake server ends up holdin
   the bytes for the other. The series write is sent on the capture's etag: one sent but not landed (500),
   then a changed occurrence deleted before the retry, is refused (412), read again, and the occurrence
   stays deleted with its saved file released; one landed with its answer lost, then overtaken by another
-  client's change, keeps its saved file for the user. A deleted place changed since the reset is skipped
+  client's change, is refused, read again, and still puts back the moved, renamed and deleted occurrences
+  and the file the first attempt kept; the series write's `If-Match` is the record's kept etag (asserted
+  on the request), and a rule is held only when every value sent is (`holdsValues`). A deleted place changed since the reset is skipped
   and the put-back goes on (a later deleted place deleted again). `CalendarPutBackFilesTests` pins the bytes' lifecycle: the
   reclaim spares a held failed row, the Settings wipe and a release boundary leave it, the drain-start
   sweep removes only orphans, the failure banner shows a held row until dismissed and the dismissal

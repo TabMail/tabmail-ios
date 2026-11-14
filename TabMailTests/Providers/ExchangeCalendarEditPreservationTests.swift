@@ -565,6 +565,7 @@ final class FakeGraphCalendar: Sendable {
     private let resets = Mutex(0)
     private let patchLog = Mutex<[(id: String, body: Data)]>([])
     private let patchAuthorizationLog = Mutex<[String]>([])
+    private let patchIfMatchLog = Mutex<[(id: String, ifMatch: String?, etag: String)]>([])
     private let failingRequests = Mutex<[String: [Int]]>([:])
     private let lostResponses = Mutex<[String: Int]>([:])
     private let readLog = Mutex<[(id: String, zone: String?)]>([])
@@ -652,6 +653,12 @@ final class FakeGraphCalendar: Sendable {
 
     /// The `Authorization` header of every PATCH, refused ones included, in order.
     var patchAuthorizations: [String] { patchAuthorizationLog.withLock { $0 } }
+
+    /// Every PATCH of `id` that arrived, refused ones included, in order: the `If-Match` it carried
+    /// (nil: none) and the series' etag when it arrived.
+    func patchConditions(_ id: String) -> [(ifMatch: String?, etag: String)] {
+        patchIfMatchLog.withLock { $0 }.filter { $0.id == id }.map { (ifMatch: $0.ifMatch, etag: $0.etag) }
+    }
 
     /// The events a create stored, as stored.
     var created: [[String: Any]] {
@@ -862,6 +869,10 @@ final class FakeGraphCalendar: Sendable {
         http.register(path: "/v1.0/me/events/", method: "PATCH") { [self] request in
             patchAuthorizationLog.withLock { $0.append(request.header("Authorization") ?? "none") }
             let parts = Self.pathParts(request.url)
+            if let id = parts.first {
+                let current = etag(of: id)
+                patchIfMatchLog.withLock { $0.append((id: id, ifMatch: request.header("If-Match"), etag: current)) }
+            }
             arrived("PATCH", parts.first ?? "")
             if let status = takeFailure("PATCH") { return .status(status) }
             if let refused = refusal("PATCH") { return refused }
