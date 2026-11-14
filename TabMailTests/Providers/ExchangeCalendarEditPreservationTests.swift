@@ -555,8 +555,12 @@ final class FakeGraphCalendar: Sendable {
             }
             created["id"] = Self.createdPrefix + String(creations.withLock { n in n += 1; return n })
             if let transactionId, let id = created["id"] as? String { transactions.withLock { $0[transactionId] = id } }
+            // A series created with a range zone other than its timed start's is refused, as a
+            // series PATCH is (measured on a create 2026-11-13: a start labelled
+            // `America/New_York` with the range in `Europe/London` or `GMT Standard Time`).
+            if let refusal = Self.seriesStartZoneRefusal(created, stored: created) { return refusal }
             if Self.allDaySeriesLengthened(created, stored: [:]) { Self.lengthen(&created, written: created, storedStart: nil) }
-            Self.defaultRecurrenceZone(in: &created)
+            Self.defaultRecurrenceZone(in: &created, created: true)
             store(created)
             if created["recurrence"] != nil, let make = createHook.withLock({ $0 }) {
                 for occurrence in make(created) { store(occurrence) }
@@ -884,12 +888,16 @@ final class FakeGraphCalendar: Sendable {
     /// measured on a series that the same write moved to UTC. Graph's documented
     /// default is the event's own zone (`recurrenceRange`), which is the zone the
     /// app dates `endDate` in. This fake models the measured label, and nothing
-    /// here reads a range's dates in it.
-    private static func defaultRecurrenceZone(in stored: inout [String: Any]) {
+    /// here reads a range's dates in it. A series CREATED without one (`created`) is
+    /// stored with its start's zone and repeats in it (measured 2026-11-13: a weekly
+    /// series created with its start labelled `America/New_York` read back
+    /// `Eastern Standard Time` and listed its occurrences on New York's clock across
+    /// New York's daylight-time start).
+    private static func defaultRecurrenceZone(in stored: inout [String: Any], created: Bool = false) {
         guard var recurrence = stored["recurrence"] as? [String: Any],
               var range = recurrence["range"] as? [String: Any], range["recurrenceTimeZone"] == nil
         else { return }
-        range["recurrenceTimeZone"] = "UTC"
+        range["recurrenceTimeZone"] = created ? (stored["start"] as? [String: Any])?["timeZone"] as? String ?? "UTC" : "UTC"
         recurrence["range"] = range
         stored["recurrence"] = recurrence
     }

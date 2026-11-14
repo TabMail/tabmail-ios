@@ -352,8 +352,10 @@ enum SplitCarry {
     /// The occurrence of the new part `newPart` that stands for the place `place` of `series`, cut
     /// at `cut`: `place` moved as far as the new part's start is from the cut, in whole days on the
     /// series' wall clock (`zone`; dates for an all-day series), at the new part's own time of day
-    /// in the zone it repeats in (`GCalEvent.seriesZone`), so a move across a change of offset
-    /// lands on the occurrence the calendar lists. It counts only when the new part's rule (its
+    /// on that clock, so a move across a change of offset lands on the occurrence the calendar
+    /// lists. A split's new part repeats in the series' zone on every provider, with a new rule too
+    /// (Google labels it with the series' zone, Outlook writes its start and range in it, a zoned
+    /// CalDAV copy keeps its own), so one clock serves both. It counts only when the new part's rule (its
     /// `recurrence`) names that day (`missingDay` as the calendar reads it); a new part that keeps
     /// the series' days and pattern places it there without reading the rule. A new part's start
     /// that its rule does not name is never a slot (`.patternStart`): RFC 5545 §3.3.10 leaves such
@@ -376,11 +378,10 @@ enum SplitCarry {
             guard let zone, cut.date == nil, start.date == nil,
                   let at = place.dateTime.flatMap(Date.fromISO8601), let cutAt = cut.dateTime.flatMap(Date.fromISO8601),
                   let startAt = start.dateTime.flatMap(Date.fromISO8601) else { return nil }
-            let partZone = newPart.seriesZone ?? zone
-            let startWall = naive(startAt, in: partZone)
+            let startWall = naive(startAt, in: zone)
             (placeDay, cutDay, startDay) = (String(naive(at, in: zone).prefix(10)), String(naive(cutAt, in: zone).prefix(10)), String(startWall.prefix(10)))
             out = { day in
-                GoogleCalendarProvider.naiveInstant("\(day)T\(startWall.dropFirst(11))", zone: partZone)
+                GoogleCalendarProvider.naiveInstant("\(day)T\(startWall.dropFirst(11))", zone: zone)
                     .map { GCalDateTime(dateTime: $0.iso8601String(), date: nil, timeZone: "UTC") }
             }
         }
@@ -401,8 +402,8 @@ enum SplitCarry {
 
     /// Whether the new part `newPart` (starting on `startDay`) has not ended by its occurrence
     /// `slot` on `slotDay`, a day its rule names: by its rule's `UNTIL` (inclusive; a date names
-    /// its whole day, a UTC time an instant, a time with no zone a wall clock in the zone the part
-    /// repeats in, `zone` when it names none) or its `COUNT` (the occurrences from its start
+    /// its whole day, a UTC time an instant, a time with no zone a wall clock in the series' zone
+    /// `zone`, the one the part repeats in) or its `COUNT` (the occurrences from its start
     /// before `slotDay` fewer than the count, its start counted as the first as RFC 5545 counts
     /// it, which can only count one more than Outlook's range does). A rule with neither has not.
     /// False when the end can't be read: no slot.
@@ -429,7 +430,7 @@ enum SplitCarry {
             guard let end = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss'Z'", timeZone: .gmt).date(from: until) else { return false }
             return at <= end
         }
-        guard let zone = newPart.seriesZone ?? zone,
+        guard let zone,
               let end = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss", timeZone: zone).date(from: until) else { return false }
         return at <= end
     }

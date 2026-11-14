@@ -78,6 +78,23 @@ that aren't included in the request body maintain their previous values".
   stored recurrence for every stored rule kind (`cardBaselineIsTheStoredRule`). Not supported: an
   explicit re-zone of a series to another zone at the same instant (iOS #667); it is no move, so it is
   not written.
+- **Amended 2026-11-13 (#563): a split's new part with a NEW rule is written in the series' zone too.**
+  Until then only the part that copies the stored range was relabelled (below); a part whose edit gave
+  a rule was created with its start labelled in the device's zone and no range zone, and Graph stores
+  such a create with its start's zone (measured 2026-11-13 on the Outlook.com test account: a weekly
+  series created with its start labelled `America/New_York` and no `recurrenceTimeZone` read back
+  `Eastern Standard Time` and listed its occurrences on New York's clock, 09:00Z then 08:00Z from New
+  York's daylight-time start; the "a range written without a zone reads back UTC" measurement holds
+  for a PATCH of a series' recurrence, not for a create). So the new part repeated on the device's
+  clock, an hour off the series' across a change of offset in either zone, on every Outlook release
+  (v1.11.3 and earlier wrote every new part so; #762 fixed only the copied-range part). Graph refuses a
+  create whose range zone differs from its start's (400 `ErrorPropertyValidationFailure` on
+  `StartTimeZoneIanaName`, measured with `Europe/London` and `GMT Standard Time` against a start in
+  `America/New_York`), and accepts start and range both in the series' zone, listing on its clock.
+  `splitNewPartJSON` now writes a given rule's range dated and named in the series' zone
+  (`GCalEvent.seriesZoneName`) and labels the start and end with it (`inSeriesZone`), as
+  `graphPatchJSON` writes a whole-series rule. Test `newRuleKeepsTheSeriesClock`; the Graph fake
+  labels a created range with its start's zone and refuses a created range zone other than its start's.
 - **Times written to an existing series carry the series' stored zone (#719, 2026-11-11).** Every
   timed start and end the app writes to an Outlook series (`graphPatchJSON` for a whole-series edit,
   the split's cap and its revert, the split's new part when it copies the stored range) is labelled

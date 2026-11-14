@@ -941,7 +941,7 @@ struct ExchangeSplitCarryTests {
         #expect(message == SplitCarry.keptHasNoSlotRefusal, "\(message)")
     }
 
-    @Test("T4: a kept occurrence between two zones' daylight-time changes lands on the new part's occurrence, the new part repeating in the zone the split names, not the series'")
+    @Test("T4: a new-rule split named from another zone repeats the new part in the series' zone, so a kept occurrence between the two zones' daylight-time changes lands on its occurrence")
     func keptBetweenTwoZonesDaylightChangesLands() async throws {
         // Weekly on Mondays at 09:00 London from 2099-03-02. New York's daylight time starts on
         // 2099-03-08, London's on 2099-03-29. The occurrence placed on 2099-03-16 was moved to
@@ -949,9 +949,12 @@ struct ExchangeSplitCarryTests {
         let london = try #require(TimeZone(identifier: "Europe/London"))
         let newYork = try #require(TimeZone(identifier: "America/New_York"))
         func at(_ wall: String, _ zone: TimeZone) throws -> Date { try #require(EKEventStoreHelper.parseNaiveISO(wall, timeZone: zone)) }
+        // Read on the device, as Graph gives it: the start labelled in the device's zone.
+        let device = TimeZone.current.identifier
         var series = GraphSplitFixture.series(range: GraphSplitFixture.noEnd)
-        series["start"] = ["dateTime": "2099-03-02T09:00:00.0000000", "timeZone": "GMT Standard Time"]
-        series["end"] = ["dateTime": "2099-03-02T09:30:00.0000000", "timeZone": "GMT Standard Time"]
+        series["start"] = ["dateTime": GraphFixture.wall(try at("2099-03-02T09:00:00", london), in: device) + ".0000000", "timeZone": device]
+        series["end"] = ["dateTime": GraphFixture.wall(try at("2099-03-02T09:30:00", london), in: device) + ".0000000", "timeZone": device]
+        series["originalStartTimeZone"] = "GMT Standard Time"
         series["recurrence"] = [
             "pattern": ["type": "weekly", "interval": 1, "month": 0, "dayOfMonth": 0, "daysOfWeek": ["monday"],
                         "firstDayOfWeek": "monday", "index": "first"],
@@ -983,7 +986,8 @@ struct ExchangeSplitCarryTests {
                 }
             }
         }
-        // A new rule (the same days), named in New York: the new part is created in New York's zone.
+        // A new rule (the same days), named in New York: the new part is still written in the
+        // series' zone, its start and its range (`splitNewPartJSON`), so it repeats at 09:00 London.
         var patch = Self.rename
         patch.recurrence = ["RRULE:FREQ=WEEKLY;BYDAY=MO"]
         let r = try await split(named: "ser-1-occ-n", start: try at("2099-03-02T09:00:00", london), exceptions: [kept], parts: [],
@@ -995,6 +999,12 @@ struct ExchangeSplitCarryTests {
             return
         }
         let partId = try #require(r.graph.created.first?["id"] as? String, "no new part: \(r.http.servedCallSequence())")
+        let part = try #require(r.graph.event(partId))
+        let rangeZone = (((part["recurrence"] as? [String: Any])?["range"] as? [String: Any])?["recurrenceTimeZone"] as? String)
+            .flatMap { CalendarTimeZoneResolver.zone(named: $0, in: .none) }
+        let startZone = ((part["start"] as? [String: Any])?["timeZone"] as? String).flatMap { CalendarTimeZoneResolver.zone(named: $0, in: .none) }
+        #expect(rangeZone?.identifier == london.identifier && startZone?.identifier == london.identifier,
+                "the new part does not repeat in the series' zone: start \(part["start"] ?? ""), range \(part["recurrence"] ?? "")")
         let onPart = r.graph.event("\(partId)-2099-03-16")
         #expect(Self.instant(onPart?["start"]) == shown, "the kept occurrence is not on the new part where it was shown: \(onPart ?? [:]); \(r.http.servedCallSequence())")
     }
@@ -1635,6 +1645,65 @@ struct ExchangeSeriesSplitCopyTests {
         #expect(posts.count == 1, "expected one create, got \(posts.count)")
         let sent = try #require(jsonObject(posts.first?.body), "the create had no JSON body")
         return (graph, try #require(graph.created.first), sent)
+    }
+
+    @Test("a new rule from another zone keeps the new part on the series' clock: every occurrence Graph lists for it stays at the series' time of day across both zones' changes of offset")
+    func newRuleKeepsTheSeriesClock() async throws {
+        // A weekly series at 09:00 in a zone whose daylight-time dates differ from the device's
+        // (London for a device in the Americas, as measured from New York), read on the device:
+        // Graph labels its start in the device's zone and keeps the range in the series'.
+        let mondays = (0..<52).map { 7.0 * 86_400 * Double($0) }
+        let deviceShifts = try mondays.map { gap -> Int in
+            let first = try #require(EKEventStoreHelper.parseNaiveISO("2099-01-05T12:00:00", timeZone: .gmt))
+            return TimeZone.current.secondsFromGMT(for: first.addingTimeInterval(gap)) - TimeZone.current.secondsFromGMT(for: first)
+        }
+        let candidates = [("Europe/London", "GMT Standard Time"), ("America/New_York", "Eastern Standard Time")]
+        let picked = try candidates.first { iana, _ in
+            let zone = try #require(TimeZone(identifier: iana))
+            let first = try #require(EKEventStoreHelper.parseNaiveISO("2099-01-05T12:00:00", timeZone: .gmt))
+            return mondays.map { zone.secondsFromGMT(for: first.addingTimeInterval($0)) - zone.secondsFromGMT(for: first) } != deviceShifts
+        }
+        let (iana, windows) = try #require(picked, "no candidate zone changes its offset on other dates than the device's")
+        let seriesZone = try #require(TimeZone(identifier: iana))
+        let device = TimeZone.current.identifier
+        let first = try #require(EKEventStoreHelper.parseNaiveISO("2099-01-05T09:00:00", timeZone: seriesZone))
+        let named = first.addingTimeInterval(7 * 86_400)
+        var series = GraphFixture.event(id: "ser-1", start: first, online: false, recurring: true)
+        series["start"] = ["dateTime": GraphFixture.wall(first, in: device) + ".0000000", "timeZone": device]
+        series["end"] = ["dateTime": GraphFixture.wall(first.addingTimeInterval(1_800), in: device) + ".0000000", "timeZone": device]
+        series["originalStartTimeZone"] = iana
+        series["recurrence"] = [
+            "pattern": ["type": "weekly", "interval": 1, "month": 0, "dayOfMonth": 0, "daysOfWeek": ["monday"],
+                        "firstDayOfWeek": "sunday", "index": "first"],
+            "range": ["type": "noEnd", "startDate": "2099-01-05", "endDate": "0001-01-01", "recurrenceTimeZone": windows, "numberOfOccurrences": 0],
+        ]
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = FakeGraphCalendar([series, GraphFixture.event(id: "ser-1-occ", start: named, online: false, seriesMasterId: "ser-1")])
+        graph.install(on: http)
+        var patch = GCalEventInput()
+        patch.recurrence = ["RRULE:FREQ=WEEKLY;BYDAY=MO"]
+        _ = try await GraphSplitFixture.provider(http).splitSeries(
+            eventId: "ser-1", recurrenceId: GraphFixture.wall(named, in: device), recurrenceIdZone: .current, patch: patch)
+        let partId = try #require(graph.created.first?["id"] as? String, "no new part: \(http.servedCallSequence())")
+        let part = try #require(graph.event(partId))
+        // Graph lists a series' occurrences on the clock of its range's zone, which a create with
+        // none takes from its start's label (measured 2026-11-13).
+        let range = (part["recurrence"] as? [String: Any])?["range"] as? [String: Any]
+        let repeatsIn = try #require((range?["recurrenceTimeZone"] as? String).flatMap { CalendarTimeZoneResolver.zone(named: $0, in: .none) })
+        let label = try #require(part["start"] as? [String: Any])
+        let start = try #require((label["timeZone"] as? String).flatMap { CalendarTimeZoneResolver.zone(named: $0, in: .none) }.flatMap { zone in
+            (label["dateTime"] as? String).flatMap { EKEventStoreHelper.parseNaiveISO(String($0.prefix(19)), timeZone: zone) }
+        })
+        let wall = GraphFixture.wall(start, in: repeatsIn.identifier)
+        let day = try #require(EKEventStoreHelper.parseNaiveISO(String(wall.prefix(10)) + "T12:00:00", timeZone: .gmt))
+        let off = try (0..<50).compactMap { week -> String? in
+            let date = GraphFixture.wall(day.addingTimeInterval(7 * 86_400 * Double(week)), in: "UTC").prefix(10)
+            let at = try #require(EKEventStoreHelper.parseNaiveISO("\(date)T\(wall.dropFirst(11))", timeZone: repeatsIn))
+            let there = GraphFixture.wall(at, in: iana)
+            return there.hasSuffix("T09:00:00") ? nil : there
+        }
+        #expect(off.isEmpty, "the new part repeats in \(repeatsIn.identifier), off the series' 09:00 \(iana) on \(off.count) weeks: \(off.prefix(4)); start \(part["start"] ?? "")")
     }
 
     @Test("the new part keeps every stored property the edit does not change, and its pattern",

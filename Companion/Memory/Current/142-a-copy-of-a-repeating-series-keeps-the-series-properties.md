@@ -795,3 +795,17 @@ an End dimension (none, `UNTIL` at the last place, `COUNT`) in all three matrice
 `keptAtTheLastPlaceUnderAnEndDateRefusesBeforeTheCreate` (Outlook), `keptAtTheLastPlaceUnderUntilRefusesBeforeTheCreate`
 (Google), `keptAtTheLastPlaceUnderUntilRefusesBeforeThePut` (CalDAV); `keptBetweenTwoZonesDaylightChangesLands` on
 each provider (London series, New York edit, 2099 daylight dates differing).
+
+**Amendment (2026-11-13, #563, twelfth): every split's new part repeats in the series' zone, so a carried slot
+is read on one clock.** Corrects the eleventh amendment's T4 sentence (kept as written above): an Outlook new part
+with a new rule did NOT repeat in `recurrenceIdZone` or UTC. Measured live: Graph stores a create with no range zone
+with its start's zone, the device's (the read labels the start in `Prefer`'s zone), and refuses a range zone other
+than the start's; the fake's UTC label on created ranges was wrong (memory 140, amendment 2026-11-13). Fix at the core:
+`splitNewPartJSON` writes a given rule in the series' zone (start, end and range, as `graphPatchJSON` does), and
+`plannedPart` names that zone. A new part now repeats in the series' zone on every provider (Google labels it with
+the master's zone; a zoned CalDAV copy keeps its own; Outlook writes it so), so `SplitCarry.slot` and `endsAtOrAfter`
+read on the series' clock `zone` alone (`newPart.seriesZone` no longer read there; the mutant the review named is
+equivalent by construction). Each provider's T4 test pins that premise: an edit named from New York leaves the part
+on London's clock and the kept occurrence lands. Red first: `newRuleKeepsTheSeriesClock` (a new-rule split from a
+device whose daylight-time dates differ from the series'; every listed occurrence must stay at the series' 09:00)
+fails on the previous commit with the honest fake (the part repeated in the device's zone, off on 30 of 50 weeks).

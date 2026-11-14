@@ -1111,8 +1111,9 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// rule it repeats by, read from the create body `createJSON` as a read of the part gives it
     /// (`rrule`: the edit's rule, else the series' pattern with its days turned by a move to another
     /// day and its range ending where the new part does, a numbered one with what is left of its
-    /// number, `newPartRecurrence`), and the zone it repeats in: the series' range zone, unless the
-    /// edit gives the rule. Throws when the create body's recurrence can't be read.
+    /// number, `newPartRecurrence`), and the zone it repeats in, the series' as `splitNewPartJSON`
+    /// writes it: its copied range's zone, or for a rule the edit gives the series' zone
+    /// (`seriesZoneName`). Throws when the create body's recurrence can't be read.
     nonisolated static func plannedPart(
         master: GCalEvent, patch: GCalEventInput, place: String, zone: TimeZone, createJSON: [String: Any]
     ) throws -> GCalEvent {
@@ -1128,7 +1129,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
             end: GCalDateTime(dateTime: times.endDateTime, date: times.endDate, timeZone: times.endTimeZone),
             attendees: nil, organizer: nil, recurrence: rules, transparency: nil, status: nil,
             htmlLink: nil, created: nil, updated: nil, recurringEventId: nil)
-        part.recurrenceTimeZoneName = given ? nil : master.recurrenceTimeZoneName
+        part.recurrenceTimeZoneName = given ? master.seriesZoneName : master.recurrenceTimeZoneName
         return part
     }
 
@@ -1486,7 +1487,13 @@ actor ExchangeCalendarProvider: CalendarProvider {
     ///   Google and CalDAV. A range whose end date is before the new start is refused, so no new
     ///   part starts after its own end: reached by a split whose edit moves the new part's start
     ///   past the series' end date (the occurrence lookup already refuses a split at an occurrence
-    ///   past it). A rule in the patch replaces the stored recurrence.
+    ///   past it). A rule in the patch replaces the stored recurrence, in the series' zone
+    ///   (`GCalEvent.seriesZoneName`): its range's dates read and named in it and the start and end
+    ///   labelled with it (`inSeriesZone`), as an edit of the whole series writes a rule
+    ///   (`graphPatchJSON`). Graph refuses a range zone other than the start's (400
+    ///   `ErrorPropertyValidationFailure`, measured 2026-11-13) and repeats a part created with no
+    ///   range zone in its start's zone, the device's, so without this the part would repeat on
+    ///   the device's clock, an hour off the series' across a change of offset in one of them.
     /// - A new place in the patch replaces the stored places (`locations`).
     /// - New notes on an online series replace only the notes in the copied body; its join section
     ///   is kept as stored (`onlineMeetingBody`). The new part is not an online meeting of its own:
@@ -1536,7 +1543,17 @@ actor ExchangeCalendarProvider: CalendarProvider {
 
         var json = stored.raw.filter { Self.splitCopiedKeys.contains($0.key) }
         if patch.location != nil { json.removeValue(forKey: "locations") }
-        for (key, value) in toGraphEventJSON(written, attendeeTypes: stored.attendeeTypes) { json[key] = value }
+        // A rule the edit gives is dated and labelled in the series' zone (`graphPatchJSON`).
+        let givenRule = !(patch.recurrence?.isEmpty ?? true)
+        let givenRuleZone = givenRule ? stored.event.seriesZoneName : nil
+        var rangeZone: TimeZone?
+        if let givenRuleZone, !stored.event.isAllDay {
+            guard let zone = CalendarTimeZoneResolver.zone(named: givenRuleZone, in: .none) else {
+                throw CalendarProviderError.unrecognizedTimeZone(givenRuleZone, consequence: "it was not split")
+            }
+            rangeZone = zone
+        }
+        for (key, value) in toGraphEventJSON(written, attendeeTypes: stored.attendeeTypes, rangeZone: rangeZone) { json[key] = value }
         // New notes on an online series keep its join section, as an edit of the series does.
         if let description = patch.description, let body = Self.onlineMeetingBody(stored.raw, notes: description) {
             json["body"] = body
@@ -1555,6 +1572,14 @@ actor ExchangeCalendarProvider: CalendarProvider {
                     if let time = json[key] as? [String: Any] { json[key] = Self.inSeriesZone(time, seriesZone: seriesZone, allDay: allDay) }
                 }
             }
+        } else if let givenRuleZone, var rule = json["recurrence"] as? [String: Any], var range = rule["range"] as? [String: Any] {
+            let allDay = json["isAllDay"] as? Bool ?? (written.startDate != nil)
+            for key in ["start", "end"] {
+                if let time = json[key] as? [String: Any] { json[key] = Self.inSeriesZone(time, seriesZone: givenRuleZone, allDay: allDay) }
+            }
+            range["recurrenceTimeZone"] = givenRuleZone
+            rule["range"] = range
+            json["recurrence"] = rule
         }
         json["transactionId"] = transactionId
         return json
