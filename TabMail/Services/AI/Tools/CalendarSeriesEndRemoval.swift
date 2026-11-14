@@ -36,8 +36,11 @@ enum CalendarSeriesEndRemoval {
     /// `recurrenceFirstDayOfWeek`); an occurrence the stored rule places that was deleted is not
     /// counted, and an `EXDATE` still counts toward a `COUNT` (RFC 5545).
     ///
-    /// Throws `Unreadable` when the stored rule, the series' first date, its zone or the edit's
-    /// end can't be read or expanded, and rethrows when the deleted occurrences can't be read.
+    /// An edit whose end is decided from the two rules alone to be no earlier (`mayEndEarlier`: the
+    /// stored end re-sent, or a later one) is nil before anything else is read, so a rename that
+    /// re-sends the rule never fails on what the count would need. Otherwise it throws `Unreadable`
+    /// when the stored rule, the series' first date, its zone or the edit's end can't be read or
+    /// expanded, and rethrows when the deleted occurrences can't be read.
     static func removal(
         series: GCalEvent, seriesId: String, edit: GCalEventInput, calendarId: String, provider: any CalendarProvider
     ) async throws -> SeriesEndRemoval? {
@@ -47,6 +50,7 @@ enum CalendarSeriesEndRemoval {
         guard let storedLine = rule(in: series.recurrence) else {
             throw Unreadable(reason: "the repeating event's stored rule can't be read")
         }
+        guard mayEndEarlier(stored: storedLine, edited: editedRule) else { return nil }
         // Dates added to the series (`RDATE`) are not counted from the rule: refused rather than
         // missed.
         guard !(series.recurrence ?? []).contains(where: { $0.uppercased().hasPrefix("RDATE") }) else {
@@ -110,6 +114,54 @@ enum CalendarSeriesEndRemoval {
             if try counter.count(before: day.adding(days: 1)) - counter.count(before: day) > 0 { removedDeleted += 1 }
         }
         return SeriesEndRemoval(count: max(0, placed - removedDeleted), after: after)
+    }
+
+    /// Whether the rule `edited` may end the series before the rule `stored` does, decided from the
+    /// rules' text alone: false only when the edit keeps the stored pattern (every part but the
+    /// end, as a set) and its end is provably no earlier: the same end, a `COUNT` no smaller, or an
+    /// `UNTIL` no earlier in the same form (a date, a UTC time, a floating time: each compares by
+    /// its digits). An `UNTIL` time in UTC after a stored date is no earlier once it is past that
+    /// date's end in every zone (`untilAfterDayEverywhere`). True otherwise, and the count decides.
+    static func mayEndEarlier(stored: String, edited: String) -> Bool {
+        func parts(_ line: String) -> [String] {
+            let body = line.uppercased().hasPrefix("RRULE:") ? String(line.dropFirst("RRULE:".count)) : line
+            return body.uppercased().split(separator: ";").map(String.init)
+        }
+        func end(_ parts: [String], _ key: String) -> String? {
+            parts.first { $0.hasPrefix(key + "=") }.map { String($0.dropFirst(key.count + 1)) }
+        }
+        let was = parts(stored)
+        let now = parts(edited)
+        func pattern(_ parts: [String]) -> Set<String> { Set(parts.filter { !$0.hasPrefix("UNTIL=") && !$0.hasPrefix("COUNT=") }) }
+        guard pattern(was) == pattern(now) else { return true }
+        if let count = end(now, "COUNT").flatMap({ Int($0) }), let stored = end(was, "COUNT").flatMap({ Int($0) }) {
+            return count < stored
+        }
+        guard let until = end(now, "UNTIL"), let storedUntil = end(was, "UNTIL") else { return true }
+        func form(_ value: String) -> Int {
+            switch (value.count, value.hasSuffix("Z")) {
+            case (8, _): return 0
+            case (16, true): return 1
+            case (15, false): return 2
+            default: return -1
+            }
+        }
+        if form(until) >= 0, form(until) == form(storedUntil) { return until < storedUntil }
+        if form(until) == 1, form(storedUntil) == 0 { return !untilAfterDayEverywhere(until, day: storedUntil) }
+        return true
+    }
+
+    /// The farthest a zone's clock is behind UTC (`Etc/GMT+12`), in seconds.
+    static let farthestZoneBehindUTC: TimeInterval = 12 * 3_600
+
+    /// Whether the UTC time `until` (`YYYYMMDDTHHMMSSZ`) is at or after the last second of the date
+    /// `day` (`YYYYMMDD`) in every zone, the one farthest behind UTC last: so the series' last day
+    /// it gives is `day` or later wherever the series repeats, with that day's occurrence in it.
+    private static func untilAfterDayEverywhere(_ until: String, day: String) -> Bool {
+        guard let instant = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss'Z'", timeZone: .gmt).date(from: until),
+              let lastSecond = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss", timeZone: .gmt).date(from: day + "T235959")
+        else { return false }
+        return instant >= lastSecond.addingTimeInterval(farthestZoneBehindUTC)
     }
 
     /// The occurrences a rule places, counted by `RecurrenceTail.occurrences`.

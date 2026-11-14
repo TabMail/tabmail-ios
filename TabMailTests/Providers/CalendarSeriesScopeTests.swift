@@ -4918,6 +4918,94 @@ struct SeriesLengthKeepsExceptionsTests {
         Self.expectOutlookKept(graph, length: Self.length, changes: changes, "after a retry")
     }
 
+    /// The first attempt keeps what it read and sends the series' write, which Graph answers 500
+    /// with nothing written (it may have landed, so the record stays sent); the user deletes
+    /// `deleting` in Outlook before the retry.
+    private static func failFirstSeriesWrite(_ graph: FakeGraphCalendar, deleting: String) {
+        graph.beforeWrite { method, id in
+            if method == "PATCH", id == "ser-1", graph.writes.filter({ $0 == "PATCH ser-1" }).count == 1 {
+                graph.failNext("PATCH", with: 500)
+                graph.userDeletesOccurrence(deleting)
+            }
+        }
+    }
+
+    @Test("Outlook: the series' write sent but not landed (500), an occurrence changed on its own then deleted in Outlook before the retry stays deleted, and the others are put back")
+    func outlookUnlandedWriteKeepsADeletionMadeBeforeTheRetry() async throws {
+        let graph = Self.outlookCalendar()
+        Self.failFirstSeriesWrite(graph, deleting: "ser-1-w1")
+        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-unlanded-500", drains: 2)
+        #expect(rows.isEmpty, "rows: \(reasons(rows))")
+        var changes = Self.ownChanges
+        changes[1] = OwnChange(deleted: true)
+        Self.expectOutlookKept(graph, length: Self.length, changes: changes, "after a retry")
+        #expect(graph.patches("ser-1").count == 1, "the series was written \(graph.patches("ser-1").count) times")
+    }
+
+    @Test("Outlook: the series' write sent but not landed, an occurrence holding a file of its own deleted before the retry: its saved copy goes with it, and nothing is held")
+    func outlookUnlandedWriteReleasesTheFileOfADeletedOccurrence() async throws {
+        let graph = Self.outlookCalendarWithOneFile()
+        Self.failFirstSeriesWrite(graph, deleting: "ser-1-w1")
+        let disk = SavedOnDevice()
+        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-unlanded-file", drains: 2,
+                                     inspect: { disk.read() })
+        #expect(rows.isEmpty, "rows: \(reasons(rows))")
+        #expect(graph.event("ser-1-w1") == nil && graph.isDeletedOccurrence("ser-1-w1"), "week 1 came back: \(graph.event("ser-1-w1") ?? [:])")
+        #expect(graph.event("ser-1-w2")?["subject"] as? String == "Renamed", "week 2: \(graph.event("ser-1-w2") ?? [:])")
+        #expect(disk.files == 0 && disk.directories == 0, "left on the device: \(disk.counts.withLock { $0 })")
+    }
+
+    @Test("Outlook: the series' write landed with its answer lost, then another client changed the series' time before the retry: the retry reads it again, and the saved file is kept for the user, never deleted")
+    func outlookOvertakenWriteKeepsItsFile() async throws {
+        let graph = Self.outlookCalendarWithOneFile()
+        graph.loseNextResponse("PATCH")
+        // After each reset another client gives the series another end, so a read of it no longer
+        // shows the edit's.
+        let label = TimeZone.current.identifier
+        let otherEnd = GraphFixture.start.addingTimeInterval(3_600)
+        graph.afterReset {
+            guard var series = graph.event("ser-1") else { return }
+            series["end"] = ["dateTime": GraphFixture.wall(otherEnd, in: label) + ".0000000", "timeZone": label]
+            graph.store(series)
+        }
+        let disk = SavedOnDevice()
+        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-overtaken", drains: 2,
+                                     inspect: {
+                                         disk.read()
+                                         await disk.readBanner()
+                                     })
+        #expect(rows.count == 1 && rows.first?.status == PendingStatus.failed.rawValue && rows.first?.failureKind == .putBackIncomplete,
+                "rows: \(reasons(rows))")
+        #expect(Self.recordFiles(rows.first) == 1 && disk.files == 1, "record \(rows.first?.argumentsJSON ?? "") saved \(disk.counts.withLock { $0 })")
+        let shown = disk.banner.withLock { $0 }
+        #expect(shown.count == 1 && shown.first?.holdsFiles == true && shown.first?.bannerText.contains(PutBackFile.notRestoredMessage(1)) == true,
+                "the banner: \(shown.map(\.bannerText))")
+    }
+
+    @Test("Outlook: a deleted occurrence changed in Outlook after the reset is left as it is, and the put-back goes on: a later deleted one is deleted again and the changed ones are put back")
+    func outlookPutBackContinuesPastAnOccurrenceChangedSince() async throws {
+        var own = Self.ownChanges
+        own[4] = OwnChange(deleted: true)
+        let graph = Self.outlookCalendar(own)
+        // Another client changes week 3, brought back by the reset, before the put-back reads it;
+        // week 4, deleted after it, comes back plain.
+        graph.afterReset {
+            guard var back = graph.event("ser-1-w3") else { return }
+            back["type"] = "exception"
+            back["subject"] = "Changed elsewhere"
+            graph.store(back)
+        }
+        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-continues")
+        #expect(rows.count == 1 && rows.first?.failureReason?.contains(Self.putBackFailure("1 event")) == true, "rows: \(reasons(rows))")
+        #expect(graph.event("ser-1-w4") == nil && graph.isDeletedOccurrence("ser-1-w4"), "week 4 came back: \(graph.event("ser-1-w4") ?? [:])")
+        #expect(graph.event("ser-1-w3")?["subject"] as? String == "Changed elsewhere", "week 3: \(graph.event("ser-1-w3") ?? [:])")
+        for n in [1, 2] {
+            let stored = graph.event("ser-1-w\(n)")
+            let start = Self.week(n).addingTimeInterval(TimeInterval(own[n].hours * 3_600))
+            #expect(instant(stored?["start"]) == start && stored?["subject"] as? String == own[n].subject, "ser-1-w\(n): \(stored ?? [:])")
+        }
+    }
+
     @Test("Outlook: a put-back stopped halfway is finished by the retry")
     func outlookPutBackStoppedHalfwayIsFinished() async throws {
         let graph = Self.outlookCalendar()
@@ -5635,7 +5723,7 @@ extension SeriesLengthKeepsExceptionsTests {
     @Test("Outlook: a record this build can't read leaves the operation queued as it is, nothing written")
     func outlookUnreadableRecordLeavesTheOperation() async throws {
         let graph = Self.outlookCalendarWithOneFile()
-        var record = SeriesEditRecord(seriesId: "ser-1", capture: "{}", files: [], write: .sent).jsonObject
+        var record = SeriesEditRecord(seriesId: "ser-1", capture: "{}", files: [], write: .sent, seriesEtag: "W/\"ser-1-0\"").jsonObject
         record["version"] = 99
         let data = try JSONSerialization.data(withJSONObject: [SeriesEditRecord.argumentKey: record])
         var args = Self.newEnd()
@@ -5820,7 +5908,7 @@ struct SeriesEditRecordIsReservedTests {
             acc.id = account
             try acc.insert(db)
         }
-        let forged = SeriesEditRecord(seriesId: "ser-1", capture: #"{"changed":[],"deleted":[],"series":{}}"#, write: .sent)
+        let forged = SeriesEditRecord(seriesId: "ser-1", capture: #"{"changed":[],"deleted":[],"series":{}}"#, write: .sent, seriesEtag: "W/\"ser-1-0\"")
         let op = try await AccountManager.shared.queueCalendarOperation(
             type: .edit, accountId: account, eventId: "ser-1", calendarId: "primary",
             arguments: ["edit_scope": .string("all"), "title": .string("Retitled"),
@@ -5845,7 +5933,8 @@ struct SeriesEditRecordIsReservedTests {
             occurrence: "occ-3", name: "logo.png", contentType: "image/png", isInline: true, contentId: "logo@example.com",
             sha256: SavedFileName.of(Data("logo".utf8)))
         let record = SeriesEditRecord(
-            seriesId: "ser-1", capture: #"{"changed":[],"deleted":["x"],"series":{}}"#, files: [file, inline], write: .landed, unconfirmedAttempts: 2)
+            seriesId: "ser-1", capture: #"{"changed":[],"deleted":["x"],"series":{}}"#, files: [file, inline], write: .landed, unconfirmedAttempts: 2,
+            seriesEtag: "W/\"ser-1-3\"")
         #expect(try SeriesEditRecord.stored(try Self.arguments(record.jsonObject)) == record)
         #expect(try SeriesEditRecord.stored(["title": .string("Retitled")]) == nil)
     }
@@ -5858,11 +5947,11 @@ struct SeriesEditRecordIsReservedTests {
         let file = PutBackFile(
             occurrence: "occ-2", name: "notes.txt", contentType: "text/plain", isInline: false, contentId: nil,
             sha256: SavedFileName.of(Data("notes".utf8)))
-        let record = SeriesEditRecord(seriesId: "ser-1", capture: "{}", files: [file], write: .sent).jsonObject
+        let record = SeriesEditRecord(seriesId: "ser-1", capture: "{}", files: [file], write: .sent, seriesEtag: "W/\"ser-1-0\"").jsonObject
         var later = record
         later["version"] = SeriesEditRecord.version + 1
         #expect(throws: SeriesEditRecord.Unreadable.self) { try SeriesEditRecord.stored(try Self.arguments(later)) }
-        for key in ["version", "series_id", "capture", "files", "write", "unconfirmed_attempts"] {
+        for key in ["version", "series_id", "capture", "files", "write", "unconfirmed_attempts", "series_etag"] {
             var partial = record
             partial[key] = nil
             #expect(throws: SeriesEditRecord.Unreadable.self, "a record without \(key) was read") {
@@ -5875,6 +5964,9 @@ struct SeriesEditRecordIsReservedTests {
         var badWrite = record
         badWrite["write"] = "maybe"
         #expect(throws: SeriesEditRecord.Unreadable.self) { try SeriesEditRecord.stored(try Self.arguments(badWrite)) }
+        var emptyEtag = record
+        emptyEtag["series_etag"] = ""
+        #expect(throws: SeriesEditRecord.Unreadable.self) { try SeriesEditRecord.stored(try Self.arguments(emptyEtag)) }
     }
 
     /// A version 1 record was kept right before the series' write, which may have landed: it is
@@ -5884,13 +5976,27 @@ struct SeriesEditRecordIsReservedTests {
         let file = PutBackFile(
             occurrence: "occ-2", name: "notes.txt", contentType: "text/plain", isInline: false, contentId: nil,
             sha256: SavedFileName.of(Data("notes".utf8)))
-        let record = SeriesEditRecord(seriesId: "ser-1", capture: "{}", files: [file], write: .landed, unconfirmedAttempts: 1)
+        let record = SeriesEditRecord(seriesId: "ser-1", capture: "{}", files: [file], write: .landed, unconfirmedAttempts: 1, seriesEtag: "W/\"ser-1-1\"")
         var first = record.jsonObject
         first["version"] = 1
         first["write"] = nil
         first["unconfirmed_attempts"] = nil
+        first["series_etag"] = nil
         let read = try SeriesEditRecord.stored(try Self.arguments(first))
-        #expect(read == SeriesEditRecord(seriesId: "ser-1", capture: "{}", files: [file], write: .sent), "\(String(describing: read))")
+        #expect(read == SeriesEditRecord(seriesId: "ser-1", capture: "{}", files: [file], write: .sent, seriesEtag: nil), "\(String(describing: read))")
+    }
+
+    /// A version 2 record kept no etag: its write is sent again only after its capture is read
+    /// again (`ExchangeCalendarProvider.updateSeries`).
+    @Test("a version 2 record, which kept no series etag, reads with none and its own write state")
+    func versionTwoRecordReadsWithNoEtag() throws {
+        let record = SeriesEditRecord(seriesId: "ser-1", capture: "{}", files: [], write: .landed, unconfirmedAttempts: 2, seriesEtag: "W/\"ser-1-1\"")
+        var second = record.jsonObject
+        second["version"] = 2
+        second["series_etag"] = nil
+        let read = try SeriesEditRecord.stored(try Self.arguments(second))
+        #expect(read == SeriesEditRecord(seriesId: "ser-1", capture: "{}", files: [], write: .landed, unconfirmedAttempts: 2, seriesEtag: nil),
+                "\(String(describing: read))")
     }
 }
 
@@ -6467,6 +6573,72 @@ struct SeriesEndRemovalCardTests {
         let error = answer?["error"] as? String ?? ""
         #expect(card.cards == 0 && error.hasPrefix("calendar_event_edit failed: could not read the repeating event to check this change (")
                 && error.hasSuffix("). The event was NOT changed. Retry."), "\(card.out)")
+    }
+
+    @Test("Google: a rename that re-sends the stored end of a series with a date added (RDATE) shows its card with no removal line: nothing the count would need is read")
+    func googleRenameOfASeriesWithAnAddedDateGoesThrough() async throws {
+        let rule = "RRULE:FREQ=WEEKLY;UNTIL=\(compact(day(42)))T090000Z"
+        var series = GoogleSeries.series(rule: rule)
+        series["recurrence"] = [rule, "RDATE:\(compact(day(31)))T090000Z"]
+        let r = try await googleTool([
+            "edit_scope": .string("all"), "timezone": .string("UTC"), "title": .string("Retitled"),
+            "recurrence": .dictionary(["freq": .string("WEEKLY"), "until": .string(day(42))]),
+        ], eventId: GoogleSeries.id, account: "series-end-g-rdate-rename", seed: [series, GoogleSeries.instance(day(0))])
+        let changes = r.run.cards.first?.changes ?? []
+        #expect(r.run.cards.count == 1 && !changes.contains { $0.contains("removed") }, "card: \(changes); \(r.run.out)")
+    }
+
+    @Test("Outlook: a rename that re-sends the stored count of a timed series whose zone can't be read shows its card with no removal line, and is written")
+    func outlookRenameOfAZonelessSeriesGoesThrough() async throws {
+        var series = GraphSeries.series()
+        var recurrence = try #require(series["recurrence"] as? [String: Any])
+        var range = try #require(recurrence["range"] as? [String: Any])
+        range.removeValue(forKey: "recurrenceTimeZone")
+        range["type"] = "numbered"
+        range["numberOfOccurrences"] = 6
+        recurrence["range"] = range
+        series["recurrence"] = recurrence
+        let weekday = try #require((recurrence["pattern"] as? [String: Any])?["daysOfWeek"] as? [String]).first ?? ""
+        let codes = ["sunday": "SU", "monday": "MO", "tuesday": "TU", "wednesday": "WE", "thursday": "TH", "friday": "FR", "saturday": "SA"]
+        let graph = FakeGraphCalendar([series, GraphSeries.occurrence(id: GraphSeries.first, at: GraphFixture.start)])
+        let r = try await outlookTool(graph, [
+            "edit_scope": .string("all"), "timezone": .string("UTC"), "title": .string("Retitled"),
+            "recurrence": .dictionary(["freq": .string("WEEKLY"), "count": .int(6), "byDay": .array([.string(codes[weekday] ?? "")])]),
+        ], eventId: "ser-1", account: "series-end-o-zoneless-rename")
+        let changes = r.cards.first?.changes ?? []
+        #expect(r.cards.count == 1 && !changes.contains { $0.contains("removed") }, "card: \(changes); \(r.out)")
+        #expect(graph.event("ser-1")?["subject"] as? String == "Retitled", "the series: \(graph.event("ser-1") ?? [:])")
+    }
+
+    struct EndCase: CustomTestStringConvertible, Sendable {
+        let stored: String
+        let edited: String
+        let mayEndEarlier: Bool
+        var testDescription: String { "\(stored) -> \(edited)" }
+    }
+
+    /// Far-future dates, so no case goes stale.
+    static let endCases: [EndCase] = [
+        EndCase(stored: "RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=6", edited: "RRULE:FREQ=WEEKLY;COUNT=6;BYDAY=MO", mayEndEarlier: false),
+        EndCase(stored: "RRULE:FREQ=WEEKLY;COUNT=6", edited: "RRULE:FREQ=WEEKLY;COUNT=8", mayEndEarlier: false),
+        EndCase(stored: "RRULE:FREQ=WEEKLY;COUNT=6", edited: "RRULE:FREQ=WEEKLY;COUNT=4", mayEndEarlier: true),
+        EndCase(stored: "RRULE:FREQ=WEEKLY;UNTIL=20991231T090000Z", edited: "RRULE:FREQ=WEEKLY;UNTIL=20991231T235959Z", mayEndEarlier: false),
+        EndCase(stored: "RRULE:FREQ=WEEKLY;UNTIL=20991231T235959Z", edited: "RRULE:FREQ=WEEKLY;UNTIL=20991231T090000Z", mayEndEarlier: true),
+        EndCase(stored: "RRULE:FREQ=WEEKLY;UNTIL=20991231", edited: "RRULE:FREQ=WEEKLY;UNTIL=20991231", mayEndEarlier: false),
+        EndCase(stored: "RRULE:FREQ=WEEKLY;UNTIL=20991231", edited: "RRULE:FREQ=WEEKLY;UNTIL=20991230", mayEndEarlier: true),
+        EndCase(stored: "RRULE:FREQ=WEEKLY;UNTIL=20991231T090000", edited: "RRULE:FREQ=WEEKLY;UNTIL=20991231T100000", mayEndEarlier: false),
+        // A UTC time after a stored date: no earlier only once past that date's end in every zone.
+        EndCase(stored: "RRULE:FREQ=WEEKLY;UNTIL=20991231", edited: "RRULE:FREQ=WEEKLY;UNTIL=21000101T115959Z", mayEndEarlier: false),
+        EndCase(stored: "RRULE:FREQ=WEEKLY;UNTIL=20991231", edited: "RRULE:FREQ=WEEKLY;UNTIL=21000101T115958Z", mayEndEarlier: true),
+        EndCase(stored: "RRULE:FREQ=WEEKLY;UNTIL=20991231T090000Z", edited: "RRULE:FREQ=WEEKLY;UNTIL=20991231", mayEndEarlier: true),
+        EndCase(stored: "RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=6", edited: "RRULE:FREQ=WEEKLY;BYDAY=TU;COUNT=6", mayEndEarlier: true),
+        EndCase(stored: "RRULE:FREQ=WEEKLY", edited: "RRULE:FREQ=WEEKLY;COUNT=6", mayEndEarlier: true),
+        EndCase(stored: "RRULE:FREQ=WEEKLY;UNTIL=20991231", edited: "RRULE:FREQ=WEEKLY;COUNT=60", mayEndEarlier: true),
+    ]
+
+    @Test("whether an edit's end may be earlier is decided from the two rules alone where it can be", arguments: Self.endCases)
+    func mayEndEarlierFromTheRules(_ c: EndCase) {
+        #expect(CalendarSeriesEndRemoval.mayEndEarlier(stored: c.stored, edited: c.edited) == c.mayEndEarlier)
     }
 
     @Test("Google: an earlier UNTIL counts the occurrences after it by their place, a moved one included and a deleted one not, with no reset note (an end-only change keeps them)")

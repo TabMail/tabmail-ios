@@ -48,7 +48,7 @@ delete's `EXDATE` `PUT` (#661); (9) a this-and-following delete's series end on 
 series after its length change, #718); (11) Outlook's series `PATCH` that moves its time, which resets
 every occurrence changed or deleted on its own (#718). The predicate and the greps are unchanged.
 
-**Twelve** (2026-11-14, #718, master-agent): (12) a whole-series edit that moves the end earlier
+**Twelve** (decided 2026-11-14, #718): (12) a whole-series edit that moves the end earlier
 removes the later occurrences, changed ones included, on all three providers: Google's `patchEvent`
 sending a recurrence whose rule changes only where it ends (to an `UNTIL`), Outlook's
 `graphPatchJSON` sending a range whose `endDate` alone moves, and CalDAV's `updateEvent` `PUT` built

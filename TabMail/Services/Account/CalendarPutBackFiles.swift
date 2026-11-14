@@ -28,20 +28,36 @@ import GRDB
 /// - by the drain-start sweep (`sweep`), for a directory whose operation row no longer exists;
 /// - a whole operation's (`remove`), when it is retired holding none (`held`): its series' write
 ///   was never sent or was refused, so the calendar still holds every file, or its record names
-///   none.
+///   none. A record this build can't read never holds none: what it names can't be told.
 /// Every other path that deletes an operation row spares a row that holds saved files (`held`).
 enum CalendarPutBackFiles {
     /// The files operation `row` holds saved on this device: those its record names
     /// (`SeriesEditRecord.files`) once its series' write was sent (`SeriesEditRecord.Write`), while
     /// any of its bytes are here. Before the write is sent, or once Graph refused it, the calendar
     /// still holds every file, so the row holds none, whatever its directory holds. Empty when the
-    /// row has no record this build can read. The one definition of a row that holds files: the
-    /// inbox banner and its warning, account removal, the reclaim of old failed rows and the
-    /// queue's retirement all read it.
+    /// row has no record. A record this build can't read (`SeriesEditRecord.Unreadable`: of a later
+    /// version, or not whole) can't say which files it names or whether its write was sent, so
+    /// every file its directory holds is held, each under no name (`unnamed`): its bytes are kept
+    /// and the user can still save them. The one definition of a row that holds files: the inbox
+    /// banner and its warning, account removal, the reclaim of old failed rows and the queue's
+    /// retirement all read it.
     static func held(_ row: PendingCalendarOperation) -> [PutBackFile] {
-        guard let record = (try? SeriesEditRecord.stored(row.arguments)) ?? nil, record.write != .notSent,
-              !record.files.isEmpty, holdsBytes(row.id) else { return [] }
+        guard holdsBytes(row.id) else { return [] }
+        let record: SeriesEditRecord?
+        do {
+            record = try SeriesEditRecord.stored(row.arguments)
+        } catch {
+            guard let dir = directory(of: row.id) else { return [] }
+            return savedNames(in: dir).sorted().map(unnamed)
+        }
+        guard let record, record.write != .notSent else { return [] }
         return record.files
+    }
+
+    /// A saved file whose record can't be read (`held`): named by nothing but its bytes, so Save
+    /// File gives it the unnamed attachment's name (`exportCopies`).
+    static func unnamed(_ sha256: String) -> PutBackFile {
+        PutBackFile(occurrence: "", name: "", contentType: "", isInline: false, contentId: nil, sha256: sha256)
     }
 
     /// The directory's name beside the database.

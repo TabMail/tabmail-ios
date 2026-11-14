@@ -675,7 +675,8 @@ case fired ("deletes an occurrence of a series it did not just create"), so it w
 put-back `DELETE` removes, from the series itself, an occurrence the series' own `PATCH` just brought
 back at a place the user had deleted (Graph brings deleted occurrences back on a time move, measured
 2026-11-14). It holds nothing of the user's own unless it was changed since; the put-back deletes
-only an instance whose `type` is `occurrence` and stops otherwise, with nothing deleted. It is found by
+only an instance whose `type` is `occurrence`; any other it skips, counts as not restored, and
+continues with the remaining places and files, with nothing deleted there. It is found by
 its place among the series' `/instances` (every page), never by position, and only at places the
 operation's record holds as deleted. (10) now reads: the Outlook carry's `DELETE` of an occurrence (a
 split's new part, #563; a series after its length change, #718).
@@ -705,7 +706,7 @@ shown to keep an occurrence's own changes across a time move.
 
 ## Re-derived for #718, an earlier end of every occurrence (2026-11-14): TWELVE
 
-**(12) A whole-series edit that moves the series' end earlier — IN the set (master-agent, 2026-11-14,
+**(12) A whole-series edit that moves the series' end earlier — IN the set (decided 2026-11-14,
 #718).** It removes every occurrence after the new last date, changed ones included (their own time,
 title, notes, guests and files), with no documented per-item recovery, on all three providers:
 

@@ -275,11 +275,18 @@ These tests read what each provider sent, or what the fake server ends up holdin
   write refused for good before it landed (404, 403) deletes the copies and shows the ordinary failure;
   files a capture saved before an error of the same plan are released; the put-back's outcome (events,
   a file too large) is the inbox banner's text; two occurrences with the same bytes, one restored, keep
-  the bytes for the other. `CalendarPutBackFilesTests` pins the bytes' lifecycle: the
+  the bytes for the other. The series write is sent on the capture's etag: one sent but not landed (500),
+  then a changed occurrence deleted before the retry, is refused (412), read again, and the occurrence
+  stays deleted with its saved file released; one landed with its answer lost, then overtaken by another
+  client's change, keeps its saved file for the user. A deleted place changed since the reset is skipped
+  and the put-back goes on (a later deleted place deleted again). `CalendarPutBackFilesTests` pins the bytes' lifecycle: the
   reclaim spares a held failed row, the Settings wipe and a release boundary leave it, the drain-start
   sweep removes only orphans, the failure banner shows a held row until dismissed and the dismissal
   deletes its bytes, Save File's names are safe, and a row whose write was never sent holds no files
-  (`CalendarPutBackFiles.held`, the one definition).
+  (`CalendarPutBackFiles.held`, the one definition), and a row whose record can't be read holds every
+  file its directory holds through a retirement and the reclaim, offered to save. `SeriesEndRemovalCardTests`
+  pin that a rename re-sending the stored end of an `RDATE` or zoneless series shows its card with no
+  removal line (`mayEndEarlier`, a table of rule pairs).
 - A new last date alone of an Outlook series is no reset (#718, `SeriesLengthKeepsExceptionsTests`,
   `FakeGraphCalendar` modelling a range-end-only `PATCH` as measured): an earlier end keeps the moved
   occurrence (time, title, own file) and the deleted one, removes the changed and plain ones after it,

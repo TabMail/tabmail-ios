@@ -423,10 +423,12 @@ final class FakeGraphCalendar: Sendable {
     let modelsExceptions = Mutex(false)
     private let cancelledStore = Mutex<[String: Data]>([:])
 
-    /// The user deletes the occurrence `id` of a series in Outlook (`modelsExceptions`).
+    /// The user deletes the occurrence `id` of a series in Outlook (`modelsExceptions`): a write in
+    /// the series, which moves its etag.
     func userDeletesOccurrence(_ id: String) {
         guard let data = events.withLock({ $0.removeValue(forKey: id) }) else { return }
         cancelledStore.withLock { $0[id] = data }
+        touchSeries(of: id)
     }
 
     /// Whether the occurrence `id` is kept deleted (`modelsExceptions`).
@@ -448,6 +450,7 @@ final class FakeGraphCalendar: Sendable {
             .compactMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
             .filter { $0["seriesMasterId"] as? String == seriesId }
             .compactMap { ($0["originalStart"] as? String).flatMap { Date.fromISO8601($0) } }
+            .sorted()
             .map { "OID.\(seriesId).\(EKEventStoreHelper.dayKey($0, timeZone: zone))" }
     }
 
@@ -1268,9 +1271,11 @@ final class FakeGraphCalendar: Sendable {
             .map { Set($0.split(separator: ",").map(String.init)) }
     }
 
+    /// `event` with only the properties `select` names, and its OData annotations (`@odata.etag`),
+    /// which Graph gives with any `$select`.
     private static func only(_ select: Set<String>?, of event: [String: Any]) -> [String: Any] {
         guard let select else { return event }
-        return event.filter { select.contains($0.key) }
+        return event.filter { select.contains($0.key) || $0.key.hasPrefix("@odata.") }
     }
 
     /// A written recurrence's range names its `startDate`.

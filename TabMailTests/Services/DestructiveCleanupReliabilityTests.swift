@@ -155,7 +155,7 @@ struct DestructiveCleanupReliabilityTests {
         let file = PutBackFile(occurrence: "occ-1", name: "notes.txt", contentType: "text/plain", isInline: false, contentId: nil,
                                sha256: SavedFileName.of(bytes))
         let recordData = try JSONSerialization.data(
-            withJSONObject: [SeriesEditRecord.argumentKey: SeriesEditRecord(seriesId: "ser-1", capture: "{}", files: [file], write: .sent).jsonObject])
+            withJSONObject: [SeriesEditRecord.argumentKey: SeriesEditRecord(seriesId: "ser-1", capture: "{}", files: [file], write: .sent, seriesEtag: "W/\"ser-1-0\"").jsonObject])
         let op = PendingCalendarOperation(
             operationType: .edit, accountId: account.id, eventId: "ser-1", calendarId: "primary",
             arguments: try JSONDecoder().decode([String: JSONValue].self, from: recordData), eventTitle: "Planning")

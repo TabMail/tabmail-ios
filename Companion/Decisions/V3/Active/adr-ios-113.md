@@ -49,6 +49,25 @@ its card.
    judge" (a zone label that does not resolve) or a series another client moved since for "not landed",
    and then replaced the record and released the only copies of the files. A version 1 record reads as
    `sent`.
+   **The write is conditional on the capture's series (review r2 C1, 2026-11-14).** The record
+   (version 3) keeps the series' `@odata.etag` the capture's read gave (`SeriesEditRecord.seriesEtag`),
+   and the series `PATCH` is sent with `If-Match` on it (`sendPatch`). Graph's etag is series-wide and
+   moves with any write anywhere in the series (measured 2026-11-14, occurrence writes; the master
+   `PATCH` is assumed to honour `If-Match` the same way). So a `sent` write that did not land (a 5xx
+   with nothing written), followed by the user deleting or changing a changed occurrence in Outlook
+   before the retry, is refused with 412 and writes nothing: the retry reads the occurrences again and
+   keeps a new record, so the stale capture is never put back over the user's newer change. When the
+   read shows the series already holds the write (an earlier attempt's landed, its answer lost), it
+   goes on as landed and puts back the kept record, sending no write: the series holds every value of
+   the `PATCH` it would send (`holdsValues`, the rule compared by every value sent, since Graph applies
+   a `PATCH` whole and gives back its own defaults besides). Without this check the landed write's own
+   etag change would refuse the resend and make the retry re-read a series Graph already reset. The re-reads are bounded by
+   `ExchangeCalendarConfig.putBackConflictReads`, then `seriesBusy` (stays queued). A record of
+   version 1 or 2 holds no etag and is read again before its write. Files of a `sent` record that the
+   new read does not name are kept in the new record (`stillHeld`), except those whose occurrence Graph
+   answers 404/410 (proven gone): the write may have landed and erased them. Kept, one whose occurrence
+   the new read holds as changed is attached again; one whose occurrence it no longer holds as changed
+   is counted as not restored and stays saved for Save File.
 4. **CalDAV: the same PUT.** A new length alone gives each override the new length from its own
    start in the same conditional `PUT` of the series resource; a field the edit also sets (a title)
    is set on each override too, as Google retitles them. A deleted occurrence (`EXDATE`) stays deleted.
@@ -95,7 +114,10 @@ its card.
    is sent, or once Graph refused it, the calendar still holds every file: a retirement then (the series
    gone, 404; no permission, 403) deletes the copies and shows the ordinary failure, never "The series
    was changed". Files a capture saved before a later refusal or error of the same plan (a second
-   occurrence holding a linked file) are released at that throw.
+   occurrence holding a linked file) are released at that throw. A record this build can't read (of a
+   later version, or not whole; review r2 R1) holds every file its directory holds, each under no name
+   (`CalendarPutBackFiles.unnamed`): never "holds none", so a retirement, the reclaim and a dismissal
+   without its warning never delete bytes nobody can account for, and Save File still offers them.
    **The put-back's outcome reaches the inbox (review r1 C3):** a put-back that can't finish after the
    series was written throws `CalendarProviderError.seriesPutBackIncomplete` with the user's words
    (`putBackOutcome`, `putBackTooLarge`); the queue retires it as `CalendarFailureKind.putBackIncomplete`,
@@ -114,7 +136,7 @@ its card.
    a new length together with a new last date moves the series' time and resets (no put-back).
    Google and CalDAV still warn of a reset for any RRULE change, an `UNTIL` alone included (not
    measured there). (Superseded for Google the same day, below.)
-   **Google, measured 2026-11-14 on the Workspace test account (master-agent's call):** a series
+   **Google, measured 2026-11-14 on the Workspace test account (decided 2026-11-14):** a series
    `PATCH` sending only a recurrence that changes its rule's `UNTIL` keeps every changed occurrence
    placed on or before the new end (own title and moved time kept), and the ones placed after it are
    left cancelled, decided by the original place, wherever they were moved (as Graph). So Google's
@@ -122,17 +144,17 @@ its card.
    (`recurrence(_:withRuleFrom:)`) changes only where the stored rule ends (`changesOnlyUntil`: one
    `RRULE` each, the stored one ending on a date or after a count, the written one on a date,
    otherwise the same rule by `canonicalRRULE`, every `EXDATE`/`RDATE` as stored; the measured series
-   was `COUNT`-ended, widened to it by master-agent the same day) and the start and end are the series' own as Google reads them
+   was `COUNT`-ended, widened to it the same day) and the start and end are the series' own as Google reads them
    (`googleTimes`, so the write sends neither and nothing is restated). Anything else still warns of a
    reset: a rule that gains or loses an end or is given a count, a new pattern, a new length or start, a
    change of kind. Outlook stays `endDate` to `endDate`. CalDAV still warns for any RRULE change.
-8. **Every calendar: an earlier last date says how many meetings it removes (master-agent,
+8. **Every calendar: an earlier last date says how many meetings it removes (decided
    2026-11-14).** The card shows "N meetings after <date> are removed." ("1 meeting ... is removed.")
    on Google, CalDAV and Outlook alike, beside a reset note where there is one, whenever the edit's
    end (`UNTIL`, or the day of its `COUNT`-th occurrence) is before the stored rule's last occurrence;
    "All meetings after <date> are removed." when the stored rule had no end. The count is ONE function
    above the provider boundary (`CalendarSeriesEndRemoval`, ADR-IOS-060), worked out FROM THE STORED
-   RULE (master-agent's ruling): the in-house expander (`RecurrenceTail.occurrences`) places the
+   RULE (decided 2026-11-14): the in-house expander (`RecurrenceTail.occurrences`) places the
    occurrences after the new last date up to the stored end (an `UNTIL`'s day, or the `COUNT`-th
    occurrence's), in the series' zone, with the calendar's own counting conventions carried on the read
    (`GCalEvent.recurrenceAnchor`, `recurrenceMissingDay`, `recurrenceFirstDayOfWeek`: Outlook counts from
@@ -143,9 +165,13 @@ its card.
    a `RECURRENCE-ID` VEVENT whose status is `CANCELLED`). A changed occurrence counts at its place,
    however far it was moved; no listing, no calendar lookup. Fails closed, never a silent 0: a stored
    rule, zone, first date or end that can't be read or expanded, an `RDATE`, or a failed deletions read
-   shows no card and the "could not read the repeating event ... Retry." error. A source check holds the
-   count free of any provider name, cast or listing.
-   **CalDAV write, master-agent's call C1 (2026-11-14):** an edit of every occurrence whose rule is the
+   shows no card and the "could not read the repeating event ... Retry." error. An edit whose end the
+   two rules alone show is no earlier (`CalendarSeriesEndRemoval.mayEndEarlier`: the stored pattern
+   kept, as a set of parts, and the same end, a `COUNT` no smaller, an `UNTIL` no earlier in the same
+   form, or a UTC `UNTIL` past a stored date's end in every zone) shows no line and reads nothing, so a
+   rename that re-sends the stored rule never fails on an `RDATE` or a zone it can't read (review r2
+   C2). A source check holds the count free of any provider name, cast or listing.
+   **CalDAV write, call C1 (decided 2026-11-14):** an edit of every occurrence whose rule is the
    stored one with an earlier end also drops, in the same single `PUT` as the rule, every changed
    occurrence (override VEVENT) whose place (`RECURRENCE-ID`) is on a day after the new last date in
    the series' zone, wherever it was moved; one placed on or before that date stays, even when moved
@@ -172,6 +198,15 @@ its card.
   (the put-back only adds). The saved bytes are new on-device data of pending-operation scope (event
   attachments, not email content: ADR-004), in the app's default protection class and the backup, as
   the database is.
+- Limits of the conditional series write (review r2): a write that landed with its answer lost, then
+  overtaken before the retry by another client's change of the series' time, is read again: the
+  occurrences' own values are not put back (the new read shows them reset), and their saved files are
+  kept and offered to save. A put-back's re-`DELETE` of a deleted place runs on the type read once by
+  `instances(around:)`, with no `If-Match` (the rulings ask it only of a `PATCH`): a change the user
+  makes to that occurrence between the listing and the `DELETE` is lost; the deletes run first, so the
+  window is short. A zoneless or `RDATE` series whose re-sent end is in another form within a day of
+  the stored one (a stored date, a UTC time before that date's end in the zone farthest behind UTC)
+  still can't be told no earlier from the rules, and fails closed as before.
 
 **Alternatives rejected:**
 - Refuse a new length when Outlook would reset something (the old branch's first design): unlike

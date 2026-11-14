@@ -207,6 +207,10 @@ struct SplitRecorder: Sendable {
 ///   undid, or judge times in a zone it can't resolve.
 /// - `unconfirmedAttempts`: the attempts whose put-back attached a file that did not read back,
 ///   bounded (`ExchangeCalendarConfig.putBackUnconfirmedAttempts`).
+/// - `seriesEtag`: the series' version as the read `capture` came from gave it, which the series'
+///   write is sent conditional on: a write of a series changed since (an occurrence deleted or
+///   changed in another app) is refused unwritten, and the capture is read again, so a retry never
+///   puts back what the user has changed since. Nil in a record of an earlier version.
 ///
 /// Unlike `SplitRecord`, it holds event content: the changed occurrences' own titles, notes,
 /// places and guests, which the write erases on the server and only this copy can put back. It
@@ -218,12 +222,14 @@ struct SplitRecorder: Sendable {
 /// operation untouched rather than being taken for none (after its write a record read as none
 /// would read the occurrences already reset, and their files would be lost). Version 1 kept no
 /// `write`: it was kept right before the write, which may have landed, so it reads as `sent`.
+/// Versions 1 and 2 kept no `seriesEtag`.
 struct SeriesEditRecord: Sendable, Equatable {
     let seriesId: String
     let capture: String
     let files: [PutBackFile]
     let write: Write
     let unconfirmedAttempts: Int
+    let seriesEtag: String?
 
     /// How far the series' own write got.
     enum Write: String, Sendable {
@@ -238,7 +244,7 @@ struct SeriesEditRecord: Sendable, Equatable {
     }
 
     /// The format this build writes, and the newest it reads.
-    static let version = 2
+    static let version = 3
 
     /// The reserved key in `PendingCalendarOperation.argumentsJSON`. Only the queue writes it
     /// (`AccountManager.recordSeriesEdit`); a tool call that carries it has it removed when the
@@ -251,13 +257,15 @@ struct SeriesEditRecord: Sendable, Equatable {
     private static let filesKey = "files"
     private static let writeKey = "write"
     private static let unconfirmedKey = "unconfirmed_attempts"
+    private static let etagKey = "series_etag"
 
-    init(seriesId: String, capture: String, files: [PutBackFile] = [], write: Write, unconfirmedAttempts: Int = 0) {
+    init(seriesId: String, capture: String, files: [PutBackFile] = [], write: Write, unconfirmedAttempts: Int = 0, seriesEtag: String?) {
         self.seriesId = seriesId
         self.capture = capture
         self.files = files
         self.write = write
         self.unconfirmedAttempts = unconfirmedAttempts
+        self.seriesEtag = seriesEtag
     }
 
     /// A record kept on an operation that this build can't read: of a later version, or not
@@ -278,16 +286,24 @@ struct SeriesEditRecord: Sendable, Equatable {
             guard let file = PutBackFile(entry) else { throw Unreadable() }
             files.append(file)
         }
-        guard stored >= 2 else { return SeriesEditRecord(seriesId: series, capture: capture, files: files, write: .sent) }
+        guard stored >= 2 else { return SeriesEditRecord(seriesId: series, capture: capture, files: files, write: .sent, seriesEtag: nil) }
         guard case .string(let raw)? = d[writeKey], let write = Write(rawValue: raw),
               let unconfirmed = d[unconfirmedKey]?.wholeNumber, unconfirmed >= 0 else { throw Unreadable() }
-        return SeriesEditRecord(seriesId: series, capture: capture, files: files, write: write, unconfirmedAttempts: unconfirmed)
+        guard stored >= 3 else {
+            return SeriesEditRecord(seriesId: series, capture: capture, files: files, write: write, unconfirmedAttempts: unconfirmed, seriesEtag: nil)
+        }
+        guard case .string(let etag)? = d[etagKey], !etag.isEmpty else { throw Unreadable() }
+        return SeriesEditRecord(seriesId: series, capture: capture, files: files, write: write, unconfirmedAttempts: unconfirmed, seriesEtag: etag)
     }
 
     /// The record as stored under `argumentKey`.
     var jsonObject: [String: Any] {
-        [Self.versionKey: Self.version, Self.seriesKey: seriesId, Self.captureKey: capture, Self.filesKey: files.map(\.jsonObject),
-         Self.writeKey: write.rawValue, Self.unconfirmedKey: unconfirmedAttempts]
+        var object: [String: Any] = [
+            Self.versionKey: Self.version, Self.seriesKey: seriesId, Self.captureKey: capture, Self.filesKey: files.map(\.jsonObject),
+            Self.writeKey: write.rawValue, Self.unconfirmedKey: unconfirmedAttempts,
+        ]
+        object[Self.etagKey] = seriesEtag
+        return object
     }
 
     /// This record without the entries `released` names.
@@ -296,17 +312,17 @@ struct SeriesEditRecord: Sendable, Equatable {
         for file in released {
             if let index = left.firstIndex(of: file) { left.remove(at: index) }
         }
-        return SeriesEditRecord(seriesId: seriesId, capture: capture, files: left, write: write, unconfirmedAttempts: unconfirmedAttempts)
+        return SeriesEditRecord(seriesId: seriesId, capture: capture, files: left, write: write, unconfirmedAttempts: unconfirmedAttempts, seriesEtag: seriesEtag)
     }
 
     /// This record with the series' write at `write`.
     func writing(_ write: Write) -> SeriesEditRecord {
-        SeriesEditRecord(seriesId: seriesId, capture: capture, files: files, write: write, unconfirmedAttempts: unconfirmedAttempts)
+        SeriesEditRecord(seriesId: seriesId, capture: capture, files: files, write: write, unconfirmedAttempts: unconfirmedAttempts, seriesEtag: seriesEtag)
     }
 
     /// This record counting one more attempt whose put-back attached a file that did not read back.
     func countingUnconfirmed() -> SeriesEditRecord {
-        SeriesEditRecord(seriesId: seriesId, capture: capture, files: files, write: write, unconfirmedAttempts: unconfirmedAttempts + 1)
+        SeriesEditRecord(seriesId: seriesId, capture: capture, files: files, write: write, unconfirmedAttempts: unconfirmedAttempts + 1, seriesEtag: seriesEtag)
     }
 }
 

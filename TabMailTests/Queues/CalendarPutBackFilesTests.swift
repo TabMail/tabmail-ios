@@ -32,7 +32,7 @@ struct CalendarPutBackFilesTests {
             PutBackFile(occurrence: "occ-1", name: $0, contentType: "text/plain", isInline: false, contentId: nil, sha256: sha)
         }
         let recordData = try JSONSerialization.data(
-            withJSONObject: [SeriesEditRecord.argumentKey: SeriesEditRecord(seriesId: "ser-1", capture: "{}", files: files, write: write).jsonObject])
+            withJSONObject: [SeriesEditRecord.argumentKey: SeriesEditRecord(seriesId: "ser-1", capture: "{}", files: files, write: write, seriesEtag: "W/\"ser-1-0\"").jsonObject])
         var args = try JSONDecoder().decode([String: JSONValue].self, from: recordData)
         args["edit_scope"] = .string("all")
         var op = PendingCalendarOperation(
@@ -85,6 +85,53 @@ struct CalendarPutBackFilesTests {
         SyncEngine.runReclaimRetiredCalendarOps(dbPool: PrioritizedDatabase(pool: db.pool))
         let left = try await Self.ids(db)
         #expect(left == [sent.id], "rows left: \(left); unsent \(unsent.id) sent \(sent.id)")
+    }
+
+    @Test("a row whose record this build can't read holds every file its directory holds: retired by a refusal it keeps them, the reclaim spares it, and the banner offers them to save")
+    func unreadableRecordHoldsItsFiles() async throws {
+        let account = "put-back-unreadable"
+        let db = try CalendarQueueTestDatabase(accountId: account)
+        defer { db.finish() }
+        let file = PutBackFile(
+            occurrence: "occ-1", name: "notes.txt", contentType: "text/plain", isInline: false, contentId: nil,
+            sha256: SavedFileName.of(Self.notes))
+        var record = SeriesEditRecord(seriesId: "ser-1", capture: "{}", files: [file], write: .landed, seriesEtag: "W/\"ser-1-1\"").jsonObject
+        record["version"] = SeriesEditRecord.version + 1
+        var args = try JSONDecoder().decode(
+            [String: JSONValue].self, from: try JSONSerialization.data(withJSONObject: [SeriesEditRecord.argumentKey: record]))
+        // A zone no resolver knows: the drain refuses the change for good before it reads the record.
+        args["edit_scope"] = .string("all")
+        args["timezone"] = .string("Not/A_Zone")
+        args["title"] = .string("Retitled")
+        var op = PendingCalendarOperation(
+            operationType: .edit, accountId: account, eventId: "ser-1", calendarId: "primary", arguments: args, eventTitle: "Planning")
+        op.createdAt = Calendar.current.date(byAdding: .day, value: -(SyncConfig.retiredCalendarOpRetentionDays + 10), to: Date()) ?? Date()
+        try await db.pool.write { [op] d in try op.insert(d) }
+        let opId = op.id
+        _ = try CalendarPutBackFiles.save(Self.notes, opId: opId)
+
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        FakeGraphCalendar([]).install(on: http)
+        let provider = ExchangeCalendarProvider(mailbox: "calendar@example.com", accessToken: { _ in "test-token" }, session: http.session)
+        await AccountManager.shared.registerCalendarProviderForTesting(accountId: account, provider: provider)
+        await AccountManager.shared.drainCalendarQueue()
+        await AccountManager.shared.unregisterCalendarProviderForTesting(accountId: account)
+
+        let retired = try #require(try await db.pool.read { d in try PendingCalendarOperation.fetchOne(d, key: opId) })
+        #expect(retired.status == PendingStatus.failed.rawValue, "the row: \(retired.status) \(retired.failureReason ?? "")")
+        #expect(CalendarPutBackFiles.holdsBytes(opId), "retiring the row deleted its bytes")
+        #expect(CalendarPutBackFiles.held(retired) == [CalendarPutBackFiles.unnamed(SavedFileName.of(Self.notes))], "held: \(CalendarPutBackFiles.held(retired))")
+        SyncEngine.runReclaimRetiredCalendarOps(dbPool: PrioritizedDatabase(pool: db.pool))
+        #expect(try await Self.ids(db) == [opId], "the reclaim took the row")
+        #expect(CalendarPutBackFiles.holdsBytes(opId), "the reclaim's bytes went")
+        let store = LateCalendarFailureStore()
+        await store.reload()
+        let failure = try #require(store.failures.first)
+        #expect(failure.holdsFiles && failure.heldFiles.count == 1, "\(failure)")
+        let urls = try CalendarPutBackFiles.exportCopies(of: failure.heldFiles, opId: failure.id)
+        #expect(urls.map(\.lastPathComponent) == [DraftReadConfig.unnamedAttachmentFilename], "\(urls)")
+        #expect(try urls.map { try Data(contentsOf: $0) } == [Self.notes])
     }
 
     @Test("Settings' local index wipe and a release boundary leave calendar rows and their saved bytes")

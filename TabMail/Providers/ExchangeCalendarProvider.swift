@@ -339,6 +339,13 @@ actor ExchangeCalendarProvider: CalendarProvider {
             BackgroundSyncLogger.logDebug("[ExchangeCalendar] updateEvent: the edit changes nothing — no PATCH")
             return existing.event
         }
+        return try await sendPatch(eventId: eventId, json: json, ifMatch: nil)
+    }
+
+    /// PATCHes the event `eventId` with `json`, sent conditional on `ifMatch` (the event's
+    /// `@odata.etag`, `If-Match`) when given: Graph then refuses it with 412, writing nothing, when
+    /// the event changed since. The event as Graph answers it.
+    private func sendPatch(eventId: String, json: [String: Any], ifMatch: String?) async throws -> GCalEvent {
         let encodedEventId = try Self.encodedGraphPathSegment(eventId, context: "Graph event id")
         let body = try JSONSerialization.data(withJSONObject: json)
         // Dump the body so we can diagnose date/tz drift in smoke tests.
@@ -349,7 +356,8 @@ actor ExchangeCalendarProvider: CalendarProvider {
                 BackgroundSyncLogger.logDebug("[ExchangeCalendar] updateEvent PATCH body=\(bodyStr.prefix(4000))")
             }
         }
-        let data = try await request(path: "/events/\(encodedEventId)", method: "PATCH", body: body)
+        let data = try await request(
+            path: "/events/\(encodedEventId)", method: "PATCH", body: body, headers: ifMatch.map { ["If-Match": $0] } ?? [:])
         if DebugModeManager.isLoggingEnabled() {
             if let respStr = String(data: data, encoding: .utf8) {
                 BackgroundSyncLogger.logDebug("[ExchangeCalendar] updateEvent response=\(respStr.prefix(4000))")
@@ -367,94 +375,160 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// change of the length (`SplitCarry.lengthChange`) of a series that has any:
     /// 1. reads and plans them before anything is written (`lengthChangeExceptions`, the plan the
     ///    edit's card also runs), refused unwritten when they can't be read or planned;
-    /// 2. keeps them on the queued operation (`record`) before the write;
-    /// 3. PATCHes the series, as `updateEvent` does (Graph resets them);
+    /// 2. keeps them on the queued operation (`record`) before the write, with the series' etag
+    ///    the read gave (`SeriesEditRecord.seriesEtag`);
+    /// 3. PATCHes the series, as `updateEvent` does (Graph resets them), conditional on that etag
+    ///    (`If-Match`; Graph's etag is series-wide and moves with any write anywhere in the series,
+    ///    measured 2026-11-14);
     /// 4. puts them back onto the series itself with the split's carry (`carry`, `putBack`), found
     ///    by their place: each deleted one deleted again, each changed one written with its own
     ///    values but the edit's fields, a moved one at its own start lasting the new length, its
     ///    guests its own with the series' change applied.
     /// Whether the series' write was sent is kept in the record (`SeriesEditRecord.Write`): `sent`
-    /// before the PATCH, `landed` once it is answered, `notSent` again when Graph answers it with
-    /// a refusal. A retry decides from that alone, never from a read of the series, which can't
-    /// tell a landed write from one another client undid, nor judge times in a zone it can't
-    /// resolve. Once sent, the kept record is what is put back, and is never replaced or shrunk
-    /// but by the put-back itself; a write still `sent` is sent again (the read shows whether it
-    /// is needed, `patchEdit`), one `landed` is not. Only a record whose write is `notSent` is read
-    /// and kept again: the series still holds its occurrences. Every put-back write is absolute,
-    /// and a DELETE answered 404 is done, so one that lands twice changes nothing. A put-back that
-    /// fails for good after the PATCH (`putBackFailsForGood`) retires the operation with how many
-    /// were not put back (`CalendarProviderError.seriesPutBackIncomplete`). Any other edit is
-    /// `updateEvent`'s.
+    /// before the PATCH, `landed` once it is answered, `notSent` again when Graph answers this
+    /// attempt's first send of it with a refusal. Once sent, a retry puts back the kept record,
+    /// which is never replaced or shrunk but by the put-back itself, while the series is the one
+    /// it was read from or already holds the write; one `landed` is not sent again. The write is
+    /// sent again only while the series does not hold it yet (the read shows whether it does), and
+    /// on the kept etag: when Graph refuses it (412), the series changed since the capture (the
+    /// user deleted or changed an occurrence in another app before the retry), so nothing is
+    /// written and the occurrences are read and kept again (`stillHeld` keeps the files the first
+    /// read saved), at most `ExchangeCalendarConfig.putBackConflictReads` reads, then `seriesBusy`
+    /// (the operation stays queued). A record whose write is `notSent` is read and kept again too:
+    /// the series still holds its occurrences. Every put-back write is absolute, and a DELETE
+    /// answered 404 is done, so one that lands twice changes nothing. A put-back that fails for
+    /// good after the PATCH (`putBackFailsForGood`) retires the operation with how many were not
+    /// put back (`CalendarProviderError.seriesPutBackIncomplete`). Any other edit is `updateEvent`'s.
     func updateSeries(
         calendarId: String = "primary", eventId: String, event: GCalEventInput, sendUpdates: String = "all",
         record: SeriesEditRecorder
     ) async throws -> GCalEvent {
         try Self.refuseUnrepresentableRule(event.recurrence)
-        let existing = try await fetchForEdit(eventId: eventId, select: Self.readSelect)
-        let series = existing.event
-        let capture: SeriesCapture
-        var kept: SeriesEditRecord?
-        // Whether this attempt kept the record it writes from: its write is then sent for the
-        // first time below.
-        var keptHere = false
-        if let earlier = record.kept, earlier.seriesId == eventId, earlier.write != .notSent {
-            capture = try seriesCapture(from: earlier.capture, series: series)
-            kept = earlier
-        } else {
-            let read = try await lengthChangeExceptions(eventId: eventId, existing: existing, edit: event, files: record.files)
-            capture = SeriesCapture(seriesRaw: existing.raw, exceptions: read.exceptions)
-            // A record an earlier attempt kept is replaced, an empty one included, so a later retry
-            // never puts back what this read no longer holds. The files it saved that this read
-            // does not hold are released once the new record is kept: its write was never sent or
-            // was refused (`notSent`), so they are not on the occurrences now because nothing of
-            // ours removed them.
-            if !read.exceptions.isEmpty || record.kept != nil {
-                let fresh: SeriesEditRecord
-                do {
-                    fresh = SeriesEditRecord(seriesId: eventId, capture: try capture.text(), files: read.files, write: .sent)
-                    try await record.keep(fresh)
-                } catch {
-                    Self.release(read.files, keeping: record.kept?.files ?? [], from: record.files)
-                    throw error
-                }
-                Self.release(record.kept?.files ?? [], keeping: read.files, from: record.files)
-                kept = fresh
-                keptHere = true
+        // What the operation holds, as this attempt keeps it.
+        var held = record.kept
+        // Whether an earlier attempt sent the write of the record the operation holds: it may have
+        // landed, so the files that record names may be on no occurrence now.
+        let sentBefore = record.kept.map { $0.seriesId == eventId && $0.write == .sent } ?? false
+        // Whether the series changed since `held`'s capture was read (its write refused by its etag).
+        var stale = false
+        var reads = 0
+        while true {
+            reads += 1
+            let existing = try await fetchForEdit(eventId: eventId, select: Self.readSelect)
+            let capture: SeriesCapture
+            var kept: SeriesEditRecord?
+            // Whether this attempt kept the record it writes from: its write is then sent for the
+            // first time below.
+            var keptHere = false
+            if let earlier = held, earlier.seriesId == eventId, earlier.write != .notSent, !stale {
+                capture = try seriesCapture(from: earlier.capture, series: existing.event)
+                kept = earlier
             } else {
-                kept = nil
-            }
-        }
-        let written: GCalEvent
-        if let landed = kept, landed.write == .landed {
-            written = series
-        } else {
-            do {
-                written = try await patchEdit(eventId: eventId, event: event, existing: existing)
-            } catch where keptHere && Self.refusedUnwritten(error) {
-                // Graph answered this attempt's first send of the write with a refusal: nothing
-                // was written, and the series still holds its occurrences. A write an earlier
-                // attempt sent stays `sent`: that send may have landed. Kept as `sent` when the
-                // record can't be written, which only keeps its files longer.
-                if let sent = kept {
+                let read = try await lengthChangeExceptions(eventId: eventId, existing: existing, edit: event, files: record.files)
+                capture = SeriesCapture(seriesRaw: existing.raw, exceptions: read.exceptions)
+                // A record an earlier read kept is replaced, an empty one included, so a later retry
+                // never puts back what this read no longer holds. The files it saved that this read
+                // does not hold are released once the new record is kept: when its write was never
+                // sent or was refused, nothing of ours removed them from their occurrences. When an
+                // earlier attempt sent it, they are kept (`stillHeld`): it may have landed.
+                if !read.exceptions.isEmpty || held != nil {
+                    let fresh: SeriesEditRecord
                     do {
-                        try await record.keep(sent.writing(.notSent))
-                    } catch {
-                        if DebugModeManager.isLoggingEnabled() {
-                            BackgroundSyncLogger.logDebug("[ExchangeCalendar] the refused write of \(eventId) stays kept as sent: \(error)")
+                        guard let etag = existing.raw["@odata.etag"] as? String, !etag.isEmpty else {
+                            throw CalendarProviderError.notSupported(Self.lengthChangeUnreadable)
                         }
+                        let carried = sentBefore ? try await stillHeld(held?.files ?? [], besides: read.files) : []
+                        fresh = SeriesEditRecord(
+                            seriesId: eventId, capture: try capture.text(), files: read.files + carried, write: .sent, seriesEtag: etag)
+                        try await record.keep(fresh)
+                    } catch {
+                        Self.release(read.files, keeping: held?.files ?? [], from: record.files)
+                        throw error
+                    }
+                    Self.release(held?.files ?? [], keeping: fresh.files, from: record.files)
+                    kept = fresh
+                    held = fresh
+                    keptHere = true
+                } else {
+                    kept = nil
+                }
+            }
+            let written: GCalEvent
+            var json = kept?.write == .landed ? nil : try graphPatchJSON(patch: event, existing: existing, allowRecurrence: true)
+            // A write an earlier attempt sent that the series holds now landed with its answer
+            // lost (the series' etag moved with it, so it is not sent again): the record it was
+            // kept with is put back. Graph applies a PATCH whole, so the series holding every
+            // value of it is that write landed.
+            if !keptHere, !stale, kept?.write == .sent, let sent = json, !sent.isEmpty,
+               Self.holdsValues(existing.raw, sent, allDay: sent["isAllDay"] as? Bool ?? existing.raw["isAllDay"] as? Bool ?? false) {
+                if DebugModeManager.isLoggingEnabled() {
+                    BackgroundSyncLogger.logDebug("[ExchangeCalendar] updateSeries: the series \(eventId) holds the write an earlier attempt sent")
+                }
+                json = nil
+            }
+            if let json, !json.isEmpty {
+                // Nil when the series changed since the capture (Graph refused the write by its
+                // etag, 412) or the record, kept by an earlier version, holds no etag: nothing was
+                // written, and the occurrences are read again.
+                var answer: GCalEvent?
+                if kept == nil || kept?.seriesEtag != nil {
+                    do {
+                        answer = try await sendPatch(eventId: eventId, json: json, ifMatch: kept?.seriesEtag)
+                    } catch ExchangeCalendarError.httpError(let code, _) where code == Self.preconditionFailed && kept != nil {
+                        answer = nil
+                    } catch where keptHere && !sentBefore && Self.refusedUnwritten(error) {
+                        // Graph answered the first send of this record's write with a refusal:
+                        // nothing was written, and the series still holds its occurrences. A write
+                        // an earlier attempt sent stays `sent`: that send may have landed.
+                        if let sent = kept { await Self.keepUnsent(sent, eventId: eventId, record: record) }
+                        throw error
                     }
                 }
-                throw error
+                guard let answer else {
+                    guard reads < ExchangeCalendarConfig.putBackConflictReads else {
+                        if keptHere, !sentBefore, let sent = kept { await Self.keepUnsent(sent, eventId: eventId, record: record) }
+                        throw ExchangeCalendarError.seriesBusy
+                    }
+                    if DebugModeManager.isLoggingEnabled() {
+                        BackgroundSyncLogger.logDebug("[ExchangeCalendar] the write of \(eventId) refused by its etag (read \(reads)): reading it again")
+                    }
+                    stale = true
+                    continue
+                }
+                written = answer
+            } else {
+                // Landed, or the series holds the write already: an earlier attempt's landed and
+                // its answer was lost.
+                BackgroundSyncLogger.logDebug("[ExchangeCalendar] updateSeries: the series holds the edit — no PATCH")
+                written = existing.event
             }
-            if let sent = kept {
+            if let sent = kept, sent.write != .landed {
                 let landed = sent.writing(.landed)
                 try await record.keep(landed)
                 kept = landed
             }
+            return try await putBackAfterWrite(
+                written, existing: existing, capture: capture, kept: kept, eventId: eventId, event: event, record: record)
         }
-        guard !capture.exceptions.isEmpty, let kept else { return written }
+    }
+
+    /// `updateSeries`' put-back once the series holds its write (`written`): what `kept` names,
+    /// read as `capture`, onto the series as `existing` was read before the write.
+    private func putBackAfterWrite(
+        _ written: GCalEvent, existing: EditSnapshot, capture: SeriesCapture, kept: SeriesEditRecord?,
+        eventId: String, event: GCalEventInput, record: SeriesEditRecorder
+    ) async throws -> GCalEvent {
+        let series = existing.event
+        guard let kept else { return written }
         let fields = SplitCarry.fields(of: event)
         let ledger = PutBackLedger(record: kept, keep: record.keep, files: record.files)
+        guard !capture.exceptions.isEmpty else {
+            // Files kept from an earlier read whose occurrence this read no longer holds as changed.
+            guard ledger.held.isEmpty else {
+                throw CalendarProviderError.seriesPutBackIncomplete(Self.putBackOutcome(events: 0, files: ledger.held.count))
+            }
+            return written
+        }
         guard let plan = SplitCarry.plan(
             exceptions: capture.exceptions.map(\.carried), series: series, newPart: written, fields: fields)
         else {
@@ -467,6 +541,44 @@ actor ExchangeCalendarProvider: CalendarProvider {
             BackgroundSyncLogger.logDebug("[ExchangeCalendar] updateSeries put back \(plan.deleted.count) deleted and \(plan.changed.count) changed occurrences of \(eventId)")
         }
         return written
+    }
+
+    /// Keeps `sent` as not sent: Graph refused its write, so nothing was written. Kept as `sent`
+    /// when the record can't be written, which only keeps its files longer.
+    private static func keepUnsent(_ sent: SeriesEditRecord, eventId: String, record: SeriesEditRecorder) async {
+        do {
+            try await record.keep(sent.writing(.notSent))
+        } catch {
+            if DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[ExchangeCalendar] the refused write of \(eventId) stays kept as sent: \(error)")
+            }
+        }
+    }
+
+    /// The files of `files` (a record whose write an earlier attempt sent, now read again) that a
+    /// new read (`besides`) does not name and that are still held: the write may have landed and
+    /// erased them, and these are their only copies, so each is kept unless its occurrence is
+    /// proven gone (Graph answers its id 404 or 410: deleted since, its files with it). Any other
+    /// answer to that read is rethrown (the operation stays queued). Kept, a file whose occurrence
+    /// the new read holds as changed is attached to it again, and one whose occurrence it does not
+    /// is counted as not restored, its bytes kept for the user.
+    private func stillHeld(_ files: [PutBackFile], besides read: [PutBackFile]) async throws -> [PutBackFile] {
+        let named = Set(read.map { "\($0.occurrence)\n\($0.sha256)" })
+        var gone: [String: Bool] = [:]
+        var out: [PutBackFile] = []
+        for file in files where !named.contains("\(file.occurrence)\n\(file.sha256)") {
+            if gone[file.occurrence] == nil {
+                let encoded = try Self.encodedGraphPathSegment(file.occurrence, context: "Graph event instance id")
+                do {
+                    _ = try await request(path: "/events/\(encoded)?$select=id")
+                    gone[file.occurrence] = false
+                } catch ExchangeCalendarError.httpError(let code, _) where code == 404 || code == 410 {
+                    gone[file.occurrence] = true
+                }
+            }
+            if gone[file.occurrence] == false { out.append(file) }
+        }
+        return out
     }
 
     /// The changed and deleted occurrences of the series `existing` that the whole-series `edit`
@@ -1843,8 +1955,10 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// value of the PATCH `sent`, compared as Graph gives them back: times as instants (an all-day
     /// one as its date), guests as a set of address and type (their answers are theirs),
     /// categories as a set, a place by its name, the body by its type and its text with the HTML
-    /// stripped and the spaces collapsed (Exchange rewrites the markup), anything else as JSON.
-    /// Any value it can't read is not equal (the occurrence is then left as it is).
+    /// stripped and the spaces collapsed (Exchange rewrites the markup), a series' rule by every
+    /// value sent (Graph gives back more: its own defaults; names in any case, lists as sets),
+    /// anything else as JSON. Any value it can't read is not equal (the occurrence is then left as
+    /// it is).
     nonisolated static func holdsValues(_ instance: [String: Any], _ sent: [String: Any], allDay: Bool) -> Bool {
         func canonical(_ value: Any?) -> String? {
             guard let value, !(value is NSNull) else { return "null" }
@@ -1866,6 +1980,23 @@ actor ExchangeCalendarProvider: CalendarProvider {
             })
         }
         func place(_ value: Any?) -> String { (value as? [String: Any])?["displayName"] as? String ?? "" }
+        func rule(_ held: Any?, holds value: Any?) -> Bool {
+            switch value {
+            case let sent as [String: Any]:
+                guard let held = held as? [String: Any] else { return false }
+                return sent.allSatisfy { rule(held[$0.key], holds: $0.value) }
+            case let sent as [String]:
+                guard let held = held as? [String] else { return false }
+                return Set(sent.map { $0.lowercased() }) == Set(held.map { $0.lowercased() })
+            case let sent as String:
+                return (held as? String)?.caseInsensitiveCompare(sent) == .orderedSame
+            case let sent as NSNumber:
+                return (held as? NSNumber) == sent
+            default:
+                let a = canonical(value), b = canonical(held)
+                return a != nil && a == b
+            }
+        }
         func text(_ value: Any?) -> String? {
             guard let body = value as? [String: Any] else { return value == nil || value is NSNull ? "" : nil }
             let content = (body["content"] as? String ?? "")
@@ -1894,6 +2025,8 @@ actor ExchangeCalendarProvider: CalendarProvider {
             case "body":
                 let a = text(value), b = text(held)
                 same = a != nil && a == b
+            case "recurrence":
+                same = rule(held, holds: value)
             default:
                 let a = canonical(value), b = canonical(held)
                 same = a != nil && a == b
