@@ -76,8 +76,26 @@ struct PendingCalendarOperation: Codable, FetchableRecord, PersistableRecord, Id
         return false
     }
 
+    /// The reserved key in `argumentsJSON` for why a still-queued change waits, when it is a reason
+    /// the user can act on (`CalendarWaitReason`). The drain writes it when it requeues the change
+    /// and clears it when a later attempt fails for another reason (#865).
+    static let waitReasonKey = "_wait_reason"
+
+    /// Why this queued change waits, or nil when no attempt gave a reason the user can act on.
+    var waitReason: CalendarWaitReason? {
+        guard case .string(let raw)? = arguments[Self.waitReasonKey] else { return nil }
+        return CalendarWaitReason(rawValue: raw)
+    }
+
+    /// Set or clear the wait reason, keeping every other argument.
+    mutating func setWaitReason(_ reason: CalendarWaitReason?) {
+        var values = arguments
+        values[Self.waitReasonKey] = reason.map { .string($0.rawValue) }
+        argumentsJSON = Self.encode(values)
+    }
+
     /// The keys only the queue writes. A tool call that carries one has it removed in `init`.
-    static let reservedKeys = [eventTitleKey, failureKindKey, failureSeenKey]
+    static let reservedKeys = [eventTitleKey, failureKindKey, failureSeenKey, waitReasonKey]
 
     /// Set reserved keys in `argumentsJSON`, keeping every other argument.
     mutating func setReservedArguments(_ values: [String: JSONValue]) {

@@ -457,6 +457,9 @@ extension AccountManager {
         defer { isDrainingCalendar = false }
 
         var failedAccounts = Set<String>()
+        // Whether a queued change's wait reason may have been written, cleared, or left the queue
+        // with its row, so the inbox's waiting banners are read again after the drain (#865).
+        var waitReasonsChanged = false
 
         for pass in 0..<3 {
             let ops: [PendingCalendarOperation]
@@ -525,6 +528,7 @@ extension AccountManager {
 
                 do {
                     let ids = try await executeCalendarOperation(currentOp, provider: calProvider)
+                    if currentOp.waitReason != nil { waitReasonsChanged = true }
                     // Post-execution delete MUST succeed — remote op already completed.
                     //
                     // 🚨 R17b-B2 — OF THE THREE DURABLE BOOKKEEPING WRITES IN THIS
@@ -581,6 +585,9 @@ extension AccountManager {
                     )
                 } catch {
                     let ageHours = Date().timeIntervalSince(currentOp.createdAt) / 3600
+                    // A reason the user can act on, kept on the row if it stays queued (#865).
+                    let waitReason = Self.calendarWaitReason(error)
+                    if currentOp.waitReason != nil || waitReason != nil { waitReasonsChanged = true }
 
                     // 🚨 R14-F4 — RAISE THE RE-AUTH SIGNAL BEFORE ANY DISPOSITION IS
                     // CHOSEN. The signal is about the ACCOUNT; the arms below decide
@@ -743,13 +750,19 @@ extension AccountManager {
                     // The row is read again and only its status and retry count are
                     // written (#601): the attempt may have kept a split's record in
                     // `argumentsJSON` (`recordSplit`), and writing back the row as it was
-                    // read before the attempt would erase it.
+                    // read before the attempt would erase it. Its wait reason (#865) is set
+                    // on that fresh read, and `argumentsJSON` is written only when it changed.
                     do {
                         try await retryWrite(dbPool, label: "CalendarQueue") { db in
                             guard var updated = try PendingCalendarOperation.fetchOne(db, key: currentOp.id) else { return }
                             updated.status = PendingStatus.queued.rawValue
                             updated.retryCount += 1
-                            try updated.update(db, columns: ["status", "retryCount"])
+                            var columns = ["status", "retryCount"]
+                            if updated.waitReason != waitReason {
+                                updated.setWaitReason(waitReason)
+                                columns.append("argumentsJSON")
+                            }
+                            try updated.update(db, columns: columns)
                         }
                     } catch {
                         BackgroundSyncLogger.logError(
@@ -767,6 +780,8 @@ extension AccountManager {
 
             if !executedAny { break }
         }
+
+        if waitReasonsChanged { await LateCalendarFailureStore.shared.reload() }
     }
 
     // MARK: - Operation Execution
@@ -1300,6 +1315,43 @@ extension AccountManager {
         if case CalDAVError.notFound = error { return true }
         if case DemoError.eventNotFound = error { return true }
         return false
+    }
+
+    /// Why a failure that keeps a change queued is one the user can act on, or nil. Only the
+    /// transient arm reads it: no terminal arm claims these errors (#865).
+    ///
+    /// `ExchangeCalendarError.mailboxFull`: Graph refused the write with 403 `ErrorQuotaExceeded`.
+    /// Signing in again can't help and the change must not be dropped, so it stays queued, the
+    /// account's later calendar changes wait behind it for the drain, and the inbox says the
+    /// mailbox is full until a drain after the user freed space makes it.
+    static func calendarWaitReason(_ error: Error) -> CalendarWaitReason? {
+        if case ExchangeCalendarError.mailboxFull = error { return .mailboxFull }
+        return nil
+    }
+
+    /// Why the account's still-queued calendar changes wait (#865), or nil: the reason the drain last
+    /// stored on the account's FIRST queued row in queue order (`createdAt`). The drain stops an
+    /// account at its first failure (`failedAccounts`), so every later change of the account waits
+    /// behind that row whether or not it was attempted, and only that row is stamped. Read by a
+    /// calendar tool whose change is still queued, so its result can say why. Rows created at the
+    /// same instant are one batch (an exdate edit's deletes) whose order the drain does not fix, so
+    /// the head is that whole batch. An in-flight row is still in the queue.
+    func calendarWaitReason(accountId: String) async -> CalendarWaitReason? {
+        let rows: [PendingCalendarOperation]
+        do {
+            rows = try await dbPool.read { db in
+                try PendingCalendarOperation
+                    .filter(Column("accountId") == accountId)
+                    .filter([PendingStatus.queued.rawValue, PendingStatus.inFlight.rawValue].contains(Column("status")))
+                    .order(Column("createdAt").asc)
+                    .fetchAll(db)
+            }
+        } catch {
+            BackgroundSyncLogger.logDebug("[CalendarQueue] Could not read the calendar queue of \(accountId): \(error)")
+            return nil
+        }
+        guard let head = rows.first else { return nil }
+        return rows.prefix { $0.createdAt == head.createdAt }.compactMap(\.waitReason).first
     }
 
     /// ⚠️ THE TYPED `.missingScope` IS NOT THE ONLY SPELLING (R12-T1, 2026-08-06).

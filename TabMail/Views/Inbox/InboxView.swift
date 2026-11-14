@@ -452,6 +452,11 @@ struct InboxView: View {
                             Task { await LateCalendarFailureStore.shared.dismiss(failure) }
                         }
                     }
+                    // Calendar changes still queued for a reason the user can act on (a full
+                    // mailbox, #865), one banner each, until the change is made.
+                    ForEach(LateCalendarFailureStore.shared.waiting) { change in
+                        WaitingCalendarChangeBanner(change: change)
+                    }
                 }
 
                 // Usage-throttle banner — surfaces when background AI

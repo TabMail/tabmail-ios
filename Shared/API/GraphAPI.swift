@@ -139,6 +139,34 @@ enum GraphAPI {
             && (components.port == nil || components.port == 443)
     }
 
+    // MARK: - Refusals
+
+    /// The status Graph refuses a write to a mailbox over its storage quota with. It is also the
+    /// status of a missing permission; only the error body's code tells the two apart (#865).
+    static let mailboxFullStatusCode = 403
+    /// Graph's error code for a mailbox over its storage quota.
+    static let mailboxFullErrorCode = "ErrorQuotaExceeded"
+
+    /// Every `code` of a Graph error body (`{"error": {"code", "message", "innerError"}}`), outermost
+    /// first: `error.code`, then each nested `innerError.code`. Graph's error resource says to code
+    /// against `code`, never `message`. Empty when the body is not a Graph error.
+    static func errorCodes(_ body: Data?) -> [String] {
+        guard let body, let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else { return [] }
+        var codes: [String] = []
+        var level = json["error"] as? [String: Any]
+        while let current = level {
+            if let code = current["code"] as? String { codes.append(code) }
+            level = current["innerError"] as? [String: Any]
+        }
+        return codes
+    }
+
+    /// Whether Graph refused a request because the mailbox is full: `mailboxFullStatusCode` with
+    /// `mailboxFullErrorCode` among the body's codes.
+    static func isMailboxFull(statusCode: Int, errorBody: Data?) -> Bool {
+        statusCode == mailboxFullStatusCode && errorCodes(errorBody).contains(mailboxFullErrorCode)
+    }
+
     // MARK: - Path-segment encoding (single source of truth for BOTH targets)
 
     /// Percent-encode `value` as one strict path segment, or `nil` if it cannot

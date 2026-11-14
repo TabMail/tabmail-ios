@@ -4,6 +4,18 @@
 
 - Register classification: `fixed`
 - Original row SHA-256: `dbca920583058a29c61a2b0844cfa25d502f346077968a811639d5ed123f7a28`
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+
+> **Amendment (2026-11-14, tabmail-ios #865): the "Accepted residual" below is reversed for a full
+> Outlook mailbox.** Graph refuses a write to a mailbox over its storage quota with 403
+> `ErrorQuotaExceeded`. Retiring that as a scope failure dropped the user's calendar change and asked
+> them to sign in again, which cannot free space. `ExchangeCalendarProvider.request` (first response and
+> post-refresh retry) and the upload session's range PUT now throw `ExchangeCalendarError.mailboxFull`
+> for it (`GraphAPI.isMailboxFull`); no terminal arm claims that, so the change stays queued with a
+> visible "mailbox full" reason and is made once space is freed. Every other 403 is unchanged and still
+> takes the missing-permission arm here. The residual still holds for an org-policy 403 and for Google.
+> Detail: `Companion/Memory/Current/149-a-full-mailbox-keeps-a-calendar-change-queued.md`.
+<!-- KNOWN-ISSUES-AMENDMENT-END -->
 
 ## Status
 
