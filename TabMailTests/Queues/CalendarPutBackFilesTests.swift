@@ -20,18 +20,19 @@ struct CalendarPutBackFilesTests {
 
     private static let notes = Data("own notes".utf8)
 
-    /// A row of `accountId` whose record names `files` of `bytes`, saved on the device when `saved`;
-    /// failed (seen on its card) unless `failed` is false, and queued `ageDays` days ago.
+    /// A row of `accountId` whose record names `files` of `bytes`, its series' write at `write`,
+    /// saved on the device when `saved`; failed (seen on its card) unless `failed` is false, and
+    /// queued `ageDays` days ago.
     private static func row(
         _ db: CalendarQueueTestDatabase, accountId: String, files names: [String] = ["notes.txt"], bytes: Data = notes,
-        saved: Bool = true, failed: Bool = true, ageDays: Int = 0
+        write: SeriesEditRecord.Write = .landed, saved: Bool = true, failed: Bool = true, ageDays: Int = 0
     ) async throws -> PendingCalendarOperation {
         let sha = SavedFileName.of(bytes)
         let files = names.map {
             PutBackFile(occurrence: "occ-1", name: $0, contentType: "text/plain", isInline: false, contentId: nil, sha256: sha)
         }
         let recordData = try JSONSerialization.data(
-            withJSONObject: [SeriesEditRecord.argumentKey: SeriesEditRecord(seriesId: "ser-1", capture: "{}", files: files).jsonObject])
+            withJSONObject: [SeriesEditRecord.argumentKey: SeriesEditRecord(seriesId: "ser-1", capture: "{}", files: files, write: write).jsonObject])
         var args = try JSONDecoder().decode([String: JSONValue].self, from: recordData)
         args["edit_scope"] = .string("all")
         var op = PendingCalendarOperation(
@@ -65,6 +66,25 @@ struct CalendarPutBackFilesTests {
         let left = try await Self.ids(db)
         #expect(left == [held.id], "rows left: \(left); held \(held.id) plain \(plain.id)")
         #expect(CalendarPutBackFiles.holdsBytes(held.id), "the held row's bytes went")
+    }
+
+    @Test("a row whose series' write was never sent holds no files, whatever its directory holds: the inbox shows it as an ordinary failure, account removal counts none, and the reclaim takes it")
+    func unsentWriteHoldsNoFiles() async throws {
+        let db = try CalendarQueueTestDatabase(accountId: "put-back-unsent")
+        defer { db.finish() }
+        let old = SyncConfig.retiredCalendarOpRetentionDays + 10
+        let unsent = try await Self.row(db, accountId: "put-back-unsent", write: .notSent, ageDays: old)
+        let sent = try await Self.row(db, accountId: "put-back-unsent", write: .sent, ageDays: old)
+        #expect(CalendarPutBackFiles.held(unsent).isEmpty && CalendarPutBackFiles.held(sent).count == 1)
+        let store = LateCalendarFailureStore()
+        await store.reload()
+        // Both were seen on their cards: only the one holding files stays shown.
+        #expect(store.failures.map(\.id) == [sent.id], "shown: \(store.failures.map(\.id))")
+        let found = await LateCalendarFailureStore.heldFiles(accountId: "put-back-unsent")
+        #expect(found.map(\.opId) == [sent.id], "\(found.map(\.opId))")
+        SyncEngine.runReclaimRetiredCalendarOps(dbPool: PrioritizedDatabase(pool: db.pool))
+        let left = try await Self.ids(db)
+        #expect(left == [sent.id], "rows left: \(left); unsent \(unsent.id) sent \(sent.id)")
     }
 
     @Test("Settings' local index wipe and a release boundary leave calendar rows and their saved bytes")

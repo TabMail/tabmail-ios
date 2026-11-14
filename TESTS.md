@@ -266,13 +266,20 @@ These tests read what each provider sent, or what the fake server ends up holdin
   not doubled), after a lost answer too; a linked file or an item of its own is refused at the card and
   at the drain with nothing written, a series item is not; a file too large retires the operation with
   its name and date and keeps its bytes; a file not read back keeps it queued, and the retry attaches
-  it; an occurrence changed elsewhere is counted and still gets its files; a stale etag is read again,
+  it; one that never reads back is added on `putBackUnconfirmedAttempts` attempts at most, then retires
+  the operation with it kept; an occurrence changed elsewhere is counted and still gets its files; a stale etag is read again,
   and `putBackConflictReads` refusals keep the operation queued; a deleted occurrence releases its
   files; a lost or changed saved copy is counted and dropped; a record of a later version leaves the
-  operation queued with nothing written. `CalendarPutBackFilesTests` pins the bytes' lifecycle: the
+  operation queued with nothing written. The series write's state is kept, never re-read: a retry after
+  a landed write puts back from the record though another client changed the series' time since; a
+  write refused for good before it landed (404, 403) deletes the copies and shows the ordinary failure;
+  files a capture saved before an error of the same plan are released; the put-back's outcome (events,
+  a file too large) is the inbox banner's text; two occurrences with the same bytes, one restored, keep
+  the bytes for the other. `CalendarPutBackFilesTests` pins the bytes' lifecycle: the
   reclaim spares a held failed row, the Settings wipe and a release boundary leave it, the drain-start
   sweep removes only orphans, the failure banner shows a held row until dismissed and the dismissal
-  deletes its bytes, Save File's names are safe.
+  deletes its bytes, Save File's names are safe, and a row whose write was never sent holds no files
+  (`CalendarPutBackFiles.held`, the one definition).
 - A new last date alone of an Outlook series is no reset (#718, `SeriesLengthKeepsExceptionsTests`,
   `FakeGraphCalendar` modelling a range-end-only `PATCH` as measured): an earlier end keeps the moved
   occurrence (time, title, own file) and the deleted one, removes the changed and plain ones after it,

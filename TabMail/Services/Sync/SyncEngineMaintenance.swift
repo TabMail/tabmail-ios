@@ -415,10 +415,24 @@ extension SyncEngine {
         ) ?? Date.distantPast
         let chunkSize = SyncConfig.pruneChunkSize
         let terminal = PendingStatus.failed.rawValue
-        // A failed row that still holds saved put-back files (#718) is never reclaimed: the
-        // files are the only copy of what the user had attached, and only the user's warned
-        // dismissal or account removal deletes them.
-        let held = Array(CalendarPutBackFiles.heldOperationIds())
+        // A failed row that still holds saved put-back files (#718, `CalendarPutBackFiles.held`) is
+        // never reclaimed: the files are the only copy of what the user had attached, and only the
+        // user's warned dismissal or account removal deletes them. A row whose directory holds
+        // bytes it does not hold is reclaimed, and the drain-start sweep removes them.
+        let candidates = Array(CalendarPutBackFiles.heldOperationIds())
+        let held: [String]
+        do {
+            held = candidates.isEmpty ? [] : try dbPool.read { db in
+                try PendingCalendarOperation.filter(keys: candidates).fetchAll(db)
+                    .filter { !CalendarPutBackFiles.held($0).isEmpty }.map(\.id)
+            }
+        } catch {
+            // Nothing is reclaimed when the rows that hold files can't be told.
+            if DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[CalendarQueue] Retired-op reclaim skipped: the rows holding saved files can't be read: \(error)")
+            }
+            return
+        }
         let spared = held.isEmpty ? "" : "AND id NOT IN (\(held.map { _ in "?" }.joined(separator: ",")))"
 
         var reclaimed = 0

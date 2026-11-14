@@ -38,6 +38,17 @@ its card.
    until the operation completes, so a retry after a lost answer puts back what the first attempt
    read. It is event content, not email content (ADR-004 covers email content), pending-operation
    scope, and is cleared with the operation.
+   **The write's state is kept, never re-derived (review r1 C1, 2026-11-14).** The record (version 2)
+   keeps how far the series' `PATCH` got (`SeriesEditRecord.Write`): `sent` before it, `landed` once
+   answered, `notSent` again when Graph answers this attempt's first send with a refusal (a 4xx, or a
+   refusal before sending, `refusedUnwritten`; a lost answer or a 5xx may have landed and stays
+   `sent`). A retry decides from that alone: once `sent` the kept record is put back and never replaced
+   or shrunk but by the put-back's own read-backs; a `sent` write is sent again (`patchEdit` sends
+   nothing when the read shows it there), a `landed` one is not. Only a `notSent` record is read and
+   kept again. The first build re-derived "landed" from a read (`!movesSeriesTime`), which takes "can't
+   judge" (a zone label that does not resolve) or a series another client moved since for "not landed",
+   and then replaced the record and released the only copies of the files. A version 1 record reads as
+   `sent`.
 4. **CalDAV: the same PUT.** A new length alone gives each override the new length from its own
    start in the same conditional `PUT` of the series resource; a field the edit also sets (a title)
    is set on each override too, as Google retitles them. A deleted occurrence (`EXDATE`) stays deleted.
@@ -68,14 +79,28 @@ its card.
    removal of its account (`PutBackLedger` keeps the record before releasing bytes). A missing or
    corrupt saved copy is skipped, counted and dropped; Outlook's `ErrorMessageSizeExceeded` retires the
    operation ("<file> could not be put back on <date>: too large for Outlook."); a file answered but
-   not read back keeps it queued (`putBackNotConfirmed`); a full mailbox keeps it queued (#865). A failed
-   operation that still holds files says "The series was changed, but N files attached to events you
-   had changed on their own are not restored yet." and is shown until dismissed; its banner and the
-   account-removal alert offer Save File (the share sheet) and warn before deleting (owner ruling
-   2026-11-14). Account removal counts the saved files again inside its delete transaction and refuses,
-   changing nothing, when there are more than the user was warned of; Settings then warns again with
-   the new count. The 30-day reclaim spares a row holding bytes; the drain-start sweep
-   removes only bytes whose row is gone.
+   not read back keeps it queued (`putBackNotConfirmed`), for at most
+   `ExchangeCalendarConfig.putBackUnconfirmedAttempts` attempts (counted in the record; each re-adds the
+   file), then retires it with the file counted as not restored and kept (review r1 R1); a full mailbox
+   keeps it queued (#865). A failed operation that still holds files says "The series was changed, but
+   N files attached to events you had changed on their own are not restored yet." and is shown until
+   dismissed; its banner and the account-removal alert offer Save File (the share sheet) and warn
+   before deleting (owner ruling 2026-11-14). Account removal counts the saved files again inside its
+   delete transaction and refuses, changing nothing, when there are more than the user was warned of;
+   Settings then warns again with the new count. The 30-day reclaim spares a row holding files; the
+   drain-start sweep removes only bytes whose row is gone.
+   **One definition of "holds files" (review r1 R2, C2):** `CalendarPutBackFiles.held(row)`, the
+   record's files once its write is `sent` or `landed`, while its bytes are on the device. The banner,
+   its warning, account removal, the reclaim and the queue's retirement all read it. Before the write
+   is sent, or once Graph refused it, the calendar still holds every file: a retirement then (the series
+   gone, 404; no permission, 403) deletes the copies and shows the ordinary failure, never "The series
+   was changed". Files a capture saved before a later refusal or error of the same plan (a second
+   occurrence holding a linked file) are released at that throw.
+   **The put-back's outcome reaches the inbox (review r1 C3):** a put-back that can't finish after the
+   series was written throws `CalendarProviderError.seriesPutBackIncomplete` with the user's words
+   (`putBackOutcome`, `putBackTooLarge`); the queue retires it as `CalendarFailureKind.putBackIncomplete`,
+   whose banner shows that stored text ("A calendar change wasn't finished: <title>. <outcome>"),
+   where every other kind's stored reason stays text for the assistant.
 7. **Outlook: a new last date alone is no reset (2026-11-14).** Measured on a work account: a series
    `PATCH` whose recurrence differs from the stored one only in its range's `endDate` (both ending on a
    date), with the stored start and end, keeps every changed occurrence (id, time, title, own file)
@@ -128,8 +153,8 @@ its card.
    `RecurrenceTail.lastDay`, the reading the count uses, so the card's place-based count is what the
    write removes). Excluded dates (`EXDATE`) are left; one past the new end is harmless. Before C1 the
    write kept every override, so one placed after the new end stayed visible at its moved time.
-   Whether this drop is a new irreversible wire operation in the census was put to the coordinator;
-   the census is unchanged until it answers.
+   The census counts this drop, with the earlier end on Google and Outlook, as irreversible
+   operation (12): twelve operations (2026-11-14, decision 7's census paragraph and memory 102).
    *Superseded first build (5c96b802, 2026-11-14):* the count listed the calendar's occurrences
    (`listEvents`) within a 7-day margin; it undercounted (a default-calendar listing gave a silent 0 for
    a series on another calendar, a far-moved occurrence was missed) and was replaced the same day.

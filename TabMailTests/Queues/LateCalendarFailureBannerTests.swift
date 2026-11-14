@@ -177,18 +177,24 @@ struct LateCalendarFailureBannerTests {
         case .signInFailed: return CalDAVError.authFailed
         case .unsupported: return CalendarProviderError.notSupported("this provider can't delete this event")
         case .refused: return GoogleCalendarError.httpError(400, nil)
+        case .putBackIncomplete: return CalendarProviderError.seriesPutBackIncomplete(Self.putBackOutcome)
         }
     }
 
-    @Test("Each kind of failure shows its own plain line, and never the text written for the assistant",
+    /// What a put-back left unfinished says (`CalendarProviderError.seriesPutBackIncomplete`),
+    /// written for the user.
+    private static let putBackOutcome = ExchangeCalendarProvider.putBackOutcome(events: 2, files: 1)
+
+    @Test("Each kind of failure shows its own plain line, and never the text written for the assistant; a put-back left unfinished shows what it did not restore",
           arguments: CalendarFailureKind.allCases)
     func eachKindShowsItsPlainLine(_ kind: CalendarFailureKind) async throws {
         let expected: String = switch kind {
-        case .notFound: "The event no longer exists."
-        case .missingPermission: "TabMail doesn't have permission to change this calendar."
-        case .signInFailed: "The calendar account needs you to sign in again."
-        case .unsupported: "This calendar can't make this kind of change."
-        case .refused: "The calendar refused the change."
+        case .notFound: "couldn't be made: Planning. The event no longer exists."
+        case .missingPermission: "couldn't be made: Planning. TabMail doesn't have permission to change this calendar."
+        case .signInFailed: "couldn't be made: Planning. The calendar account needs you to sign in again."
+        case .unsupported: "couldn't be made: Planning. This calendar can't make this kind of change."
+        case .refused: "couldn't be made: Planning. The calendar refused the change."
+        case .putBackIncomplete: "wasn't finished: Planning. \(Self.putBackOutcome)"
         }
         let accountId = "late-cal-kind-\(kind.rawValue)"
         let (pool, dir, previous) = try makeTestDB(accountId: accountId)
@@ -214,9 +220,11 @@ struct LateCalendarFailureBannerTests {
                 "fixture check: the \(kind) error must retire the change; got \(String(describing: row?.status))")
         let store = LateCalendarFailureStore()
         await store.reload()
-        #expect(store.failures.map(\.bannerText) == ["A calendar change couldn't be made: Planning. \(expected)"])
+        #expect(row?.failureKind == kind, "retired as \(String(describing: row?.failureKind))")
+        #expect(store.failures.map(\.bannerText) == ["A calendar change \(expected)"])
         let reason = row?.failureReason ?? ""
-        #expect(!reason.isEmpty && !store.failures.contains { $0.bannerText.contains(reason) },
+        // A put-back's outcome is the one reason written for the user.
+        #expect(!reason.isEmpty && (kind == .putBackIncomplete) == store.failures.contains { $0.bannerText.contains(reason) },
                 "the banner shows the text written for the assistant (\(reason)): \(store.failures.map(\.bannerText))")
     }
 

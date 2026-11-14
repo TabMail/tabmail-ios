@@ -19,9 +19,13 @@ enum CalendarFailureKind: String, Sendable, CaseIterable {
     case unsupported
     /// The calendar refused the request as malformed.
     case refused
+    /// An edit of every occurrence wrote the series but could not put back everything the write
+    /// reset (`CalendarProviderError.seriesPutBackIncomplete`, #718).
+    case putBackIncomplete
 
     /// The plain line the inbox shows for this kind. The stored `failureReason` is text for
-    /// the assistant and is never shown.
+    /// the assistant and is never shown, but for `putBackIncomplete`, whose reason is written for
+    /// the user (`LateCalendarFailure.outcome`).
     var userReason: String {
         switch self {
         case .notFound: return "The event no longer exists."
@@ -29,6 +33,7 @@ enum CalendarFailureKind: String, Sendable, CaseIterable {
         case .signInFailed: return "The calendar account needs you to sign in again."
         case .unsupported: return "This calendar can't make this kind of change."
         case .refused: return "The calendar refused the change."
+        case .putBackIncomplete: return "The series was changed, but not everything it had could be restored. Check it in your calendar."
         }
     }
 }
@@ -76,15 +81,20 @@ struct LateCalendarFailure: Identifiable, Equatable, Sendable {
     let title: String
     let kind: CalendarFailureKind
     /// The files of changed occurrences the change saved on this device and could not attach
-    /// again (#718): kept with the row until the user saves or dismisses them. Empty for any
-    /// other failure.
+    /// again (#718, `CalendarPutBackFiles.held`): kept with the row until the user saves or
+    /// dismisses them. Empty for any other failure.
     var heldFiles: [PutBackFile] = []
+    /// What an edit of every occurrence did not put back after writing the series
+    /// (`CalendarFailureKind.putBackIncomplete`): the stored reason, written for the user (which
+    /// occurrences and files, a file too large for Outlook). Nil for any other failure.
+    var outcome: String?
 
     /// Whether the row holds saved files, so dismissing it deletes them.
     var holdsFiles: Bool { !heldFiles.isEmpty }
 
     /// The inbox banner's line.
     var bannerText: String {
+        if let outcome { return "A calendar change wasn't finished: \(title). \(outcome)" }
         guard holdsFiles else { return "A calendar change couldn't be made: \(title). \(kind.userReason)" }
         return "A calendar change wasn't finished: \(title). \(PutBackFile.notRestoredMessage(heldFiles.count))"
     }
@@ -146,9 +156,10 @@ final class LateCalendarFailureStore {
         failures = rows.compactMap { row in
             // A row holding saved files is shown until the user dismisses it, seen or not: its
             // files are the only copy (#718).
-            let held = CalendarPutBackFiles.holdsBytes(row.id) ? (((try? SeriesEditRecord.stored(row.arguments)) ?? nil)?.files ?? []) : []
+            let held = CalendarPutBackFiles.held(row)
             guard let kind = row.failureKind, !row.failureSeen || !held.isEmpty else { return nil }
-            return LateCalendarFailure(id: row.id, title: row.eventTitle ?? "(No title)", kind: kind, heldFiles: held)
+            let outcome = kind == .putBackIncomplete ? row.failureReason.flatMap { $0.isEmpty ? nil : $0 } : nil
+            return LateCalendarFailure(id: row.id, title: row.eventTitle ?? "(No title)", kind: kind, heldFiles: held, outcome: outcome)
         }
         waiting = queued.compactMap { row in
             guard let reason = row.waitReason else { return nil }
@@ -192,11 +203,11 @@ final class LateCalendarFailureStore {
 
     /// `heldFiles(accountId:)` read in `db`, so account removal counts them in its own transaction.
     nonisolated static func heldFiles(_ db: Database, accountId: String) throws -> [HeldFiles] {
-        let held = CalendarPutBackFiles.heldOperationIds()
-        guard !held.isEmpty else { return [] }
+        guard !CalendarPutBackFiles.heldOperationIds().isEmpty else { return [] }
         let rows = try PendingCalendarOperation.filter(Column("accountId") == accountId).fetchAll(db)
-        return rows.filter { held.contains($0.id) }.map { row in
-            HeldFiles(opId: row.id, files: ((try? SeriesEditRecord.stored(row.arguments)) ?? nil)?.files ?? [])
+        return rows.compactMap { row in
+            let files = CalendarPutBackFiles.held(row)
+            return files.isEmpty ? nil : HeldFiles(opId: row.id, files: files)
         }
     }
 

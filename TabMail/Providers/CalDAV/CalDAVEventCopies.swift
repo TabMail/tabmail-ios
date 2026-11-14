@@ -399,7 +399,7 @@ extension CalDAVProvider {
     }
 
     /// The resource an edit of every occurrence writes when its rule is the stored one with an
-    /// earlier end (#718, master-agent's call C1): `merged` (the stored resource with the patch in
+    /// earlier end (#718): `merged` (the stored resource with the patch in
     /// its series VEVENT) without every changed occurrence (override VEVENT) whose place in the
     /// series (`RECURRENCE-ID`) is on a day after the new last date, in the series' zone, wherever
     /// it was moved to; one placed on or before that date stays, also when it was moved past it

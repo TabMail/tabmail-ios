@@ -373,12 +373,18 @@ actor ExchangeCalendarProvider: CalendarProvider {
     ///    by their place: each deleted one deleted again, each changed one written with its own
     ///    values but the edit's fields, a moved one at its own start lasting the new length, its
     ///    guests its own with the series' change applied.
-    /// A retry uses the kept record only once a fresh read shows the PATCH landed (the edit no
-    /// longer moves the series' time); otherwise the series still holds its occurrences and they
-    /// are read and kept again. Every put-back write is absolute, and a DELETE answered 404 is
-    /// done, so one that lands twice changes nothing. A put-back write that fails for good after
-    /// the PATCH (`putBackFailsForGood`) retires the operation with how many were not put back
-    /// (`putBackFailure`). Any other edit is `updateEvent`'s.
+    /// Whether the series' write was sent is kept in the record (`SeriesEditRecord.Write`): `sent`
+    /// before the PATCH, `landed` once it is answered, `notSent` again when Graph answers it with
+    /// a refusal. A retry decides from that alone, never from a read of the series, which can't
+    /// tell a landed write from one another client undid, nor judge times in a zone it can't
+    /// resolve. Once sent, the kept record is what is put back, and is never replaced or shrunk
+    /// but by the put-back itself; a write still `sent` is sent again (the read shows whether it
+    /// is needed, `patchEdit`), one `landed` is not. Only a record whose write is `notSent` is read
+    /// and kept again: the series still holds its occurrences. Every put-back write is absolute,
+    /// and a DELETE answered 404 is done, so one that lands twice changes nothing. A put-back that
+    /// fails for good after the PATCH (`putBackFailsForGood`) retires the operation with how many
+    /// were not put back (`CalendarProviderError.seriesPutBackIncomplete`). Any other edit is
+    /// `updateEvent`'s.
     func updateSeries(
         calendarId: String = "primary", eventId: String, event: GCalEventInput, sendUpdates: String = "all",
         record: SeriesEditRecorder
@@ -386,10 +392,12 @@ actor ExchangeCalendarProvider: CalendarProvider {
         try Self.refuseUnrepresentableRule(event.recurrence)
         let existing = try await fetchForEdit(eventId: eventId, select: Self.readSelect)
         let series = existing.event
-        let landed = !movesSeriesTime(event, existing: series)
         let capture: SeriesCapture
-        let kept: SeriesEditRecord?
-        if let earlier = record.kept, earlier.seriesId == eventId, landed {
+        var kept: SeriesEditRecord?
+        // Whether this attempt kept the record it writes from: its write is then sent for the
+        // first time below.
+        var keptHere = false
+        if let earlier = record.kept, earlier.seriesId == eventId, earlier.write != .notSent {
             capture = try seriesCapture(from: earlier.capture, series: series)
             kept = earlier
         } else {
@@ -397,29 +405,60 @@ actor ExchangeCalendarProvider: CalendarProvider {
             capture = SeriesCapture(seriesRaw: existing.raw, exceptions: read.exceptions)
             // A record an earlier attempt kept is replaced, an empty one included, so a later retry
             // never puts back what this read no longer holds. The files it saved that this read
-            // does not hold are released once the new record is kept: the series' write has not
-            // landed (`landed`), so they are not on the occurrences now because nothing of ours
-            // removed them.
+            // does not hold are released once the new record is kept: its write was never sent or
+            // was refused (`notSent`), so they are not on the occurrences now because nothing of
+            // ours removed them.
             if !read.exceptions.isEmpty || record.kept != nil {
-                let fresh = SeriesEditRecord(seriesId: eventId, capture: try capture.text(), files: read.files)
-                try await record.keep(fresh)
-                let named = Set(read.files.map(\.sha256))
-                for name in Set((record.kept?.files ?? []).map(\.sha256)).subtracting(named) {
-                    try? record.files.release(name)
+                let fresh: SeriesEditRecord
+                do {
+                    fresh = SeriesEditRecord(seriesId: eventId, capture: try capture.text(), files: read.files, write: .sent)
+                    try await record.keep(fresh)
+                } catch {
+                    Self.release(read.files, keeping: record.kept?.files ?? [], from: record.files)
+                    throw error
                 }
+                Self.release(record.kept?.files ?? [], keeping: read.files, from: record.files)
                 kept = fresh
+                keptHere = true
             } else {
                 kept = nil
             }
         }
-        let written = try await patchEdit(eventId: eventId, event: event, existing: existing)
+        let written: GCalEvent
+        if let landed = kept, landed.write == .landed {
+            written = series
+        } else {
+            do {
+                written = try await patchEdit(eventId: eventId, event: event, existing: existing)
+            } catch where keptHere && Self.refusedUnwritten(error) {
+                // Graph answered this attempt's first send of the write with a refusal: nothing
+                // was written, and the series still holds its occurrences. A write an earlier
+                // attempt sent stays `sent`: that send may have landed. Kept as `sent` when the
+                // record can't be written, which only keeps its files longer.
+                if let sent = kept {
+                    do {
+                        try await record.keep(sent.writing(.notSent))
+                    } catch {
+                        if DebugModeManager.isLoggingEnabled() {
+                            BackgroundSyncLogger.logDebug("[ExchangeCalendar] the refused write of \(eventId) stays kept as sent: \(error)")
+                        }
+                    }
+                }
+                throw error
+            }
+            if let sent = kept {
+                let landed = sent.writing(.landed)
+                try await record.keep(landed)
+                kept = landed
+            }
+        }
         guard !capture.exceptions.isEmpty, let kept else { return written }
         let fields = SplitCarry.fields(of: event)
         let ledger = PutBackLedger(record: kept, keep: record.keep, files: record.files)
         guard let plan = SplitCarry.plan(
             exceptions: capture.exceptions.map(\.carried), series: series, newPart: written, fields: fields)
         else {
-            throw CalendarProviderError.notSupported(Self.putBackOutcome(events: capture.exceptions.count, files: ledger.held.count))
+            throw CalendarProviderError.seriesPutBackIncomplete(Self.putBackOutcome(events: capture.exceptions.count, files: ledger.held.count))
         }
         try await putBack(
             plan, capture: capture, series: series, seriesId: eventId, fields: fields, guests: event.attendeeChange,
@@ -486,14 +525,29 @@ actor ExchangeCalendarProvider: CalendarProvider {
     ///   (#854). An item pairs by the JSON Graph expands it to (`itemDigest`).
     /// - A file of its own, with `files`: its bytes are read and saved (`SavedFiles.save`), and it
     ///   is named in the result (`PutBackFile`). Without `files` (the card's check) no file is read.
-    /// Throws, with nothing written, when a list or a file can't be read or saved.
+    /// Throws, with nothing written, when a list or a file can't be read or saved; the files it
+    /// saved before are released then, as no record names them.
     private func ownFiles(of exceptions: [TailException], seriesId: String, files: SavedFiles?) async throws -> [PutBackFile] {
+        var saved: [PutBackFile] = []
+        do {
+            try await ownFiles(of: exceptions, seriesId: seriesId, files: files, saving: &saved)
+        } catch {
+            if let files { Self.release(saved, keeping: [], from: files) }
+            throw error
+        }
+        if DebugModeManager.isLoggingEnabled(), !saved.isEmpty {
+            BackgroundSyncLogger.logDebug("[ExchangeCalendar] saved \(saved.count) file(s) of changed occurrences of \(seriesId) before its write")
+        }
+        return saved
+    }
+
+    /// `ownFiles`' walk, adding each file it saves to `saved` as it goes.
+    private func ownFiles(of exceptions: [TailException], seriesId: String, files: SavedFiles?, saving saved: inout [PutBackFile]) async throws {
         let seriesPath = try "/events/" + Self.encodedGraphPathSegment(seriesId, context: "Graph series master id")
         let seriesList = SeriesAttachmentList()
         func seriesAttachments() async throws -> [EventAttachment] {
             try await seriesList.read { try await self.attachments(of: seriesPath).map { EventAttachment(eventPath: seriesPath, meta: $0) } }
         }
-        var saved: [PutBackFile] = []
         for exception in exceptions {
             guard case .changed = exception.carried, let id = exception.raw["id"] as? String,
                   exception.raw["hasAttachments"] as? Bool != false else { continue }
@@ -537,10 +591,6 @@ actor ExchangeCalendarProvider: CalendarProvider {
                     isInline: file.meta.isInline ?? false, contentId: content.contentId, sha256: name))
             }
         }
-        if DebugModeManager.isLoggingEnabled(), !saved.isEmpty {
-            BackgroundSyncLogger.logDebug("[ExchangeCalendar] saved \(saved.count) file(s) of changed occurrences of \(seriesId) before its write")
-        }
-        return saved
     }
 
     /// The content type a file with none is written with, as a split's copy writes it.
@@ -630,6 +680,35 @@ actor ExchangeCalendarProvider: CalendarProvider {
         if error is CalendarProviderError { return true }
         guard case ExchangeCalendarError.httpError(let code, _) = error else { return false }
         return (400...499).contains(code) && code != 401 && code != 403 && code != 404 && !CalendarHTTPStatus.isComeBackLater(code)
+    }
+
+    /// Whether the series' write (`patchEdit`) failed with nothing written: refused before it was
+    /// sent (`CalendarProviderError`, an id that can't be a path segment), or answered by Graph
+    /// with a refusal (4xx: a request it validated and refused, a missing permission, a full
+    /// mailbox, a series that is gone). Anything else may have landed: a lost answer, a 5xx (the
+    /// write may have been made behind it), an answer that can't be read.
+    nonisolated static func refusedUnwritten(_ error: Error) -> Bool {
+        if error is CalendarProviderError { return true }
+        switch error as? ExchangeCalendarError {
+        case .invalidPathSegment?, .missingScope?, .mailboxFull?, .eventNotFound?: return true
+        case .httpError(let code, _)?: return (400...499).contains(code)
+        default: return false
+        }
+    }
+
+    /// Releases the saved bytes of `files` that no entry of `keeping` names: a record that named
+    /// them is replaced, or never kept. A release that fails leaves them for the drain-start sweep
+    /// once the row is gone.
+    nonisolated static func release(_ files: [PutBackFile], keeping: [PutBackFile], from saved: SavedFiles) {
+        for name in Set(files.map(\.sha256)).subtracting(keeping.map(\.sha256)) {
+            do {
+                try saved.release(name)
+            } catch {
+                if DebugModeManager.isLoggingEnabled() {
+                    BackgroundSyncLogger.logDebug("[ExchangeCalendar] a saved file could not be released: \(error)")
+                }
+            }
+        }
     }
 
     /// The start and end of `series` once `edit` is written, as the write merges them
@@ -1610,11 +1689,14 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// PATCH) are attached again (`reattach`), on an occurrence left as it is too: an add only adds.
     ///
     /// Every write that fails for good (`putBackFailsForGood`) and every refusal stops it, with
-    /// how many occurrences and files were not put back (`putBackOutcome`). Any other error is
-    /// rethrown, and a retry puts back from the kept record. It ends refused, with the same
+    /// how many occurrences and files were not put back (`putBackOutcome`), as
+    /// `CalendarProviderError.seriesPutBackIncomplete`, which the inbox shows as it is. Any other
+    /// error is rethrown, and a retry puts back from the kept record. It ends so too, with the same
     /// counts, when an occurrence was left as it is, a saved file was lost, or a file is too large
     /// for Outlook (`putBackTooLarge`); and it ends with `putBackNotConfirmed` (the operation stays
-    /// queued) when a file it attached does not read back.
+    /// queued) when a file it attached does not read back, until that has happened on
+    /// `ExchangeCalendarConfig.putBackUnconfirmedAttempts` attempts (counted in the record), when
+    /// it ends with the files counted as not restored.
     private func putBack(
         _ plan: SplitCarry.Plan, capture: SeriesCapture, series: GCalEvent, seriesId: String,
         fields: Set<SplitCarry.Field>, guests: AttendeeChange?, seriesZone: String?, zone: TimeZone?, ledger: PutBackLedger
@@ -1679,12 +1761,16 @@ actor ExchangeCalendarProvider: CalendarProvider {
             if DebugModeManager.isLoggingEnabled() {
                 BackgroundSyncLogger.logDebug("[ExchangeCalendar] put-back onto \(seriesId) stopped with \(remaining) left: \(error)")
             }
-            throw CalendarProviderError.notSupported(Self.putBackOutcome(events: remaining, files: ledger.held.count + lost))
+            throw CalendarProviderError.seriesPutBackIncomplete(Self.putBackOutcome(events: remaining, files: ledger.held.count + lost))
         }
-        if unconfirmed > 0 { throw ExchangeCalendarError.putBackNotConfirmed }
+        // A file that never reads back is added again by each retry, so the retries are bounded:
+        // past the bound the files stay saved with the failed operation, as a refused one does.
+        if unconfirmed > 0, try await ledger.countUnconfirmed() < ExchangeCalendarConfig.putBackUnconfirmedAttempts {
+            throw ExchangeCalendarError.putBackNotConfirmed
+        }
         let files = ledger.held.count + lost
         guard left > 0 || files > 0 else { return }
-        throw CalendarProviderError.notSupported((tooLarge + [Self.putBackOutcome(events: left, files: files)]).joined(separator: " "))
+        throw CalendarProviderError.seriesPutBackIncomplete((tooLarge + [Self.putBackOutcome(events: left, files: files)]).joined(separator: " "))
     }
 
     /// The date an occurrence starting at `time` is on, as the user is told it: plain Gregorian
@@ -1972,6 +2058,15 @@ actor ExchangeCalendarProvider: CalendarProvider {
 
         /// `entries`' saved copies are lost: dropped, counted by the caller.
         func drop(_ entries: [PutBackFile]) async throws { try await remove(entries) }
+
+        /// One more attempt attached a file that did not read back: kept in the record, and the
+        /// number of such attempts so far returned.
+        func countUnconfirmed() async throws -> Int {
+            let next = record.withLock { $0 }.countingUnconfirmed()
+            try await keep(next)
+            record.withLock { $0 = next }
+            return next.unconfirmedAttempts
+        }
 
         private func remove(_ entries: [PutBackFile]) async throws {
             guard !entries.isEmpty else { return }
@@ -4172,7 +4267,8 @@ enum ExchangeCalendarError: Error {
     /// claims it, so the operation stays queued (#718).
     case seriesBusy
     /// A file a put-back attached again does not read back on its occurrence. No terminal arm
-    /// claims it, so the operation stays queued and the retry reads and adds again (#718).
+    /// claims it, so the operation stays queued and the retry reads and adds again (#718), at
+    /// most `ExchangeCalendarConfig.putBackUnconfirmedAttempts` times.
     case putBackNotConfirmed
 }
 
@@ -4183,6 +4279,14 @@ enum ExchangeCalendarConfig {
     /// a few reads ride out another write landing; more mean the series is being edited, and the
     /// operation waits for a later drain (`seriesBusy`).
     static let putBackConflictReads = 3
+
+    /// Attempts of one edit of every occurrence whose put-back may attach a file that then does
+    /// not read back on its occurrence (`putBackNotConfirmed`) before the edit stops with the file
+    /// counted as not restored and kept saved. Each such attempt adds the file again, since it is
+    /// still missing, so this bounds the copies a calendar that never shows it can collect, and
+    /// how long the account's other calendar changes wait behind it; a few ride out a read that
+    /// lags behind the add.
+    static let putBackUnconfirmedAttempts = 3
 
     /// Events asked for per page (`$top`) of an event listing. The `$top` every event listing
     /// sent before it read further pages (the search tool's `maxResults`), so Graph takes it

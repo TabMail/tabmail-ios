@@ -25,10 +25,25 @@ import GRDB
 ///   missing or corrupt;
 /// - a whole operation's (`remove`), when the user removes its account or dismisses its failure
 ///   after being warned, or the whole store (`removeAll`) when the app's data is wiped;
-/// - by the drain-start sweep (`sweep`), for a directory whose operation row no longer exists.
-/// Every other path that deletes an operation row spares a row that holds saved bytes
-/// (`heldOperationIds`).
+/// - by the drain-start sweep (`sweep`), for a directory whose operation row no longer exists;
+/// - a whole operation's (`remove`), when it is retired holding none (`held`): its series' write
+///   was never sent or was refused, so the calendar still holds every file, or its record names
+///   none.
+/// Every other path that deletes an operation row spares a row that holds saved files (`held`).
 enum CalendarPutBackFiles {
+    /// The files operation `row` holds saved on this device: those its record names
+    /// (`SeriesEditRecord.files`) once its series' write was sent (`SeriesEditRecord.Write`), while
+    /// any of its bytes are here. Before the write is sent, or once Graph refused it, the calendar
+    /// still holds every file, so the row holds none, whatever its directory holds. Empty when the
+    /// row has no record this build can read. The one definition of a row that holds files: the
+    /// inbox banner and its warning, account removal, the reclaim of old failed rows and the
+    /// queue's retirement all read it.
+    static func held(_ row: PendingCalendarOperation) -> [PutBackFile] {
+        guard let record = (try? SeriesEditRecord.stored(row.arguments)) ?? nil, record.write != .notSent,
+              !record.files.isEmpty, holdsBytes(row.id) else { return [] }
+        return record.files
+    }
+
     /// The directory's name beside the database.
     static let directoryName = "calendar_put_back"
 
@@ -113,7 +128,8 @@ enum CalendarPutBackFiles {
     }
 
     /// Deletes every file kept for operation `opId`. Only for the user's warned removal of its
-    /// account or warned dismissal of its failure, after the row's deletion committed.
+    /// account or warned dismissal of its failure, after the row's deletion committed, or for an
+    /// operation retired holding none (`held`).
     static func remove(opId: String) {
         guard let dir = directory(of: opId) else { return }
         try? FileManager.default.removeItem(at: dir)

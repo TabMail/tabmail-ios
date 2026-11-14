@@ -213,6 +213,12 @@ enum CalendarProviderError: Error {
     /// `seriesNotInThisCalendarReason` (`reason`), `exdates_add` with its own words (#694).
     case seriesNotInThisCalendar
 
+    /// An edit of every occurrence wrote the series, and could not put back everything its write
+    /// reset (#718): the occurrences changed or deleted on their own, and their files, it did not
+    /// restore. The message is written for the user (`putBackOutcome`), so the inbox shows it as it
+    /// is. A final answer: a retry can't restore them.
+    case seriesPutBackIncomplete(String)
+
     /// What an edit is told for `seriesNotInThisCalendar` (#729's wording).
     static let seriesNotInThisCalendarReason =
         "The series of this repeating event is not in this calendar, which holds only changed occurrences of it (an invitation to single occurrences of someone else's series), so it can't be changed as a whole or split here. One of those occurrences can be changed on its own: edit_scope this_only, with the event_id listed for it and its start_iso as recurrence_id"
@@ -223,6 +229,7 @@ enum CalendarProviderError: Error {
         switch self {
         case .notSupported(let reason): return reason
         case .seriesNotInThisCalendar: return Self.seriesNotInThisCalendarReason
+        case .seriesPutBackIncomplete(let outcome): return outcome
         }
     }
 

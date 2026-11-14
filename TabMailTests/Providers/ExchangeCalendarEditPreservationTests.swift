@@ -265,6 +265,12 @@ final class FakeGraphCalendar: Sendable {
 
     /// The next attachment added is answered 201 but not kept: a read shows it is not there.
     let dropsNextAttachment = Mutex(false)
+    /// Every attachment added is answered 201 but not kept.
+    let dropsEveryAttachment = Mutex(false)
+    /// The events each file attachment added in one request was added to, in order, kept or dropped.
+    let fileAdds = Mutex<[String]>([])
+    /// Attachments whose read by id (their content) is answered 500 and does nothing.
+    let unreadableNames = Mutex<Set<String>>([])
     /// How much larger Graph lists an exception's copy of a series attachment (measured: +16 for a
     /// file and a link, more for an item; one figure is enough, since size is never compared).
     private static let copySizeGrowth = 16
@@ -811,6 +817,7 @@ final class FakeGraphCalendar: Sendable {
                     return Self.json(body)
                 }
                 guard parts.count == 3, var one = held.first(where: { $0["id"] as? String == parts[2] }) else { return .status(404) }
+                if let name = one["name"] as? String, unreadableNames.withLock({ $0.contains(name) }) { return .status(500) }
                 // An attached item's own properties come back only with Graph's `$expand`.
                 let expand = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "$expand" }?.value
                 if expand?.lowercased() != "microsoft.graph.itemattachment/item" { one["item"] = nil }
@@ -980,7 +987,10 @@ final class FakeGraphCalendar: Sendable {
             if tooLargeNames.withLock({ $0.contains(name) }) {
                 return .json(raw: #"{"error":{"code":"ErrorMessageSizeExceeded","message":"The message exceeds the maximum supported size."}}"#, statusCode: 400)
             }
-            if dropsNextAttachment.withLock({ let drop = $0; $0 = false; return drop }) { return .json(raw: "{}", statusCode: 201) }
+            fileAdds.withLock { $0.append(parts[0]) }
+            if dropsNextAttachment.withLock({ let drop = $0; $0 = false; return drop }) || dropsEveryAttachment.withLock({ $0 }) {
+                return .json(raw: "{}", statusCode: 201)
+            }
             attachFile(name, contentType: json["contentType"] as? String ?? "", bytes: bytes, to: parts[0],
                        isInline: json["isInline"] as? Bool ?? false, contentId: json["contentId"] as? String)
             return .json(raw: "{}", statusCode: 201)

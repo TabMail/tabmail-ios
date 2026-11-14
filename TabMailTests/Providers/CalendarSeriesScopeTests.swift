@@ -5,6 +5,7 @@
 import Testing
 import Foundation
 import GRDB
+import Synchronization
 @testable import TabMail
 
 // MARK: - An edit of every occurrence reaches the series
@@ -4898,14 +4899,15 @@ struct SeriesLengthKeepsExceptionsTests {
         Self.expectOutlookKept(graph, length: Self.length, "after a retry")
     }
 
-    @Test("Outlook: the series' write failed, an occurrence deleted before the retry stays deleted: the retry reads the occurrences again")
+    @Test("Outlook: the series' write refused by Graph's answer, an occurrence deleted before the retry stays deleted: the retry reads the occurrences again")
     func outlookRetryAfterAFailedWriteReadsAgain() async throws {
         let graph = Self.outlookCalendar()
-        // The first attempt keeps what it read, then its write of the series fails and nothing is
-        // written; the user deletes week 4 before the retry.
+        // The first attempt keeps what it read, then Graph refuses its write of the series for now
+        // (409, a come-back-later answer: the operation stays queued) and nothing is written; the
+        // user deletes week 4 before the retry.
         graph.beforeWrite { method, id in
             if method == "PATCH", id == "ser-1", graph.writes.filter({ $0 == "PATCH ser-1" }).count == 1 {
-                graph.failNext("PATCH", with: 500)
+                graph.failNext("PATCH", with: 409)
                 graph.userDeletesOccurrence("ser-1-w4")
             }
         }
@@ -5345,7 +5347,7 @@ extension SeriesLengthKeepsExceptionsTests {
         Self.expectOutlookKept(graph, length: Self.length, "too large")
     }
 
-    @Test("Outlook: a file answered 201 but not read back keeps the operation queued with its bytes saved")
+    @Test("Outlook: a file answered 201 but not read back keeps the operation queued with its bytes saved, the attempt counted toward ExchangeCalendarConfig.putBackUnconfirmedAttempts")
     func outlookUnconfirmedFileStaysQueued() async throws {
         let graph = Self.outlookCalendarWithOneFile()
         graph.dropsNextAttachment.withLock { $0 = true }
@@ -5353,6 +5355,8 @@ extension SeriesLengthKeepsExceptionsTests {
         let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-dropped", inspect: { disk.read() })
         #expect(rows.count == 1 && rows.first?.status == PendingStatus.queued.rawValue, "rows: \(reasons(rows))")
         #expect(Self.recordFiles(rows.first) == 1 && disk.files == 1, "record \(Self.recordFiles(rows.first) ?? -1) saved \(disk.counts.withLock { $0 })")
+        #expect(Self.record(rows.first)?.unconfirmedAttempts == 1 && Self.record(rows.first)?.write == .landed,
+                "the record: \(rows.first?.argumentsJSON ?? "")")
         #expect(!Self.fileList(graph, "ser-1-w1").contains("notes.txt:own notes"), "week 1: \(Self.fileList(graph, "ser-1-w1"))")
     }
 
@@ -5631,7 +5635,7 @@ extension SeriesLengthKeepsExceptionsTests {
     @Test("Outlook: a record this build can't read leaves the operation queued as it is, nothing written")
     func outlookUnreadableRecordLeavesTheOperation() async throws {
         let graph = Self.outlookCalendarWithOneFile()
-        var record = SeriesEditRecord(seriesId: "ser-1", capture: "{}", files: []).jsonObject
+        var record = SeriesEditRecord(seriesId: "ser-1", capture: "{}", files: [], write: .sent).jsonObject
         record["version"] = 99
         let data = try JSONSerialization.data(withJSONObject: [SeriesEditRecord.argumentKey: record])
         var args = Self.newEnd()
@@ -5640,6 +5644,160 @@ extension SeriesLengthKeepsExceptionsTests {
         #expect(rows.count == 1 && rows.first?.status == PendingStatus.queued.rawValue, "rows: \(reasons(rows))")
         #expect(rows.first?.arguments[SeriesEditRecord.argumentKey] == args[SeriesEditRecord.argumentKey], "the record: \(rows.first?.argumentsJSON ?? "")")
         #expect(graph.writes.isEmpty && graph.seriesResets == 0, "written: \(graph.writes)")
+    }
+
+    /// The record kept on the operation `row`, nil when none can be read.
+    private static func record(_ row: PendingCalendarOperation?) -> SeriesEditRecord? {
+        row.flatMap { (try? SeriesEditRecord.stored($0.arguments)) ?? nil }
+    }
+
+    @Test("Outlook: once the series' write landed, a retry puts back from the kept record and keeps its files, though the series reads as not written (another client changed its time since)")
+    func outlookLandedWriteIsNeverReadAgain() async throws {
+        let graph = Self.outlookCalendarWithOneFile()
+        // After the reset, another client gives the series another end, so a read of it no longer
+        // shows the edit's; the first changed occurrence's put-back write then fails for now (500),
+        // and the operation stays queued.
+        let label = TimeZone.current.identifier
+        let otherEnd = GraphFixture.start.addingTimeInterval(3_600)
+        graph.afterReset {
+            guard var series = graph.event("ser-1") else { return }
+            series["end"] = ["dateTime": GraphFixture.wall(otherEnd, in: label) + ".0000000", "timeZone": label]
+            graph.store(series)
+        }
+        graph.beforeWrite { method, id in
+            if method == "PATCH", id == "ser-1-w1", graph.writes.filter({ $0 == "PATCH ser-1-w1" }).count == 1 {
+                graph.failNext("PATCH", with: 500)
+            }
+        }
+        let disk = SavedOnDevice()
+        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-landed", drains: 2,
+                                     inspect: { disk.read() })
+        #expect(rows.isEmpty, "rows: \(reasons(rows))")
+        // The landed write is not sent again over the other client's change.
+        #expect(graph.patches("ser-1").count == 1, "the series was written \(graph.patches("ser-1").count) times")
+        #expect(instant(graph.event("ser-1")?["end"]) == otherEnd, "the series: \(graph.event("ser-1") ?? [:])")
+        #expect(graph.event("ser-1-w1")?["subject"] as? String == "Moved" && graph.event("ser-1-w2")?["subject"] as? String == "Renamed",
+                "weeks 1 and 2: \(graph.event("ser-1-w1") ?? [:]), \(graph.event("ser-1-w2") ?? [:])")
+        #expect(graph.isDeletedOccurrence("ser-1-w3"), "week 3 came back")
+        #expect(Self.fileList(graph, "ser-1-w1") == ["notes.txt:own notes"], "week 1: \(Self.fileList(graph, "ser-1-w1"))")
+        #expect(disk.files == 0 && disk.directories == 0, "left on the device: \(disk.counts.withLock { $0 })")
+    }
+
+    @Test("Outlook: the series' write refused for good before it landed (the series gone, no permission) deletes the saved copies and shows the ordinary failure",
+          arguments: [404, 403])
+    func outlookRefusedWriteHoldsNoFiles(_ status: Int) async throws {
+        let graph = Self.outlookCalendarWithOneFile()
+        // The first PATCH is the series' own.
+        graph.failNext("PATCH", with: status)
+        let disk = SavedOnDevice()
+        let account = "series-length-x-refused-\(status)"
+        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: account, inspect: {
+            disk.read()
+            await disk.readBanner()
+        })
+        await AccountManager.shared.clearAuthFailed(account)
+        #expect(rows.count == 1 && rows.first?.status == PendingStatus.failed.rawValue, "rows: \(reasons(rows))")
+        #expect(Self.record(rows.first)?.write == .notSent, "the record: \(rows.first?.argumentsJSON ?? "")")
+        #expect(disk.files == 0 && disk.directories == 0, "left on the device: \(disk.counts.withLock { $0 })")
+        let shown = disk.banner.withLock { $0 }
+        #expect(shown.count == 1 && shown.first?.holdsFiles == false
+                && shown.first?.bannerText.hasPrefix("A calendar change couldn't be made: ") == true
+                && shown.first?.bannerText.contains("The series was changed") == false,
+                "the banner: \(shown.map(\.bannerText))")
+        #expect(graph.seriesResets == 0 && Self.fileList(graph, "ser-1-w1") == ["notes.txt:own notes"], "written: \(graph.writes)")
+    }
+
+    @Test("Outlook: a put-back that can't restore everything shows what it did not restore in the inbox, an event or a file too large")
+    func outlookPutBackOutcomeReachesTheBanner() async throws {
+        let graph = Self.outlookCalendar([OwnChange(), OwnChange(subject: "Renamed")])
+        graph.beforeWrite { method, id in
+            if method == "PATCH", id == "ser-1-w1" { graph.failNext("PATCH", with: 400) }
+        }
+        let disk = SavedOnDevice()
+        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-outcome-event",
+                                     inspect: { await disk.readBanner() })
+        let shown = disk.banner.withLock { $0 }
+        #expect(rows.first?.failureKind == .putBackIncomplete, "rows: \(reasons(rows))")
+        #expect(shown.count == 1 && shown.first?.holdsFiles == false
+                && shown.first?.bannerText == "A calendar change wasn't finished: (No title). \(Self.putBackFailure("1 event"))",
+                "the banner: \(shown.map(\.bannerText))")
+
+        let large = Self.outlookCalendarWithOneFile("big.bin", Data("big".utf8))
+        large.tooLargeNames.withLock { $0 = ["big.bin"] }
+        let held = SavedOnDevice()
+        _ = try await outlook(large, eventId: "ser-1", Self.newEnd(), account: "series-length-x-outcome-large",
+                              inspect: { await held.readBanner() })
+        let date = Self.shownDate(Self.week(1).addingTimeInterval(7_200))
+        let tooLarge = held.banner.withLock { $0 }
+        #expect(tooLarge.count == 1 && tooLarge.first?.holdsFiles == true
+                && tooLarge.first?.bannerText.contains("big.bin could not be put back on \(date): too large for Outlook.") == true
+                && tooLarge.first?.bannerText.contains(PutBackFile.notRestoredMessage(1)) == true,
+                "the banner: \(tooLarge.map(\.bannerText))")
+    }
+
+    @Test("Outlook: a file that never reads back is added again on ExchangeCalendarConfig.putBackUnconfirmedAttempts attempts at most, then the change fails with it kept saved and offered to save")
+    func outlookUnconfirmedFileIsBounded() async throws {
+        let graph = Self.outlookCalendarWithOneFile()
+        graph.dropsEveryAttachment.withLock { $0 = true }
+        let disk = SavedOnDevice()
+        let attempts = ExchangeCalendarConfig.putBackUnconfirmedAttempts
+        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-never-back", drains: attempts + 1,
+                                     inspect: {
+                                         disk.read()
+                                         await disk.readBanner()
+                                     })
+        let reason = rows.first?.failureReason ?? ""
+        #expect(rows.count == 1 && rows.first?.status == PendingStatus.failed.rawValue && reason.contains(PutBackFile.notRestoredMessage(1)),
+                "rows: \(reasons(rows))")
+        #expect(graph.fileAdds.withLock { $0 } == Array(repeating: "ser-1-w1", count: attempts), "added: \(graph.fileAdds.withLock { $0 })")
+        #expect(Self.recordFiles(rows.first) == 1 && Self.record(rows.first)?.unconfirmedAttempts == attempts && disk.files == 1,
+                "record \(rows.first?.argumentsJSON ?? "") saved \(disk.counts.withLock { $0 })")
+        let shown = disk.banner.withLock { $0 }
+        #expect(shown.count == 1 && shown.first?.holdsFiles == true && shown.first?.heldFiles.count == 1
+                && shown.first?.bannerText.contains(PutBackFile.notRestoredMessage(1)) == true,
+                "the banner: \(shown.map(\.bannerText))")
+    }
+
+    @Test("Outlook: files a capture saved before an error of the same plan are deleted at that error, nothing held")
+    func outlookCaptureErrorKeepsNoFiles() async throws {
+        let graph = Self.outlookCalendar()
+        // Week 1 holds two files of its own: the first is saved, the second can't be read for now.
+        graph.attachFile("notes.txt", contentType: "text/plain", bytes: Self.notes, to: "ser-1-w1")
+        graph.attachFile("minutes.txt", contentType: "text/plain", bytes: Data("minutes".utf8), to: "ser-1-w1")
+        graph.unreadableNames.withLock { $0 = ["minutes.txt"] }
+        let disk = SavedOnDevice()
+        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-capture-error",
+                                     inspect: { disk.read() })
+        #expect(rows.count == 1 && rows.first?.status == PendingStatus.queued.rawValue && Self.record(rows.first) == nil,
+                "rows: \(reasons(rows)) \(rows.first?.argumentsJSON ?? "")")
+        #expect(disk.files == 0 && disk.directories == 0, "left on the device: \(disk.counts.withLock { $0 })")
+        #expect(graph.writes.isEmpty && graph.seriesResets == 0, "written: \(graph.writes)")
+    }
+
+    @Test("Outlook: two occurrences holding the same bytes, one attached again and one too large: the bytes stay saved for the one not restored")
+    func outlookSharedBytesStayForTheOneNotRestored() async throws {
+        let graph = Self.outlookCalendar()
+        graph.attachFile("notes.txt", contentType: "text/plain", bytes: Self.notes, to: "ser-1-w1")
+        graph.attachFile("copy.txt", contentType: "text/plain", bytes: Self.notes, to: "ser-1-w2")
+        graph.tooLargeNames.withLock { $0 = ["copy.txt"] }
+        let disk = SavedOnDevice()
+        let exported = Mutex<[Data]>([])
+        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-shared-bytes", inspect: {
+            disk.read()
+            await disk.readBanner()
+            // Save File, while the store is there.
+            guard let failure = disk.banner.withLock({ $0.first }) else { return }
+            let urls = try CalendarPutBackFiles.exportCopies(of: failure.heldFiles, opId: failure.id)
+            let copies = try urls.map { try Data(contentsOf: $0) }
+            exported.withLock { $0 = copies }
+        })
+        #expect(rows.count == 1 && rows.first?.status == PendingStatus.failed.rawValue, "rows: \(reasons(rows))")
+        #expect(Self.fileList(graph, "ser-1-w1") == ["notes.txt:own notes"], "week 1: \(Self.fileList(graph, "ser-1-w1"))")
+        #expect(Self.record(rows.first)?.files.map(\.name) == ["copy.txt"] && disk.files == 1,
+                "record \(rows.first?.argumentsJSON ?? "") saved \(disk.counts.withLock { $0 })")
+        let shown = disk.banner.withLock { $0 }
+        #expect(shown.first?.heldFiles.map(\.name) == ["copy.txt"], "the banner: \(shown)")
+        #expect(exported.withLock { $0 } == [Self.notes], "Save File: \(exported.withLock { $0 })")
     }
 }
 
@@ -5662,7 +5820,7 @@ struct SeriesEditRecordIsReservedTests {
             acc.id = account
             try acc.insert(db)
         }
-        let forged = SeriesEditRecord(seriesId: "ser-1", capture: #"{"changed":[],"deleted":[],"series":{}}"#)
+        let forged = SeriesEditRecord(seriesId: "ser-1", capture: #"{"changed":[],"deleted":[],"series":{}}"#, write: .sent)
         let op = try await AccountManager.shared.queueCalendarOperation(
             type: .edit, accountId: account, eventId: "ser-1", calendarId: "primary",
             arguments: ["edit_scope": .string("all"), "title": .string("Retitled"),
@@ -5686,7 +5844,8 @@ struct SeriesEditRecordIsReservedTests {
         let inline = PutBackFile(
             occurrence: "occ-3", name: "logo.png", contentType: "image/png", isInline: true, contentId: "logo@example.com",
             sha256: SavedFileName.of(Data("logo".utf8)))
-        let record = SeriesEditRecord(seriesId: "ser-1", capture: #"{"changed":[],"deleted":["x"],"series":{}}"#, files: [file, inline])
+        let record = SeriesEditRecord(
+            seriesId: "ser-1", capture: #"{"changed":[],"deleted":["x"],"series":{}}"#, files: [file, inline], write: .landed, unconfirmedAttempts: 2)
         #expect(try SeriesEditRecord.stored(try Self.arguments(record.jsonObject)) == record)
         #expect(try SeriesEditRecord.stored(["title": .string("Retitled")]) == nil)
     }
@@ -5699,11 +5858,11 @@ struct SeriesEditRecordIsReservedTests {
         let file = PutBackFile(
             occurrence: "occ-2", name: "notes.txt", contentType: "text/plain", isInline: false, contentId: nil,
             sha256: SavedFileName.of(Data("notes".utf8)))
-        let record = SeriesEditRecord(seriesId: "ser-1", capture: "{}", files: [file]).jsonObject
+        let record = SeriesEditRecord(seriesId: "ser-1", capture: "{}", files: [file], write: .sent).jsonObject
         var later = record
         later["version"] = SeriesEditRecord.version + 1
         #expect(throws: SeriesEditRecord.Unreadable.self) { try SeriesEditRecord.stored(try Self.arguments(later)) }
-        for key in ["version", "series_id", "capture", "files"] {
+        for key in ["version", "series_id", "capture", "files", "write", "unconfirmed_attempts"] {
             var partial = record
             partial[key] = nil
             #expect(throws: SeriesEditRecord.Unreadable.self, "a record without \(key) was read") {
@@ -5713,6 +5872,25 @@ struct SeriesEditRecordIsReservedTests {
         var badFile = record
         badFile["files"] = [["occurrence": "occ-2", "name": "notes.txt", "content_type": "text/plain", "is_inline": false, "sha256": "../../x"]]
         #expect(throws: SeriesEditRecord.Unreadable.self) { try SeriesEditRecord.stored(try Self.arguments(badFile)) }
+        var badWrite = record
+        badWrite["write"] = "maybe"
+        #expect(throws: SeriesEditRecord.Unreadable.self) { try SeriesEditRecord.stored(try Self.arguments(badWrite)) }
+    }
+
+    /// A version 1 record was kept right before the series' write, which may have landed: it is
+    /// read as sent, so a retry puts back from it and never reads the series again.
+    @Test("a version 1 record, which kept no write, reads as a write sent")
+    func versionOneRecordReadsAsSent() throws {
+        let file = PutBackFile(
+            occurrence: "occ-2", name: "notes.txt", contentType: "text/plain", isInline: false, contentId: nil,
+            sha256: SavedFileName.of(Data("notes".utf8)))
+        let record = SeriesEditRecord(seriesId: "ser-1", capture: "{}", files: [file], write: .landed, unconfirmedAttempts: 1)
+        var first = record.jsonObject
+        first["version"] = 1
+        first["write"] = nil
+        first["unconfirmed_attempts"] = nil
+        let read = try SeriesEditRecord.stored(try Self.arguments(first))
+        #expect(read == SeriesEditRecord(seriesId: "ser-1", capture: "{}", files: [file], write: .sent), "\(String(describing: read))")
     }
 }
 

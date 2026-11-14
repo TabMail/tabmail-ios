@@ -251,12 +251,19 @@ extension AccountManager {
             "[CalendarQueue] TERMINAL \(op.operationType) op=\(op.id) account=\(op.accountId) event=\(op.eventId ?? "new"): \(reason)",
             source: "CalendarQueue")
         do {
-            try await retryWrite(dbPool, label: "CalendarQueue") { db in
-                guard var row = try PendingCalendarOperation.fetchOne(db, key: op.id) else { return }
+            let retired = try await retryWrite(dbPool, label: "CalendarQueue") { db -> PendingCalendarOperation? in
+                guard var row = try PendingCalendarOperation.fetchOne(db, key: op.id) else { return nil }
                 row.status = PendingStatus.failed.rawValue
                 row.failureReason = reason
                 row.setReservedArguments([PendingCalendarOperation.failureKindKey: .string(kind.rawValue)])
                 try row.update(db)
+                return row
+            }
+            // Retired holding no saved files (#718, `CalendarPutBackFiles.held`): its series' write
+            // was never sent or was refused, so the calendar still holds every file its attempts
+            // saved, and the failure is an ordinary one. Their copies go now.
+            if let retired, CalendarPutBackFiles.holdsBytes(retired.id), CalendarPutBackFiles.held(retired).isEmpty {
+                CalendarPutBackFiles.remove(opId: retired.id)
             }
             return true
         } catch {
@@ -733,7 +740,11 @@ extension AccountManager {
                     if Self.isCalendarUnsupportedError(error) {
                         let reason = unsupportedReason(error)
                         BackgroundSyncLogger.logDebug("[CalendarQueue] Unsupported \(opType) (\(reason)) — retiring (no retry)")
-                        await retireAndAnnounce(currentOp, reason: reason, kind: .unsupported)
+                        // A put-back left unfinished after the series was written (#718) is told as
+                        // what it is: its reason is written for the user.
+                        let kind: CalendarFailureKind
+                        if case .seriesPutBackIncomplete? = error as? CalendarProviderError { kind = .putBackIncomplete } else { kind = .unsupported }
+                        await retireAndAnnounce(currentOp, reason: reason, kind: kind)
                         executedAny = true
                         continue
                     }
