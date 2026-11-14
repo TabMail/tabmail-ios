@@ -335,6 +335,62 @@ extension OutlookCatchUpTests {
         }
     }
 
+    /// A two-member Outlook move: Graph moves one member per request, so the
+    /// first attempt proves one member and the queue retires it on its own
+    /// (`retirePartiallyCompletedOp`), and the second member completes later.
+    /// A catch-up read of the source folder that began before the move loaded
+    /// both messages under their old ids. Once the 30 s protection has run out,
+    /// its apply must put neither back: the member the partial retire completed
+    /// is shielded only by that retire's entry in the completion log.
+    @Test("A member a partial move retired is not put back by a catch-up load read before the move")
+    func partiallyRetiredMemberIsNotPutBack() async throws {
+        let c = Clock()
+        try await Self.withWorld(seeds: [
+            Self.seed("a", in: Self.archive, at: c.daysAgo(5)), Self.seed("b", in: Self.archive, at: c.daysAgo(6)),
+        ]) { w, engine in
+            try w.insertRow("a", in: w.archive, date: c.daysAgo(5))
+            try w.insertRow("b", in: w.archive, date: c.daysAgo(6))
+            try await w.baselineAll()
+            await AccountManager.shared.registerProviderForTesting(accountId: w.accountId, provider: w.provider)
+            let wall = OSAllocatedUnfairLock(initialState: Date())
+            do {
+                try await Self.withWallClock(wall) {
+                    // The read: it lists both messages in the Archive and loads them.
+                    let readStartedAt = wall.withLock { $0 }
+                    var read: [BackfillResult] = []
+                    for await loaded in await w.provider.fetchBackfillBatch(ids: ["a", "b"], concurrency: 1) {
+                        read.append(loaded)
+                    }
+                    #expect(read.compactMap(\.header).count == 2, "precondition: the read loaded both messages")
+                    wall.withLock { $0 = $0.addingTimeInterval(1) }
+
+                    let rows = [try #require(try w.row("a", in: w.archive)), try #require(try w.row("b", in: w.archive))]
+                    _ = await AccountManager.shared.move(rows, to: w.inbox)
+                    try await Self.drainQueue(w)
+                    #expect(w.server.messageIds(inFolder: Self.archive).isEmpty, "precondition: both moves landed")
+                    #expect(try w.rowIds(in: w.archive).isDisjoint(with: ["a", "b"]), "precondition: the moves left the Archive")
+
+                    // The shared 30 s protection runs out.
+                    await AccountManager.shared.clearRecentlyCompletedForTesting()
+                    wall.withLock { $0 = $0.addingTimeInterval(SyncConfig.recentlyCompletedTTLSeconds + 1) }
+
+                    var stale = CatchUpFolderResult(folderId: w.folderId(w.archive), epoch: nil)
+                    stale.loaded = read
+                    stale.newState = try w.folder(w.archive).catchUpState
+                    let outcome = await engine.applyCatchUpResult(stale, windowMode: .date, readStartedAt: readStartedAt)
+
+                    guard case .applied = outcome else { Issue.record("not applied: \(outcome)"); return }
+                    let regained = try w.rowIds(in: w.archive).intersection(["a", "b"])
+                    #expect(regained.isEmpty, "a load read before the move put \(regained.sorted()) back in the Archive")
+                }
+            } catch {
+                await AccountManager.shared.unregisterProviderForTesting(accountId: w.accountId)
+                throw error
+            }
+            await AccountManager.shared.unregisterProviderForTesting(accountId: w.accountId)
+        }
+    }
+
     /// Drains the action queue until it is empty and no drain is in flight.
     static func drainQueue(_ w: R.World) async throws {
         for _ in 0..<300 {

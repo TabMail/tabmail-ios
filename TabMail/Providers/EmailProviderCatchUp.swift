@@ -86,13 +86,13 @@ struct CatchUpContext: Sendable {
         clock() < deadline && charged.withLock { $0 < maxRequests }
     }
 
+    /// Requests this call may still send by its count (`maxRequests`).
+    var requestsLeft: Int { charged.withLock { max(0, maxRequests - $0) } }
+
     /// Checked before EVERY request, with `cost` the requests about to be sent (the
     /// whole width of a batch of concurrent loads). True, and `cost` charged,
     /// only when time is left and the count stays within `maxRequests`; false
     /// otherwise, and nothing is charged.
-    /// Requests this call may still send by its count (`maxRequests`).
-    var requestsLeft: Int { charged.withLock { max(0, maxRequests - $0) } }
-
     func hasBudget(cost: Int) -> Bool {
         guard clock() < deadline else { return false }
         return charged.withLock { spent in
