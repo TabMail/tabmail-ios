@@ -1902,9 +1902,9 @@ actor ExchangeProvider: EmailProvider {
         "$select=id,displayName,unreadItemCount,totalItemCount,childFolderCount"
     }
 
-    private func topParam(_ n: Int) -> String { "$top=\(n)" }
+    func topParam(_ n: Int) -> String { "$top=\(n)" }
 
-    private var orderByReceived: String { "$orderby=receivedDateTime desc" }
+    var orderByReceived: String { "$orderby=receivedDateTime desc" }
 }
 
 /// Message header with Exchange parent folder ID — used by the change reader to

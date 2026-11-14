@@ -1198,7 +1198,7 @@ struct GmailCatchUpTests {
 
     // MARK: - Lexical fence
 
-    @Test("The seam stays provider-blind, and the Gmail catch-up never reads the network state or the storage limit itself")
+    @Test("The seam stays provider-blind, and the Gmail and Outlook catch-ups never read the network state, the storage limit or a setting themselves")
     func lexicalFence() throws {
         let sources = try DiagnosticPrintGateTests.appTargetSources()
         func source(_ path: String) throws -> String {
@@ -1221,6 +1221,12 @@ struct GmailCatchUpTests {
         #expect(engine.components(separatedBy: "NetworkMonitor").count == 2,
                 "the engine reads the network state once, in the run's snapshot (CatchUpRun.snapshot); no slice re-reads it")
         #expect(!gmail.contains("UserDefaults"), "no setting is read mid-pass: what the pass needs comes from the CatchUpContext snapshot")
+        for path in ["TabMail/Providers/ExchangeProviderCatchUp.swift", "TabMail/Providers/CatchUpListing.swift"] {
+            let text = try source(path)
+            for name in ["NetworkMonitor", "StorageEstimator", "UserDefaults"] {
+                #expect(!text.contains(name), "\(path) reads \(name): what the pass needs comes from the CatchUpContext snapshot")
+            }
+        }
     }
 
     /// The walk's two bookkeeping columns, `backfillComplete` and

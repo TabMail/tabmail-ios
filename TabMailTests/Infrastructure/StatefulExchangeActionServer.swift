@@ -142,6 +142,9 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         /// Graph's change model for the delta routes
         /// (`StatefulExchangeActionServer+Delta.swift`).
         var delta = DeltaModel()
+        /// The date-filtered listings of the Outlook catch-up
+        /// (`StatefulExchangeActionServer+CatchUp.swift`).
+        var catchUp = CatchUpListingModel()
     }
 
     final class StateBox: Sendable {
@@ -512,6 +515,9 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
             let queryItems = components?.queryItems ?? []
             let filter = queryItems.first(where: { $0.name == "$filter" })?.value
             let rfc822MessageId = Self.rfcIdentity(fromLookupURL: request.url)
+            if let filter, filter.contains("receivedDateTime") {
+                return Self.serveDateFilteredListing(request, folderId: folderId, state: state)
+            }
             if filter != nil {
                 guard rfc822MessageId != nil else { return .status(400) }
                 if let rfc822MessageId,
@@ -547,6 +553,7 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
                 let matches = model.messagesByProviderId.values
                     .filter {
                         $0.folderId == folderId
+                            && !model.catchUp.hiddenIds.contains($0.providerMessageId)
                             && (rfc822MessageId == nil || $0.rfc822MessageId == rfc822MessageId)
                     }
                     .sorted {
