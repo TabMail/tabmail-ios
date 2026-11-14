@@ -1329,15 +1329,29 @@ extension AccountManager {
         return nil
     }
 
-    /// Why the queued change `opId` waits, as the drain last stored it on its row (#865), or nil:
-    /// read by a calendar tool whose change is still queued, so its result can say why.
-    func calendarWaitReason(opId: String) async -> CalendarWaitReason? {
+    /// Why the account's still-queued calendar changes wait (#865), or nil: the reason the drain last
+    /// stored on the account's FIRST queued row in queue order (`createdAt`). The drain stops an
+    /// account at its first failure (`failedAccounts`), so every later change of the account waits
+    /// behind that row whether or not it was attempted, and only that row is stamped. Read by a
+    /// calendar tool whose change is still queued, so its result can say why. Rows created at the
+    /// same instant are one batch (an exdate edit's deletes) whose order the drain does not fix, so
+    /// the head is that whole batch. An in-flight row is still in the queue.
+    func calendarWaitReason(accountId: String) async -> CalendarWaitReason? {
+        let rows: [PendingCalendarOperation]
         do {
-            return try await dbPool.read { db in try PendingCalendarOperation.fetchOne(db, key: opId) }?.waitReason
+            rows = try await dbPool.read { db in
+                try PendingCalendarOperation
+                    .filter(Column("accountId") == accountId)
+                    .filter([PendingStatus.queued.rawValue, PendingStatus.inFlight.rawValue].contains(Column("status")))
+                    .order(Column("createdAt").asc)
+                    .fetchAll(db)
+            }
         } catch {
-            BackgroundSyncLogger.logDebug("[CalendarQueue] Could not read the wait reason of \(opId): \(error)")
+            BackgroundSyncLogger.logDebug("[CalendarQueue] Could not read the calendar queue of \(accountId): \(error)")
             return nil
         }
+        guard let head = rows.first else { return nil }
+        return rows.prefix { $0.createdAt == head.createdAt }.compactMap(\.waitReason).first
     }
 
     /// ⚠️ THE TYPED `.missingScope` IS NOT THE ONLY SPELLING (R12-T1, 2026-08-06).

@@ -10,10 +10,12 @@ enum CalendarToolHelpers {
 
     // MARK: - Queued Changes
 
-    /// The line a calendar tool's "queued" result adds when the queue stored why the change waits,
-    /// such as a full Outlook mailbox (#865), so the model can tell the user. Nil when it stored none.
-    static func waitLine(opId: String) async -> String? {
-        await AccountManager.shared.calendarWaitReason(opId: opId).map { "This change is \($0.toolClause)." }
+    /// The line a calendar tool's "queued" result adds when the account's calendar queue waits for a
+    /// reason the user can act on, such as a full Outlook mailbox (#865), so the model can tell the
+    /// user. It is the reason of the account's first queued change, which every later one waits behind
+    /// (`AccountManager.calendarWaitReason(accountId:)`). Nil when there is none.
+    static func waitLine(accountId: String) async -> String? {
+        await AccountManager.shared.calendarWaitReason(accountId: accountId).map { "This change is \($0.toolClause)." }
     }
 
     // MARK: - Timezone Resolution

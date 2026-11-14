@@ -582,6 +582,26 @@ struct CalendarEditExdatesOutlookTests {
         #expect(o.run.failureReasons.allSatisfy { $0 == nil }, "the card shows a failure: \(o.run.failureReasons)")
     }
 
+    @Test("deletes refused for a full mailbox are each reported queued and waiting for space, also the ones queued behind the first (#865)")
+    func fullMailboxIsReportedForEveryOccurrence() async throws {
+        let graph = GraphWeekly.calendar()
+        graph.refuseWrites(["DELETE"], code: FakeGraphCalendar.mailboxFullCode)
+        let dates = [GraphFixture.naive(GraphFixture.start), GraphFixture.naive(GraphFixture.occurrenceStart)]
+        let o = try await outlook([
+            "exdates_add": .array(dates.map { .string($0) }), "timezone": .string("UTC"),
+        ], account: "exdates-o-mailbox-full", graph: graph)
+        // The drain stops the account at the first refused delete; the second waits behind it unattempted.
+        #expect(o.run.queued.count == 2 && o.run.queued.filter { $0.waitReason == .mailboxFull }.count == 1,
+                "fixture check: \(o.run.queued.map { "\($0.status) \(String(describing: $0.waitReason))" }); \(o.run.out)")
+        for date in dates {
+            #expect(answerLine(o.run.out, date: date)?.hasSuffix("): queued, will be deleted shortly; waiting because the Outlook mailbox is full") == true,
+                    "\(date) does not say it waits for space: \(o.run.out)")
+        }
+        #expect(o.run.out.hasPrefix("Occurrence deletion queued successfully."), "\(o.run.out)")
+        #expect(o.calendar.deleted.isEmpty, "a refused delete landed: \(o.calendar.deleted)")
+        #expect(o.run.failureReasons.allSatisfy { $0 == nil }, "the card shows a failure: \(o.run.failureReasons)")
+    }
+
     @Test("an occurrence's own id given with another occurrence's date deletes that other occurrence")
     func occurrenceIdWithAnotherDate() async throws {
         let date = GraphFixture.naive(GraphFixture.occurrenceStart)

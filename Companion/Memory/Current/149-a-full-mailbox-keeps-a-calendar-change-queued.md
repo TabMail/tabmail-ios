@@ -6,7 +6,8 @@
 calendar queue; transient arm; `CalendarWaitReason`; `PendingCalendarOperation.waitReasonKey`
 (`_wait_reason`); `WaitingCalendarChangeBanner`; `LateCalendarFailureStore.waiting`; sign in again;
 never drop; `IOS-CAL-003` accepted residual reversed; chat tool result; `CalendarToolHelpers.waitLine`;
-`AccountManager.calendarWaitReason(opId:)`; `toolClause`; still queued.
+`AccountManager.calendarWaitReason(accountId:)`; `toolClause`; still queued; queued behind; queue head;
+`failedAccounts`; derived, not stamped.
 
 ## What was wrong
 
@@ -50,13 +51,19 @@ written before this was seen; for the quota case it is reversed (see the amendme
   change is made (the row is deleted) or fails for good. The drain reloads the store when a wait reason was
   written, cleared, or its row left the queue. No column, no migration, nothing new persisted beyond the
   queue row the change already had.
-- **The chat is told why.** A calendar tool whose change did not complete in-turn (create, edit, delete,
-  and each occurrence of an exdate edit) reads the reason the drain stored on the row
-  (`AccountManager.calendarWaitReason(opId:)`) and adds one line, `CalendarToolHelpers.waitLine`:
+- **The chat is told why, derived from the account's queue head.** A calendar tool whose change did not
+  complete in-turn (create, edit, delete, and every occurrence of an exdate edit) reads the wait reason
+  of its ACCOUNT's first queued calendar change in queue order (`createdAt`; queued or in flight), via
+  `AccountManager.calendarWaitReason(accountId:)`, and adds one line, `CalendarToolHelpers.waitLine`:
   *"This change is waiting because the Outlook mailbox is full."* (per occurrence: `; waiting because …`).
-  The drain signals `.stillQueued` only after the requeue wrote the reason, so the read sees it. A change
-  queued behind another account change that found the mailbox full carries no reason of its own (it was
-  never attempted) and gets no line.
+  The reason is NOT stamped on the rows held back (master-agent ruling 2026-11-14): the drain stops an
+  account at its first failure (`failedAccounts`), so a change queued behind a mailbox-full change is never
+  tried and waits for the same space; the head's reason is its reason too. This also covers an exdate
+  edit's occurrences after the first. Rows created at the same instant (one exdate batch) are all the head,
+  since the drain does not fix their order. When the head's reason is cleared (a later attempt fails for
+  another reason), the line goes with it. The drain signals `.stillQueued` only after the requeue wrote the
+  reason, so the head's own tool reads it; a change behind it learns the reason when its wait times out.
+  (Superseded: the first version read only the change's own row, so a change queued behind got no line.)
 
 ## Not measured
 
@@ -75,7 +82,10 @@ prompt), `GraphAPIMailboxFullTests` (`errorCodes` and `isMailboxFull` on the out
 `innerError`, another code and another status), `CalendarBadRequestClassificationTests` (`mailboxFull` in
 the roster and the transient list, not terminal) and `ExchangeCalendarErrorTests` (the exhaustive case
 switch). `CalendarToolMailboxFullTests` runs the create, edit and delete tools, confirmed, against the
-real queue with the write refused for a full mailbox (the result says why) and with a 409 (it does not).
+real queue with the write refused for a full mailbox (the result says why) and with a 409 (it does not),
+and a create queued behind an older mailbox-full edit (it says why; once the head's reason is cleared by a
+409, a later create does not). `CalendarEditExdatesOutlookTests.fullMailboxIsReportedForEveryOccurrence`
+asserts the clause on both occurrences of an exdate edit, the second never attempted.
 
 Red first on main (the four-write suite, before the fix): the create, PATCH and single attachment POST
 cases were retired as `failed`/`missingPermission` with "sign in again" raised, 24 issues. The

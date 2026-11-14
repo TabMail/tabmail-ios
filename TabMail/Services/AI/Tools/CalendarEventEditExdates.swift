@@ -263,6 +263,9 @@ enum CalendarEventEditExdates {
         var lines: [String] = []
         var failures: [String] = []
         var allDeleted = true
+        // Why a still-queued delete waits, when the account's queue waits for a reason the user can
+        // act on (#865): the same for every occurrence, which all wait behind the account's first change.
+        let waiting = await manager.calendarWaitReason(accountId: target.accountId).map { "; \($0.toolClause)" } ?? ""
         for entry in found {
             // `ops` is built from `occurrences`, index for index.
             let opId = occurrences.firstIndex { $0.id == entry.id }.map { ops[$0].id }
@@ -277,9 +280,6 @@ enum CalendarEventEditExdates {
                 failures.append("\(entry.date): \(reason)")
                 allDeleted = false
             case .stillQueued, .timedOut:
-                // Why it waits, when the queue stored a reason the user can act on (#865).
-                var waiting = ""
-                if let opId, let reason = await manager.calendarWaitReason(opId: opId) { waiting = "; \(reason.toolClause)" }
                 lines.append("\(named): queued, will be deleted shortly\(waiting)")
                 allDeleted = false
             }

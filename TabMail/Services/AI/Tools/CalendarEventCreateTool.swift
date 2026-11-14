@@ -297,10 +297,10 @@ struct CalendarEventCreateTool: AgentTool, Sendable {
         let echoIsoFmt = FixedDateFormat.formatter(isAllDay ? "yyyy-MM-dd" : "yyyy-MM-dd'T'HH:mm:ss", timeZone: resolvedTz)
         let startIsoLine = "start_iso: \(echoIsoFmt.string(from: startDate))"
         let endIsoLine = "end_iso: \(echoIsoFmt.string(from: endDate))"
-        // Why the change still waits, when the queue stored a reason the user can act on (#865).
+        // Why the change still waits, when its account's queue waits for a reason the user can act on (#865).
         let made: Bool = if case .success = outcome { true } else { false }
         var waitLine: String?
-        if !made { waitLine = await CalendarToolHelpers.waitLine(opId: op.id) }
+        if !made { waitLine = await CalendarToolHelpers.waitLine(accountId: op.accountId) }
 
         return [
             "Calendar event creation queued successfully.",
