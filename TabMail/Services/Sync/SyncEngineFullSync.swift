@@ -614,7 +614,7 @@ extension SyncEngine {
         // quarantined and unsynced FOREVER — the reaction's own abort legs
         // deliberately leave the flag set precisely because a re-drive is assumed
         // to exist. On-demand navigation is that folder's only door
-        // (`AccountManager.syncFolders(_:)` → here → `runSyncMessages`, whose
+        // (`AccountManager.syncFolders(_:connecting:)` → here → `runSyncMessages`, whose
         // filter is `!folder.path.isEmpty` and nothing else), so the branch belongs
         // here. Re-read the flag rather than trusting the caller's snapshot — the
         // caller's `Folder` may predate an arm by an arbitrary interval.

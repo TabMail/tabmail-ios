@@ -322,7 +322,7 @@ struct SelectSourcedFolderEpochTests {
     /// This drives the REAL on-open entry point —
     /// `SyncEngine.syncFolderMessages(folder:provider:)`, *"On-demand sync for a
     /// single folder (called when user navigates to it)"*, the method
-    /// `AccountManager.syncFolders(_:)` (`AccountManagerFetch.swift`) calls for every folder the user
+    /// `AccountManager.syncFolders(_:connecting:)` (`AccountManagerFetch.swift`) calls for every folder the user
     /// navigates to (`AccountManagerFetch.swift:132`) — not the `runSyncMessages`
     /// core it currently delegates to through `syncMessages(for:provider:limit:)`.
     /// Driving the core directly would leave this test green if the on-open

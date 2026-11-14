@@ -172,7 +172,7 @@ extension SyncEngine {
     /// ⚠ Round 7 described that backfill caller as "the ONLY writer that reaches a
     /// custom non-favourite folder, which no `syncableFolders` pass ever visits".
     /// RETRACTED (round 8): on-demand navigation reaches ANY folder via
-    /// `AccountManager.syncFolders(_:)` → `SyncEngine.syncFolderMessages` →
+    /// `AccountManager.syncFolders(_:connecting:)` → `SyncEngine.syncFolderMessages` →
     /// `runSyncMessages`, whose filter is `!folder.path.isEmpty` and nothing else.
     /// The crawl's bootstrap is still needed — backfill makes a folder's mail
     /// account-wide searchable long before the user ever opens it — but the window

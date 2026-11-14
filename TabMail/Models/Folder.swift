@@ -102,7 +102,7 @@ struct Folder: Codable, FetchableRecord, PersistableRecord, Identifiable, Hashab
     /// reach a custom NON-FAVOURITE folder. That is FALSE and is retracted (round
     /// 8): `syncableFolders` does exclude such a folder from full sync, delta sync
     /// and self-heal, but ON-DEMAND NAVIGATION reaches any folder through
-    /// `AccountManager.syncFolders(_:)`, which filters on `!folder.path.isEmpty`
+    /// `AccountManager.syncFolders(_:connecting:)`, which filters on `!folder.path.isEmpty`
     /// alone, and lands in `runSyncMessages` with its T1.2b bootstrap. Without the
     /// crawl's bootstrap the epoch stayed nil INDEFINITELY — until the user opened
     /// that folder — not forever; the crawl's bootstrap matters because backfill
