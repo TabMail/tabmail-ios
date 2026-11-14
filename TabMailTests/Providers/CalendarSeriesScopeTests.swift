@@ -4965,14 +4965,9 @@ struct SeriesLengthKeepsExceptionsTests {
         // longer shows the edit's and finds every occurrence reset.
         let label = TimeZone.current.identifier
         let otherEnd = GraphFixture.start.addingTimeInterval(3_600)
-        final class Once: Sendable {
-            private let done = Mutex(false)
-            /// True the first time only.
-            func first() -> Bool { done.withLock { done in defer { done = true }; return !done } }
-        }
-        let overtaken = Once()
+        let overtaken = Tally()
         graph.afterReset {
-            guard overtaken.first(), var series = graph.event("ser-1") else { return }
+            guard overtaken.take(below: 1), var series = graph.event("ser-1") else { return }
             series["end"] = ["dateTime": GraphFixture.wall(otherEnd, in: label) + ".0000000", "timeZone": label]
             graph.store(series)
         }
@@ -5567,13 +5562,33 @@ extension SeriesLengthKeepsExceptionsTests {
     @Test("Outlook: a series under active edit refuses the put-back's PATCH ExchangeCalendarConfig.putBackConflictReads times, and the operation stays queued")
     func outlookBusySeriesStaysQueued() async throws {
         let graph = Self.outlookCalendar()
+        // Another client writes the series as each of the bound's PATCHes arrives, and then stops:
+        // one more attempt would land.
+        let edits = Tally()
         graph.beforeWrite { method, id in
-            if method == "PATCH", id == "ser-1-w1" { graph.touchSeries(of: id) }
+            if method == "PATCH", id == "ser-1-w1", edits.take(below: ExchangeCalendarConfig.putBackConflictReads) { graph.touchSeries(of: id) }
         }
         let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-busy")
         #expect(rows.count == 1 && rows.first?.status == PendingStatus.queued.rawValue, "rows: \(reasons(rows))")
         #expect(graph.writes.filter { $0 == "PATCH ser-1-w1" }.count == ExchangeCalendarConfig.putBackConflictReads, "writes: \(graph.writes)")
         #expect(graph.patches("ser-1-w1").isEmpty, "a refused PATCH was applied: \(graph.patches("ser-1-w1"))")
+    }
+
+    @Test("Outlook: a series another client writes as each of the series' writes arrives refuses it ExchangeCalendarConfig.putBackConflictReads times, nothing is written, and the operation stays queued")
+    func outlookBusySeriesRefusesTheSeriesWrite() async throws {
+        let graph = Self.outlookCalendar()
+        // Another client writes the series as each of the bound's series writes arrives, and then
+        // stops: one more attempt would land.
+        let edits = Tally()
+        graph.beforeWrite { method, id in
+            if method == "PATCH", id == "ser-1", edits.take(below: ExchangeCalendarConfig.putBackConflictReads) { graph.touchSeries(of: id) }
+        }
+        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-busy-series")
+        #expect(rows.count == 1 && rows.first?.status == PendingStatus.queued.rawValue, "rows: \(reasons(rows))")
+        #expect(graph.patchConditions("ser-1").count == ExchangeCalendarConfig.putBackConflictReads, "the series' writes: \(graph.patchConditions("ser-1"))")
+        #expect(graph.patches("ser-1").isEmpty && graph.seriesResets == 0, "a refused write was applied: \(graph.writes)")
+        #expect(graph.event("ser-1-w1")?["subject"] as? String == "Moved" && graph.event("ser-1-w2")?["subject"] as? String == "Renamed"
+                && graph.isDeletedOccurrence("ser-1-w3"), "the occurrences: \(graph.event("ser-1-w1") ?? [:]), \(graph.event("ser-1-w2") ?? [:])")
     }
 
     @Test("Outlook: a changed occurrence deleted after the reset releases its saved files, and they are not counted as not restored")
@@ -6874,5 +6889,18 @@ struct SeriesEndRemovalCardTests {
         }
         #expect(code.contains("RecurrenceTail.occurrences(") && code.contains("provider.deletedOccurrencePlaces("),
                 "the count no longer expands the stored rule, or no longer reads the deletions through the provider protocol")
+    }
+}
+
+/// A count shared with a fake's hook: `take(below:)` is true, and counts, while fewer than `limit`
+/// were taken.
+private final class Tally: Sendable {
+    private let taken = Mutex(0)
+    func take(below limit: Int) -> Bool {
+        taken.withLock { taken in
+            guard taken < limit else { return false }
+            taken += 1
+            return true
+        }
     }
 }
