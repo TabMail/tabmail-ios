@@ -63,6 +63,15 @@ import Testing
 /// siblings are dropped; only the connections that failed remain grouped with
 /// the directory and are retried on a later retirement.
 ///
+/// **Exit-only groups are held weakly.** Fixtures whose escaped work may run
+/// for an unknown time (`registerForProcessExit`,
+/// `InstalledTestDatabaseLifetime`) are never closed by the registry before
+/// process exit, but they are not kept alive by it either: once every
+/// connection in a group has been released, the next registry transition
+/// unlinks its directory, provided no descriptor still names a file in it.
+/// Holding them strongly leaked every such fixture's descriptors until the
+/// test host ran out (iOS #885).
+///
 /// Real GRDB `close()` may block until borrowed access has quiesced. The
 /// lifecycle mutex intentionally remains held through that close and the
 /// conditional unlink, serializing every registry transition for the directory.
@@ -78,7 +87,7 @@ enum TestDatabaseTeardown {
     /// test host may then remove the stale directory without touching a live
     /// SQLite vnode.
     private final class DirectoryLease: @unchecked Sendable {
-        private static let markerName = ".tabmail-test-fixture-owner-v1.lock"
+        static let markerName = ".tabmail-test-fixture-owner-v1.lock"
 
         let directory: URL
         private let descriptor: Int32
@@ -227,7 +236,7 @@ enum TestDatabaseTeardown {
         }
     }
 
-    private enum Connection: @unchecked Sendable {
+    private enum LiveConnection {
         case pool(DatabasePool)
         case queue(DatabaseQueue)
 
@@ -246,14 +255,81 @@ enum TestDatabaseTeardown {
         }
     }
 
+    /// The registry's weak handle on one connection. Loading it after the
+    /// connection was deallocated yields nil even if a new connection now
+    /// occupies the same address, so a released connection can never be
+    /// mistaken for a newly registered one.
+    private final class WeakConnection: @unchecked Sendable {
+        private weak var pool: DatabasePool?
+        private weak var queue: DatabaseQueue?
+
+        init(_ connection: LiveConnection) {
+            switch connection {
+            case .pool(let pool): self.pool = pool
+            case .queue(let queue): self.queue = queue
+            }
+        }
+
+        func load() -> LiveConnection? {
+            if let pool { return .pool(pool) }
+            if let queue { return .queue(queue) }
+            return nil
+        }
+    }
+
+    /// One registered connection. Ordinary retirement holds it strongly until
+    /// the registry closes it. Exit-only groups hold it WEAKLY (`weakened()`):
+    /// the escaped production work those groups wait for keeps the connection
+    /// alive for exactly as long as it uses it, and GRDB closes the
+    /// connection when the last reference goes. A released connection stays
+    /// in its group as a placeholder whose directory may be unlinked only
+    /// after `openDescriptorPaths()` proves no descriptor still names it.
+    private struct Connection: @unchecked Sendable {
+        private let retained: LiveConnection?
+        private let reference: WeakConnection
+
+        init(_ connection: LiveConnection) {
+            retained = connection
+            reference = WeakConnection(connection)
+        }
+
+        private init(reference: WeakConnection) {
+            retained = nil
+            self.reference = reference
+        }
+
+        static func pool(_ pool: DatabasePool) -> Connection { Connection(.pool(pool)) }
+        static func queue(_ queue: DatabaseQueue) -> Connection { Connection(.queue(queue)) }
+
+        /// Nil once the connection was released (deallocated).
+        var live: LiveConnection? { retained ?? reference.load() }
+
+        /// Identity of a live connection; a released one has none.
+        var identity: ObjectIdentifier? { live?.identity }
+
+        func weakened() -> Connection { Connection(reference: reference) }
+    }
+
     private struct Retired: Sendable {
         let connections: [Connection]
         let directory: URL
         let exitOnly: Bool
         let lease: DirectoryLease
 
+        init(connections: [Connection], directory: URL, exitOnly: Bool, lease: DirectoryLease) {
+            self.connections = exitOnly ? connections.map { $0.weakened() } : connections
+            self.directory = directory
+            self.exitOnly = exitOnly
+            self.lease = lease
+        }
+
         func contains(_ identity: ObjectIdentifier) -> Bool {
             connections.contains { $0.identity == identity }
+        }
+
+        /// Exit-only group whose every connection has been released.
+        var isReleasedExitGroup: Bool {
+            exitOnly && connections.allSatisfy { $0.live == nil }
         }
     }
 
@@ -304,11 +380,18 @@ enum TestDatabaseTeardown {
     /// directories carrying the exact lease marker above.
     private static let staleReapPrepared = Mutex<Bool>(false)
 
-    /// Exit-owned action fixtures deliberately keep live SQLite connections
-    /// until the process boundary. The simulator test host otherwise inherits
-    /// a soft descriptor ceiling that a complete suite can exhaust even though
-    /// every fixture has a bounded close-before-unlink path. Raise only the
+    /// Parallel suites keep many fixtures open at once (about 60 directories,
+    /// some 600 descriptors, early in a full run), and exit-only groups stay
+    /// open while their escaped work still holds them. The simulator test host
+    /// otherwise inherits a soft descriptor ceiling below that. Raise only the
     /// test process's soft ceiling, once; never alter the hard ceiling.
+    ///
+    /// This budget is for CONCURRENT fixtures, not for accumulation: until
+    /// iOS #885 the registry held every exit-only group's connections until
+    /// the process boundary, so the count grew with every such fixture and a
+    /// full suite exhausted even this raised ceiling after about 7,400 tests.
+    /// Exit-only groups are now held weakly and reclaimed once released
+    /// (`reclaimReleasedExitGroups`). Do not raise this number to absorb growth.
     private static let fileDescriptorBudgetPrepared = Mutex<Bool>(false)
     private static let minimumFileDescriptorBudget: rlim_t = 4_096
     private static let requestedFileDescriptorBudget: rlim_t = 10_240
@@ -437,9 +520,15 @@ enum TestDatabaseTeardown {
         atexit { TestDatabaseTeardown.flushAllRegistered() }
     }
 
+    /// De-duplicates live connections by identity. Released placeholders have
+    /// no identity and are kept: each one demands the descriptor proof before
+    /// its directory may be unlinked.
     private static func uniqueConnections(_ connections: [Connection]) -> [Connection] {
         var seen: Set<ObjectIdentifier> = []
-        return connections.filter { seen.insert($0.identity).inserted }
+        return connections.filter { connection in
+            guard let identity = connection.identity else { return true }
+            return seen.insert(identity).inserted
+        }
     }
 
     private static func makeEntry(
@@ -475,13 +564,13 @@ enum TestDatabaseTeardown {
             let incomingConnections = uniqueConnections(rawEntry.connections)
             guard !incomingConnections.isEmpty else { continue }
 
-            let incomingIdentities = Set(incomingConnections.map(\.identity))
+            let incomingIdentities = Set(incomingConnections.compactMap(\.identity))
             let standardizedDirectory = rawEntry.directory.standardizedFileURL
             precondition(
                 !parked.contains { parkedEntry in
                     parkedEntry.directory.standardizedFileURL != standardizedDirectory
                         && parkedEntry.connections.contains {
-                            incomingIdentities.contains($0.identity)
+                            $0.identity.map(incomingIdentities.contains) ?? false
                         }
                 },
                 "A test database connection cannot be registered under multiple directories"
@@ -490,7 +579,7 @@ enum TestDatabaseTeardown {
                 let parkedEntry = parked[index]
                 return parkedEntry.directory.standardizedFileURL == standardizedDirectory
                     || parkedEntry.connections.contains {
-                        incomingIdentities.contains($0.identity)
+                        $0.identity.map(incomingIdentities.contains) ?? false
                     }
             }
 
@@ -529,25 +618,44 @@ enum TestDatabaseTeardown {
     /// Closes first and unlinks second. Real GRDB close may block for borrowed
     /// access. A real or injected close failure returns the connection to its
     /// registry, still strongly retained, and leaves its directory untouched.
+    ///
+    /// A released connection (exit-only groups hold theirs weakly) was closed
+    /// by its own deallocation, not by this call, and SQLite can keep a
+    /// deallocated connection's descriptors open (a `close_v2` zombie). Such a
+    /// group is unlinked only when no descriptor of this process still names a
+    /// file in its directory; otherwise it stays registered and is retried.
     private static func closeThenUnlink(_ entries: [Retired]) -> [Retired] {
         var grouped: [Retired] = []
         appendUnique(entries, to: &grouped)
 
+        var openPaths: Set<String>?
         var stillOpen: [Retired] = []
         for entry in grouped {
             var failedConnections: [Connection] = []
+            var released: [Connection] = []
             for connection in entry.connections {
+                guard let live = connection.live else {
+                    released.append(connection)
+                    continue
+                }
                 let forcedFailure = forcedCloseFailures.withLock {
-                    $0.contains(connection.identity)
+                    $0.contains(live.identity)
                 }
                 guard !forcedFailure else {
                     failedConnections.append(connection)
                     continue
                 }
                 do {
-                    try connection.close()
+                    try live.close()
                 } catch {
                     failedConnections.append(connection)
+                }
+            }
+            if failedConnections.isEmpty, !released.isEmpty {
+                let paths = openPaths ?? openDescriptorPaths()
+                openPaths = paths
+                if hasOpenDescriptor(in: entry.directory, openPaths: paths) {
+                    failedConnections = released
                 }
             }
             if failedConnections.isEmpty {
@@ -562,6 +670,64 @@ enum TestDatabaseTeardown {
             }
         }
         return stillOpen
+    }
+
+    /// Paths of every file this process currently holds a descriptor on.
+    private static func openDescriptorPaths() -> Set<String> {
+        var paths: Set<String> = []
+        var buffer = [UInt8](repeating: 0, count: Int(MAXPATHLEN))
+        for descriptor in 0..<Darwin.getdtablesize() {
+            let found = buffer.withUnsafeMutableBytes { bytes in
+                Darwin.fcntl(descriptor, F_GETPATH, bytes.baseAddress!) != -1
+            }
+            if found {
+                paths.insert(String(decoding: buffer.prefix { $0 != 0 }, as: UTF8.self))
+            }
+        }
+        return paths
+    }
+
+    /// The open-descriptor paths that name a file inside `directory`.
+    private static func descriptorPaths(in directory: URL, openPaths: Set<String>) -> [String] {
+        let prefixes = Set([
+            directory.standardizedFileURL.path,
+            directory.resolvingSymlinksInPath().path,
+        ]).map { $0.hasSuffix("/") ? $0 : $0 + "/" }
+        return openPaths.filter { path in prefixes.contains { path.hasPrefix($0) } }
+    }
+
+    /// Whether any descriptor other than the directory's own ownership marker
+    /// names a file inside `directory`.
+    private static func hasOpenDescriptor(in directory: URL, openPaths: Set<String>) -> Bool {
+        descriptorPaths(in: directory, openPaths: openPaths).contains {
+            ($0 as NSString).lastPathComponent != DirectoryLease.markerName
+        }
+    }
+
+    /// Every descriptor this process holds on a file inside `directory`,
+    /// ownership marker included.
+    static func openDescriptorCountForTesting(directory: URL) -> Int {
+        descriptorPaths(in: directory, openPaths: openDescriptorPaths()).count
+    }
+
+    /// Closes the unlink step for exit-only groups whose escaped work is over.
+    /// Runs at the start of every registry transition, so the registry holds
+    /// a directory (its marker descriptor, and nothing else) only while some
+    /// connection to it is still alive or a descriptor still names it, instead
+    /// of retaining every exit-only fixture's connections until process exit.
+    private static func reclaimReleasedExitGroups(_ state: inout RegistryState) {
+        var due: [Retired] = []
+        var kept: [Retired] = []
+        for entry in state.entries {
+            if entry.isReleasedExitGroup {
+                due.append(entry)
+            } else {
+                kept.append(entry)
+            }
+        }
+        guard !due.isEmpty else { return }
+        state.entries = kept
+        appendUnique(closeThenUnlink(due), to: &state.entries)
     }
 
     /// Deterministic barrier for one exact fixture. It never drains an unrelated
@@ -649,6 +815,7 @@ enum TestDatabaseTeardown {
     private static func closeThenUnlinkNow(connections: [Connection], directory: URL) {
         registerExitFlushIfNeeded()
         registry.withLock { state in
+            reclaimReleasedExitGroups(&state)
             let standardizedDirectory = directory.standardizedFileURL
             let alreadyExitOnly = state.entries.contains {
                 $0.exitOnly
@@ -682,6 +849,7 @@ enum TestDatabaseTeardown {
         registerExitFlushIfNeeded()
 
         registry.withLock { state in
+            reclaimReleasedExitGroups(&state)
             let entry = makeEntry(
                 connections: connections,
                 directory: directory,
@@ -692,7 +860,8 @@ enum TestDatabaseTeardown {
                 $0.directory.standardizedFileURL == directory.standardizedFileURL
             }
             let identityAlreadyParked = connections.contains { connection in
-                state.entries.contains { $0.contains(connection.identity) }
+                guard let identity = connection.identity else { return false }
+                return state.entries.contains { $0.contains(identity) }
             }
             if directoryAlreadyParked || identityAlreadyParked {
                 appendUnique([entry], to: &state.entries)
@@ -706,11 +875,23 @@ enum TestDatabaseTeardown {
         }
     }
 
-    /// Keeps a complete exact file-backed fixture group alive until process
-    /// exit when no earlier cleanup boundary can safely close it. Register all
-    /// already-known directory siblings in one call. Identity de-duplication
-    /// makes repeat registration idempotent, and exit-only ownership is sticky
-    /// for the entire merged directory group.
+    /// Registers a complete exact file-backed fixture group that no explicit
+    /// cleanup boundary can safely close, because escaped production work may
+    /// still be using it. The registry never closes such a group early: it
+    /// holds the connections WEAKLY, so they stay open exactly as long as
+    /// something (the escaped work, the global, the test) still references
+    /// them, and GRDB closes each one when its last reference goes. The next
+    /// registry transition after the whole group is released unlinks the
+    /// directory, once no descriptor of this process still names a file in it.
+    /// Connections still alive at process exit are closed then, before unlink.
+    /// Register all already-known directory siblings in one call. Identity
+    /// de-duplication makes repeat registration idempotent, and exit-only
+    /// ownership is sticky for the entire merged directory group.
+    ///
+    /// Why weak (iOS #885): holding these groups strongly until exit kept every
+    /// exit-only fixture's descriptors open (marker, database, WAL, SHM, per
+    /// connection): 1,758 groups and 12,164 descriptors after 7,089 tests of a
+    /// full run, until SQLite failed with `os_unix.c (24)` / error 14.
     static func registerForProcessExit(pool: DatabasePool, directory: URL) {
         registerForProcessExit(pools: [pool], directory: directory)
     }
@@ -724,6 +905,7 @@ enum TestDatabaseTeardown {
         let connections = pools.map(Connection.pool) + queues.map(Connection.queue)
         guard !connections.isEmpty else { return }
         registry.withLock { state in
+            reclaimReleasedExitGroups(&state)
             appendUnique(
                 [makeEntry(
                     connections: connections,
@@ -745,10 +927,11 @@ enum TestDatabaseTeardown {
 /// The invariant is class-wide, though. Restoring a real predecessor removes
 /// the fixture from the global, but it does not prove escaped work has released
 /// the fixture's exact connections. Leave a nil-predecessor fixture installed;
-/// restore a real predecessor when present; then retain the complete fixture
-/// group until process exit in both cases. `prepareProcess()` establishes the
-/// XCTest-only descriptor budget before the registry can retain those groups;
-/// final close-before-unlink remains the safe process boundary. These
+/// restore a real predecessor when present; then hand the complete fixture
+/// group to the exit-only registry in both cases. The registry never closes it
+/// under escaped work: it holds the group weakly, unlinks the directory only
+/// after every connection was released and no descriptor names it, and closes
+/// whatever is still alive at process exit before unlinking. These
 /// installed/action/global fixtures must never enter ordinary next-retirement
 /// teardown.
 enum InstalledTestDatabaseLifetime {
@@ -1033,6 +1216,90 @@ struct TestDatabaseTeardownInvariantTests {
 
         #expect(!FileManager.default.fileExists(atPath: fixture.directory.path))
         #expect(!TestDatabaseTeardown.isPendingForTesting(pool: sibling))
+    }
+
+    /// Number of released exit-only fixtures the accumulation test registers.
+    private static let releasedFixtureCount = 25
+
+    /// Registers an exit-only fixture and releases every reference the test
+    /// holds, the way a finished test drops its fixture. `whileHeld` runs
+    /// before the release (for example to open a descriptor of its own).
+    private func registerReleasedExitOnlyFixture(
+        whileHeld: (URL) -> Void = { _ in }
+    ) throws -> URL {
+        let fixture = try makeFixture()
+        TestDatabaseTeardown.registerForProcessExit(
+            pool: fixture.pool,
+            directory: fixture.directory
+        )
+        whileHeld(fixture.directory)
+        return fixture.directory
+    }
+
+    /// Any later registry transition; registering is the one every exit-only
+    /// fixture performs.
+    private func registryTransition() throws -> DatabasePool {
+        let trigger = try makeFixture()
+        TestDatabaseTeardown.registerForProcessExit(
+            pool: trigger.pool,
+            directory: trigger.directory
+        )
+        return trigger.pool
+    }
+
+    @Test("released exit-only fixtures do not accumulate open descriptors (iOS #885)")
+    func releasedExitOnlyFixturesDoNotAccumulateDescriptors() throws {
+        var directories: [URL] = []
+        for _ in 0..<Self.releasedFixtureCount {
+            directories.append(try registerReleasedExitOnlyFixture())
+        }
+        let trigger = try registryTransition()
+        defer { TestDatabaseTeardown.flushRegisteredForTesting(pool: trigger) }
+
+        let stillOpen = directories.reduce(0) {
+            $0 + TestDatabaseTeardown.openDescriptorCountForTesting(directory: $1)
+        }
+        #expect(stillOpen == 0, "released exit-only fixtures still hold \(stillOpen) descriptors")
+        #expect(directories.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+    }
+
+    @Test("a released exit-only fixture is never unlinked while a descriptor still names it")
+    func releasedExitOnlyFixtureWithOpenDescriptorKeepsDirectory() throws {
+        var descriptor: Int32 = -1
+        let directory = try registerReleasedExitOnlyFixture { directory in
+            descriptor = Darwin.open(
+                directory.appendingPathComponent("test.sqlite").path,
+                O_RDONLY | O_CLOEXEC
+            )
+        }
+        #expect(descriptor >= 0)
+        let first = try registryTransition()
+        defer { TestDatabaseTeardown.flushRegisteredForTesting(pool: first) }
+        #expect(FileManager.default.fileExists(atPath: directory.path))
+
+        _ = Darwin.close(descriptor)
+        let second = try registryTransition()
+        defer { TestDatabaseTeardown.flushRegisteredForTesting(pool: second) }
+        #expect(!FileManager.default.fileExists(atPath: directory.path))
+    }
+
+    @Test("an exit-only fixture still referenced by escaped work stays open and usable")
+    func referencedExitOnlyFixtureStaysOpen() throws {
+        let fixture = try makeFixture()
+        defer { TestDatabaseTeardown.flushRegisteredForTesting(pool: fixture.pool) }
+        TestDatabaseTeardown.registerForProcessExit(
+            pool: fixture.pool,
+            directory: fixture.directory
+        )
+        let trigger = try registryTransition()
+        defer { TestDatabaseTeardown.flushRegisteredForTesting(pool: trigger) }
+
+        #expect(FileManager.default.fileExists(atPath: fixture.directory.path))
+        #expect(TestDatabaseTeardown.isRegisteredForProcessExitForTesting(pool: fixture.pool))
+        let rowCount = try fixture.pool.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM probe")
+        }
+        #expect(rowCount == 0)
     }
 
     @Test("the process database sink owns one exact process-exit registration")
