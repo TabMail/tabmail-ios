@@ -93,6 +93,10 @@ struct InvalidRecurrenceCase: CustomTestStringConvertible, Sendable {
         .init(fields: ["freq": .string("WEEKLY"), "wkst": .string("XX")], field: "wkst", value: "\"XX\""),
         .init(fields: ["freq": .string("FORTNIGHTLY")], field: "freq", value: "\"FORTNIGHTLY\""),
         .init(fields: ["byDay": .array([.string("MO")])], field: "freq", value: "missing"),
+        // `other` is what the read tools show for stored parts the fields cannot express (#552);
+        // passed back it is refused, never dropped (which would save the series without them).
+        .init(fields: ["freq": .string("MONTHLY"), "byDay": .array([.string("TU"), .string("TH")]), "other": .string("BYSETPOS=2")],
+              field: "other", value: "\"BYSETPOS=2\""),
     ] + until
 
     /// An invalid `until` is refused like every other field, never dropped (which would save an
@@ -700,6 +704,188 @@ struct RecurrenceDaysToolTests {
             #expect(sink.calendarEvents[0].changes.contains("recurrence: monthly on day 1, day 15"), "\(sink.calendarEvents[0].changes)")
             let created = await mock.createdEvents
             #expect(created.first?.event.recurrence == ["RRULE:FREQ=MONTHLY;BYMONTHDAY=1,15"])
+        }
+    }
+
+    // MARK: The read rule given back (#552)
+
+    /// An Outlook series in Los Angeles at 10:00 on a position among `days` of each month
+    /// (`relativeMonthly`, index second), from the second Tuesday two months ahead, ending on a
+    /// date five months later, as Graph stores it.
+    private static func outlookPositionSeries(id: String, days: [String]) throws -> (series: [String: Any], zone: TimeZone) {
+        let la = try #require(TimeZone(identifier: "America/Los_Angeles"))
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = la
+        let month = cal.dateComponents([.year, .month], from: try #require(cal.date(byAdding: .month, value: 2, to: Date())))
+        let firstDay = try #require(cal.date(from: DateComponents(year: month.year, month: month.month, weekday: 3, weekdayOrdinal: 2)))
+        let start = try #require(cal.date(bySettingHour: 10, minute: 0, second: 0, of: firstDay))
+        let lastDay = try #require(cal.date(byAdding: .month, value: 5, to: firstDay))
+        var series = GraphFixture.event(id: id, start: start, online: false, recurring: true)
+        series["start"] = ["dateTime": OccurrenceFixture.naive(start, la) + ".0000000", "timeZone": "Pacific Standard Time"]
+        series["end"] = ["dateTime": OccurrenceFixture.naive(start.addingTimeInterval(1_800), la) + ".0000000", "timeZone": "Pacific Standard Time"]
+        series["recurrence"] = [
+            "pattern": ["type": "relativeMonthly", "interval": 1, "month": 0, "dayOfMonth": 0, "daysOfWeek": days,
+                        "firstDayOfWeek": "sunday", "index": "second"],
+            "range": ["type": "endDate", "startDate": OccurrenceFixture.isoDate(start, la),
+                      "endDate": OccurrenceFixture.isoDate(lastDay, la),
+                      "recurrenceTimeZone": "Pacific Standard Time", "numberOfOccurrences": 0],
+        ]
+        return (series, la)
+    }
+
+    /// The `recurrence:` line of a read, its note left off, as JSON text and as the fields the
+    /// assistant gives back.
+    private static func readRule(_ printed: String) throws -> (json: String, fields: [String: JSONValue]) {
+        let line = try #require(printed.split(separator: "\n").first { $0.hasPrefix("recurrence: ") },
+                                "the read shows no recurrence line: \(printed)")
+        var json = String(line.dropFirst("recurrence: ".count))
+        let note = " (\(CalendarRecurrenceFormat.otherPartsNote))"
+        if json.hasSuffix(note) { json = String(json.dropLast(note.count)) }
+        return (json, try JSONDecoder().decode([String: JSONValue].self, from: Data(json.utf8)))
+    }
+
+    private static func canonical(_ value: Any?) -> String {
+        guard let value, let data = try? JSONSerialization.data(withJSONObject: [value], options: [.sortedKeys]) else { return "null" }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    /// **INVARIANT.** *A rule the read tools show, given back to the edit tool unchanged, keeps the
+    /// series as it is.* Outlook keeps "the second Tuesday of each month" as a position over one
+    /// weekday (`BYDAY=TU;BYSETPOS=2`); the read shows it as `"byDay":["2TU"]`, the same days
+    /// (RFC 5545), so the whole-series edit that restates it is shown on a card, writes no rule and
+    /// resets none of the series' exceptions.
+    @Test("an Outlook series on the second Tuesday, read and given back to the edit tool, keeps its rule (#552)")
+    func outlookSecondTuesdayRestates() async throws {
+        let (series, la) = try Self.outlookPositionSeries(id: "ser-2tu", days: ["tuesday"])
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = FakeGraphCalendar([series])
+        graph.install(on: http)
+        let before = try #require(graph.event("ser-2tu"))
+        let provider = ExchangeCalendarProvider(mailbox: "calendar@example.com", accessToken: { _ in "test-token" }, session: http.session)
+        let read = try await provider.getEvent(eventId: "ser-2tu")
+        // Non-vacuity: Outlook's pattern is read as a position over one weekday.
+        #expect(read.recurrence?.first?.contains("BYSETPOS=2") == true, "read as \(read.recurrence ?? [])")
+        let rule = try Self.readRule(CalendarToolHelpers.formatDetailedEvent(read, timeZone: la))
+        #expect(rule.json.contains(#""byDay":["2TU"]"#) && !rule.json.contains("other") && rule.json.contains(#""until":"#),
+                "shown as \(rule.json)")
+
+        let arguments: [String: JSONValue] = [
+            "event_id": .string("ser-2tu"), "edit_scope": .string("all"), "title": .string("Planning renamed"),
+            "timezone": .string(la.identifier), "recurrence": .dictionary(rule.fields),
+        ]
+        try await withCalendar(provider) { pool in
+            let sink = RecordingConfirmSink()
+            let output = try await CalendarEventEditTool(context: ToolContext(db: pool, translator: MockChatIdTranslator(), deviceZone: la)).execute(
+                arguments: arguments, invocation: ToolInvocation(uiSink: sink, sessionKey: "rd-edit-2tu"))
+            #expect(sink.calendarEvents.count == 1, "no card: \(output)")
+        }
+        var queued = arguments
+        queued.removeValue(forKey: "event_id")
+        let rows = try await drainEdit(accountId: "rd-2tu", eventId: "ser-2tu", calendarId: "primary",
+                                       arguments: queued, provider: provider)
+
+        #expect(rows.isEmpty, "the edit was not written: \(rows.map { $0.failureReason ?? $0.status })")
+        #expect(graph.seriesResets == 0, "the restated rule reset the series' exceptions")
+        let after = try #require(graph.event("ser-2tu"))
+        #expect(Self.canonical(after["recurrence"]) == Self.canonical(before["recurrence"]),
+                "the rule changed: \(Self.canonical(after["recurrence"]))")
+        #expect(after["subject"] as? String == "Planning renamed")
+    }
+
+    /// **INVARIANT.** *A rule the fields cannot say is never rewritten without the parts they
+    /// cannot say.* "The second Tuesday or Thursday" (a position over two weekdays) is shown with
+    /// `BYSETPOS` in `other`; a whole-series edit that gives a rule for it, which would replace the
+    /// stored rule and drop the position, is refused before the card with nothing sent. The same
+    /// edit without a rule is not refused (control).
+    @Test("a whole-series edit giving a rule for a series whose rule the fields cannot say is refused before the card (#552)")
+    func positionOverSeveralDaysRefusesARule() async throws {
+        let (series, la) = try Self.outlookPositionSeries(id: "ser-2tuth", days: ["tuesday", "thursday"])
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = FakeGraphCalendar([series])
+        graph.install(on: http)
+        let provider = ExchangeCalendarProvider(mailbox: "calendar@example.com", accessToken: { _ in "test-token" }, session: http.session)
+        let printed = CalendarToolHelpers.formatDetailedEvent(try await provider.getEvent(eventId: "ser-2tuth"), timeZone: la)
+        let rule = try Self.readRule(printed)
+        #expect(rule.json.contains(#""byDay":["TU","TH"]"#) && rule.json.contains(#""other":"BYSETPOS=2""#), "shown as \(rule.json)")
+        #expect(printed.contains(CalendarRecurrenceFormat.otherPartsNote), "the read does not say to omit recurrence: \(printed)")
+
+        // A rule Outlook can hold ("the second Tuesday"), so only the stored rule's `other` part
+        // can refuse it: written, it would drop the position over two weekdays. (The fields read
+        // back without `other`, `byDay` [TU,TH], Outlook refuses on its own as a pattern it can't hold.)
+        var given = rule.fields
+        given.removeValue(forKey: "other")
+        given["byDay"] = .array([.string("2TU")])
+        try await withCalendar(provider) { pool in
+            let refusedSink = RecordingConfirmSink()
+            let refused = try await CalendarEventEditTool(context: ToolContext(db: pool, translator: MockChatIdTranslator(), deviceZone: la)).execute(
+                arguments: ["event_id": .string("ser-2tuth"), "edit_scope": .string("all"), "timezone": .string(la.identifier),
+                            "recurrence": .dictionary(given)],
+                invocation: ToolInvocation(uiSink: refusedSink, sessionKey: "rd-edit-2tuth-rule"))
+            #expect(refused.contains("cannot express (BYSETPOS=2)") && refused.contains("NOT changed"), "tool said: \(refused)")
+            #expect(refusedSink.calendarEvents.isEmpty, "a card was shown for a rule that drops BYSETPOS")
+            #expect(graph.writes.isEmpty, "sent \(graph.writes)")
+
+            // Control: no rule given, the stored one is kept, and the card is shown.
+            let sink = RecordingConfirmSink()
+            let output = try await CalendarEventEditTool(context: ToolContext(db: pool, translator: MockChatIdTranslator(), deviceZone: la)).execute(
+                arguments: ["event_id": .string("ser-2tuth"), "edit_scope": .string("all"), "title": .string("Planning renamed")],
+                invocation: ToolInvocation(uiSink: sink, sessionKey: "rd-edit-2tuth-title"))
+            #expect(sink.calendarEvents.count == 1, "no card for an edit without a rule: \(output)")
+        }
+    }
+
+    /// The refusal covers every edit that writes the series' rule: the whole series, and a change
+    /// of an occurrence and the following ones (whose new series takes the rule given). An edit
+    /// that gives no rule keeps the stored one, and one occurrence's edit writes no series rule:
+    /// neither is refused for it (controls).
+    @Test("a rule given for a series with parts the fields cannot say is refused for the whole series and for this and following (#552)",
+          arguments: ["all", "this_and_following", "this_only", "no rule", "empty rule"])
+    func storedOtherRefusalCoversEveryRuleWrite(_ scope: String) async throws {
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = .gmt
+        let firstDay = try #require(utc.date(byAdding: .day, value: 7, to: utc.startOfDay(for: Date())))
+        let first = try #require(utc.date(bySettingHour: 10, minute: 0, second: 0, of: firstDay))
+        let weekday = CalendarToolHelpers.rruleWeekdays[utc.component(.weekday, from: first) - 1]
+        let series = GCalEvent(
+            id: "evt-series", summary: "Sync", location: nil, description: nil,
+            start: GCalDateTime(dateTime: first.iso8601String(), date: nil, timeZone: "UTC"),
+            end: GCalDateTime(dateTime: first.addingTimeInterval(3_600).iso8601String(), date: nil, timeZone: "UTC"),
+            attendees: nil, organizer: nil, recurrence: ["RRULE:FREQ=WEEKLY;BYDAY=\(weekday);BYHOUR=10"],
+            transparency: nil, status: "confirmed", htmlLink: nil, created: nil, updated: nil
+        )
+        let mock = MockCalendarProvider()
+        await mock.setGetEventResult(series)
+        var arguments: [String: JSONValue] = ["event_id": .string("evt-series"), "timezone": .string("UTC"), "title": .string("Sync renamed")]
+        if scope == "empty rule" {
+            arguments["edit_scope"] = .string("all")
+            arguments["recurrence"] = .dictionary([:])
+        } else if scope != "no rule" {
+            arguments["edit_scope"] = .string(scope)
+            arguments["recurrence"] = .dictionary(["freq": .string("WEEKLY"), "byDay": .array([.string(weekday)])])
+        } else {
+            arguments["edit_scope"] = .string("all")
+        }
+        if scope == "this_and_following" || scope == "this_only" {
+            arguments["recurrence_id"] = .string(OccurrenceFixture.naive(first.addingTimeInterval(OccurrenceFixture.days(14)), .gmt))
+        }
+        try await withCalendar(mock) { pool in
+            let sink = RecordingConfirmSink()
+            let output = try await CalendarEventEditTool(context: ToolContext(db: pool, translator: MockChatIdTranslator(), deviceZone: .gmt)).execute(
+                arguments: arguments, invocation: ToolInvocation(uiSink: sink, sessionKey: "rd-edit-other-\(scope)"))
+            let refused = output.contains("cannot express (BYHOUR=10)")
+            if scope == "all" || scope == "this_and_following" {
+                #expect(refused && output.contains("NOT changed"), "\(scope): \(output)")
+                #expect(sink.calendarEvents.isEmpty, "\(scope): a card was shown")
+                let updated = await mock.updatedEvents
+                #expect(updated.isEmpty)
+            } else if scope == "this_only" {
+                #expect(!refused, "\(scope): \(output)")
+            } else {
+                #expect(!refused, "\(scope): \(output)")
+                #expect(sink.calendarEvents.count == 1, "\(scope): no card: \(output)")
+            }
         }
     }
 

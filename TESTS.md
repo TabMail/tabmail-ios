@@ -1112,7 +1112,28 @@ naming the field and the value, with nothing sent.
   rule Graph can't hold with no POST or PATCH.
 - `RecurrenceDaysToolTests`: the cards name the days; every invalid field, and an invalid `until`
   on Google, Outlook and CalDAV, is refused before both cards with nothing sent; a rule Outlook
-  can't hold is refused before both cards.
+  can't hold is refused before both cards. The read rule given back (#552): an Outlook "second
+  Tuesday" series, read through `formatDetailedEvent`, restated through the edit tool and drained,
+  keeps its stored recurrence with no exception reset; "second Tuesday or Thursday" shows BYSETPOS in
+  `other` and a whole-series edit giving a rule is refused before the card, nothing sent (control: no
+  rule, a card); the refusal covers `all` and `this_and_following`; `other` passed as a field is
+  refused by name (`InvalidRecurrenceCase`).
+
+`TabMailTests/Tools/CalendarRecurrenceFormatTests.swift` pins #552's read format
+(`CalendarRecurrenceFormat`): each stored part in its field and order, the rest in `other` (a FREQ
+below DAILY, BYHOUR, invalid tokens, a part twice, day fields the writer refuses with that FREQ, an
+UNTIL beside a COUNT, a further RRULE); a rule with no `other` part is written back as stored; the
+detailed read shows EXDATE/RDATE verbatim and no RRULE text. `CalendarRecurrenceSetPositionTests`:
+the numbered day shown for a position over one weekday has the stored rule's occurrences (every
+weekday and position, monthly, every other month, yearly in one month, monthly in two months, through
+the CalDAV expander); every other BYSETPOS stays in `other`. `CalendarRecurrenceUntilTests`: the
+round-trip property (five series zones, seven read zones, 00:30/10:00/23:30, eight stored end shapes,
+end days far from and around clock changes): a shown `until` is the last occurrence's date in the
+read's zone and the rule written back lists the same occurrences; a bare date also comes back as
+Outlook's end through `graphEndDate`; every end is shown, as the last occurrence's UTC instant
+only near a clock change. CalDAV series in UTC and floating (`GCalEvent.ruleZone`) show their end
+on listed rows and on the series read, and restate to the same occurrences. All-day ends round-trip; unreadable ends and a series with no known zone keep the end in
+`other`.
 
 ## Calendar writes queued across a zone change — written as the card showed
 

@@ -2442,6 +2442,13 @@ struct GCalEvent: Codable, Sendable {
     /// `CalendarProvider.editResetsChangedOccurrences`. Nil elsewhere. In memory only: left out of
     /// the encoding (`CodingKeys`), never stored.
     var holdsSeries: Bool? = nil
+    /// The zone a CalDAV series' rule repeats in, as its DTSTART places it: the zone its TZID
+    /// names (nil when `CalendarTimeZoneResolver` does not recognize it, as `seriesZone`), UTC for a
+    /// start in UTC (`Z`), and for a floating start the zone its wall times were read in. Set by
+    /// `ICSParser` and the `CalDAVOccurrences` rows, nil on an all-day series and on other calendars
+    /// (their zone is `seriesZone`). Read only by `CalendarRecurrenceFormat.untilDay`, to show a
+    /// stored end; no write reads it. In memory only: left out of the encoding (`CodingKeys`).
+    var ruleZone: TimeZone? = nil
 
     /// Whether `start.timeZone` is only the zone the read asked for, not the event's own (Outlook:
     /// `Prefer: outlook.timezone`), so `seriesZone` never reads a date in it. Optional so a

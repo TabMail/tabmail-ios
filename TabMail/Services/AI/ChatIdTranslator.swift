@@ -760,10 +760,11 @@ actor ChatIdTranslator {
                         if let sep = beforeTab.range(of: ": ") {
                             var title = String(beforeTab[sep.upperBound...])
                             // Strip the recurrence marker — both the bare `(↻)`
-                            // and the richer `(↻ RRULE:…)` form added in v1.5.21
+                            // and the richer `(↻ {...})` form (the rule in the
+                            // tools' fields, #552; `(↻ RRULE:…)` from v1.5.21)
                             // so the LLM can reason about edit_scope. The chip
-                            // title shown to the USER should never carry raw
-                            // RRULE text.
+                            // title shown to the USER should never carry the
+                            // rule's text.
                             title = title
                                 .replacing(/\s*\(↻[^)]*\)/, with: "")
                                 .replacingOccurrences(of: " [free]", with: "")

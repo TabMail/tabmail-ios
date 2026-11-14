@@ -418,7 +418,8 @@ struct CalendarToolHelpersFormatTests {
         )
         let output = CalendarToolHelpers.formatDetailedEvent(event)
         #expect(output.contains("recurring: yes"))
-        #expect(output.contains("RRULE: RRULE:FREQ=WEEKLY"))
+        #expect(output.contains("recurrence: {\"freq\":\"WEEKLY\"}"))
+        #expect(!output.contains("RRULE"))
     }
 
     @Test("No title shows (No title)")
@@ -706,10 +707,8 @@ struct CalendarToolHelpersGroupedSummaryTests {
             updated: nil
         )
         let output = CalendarToolHelpers.formatGroupedSummary(gcalEvents: [event])
-        // The formatter now embeds the RRULE alongside the recurrence marker so
-        // the LLM can see UNTIL/COUNT details inline (commit 28959af). The
-        // marker remains "↻", but the full token is "(↻ <RRULE>)".
-        #expect(output.contains("(\u{21BB} RRULE:FREQ=WEEKLY)"))
+        // The marker carries the rule in the fields the tools write (#552): "(↻ {...})".
+        #expect(output.contains(#"(\#u{21BB} {"freq":"WEEKLY"})"#))
     }
 
     @Test("Transparent event shows [free] marker")
