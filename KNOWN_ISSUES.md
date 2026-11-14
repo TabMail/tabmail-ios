@@ -101,7 +101,13 @@ The full records are split into [`Companion/Process/Current/KnownIssues/`](Compa
 
 ## Post-freeze amendments
 
-> **Current tracker census (2026-11-08, #422): back to 6 `open` records.** `IOS-DRAFT-026` is now
+> **Current tracker census (2026-11-13, #750): unchanged at 6 `open` records.** The Outlook
+> older-mail check adds three `accepted` records, shared with Gmail's check (and IMAP's for the
+> last two): `IOS-CATCHUP-001` (what waits for a folder's next listing), `IOS-CATCHUP-002` (a proven
+> removal declined by the user's own action) and `IOS-CATCHUP-003` (a read over an hour old skips
+> its flag corrections).
+>
+> *Preserved:* **Current tracker census (2026-11-08, #422): back to 6 `open` records.** `IOS-DRAFT-026` is now
 > `accepted` (owner, 2026-11-08): a failed Outlook send with files can leave its draft in Drafts.
 >
 > *Preserved:* **Current tracker census (2026-11-07, #422): 7 `open` records.** `IOS-DRAFT-026` (`open`, proposed
@@ -304,6 +310,14 @@ above, whose bytes cannot change. For example `IOS-OUTBOX-007` still reads `acce
 | ID | Class | Executive statement |
 |---|---|---|
 | [IOS-GRAPH-005](Companion/Process/Current/KnownIssues/Amendments/ios-graph-005.md) | `resolved` | ✅ **RESOLVED (2026-09-05)** — a second gesture on an Outlook message that was queued behind a move was lost. Graph reallocates a message's default id on every folder move (`IOS-GRAPH-002`; this tree sends no `Prefer: IdType="ImmutableId"`), so the follower named an id the first move had just destroyed, Graph answered `404`, and `executeSingleOp`'s single-message conflict arm read that as provider-authoritative "already done" and DELETED the operation — the user's LATEST intention, gone with nothing recording that they had asked. The same shape covers delete → undo → delete again, because the undo is an ordinary reverse move built from the optimistic row. **Fix:** `MessageHeaderRekey.finishMove` now carries the wire-proven destination address into the queue — in the SAME transaction that re-keys the header and retires the move, every non-cancelled same-account `PendingOperation` whose members name a proven source id has each such member replaced by its mapped destination id — and on an account-scoped provider the re-key FOLLOWS THE ROW, locating it by `(accountId, messageId)` and re-keying it in the folder it currently occupies rather than at the operation's destination path. The drain re-reads each operation by primary key before executing it (no `?? op` fallback) and requeues by COLUMN rather than by saving a pre-drain struct, so a halted lane can no longer write dead ids back over addresses the wire had just proved. Only with that handoff in place is `.outlook` admitted to account-qualified drain lanes, which SUPERSEDES the exclusion recorded under `IOS-QUEUE-008`: serializing without the handoff would have converted an inherited race into a DETERMINISTIC dropped intention, which is strictly worse. The classifier is renamed `immutableIdAccountIds` → `accountScopedIdAccountIds` because the property the lane key needs is "one provider id names one message per ACCOUNT", not "the id survives a move". ⚠️ **Accepted limitation (owner, 2026-09-04), stated in the source beside `readdressQueuedOperations`:** process death between Graph's `2xx` and the retirement commit leaves that move's queued followers on a dead id. It is bounded to one process death inside one write, is strictly narrower than the pre-handoff loss (which needed no crash at all), and is not closable here — re-associating the follower would need RFC identity as a mutation authority, which ADR-IOS-068 D4 bans. The structural fix (Graph immutable ids) is tracked as [#117](https://github.com/TabMail/tabmail-ios/issues/117); the launch-time drop of an interrupted move that the window relies on is [#116](https://github.com/TabMail/tabmail-ios/issues/116). No schema, migration or drain-ordering change |
+
+### CATCHUP (3)
+
+| ID | Class | Executive statement |
+|---|---|---|
+| [IOS-CATCHUP-001](Companion/Process/Current/KnownIssues/Amendments/ios-catchup-001.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-13, #750)** — once an Outlook folder's older-mail listing completes, it is listed again only after a change-cursor lapse, or when its page walk completes after a listing that ran while the walk was incomplete. Until then a missing message whose load kept failing past the 60-minute hold, a removal candidate dropped after its proof kept failing, and a message the listing missed through page-link drift inside one second all wait. Same as Gmail. Opening a message that is gone removes it (body 404); nothing is removed on a guess. |
+| [IOS-CATCHUP-002](Companion/Process/Current/KnownIssues/Amendments/ios-catchup-002.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-13, #750)** — a removal the older-mail check proved (gone, or moved elsewhere) is declined while the user's own operation on that message is queued or completed in the last 30 s, and is not tried again until the folder's next listing. Usually the user's move or delete re-keys or removes the row at once; otherwise opening the message removes it (body 404). Shared apply: Outlook, Gmail and IMAP. |
+| [IOS-CATCHUP-003](Companion/Process/Current/KnownIssues/Amendments/ios-catchup-003.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-13, #750)** — an older-mail read whose apply comes 1 hour or more after the read began (for example the app suspended in the middle of a slice) skips every read and flag correction in that result, because the in-memory log of completed user actions keeps only an hour. Removals, loads and the folder's state still apply, so the check never stalls, and no newer user value is overwritten. The skipped corrections wait for the next listing. Shared apply: Outlook, Gmail and IMAP. |
 
 ### TEST (1)
 
