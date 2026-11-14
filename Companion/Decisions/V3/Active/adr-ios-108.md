@@ -220,6 +220,19 @@ of the resource, which holds every occurrence (irreversible wire operation #5, n
   the range's zone alone (`startZoneIsDisplay`, `unreadableSeriesZone`, #806). Tests:
   `zonelessSeriesIsRefused`, `eventZoneDatesTheCarry`, `customRangeZoneIsRefused`,
   `noRangeZoneIsNotReadInTheDisplayZone`.
+  **Amended 2026-11-13 (#563, review of the rebuild):** an occurrence carried onto the new part (kept
+  whole, or the named one on a reset) is written at the slot the new part has
+  (`SplitCarry.slot`: its place moved by whole days from the cut to the new part's first day, at the new
+  part's time of day, on the new part's rule), never at its old place, which a shifted or reshaped new
+  part does not have. Decided before the create in one provider-neutral function
+  (`SplitCarry.carryPlan`): an occurrence kept with no slot refuses the split (`keptHasNoSlotRefusal`),
+  a change of all-day/timed with an occurrence moved from before the cut to after it refuses
+  (`editedKindRefusal`), and a reset's named occurrence with no slot is reset with the rest. A change of
+  kind at a moved occurrence moves the new part by whole days to the cut, as Google does. The
+  confirmation card reads the zone the write dates in: Outlook's read carries `originalStartTimeZone`
+  (`GCalEvent.eventZoneName`), and `GCalEvent.seriesZoneName` falls back to it when the range names no
+  zone. Open: CalDAV's split keeps such an override at its old RECURRENCE-ID. Memory 142, ninth
+  amendment.
 - The series id with a moved occurrence's new time edits that occurrence in place, and with its old
   place is not found, the same as on Google, whose resolver finds no instance there.
 - A retry after a lost response is reported not found, with nothing written, when the first attempt

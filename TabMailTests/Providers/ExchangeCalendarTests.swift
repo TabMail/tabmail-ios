@@ -315,6 +315,9 @@ struct ExchangeCalendarRecurringTests {
                                attendees: nil, organizer: nil, recurrence: ["RRULE:FREQ=DAILY"], transparency: nil,
                                status: nil, htmlLink: nil, created: nil, updated: nil)
         series.recurrenceTimeZoneName = zone
+        // As every Outlook read gives it (`toGCalEvent`): the start's zone is only the one the read
+        // asked for, and no `originalStartTimeZone` was read.
+        series.startZoneIsDisplay = true
         return ExchangeCalendarProvider.EditSnapshot(event: series, raw: [:])
     }
 

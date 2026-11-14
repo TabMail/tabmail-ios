@@ -672,7 +672,7 @@ actor CalDAVProvider: CalendarProvider {
             return nil
         }
         let namedStart = point.namedStart, namedPlace = point.namedPlace, namedInstants = point.namedInstants
-        guard let patch = SplitCarry.partEdit(patch, namedStart: namedStart, cut: cutTime) else {
+        guard let patch = SplitCarry.partEdit(patch, namedStart: namedStart, cut: cutTime, zone: point.seriesZone) else {
             throw CalendarProviderError.notSupported(Self.splitPointUnreadable)
         }
 
@@ -777,6 +777,8 @@ actor CalDAVProvider: CalendarProvider {
         let cut: SplitCarry.Cut
         /// The split's slot, a naive wall clock in `zone` (nil past the series' end).
         let slot: String?
+        /// The zone the series' places are wall clocks in: its start's, else the operation's.
+        let seriesZone: TimeZone
     }
 
     /// The split point (`SplitPoint`) of `masterICS`: the occurrence named is the one
@@ -807,7 +809,7 @@ actor CalDAVProvider: CalendarProvider {
                 ? SplitCarry.naive(of: cutTime, recurrenceId: recurrenceId, zone: zone) : placeSlot else { throw unreadable }
             slot = at
         }
-        return SplitPoint(zones: zones, namedStart: namedStart, namedPlace: namedPlace, namedInstants: namedInstants, cut: cut, slot: slot)
+        return SplitPoint(zones: zones, namedStart: namedStart, namedPlace: namedPlace, namedInstants: namedInstants, cut: cut, slot: slot, seriesZone: seriesZone)
     }
 
     /// The instants `start` and `place` name, as `parseICSDateTime` reads a resource's times: a

@@ -355,9 +355,10 @@ enum CalDAVOccurrences {
                 throw CalendarProviderError.notSupported(
                     "TabMail can't express the occurrence recurrence_id '\(recurrenceId)' names in \(zone.identifier), so nothing was changed.")
             }
-            // A split at an occurrence moved from its place splits at that place (#687), as Google
-            // Calendar does: `slot` is the key's place, and the moved occurrence goes to the new
-            // part with the other changed occurrences there.
+            // `slot` is the key's place, the occurrence named as its series holds it. A split named
+            // at an occurrence moved from its place does not cut there: it cuts in calendar order,
+            // at the first place at or after where the occurrence starts now (owner rule,
+            // 2026-11-12; `CalDAVProvider.splitPoint`, `SplitCarry.cut`), worked out from this.
             return (named, slot)
         case .absent:
             throw CalDAVError.notFound

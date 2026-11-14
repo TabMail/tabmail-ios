@@ -134,6 +134,14 @@ final class FakeGraphCalendar: Sendable {
     private let creations = Mutex(0)
     private let writeLog = Mutex<[String]>([])
     private let writeHook = Mutex<(@Sendable (_ method: String, _ id: String) -> Void)?>(nil)
+    private let createHook = Mutex<(@Sendable (_ created: [String: Any]) -> [[String: Any]])?>(nil)
+
+    /// Once a create (`POST /me/events`) stores a series, the occurrences `make` gives for it
+    /// (from the series as created) are stored with it, so its instances list holds them where the
+    /// created series places them, as Graph lists a new series' occurrences.
+    func occurrencesOnCreate(_ make: @escaping @Sendable (_ created: [String: Any]) -> [[String: Any]]) {
+        createHook.withLock { $0 = make }
+    }
 
     /// The user deletes `id` in their calendar app.
     func userDeletes(_ id: String) { events.withLock { $0[id] = nil } }
@@ -550,6 +558,9 @@ final class FakeGraphCalendar: Sendable {
             if Self.allDaySeriesLengthened(created, stored: [:]) { Self.lengthen(&created, written: created, storedStart: nil) }
             Self.defaultRecurrenceZone(in: &created)
             store(created)
+            if created["recurrence"] != nil, let make = createHook.withLock({ $0 }) {
+                for occurrence in make(created) { store(occurrence) }
+            }
             if takeLoss("POST") { return .transportError(.networkConnectionLost) }
             return Self.json(created)
         }

@@ -211,7 +211,11 @@ final class FakeGoogleCalendar: Sendable {
             let parts = Self.pathParts(request.url)
             runWriteHook("PATCH", parts.first ?? "")
             if let status = takeFailure("PATCH") { return .status(status) }
-            if parts.count == 1, event(parts[0]) == nil, let occurrence = Self.instance(parts[0], of: event) { store(occurrence) }
+            // An occurrence id off its series' rule, or of no series, is not found (`instance`).
+            if parts.count == 1, event(parts[0]) == nil {
+                guard let occurrence = Self.instance(parts[0], of: event) else { return .status(404) }
+                store(occurrence)
+            }
             guard parts.count == 1, var stored = event(parts[0]), let body = request.body,
                   let patch = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any]
             else { return .status(400) }
@@ -328,9 +332,68 @@ final class FakeGoogleCalendar: Sendable {
 
     /// The occurrence `id` (`<series id>_<UTC start>Z`, or `<series id>_<date>` for an all-day
     /// series) of a stored series, as Google gives it before it is changed: the series' fields at
-    /// its place, lasting as long as the series. Nil when `id` names no occurrence of a stored
-    /// series. Not checked against the rule.
+    /// its place, lasting as long as the series. Nil (a 404) when `id` names no occurrence of a
+    /// stored series: no series, or a start its rule does not place an occurrence at (`onRule`), as
+    /// Google answers an instance id off the rule.
     private static func instance(_ id: String, of event: (String) -> [String: Any]?) -> [String: Any]? {
+        guard let occurrence = anyInstance(id, of: event), let seriesId = occurrence["recurringEventId"] as? String,
+              let series = event(seriesId), onRule(series, occurrence: occurrence) else { return nil }
+        return occurrence
+    }
+
+    /// Whether the series `series` places an occurrence where `occurrence` (built by `anyInstance`)
+    /// starts: on a day its rule names from its start, at its own time of day in its own zone. Read
+    /// here, apart from the code under test, for `FREQ=DAILY` and `FREQ=WEEKLY` (`INTERVAL`,
+    /// `BYDAY`, weeks from Monday, `UNTIL`); a rule of any other frequency is not checked.
+    private static func onRule(_ series: [String: Any], occurrence: [String: Any]) -> Bool {
+        guard let rule = (series["recurrence"] as? [String])?.first(where: { $0.uppercased().hasPrefix("RRULE:") }) else { return false }
+        var parts: [String: String] = [:]
+        for part in rule.uppercased().dropFirst("RRULE:".count).split(separator: ";") {
+            let pair = part.split(separator: "=", maxSplits: 1).map(String.init)
+            if pair.count == 2 { parts[pair[0]] = pair[1] }
+        }
+        guard let freq = parts["FREQ"], freq == "DAILY" || freq == "WEEKLY" else { return true }
+        var cal = Calendar(identifier: .gregorian)
+        let start = series["start"] as? [String: Any], at = occurrence["start"] as? [String: Any]
+        let day: (Date) -> Date
+        let first: Date, target: Date
+        if let startDate = start?["date"] as? String {
+            cal.timeZone = .gmt
+            guard let date = at?["date"] as? String,
+                  let s = EKEventStoreHelper.parseNaiveISO(startDate, timeZone: .gmt),
+                  let t = EKEventStoreHelper.parseNaiveISO(date, timeZone: .gmt) else { return false }
+            (first, target) = (s, t)
+        } else {
+            let zone = (start?["timeZone"] as? String).flatMap { CalendarTimeZoneResolver.zone(named: $0, in: .none) } ?? .gmt
+            cal.timeZone = zone
+            guard let s = (start?["dateTime"] as? String).flatMap({ Date.fromISO8601($0) }),
+                  let t = (at?["dateTime"] as? String).flatMap({ Date.fromISO8601($0) }) else { return false }
+            let clock: Set<Calendar.Component> = [.hour, .minute, .second]
+            guard cal.dateComponents(clock, from: s) == cal.dateComponents(clock, from: t) else { return false }
+            (first, target) = (s, t)
+        }
+        day = { cal.startOfDay(for: $0) }
+        guard target >= first, let days = cal.dateComponents([.day], from: day(first), to: day(target)).day else { return false }
+        if let until = parts["UNTIL"] {
+            let fmt = DateFormatter()
+            fmt.locale = Locale(identifier: "en_US_POSIX")
+            fmt.timeZone = .gmt
+            fmt.dateFormat = until.count == 8 ? "yyyyMMdd" : "yyyyMMdd'T'HHmmss'Z'"
+            guard let end = fmt.date(from: until) else { return false }
+            if until.count == 8 ? day(target) > end : target > end { return false }
+        }
+        let interval = Int(parts["INTERVAL"] ?? "1") ?? 1
+        guard freq == "WEEKLY" else { return days % interval == 0 }
+        let codes = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"]
+        let weekday = { (date: Date) in codes[cal.component(.weekday, from: date) - 1] }
+        let named = parts["BYDAY"].map { Set($0.split(separator: ",").map(String.init)) } ?? [weekday(first)]
+        // Weeks start on Monday (`WKST` is not read): the week holding the series' start is week 0.
+        let fromMonday = (cal.component(.weekday, from: first) + 5) % 7
+        return named.contains(weekday(target)) && ((days + fromMonday) / 7) % interval == 0
+    }
+
+    /// `instance` before its rule is checked.
+    private static func anyInstance(_ id: String, of event: (String) -> [String: Any]?) -> [String: Any]? {
         guard let cut = id.lastIndex(of: "_") else { return nil }
         let seriesId = String(id[..<cut])
         let suffix = String(id[id.index(after: cut)...])

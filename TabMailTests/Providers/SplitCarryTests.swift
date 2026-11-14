@@ -368,7 +368,7 @@ struct SplitCarryTests {
     func endOnlyAtMovedOccurrence() throws {
         var edit = GCalEventInput()
         edit.endDateTime = Self.at(9, "10:00:00")
-        let written = try #require(SplitCarry.partEdit(edit, namedStart: Self.instant(Self.at(9)), cut: Self.instant(Self.at(14))))
+        let written = try #require(SplitCarry.partEdit(edit, namedStart: Self.instant(Self.at(9)), cut: Self.instant(Self.at(14)), zone: .gmt))
         #expect(written.endDateTime.flatMap(Date.fromISO8601) == Date.fromISO8601(Self.at(14, "10:00:00")))
     }
 
@@ -377,12 +377,122 @@ struct SplitCarryTests {
         var edit = GCalEventInput()
         edit.startDateTime = Self.at(9, "11:00:00")
         edit.endDateTime = Self.at(9, "11:30:00")
-        let written = try #require(SplitCarry.partEdit(edit, namedStart: Self.instant(Self.at(9)), cut: Self.instant(Self.at(14))))
+        let written = try #require(SplitCarry.partEdit(edit, namedStart: Self.instant(Self.at(9)), cut: Self.instant(Self.at(14)), zone: .gmt))
         #expect(written.startDateTime.flatMap(Date.fromISO8601) == Date.fromISO8601(Self.at(14, "11:00:00")))
         #expect(written.endDateTime.flatMap(Date.fromISO8601) == Date.fromISO8601(Self.at(14, "11:30:00")))
         // At a cut that is the named start, the edit is written as given.
-        let same = try #require(SplitCarry.partEdit(edit, namedStart: Self.instant(Self.at(9)), cut: Self.instant(Self.at(9))))
+        let same = try #require(SplitCarry.partEdit(edit, namedStart: Self.instant(Self.at(9)), cut: Self.instant(Self.at(9)), zone: .gmt))
         #expect(same.startDateTime == edit.startDateTime)
+    }
+
+    @Test("a change between all-day and timed at a moved occurrence moves the new part by whole days from the cut, in the requested kind (#837)")
+    func kindChangeAtAMovedOccurrenceMovesByDays() throws {
+        // Timed made all-day: named on day 9 (moved), cut on day 14; the day given is the named one's.
+        var allDay = GCalEventInput()
+        allDay.startDate = String(Self.at(9).prefix(10))
+        allDay.endDate = String(Self.at(10).prefix(10))
+        let toDates = try #require(SplitCarry.partEdit(allDay, namedStart: Self.instant(Self.at(9)), cut: Self.instant(Self.at(14)), zone: .gmt))
+        #expect(toDates.startDate == String(Self.at(14).prefix(10)) && toDates.endDate == String(Self.at(15).prefix(10)),
+                "\(toDates.startDate ?? "nil")-\(toDates.endDate ?? "nil")")
+        #expect(toDates.startDateTime == nil && toDates.endDateTime == nil)
+        // All-day made timed: named on day 9 (a date), cut on day 14; the time of day given is kept.
+        var timed = GCalEventInput()
+        timed.startDateTime = Self.at(10, "11:00:00")
+        timed.endDateTime = Self.at(10, "11:30:00")
+        timed.startTimeZone = "UTC"
+        timed.endTimeZone = "UTC"
+        let date = { (d: Int) in GCalDateTime(dateTime: nil, date: String(Self.at(d).prefix(10)), timeZone: nil) }
+        let toTimes = try #require(SplitCarry.partEdit(timed, namedStart: date(9), cut: date(14), zone: nil))
+        #expect(toTimes.startDateTime.flatMap(Date.fromISO8601) == Date.fromISO8601(Self.at(15, "11:00:00")))
+        #expect(toTimes.endDateTime.flatMap(Date.fromISO8601) == Date.fromISO8601(Self.at(15, "11:30:00")))
+        // With no series zone a timed series' days can't be read: refused, never guessed.
+        #expect(SplitCarry.partEdit(allDay, namedStart: Self.instant(Self.at(9)), cut: Self.instant(Self.at(14)), zone: nil) == nil)
+    }
+
+    // MARK: the new part's slots (C1)
+
+    /// A new part starting at `start` (UTC) repeating by `rule`.
+    private static func part(_ start: GCalDateTime, rule: String) throws -> GCalEvent {
+        let time: [String: Any] = start.date.map { ["date": $0] } ?? ["dateTime": start.dateTime ?? "", "timeZone": start.timeZone ?? "UTC"]
+        return try event(["id": "p", "start": time, "recurrence": [rule]])
+    }
+
+    @Test("a carried occurrence is written on the new part's occurrence that stands for its place: moved as the part moved, and only where the part's rule has one")
+    func slotFollowsTheNewPart() throws {
+        let series = try Self.event(Self.series.merging(["recurrence": ["RRULE:FREQ=WEEKLY"]]) { $1 })
+        let cut = Self.instant(Self.at(14))
+        let place = Self.instant(Self.at(21))
+        // The same part: the place itself.
+        let same = try Self.part(cut, rule: "RRULE:FREQ=WEEKLY")
+        #expect(SplitCarry.slot(of: place, cut: cut, newPart: same, series: series, zone: .gmt)?.dateTime == Self.at(21))
+        // An hour later: the place an hour later.
+        let later = try Self.part(Self.instant(Self.at(14, "10:00:00")), rule: "RRULE:FREQ=WEEKLY")
+        #expect(SplitCarry.slot(of: place, cut: cut, newPart: later, series: series, zone: .gmt)?.dateTime == Self.at(21, "10:00:00"))
+        // A day later (the days turned with it): the place a day later.
+        let nextDay = try Self.part(Self.instant(Self.at(15)), rule: "RRULE:FREQ=WEEKLY")
+        #expect(SplitCarry.slot(of: place, cut: cut, newPart: nextDay, series: series, zone: .gmt)?.dateTime == Self.at(22))
+        // Every other week: day 21 has none, day 28 has one.
+        let fortnightly = try Self.part(cut, rule: "RRULE:FREQ=WEEKLY;INTERVAL=2")
+        #expect(SplitCarry.slot(of: place, cut: cut, newPart: fortnightly, series: series, zone: .gmt) == nil)
+        #expect(SplitCarry.slot(of: Self.instant(Self.at(28)), cut: cut, newPart: fortnightly, series: series, zone: .gmt)?.dateTime == Self.at(28))
+        // The other kind: none.
+        let allDay = try Self.part(GCalDateTime(dateTime: nil, date: String(Self.at(14).prefix(10)), timeZone: nil), rule: "RRULE:FREQ=WEEKLY")
+        #expect(SplitCarry.slot(of: place, cut: cut, newPart: allDay, series: series, zone: .gmt) == nil)
+        // A new rule that does not name the new part's own start day: no slot there (RFC 5545
+        // leaves such a start undefined), only on the days the rule names.
+        var gregorian = Calendar(identifier: .gregorian)
+        gregorian.timeZone = .gmt
+        let nextWeekday = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"][gregorian.component(.weekday, from: try #require(Date.fromISO8601(Self.at(15)))) - 1]
+        let offStart = try Self.part(cut, rule: "RRULE:FREQ=WEEKLY;BYDAY=\(nextWeekday)")
+        #expect(SplitCarry.slot(of: cut, cut: cut, newPart: offStart, series: series, zone: .gmt) == nil)
+        #expect(SplitCarry.slot(of: Self.instant(Self.at(15)), cut: cut, newPart: offStart, series: series, zone: .gmt)?.dateTime == Self.at(15))
+    }
+
+    @Test("the carry is decided before the create: a kept occurrence with no slot refuses, the named one with none resets, and a change of kind with an occurrence left on the old part refuses")
+    func carryPlanDecidesBeforeTheCreate() throws {
+        let series = try Self.event(Self.series.merging(["recurrence": ["RRULE:FREQ=WEEKLY"]]) { $1 })
+        let cut = Self.instant(Self.at(14))
+        let fortnightly = try Self.part(cut, rule: "RRULE:FREQ=WEEKLY;INTERVAL=2")
+        let allDay = try Self.part(GCalDateTime(dateTime: nil, date: String(Self.at(14).prefix(10)), timeZone: nil), rule: "RRULE:FREQ=WEEKLY")
+        // Placed on day 21, shown on day 13, before the one named on day 14: kept.
+        let kept = try Self.occurrence(place: 21, start: Self.at(13), end: Self.at(13, "09:30:00"))
+        let keptParts = try #require(SplitCarry.partition([.changed(kept)], cut: .at(cut), namedStart: cut))
+        for part in [fortnightly, allDay] {
+            #expect(throws: CalendarProviderError.self) {
+                _ = try SplitCarry.carryPlan(parts: keptParts, mode: .reset, namedStart: cut, namedPlace: cut, cut: cut,
+                                             series: series, zone: .gmt, newPart: part, fields: [])
+            }
+        }
+        do {
+            _ = try SplitCarry.carryPlan(parts: keptParts, mode: .reset, namedStart: cut, namedPlace: cut, cut: cut,
+                                         series: series, zone: .gmt, newPart: fortnightly, fields: [])
+        } catch CalendarProviderError.notSupported(let message) {
+            #expect(message == SplitCarry.keptHasNoSlotRefusal)
+        }
+        // The one named placed on day 21 moved to day 12: the cut is day 14; with no slot it is reset.
+        let named = try Self.occurrence(place: 21, start: Self.at(12), end: Self.at(12, "09:30:00"))
+        let namedStart = Self.instant(Self.at(12)), namedPlace = Self.instant(Self.at(21))
+        let namedParts = try #require(SplitCarry.partition([.changed(named)], cut: .at(cut), namedStart: namedStart))
+        let reset = try #require(try SplitCarry.carryPlan(parts: namedParts, mode: .reset, namedStart: namedStart, namedPlace: namedPlace,
+                                                          cut: cut, series: series, zone: .gmt, newPart: fortnightly, fields: []))
+        #expect(reset.changed.isEmpty, "the named one was carried with no slot: \(reset.changed.map(\.place))")
+        let weekly = try Self.part(cut, rule: "RRULE:FREQ=WEEKLY")
+        let carried = try #require(try SplitCarry.carryPlan(parts: namedParts, mode: .reset, namedStart: namedStart, namedPlace: namedPlace,
+                                                            cut: cut, series: series, zone: .gmt, newPart: weekly, fields: []))
+        #expect(carried.changed.map(\.place.dateTime) == [Self.at(21)], "the named one with a slot: \(carried.changed.map(\.place))")
+        // Placed on day 7, shown on day 15, after the one named on day 14: left on the old part.
+        let edited = try Self.occurrence(place: 7, start: Self.at(15), end: Self.at(15, "09:30:00"))
+        let editedParts = try #require(SplitCarry.partition([.changed(edited)], cut: .at(cut), namedStart: cut))
+        do {
+            _ = try SplitCarry.carryPlan(parts: editedParts, mode: .reset, namedStart: cut, namedPlace: cut, cut: cut,
+                                         series: series, zone: .gmt, newPart: allDay, fields: [])
+            Issue.record("a change of kind with an occurrence left on the old part was not refused")
+        } catch CalendarProviderError.notSupported(let message) {
+            #expect(message == SplitCarry.editedKindRefusal)
+        }
+        // The same occurrence, the kind kept: edited where it is, nothing refused.
+        #expect(try SplitCarry.carryPlan(parts: editedParts, mode: .reset, namedStart: cut, namedPlace: cut, cut: cut,
+                                         series: series, zone: .gmt, newPart: weekly, fields: []) != nil)
     }
 
     @Test("(b) an edited occurrence moves by the shift; a retry moves it to the start kept, never twice")
@@ -409,10 +519,13 @@ struct SplitCarryTests {
         let series = try Self.event(Self.series)
         let movedIn = try Self.occurrence(place: 28, start: Self.at(8), end: Self.at(8, "09:30:00"))
         let named = try Self.occurrence(place: 14, start: Self.at(12), end: Self.at(12, "09:30:00"))
+        let keptSlot = GCalDateTime(dateTime: Self.at(28, "10:00:00"), date: nil, timeZone: "UTC")
+        let namedSlot = GCalDateTime(dateTime: Self.at(14, "10:00:00"), date: nil, timeZone: "UTC")
         let plan = try #require(SplitCarry.plan(
-            exceptions: [], kept: [movedIn], named: named, shift: 3600, series: series, newPart: series, fields: [.summary]))
+            exceptions: [], kept: [(movedIn, keptSlot)], named: (named, namedSlot), shift: 3600, series: series, newPart: series, fields: [.summary]))
         #expect(plan.changed.count == 2)
         guard plan.changed.count == 2 else { return }
+        #expect(plan.changed.map(\.place) == [keptSlot, namedSlot], "each is written at its slot on the new part")
         #expect(plan.changed[0].whole && plan.changed[0].start?.dateTime == Self.at(8))
         #expect(!plan.changed[1].whole)
         #expect(plan.changed[1].start?.dateTime.flatMap(Date.fromISO8601) == Date.fromISO8601(Self.at(12, "10:00:00")))

@@ -929,7 +929,7 @@ actor GoogleCalendarProvider: CalendarProvider {
                 record: record)
             return nil
         }
-        guard let partPatch = SplitCarry.partEdit(patch, namedStart: namedStart, cut: splitPlace) else {
+        guard let partPatch = SplitCarry.partEdit(patch, namedStart: namedStart, cut: splitPlace, zone: master.isAllDay ? nil : master.seriesZone) else {
             throw CalendarProviderError.notSupported("where the occurrence named falls in its series can't be read, so the series can't be split at it")
         }
         let mode = SplitCarry.mode(edit: partPatch, place: splitPlace, storedRules: masterRecurrence, seriesZone: master.isAllDay ? nil : master.seriesZone)
@@ -1001,6 +1001,21 @@ actor GoogleCalendarProvider: CalendarProvider {
             newRecurrence: recurrenceParts.tail,
             newId: newSeriesId
         )
+
+        // The new part as this split writes it, and what the split writes after the create,
+        // planned here, before it: the carry onto the new part, each changed occurrence on the
+        // occurrence of the new part that stands for its place (`SplitCarry.carryPlan`, which
+        // refuses one with none), and the edits of those that stay on the series. The shift and
+        // length are read from the body this split writes, not from Google's answer: they are the
+        // edit's, and a duplicate's read-back could hold the user's later change.
+        let fields = SplitCarry.fields(of: partPatch)
+        guard let written = try? JSONDecoder().decode(GCalEvent.self, from: JSONSerialization.data(withJSONObject: newSeriesJSON)),
+              try SplitCarry.carryPlan(
+                parts: parts, mode: mode, namedStart: namedStart, namedPlace: namedPlace, cut: splitPlace, series: master,
+                zone: master.isAllDay ? nil : master.seriesZone, newPart: written, fields: fields) != nil,
+              let edits = SplitCarry.edits(of: parts.edited, shift: SplitCarry.shift(cut: splitPlace, newPart: written), length: SplitCarry.length(of: written), fields: fields) else {
+            throw CalendarProviderError.notSupported("the new part of this repeating event has a time TabMail can't read, so it was not split")
+        }
 
         // 4. Create the new series.
         let created: GCalEvent
@@ -1081,13 +1096,6 @@ actor GoogleCalendarProvider: CalendarProvider {
         //    and caps alone (`finishSplit`), from the series, untouched until the cap but for the
         //    occurrences edited where they are, whose targets the record keeps.
         let partId = created.id ?? newSeriesId
-        let fields = SplitCarry.fields(of: partPatch)
-        // The shift and length are read from the body this split wrote, not from Google's answer:
-        // they are the edit's, and a duplicate's read-back could hold the user's later change.
-        guard let written = try? JSONDecoder().decode(GCalEvent.self, from: JSONSerialization.data(withJSONObject: newSeriesJSON)),
-              let edits = SplitCarry.edits(of: parts.edited, shift: SplitCarry.shift(cut: splitPlace, newPart: written), length: SplitCarry.length(of: written), fields: fields) else {
-            throw CalendarProviderError.notSupported("the new part of this repeating event has a time TabMail can't read, so the change can't be finished")
-        }
         let splitRecord = SplitRecord(
             seriesId: eventId, newPartId: partId, splitAt: place, mode: mode, fields: fields,
             namedPlace: SplitCarry.key(namedPlace), namedStart: SplitCarry.key(namedStart), edits: SplitCarry.targets(of: edits))
@@ -1198,12 +1206,9 @@ actor GoogleCalendarProvider: CalendarProvider {
         let namedStart = record.namedStart.flatMap(SplitCarry.time) ?? cut
         let namedPlace = record.namedPlace.flatMap(SplitCarry.time) ?? cut
         guard let parts = SplitCarry.partition(exceptions.map(\.carried), cut: .at(cut), namedStart: namedStart) else { throw unreadable }
-        let shift = SplitCarry.shift(cut: cut, newPart: newPart)
-        let moved = SplitCarry.key(namedStart) != SplitCarry.key(namedPlace)
-        let named = record.mode == .reset && moved ? SplitCarry.named(in: parts, place: namedPlace) : nil
-        guard let plan = SplitCarry.plan(
-            exceptions: record.mode == .carry ? parts.tail : [], kept: parts.kept, named: named, shift: shift,
-            series: master, newPart: newPart, fields: record.fields) else { throw unreadable }
+        guard let plan = try SplitCarry.carryPlan(
+            parts: parts, mode: record.mode, namedStart: namedStart, namedPlace: namedPlace, cut: cut, series: master,
+            zone: master.isAllDay ? nil : master.seriesZone, newPart: newPart, fields: record.fields) else { throw unreadable }
         try await carry(
             calendarId: calendarId, plan: plan, exceptions: exceptions, masterJSON: masterJSON,
             newPartId: record.newPartId, fields: record.fields, guests: guests, sendUpdates: sendUpdates)
@@ -2442,6 +2447,10 @@ struct GCalEvent: Codable, Sendable {
     /// `Prefer: outlook.timezone`), so `seriesZone` never reads a date in it. Optional so a
     /// decoded event without it (every Google and cached one) reads as the event's own. In memory only.
     var startZoneIsDisplay: Bool? = nil
+    /// The zone the event itself was created in, where its calendar gives it apart from its start
+    /// (Outlook's `originalStartTimeZone`, read with the event alone, not by a listing): the zone
+    /// a series whose rule names none repeats in (`seriesZoneName`). Nil elsewhere; in memory only.
+    var eventZoneName: String? = nil
 
     private enum CodingKeys: String, CodingKey {
         case id, summary, location, description, start, end, attendees, organizer, recurrence
@@ -2450,14 +2459,23 @@ struct GCalEvent: Codable, Sendable {
         case occurrencesNotListed, originalStartTime
     }
 
-    /// The zone a series' rule repeats in, where its dates are read: the zone its calendar keeps
-    /// the rule in (`recurrenceTimeZoneName`, Outlook's), else its start's (Google's and CalDAV's
-    /// own zone; never a zone the read was only given in, `startZoneIsDisplay`), through
-    /// `CalendarTimeZoneResolver` alone. Nil when the resolver recognizes none, or none is named
-    /// (a CalDAV time in UTC or floating, which the parser gives no zone name).
+    /// The name of the zone a series' rule repeats in, where its dates are read: the zone its
+    /// calendar keeps the rule in (`recurrenceTimeZoneName`, Outlook's range zone), else the
+    /// event's own: its start's (Google's and CalDAV's), or, when the start is only in the zone the
+    /// read was given (`startZoneIsDisplay`, Outlook), the zone the event was created in
+    /// (`eventZoneName`). Graph's recurrenceRange: "recurrenceTimeZone: Time zone for the
+    /// startDate and endDate properties. Optional. If not specified, the time zone of the event is
+    /// used." (https://learn.microsoft.com/graph/api/resources/recurrencerange). Nil when none is
+    /// named (a CalDAV time in UTC or floating, which the parser gives no zone name). A split, its
+    /// cap and its carry, and the confirmation card, all read this one name.
+    var seriesZoneName: String? {
+        recurrenceTimeZoneName ?? (startZoneIsDisplay == true ? eventZoneName : start?.timeZone)
+    }
+
+    /// `seriesZoneName` as `CalendarTimeZoneResolver` alone reads it. Nil when it recognizes none,
+    /// or none is named.
     var seriesZone: TimeZone? {
-        (recurrenceTimeZoneName ?? (startZoneIsDisplay == true ? nil : start?.timeZone))
-            .flatMap { CalendarTimeZoneResolver.zone(named: $0, in: .none) }
+        seriesZoneName.flatMap { CalendarTimeZoneResolver.zone(named: $0, in: .none) }
     }
 }
 

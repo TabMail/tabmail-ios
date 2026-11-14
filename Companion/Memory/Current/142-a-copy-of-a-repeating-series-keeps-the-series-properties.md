@@ -679,3 +679,64 @@ it. Pinned by main's `GoogleCalendarEditKeepsKindTests.splitExplicitTrueMakesNew
 this repeating event has a time TabMail can't read"). Open: a kind change at a MOVED occurrence is
 refused for the occurrences that would move, and carries those shown before it whole at their own
 kind onto a new part of the other kind (unmeasured on Graph and Google).
+
+**Amendment (2026-11-13, #563, ninth, review of the rebuild): a carried occurrence is written at the slot the new part
+has, or the split is refused before the create; the card reads the zone the write reads.** Supersedes, for the
+`kept` and reset-`named` carry, "written whole at its own times when the cap would drop its place" and the
+eighth amendment's "Open" sentences on the card zone and on a kind change at a moved occurrence (all kept as
+written above). Found by review (C1): `SplitCarry.plan` addressed a kept or a reset's named occurrence at its
+OLD place, an instance id a shifted or reshaped new part does not have. Google numbers a new part's instances
+by their own start, so the PATCH named a missing id; Outlook's `/instances` never matched and the carry threw
+after the create and the record, every retry the same, both parts showing the later occurrences.
+(1) **Slots.** `SplitCarry.slot(of:cut:newPart:series:zone:missingDay:)` places an occurrence on the
+new part: its place moved by whole days (the series' wall clock) from the cut to the new part's first day, at
+the new part's time of day in `newPart.seriesZone ?? zone`; nil when the kinds differ, and nil when the day is
+not on the new part's rule (`RecurrenceTail.firstDay` with `.patternStart`, so a day the rule names: a new
+part's start off its own rule is never a slot, RFC 5545 §3.3.10 leaving that set undefined; skipped only when no
+day moves and the rule is the same pattern, RRULE parts but UNTIL/COUNT). `plan` takes `kept` and `named` as (event, slot) pairs and writes them
+at the slot (`Change.place`). (2) **Decided before the create, one function for both providers.**
+`SplitCarry.carryPlan(parts:mode:namedStart:namedPlace:cut:series:zone:newPart:fields:missingDay:)` (the
+selection review called duplicated, moved out of Outlook's `carryPlan` and Google's `writeSplitOccurrences`)
+throws, before anything is written: X1 `keptHasNoSlotRefusal` when an occurrence kept on the new part (placed
+after the cut, shown before it) has no slot ("An occurrence of this repeating event moved to before the one
+named has no place in the new repeat, so it would vanish or change, and the occurrences from the one named on
+can't be split off. Make the change in your calendar app instead."); X2 `editedKindRefusal` when the edit
+changes all-day/timed and an occurrence placed before the cut is shown after it (`parts.edited`: it stays on
+the old part, which can't change kind for one occurrence; "An occurrence of this repeating event moved to after
+the one named stays on the earlier part, which can't change between all-day and timed for one occurrence, so
+the occurrences from the one named on can't be split off. Make the change in your calendar app instead."). R:
+a reset's named occurrence with no slot is not carried (it is reset with the rest). Both messages are in #681's
+shape and are on the owner's panel (moved-and-reset clash, recommending A), so they stay single constants
+easy to swap. Outlook plans it in `dateSplitMoves` and `splitCarry` (`missingDay: .lastDay`) against `plannedPart`, which now `throws` and carries the patch's rule, else the stored RRULE turned
+by `ruleDayMove` (`RecurrenceDayShift.shifted`), and the stored range zone; Google decodes the create body
+(`newSeriesJSON`) BEFORE the POST and runs the same plan there (a part it can't read: "the new part of this
+repeating event has a time TabMail can't read, so it was not split"), then writes with it after. (3) **Kind
+change at a moved occurrence** (the eighth's open case, owner ruling #837/google-split-kind: as Google):
+`partEdit(_:namedStart:cut:zone:)` moves a timed-to-all-day part's dates, or an all-day-to-timed part's times
+at the given time of day, by the whole days between the named start and the cut (`days(from:to:)`,
+`movedDay(_:by:)`), nil when it needs a zone it lacks; the mode is a reset, so changed occurrences reset and
+deleted dates come back (#640/#841). CalDAV passes `SplitPoint.seriesZone`. (4) **Card zone** (C2, closes the
+eighth's open sentence): Outlook's read now selects `originalStartTimeZone` (`readSelect` = `eventSelect` +
+it, used by `getEvent`; `splitSelect` builds on it) into `GCalEvent.eventZoneName` (memory only, not in
+CodingKeys), and `GCalEvent.seriesZoneName` = `recurrenceTimeZoneName ?? (startZoneIsDisplay ? eventZoneName :
+start.timeZone)`, `seriesZone` resolving it. The static `ExchangeCalendarProvider.seriesZoneName(_:)` is
+deleted; `seriesTimeZone` and the split read `stored.event.seriesZoneName`. So the card's reset note
+(`CalendarEventEditTool`, `SplitCarry.mode`) and `CalendarSeriesScope` read the zone the write dates in, through
+the neutral model (no provider cast, ADR-IOS-060); the tool-level limits (2) to (4) now apply only to a series
+naming no recognized zone in its range or its event, which the write refuses anyway. (5) **Honest fakes**
+(T1): `FakeGoogleCalendar.instance` answers only an id on the series' rule (DAILY/WEEKLY with INTERVAL,
+BYDAY, UNTIL, the series' time of day in its zone; other frequencies unchecked; the old lookup is
+`anyInstance`), and a PATCH of an unknown or off-rule instance id answers 404; `FakeGraphCalendar` gains
+`occurrencesOnCreate`, and `ExchangeSplitCarryTests.calendar(_:parts:)`/`partOccurrences` derive
+`created-1-w<week>` from the created part's own pattern, start and zone. Tests: the matrices
+`ExchangeSplitCarryTests.carriedOccurrencesLandOrRefuseBeforeTheCreate` and
+`CalendarEditToolSeriesScopeTests.googleCarriedOccurrencesLandOrRefuseBeforeTheCreate` (shift none / typed
+start / day turn x same or new RRULE x same or changed kind x kept-whole, named, named-moved-earlier,
+edited-before-cut: every carried occurrence lands on an existing instance of the new part, or the split is
+refused with no POST), `resetCarriesOntoTheNewPartsOccurrences`, `unplacedMoveRefusesWhilePlanned` (T3),
+`kindChangeAtAMovedOccurrenceResetsIt`, `outlookCardReadsTheEventZone` (T2); `SplitCarryTests`
+`slotFollowsTheNewPart`, `carryPlanDecidesBeforeTheCreate`, `kindChangeAtAMovedOccurrenceMovesByDays`;
+`movedSplitResetKeepsWhatIsShownBefore` now expects the kept occurrence at the new part's slot. OPEN (not
+fixed here): CalDAV has the same class. `CalDAVEventCopies.seriesSplitResources` keeps a kept or reset-named
+override with its old RECURRENCE-ID on a shifted or reshaped new part (a silent orphaned override rather than
+a failure after the create) and has no X1/X2.

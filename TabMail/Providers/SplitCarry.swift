@@ -102,6 +102,21 @@ enum SplitCarry {
         return naive(of: cut, recurrenceId: recurrenceId, zone: zone)
     }
 
+    /// The whole days from the date `from` begins with to the date `to` begins with. Nil when
+    /// either can't be read.
+    private static func days(from: String, to: String) -> Int? {
+        guard let a = day(from), let b = day(to) else { return nil }
+        return gregorianUTC.dateComponents([.day], from: a, to: b).day
+    }
+
+    /// The date `text` begins with, moved by `count` days: `.some(nil)` when there is none, nil
+    /// when it can't be read.
+    private static func movedDay(_ text: String?, by count: Int) -> String?? {
+        guard let text else { return .some(nil) }
+        guard let date = day(text), let out = gregorianUTC.date(byAdding: .day, value: count, to: date) else { return nil }
+        return .some(dayString(out))
+    }
+
     /// `instant` as a naive `yyyy-MM-dd'T'HH:mm:ss` wall clock in `zone`.
     static func naive(_ instant: Date, in zone: TimeZone) -> String {
         FixedDateFormat.formatter("yyyy-MM-dd'T'HH:mm:ss", timeZone: zone).string(from: instant)
@@ -113,10 +128,42 @@ enum SplitCarry {
     /// (Google: the new end minus the moved occurrence's current start), and a start given moves
     /// the new part, and every occurrence after it, as far as it moves the one named (owner rule,
     /// 2026-11-12). At a cut that is the named start (an occurrence never moved), the edit is
-    /// written as given. Nil when a time can't be read.
-    static func partEdit(_ edit: GCalEventInput, namedStart: GCalDateTime, cut: GCalDateTime) -> GCalEventInput? {
+    /// written as given. A change between all-day and timed moves the new part by whole days, the
+    /// days from the named occurrence's day to the day given, read in the series' zone `zone`
+    /// (#837: the new part takes the requested kind), and keeps the time of day given. Nil when a
+    /// time can't be read.
+    static func partEdit(_ edit: GCalEventInput, namedStart: GCalDateTime, cut: GCalDateTime, zone: TimeZone?) -> GCalEventInput? {
         guard isInTail(namedStart, split: cut) != true || isInTail(cut, split: namedStart) != true else { return edit }
         var written = edit
+        if cut.date == nil, edit.startDate != nil || edit.endDate != nil {
+            // A timed series made all-day: the dates given, moved by the days from the named
+            // occurrence's day to the cut's, in the series' zone.
+            guard let zone, let from = namedStart.dateTime.flatMap(Date.fromISO8601), let at = cut.dateTime.flatMap(Date.fromISO8601),
+                  let days = days(from: naive(from, in: zone), to: naive(at, in: zone)) else { return nil }
+            guard let start = movedDay(edit.startDate, by: days), let end = movedDay(edit.endDate, by: days) else { return nil }
+            written.startDate = start
+            written.endDate = end
+            return written
+        }
+        if let date = cut.date, edit.startDateTime != nil || edit.endDateTime != nil {
+            // An all-day series made timed: each time given, moved by the days from the named
+            // occurrence's date to the cut's, at the time of day given in its own zone.
+            guard let named = namedStart.date, let days = days(from: named, to: date) else { return nil }
+            func moved(_ text: String?, zone name: String?) -> String?? {
+                guard let text else { return .some(nil) }
+                guard let given = Date.fromISO8601(text) else { return nil }
+                let zone = name.flatMap { CalendarTimeZoneResolver.zone(named: $0, in: .none) } ?? .gmt
+                let wall = naive(given, in: zone)
+                guard let day = movedDay(String(wall.prefix(10)), by: days).flatMap({ $0 }),
+                      let instant = GoogleCalendarProvider.naiveInstant("\(day)T\(wall.dropFirst(11))", zone: zone) else { return nil }
+                return .some(instant.iso8601String(timeZone: zone))
+            }
+            guard let start = moved(edit.startDateTime, zone: edit.startTimeZone),
+                  let end = moved(edit.endDateTime, zone: edit.endTimeZone) else { return nil }
+            written.startDateTime = start
+            written.endDateTime = end
+            return written
+        }
         if let date = cut.date {
             guard let from = namedStart.date.flatMap(day), let at = day(date) else { return nil }
             func moved(_ text: String?) -> String?? {
@@ -161,7 +208,8 @@ enum SplitCarry {
         }
     }
 
-    /// What a carry writes for one changed occurrence of the new part, at `place`: the whole
+    /// What a carry writes for one changed occurrence of the new part, at `place` (the new part's
+    /// occurrence it is written on): the whole
     /// `exception` as the calendar read it, but for the fields the edit set (the calendar copies
     /// its own read of it), and its own times (`start`, `end`, absolute) when it starts or ends
     /// elsewhere than the new part's plain occurrence there.
@@ -195,20 +243,25 @@ enum SplitCarry {
     /// `kept` (`Parts.kept`) are written whole at their own times, in either mode. `named`, on a
     /// reset, is the occurrence named when it was moved and is placed in the new part: it is
     /// carried like a changed one, at its own times moved by `shift`, so it starts where the edit
-    /// put it; a `shift` that can't be read (nil, `shift(cut:newPart:)`) is needed only then.
+    /// put it; a `shift` that can't be read (nil, `shift(cut:newPart:)`) is needed only then. Each
+    /// of them is written at its `slot`, the new part's occurrence that stands for its place
+    /// (`slot(of:cut:newPart:series:zone:missingDay:)`), which on a reset that moves the new
+    /// part is not its old place; the exceptions after the cut are carried only by an edit that
+    /// moves nothing, so they keep their places.
     static func plan(
-        exceptions: [Exception], kept: [GCalEvent] = [], named: GCalEvent? = nil, shift: TimeInterval? = 0,
+        exceptions: [Exception], kept: [(event: GCalEvent, slot: GCalDateTime)] = [],
+        named: (event: GCalEvent, slot: GCalDateTime)? = nil, shift: TimeInterval? = 0,
         series: GCalEvent, newPart: GCalEvent, fields: Set<Field>
     ) -> Plan? {
         var plan = Plan()
-        for event in kept {
-            guard let place = event.originalStartTime, let start = event.start, let end = event.end else { return nil }
-            plan.changed.append(Change(place: place, exception: event, start: start, end: end, whole: true))
+        for (event, slot) in kept {
+            guard let start = event.start, let end = event.end else { return nil }
+            plan.changed.append(Change(place: slot, exception: event, start: start, end: end, whole: true))
         }
-        if let named {
-            guard let place = named.originalStartTime, let start = named.start, let end = named.end,
+        if let (named, slot) = named {
+            guard let start = named.start, let end = named.end,
                   let edit = edits(of: [named], shift: shift, length: length(of: newPart), fields: fields)?.first else { return nil }
-            plan.changed.append(Change(place: place, exception: named, start: edit.start ?? start, end: edit.end ?? end))
+            plan.changed.append(Change(place: slot, exception: named, start: edit.start ?? start, end: edit.end ?? end))
         }
         let seriesLength = length(of: series)
         let partLength = length(of: newPart)
@@ -233,6 +286,126 @@ enum SplitCarry {
             }
         }
         return plan
+    }
+
+    // MARK: - The carry onto the new part
+
+    /// Why a split is refused when an occurrence moved to before the one named, but placed in the
+    /// new part (`Parts.kept`), has no occurrence of the new part to stay on: the new part is of
+    /// the other kind (all-day or timed), or repeats on other days. It must keep what it shows
+    /// (owner rule, 2026-11-12), and the new part has nowhere to keep it. Refused before anything
+    /// is written.
+    static let keptHasNoSlotRefusal =
+        "An occurrence of this repeating event moved to before the one named has no place in the new repeat, so it would vanish or change, and the occurrences from the one named on can't be split off. Make the change in your calendar app instead."
+
+    /// Why a change between all-day and timed is refused when an occurrence moved to after the one
+    /// named is placed before the cut (`Parts.edited`): it stays on the old part, which keeps its
+    /// kind, and one occurrence can't change kind on its own, so the edit can't reach it.
+    /// Refused before anything is written.
+    static let editedKindRefusal =
+        "An occurrence of this repeating event moved to after the one named stays on the earlier part, which can't change between all-day and timed for one occurrence, so the occurrences from the one named on can't be split off. Make the change in your calendar app instead."
+
+    /// THE carry a split writes onto its new part `newPart` (its start, its end, its rule in its
+    /// `recurrence`), cut at `cut` from `series` (its places wall clocks in `zone`, nil for an
+    /// all-day one): on a carry the exceptions after the cut, in either mode those shown before the
+    /// one named whole (`Parts.kept`), and on a reset the one named when it was moved, moved as the
+    /// edit moves it. Each is written on the new part's occurrence that stands for its place
+    /// (`slot`). Decided before the new part is created, against the part the create will write,
+    /// and again on a retry against the part written, so no carried write can miss its occurrence
+    /// after the create:
+    /// - one shown before the one named with no occurrence on the new part is refused
+    ///   (`keptHasNoSlotRefusal`);
+    /// - the one named with none (a change of kind, or a new rule that does not place it) is reset,
+    ///   as a reset resets every changed occurrence: it is the new part's own occurrence, in the
+    ///   requested kind;
+    /// - a change of kind is refused while an occurrence shown after the one named stays on the old
+    ///   part (`editedKindRefusal`).
+    /// Nil when a time can't be read.
+    static func carryPlan(
+        parts: Parts, mode: Mode, namedStart: GCalDateTime, namedPlace: GCalDateTime, cut: GCalDateTime,
+        series: GCalEvent, zone: TimeZone?, newPart: GCalEvent, fields: Set<Field>,
+        missingDay: RecurrenceTail.MissingMonthDay = .skip
+    ) throws -> Plan? {
+        guard let partStart = newPart.start else { return nil }
+        if (cut.date != nil) != (partStart.date != nil), !parts.edited.isEmpty {
+            throw CalendarProviderError.notSupported(editedKindRefusal)
+        }
+        func slotOf(_ place: GCalDateTime) -> GCalDateTime? {
+            slot(of: place, cut: cut, newPart: newPart, series: series, zone: zone, missingDay: missingDay)
+        }
+        var kept: [(event: GCalEvent, slot: GCalDateTime)] = []
+        for event in parts.kept {
+            guard let place = event.originalStartTime else { return nil }
+            guard let slot = slotOf(place) else { throw CalendarProviderError.notSupported(keptHasNoSlotRefusal) }
+            kept.append((event, slot))
+        }
+        var named: (event: GCalEvent, slot: GCalDateTime)?
+        if mode == .reset, key(namedStart) != key(namedPlace), let event = Self.named(in: parts, place: namedPlace),
+           let slot = slotOf(namedPlace) {
+            named = (event, slot)
+        }
+        return plan(
+            exceptions: mode == .carry ? parts.tail : [], kept: kept, named: named, shift: shift(cut: cut, newPart: newPart),
+            series: series, newPart: newPart, fields: fields)
+    }
+
+    /// The occurrence of the new part `newPart` that stands for the place `place` of `series`, cut
+    /// at `cut`: `place` moved as far as the new part's start is from the cut, in whole days on the
+    /// series' wall clock (`zone`; dates for an all-day series), at the new part's own time of day
+    /// in the zone it repeats in (`GCalEvent.seriesZone`), so a move across a change of offset
+    /// lands on the occurrence the calendar lists. It counts only when the new part's rule (its
+    /// `recurrence`) names that day (`missingDay` as the calendar reads it); a new part that keeps
+    /// the series' days and pattern places it there without reading the rule. A new part's start
+    /// that its rule does not name is never a slot (`.patternStart`): RFC 5545 §3.3.10 leaves such
+    /// a recurrence set undefined, so whether the calendar lists an occurrence there is not known.
+    /// Nil when there is none: the new part is of the other kind (all-day or timed), its rule
+    /// names no occurrence there, or a time or the rule can't be read.
+    static func slot(
+        of place: GCalDateTime, cut: GCalDateTime, newPart: GCalEvent, series: GCalEvent, zone: TimeZone?,
+        missingDay: RecurrenceTail.MissingMonthDay = .skip
+    ) -> GCalDateTime? {
+        guard let start = newPart.start else { return nil }
+        let placeDay: String, cutDay: String, startDay: String
+        let out: (String) -> GCalDateTime?
+        if let date = place.date {
+            guard let cutDate = cut.date, let startDate = start.date else { return nil }
+            (placeDay, cutDay, startDay) = (String(date.prefix(10)), String(cutDate.prefix(10)), String(startDate.prefix(10)))
+            out = { GCalDateTime(dateTime: nil, date: $0, timeZone: nil) }
+        } else {
+            guard let zone, cut.date == nil, start.date == nil,
+                  let at = place.dateTime.flatMap(Date.fromISO8601), let cutAt = cut.dateTime.flatMap(Date.fromISO8601),
+                  let startAt = start.dateTime.flatMap(Date.fromISO8601) else { return nil }
+            let partZone = newPart.seriesZone ?? zone
+            let startWall = naive(startAt, in: partZone)
+            (placeDay, cutDay, startDay) = (String(naive(at, in: zone).prefix(10)), String(naive(cutAt, in: zone).prefix(10)), String(startWall.prefix(10)))
+            out = { day in
+                GoogleCalendarProvider.naiveInstant("\(day)T\(startWall.dropFirst(11))", zone: partZone)
+                    .map { GCalDateTime(dateTime: $0.iso8601String(), date: nil, timeZone: "UTC") }
+            }
+        }
+        guard let from = day(cutDay), let to = day(startDay), let at = day(placeDay),
+              let days = gregorianUTC.dateComponents([.day], from: from, to: to).day,
+              let moved = gregorianUTC.date(byAdding: .day, value: days, to: at) else { return nil }
+        let slotDay = dayString(moved)
+        if days != 0 || !samePattern(newPart.recurrence, series.recurrence) {
+            guard let rule = newPart.recurrence?.first(where: isRule), let first = RecurrenceTail.Day(iso: startDay),
+                  let target = RecurrenceTail.Day(iso: slotDay),
+                  RecurrenceTail.firstDay(of: rule, seriesStart: first, onOrAfter: target, anchor: .patternStart, missingDay: missingDay) == .day(target)
+            else { return nil }
+        }
+        return out(slotDay)
+    }
+
+    /// Whether two series' rules repeat alike: the same parts but where they end (`UNTIL`,
+    /// `COUNT`), which a split's new part takes over from what is left of the series.
+    private static func samePattern(_ a: [String]?, _ b: [String]?) -> Bool {
+        func parts(_ lines: [String]?) -> Set<String>? {
+            guard let rule = lines?.first(where: isRule) else { return nil }
+            return Set(rule.uppercased().dropFirst("RRULE:".count).split(separator: ";").map(String.init)
+                .filter { !$0.hasPrefix("UNTIL=") && !$0.hasPrefix("COUNT=") })
+        }
+        guard let a = parts(a), let b = parts(b) else { return false }
+        return a == b
     }
 
     // MARK: - Calendar order (a split named at a moved occurrence)
