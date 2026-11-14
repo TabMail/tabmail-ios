@@ -289,12 +289,16 @@ extension SyncEngine {
         }
         guard !folders.isEmpty else { return false }
 
+        // Just before the provider reads: every value it returns was read after
+        // this, so an action that completed at or after it may be newer than
+        // what the result carries (`applyCatchUpTransaction`).
+        let readStartedAt = CatchUpWallClock.now()
         let results = await provider.catchUp(
             folders: folders, localRows: SyncEngineCatchUpRowReader(pool: dbPool), context: context)
         let windowMode = provider.staleWindowMode
         var madeProgress = false
         for result in results {
-            let outcome = await applyCatchUpResult(result, windowMode: windowMode)
+            let outcome = await applyCatchUpResult(result, windowMode: windowMode, readStartedAt: readStartedAt)
             if result.madeProgress, case .applied = outcome { madeProgress = true }
         }
         return madeProgress
@@ -308,9 +312,12 @@ extension SyncEngine {
     /// skips what is already there. A load that did not land (a write chunk
     /// failed, or the folder could take nothing) writes nothing at all, the
     /// state included: the listing stays where it was and the provider lists
-    /// those ranges again on a later pass.
+    /// those ranges again on a later pass. `readStartedAt` is when the read that
+    /// produced `result` began, on `CatchUpWallClock`.
     @discardableResult
-    func applyCatchUpResult(_ result: CatchUpFolderResult, windowMode: StaleWindowMode) async -> CatchUpApplyOutcome {
+    func applyCatchUpResult(
+        _ result: CatchUpFolderResult, windowMode: StaleWindowMode, readStartedAt: Date
+    ) async -> CatchUpApplyOutcome {
         let folderId = result.folderId
         if !result.loadFailures.isEmpty && DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): \(result.loadFailures.count) missing id(s) did not load: \(result.loadFailures.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: ", "))")
@@ -321,9 +328,11 @@ extension SyncEngine {
         }
 
         let outcome: CatchUpApplyOutcome
+        let appliedAt = CatchUpWallClock.now()
         do {
             outcome = try await dbPool.write { db in
-                try Self.applyCatchUpTransaction(result, windowMode: windowMode, db: db)
+                try Self.applyCatchUpTransaction(
+                    result, windowMode: windowMode, readStartedAt: readStartedAt, now: appliedAt, db: db)
             }
         } catch {
             BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): apply failed: \(error)")
@@ -332,6 +341,10 @@ extension SyncEngine {
 
         switch outcome {
         case .applied(let updatedFlags, let removedIds):
+            let readAge = appliedAt.timeIntervalSince(readStartedAt)
+            if readAge >= SyncConfig.catchUpCompletionLogRetentionSeconds && !result.flagUpdates.isEmpty && DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): read began \(Int(readAge)) s ago — \(result.flagUpdates.count) read/flag update(s) not applied")
+            }
             if !removedIds.isEmpty { removeHeadersFromFTS(removedIds) }
             if updatedFlags > 0 || !removedIds.isEmpty {
                 await UnreadCountManager.shared.requestRecount(folderId: folderId)
@@ -397,8 +410,9 @@ extension SyncEngine {
 
     /// The transaction itself. Everything it decides on is read INSIDE it: the folder
     /// row (quarantine, epoch), the pending operations and the recent completions.
+    /// `now` is the wall clock (`CatchUpWallClock`) at the apply.
     nonisolated static func applyCatchUpTransaction(
-        _ result: CatchUpFolderResult, windowMode: StaleWindowMode, db: Database
+        _ result: CatchUpFolderResult, windowMode: StaleWindowMode, readStartedAt: Date, now: Date, db: Database
     ) throws -> CatchUpApplyOutcome {
         guard let folder = try Folder.fetchOne(db, key: result.folderId),
               folder.uidValidityResetPendingAt == nil else { return .skipped }
@@ -420,9 +434,19 @@ extension SyncEngine {
         }).flag
         let recentlyCompleted = AccountManager.shared.liveRecentlyCompleted()
         let sourceBoundEpoch = result.epoch.flatMap { Int(exactly: $0) }
+        // A user action that completed at or after the read began is newer than
+        // what the read carries for that message, however long the read took to
+        // get here (the 30 s protection above may have run out). A read as old as
+        // the completion log's retention may predate an entry already dropped, so
+        // it applies no read or flag update at all; its removals and state still
+        // apply, so the listing moves on.
+        let readIsOverAge = now.timeIntervalSince(readStartedAt) >= SyncConfig.catchUpCompletionLogRetentionSeconds
+        let completedSinceRead = { (key: String) -> Bool in
+            AccountManager.shared.actionCompletedAt(accountId: folder.accountId, messageKey: key).map { $0 >= readStartedAt } ?? false
+        }
 
         var updatedFlags = 0
-        for update in result.flagUpdates {
+        for update in result.flagUpdates where !readIsOverAge {
             let canonicalId = MessageIdentity.headerId(
                 accountId: folder.accountId, folderPath: folder.path, messageId: update.messageId)
             guard var row = try MessageHeader.fetchOne(db, key: canonicalId),
@@ -433,6 +457,7 @@ extension SyncEngine {
             if pendingFlags.containsAnyKey(messageId: row.messageId, rfc822MessageId: row.rfc822MessageId) { continue }
             if recentlyCompleted[row.messageId] != nil
                 || (row.rfc822MessageId.map { recentlyCompleted[$0] != nil } ?? false) { continue }
+            if completedSinceRead(row.messageId) || (row.rfc822MessageId.map(completedSinceRead) ?? false) { continue }
             let original = row
             row.isRead = update.isRead
             row.isFlagged = update.isFlagged

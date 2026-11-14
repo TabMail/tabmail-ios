@@ -402,6 +402,16 @@ enum SyncConfig {
     /// Actual gap is 1-2s; 30s gives 15x margin for edge cases (brief app backgrounding, etc.).
     static let recentlyCompletedTTLSeconds: TimeInterval = 30
 
+    /// How long the catch-up's log of completed actions keeps an entry
+    /// (`AccountManager.recordActionCompleted`, ADR-IOS-107). A catch-up read
+    /// that began before a user action completed never overwrites that action's
+    /// read or flag state, however long the read takes to reach the apply; a read
+    /// older than this may predate an entry already dropped, so it applies no
+    /// read or flag update at all (its removals, loads and state still apply).
+    /// An hour: only a slice suspended for that long in the middle loses its
+    /// flag repairs, which the next listing makes.
+    static let catchUpCompletionLogRetentionSeconds: TimeInterval = 3_600
+
     /// TTL for NSE push-merge arrival stale-protection (NSEDataBridge). A message that
     /// becomes durable via push-merge is upserted ONLY by the merge — sync deliberately
     /// skips its upsert while protected — so a transient server-fetch miss (STATUS/fetch
