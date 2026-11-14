@@ -176,7 +176,8 @@ actor GmailProvider: EmailProvider {
     /// system labels). Never a user label, so one on a message never makes
     /// its user-label set incomplete, whether or not `/labels` listed it.
     nonisolated static let systemLabelIds: Set<String> = hiddenSystemLabelIds
-        .union(["INBOX", "SENT", "DRAFT", "TRASH", "SPAM", "STARRED"])
+        .union(allMailExcludedLabelIds)
+        .union(["STARRED"])
 
     /// The details again with their user labels extracted by the catalog as it
     /// is now (after a reload in the same pass).
