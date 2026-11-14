@@ -187,6 +187,8 @@ enum AppDataWiper {
         // 5b. Delete outbox attachment files from disk
         let attachmentsDir = OutboxMessage.attachmentsBaseDir
         try? FileManager.default.removeItem(at: attachmentsDir)
+        // 5c. The saved put-back files of the calendar operations deleted above (#718).
+        CalendarPutBackFiles.removeAll()
 
         // 6. Reset FTS index and reclaim its disk space
         await AccountManager.shared.syncEngine.cancelAllFTSTasks()

@@ -448,9 +448,10 @@ struct InboxView: View {
                 // each, until dismissed (`LateCalendarFailureStore`). Inbox only.
                 if isInboxView {
                     ForEach(LateCalendarFailureStore.shared.failures) { failure in
-                        LateCalendarFailureBanner(failure: failure) {
-                            Task { await LateCalendarFailureStore.shared.dismiss(failure) }
-                        }
+                        LateCalendarFailureBanner(
+                            failure: failure,
+                            onDismiss: { Task { await LateCalendarFailureStore.shared.dismiss(failure) } },
+                            onExport: { try LateCalendarFailureStore.shared.exportFiles(of: failure) })
                     }
                     // Calendar changes still queued for a reason the user can act on (a full
                     // mailbox, #865), one banner each, until the change is made.

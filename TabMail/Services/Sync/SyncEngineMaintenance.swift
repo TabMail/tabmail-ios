@@ -415,6 +415,11 @@ extension SyncEngine {
         ) ?? Date.distantPast
         let chunkSize = SyncConfig.pruneChunkSize
         let terminal = PendingStatus.failed.rawValue
+        // A failed row that still holds saved put-back files (#718) is never reclaimed: the
+        // files are the only copy of what the user had attached, and only the user's warned
+        // dismissal or account removal deletes them.
+        let held = Array(CalendarPutBackFiles.heldOperationIds())
+        let spared = held.isEmpty ? "" : "AND id NOT IN (\(held.map { _ in "?" }.joined(separator: ",")))"
 
         var reclaimed = 0
         while true {
@@ -424,10 +429,10 @@ extension SyncEngine {
                         db,
                         sql: """
                             SELECT id FROM pendingCalendarOperation
-                            WHERE status = ? AND createdAt < ?
+                            WHERE status = ? AND createdAt < ? \(spared)
                             LIMIT ?
                             """,
-                        arguments: [terminal, cutoff, chunkSize])
+                        arguments: [terminal, cutoff] + StatementArguments(held) + [chunkSize])
                     guard !ids.isEmpty else { return 0 }
                     // Each batch deletes exactly the rows it just selected, so the
                     // loop is monotone and needs no offset cursor — unlike the AI

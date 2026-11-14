@@ -75,10 +75,18 @@ struct LateCalendarFailure: Identifiable, Equatable, Sendable {
     let id: String
     let title: String
     let kind: CalendarFailureKind
+    /// The files of changed occurrences the change saved on this device and could not attach
+    /// again (#718): kept with the row until the user saves or dismisses them. Empty for any
+    /// other failure.
+    var heldFiles: [PutBackFile] = []
+
+    /// Whether the row holds saved files, so dismissing it deletes them.
+    var holdsFiles: Bool { !heldFiles.isEmpty }
 
     /// The inbox banner's line.
     var bannerText: String {
-        "A calendar change couldn't be made: \(title). \(kind.userReason)"
+        guard holdsFiles else { return "A calendar change couldn't be made: \(title). \(kind.userReason)" }
+        return "A calendar change wasn't finished: \(title). \(PutBackFile.notRestoredMessage(heldFiles.count))"
     }
 }
 
@@ -136,8 +144,11 @@ final class LateCalendarFailureStore {
         }
         guard generation == reloadGeneration else { return }
         failures = rows.compactMap { row in
-            guard let kind = row.failureKind, !row.failureSeen else { return nil }
-            return LateCalendarFailure(id: row.id, title: row.eventTitle ?? "(No title)", kind: kind)
+            // A row holding saved files is shown until the user dismisses it, seen or not: its
+            // files are the only copy (#718).
+            let held = CalendarPutBackFiles.holdsBytes(row.id) ? (((try? SeriesEditRecord.stored(row.arguments)) ?? nil)?.files ?? []) : []
+            guard let kind = row.failureKind, !row.failureSeen || !held.isEmpty else { return nil }
+            return LateCalendarFailure(id: row.id, title: row.eventTitle ?? "(No title)", kind: kind, heldFiles: held)
         }
         waiting = queued.compactMap { row in
             guard let reason = row.waitReason else { return nil }
@@ -146,7 +157,9 @@ final class LateCalendarFailureStore {
     }
 
     /// Dismiss a failure: its row is deleted, so it is not shown again. When the delete
-    /// fails the banner stays and the user can dismiss it again.
+    /// fails the banner stays and the user can dismiss it again. A failure holding saved files
+    /// (`holdsFiles`) is dismissed only after the user was warned (the banner's confirmation);
+    /// its files are deleted once the row's deletion committed (#718).
     func dismiss(_ failure: LateCalendarFailure) async {
         do {
             try await AppDatabase.dbPool.write { db in
@@ -161,6 +174,37 @@ final class LateCalendarFailureStore {
                 source: "CalendarQueue")
             return
         }
+        if failure.holdsFiles { CalendarPutBackFiles.remove(opId: failure.id) }
         failures.removeAll { $0.id == failure.id }
+    }
+
+    /// The saved files of one calendar operation (#718).
+    struct HeldFiles: Sendable {
+        let opId: String
+        let files: [PutBackFile]
+    }
+
+    /// The saved files of every calendar operation of the account `accountId`, whatever its
+    /// status: what removing the account deletes. Empty when none, or when the rows can't be read.
+    nonisolated static func heldFiles(accountId: String) async -> [HeldFiles] {
+        let held = CalendarPutBackFiles.heldOperationIds()
+        guard !held.isEmpty else { return [] }
+        let rows = (try? await AppDatabase.dbPool.read { db in
+            try PendingCalendarOperation.filter(Column("accountId") == accountId).fetchAll(db)
+        }) ?? []
+        return rows.filter { held.contains($0.id) }.map { row in
+            HeldFiles(opId: row.id, files: ((try? SeriesEditRecord.stored(row.arguments)) ?? nil)?.files ?? [])
+        }
+    }
+
+    /// Copies of the saved files `held` under their own names, for the share sheet.
+    nonisolated static func exportFiles(_ held: [HeldFiles]) throws -> [URL] {
+        try held.flatMap { try CalendarPutBackFiles.exportCopies(of: $0.files, opId: $0.opId) }
+    }
+
+    /// Copies of a failure's saved files under their own names, for the share sheet ("Save
+    /// File"). Throws when a copy can't be read or written.
+    func exportFiles(of failure: LateCalendarFailure) throws -> [URL] {
+        try CalendarPutBackFiles.exportCopies(of: failure.heldFiles, opId: failure.id)
     }
 }

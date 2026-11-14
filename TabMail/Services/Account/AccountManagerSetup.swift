@@ -565,7 +565,7 @@ extension AccountManager {
         // Capture every identifier needed for post-commit file/Keychain cleanup
         // while the account graph still exists. These are reads only. If either
         // fails, nothing has been changed and the error is surfaced to Settings.
-        let cleanupInventory = try await dbPool.read { db -> ([String], [OutboxMessage]) in
+        let cleanupInventory = try await dbPool.read { db -> ([String], [OutboxMessage], [String]) in
             let caldavIds = try CalDAVConfig
                 .filter(Column("accountId") == acctId)
                 .fetchAll(db)
@@ -573,7 +573,11 @@ extension AccountManager {
             let outboxMessages = try OutboxMessage
                 .filter(Column("accountId") == acctId)
                 .fetchAll(db)
-            return (caldavIds, outboxMessages)
+            // Its calendar operations, whose saved put-back files (#718) go with the account; the
+            // user was warned of them before confirming (`SettingsView`).
+            let calendarOpIds = try String.fetchAll(
+                db, sql: "SELECT id FROM pendingCalendarOperation WHERE accountId = ?", arguments: [acctId])
+            return (caldavIds, outboxMessages, calendarOpIds)
         }
         // A raw current access token is the most we retain for the one-shot
         // upstream watch stop. It is never persisted as cleanup debt and may be
@@ -673,6 +677,9 @@ extension AccountManager {
         )
         for message in cleanupInventory.1 {
             message.deleteAttachments()
+        }
+        for opId in cleanupInventory.2 {
+            CalendarPutBackFiles.remove(opId: opId)
         }
 
         // The local removal is complete. Remote attempts must not hold Settings

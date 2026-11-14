@@ -14,6 +14,10 @@ struct SettingsView: View {
     /// greyed out (#109) — the same gate that hides AI features elsewhere.
     @Environment(\.hasTabMailSession) private var hasTabMailSession
     @State private var accountToDelete: Account?
+    /// The files of changed calendar occurrences the account's queued or failed calendar changes
+    /// still hold on this device (#718), read when its removal is asked; the alert warns of them.
+    @State private var accountHeldFiles: [LateCalendarFailureStore.HeldFiles] = []
+    @State private var exportedHeldFiles: SavedPutBackFilesWarning.Export?
     @State private var settingsErrorMessage = ""
     @State private var showSettingsError = false
     @AppStorage(SyncScheduler.wifiOnlyKey) private var backgroundSyncWiFiOnly = true
@@ -89,7 +93,10 @@ struct SettingsView: View {
                     }
                     .swipeActions(edge: .trailing) {
                         Button(role: .destructive) {
-                            accountToDelete = account
+                            Task {
+                                accountHeldFiles = await LateCalendarFailureStore.heldFiles(accountId: account.id)
+                                accountToDelete = account
+                            }
                         } label: {
                             Label("Remove", systemImage: "trash")
                         }
@@ -397,6 +404,13 @@ struct SettingsView: View {
             set: { if !$0 { accountToDelete = nil } }
         )) {
             Button("Cancel", role: .cancel) { accountToDelete = nil }
+            if !accountHeldFiles.isEmpty {
+                let held = accountHeldFiles
+                Button(SavedPutBackFilesWarning.saveTitle(held.reduce(0) { $0 + $1.files.count })) {
+                    accountToDelete = nil
+                    exportedHeldFiles = SavedPutBackFilesWarning.export { try LateCalendarFailureStore.exportFiles(held) }
+                }
+            }
             Button("Remove", role: .destructive) {
                 if let account = accountToDelete {
                     accountToDelete = nil
@@ -416,7 +430,15 @@ struct SettingsView: View {
                 }
             }
         } message: {
-            Text("This will remove \(accountToDelete?.emailAddress ?? "this account") and all its local data.")
+            let count = accountHeldFiles.reduce(0) { $0 + $1.files.count }
+            if count > 0 {
+                Text(SavedPutBackFilesWarning.accountRemovalMessage(count, email: accountToDelete?.emailAddress ?? "this account"))
+            } else {
+                Text("This will remove \(accountToDelete?.emailAddress ?? "this account") and all its local data.")
+            }
+        }
+        .sheet(item: $exportedHeldFiles) { export in
+            SavedPutBackFilesWarning.sheet(export)
         }
         .task {
             await loadOldMessageCount()
