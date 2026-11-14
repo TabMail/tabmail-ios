@@ -194,7 +194,7 @@ enum ICSParser {
         let createdRFC = created.flatMap { icsDateToRFC3339($0) }
         let updatedRFC = lastModified.flatMap { icsDateToRFC3339($0) }
 
-        let event = GCalEvent(
+        var event = GCalEvent(
             id: resourceHref,
             summary: summary.isEmpty ? nil : summary,
             location: location,
@@ -210,6 +210,7 @@ enum ICSParser {
             created: createdRFC,
             updated: updatedRFC
         )
+        event.ruleZone = ruleZone(raw: dtstart, params: dtstartParams, isAllDay: isAllDay)
         return VEventComponent(
             event: event,
             dtstart: dtstart.map { PropertyValue(params: dtstartParams, value: $0) },
@@ -241,6 +242,16 @@ enum ICSParser {
             return GCalDateTime(dateTime: date.iso8601String(), date: nil, timeZone: tz)
         }
         return nil
+    }
+
+    /// `GCalEvent.ruleZone` for a DTSTART: nil for a date or no start; UTC for a `Z` time; the
+    /// zone a TZID names, through the resolver alone as `GCalEvent.seriesZone` reads it (nil when
+    /// not recognized); else, a floating time, the zone `parseICSDate` reads its wall time in.
+    private static func ruleZone(raw: String?, params: String?, isAllDay: Bool) -> TimeZone? {
+        guard let raw, !isAllDay else { return nil }
+        if raw.trimmingCharacters(in: .whitespaces).uppercased().hasSuffix("Z") { return .gmt }
+        if let tzid = params.flatMap({ extractTZID($0) }) { return CalendarTimeZoneResolver.zone(named: tzid, in: .none) }
+        return wallTimeZone(params: nil, zones: .none)
     }
 
     // MARK: - ICS Helpers (reuse ICSBuilder patterns)

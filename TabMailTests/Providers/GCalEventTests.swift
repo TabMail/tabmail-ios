@@ -516,7 +516,7 @@ struct FormatDetailedEventTests {
         )
         let output = CalendarToolHelpers.formatDetailedEvent(event)
         #expect(output.contains("recurring: yes"))
-        #expect(output.contains("RRULE: RRULE:FREQ=WEEKLY"))
+        #expect(output.contains("recurrence: {\"freq\":\"WEEKLY\"}"))
     }
 
     @Test("Formats event with attendees")

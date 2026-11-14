@@ -127,6 +127,66 @@ series' could name, and now delete, the next day's occurrence; pinned with #647'
 Pinned by `CalendarEditExdatesTests` (Google, Outlook, CalDAV
 fakes; the refused keys are pinned against a copy of the published schema's properties).
 
+## The read tools show a rule in the same fields (#552, 2026-11-12)
+
+Before #552 `calendar_event_read` printed `RRULE: <every recurrence line joined by ;>` and
+`calendar_search`/`calendar_read` marked a row `(↻ RRULE:…)`, so the assistant had to translate RFC
+5545 into the write fields, and a stored UTC `UNTIL` became a date by guesswork. Now one formatter,
+`CalendarRecurrenceFormat` (the Thunderbird add-on's format, TB #261/#281), shows the rule in the
+fields the tools write:
+
+- `calendar_event_read`: `recurring: yes`, then `recurrence: {"freq":"WEEKLY","byDay":["MO","WE"],"until":"…"}`
+  (compact JSON, the tools' field order, `interval` 1 and `wkst` MO left out), then every non-rule line
+  (EXDATE, RDATE) verbatim. The search rows: `(↻ {…})`; a series whose occurrences are not listed
+  `(↻ {…}; <occurrencesNotListedNote>)`. `ChatIdTranslator`'s pill-title regex strips either form (no
+  `)` inside the JSON).
+- **`other`**: every part the fields cannot say, as stored, joined by `;`: a FREQ below DAILY, BYHOUR
+  and the like, an invalid token, a part given twice, a day field the writer refuses with that FREQ
+  (decided by calling the writer's own `recurrenceDayParts`, so reader and writer cannot drift), an
+  UNTIL beside a COUNT or in a rule of several times a day, a further RRULE (`RRULE:…`). The read line
+  then adds `otherPartsNote` ("the edit tool cannot express these; omit recurrence to keep the rule").
+  The writer REFUSES a non-null `other` (`recurrenceFreq`, `recurrence.other has an invalid value …`),
+  and `calendar_event_edit` refuses any valid rule for a series whose stored rule has `other` parts,
+  for `edit_scope` all and `this_and_following`, before the card, nothing queued
+  (`storedOtherRefusal`, the shared table's wording). An edit with no rule keeps the stored one.
+- **BYSETPOS fold (2026-11-12):** `BYDAY=<one plain weekday>;BYSETPOS=<one n>` with
+  FREQ MONTHLY, or YEARLY with exactly one BYMONTH, and no other day-selecting part, is shown as
+  `"byDay":["<n><day>"]` (`foldedSetPosition`): RFC 5545 makes them the same days, so Outlook's
+  "second Tuesday" (read as `BYDAY=TU;BYSETPOS=2`) restates without a reset (`sameRule`). Every other
+  BYSETPOS (several weekdays, several positions, YEARLY without one month) stays in `other`. The TB
+  add-on keeps every BYSETPOS in `other` because Thunderbird 140 to 158 expand the two forms
+  differently; iOS never runs that expander. Removing the call in `fields` reverts to the add-on.
+- **`until` is the last occurrence's day** (`untilDay`): all-day, the bound's date; timed, the last day
+  E whose slot (the start's time of day in the series' zone, from `originalStartTime ?? start`) is
+  at or before the bound, a UTC instant, a bare date (Outlook's range end) or a floating wall time in
+  the series' zone; a split's cap (one second before a slot) reads as the day before. Shown as the
+  date of E's slot in the zone the output prints in when it round-trips: the bound the edit tool
+  writes for that date in that zone (`validatedRRuleUntil`, end of day) must keep E and not E+1.
+  **Superseded 2026-11-13:** where it does not (near a clock change: a last occurrence just after
+  midnight on the day before the clocks change), the UNTIL no longer stays in `other` (which refused
+  every restatement); `until` is E's slot itself as a UTC date-time (`2099-03-07T05:30:00Z`), which
+  `validatedRRuleUntil` writes unchanged, so the rule restates exactly in any edit zone. `other` keeps
+  the UNTIL only when the bound can't be read or placed, or the series' zone is unknown. iOS-only
+  (the add-on has no such form yet).
+  **Series' zone on CalDAV (2026-11-13):** a start in UTC (`Z`) or floating names no zone, so
+  `seriesZone` is nil there (and stays nil: #679's refuse side is unchanged). The zone the rule repeats
+  in is carried in memory as `GCalEvent.ruleZone` (UTC; the floating read zone; a TZID through the
+  resolver alone, nil when unknown), set by `ICSParser` (series read) and both `CalDAVOccurrences`
+  row builders (`Frame.ruleZone`); `untilDay` reads `ruleZone ?? seriesZone`. No write path reads it;
+  not encoded.
+  **Decided 2026-11-13: the user's day** (the zone the output prints in);
+  Thunderbird is moved to match in its own unit, not in #552. `zone` in `untilDay` is the single
+  switch point. Known limit: the read by `event_id` prints in the device zone (#794), so an edit
+  given a different `timezone` reads the shown date there.
+
+Pinned by `CalendarRecurrenceFormatTests` (field mapping, write-back equality, the fold's
+occurrences against the CalDAV expander for every weekday and position, the `until` round-trip
+property over five series zones, seven read zones, three times of day, eight bound shapes and days
+around clock changes, checked through `CalDAVOccurrences.listing` and, for a bare date,
+`graphEndDate`; CalDAV series in UTC and floating, listed rows and the series read) and `RecurrenceDaysToolTests` (Outlook second Tuesday read, restated and drained with
+no reset; second Tuesday-or-Thursday refused before the card; the scope matrix; `other` refused as a
+field).
+
 ## Pinned by
 
 `TabMailTests/Tools/CalendarRecurrenceDaysTests.swift`: the writer and the card per field and

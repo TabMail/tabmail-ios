@@ -16,8 +16,9 @@ import Foundation
 // stemmed from this on the TB side; iOS has the same shape with Google.
 //
 // `CalendarToolHelpers.resolveMasterRecurrence` fetches each unique master
-// once and returns id→RRULE. `formatGroupedSummary` accepts that map and
-// renders `(↻ RRULE:FREQ=WEEKLY;UNTIL=…)` on every occurrence line.
+// once and returns id→master. `formatGroupedSummary` accepts that map and
+// renders the master's rule in the tools' fields (#552),
+// `(↻ {"freq":"WEEKLY","until":"…"})`, on every occurrence line.
 
 @Suite("CalendarToolHelpers.resolveMasterRecurrence")
 struct CalendarMasterRecurrenceResolveTests {
@@ -67,7 +68,7 @@ struct CalendarMasterRecurrenceResolveTests {
         ]
 
         let map = await CalendarToolHelpers.resolveMasterRecurrence(events: events, backends: backends)
-        #expect(map["master-abc"] == "RRULE:FREQ=WEEKLY;UNTIL=20260527T235959Z")
+        #expect(map["master-abc"]?.recurrence == ["RRULE:FREQ=WEEKLY;UNTIL=20260527T235959Z"])
         // Both instances refer to the SAME master — provider should be called exactly once.
         let callLog = await provider.callLog
         let getEventCalls = callLog.filter { $0.hasPrefix("getEvent") }
@@ -150,7 +151,7 @@ struct CalendarMasterRecurrenceResolveTests {
     }
 }
 
-@Suite("CalendarToolHelpers.formatGroupedSummary uses masterRRuleById for expanded instances")
+@Suite("CalendarToolHelpers.formatGroupedSummary uses seriesById for expanded instances")
 struct CalendarMasterRecurrenceFormatTests {
 
     private func makeInstance(id: String, dateTime: String, recurringEventId: String?) -> GCalEvent {
@@ -166,16 +167,32 @@ struct CalendarMasterRecurrenceFormatTests {
         )
     }
 
-    @Test("Instance with recurringEventId + map entry renders (↻ RRULE:…)")
-    func rendersRRuleFromMap() {
-        let events: [(event: GCalEvent, accountId: String, calendarId: String, accessRole: String?)] = [
-            (makeInstance(id: "i1", dateTime: "2026-05-13T17:00:00-07:00", recurringEventId: "master-abc"),
-             "acct-1", "cal", "owner")
-        ]
-        let map = ["master-abc": "RRULE:FREQ=WEEKLY;UNTIL=20260527T235959Z"]
-        let out = CalendarToolHelpers.formatGroupedSummary(events, masterRRuleById: map)
-        #expect(out.contains("Weekly sync (↻ RRULE:FREQ=WEEKLY;UNTIL=20260527T235959Z)"),
-                "expected RRULE inline, got: \(out)")
+    @Test("Instance with recurringEventId + map entry renders the master's rule in the tools' fields")
+    func rendersRuleFromMap() throws {
+        // A weekly master at 17:00 in Los Angeles, its UNTIL one second before the occurrence slot
+        // three weeks on (a split's cap): the last day it admits is the day before that slot.
+        let la = try #require(TimeZone(identifier: "America/Los_Angeles"))
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = la
+        let firstDay = try #require(cal.date(byAdding: .day, value: 14, to: cal.startOfDay(for: Date())))
+        let first = try #require(cal.date(bySettingHour: 17, minute: 0, second: 0, of: firstDay))
+        let capSlot = try #require(cal.date(byAdding: .day, value: 21, to: first))
+        let until = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss'Z'", timeZone: .gmt).string(from: capSlot.addingTimeInterval(-1))
+        let lastDay = EKEventStoreHelper.dayKey(try #require(cal.date(byAdding: .day, value: -1, to: capSlot)), timeZone: la)
+        let master = GCalEvent(
+            id: "master-abc", summary: "Weekly sync", location: nil, description: nil,
+            start: GCalDateTime(dateTime: first.iso8601String(), date: nil, timeZone: "America/Los_Angeles"),
+            end: GCalDateTime(dateTime: first.addingTimeInterval(2700).iso8601String(), date: nil, timeZone: "America/Los_Angeles"),
+            attendees: nil, organizer: nil,
+            recurrence: ["RRULE:FREQ=WEEKLY;UNTIL=\(until)"], transparency: nil, status: "confirmed",
+            htmlLink: nil, created: nil, updated: nil
+        )
+        let instance = makeInstance(id: "i1", dateTime: cal.date(byAdding: .day, value: 7, to: first)!.iso8601String(), recurringEventId: "master-abc")
+        let out = CalendarToolHelpers.formatGroupedSummary(
+            [(instance, "acct-1", "cal", "owner")], timeZone: la, seriesById: ["master-abc": master])
+        #expect(out.contains("Weekly sync (↻ {\"freq\":\"WEEKLY\",\"until\":\"\(lastDay)\"})"),
+                "expected the rule in the tools' fields, got: \(out)")
+        #expect(!out.contains("RRULE"))
     }
 
     @Test("Instance with recurringEventId but NO map entry renders bare (↻) — never \"\"")
@@ -184,7 +201,7 @@ struct CalendarMasterRecurrenceFormatTests {
             (makeInstance(id: "i1", dateTime: "2026-05-13T17:00:00-07:00", recurringEventId: "master-abc"),
              "acct-1", "cal", "owner")
         ]
-        let out = CalendarToolHelpers.formatGroupedSummary(events, masterRRuleById: [:])
+        let out = CalendarToolHelpers.formatGroupedSummary(events, seriesById: [:])
         #expect(out.contains("Weekly sync (↻)"))
         #expect(!out.contains("Weekly sync (↻ "), "no RRULE means no enriched marker")
     }
@@ -203,10 +220,15 @@ struct CalendarMasterRecurrenceFormatTests {
             (master, "acct-1", "cal", "owner")
         ]
         // Map points to a DIFFERENT rule — inline should win.
-        let map = ["m1": "RRULE:FREQ=DAILY"]
-        let out = CalendarToolHelpers.formatGroupedSummary(events, masterRRuleById: map)
-        #expect(out.contains("RRULE:FREQ=WEEKLY;COUNT=10"))
-        #expect(!out.contains("RRULE:FREQ=DAILY"))
+        let daily = GCalEvent(
+            id: "m1", summary: "Weekly sync", location: nil, description: nil,
+            start: master.start, end: master.end, attendees: nil, organizer: nil,
+            recurrence: ["RRULE:FREQ=DAILY"], transparency: nil, status: "confirmed",
+            htmlLink: nil, created: nil, updated: nil
+        )
+        let out = CalendarToolHelpers.formatGroupedSummary(events, seriesById: ["m1": daily])
+        #expect(out.contains("(↻ {\"freq\":\"WEEKLY\",\"count\":10})"))
+        #expect(!out.contains("DAILY"))
     }
 
     @Test("Non-recurring event renders no marker at all")
@@ -215,7 +237,7 @@ struct CalendarMasterRecurrenceFormatTests {
             (makeInstance(id: "i1", dateTime: "2026-05-13T17:00:00-07:00", recurringEventId: nil),
              "acct-1", "cal", "owner")
         ]
-        let out = CalendarToolHelpers.formatGroupedSummary(events, masterRRuleById: [:])
+        let out = CalendarToolHelpers.formatGroupedSummary(events, seriesById: [:])
         #expect(!out.contains("(↻"))
     }
 }

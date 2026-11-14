@@ -359,6 +359,17 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         // occurrence, which is what the queue writes; otherwise the event named.
         let shown = resolvedScope == "all" ? try named.readSeries() : fetchedEvent
 
+        // A rule given for a series whose stored rule has parts the fields cannot express is
+        // refused before the card: written, it would replace the stored rule and drop them (#552).
+        if resolvedScope == "all" || resolvedScope == "this_and_following",
+           let reason = CalendarRecurrenceFormat.storedOtherRefusal(arguments, series: try named.readSeries(), zone: tz) {
+            return ToolJSON.string(from: [
+                "ok": false,
+                "error": "calendar_event_edit failed: \(reason). The event was NOT changed.",
+                "event_id": compoundId,
+            ] as [String: Any])
+        }
+
         // An all-day event given a time of day without `all_day`, an all-day end on or before
         // its start, or a stated `all_day` of the other kind (the event's, or the named
         // occurrence's when it was changed on its own) without both a start and an end, is refused

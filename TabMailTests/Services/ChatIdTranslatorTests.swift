@@ -135,12 +135,14 @@ struct CoreTranslationTests {
         let allDayId = "evt-allday-\(UUID().uuidString)"
         let events: [(event: GCalEvent, accountId: String, calendarId: String, accessRole: String?)] = [
             (mk(timedId, "Early run", start: "\(d)T05:03:00Z", end: "\(d)T06:00:00Z"), "acct-a", "cal-a", nil),
-            (mk(recurId, "Weekly: planning", start: "\(d)T17:00:00Z", end: "\(d)T18:00:00Z", recurrence: ["RRULE:FREQ=WEEKLY"]), "acct-a", "cal-a", nil),
+            (mk(recurId, "Weekly: planning", start: "\(d)T17:00:00Z", end: "\(d)T18:00:00Z", recurrence: ["RRULE:FREQ=MONTHLY;BYDAY=TU,TH;BYSETPOS=2"]), "acct-a", "cal-a", nil),
             (mk(freeId, "Focus", start: "\(d)T14:00:00Z", end: "\(d)T16:00:00Z", transparency: "transparent"), "acct-a", "cal-a", nil),
             (mk(allDayId, "Holiday", start: nil, end: nil, date: d), "acct-a", "cal-a", nil),
         ]
         let output = CalendarToolHelpers.formatGroupedSummary(events, timeZone: TimeZone(identifier: "UTC"))
         #expect(output.contains("05:03 (5:03 a.m.) - 06:00 (6 a.m.): Early run"))
+        // The rule in the tools' fields (#552): quotes, colons and an `other` part in the marker.
+        #expect(output.contains("Weekly: planning (↻ {\"freq\":\"MONTHLY\",\"byDay\":[\"TU\",\"TH\"],\"other\":\"BYSETPOS=2\"})"))
 
         let translator = ChatIdTranslator.createIsolated()
         let translated = await translator.processToolOutputForLLM(output)

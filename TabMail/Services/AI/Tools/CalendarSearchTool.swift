@@ -48,11 +48,11 @@ struct CalendarSearchTool: AgentTool, Sendable {
 
         // Google's `singleEvents=true` expansion returns each occurrence as its
         // own row with `recurrence` empty and `recurringEventId` set on the
-        // instance. Resolve the master's RRULE up-front (deduped, concurrent)
-        // so the LLM sees UNTIL/COUNT on every line and can tell a capped
-        // predecessor series from its open-ended successor — matches TB's
-        // calendar_search behavior where the bridge always returns the rule.
-        let masterRRuleById = await CalendarToolHelpers.resolveMasterRecurrence(
+        // instance. Resolve the master up-front (deduped, concurrent) so the
+        // LLM sees the rule, its end included, on every line and can tell a
+        // capped predecessor series from its open-ended successor — matches
+        // TB's calendar_search behavior where the bridge always returns the rule.
+        let seriesById = await CalendarToolHelpers.resolveMasterRecurrence(
             events: result.events, backends: backends
         )
 
@@ -60,14 +60,14 @@ struct CalendarSearchTool: AgentTool, Sendable {
         Task { await CalendarToolHelpers.cacheEventDetailsForPills(result.events, calendarNames: result.calendarNames) }
         return paginateAndFormat(
             events: result.events, calendarNames: result.calendarNames,
-            pageIndex: pageIndex, timeZone: tz, masterRRuleById: masterRRuleById
+            pageIndex: pageIndex, timeZone: tz, seriesById: seriesById
         )
     }
 
     func paginateAndFormat(
         events: [(event: GCalEvent, accountId: String, calendarId: String, accessRole: String?)],
         calendarNames: [String: String], pageIndex: Int, timeZone: TimeZone? = nil,
-        masterRRuleById: [String: String] = [:]
+        seriesById: [String: GCalEvent] = [:]
     ) -> String {
         let totalEvents = events.count
         let totalPages = (totalEvents + Config.eventsPerPage - 1) / Config.eventsPerPage
@@ -82,7 +82,7 @@ struct CalendarSearchTool: AgentTool, Sendable {
         let pageEvents = Array(events[startIdx..<endIdx])
         var output = CalendarToolHelpers.formatGroupedSummary(
             pageEvents, calendarNames: calendarNames, timeZone: timeZone,
-            masterRRuleById: masterRRuleById
+            seriesById: seriesById
         )
 
         if totalPages > 1 {

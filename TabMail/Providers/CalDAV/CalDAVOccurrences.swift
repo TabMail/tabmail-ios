@@ -547,6 +547,18 @@ enum CalDAVOccurrences {
             }
         }
 
+        /// `GCalEvent.ruleZone` for a row of a series in this frame: nil for an all-day one, the
+        /// zone a floating one's wall times are read in, UTC, or the zone a TZID names through the
+        /// resolver alone, as `ICSParser` and `GCalEvent.seriesZone` read it (nil when not recognized).
+        var ruleZone: TimeZone? {
+            switch self {
+            case .allDay: return nil
+            case .floating(let zone): return zone
+            case .utc: return .gmt
+            case .zoned(_, let tzid): return CalendarTimeZoneResolver.zone(named: tzid, in: .none)
+            }
+        }
+
         /// The calendar day `instant` falls on here.
         func day(of instant: Date) -> RecurrenceTail.Day? {
             var calendar = Calendar(identifier: .gregorian)
@@ -1035,6 +1047,7 @@ enum CalDAVOccurrences {
             htmlLink: master.htmlLink, created: master.created, updated: master.updated,
             recurringEventId: href, conferenceUrl: master.conferenceUrl)
         row.originalStartTime = originalStart(ofKey: instance.key, in: series.frame)
+        row.ruleZone = series.frame.ruleZone
         return row
     }
 
@@ -1052,6 +1065,7 @@ enum CalDAVOccurrences {
             htmlLink: event.htmlLink, created: event.created, updated: event.updated,
             recurringEventId: href, conferenceUrl: event.conferenceUrl)
         row.originalStartTime = originalStart(ofKey: key, in: frame)
+        row.ruleZone = frame.ruleZone
         return row
     }
 

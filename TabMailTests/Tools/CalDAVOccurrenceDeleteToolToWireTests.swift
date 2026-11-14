@@ -347,7 +347,7 @@ struct CalDAVOccurrenceToolOutputTests {
         let output = CalendarToolHelpers.formatGroupedSummary(
             [(event: row, accountId: "acct-a", calendarId: "/cal/", accessRole: nil)], timeZone: TimeZone(identifier: "UTC"))
 
-        #expect(output.contains("Standup (↻ RRULE:FREQ=HOURLY;INTERVAL=2; \(CalendarToolHelpers.occurrencesNotListedNote))"),
+        #expect(output.contains("Standup (↻ {\"interval\":2,\"other\":\"FREQ=HOURLY\"}; \(CalendarToolHelpers.occurrencesNotListedNote))"),
                 "the row does not say it is a series whose occurrences are not listed: \(output)")
 
         let translator = ChatIdTranslator.createIsolated()

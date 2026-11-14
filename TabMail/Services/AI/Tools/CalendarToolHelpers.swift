@@ -254,7 +254,9 @@ enum CalendarToolHelpers {
 
     /// For each unique `recurringEventId` referenced by the supplied events,
     /// fetch the master via the matching provider (deduped) and return a map
-    /// `recurringEventId → first RRULE string`. This is the enrichment that
+    /// `recurringEventId → master` for each master that has an RRULE (its rule,
+    /// and the start and zone its `until` is read against,
+    /// `CalendarRecurrenceFormat.fields`). This is the enrichment that
     /// makes `formatGroupedSummary` parity-with-TB for Google's
     /// `singleEvents=true` path: expanded instances arrive with an empty
     /// `recurrence` array, but the LLM needs the rule (UNTIL/COUNT) to
@@ -266,7 +268,7 @@ enum CalendarToolHelpers {
     static func resolveMasterRecurrence(
         events: [(event: GCalEvent, accountId: String, calendarId: String, accessRole: String?)],
         backends: [(provider: any CalendarProvider, account: Account)]
-    ) async -> [String: String] {
+    ) async -> [String: GCalEvent] {
         // Index providers by account id for O(1) lookup.
         let providerByAccount = Dictionary(uniqueKeysWithValues: backends.map { ($0.account.id, $0.provider) })
 
@@ -293,24 +295,24 @@ enum CalendarToolHelpers {
         if keyToCalendarId.isEmpty { return [:] }
 
         let pairs = keyToCalendarId.map { ($0.key, $0.value) }
-        var out: [String: String] = [:]
+        var out: [String: GCalEvent] = [:]
 
-        await withTaskGroup(of: (String, String?).self) { group in
+        await withTaskGroup(of: (String, GCalEvent?).self) { group in
             for (key, calendarId) in pairs {
                 guard let provider = providerByAccount[key.accountId] else { continue }
                 group.addTask {
                     do {
                         let master = try await provider.getEvent(calendarId: calendarId, eventId: key.masterId)
-                        let rrule = master.recurrence?.first(where: { $0.uppercased().hasPrefix("RRULE:") }) ?? ""
-                        return (key.masterId, rrule.isEmpty ? nil : rrule)
+                        let hasRule = master.recurrence?.contains(where: CalendarRecurrenceFormat.isRuleLine) == true
+                        return (key.masterId, hasRule ? master : nil)
                     } catch {
                         BackgroundSyncLogger.logDebug("[CalendarToolHelpers] resolveMasterRecurrence: getEvent failed acct=\(key.accountId) master=\(key.masterId): \(error)")
                         return (key.masterId, nil)
                     }
                 }
             }
-            for await (masterId, rrule) in group {
-                if let rrule { out[masterId] = rrule }
+            for await (masterId, master) in group {
+                if let master { out[masterId] = master }
             }
         }
         BackgroundSyncLogger.logDebug("[CalendarToolHelpers] resolveMasterRecurrence: enriched \(out.count) master(s) from \(keyToCalendarId.count) unique reference(s)")
@@ -351,7 +353,7 @@ enum CalendarToolHelpers {
         _ events: [(event: GCalEvent, accountId: String, calendarId: String, accessRole: String?)],
         calendarNames: [String: String] = [:],
         timeZone: TimeZone? = nil,
-        masterRRuleById: [String: String] = [:]
+        seriesById: [String: GCalEvent] = [:]
     ) -> String {
         struct DayEntry {
             let dayKey: String
@@ -397,35 +399,33 @@ enum CalendarToolHelpers {
             // Suppress recur/free marks on freeBusy rows: the title is already
             // "Busy — …", and Google strips both fields server-side, but if
             // partial data ever leaks through we don't want "Busy — X (↻) [free]".
-            // Surface the RRULE on recurring entries so the LLM can see UNTIL/COUNT
-            // and reason about edit_scope. Two sources, in priority:
+            // Show the rule on recurring entries, in the fields the create and
+            // edit tools take (`CalendarRecurrenceFormat`, #552), so the LLM can
+            // see its end and reason about edit_scope. Two sources, in priority:
             //   1. `entry.event.recurrence` — populated when the API returned the
-            //      master directly (e.g. singleEvents=false, or the event is non-
-            //      recurring's master with its own recurrence).
-            //   2. `masterRRuleById[recurringEventId]` — populated by the caller
+            //      master directly (e.g. singleEvents=false), or on a CalDAV
+            //      occurrence row, which carries its series' rule.
+            //   2. `seriesById[recurringEventId]` — populated by the caller
             //      via `resolveMasterRecurrence` for instances Google expanded
             //      out of a recurring master. Without this, every line for the
             //      "Weekly sync" series would carry only `(↻)` — no UNTIL info.
-            // Match TB parity: TB's bridge always has access to the master's RRULE
+            // Match TB parity: TB's bridge always has access to the master's rule
             // because Lightning's recurrenceInfo lives on the parent item.
             let recurMark: String = {
                 if isFreeBusy { return "" }
+                let rule = CalendarRecurrenceFormat.fields(entry.event.recurrence, series: entry.event, zone: tz)
                 // A series whose occurrences the provider could not work out is
                 // listed once, at its first date (CalDAV, ADR-IOS-108). Saying so is
                 // what keeps that date from reading as an occurrence. No ")" inside
                 // the marker: the pill title strips "(↻" up to the first ")".
                 if entry.event.occurrencesNotListed == true {
-                    let rule = entry.event.recurrence?.first(where: { $0.uppercased().hasPrefix("RRULE:") })
-                        ?? entry.event.recurrence?.first ?? ""
-                    return " (↻ \(rule); \(Self.occurrencesNotListedNote))"
+                    let shown = rule?.json ?? entry.event.recurrence?.first ?? ""
+                    return " (↻ \(shown); \(Self.occurrencesNotListedNote))"
                 }
-                if let recArr = entry.event.recurrence, !recArr.isEmpty,
-                   let rrule = recArr.first(where: { $0.uppercased().hasPrefix("RRULE:") }) {
-                    return " (↻ \(rrule))"
-                }
-                if let masterId = entry.event.recurringEventId,
-                   let rrule = masterRRuleById[masterId], !rrule.isEmpty {
-                    return " (↻ \(rrule))"
+                if let rule { return " (↻ \(rule.json))" }
+                if let masterId = entry.event.recurringEventId, let master = seriesById[masterId],
+                   let rule = CalendarRecurrenceFormat.fields(master.recurrence, series: master, zone: tz) {
+                    return " (↻ \(rule.json))"
                 }
                 // Fallback: instance from a recurring master we couldn't enrich,
                 // or some other recurrence path. Show the marker so the LLM at
@@ -670,9 +670,14 @@ enum CalendarToolHelpers {
         // server-side; if any partial data ever leaks through, rendering it
         // under a "Busy" title would mislead the agent.
         if !isFreeBusy {
+            // The rule in the fields the create and edit tools take (#552); the series' excluded
+            // and added dates, which a rule write keeps, each on its own line as stored.
             if let recurrence = event.recurrence, !recurrence.isEmpty {
                 lines.append("recurring: yes")
-                lines.append("RRULE: \(recurrence.joined(separator: ";"))")
+                if let rule = CalendarRecurrenceFormat.fields(recurrence, series: event, zone: tz) {
+                    lines.append(CalendarRecurrenceFormat.readLine(rule))
+                }
+                lines.append(contentsOf: recurrence.filter { !CalendarRecurrenceFormat.isRuleLine($0) })
             }
 
             if let loc = event.location, !loc.isEmpty {
@@ -944,6 +949,13 @@ enum CalendarToolHelpers {
     /// field). A `freq` that is not one of RFC 5545's tokens, or other fields without a `freq`,
     /// is refused (`notSupported`) naming the field and the value, so it is never dropped.
     static func recurrenceFreq(_ rec: [String: JSONValue]) throws -> String? {
+        // `other` is what the read tools show for a stored rule's parts the fields cannot express
+        // (`CalendarRecurrenceFormat`). It is never written: passed back, it would be dropped and
+        // the series saved without those parts (#552).
+        if let other = rec["other"], !isNullArgument(other) {
+            throw CalendarProviderError.notSupported(
+                "recurrence.other has an invalid value \(Self.shownRecurrenceValue(other)): these parts of a stored rule can't be written. On an edit, omit recurrence to keep the stored rule; to create such a series, tell the user to create it in the calendar app")
+        }
         guard let value = rec["freq"], !isNullArgument(value) else {
             if rec.values.allSatisfy(isNullArgument) { return nil }
             throw CalendarProviderError.notSupported("recurrence.freq is missing: give one of DAILY, WEEKLY, MONTHLY, YEARLY")
