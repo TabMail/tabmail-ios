@@ -448,6 +448,33 @@ struct SplitCarryTests {
         #expect(SplitCarry.slot(of: Self.instant(Self.at(15)), cut: cut, newPart: offStart, series: series, zone: .gmt)?.dateTime == Self.at(15))
     }
 
+    @Test("a new part's end bounds its slots: its COUNT counts from its start, its UNTIL (UTC, or a wall clock in the series' zone) is inclusive")
+    func slotEndsWithTheNewPart() throws {
+        let series = try Self.event(Self.series.merging(["recurrence": ["RRULE:FREQ=WEEKLY"]]) { $1 })
+        let cut = Self.instant(Self.at(14))
+        // COUNT=2 from day 14: day 21 is its second and last occurrence, day 28 is past its end.
+        let counted = try Self.part(cut, rule: "RRULE:FREQ=WEEKLY;COUNT=2")
+        #expect(SplitCarry.slot(of: Self.instant(Self.at(21)), cut: cut, newPart: counted, series: series, zone: .gmt)?.dateTime == Self.at(21))
+        #expect(SplitCarry.slot(of: Self.instant(Self.at(28)), cut: cut, newPart: counted, series: series, zone: .gmt) == nil)
+        // COUNT=1: only its start; day 21 is past its end.
+        let once = try Self.part(cut, rule: "RRULE:FREQ=WEEKLY;COUNT=1")
+        #expect(SplitCarry.slot(of: Self.instant(Self.at(21)), cut: cut, newPart: once, series: series, zone: .gmt) == nil)
+        // A UTC UNTIL at day 21's occurrence keeps it; one a second before ends the part before it.
+        let utcAt = try Self.part(cut, rule: "RRULE:FREQ=WEEKLY;UNTIL=\(Self.ical(21))")
+        #expect(SplitCarry.slot(of: Self.instant(Self.at(21)), cut: cut, newPart: utcAt, series: series, zone: .gmt)?.dateTime == Self.at(21))
+        let utcBefore = try Self.part(cut, rule: "RRULE:FREQ=WEEKLY;UNTIL=\(Self.ical(21, "08:59:59"))")
+        #expect(SplitCarry.slot(of: Self.instant(Self.at(21)), cut: cut, newPart: utcBefore, series: series, zone: .gmt) == nil)
+        // An UNTIL with no zone is the wall clock in the series' zone (New York here), not UTC:
+        // at day 21's occurrence on New York's clock it keeps it, a second before it does not.
+        let newYork = try #require(TimeZone(identifier: "America/New_York"))
+        let occurrence = try #require(Date.fromISO8601(Self.at(21)))
+        let wall = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss", timeZone: newYork)
+        let localAt = try Self.part(cut, rule: "RRULE:FREQ=WEEKLY;UNTIL=\(wall.string(from: occurrence))")
+        #expect(SplitCarry.slot(of: Self.instant(Self.at(21)), cut: cut, newPart: localAt, series: series, zone: newYork)?.dateTime == Self.at(21))
+        let localBefore = try Self.part(cut, rule: "RRULE:FREQ=WEEKLY;UNTIL=\(wall.string(from: occurrence.addingTimeInterval(-1)))")
+        #expect(SplitCarry.slot(of: Self.instant(Self.at(21)), cut: cut, newPart: localBefore, series: series, zone: newYork) == nil)
+    }
+
     @Test("the carry is decided before the create: a kept occurrence with no slot refuses, the named one with none resets, and a change of kind with an occurrence left on the old part refuses")
     func carryPlanDecidesBeforeTheCreate() throws {
         let series = try Self.event(Self.series.merging(["recurrence": ["RRULE:FREQ=WEEKLY"]]) { $1 })

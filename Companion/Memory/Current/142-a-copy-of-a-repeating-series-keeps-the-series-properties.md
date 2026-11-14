@@ -809,3 +809,18 @@ equivalent by construction). Each provider's T4 test pins that premise: an edit 
 on London's clock and the kept occurrence lands. Red first: `newRuleKeepsTheSeriesClock` (a new-rule split from a
 device whose daylight-time dates differ from the series'; every listed occurrence must stay at the series' 09:00)
 fails on the previous commit with the honest fake (the part repeated in the device's zone, off on 30 of 50 weeks).
+
+**Amendment (2026-11-13, #563, thirteenth): one zone source for an Outlook new part, given rule or copied.**
+Review r3 (C-r3-1) found the twelfth amendment's fix covered only a given rule: a copied rule took its zone from the
+range alone, so a series whose range names no zone (Graph then reads `originalStartTimeZone`) still wrote its new
+part on the device's clock. `splitNewPartJSON` now reads the series' zone once, `seriesZoneName` (the range's zone,
+else the event's own), and labels start, end and range with it in both branches; `plannedPart` names the same zone.
+The unreachable unrecognised-zone guard there was deleted (the zone is resolved before). Tests: `newRuleKeepsTheSeriesClock`
+and the Outlook `keptBetweenTwoZonesDaylightChangesLands` run over both rules (`SplitClockCase`: new rule; copied
+rule with a zone-less range), and the T4 kept place is picked per device (`SplitClockCase.zoneApartFromTheDevice`:
+the first Monday on which the device's clock and the series' have moved apart; on a Mac in a zone with no daylight
+change, that is the series' own change). End of the new part (T-r3-1, T-r3-2): `slotEndsWithTheNewPart`
+(SplitCarry unit: COUNT from the part's start, UTC and wall-clock UNTIL inclusive), `keptPastTheNewRulesCountRefusesBeforeTheCreate`
+(Outlook: COUNT=1 refuses before the POST, COUNT=2 lands) and `floatingKeptAtTheLastPlaceUnderUntilRefusesBeforeThePut`
+(CalDAV: a floating series' wall-clock UNTIL, a day turn, refused before any PUT) kill the COUNT and floating-UNTIL
+mutants of `SplitCarry.endsAtOrAfter`.

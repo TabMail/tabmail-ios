@@ -2856,6 +2856,38 @@ struct CalDAVSplitCarrySlotTests {
         #expect(r.puts.isEmpty, "refused after a PUT: \(r.puts)")
     }
 
+    @Test("N1 on CalDAV, floating: a kept override at the last place of a series with no zone, whose UNTIL is a wall clock, refuses before any PUT when a day turn moves its slot past it")
+    func floatingKeptAtTheLastPlaceUnderUntilRefusesBeforeThePut() async throws {
+        // Weekly on Mondays at 09:00 with no zone, until day 21 at 09:00 (a wall clock, read in the
+        // operation's zone, New York); the day-21 occurrence moved to Saturday day 13, before the one
+        // named on day 14, which moves to Tuesday with the rule's day: its slot, day 22, is past the end.
+        let wall = { (day: String, time: String) in day.replacingOccurrences(of: "-", with: "") + "T" + time }
+        let ics = [
+            "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//TabMail//Test//EN",
+            "BEGIN:VEVENT", "UID:carry-floating", "DTSTAMP:20990101T000000Z",
+            "DTSTART:\(wall(Self.day(0), "090000"))", "DTEND:\(wall(Self.day(0), "093000"))",
+            "SUMMARY:Standup", "RRULE:FREQ=WEEKLY;UNTIL=\(wall(Self.day(21), "090000"))", "END:VEVENT",
+            "BEGIN:VEVENT", "UID:carry-floating", "DTSTAMP:20990101T000000Z", "RECURRENCE-ID:\(wall(Self.day(21), "090000"))",
+            "DTSTART:\(wall(Self.day(13), "120000"))", "DTEND:\(wall(Self.day(13), "123000"))",
+            "SUMMARY:Moved earlier", "END:VEVENT",
+            "END:VCALENDAR",
+        ].joined(separator: "\r\n")
+        let newYork = try #require(TimeZone(identifier: "America/New_York"))
+        let start = try #require(FixedDateFormat.formatter("yyyy-MM-dd'T'HH:mm:ss", timeZone: newYork).date(from: "\(Self.day(15))T09:00:00"))
+        var patch = GCalEventInput()
+        patch.startDateTime = start.iso8601String()
+        patch.startTimeZone = "UTC"
+        patch.ruleDayMove = RecurrenceDayShift.Move(from: try #require(RecurrenceTail.Day(iso: Self.day(14))),
+                                                    to: try #require(RecurrenceTail.Day(iso: Self.day(15))))
+        let r = await Self.split(ics, recurrenceId: "\(Self.day(14))T09:00:00", zone: newYork, patch: patch)
+        guard case CalendarProviderError.notSupported(let message)? = r.error else {
+            Issue.record("not refused: \(String(describing: r.error)); \(r.newPart ?? "")")
+            return
+        }
+        #expect(message == SplitCarry.keptHasNoSlotRefusal, "\(message)")
+        #expect(r.puts.isEmpty, "refused after a PUT: \(r.puts)")
+    }
+
     @Test("T4 on CalDAV: a kept override between two zones' daylight changes lands on the new part's occurrence; a zoned new part stays in the series' zone even when the edit names another")
     func keptBetweenTwoZonesDaylightChangesLands() async throws {
         // Weekly on Mondays at 09:00 London from 2099-03-02 (UK summer time starts 2099-03-29, US

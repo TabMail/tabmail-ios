@@ -1111,15 +1111,14 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// rule it repeats by, read from the create body `createJSON` as a read of the part gives it
     /// (`rrule`: the edit's rule, else the series' pattern with its days turned by a move to another
     /// day and its range ending where the new part does, a numbered one with what is left of its
-    /// number, `newPartRecurrence`), and the zone it repeats in, the series' as `splitNewPartJSON`
-    /// writes it: its copied range's zone, or for a rule the edit gives the series' zone
-    /// (`seriesZoneName`). Throws when the create body's recurrence can't be read.
+    /// number, `newPartRecurrence`), and the zone it repeats in, the series' (`seriesZoneName`) as
+    /// `splitNewPartJSON` writes it with either rule. Throws when the create body's recurrence
+    /// can't be read.
     nonisolated static func plannedPart(
         master: GCalEvent, patch: GCalEventInput, place: String, zone: TimeZone, createJSON: [String: Any]
     ) throws -> GCalEvent {
         let times = GoogleCalendarProvider.mergeMasterAndPatch(
             master: master, patch: patch, newStartNaiveISO: place, newStartZone: zone, newRecurrence: [])
-        let given = patch.recurrence?.isEmpty == false
         let rules = try createJSON["recurrence"].map { recurrence in
             rrule(try JSONDecoder().decode(MSPatternedRecurrence.self, from: try JSONSerialization.data(withJSONObject: recurrence)))
         }
@@ -1129,7 +1128,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
             end: GCalDateTime(dateTime: times.endDateTime, date: times.endDate, timeZone: times.endTimeZone),
             attendees: nil, organizer: nil, recurrence: rules, transparency: nil, status: nil,
             htmlLink: nil, created: nil, updated: nil, recurringEventId: nil)
-        part.recurrenceTimeZoneName = given ? master.seriesZoneName : master.recurrenceTimeZoneName
+        part.recurrenceTimeZoneName = master.seriesZoneName
         return part
     }
 
@@ -1513,12 +1512,12 @@ actor ExchangeCalendarProvider: CalendarProvider {
         let edited = GoogleCalendarProvider.mergeMasterAndPatch(
             master: stored.event, patch: patch, newStartNaiveISO: newStartNaiveISO,
             newStartZone: newStartZone, newRecurrence: [])
-        // Dated in the zone the new part is written in (#719): the copied range's, so its start
-        // and its range's `startDate` name the same day.
-        let copiedZone = patch.recurrence?.isEmpty ?? true
-            ? ((stored.raw["recurrence"] as? [String: Any])?["range"] as? [String: Any])?["recurrenceTimeZone"] as? String
-            : nil
-        guard let newDay = Self.seriesDay(edited.startDate, edited.startDateTime, in: edited.startTimeZone, seriesZone: copiedZone) else {
+        // The zone the new part is written in and repeats in, whichever rule it takes: the
+        // series' (`seriesZoneName`: its range's, else the event's own, as `seriesTimeZone` reads
+        // it), so the plan's slots (`plannedPart`) and the occurrences Graph lists agree. Dated in
+        // it (#719), its start and its range's `startDate` name the same day.
+        let seriesZone = stored.event.seriesZoneName
+        guard let newDay = Self.seriesDay(edited.startDate, edited.startDateTime, in: edited.startTimeZone, seriesZone: seriesZone) else {
             throw CalendarProviderError.notSupported("The repeating event's start can't be read, so it can't be split.")
         }
         var written = GCalEventInput()
@@ -1543,43 +1542,35 @@ actor ExchangeCalendarProvider: CalendarProvider {
 
         var json = stored.raw.filter { Self.splitCopiedKeys.contains($0.key) }
         if patch.location != nil { json.removeValue(forKey: "locations") }
-        // A rule the edit gives is dated and labelled in the series' zone (`graphPatchJSON`).
+        // A rule the edit gives is dated in the series' zone (`graphPatchJSON`); `splitSeries` has
+        // refused a timed series whose zone it does not recognize (`seriesTimeZone`).
         let givenRule = !(patch.recurrence?.isEmpty ?? true)
-        let givenRuleZone = givenRule ? stored.event.seriesZoneName : nil
-        var rangeZone: TimeZone?
-        if let givenRuleZone, !stored.event.isAllDay {
-            guard let zone = CalendarTimeZoneResolver.zone(named: givenRuleZone, in: .none) else {
-                throw CalendarProviderError.unrecognizedTimeZone(givenRuleZone, consequence: "it was not split")
-            }
-            rangeZone = zone
-        }
+        let rangeZone = givenRule && !stored.event.isAllDay ? seriesZone.flatMap { CalendarTimeZoneResolver.zone(named: $0, in: .none) } : nil
         for (key, value) in toGraphEventJSON(written, attendeeTypes: stored.attendeeTypes, rangeZone: rangeZone) { json[key] = value }
         // New notes on an online series keep its join section, as an edit of the series does.
         if let description = patch.description, let body = Self.onlineMeetingBody(stored.raw, notes: description) {
             json["body"] = body
         }
-        if patch.recurrence?.isEmpty ?? true, let recurrence = stored.raw["recurrence"] as? [String: Any] {
+        if !givenRule, let recurrence = stored.raw["recurrence"] as? [String: Any] {
             json["recurrence"] = try Self.newPartRecurrence(
                 stored: stored, storedRecurrence: recurrence, newDay: newDay,
                 splitNaiveISO: newStartNaiveISO, splitZone: newStartZone, move: patch.ruleDayMove)
-            // The new part is written in the zone its copied range names: a timed one at the same
-            // instant (#719), as Google Calendar keeps a series' zone on "this and following", an
-            // all-day one on the same dates (#747), or Graph stores it two days longer.
-            if let storedRange = recurrence["range"] as? [String: Any] {
-                let seriesZone = storedRange["recurrenceTimeZone"] as? String
-                let allDay = json["isAllDay"] as? Bool ?? (written.startDate != nil)
-                for key in ["start", "end"] {
-                    if let time = json[key] as? [String: Any] { json[key] = Self.inSeriesZone(time, seriesZone: seriesZone, allDay: allDay) }
-                }
-            }
-        } else if let givenRuleZone, var rule = json["recurrence"] as? [String: Any], var range = rule["range"] as? [String: Any] {
+        }
+        // The new part is written in the series' zone, with either rule: a timed one at the same
+        // instant (#719), as Google Calendar keeps a series' zone on "this and following", an
+        // all-day one on the same dates (#747), or Graph stores it two days longer; its range
+        // names that zone, which Graph requires to be its start's (400 otherwise, measured
+        // 2026-11-13) and lists the occurrences on.
+        if let seriesZone {
             let allDay = json["isAllDay"] as? Bool ?? (written.startDate != nil)
             for key in ["start", "end"] {
-                if let time = json[key] as? [String: Any] { json[key] = Self.inSeriesZone(time, seriesZone: givenRuleZone, allDay: allDay) }
+                if let time = json[key] as? [String: Any] { json[key] = Self.inSeriesZone(time, seriesZone: seriesZone, allDay: allDay) }
             }
-            range["recurrenceTimeZone"] = givenRuleZone
-            rule["range"] = range
-            json["recurrence"] = rule
+            if var rule = json["recurrence"] as? [String: Any], var range = rule["range"] as? [String: Any] {
+                range["recurrenceTimeZone"] = seriesZone
+                rule["range"] = range
+                json["recurrence"] = rule
+            }
         }
         json["transactionId"] = transactionId
         return json
