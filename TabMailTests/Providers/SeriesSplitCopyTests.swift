@@ -89,6 +89,13 @@ private enum GoogleSplitFixture {
         ]
     }
 
+    /// The series' recurrence with no date added at or after the split: a split that moves the new
+    /// part's start is refused on Google while the new part holds added dates, which Google leaves
+    /// at their old time (#894), so a reschedule is tested on a series without one.
+    static let noLaterAddedDate = [
+        "RRULE:FREQ=WEEKLY;UNTIL=20991230T170000Z", "EXDATE:20990513T170000Z,20990527T170000Z", "RDATE:20990515T170000Z",
+    ]
+
     struct Wire {
         let created: [String: Any]?
         let createQuery: [String: String]
@@ -279,7 +286,7 @@ struct GoogleSeriesSplitCopyTests {
         case "only a new rule": patch.recurrence = ["RRULE:FREQ=DAILY"]
         default: patch.location = "Room 2"
         }
-        let wire = try await GoogleSplitFixture.split(GoogleSplitFixture.master(), patch: patch)
+        let wire = try await GoogleSplitFixture.split(GoogleSplitFixture.master(recurrence: GoogleSplitFixture.noLaterAddedDate), patch: patch)
         let organizer = GoogleSplitFixture.attendee(wire.created, "olivia@example.com")
         #expect(organizer?["responseStatus"] as? String == "accepted", "\(label): the organizer was asked")
         let alice = try #require(GoogleSplitFixture.attendee(wire.created, "alice@example.com"))
@@ -293,7 +300,7 @@ struct GoogleSeriesSplitCopyTests {
     @Test("the organizer is never asked again, whether the attendee list flags them or only names them",
           arguments: ["flag only", "address only"])
     func organizerIsNotAskedAgain(_ how: String) async throws {
-        var master = GoogleSplitFixture.master()
+        var master = GoogleSplitFixture.master(recurrence: GoogleSplitFixture.noLaterAddedDate)
         var attendees = GoogleSplitFixture.attendees
         if how == "flag only" {
             // The series' organizer is a shared calendar; the attendee entry carries the flag.

@@ -173,6 +173,17 @@ protocol CalendarProvider: Sendable {
     /// naming the field, with nothing sent; the provider's writer refuses it the same way. Default:
     /// nil (Google and CalDAV store the rule as written).
     func recurrenceRuleRefusal(_ rrule: String) -> String?
+
+    /// Whether this calendar moves a repeating event's added dates (`RDATE`) with the event when a
+    /// write moves its start: a split's new part given a new time or date (#894). CalDAV does
+    /// (`shiftSeriesAnchoredValues` moves them by the same amount); Google does not (its write
+    /// re-anchors only the start and end, and the added dates stay at their old time, so a new part
+    /// moved off its cut shows them at the old time, one of them twice when it is the cut). A split
+    /// that moves the new part off its cut while the new part holds added dates is refused before
+    /// anything is written on a calendar that does not (`SplitCarry.leavesAddedDatesBehind`, owner
+    /// ruling 2026-11-14). A capability, read by the calendar's own split plan, never a provider
+    /// type check. Default: false (refuse), for a calendar that holds no added dates or was not checked.
+    static var movesAddedDatesWithSeries: Bool { get }
 }
 
 /// A write of a repeating series as the queue will make it, for the calendar's check before the
@@ -258,6 +269,7 @@ extension CalendarProvider {
         String(recurrenceId.prefix(10))
     }
     func recurrenceRuleRefusal(_ rrule: String) -> String? { nil }
+    static var movesAddedDatesWithSeries: Bool { false }
     func occurrence(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone) async throws -> GCalEvent {
         throw CalendarProviderError.notSupported("Changing one occurrence of a repeating event, or the occurrences from one on, is not yet supported on this calendar provider. Edit the whole series instead.")
     }
@@ -487,6 +499,10 @@ enum RecurrenceOccurrenceResolver {
 /// Mirrors `GmailProvider` actor pattern — same `accessToken` closure, same retry logic.
 /// Google handles invitations natively via `sendUpdates=all` — no ICS generation needed.
 actor GoogleCalendarProvider: CalendarProvider {
+    /// `CalendarProvider.movesAddedDatesWithSeries`: no. `splitNewPartJSON` and `patchEvent`
+    /// re-anchor only the start and end; the new part's `RDATE` values stay where they were (#894).
+    static let movesAddedDatesWithSeries = false
+
     private let accessToken: @Sendable (_ forceRefresh: Bool) async throws -> String
     private let baseURL = "https://www.googleapis.com/calendar/v3"
     /// Test-only transport override. `nil` on every production path, where
@@ -1108,6 +1124,17 @@ actor GoogleCalendarProvider: CalendarProvider {
         guard let place = point.place, case .at(let splitPlace) = point.cut else {
             return .shown(try await shownPlan(calendarId: calendarId, master: master, masterId: eventId, named: found, patch: patch))
         }
+        // A cut on a date added outside the repeat pattern (`RDATE`) would start the new part off
+        // the rule it keeps, so it would lose meetings or make some up: refused before anything is
+        // written, in #880's words (#894; full support is #881).
+        switch SplitCarry.cutsAtAddedDate(point.cut, series: master) {
+        case nil:
+            throw CalendarProviderError.notSupported("where the occurrence named falls in its series can't be read, so the series can't be split at it")
+        case true?:
+            throw CalendarProviderError.notSupported(CalendarSeriesEndRemoval.AddedDates.reason)
+        case false?:
+            break
+        }
         guard let partPatch = SplitCarry.partEdit(patch, namedStart: namedStart, cut: splitPlace, zone: master.isAllDay ? nil : master.seriesZone) else {
             throw CalendarProviderError.notSupported("where the occurrence named falls in its series can't be read, so the series can't be split at it")
         }
@@ -1194,6 +1221,18 @@ actor GoogleCalendarProvider: CalendarProvider {
                 zone: master.isAllDay ? nil : master.seriesZone, newPart: written, fields: fields) != nil,
               let edits = SplitCarry.edits(of: parts.edited, shift: SplitCarry.shift(cut: splitPlace, newPart: written), length: SplitCarry.length(of: written), fields: fields) else {
             throw CalendarProviderError.notSupported("the new part of this repeating event has a time TabMail can't read, so it was not split")
+        }
+        // A new part moved off its cut keeps its added dates at their old time on a calendar that
+        // does not move them with it: refused before anything is written, in #880's words (#894).
+        switch SplitCarry.leavesAddedDatesBehind(
+            cut: splitPlace, newPartStart: written.start, holdsAddedDates: recurrenceParts.tail.contains(where: SplitCarry.isAddedDates),
+            movesAddedDates: Self.movesAddedDatesWithSeries) {
+        case nil:
+            throw CalendarProviderError.notSupported("the new part of this repeating event has a time TabMail can't read, so it was not split")
+        case true?:
+            throw CalendarProviderError.notSupported(CalendarSeriesEndRemoval.AddedDates.reason)
+        case false?:
+            break
         }
 
         return .split(SplitPlan(

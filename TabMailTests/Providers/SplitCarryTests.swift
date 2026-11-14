@@ -164,6 +164,43 @@ struct SplitCarryTests {
         #expect(later == .at(Self.instant(Self.at(14))))
     }
 
+    /// A weekly series from today at 09:00 UTC ending on day 42, with `extra` recurrence lines.
+    private static func weeklyUntil42(_ extra: [String]) throws -> GCalEvent {
+        var series = Self.series
+        series["recurrence"] = ["RRULE:FREQ=WEEKLY;UNTIL=\(Self.ical(42))"] + extra
+        return try Self.event(series)
+    }
+
+    @Test("a cut is on an added date (#894) only when an added date is there and the rule gives no place there")
+    func cutsAtAddedDateReadsTheSeries() throws {
+        func cut(_ days: Int, _ time: String = "09:00:00") -> SplitCarry.Cut { .at(Self.instant(Self.at(days, time))) }
+        let added16 = "RDATE:\(Self.ical(16))"
+        // Off the rule: on the added day 16.
+        #expect(SplitCarry.cutsAtAddedDate(cut(16), series: try Self.weeklyUntil42([added16])) == true)
+        // A regular meeting with a date added elsewhere, or the same date added on a rule place.
+        #expect(SplitCarry.cutsAtAddedDate(cut(14), series: try Self.weeklyUntil42([added16])) == false)
+        #expect(SplitCarry.cutsAtAddedDate(cut(14), series: try Self.weeklyUntil42(["RDATE:\(Self.ical(14))"])) == false)
+        // A date added on a rule day at another time, or after the rule's end, is off the rule.
+        #expect(SplitCarry.cutsAtAddedDate(cut(14, "15:00:00"), series: try Self.weeklyUntil42(["RDATE:\(Self.ical(14, "15:00:00"))"])) == true)
+        #expect(SplitCarry.cutsAtAddedDate(cut(49), series: try Self.weeklyUntil42(["RDATE:\(Self.ical(49))"])) == true)
+        // No added date: nothing more is read. Past the end: no cut.
+        #expect(SplitCarry.cutsAtAddedDate(cut(16), series: try Self.weeklyUntil42([])) == false)
+        #expect(SplitCarry.cutsAtAddedDate(.pastEnd, series: try Self.weeklyUntil42([added16])) == false)
+        // A CalDAV series' added dates held outside its recurrence lines.
+        #expect(SplitCarry.cutsAtAddedDate(cut(16), series: try Self.weeklyUntil42([]), rdates: [added16]) == true)
+        // An added date that can't be read: nil, never a silent no.
+        #expect(SplitCarry.cutsAtAddedDate(cut(16), series: try Self.weeklyUntil42(["RDATE:NOTADATE"])) == nil)
+        // An all-day series, by dates.
+        var allDay = Self.series
+        allDay["start"] = ["date": String(Self.at(0).prefix(10))]
+        allDay["end"] = ["date": String(Self.at(1).prefix(10))]
+        allDay["recurrence"] = ["RRULE:FREQ=WEEKLY", "RDATE;VALUE=DATE:\(Self.ical(16).prefix(8))"]
+        let allDaySeries = try Self.event(allDay)
+        func date(_ days: Int) -> SplitCarry.Cut { .at(GCalDateTime(dateTime: nil, date: String(Self.at(days).prefix(10)), timeZone: nil)) }
+        #expect(SplitCarry.cutsAtAddedDate(date(16), series: allDaySeries) == true)
+        #expect(SplitCarry.cutsAtAddedDate(date(14), series: allDaySeries) == false)
+    }
+
     @Test("a UTC UNTIL before the next place leaves no cut; one at it keeps the place")
     func cutPastUTCUntil() throws {
         let moved = try Self.occurrence(place: 7, start: Self.at(9), end: Self.at(9, "09:30:00"))

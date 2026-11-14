@@ -464,6 +464,21 @@ occurrence whose earlier-placed neighbour is shown after the cut, then GET the c
 `shownEdits*`, reset keeps deleted), `ExchangeSplitCarryTests` (`pastEndRetryMovesOnce`,
 `shownEditsAreOrderedOffHeldDays`, `movedSplitRetryMovesEditedOnce`, `movedSplitKeptItemKeepsItsGuests`).
 
+**A cut on an added date is refused (amended 2026-11-14, #894, owner ruling):** the new part keeps
+the series' rule, so a cut on an `RDATE` the rule gives no place at (named there, or a moved meeting
+cut there) would start it off its rule and lose or invent meetings. Google's and CalDAV's `splitPlan`
+refuse it before any write with #880's message (`CalendarSeriesEndRemoval.AddedDates.reason`), by the
+neutral `SplitCarry.cutsAtAddedDate`; the card's check and the queued write both run that plan.
+`finishSplit` is not checked (a record exists only after the plan passed). ADR-IOS-113 decision 9.
+Tests: `SplitAtAnAddedDateTests`, `SplitCarryTests.cutsAtAddedDateReadsTheSeries`.
+Owner ruling 2026-11-14 (panel, A): on Google a split that moves the new part off its cut (new time,
+day or kind) while it holds added dates (any at or after the cut) is refused too, same message: Google
+leaves an added date at its old time. Decided by the capability `CalendarProvider.movesAddedDatesWithSeries`
+(Google false, CalDAV true, default false) and `SplitCarry.leavesAddedDatesBehind`, in the same
+`splitPlan`s; CalDAV writes it with the added date moved. Not covered: a whole-series time change on
+Google also leaves added dates behind. Google fixtures that reschedule a split use a series with no added
+date after the cut (`GoogleSplitFixture.noLaterAddedDate`).
+
 **The card asks the write's cut (amended 2026-11-12, review rounds 3-4):** the card of a split named
 at a moved occurrence asks `CalendarProvider.splitCut` (each calendar's `splitPoint`, nothing written).
 Past the end it shows no reset note and refuses a rule or day change before the card
