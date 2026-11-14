@@ -4815,6 +4815,8 @@ struct SeriesLengthKeepsExceptionsTests {
         var hours = 0
         var subject: String?
         var deleted = false
+        /// A room of its own (`location`, and `locations` holding it alone, as Graph writes them).
+        var location: String?
     }
 
     /// Outlook's series `ser-1` (`GraphSeries`, 30 minutes from `GraphFixture.start`) and its
@@ -4825,8 +4827,12 @@ struct SeriesLengthKeepsExceptionsTests {
         for (n, change) in changes.enumerated() {
             var e = change.hours == 0 ? GraphSeries.occurrence(id: "ser-1-w\(n)", at: week(n))
                 : GraphSeries.moved(id: "ser-1-w\(n)", from: week(n), to: week(n).addingTimeInterval(TimeInterval(change.hours * 3_600)))
-            e["type"] = change.hours == 0 && change.subject == nil ? "occurrence" : "exception"
+            e["type"] = change.hours == 0 && change.subject == nil && change.location == nil ? "occurrence" : "exception"
             if let subject = change.subject { e["subject"] = subject }
+            if let location = change.location {
+                e["location"] = ["displayName": location]
+                e["locations"] = [["displayName": location]]
+            }
             events.append(e)
         }
         let graph = FakeGraphCalendar(events)
@@ -4884,6 +4890,68 @@ struct SeriesLengthKeepsExceptionsTests {
         #expect(r.cards.first?.changes.contains(CalendarToolHelpers.ruleChangeResetNote) == false, "card: \(r.cards.first?.changes ?? [])")
         #expect(graph.seriesResets == 1, "Graph did not reset the series: the fake models no reset to put back")
         Self.expectOutlookKept(graph, length: Self.length, "one attempt")
+    }
+
+    // **INVARIANT (#878).** *The put-back writes back only what a changed occurrence differed from
+    // the series in when it was read:* its own time and each property it held of its own. What it
+    // held as the series did follows the series, so a change another app makes to the series while
+    // the put-back runs is kept on that occurrence, and the occurrence's own changes still come back.
+
+    /// Runs another app's write of `values()` to the series, once, right after TabMail's write
+    /// reset it and before the put-back.
+    private static func otherAppWritesSeriesAfterTheReset(_ graph: FakeGraphCalendar, _ values: @escaping @Sendable () -> [String: Any]) {
+        let written = Tally()
+        graph.afterReset {
+            guard written.take(below: 1) else { return }
+            graph.otherAppWritesSeries("ser-1", values())
+        }
+    }
+
+    /// The room an Outlook event's `location` names.
+    private static func room(_ event: [String: Any]?) -> String? { (event?["location"] as? [String: Any])?["displayName"] as? String }
+
+    /// What `locations` names, in order.
+    private static func rooms(_ event: [String: Any]?) -> [String] {
+        (event?["locations"] as? [[String: Any]] ?? []).compactMap { $0["displayName"] as? String }
+    }
+
+    @Test("Outlook: the series renamed in another app during the put-back keeps its new title on a moved occurrence, which still gets back its own time and room (#878)")
+    func outlookPutBackKeepsASeriesRenameMadeMeanwhile() async throws {
+        let changes = [OwnChange(), OwnChange(hours: 2, location: "Room 9"), OwnChange(subject: "Renamed"), OwnChange()]
+        let graph = Self.outlookCalendar(changes)
+        Self.otherAppWritesSeriesAfterTheReset(graph) { ["subject": "Roadmap"] }
+        let r = try await outlookTool(graph, Self.newEnd(), eventId: "ser-1", account: "series-length-x-renamed-meanwhile")
+        #expect(r.cards.count == 1 && r.queued.isEmpty, "cards \(r.cards.count) queued \(reasons(r.queued)); \(r.out)")
+        #expect(graph.seriesResets == 1 && graph.event("ser-1")?["subject"] as? String == "Roadmap",
+                "non-vacuity: the series was not reset and renamed: \(graph.event("ser-1") ?? [:])")
+        let moved = graph.event("ser-1-w1")
+        let start = Self.week(1).addingTimeInterval(2 * 3_600)
+        #expect(instant(moved?["start"]) == start && instant(moved?["end"]) == start.addingTimeInterval(Self.length),
+                "the moved occurrence lost its own time: \(moved ?? [:])")
+        #expect(Self.room(moved) == "Room 9" && Self.rooms(moved) == ["Room 9"], "the moved occurrence lost its own room: \(moved ?? [:])")
+        #expect(moved?["subject"] as? String == "Roadmap", "the put-back wrote the title it read over the series' rename: \(moved ?? [:])")
+        #expect(graph.event("ser-1-w2")?["subject"] as? String == "Renamed", "an occurrence's own title was not put back: \(graph.event("ser-1-w2") ?? [:])")
+        #expect(graph.event("ser-1-w3")?["subject"] as? String == "Roadmap", "a plain occurrence: \(graph.event("ser-1-w3") ?? [:])")
+    }
+
+    @Test("Outlook: the series given another room in another app during the put-back keeps it on a moved occurrence, which still gets back its own time and title (#878)")
+    func outlookPutBackKeepsASeriesRoomChangeMadeMeanwhile() async throws {
+        let changes = [OwnChange(), OwnChange(hours: 2, subject: "Moved"), OwnChange(location: "Room 9"), OwnChange()]
+        let graph = Self.outlookCalendar(changes)
+        Self.otherAppWritesSeriesAfterTheReset(graph) { ["location": ["displayName": "Room Z"], "locations": [["displayName": "Room Z"]]] }
+        let r = try await outlookTool(graph, Self.newEnd(), eventId: "ser-1", account: "series-length-x-relocated-meanwhile")
+        #expect(r.cards.count == 1 && r.queued.isEmpty, "cards \(r.cards.count) queued \(reasons(r.queued)); \(r.out)")
+        #expect(graph.seriesResets == 1 && Self.room(graph.event("ser-1")) == "Room Z",
+                "non-vacuity: the series was not reset and given another room: \(graph.event("ser-1") ?? [:])")
+        let moved = graph.event("ser-1-w1")
+        let start = Self.week(1).addingTimeInterval(2 * 3_600)
+        #expect(instant(moved?["start"]) == start && instant(moved?["end"]) == start.addingTimeInterval(Self.length),
+                "the moved occurrence lost its own time: \(moved ?? [:])")
+        #expect(moved?["subject"] as? String == "Moved", "the moved occurrence lost its own title: \(moved ?? [:])")
+        #expect(Self.room(moved) == "Room Z" && Self.rooms(moved) == ["Room Z"],
+                "the put-back wrote the room it read over the series' new one: \(moved ?? [:])")
+        let ownRoom = graph.event("ser-1-w2")
+        #expect(Self.room(ownRoom) == "Room 9" && Self.rooms(ownRoom) == ["Room 9"], "an occurrence's own room was not put back: \(ownRoom ?? [:])")
     }
 
     @Test("Outlook: the write's answer lost, the retry puts back what the first attempt kept on the operation")

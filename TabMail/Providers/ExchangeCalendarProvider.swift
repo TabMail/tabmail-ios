@@ -381,9 +381,10 @@ actor ExchangeCalendarProvider: CalendarProvider {
     ///    (`If-Match`; Graph's etag is series-wide and moves with any write anywhere in the series,
     ///    measured 2026-11-14), or on the read's when it found nothing to keep;
     /// 4. puts them back onto the series itself with the split's carry (`carry`, `putBack`), found
-    ///    by their place: each deleted one deleted again, each changed one written with its own
-    ///    values but the edit's fields, a moved one at its own start lasting the new length, its
-    ///    guests its own with the series' change applied.
+    ///    by their place: each deleted one deleted again, each changed one written with what it
+    ///    differed from the series in when read (`ownChanges`, #878) but the edit's fields, a moved
+    ///    one at its own start lasting the new length, guests of its own with the series' change
+    ///    applied; what it held as the series did follows the series as it is then.
     /// Whether the series' write was sent is kept in the record (`SeriesEditRecord.Write`): `sent`
     /// before the PATCH, `landed` once it is answered, `notSent` again when Graph answers this
     /// attempt's first send of it with a refusal. Once sent, a retry puts back the kept record,
@@ -613,7 +614,8 @@ actor ExchangeCalendarProvider: CalendarProvider {
     }
 
     /// The changed and deleted occurrences of the series `existing` that the whole-series `edit`
-    /// resets and `updateSeries` puts back, read and planned before anything is written: empty
+    /// resets and `updateSeries` puts back, each changed one holding only what it differs from
+    /// the series in (`ownChanges`), read and planned before anything is written: empty
     /// when `edit` is not a change of the series' length (`SplitCarry.lengthChange`) or the series
     /// has none. Planned against the series as the write will leave it (`plannedSeries`), so a
     /// move Graph can't take in order (`carryOrder`) is refused while nothing has changed. A timed
@@ -634,9 +636,12 @@ actor ExchangeCalendarProvider: CalendarProvider {
         var zone: TimeZone?
         var zoneRefusal: Error?
         do { zone = try Self.seriesTimeZone(existing, refusal: .lengthChange) } catch { zoneRefusal = error }
-        let exceptions = try await seriesExceptions(
+        let read = try await seriesExceptionsRead(
             seriesId: eventId, series: series, seriesZone: series.seriesZoneName, zone: zone,
             refusal: Self.lengthChangeUnreadable, unplaced: zoneRefusal)
+        // Each changed occurrence keeps only what it holds of its own (#878): a property it holds
+        // as the series does follows the series, as it is when the put-back runs.
+        let exceptions = read.exceptions.map { TailException(carried: $0.carried, raw: Self.ownChanges($0.raw, series: read.series)) }
         guard !exceptions.isEmpty else { return LengthChangeCapture() }
         if let zoneRefusal, exceptions.contains(where: Self.deletedOrMoved) { throw zoneRefusal }
         guard let plan = SplitCarry.plan(
@@ -878,7 +883,10 @@ actor ExchangeCalendarProvider: CalendarProvider {
         let exceptions: [TailException]
 
         /// The properties of the series and of each changed occurrence the capture keeps: what the
-        /// carry writes (`carriedJSON`, its guests and times) and what places and names it.
+        /// carry writes (`carriedJSON`, its guests and times) and what places and names it. A
+        /// changed occurrence holds only the written properties it differed from the series in
+        /// (`ownChanges`, #878); a record kept by an earlier build holds each whole, and is put
+        /// back whole.
         static let keptKeys = splitCopiedKeys.union(["id", "originalStart", "start", "end", "attendees", "type", "seriesMasterId"])
 
         /// The capture as `SeriesEditRecord.capture` keeps it.
@@ -1500,6 +1508,15 @@ actor ExchangeCalendarProvider: CalendarProvider {
         refusal: String = "the occurrences of this repeating event changed or deleted one by one can't be read, so it was not split",
         unplaced: Error? = nil
     ) async throws -> [TailException] {
+        try await seriesExceptionsRead(seriesId: seriesId, series: series, seriesZone: seriesZone, zone: zone, refusal: refusal, unplaced: unplaced).exceptions
+    }
+
+    /// `seriesExceptions`, with the series as the same read gave it (`series`: the master's JSON
+    /// beside its `exceptionOccurrences`, every property, as each exception is read), so what an
+    /// exception holds of its own can be told from what it holds as its series does (`ownChanges`).
+    private func seriesExceptionsRead(
+        seriesId: String, series: GCalEvent, seriesZone: String?, zone: TimeZone?, refusal: String, unplaced: Error?
+    ) async throws -> (series: [String: Any], exceptions: [TailException]) {
         let unreadable = CalendarProviderError.notSupported(refusal)
         let encodedId = try Self.encodedGraphPathSegment(seriesId, context: "Graph series master id")
         let expanded = try await request(path: "/events/\(encodedId)?$expand=exceptionOccurrences", timeZoneName: seriesZone)
@@ -1517,7 +1534,9 @@ actor ExchangeCalendarProvider: CalendarProvider {
             guard let place = Self.deletedPlace(date: date, series: series, zone: zone) else { throw unplaced ?? unreadable }
             found.append(TailException(carried: .deleted(place: place), raw: [:]))
         }
-        return found
+        var master = expandedJSON
+        master["exceptionOccurrences"] = nil
+        return (master, found)
     }
 
     /// Outlook's deleted occurrences: the series' `cancelledOccurrences`, each named by its date in
@@ -1786,15 +1805,20 @@ actor ExchangeCalendarProvider: CalendarProvider {
 
     /// The PATCH a carry writes for the changed occurrence `change`: its own values of the fields
     /// the edit did not set (`carriedJSON`), its own guests with the series' difference applied,
-    /// and its own times labelled in the series' zone (#747).
+    /// and its own times labelled in the series' zone (#747). What the occurrence's JSON does not
+    /// hold is not written: a put-back's capture leaves out what it held as its series did
+    /// (`ownChanges`, guests included), and those follow the series. A split's read holds every
+    /// property, guests included, so its carry writes the occurrence whole.
     private func carriedWrite(
         _ change: SplitCarry.Change, exceptions: [TailException], fields: Set<SplitCarry.Field>,
         difference: AttendeeChange?, series: GCalEvent, seriesZone: String?
     ) -> [String: Any] {
         let own = exceptions.first { $0.raw["id"] as? String == change.exception.id }?.raw ?? [:]
         var json = Self.carriedJSON(own, fields: change.whole ? [] : fields)
-        let held = own["attendees"] as? [[String: Any]] ?? []
-        json["attendees"] = change.whole ? held : difference.map { Self.appliedAttendeesJSON($0, to: held) } ?? held
+        if own["attendees"] != nil {
+            let held = own["attendees"] as? [[String: Any]] ?? []
+            json["attendees"] = change.whole ? held : difference.map { Self.appliedAttendeesJSON($0, to: held) } ?? held
+        }
         if let start = change.start, let end = change.end {
             var times = GCalEventInput()
             times.startDate = start.date
@@ -1958,6 +1982,9 @@ actor ExchangeCalendarProvider: CalendarProvider {
             guard let instance = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return .left }
             switch instance["type"] as? String {
             case "occurrence":
+                // Nothing of its own to write (it differed from the series only in what the
+                // series' write gave it, or what the edit sets): the reset left it as it should be.
+                guard !json.isEmpty else { return .restored }
                 guard let etag = instance["@odata.etag"] as? String, !etag.isEmpty else { return .left }
                 do {
                     _ = try await request(path: "/events/\(encoded)", method: "PATCH", body: body, headers: ["If-Match": etag])
@@ -2271,6 +2298,48 @@ actor ExchangeCalendarProvider: CalendarProvider {
             }
         }
         return exception.filter { splitCopiedKeys.contains($0.key) && !set.contains($0.key) }
+    }
+
+    /// The changed occurrence `exception` without the properties the put-back writes
+    /// (`carriedJSON`'s, and its guests) that it holds as its series `series` does, read together
+    /// (#878): those follow the series, as it is when the put-back runs, so a change made to the
+    /// series in between (a rename in another app) stays on the occurrence. What it differs in
+    /// stays, and its times and what places and names it are never removed (they make it an
+    /// exception). A property the series does not hold is kept: only a value shown the same is
+    /// left out. The place (`location`, `locations`) goes as one, as Graph writes it (a written
+    /// `location` replaces `locations`). Guests are compared by what a write can set (address in
+    /// any letter case, name, type): their answers are read-only, so they are not restored either
+    /// way. Everything else is compared as its JSON.
+    /// Only `updateSeries`' capture leaves properties out: a split's new part is a new series,
+    /// with nothing of its own to follow, so its carry writes each changed occurrence whole.
+    nonisolated static func ownChanges(_ exception: [String: Any], series: [String: Any]) -> [String: Any] {
+        func canonical(_ value: Any) -> String? {
+            (try? JSONSerialization.data(withJSONObject: [value], options: [.sortedKeys])).flatMap { String(data: $0, encoding: .utf8) }
+        }
+        func guests(_ value: Any) -> [String]? {
+            guard let list = value as? [[String: Any]] else { return nil }
+            return list.map { guest in
+                let address = guest["emailAddress"] as? [String: Any]
+                return canonical([(address?["address"] as? String ?? "").lowercased(), address?["name"] ?? NSNull(), guest["type"] ?? NSNull()])
+                    ?? ""
+            }.sorted()
+        }
+        func same(_ key: String) -> Bool {
+            guard let own = exception[key], let held = series[key] else { return false }
+            if key == "attendees" {
+                guard let a = guests(own), let b = guests(held) else { return false }
+                return a == b
+            }
+            guard let a = canonical(own), let b = canonical(held) else { return false }
+            return a == b
+        }
+        let places = ["location", "locations"]
+        let groups = [places, ["attendees"]] + splitCopiedKeys.subtracting(places + ["isAllDay"]).sorted().map { [$0] }
+        var own = exception
+        for group in groups where group.allSatisfy(same) {
+            for key in group { own[key] = nil }
+        }
+        return own
     }
 
     /// The path, under `baseURL`, of a Graph `@odata.nextLink`. A link to anywhere else is

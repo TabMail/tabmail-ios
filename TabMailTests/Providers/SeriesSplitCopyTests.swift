@@ -1265,6 +1265,40 @@ struct ExchangeSplitCarryTests {
         #expect(!r.graph.patches("ser-1").isEmpty, "the series was not capped: \(r.http.servedCallSequence())")
     }
 
+    /// **INVARIANT (#878).** *A split's carry writes a changed occurrence WHOLE:* every property it
+    /// holds that the organizer can write, those it holds as the series does included, and its
+    /// guests, but the fields the edit sets. The new part is a new series with nothing of the old
+    /// one to follow, so only the put-back of an edit of every occurrence onto the series itself
+    /// leaves out what an occurrence holds as its series does (`ownChanges`).
+    @Test("a split's carry writes a changed occurrence whole, each property it holds as the series does included (#878)")
+    func splitCarryWritesTheOccurrenceWhole() async throws {
+        let series = GraphSplitFixture.series(range: GraphSplitFixture.noEnd)
+        let shared = [
+            "body", "importance", "sensitivity", "showAs", "categories", "isReminderOn", "reminderMinutesBeforeStart",
+            "responseRequested", "allowNewTimeProposals", "hideAttendees", "attendees",
+        ]
+        let changed = Self.exception(2) { e in
+            for key in shared { e[key] = series[key] }
+            e["location"] = ["displayName": "Room 9"]
+            e["locations"] = [["displayName": "Room 9"]]
+        }
+        // Non-vacuity: the occurrence holds every one of them as the series does.
+        for key in shared {
+            #expect(series[key] != nil && canonical(changed[key]) == canonical(series[key]), "\(key): the series holds \(canonical(series[key]))")
+        }
+        let r = try await split(exceptions: [changed], parts: [2, 3], patch: Self.rename)
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error)); \(r.http.servedCallSequence())")
+        let sent = r.graph.patches("created-1-w2")
+        #expect(sent.count == 1, "the carry's writes: \(sent)")
+        guard sent.count == 1 else { return }
+        for key in shared {
+            #expect(canonical(sent[0][key]) == canonical(series[key]), "\(key) was not carried: \(sent[0])")
+        }
+        #expect(Self.displayName(sent[0]["location"]) == "Room 9", "the room was not carried: \(sent[0])")
+        #expect(sent[0]["subject"] == nil, "the carry wrote the title the edit sets: \(sent[0])")
+    }
+
     @Test("a changed later occurrence carried onto the new part keeps its own file, before the cap; a retry after a failed copy adds it once")
     func carriedOccurrenceKeepsItsOwnFile() async throws {
         let minutes = Data("Minutes of week 2\n".utf8)
