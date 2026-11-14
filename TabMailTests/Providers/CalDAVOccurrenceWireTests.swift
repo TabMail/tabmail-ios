@@ -639,6 +639,8 @@ struct CalDAVOccurrenceWireTests {
                 let part = store.recordedPuts().map(\.path).first { $0 != W.seriesPath }
                 let partICS = part.flatMap { store.storedICS(path: $0) } ?? ""
                 #expect(partICS.contains(try frame.line("DTSTART", cut)), "\(label): the new part does not start at the cut: \(partICS)")
+                // It lasts what the series does, its end written in the frame its start is read in.
+                #expect(partICS.contains(try frame.line("DTEND", cut.addingTimeInterval(length))), "\(label): the new part does not end a length after the cut: \(partICS)")
             }
         }
     }

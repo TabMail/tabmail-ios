@@ -233,6 +233,15 @@ of the resource, which holds every occurrence (irreversible wire operation #5, n
   (`GCalEvent.eventZoneName`), and `GCalEvent.seriesZoneName` falls back to it when the range names no
   zone. Open: CalDAV's split keeps such an override at its old RECURRENCE-ID. Memory 142, ninth
   amendment.
+  **Amended again 2026-11-13 (#563), closing that open sentence:** CalDAV's split
+  (`CalDAVEventCopies.seriesSplitResources`, `carrySlots`) decides a kept or reset-named override
+  with the same `SplitCarry.partition`/`carryPlan` before any PUT, rewrites its `RECURRENCE-ID` to the
+  slot in the series' `DTSTART` form, refuses X1/X2 with the same constants, and drops a reset's named
+  override with no slot. A new rule resets the later changed occurrences, so none stays off the new
+  rule (an unreleased #610 regression on main). Test: `CalDAVSplitCarrySlotTests`, against an RFC 5545
+  weekly oracle. A floating value is now written in the zone it is read in (the operation's,
+  `zones.floating`), and the slot reads the new part's time of day in the series' zone, not UTC.
+  Memory 142, tenth amendment.
 - The series id with a moved occurrence's new time edits that occurrence in place, and with its old
   place is not found, the same as on Google, whose resolver finds no instance there.
 - A retry after a lost response is reported not found, with nothing written, when the first attempt

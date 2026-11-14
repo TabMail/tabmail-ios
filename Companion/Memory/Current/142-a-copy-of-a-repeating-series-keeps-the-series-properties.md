@@ -740,3 +740,33 @@ refused with no POST), `resetCarriesOntoTheNewPartsOccurrences`, `unplacedMoveRe
 fixed here): CalDAV has the same class. `CalDAVEventCopies.seriesSplitResources` keeps a kept or reset-named
 override with its old RECURRENCE-ID on a shifted or reshaped new part (a silent orphaned override rather than
 a failure after the create) and has no X1/X2.
+
+**Amendment (2026-11-13, #563, tenth): CalDAV's split places its carried overrides through the same plan; a rule
+change no longer leaves a later changed occurrence off the new rule.** Closes the ninth amendment's OPEN sentence
+(kept as written above). `CalDAVEventCopies.seriesSplitResources` now sets aside, before building the new part,
+each override placed at or after the cut that is kept (shown before the occurrence named) or is a reset's named
+one, and decides them with `SplitCarry.partition` and `SplitCarry.carryPlan` (`carrySlots`: the stored overrides,
+the series and the new part read as the neutral model, the series zone `seriesStartZone ?? zones.floating`),
+before any PUT. X1 and X2 refuse with the same constants as Google and Outlook; a reset's named override with no
+slot is dropped (R). Each set-aside override gets its `RECURRENCE-ID` rewritten to its slot in the series'
+`DTSTART` form (`formatLike`) and is appended to the new part (`appendingVEvents`); a carried override in carry
+mode stays at its own place, which the new part's same pattern has. Also found and fixed (owner-visible on main,
+unreleased): #610 (4ea4cd12, 2026-11-10, in no tag; v1.11.3 built the new part fresh) kept every override at or
+after the cut unchanged when the edit set a new rule, so a later changed occurrence off the new rule stayed as a
+one-off TabMail's listing still showed (`CalDAVOccurrences.occurrenceRows` shows each override at its own time).
+A new rule is a reset, so those overrides are dropped (already so since this PR's rebuild of the carry; the test
+fails on main 28ed733b and pins it). No cleanup is built for resources written by main in
+between (owner: no cleanup for old data). Tests, `CalDAVSplitCarrySlotTests` (wire level, an RFC 5545 weekly
+oracle `isOccurrence` independent of the provider's reader): `carriedOverridesLandOrRefuseBeforeThePut` (the
+same matrix as Google and Outlook: every override of the new part names an occurrence of it, or the split is
+refused with no PUT), `ruleChangeDropsALaterChangedOccurrenceOffTheNewRule` (#610: weekly MO,WE,FR, a later
+renamed Wednesday, a rule change to MO), `isOccurrenceOracle`.
+Two more found while making this green. (a) `formatLike` wrote a floating value in the DEVICE zone while
+`parseICSDateTime` reads it in `zones.floating` (the operation's zone, `readingFloating(in:)`, added by this PR's
+rebuild): a split of a floating series queued in another zone wrote the new part's `DTEND` a zone offset away from its
+`DTSTART` (before it, for a western device and an eastern zone). It now writes in `zones.floating`; pinned by
+`CalDAVOccurrenceWireTests.splitIsAtThePlaceInEveryFrame`, which now also checks the new part's `DTEND` in every frame.
+(b) `carrySlots` named its times' zone UTC, so `SplitCarry.slot` read the new part's time of day in UTC and a kept
+override placed across a change of offset landed an hour off its occurrence; its times now name the series' zone, the
+new part its own `DTSTART` zone (`seriesStartZone`, else the series'). Test
+`keptOverrideAcrossAnOffsetChangeLandsInTheSeriesZone` (New York, across the 2099 daylight-time start).
