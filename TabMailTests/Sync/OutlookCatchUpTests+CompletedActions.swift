@@ -142,6 +142,73 @@ extension OutlookCatchUpTests {
         }
     }
 
+    /// The completion log's retention and the over-age bound are one constant.
+    /// Another action completes while the read is in flight, late enough that a
+    /// shorter retention would have dropped the user's entry. Just past the
+    /// retention the read is over-age, so no flag update applies; just inside
+    /// it, the entry is still in the log, so the user's flag wins. Either way the
+    /// user's flag stays.
+    @Test("26d: an entry the log may have dropped is never needed, and one it still needs is never dropped",
+          arguments: [120.0, -60.0])
+    func retentionAndOverAgeAreOneBound(offset: TimeInterval) async throws {
+        try await Self.applyWorld { w, engine in
+            let readStartedAt = Date()
+            let retention = SyncConfig.catchUpCompletionLogRetentionSeconds
+            try Self.completeAction(w, ["u"], at: readStartedAt.addingTimeInterval(1))
+            // Another action, just before the apply: a shorter retention would
+            // drop the user's entry here.
+            try Self.completeAction(w, ["x"], at: readStartedAt.addingTimeInterval(retention + offset - 1))
+            let now = readStartedAt.addingTimeInterval(retention + offset)
+
+            let outcome = await Self.apply(w, engine, Self.staleResult(w), readStartedAt: readStartedAt, now: now)
+
+            guard case .applied = outcome else { Issue.record("not applied: \(outcome)"); return }
+            let overAge = offset >= 0
+            #expect(try w.row("u", in: w.archive)?.isFlagged == true, "the read overwrote the user's newer flag")
+            #expect(try w.row("o", in: w.archive)?.isRead == !overAge,
+                    overAge ? "an over-age read applied a flag update" : "a read inside the retention applied no flag update")
+            #expect(try w.row("g", in: w.archive) == nil, "the removal did not apply")
+        }
+    }
+
+    /// 26a through the queue: the user's flag is queued before the read began and
+    /// completes after it (its request is answered late). What counts is when
+    /// the action completed, not when it was queued, so the flag wins.
+    @Test("26a: a flag queued before the read began and completed after it wins over the read")
+    func queuedBeforeReadCompletedAfterWins() async throws {
+        let c = Clock()
+        try await Self.withWorld(seeds: [Self.seed("u", in: Self.archive, at: c.daysAgo(3))]) { w, engine in
+            try w.insertRow("u", in: w.archive, date: c.daysAgo(3))
+            try await w.baselineAll()
+            await AccountManager.shared.registerProviderForTesting(accountId: w.accountId, provider: w.provider)
+            let wall = OSAllocatedUnfairLock(initialState: Date())
+            do {
+                try await Self.withWallClock(wall) {
+                    w.server.holdPatch(providerMessageId: "u", forSeconds: 0.5)
+                    await AccountManager.shared.markFlagged([try #require(try w.row("u", in: w.archive))], flagged: true)
+                    let readStartedAt = wall.withLock { $0 = $0.addingTimeInterval(1); return $0 }
+                    wall.withLock { $0 = $0.addingTimeInterval(1) }
+                    try await Self.drainQueue(w)
+                    #expect(w.server.snapshot(providerMessageId: "u")?.isFlagged == true, "precondition: the flag landed")
+                    // The shared 30 s protection runs out.
+                    await AccountManager.shared.clearRecentlyCompletedForTesting()
+                    wall.withLock { $0 = $0.addingTimeInterval(SyncConfig.recentlyCompletedTTLSeconds + 1) }
+
+                    var stale = CatchUpFolderResult(folderId: w.folderId(w.archive), epoch: nil)
+                    stale.flagUpdates = [CatchUpFlagUpdate(messageId: "u", isRead: false, isFlagged: false)]
+                    stale.newState = try w.folder(w.archive).catchUpState
+                    _ = await engine.applyCatchUpResult(stale, windowMode: .date, readStartedAt: readStartedAt)
+
+                    #expect(try w.row("u", in: w.archive)?.isFlagged == true, "a read that began before the flag completed overwrote it")
+                }
+            } catch {
+                await AccountManager.shared.unregisterProviderForTesting(accountId: w.accountId)
+                throw error
+            }
+            await AccountManager.shared.unregisterProviderForTesting(accountId: w.accountId)
+        }
+    }
+
     /// 26e, the whole cycle: the user's flag completes while the slice's read is
     /// in flight (after the page that carries the message is served), so the
     /// page holds the state from before it. The read began before the provider
@@ -175,6 +242,37 @@ extension OutlookCatchUpTests {
 
             #expect(try w.row("u", in: w.archive)?.isFlagged == true, "the slice's older value overwrote the user's flag")
             #expect(try w.row("o", in: w.archive)?.isRead == true, "precondition: the slice healed another row")
+        }
+    }
+
+    /// 26e with the slice's own clock far from the wall clock: the read's start
+    /// is taken on the wall clock the completions are recorded on, never on the
+    /// slice's budget clock, so the user's flag still stays.
+    @Test("26f: the read's start is on the wall clock, not the slice's clock")
+    func readStartIsOnTheWallClock() async throws {
+        let c = Clock()
+        try await Self.withWorld(seeds: [Self.seed("u", in: Self.archive, at: c.daysAgo(3))]) { w, engine in
+            try w.insertRow("u", in: w.archive, date: c.daysAgo(3))
+            try await w.baselineAll()
+            let wall = OSAllocatedUnfairLock(initialState: Date())
+            let key = MessageIdentity.headerId(accountId: w.accountId, folderPath: w.archive, messageId: "u")
+            let (pool, server, accountId) = (w.pool, w.server, w.accountId)
+            server.afterCatchUpListingPage { serial in
+                guard serial == 1 else { return }
+                try? pool.write { db in try db.execute(sql: "UPDATE messageHeader SET isFlagged = 1 WHERE id = ?", arguments: [key]) }
+                server.setFlagFromOtherClient(providerMessageId: "u", isFlagged: true)
+                wall.withLock { $0 = $0.addingTimeInterval(5) }
+                AccountManager.shared.recordActionCompleted(accountId: accountId, messageKeys: ["u"])
+            }
+            // The slice's clock runs two hours ahead of the wall clock.
+            let sliceClock: @Sendable () -> Date = { wall.withLock { $0 }.addingTimeInterval(7_200) }
+
+            let listed = try await Self.withWallClock(wall) {
+                try await Self.untilListed(w, engine, w.archive, context: Self.unlimited(at: sliceClock))
+            }
+            #expect(listed != nil, "the listing did not complete")
+
+            #expect(try w.row("u", in: w.archive)?.isFlagged == true, "the slice's older value overwrote the user's flag")
         }
     }
 
