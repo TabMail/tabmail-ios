@@ -157,3 +157,18 @@ fails, and opening one of its files returns its bytes. `AttachedEmailFilesLister
 gets a lister (`AttachmentListView.filesLister`), and `BodyAddressGateTests` that the list is refused
 mid-move. `GraphPageLinkTests`
 pins `isGraphPageLink` both ways.
+
+## Amendment (2026-11-14, #863): an exception holds COPIES of its series' attachments
+
+Measured live on the Microsoft 365 work test account (2026-11-14): a plain occurrence lists its series'
+attachments read through (ids of its own; the series' sizes, `lastModifiedDateTime` and content). An
+occurrence changed on its own (an exception) holds its own COPY of each series attachment, made when it
+became one: same name, kind and content (a file's `contentBytes` sha256 equal; a link's beta fields; an
+item's `$expand` fields), but a new id, a larger listed size (+16 for a file and a link, more for an item)
+and a new `lastModifiedDateTime`. A series attachment added later does not reach an existing exception; a
+copy removed or replaced on it stays removed or replaced. A whole-series time or pattern reset discards an
+exception's whole set, and it reads the series' again. Content is comparable on v1.0 for a file
+(`contentBytes` or `$value`), an attached message (`$value` MIME) and an attached event (`$expand`
+fields; its `$value` has a random `UID` per read); a link only on beta. So attachments are compared by
+name, kind and content, never id, size or timestamp: `AttachmentPairing.unpaired` (memory 142, #863
+amendment).

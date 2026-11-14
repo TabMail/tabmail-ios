@@ -250,6 +250,12 @@ These tests read what each provider sent, or what the fake server ends up holdin
   - new notes on an online series keeping its join section as stored;
   - a split whose new start can't be dated refused before the series is capped;
   - the stored recurrence restored exactly when the create fails.
+- A split pairs files by name, kind and content, one to one (`AttachmentPairingTests`, and in
+  `ExchangeSplitCarryTests`, #863): a carried occurrence's same-name replacement of a series file is
+  carried (and once after a failed write and a retry); its copies of the series' files are not
+  written again; an extra file is written once; two equal files against the series' one carry one.
+  `FakeGraphCalendar` models Outlook's measured copies: an exception holds its own copies of the
+  series' attachments, a plain occurrence reads the series' through.
 
 ## Google attendee edits — the others stay as stored
 

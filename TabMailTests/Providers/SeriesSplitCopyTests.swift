@@ -597,10 +597,12 @@ struct ExchangeSplitCarryTests {
         GraphFixture.onDevice(days: 7 * weeks + plusDays, hour: hour)
     }
 
-    /// An exception of `ser-1` at week `place`, now at `at`.
+    /// An exception of `ser-1` at week `place`, now at `at`. It holds its own copies of the series'
+    /// attachments as they are when the run first reads or writes its own (`FakeGraphCalendar`).
     private static func exception(_ place: Int, at: Date? = nil, edit: (inout [String: Any]) -> Void = { _ in }) -> [String: Any] {
         var e = GraphFixture.event(id: "ser-1-occ-\(place)", start: at ?? week(place), online: false, seriesMasterId: "ser-1")
         e["originalStart"] = GraphFixture.rfc3339(week(place))
+        e["type"] = "exception"
         edit(&e)
         return e
     }
@@ -1394,6 +1396,120 @@ struct ExchangeSplitCarryTests {
         #expect(held.map(\.name) == ["minutes.txt"] && held.first?.bytes == minutes,
                 "the carried occurrence holds \(held.map(\.name))")
         #expect(!r.graph.patches("ser-1").isEmpty, "the retry did not cap: \(writes)")
+    }
+
+    /// The files an event holds, as name and bytes, in a stable order (a multiset).
+    private static func fileSet(_ graph: FakeGraphCalendar, _ id: String) -> [String] {
+        graph.files(of: id).map { "\($0.name):\($0.bytes.base64EncodedString())" }.sorted()
+    }
+
+    /// Whether every file of `inner` (name and bytes, counted) is among `outer`'s.
+    private static func holdsEvery(_ inner: [String], of outer: [String]) -> Bool {
+        var left = outer
+        for file in inner {
+            guard let index = left.firstIndex(of: file) else { return false }
+            left.remove(at: index)
+        }
+        return true
+    }
+
+    private static let agenda = Data("Agenda for the series\n".utf8)
+    private static let editedAgenda = Data("Agenda edited for week 2 only\n".utf8)
+
+    /// Splits from week 1, carrying week 2's changed occurrence, with the series holding
+    /// `agenda.pdf` before week 2 copies it (Outlook's exception copies, measured 2026-11-14);
+    /// `occurrence` then changes week 2's own files. `failCarriedCopy` refuses week 2's first
+    /// file write onto the new part once, so the first attempt stops before its cap.
+    private func splitCarryingFiles(
+        failCarriedCopy: Bool = false, occurrence: @escaping (FakeGraphCalendar) -> Void
+    ) async throws -> Run {
+        try await split(exceptions: [Self.exception(2) { $0["location"] = ["displayName": "Room 9"] }],
+                        parts: [2, 3], patch: Self.rename) { graph, _ in
+            graph.attachFile("agenda.pdf", contentType: "application/pdf", bytes: Self.agenda, to: "ser-1")
+            occurrence(graph)
+            guard failCarriedCopy else { return }
+            let failed = Mutex(false)
+            graph.beforeWrite { method, id in
+                // The carry PATCHes week 2's new-part occurrence just before it copies its files.
+                guard method == "PATCH", id == "created-1-w2", !failed.withLock({ $0 }) else { return }
+                failed.withLock { $0 = true }
+                graph.failNext("ATTACH", with: 400)
+            }
+        }
+    }
+
+    /// The file writes onto week 2's occurrence on the new part.
+    private static func carriedFileWrites(_ r: Run) -> Int {
+        r.http.recordedCalls().filter { $0.method == "POST" && $0.url.contains("/events/created-1-w2/attachments") }.count
+    }
+
+    @Test("a carried occurrence whose series file was replaced by a same-name file with other bytes keeps the replacement (#863)")
+    func carriedOccurrenceKeepsASameNameReplacement() async throws {
+        let r = try await splitCarryingFiles { graph in
+            graph.removeAttachment(named: "agenda.pdf", from: "ser-1-occ-2")
+            graph.attachFile("agenda.pdf", contentType: "application/pdf", bytes: Self.editedAgenda, to: "ser-1-occ-2")
+        }
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error)); \(r.http.servedCallSequence())")
+        let own = Self.fileSet(r.graph, "ser-1-occ-2")
+        #expect(own == ["agenda.pdf:\(Self.editedAgenda.base64EncodedString())"], "non-vacuity: week 2 holds \(own)")
+        let carried = Self.fileSet(r.graph, "created-1-w2")
+        #expect(Self.holdsEvery(own, of: carried), "the carried occurrence lost week 2's own file: it holds \(carried)")
+        #expect(!r.graph.patches("ser-1").isEmpty, "the series was not capped: \(r.http.servedCallSequence())")
+    }
+
+    @Test("a carried occurrence holding only its copies of the series' files gets no file written: the new part's copies are already on it (#863)")
+    func carriedOccurrenceWithOnlyCopiesWritesNoFile() async throws {
+        let r = try await splitCarryingFiles { graph in
+            #expect(graph.files(of: "ser-1-occ-2").map(\.bytes) == [Self.agenda], "non-vacuity: week 2 holds no copy")
+        }
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error)); \(r.http.servedCallSequence())")
+        #expect(Self.carriedFileWrites(r) == 0, "a copy of a series file was written again: \(r.http.servedCallSequence())")
+        #expect(Self.fileSet(r.graph, "created-1-w2") == Self.fileSet(r.graph, "ser-1-occ-2"),
+                "the carried occurrence holds \(Self.fileSet(r.graph, "created-1-w2"))")
+    }
+
+    @Test("a carried occurrence's extra file is carried once, its copy of the series file not again (#863)")
+    func carriedOccurrenceExtraFileIsCarried() async throws {
+        let minutes = Data("Minutes of week 2\n".utf8)
+        let r = try await splitCarryingFiles { graph in
+            graph.attachFile("minutes.txt", contentType: "text/plain", bytes: minutes, to: "ser-1-occ-2")
+        }
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error)); \(r.http.servedCallSequence())")
+        #expect(Self.carriedFileWrites(r) == 1, "week 2 needed one file written: \(r.http.servedCallSequence())")
+        #expect(Self.fileSet(r.graph, "created-1-w2") == Self.fileSet(r.graph, "ser-1-occ-2"),
+                "the carried occurrence holds \(Self.fileSet(r.graph, "created-1-w2")), week 2 \(Self.fileSet(r.graph, "ser-1-occ-2"))")
+    }
+
+    @Test("a series with one agenda.pdf and a carried occurrence with two of the same bytes: one is the copy, the other is carried (#863)")
+    func carriedOccurrenceDuplicateIsCarriedOnce() async throws {
+        let r = try await splitCarryingFiles { graph in
+            graph.attachFile("agenda.pdf", contentType: "application/pdf", bytes: Self.agenda, to: "ser-1-occ-2")
+        }
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error)); \(r.http.servedCallSequence())")
+        #expect(Self.fileSet(r.graph, "ser-1-occ-2").count == 2, "non-vacuity: week 2 holds \(Self.fileSet(r.graph, "ser-1-occ-2"))")
+        #expect(Self.carriedFileWrites(r) == 1, "week 2 needed one file written: \(r.http.servedCallSequence())")
+        #expect(Self.fileSet(r.graph, "created-1-w2") == Self.fileSet(r.graph, "ser-1-occ-2"),
+                "the carried occurrence holds \(Self.fileSet(r.graph, "created-1-w2"))")
+    }
+
+    @Test("a retry after the carried occurrence's file write failed adds its same-name replacement once, then caps (#863)")
+    func retryCarriesASameNameReplacementOnce() async throws {
+        let r = try await splitCarryingFiles(failCarriedCopy: true) { graph in
+            graph.removeAttachment(named: "agenda.pdf", from: "ser-1-occ-2")
+            graph.attachFile("agenda.pdf", contentType: "application/pdf", bytes: Self.editedAgenda, to: "ser-1-occ-2")
+        }
+        defer { r.http.close() }
+        #expect(r.error != nil && r.graph.patches("ser-1").isEmpty, "non-vacuity: the first attempt capped: \(r.http.servedCallSequence())")
+        let record = try #require(r.records.records.first, "no record was kept")
+        try await r.provider.finishSplit(record: record, zone: .current, guests: nil)
+        let carried = Self.fileSet(r.graph, "created-1-w2")
+        let replacement = "agenda.pdf:\(Self.editedAgenda.base64EncodedString())"
+        #expect(carried.filter { $0 == replacement }.count == 1, "the replacement is not held once: \(carried)")
+        #expect(!r.graph.patches("ser-1").isEmpty, "the retry did not cap: \(r.http.servedCallSequence())")
     }
 
     @Test("a retry of a split whose SERIES holds an attached Outlook item finishes: the cap is written, and the item stays on the old part only (#854)",

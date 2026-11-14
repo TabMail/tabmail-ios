@@ -824,3 +824,30 @@ change, that is the series' own change). End of the new part (T-r3-1, T-r3-2): `
 (Outlook: COUNT=1 refuses before the POST, COUNT=2 lands) and `floatingKeptAtTheLastPlaceUnderUntilRefusesBeforeThePut`
 (CalDAV: a floating series' wall-clock UNTIL, a day turn, refused before any PUT) kill the COUNT and floating-UNTIL
 mutants of `SplitCarry.endsAtOrAfter`.
+
+**Amendment (2026-11-14, #863): a split pairs files by name, kind and CONTENT, one to one (`AttachmentPairing.unpaired`).**
+Supersedes "pairing by name makes a retry add only what is missing" in the second amendment and "A file the new part
+already holds by name (one to one, as a draft save pairs)" in the first (both kept as written). Measured on a work account
+(2026-11-14): an Outlook exception holds its own COPY of each of its series' attachments, made when it became one, with the
+same name, kind and bytes (sha256 equal) but a new id, a larger listed size (+16 for a file) and a new `lastModifiedDateTime`;
+a plain occurrence lists the series' attachments read through; a series attachment added later does not reach an exception.
+So the split's carry pairs by what a file IS. The bug (#863): `copy` paired a carried occurrence's files with what its
+new-part instance already holds (the copies of the series' files the new part got first) by NAME only, so a same-name
+replacement of a series file on that occurrence (an edited `agenda.pdf`) counted as a copy, was not written, and was lost
+once the cap took the occurrence off the old part. Fix at the core: ONE shared pairing function,
+`AttachmentPairing.unpaired(_:against:name:kind:content:)` (`TabMail/Providers/AttachmentPairing.swift`, generic, no
+provider type in it): the members of `attachments` no member of `reference` pairs with, in order; a multiset match keyed by
+name + kind + content, each reference member pairing with at most one; `content` asked only of attachments whose name and
+kind the other side shares, at most once each. Content of a file = `AttachmentPairing.contentDigest` (SHA-256 of its bytes,
+hex), never id, size or timestamps. `ExchangeCalendarProvider.copy` (the series onto the new part AND a carried occurrence
+onto its new-part instance; first attempt and `finishSplit` alike) writes exactly the unpaired files: a copy is not written
+again, an extra file or a second equal file is written once, a retry writes only what is still missing. Kind is the Graph
+`@odata.type` (`attachmentKind`). A file whose name and kind meet a partner is read once more (its bytes) for the digest;
+one with no possible partner is not. #718 reuses this function for the exception's own files against its series'.
+Not changed (separate gap, reported, not fixed here): a series copy the user REMOVED from a carried occurrence (or replaced)
+still shows on its new-part instance, which got its own copy of the new part's files when the carry made it an exception.
+Tests (`ExchangeSplitCarryTests`): `carriedOccurrenceKeepsASameNameReplacement` (red first on the name pairing),
+`carriedOccurrenceWithOnlyCopiesWritesNoFile`, `carriedOccurrenceExtraFileIsCarried`, `carriedOccurrenceDuplicateIsCarriedOnce`,
+`retryCarriesASameNameReplacementOnce`; `AttachmentPairingTests` (the function alone). `FakeGraphCalendar` now models the
+measured copies: read-through on a plain occurrence, copies on the first PATCH or attachment write (or, for an occurrence
+seeded with `type` `exception`, the first read), `removeAttachment`.
