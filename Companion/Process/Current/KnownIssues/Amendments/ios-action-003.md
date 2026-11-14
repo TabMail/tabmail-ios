@@ -124,11 +124,17 @@ throw and stop `AppDatabase.init`), and for every account that holds a change bo
 - a move (archive, delete, move) or a read/flag change (read, unread, flag, unflag): its ids go on the
   re-read list (`Folder.changeState.recheck`) of the folder it was queued on and, for a move, of its
   destination too (Outlook re-reads folder by folder; Gmail places a re-read message by its labels in
-  every folder), but ONLY of a folder whose change state is tracked. An untracked folder gets nothing:
-  the full sync window-lists every untracked syncable folder, and a folder outside the syncable set
-  (an Outlook custom, non-favourite folder) is listed when it is opened. An id put on such a folder's
-  list would never be read by a per-folder reader, would stick, and would take part of every pass's
-  re-read budget for good;
+  every folder), but ONLY of a folder the change reader reads: one in the syncable set
+  (`SyncEngine.isSyncable`, main roles and favourites, the folders `ChangeFolder.isSynced` marks),
+  tracked or not. Outlook reads every synced folder's list, also while that folder is still in its
+  baseline; Gmail reads every list. An untracked syncable folder is NOT left to the full sync: on Gmail
+  and Outlook its window listing's stale sweep is date-bounded, so an older message's optimistic row
+  would survive it (an old message archived just before the update would show in both the Inbox and
+  the Archive until the Archive's catch-up ran). A folder outside the syncable set (a custom,
+  non-favourite folder) gets nothing: a per-folder reader never reads its list, so an id there would
+  stick and take part of every pass's re-read budget for good. Such a folder is corrected when it is
+  opened, within that listing's window only; an older message's optimistic row there stays until the
+  user acts on it (accepted, below);
 - a draft delete arms its folder's catch-up (`markCatchUpLapse`, folder found by the recorded path),
   which loads the server draft back so the delete can be redone; its address is a draft resource
   (Gmail) and never goes on a list. Without this the server draft stayed on the server and other
@@ -156,6 +162,14 @@ server; the phone keeps showing L, which the server never got, until the message
 merge's missing label and answered-state reconciliation for stored rows is an older, separate gap in
 the change apply and is tracked on its own; once it is fixed, these kinds belong on the list.
 
+**Not corrected, accepted (2026-11-14): an older message in a folder outside the syncable set.** A
+retired move into (or out of) a custom, non-favourite folder lists nothing there, because no
+per-folder reader reads that folder's list. Opening the folder lists it, but its stale sweep is
+date-bounded on Gmail and Outlook, so the optimistic row of a message older than that window stays in
+that folder until the user acts on it; the synced side of the move is still read again. This predates
+#876 (the boundary's full sync never listed such a folder) and is recoverable by one ordinary gesture
+(move the message again).
+
 **Address.** The ids listed are the queue's own: the provider's id for the message in the folder the
 action was queued on. A move that drained re-addresses the queued rows after it to the destination id
 the server named (`MessageHeaderRekey.readdressQueuedOperations`), so a queued row names the message
@@ -176,6 +190,8 @@ by sync, but for that row the listed id is not one the server can answer for as 
 User-visible: after the update, an email whose queued action was cleared shows its server state again
 (for example, an email archived just before the update is back in the inbox). Tests:
 `ReleaseBoundaryRecheckTests` (Gmail archive and mark-read, Outlook move, kinds left out, draft delete,
-no-bookmark account untouched, unreadable kind or ids, a folder that is gone, an untracked folder, no
-duplicate ids, overflow, rollback on a throw);
+every kind read again, no-bookmark account untouched, unreadable kind or ids, an unknown kind alone,
+a folder that is gone, a draft delete whose Drafts folder is gone, an untracked synced folder read
+again, a folder outside the syncable set, no duplicate ids, overflow, rollback on a throw; Outlook
+read change end to end);
 `ChangeSeamFenceTests.retiredActionRecheckIsProviderBlind`.

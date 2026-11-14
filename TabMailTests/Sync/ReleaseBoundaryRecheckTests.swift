@@ -113,22 +113,31 @@ struct ReleaseBoundaryRecheckTests {
 
     // MARK: - Outlook
 
-    @Test("Outlook: a move cleared at the update lists the id in source and destination, and the next sync shows the server's state with no folder listed")
+    @Test("Outlook: a move and a mark-read cleared at the update are listed, and the next sync shows the server's state with no folder listed")
     func outlookRetiredMoveIsReadAgainInBothFolders() async throws {
-        try await Outlook.withWorld(seeds: [Outlook.seed("ob-move", in: Outlook.inbox, daysAgo: 1)]) { w in
+        try await Outlook.withWorld(seeds: [
+            Outlook.seed("ob-move", in: Outlook.inbox, daysAgo: 1),
+            Outlook.seed("ob-read", in: Outlook.inbox, daysAgo: 1),
+        ]) { w in
             try await w.foregroundPass()
             try await w.foregroundPass()
             #expect(try Self.tracking(w.pool, folderId: w.folderId(w.inbox)), "precondition: the Inbox is tracked")
             #expect(try Self.tracking(w.pool, folderId: w.folderId(w.archive)), "precondition: the Archive is tracked")
             let moved = try #require(try w.row("ob-move", in: w.inbox), "precondition: listed")
+            let read = try #require(try w.row("ob-read", in: w.inbox), "precondition: listed")
+            #expect(read.isRead == false, "precondition: unread on the server and here")
 
             // Unsent move: the row sits in the Archive under the Inbox id, which
             // is still the server's id for the message (in the Inbox).
             try Self.moveRowOptimistically(w.pool, headerId: moved.id, to: try w.folder(w.archive))
             try Self.queue(w.pool, .move, ids: ["ob-move"], accountId: w.accountId, from: w.inbox, to: w.archive)
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE messageHeader SET isRead = 1 WHERE id = ?", arguments: [read.id])
+            }
+            try Self.queue(w.pool, .markRead, ids: ["ob-read"], accountId: w.accountId, from: w.inbox)
 
             #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: Self.nextRelease()))
-            #expect(try w.recheck(w.inbox) == ["ob-move"], "the source lists the id")
+            #expect(try w.recheck(w.inbox) == ["ob-move", "ob-read"], "the source lists every retired id")
             #expect(try w.recheck(w.archive) == ["ob-move"], "the destination lists the id: Outlook reads folder by folder")
 
             let listingsBefore = Self.outlookListings(w)
@@ -136,6 +145,7 @@ struct ReleaseBoundaryRecheckTests {
 
             #expect(try w.row("ob-move", in: w.inbox) != nil, "the message is back in the Inbox, as on the server")
             #expect(try w.row("ob-move", in: w.archive) == nil, "and no longer shown in the Archive")
+            #expect(try w.row("ob-read", in: w.inbox)?.isRead == false, "the message shows unread again, as on the server")
             #expect(Self.outlookListings(w) == listingsBefore, "no folder listing")
             #expect(try w.recheck(w.inbox).isEmpty)
             #expect(try w.recheck(w.archive).isEmpty)
@@ -253,6 +263,25 @@ struct ReleaseBoundaryRecheckTests {
         }
     }
 
+    /// The kinds a re-read corrects: the source lists the id, and a move's
+    /// destination too; no catch-up is armed.
+    @Test("Every retired move and read/flag kind lists its ids in the source, and a move's in its destination",
+          arguments: [OperationType.archive, .delete, .move, .markRead, .markUnread, .markFlagged, .markUnflagged])
+    func kindsReadAgainAreListed(kind: OperationType) async throws {
+        try await Gmail.withWorld(seeds: []) { w in
+            try await Self.seedCatchUpStates(w.pool, accountId: w.accountId)
+            let isMove = [OperationType.archive, .delete, .move].contains(kind)
+            let destination = kind == .delete ? w.folder("TRASH") : w.allMail
+            try Self.queue(w.pool, kind, ids: ["k-1", "k-2"], accountId: w.accountId, from: w.inbox.path,
+                           to: isMove ? destination.path : nil)
+            #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: Self.nextRelease()))
+            #expect(try Self.recheck(w.pool, folderId: w.inbox.id) == ["k-1", "k-2"], "\(kind) lists its ids in the source")
+            #expect(try Self.recheck(w.pool, folderId: destination.id) == (isMove ? ["k-1", "k-2"] : []),
+                    "\(kind) lists its ids in a move's destination only")
+            #expect(try Self.armedFolderIds(w.pool, accountId: w.accountId).isEmpty)
+        }
+    }
+
     @Test("A retired draft delete arms its Drafts folder's catch-up and lists no id")
     func retiredDraftDeleteArmsTheDraftsCatchUp() async throws {
         try await Gmail.withWorld(seeds: []) { w in
@@ -263,6 +292,30 @@ struct ReleaseBoundaryRecheckTests {
             #expect(try Self.armedFolderIds(w.pool, accountId: w.accountId) == [w.drafts.id],
                     "the Drafts catch-up loads the server draft back")
             #expect(try Self.allRecheckIds(w.pool, accountId: w.accountId).isEmpty, "a draft resource id is never listed")
+        }
+        try await Gmail.withWorld(seeds: []) { w in
+            try await Self.seedCatchUpStates(w.pool, accountId: w.accountId)
+            try Self.queue(w.pool, .deleteDraft, ids: ["r-draft-gone"], accountId: w.accountId, from: "DRAFT_gone")
+            #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: Self.nextRelease()))
+            #expect(try Self.armedFolderIds(w.pool, accountId: w.accountId) == Set(w.folders.values.map(\.id)),
+                    "a draft delete whose folder is gone arms the whole account")
+            #expect(try Self.allRecheckIds(w.pool, accountId: w.accountId).isEmpty)
+        }
+    }
+
+    @Test("A retired row whose kind is unknown to this release, with readable ids, arms its folder's catch-up")
+    func unknownKindAloneArmsTheCatchUp() async throws {
+        try await Gmail.withWorld(seeds: []) { w in
+            try await Self.seedCatchUpStates(w.pool, accountId: w.accountId)
+            let row = PendingOperation(type: .markRead, messageIds: ["unknown-kind"], accountId: w.accountId, folderPath: w.inbox.path)
+            try await w.pool.write { db in
+                var op = row
+                try op.insert(db)
+                try db.execute(sql: "UPDATE pendingOperation SET type = 'kindFromAnOlderRelease' WHERE id = ?", arguments: [op.id])
+            }
+            #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: Self.nextRelease()))
+            #expect(try Self.armedFolderIds(w.pool, accountId: w.accountId) == [w.inbox.id])
+            #expect(try Self.allRecheckIds(w.pool, accountId: w.accountId).isEmpty)
         }
     }
 
@@ -332,8 +385,8 @@ struct ReleaseBoundaryRecheckTests {
         }
     }
 
-    @Test("Outlook: a retired move into a folder that is not tracked lists the id at its tracked source only")
-    func untrackedFolderGetsNothing() async throws {
+    @Test("Outlook: a retired move lists its id in a synced folder that is not tracked yet, and nothing in a folder outside the syncable set")
+    func listedOnlyWhereTheReaderReads() async throws {
         try await Outlook.withWorld { w in
             let custom = Folder(name: "Projects", path: "fld-custom", role: .custom, accountId: w.accountId)
             try await w.pool.write { db in
@@ -342,11 +395,39 @@ struct ReleaseBoundaryRecheckTests {
                 try db.execute(sql: "UPDATE folder SET catchUpState = '{}' WHERE accountId = ?", arguments: [w.accountId])
             }
             try await Self.setTracking(w.pool, folderIds: [w.folderId(w.inbox)])
-            try Self.queue(w.pool, .move, ids: ["u-1"], accountId: w.accountId, from: w.inbox, to: custom.path)
+            #expect(try Self.tracking(w.pool, folderId: w.folderId(w.archive)) == false, "precondition: the Archive is not tracked")
+            try Self.queue(w.pool, .move, ids: ["u-custom"], accountId: w.accountId, from: w.inbox, to: custom.path)
+            try Self.queue(w.pool, .move, ids: ["u-archive"], accountId: w.accountId, from: w.inbox, to: w.archive)
             #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: Self.nextRelease()))
-            #expect(try w.recheck(w.inbox) == ["u-1"])
+            #expect(try w.recheck(w.inbox) == ["u-custom", "u-archive"])
+            #expect(try w.recheck(w.archive) == ["u-archive"], "the reader reads a synced folder's list, tracked or not")
             #expect(try w.recheck(custom.path).isEmpty, "a folder no reader reads never gets an id that would stick")
             #expect(try Self.armedFolderIds(w.pool, accountId: w.accountId).isEmpty)
+        }
+    }
+
+    /// The case the full sync cannot repair: its stale sweep is date-bounded on
+    /// Outlook, so the listing is set aside here (only the change read runs), as
+    /// it would miss an older message's row in a large folder.
+    @Test("Outlook: a retired move into a synced folder that is not tracked yet is corrected there by the change read alone")
+    func untrackedSyncedDestinationIsCorrectedByTheRead() async throws {
+        try await Outlook.withWorld(seeds: [Outlook.seed("ut-move", in: Outlook.inbox, daysAgo: 1)]) { w in
+            try w.insertRow("ut-move", in: w.inbox, date: Outlook.daysAgo(1))
+            try await w.baselineAll()
+            #expect(try w.account().lastHistoryId != nil, "precondition: the account holds a change bookmark")
+            try await Self.setTracking(w.pool, folderIds: [w.folderId(w.inbox)])
+            #expect(try Self.tracking(w.pool, folderId: w.folderId(w.archive)) == false, "precondition: the Archive is not tracked")
+            let moved = try #require(try w.row("ut-move", in: w.inbox), "precondition: held")
+
+            try Self.moveRowOptimistically(w.pool, headerId: moved.id, to: try w.folder(w.archive))
+            try Self.queue(w.pool, .move, ids: ["ut-move"], accountId: w.accountId, from: w.inbox, to: w.archive)
+            #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: Self.nextRelease()))
+
+            try await w.read()
+            #expect(try w.row("ut-move", in: w.inbox) != nil, "the message is back in the Inbox, as on the server")
+            #expect(try w.row("ut-move", in: w.archive) == nil, "and no longer shown in the untracked Archive")
+            #expect(try w.recheck(w.inbox).isEmpty)
+            #expect(try w.recheck(w.archive).isEmpty)
         }
     }
 

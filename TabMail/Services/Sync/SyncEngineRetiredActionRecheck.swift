@@ -25,14 +25,18 @@ import GRDB
 // is left alone):
 // - a move (archive, delete, move) or a read/flag change: its ids go on the
 //   re-read list (`FolderChangeState.recheck`) of the folder it was queued on
-//   and, for a move, of its destination, but only of a folder whose change state
-//   is TRACKED. The change reader reads those messages again and the apply
-//   writes what the server says (Gmail places a message by its labels in every
-//   folder; Outlook reads folder by folder, so a message the server holds
-//   elsewhere is a removal there). An untracked folder gets nothing: the full
-//   sync window-lists every untracked syncable folder, and a folder outside the
-//   syncable set is listed when it is opened; listing an id there would only
-//   stick, because a per-folder reader never reads that folder's list.
+//   and, for a move, of its destination, but only of a folder the change reader
+//   reads: one in the syncable set (`SyncEngine.isSyncable`, the folders
+//   `ChangeFolder.isSynced` marks), tracked or not. The reader reads those
+//   messages again and the apply writes what the server says (Gmail places a
+//   message by its labels in every folder; Outlook reads every synced folder's
+//   list, also during its baseline, so a message the server holds elsewhere is a
+//   removal there). The full sync's window listing is no substitute in an
+//   untracked folder: on Gmail and Outlook its stale sweep is date-bounded, so an
+//   older message's optimistic row would survive it.
+//   A folder outside the syncable set gets nothing: a per-folder reader never
+//   reads its list, so an id there would only stick. That folder is corrected
+//   when it is opened, within that listing's window (IOS-ACTION-003).
 // - a draft delete: its folder's catch-up is armed (`markCatchUpLapse`), which
 //   loads the server draft back. Its address is a draft resource, not a message
 //   id, so it never goes on a list.
@@ -77,8 +81,8 @@ extension SyncEngine {
     ]
 
     /// Inside the release boundary's transaction, BEFORE its delete: put the
-    /// retired actions' message ids on the re-read lists of the tracked folders
-    /// they named, or arm the catch-up where a re-read cannot name them.
+    /// retired actions' message ids on the re-read lists of the folders they
+    /// named that the change reader reads, or arm the catch-up where a re-read cannot name them.
     nonisolated static func recheckRetiredActions(db: Database) throws -> RetiredActionRecheckSummary {
         var summary = RetiredActionRecheckSummary()
         let bookmarked = Set(try rawStrings(db, "SELECT id FROM account WHERE lastHistoryId IS NOT NULL"))
@@ -91,10 +95,16 @@ extension SyncEngine {
             let key = "\(accountId)\u{1F}\(path)"
             if let cached = foldersByKey[key] { return cached }
             let row = try Row.fetchOne(
-                db, sql: "SELECT id, changeState FROM folder WHERE accountId = ? AND path = ?",
+                db, sql: "SELECT id, changeState, role, isFavorite FROM folder WHERE accountId = ? AND path = ?",
                 arguments: [accountId, path])
             let found = row.flatMap { row in
-                Self.rawString(row, "id").map { RetiredActionFolder(id: $0, changeState: Self.rawString(row, "changeState")) }
+                Self.rawString(row, "id").map { id in
+                    RetiredActionFolder(
+                        id: id, changeState: Self.rawString(row, "changeState"),
+                        readByChangeReader: Self.rawString(row, "role").flatMap(FolderRole.init(rawValue:)).map {
+                            Self.isSyncable(role: $0, isFavorite: Bool.fromDatabaseValue(row["isFavorite"] as DatabaseValue) ?? false)
+                        } ?? false)
+                }
             }
             foldersByKey[key] = found
             if let found { foldersById[found.id] = found }
@@ -145,7 +155,7 @@ extension SyncEngine {
                     armAccountIds.insert(accountId)
                     continue
                 }
-                guard FolderChangeState(raw: named.changeState).tracking else { continue }
+                guard named.readByChangeReader else { continue }
                 if idsByFolder[named.id] == nil { folderOrder.append(named.id) }
                 idsByFolder[named.id, default: []].append(contentsOf: ids)
             }
@@ -193,8 +203,10 @@ extension SyncEngine {
     }
 }
 
-/// A folder as the boundary reads it: its id and its raw change state only.
+/// A folder as the boundary reads it: its id, its raw change state, and whether
+/// the change reader reads its re-read list (it is in the syncable set).
 private struct RetiredActionFolder {
     let id: String
     let changeState: String?
+    let readByChangeReader: Bool
 }

@@ -381,8 +381,12 @@ Decision 4 took the window listing away from tracked folders, and with it the co
 boundary relied on for actions it retires (ADR-IOS-071). The boundary now writes the re-read list
 itself: before its delete it reads each retired row's raw columns only and appends the ids of a move or
 read/flag change to `Folder.changeState.recheck` of the source folder and, for a move, the destination
-folder, only where that folder is tracked (an untracked folder's list would never be read by a
-per-folder reader and would hold part of every pass's re-read budget), for every account holding a
+folder, only where the change reader reads that folder: the syncable set (`SyncEngine.isSyncable`,
+the folders `ChangeFolder.isSynced` marks), tracked or not. *Superseded within this amendment, same
+day:* "only where that folder is tracked". An untracked synced folder is read by the reader (Outlook
+reads its list during the baseline too) and its window listing's stale sweep is date-bounded, so it
+cannot be left to the full sync; a folder outside the syncable set is never read by a per-folder
+reader, and an id there would hold part of every pass's re-read budget, for every account holding a
 change bookmark (`SyncEngine.recheckRetiredActions`,
 provider-blind, pinned by `ChangeSeamFenceTests.retiredActionRecheckIsProviderBlind`). The cap and the
 overflow rule are decision 3's. A row the release cannot decode arms its folder's catch-up (the
