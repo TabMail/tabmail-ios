@@ -6311,6 +6311,22 @@ struct SeriesEndRemovalCardTests {
                 && !changes.contains(CalendarToolHelpers.ruleChangeResetNote), "card: \(changes); \(r.run.out)")
     }
 
+    @Test("Google: a series ending after a count given an earlier UNTIL shows the removal line and no reset note (an end-only change keeps them)")
+    func googleCountGivenAnEarlierUntilKeepsThem() async throws {
+        let r = try await googleTool([
+            "edit_scope": .string("all"), "timezone": .string("UTC"),
+            "recurrence": .dictionary(["freq": .string("WEEKLY"), "until": .string(day(21))]),
+        ], eventId: GoogleSeries.id, account: "series-end-g-count-until", seed: [
+            GoogleSeries.series(rule: "RRULE:FREQ=WEEKLY;COUNT=8"), GoogleSeries.instance(day(0)),
+            GoogleSeries.moved(day(7), start: "\(day(7))T11:00:00", end: "\(day(7))T11:30:00"),
+        ])
+        let changes = r.run.cards.first?.changes ?? []
+        // Eight weekly occurrences end on day 49: weeks 4 to 7 are after the new last date.
+        let removal = try Self.line(4, after: day(21))
+        #expect(r.run.cards.count == 1 && changes.contains(removal)
+                && !changes.contains(CalendarToolHelpers.ruleChangeResetNote), "card: \(changes); \(r.run.out)")
+    }
+
     @Test("Google: an earlier UNTIL that also changes the pattern still says changed occurrences may be reset")
     func googleEarlierEndWithANewPatternResets() async throws {
         let rule = "RRULE:FREQ=WEEKLY;UNTIL=\(compact(day(42)))T090000Z"

@@ -287,7 +287,8 @@ These tests read what each provider sent, or what the fake server ends up holdin
   nothing. `calDAVEarlierEndDropsOverridesPlacedAfterIt`: on CalDAV the one `PUT` drops the overrides
   placed after the new last date (one moved before it, one not moved) and keeps one placed before it but
   moved past it, and the card counts by place. On Google an earlier `UNTIL` alone shows the removal line with no reset note
-  (`googleCardCountsTheMeetingsRemoved`), and one that also changes the pattern still shows the note
+  (`googleCardCountsTheMeetingsRemoved`), as does a `COUNT=8` series given an earlier `UNTIL`
+  (`googleCountGivenAnEarlierUntilKeepsThem`), and one that also changes the pattern still shows the note
   (`googleEarlierEndWithANewPatternResets`).
 
 ## Google attendee edits — the others stay as stored

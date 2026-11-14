@@ -226,11 +226,11 @@ that aren't included in the request body maintain their previous values".
   `originalEndTimeZone`, now read by `getEvent`); a relabel is unmeasured and stays a reset
   (`outlookEarlierSeriesEndRelabelledIsAReset`). Google likewise (measured on the Workspace test
   account 2026-11-14, ADR-IOS-113 decision 7): a recurrence that changes only its rule's `UNTIL`
-  (`GoogleCalendarProvider.changesOnlyUntil`: both `UNTIL`-ended, same pattern, `EXDATE`/`RDATE` as
-  stored) with the series' own start and end (`googleTimes`, which the write then does not send)
+  (`GoogleCalendarProvider.changesOnlyUntil`: the stored rule `UNTIL`- or `COUNT`-ended, the edit
+  `UNTIL`-ended, same pattern, `EXDATE`/`RDATE` as stored) with the series' own start and end (`googleTimes`, which the write then does not send)
   keeps the changed occurrences placed on or before the new end and cancels those after it, by
-  original place; the card answers no reset (`googleCardCountsTheMeetingsRemoved`), while a new
-  pattern, `COUNT`, length or start still warns (`googleEarlierEndWithANewPatternResets`). Every calendar's card shows, for an earlier end,
+  original place; the card answers no reset (`googleCardCountsTheMeetingsRemoved`,
+  `googleCountGivenAnEarlierUntilKeepsThem`), while a new pattern, a new `COUNT`, length or start still warns (`googleEarlierEndWithANewPatternResets`). Every calendar's card shows, for an earlier end,
   "N meetings after <date> are removed." (`CalendarSeriesEndRemoval`, shared, from the stored rule less
   `cancelledOccurrences` through `deletedOccurrencePlaces`, ADR-IOS-113 decision 8,
   `CalendarToolHelpers.seriesEndRemovalNote`). `FakeGraphCalendar` models it (no reset counted; with

@@ -94,13 +94,13 @@ its card.
    placed on or before the new end (own title and moved time kept), and the ones placed after it are
    left cancelled, decided by the original place, wherever they were moved (as Graph). So Google's
    `editResetsChangedOccurrences` answers no reset when the recurrence the write writes
-   (`recurrence(_:withRuleFrom:)`) changes only the `UNTIL` of the stored rule (`changesOnlyUntil`:
-   one `RRULE` each, both ending on a date, otherwise the same rule by `canonicalRRULE`, every
-   `EXDATE`/`RDATE` as stored) and the start and end are the series' own as Google reads them
+   (`recurrence(_:withRuleFrom:)`) changes only where the stored rule ends (`changesOnlyUntil`: one
+   `RRULE` each, the stored one ending on a date or after a count, the written one on a date,
+   otherwise the same rule by `canonicalRRULE`, every `EXDATE`/`RDATE` as stored; the measured series
+   was `COUNT`-ended, widened to it by master-agent the same day) and the start and end are the series' own as Google reads them
    (`googleTimes`, so the write sends neither and nothing is restated). Anything else still warns of a
-   reset: a rule that gains or loses an end or ends after a count (the measured case had a `COUNT`
-   stored; a `COUNT` to `UNTIL` change stays a reset until ruled otherwise), a new pattern, a new length
-   or start, a change of kind. CalDAV still warns for any RRULE change.
+   reset: a rule that gains or loses an end or is given a count, a new pattern, a new length or start, a
+   change of kind. Outlook stays `endDate` to `endDate`. CalDAV still warns for any RRULE change.
 8. **Every calendar: an earlier last date says how many meetings it removes (master-agent,
    2026-11-14).** The card shows "N meetings after <date> are removed." ("1 meeting ... is removed.")
    on Google, CalDAV and Outlook alike, beside a reset note where there is one, whenever the edit's

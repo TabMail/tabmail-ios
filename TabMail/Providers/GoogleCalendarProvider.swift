@@ -2138,8 +2138,8 @@ actor GoogleCalendarProvider: CalendarProvider {
     /// its own start and takes the new length, and deleted ones stay deleted. So the time asked
     /// about is the start alone, read as Google reads it (`googleStart`): a start restated in a
     /// zone Google keys apart (`googleZone`, a zone name TabMail can't resolve included) is a move.
-    /// A rule that changes only its `UNTIL` (`changesOnlyUntil`, the recurrence as the write
-    /// writes it), with the start and end the series' own (`googleTimes`: the write then sends
+    /// A rule that changes only where it ends, to a date (`changesOnlyUntil`, the recurrence as the
+    /// write writes it: an `UNTIL` or a `COUNT` given a new `UNTIL`), with the start and end the series' own (`googleTimes`: the write then sends
     /// neither), is no reset either (#718, measured 2026-11-14): changed occurrences placed on or
     /// before the new end keep their own title and moved time, and the ones placed after it go,
     /// wherever they were moved.
@@ -2158,10 +2158,11 @@ actor GoogleCalendarProvider: CalendarProvider {
         return Self.recurrenceLinesDiffer(event.recurrence ?? [], rule)
     }
 
-    /// Whether the recurrence `written` changes only the `UNTIL` of `stored`'s rule (#718): each
-    /// holds one `RRULE`, both end on a date (`UNTIL`), on different ones, and the rules are
-    /// otherwise the same (`canonicalRRULE`), and every other line (`EXDATE`, `RDATE`) is as
-    /// stored. A rule that gains or loses an end, or ends after a count, is another rule.
+    /// Whether the recurrence `written` changes only where `stored`'s rule ends (#718): each holds
+    /// one `RRULE`, the stored one ends on a date (`UNTIL`) or after a count (`COUNT`), the written
+    /// one on a date, a different end, and the rules are otherwise the same (`canonicalRRULE`), and
+    /// every other line (`EXDATE`, `RDATE`) is as stored. A rule that gains or loses an end, or that
+    /// is given a count, is another rule.
     nonisolated static func changesOnlyUntil(stored: [String], written: [String]) -> Bool {
         func isRule(_ line: String) -> Bool { line.trimmingCharacters(in: .whitespacesAndNewlines).uppercased().hasPrefix("RRULE:") }
         let storedRules = stored.filter(isRule), writtenRules = written.filter(isRule)
@@ -2176,8 +2177,9 @@ actor GoogleCalendarProvider: CalendarProvider {
             return parts
         }
         var mine = parts(writtenRules[0]), theirs = parts(storedRules[0])
-        guard let newEnd = mine.removeValue(forKey: "UNTIL"), let oldEnd = theirs.removeValue(forKey: "UNTIL"),
-              newEnd != oldEnd else { return false }
+        let oldUntil = theirs.removeValue(forKey: "UNTIL"), oldCount = theirs.removeValue(forKey: "COUNT")
+        guard let newEnd = mine.removeValue(forKey: "UNTIL"), oldUntil != nil || oldCount != nil,
+              newEnd != oldUntil else { return false }
         return mine == theirs
     }
 
