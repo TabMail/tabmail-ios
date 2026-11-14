@@ -653,16 +653,18 @@ func drainEdit(
     calendarId: String,
     arguments: [String: JSONValue],
     provider: any CalendarProvider,
-    drains: Int = 1
+    drains: Int = 1,
+    inspect: (@Sendable () async throws -> Void)? = nil
 ) async throws -> [PendingCalendarOperation] {
     try await drainCalendarOperation(
         type: .edit, accountId: accountId, eventId: eventId, calendarId: calendarId,
-        arguments: arguments, provider: provider, drains: drains)
+        arguments: arguments, provider: provider, drains: drains, inspect: inspect)
 }
 
 /// One calendar operation of `type` drained through `AccountManager.drainCalendarQueue` against
 /// `provider`, `drains` times on the same database (a later drain runs an op the earlier one left
 /// queued), and the durable rows afterwards. A create uses `eventId` as its pre-generated id.
+/// `inspect` runs after the drains, while the database (and the files beside it) is still there.
 func drainCalendarOperation(
     type: CalendarOperationType,
     accountId: String,
@@ -670,7 +672,8 @@ func drainCalendarOperation(
     calendarId: String,
     arguments: [String: JSONValue],
     provider: any CalendarProvider,
-    drains: Int = 1
+    drains: Int = 1,
+    inspect: (@Sendable () async throws -> Void)? = nil
 ) async throws -> [PendingCalendarOperation] {
     let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -701,6 +704,7 @@ func drainCalendarOperation(
     for _ in 0..<drains {
         await AccountManager.shared.drainCalendarQueue()
     }
+    try await inspect?()
 
     return try await pool.read { db in try PendingCalendarOperation.fetchAll(db) }
 }

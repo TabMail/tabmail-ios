@@ -241,7 +241,7 @@ private enum GraphSeries {
 }
 
 private func outlook(_ graph: FakeGraphCalendar, eventId: String, _ arguments: [String: JSONValue], account: String,
-                     drains: Int = 1)
+                     drains: Int = 1, inspect: (@Sendable () async throws -> Void)? = nil)
     async throws -> [PendingCalendarOperation] {
     let http = FakeHTTP.Scenario()
     defer { http.close() }
@@ -249,7 +249,7 @@ private func outlook(_ graph: FakeGraphCalendar, eventId: String, _ arguments: [
     let provider = ExchangeCalendarProvider(mailbox: "calendar@example.com", accessToken: { _ in "test-token" },
                                             session: http.session)
     return try await drainEdit(accountId: account, eventId: eventId, calendarId: "primary",
-                               arguments: arguments, provider: provider, drains: drains)
+                               arguments: arguments, provider: provider, drains: drains, inspect: inspect)
 }
 
 /// What the queue's drain records for an edit the provider says names no occurrence there now.
@@ -4941,7 +4941,15 @@ struct SeriesLengthKeepsExceptionsTests {
             graph.store(back)
         }
         let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-changed-since")
-        #expect(rows.count == 1 && rows.first?.failureReason?.contains(Self.putBackFailure("3 events")) == true, "rows: \(reasons(rows))")
+        // Only that occurrence is left as it is; the changed ones are still put back.
+        #expect(rows.count == 1 && rows.first?.failureReason?.contains(Self.putBackFailure("1 event")) == true, "rows: \(reasons(rows))")
+        var changes = Self.ownChanges
+        changes[3] = OwnChange(subject: "Changed elsewhere")
+        for n in [1, 2] {
+            let stored = graph.event("ser-1-w\(n)")
+            let start = Self.week(n).addingTimeInterval(TimeInterval(changes[n].hours * 3_600))
+            #expect(instant(stored?["start"]) == start && stored?["subject"] as? String == changes[n].subject, "ser-1-w\(n): \(stored ?? [:])")
+        }
         #expect(graph.event("ser-1-w3")?["subject"] as? String == "Changed elsewhere" && !graph.deleted.contains("ser-1-w3"),
                 "deleted: \(graph.deleted); \(graph.event("ser-1-w3") ?? [:])")
     }
@@ -5170,6 +5178,270 @@ struct SeriesLengthKeepsExceptionsTests {
     }
 }
 
+// MARK: - The files of changed occurrences, saved and attached again (#718)
+//
+// **INVARIANT (#718).** *A file the user attached to an Outlook occurrence changed on its own is on
+// that occurrence again, once, after a new length of every occurrence resets it; until a read shows
+// it there, or its occurrence is gone, its bytes stay saved on the device with the operation.* An
+// occurrence holding what TabMail can't put back (a linked file, an Outlook item the series does not
+// hold) refuses the change before anything is written, at the card and at the drain alike.
+extension SeriesLengthKeepsExceptionsTests {
+
+    private static let seriesFile = Data("series agenda".utf8)
+    private static let notes = Data("own notes".utf8)
+    private static let ownAgenda = Data("own agenda, replacing the series'".utf8)
+    private static let logo = Data("logo pixels".utf8)
+
+    /// `outlookCalendar()` with a file on the series (`agenda.pdf`, which each changed occurrence
+    /// holds a copy of) and files of their own on the changed occurrences: week 1 holds
+    /// `notes.txt` and its own `agenda.pdf` in place of the series' copy, week 2 an inline logo.
+    private static func outlookCalendarWithFiles() -> FakeGraphCalendar {
+        let graph = outlookCalendar()
+        graph.attachFile("agenda.pdf", contentType: "application/pdf", bytes: seriesFile, to: "ser-1")
+        graph.attachFile("notes.txt", contentType: "text/plain", bytes: notes, to: "ser-1-w1")
+        graph.removeAttachment(named: "agenda.pdf", from: "ser-1-w1")
+        graph.attachFile("agenda.pdf", contentType: "application/pdf", bytes: ownAgenda, to: "ser-1-w1")
+        graph.attachFile("logo.png", contentType: "image/png", bytes: logo, to: "ser-1-w2", isInline: true, contentId: "logo@example.com")
+        return graph
+    }
+
+    /// `outlookCalendar()` with one file of week 1's own, `name` holding `bytes`.
+    private static func outlookCalendarWithOneFile(_ name: String = "notes.txt", _ bytes: Data = notes) -> FakeGraphCalendar {
+        let graph = outlookCalendar()
+        graph.attachFile(name, contentType: "text/plain", bytes: bytes, to: "ser-1-w1")
+        return graph
+    }
+
+    /// Event `id`'s files as `name:content`, sorted (a file held twice is listed twice).
+    private static func fileList(_ graph: FakeGraphCalendar, _ id: String) -> [String] {
+        graph.files(of: id).map { "\($0.name):\(String(decoding: $0.bytes, as: UTF8.self))" }.sorted()
+    }
+
+    private static func expectFilesBack(_ graph: FakeGraphCalendar, _ context: String) {
+        // Week 1: its own two once each, and the series' copy the reset gave it back (a put-back
+        // only adds); week 2: the series' copy and its inline logo, in the body as it was.
+        #expect(fileList(graph, "ser-1-w1") == ["agenda.pdf:own agenda, replacing the series'", "agenda.pdf:series agenda", "notes.txt:own notes"],
+                "\(context): week 1 holds \(fileList(graph, "ser-1-w1"))")
+        #expect(fileList(graph, "ser-1-w2") == ["agenda.pdf:series agenda", "logo.png:logo pixels"],
+                "\(context): week 2 holds \(fileList(graph, "ser-1-w2"))")
+        let inline = graph.attachments(of: "ser-1-w2").first { $0["name"] as? String == "logo.png" }
+        #expect(inline?["isInline"] as? Bool == true && inline?["contentId"] as? String == "logo@example.com",
+                "\(context): the logo is \(inline ?? [:])")
+        #expect(fileList(graph, "ser-1") == ["agenda.pdf:series agenda"], "\(context): the series holds \(fileList(graph, "ser-1"))")
+    }
+
+    /// The date the user is told an occurrence starting at `at` is on.
+    private static func shownDate(_ at: Date) -> String {
+        FixedDateFormat.formatter("MMMM d, yyyy", timeZone: GraphSeries.eventZone).string(from: at)
+    }
+
+    /// The files the operation `row` still names in its record.
+    private static func recordFiles(_ row: PendingCalendarOperation?) -> Int? {
+        guard let row else { return nil }
+        return ((try? SeriesEditRecord.stored(row.arguments)) ?? nil)?.files.count
+    }
+
+    @Test("Outlook: the files changed occurrences held of their own are on them again once, the series' copies not doubled, and nothing stays saved")
+    func outlookOwnFilesAreAttachedAgainOnce() async throws {
+        let graph = Self.outlookCalendarWithFiles()
+        let disk = SavedOnDevice()
+        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-files", inspect: { disk.read() })
+        #expect(rows.isEmpty, "rows: \(reasons(rows))")
+        #expect(graph.seriesResets == 1, "Graph did not reset the series: the fake models no reset to put back")
+        Self.expectOutlookKept(graph, length: Self.length, "files")
+        Self.expectFilesBack(graph, "one attempt")
+        #expect(disk.files == 0 && disk.directories == 0, "left on the device: \(disk.counts.withLock { $0 })")
+    }
+
+    @Test("Outlook: the series write's answer lost, the retry attaches the saved files again from the record, once")
+    func outlookOwnFilesAfterALostAnswer() async throws {
+        let graph = Self.outlookCalendarWithFiles()
+        graph.loseNextResponse("PATCH")
+        let disk = SavedOnDevice()
+        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-files-retry", drains: 2,
+                                     inspect: { disk.read() })
+        #expect(rows.isEmpty, "rows: \(reasons(rows))")
+        #expect(graph.patches("ser-1").count == 1, "the series was written \(graph.patches("ser-1").count) times")
+        Self.expectFilesBack(graph, "after a retry")
+        #expect(disk.files == 0 && disk.directories == 0, "left on the device: \(disk.counts.withLock { $0 })")
+    }
+
+    /// A changed occurrence holding what TabMail can't put back: a linked file, or an Outlook item
+    /// of its own.
+    private static func unrestorable(_ kind: String) -> FakeGraphCalendar {
+        let graph = outlookCalendar()
+        if kind == "link" {
+            graph.attachOther("#microsoft.graph.referenceAttachment", name: "Plan link", to: "ser-1-w2")
+        } else {
+            graph.attachItem("Minutes", item: ["@odata.type": "#microsoft.graph.message", "subject": "Minutes"], to: "ser-1-w2")
+        }
+        return graph
+    }
+
+    @Test("Outlook: a changed occurrence with a linked file or an Outlook item of its own refuses the new length at the card, nothing written",
+          arguments: ["link", "item"])
+    func outlookUnrestorableAttachmentRefusedAtTheCard(_ kind: String) async throws {
+        let graph = Self.unrestorable(kind)
+        let refusal = kind == "link" ? ExchangeCalendarProvider.lengthChangeLinkedFileRefusal : ExchangeCalendarProvider.lengthChangeItemRefusal
+        let r = try await outlookTool(graph, Self.newEnd(), eventId: "ser-1", account: "series-length-x-card-\(kind)")
+        #expect(r.cards.isEmpty && r.queued.isEmpty && graph.writes.isEmpty,
+                "cards \(r.cards.count) queued \(reasons(r.queued)) writes \(graph.writes); \(r.out)")
+        #expect(r.out.contains(refusal), "\(r.out)")
+    }
+
+    @Test("Outlook: a changed occurrence with a linked file or an Outlook item of its own refuses the new length at the drain, nothing written or saved",
+          arguments: ["link", "item"])
+    func outlookUnrestorableAttachmentRefusedAtTheDrain(_ kind: String) async throws {
+        let graph = Self.unrestorable(kind)
+        let refusal = kind == "link" ? ExchangeCalendarProvider.lengthChangeLinkedFileRefusal : ExchangeCalendarProvider.lengthChangeItemRefusal
+        let disk = SavedOnDevice()
+        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-drain-\(kind)", inspect: { disk.read() })
+        #expect(rows.count == 1 && rows.first?.status == PendingStatus.failed.rawValue && rows.first?.failureReason?.contains(refusal) == true,
+                "rows: \(reasons(rows))")
+        #expect(graph.writes.isEmpty && graph.seriesResets == 0, "written: \(graph.writes)")
+        #expect(disk.files == 0, "saved: \(disk.counts.withLock { $0 })")
+    }
+
+    @Test("Outlook: an Outlook item the series holds, copied on a changed occurrence, is no reason to refuse: the reset gives it back")
+    func outlookSeriesItemIsNotRefused() async throws {
+        let graph = Self.outlookCalendar()
+        graph.attachItem("Minutes", item: ["@odata.type": "#microsoft.graph.message", "subject": "Minutes"], to: "ser-1")
+        let r = try await outlookTool(graph, Self.newEnd(), eventId: "ser-1", account: "series-length-x-series-item")
+        #expect(r.cards.count == 1 && r.queued.isEmpty, "cards \(r.cards.count) queued \(reasons(r.queued)); \(r.out)")
+        Self.expectOutlookKept(graph, length: Self.length, "a series item")
+    }
+
+    @Test("Outlook: a file Outlook refuses as too large retires the operation naming it and its date, and its bytes stay saved with the failed row")
+    func outlookTooLargeFileStaysSaved() async throws {
+        let graph = Self.outlookCalendarWithOneFile("big.bin", Data("big".utf8))
+        graph.tooLargeNames.withLock { $0 = ["big.bin"] }
+        let disk = SavedOnDevice()
+        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-too-large", inspect: { disk.read() })
+        let date = Self.shownDate(Self.week(1).addingTimeInterval(7_200))
+        let reason = rows.first?.failureReason ?? ""
+        #expect(rows.count == 1 && rows.first?.status == PendingStatus.failed.rawValue
+                && reason.contains("big.bin could not be put back on \(date): too large for Outlook.")
+                && reason.contains(PutBackFile.notRestoredMessage(1)),
+                "rows: \(reasons(rows))")
+        #expect(Self.recordFiles(rows.first) == 1, "the record: \(rows.first?.argumentsJSON ?? "")")
+        #expect(disk.files == 1 && disk.counts.withLock { $0[rows.first?.id ?? ""] } == 1, "saved: \(disk.counts.withLock { $0 })")
+        Self.expectOutlookKept(graph, length: Self.length, "too large")
+    }
+
+    @Test("Outlook: a file answered 201 but not read back keeps the operation queued with its bytes saved")
+    func outlookUnconfirmedFileStaysQueued() async throws {
+        let graph = Self.outlookCalendarWithOneFile()
+        graph.dropsNextAttachment.withLock { $0 = true }
+        let disk = SavedOnDevice()
+        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-dropped", inspect: { disk.read() })
+        #expect(rows.count == 1 && rows.first?.status == PendingStatus.queued.rawValue, "rows: \(reasons(rows))")
+        #expect(Self.recordFiles(rows.first) == 1 && disk.files == 1, "record \(Self.recordFiles(rows.first) ?? -1) saved \(disk.counts.withLock { $0 })")
+        #expect(!Self.fileList(graph, "ser-1-w1").contains("notes.txt:own notes"), "week 1: \(Self.fileList(graph, "ser-1-w1"))")
+    }
+
+    @Test("Outlook: a file answered 201 but not read back is attached by the retry, once, and its bytes released")
+    func outlookUnconfirmedFileIsAttachedByTheRetry() async throws {
+        let graph = Self.outlookCalendarWithOneFile()
+        graph.dropsNextAttachment.withLock { $0 = true }
+        let disk = SavedOnDevice()
+        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-dropped-retry", drains: 2,
+                                     inspect: { disk.read() })
+        #expect(rows.isEmpty, "rows: \(reasons(rows))")
+        #expect(Self.fileList(graph, "ser-1-w1") == ["notes.txt:own notes"], "week 1: \(Self.fileList(graph, "ser-1-w1"))")
+        #expect(disk.files == 0 && disk.directories == 0, "left on the device: \(disk.counts.withLock { $0 })")
+        Self.expectOutlookKept(graph, length: Self.length, "after a retry")
+    }
+
+    @Test("Outlook: an occurrence changed elsewhere after the reset is left as it is and counted, and its files are attached again all the same")
+    func outlookChangedElsewhereStillGetsItsFiles() async throws {
+        let graph = Self.outlookCalendarWithOneFile()
+        graph.afterReset {
+            guard var back = graph.event("ser-1-w1") else { return }
+            back["type"] = "exception"
+            back["subject"] = "Changed elsewhere"
+            graph.store(back)
+        }
+        let disk = SavedOnDevice()
+        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-files-elsewhere", inspect: { disk.read() })
+        let reason = rows.first?.failureReason ?? ""
+        #expect(rows.count == 1 && reason.contains(Self.putBackFailure("1 event")) && !reason.contains(PutBackFile.notRestoredMessage(1)),
+                "rows: \(reasons(rows))")
+        #expect(graph.event("ser-1-w1")?["subject"] as? String == "Changed elsewhere", "\(graph.event("ser-1-w1") ?? [:])")
+        #expect(Self.fileList(graph, "ser-1-w1") == ["notes.txt:own notes"], "week 1: \(Self.fileList(graph, "ser-1-w1"))")
+        #expect(disk.files == 0, "saved: \(disk.counts.withLock { $0 })")
+    }
+
+    @Test("Outlook: a put-back PATCH refused by a stale etag is read and judged again, never sent blind, and then written")
+    func outlookStaleEtagIsReadAgain() async throws {
+        let graph = Self.outlookCalendar()
+        // Another write lands in the series between the put-back's read of week 1 and its PATCH.
+        graph.beforeWrite { method, id in
+            if method == "PATCH", id == "ser-1-w1", graph.writes.filter({ $0 == "PATCH ser-1-w1" }).count == 1 { graph.touchSeries(of: id) }
+        }
+        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-etag")
+        #expect(rows.isEmpty, "rows: \(reasons(rows))")
+        #expect(graph.writes.filter { $0 == "PATCH ser-1-w1" }.count == 2, "writes: \(graph.writes)")
+        Self.expectOutlookKept(graph, length: Self.length, "after a stale etag")
+    }
+
+    @Test("Outlook: a series under active edit refuses the put-back's PATCH ExchangeCalendarConfig.putBackConflictReads times, and the operation stays queued")
+    func outlookBusySeriesStaysQueued() async throws {
+        let graph = Self.outlookCalendar()
+        graph.beforeWrite { method, id in
+            if method == "PATCH", id == "ser-1-w1" { graph.touchSeries(of: id) }
+        }
+        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-busy")
+        #expect(rows.count == 1 && rows.first?.status == PendingStatus.queued.rawValue, "rows: \(reasons(rows))")
+        #expect(graph.writes.filter { $0 == "PATCH ser-1-w1" }.count == ExchangeCalendarConfig.putBackConflictReads, "writes: \(graph.writes)")
+        #expect(graph.patches("ser-1-w1").isEmpty, "a refused PATCH was applied: \(graph.patches("ser-1-w1"))")
+    }
+
+    @Test("Outlook: a changed occurrence deleted after the reset releases its saved files, and they are not counted as not restored")
+    func outlookDeletedSinceReleasesItsFiles() async throws {
+        let graph = Self.outlookCalendarWithOneFile()
+        graph.afterReset { graph.userDeletesOccurrence("ser-1-w1") }
+        let disk = SavedOnDevice()
+        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-files-gone", inspect: { disk.read() })
+        #expect(rows.isEmpty, "rows: \(reasons(rows))")
+        #expect(graph.isDeletedOccurrence("ser-1-w1"), "week 1 came back: \(graph.event("ser-1-w1") ?? [:])")
+        #expect(disk.files == 0 && disk.directories == 0, "left on the device: \(disk.counts.withLock { $0 })")
+    }
+
+    @Test("Outlook: a saved copy missing or changed on the device is skipped, counted as not restored and dropped from the record",
+          arguments: [true, false])
+    func outlookLostSavedCopyIsCountedAndDropped(_ deleting: Bool) async throws {
+        let graph = Self.outlookCalendarWithOneFile()
+        // The copy is saved before the series' write; it is lost as the write arrives.
+        graph.beforeWrite { method, id in
+            if method == "PATCH", id == "ser-1" { SavedOnDevice.spoil(deleting: deleting) }
+        }
+        let disk = SavedOnDevice()
+        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-lost-\(deleting)", inspect: { disk.read() })
+        let reason = rows.first?.failureReason ?? ""
+        #expect(rows.count == 1 && rows.first?.status == PendingStatus.failed.rawValue && reason.contains(PutBackFile.notRestoredMessage(1))
+                && !reason.contains(Self.putBackFailure("1 event")),
+                "rows: \(reasons(rows))")
+        #expect(Self.recordFiles(rows.first) == 0, "the record: \(rows.first?.argumentsJSON ?? "")")
+        #expect(Self.fileList(graph, "ser-1-w1").isEmpty, "week 1: \(Self.fileList(graph, "ser-1-w1"))")
+        #expect(disk.files == 0, "saved: \(disk.counts.withLock { $0 })")
+        Self.expectOutlookKept(graph, length: Self.length, "a lost copy")
+    }
+
+    @Test("Outlook: a record this build can't read leaves the operation queued as it is, nothing written")
+    func outlookUnreadableRecordLeavesTheOperation() async throws {
+        let graph = Self.outlookCalendarWithOneFile()
+        var record = SeriesEditRecord(seriesId: "ser-1", capture: "{}", files: []).jsonObject
+        record["version"] = 99
+        let data = try JSONSerialization.data(withJSONObject: [SeriesEditRecord.argumentKey: record])
+        var args = Self.newEnd()
+        args.merge(try JSONDecoder().decode([String: JSONValue].self, from: data)) { _, new in new }
+        let rows = try await outlook(graph, eventId: "ser-1", args, account: "series-length-x-unreadable")
+        #expect(rows.count == 1 && rows.first?.status == PendingStatus.queued.rawValue, "rows: \(reasons(rows))")
+        #expect(rows.first?.arguments[SeriesEditRecord.argumentKey] == args[SeriesEditRecord.argumentKey], "the record: \(rows.first?.argumentsJSON ?? "")")
+        #expect(graph.writes.isEmpty && graph.seriesResets == 0, "written: \(graph.writes)")
+    }
+}
+
 @Suite("The record of an edit of every occurrence is reserved for the queue (#718)", .serialized, .processGlobalState)
 struct SeriesEditRecordIsReservedTests {
 
@@ -5196,22 +5468,50 @@ struct SeriesEditRecordIsReservedTests {
                         SeriesEditRecord.argumentKey: .dictionary(["series_id": .string(forged.seriesId), "capture": .string(forged.capture)])],
             eventTitle: "Card title")
         let stored = try #require(try await pool.read { db in try PendingCalendarOperation.fetchOne(db, key: op.id) })
-        #expect(SeriesEditRecord(stored.arguments) == nil, "the forged record was queued: \(stored.argumentsJSON)")
+        #expect(try SeriesEditRecord.stored(stored.arguments) == nil, "the forged record was queued: \(stored.argumentsJSON)")
         #expect(stored.arguments["title"] != nil, "the rest of the arguments were not kept: \(stored.argumentsJSON)")
     }
 
-    @Test("a record round-trips through the stored arguments, and a partial one is no record")
+    private static func arguments(_ object: [String: Any]) throws -> [String: JSONValue] {
+        let data = try JSONSerialization.data(withJSONObject: [SeriesEditRecord.argumentKey: object])
+        return try JSONDecoder().decode([String: JSONValue].self, from: data)
+    }
+
+    @Test("a record round-trips through the stored arguments, with its saved files, and none is no record")
     func recordRoundTrips() throws {
-        let record = SeriesEditRecord(seriesId: "ser-1", capture: #"{"changed":[],"deleted":["x"],"series":{}}"#)
-        let data = try JSONSerialization.data(withJSONObject: [SeriesEditRecord.argumentKey: record.jsonObject])
-        let arguments = try JSONDecoder().decode([String: JSONValue].self, from: data)
-        #expect(SeriesEditRecord(arguments) == record)
-        for key in ["series_id", "capture"] {
-            var partial = record.jsonObject
+        let file = PutBackFile(
+            occurrence: "occ-2", name: "notes.txt", contentType: "text/plain", isInline: false, contentId: nil,
+            sha256: SavedFileName.of(Data("notes".utf8)))
+        let inline = PutBackFile(
+            occurrence: "occ-3", name: "logo.png", contentType: "image/png", isInline: true, contentId: "logo@example.com",
+            sha256: SavedFileName.of(Data("logo".utf8)))
+        let record = SeriesEditRecord(seriesId: "ser-1", capture: #"{"changed":[],"deleted":["x"],"series":{}}"#, files: [file, inline])
+        #expect(try SeriesEditRecord.stored(try Self.arguments(record.jsonObject)) == record)
+        #expect(try SeriesEditRecord.stored(["title": .string("Retitled")]) == nil)
+    }
+
+    /// A record this build can't read is never taken for none: after the series' write that would
+    /// read the occurrences already reset and lose their files. It throws, and the queue leaves the
+    /// operation as it is.
+    @Test("a record of a later version, or not whole, is unreadable, never no record")
+    func unreadableRecordIsNotNoRecord() throws {
+        let file = PutBackFile(
+            occurrence: "occ-2", name: "notes.txt", contentType: "text/plain", isInline: false, contentId: nil,
+            sha256: SavedFileName.of(Data("notes".utf8)))
+        let record = SeriesEditRecord(seriesId: "ser-1", capture: "{}", files: [file]).jsonObject
+        var later = record
+        later["version"] = SeriesEditRecord.version + 1
+        #expect(throws: SeriesEditRecord.Unreadable.self) { try SeriesEditRecord.stored(try Self.arguments(later)) }
+        for key in ["version", "series_id", "capture", "files"] {
+            var partial = record
             partial[key] = nil
-            let data = try JSONSerialization.data(withJSONObject: [SeriesEditRecord.argumentKey: partial])
-            #expect(SeriesEditRecord(try JSONDecoder().decode([String: JSONValue].self, from: data)) == nil, "a record without \(key) was read")
+            #expect(throws: SeriesEditRecord.Unreadable.self, "a record without \(key) was read") {
+                try SeriesEditRecord.stored(try Self.arguments(partial))
+            }
         }
+        var badFile = record
+        badFile["files"] = [["occurrence": "occ-2", "name": "notes.txt", "content_type": "text/plain", "is_inline": false, "sha256": "../../x"]]
+        #expect(throws: SeriesEditRecord.Unreadable.self) { try SeriesEditRecord.stored(try Self.arguments(badFile)) }
     }
 }
 

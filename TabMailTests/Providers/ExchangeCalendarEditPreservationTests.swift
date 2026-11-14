@@ -134,6 +134,60 @@ import Synchronization
 /// made while it is still there, and makes a new event once it was deleted (measured 2026-11-10).
 /// `userDeletes` deletes an event as the user does in Outlook: a GET of it is then 404 (measured).
 /// `writes` is every write that arrived, in order; `beforeWrite` runs as one arrives.
+/// `SavedFiles` kept in memory, for a provider test that runs no queue.
+final class MemorySavedFiles: Sendable {
+    let saved = Mutex<[String: Data]>([:])
+
+    var files: SavedFiles {
+        SavedFiles(
+            save: { [self] data in
+                let name = SavedFileName.of(data)
+                saved.withLock { $0[name] = data }
+                return name
+            },
+            load: { [self] name in
+                guard let data = saved.withLock({ $0[name] }), SavedFileName.of(data) == name else { throw SavedFiles.Missing() }
+                return data
+            },
+            release: { [self] name in saved.withLock { _ = $0.removeValue(forKey: name) } })
+    }
+}
+
+/// What the put-back store (`CalendarPutBackFiles`) holds on the device, read while a test's
+/// queue database is installed: the number of saved files of each operation directory.
+final class SavedOnDevice: Sendable {
+    let counts = Mutex<[String: Int]>([:])
+
+    /// Reads the store now.
+    func read() {
+        let base = CalendarPutBackFiles.baseDirectory()
+        let entries = (try? FileManager.default.contentsOfDirectory(atPath: base.path)) ?? []
+        var out: [String: Int] = [:]
+        for entry in entries {
+            out[entry] = ((try? FileManager.default.contentsOfDirectory(atPath: base.appendingPathComponent(entry).path)) ?? []).count
+        }
+        counts.withLock { $0 = out }
+    }
+
+    /// The number of saved files, every operation's.
+    var files: Int { counts.withLock { $0.values.reduce(0, +) } }
+
+    /// The number of operation directories.
+    var directories: Int { counts.withLock { $0.count } }
+
+    /// Changes every saved file of the store: deletes it, or overwrites it with other bytes.
+    static func spoil(deleting: Bool) {
+        let base = CalendarPutBackFiles.baseDirectory()
+        for entry in (try? FileManager.default.contentsOfDirectory(atPath: base.path)) ?? [] {
+            let dir = base.appendingPathComponent(entry)
+            for name in (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? [] {
+                let file = dir.appendingPathComponent(name)
+                if deleting { try? FileManager.default.removeItem(at: file) } else { try? Data("spoiled".utf8).write(to: file) }
+            }
+        }
+    }
+}
+
 final class FakeGraphCalendar: Sendable {
     private let events: Mutex<[String: Data]>
     private let transactions = Mutex<[String: String]>([:])
@@ -165,6 +219,36 @@ final class FakeGraphCalendar: Sendable {
     /// those seeded as exceptions that have not yet copied their series' attachments.
     private let exceptionIds = Mutex<Set<String>>([])
     private let seededExceptionIds = Mutex<Set<String>>([])
+
+    /// Each series' etag, one for the series and every occurrence of it (measured 2026-11-14):
+    /// every write anywhere in the series (a PATCH, a DELETE, an attachment added) moves it. A
+    /// GET of an event gives it as `@odata.etag`; a PATCH with an `If-Match` that is not it is
+    /// refused with 412 `ErrorIrresolvableConflict` and writes nothing.
+    private let etagCounters = Mutex<[String: Int]>([:])
+
+    private func seriesKey(_ id: String) -> String {
+        (event(id)?["seriesMasterId"] as? String) ?? (cancelledStore.withLock { $0[id] }
+            .flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }?["seriesMasterId"] as? String) ?? id
+    }
+
+    /// The etag of event `id` (its series').
+    func etag(of id: String) -> String {
+        let key = seriesKey(id)
+        return "W/\"\(key)-\(etagCounters.withLock { $0[key] ?? 0 })\""
+    }
+
+    /// Something in the series of `id` was written: its etag moves.
+    func touchSeries(of id: String) {
+        let key = seriesKey(id)
+        etagCounters.withLock { $0[key, default: 0] += 1 }
+    }
+
+    /// Attachments named here are refused as making their event too large (400
+    /// `ErrorMessageSizeExceeded`), as Graph refuses an item over the mailbox's size limit.
+    let tooLargeNames = Mutex<Set<String>>([])
+
+    /// The next attachment added is answered 201 but not kept: a read shows it is not there.
+    let dropsNextAttachment = Mutex(false)
     /// How much larger Graph lists an exception's copy of a series attachment (measured: +16 for a
     /// file and a link, more for an item; one figure is enough, since size is never compared).
     private static let copySizeGrowth = 16
@@ -192,6 +276,12 @@ final class FakeGraphCalendar: Sendable {
         guard let master = event(id)?["seriesMasterId"] as? String,
               exceptionIds.withLock({ $0.insert(id).inserted }) else { return }
         copySeriesAttachments(of: master, onto: id)
+        // Any write makes an occurrence an exception, an attachment added alone included
+        // (measured 2026-11-14).
+        if modelsExceptions.withLock({ $0 }), var stored = event(id), stored["type"] as? String == "occurrence" {
+            stored["type"] = "exception"
+            store(stored)
+        }
     }
 
     /// An occurrence seeded as an exception copies its series' attachments the first time its own
@@ -248,6 +338,7 @@ final class FakeGraphCalendar: Sendable {
         file["contentId"] = contentId
         becomeException(id)
         store(attachment: file, on: id)
+        touchSeries(of: id)
     }
 
     /// Attaches a non-file attachment of `odataType` (`#microsoft.graph.referenceAttachment`, a
@@ -370,7 +461,12 @@ final class FakeGraphCalendar: Sendable {
             plain["start"] = time(start)
             plain["end"] = time(start.addingTimeInterval(length))
             store(plain)
+            // The occurrence's whole attachment set goes: it reads the series' again (measured).
+            exceptionIds.withLock { _ = $0.remove(id) }
+            seededExceptionIds.withLock { _ = $0.remove(id) }
+            attachmentStore.withLock { $0[id] = nil }
         }
+        touchSeries(of: seriesId)
         let hook = resetHook.withLock { $0 }
         hook?()
     }
@@ -659,7 +755,9 @@ final class FakeGraphCalendar: Sendable {
             }
             if parts.count == 1 { readLog.withLock { $0.append((id: parts[0], zone: preferName)) } }
             guard parts.count == 1, let stored = event(parts[0]) else { return .status(404) }
-            let shown = Self.rendered(stored, in: prefer, named: preferName)
+            var shown = Self.rendered(stored, in: prefer, named: preferName)
+            shown["@odata.etag"] = etag(of: parts[0])
+            shown["hasAttachments"] = !attachments(of: parts[0]).isEmpty
             guard modelsExceptions.withLock({ $0 }) else { return Self.json(Self.only(select, of: shown)) }
             var out = shown
             if select?.contains("cancelledOccurrences") == true { out["cancelledOccurrences"] = cancelledNames(of: stored) }
@@ -669,7 +767,11 @@ final class FakeGraphCalendar: Sendable {
                 if let status = failingExpands.withLock({ $0.isEmpty ? nil : $0.removeFirst() }) { return .status(status) }
                 out["exceptionOccurrences"] = occurrences(of: parts[0])
                     .filter { $0["type"] as? String == "exception" }
-                    .map { Self.rendered($0, in: prefer, named: preferName) }
+                    .map { exception -> [String: Any] in
+                        var shown = Self.rendered(exception, in: prefer, named: preferName)
+                        shown["hasAttachments"] = (exception["id"] as? String).map { !attachments(of: $0).isEmpty } ?? false
+                        return shown
+                    }
                     .map { exception in select == nil ? exception : exception.filter { $0.key != "originalStart" && $0.key != "subject" } }
             }
             return Self.json(out)
@@ -690,6 +792,10 @@ final class FakeGraphCalendar: Sendable {
             arrived("PATCH", parts.first ?? "")
             if let status = takeFailure("PATCH") { return .status(status) }
             if let refused = refusal("PATCH") { return refused }
+            if let ifMatch = request.header("If-Match"), parts.count == 1, ifMatch != etag(of: parts[0]) {
+                return .json(raw: #"{"error":{"code":"ErrorIrresolvableConflict","message":"The change key passed in the request does not match the current change key for the item."}}"#,
+                             statusCode: 412)
+            }
             guard parts.count == 1, var stored = event(parts[0]),
                   let body = request.body,
                   let patch = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any],
@@ -744,6 +850,7 @@ final class FakeGraphCalendar: Sendable {
             let models = modelsExceptions.withLock { $0 }
             if models, stored["seriesMasterId"] is String { stored["type"] = "exception" }
             store(stored)
+            touchSeries(of: parts[0])
             // An occurrence written becomes an exception, with its own copies of its series' attachments.
             becomeException(parts[0])
             if models, changesRule || movesTime { applyReset(to: stored, wasStart: storedStart) }
@@ -803,6 +910,10 @@ final class FakeGraphCalendar: Sendable {
                   let name = json["name"] as? String, let raw = json["contentBytes"] as? String,
                   let bytes = Data(base64Encoded: raw) else { return .status(400) }
             guard bytes.count < GraphAttachmentLimits.singlePostMaxExclusive else { return .status(413) }
+            if tooLargeNames.withLock({ $0.contains(name) }) {
+                return .json(raw: #"{"error":{"code":"ErrorMessageSizeExceeded","message":"The message exceeds the maximum supported size."}}"#, statusCode: 400)
+            }
+            if dropsNextAttachment.withLock({ let drop = $0; $0 = false; return drop }) { return .json(raw: "{}", statusCode: 201) }
             attachFile(name, contentType: json["contentType"] as? String ?? "", bytes: bytes, to: parts[0],
                        isInline: json["isInline"] as? Bool ?? false, contentId: json["contentId"] as? String)
             return .json(raw: "{}", statusCode: 201)
@@ -835,6 +946,7 @@ final class FakeGraphCalendar: Sendable {
             if let refused = refusal("DELETE") { return refused }
             let parts = Self.pathParts(request.url)
             guard parts.count == 1, let stored = event(parts[0]) else { return .status(404) }
+            touchSeries(of: parts[0])
             if modelsExceptions.withLock({ $0 }), stored["seriesMasterId"] is String {
                 userDeletesOccurrence(parts[0])
             } else {
@@ -2306,7 +2418,7 @@ struct ExchangeCalendarEditPreservationTests {
         }
 
         let answer = provider.editResetsChangedOccurrences(read, edit: patch)
-        _ = try await provider.updateSeries(eventId: "ser-c", event: patch, record: SeriesEditRecorder(kept: nil, keep: { _ in }))
+        _ = try await provider.updateSeries(eventId: "ser-c", event: patch, record: SeriesEditRecorder(kept: nil, keep: { _ in }, files: MemorySavedFiles().files))
 
         let label = "\(rule.rawValue), \(edit.rawValue) (\(patch.recurrence?.first ?? "no rule"))"
         let reset = graph.seriesResets > 0

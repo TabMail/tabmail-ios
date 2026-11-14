@@ -408,6 +408,20 @@ extension AccountManager {
         }
     }
 
+    /// Removes the saved put-back files of every operation whose row no longer exists
+    /// (`CalendarPutBackFiles.sweep`), keeping every row's, whatever its status. Skipped when the
+    /// rows can't be read.
+    private func sweepCalendarPutBackFiles() async {
+        do {
+            let ids = try await dbPool.read { db in
+                try String.fetchSet(db, sql: "SELECT id FROM pendingCalendarOperation")
+            }
+            CalendarPutBackFiles.sweep(keeping: ids)
+        } catch {
+            BackgroundSyncLogger.logDebug("[CalendarQueue] put-back sweep skipped: \(error)")
+        }
+    }
+
     // MARK: - Calendar Operation Queue
 
     /// Queue a calendar mutation for async execution.
@@ -470,6 +484,11 @@ extension AccountManager {
         }
         isDrainingCalendar = true
         defer { isDrainingCalendar = false }
+
+        // Saved put-back files whose operation row is gone (#718): a crash between a row's
+        // deletion and its directory's removal. Race-free: only an operation this drain executes
+        // writes saved files, and none is executing yet.
+        await sweepCalendarPutBackFiles()
 
         var failedAccounts = Set<String>()
         // Whether a queued change's wait reason may have been written, cleared, or left the queue
@@ -582,6 +601,9 @@ extension AccountManager {
                         try await retryWrite(dbPool, label: "CalendarQueue") { db in
                             _ = try PendingCalendarOperation.deleteOne(db, key: currentOp.id)
                         }
+                        // Its put-back files' directory, only when empty: every file a put-back
+                        // saved was released once it read back (#718); one still saved stays.
+                        CalendarPutBackFiles.removeEmptyDirectory(of: currentOp.id)
                     } catch {
                         BackgroundSyncLogger.logError(
                             "[CalendarQueue] CRITICAL: failed to delete completed op \(currentOp.id) — it stays inFlight and can re-execute after successful startup recovery: \(error)",
@@ -1190,13 +1212,18 @@ extension AccountManager {
                 return (created?.id, nil)
             case "all":
                 // What the write must put back after it (#718) is kept on this operation before the
-                // write (`recordSeriesEdit`), and handed back to a retry.
+                // write (`recordSeriesEdit`), and handed back to a retry; the files it names are
+                // saved beside the database under this operation (`CalendarPutBackFiles`). A record
+                // this build can't read throws here, before anything is written, and no terminal
+                // arm claims it: the operation stays queued as it is.
                 let opId = op.id
+                let kept = try SeriesEditRecord.stored(args)
                 _ = try await provider.updateSeries(
                     calendarId: calId, eventId: writeId, event: input, sendUpdates: "all",
                     record: SeriesEditRecorder(
-                        kept: SeriesEditRecord(args),
-                        keep: { record in try await self.recordSeriesEdit(opId: opId, record) }))
+                        kept: kept,
+                        keep: { record in try await self.recordSeriesEdit(opId: opId, record) },
+                        files: CalendarPutBackFiles.savedFiles(opId: opId)))
                 BackgroundSyncLogger.logDebug("[CalendarQueue] Updated event id=\(writeId) scope=all")
             default:
                 // Unknown edit_scope value — reject rather than silently defaulting

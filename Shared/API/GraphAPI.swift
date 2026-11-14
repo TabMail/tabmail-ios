@@ -167,6 +167,15 @@ enum GraphAPI {
         statusCode == mailboxFullStatusCode && errorCodes(errorBody).contains(mailboxFullErrorCode)
     }
 
+    /// Graph's error code for a write that would make an item larger than the mailbox's maximum
+    /// message size (400; measured 2026-11-13 for an item attached to an event).
+    static let messageTooLargeErrorCode = "ErrorMessageSizeExceeded"
+
+    /// Whether Graph refused a write because the item would be over the mailbox's size limit.
+    static func isMessageTooLarge(errorBody: Data?) -> Bool {
+        errorCodes(errorBody).contains(messageTooLargeErrorCode)
+    }
+
     // MARK: - Path-segment encoding (single source of truth for BOTH targets)
 
     /// Percent-encode `value` as one strict path segment, or `nil` if it cannot
