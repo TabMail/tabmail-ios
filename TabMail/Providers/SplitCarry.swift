@@ -82,6 +82,21 @@ enum SplitCarry {
         return .carry
     }
 
+    /// THE predicate of a length change (#718): whether an edit of every occurrence of `series`
+    /// gives a new end while leaving its start, rule and kind as they are (`mode` at the series'
+    /// start is `.carry`, and no change between all-day and timed). Other fields may change too.
+    /// Google Calendar keeps every changed occurrence then, each at its own start lasting the new
+    /// length, and keeps deleted ones deleted (measured); a start or rule change resets them.
+    /// Outlook's card and write (`ExchangeCalendarProvider`), its check before the card, and
+    /// CalDAV's write all ask it, so they can't disagree. A start restated at the same instant in
+    /// another zone is the same start (`seriesZone` nil): reads give a series' times in the zone
+    /// they ask for. False for a series whose start can't be read.
+    static func lengthChange(_ edit: GCalEventInput, series: GCalEvent) -> Bool {
+        guard fields(of: edit).contains(.end), let start = series.start,
+              !CalendarToolHelpers.editChangesKind(edit, storedIsAllDay: start.date != nil) else { return false }
+        return mode(edit: edit, place: start, storedRules: series.recurrence ?? [], seriesZone: nil) == .carry
+    }
+
     private static func isRule(_ line: String) -> Bool { line.uppercased().hasPrefix("RRULE:") }
 
     /// Whether the zone named `name` is `zone`: the name resolves (`CalendarTimeZoneResolver`, so a

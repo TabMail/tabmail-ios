@@ -293,6 +293,96 @@ final class FakeGraphCalendar: Sendable {
     /// refused.
     let refusesSameDayMoves = Mutex(false)
 
+    /// When set, the calendar keeps a series' changed and deleted occurrences as Graph does, and
+    /// applies the resets it counts (`seriesResets`), so a test can hold the app to what the series
+    /// ends up showing (#718; measured on a work account and an Outlook.com test account,
+    /// 2026-11-11). Off by default, where a reset is only counted.
+    /// - an occurrence PATCHed becomes an exception (`type` "exception");
+    /// - a DELETE of an occurrence keeps it deleted (`userDeletesOccurrence` does the same): it
+    ///   leaves the instances list, a GET by its id is 404, and the series names it in
+    ///   `cancelledOccurrences` as `OID.<series id>.<its place's date in the series' zone>`;
+    /// - a GET of a series with `$expand=exceptionOccurrences` holds its exceptions; with a
+    ///   `$select` beside it each comes without `originalStart` and `subject`;
+    /// - a reset makes every occurrence of the series, deleted ones brought back, a plain
+    ///   occurrence (`type` "occurrence", the series' properties) at its place, moved as far as the
+    ///   series' start moved, lasting as long as the series now does. Its id stays (measured for a
+    ///   change of the end; the place moving with a moved start is assumed).
+    let modelsExceptions = Mutex(false)
+    private let cancelledStore = Mutex<[String: Data]>([:])
+
+    /// The user deletes the occurrence `id` of a series in Outlook (`modelsExceptions`).
+    func userDeletesOccurrence(_ id: String) {
+        guard let data = events.withLock({ $0.removeValue(forKey: id) }) else { return }
+        cancelledStore.withLock { $0[id] = data }
+    }
+
+    /// Whether the occurrence `id` is kept deleted (`modelsExceptions`).
+    func isDeletedOccurrence(_ id: String) -> Bool { cancelledStore.withLock { $0[id] != nil } }
+
+    /// The stored occurrences of the series `seriesId`.
+    private func occurrences(of seriesId: String) -> [[String: Any]] {
+        events.withLock { Array($0.values) }
+            .compactMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
+            .filter { $0["seriesMasterId"] as? String == seriesId }
+    }
+
+    /// The names Graph gives the deleted occurrences of `series` (`cancelledOccurrences`): each
+    /// place's date in the series' zone (`seriesZoneName`).
+    private func cancelledNames(of series: [String: Any]) -> [String] {
+        let seriesId = series["id"] as? String ?? ""
+        let zone = Self.seriesZoneName(series).flatMap { zones[$0] ?? CalendarTimeZoneResolver.zone(named: $0, in: .none) } ?? .gmt
+        return cancelledStore.withLock { Array($0.values) }
+            .compactMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
+            .filter { $0["seriesMasterId"] as? String == seriesId }
+            .compactMap { ($0["originalStart"] as? String).flatMap { Date.fromISO8601($0) } }
+            .map { "OID.\(seriesId).\(EKEventStoreHelper.dayKey($0, timeZone: zone))" }
+    }
+
+    /// A reset of the series `series` (`modelsExceptions`), its start before the write `wasStart`.
+    private func applyReset(to series: [String: Any], wasStart: Any?) {
+        guard let seriesId = series["id"] as? String,
+              let newStart = Self.instant(series["start"]), let newEnd = Self.instant(series["end"]),
+              let oldStart = Self.instant(wasStart) else { return }
+        let shift = newStart.timeIntervalSince(oldStart)
+        let length = newEnd.timeIntervalSince(newStart)
+        let label = (series["start"] as? [String: Any])?["timeZone"] as? String ?? "UTC"
+        let zone = CalendarTimeZoneResolver.zone(named: label, in: .none) ?? .gmt
+        func time(_ at: Date) -> [String: Any] {
+            ["dateTime": EKEventStoreHelper.toNaiveISO(at, timeZone: zone) + ".0000000", "timeZone": label]
+        }
+        let restored = cancelledStore.withLock { store -> [Data] in
+            let mine = store.filter { _, data in
+                ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["seriesMasterId"] as? String == seriesId
+            }
+            for id in mine.keys { store[id] = nil }
+            return Array(mine.values)
+        }
+        let own: Set<String> = ["id", "recurrence", "start", "end", "type", "seriesMasterId", "originalStart"]
+        for occurrence in occurrences(of: seriesId) + restored.compactMap({ (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }) {
+            guard let id = occurrence["id"] as? String,
+                  let place = (occurrence["originalStart"] as? String).flatMap({ Date.fromISO8601($0) }) else { continue }
+            var plain = series.filter { !own.contains($0.key) }
+            let start = place.addingTimeInterval(shift)
+            plain["id"] = id
+            plain["seriesMasterId"] = seriesId
+            plain["type"] = "occurrence"
+            plain["originalStart"] = start.iso8601String()
+            plain["start"] = time(start)
+            plain["end"] = time(start.addingTimeInterval(length))
+            store(plain)
+        }
+        let hook = resetHook.withLock { $0 }
+        hook?()
+    }
+
+    /// Runs once a reset is applied (`modelsExceptions`), as another client's change right after it.
+    func afterReset(_ hook: @escaping @Sendable () -> Void) { resetHook.withLock { $0 = hook } }
+    private let resetHook = Mutex<(@Sendable () -> Void)?>(nil)
+
+    /// The next GET with `$expand=exceptionOccurrences` is answered with `status` and does nothing.
+    func failNextExpand(with status: Int) { failingExpands.withLock { $0.append(status) } }
+    private let failingExpands = Mutex<[Int]>([])
+
     /// `"PATCH <id>"` / `"POST"` for every write that arrived, refused ones included, in order.
     var writes: [String] { writeLog.withLock { $0 } }
 
@@ -569,7 +659,20 @@ final class FakeGraphCalendar: Sendable {
             }
             if parts.count == 1 { readLog.withLock { $0.append((id: parts[0], zone: preferName)) } }
             guard parts.count == 1, let stored = event(parts[0]) else { return .status(404) }
-            return Self.json(Self.only(select, of: Self.rendered(stored, in: prefer, named: preferName)))
+            let shown = Self.rendered(stored, in: prefer, named: preferName)
+            guard modelsExceptions.withLock({ $0 }) else { return Self.json(Self.only(select, of: shown)) }
+            var out = shown
+            if select?.contains("cancelledOccurrences") == true { out["cancelledOccurrences"] = cancelledNames(of: stored) }
+            out = Self.only(select, of: out)
+            let expand = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "$expand" }?.value
+            if expand == "exceptionOccurrences" {
+                if let status = failingExpands.withLock({ $0.isEmpty ? nil : $0.removeFirst() }) { return .status(status) }
+                out["exceptionOccurrences"] = occurrences(of: parts[0])
+                    .filter { $0["type"] as? String == "exception" }
+                    .map { Self.rendered($0, in: prefer, named: preferName) }
+                    .map { exception in select == nil ? exception : exception.filter { $0.key != "originalStart" && $0.key != "subject" } }
+            }
+            return Self.json(out)
         }
         http.register(path: "/v1.0/me/calendarView", method: "GET") { [self] request in
             if let status = takeFailure("GET") { return .status(status) }
@@ -638,9 +741,12 @@ final class FakeGraphCalendar: Sendable {
             }
             Self.apply(patch, to: &stored)
             if lengthened { Self.lengthen(&stored, written: patch, storedStart: storedStart) }
+            let models = modelsExceptions.withLock { $0 }
+            if models, stored["seriesMasterId"] is String { stored["type"] = "exception" }
             store(stored)
             // An occurrence written becomes an exception, with its own copies of its series' attachments.
             becomeException(parts[0])
+            if models, changesRule || movesTime { applyReset(to: stored, wasStart: storedStart) }
             if takeLoss("PATCH") { return .transportError(.networkConnectionLost) }
             return Self.json(stored)
         }
@@ -728,8 +834,12 @@ final class FakeGraphCalendar: Sendable {
             if let status = takeFailure("DELETE") { return .status(status) }
             if let refused = refusal("DELETE") { return refused }
             let parts = Self.pathParts(request.url)
-            guard parts.count == 1, event(parts[0]) != nil else { return .status(404) }
-            events.withLock { _ = $0.removeValue(forKey: parts[0]) }
+            guard parts.count == 1, let stored = event(parts[0]) else { return .status(404) }
+            if modelsExceptions.withLock({ $0 }), stored["seriesMasterId"] is String {
+                userDeletesOccurrence(parts[0])
+            } else {
+                events.withLock { _ = $0.removeValue(forKey: parts[0]) }
+            }
             deleteLog.withLock { $0.append(parts[0]) }
             return .status(204)
         }
@@ -2128,18 +2238,23 @@ struct ExchangeCalendarEditPreservationTests {
         case ownTimeResent, ownTimeResentWithRename, sameInstantOtherZone, sameInstantOtherZoneWithRename, endOnly
         var testDescription: String { rawValue }
 
-        /// Whether the edit resets the series' changed occurrences: a rule change, or a start or
-        /// end at another instant than the series' own (the same instant under another zone label
-        /// is its own, and is not sent).
+        /// Whether the edit leaves the series' changed occurrences reset: a rule change, or a start
+        /// at another instant than the series' own (the same instant under another zone label is
+        /// its own, and is not sent). A new end alone does not: Graph resets them and the write
+        /// puts them back (`updateSeries`, #718).
         var resets: Bool {
-            ![.resent, .renameOnly, .ownTimeResent, .ownTimeResentWithRename, .sameInstantOtherZone, .sameInstantOtherZoneWithRename]
+            ![.resent, .renameOnly, .ownTimeResent, .ownTimeResentWithRename, .sameInstantOtherZone, .sameInstantOtherZoneWithRename, .endOnly]
                 .contains(self)
         }
+
+        /// Whether Graph resets the series on the write (any change of its rule, start or end).
+        var graphResets: Bool { resets || self == .endOnly }
     }
 
     /// The edit's card says changed occurrences may be reset exactly when the write resets
-    /// them, as Graph does on any change of a series' rule, start or end: both decide from the
-    /// same merge of the edit with the series, the card from the event it read.
+    /// them, as Graph does on any change of a series' rule, start or end, but for a new end alone,
+    /// which the write puts back (#718): both decide from the same merge of the edit with the
+    /// series, the card from the event it read.
     @Test("the card's answer to whether an edit resets changed occurrences is the write's",
           arguments: StoredRule.allCases, RuleEdit.allCases)
     func cardAnswerIsTheWrites(_ rule: StoredRule, _ edit: RuleEdit) async throws {
@@ -2191,17 +2306,18 @@ struct ExchangeCalendarEditPreservationTests {
         }
 
         let answer = provider.editResetsChangedOccurrences(read, edit: patch)
-        _ = try await provider.updateEvent(eventId: "ser-c", event: patch)
+        _ = try await provider.updateSeries(eventId: "ser-c", event: patch, record: SeriesEditRecorder(kept: nil, keep: { _ in }))
 
         let label = "\(rule.rawValue), \(edit.rawValue) (\(patch.recurrence?.first ?? "no rule"))"
         let reset = graph.seriesResets > 0
-        #expect(answer == reset, "\(label): the card says \(answer ? "a reset" : "no reset"), the write \(reset ? "reset" : "did not reset") the series")
+        #expect(reset == edit.graphResets, "\(label): the write \(reset ? "reset" : "did not reset") the series")
+        #expect(answer == (reset && edit != .endOnly), "\(label): the card says \(answer ? "a reset" : "no reset"), the write \(reset ? "reset" : "did not reset") the series")
         #expect(answer == edit.resets, "\(label): the card says \(answer ? "a reset" : "no reset")")
         // One decision: the card warns exactly when the PATCH carries the series' start and end
-        // (a move, or beside a written rule).
+        // (a move, or beside a written rule), but for a new end alone, which is put back.
         let sent = graph.patches("ser-c")
         let sentTimes = sent.contains { $0["start"] != nil || $0["end"] != nil }
-        #expect(answer == sentTimes, "\(label): the card says \(answer ? "a reset" : "no reset"), the PATCH \(sentTimes ? "carries" : "does not carry") start and end")
+        #expect(answer == (sentTimes && edit != .endOnly), "\(label): the card says \(answer ? "a reset" : "no reset"), the PATCH \(sentTimes ? "carries" : "does not carry") start and end")
         if [.ownTimeResent, .ownTimeResentWithRename, .sameInstantOtherZone, .sameInstantOtherZoneWithRename].contains(edit) {
             #expect(sent.allSatisfy { $0["start"] == nil && $0["end"] == nil && $0["recurrence"] == nil },
                     "\(label): the series' own times sent back were PATCHed: \(sent.map { $0.keys.sorted() })")

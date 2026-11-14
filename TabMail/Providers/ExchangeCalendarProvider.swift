@@ -325,6 +325,13 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // `graphPatchJSON` says what rides along and why.
         try Self.refuseUnrepresentableRule(event.recurrence)
         let existing = try await fetchForEdit(eventId: eventId)
+        return try await patchEdit(eventId: eventId, event: event, existing: existing)
+    }
+
+    /// The PATCH of `updateEvent`: only what `event` changes on `existing` (`graphPatchJSON`), and
+    /// nothing when it changes nothing. The event as Graph answers it, or `existing`'s when nothing
+    /// was written.
+    private func patchEdit(eventId: String, event: GCalEventInput, existing: EditSnapshot) async throws -> GCalEvent {
         let json = try graphPatchJSON(patch: event, existing: existing, allowRecurrence: true)
         guard !json.isEmpty else {
             BackgroundSyncLogger.logDebug("[ExchangeCalendar] updateEvent: the edit changes nothing — no PATCH")
@@ -348,6 +355,197 @@ actor ExchangeCalendarProvider: CalendarProvider {
         }
         let updated = try JSONDecoder().decode(MSEvent.self, from: data)
         return toGCalEvent(updated)
+    }
+
+    /// An edit of every occurrence (`CalendarProvider.updateSeries`). Graph resets a series' changed
+    /// and deleted occurrences on any change of its start or end (measured, #423), and for a change
+    /// of its end alone no request shape avoids it (measured 2026-11-11: with or without the start,
+    /// under three zone labels), where Google Calendar keeps them: each changed occurrence keeps its
+    /// own start and other changes and takes the new length, and deleted ones stay deleted. So a
+    /// change of the length (`SplitCarry.lengthChange`) of a series that has any:
+    /// 1. reads and plans them before anything is written (`lengthChangeExceptions`, the plan the
+    ///    edit's card also runs), refused unwritten when they can't be read or planned;
+    /// 2. keeps them on the queued operation (`record`) before the write;
+    /// 3. PATCHes the series, as `updateEvent` does (Graph resets them);
+    /// 4. puts them back onto the series itself with the split's carry (`carry`, `putBack`), found
+    ///    by their place: each deleted one deleted again, each changed one written with its own
+    ///    values but the edit's fields, a moved one at its own start lasting the new length, its
+    ///    guests its own with the series' change applied.
+    /// A retry uses the kept record only once a fresh read shows the PATCH landed (the edit no
+    /// longer moves the series' time); otherwise the series still holds its occurrences and they
+    /// are read and kept again. Every put-back write is absolute, and a DELETE answered 404 is
+    /// done, so one that lands twice changes nothing. A put-back write that fails for good after
+    /// the PATCH (`putBackFailsForGood`) retires the operation with how many were not put back
+    /// (`putBackFailure`). Any other edit is `updateEvent`'s.
+    func updateSeries(
+        calendarId: String = "primary", eventId: String, event: GCalEventInput, sendUpdates: String = "all",
+        record: SeriesEditRecorder
+    ) async throws -> GCalEvent {
+        try Self.refuseUnrepresentableRule(event.recurrence)
+        let existing = try await fetchForEdit(eventId: eventId, select: Self.readSelect)
+        let series = existing.event
+        let landed = !movesSeriesTime(event, existing: series)
+        let capture: SeriesCapture
+        if let kept = record.kept, kept.seriesId == eventId, landed {
+            capture = try seriesCapture(from: kept.capture, series: series)
+        } else {
+            let exceptions = try await lengthChangeExceptions(eventId: eventId, existing: existing, edit: event)
+            capture = SeriesCapture(seriesRaw: existing.raw, exceptions: exceptions)
+            // A record an earlier attempt kept is replaced, an empty one included, so a later retry
+            // never puts back what this read no longer holds.
+            if !exceptions.isEmpty || record.kept != nil {
+                try await record.keep(SeriesEditRecord(seriesId: eventId, capture: try capture.text()))
+            }
+        }
+        let written = try await patchEdit(eventId: eventId, event: event, existing: existing)
+        guard !capture.exceptions.isEmpty else { return written }
+        let fields = SplitCarry.fields(of: event)
+        let total = capture.exceptions.count
+        guard let plan = SplitCarry.plan(
+            exceptions: capture.exceptions.map(\.carried), series: series, newPart: written, fields: fields)
+        else { throw CalendarProviderError.notSupported(Self.putBackFailure(total)) }
+        try await carry(
+            plan, exceptions: capture.exceptions, series: series, seriesRaw: capture.seriesRaw, newPartId: eventId,
+            fields: fields, guests: event.attendeeChange, seriesZone: series.seriesZoneName,
+            zone: try? Self.seriesTimeZone(existing, refusal: .lengthChange), copies: [:], putBack: true)
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[ExchangeCalendar] updateSeries put back \(plan.deleted.count) deleted and \(plan.changed.count) changed occurrences of \(eventId)")
+        }
+        return written
+    }
+
+    /// The changed and deleted occurrences of the series `existing` that the whole-series `edit`
+    /// resets and `updateSeries` puts back, read and planned before anything is written: empty
+    /// when `edit` is not a change of the series' length (`SplitCarry.lengthChange`) or the series
+    /// has none. Planned against the series as the write will leave it (`plannedSeries`), so a
+    /// move Graph can't take in order (`carryOrder`) is refused while nothing has changed. A timed
+    /// series whose zone can't be read (`seriesTimeZone`, in `.lengthChange`'s words) is refused
+    /// when it holds an occurrence deleted or moved on its own (`deletedOrMoved`): the put-back
+    /// can't place the one or date the other. Throws too when they can't be read. The one plan the
+    /// write (`updateSeries`) and the edit's card (`refuseSeriesWrite`) make.
+    private func lengthChangeExceptions(eventId: String, existing: EditSnapshot, edit: GCalEventInput) async throws -> [TailException] {
+        let series = existing.event
+        guard series.recurrence?.isEmpty == false, movesSeriesTime(edit, existing: series),
+              SplitCarry.lengthChange(edit, series: series) else { return [] }
+        var zone: TimeZone?
+        var zoneRefusal: Error?
+        do { zone = try Self.seriesTimeZone(existing, refusal: .lengthChange) } catch { zoneRefusal = error }
+        let exceptions = try await seriesExceptions(
+            seriesId: eventId, series: series, seriesZone: series.seriesZoneName, zone: zone,
+            refusal: Self.lengthChangeUnreadable, unplaced: zoneRefusal)
+        guard !exceptions.isEmpty else { return [] }
+        if let zoneRefusal, exceptions.contains(where: Self.deletedOrMoved) { throw zoneRefusal }
+        guard let plan = SplitCarry.plan(
+            exceptions: exceptions.map(\.carried), series: series,
+            newPart: Self.plannedSeries(series, edit: edit), fields: SplitCarry.fields(of: edit))
+        else { throw CalendarProviderError.notSupported(Self.lengthChangeUnreadable) }
+        _ = try Self.carryOrder(plan.changed, zone: zone)
+        return exceptions
+    }
+
+    /// Whether `exception` is an occurrence deleted on its own, or one changed to another start
+    /// than its place in the series.
+    nonisolated static func deletedOrMoved(_ exception: TailException) -> Bool {
+        switch exception.carried {
+        case .deleted: return true
+        case .changed(let event):
+            guard let start = event.start, let place = event.originalStartTime else { return true }
+            return SplitCarry.key(start) != SplitCarry.key(place)
+        }
+    }
+
+    static let lengthChangeUnreadable =
+        "the occurrences of this repeating event changed or deleted one by one can't be read, so its length was not changed"
+
+    /// What the user is told when the put-back after a series' PATCH fails for good
+    /// (`putBackFailsForGood`): the series was written, and `remaining` of the occurrences changed
+    /// or deleted on their own were not put back.
+    nonisolated static func putBackFailure(_ remaining: Int) -> String {
+        "The series was changed, but \(remaining == 1 ? "1 event" : "\(remaining) events") you had changed on their own could not be restored. Check them in your calendar."
+    }
+
+    /// Whether a put-back write's error fails for good, so a retry can't put the rest back: a
+    /// refusal of the carry (`CalendarProviderError`), or a 4xx that is no sign-in, permission,
+    /// not-found or come-back-later answer, as the queue retires one (`isCalendarBadRequestError`).
+    nonisolated static func putBackFailsForGood(_ error: Error) -> Bool {
+        if error is CalendarProviderError { return true }
+        guard case ExchangeCalendarError.httpError(let code, _) = error else { return false }
+        return (400...499).contains(code) && code != 401 && code != 403 && code != 404 && !CalendarHTTPStatus.isComeBackLater(code)
+    }
+
+    /// The start and end of `series` once `edit` is written, as the write merges them
+    /// (`mergeExistingEventWithPatch`): what the put-back's plan needs of the series it writes onto.
+    nonisolated static func plannedSeries(_ series: GCalEvent, edit: GCalEventInput) -> GCalEvent {
+        let merged = GoogleCalendarProvider.mergeExistingEventWithPatch(existing: series, patch: edit)
+        return GCalEvent(
+            id: nil, summary: nil, location: nil, description: nil,
+            start: GCalDateTime(dateTime: merged.startDateTime, date: merged.startDate, timeZone: merged.startTimeZone),
+            end: GCalDateTime(dateTime: merged.endDateTime, date: merged.endDate, timeZone: merged.endTimeZone),
+            attendees: nil, organizer: nil, recurrence: nil, transparency: nil, status: nil,
+            htmlLink: nil, created: nil, updated: nil, recurringEventId: nil)
+    }
+
+    /// What `updateSeries` reads before its write and puts back after it: the series' guests as
+    /// they were (a guest change reaches each occurrence as the series' difference), its changed
+    /// occurrences and its deleted ones.
+    struct SeriesCapture {
+        let seriesRaw: [String: Any]
+        let exceptions: [TailException]
+
+        /// The properties of the series and of each changed occurrence the capture keeps: what the
+        /// carry writes (`carriedJSON`, its guests and times) and what places and names it.
+        static let keptKeys = splitCopiedKeys.union(["id", "originalStart", "start", "end", "attendees", "type", "seriesMasterId"])
+
+        /// The capture as `SeriesEditRecord.capture` keeps it.
+        func text() throws -> String {
+            var changed: [[String: Any]] = []
+            var deleted: [String] = []
+            for exception in exceptions {
+                switch exception.carried {
+                case .changed: changed.append(exception.raw.filter { Self.keptKeys.contains($0.key) })
+                case .deleted(let place): deleted.append(SplitCarry.key(place))
+                }
+            }
+            let object: [String: Any] = [
+                "series": seriesRaw.filter { $0.key == "attendees" }, "changed": changed, "deleted": deleted,
+            ]
+            guard let text = String(data: try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]), encoding: .utf8) else {
+                throw CalendarProviderError.notSupported(ExchangeCalendarProvider.lengthChangeUnreadable)
+            }
+            return text
+        }
+    }
+
+    /// The capture `SeriesCapture.text()` kept, read back for the series `series`.
+    private func seriesCapture(from text: String, series: GCalEvent) throws -> SeriesCapture {
+        let unreadable = CalendarProviderError.notSupported(
+            "what this change must put back on the repeating event can't be read, so it was not finished. Check the event's changed occurrences in your calendar app.")
+        guard let data = text.data(using: .utf8),
+              let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let seriesRaw = object["series"] as? [String: Any],
+              let changed = object["changed"] as? [[String: Any]],
+              let deleted = object["deleted"] as? [String] else { throw unreadable }
+        var exceptions: [TailException] = []
+        for raw in changed {
+            guard let exception = try changedException(raw, series: series) else { throw unreadable }
+            exceptions.append(exception)
+        }
+        for key in deleted {
+            guard let place = SplitCarry.time(key) else { throw unreadable }
+            exceptions.append(TailException(carried: .deleted(place: place), raw: [:]))
+        }
+        return SeriesCapture(seriesRaw: seriesRaw, exceptions: exceptions)
+    }
+
+    /// A changed occurrence of `series` as Graph expands it (`raw`, read with `Prefer` naming the
+    /// series' zone): the neutral value with its place, and the JSON. Nil when its place can't be
+    /// read.
+    private func changedException(_ raw: [String: Any], series: GCalEvent) throws -> TailException? {
+        let read = try JSONDecoder().decode(MSEvent.self, from: JSONSerialization.data(withJSONObject: raw))
+        var event = toGCalEvent(read)
+        if series.isAllDay { event.originalStartTime = Self.allDayPlace(read.originalStart) }
+        guard event.originalStartTime != nil else { return nil }
+        return TailException(carried: .changed(event), raw: raw)
     }
 
     func deleteEvent(
@@ -814,27 +1012,28 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// gives each exception's `originalStart` and fields (measured). Both are read with `Prefer`
     /// naming the series' zone `seriesZone`, so an all-day place is its date; a deleted timed
     /// one is placed at the series' time of day on its date in `zone` (`seriesTimeZone`). Nothing
-    /// is written; a deletion that can't be placed is refused.
-    private func seriesExceptions(seriesId: String, series: GCalEvent, seriesZone: String?, zone: TimeZone?) async throws -> [TailException] {
-        let unreadable = CalendarProviderError.notSupported(
-            "the occurrences of this repeating event changed or deleted one by one can't be read, so it was not split")
+    /// is written; a deletion that can't be placed is refused, with `unplaced` when given. A read
+    /// that can't be used is refused in the caller's words (`refusal`).
+    private func seriesExceptions(
+        seriesId: String, series: GCalEvent, seriesZone: String?, zone: TimeZone?,
+        refusal: String = "the occurrences of this repeating event changed or deleted one by one can't be read, so it was not split",
+        unplaced: Error? = nil
+    ) async throws -> [TailException] {
+        let unreadable = CalendarProviderError.notSupported(refusal)
         let encodedId = try Self.encodedGraphPathSegment(seriesId, context: "Graph series master id")
         let expanded = try await request(path: "/events/\(encodedId)?$expand=exceptionOccurrences", timeZoneName: seriesZone)
         guard let expandedJSON = try JSONSerialization.jsonObject(with: expanded) as? [String: Any] else { throw unreadable }
         var found: [TailException] = []
         for raw in expandedJSON["exceptionOccurrences"] as? [[String: Any]] ?? [] {
-            let read = try JSONDecoder().decode(MSEvent.self, from: JSONSerialization.data(withJSONObject: raw))
-            var event = toGCalEvent(read)
-            if series.isAllDay { event.originalStartTime = Self.allDayPlace(read.originalStart) }
-            guard event.originalStartTime != nil else { throw unreadable }
-            found.append(TailException(carried: .changed(event), raw: raw))
+            guard let exception = try changedException(raw, series: series) else { throw unreadable }
+            found.append(exception)
         }
         let cancelled = try await request(path: "/events/\(encodedId)?$select=cancelledOccurrences", timeZoneName: seriesZone)
         guard let cancelledJSON = try JSONSerialization.jsonObject(with: cancelled) as? [String: Any] else { throw unreadable }
         for name in cancelledJSON["cancelledOccurrences"] as? [String] ?? [] {
             let date = String(name.suffix(10))
             guard RecurrenceTail.Day(iso: date) != nil else { throw unreadable }
-            guard let place = Self.deletedPlace(date: date, series: series, zone: zone) else { throw unreadable }
+            guard let place = Self.deletedPlace(date: date, series: series, zone: zone) else { throw unplaced ?? unreadable }
             found.append(TailException(carried: .deleted(place: place), raw: [:]))
         }
         return found
@@ -969,11 +1168,40 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// (`ErrorOccurrenceCrossingBoundary`, measured), so the deletes go first, then the moves, each
     /// once the date it moves to is free. A move that can't be ordered so is written all the same
     /// and refused: the split stops before its cap, with the series whole.
+    ///
+    /// `putBack`: the carry is `updateSeries`' put-back onto the series `newPartId` itself, after
+    /// its PATCH reset it (#718). A deleted place is deleted again only while Graph lists a plain
+    /// occurrence there (`type` "occurrence"): one changed since the reset is the user's, never
+    /// deleted, and the put-back stops. Every refusal of the carry and every write that fails for
+    /// good (`putBackFailsForGood`) stops it with how many were not put back (`putBackFailure`):
+    /// the series is already written, so a retry can't finish it. Any other error is rethrown, and
+    /// a retry puts back from the kept record.
     private func carry(
         _ plan: SplitCarry.Plan, exceptions: [TailException], series: GCalEvent, seriesRaw: [String: Any], newPartId: String,
-        fields: Set<SplitCarry.Field>, guests: AttendeeChange?, seriesZone: String?, zone: TimeZone?, copies: [String: AttachmentCopyPlan]
+        fields: Set<SplitCarry.Field>, guests: AttendeeChange?, seriesZone: String?, zone: TimeZone?, copies: [String: AttachmentCopyPlan],
+        putBack: Bool = false
     ) async throws {
         guard !plan.deleted.isEmpty || !plan.changed.isEmpty else { return }
+        var done = 0
+        do {
+            try await carryWrites(
+                plan, exceptions: exceptions, series: series, seriesRaw: seriesRaw, newPartId: newPartId, fields: fields,
+                guests: guests, seriesZone: seriesZone, zone: zone, copies: copies, putBack: putBack, done: &done)
+        } catch where putBack && Self.putBackFailsForGood(error) {
+            let remaining = plan.deleted.count + plan.changed.count - done
+            if DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[ExchangeCalendar] put-back onto \(newPartId) stopped with \(remaining) left: \(error)")
+            }
+            throw CalendarProviderError.notSupported(Self.putBackFailure(remaining))
+        }
+    }
+
+    /// `carry`'s writes, counting each one done (written, or found already done) in `done`.
+    private func carryWrites(
+        _ plan: SplitCarry.Plan, exceptions: [TailException], series: GCalEvent, seriesRaw: [String: Any], newPartId: String,
+        fields: Set<SplitCarry.Field>, guests: AttendeeChange?, seriesZone: String?, zone: TimeZone?, copies: [String: AttachmentCopyPlan],
+        putBack: Bool, done: inout Int
+    ) async throws {
         let unplaced = CalendarProviderError.notSupported(
             "an occurrence of this repeating event can't be dated in its time zone, so its change can't be carried")
 
@@ -1000,7 +1228,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
             instances += page["value"] as? [[String: Any]] ?? []
             next = try (page["@odata.nextLink"] as? String).map { try graphPath(ofNextLink: $0) }
         }
-        func instanceId(at place: GCalDateTime) -> String? {
+        func instance(at place: GCalDateTime) -> [String: Any]? {
             instances.first { instance in
                 guard let original = instance["originalStart"] as? String, let at = Date.fromISO8601(original) else { return false }
                 if let date = place.date {
@@ -1008,18 +1236,24 @@ actor ExchangeCalendarProvider: CalendarProvider {
                     return originalDate == String(date.prefix(10))
                 }
                 return place.dateTime.flatMap(Date.fromISO8601) == at
-            }?["id"] as? String
+            }
         }
+        func instanceId(at place: GCalDateTime) -> String? { instance(at: place)?["id"] as? String }
 
         // 1. The deleted places first: each frees its date for a move.
         for place in plan.deleted {
-            guard let id = instanceId(at: place) else { continue }
+            guard let listed = instance(at: place), let id = listed["id"] as? String else { done += 1; continue }
+            if putBack, listed["type"] as? String != "occurrence" {
+                throw CalendarProviderError.notSupported("an occurrence deleted on its own was changed since, so it was not deleted again")
+            }
             let encoded = try Self.encodedGraphPathSegment(id, context: "Graph event instance id")
             do {
                 _ = try await request(path: "/events/\(encoded)", method: "DELETE")
             } catch ExchangeCalendarError.httpError(let code, _) where code == 404 || code == 410 {
+                done += 1
                 continue
             }
+            done += 1
         }
 
         // 2. The changed ones, each move once the date it moves to is free.
@@ -1063,6 +1297,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
             if let source = change.exception.id, let planned = copies[source] {
                 try await copy(planned, from: source, to: id, context: "Graph event instance id")
             }
+            done += 1
             if DebugModeManager.isLoggingEnabled() {
                 BackgroundSyncLogger.logDebug("[ExchangeCalendar] split carried a changed occurrence onto \(id): keys=\(json.keys.sorted()) times=\(change.start != nil)")
             }
@@ -1453,12 +1688,23 @@ actor ExchangeCalendarProvider: CalendarProvider {
     struct ZoneRefusal: Sendable {
         let consequence: String
         let remedy: String
+        /// What the user is told when the series names no zone at all (`seriesTimeZone`).
+        let noZone: String
 
         /// A change of the series: a split, and its finish.
-        static let change = ZoneRefusal(consequence: "it did not change the event", remedy: "Make the change in your calendar app instead.")
+        static let change = ZoneRefusal(
+            consequence: "it did not change the event", remedy: "Make the change in your calendar app instead.",
+            noZone: "Outlook gives no time zone for this repeating event, so the day of the occurrence named can't be worked out and the occurrences from it on can't be split off. Make the change in your calendar app instead.")
         /// A delete of an occurrence and every later one (`endSeries`).
         static let followingDelete = ZoneRefusal(
-            consequence: "it did not delete these occurrences", remedy: "Delete them in your calendar app instead.")
+            consequence: "it did not delete these occurrences", remedy: "Delete them in your calendar app instead.",
+            noZone: "Outlook gives no time zone for this repeating event, so the day of the occurrence named can't be worked out and the occurrences from it on can't be split off. Make the change in your calendar app instead.")
+        /// A new length of every occurrence, whose put-back places each deleted occurrence and
+        /// dates each moved one in the series' zone (`updateSeries`, #718). Decided (2026-11-13).
+        static let lengthChange = ZoneRefusal(
+            consequence: "its occurrences changed or deleted one by one can't be kept, and its length was not changed",
+            remedy: "Make the change in your calendar app instead.",
+            noZone: "Outlook gives no time zone for this repeating event, so its occurrences changed or deleted one by one can't be kept, and its length was not changed. Make the change in your calendar app instead.")
     }
 
     /// The day the split occurrence at `splitNaiveISO` falls on in the stored series' own zone, the
@@ -1499,8 +1745,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
     nonisolated static func seriesTimeZone(_ stored: EditSnapshot, refusal: ZoneRefusal = .change) throws -> TimeZone? {
         if stored.event.isAllDay { return nil }
         guard let zoneName = stored.event.seriesZoneName else {
-            throw CalendarProviderError.notSupported(
-                "Outlook gives no time zone for this repeating event, so the day of the occurrence named can't be worked out and the occurrences from it on can't be split off. Make the change in your calendar app instead.")
+            throw CalendarProviderError.notSupported(refusal.noZone)
         }
         guard let zone = CalendarTimeZoneResolver.zone(named: zoneName, in: .none) else {
             throw CalendarProviderError.unrecognizedTimeZone(zoneName, consequence: refusal.consequence, remedy: refusal.remedy)
@@ -2044,7 +2289,9 @@ actor ExchangeCalendarProvider: CalendarProvider {
         if CalendarToolHelpers.editChangesKind(edit, storedIsAllDay: event.start?.date != nil) {
             return !(event.recurrence ?? []).isEmpty
         }
-        if movesSeriesTime(edit, existing: event) { return true }
+        // A new length resets them too, but the write puts them back (`updateSeries`, #718), so the
+        // series ends as Google Calendar leaves it: no reset.
+        if movesSeriesTime(edit, existing: event), !SplitCarry.lengthChange(edit, series: event) { return true }
         guard edit.recurrence != nil else { return false }
         guard let baseline = storedRuleBaseline(event) else { return true }
         return seriesRuleToWrite(edit, existing: event, stored: baseline.recurrence, rangeZone: baseline.rangeZone) != nil

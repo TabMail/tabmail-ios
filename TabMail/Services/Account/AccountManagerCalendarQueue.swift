@@ -347,6 +347,19 @@ extension AccountManager {
         }
     }
 
+    /// Keep an edit of every occurrence's `SeriesEditRecord` on its queued operation (#718): the
+    /// provider calls it before its write, and writes only after it returns. Written as
+    /// `recordSplit` writes its record, under `SeriesEditRecord.argumentKey`, replacing one kept
+    /// before; throws as it does, so nothing is written then.
+    func recordSeriesEdit(opId: String, _ record: SeriesEditRecord) async throws {
+        try await updateSplitArguments(opId: opId) { object in
+            object[SeriesEditRecord.argumentKey] = record.jsonObject
+        }
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[CalendarQueue] Recorded what the edit of series \(record.seriesId) puts back on op \(opId)")
+        }
+    }
+
     /// The split's `SplitRecorder.partNotFound` (#601): the calendar answered "not found" for a
     /// new part it had reported as already created. Keeps the time of the first such answer on
     /// the operation (`SplitRecord.partNotFoundSinceKey`, written the first time only) and
@@ -399,8 +412,9 @@ extension AccountManager {
 
     /// Queue a calendar mutation for async execution.
     /// Persists the operation to GRDB before returning — survives crashes/kills.
-    /// `SplitRecord.argumentKey` and `SplitRecord.partNotFoundSinceKey` are reserved for the
-    /// queue (`recordSplit`, `noteSplitPartNotFound`); a tool call that carries them has them
+    /// `SplitRecord.argumentKey`, `SplitRecord.partNotFoundSinceKey` and
+    /// `SeriesEditRecord.argumentKey` are reserved for the queue (`recordSplit`,
+    /// `noteSplitPartNotFound`, `recordSeriesEdit`); a tool call that carries them has them
     /// removed here. `eventTitle` is the title the confirmation card showed; it names the
     /// event if the change fails after the chat turn (`LateCalendarFailureStore`).
     func queueCalendarOperation(
@@ -414,6 +428,7 @@ extension AccountManager {
         var arguments = arguments
         arguments.removeValue(forKey: SplitRecord.argumentKey)
         arguments.removeValue(forKey: SplitRecord.partNotFoundSinceKey)
+        arguments.removeValue(forKey: SeriesEditRecord.argumentKey)
         let op = PendingCalendarOperation(
             operationType: type,
             accountId: accountId,
@@ -1194,7 +1209,14 @@ extension AccountManager {
                 // An edit past the series' last place makes no new part (nil): nothing to surface.
                 return (created?.id, nil)
             case "all":
-                _ = try await provider.updateEvent(calendarId: calId, eventId: writeId, event: input, sendUpdates: "all")
+                // What the write must put back after it (#718) is kept on this operation before the
+                // write (`recordSeriesEdit`), and handed back to a retry.
+                let opId = op.id
+                _ = try await provider.updateSeries(
+                    calendarId: calId, eventId: writeId, event: input, sendUpdates: "all",
+                    record: SeriesEditRecorder(
+                        kept: SeriesEditRecord(args),
+                        keep: { record in try await self.recordSeriesEdit(opId: opId, record) }))
                 BackgroundSyncLogger.logDebug("[CalendarQueue] Updated event id=\(writeId) scope=all")
             default:
                 // Unknown edit_scope value — reject rather than silently defaulting

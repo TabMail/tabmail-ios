@@ -184,3 +184,55 @@ struct SplitRecorder: Sendable {
         try await keep(record)
     }
 }
+
+/// What an edit of every occurrence must put back after its write, kept on its queued operation
+/// BEFORE the write (#718), so a retry can put it back too. Outlook resets a series' changed and
+/// deleted occurrences on any change of its time, its end alone included, where Google Calendar
+/// keeps them (measured); a retry after a lost answer would read the series already reset and
+/// find nothing to put back, so what it puts back is read before the write and kept here.
+/// - `seriesId`: the series the edit writes;
+/// - `capture`: what the calendar read, in its own form, opaque to the queue
+///   (`ExchangeCalendarProvider.updateSeries`).
+///
+/// Unlike `SplitRecord`, it holds event content: the changed occurrences' own titles, notes,
+/// places and guests, which the write erases on the server and only this copy can put back. It
+/// lives on the operation's row until the operation completes, beside the edit's own fields the row
+/// already holds; ADR-004 covers email content only.
+struct SeriesEditRecord: Sendable, Equatable {
+    let seriesId: String
+    let capture: String
+
+    /// The reserved key in `PendingCalendarOperation.argumentsJSON`. Only the queue writes it
+    /// (`AccountManager.recordSeriesEdit`); a tool call that carries it has it removed when the
+    /// operation is queued.
+    static let argumentKey = "_series_edit_record"
+
+    private static let seriesKey = "series_id"
+    private static let captureKey = "capture"
+
+    init(seriesId: String, capture: String) {
+        self.seriesId = seriesId
+        self.capture = capture
+    }
+
+    /// The record in a queued operation's arguments, or nil when it has none.
+    init?(_ arguments: [String: JSONValue]) {
+        guard case .dictionary(let d)? = arguments[Self.argumentKey],
+              case .string(let series)? = d[Self.seriesKey],
+              case .string(let capture)? = d[Self.captureKey] else { return nil }
+        self.init(seriesId: series, capture: capture)
+    }
+
+    /// The record as stored under `argumentKey`.
+    var jsonObject: [String: Any] { [Self.seriesKey: seriesId, Self.captureKey: capture] }
+}
+
+/// What an edit of every occurrence keeps on the queued operation that is writing it (#718).
+struct SeriesEditRecorder: Sendable {
+    /// What an earlier attempt of this operation kept, nil when none did.
+    let kept: SeriesEditRecord?
+
+    /// Keeps a `SeriesEditRecord` with the operation, replacing one kept before. A throw stops the
+    /// edit before its write.
+    let keep: @Sendable (SeriesEditRecord) async throws -> Void
+}

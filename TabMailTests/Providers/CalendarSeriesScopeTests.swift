@@ -4739,7 +4739,11 @@ struct SeriesLengthEndToEndTests {
         let lines = (store.storedICS(path: "/cal/len-c.ics") ?? "").components(separatedBy: "\r\n")
         #expect(run.cards.count == 1, "\(run.out)")
         #expect(lines.contains("DTSTART;TZID=Etc/UTC:\(compact(day(0)))T090000"), "\(lines)")
-        #expect(lines.contains("DTEND;TZID=Etc/UTC:\(compact(day(1)))T100000"), "\(lines); \(run.out)")
+        // 10:00 UTC on day 1, in whatever name of UTC the write labels it with.
+        let end = lines.first { $0.hasPrefix("DTEND;TZID=") && $0.hasSuffix(":\(compact(day(1)))T100000") }
+        let endZone = end.flatMap { $0.dropFirst("DTEND;TZID=".count).split(separator: ":").first }
+            .flatMap { CalendarTimeZoneResolver.zone(named: String($0), in: .none) }
+        #expect(endZone?.secondsFromGMT() == 0 && endZone?.nextDaylightSavingTimeTransition == nil, "\(lines); \(run.out)")
         #expect(run.queued.isEmpty, "the drain did not write it: \(reasons(run.queued))")
     }
 
@@ -4759,5 +4763,454 @@ struct SeriesLengthEndToEndTests {
         #expect((series?["start"] as? [String: Any])?["date"] as? String == day(0), "start: \(series?["start"] ?? "none")")
         #expect((series?["end"] as? [String: Any])?["date"] as? String == day(2), "end: \(series?["end"] ?? "none"); \(r.run.out)")
         #expect(r.run.queued.isEmpty, "the drain did not write it: \(reasons(r.run.queued))")
+    }
+}
+
+// MARK: - A new length of every occurrence keeps the ones changed and deleted one by one (#718)
+//
+// **INVARIANT (#718).** *An edit of every occurrence that changes its end alone is a new length,
+// and the series ends up as Google Calendar leaves it:* each occurrence changed on its own keeps its
+// own start and its own other changes and lasts the new length; each deleted one stays deleted; every
+// other one lasts the new length. The new length is the new end less the start of the occurrence
+// the edit names, where it is now. Asserted on what each calendar ends up holding: Google keeps the
+// exceptions itself; Outlook resets them on the write and the edit puts them back (also across a
+// retry whose first attempt lost its answer, and from a fresh read when the first write did not
+// land); a put-back that fails for good says how many were not put back.
+
+@Suite("A new length of every occurrence keeps the occurrences changed and deleted one by one (#718)", .serialized, .processGlobalState)
+struct SeriesLengthKeepsExceptionsTests {
+
+    /// The new length of the Outlook series (30 minutes now): short enough that its new end stays
+    /// on the date of its old one in the series' zone, wherever the device is (`GraphFixture.start`).
+    private static let length: TimeInterval = 2_700
+
+    /// The series' occurrence `n` weeks after its first: seven calendar days apart in the series'
+    /// own zone (Pacific), where Graph repeats it, so a change of summer time between keeps its time.
+    private static func week(_ n: Int) -> Date {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = GraphSeries.eventZone
+        return cal.date(byAdding: .day, value: 7 * n, to: GraphFixture.start)!
+    }
+
+    /// How an occurrence of the Outlook series was changed on its own before the edit.
+    private struct OwnChange {
+        var hours = 0
+        var subject: String?
+        var deleted = false
+    }
+
+    /// Outlook's series `ser-1` (`GraphSeries`, 30 minutes from `GraphFixture.start`) and its
+    /// occurrences `ser-1-w<n>` week by week, each changed on its own as `changes[n]` says. The
+    /// calendar keeps them as Graph does (`modelsExceptions`).
+    private static func outlookCalendar(_ changes: [OwnChange]) -> FakeGraphCalendar {
+        var events: [[String: Any]] = [GraphSeries.series()]
+        for (n, change) in changes.enumerated() {
+            var e = change.hours == 0 ? GraphSeries.occurrence(id: "ser-1-w\(n)", at: week(n))
+                : GraphSeries.moved(id: "ser-1-w\(n)", from: week(n), to: week(n).addingTimeInterval(TimeInterval(change.hours * 3_600)))
+            e["type"] = change.hours == 0 && change.subject == nil ? "occurrence" : "exception"
+            if let subject = change.subject { e["subject"] = subject }
+            events.append(e)
+        }
+        let graph = FakeGraphCalendar(events)
+        graph.modelsExceptions.withLock { $0 = true }
+        for (n, change) in changes.enumerated() where change.deleted { graph.userDeletesOccurrence("ser-1-w\(n)") }
+        return graph
+    }
+
+    /// Weeks 0-4: week 1 moved two hours later and renamed, week 2 renamed, week 3 deleted, weeks 0
+    /// and 4 as the series has them.
+    private static let ownChanges = [
+        OwnChange(), OwnChange(hours: 2, subject: "Moved"), OwnChange(subject: "Renamed"), OwnChange(deleted: true), OwnChange(),
+    ]
+
+    private static func outlookCalendar() -> FakeGraphCalendar { outlookCalendar(ownChanges) }
+
+    /// The series as Google Calendar leaves it once every occurrence lasts `length`, each changed
+    /// as `changes` says.
+    private static func expectOutlookKept(
+        _ graph: FakeGraphCalendar, length: TimeInterval, changes: [OwnChange] = ownChanges, _ context: String
+    ) {
+        let series = graph.event("ser-1")
+        #expect(instant(series?["end"]) == GraphFixture.start.addingTimeInterval(length), "\(context): the series: \(series ?? [:])")
+        for (n, change) in changes.enumerated() {
+            let id = "ser-1-w\(n)"
+            let stored = graph.event(id)
+            if change.deleted {
+                #expect(stored == nil && graph.isDeletedOccurrence(id), "\(context): the deleted occurrence \(id) came back: \(stored ?? [:])")
+                continue
+            }
+            let start = week(n).addingTimeInterval(TimeInterval(change.hours * 3_600))
+            #expect(instant(stored?["start"]) == start && instant(stored?["end"]) == start.addingTimeInterval(length)
+                    && stored?["subject"] as? String == change.subject ?? "Planning",
+                    "\(context): \(id) is \(stored ?? [:])")
+        }
+    }
+
+    /// A new end alone of every occurrence, `length` after the series' start.
+    private static func newEnd(_ length: TimeInterval = length) -> [String: JSONValue] {
+        ["edit_scope": .string("all"), "end_iso": .string(GraphFixture.naive(GraphFixture.start.addingTimeInterval(length))),
+         "timezone": .string("UTC")]
+    }
+
+    /// What the user is told when `remaining` occurrences could not be put back after the series
+    /// was written.
+    private static func putBackFailure(_ remaining: String) -> String {
+        "The series was changed, but \(remaining) you had changed on their own could not be restored. Check them in your calendar."
+    }
+
+    @Test("Outlook: a new end of every occurrence keeps the moved, renamed and deleted ones, and the card warns of no reset")
+    func outlookKeepsExceptions() async throws {
+        let graph = Self.outlookCalendar()
+        let r = try await outlookTool(graph, Self.newEnd(), eventId: "ser-1", account: "series-length-x")
+        #expect(r.cards.count == 1 && r.queued.isEmpty, "cards \(r.cards.count) queued \(reasons(r.queued)); \(r.out)")
+        #expect(r.cards.first?.changes.contains(CalendarToolHelpers.ruleChangeResetNote) == false, "card: \(r.cards.first?.changes ?? [])")
+        #expect(graph.seriesResets == 1, "Graph did not reset the series: the fake models no reset to put back")
+        Self.expectOutlookKept(graph, length: Self.length, "one attempt")
+    }
+
+    @Test("Outlook: the write's answer lost, the retry puts back what the first attempt kept on the operation")
+    func outlookRetryPutsBackWhatWasKept() async throws {
+        let graph = Self.outlookCalendar()
+        graph.loseNextResponse("PATCH")
+        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-retry", drains: 2)
+        #expect(rows.isEmpty, "rows: \(reasons(rows))")
+        // The first attempt's write landed and reset the series; its answer was lost before the
+        // put-back, which the second attempt wrote from the operation's record alone (the series'
+        // end already the new one, nothing is read as changed).
+        #expect(graph.patches("ser-1").count == 1, "the series was written \(graph.patches("ser-1").count) times")
+        Self.expectOutlookKept(graph, length: Self.length, "after a retry")
+    }
+
+    @Test("Outlook: the series' write failed, an occurrence deleted before the retry stays deleted: the retry reads the occurrences again")
+    func outlookRetryAfterAFailedWriteReadsAgain() async throws {
+        let graph = Self.outlookCalendar()
+        // The first attempt keeps what it read, then its write of the series fails and nothing is
+        // written; the user deletes week 4 before the retry.
+        graph.beforeWrite { method, id in
+            if method == "PATCH", id == "ser-1", graph.writes.filter({ $0 == "PATCH ser-1" }).count == 1 {
+                graph.failNext("PATCH", with: 500)
+                graph.userDeletesOccurrence("ser-1-w4")
+            }
+        }
+        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-unlanded", drains: 2)
+        #expect(rows.isEmpty, "rows: \(reasons(rows))")
+        var changes = Self.ownChanges
+        changes[4].deleted = true
+        Self.expectOutlookKept(graph, length: Self.length, changes: changes, "after a retry")
+    }
+
+    @Test("Outlook: a put-back stopped halfway is finished by the retry")
+    func outlookPutBackStoppedHalfwayIsFinished() async throws {
+        let graph = Self.outlookCalendar()
+        // The deleted occurrence is deleted again first; the first changed one's PATCH, the first
+        // write of an occurrence to arrive, then fails, and the operation stays queued.
+        graph.beforeWrite { method, id in
+            if method == "PATCH", id.hasPrefix("ser-1-w"), graph.writes.filter({ $0.hasPrefix("PATCH ser-1-w") }).count == 1 {
+                graph.failNext("PATCH", with: 500)
+            }
+        }
+        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-half", drains: 2)
+        #expect(rows.isEmpty, "rows: \(reasons(rows))")
+        Self.expectOutlookKept(graph, length: Self.length, "after a retry")
+    }
+
+    @Test("Outlook: a put-back write refused for good retires the operation, saying how many occurrences were not put back")
+    func outlookPutBackRefusedForGoodSaysHowMany() async throws {
+        let graph = Self.outlookCalendar()
+        // The deleted occurrence is deleted again; the first changed one's PATCH is then refused.
+        graph.beforeWrite { method, id in
+            if method == "PATCH", id.hasPrefix("ser-1-w"), graph.writes.filter({ $0.hasPrefix("PATCH ser-1-w") }).count == 1 {
+                graph.failNext("PATCH", with: 400)
+            }
+        }
+        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-refused", drains: 2)
+        #expect(rows.count == 1 && rows.first?.failureReason?.contains(Self.putBackFailure("2 events")) == true, "rows: \(reasons(rows))")
+        #expect(graph.writes.filter { $0.hasPrefix("PATCH ser-1-w") }.count == 1, "retried: \(graph.writes)")
+        #expect(graph.patches("ser-1").count == 1, "the series was written \(graph.patches("ser-1").count) times")
+        #expect(graph.event("ser-1-w3") == nil && graph.isDeletedOccurrence("ser-1-w3"), "the deleted occurrence came back")
+    }
+
+    @Test("Outlook: an occurrence deleted on its own and changed in Outlook after the reset is not deleted again, and the operation says how many were not put back")
+    func outlookPutBackNeverDeletesAnOccurrenceChangedSince() async throws {
+        let graph = Self.outlookCalendar()
+        // Another client changes week 3, brought back by the reset, before the put-back reads it.
+        graph.afterReset {
+            guard var back = graph.event("ser-1-w3") else { return }
+            back["type"] = "exception"
+            back["subject"] = "Changed elsewhere"
+            graph.store(back)
+        }
+        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-changed-since")
+        #expect(rows.count == 1 && rows.first?.failureReason?.contains(Self.putBackFailure("3 events")) == true, "rows: \(reasons(rows))")
+        #expect(graph.event("ser-1-w3")?["subject"] as? String == "Changed elsewhere" && !graph.deleted.contains("ser-1-w3"),
+                "deleted: \(graph.deleted); \(graph.event("ser-1-w3") ?? [:])")
+    }
+
+    @Test("Outlook: one occurrence not put back is one event")
+    func outlookPutBackFailureNamesOneEvent() async throws {
+        let graph = Self.outlookCalendar([OwnChange(), OwnChange(subject: "Renamed")])
+        graph.beforeWrite { method, id in
+            if method == "PATCH", id == "ser-1-w1" { graph.failNext("PATCH", with: 400) }
+        }
+        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-refused-one")
+        #expect(rows.count == 1 && rows.first?.failureReason?.contains(Self.putBackFailure("1 event")) == true, "rows: \(reasons(rows))")
+    }
+
+    /// The guests' addresses `event` holds, lowercased and sorted.
+    private static func guests(_ event: [String: Any]?) -> [String] {
+        (event?["attendees"] as? [[String: Any]] ?? [])
+            .compactMap { (($0["emailAddress"] as? [String: Any])?["address"] as? String)?.lowercased() }
+            .sorted()
+    }
+
+    /// `outlookCalendar()` with week 2's renamed occurrence holding a guest of its own.
+    private static func outlookCalendarWithAnOwnGuest() -> FakeGraphCalendar {
+        let graph = outlookCalendar()
+        var renamed = graph.event("ser-1-w2") ?? [:]
+        renamed["attendees"] = GraphFixture.attendees + [
+            ["emailAddress": ["address": "cy@example.com", "name": "Cy"], "type": "required",
+             "status": ["response": "accepted", "time": GraphFixture.answeredAt]],
+        ]
+        graph.store(renamed)
+        return graph
+    }
+
+    /// A new end with Bo removed and Dee added: every occurrence gets the series' difference on
+    /// its own guests, as Google Calendar and Outlook apply a series' guest change (#620).
+    private static var endAndGuests: [String: JSONValue] {
+        var args = newEnd()
+        args["remove_attendees"] = .array([.string("bo@example.com")])
+        args["add_attendees"] = .array([.dictionary(["email": .string("dee@example.com"), "name": .string("Dee")])])
+        return args
+    }
+
+    private static func expectGuestsCarried(_ graph: FakeGraphCalendar, _ context: String) {
+        let series = ["ana@example.com", "dee@example.com", "room-1@example.com"]
+        #expect(guests(graph.event("ser-1")) == series, "\(context): the series: \(guests(graph.event("ser-1")))")
+        #expect(guests(graph.event("ser-1-w1")) == series, "\(context): the moved occurrence: \(guests(graph.event("ser-1-w1")))")
+        // Its own guest kept, Bo gone and Dee added.
+        #expect(guests(graph.event("ser-1-w2")) == ["ana@example.com", "cy@example.com", "dee@example.com", "room-1@example.com"],
+                "\(context): the renamed occurrence: \(guests(graph.event("ser-1-w2")))")
+        #expect(graph.event("ser-1-w2")?["subject"] as? String == "Renamed", "\(context): \(graph.event("ser-1-w2") ?? [:])")
+    }
+
+    @Test("Outlook: a new end with a change of guests gives each occurrence put back the series' guest change on its own guests")
+    func outlookEndAndGuestsCarryTheGuestChange() async throws {
+        let graph = Self.outlookCalendarWithAnOwnGuest()
+        let r = try await outlookTool(graph, Self.endAndGuests, eventId: "ser-1", account: "series-length-x-guests")
+        #expect(r.cards.count == 1 && r.queued.isEmpty, "cards \(r.cards.count) queued \(reasons(r.queued)); \(r.out)")
+        #expect(graph.seriesResets == 1, "Graph did not reset the series: the fake models no reset to put back")
+        Self.expectGuestsCarried(graph, "one attempt")
+    }
+
+    @Test("Outlook: a new end with a change of guests, the write's answer lost: the retry gives the series' guest change from what the first attempt kept")
+    func outlookEndAndGuestsRetryCarriesTheGuestChange() async throws {
+        let graph = Self.outlookCalendarWithAnOwnGuest()
+        graph.loseNextResponse("PATCH")
+        let rows = try await outlook(graph, eventId: "ser-1", Self.endAndGuests, account: "series-length-x-guests-retry", drains: 2)
+        #expect(rows.isEmpty, "rows: \(reasons(rows))")
+        Self.expectGuestsCarried(graph, "after a retry")
+    }
+
+    @Test("Outlook: a new end with a new title puts the changed occurrences back with the new title, as a split carries a field the edit sets")
+    func outlookEndAndRenameCarryTheNewTitle() async throws {
+        let graph = Self.outlookCalendar()
+        var args = Self.newEnd()
+        args["title"] = .string("Planning (weekly)")
+        let r = try await outlookTool(graph, args, eventId: "ser-1", account: "series-length-x-rename")
+        #expect(r.cards.count == 1 && r.queued.isEmpty, "cards \(r.cards.count) queued \(reasons(r.queued)); \(r.out)")
+        for (id, start) in [("ser-1-w1", Self.week(1).addingTimeInterval(7_200)), ("ser-1-w2", Self.week(2))] {
+            let stored = graph.event(id)
+            #expect(stored?["subject"] as? String == "Planning (weekly)", "\(id): \(stored ?? [:])")
+            #expect(instant(stored?["start"]) == start && instant(stored?["end"]) == start.addingTimeInterval(Self.length),
+                    "\(id): \(stored ?? [:])")
+        }
+        #expect(graph.event("ser-1-w3") == nil && graph.isDeletedOccurrence("ser-1-w3"), "the deleted occurrence came back")
+    }
+
+    /// Graph's series `ser-1` and its first occurrence and a later one, its range naming no zone.
+    private static func zonelessOutlookCalendar() throws -> FakeGraphCalendar {
+        var series = GraphSeries.series()
+        var recurrence = try #require(series["recurrence"] as? [String: Any])
+        var range = try #require(recurrence["range"] as? [String: Any])
+        range.removeValue(forKey: "recurrenceTimeZone")
+        recurrence["range"] = range
+        series["recurrence"] = recurrence
+        return FakeGraphCalendar([series, GraphSeries.occurrence(id: GraphSeries.first, at: GraphFixture.start),
+                                  GraphSeries.occurrence(id: GraphSeries.later, at: GraphFixture.occurrenceStart)])
+    }
+
+    @Test("Outlook: a new end whose put-back can't be planned is refused with nothing kept on the operation and nothing written")
+    func outlookUnplannablePutBackWritesNothing() async throws {
+        // A series whose range names no zone, with an occurrence moved two hours later: putting it
+        // back is a move that can't be dated without the series' zone.
+        let graph = try Self.zonelessOutlookCalendar()
+        graph.modelsExceptions.withLock { $0 = true }
+        var moved = GraphSeries.moved(id: GraphSeries.later, from: GraphFixture.occurrenceStart,
+                                      to: GraphFixture.occurrenceStart.addingTimeInterval(7_200))
+        moved["type"] = "exception"
+        graph.store(moved)
+        let rows = try await outlook(graph, eventId: GraphSeries.first, [
+            "end_iso": .string(GraphFixture.naive(GraphFixture.start.addingTimeInterval(Self.length))), "timezone": .string("UTC"),
+        ], account: "series-length-x-unplannable")
+        #expect(graph.writes.isEmpty && graph.deleted.isEmpty, "written: \(graph.writes) deleted \(graph.deleted)")
+        #expect(rows.count == 1 && rows.first?.failureReason?.contains(
+            "Outlook gives no time zone for this repeating event, so its occurrences changed or deleted one by one can't be kept, and its length was not changed") == true,
+                "rows: \(reasons(rows))")
+        #expect(rows.first?.argumentsJSON.contains(SeriesEditRecord.argumentKey) == false, "kept: \(rows.first?.argumentsJSON ?? "")")
+    }
+
+    @Test("Outlook: a new end alone of a series whose zone TabMail can't read, with no occurrence changed on its own, is written as its card showed, from its first occurrence or a later one")
+    func outlookZonelessEndAloneIsWrittenAsTheCardShowed() async throws {
+        let first = try Self.zonelessOutlookCalendar()
+        let fromFirst = try await outlookTool(first, [
+            "end_iso": .string(GraphFixture.naive(GraphFixture.start.addingTimeInterval(Self.length))), "timezone": .string("UTC"),
+        ], eventId: GraphSeries.first, account: "series-length-x-zoneless-first")
+        #expect(fromFirst.cards.count == 1 && fromFirst.queued.isEmpty,
+                "cards \(fromFirst.cards.count) queued \(reasons(fromFirst.queued)); \(fromFirst.out)")
+        #expect(instant(first.event("ser-1")?["end"]) == GraphFixture.start.addingTimeInterval(Self.length),
+                "the series: \(first.event("ser-1") ?? [:])")
+        #expect(first.created.isEmpty, "a new part was made: \(first.created)")
+
+        let later = try Self.zonelessOutlookCalendar()
+        let fromLater = try await outlookTool(later, [
+            "end_iso": .string(GraphFixture.naive(GraphFixture.occurrenceStart.addingTimeInterval(Self.length))), "timezone": .string("UTC"),
+        ], eventId: GraphSeries.later, account: "series-length-x-zoneless-later")
+        #expect(fromLater.cards.count == 1 && fromLater.queued.isEmpty,
+                "cards \(fromLater.cards.count) queued \(reasons(fromLater.queued)); \(fromLater.out)")
+        #expect(instant(later.event("ser-1")?["end"]) == GraphFixture.start.addingTimeInterval(Self.length),
+                "the series: \(later.event("ser-1") ?? [:])")
+        #expect(later.created.isEmpty, "a new part was made: \(later.created)")
+    }
+
+    /// INVARIANT (#718), over a seeded table: whatever occurrences were moved, renamed and deleted
+    /// on their own, whatever the new length, and whether or not the write's answer was lost, the
+    /// Outlook series ends up as Google Calendar leaves it (`expectOutlookKept`).
+    @Test("Outlook: over a seeded table of occurrences moved, renamed and deleted, new lengths and lost answers, the series ends up as Google Calendar leaves it",
+          .timeLimit(.minutes(5)))
+    func outlookPutBackOverASeededTable() async throws {
+        var rng = SplitMix64(seed: 718)
+        // 30 minutes now: every other length up to an hour and a half.
+        let lengths: [TimeInterval] = [900, 2_700, 3_600, 4_500, 5_400]
+        for round in 0..<12 {
+            var changes = [OwnChange()]
+            for n in 1...5 {
+                var change = OwnChange()
+                switch Int.random(in: 0...4, using: &rng) {
+                case 1: change.hours = Int.random(in: 1...2, using: &rng)
+                case 2: change.subject = "Renamed \(n)"
+                case 3: change.hours = Int.random(in: 1...2, using: &rng); change.subject = "Moved \(n)"
+                case 4: change.deleted = true
+                default: break
+                }
+                changes.append(change)
+            }
+            let length = lengths[Int.random(in: 0..<lengths.count, using: &rng)]
+            let loses = Bool.random(using: &rng)
+            let graph = Self.outlookCalendar(changes)
+            if loses { graph.loseNextResponse("PATCH") }
+            let context = "round \(round): \(changes.map { $0.deleted ? "deleted" : "\($0.hours)h \($0.subject ?? "-")" }) length \(length) lost \(loses)"
+            let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(length), account: "series-length-x-seeded-\(round)", drains: 2)
+            #expect(rows.isEmpty, "\(context): rows: \(reasons(rows))")
+            Self.expectOutlookKept(graph, length: length, changes: changes, context)
+        }
+    }
+
+    @Test("Google: a new end named from an occurrence moved on its own is a length from where it starts, and every changed and deleted occurrence stays")
+    func googleLengthFromTheMovedOccurrence() async throws {
+        // Day 7's occurrence moved to 08:00 and day 14's deleted: an end at 12:00 on day 7 is four hours.
+        let seed = [GoogleSeries.series(rule: GoogleSeries.weekly), GoogleSeries.instance(day(0)),
+                    GoogleSeries.moved(day(7), start: "\(day(7))T08:00:00", end: "\(day(7))T08:30:00"),
+                    GoogleSeries.deleted(day(14))]
+        let r = try await googleTool([
+            "end_iso": .string("\(day(7))T12:00:00"), "timezone": .string("UTC"),
+        ], eventId: GoogleSeries.later, account: "series-length-g", seed: seed)
+        #expect(r.run.cards.count == 1 && r.run.queued.isEmpty, "cards \(r.run.cards.count) queued \(reasons(r.run.queued)); \(r.run.out)")
+        #expect(r.run.cards.first?.changes.contains(CalendarToolHelpers.ruleChangeResetNote) == false, "card: \(r.run.cards.first?.changes ?? [])")
+        #expect(r.calendar.seriesResets == 0, "the series was reset: \(r.calendar.writes)")
+        let series = r.calendar.event(GoogleSeries.id)
+        #expect(instant(series?["start"]) == utcAt("\(day(0))T09:00:00") && instant(series?["end"]) == utcAt("\(day(0))T13:00:00"),
+                "the series: \(series ?? [:])")
+        let moved = r.calendar.event(GoogleSeries.later)
+        #expect(instant(moved?["start"]) == utcAt("\(day(7))T08:00:00") && instant(moved?["end"]) == utcAt("\(day(7))T12:00:00"),
+                "the moved occurrence: \(moved ?? [:])")
+        #expect(r.calendar.event(GoogleSeries.instanceId(day(14)))?["status"] as? String == "cancelled", "the deleted occurrence came back")
+    }
+
+    @Test("Google: a new end with a new title gives every changed occurrence the new title and the new length from its own start, and a deleted one stays deleted, as Outlook's put-back does")
+    func googleEndAndRenameRetitleTheChangedOccurrences() async throws {
+        // Day 7's occurrence moved to 10:00 and given its own title; day 14's deleted.
+        var moved = GoogleSeries.moved(day(7), start: "\(day(7))T10:00:00", end: "\(day(7))T10:30:00")
+        moved["summary"] = "Standup (own title)"
+        let seed = [GoogleSeries.series(rule: GoogleSeries.weekly), GoogleSeries.instance(day(0)), moved,
+                    GoogleSeries.deleted(day(14))]
+        let r = try await googleTool([
+            "edit_scope": .string("all"), "end_iso": .string("\(day(0))T10:00:00"),
+            "title": .string("Team standup"), "timezone": .string("UTC"),
+        ], eventId: GoogleSeries.id, account: "series-length-g-rename", seed: seed)
+        #expect(r.run.cards.count == 1 && r.run.queued.isEmpty, "cards \(r.run.cards.count) queued \(reasons(r.run.queued)); \(r.run.out)")
+        #expect(r.calendar.seriesResets == 0, "the series was reset: \(r.calendar.writes)")
+        let changed = r.calendar.event(GoogleSeries.later)
+        #expect(changed?["summary"] as? String == "Team standup", "the changed occurrence: \(changed ?? [:])")
+        #expect(instant(changed?["start"]) == utcAt("\(day(7))T10:00:00") && instant(changed?["end"]) == utcAt("\(day(7))T11:00:00"),
+                "the changed occurrence: \(changed ?? [:])")
+        #expect(r.calendar.event(GoogleSeries.instanceId(day(14)))?["status"] as? String == "cancelled", "the deleted occurrence came back")
+    }
+
+    @Test("Google: a new end before the start of the occurrence named is refused before the card, nothing written")
+    func googleEndBeforeTheNamedOccurrenceIsRefused() async throws {
+        let seed = [GoogleSeries.series(rule: GoogleSeries.weekly), GoogleSeries.instance(day(0)),
+                    GoogleSeries.moved(day(7), start: "\(day(7))T08:00:00", end: "\(day(7))T08:30:00")]
+        let r = try await googleTool([
+            "end_iso": .string("\(day(7))T07:00:00"), "timezone": .string("UTC"),
+        ], eventId: GoogleSeries.later, account: "series-length-g-before", seed: seed)
+        #expect(r.run.cards.isEmpty && r.run.queued.isEmpty && r.calendar.writes.isEmpty,
+                "cards \(r.run.cards.count) queued \(reasons(r.run.queued)) writes \(r.calendar.writes); \(r.run.out)")
+        #expect(r.run.out.contains("is not after the start of the occurrence named"), "\(r.run.out)")
+    }
+}
+
+@Suite("The record of an edit of every occurrence is reserved for the queue (#718)", .serialized, .processGlobalState)
+struct SeriesEditRecordIsReservedTests {
+
+    @Test("a record in a tool call's arguments is dropped when the change is queued")
+    func forgedRecordIsDropped() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let pool = try DatabasePool(path: dir.appendingPathComponent("test.sqlite").path)
+        let appDb = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let prev = current; current = appDb; return prev
+        }
+        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir) }
+        let account = "series-edit-forged"
+        try await pool.write { db in
+            var acc = Account(emailAddress: "cal@example.com", displayName: "Cal", provider: .gmail)
+            acc.id = account
+            try acc.insert(db)
+        }
+        let forged = SeriesEditRecord(seriesId: "ser-1", capture: #"{"changed":[],"deleted":[],"series":{}}"#)
+        let op = try await AccountManager.shared.queueCalendarOperation(
+            type: .edit, accountId: account, eventId: "ser-1", calendarId: "primary",
+            arguments: ["edit_scope": .string("all"), "title": .string("Retitled"),
+                        SeriesEditRecord.argumentKey: .dictionary(["series_id": .string(forged.seriesId), "capture": .string(forged.capture)])],
+            eventTitle: "Card title")
+        let stored = try #require(try await pool.read { db in try PendingCalendarOperation.fetchOne(db, key: op.id) })
+        #expect(SeriesEditRecord(stored.arguments) == nil, "the forged record was queued: \(stored.argumentsJSON)")
+        #expect(stored.arguments["title"] != nil, "the rest of the arguments were not kept: \(stored.argumentsJSON)")
+    }
+
+    @Test("a record round-trips through the stored arguments, and a partial one is no record")
+    func recordRoundTrips() throws {
+        let record = SeriesEditRecord(seriesId: "ser-1", capture: #"{"changed":[],"deleted":["x"],"series":{}}"#)
+        let data = try JSONSerialization.data(withJSONObject: [SeriesEditRecord.argumentKey: record.jsonObject])
+        let arguments = try JSONDecoder().decode([String: JSONValue].self, from: data)
+        #expect(SeriesEditRecord(arguments) == record)
+        for key in ["series_id", "capture"] {
+            var partial = record.jsonObject
+            partial[key] = nil
+            let data = try JSONSerialization.data(withJSONObject: [SeriesEditRecord.argumentKey: partial])
+            #expect(SeriesEditRecord(try JSONDecoder().decode([String: JSONValue].self, from: data)) == nil, "a record without \(key) was read")
+        }
     }
 }

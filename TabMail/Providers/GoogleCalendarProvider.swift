@@ -14,6 +14,13 @@ protocol CalendarProvider: Sendable {
     func getEvent(calendarId: String, eventId: String) async throws -> GCalEvent
     func createEvent(calendarId: String, event: GCalEventInput, sendUpdates: String) async throws -> GCalEvent
     func updateEvent(calendarId: String, eventId: String, event: GCalEventInput, sendUpdates: String) async throws -> GCalEvent
+
+    /// An edit of every occurrence of the repeating event `eventId` (edit_scope "all"), as the
+    /// queue writes it. `record` keeps, on the queued operation and before the write, what the
+    /// write must put back after it, and hands a retry what an earlier attempt kept (#718).
+    /// Default: `updateEvent`, for a calendar whose series write keeps its changed occurrences or
+    /// resets them only where the card says so.
+    func updateSeries(calendarId: String, eventId: String, event: GCalEventInput, sendUpdates: String, record: SeriesEditRecorder) async throws -> GCalEvent
     func deleteEvent(calendarId: String, eventId: String, sendUpdates: String) async throws
 
     /// Update a SINGLE OCCURRENCE of a recurring event (this_only edit_scope).
@@ -136,7 +143,8 @@ protocol CalendarProvider: Sendable {
 
     /// Whether the whole-series edit `edit` (the input the write is given) resets the
     /// occurrences of `event` changed one by one, as this calendar's write treats them: on
-    /// Outlook and Google, any change of the series' rule, start or end; on CalDAV, a change of
+    /// Outlook and Google, any change of the series' rule or start, and of its end but for a new
+    /// length (#718: Google keeps them, Outlook's write puts them back); on CalDAV, a change of
     /// its rule. Pure: it reads only `event`, the series as already read, and makes no request.
     /// The edit's confirmation card says so when it does (#423).
     func editResetsChangedOccurrences(_ event: GCalEvent, edit: GCalEventInput) -> Bool
@@ -201,6 +209,9 @@ enum CalendarProviderError: Error {
 // implemented the recurring-aware paths yet. These keep existing callers
 // compiling while letting newly-aware providers override.
 extension CalendarProvider {
+    func updateSeries(calendarId: String, eventId: String, event: GCalEventInput, sendUpdates: String, record: SeriesEditRecorder) async throws -> GCalEvent {
+        try await updateEvent(calendarId: calendarId, eventId: eventId, event: event, sendUpdates: sendUpdates)
+    }
     func updateOccurrence(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone, event: GCalEventInput, sendUpdates: String) async throws -> GCalEvent {
         throw CalendarProviderError.notSupported("Editing a single occurrence of a recurring event is not yet supported on this calendar provider. Edit the whole series or use the Thunderbird add-on for fine-grained occurrence edits.")
     }
