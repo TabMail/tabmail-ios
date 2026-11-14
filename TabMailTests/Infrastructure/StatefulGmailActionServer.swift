@@ -136,6 +136,8 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         var lookupFailuresConsumed = 0
         /// `GET /labels` answers 503 while set.
         var failsLabelListings = false
+        /// Run whenever `GET /labels` is served, before it is answered.
+        var labelListingHook: (@Sendable () -> Void)?
         /// Label ids `/messages/{id}/modify` and `/messages` (list) must
         /// reject as gone — simulates a label deleted remotely between
         /// enqueue and drain. Gmail's real shape for this is a structural
@@ -407,6 +409,12 @@ final class StatefulGmailActionServer: @unchecked Sendable {
     /// Make every `GET /labels` answer 503 (`true`) or list again (`false`).
     func failLabelListings(_ failing: Bool) {
         state.value.withLock { $0.failsLabelListings = failing }
+    }
+
+    /// Run `hook` whenever `GET /labels` is served, before it is answered (an
+    /// injected failure included). nil removes it.
+    func onLabelListing(_ hook: (@Sendable () -> Void)?) {
+        state.value.withLock { $0.labelListingHook = hook }
     }
 
     func failNextLookup() {
@@ -1101,6 +1109,7 @@ final class StatefulGmailActionServer: @unchecked Sendable {
 
     private func registerRoutes() {
         http.register(path: "/labels", method: "GET") { [state, systemLabels] _ in
+            if let hook = state.value.withLock({ $0.labelListingHook }) { hook() }
             if state.value.withLock({ $0.failsLabelListings }) { return .status(503) }
             let system = systemLabels.map {
                 ["id": $0, "name": $0, "type": "system", "messagesTotal": 0, "messagesUnread": 0] as [String: Any]

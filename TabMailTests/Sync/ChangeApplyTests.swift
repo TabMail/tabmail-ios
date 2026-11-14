@@ -337,6 +337,27 @@ struct ChangeApplyTests {
         }
     }
 
+    @Test("A shielded record whose label set already equals the stored one settles the message")
+    func shieldedEqualLabelSetSettles() async throws {
+        try await Self.withWorld { w in
+            try w.insertRow("le1", in: w.inboxId, path: "INBOX")
+            try Self.addLabel(w, "Label_A", to: "le1", in: w.inboxId)
+            try w.insertOp(.addUserLabel, ids: ["le1"], path: "INBOX")
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?",
+                               arguments: [FolderChangeState(recheck: ["le1"]).encoded, w.inboxId])
+            }
+            let inboxId = w.inboxId
+            await w.script([{ _, request in
+                // The server already has the user's label: nothing is kept back.
+                Self.tracked(request, records: [inboxId: [ChangeRecord(header: Self.info("le1", labels: ["Label_A"]))]])
+            }])
+            try await w.pass()
+            #expect(try Self.labels(w, "le1", in: w.inboxId) == ["Label_A"])
+            #expect(try w.state(w.inboxId).recheck.isEmpty, "a set equal to the stored one settles under the shield")
+        }
+    }
+
     @Test("A label op shields the message by its RFC id and in every folder copy")
     func labelOpShieldsByAnyKey() async throws {
         try await Self.withWorld { w in

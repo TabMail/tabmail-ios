@@ -278,7 +278,12 @@ struct GmailChangeReadingTests {
 
     /// The Inbox's re-read list.
     static func inboxRecheck(_ w: Pins.World) throws -> [String] {
-        let raw = try w.pool.read { db in try Folder.fetchOne(db, key: w.inbox.id)?.changeState }
+        try recheck(w, w.inbox)
+    }
+
+    /// A folder's re-read list.
+    static func recheck(_ w: Pins.World, _ folder: Folder) throws -> [String] {
+        let raw = try w.pool.read { db in try Folder.fetchOne(db, key: folder.id)?.changeState }
         return FolderChangeState(raw: raw).recheck
     }
 
@@ -340,6 +345,69 @@ struct GmailChangeReadingTests {
             try await w.completedDelta()
             #expect(try w.userLabels(ofHeader: row.id) == ["Label_ghost"], "the server's set lands")
             #expect(try Self.inboxRecheck(w).isEmpty, "and the message leaves the list")
+        }
+    }
+
+    @Test("an unknown label id lists the message in every folder its record lands in")
+    func unknownLabelSetIsListedInEveryFolder() async throws {
+        try await Pins.withWorld(seeds: [Pins.seed("lbl-9", labels: ["INBOX", Pins.userLabelId])]) { w in
+            let inboxRow = try w.insertRow("lbl-9", in: w.inbox)
+            let labelRow = try w.insertRow("lbl-9", in: w.label)
+            try Self.storeLabel(w, Pins.userLabelId, on: inboxRow.id)
+            try Self.storeLabel(w, Pins.userLabelId, on: labelRow.id)
+            // The message now carries a label `/labels` does not list.
+            w.server.applyLabelChange(providerMessageId: "lbl-9", add: ["Label_ghost"])
+            try await w.completedDelta()
+            #expect(try Self.recheck(w, w.inbox) == ["lbl-9"], "listed in the Inbox")
+            #expect(try Self.recheck(w, w.label) == ["lbl-9"], "and in the label folder")
+            #expect(try w.userLabels(ofHeader: labelRow.id) == [Pins.userLabelId], "the stored labels stay")
+        }
+    }
+
+    @Test("a failed reload of the label list leaves the unknown set unknown and the pass lands")
+    func failedReloadKeepsLabelsAndPassLands() async throws {
+        try await Pins.withWorld(seeds: [Pins.seed("lbl-10", labels: ["INBOX", "UNREAD", Pins.userLabelId])]) { w in
+            let row = try w.insertRow("lbl-10", in: w.inbox)
+            try Self.storeLabel(w, Pins.userLabelId, on: row.id)
+            // A label created on the web after the provider's catalog loaded;
+            // the reload that would learn it fails.
+            w.server.setUserLabel(id: "Label_new", name: "New")
+            w.server.applyLabelChange(providerMessageId: "lbl-10", add: ["Label_new"], remove: ["UNREAD"])
+            w.server.failLabelListings(true)
+            let outcome = try await SyncEngine().performDeltaSync(account: try w.account(), provider: w.provider, inboxOnly: true)
+            #expect(outcome.succeeded, "the pass does not fail")
+            #expect(try w.account().lastHistoryId == w.server.currentHistoryId(), "the bookmark moves")
+            #expect(try w.row("lbl-10", in: w.inbox)?.isRead == true, "what the record knows lands")
+            #expect(try w.userLabels(ofHeader: row.id) == [Pins.userLabelId], "the stored labels stay")
+            #expect(try Self.inboxRecheck(w) == ["lbl-10"], "and the message is listed for a read that knows the set")
+        }
+    }
+
+    @Test("a reload of the label list cut short by cancellation ends the pass with the bookmark kept")
+    func cancelledReloadEndsThePass() async throws {
+        try await Pins.withWorld(seeds: [Pins.seed("lbl-11", labels: ["INBOX", Pins.userLabelId])]) { w in
+            let row = try w.insertRow("lbl-11", in: w.inbox)
+            try Self.storeLabel(w, Pins.userLabelId, on: row.id)
+            w.server.setUserLabel(id: "Label_new", name: "New")
+            w.server.applyLabelChange(providerMessageId: "lbl-11", add: ["Label_new"])
+            w.server.failLabelListings(true)
+            let account = try w.account()
+            let before = account.lastHistoryId
+            let provider = w.provider
+            let (gate, open) = AsyncStream<Void>.makeStream()
+            let task = Task {
+                for await _ in gate { break }
+                return try await SyncEngine().performDeltaSync(account: account, provider: provider, inboxOnly: true)
+            }
+            // The pass is cancelled while the reload is in flight.
+            w.server.onLabelListing { task.cancel() }
+            open.yield()
+            open.finish()
+            let result = await task.result
+            w.server.onLabelListing(nil)
+            #expect((try? result.get())?.succeeded != true, "a cancelled pass does not succeed")
+            #expect(try w.account().lastHistoryId == before, "the bookmark is kept")
+            #expect(try w.userLabels(ofHeader: row.id) == [Pins.userLabelId], "and the stored labels stay")
         }
     }
 
