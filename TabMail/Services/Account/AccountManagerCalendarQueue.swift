@@ -457,6 +457,9 @@ extension AccountManager {
         defer { isDrainingCalendar = false }
 
         var failedAccounts = Set<String>()
+        // Whether a queued change's wait reason may have been written, cleared, or left the queue
+        // with its row, so the inbox's waiting banners are read again after the drain (#865).
+        var waitReasonsChanged = false
 
         for pass in 0..<3 {
             let ops: [PendingCalendarOperation]
@@ -525,6 +528,7 @@ extension AccountManager {
 
                 do {
                     let ids = try await executeCalendarOperation(currentOp, provider: calProvider)
+                    if currentOp.waitReason != nil { waitReasonsChanged = true }
                     // Post-execution delete MUST succeed — remote op already completed.
                     //
                     // 🚨 R17b-B2 — OF THE THREE DURABLE BOOKKEEPING WRITES IN THIS
@@ -581,6 +585,9 @@ extension AccountManager {
                     )
                 } catch {
                     let ageHours = Date().timeIntervalSince(currentOp.createdAt) / 3600
+                    // A reason the user can act on, kept on the row if it stays queued (#865).
+                    let waitReason = Self.calendarWaitReason(error)
+                    if currentOp.waitReason != nil || waitReason != nil { waitReasonsChanged = true }
 
                     // 🚨 R14-F4 — RAISE THE RE-AUTH SIGNAL BEFORE ANY DISPOSITION IS
                     // CHOSEN. The signal is about the ACCOUNT; the arms below decide
@@ -743,13 +750,19 @@ extension AccountManager {
                     // The row is read again and only its status and retry count are
                     // written (#601): the attempt may have kept a split's record in
                     // `argumentsJSON` (`recordSplit`), and writing back the row as it was
-                    // read before the attempt would erase it.
+                    // read before the attempt would erase it. Its wait reason (#865) is set
+                    // on that fresh read, and `argumentsJSON` is written only when it changed.
                     do {
                         try await retryWrite(dbPool, label: "CalendarQueue") { db in
                             guard var updated = try PendingCalendarOperation.fetchOne(db, key: currentOp.id) else { return }
                             updated.status = PendingStatus.queued.rawValue
                             updated.retryCount += 1
-                            try updated.update(db, columns: ["status", "retryCount"])
+                            var columns = ["status", "retryCount"]
+                            if updated.waitReason != waitReason {
+                                updated.setWaitReason(waitReason)
+                                columns.append("argumentsJSON")
+                            }
+                            try updated.update(db, columns: columns)
                         }
                     } catch {
                         BackgroundSyncLogger.logError(
@@ -767,6 +780,8 @@ extension AccountManager {
 
             if !executedAny { break }
         }
+
+        if waitReasonsChanged { await LateCalendarFailureStore.shared.reload() }
     }
 
     // MARK: - Operation Execution
@@ -1322,6 +1337,18 @@ extension AccountManager {
     /// threw `result.data`. Which arm carries what, stated so no future reader has
     /// to re-derive it: **first response and refresh-retry both carry the server's
     /// raw body now; neither carries `nil` unless the response body was empty.**
+    /// Why a failure that keeps a change queued is one the user can act on, or nil. Only the
+    /// transient arm reads it: no terminal arm claims these errors (#865).
+    ///
+    /// `ExchangeCalendarError.mailboxFull`: Graph refused the write with 403 `ErrorQuotaExceeded`.
+    /// Signing in again can't help and the change must not be dropped, so it stays queued, the
+    /// account's later calendar changes wait behind it for the drain, and the inbox says the
+    /// mailbox is full until a drain after the user freed space makes it.
+    static func calendarWaitReason(_ error: Error) -> CalendarWaitReason? {
+        if case ExchangeCalendarError.mailboxFull = error { return .mailboxFull }
+        return nil
+    }
+
     static func isCalendarMissingScopeError(_ error: Error) -> Bool {
         if case GoogleCalendarError.missingScope = error { return true }
         if case ExchangeCalendarError.missingScope = error { return true }

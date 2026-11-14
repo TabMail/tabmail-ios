@@ -33,6 +33,34 @@ enum CalendarFailureKind: String, Sendable, CaseIterable {
     }
 }
 
+/// Why a calendar change is still queued, when the user can do something about it: written on the
+/// queued row by the drain's transient arm (`PendingCalendarOperation.waitReasonKey`), so the inbox
+/// can say it. The change is still made once the cause is gone (#865).
+enum CalendarWaitReason: String, Sendable, CaseIterable {
+    /// The mailbox is over its storage quota (`ExchangeCalendarError.mailboxFull`).
+    case mailboxFull
+
+    /// The plain line the inbox shows for this reason.
+    var userReason: String {
+        switch self {
+        case .mailboxFull: return "The mailbox is full. It will be made once space is freed."
+        }
+    }
+}
+
+/// A queued calendar change waiting for a reason the user can act on.
+struct WaitingCalendarChange: Identifiable, Equatable, Sendable {
+    /// The `PendingCalendarOperation.id` of the queued operation.
+    let id: String
+    let title: String
+    let reason: CalendarWaitReason
+
+    /// The inbox banner's line.
+    var bannerText: String {
+        "A calendar change is waiting: \(title). \(reason.userReason)"
+    }
+}
+
 /// A queued calendar change that failed for good where nobody saw it: after the chat turn
 /// that queued it had ended, or in a drain no chat turn started.
 struct LateCalendarFailure: Identifiable, Equatable, Sendable {
@@ -55,6 +83,9 @@ struct LateCalendarFailure: Identifiable, Equatable, Sendable {
 /// (`AccountManager.retireAndAnnounce`), so every row shown here is shown once, after a
 /// relaunch too, until the user dismisses it. Dismiss deletes the row. Nothing is
 /// retried. A row retired by an app version that recorded no kind is not shown.
+///
+/// It also reads the changes still queued with a wait reason (`waiting`): a queued or in-flight
+/// row whose last attempt gave a reason the user can act on, such as a full mailbox (#865).
 @MainActor
 @Observable
 final class LateCalendarFailureStore {
@@ -62,6 +93,10 @@ final class LateCalendarFailureStore {
 
     /// The failures to show, oldest first.
     private(set) var failures: [LateCalendarFailure] = []
+
+    /// The changes still queued for a reason the user can act on, oldest first. Each goes when its
+    /// change is made or fails for good; there is nothing to dismiss.
+    private(set) var waiting: [WaitingCalendarChange] = []
 
     /// Counts reloads, so an older read that finishes last does not overwrite a newer one.
     private var reloadGeneration = 0
@@ -73,12 +108,18 @@ final class LateCalendarFailureStore {
         reloadGeneration += 1
         let generation = reloadGeneration
         let rows: [PendingCalendarOperation]
+        let queued: [PendingCalendarOperation]
         do {
-            rows = try await AppDatabase.dbPool.read { db in
-                try PendingCalendarOperation
+            (rows, queued) = try await AppDatabase.dbPool.read { db in
+                let failed = try PendingCalendarOperation
                     .filter(Column("status") == PendingStatus.failed.rawValue)
                     .order(Column("createdAt").asc)
                     .fetchAll(db)
+                let pending = try PendingCalendarOperation
+                    .filter([PendingStatus.queued.rawValue, PendingStatus.inFlight.rawValue].contains(Column("status")))
+                    .order(Column("createdAt").asc)
+                    .fetchAll(db)
+                return (failed, pending)
             }
         } catch {
             BackgroundSyncLogger.logError(
@@ -90,6 +131,10 @@ final class LateCalendarFailureStore {
         failures = rows.compactMap { row in
             guard let kind = row.failureKind, !row.failureSeen else { return nil }
             return LateCalendarFailure(id: row.id, title: row.eventTitle ?? "(No title)", kind: kind)
+        }
+        waiting = queued.compactMap { row in
+            guard let reason = row.waitReason else { return nil }
+            return WaitingCalendarChange(id: row.id, title: row.eventTitle ?? "(No title)", reason: reason)
         }
     }
 

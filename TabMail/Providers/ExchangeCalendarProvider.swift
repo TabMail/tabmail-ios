@@ -1315,6 +1315,11 @@ actor ExchangeCalendarProvider: CalendarProvider {
                 itemPath: target,
                 inline: GraphInlinePlacement(isInline: file.meta.isInline, contentId: bytes.contentId),
                 post: { path, body in try await self.request(path: path, method: "POST", body: body) },
+                rangeRefused: { status, body in
+                    GraphAPI.isMailboxFull(statusCode: status, errorBody: body)
+                        ? ExchangeCalendarError.mailboxFull
+                        : ExchangeProvider.uploadRangeRefusal(status: status, body: body)
+                },
                 session: testSession ?? sharedEphemeralSession, gate: mailboxGate)
         }
         if DebugModeManager.isLoggingEnabled() {
@@ -2407,7 +2412,15 @@ actor ExchangeCalendarProvider: CalendarProvider {
             if let data = retry.data {
                 return data
             }
+            if GraphAPI.isMailboxFull(statusCode: retry.statusCode, errorBody: retry.errorBody) {
+                throw ExchangeCalendarError.mailboxFull
+            }
             throw ExchangeCalendarError.httpError(retry.statusCode, retry.errorBody)
+        }
+
+        // 403 for a full mailbox (#865): told apart from a missing scope by Graph's error code.
+        if GraphAPI.isMailboxFull(statusCode: result.statusCode, errorBody: result.errorBody) {
+            throw ExchangeCalendarError.mailboxFull
         }
 
         // 403 — missing scope
@@ -3135,6 +3148,10 @@ actor ExchangeCalendarProvider: CalendarProvider {
 
 enum ExchangeCalendarError: Error {
     case missingScope
+    /// Graph refused a write because the mailbox is over its storage quota (403
+    /// `ErrorQuotaExceeded`, `GraphAPI.isMailboxFull`). Not a missing permission: the calendar
+    /// queue keeps the change queued until the user frees space (#865).
+    case mailboxFull
     case httpError(Int, Data?)
     case eventNotFound
     /// A Graph resource id could not be encoded as one strict path segment.

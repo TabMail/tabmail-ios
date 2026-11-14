@@ -1221,6 +1221,7 @@ actor ExchangeProvider: EmailProvider {
         try await Self.addFileAttachment(
             attachment, itemPath: "/messages/\(encodedMessageId)",
             post: { path, body in try await self.request(path: path, method: "POST", body: body) },
+            rangeRefused: Self.uploadRangeRefusal,
             session: testSession ?? sharedEphemeralSession, gate: mailboxGate)
     }
 
@@ -1239,11 +1240,16 @@ actor ExchangeProvider: EmailProvider {
     /// `cid:` link names), written on the single POST (`fileAttachment`) and on the upload
     /// session's `attachmentItem`, which both document the two properties; nil (a draft) writes
     /// neither, as before.
+    ///
+    /// `rangeRefused` turns a range the upload URL refused into the caller's error, given the
+    /// refusal's status and body (Graph's error code is in the body), so the caller can tell its
+    /// refusals apart as `post` does (#865: a full mailbox).
     nonisolated static func addFileAttachment(
         _ attachment: DraftAttachment,
         itemPath: String,
         inline: GraphInlinePlacement? = nil,
         post: @Sendable (_ path: String, _ body: Data) async throws -> Data,
+        rangeRefused: @Sendable (_ status: Int, _ body: Data) -> Error,
         session: URLSession,
         gate: HTTPConcurrencyGate
     ) async throws {
@@ -1272,9 +1278,10 @@ actor ExchangeProvider: EmailProvider {
             put.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
             put.setValue("bytes \(offset)-\(end - 1)/\(total)", forHTTPHeaderField: "Content-Range")
             put.httpBody = attachment.data.subdata(in: offset..<end)
+            let answer: Data
             let response: URLResponse
             do {
-                (_, response) = try await gate.withSlot { try await session.data(for: put) }
+                (answer, response) = try await gate.withSlot { try await session.data(for: put) }
             } catch let error as URLError {
                 // The session URL carries a pre-authenticated token, and a URLError
                 // carries its failing URL into every log line that prints the error
@@ -1288,10 +1295,16 @@ actor ExchangeProvider: EmailProvider {
             // so the deletes that follow every add must not run.
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             guard status == (end == total ? 201 : 200) else {
-                throw ProviderError.networkError(underlying: HTTPError.networkError(statusCode: status))
+                throw rangeRefused(status, answer)
             }
             offset = end
         }
+    }
+
+    /// A refused upload range as a draft save and send take it: a network error carrying the
+    /// status, which their retry classification reads. The body is not kept.
+    nonisolated static func uploadRangeRefusal(status: Int, body: Data) -> Error {
+        ProviderError.networkError(underlying: HTTPError.networkError(statusCode: status))
     }
 
     /// The upload session's URL, only if it is https on a documented Outlook host:

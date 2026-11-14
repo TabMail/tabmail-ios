@@ -345,6 +345,28 @@ final class FakeGraphCalendar: Sendable {
         failingRequests.withLock { $0[method]?.isEmpty == false ? $0[method]?.removeFirst() : nil }
     }
 
+    /// Graph's error code for a write to a mailbox over its storage quota (#865).
+    static let mailboxFullCode = "ErrorQuotaExceeded"
+
+    private let standingRefusal = Mutex<(kinds: Set<String>, status: Int, body: String)?>(nil)
+
+    /// Until `acceptWrites`, every request of `kinds` (`"POST"` a create, `"PATCH"`, `"ATTACH"` an
+    /// attachment POST or upload session, `"PUT"` an upload range) is refused with `status` and
+    /// Graph's error body naming `code` (`{"error": {"code", "message"}}`), and does nothing.
+    /// A full mailbox is `refuseWrites(kinds, code: Self.mailboxFullCode)`.
+    func refuseWrites(_ kinds: Set<String>, status: Int = 403, code: String) {
+        let body = #"{"error":{"code":"\#(code)","message":"The request was refused."}}"#
+        standingRefusal.withLock { $0 = (kinds, status, body) }
+    }
+
+    /// Ends `refuseWrites`: the user freed space in the mailbox.
+    func acceptWrites() { standingRefusal.withLock { $0 = nil } }
+
+    private func refusal(_ kind: String) -> FakeHTTP.CannedResponse? {
+        guard let refusal = standingRefusal.withLock({ $0 }), refusal.kinds.contains(kind) else { return nil }
+        return .json(raw: refusal.body, statusCode: refusal.status)
+    }
+
     /// The next `method` write is applied, and its response is lost: the connection drops before
     /// it arrives (`PATCH` and `POST`).
     func loseNextResponse(_ method: String) { lostResponses.withLock { $0[method, default: 0] += 1 } }
@@ -564,6 +586,7 @@ final class FakeGraphCalendar: Sendable {
             let parts = Self.pathParts(request.url)
             arrived("PATCH", parts.first ?? "")
             if let status = takeFailure("PATCH") { return .status(status) }
+            if let refused = refusal("PATCH") { return refused }
             guard parts.count == 1, var stored = event(parts[0]),
                   let body = request.body,
                   let patch = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any],
@@ -624,6 +647,7 @@ final class FakeGraphCalendar: Sendable {
         http.register(path: "/v1.0/me/events", method: "POST") { [self] request in
             arrived("POST", "")
             if let status = takeFailure("POST") { return .status(status) }
+            if let refused = refusal("POST") { return refused }
             guard let body = request.body,
                   var created = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any],
                   Self.rangeHasStart(created)
@@ -652,6 +676,7 @@ final class FakeGraphCalendar: Sendable {
         http.register(path: "/v1.0/me/events/", method: "POST") { [self] request in
             let parts = Self.pathParts(request.url)
             if let status = takeFailure("ATTACH") { return .status(status) }
+            if let refused = refusal("ATTACH") { return refused }
             guard parts.count >= 2, parts[1] == "attachments", event(parts[0]) != nil else { return .status(404) }
             guard let body = request.body, let json = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] else { return .status(400) }
             if parts.count == 3, parts[2] == "createUploadSession" {
@@ -679,6 +704,7 @@ final class FakeGraphCalendar: Sendable {
         http.register(path: "AttachmentSessions", method: "PUT") { [self] request in
             uploadAuthorizationLog.withLock { $0.append(request.header("Authorization")) }
             if let status = takeFailure("PUT") { return .status(status) }
+            if let refused = refusal("PUT") { return refused }
             let token = request.url.lastPathComponent
             guard let body = request.body, let range = request.header("Content-Range"),
                   let total = range.split(separator: "/").last.flatMap({ Int($0) }),

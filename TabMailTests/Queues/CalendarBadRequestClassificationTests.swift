@@ -169,6 +169,7 @@ struct CalendarBadRequestClassificationTests {
             ("CalDAV 503", CalDAVError.httpError(503, nil)),
             ("Google 408", GoogleCalendarError.httpError(408, nil)),
             ("Exchange 429", ExchangeCalendarError.httpError(429, nil)),
+            ("Exchange mailbox full", ExchangeCalendarError.mailboxFull),
             ("CalDAV 423", CalDAVError.httpError(423, nil)),
         ]
         for (label, error) in transient {
@@ -330,6 +331,7 @@ struct CalendarBadRequestClassificationTests {
             ("Exchange post-refresh 401 (grant revoked)", ExchangeCalendarError.httpError(401, nil), true),
             ("Exchange 400 (malformed payload)", ExchangeCalendarError.httpError(400, nil), true),
             ("Exchange 503 (server could not answer)", ExchangeCalendarError.httpError(503, nil), false),
+            ("Exchange mailbox full (403 ErrorQuotaExceeded, #865)", ExchangeCalendarError.mailboxFull, false),
             ("Exchange event not found", ExchangeCalendarError.eventNotFound, true),
             ("Exchange unencodable path segment", ExchangeCalendarError.invalidPathSegment("Graph event id"), true),
             // — CalDAV —
@@ -384,7 +386,7 @@ struct CalendarBadRequestClassificationTests {
         // MIS-030: anchor the roster's own cardinality, so a future edit that
         // silently empties or truncates it cannot make every assertion below
         // pass over nothing.
-        #expect(roster.count == 34,"the roster lost or gained entries — re-derive it from the call graph")
+        #expect(roster.count == 35,"the roster lost or gained entries — re-derive it from the call graph")
         for (label, error, terminal) in roster {
             #expect(
                 claimedByATerminalArm(error) == terminal,

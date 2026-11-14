@@ -536,7 +536,7 @@ enum SplitClockCase: String, CaseIterable, Sendable {
     }
 }
 
-private enum GraphSplitFixture {
+enum GraphSplitFixture {
     static let zone = TimeZone.current.identifier
     /// 10:00 on the device eight days ahead, and the same time a week later.
     static let start = GraphFixture.onDevice(days: 0, hour: 10)
