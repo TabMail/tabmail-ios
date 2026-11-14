@@ -62,6 +62,27 @@ table; a deallocated SQLite connection can stay a `close_v2` zombie). Connection
 are closed at exit, before unlink, as before. The descriptor budget stays: it is for fixtures in use
 at the same time, not for accumulation; do not raise it to absorb growth.
 
+Why the descriptor proof and not "unlink when the pool deinits" (review round 1, 2026-11-14): a pool's
+deallocation does not prove its files are closed. GRDB's `DatabasePool.asyncRead` captures the reader
+pool and the reader `SerializedDatabase`, not the `DatabasePool`, so a read still queued or running
+keeps a reader connection (and its descriptors) open after the pool is gone; `SerializedDatabase.deinit`
+closes with `sqlite3_close_v2`, which leaves a zombie while a statement is unfinalized; and a Swift weak
+reference reads nil as soon as the last strong reference goes, before the releasing thread has finished
+the deinit's closes. The kernel's own list of open descriptors is the only direct evidence.
+
+Round 1 hardening of the proof:
+- The directory is spelled for comparison through `realpath(3)` of its parent (`kernelPath(of:)`),
+  because `F_GETPATH` reports the kernel path and Foundation's `resolvingSymlinksInPath` strips a
+  leading `/private` that the kernel keeps; under a `/private`-rooted temp path the old comparison
+  never matched and the proof passed trivially. A directory whose spelling cannot be resolved counts
+  as still open.
+- When a live sibling's close fails, the released siblings' placeholders stay in the retried group, so
+  the retry still owes the proof (they were dropped, and the later retry skipped the proof).
+- The scan walks the whole descriptor table (never misses one), and `prepareFileDescriptorBudget` now
+  sets the soft limit to exactly the budget (it only raised it before), which bounds the table. One
+  scan of 10,240 slots costs about 2 ms (host benchmark, 30 to 1,000 open descriptors), and runs at
+  most once per registry transition that has a released group.
+
 ## Proof
 
 - Red first (fix inverted: exit-only groups held strongly again; the teardown invariant suite plus
@@ -74,6 +95,9 @@ at the same time, not for accumulation; do not raise it to absorb growth.
 
 Invariant tests (`TestDatabaseTeardownInvariantTests`): released exit-only fixtures leave no
 descriptor and no directory after the next transition; a released fixture whose file is still open is
-not unlinked until that descriptor closes; a still-referenced exit-only fixture stays open and usable.
+not unlinked until that descriptor closes; a still-referenced exit-only fixture stays open and usable;
+an ordinary `retire` and a `closeThenUnlinkNow` each reclaim a released fixture; the proof sees a file
+opened under a symlinked temp path that resolves through `/private`; a failed live close keeps a
+released sibling's proof owed until its descriptor closes.
 
 Rule text: `Companion/Rules/Active/data-integrity.md` rule 6.

@@ -383,8 +383,10 @@ enum TestDatabaseTeardown {
     /// Parallel suites keep many fixtures open at once (about 60 directories,
     /// some 600 descriptors, early in a full run), and exit-only groups stay
     /// open while their escaped work still holds them. The simulator test host
-    /// otherwise inherits a soft descriptor ceiling below that. Raise only the
-    /// test process's soft ceiling, once; never alter the hard ceiling.
+    /// otherwise inherits a soft descriptor ceiling below that. Set only the
+    /// test process's soft ceiling, once, to exactly the budget; never alter
+    /// the hard ceiling. "Exactly" also bounds the descriptor-table scan in
+    /// `openDescriptorPaths`, whose size is this soft ceiling.
     ///
     /// This budget is for CONCURRENT fixtures, not for accumulation: until
     /// iOS #885 the registry held every exit-only group's connections until
@@ -394,7 +396,7 @@ enum TestDatabaseTeardown {
     /// (`reclaimReleasedExitGroups`). Do not raise this number to absorb growth.
     private static let fileDescriptorBudgetPrepared = Mutex<Bool>(false)
     private static let minimumFileDescriptorBudget: rlim_t = 4_096
-    private static let requestedFileDescriptorBudget: rlim_t = 10_240
+    static let requestedFileDescriptorBudget: rlim_t = 10_240
 
     private static func prepareFileDescriptorBudget() {
         fileDescriptorBudgetPrepared.withLock { prepared in
@@ -410,7 +412,7 @@ enum TestDatabaseTeardown {
                 target >= minimumFileDescriptorBudget,
                 "XCTest host hard file-descriptor limit is below the required fixture budget"
             )
-            if limits.rlim_cur < target {
+            if limits.rlim_cur != target {
                 limits.rlim_cur = target
                 precondition(
                     Darwin.setrlimit(RLIMIT_NOFILE, &limits) == 0,
@@ -651,7 +653,11 @@ enum TestDatabaseTeardown {
                     failedConnections.append(connection)
                 }
             }
-            if failedConnections.isEmpty, !released.isEmpty {
+            if !failedConnections.isEmpty {
+                // A released sibling may still be a `close_v2` zombie. Keep its
+                // placeholder so the retry still owes the descriptor proof.
+                failedConnections += released
+            } else if !released.isEmpty {
                 let paths = openPaths ?? openDescriptorPaths()
                 openPaths = paths
                 if hasOpenDescriptor(in: entry.directory, openPaths: paths) {
@@ -672,7 +678,13 @@ enum TestDatabaseTeardown {
         return stillOpen
     }
 
-    /// Paths of every file this process currently holds a descriptor on.
+    /// Paths of every file this process currently holds a descriptor on, as
+    /// the kernel reports them (`F_GETPATH`, symlinks resolved).
+    ///
+    /// The scan covers the whole descriptor table, so it can never miss an
+    /// open descriptor. The table size is the soft descriptor limit, which
+    /// `prepareFileDescriptorBudget` pins to the budget before any fixture is
+    /// registered, so one scan is bounded by that budget.
     private static func openDescriptorPaths() -> Set<String> {
         var paths: Set<String> = []
         var buffer = [UInt8](repeating: 0, count: Int(MAXPATHLEN))
@@ -687,27 +699,47 @@ enum TestDatabaseTeardown {
         return paths
     }
 
-    /// The open-descriptor paths that name a file inside `directory`.
-    private static func descriptorPaths(in directory: URL, openPaths: Set<String>) -> [String] {
-        let prefixes = Set([
-            directory.standardizedFileURL.path,
-            directory.resolvingSymlinksInPath().path,
-        ]).map { $0.hasSuffix("/") ? $0 : $0 + "/" }
-        return openPaths.filter { path in prefixes.contains { path.hasPrefix($0) } }
+    /// `directory` spelled the way `F_GETPATH` spells the files inside it.
+    /// The parent goes through `realpath(3)`; Foundation's
+    /// `resolvingSymlinksInPath` is not usable here because it strips a
+    /// leading `/private` that the kernel keeps. Only the parent is resolved:
+    /// a fixture directory is never itself a symlink (`eligibleDirectory`),
+    /// and the directory may already be gone when this is asked.
+    private static func kernelPath(of directory: URL) -> String? {
+        let standardized = directory.standardizedFileURL
+        guard let resolvedParent = Darwin.realpath(
+            standardized.deletingLastPathComponent().path,
+            nil
+        ) else { return nil }
+        defer { Darwin.free(resolvedParent) }
+        return (String(cString: resolvedParent) as NSString)
+            .appendingPathComponent(standardized.lastPathComponent)
+    }
+
+    /// The open-descriptor paths that name a file inside `directory`, or nil
+    /// when the directory's kernel spelling cannot be determined.
+    private static func descriptorPaths(in directory: URL, openPaths: Set<String>) -> [String]? {
+        guard let path = kernelPath(of: directory) else { return nil }
+        let prefix = path.hasSuffix("/") ? path : path + "/"
+        return openPaths.filter { $0.hasPrefix(prefix) }
     }
 
     /// Whether any descriptor other than the directory's own ownership marker
-    /// names a file inside `directory`.
+    /// names a file inside `directory`. A directory whose kernel spelling is
+    /// unknown cannot be proven free, so it counts as still open.
     private static func hasOpenDescriptor(in directory: URL, openPaths: Set<String>) -> Bool {
-        descriptorPaths(in: directory, openPaths: openPaths).contains {
+        guard let paths = descriptorPaths(in: directory, openPaths: openPaths) else {
+            return true
+        }
+        return paths.contains {
             ($0 as NSString).lastPathComponent != DirectoryLease.markerName
         }
     }
 
     /// Every descriptor this process holds on a file inside `directory`,
-    /// ownership marker included.
-    static func openDescriptorCountForTesting(directory: URL) -> Int {
-        descriptorPaths(in: directory, openPaths: openDescriptorPaths()).count
+    /// ownership marker included; nil when the directory cannot be resolved.
+    static func openDescriptorCountForTesting(directory: URL) -> Int? {
+        descriptorPaths(in: directory, openPaths: openDescriptorPaths())?.count
     }
 
     /// Closes the unlink step for exit-only groups whose escaped work is over.
@@ -1256,11 +1288,103 @@ struct TestDatabaseTeardownInvariantTests {
         let trigger = try registryTransition()
         defer { TestDatabaseTeardown.flushRegisteredForTesting(pool: trigger) }
 
-        let stillOpen = directories.reduce(0) {
-            $0 + TestDatabaseTeardown.openDescriptorCountForTesting(directory: $1)
+        let stillOpen = directories.map {
+            TestDatabaseTeardown.openDescriptorCountForTesting(directory: $0)
         }
-        #expect(stillOpen == 0, "released exit-only fixtures still hold \(stillOpen) descriptors")
+        #expect(stillOpen.allSatisfy { $0 == 0 }, "released exit-only fixtures still hold descriptors: \(stillOpen)")
         #expect(directories.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+    }
+
+    @Test("an ordinary retirement reclaims released exit-only fixtures")
+    func retirementReclaimsReleasedExitOnlyFixture() throws {
+        let released = try registerReleasedExitOnlyFixture()
+        let ordinary = try makeFixture()
+        defer { TestDatabaseTeardown.flushRegisteredForTesting(pool: ordinary.pool) }
+
+        TestDatabaseTeardown.retire(pool: ordinary.pool, directory: ordinary.directory)
+
+        #expect(TestDatabaseTeardown.openDescriptorCountForTesting(directory: released) == 0)
+        #expect(!FileManager.default.fileExists(atPath: released.path))
+    }
+
+    @Test("an immediate close-then-unlink reclaims released exit-only fixtures")
+    func immediateCloseReclaimsReleasedExitOnlyFixture() throws {
+        let released = try registerReleasedExitOnlyFixture()
+        let ordinary = try makeFixture()
+        defer { TestDatabaseTeardown.flushRegisteredForTesting(pool: ordinary.pool) }
+
+        TestDatabaseTeardown.closeThenUnlinkNow(pool: ordinary.pool, directory: ordinary.directory)
+
+        #expect(TestDatabaseTeardown.openDescriptorCountForTesting(directory: released) == 0)
+        #expect(!FileManager.default.fileExists(atPath: released.path))
+    }
+
+    /// Host temp root reached through the `/tmp` -> `/private/tmp` symlink, so
+    /// the kernel spells its files with a `/private` prefix.
+    private static let symlinkedHostTemporaryRoot = URL(fileURLWithPath: "/tmp", isDirectory: true)
+
+    @Test("the descriptor proof sees a file opened under a symlinked temp path")
+    func descriptorProofResolvesSymlinkedTemporaryPath() throws {
+        let fileManager = FileManager.default
+        let realRoot = Self.symlinkedHostTemporaryRoot
+            .appendingPathComponent("teardown-real-\(UUID().uuidString)", isDirectory: true)
+        let fixtureName = "fixture"
+        try fileManager.createDirectory(
+            at: realRoot.appendingPathComponent(fixtureName, isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        let link = fileManager.temporaryDirectory
+            .appendingPathComponent("teardown-link-\(UUID().uuidString)", isDirectory: false)
+        try fileManager.createSymbolicLink(at: link, withDestinationURL: realRoot)
+        defer {
+            try? fileManager.removeItem(at: link)
+            try? fileManager.removeItem(at: realRoot)
+        }
+        let linkedDirectory = link.appendingPathComponent(fixtureName, isDirectory: true)
+        let probe = linkedDirectory.appendingPathComponent("test.sqlite", isDirectory: false)
+        #expect(fileManager.createFile(atPath: probe.path, contents: Data()))
+
+        let descriptor = Darwin.open(probe.path, O_RDONLY | O_CLOEXEC)
+        #expect(descriptor >= 0)
+        #expect(TestDatabaseTeardown.openDescriptorCountForTesting(directory: linkedDirectory) == 1)
+        _ = Darwin.close(descriptor)
+        #expect(TestDatabaseTeardown.openDescriptorCountForTesting(directory: linkedDirectory) == 0)
+    }
+
+    @Test("a failed close keeps a released sibling's descriptor proof owed")
+    func failedCloseKeepsReleasedSiblingProof() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("teardown-invariant-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let live = try DatabasePool(path: directory.appendingPathComponent("live.sqlite").path)
+        let releasedPath = directory.appendingPathComponent("released.sqlite").path
+        var descriptor: Int32 = -1
+        do {
+            let released = try DatabasePool(path: releasedPath)
+            TestDatabaseTeardown.registerForProcessExit(pools: [live, released], directory: directory)
+            descriptor = Darwin.open(releasedPath, O_RDONLY | O_CLOEXEC)
+        }
+        #expect(descriptor >= 0)
+        defer {
+            if descriptor >= 0 { _ = Darwin.close(descriptor) }
+            TestDatabaseTeardown.forceCloseFailureForTesting(pool: live, enabled: false)
+            TestDatabaseTeardown.flushRegisteredForTesting(pool: live)
+        }
+
+        TestDatabaseTeardown.forceCloseFailureForTesting(pool: live, enabled: true)
+        TestDatabaseTeardown.flushRegisteredForTesting(pool: live)
+        #expect(FileManager.default.fileExists(atPath: directory.path))
+
+        TestDatabaseTeardown.forceCloseFailureForTesting(pool: live, enabled: false)
+        TestDatabaseTeardown.flushRegisteredForTesting(pool: live)
+        #expect(FileManager.default.fileExists(atPath: directory.path),
+                "the directory was unlinked while a descriptor still named a file in it")
+
+        _ = Darwin.close(descriptor)
+        descriptor = -1
+        let trigger = try registryTransition()
+        defer { TestDatabaseTeardown.flushRegisteredForTesting(pool: trigger) }
+        #expect(!FileManager.default.fileExists(atPath: directory.path))
     }
 
     @Test("a released exit-only fixture is never unlinked while a descriptor still names it")
@@ -1313,5 +1437,9 @@ struct TestDatabaseTeardownInvariantTests {
     func processHasRequiredFileDescriptorBudget() {
         TestDatabaseTeardown.prepareProcess()
         #expect(TestDatabaseTeardown.fileDescriptorSoftLimitForTesting() >= 4_096)
+        #expect(
+            TestDatabaseTeardown.fileDescriptorSoftLimitForTesting()
+                <= TestDatabaseTeardown.requestedFileDescriptorBudget
+        )
     }
 }
