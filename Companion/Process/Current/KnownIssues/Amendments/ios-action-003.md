@@ -78,6 +78,16 @@ open route also had to change: it sent every Drafts row to the Gmail draft looku
 placeholder id, so `ServerDraftComposeLoader.resolveOpenAuthority` now sends a placeholder id to its
 local owner on every provider. The boundary itself is unchanged.
 
+**Testing consequence, recorded 2026-11-14 (GitHub #883).** Since #519, "the save landed" and "the
+save's op is gone" are different states. A save that lands as `.created` leaves the draft a
+`serverDraftId` (`DraftStore.applyPushCompletion`; a Gmail answer with no message id still names the
+resource), while an op that disappeared with no `serverDraftId` is the never-uploaded state this rule
+protects. A test that means a landed save must land it through `DraftStore.pushDraftToServer`, not by
+deleting the op: `DraftPlaceholderStaleWindowTests` did the latter and went red at #519's fix,
+although the Gmail path was right. (The one landed save that leaves no `serverDraftId` is IMAP's
+`.unaddressable`, an APPEND without APPENDUID; this rule also keeps that draft's placeholder, which
+#883 did not examine.)
+
 **Why a blanket purge rather than a version-aware migration.** The same reason IOS-ACTION-001 gives
 for `v74`: deciding per row would mean decoding each one and validating its address space against
 whatever keying the previous release used — the "reconstruct an address the system was already told

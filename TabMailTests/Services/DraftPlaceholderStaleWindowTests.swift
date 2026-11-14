@@ -18,12 +18,22 @@ import GRDB
 /// time of its latest save; one stuck at its first save sits below the page once
 /// a full page of drafts is newer than that, and the Drafts list shows the draft
 /// twice for as long as that lasts. Inside the page, the queued save is all that
-/// keeps the placeholder of a draft the server does not have yet.
+/// keeps the placeholder of the edit the server does not have yet.
+///
+/// Each save lands the way the drain lands a Gmail save today: the `.saveDraft`
+/// arm of `AccountOperationExecutor` calls `DraftStore.pushDraftToServer`, and a
+/// Gmail answer that names the draft resource but not its message
+/// (`GmailProvider.saveDraft`'s update arm when the response does not parse)
+/// gives the draft its `serverDraftId` without re-keying the placeholder. A draft
+/// with no `serverDraftId` is a different state, one whose save never reached the
+/// server, and sync keeps its placeholder on purpose
+/// (`SyncEngine.neverUploadedDraftPlaceholderIds`, #617).
 @Suite("A re-saved draft placeholder stays inside the Drafts sync window", .serialized, .processGlobalState)
 struct DraftPlaceholderStaleWindowTests {
 
     private static let draftsPath = "DRAFTS"
     private static let pageLimit = 50
+    private static let resourceId = "r-stale-window"
 
     private static func info(id: String, date: Date) -> MessageHeaderInfo {
         MessageHeaderInfo(
@@ -41,15 +51,33 @@ struct DraftPlaceholderStaleWindowTests {
     private struct Scene: Sendable {
         let pool: DatabasePool
         let folder: Folder
+        let draftId: String
+        let instanceEpoch: String
         let placeholderMessageId: String
         let firstSave: Date
         let latestSave: Date
     }
 
-    /// Builds the scene and runs `body` on it. The first save's op is retired
-    /// with no server address, as is the latest one unless
-    /// `keepLatestSaveQueued`, which leaves it in the queue the way a save that
-    /// has not reached the server stays there.
+    /// Lands the queued save the way the drain does: the push its `.saveDraft`
+    /// arm makes, answered by Gmail with the draft resource and no message id,
+    /// then the op's retirement.
+    private func landSave(draftId: String, instanceEpoch: String, pool: DatabasePool) async throws {
+        let provider = MockEmailProvider(
+            saveDraftResult: .created(.gmail(resourceId: Self.resourceId, containedMessageId: nil)))
+        let disposition = try await DraftStore.shared.pushDraftToServer(
+            draftId: draftId, expectedInstanceEpoch: instanceEpoch, provider: provider,
+            runtimeKind: .gmail, draftsFolderPath: Self.draftsPath)
+        #expect(disposition == .completed, "precondition: the save reached the server")
+        try await pool.write { db in _ = try PendingOperation.deleteAll(db) }
+        let landed = try await pool.read { db in try Draft.fetchOne(db, key: draftId) }
+        #expect(landed?.serverDraftId == Self.resourceId, "precondition: the landed save gave the draft its server id")
+        #expect(landed?.serverPushStatus == "pushed", "precondition: the landed save left nothing to push")
+    }
+
+    /// Builds the scene and runs `body` on it. The first save lands with no
+    /// message id, as does the latest one unless `keepLatestSaveQueued`, which
+    /// leaves it in the queue the way a save that has not reached the server
+    /// stays there.
     @MainActor
     private func withReSavedPlaceholder(
         keepLatestSaveQueued: Bool,
@@ -82,28 +110,39 @@ struct DraftPlaceholderStaleWindowTests {
             updatedAt: firstSave.timeIntervalSince1970,
             serverDraftId: nil, serverPushStatus: nil,
             rfc822MessageId: nil, attachmentsDirName: nil)
-        draft.instanceEpoch = "E-\(UUID().uuidString)"
+        let instanceEpoch = "E-\(UUID().uuidString)"
+        draft.instanceEpoch = instanceEpoch
         let firstVersion = draft
-        try await pool.write { db in try firstVersion.insert(db) }
+        try await pool.write { db in _ = try DraftStore.applySave(firstVersion, db: db) }
         #expect(await AccountManager.shared.queueDraftSave(draftId: draftId, accountId: accountId))
 
-        // That save landed with no server address: its op is gone and the
-        // placeholder row stays.
-        try await pool.write { db in _ = try PendingOperation.deleteAll(db) }
+        // That save landed with no message id: the draft has its server id, its
+        // op is gone and the placeholder row stays.
+        try await landSave(draftId: draftId, instanceEpoch: instanceEpoch, pool: pool)
 
-        // The user edits the draft an hour ago.
+        // The user edits the draft an hour ago, through the compose save.
+        draft.body = "Draft body, edited"
         draft.updatedAt = latestSave.timeIntervalSince1970
         let secondVersion = draft
-        try await pool.write { db in try secondVersion.update(db) }
+        try await pool.write { db in _ = try DraftStore.applySave(secondVersion, db: db) }
         #expect(await AccountManager.shared.queueDraftSave(draftId: draftId, accountId: accountId))
         if !keepLatestSaveQueued {
-            try await pool.write { db in _ = try PendingOperation.deleteAll(db) }
+            try await landSave(draftId: draftId, instanceEpoch: instanceEpoch, pool: pool)
         }
 
         let placeholderMessageId = PendingOperation.draftPlaceholderMessageId(
-            draftId: draftId, instanceEpoch: draft.instanceEpoch)
+            draftId: draftId, instanceEpoch: instanceEpoch)
+        let storedDraft = try await pool.read { db in try Draft.fetchOne(db, key: draftId) }
+        #expect(storedDraft?.serverDraftId == Self.resourceId,
+                "precondition: the draft has a server copy, so only the stale rule decides its placeholder")
+        let neverUploaded = try await pool.read { db in
+            try SyncEngine.neverUploadedDraftPlaceholderIds(accountId: accountId, db: db)
+        }
+        #expect(!neverUploaded.contains(placeholderMessageId),
+                "precondition: the draft reached the server, so its placeholder is not a never-uploaded one")
         let scene = Scene(
-            pool: pool, folder: folder, placeholderMessageId: placeholderMessageId,
+            pool: pool, folder: folder, draftId: draftId, instanceEpoch: instanceEpoch,
+            placeholderMessageId: placeholderMessageId,
             firstSave: firstSave, latestSave: latestSave)
         #expect(try await placeholderCount(scene) == 1, "precondition: the placeholder row exists before sync")
         try await body(scene)
@@ -173,8 +212,8 @@ struct DraftPlaceholderStaleWindowTests {
                 only row in the Drafts list; sync must keep it while that save is \(saveStatus.rawValue)
                 """)
 
-            // The save lands with no server address.
-            try await scene.pool.write { db in _ = try PendingOperation.deleteAll(db) }
+            // The save lands with no message id.
+            try await landSave(draftId: scene.draftId, instanceEpoch: scene.instanceEpoch, pool: scene.pool)
             try await syncDrafts(scene)
             #expect(try await placeholderCount(scene) == 0, "once the save has landed, the next sync removes the placeholder")
         }
