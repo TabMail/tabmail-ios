@@ -406,7 +406,7 @@ struct SettingsView: View {
             Button("Cancel", role: .cancel) { accountToDelete = nil }
             if !accountHeldFiles.isEmpty {
                 let held = accountHeldFiles
-                Button(SavedPutBackFilesWarning.saveTitle(held.reduce(0) { $0 + $1.files.count })) {
+                Button(SavedPutBackFilesWarning.saveTitle(LateCalendarFailureStore.heldFileCount(held))) {
                     accountToDelete = nil
                     exportedHeldFiles = SavedPutBackFilesWarning.export { try LateCalendarFailureStore.exportFiles(held) }
                 }
@@ -414,9 +414,15 @@ struct SettingsView: View {
             Button("Remove", role: .destructive) {
                 if let account = accountToDelete {
                     accountToDelete = nil
+                    let warned = LateCalendarFailureStore.heldFileCount(accountHeldFiles)
                     Task {
                         do {
-                            try await AccountManager.shared.removeAccount(account)
+                            try await AccountManager.shared.removeAccount(account, warnedSavedFiles: warned)
+                        } catch is AccountRemovalSavedFilesGrew {
+                            // More files were saved since the warning: warn again with the new
+                            // count and Save File, nothing removed (#718).
+                            accountHeldFiles = await LateCalendarFailureStore.heldFiles(accountId: account.id)
+                            accountToDelete = account
                         } catch let error as AccountRemovalError {
                             BackgroundSyncLogger.logDebug("[Settings] Account removal completed with derived cleanup failure: \(error)")
                             settingsErrorMessage = error.localizedDescription
@@ -430,7 +436,7 @@ struct SettingsView: View {
                 }
             }
         } message: {
-            let count = accountHeldFiles.reduce(0) { $0 + $1.files.count }
+            let count = LateCalendarFailureStore.heldFileCount(accountHeldFiles)
             if count > 0 {
                 Text(SavedPutBackFilesWarning.accountRemovalMessage(count, email: accountToDelete?.emailAddress ?? "this account"))
             } else {

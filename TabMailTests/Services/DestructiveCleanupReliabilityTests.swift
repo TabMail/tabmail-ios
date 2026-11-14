@@ -100,7 +100,7 @@ struct DestructiveCleanupReliabilityTests {
             }
 
             await #expect(throws: (any Error).self) {
-                try await AccountManager.shared.removeAccount(account)
+                try await AccountManager.shared.removeAccount(account, warnedSavedFiles: 0)
             }
 
             #expect(try await pool.read { try Account.fetchCount($0) } == 1)
@@ -115,6 +115,80 @@ struct DestructiveCleanupReliabilityTests {
             throw error
         }
         await cleanup()
+    }
+
+    /// INVARIANT (#718): account removal deletes no saved put-back file the user was not warned
+    /// of. The files are counted again in the delete's own transaction; more than the warning said
+    /// refuses the removal with the new count and changes nothing. As many as it said passes the
+    /// count (the injected abort, which fires only at the delete, is what stops it then).
+    @Test("account removal refuses, changing nothing, when more saved put-back files exist than the user was warned of")
+    func accountRemovalRecountsSavedFiles() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var config = Configuration()
+        config.foreignKeysEnabled = true
+        let pool = try DatabasePool(path: directory.appendingPathComponent("cleanup.sqlite").path, configuration: config)
+        let appDatabase = try AppDatabase(dbPool: pool)
+        let previousDatabase = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let previous = current
+            current = appDatabase
+            return previous
+        }
+        let suiteName = "DestructiveCleanupReliabilityTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        let nseDefaults = UserDefaults(suiteName: "group.ai.tabmail")!
+        let previousNSEAccountMap = nseDefaults.string(forKey: "nse.accountMap")
+        let previousNSEIMAPAccounts = nseDefaults.string(forKey: "nse.imapAccounts")
+        await PushNotificationService.shared._setRemovedAccountCleanupDependenciesForTesting(
+            client: nil, defaults: SendableRemovedAccountCleanupDefaults(value: defaults))
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+            if let previousNSEAccountMap { nseDefaults.set(previousNSEAccountMap, forKey: "nse.accountMap") } else { nseDefaults.removeObject(forKey: "nse.accountMap") }
+            if let previousNSEIMAPAccounts { nseDefaults.set(previousNSEIMAPAccounts, forKey: "nse.imapAccounts") } else { nseDefaults.removeObject(forKey: "nse.imapAccounts") }
+            AppDatabase.shared.withLock { $0 = previousDatabase }
+            TestDatabaseTeardown.retire(pool: pool, directory: directory)
+        }
+
+        var account = Account(emailAddress: "saved-\(UUID().uuidString)@example.com", displayName: "Saved", provider: .outlook)
+        account.id = "saved-files-account-\(UUID().uuidString)"
+        let bytes = Data("own notes".utf8)
+        let file = PutBackFile(occurrence: "occ-1", name: "notes.txt", contentType: "text/plain", isInline: false, contentId: nil,
+                               sha256: SavedFileName.of(bytes))
+        let recordData = try JSONSerialization.data(
+            withJSONObject: [SeriesEditRecord.argumentKey: SeriesEditRecord(seriesId: "ser-1", capture: "{}", files: [file]).jsonObject])
+        let op = PendingCalendarOperation(
+            operationType: .edit, accountId: account.id, eventId: "ser-1", calendarId: "primary",
+            arguments: try JSONDecoder().decode([String: JSONValue].self, from: recordData), eventTitle: "Planning")
+        let snapshot = account
+        try await pool.write { conn in
+            try snapshot.insert(conn)
+            try op.insert(conn)
+        }
+        // Saved by a drain after the user saw a warning of none.
+        _ = try CalendarPutBackFiles.save(bytes, opId: op.id)
+
+        await #expect(throws: AccountRemovalSavedFilesGrew(savedFiles: 1)) {
+            try await AccountManager.shared.removeAccount(account, warnedSavedFiles: 0)
+        }
+        #expect(try await pool.read { try Account.fetchCount($0) } == 1)
+        #expect(try await pool.read { try PendingCalendarOperation.fetchCount($0) } == 1)
+        #expect(CalendarPutBackFiles.holdsBytes(op.id), "the saved file went")
+        #expect(PendingRemovedAccountPushCleanup.load(from: defaults).isEmpty)
+
+        try await pool.write { conn in
+            try conn.execute(sql: """
+                CREATE TEMP TRIGGER fail_account_removal
+                BEFORE DELETE ON account
+                BEGIN SELECT RAISE(ABORT, 'injected account removal failure'); END;
+                """)
+        }
+        do {
+            try await AccountManager.shared.removeAccount(account, warnedSavedFiles: 1)
+            Issue.record("the injected abort did not fire")
+        } catch {
+            #expect(!(error is AccountRemovalSavedFilesGrew), "warned of as many files as are saved, the removal was still refused: \(error)")
+        }
+        #expect(CalendarPutBackFiles.holdsBytes(op.id), "the saved file went with an aborted removal")
     }
 
     @Test("a stale Account value cannot resurrect runtime state after committed removal")

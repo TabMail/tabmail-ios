@@ -187,14 +187,23 @@ final class LateCalendarFailureStore {
     /// The saved files of every calendar operation of the account `accountId`, whatever its
     /// status: what removing the account deletes. Empty when none, or when the rows can't be read.
     nonisolated static func heldFiles(accountId: String) async -> [HeldFiles] {
+        (try? await AppDatabase.dbPool.read { db in try heldFiles(db, accountId: accountId) }) ?? []
+    }
+
+    /// `heldFiles(accountId:)` read in `db`, so account removal counts them in its own transaction.
+    nonisolated static func heldFiles(_ db: Database, accountId: String) throws -> [HeldFiles] {
         let held = CalendarPutBackFiles.heldOperationIds()
         guard !held.isEmpty else { return [] }
-        let rows = (try? await AppDatabase.dbPool.read { db in
-            try PendingCalendarOperation.filter(Column("accountId") == accountId).fetchAll(db)
-        }) ?? []
+        let rows = try PendingCalendarOperation.filter(Column("accountId") == accountId).fetchAll(db)
         return rows.filter { held.contains($0.id) }.map { row in
             HeldFiles(opId: row.id, files: ((try? SeriesEditRecord.stored(row.arguments)) ?? nil)?.files ?? [])
         }
+    }
+
+    /// The number of files `held` names: what the user is warned of, and what account removal
+    /// counts again (`AccountManager.removeAccount`).
+    nonisolated static func heldFileCount(_ held: [HeldFiles]) -> Int {
+        held.reduce(0) { $0 + $1.files.count }
     }
 
     /// Copies of the saved files `held` under their own names, for the share sheet.
