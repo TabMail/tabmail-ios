@@ -703,6 +703,90 @@ struct OutlookCatchUpTests {
         }
     }
 
+    // MARK: - The tracking gate: when the first listing starts
+
+    /// 27, on Wi-Fi: no listing starts before the folder's first change read
+    /// (its baseline) completes, while the folder has no bookmark or while that
+    /// read is still running; the first cycle after it completes lists the
+    /// folder, so the gate adds no wait of its own. A message deleted on another
+    /// device before the first read, which that read never removes and no delta
+    /// reports, is removed by that listing.
+    @Test("27: on Wi-Fi a folder's first listing starts in the first cycle after its first read completes, never before")
+    func firstListingFollowsTheBaseline() async throws {
+        let c = Clock()
+        let ids = ["a-1", "a-2", "a-3"]
+        try await Self.withWorld(
+            seeds: ids.enumerated().map { Self.seed($0.element, in: Self.archive, at: c.daysAgo(Double($0.offset) + 5)) }
+        ) { w, engine in
+            for (i, id) in ids.enumerated() { try w.insertRow(id, in: w.archive, date: c.daysAgo(Double(i) + 5)) }
+            #expect(try w.cursor(w.archive) == nil, "precondition: the folder has not been read")
+            await Self.pass(w, engine, [w.archive])
+            #expect(w.server.requestCounts().dateFilteredListings == 0, "a listing started before the folder's first read")
+
+            // Deleted on another device before the folder's first read.
+            w.server.deleteFromOtherClient(providerMessageId: "a-2")
+            w.server.setDeltaMaxPageSize(1)
+            // The first read starts but does not finish (two requests per call).
+            var reads = 0
+            while try w.cursor(w.archive)?.phase != .baseline, reads < 10 {
+                try await w.read(requests: 2)
+                reads += 1
+            }
+            #expect(try w.cursor(w.archive)?.phase == .baseline, "precondition: the first read is running")
+            await Self.pass(w, engine, [w.archive])
+            #expect(w.server.requestCounts().dateFilteredListings == 0, "a listing started while the folder's first read ran")
+
+            reads = 0
+            while try w.cursor(w.archive)?.phase != .tracking, reads < 10 {
+                try await w.read()
+                reads += 1
+            }
+            #expect(try w.cursor(w.archive)?.phase == .tracking, "precondition: the first read completed")
+            #expect(try w.row("a-2", in: w.archive) != nil, "precondition: the first read removed nothing")
+
+            await Self.pass(w, engine, [w.archive])
+            #expect(w.server.requestCounts().dateFilteredListings > 0, "the first cycle after the first read did not list the folder")
+            #expect(try await Self.untilListed(w, engine, w.archive) != nil, "the listing did not complete")
+            #expect(try w.rowIds(in: w.archive) == ["a-1", "a-3"], "a message deleted before the first read stayed on the phone")
+        }
+    }
+
+    /// 28, on mobile data: the listing's wait and the first read's wait both
+    /// count from first sight, so they run side by side even while the gate
+    /// holds. Once both bounds have passed, the listing waits only for the first
+    /// read itself, and starts in the first cycle after it completes, not a
+    /// whole wait later.
+    @Test("28: on mobile data the listing's and the first read's waits run side by side; the listing starts right after the first read")
+    func mobileWaitsRunSideBySide() async throws {
+        let c = Clock()
+        try await Self.withWorld(seeds: [Self.seed("a-1", in: Self.archive, at: c.daysAgo(5))]) { w, engine in
+            try w.insertRow("a-1", in: w.archive, date: c.daysAgo(5))
+            let t0 = Date()
+            let wait = SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds
+            func mobile(_ t: Date) -> CatchUpContext { Self.unlimited(expensive: true, at: { t }) }
+
+            // First sight, by the catch-up and by the change reader, on mobile data.
+            await Self.pass(w, engine, [w.archive], context: mobile(t0))
+            try await w.read(now: t0, expensive: true)
+            #expect(try w.cursor(w.archive)?.phase != .tracking, "precondition: the first read waits on mobile data")
+            #expect(try Self.state(w, w.archive)?.createdAt == t0, "the listing's wait did not start at first sight while the gate held")
+
+            // Both bounds have passed; the first read has not run yet.
+            let t1 = t0.addingTimeInterval(wait)
+            await Self.pass(w, engine, [w.archive], context: mobile(t1))
+            #expect(w.server.requestCounts().dateFilteredListings == 0, "a listing started before the folder's first read")
+            var reads = 0
+            while try w.cursor(w.archive)?.phase != .tracking, reads < 10 {
+                try await w.read(now: t1, expensive: true)
+                reads += 1
+            }
+            #expect(try w.cursor(w.archive)?.phase == .tracking, "precondition: past its bound the first read ran on mobile data")
+
+            await Self.pass(w, engine, [w.archive], context: mobile(t1))
+            #expect(w.server.requestCounts().dateFilteredListings > 0, "the listing waited again after the first read instead of starting")
+        }
+    }
+
     /// On an expensive network the first listing waits up to the wait bound
     /// from the catch-up's first sight of the folder.
     @Test("On an expensive network a folder's first listing waits until the bound, counted from first sight")
