@@ -431,6 +431,10 @@ final class FakeGraphCalendar: Sendable {
         touchSeries(of: id)
     }
 
+    /// What a GET of an occurrence the user deleted (`userDeletesOccurrence`) by its own id is
+    /// answered: 404, or 410 (Graph's other proven-gone answer).
+    let deletedOccurrenceReadStatus = Mutex(404)
+
     /// Whether the occurrence `id` is kept deleted (`modelsExceptions`).
     func isDeletedOccurrence(_ id: String) -> Bool { cancelledStore.withLock { $0[id] != nil } }
 
@@ -834,7 +838,9 @@ final class FakeGraphCalendar: Sendable {
                 return Self.json(one)
             }
             if parts.count == 1 { readLog.withLock { $0.append((id: parts[0], zone: preferName)) } }
-            guard parts.count == 1, let stored = event(parts[0]) else { return .status(404) }
+            guard parts.count == 1, let stored = event(parts[0]) else {
+                return .status(parts.count == 1 && isDeletedOccurrence(parts[0]) ? deletedOccurrenceReadStatus.withLock { $0 } : 404)
+            }
             var shown = Self.rendered(stored, in: prefer, named: preferName)
             shown["@odata.etag"] = etag(of: parts[0])
             shown["hasAttachments"] = !attachments(of: parts[0]).isEmpty

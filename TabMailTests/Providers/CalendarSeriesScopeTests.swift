@@ -4942,12 +4942,14 @@ struct SeriesLengthKeepsExceptionsTests {
         #expect(graph.patches("ser-1").count == 1, "the series was written \(graph.patches("ser-1").count) times")
     }
 
-    @Test("Outlook: the series' write sent but not landed, an occurrence holding a file of its own deleted before the retry: its saved copy goes with it, and nothing is held")
-    func outlookUnlandedWriteReleasesTheFileOfADeletedOccurrence() async throws {
+    @Test("Outlook: the series' write sent but not landed, an occurrence holding a file of its own deleted before the retry (read back 404 or 410): its saved copy goes with it, and nothing is held",
+          arguments: [404, 410])
+    func outlookUnlandedWriteReleasesTheFileOfADeletedOccurrence(_ gone: Int) async throws {
         let graph = Self.outlookCalendarWithOneFile()
+        graph.deletedOccurrenceReadStatus.withLock { $0 = gone }
         Self.failFirstSeriesWrite(graph, deleting: "ser-1-w1")
         let disk = SavedOnDevice()
-        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-unlanded-file", drains: 2,
+        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-unlanded-file-\(gone)", drains: 2,
                                      inspect: { disk.read() })
         #expect(rows.isEmpty, "rows: \(reasons(rows))")
         #expect(graph.event("ser-1-w1") == nil && graph.isDeletedOccurrence("ser-1-w1"), "week 1 came back: \(graph.event("ser-1-w1") ?? [:])")
@@ -4999,6 +5001,34 @@ struct SeriesLengthKeepsExceptionsTests {
         #expect(sent[1].ifMatch == sent[0].ifMatch && sent[1].ifMatch != sent[1].etag, "retry: \(sent[1])")
         // After the new read: on its etag.
         #expect(sent[2].ifMatch == sent[2].etag && sent[2].ifMatch != sent[0].ifMatch, "after the new read: \(sent[2])")
+    }
+
+    @Test("Outlook: with nothing changed or deleted when read, the series' write is still sent on the read's etag: an occurrence the user changes before it lands is refused (412), read and kept, and put back")
+    func outlookWriteWithNothingCapturedIsConditional() async throws {
+        let plain = [OwnChange(), OwnChange(), OwnChange()]
+        let graph = Self.outlookCalendar(plain)
+        // The user renames week 1 in Outlook as the series' write arrives, before Graph applies it.
+        graph.beforeWrite { method, id in
+            guard method == "PATCH", id == "ser-1", graph.writes.filter({ $0 == "PATCH ser-1" }).count == 1,
+                  var renamed = graph.event("ser-1-w1") else { return }
+            renamed["subject"] = "Renamed"
+            renamed["type"] = "exception"
+            graph.store(renamed)
+            graph.touchSeries(of: "ser-1-w1")
+        }
+        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-nothing-captured")
+        #expect(rows.isEmpty, "rows: \(reasons(rows))")
+        let sent = graph.patchConditions("ser-1")
+        #expect(sent.count == 2, "the series' writes: \(sent)")
+        guard sent.count == 2 else { return }
+        // The first on the read's etag (refused: the rename moved it), the second on the new read's.
+        #expect(sent[0].ifMatch != nil && sent[0].ifMatch == sent[0].etag, "first: \(sent[0])")
+        #expect(sent[1].ifMatch == sent[1].etag && sent[1].ifMatch != sent[0].ifMatch, "after the new read: \(sent[1])")
+        #expect(graph.patches("ser-1").count == 1 && graph.seriesResets == 1,
+                "applied \(graph.patches("ser-1").count), reset \(graph.seriesResets)")
+        var changes = plain
+        changes[1] = OwnChange(subject: "Renamed")
+        Self.expectOutlookKept(graph, length: Self.length, changes: changes, "a change before the write")
     }
 
     /// A weekly Monday rule as Graph gives it back (its own defaults included), ending `end`.

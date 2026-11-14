@@ -280,7 +280,8 @@ These tests read what each provider sent, or what the fake server ends up holdin
   stays deleted with its saved file released; one landed with its answer lost, then overtaken by another
   client's change, is refused, read again, and still puts back the moved, renamed and deleted occurrences
   and the file the first attempt kept; the series write's `If-Match` is the record's kept etag (asserted
-  on the request), and a rule is held only when every value sent is (`holdsValues`). A deleted place changed since the reset is skipped
+  on the request), or the read's when it kept nothing (a change made before the write is refused, read
+  and put back), a saved file is released on its occurrence read back 404 or 410, and a rule is held only when every value sent is (`holdsValues`). A deleted place changed since the reset is skipped
   and the put-back goes on (a later deleted place deleted again). `CalendarPutBackFilesTests` pins the bytes' lifecycle: the
   reclaim spares a held failed row, the Settings wipe and a release boundary leave it, the drain-start
   sweep removes only orphans, the failure banner shows a held row until dismissed and the dismissal

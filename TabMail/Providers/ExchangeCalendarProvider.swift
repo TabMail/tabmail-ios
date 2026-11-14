@@ -379,7 +379,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
     ///    the read gave (`SeriesEditRecord.seriesEtag`);
     /// 3. PATCHes the series, as `updateEvent` does (Graph resets them), conditional on that etag
     ///    (`If-Match`; Graph's etag is series-wide and moves with any write anywhere in the series,
-    ///    measured 2026-11-14);
+    ///    measured 2026-11-14), or on the read's when it found nothing to keep;
     /// 4. puts them back onto the series itself with the split's carry (`carry`, `putBack`), found
     ///    by their place: each deleted one deleted again, each changed one written with its own
     ///    values but the edit's fields, a moved one at its own start lasting the new length, its
@@ -471,14 +471,26 @@ actor ExchangeCalendarProvider: CalendarProvider {
                 json = nil
             }
             if let json, !json.isEmpty {
-                // Nil when the series changed since the capture (Graph refused the write by its
+                // The etag the write is conditional on: the record's, or with no record (this read
+                // found nothing changed or deleted) this read's, so an occurrence the user changes
+                // between the read and the write is read and kept before the write resets it.
+                let ifMatch: String?
+                if let kept {
+                    ifMatch = kept.seriesEtag
+                } else {
+                    guard let etag = existing.raw["@odata.etag"] as? String, !etag.isEmpty else {
+                        throw CalendarProviderError.notSupported(Self.lengthChangeUnreadable)
+                    }
+                    ifMatch = etag
+                }
+                // Nil when the series changed since it was read (Graph refused the write by its
                 // etag, 412) or the record, kept by an earlier version, holds no etag: nothing was
                 // written, and the occurrences are read again.
                 var answer: GCalEvent?
-                if kept == nil || kept?.seriesEtag != nil {
+                if let ifMatch {
                     do {
-                        answer = try await sendPatch(eventId: eventId, json: json, ifMatch: kept?.seriesEtag)
-                    } catch ExchangeCalendarError.httpError(let code, _) where code == Self.preconditionFailed && kept != nil {
+                        answer = try await sendPatch(eventId: eventId, json: json, ifMatch: ifMatch)
+                    } catch ExchangeCalendarError.httpError(let code, _) where code == Self.preconditionFailed {
                         answer = nil
                     } catch where keptHere && !sentBefore && Self.refusedUnwritten(error) {
                         // Graph answered the first send of this record's write with a refusal:
