@@ -843,7 +843,7 @@ hex), never id, size or timestamps. `ExchangeCalendarProvider.copy` (the series 
 onto its new-part instance; first attempt and `finishSplit` alike) writes exactly the unpaired files: a copy is not written
 again, an extra file or a second equal file is written once, a retry writes only what is still missing. Kind is the Graph
 `@odata.type` (`attachmentKind`). A file whose name and kind meet a partner is read once more (its bytes) for the digest;
-one with no possible partner is not. #718 reuses this function for the exception's own files against its series'.
+one with no possible partner is not. #718 is to reuse this function for the exception's own files against its series'.
 Each source file is read (GET by id) at most once: one read to compare is written from the same bytes (`SourceFileReads`); a
 target file is read only to compare with a source file of its name and kind (Graph gives no content hash). Known limitation,
 ruled (#871, P4): a series copy the user REMOVED from a carried occurrence, or replaced, still shows on its new-part instance,
