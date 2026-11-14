@@ -279,8 +279,12 @@ These tests read what each provider sent, or what the fake server ends up holdin
   and its card shows no reset note and "2 meetings after <date> are removed." (the deleted one after
   the end not counted); a later end keeps everything and its card shows neither line; a series stored
   under another name of its zone is warned of as a reset. `SeriesEndRemovalCardTests`: the same line on
-  Google and CalDAV beside their reset note (a moved occurrence counted by its place, a deleted one or
-  an EXDATE not), none for a later end, and a source check that the shared count names no provider.
+  Google and CalDAV beside their reset note (a moved occurrence counted by its place, one moved 30 days
+  past the stored end counted once, a deleted one, an EXDATE or a cancelled override not; a CalDAV
+  series on a calendar other than the default one), a COUNT-ended series, an edit giving a COUNT, a
+  series with no end ("All meetings after"), a stored rule the expander can't read (no card, retry
+  error), none for a later end, and a source check that the shared count names no provider and lists
+  nothing.
 
 ## Google attendee edits — the others stay as stored
 

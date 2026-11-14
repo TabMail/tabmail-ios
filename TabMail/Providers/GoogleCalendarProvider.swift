@@ -158,6 +158,14 @@ protocol CalendarProvider: Sendable {
     /// The edit's confirmation card says so when it does (#423).
     func editResetsChangedOccurrences(_ event: GCalEvent, edit: GCalEventInput) -> Bool
 
+    /// The places (as `GCalEvent.originalStartTime` gives one) of the occurrences of the series
+    /// `seriesId` (`series`, as `getEvent` read it on `calendarId`) deleted one by one in a way its
+    /// rule lines (`recurrence`'s `EXDATE`) do not already say: Google's cancelled instances,
+    /// Outlook's `cancelledOccurrences`, CalDAV's cancelled `RECURRENCE-ID` VEVENTs. Read for the
+    /// card's count of the meetings an earlier last date removes (#718, `CalendarSeriesEndRemoval`).
+    /// Throws when they can't be read; the default throws `notSupported`.
+    func deletedOccurrencePlaces(calendarId: String, seriesId: String, series: GCalEvent) async throws -> [GCalDateTime]
+
     /// Why this provider cannot hold a repeat rule, or nil when it can. `rrule` is an RFC 5545
     /// `RRULE:` line whose tokens are already valid (`CalendarToolHelpers.recurrenceDayParts`); the
     /// answer is about what the provider's own recurrence model can express. The calendar tools
@@ -265,6 +273,9 @@ extension CalendarProvider {
         throw CalendarProviderError.notSupported(Self.splitNotSupported)
     }
     func refuseSeriesWrite(calendarId: String, write: SeriesWrite) async throws {}
+    func deletedOccurrencePlaces(calendarId: String, seriesId: String, series: GCalEvent) async throws -> [GCalDateTime] {
+        throw CalendarProviderError.notSupported("The occurrences deleted from a repeating event can't be read on this calendar provider.")
+    }
     func dayMovedRules(calendarId: String, eventId: String, series: GCalEvent, scope: String, recurrenceId: String?,
                        zone: TimeZone, move: RecurrenceDayShift.Move) async throws -> [String] {
         throw CalendarProviderError.notSupported("Moving a repeating event's named days to another date is not supported on this calendar provider.")
@@ -1267,6 +1278,15 @@ actor GoogleCalendarProvider: CalendarProvider {
             pageToken = page["nextPageToken"] as? String
         } while pageToken != nil
         return found
+    }
+
+    /// Google's deleted occurrences are its cancelled instances (measured: deleting one marks it
+    /// `cancelled`; the series' `recurrence` gets no `EXDATE`), each by its `originalStartTime`.
+    func deletedOccurrencePlaces(calendarId: String, seriesId: String, series: GCalEvent) async throws -> [GCalDateTime] {
+        try await seriesExceptions(calendarId: calendarId, master: series, masterId: seriesId).compactMap { exception in
+            if case .deleted(let place) = exception.carried { return place }
+            return nil
+        }
     }
 
     /// The `EXDATE` line that removes the occurrence at `place` from a copy of `master`: a date
@@ -2591,6 +2611,13 @@ struct GCalEvent: Codable, Sendable {
     /// The zone the event's end was stored in, where its calendar gives it (Outlook's
     /// `originalEndTimeZone`, read with the event alone). Nil elsewhere; in memory only.
     var eventEndZoneName: String? = nil
+    /// Where the calendar counts a series' occurrences from (`RecurrenceTail.Anchor`): Outlook's
+    /// range start (`.patternStart`). Nil reads as RFC 5545's DTSTART. In memory only.
+    var recurrenceAnchor: RecurrenceTail.Anchor? = nil
+    /// What the calendar does in a month without the rule's day of the month
+    /// (`RecurrenceTail.MissingMonthDay`): Outlook holds it on the month's last day. Nil reads as
+    /// RFC 5545's skip. In memory only.
+    var recurrenceMissingDay: RecurrenceTail.MissingMonthDay? = nil
 
     private enum CodingKeys: String, CodingKey {
         case id, summary, location, description, start, end, attendees, organizer, recurrence

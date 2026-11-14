@@ -1294,6 +1294,23 @@ actor ExchangeCalendarProvider: CalendarProvider {
         return found
     }
 
+    /// Outlook's deleted occurrences: the series' `cancelledOccurrences`, each named by its date in
+    /// the series' zone (measured), placed as `seriesExceptions` places them (`deletedPlace`). One
+    /// read, with `Prefer` naming the series' zone. Throws `notSupported` when it can't be read or
+    /// a date can't be placed (a timed series whose zone can't be read).
+    func deletedOccurrencePlaces(calendarId: String, seriesId: String, series: GCalEvent) async throws -> [GCalDateTime] {
+        let unreadable = CalendarProviderError.notSupported("the occurrences deleted from this repeating event can't be read")
+        let encodedId = try Self.encodedGraphPathSegment(seriesId, context: "Graph series master id")
+        let data = try await request(path: "/events/\(encodedId)?$select=cancelledOccurrences", timeZoneName: series.seriesZoneName)
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw unreadable }
+        return try (json["cancelledOccurrences"] as? [String] ?? []).map { name in
+            let date = String(name.suffix(10))
+            guard RecurrenceTail.Day(iso: date) != nil,
+                  let place = Self.deletedPlace(date: date, series: series, zone: series.seriesZone) else { throw unreadable }
+            return place
+        }
+    }
+
     /// The place of an occurrence Graph names deleted by its date `date` (in the series' zone): the
     /// date for an all-day series, else the series' time of day on it in `zone`, so it compares
     /// with a cut. Nil when it can't be read.
@@ -3553,6 +3570,12 @@ actor ExchangeCalendarProvider: CalendarProvider {
         )
         event.recurrenceTimeZoneName = e.recurrence?.range?.recurrenceTimeZone.flatMap { $0.isEmpty ? nil : $0 }
         event.recurrenceFirstDayOfWeek = e.recurrence?.pattern?.firstDayOfWeek.flatMap { $0.isEmpty ? nil : $0 }
+        // Graph counts a series from its range start, an occurrence only on a pattern day, and holds
+        // a month's missing day of the month on its last day (measured; `RecurrenceTail`).
+        if e.recurrence != nil {
+            event.recurrenceAnchor = .patternStart
+            event.recurrenceMissingDay = .lastDay
+        }
         event.originalStartTime = Self.originalStartTime(e.originalStart)
         event.eventZoneName = e.originalStartTimeZone.flatMap { $0.isEmpty ? nil : $0 }
         event.eventEndZoneName = e.originalEndTimeZone.flatMap { $0.isEmpty ? nil : $0 }

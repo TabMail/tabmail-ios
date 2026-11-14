@@ -495,12 +495,13 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         }
         // A rule that moves the series' last date earlier removes the meetings after it, on every
         // calendar: the card says how many (#718), counted the same way for each
-        // (`CalendarSeriesEndRemoval`, from the series as read and the calendar's listing).
+        // (`CalendarSeriesEndRemoval`, from the stored rule less the occurrences deleted). A count
+        // that can't be worked out shows no card.
         if resolvedScope == "all", shown.recurrence?.isEmpty == false, input.recurrence != nil {
             do {
                 if let removal = try await CalendarSeriesEndRemoval.removal(
                     series: shown, seriesId: named.seriesId, edit: input, calendarId: lookupCalId, provider: provider),
-                   removal.count > 0 {
+                   removal.count.map({ $0 > 0 }) ?? true {
                     changes.append(CalendarToolHelpers.seriesEndRemovalNote(removal))
                 }
             } catch {

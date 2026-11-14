@@ -308,6 +308,26 @@ actor CalDAVProvider: CalendarProvider {
         return event
     }
 
+    /// CalDAV deletes an occurrence with an `EXDATE` on the series, which `recurrence` already
+    /// gives; another client may instead keep it as a `RECURRENCE-ID` VEVENT whose status is
+    /// `CANCELLED` (RFC 5545 §3.8.1.11). Those are read from the resource, each by its
+    /// `RECURRENCE-ID`. Throws when the resource or a place can't be read.
+    func deletedOccurrencePlaces(calendarId: String, seriesId: String, series: GCalEvent) async throws -> [GCalDateTime] {
+        let (seriesHref, _) = try CalDAVOccurrences.OccurrenceId.split(seriesId)
+        let (data, _) = try await client.get(url: try resolveEventURL(seriesHref, calendarId: calendarId))
+        guard let icsText = String(data: data, encoding: .utf8), !icsText.isEmpty else {
+            throw CalDAVError.parseError("Empty response for event \(seriesId)")
+        }
+        return try ICSParser.components(icsText: icsText, resourceHref: seriesHref)
+            .filter { $0.recurrenceId != nil && $0.event.status?.lowercased() == "cancelled" }
+            .map { component in
+                guard let rid = component.recurrenceId, let place = ICSParser.occurrencePlace(rid, zones: component.zones) else {
+                    throw CalDAVError.parseError("A cancelled occurrence of \(seriesId) has a RECURRENCE-ID that can't be read")
+                }
+                return place
+            }
+    }
+
     func createEvent(
         calendarId: String,
         event: GCalEventInput,

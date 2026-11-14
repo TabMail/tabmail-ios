@@ -225,7 +225,8 @@ that aren't included in the request body maintain their previous values".
   the write restates carry the stored labels exactly (`restatesStoredTimes`, `originalStartTimeZone` /
   `originalEndTimeZone`, now read by `getEvent`); a relabel is unmeasured and stays a reset
   (`outlookEarlierSeriesEndRelabelledIsAReset`). Every calendar's card shows, for an earlier end,
-  "N meetings after <date> are removed." (`CalendarSeriesEndRemoval`, shared, ADR-IOS-113 decision 8,
+  "N meetings after <date> are removed." (`CalendarSeriesEndRemoval`, shared, from the stored rule less
+  `cancelledOccurrences` through `deletedOccurrencePlaces`, ADR-IOS-113 decision 8,
   `CalendarToolHelpers.seriesEndRemovalNote`). `FakeGraphCalendar` models it (no reset counted; with
   `modelsExceptions` the occurrences after the new end are gone). Pinned in
   `SeriesLengthKeepsExceptionsTests` (`outlookEarlierSeriesEndAloneKeepsExceptions`,

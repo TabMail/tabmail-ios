@@ -539,10 +539,14 @@ changes only where the series ends (Graph range `endDate` to `endDate`) resets n
 work account), so the card's reset note is not shown for it (`newRangeEnd`) when the write restates the
 stored start and end with their stored zone labels (`restatesStoredTimes`; a relabel stays a reset).
 On EVERY calendar an earlier `UNTIL` gets "N meetings after <date> are removed." (ADR-IOS-113
-decision 8, `CalendarSeriesEndRemoval`, one shared count above the provider boundary: the calendar's
-single-events listing from the new last date to the stored one, each occurrence by its place, deleted
-ones not listed; a failed listing shows no card). Google (`recurrenceLinesDiffer`) and CalDAV (RRULE
+decision 8, `CalendarSeriesEndRemoval`, one shared count above the provider boundary, FROM THE STORED
+RULE: `RecurrenceTail` places the occurrences after the new last date up to the stored end, `UNTIL` or
+`COUNT`, in the series' zone, less `EXDATE`s and the calendar's deleted places
+(`CalendarProvider.deletedOccurrencePlaces`); a changed occurrence counts at its place however far it
+moved; a rule with no end gets "All meetings after <date> are removed."; anything unreadable shows no
+card and asks for a retry, never a silent 0). (Superseded same-day first build: a single-events listing
+with a 7-day margin, which undercounted.) Google (`recurrenceLinesDiffer`) and CalDAV (RRULE
 compare) still show the reset note beside it (not measured on either). Pinned by
 `outlookEarlierSeriesEndAloneKeepsExceptions`, `outlookLaterSeriesEndAloneKeepsExceptions`,
 `outlookEarlierSeriesEndRelabelledIsAReset` and `SeriesEndRemovalCardTests` (Google, CalDAV, and the
-source check that the count names no provider).
+source check that the count names no provider and lists nothing).

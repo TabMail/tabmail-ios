@@ -92,16 +92,25 @@ its card.
 8. **Every calendar: an earlier last date says how many meetings it removes (master-agent,
    2026-11-14).** The card shows "N meetings after <date> are removed." ("1 meeting ... is removed.")
    on Google, CalDAV and Outlook alike, beside a reset note where there is one, whenever the edit's
-   `UNTIL` is before the stored rule's. The count is ONE function above the provider boundary
-   (`CalendarSeriesEndRemoval`, ADR-IOS-060): the occurrences the stored rule places after the new last
-   date up to the stored one, as the calendar's own listing gives them (`listEvents`, single events),
-   each counted by its place (`originalStartTime`), so a changed one counts where the series had it and
-   a deleted one is not listed; dates in the series' zone. A source check holds it free of any provider
-   name or cast. Not counted: a stored rule that ends after a count or never; an occurrence moved on its
-   own more than the listing margin away from the dates counted; a series the tool reads by an id
-   that names no calendar (no cached calendar, so the default one is listed) on Outlook or CalDAV,
-   where the read finds it on any calendar but the listing covers only the default one, is counted
-   as 0 and gets no line. A failed listing shows no card.
+   end (`UNTIL`, or the day of its `COUNT`-th occurrence) is before the stored rule's last occurrence;
+   "All meetings after <date> are removed." when the stored rule had no end. The count is ONE function
+   above the provider boundary (`CalendarSeriesEndRemoval`, ADR-IOS-060), worked out FROM THE STORED
+   RULE (master-agent's ruling): the in-house expander (`RecurrenceTail.occurrences`) places the
+   occurrences after the new last date up to the stored end (an `UNTIL`'s day, or the `COUNT`-th
+   occurrence's), in the series' zone, with the calendar's own counting conventions carried on the read
+   (`GCalEvent.recurrenceAnchor`, `recurrenceMissingDay`, `recurrenceFirstDayOfWeek`: Outlook counts from
+   the range start and holds a missing month day on the month's last day), less the ones deleted one by
+   one: the series' `EXDATE` lines, and the places its calendar gives through ONE new protocol read,
+   `CalendarProvider.deletedOccurrencePlaces` (Google: its cancelled instances, as the series'
+   `recurrence` gets no `EXDATE` when one is deleted, measured; Outlook: `cancelledOccurrences`; CalDAV:
+   a `RECURRENCE-ID` VEVENT whose status is `CANCELLED`). A changed occurrence counts at its place,
+   however far it was moved; no listing, no calendar lookup. Fails closed, never a silent 0: a stored
+   rule, zone, first date or end that can't be read or expanded, an `RDATE`, or a failed deletions read
+   shows no card and the "could not read the repeating event ... Retry." error. A source check holds the
+   count free of any provider name, cast or listing.
+   *Superseded first build (5c96b802, 2026-11-14):* the count listed the calendar's occurrences
+   (`listEvents`) within a 7-day margin; it undercounted (a default-calendar listing gave a silent 0 for
+   a series on another calendar, a far-moved occurrence was missed) and was replaced the same day.
 
 **Consequences:**
 - Outlook attendees get the series update and then one update or cancellation per put-back write

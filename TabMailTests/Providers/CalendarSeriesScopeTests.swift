@@ -1118,28 +1118,29 @@ private func outlookTool(_ graph: FakeGraphCalendar, _ arguments: [String: JSONV
     return try await runTool(arguments, eventId: eventId, account: account, provider: provider)
 }
 
+/// `defaultCalendar`, when given, is the account's one calendar as the server lists it, so the
+/// tool's default calendar is that one and not the one the event is on.
 private func calDAVTool(_ store: FakeCalDAVStore, _ arguments: [String: JSONValue], eventId: String,
-                        account: String) async throws -> ToolRun {
+                        account: String, defaultCalendar: String? = nil) async throws -> ToolRun {
     let http = FakeHTTP.Scenario()
     defer { http.close() }
     http.register(path: "/cal/", method: "GET") { store.handleGET($0) }
     http.register(path: "/cal/", method: "PUT") { store.handlePUT($0) }
-    http.register(path: "/cal/", method: "REPORT") { store.handleREPORT($0) }
-    // The home is the account's one calendar, so the tool's default calendar is the one the
-    // series is on, as a calendar the listing named it on would be.
-    http.register(
-        path: "/cal/", method: "PROPFIND",
-        response: .raw(statusCode: 207, headers: ["Content-Type": "application/xml; charset=utf-8"], body: Data("""
-            <?xml version="1.0" encoding="utf-8"?>
-            <d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
-            <d:response><d:href>/cal/</d:href><d:propstat><d:prop>
-            <d:displayname>Work</d:displayname>
-            <d:resourcetype><d:collection/><c:calendar/></d:resourcetype>
-            <d:current-user-privilege-set><d:privilege><d:write/></d:privilege></d:current-user-privilege-set>
-            <c:supported-calendar-component-set><c:comp name="VEVENT"/></c:supported-calendar-component-set>
-            </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
-            </d:multistatus>
-            """.utf8)))
+    if let defaultCalendar {
+        http.register(
+            path: "/cal/", method: "PROPFIND",
+            response: .raw(statusCode: 207, headers: ["Content-Type": "application/xml; charset=utf-8"], body: Data("""
+                <?xml version="1.0" encoding="utf-8"?>
+                <d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+                <d:response><d:href>\(defaultCalendar)</d:href><d:propstat><d:prop>
+                <d:displayname>Main</d:displayname>
+                <d:resourcetype><d:collection/><c:calendar/></d:resourcetype>
+                <d:current-user-privilege-set><d:privilege><d:write/></d:privilege></d:current-user-privilege-set>
+                <c:supported-calendar-component-set><c:comp name="VEVENT"/></c:supported-calendar-component-set>
+                </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+                </d:multistatus>
+                """.utf8)))
+    }
     let home = URL(string: "https://caldav.example.com/cal/")!
     let provider = CalDAVProvider(
         client: CalDAVClient(username: "user@example.com", password: "pw", session: http.session),
@@ -6209,10 +6210,85 @@ struct SeriesWriteCheckedBeforeTheCardTests {
 @Suite("An earlier last date of every occurrence: the card says how many meetings it removes, on every calendar (#718)", .serialized, .processGlobalState)
 struct SeriesEndRemovalCardTests {
 
-    /// The card line for `count` meetings after `last` (a `yyyy-MM-dd` date, in UTC).
-    private static func line(_ count: Int, after last: String, zone: TimeZone = utc) throws -> String {
-        let date = try #require(FixedDateFormat.formatter("yyyy-MM-dd", timeZone: zone).date(from: last))
-        return "\(count) meetings after \(FixedDateFormat.formatter("MMMM d, yyyy", timeZone: zone).string(from: date)) are removed."
+    /// The card line for `count` meetings after `last` (a `yyyy-MM-dd` date), every one when
+    /// `count` is nil.
+    private static func line(_ count: Int?, after last: String) throws -> String {
+        let date = try #require(FixedDateFormat.formatter("yyyy-MM-dd", timeZone: utc).date(from: last))
+        let shown = FixedDateFormat.formatter("MMMM d, yyyy", timeZone: utc).string(from: date)
+        switch count {
+        case nil: return "All meetings after \(shown) are removed."
+        case 1?: return "1 meeting after \(shown) is removed."
+        case let n?: return "\(n) meetings after \(shown) are removed."
+        }
+    }
+
+    /// A Google edit of every occurrence of `seed`'s series giving `recurrence`, and its card.
+    private static func googleCard(_ seed: [[String: Any]], _ recurrence: [String: JSONValue], account: String)
+        async throws -> (changes: [String], cards: Int, out: String) {
+        let r = try await googleTool([
+            "edit_scope": .string("all"), "timezone": .string("UTC"), "recurrence": .dictionary(recurrence),
+        ], eventId: GoogleSeries.id, account: account, seed: seed)
+        return (r.run.cards.first?.changes ?? [], r.run.cards.count, r.run.out)
+    }
+
+    @Test("Google: an occurrence moved 30 days past the stored end counts once, at its place in the series")
+    func googleFarMovedOccurrenceCountsOnceAtItsPlace() async throws {
+        let rule = "RRULE:FREQ=WEEKLY;UNTIL=\(compact(day(42)))T090000Z"
+        let card = try await Self.googleCard([
+            GoogleSeries.series(rule: rule), GoogleSeries.instance(day(0)), GoogleSeries.instance(day(21)),
+            GoogleSeries.moved(day(28), start: "\(day(58))T09:00:00", end: "\(day(58))T09:30:00"),
+            GoogleSeries.instance(day(35)), GoogleSeries.instance(day(42)),
+        ], ["freq": .string("WEEKLY"), "until": .string(day(21))], account: "series-end-g-far")
+        // Weeks 4 (moved to day 58), 5 and 6 are after the new last date.
+        let expected = try Self.line(3, after: day(21))
+        #expect(card.cards == 1 && card.changes.contains(expected), "card: \(card.changes); \(card.out)")
+    }
+
+    @Test("Google: a series ending after a count counts its occurrences up to the last one, less a deleted one")
+    func googleCountEndedSeries() async throws {
+        let card = try await Self.googleCard([
+            GoogleSeries.series(rule: "RRULE:FREQ=WEEKLY;COUNT=7"), GoogleSeries.instance(day(0)),
+            GoogleSeries.deleted(day(14)), GoogleSeries.instance(day(28)), GoogleSeries.deleted(day(35)),
+        ], ["freq": .string("WEEKLY"), "until": .string(day(21))], account: "series-end-g-count")
+        // Seven weekly occurrences end on day 42: weeks 4 and 6 are after the new last date, week 5 is deleted.
+        let expected = try Self.line(2, after: day(21))
+        #expect(card.cards == 1 && card.changes.contains(expected), "card: \(card.changes); \(card.out)")
+    }
+
+    @Test("Google: an edit ending the series after a count names the day of its last occurrence")
+    func googleEditGivingACount() async throws {
+        let rule = "RRULE:FREQ=WEEKLY;UNTIL=\(compact(day(42)))T090000Z"
+        let card = try await Self.googleCard([
+            GoogleSeries.series(rule: rule), GoogleSeries.instance(day(0)),
+        ], ["freq": .string("WEEKLY"), "count": .int(4)], account: "series-end-g-edit-count")
+        // The fourth occurrence is on day 21; weeks 4, 5 and 6 go.
+        let expected = try Self.line(3, after: day(21))
+        #expect(card.cards == 1 && card.changes.contains(expected), "card: \(card.changes); \(card.out)")
+    }
+
+    @Test("Google: a series with no end given one says every meeting after the new last date is removed")
+    func googleOpenSeriesGivenAnEnd() async throws {
+        let card = try await Self.googleCard([
+            GoogleSeries.series(rule: GoogleSeries.weekly), GoogleSeries.instance(day(0)),
+        ], ["freq": .string("WEEKLY"), "until": .string(day(21))], account: "series-end-g-open")
+        let expected = try Self.line(nil, after: day(21))
+        #expect(card.cards == 1 && card.changes.contains(expected), "card: \(card.changes); \(card.out)")
+    }
+
+    /// Every rule part the tool's fields express is one the expander places (a stored rule with any
+    /// other part is refused before this count, `storedOtherRefusal`), so the stored recurrence the
+    /// count can't read here is one with a date added to it (`RDATE`), which the rule does not place.
+    @Test("Google: a stored recurrence the count can't read (a date added with RDATE) shows no card and asks for a retry")
+    func googleUnreadableRuleShowsNoCard() async throws {
+        var series = GoogleSeries.series(rule: "RRULE:FREQ=WEEKLY;UNTIL=\(compact(day(42)))T090000Z")
+        series["recurrence"] = ["RRULE:FREQ=WEEKLY;UNTIL=\(compact(day(42)))T090000Z", "RDATE:\(compact(day(31)))T090000Z"]
+        let card = try await Self.googleCard([
+            series, GoogleSeries.instance(day(0)),
+        ], ["freq": .string("WEEKLY"), "until": .string(day(21))], account: "series-end-g-unreadable")
+        let answer = try JSONSerialization.jsonObject(with: Data(card.out.utf8)) as? [String: Any]
+        let error = answer?["error"] as? String ?? ""
+        #expect(card.cards == 0 && error.hasPrefix("calendar_event_edit failed: could not read the repeating event to check this change (")
+                && error.hasSuffix("). The event was NOT changed. Retry."), "\(card.out)")
     }
 
     @Test("Google: an earlier UNTIL counts the occurrences after it by their place, a moved one included and a deleted one not, beside the reset note")
@@ -6248,7 +6324,7 @@ struct SeriesEndRemovalCardTests {
         #expect(r.run.cards.count == 1 && !changes.contains { $0.contains("removed") }, "card: \(changes); \(r.run.out)")
     }
 
-    @Test("CalDAV: an earlier UNTIL counts the occurrences after it by their place, a moved one included and an EXDATE not, beside the reset note")
+    @Test("CalDAV, on a calendar other than the default one: an earlier UNTIL counts the occurrences after it by their place, one moved far included, an EXDATE and a cancelled one not, beside the reset note")
     func calDAVCardCountsTheMeetingsRemoved() async throws {
         let zone = "America/New_York"
         func at(_ d: String, _ time: String) -> String { "TZID=\(zone):\(compact(d))T\(time)" }
@@ -6263,20 +6339,24 @@ struct SeriesEndRemovalCardTests {
             "RECURRENCE-ID;\(at(day(7), "090000"))", "DTSTART;\(at(day(7), "110000"))", "DTEND;\(at(day(7), "113000"))",
             "SUMMARY:Moved", "END:VEVENT",
             "BEGIN:VEVENT", "UID:end-c", "DTSTAMP:\(compact(day(-14)))T000000Z",
-            "RECURRENCE-ID;\(at(day(28), "090000"))", "DTSTART;\(at(day(28), "110000"))", "DTEND;\(at(day(28), "113000"))",
-            "SUMMARY:Moved later", "END:VEVENT",
+            "RECURRENCE-ID;\(at(day(28), "090000"))", "DTSTART;\(at(day(58), "110000"))", "DTEND;\(at(day(58), "113000"))",
+            "SUMMARY:Moved far", "END:VEVENT",
+            "BEGIN:VEVENT", "UID:end-c", "DTSTAMP:\(compact(day(-14)))T000000Z",
+            "RECURRENCE-ID;\(at(day(35), "090000"))", "DTSTART;\(at(day(35), "090000"))", "DTEND;\(at(day(35), "093000"))",
+            "STATUS:CANCELLED", "SUMMARY:Standup", "END:VEVENT",
             "END:VCALENDAR",
         ].joined(separator: "\r\n")
         let store = FakeCalDAVStore(servesETags: true)
-        store.seed(path: "/cal/end-c.ics", ics: ics)
+        // The series is on a calendar other than the account's default one.
+        store.seed(path: "/cal/other/end-c.ics", ics: ics)
         let r = try await calDAVTool(store, [
             "edit_scope": .string("all"), "timezone": .string(zone),
             "recurrence": .dictionary(["freq": .string("WEEKLY"), "until": .string(day(21))]),
-        ], eventId: "/cal/end-c.ics", account: "series-end-c-card")
+        ], eventId: "/cal/other/end-c.ics", account: "series-end-c-card", defaultCalendar: "/cal/main/")
         let changes = r.cards.first?.changes ?? []
-        // Weeks 4 (moved) and 5 are after the new last date; week 6 is an EXDATE.
-        let newYork = try #require(TimeZone(identifier: zone))
-        let removal = try Self.line(2, after: day(21), zone: newYork)
+        // After the new last date: week 4 (moved 30 days on), week 5 (cancelled on its own) and
+        // week 6 (an EXDATE): only week 4 counts.
+        let removal = try Self.line(1, after: day(21))
         #expect(r.cards.count == 1 && changes.contains(removal)
                 && changes.contains(CalendarToolHelpers.ruleChangeResetNote), "card: \(changes); \(r.out)")
     }
@@ -6294,9 +6374,10 @@ struct SeriesEndRemovalCardTests {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             return !(trimmed.hasPrefix("//") || trimmed.hasPrefix("/*") || trimmed.hasPrefix("*"))
         }.joined(separator: "\n")
-        for word in ["Exchange", "Google", "CalDAV", "Outlook", "Graph", "Demo", " as? ", " as! ", " is "] {
+        for word in ["Exchange", "Google", "CalDAV", "Outlook", "Graph", "Demo", " as? ", " as! ", " is ", "listEvents"] {
             #expect(!code.contains(word), "the removal count's code names \(word)")
         }
-        #expect(code.contains("provider.listEvents("), "the count no longer lists through the provider protocol")
+        #expect(code.contains("RecurrenceTail.occurrences(") && code.contains("provider.deletedOccurrencePlaces("),
+                "the count no longer expands the stored rule, or no longer reads the deletions through the provider protocol")
     }
 }

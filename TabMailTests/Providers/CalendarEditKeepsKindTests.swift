@@ -199,17 +199,6 @@ final class FakeGoogleCalendar: Sendable {
         // the one stored, else its id at google.com, as `GET` gives it.
         http.register(path: prefix, method: "GET") { [self] request in
             let items = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?.queryItems ?? []
-            // A listing (`singleEvents=true`, a window): the stored instances that are not
-            // cancelled and overlap it, as Google lists a series' occurrences one by one. Only the
-            // instances stored are listed; a plain one a test needs is seeded.
-            if items.first(where: { $0.name == "iCalUID" }) == nil, items.contains(where: { $0.name == "singleEvents" && $0.value == "true" }) {
-                let window = Self.window(request.url)
-                let listed = events.withLock { Array($0.values) }
-                    .compactMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
-                    .filter { $0["recurringEventId"] is String && $0["status"] as? String != "cancelled" }
-                    .filter { Self.overlaps($0, window) }
-                return Self.json(["items": listed])
-            }
             guard let uid = items.first(where: { $0.name == "iCalUID" })?.value else { return .status(400) }
             let all = events.withLock { Array($0.values) }
                 .compactMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
