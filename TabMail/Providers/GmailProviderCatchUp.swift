@@ -3,7 +3,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
-import os
 
 /// Gmail's opaque per-folder catch-up state (ADR-IOS-107), stored as JSON in
 /// `Folder.catchUpState`. Only `GmailProvider` reads or writes it. Gmail ids carry
@@ -62,7 +61,7 @@ struct GmailCatchUpState: Codable, Equatable, Sendable {
     struct RangeScan: Codable, Equatable, Sendable {
         enum Step: String, Codable, Sendable { case membership, unread, starred }
 
-        let range: GmailProvider.CatchUpRange
+        let range: CatchUpRange
         var step: Step = .membership
         /// The page the current list resumes at; nil is its first page.
         var pageToken: String?
@@ -147,63 +146,6 @@ extension GmailProvider {
         return .none
     }
 
-    /// One listing range, in whole epoch seconds. Ranges tile the folder's local
-    /// range without gaps, newest first: each ends where the previous (newer)
-    /// one started.
-    struct CatchUpRange: Codable, Equatable, Sendable {
-        /// Where the range starts (inclusive): the next (older) range ends here.
-        /// The oldest range of a listing that reaches the epoch starts at 0.
-        let from: Int
-        /// The second of the range's oldest local row (`>= from`). The stretch
-        /// before it held no local row when the range was cut.
-        let firstLocal: Int
-        /// One past the second of the range's newest local row (`<= upTo`). The
-        /// stretch from it to `upTo` held no local row when the range was cut.
-        let localEnd: Int
-        /// Where the range ends (exclusive): the previous (newer) range's start,
-        /// or the first range's `localEnd`.
-        let upTo: Int
-    }
-
-    /// The range ending just before `nextBeforeSecond` (nil: just after the newest
-    /// local row), given the order dates of the newest local rows before it
-    /// (`head`, descending, non-empty, at most `rowLimit + 1` of them). The range
-    /// holds at most `rowLimit` rows unless more than that share its newest
-    /// second, starts on a whole second (rows sharing the cut second go to the
-    /// next range), and its local rows span at most `maxSpanSeconds`. When it
-    /// holds every remaining row and `toEpoch` is set, it starts at 0.
-    nonisolated static func catchUpRange(
-        nextBeforeSecond: Int?, head: [Date], rowLimit: Int, maxSpanSeconds: Int, toEpoch: Bool
-    ) -> CatchUpRange {
-        let second = { (date: Date) in Int(date.timeIntervalSince1970.rounded(.down)) }
-        let seconds = head.map(second)
-        let newest = seconds[0]
-        let localEnd = newest + 1
-        var from: Int
-        var holdsTheRest: Bool
-        if seconds.count > rowLimit {
-            from = min(seconds[rowLimit] + 1, newest)
-            holdsTheRest = false
-        } else {
-            from = seconds[seconds.count - 1]
-            holdsTheRest = true
-        }
-        if from < localEnd - maxSpanSeconds {
-            from = localEnd - maxSpanSeconds
-            holdsTheRest = false
-        }
-        let firstLocal = seconds.filter { $0 >= from }.min() ?? newest
-        if holdsTheRest && toEpoch { from = min(from, 0) }
-        return CatchUpRange(from: from, firstLocal: firstLocal, localEnd: localEnd, upTo: nextBeforeSecond ?? localEnd)
-    }
-
-    /// Whether a listing starting now reaches down to the epoch: only while the
-    /// folder's walk is complete (an unfinished walk reaches older mail itself)
-    /// and no storage limit is in force (the limit means old mail is not kept).
-    private nonisolated static func listsToEpoch(_ folder: Folder, context: CatchUpContext) -> Bool {
-        folder.backfillComplete && !context.storageLimitInForce
-    }
-
     /// `EmailProvider.catchUp` for Gmail (ADR-IOS-107). For each folder whose
     /// listing is due (its first, or after a lapse) or in progress: a listing by
     /// provider-date ranges taken from the local rows, newest first, resuming across passes.
@@ -213,7 +155,7 @@ extension GmailProvider {
     /// a `format=minimal` GET for every local row the membership list left out:
     /// only a 404 or labels that no longer place the message in the folder remove
     /// it. An id a membership page names that no local row in the folder holds is
-    /// loaded at once (the direct load, `loadMissing`): the page's token moves on
+    /// loaded at once (the direct load, `CatchUpDirectLoad`): the page's token moves on
     /// only once every such id has loaded or been classified done. Least recently
     /// attempted folder first; every request (every batch of concurrent loads) is
     /// preceded by a budget check and bounded by
@@ -247,58 +189,6 @@ extension GmailProvider {
         /// the hold bound: the page is listed and loaded again on a later pass.
         /// (A page held when its loads stopped on the budget stops with `budget`.)
         case loadHeld
-    }
-
-    /// What loading one membership page's missing ids found.
-    private struct MissingLoad {
-        var loaded: [BackfillResult] = []
-        var failures: [String: SyncEngine.BackfillFetchFailureKind] = [:]
-        /// False when the budget ran out before every id was asked for.
-        var complete = true
-    }
-
-    /// The direct load: fetches `ids` (in the membership list's order, newest
-    /// first) through the backfill's own fetch (`fetchBackfillBatch`: header and
-    /// body in one `format=full` GET each), `BackfillProfile.normal.gmailBodyConcurrency`
-    /// at a time, the width the provider uses for every body fetch. Each batch is
-    /// preceded by a budget check and bounded by the request timeout, so the pass's
-    /// added hold stays the budget plus one timeout. A failed id is classified by
-    /// the page walk's own rule (`SyncEngine.backfillFetchFailureKind`); an id with
-    /// no answer when the timeout fires is a `hold` (no answer at all).
-    private func loadMissing(_ ids: [String], context: CatchUpContext) async -> MissingLoad {
-        var load = MissingLoad()
-        let batchSize = BackfillProfile.normal.gmailBodyConcurrency
-        for start in stride(from: 0, to: ids.count, by: batchSize) {
-            let batch = Array(ids[start..<min(start + batchSize, ids.count)])
-            // The whole batch is charged before any of it is sent.
-            guard context.hasBudget(cost: batch.count) else {
-                load.complete = false
-                break
-            }
-            let answered = OSAllocatedUnfairLock<[BackfillResult]>(initialState: [])
-            do {
-                try await withTimeout(seconds: SyncConfig.catchUpRequestTimeoutSeconds) {
-                    for await result in await self.fetchBackfillBatch(ids: batch, concurrency: batchSize) {
-                        answered.withLock { $0.append(result) }
-                    }
-                }
-            } catch {
-                if DebugModeManager.isLoggingEnabled() {
-                    BackgroundSyncLogger.logDebug("[CatchUp] load of \(batch.count) missing id(s) stopped (\(error)) — the unanswered ones are held")
-                }
-            }
-            let results = answered.withLock { $0 }
-            for result in results {
-                if result.header != nil {
-                    load.loaded.append(result)
-                } else {
-                    load.failures[result.id] = SyncEngine.backfillFetchFailureKind(result.error)
-                }
-            }
-            let answeredIds = Set(results.map(\.id))
-            for id in batch where !answeredIds.contains(id) { load.failures[id] = .hold }
-        }
-        return load
     }
 
     /// One page of a list, preceded by a budget check and bounded by the request
@@ -339,7 +229,7 @@ extension GmailProvider {
         // local row that moved in is missing too, and the listing loads it. An
         // unfinished walk reaches that mail itself. Under a storage limit the
         // oldest local row is where kept mail ends, so the listing stops there.
-        if state?.listing == nil { listing.toEpoch = Self.listsToEpoch(folder, context: context) }
+        if state?.listing == nil { listing.toEpoch = CatchUpRange.listsToEpoch(folder, context: context) }
 
         var result = CatchUpFolderResult(folderId: folder.id, epoch: nil)
         var newState = state ?? GmailCatchUpState(createdAt: context.clock())
@@ -418,10 +308,10 @@ extension GmailProvider {
                         // for `SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds`
                         // after this completion (`catchUpPlan`).
                         listing = GmailCatchUpState.Listing(
-                            toEpoch: Self.listsToEpoch(folder, context: context), lapseCountAtStart: newState.lapseCount)
+                            toEpoch: CatchUpRange.listsToEpoch(folder, context: context), lapseCountAtStart: newState.lapseCount)
                         continue rangeLoop
                     }
-                    listing.range = GmailCatchUpState.RangeScan(range: Self.catchUpRange(
+                    listing.range = GmailCatchUpState.RangeScan(range: CatchUpRange.cut(
                         nextBeforeSecond: listing.nextBeforeSecond, head: headDates,
                         rowLimit: rowLimit, maxSpanSeconds: SyncConfig.catchUpGmailRangeMaxSpanSeconds,
                         toEpoch: listing.toEpoch))
@@ -511,7 +401,10 @@ extension GmailProvider {
                         }
                         let missing = unseen.filter { !held.contains($0) }
                         if !missing.isEmpty {
-                            let load = await loadMissing(missing, context: context)
+                            let load = await CatchUpDirectLoad.load(
+                                missing, batchSize: BackfillProfile.normal.gmailBodyConcurrency,
+                                charge: { context.hasBudget(cost: $0) },
+                                fetch: { ids, concurrency in await self.fetchBackfillBatch(ids: ids, concurrency: concurrency) })
                             result.loaded += load.loaded
                             loadedThisPass.formUnion(load.loaded.map(\.id))
                             result.loadFailures.merge(load.failures) { _, latest in latest }
@@ -520,32 +413,28 @@ extension GmailProvider {
                             // where what loaded is no longer missing. It moved, so it
                             // is not held, and its hold clock starts again at its
                             // next hold: a page whose loads keep moving is never
-                            // passed over for an earlier hold.
-                            if !load.complete && !load.loaded.isEmpty {
-                                scan.loadHeldSince = nil
-                                listing.range = scan
-                                throw RangeStop.budget
-                            }
-                            // The page is held: a `hold` failure (a transient error,
-                            // or no answer within the timeout), as it holds the walk's
-                            // page, or loads that stopped on the budget with nothing
-                            // loaded (every id asked for held, or a slow link where
-                            // the list alone spent the budget and none was asked
-                            // for). Inside the bound the page is listed and loaded
-                            // again later; past it the held ids and the ids not yet
-                            // asked for count as done and the page moves on. Gone or
-                            // per-message failures count as done at once.
+                            // passed over for an earlier hold. The page is held: a
+                            // `hold` failure (a transient error, or no answer within
+                            // the timeout), as it holds the walk's page, or loads that
+                            // stopped on the budget with nothing loaded (every id
+                            // asked for held, or a slow link where the list alone
+                            // spent the budget and none was asked for). Inside the
+                            // bound the page is listed and loaded again later; past it
+                            // the held ids and the ids not yet asked for count as done
+                            // and the page moves on. Gone or per-message failures
+                            // count as done at once (`CatchUpDirectLoad.pageVerdict`).
                             // *Superseded (2026-11-12):* the budget stop came first,
                             // so a page whose loads always ran out of budget never
                             // started the clock and was listed again forever.
-                            if load.failures.values.contains(.hold) || !load.complete {
-                                let now = SyncEngine.backfillPageHoldNow()
-                                let firstHeld = scan.loadHeldSince ?? now
-                                scan.loadHeldSince = firstHeld
-                                if case .hold = SyncEngine.decideBackfillPage(strictestFailure: .hold, firstHeld: firstHeld, now: now) {
-                                    listing.range = scan
-                                    throw load.complete ? RangeStop.loadHeld : RangeStop.budget
-                                }
+                            switch CatchUpDirectLoad.pageVerdict(load, heldSince: &scan.loadHeldSince) {
+                            case .passes:
+                                break
+                            case .stopsOnBudget:
+                                listing.range = scan
+                                throw RangeStop.budget
+                            case .held:
+                                listing.range = scan
+                                throw RangeStop.loadHeld
                             }
                         }
                         let namedSoFar = Set(scan.namedIds)

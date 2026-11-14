@@ -76,6 +76,7 @@ enum ProcessGlobalTestState {
             // that composes across suites. Clearing it BEFORE acquiring would let
             // a queued test wipe the entries the RUNNING test just recorded.
             await AccountManager.shared.clearRecentlyCompletedForTesting()
+            AccountManager.shared.clearActionCompletionsForTesting()
             try await $ownerToken.withValue(acquiredOwnerToken) {
                 try await function()
             }

@@ -603,6 +603,9 @@ final class AccountOperationExecutor {
                 if let numericId, numericId != msgId { completedIds.append(numericId) }
             }
             manager.recordRecentlyCompleted(messageIds: completedIds)
+            // The catch-up's completion log, with the same keys: a catch-up read
+            // that began before now never overwrites this action's state.
+            manager.recordActionCompleted(accountId: currentOp.accountId, messageKeys: completedIds)
 
             // Step 3: Delete PendingOp. MUST succeed — remote op already completed.
             // If we don't delete, it re-executes on next drain (idempotent but wasteful).
@@ -1247,6 +1250,7 @@ final class AccountOperationExecutor {
             }
         }
         manager.recordRecentlyCompleted(messageIds: completedIds)
+        manager.recordActionCompleted(accountId: currentOp.accountId, messageKeys: completedIds)
 
         // The retired members only — an unproven member has no server-named
         // destination and must keep its source address.

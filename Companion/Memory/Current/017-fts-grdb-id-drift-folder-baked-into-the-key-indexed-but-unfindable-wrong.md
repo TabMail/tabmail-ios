@@ -1,3 +1,10 @@
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+> **Correction (2026-11-13): Graph ids are not move-stable.** The body below calls Gmail and Graph ids
+> "move-stable" and gates the drift heal to "Gmail/Graph". That holds for Gmail only: Outlook (Graph)
+> gives a message a new id on every move (ADR-IOS-068, ADR-IOS-081, Memory 108), so recovering an
+> Outlook hit by `(accountId, messageId)` after a move finds nothing under the old id. The body is
+> kept as written.
+<!-- COMPANION-CURRENT-NOTE-END -->
 
 ### FTS↔GRDB id drift (folder baked into the key) — "indexed but unfindable" / wrong-subject class
 - **The FTS `headerId` IS the GRDB `MessageHeader.id` = `"accountId:folderPath:messageId"` — it embeds the folder.** So ANY folder move re-keys the GRDB header and the FTS entry MUST be re-keyed in lockstep or it drifts: search/AI/embedding re-hydration does `MessageHeader.fetchOne(key: ftsHeaderId)` and **silently drops** the hit on a miss (`compactMap` → nil). Confirmed real: Gmail archive (INBOX→`__GMAIL_ALL_MAIL__`) and trash (→`TRASH`) left stale `:INBOX:` FTS entries.

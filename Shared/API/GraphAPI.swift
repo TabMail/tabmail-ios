@@ -99,6 +99,13 @@ enum GraphAPI {
         "id", "isRead", "flag", "receivedDateTime", "categories"
     ])
 
+    /// Fields of one record of the Outlook catch-up's folder listing (ADR-IOS-107):
+    /// the id, the date the listing pages by, and the read and flag state it
+    /// compares with the phone's.
+    static let catchUpListingSelection = GraphMessageSelection(fields: [
+        "id", "receivedDateTime", "isRead", "flag"
+    ])
+
     /// Graph JSON batching endpoint. Each request in a batch names its URL
     /// relative to the version root, so a mailbox request starts with
     /// `batchItemPathPrefix`.

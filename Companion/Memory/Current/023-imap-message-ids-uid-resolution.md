@@ -1,4 +1,11 @@
 <!-- COMPANION-CURRENT-NOTE-BEGIN -->
+> **Correction (2026-11-13): Graph message ids are NOT stable across moves.** The body below says
+> "For Gmail/Exchange, `messageId` is a stable provider ID" and that `stableId` is "`messageId` for
+> Gmail/Exchange (already stable)". That holds for Gmail only. Outlook (Graph) gives a message a new id
+> on every move (ADR-IOS-068, ADR-IOS-081, Memory 108): the move's response carries the new id, the way
+> IMAP's `COPYUID` carries the new UID. A key that must survive an Outlook move cannot be the Graph id.
+> The body is kept as written.
+>
 > **⚠️ CURRENT ROUTING NOTE (2026-08-05) — the `markRead`/`markUnread` bullet below is STALE and its
 > mechanism NO LONGER EXISTS. Read this before that bullet; the body is preserved unedited because
 > its bytes are hash-pinned in `Companion/Memory/manifest.tsv` and reconstruct `PROJECT_MEMORY.md`.**

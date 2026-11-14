@@ -61,3 +61,15 @@ and `liveRecentlyCompleted()`) INSIDE each folder's own write transaction (`Sync
 never once per pass: the folders are applied one transaction each with awaits between them, so a
 completion that lands while an earlier folder is applied is honoured by the later folders. A source
 fence in `ChangeSeamFenceTests` pins that the pass file never reads them.
+
+**Note (2026-11-13, ADR-IOS-107):** the older-mail catch-up's direct load is a consumer too. Its insert
+(`insertBackfillBatch` with `catchUpReadStartedAt`, through `insertFetchedBackfillMessages` from
+`SyncEngine.applyCatchUpResult`) reads `liveRecentlyCompleted()` and the completion log
+(`AccountManager.actionCompletedAt`) INSIDE each insert chunk's transaction, and skips a message
+either names (`SyncEngine.catchUpReadPredatesAction`): a move that completes after the catch-up read
+listed and loaded the message, before its apply, would otherwise put the old id back in the source
+folder, this note's ghost. A read at least the completion log's retention old inserts no load at all.
+A skipped load is not a failure and marks nothing; if the server still lists it in the folder, the next
+listing finds it missing again. The page walk and the other callers of the insert pass no read start
+and are unchanged. Tests: `OutlookCatchUpTests.moveDuringTheLoadLeavesNoGhost`,
+`GmailCatchUpTests.moveDuringTheLoadLeavesNoGhost`, and 29 in `OutlookCatchUpTests+CompletedActions`.

@@ -402,6 +402,17 @@ enum SyncConfig {
     /// Actual gap is 1-2s; 30s gives 15x margin for edge cases (brief app backgrounding, etc.).
     static let recentlyCompletedTTLSeconds: TimeInterval = 30
 
+    /// How long the catch-up's log of completed actions keeps an entry
+    /// (`AccountManager.recordActionCompleted`, ADR-IOS-107). A catch-up read
+    /// that began before a user action completed never overwrites that action's
+    /// read or flag state, and never puts back a message the user moved out of
+    /// the folder after the read listed it, however long the read takes to reach
+    /// the apply; a read older than this may predate an entry already dropped, so
+    /// it applies no read or flag update and inserts no load at all (its removals
+    /// and state still apply). An hour: only a slice suspended for that long in
+    /// the middle loses its flag repairs and loads, which the next listing makes.
+    static let catchUpCompletionLogRetentionSeconds: TimeInterval = 3_600
+
     /// TTL for NSE push-merge arrival stale-protection (NSEDataBridge). A message that
     /// becomes durable via push-merge is upserted ONLY by the merge — sync deliberately
     /// skips its upsert while protected — so a transient server-fetch miss (STATUS/fetch
@@ -641,6 +652,19 @@ enum SyncConfig {
     /// each request in a batch against the throttling limits on its own.
     static let graphChangeReadRequestsPerSecond: Double =
         graphMailboxRequestLimit / graphMailboxRequestWindowSeconds * graphChangeReadRequestShare
+    /// The share of that limit the Outlook catch-up of older mail (ADR-IOS-107)
+    /// may use. Smaller than the change reader's: the catch-up repairs what
+    /// changes the delta lost, so it gives way to the user's own actions, the
+    /// change reads, the full sync and the calendar, which count against the same
+    /// mailbox limit and whose throttling delays the user.
+    static let graphCatchUpRequestShare: Double = 0.25
+    /// The Outlook catch-up's request rate: 10,000 / 600 s x 0.25 = about 4.2
+    /// requests per second. One catch-up call (one backfill slice) may send this
+    /// rate times `catchUpSliceIntervalSeconds` (8); the slice interval turns that
+    /// into the rate. Every request is charged before it is sent, a `$batch` at
+    /// its width (`GraphCatchUpAllowance`).
+    static let graphCatchUpRequestsPerSecond: Double =
+        graphMailboxRequestLimit / graphMailboxRequestWindowSeconds * graphCatchUpRequestShare
     /// Requests one Graph `$batch` carries at most (JSON batching: "limited to 20
     /// individual requests"). A batch of 20 is charged 20, which fits the smallest
     /// read's allowance above (41), so missing headers are fetched in batches.
@@ -818,6 +842,21 @@ enum SyncConfig {
     static let catchUpGmailRangeSlackSeconds = 1
     /// `maxResults` of one Gmail catch-up list request (Gmail's documented maximum).
     static let catchUpGmailListPageSize = 500
+    /// Most local rows one Outlook listing range covers (ADR-IOS-107). A range is
+    /// taken from the folder's local rows in provider-date order
+    /// (`receivedDateTime`). A proposed default, to be measured against a live
+    /// mailbox.
+    static let catchUpGraphRangeRowLimit = 500
+    /// Longest stretch of provider dates one Outlook listing range covers: none.
+    /// Gmail caps its ranges because its read and starred lists are account-wide;
+    /// a Graph listing page carries each message's read and flag state itself and
+    /// lists the folder only, so a sparse folder costs nothing extra.
+    static let catchUpGraphRangeMaxSpanSeconds: Int? = nil
+    /// `$top` of one Outlook catch-up listing request. A record (`id`,
+    /// `receivedDateTime`, `isRead`, `flag`) is a few hundred bytes, so a page
+    /// stays well inside `catchUpRequestTimeoutSeconds` on a slow link. A
+    /// proposed default, to be measured against a live mailbox.
+    static let catchUpGraphListPageSize = 250
 
     // MARK: - Sent-Reply Parent Discovery
 

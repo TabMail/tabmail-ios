@@ -1021,8 +1021,8 @@ struct GmailCatchUpTests {
         let base = Int(Clock().daysAgo(100).timeIntervalSince1970)
         let at = { (second: Int) in Date(timeIntervalSince1970: TimeInterval(second)) }
         let week = SyncConfig.catchUpGmailRangeMaxSpanSeconds
-        func range(_ before: Int?, _ head: [Int], limit: Int = 500, toEpoch: Bool = false) -> GmailProvider.CatchUpRange {
-            GmailProvider.catchUpRange(
+        func range(_ before: Int?, _ head: [Int], limit: Int = 500, toEpoch: Bool = false) -> CatchUpRange {
+            CatchUpRange.cut(
                 nextBeforeSecond: before, head: head.map(at), rowLimit: limit, maxSpanSeconds: week, toEpoch: toEpoch)
         }
 
@@ -1039,7 +1039,7 @@ struct GmailCatchUpTests {
         // A later range ends where the previous (newer) one started, even past its newest row.
         #expect(range(base + 50, [base]) == .init(from: base, firstLocal: base, localEnd: base + 1, upTo: base + 50))
         // A fractional order date belongs to its whole second.
-        #expect(GmailProvider.catchUpRange(
+        #expect(CatchUpRange.cut(
             nextBeforeSecond: nil, head: [Date(timeIntervalSince1970: TimeInterval(base) + 0.5)], rowLimit: 500,
             maxSpanSeconds: week, toEpoch: false) == .init(from: base, firstLocal: base, localEnd: base + 1, upTo: base + 1))
         // Reaching the epoch: only the range that holds every remaining row starts at 0.
@@ -1198,7 +1198,7 @@ struct GmailCatchUpTests {
 
     // MARK: - Lexical fence
 
-    @Test("The seam stays provider-blind, and the Gmail catch-up never reads the network state or the storage limit itself")
+    @Test("The seam stays provider-blind, and the Gmail and Outlook catch-ups never read the network state, the storage limit or a setting themselves")
     func lexicalFence() throws {
         let sources = try DiagnosticPrintGateTests.appTargetSources()
         func source(_ path: String) throws -> String {
@@ -1221,6 +1221,12 @@ struct GmailCatchUpTests {
         #expect(engine.components(separatedBy: "NetworkMonitor").count == 2,
                 "the engine reads the network state once, in the run's snapshot (CatchUpRun.snapshot); no slice re-reads it")
         #expect(!gmail.contains("UserDefaults"), "no setting is read mid-pass: what the pass needs comes from the CatchUpContext snapshot")
+        for path in ["TabMail/Providers/ExchangeProviderCatchUp.swift", "TabMail/Providers/CatchUpListing.swift"] {
+            let text = try source(path)
+            for name in ["NetworkMonitor", "StorageEstimator", "UserDefaults"] {
+                #expect(!text.contains(name), "\(path) reads \(name): what the pass needs comes from the CatchUpContext snapshot")
+            }
+        }
     }
 
     /// The walk's two bookkeeping columns, `backfillComplete` and
@@ -1710,6 +1716,48 @@ struct GmailCatchUpTests {
             #expect(try Self.rows(world, inboxPath)["m"] == nil, "precondition: the archive left the Inbox")
             #expect(try Self.rows(world, allMailPath)["m"] != nil, "the check loads the archived message into All Mail")
             #expect(try Self.folder(world, allMailPath).backfillComplete, "All Mail's walk is left as it was")
+        }
+    }
+
+    /// The user moves a message out of a label while the check is loading it
+    /// (the label lacked it locally once the move was made on the phone): the
+    /// move completes after the check fetched the message and before the apply.
+    /// The apply never puts the message back in the label, whether the
+    /// completion is still under the shared 30 s protection or only in the
+    /// completion log. Another missing message in the same insert still loads.
+    @Test("A message moved out of a label while the check was loading it is not put back; another missing message still loads",
+          .enabled(if: !NetworkMonitor.checkExpensive()), arguments: [false, true])
+    func moveDuringTheLoadLeavesNoGhost(liveProtection: Bool) async throws {
+        let clock = Clock()
+        let seeds = [
+            Self.seed("l1", clock.daysAgo(30), [labelPath]),
+            Self.seed("m", clock.daysAgo(35), [labelPath]),
+            Self.seed("o", clock.daysAgo(37), [labelPath]),
+            Self.seed("l3", clock.daysAgo(40), [labelPath]),
+        ]
+        let local = [
+            Local(id: "m", path: inboxPath, date: clock.daysAgo(35)),
+            Local(id: "l1", path: labelPath, date: clock.daysAgo(30)),
+            Local(id: "l3", path: labelPath, date: clock.daysAgo(40)),
+        ]
+        try await Self.withWorld("gcu-move-during-load-\(liveProtection)", seeds: seeds, local: local) { world async throws in
+            if liveProtection {
+                await AccountManager.shared.recordRecentlyCompleted(messageIds: ["m", "m@example.com"])
+            }
+            let (server, accountId) = (world.server, world.accountId)
+            server.onGet(providerMessageId: "m") {
+                server.applyLabelChange(providerMessageId: "m", add: [inboxPath], remove: [labelPath])
+                if !liveProtection {
+                    AccountManager.shared.recordActionCompleted(accountId: accountId, messageKeys: ["m", "m@example.com"])
+                }
+            }
+
+            await Self.pass(world, [labelPath])
+
+            #expect(world.server.messageGets().contains("m"), "precondition: the check fetched the moved message")
+            let label = try Self.rows(world, labelPath)
+            #expect(label["m"] == nil, "the apply put the moved message back in the label")
+            #expect(label["o"] != nil, "another missing message did not load")
         }
     }
 
@@ -2634,7 +2682,7 @@ struct GmailCatchUpTests {
     func idWhereTwoRangesMeetLoadsOnce() async throws {
         let clock = Clock()
         let (l0, l1) = (clock.daysAgo(1), clock.daysAgo(30))
-        let newer = GmailProvider.catchUpRange(
+        let newer = CatchUpRange.cut(
             nextBeforeSecond: nil, head: [l0, l1], rowLimit: SyncConfig.catchUpGmailRangeRowLimit,
             maxSpanSeconds: SyncConfig.catchUpGmailRangeMaxSpanSeconds, toEpoch: true)
         let seam = Date(timeIntervalSince1970: TimeInterval(newer.from))

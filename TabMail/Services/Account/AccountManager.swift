@@ -725,6 +725,51 @@ actor AccountManager {
         recentlyCompletedStore.withLock { $0.removeAll() }
     }
 
+    /// When each completed action completed, by account and message key
+    /// (`actionCompletionKey`), on the catch-up's wall clock (`CatchUpWallClock`).
+    /// The catch-up apply (`SyncEngine.applyCatchUpTransaction`) skips a read or
+    /// flag update, and its direct load's insert (`insertBackfillBatch`) skips a
+    /// load, for a message whose action completed at or after the moment the
+    /// catch-up read began (`SyncEngine.catchUpReadPredatesAction`): that read is
+    /// older than the user's change, and the shared `recentlyCompleted`
+    /// protection (30 s) can run out before a slow read is applied. Entries older
+    /// than `SyncConfig.catchUpCompletionLogRetentionSeconds` are dropped; a read
+    /// older than that applies no read or flag update and inserts no load at all.
+    /// Ids and times only, in
+    /// memory only (a relaunch also ends every read in flight); never message
+    /// content (ADR-004).
+    nonisolated private let actionCompletedAtStore = Mutex<[String: Date]>([:])
+
+    /// The log's key: the message key (provider message id, RFC Message-ID or
+    /// numeric id, the keys `recentlyCompleted` uses) within its account.
+    nonisolated static func actionCompletionKey(accountId: String, messageKey: String) -> String {
+        "\(accountId)\u{1F}\(messageKey)"
+    }
+
+    /// Records that an action on `messageKeys` of `accountId` completed now, and
+    /// drops entries past the retention.
+    nonisolated func recordActionCompleted(accountId: String, messageKeys: [String]) {
+        let now = CatchUpWallClock.now()
+        let oldest = now.addingTimeInterval(-SyncConfig.catchUpCompletionLogRetentionSeconds)
+        actionCompletedAtStore.withLock { log in
+            log = log.filter { $0.value >= oldest }
+            for key in messageKeys {
+                log[Self.actionCompletionKey(accountId: accountId, messageKey: key)] = now
+            }
+        }
+    }
+
+    /// When the last action on `messageKey` of `accountId` completed, if the log
+    /// still holds it.
+    nonisolated func actionCompletedAt(accountId: String, messageKey: String) -> Date? {
+        actionCompletedAtStore.withLock { $0[Self.actionCompletionKey(accountId: accountId, messageKey: messageKey)] }
+    }
+
+    /// Test seam: drop every entry of the completion log.
+    nonisolated func clearActionCompletionsForTesting() {
+        actionCompletedAtStore.withLock { $0.removeAll() }
+    }
+
     // MARK: - Optimistic Overlay
 
     /// Pending mutations registered by user actions before their DB writes commit.
