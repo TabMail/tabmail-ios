@@ -528,5 +528,8 @@ it in `SeriesEditRecord.files`. The put-back reads each occurrence right before 
 add-only (`reattach`), releasing bytes only after a read shows them (`PutBackLedger`). Bytes outlive
 every path but the user's: the reclaim of failed rows spares a row holding bytes
 (`heldOperationIds`), the drain-start sweep removes only orphans, `LateCalendarFailureStore` shows a
-held row until dismissed (Save File, warned delete), and account removal warns and offers Save File.
+held row until dismissed (Save File, warned delete), and account removal warns and offers Save File,
+then counts the files again in its delete transaction and refuses when there are more than it warned of
+(`AccountRemovalSavedFilesGrew`). A changed occurrence missing from the instances read is read by its own
+id: the window lists by start now, so only a 404 or 410 proves it deleted (`GuardedPatch.gone`).
 Pinned by the file cases of `SeriesLengthKeepsExceptionsTests` and by `CalendarPutBackFilesTests`.

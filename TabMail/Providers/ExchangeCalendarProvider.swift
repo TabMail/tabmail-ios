@@ -1581,8 +1581,11 @@ actor ExchangeCalendarProvider: CalendarProvider {
     ///   measured 2026-11-14), and it is read and judged again. One that already holds what the
     ///   PATCH sends (an earlier attempt's write, `holdsValues`) is done; any other is left as it
     ///   is and counted.
-    /// - A changed occurrence no longer listed at its place was deleted since: it is done, and the
-    ///   files saved for it are released.
+    /// - A changed occurrence is found by its place among the listed instances, else by its own id
+    ///   (Graph keeps an occurrence's id through the reset, measured): the listing reads a window
+    ///   by each occurrence's start NOW, so one moved since out of the window is not listed, and
+    ///   its absence proves nothing. Only Graph's 404 or 410 for its id proves it was deleted
+    ///   since: it is done, and the files saved for it are released.
     ///
     /// The files a changed occurrence held of its own (`PutBackFile`, saved before the series'
     /// PATCH) are attached again (`reattach`), on an occurrence left as it is too: an add only adds.
@@ -1620,14 +1623,21 @@ actor ExchangeCalendarProvider: CalendarProvider {
             let difference = Self.guestDifference(guests, seriesRaw: capture.seriesRaw)
             for change in try Self.carryOrder(plan.changed, zone: zone) {
                 let entries = ledger.held.filter { $0.occurrence == change.exception.id }
-                guard let id = listed.instance(at: change.place)?["id"] as? String else {
-                    // The read listed nothing at its place: it was deleted since.
+                // Not listed at its place: moved out of the window since, or deleted; its own id
+                // tells which (`guardedPatch`). Without an id it can't be told: left, its files kept.
+                guard let id = listed.instance(at: change.place)?["id"] as? String ?? change.exception.id else {
+                    left += 1
+                    continue
+                }
+                let json = carriedWrite(change, exceptions: capture.exceptions, fields: fields, difference: difference, series: series, seriesZone: seriesZone)
+                let guarded = try await guardedPatch(id, json: json, seriesZone: seriesZone, allDay: series.isAllDay)
+                if guarded == .gone {
+                    // Graph says the occurrence is gone: deleted since, its files with it.
                     try await ledger.confirm(entries)
                     done += 1
                     continue
                 }
-                let json = carriedWrite(change, exceptions: capture.exceptions, fields: fields, difference: difference, series: series, seriesZone: seriesZone)
-                let restored = try await guardedPatch(id, json: json, seriesZone: seriesZone, allDay: series.isAllDay)
+                let restored = guarded == .restored
                 if !entries.isEmpty {
                     let outcome = try await reattach(
                         entries, to: id,
@@ -1677,10 +1687,11 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// sends the read's `@odata.etag` as `If-Match`. Graph's etag is series-wide and moves with
     /// any write in the series, so a 412 means something in the series changed since the read:
     /// it is read and judged again, at most `ExchangeCalendarConfig.putBackConflictReads` times,
-    /// then `seriesBusy` (the operation stays queued). True when the occurrence holds `json`'s
-    /// values: written, or already (`holdsValues`, an earlier attempt's write). False when it is
-    /// left as it is: changed by someone else, gone, or a read that can't be judged.
-    private func guardedPatch(_ id: String, json: [String: Any], seriesZone: String?, allDay: Bool) async throws -> Bool {
+    /// then `seriesBusy` (the operation stays queued). `restored` when the occurrence holds
+    /// `json`'s values: written, or already (`holdsValues`, an earlier attempt's write); `gone`
+    /// when Graph answers its read 404 or 410; `left` when it is left as it is: changed by someone
+    /// else, or a read that can't be judged.
+    private func guardedPatch(_ id: String, json: [String: Any], seriesZone: String?, allDay: Bool) async throws -> GuardedPatch {
         let encoded = try Self.encodedGraphPathSegment(id, context: "Graph event instance id")
         let body = try JSONSerialization.data(withJSONObject: json)
         var reads = 0
@@ -1690,15 +1701,15 @@ actor ExchangeCalendarProvider: CalendarProvider {
             do {
                 data = try await request(path: "/events/\(encoded)", timeZoneName: seriesZone)
             } catch ExchangeCalendarError.httpError(let code, _) where code == 404 || code == 410 {
-                return false
+                return .gone
             }
-            guard let instance = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+            guard let instance = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return .left }
             switch instance["type"] as? String {
             case "occurrence":
-                guard let etag = instance["@odata.etag"] as? String, !etag.isEmpty else { return false }
+                guard let etag = instance["@odata.etag"] as? String, !etag.isEmpty else { return .left }
                 do {
                     _ = try await request(path: "/events/\(encoded)", method: "PATCH", body: body, headers: ["If-Match": etag])
-                    return true
+                    return .restored
                 } catch ExchangeCalendarError.httpError(let code, _) where code == Self.preconditionFailed {
                     guard reads < ExchangeCalendarConfig.putBackConflictReads else { throw ExchangeCalendarError.seriesBusy }
                     if DebugModeManager.isLoggingEnabled() {
@@ -1706,11 +1717,18 @@ actor ExchangeCalendarProvider: CalendarProvider {
                     }
                 }
             case "exception":
-                return Self.holdsValues(instance, json, allDay: allDay)
+                return Self.holdsValues(instance, json, allDay: allDay) ? .restored : .left
             default:
-                return false
+                return .left
             }
         }
+    }
+
+    /// What `guardedPatch` found the occurrence to be.
+    enum GuardedPatch {
+        case restored
+        case left
+        case gone
     }
 
     /// The status Graph refuses a write whose `If-Match` etag is stale with (`ErrorIrresolvableConflict`).

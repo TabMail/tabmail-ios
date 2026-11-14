@@ -169,6 +169,17 @@ final class SavedOnDevice: Sendable {
         counts.withLock { $0 = out }
     }
 
+    /// The failures the inbox shows (`LateCalendarFailureStore`), read by `readBanner`.
+    let banner = Mutex<[LateCalendarFailure]>([])
+
+    /// Reads what the inbox shows now.
+    func readBanner() async {
+        let store = await LateCalendarFailureStore()
+        await store.reload()
+        let shown = await store.failures
+        banner.withLock { $0 = shown }
+    }
+
     /// The number of saved files, every operation's.
     var files: Int { counts.withLock { $0.values.reduce(0, +) } }
 

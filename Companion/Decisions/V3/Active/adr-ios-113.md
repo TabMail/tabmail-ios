@@ -29,7 +29,10 @@ its card.
    series moved: it is read and judged again, at most `ExchangeCalendarConfig.putBackConflictReads`
    times, then `ExchangeCalendarError.seriesBusy` keeps the operation queued. An exception that already
    holds what the `PATCH` sends (`holdsValues`, a normalized compare) is done; any other is left as it is
-   and counted.
+   and counted. A changed occurrence not listed at its place is read by its own id (Graph keeps it
+   through the reset): the instances read lists by each occurrence's start now, so one moved since out
+   of the window is missing, and only Graph's 404 or 410 for its id proves it deleted (its files are
+   then released).
 3. **The record (C3).** What the put-back needs (the changed occurrences' times, titles, notes,
    places and guests) is kept on the queued operation (`SeriesEditRecord`) from before the `PATCH`
    until the operation completes, so a retry after a lost answer puts back what the first attempt
@@ -69,7 +72,9 @@ its card.
    operation that still holds files says "The series was changed, but N files attached to events you
    had changed on their own are not restored yet." and is shown until dismissed; its banner and the
    account-removal alert offer Save File (the share sheet) and warn before deleting (owner ruling
-   2026-11-14). The 30-day reclaim spares a row holding bytes; the drain-start sweep
+   2026-11-14). Account removal counts the saved files again inside its delete transaction and refuses,
+   changing nothing, when there are more than the user was warned of; Settings then warns again with
+   the new count. The 30-day reclaim spares a row holding bytes; the drain-start sweep
    removes only bytes whose row is gone.
 
 **Consequences:**

@@ -5427,6 +5427,80 @@ extension SeriesLengthKeepsExceptionsTests {
         Self.expectOutlookKept(graph, length: Self.length, "a lost copy")
     }
 
+    @Test("Outlook: an occurrence's own write refused as too large keeps every saved file of the operation, and its banner offers Save File")
+    func outlookOccurrenceTooLargeKeepsTheFiles() async throws {
+        let graph = Self.outlookCalendarWithOneFile()
+        // Outlook refuses week 1's own put-back write, and every write after it, as too large.
+        graph.beforeWrite { method, id in
+            if method == "PATCH", id == "ser-1-w1" { graph.refuseWrites(["PATCH"], status: 400, code: GraphAPI.messageTooLargeErrorCode) }
+        }
+        let disk = SavedOnDevice()
+        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-own-too-large", inspect: {
+            disk.read()
+            await disk.readBanner()
+        })
+        let reason = rows.first?.failureReason ?? ""
+        #expect(rows.count == 1 && rows.first?.status == PendingStatus.failed.rawValue
+                && reason.contains("you had changed on their own could not be restored") && reason.contains(PutBackFile.notRestoredMessage(1)),
+                "rows: \(reasons(rows))")
+        #expect(Self.recordFiles(rows.first) == 1 && disk.files == 1, "record \(Self.recordFiles(rows.first) ?? -1) saved \(disk.counts.withLock { $0 })")
+        let shown = disk.banner.withLock { $0 }
+        #expect(shown.count == 1 && shown.first?.id == rows.first?.id && shown.first?.holdsFiles == true && shown.first?.heldFiles.count == 1,
+                "the banner: \(shown)")
+        #expect(shown.first?.bannerText.contains(PutBackFile.notRestoredMessage(1)) == true, "\(shown.first?.bannerText ?? "")")
+    }
+
+    @Test("Outlook: a changed occurrence moved since the reset to just past the read's window, in UTC though not in its own zone, is not taken for deleted: its files are attached again and kept until then")
+    func outlookMovedPastTheWindowIsNotGone() async throws {
+        let graph = Self.outlookCalendarWithOneFile()
+        // The put-back reads the instances from two UTC days before its earliest place to three
+        // after its latest (week 3's, deleted on its own). Another client moves week 1 to that
+        // window's first instant after it: the evening before in the series' own zone.
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = .gmt
+        let windowEnd = try #require(utc.date(byAdding: .day, value: 3, to: utc.startOfDay(for: Self.week(3))))
+        graph.afterReset {
+            var moved = GraphSeries.moved(id: "ser-1-w1", from: Self.week(1), to: windowEnd)
+            moved["type"] = "exception"
+            moved["subject"] = "Moved past the window"
+            graph.store(moved)
+        }
+        let disk = SavedOnDevice()
+        let rows = try await outlook(graph, eventId: "ser-1", Self.newEnd(), account: "series-length-x-past-window", inspect: { disk.read() })
+        let reason = rows.first?.failureReason ?? ""
+        #expect(rows.count == 1 && reason.contains(Self.putBackFailure("1 event")) && !reason.contains(PutBackFile.notRestoredMessage(1)),
+                "rows: \(reasons(rows))")
+        #expect(graph.event("ser-1-w1")?["subject"] as? String == "Moved past the window" && instant(graph.event("ser-1-w1")?["start"]) == windowEnd,
+                "\(graph.event("ser-1-w1") ?? [:])")
+        #expect(Self.fileList(graph, "ser-1-w1") == ["notes.txt:own notes"], "week 1: \(Self.fileList(graph, "ser-1-w1"))")
+        #expect(disk.files == 0, "saved: \(disk.counts.withLock { $0 })")
+    }
+
+    /// An earlier end of the series (a new `until`) with the new length.
+    private static var endAndEarlierSeriesEnd: [String: JSONValue] {
+        var args = newEnd()
+        args["recurrence"] = .dictionary([
+            "freq": .string("WEEKLY"),
+            "until": .string(FixedDateFormat.formatter("yyyy-MM-dd", timeZone: GraphSeries.eventZone).string(from: week(2))),
+        ])
+        return args
+    }
+
+    @Test("Outlook: a new length with an earlier series end is a rule change, no length change: its card warns of the reset, and nothing is saved or put back")
+    func outlookEarlierSeriesEndIsARuleChange() async throws {
+        let card = try await outlookTool(Self.outlookCalendarWithOneFile(), Self.endAndEarlierSeriesEnd, eventId: "ser-1",
+                                         account: "series-length-x-earlier-end-card")
+        #expect(card.cards.count == 1 && card.cards.first?.changes.contains(CalendarToolHelpers.ruleChangeResetNote) == true,
+                "cards \(card.cards.count): \(card.cards.first?.changes ?? []); \(card.out)")
+        let graph = Self.outlookCalendarWithOneFile()
+        let disk = SavedOnDevice()
+        let rows = try await outlook(graph, eventId: "ser-1", Self.endAndEarlierSeriesEnd, account: "series-length-x-earlier-end",
+                                     inspect: { disk.read() })
+        #expect(rows.isEmpty, "rows: \(reasons(rows))")
+        #expect(graph.seriesResets == 1 && graph.patchedIds == ["ser-1"], "writes: \(graph.writes)")
+        #expect(disk.files == 0 && disk.directories == 0, "saved: \(disk.counts.withLock { $0 })")
+    }
+
     @Test("Outlook: a record this build can't read leaves the operation queued as it is, nothing written")
     func outlookUnreadableRecordLeavesTheOperation() async throws {
         let graph = Self.outlookCalendarWithOneFile()
