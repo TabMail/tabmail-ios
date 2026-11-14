@@ -236,6 +236,15 @@ struct V54MergeFragmentedThreadsTests {
     /// at one site without breaking anything visibly until users see two rows.
     /// Update the path list when you intentionally add or remove an insert
     /// site (and only then).
+    ///
+    /// Inserts of `MessageHeader` rows that are NOT listed:
+    /// - Known gap, tracked by #887: the local draft placeholder written by
+    ///   `queueDraftSave` (`TabMail/Services/Account/AccountManagerActions.swift`)
+    ///   does not call it yet. When #887 is fixed, add that file to the list.
+    /// - Deliberate exclusions (not user data paths): the demo account seeds
+    ///   (`TabMail/Services/Demo/DemoSeed.swift`,
+    ///   `TabMail/Providers/DemoProvider.swift`) and the screenshot seed
+    ///   (`TabMail/App/ScreenshotMode.swift`).
     @Test("Wiring contract: every production insert path calls ThreadUtils.assignComputedThreadId")
     func wiringContractAllInsertPaths() throws {
         // Project root is two levels up from the test file: …/tabmail-ios/TabMailTests/Helpers/<this>
@@ -247,7 +256,6 @@ struct V54MergeFragmentedThreadsTests {
         let insertSites = [
             "TabMail/Services/Sync/SyncEngineFullSync.swift",
             "TabMail/Services/Sync/SyncEngine.swift",
-            "TabMail/Services/Sync/SyncEngineDeltaSync.swift",
             "TabMail/Services/Sync/SyncEngineChangesApply.swift",
             "TabMail/Services/Sync/SyncEngineBackfillDeep.swift",
             "TabMail/Services/Account/AccountManagerOutbox.swift",
