@@ -5,9 +5,10 @@
 > which REPLACES the stored set in the change merge (`SyncEngineChangesApply.mergeChangeRecord`,
 > ADR-IOS-111 amendment 2026-11-14); a non-authoritative header gives `nil` (labels unknown, the
 > stored set stays and the message stays on the re-read list). Both producers derive the value from
-> evidence (Gmail: label catalog loaded; Outlook: `categories` selected and decoded), and the Gmail
-> reader now loads the catalog before it reads any message detail, so a push pass in a fresh process
-> is authoritative too. **The IMAP trip-wire below is still live but not tripped:** IMAP has no
+> evidence (Gmail: the label catalog has loaded AND knows every label id on the message,
+> `isCompleteUserLabelSet`; Outlook: `categories` selected and decoded). The Gmail reader loads the
+> catalog before it reads any message detail, so a push pass in a fresh process is authoritative too,
+> and reloads it once when a message carries an id it does not know. **The IMAP trip-wire below is still live but not tripped:** IMAP has no
 > change reader, so no IMAP header reaches `ChangeRecord.init(header:)`. When an IMAP change reader
 > lands, its keyword FETCH must set the flag in the same change, otherwise every IMAP record carries
 > `nil` labels, never settles a re-read and never updates labels. The other sync paths (full sync's

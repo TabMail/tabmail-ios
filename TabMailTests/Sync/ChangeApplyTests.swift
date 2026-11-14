@@ -286,6 +286,85 @@ struct ChangeApplyTests {
         }
     }
 
+    @Test("A record whose label set is not known keeps a held row's labels and inserts a new row with the labels it knows")
+    func unknownLabelSetKeepsHeldAndInsertsKnown() async throws {
+        try await Self.withWorld { w in
+            // A Gmail record carrying a label id the catalog does not know (a
+            // label created on the web after the catalog loaded); the reader lists
+            // such a message itself (`rereadLater`).
+            try w.insertRow("lu1", in: w.inboxId, path: "INBOX")
+            try Self.addLabel(w, "Label_old", to: "lu1", in: w.inboxId)
+            let inboxId = w.inboxId
+            await w.script([{ _, request in
+                var held = Self.info("lu1", isRead: true, labels: ["Label_known"])
+                held.userLabelIdsAreAuthoritative = false
+                var fresh = Self.info("lu2", labels: ["Label_known"])
+                fresh.userLabelIdsAreAuthoritative = false
+                return ChangeSet(account: .set("200"), folderList: nil, folders: request.folders.map {
+                    FolderChanges(folderId: $0.id, status: .tracked,
+                                  records: $0.id == inboxId ? [ChangeRecord(header: held), ChangeRecord(header: fresh)] : [],
+                                  rereadLater: $0.id == inboxId ? ["lu1", "lu2"] : [])
+                })
+            }])
+            try await w.pass()
+            #expect(try Self.labels(w, "lu1", in: w.inboxId) == ["Label_old"], "an incomplete set never replaces the stored one")
+            #expect(try w.row("lu1", in: w.inboxId)?.isRead == true, "the fields the record knows still land")
+            #expect(try Self.labels(w, "lu2", in: w.inboxId) == ["Label_known"], "a new message is inserted with the labels the header knows")
+            #expect(Set(try w.state(w.inboxId).recheck) == ["lu1", "lu2"], "both stay listed for a read that knows the set")
+        }
+    }
+
+    @Test("A just-completed label action keeps a stale, different label set back; it lands once the shield lifts")
+    func completedLabelActionShieldsStaleSet() async throws {
+        try await Self.withWorld { w in
+            try w.insertRow("lc1", in: w.inboxId, path: "INBOX")
+            // The user's label, whose op just reached the server; the read began before it.
+            try Self.addLabel(w, "Label_A", to: "lc1", in: w.inboxId)
+            await AccountManager.shared.recordRecentlyCompleted(messageIds: ["lc1"])
+            let inboxId = w.inboxId
+            let build: @Sendable (ChangeCursor, ChangeRequest) -> ChangeSet = { _, request in
+                Self.tracked(request, records: [inboxId: [ChangeRecord(header: Self.info("lc1", labels: []))]])
+            }
+            await w.script([build, build])
+            try await w.pass()
+            #expect(try Self.labels(w, "lc1", in: w.inboxId) == ["Label_A"], "the stale read does not undo the completed action")
+            #expect(try w.state(w.inboxId).recheck == ["lc1"], "and the message is put on the re-read list")
+
+            await AccountManager.shared.clearRecentlyCompletedForTesting()
+            try await w.pass()
+            #expect(try Self.labels(w, "lc1", in: w.inboxId).isEmpty, "the server's set lands once the shield lifts")
+            #expect(try w.state(w.inboxId).recheck.isEmpty, "and leaves the list")
+        }
+    }
+
+    @Test("A label op shields the message by its RFC id and in every folder copy")
+    func labelOpShieldsByAnyKey() async throws {
+        try await Self.withWorld { w in
+            // An op whose member is the RFC id.
+            try w.insertRow("lk1", in: w.inboxId, path: "INBOX")
+            try Self.addLabel(w, "Label_mine", to: "lk1", in: w.inboxId)
+            try w.insertOp(.addUserLabel, ids: [Self.rfc("lk1")], path: "INBOX")
+            // An op admitted on the Inbox copy; the record is for the Archive copy.
+            try w.insertRow("lk2", in: w.inboxId, path: "INBOX")
+            try w.insertRow("lk2", in: w.archiveId, path: "Archive")
+            try Self.addLabel(w, "Label_mine", to: "lk2", in: w.archiveId)
+            try w.insertOp(.removeUserLabel, ids: ["lk2"], path: "INBOX")
+            let inboxId = w.inboxId
+            let archiveId = w.archiveId
+            await w.script([{ _, request in
+                Self.tracked(request, records: [
+                    inboxId: [ChangeRecord(header: Self.info("lk1", labels: []))],
+                    archiveId: [ChangeRecord(header: Self.info("lk2", labels: []))],
+                ])
+            }])
+            try await w.pass()
+            #expect(try Self.labels(w, "lk1", in: w.inboxId) == ["Label_mine"], "an op keyed by the RFC id shields the row")
+            #expect(try w.state(w.inboxId).recheck == ["lk1"])
+            #expect(try Self.labels(w, "lk2", in: w.archiveId) == ["Label_mine"], "an op on another copy shields this copy")
+            #expect(try w.state(w.archiveId).recheck == ["lk2"])
+        }
+    }
+
     @Test("A change read keeps a stored replied or forwarded mark: no reader carries one")
     func repliedAndForwardedMarksStay() async throws {
         try await Self.withWorld { w in

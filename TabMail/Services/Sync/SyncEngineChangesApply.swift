@@ -22,7 +22,9 @@ import GRDB
 //   the server tag are kept back while the user's flag action is pending or just
 //   completed; a user-label set (the message's whole set on the server) replaces
 //   the stored one, kept back while the user's label action is pending or just
-//   completed. Replied/forwarded marks are not written: no reader carries them
+//   completed; a record whose label set is not known (nil) keeps the stored
+//   labels (the reader lists a message whose set it could not complete,
+//   `rereadLater`). Replied/forwarded marks are not written: no reader carries them
 //   (Gmail's API and Graph expose no answered state the app maps; a reply sent
 //   elsewhere marks its parent through the Sent folder, `ReplyParentResolver`);
 // - a record from a baseline (`FolderChangeStatus.isBaseline`: the folder's
@@ -234,8 +236,10 @@ extension SyncEngine {
             }
         }
         // User labels: the record's set replaces the stored one, under the
-        // user's own pending or just-completed label change (a nil set is not
-        // known this read and changes nothing).
+        // user's own pending or just-completed label change. A nil set is not
+        // known this read and changes nothing; a reader whose set may have
+        // changed but could not be completed lists the message itself
+        // (`rereadLater`, Gmail's unknown label id, #882).
         if let incoming = record.userLabelIds {
             let labelShielded = snapshot.userLabel.containsAnyKey(messageId: record.messageId, rfc822MessageId: rfc822)
                 || recentlyCompleted[record.messageId] != nil

@@ -24,8 +24,10 @@ import Foundation
 ///   every folder's `rereadLater` and the rest of the pass lands, bookmark
 ///   included. A failure about the account (connection, credentials) keeps the
 ///   removals, reports `.failed` and keeps the bookmark.
-/// - Every record carries the message's complete user-label set: the label
-///   catalog is loaded before any message is read (#882).
+/// - A record carries the message's user-label set only when it is complete:
+///   the label catalog is loaded before any message is read, and reloaded once
+///   when a message carries a label id it does not know; a set still
+///   incomplete is unknown (nil) (#882).
 ///
 /// `inboxOnly` changes nothing but the folder list: the history is one call for
 /// the whole account. A turn that starts with no read budget left reads nothing.
@@ -97,6 +99,23 @@ extension GmailProvider {
                 failure = error
             }
         }
+        // A message carrying a label id the catalog does not know (a label
+        // created on the server after the catalog loaded): reload the catalog
+        // once this pass and extract the labels again. A label still unknown
+        // leaves that message's set unknown (nil in its record): the apply keeps
+        // the stored labels, and the message goes on the re-read list
+        // (`rereadLater`) of every folder its record lands in, so a later read
+        // that knows the set lands it. A failed reload leaves those sets unknown
+        // the same way (#882).
+        if failure == nil, batch.details.contains(where: { !$0.header.userLabelIdsAreAuthoritative }) {
+            do {
+                _ = try await fetchFolders()
+                batch = reextractUserLabels(batch)
+            } catch {
+                if error is CancellationError || Task.isCancelled { throw error }
+                BackgroundSyncLogger.logDebug("[Sync] Gmail delta: label list reload failed, unknown label sets stay unknown: \(error)")
+            }
+        }
         let details = batch.details
 
         // A message that is gone (404/410) is left out of `details` and of
@@ -120,6 +139,9 @@ extension GmailProvider {
             for detail in details {
                 if Self.folder(folder.path, containsMessageWithLabels: detail.labelIds) {
                     changes.records.append(ChangeRecord(header: detail.header))
+                    if !detail.header.userLabelIdsAreAuthoritative {
+                        changes.rereadLater.append(detail.header.messageId)
+                    }
                 } else {
                     changes.removals.append(detail.header.messageId)
                 }

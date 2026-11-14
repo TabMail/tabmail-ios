@@ -276,6 +276,97 @@ struct GmailChangeReadingTests {
         }
     }
 
+    /// The Inbox's re-read list.
+    static func inboxRecheck(_ w: Pins.World) throws -> [String] {
+        let raw = try w.pool.read { db in try Folder.fetchOne(db, key: w.inbox.id)?.changeState }
+        return FolderChangeState(raw: raw).recheck
+    }
+
+    /// A user label on a stored row, as a sync left it.
+    static func storeLabel(_ w: Pins.World, _ providerLabelId: String, on headerId: String) throws {
+        try w.pool.write { db in
+            let label = UserLabel(accountId: w.accountId, providerLabelId: providerLabelId, name: providerLabelId, isSystem: false)
+            try label.insert(db, onConflict: .ignore)
+            try MessageUserLabel(messageId: headerId, userLabelId: label.id).insert(db)
+        }
+    }
+
+    @Test("a label created on the web after the label list loaded, and applied in the same gesture, reaches the stored message")
+    func labelCreatedAfterCatalogLoadReachesStoredMessage() async throws {
+        try await Pins.withWorld(seeds: [Pins.seed("lbl-5", labels: ["INBOX"])]) { w in
+            let row = try w.insertRow("lbl-5", in: w.inbox)
+            // "Label as > Create new" on the web: a new label, on this message.
+            w.server.setUserLabel(id: "Label_trips", name: "Trips")
+            w.server.applyLabelChange(providerMessageId: "lbl-5", add: ["Label_trips"])
+            // A push pass on the provider whose catalog loaded before the label existed.
+            let outcome = try await SyncEngine().performDeltaSync(account: try w.account(), provider: w.provider, inboxOnly: true)
+            #expect(outcome.succeeded)
+            #expect(try w.account().lastHistoryId == w.server.currentHistoryId(), "precondition: the pass completed")
+            #expect(try w.userLabels(ofHeader: row.id) == ["Label_trips"], "the new label shows")
+            #expect(try Self.inboxRecheck(w).isEmpty, "and nothing is left to re-read")
+        }
+    }
+
+    @Test("a stored label the provider's label list does not know yet is never removed by a read")
+    func storedLabelUnknownToTheCatalogStays() async throws {
+        try await Pins.withWorld(seeds: [Pins.seed("lbl-6", labels: ["INBOX", "UNREAD", Pins.userLabelId])]) { w in
+            let row = try w.insertRow("lbl-6", in: w.inbox)
+            // Another process, with a newer label list, stored both labels.
+            w.server.setUserLabel(id: "Label_late", name: "Late")
+            w.server.applyLabelChange(providerMessageId: "lbl-6", add: ["Label_late"])
+            try Self.storeLabel(w, Pins.userLabelId, on: row.id)
+            try Self.storeLabel(w, "Label_late", on: row.id)
+            w.server.applyLabelChange(providerMessageId: "lbl-6", remove: ["UNREAD"])
+            let outcome = try await SyncEngine().performDeltaSync(account: try w.account(), provider: w.provider, inboxOnly: true)
+            #expect(outcome.succeeded)
+            #expect(try w.row("lbl-6", in: w.inbox)?.isRead == true, "precondition: the read applied")
+            #expect(try w.userLabels(ofHeader: row.id) == [Pins.userLabelId, "Label_late"], "both labels stay")
+        }
+    }
+
+    @Test("a label id the label list never names leaves the stored labels and the message on the re-read list until it is known")
+    func labelUnknownAfterReloadKeepsLabelsAndRereads() async throws {
+        try await Pins.withWorld(seeds: [Pins.seed("lbl-7", labels: ["INBOX", Pins.userLabelId])]) { w in
+            let row = try w.insertRow("lbl-7", in: w.inbox)
+            try Self.storeLabel(w, Pins.userLabelId, on: row.id)
+            // The message now carries a label `/labels` does not list.
+            w.server.applyLabelChange(providerMessageId: "lbl-7", add: ["Label_ghost"], remove: [Pins.userLabelId])
+            try await w.completedDelta()
+            #expect(try w.userLabels(ofHeader: row.id) == [Pins.userLabelId], "an incomplete set never replaces the stored one")
+            #expect(try Self.inboxRecheck(w) == ["lbl-7"], "the message is listed for a read that knows the set")
+
+            // The label list names it now: the re-read lands the whole set.
+            w.server.setUserLabel(id: "Label_ghost", name: "Ghost")
+            try await w.completedDelta()
+            #expect(try w.userLabels(ofHeader: row.id) == ["Label_ghost"], "the server's set lands")
+            #expect(try Self.inboxRecheck(w).isEmpty, "and the message leaves the list")
+        }
+    }
+
+    @Test("a push pass whose label list cannot load fails, keeps its bookmark and changes nothing")
+    func labelListFailureFailsThePushPass() async throws {
+        try await Pins.withWorld(seeds: [Pins.seed("lbl-8", labels: ["INBOX", "UNREAD", Pins.userLabelId])]) { w in
+            let row = try w.insertRow("lbl-8", in: w.inbox)
+            try Self.storeLabel(w, Pins.userLabelId, on: row.id)
+            w.server.applyLabelChange(providerMessageId: "lbl-8", remove: ["UNREAD", Pins.userLabelId])
+            let before = try w.account().lastHistoryId
+            w.server.failLabelListings(true)
+            // A new provider: its label catalog has not loaded.
+            let fresh = w.server.provider()
+            let failed = try? await SyncEngine().performDeltaSync(account: try w.account(), provider: fresh, inboxOnly: true)
+            #expect(failed?.succeeded != true, "the pass does not succeed")
+            #expect(try w.account().lastHistoryId == before, "the bookmark is kept, so the next pass reads the change again")
+            #expect(try w.row("lbl-8", in: w.inbox)?.isRead == false, "nothing of the change is applied")
+            #expect(try w.userLabels(ofHeader: row.id) == [Pins.userLabelId], "no label is wiped")
+
+            w.server.failLabelListings(false)
+            let outcome = try await SyncEngine().performDeltaSync(account: try w.account(), provider: fresh, inboxOnly: true)
+            #expect(outcome.succeeded)
+            #expect(try w.row("lbl-8", in: w.inbox)?.isRead == true)
+            #expect(try w.userLabels(ofHeader: row.id).isEmpty, "the next pass lands the change")
+        }
+    }
+
     // MARK: - a tracked folder gets no window listing
 
     @Test("a full sync of a tracked Gmail account sends no window listing")

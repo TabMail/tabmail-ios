@@ -1049,6 +1049,30 @@ struct OutlookChangeReadingTests {
         }
     }
 
+    @Test("A listed message whose delta record leaves out the categories is read again in full in the same pass")
+    func listedRecordWithoutCategoriesIsRereadInFull() async throws {
+        try await Self.withWorld(seeds: [Self.seed("c-3", in: Self.archive, categories: ["Mine"])]) { w in
+            try w.insertRow("c-3", in: w.archive)
+            try await w.baselineAll()
+            #expect(try labels(w, "c-3", in: w.archive) == ["Mine"], "precondition")
+            // Listed for a re-read, as a change kept back under the user's label op leaves it.
+            var state = FolderChangeState(raw: try w.folder(w.archive).changeState)
+            state.recheck = ["c-3"]
+            let encoded = state.encoded
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [encoded, w.folderId(w.archive)])
+            }
+            // The categories changed meanwhile; the delta record does not carry them.
+            w.server.setCategoriesFromOtherClient(providerMessageId: "c-3", categories: ["Theirs"])
+            w.server.omitDeltaFields(["categories"], providerMessageId: "c-3")
+            let batchedBefore = w.batchedIds().count
+            try await w.read()
+            #expect(w.batchedIds().dropFirst(batchedBefore).contains("c-3"), "the message is read again in full")
+            #expect(try labels(w, "c-3", in: w.archive) == ["Theirs"], "and the full read lands the categories")
+            #expect(try w.recheck(w.archive).isEmpty, "and settles it")
+        }
+    }
+
     @Test("A partial record never overwrites a field it does not carry")
     func absentFieldKeepsStored() async throws {
         try await Self.withWorld(seeds: [Self.seed("p-1", in: Self.archive, isFlagged: true)]) { w in

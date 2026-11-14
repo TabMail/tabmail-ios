@@ -576,11 +576,13 @@ struct StatefulGmailActionServerTests {
         catalog.apply(
             userLabelIds: ["Label_42"],
             legacyTmLabelIds: [],
+            listedLabelIds: ["Label_42"],
             request: newerRequest
         )
         catalog.apply(
             userLabelIds: ["Label_41"],
             legacyTmLabelIds: [],
+            listedLabelIds: ["Label_41"],
             request: olderRequest
         )
 
@@ -592,9 +594,35 @@ struct StatefulGmailActionServerTests {
         catalog.apply(
             userLabelIds: ["Label_42"],
             legacyTmLabelIds: [],
+            listedLabelIds: ["Label_42"],
             request: requestBeforeCreate
         )
         #expect(catalog.knownUserLabelIds == ["Label_42", "Label_43"])
+    }
+
+    /// #882: a loaded catalog does not know a label created after it loaded, so
+    /// a message carrying that id has an incomplete user-label set. System
+    /// labels never make a set incomplete; a label the catalog learns makes it
+    /// complete again.
+    @Test("a user-label set is complete only when the catalog knows every label id on the message")
+    func userLabelSetCompleteOnlyWhenEveryIdIsKnown() {
+        var catalog = GmailUserLabelCatalogState()
+        #expect(!catalog.isCompleteUserLabelSet(["INBOX"]), "nothing is complete before the catalog loads")
+
+        let request = catalog.beginRequest()
+        catalog.apply(
+            userLabelIds: ["Label_42"],
+            legacyTmLabelIds: ["Label_9"],
+            listedLabelIds: ["INBOX", "Label_42", "Label_9", "Label_5"],
+            request: request
+        )
+        #expect(catalog.isCompleteUserLabelSet(["INBOX", "UNREAD", "STARRED", "CATEGORY_UPDATES", "Label_42"]))
+        #expect(catalog.isCompleteUserLabelSet(["Label_9", "Label_5"]), "legacy and excluded labels the listing named are known")
+        #expect(catalog.isCompleteUserLabelSet(nil))
+        #expect(!catalog.isCompleteUserLabelSet(["INBOX", "Label_77"]), "a label created after the catalog loaded")
+
+        catalog.recordKnownUserLabel("Label_77")
+        #expect(catalog.isCompleteUserLabelSet(["INBOX", "Label_77"]))
     }
 
     // MARK: - T3.5 — Gmail structural 400 classification (provider boundary)
