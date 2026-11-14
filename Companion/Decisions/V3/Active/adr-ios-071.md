@@ -89,6 +89,19 @@ above (kept as history). In the same transaction as the delete, the boundary adm
 and no owning `outboxMessage`. Selection reads `Draft` state only, never the retired rows, so decision
 2 ("retire without decoding") is unchanged; every other action is still retired.
 
+**2026-11-14 amendment (owner ruling, GitHub #876): retired actions are read again.** The
+2026-09-06 text relies on the boundary's full sync to restore the server's state; a folder the change
+reader tracks gets no window listing (ADR-IOS-111), so that no longer holds there. In the same
+transaction, before the delete, `SyncEngine.recheckRetiredActions` reads each retired row for its
+account, folder(s) and message ids ONLY and, for every account holding a change bookmark, puts the ids
+on the re-read lists of the source folder and (moves) the destination folder, within
+`SyncConfig.changeRecheckLimit` (overflow arms that folder's catch-up). A row this release cannot
+decode arms its folder's catch-up, or its account's when the folder is unknown; it is never skipped
+silently. Decision 2's "retire without decoding" is narrowed, not dropped: no row is re-sent, replayed
+or interpreted, nothing about any operation is decided, and an undecodable row is never an error.
+Accounts with no bookmark (IMAP today) are unchanged. Detail and the address reasoning:
+`IOS-ACTION-003` ("Retired actions read again").
+
 **Relates:** ADR-IOS-068, ADR-IOS-069, ADR-IOS-070 (migration immutability precedent),
 `KNOWN_ISSUES.md` (`IOS-ACTION-001`, `IOS-ACTION-003`), migrations
 `v74_purgeLegacyPendingOperations` and `v89_createAppReleaseStamp`,

@@ -374,3 +374,19 @@ PendingOperationSnapshot.userLabel, carriesKeptBackFields, settle set labels, us
 label catalog, isUserLabelCatalogLoaded, inboxOnly push pass, isCompleteUserLabelSet, listedLabelIds,
 systemLabelIds, reextractUserLabels, unknown label id, label created after catalog, catalog reload,
 replied, forwarded, PidTagLastVerbExecuted, ReplyParentResolver, #882.
+
+### Amendment 2026-11-14: the release boundary fills the re-read list (#876)
+
+Decision 4 took the window listing away from tracked folders, and with it the correction the release
+boundary relied on for actions it retires (ADR-IOS-071). The boundary now writes the re-read list
+itself: before its delete it reads each retired row for its account, folder(s) and message ids only
+and appends the ids to `Folder.changeState.recheck` of the source folder and, for a move, the
+destination folder, for every account holding a change bookmark (`SyncEngine.recheckRetiredActions`,
+provider-blind, pinned by `ChangeSeamFenceTests.retiredActionRecheckIsProviderBlind`). The cap and the
+overflow rule are decision 3's. A row the release cannot decode arms its folder's catch-up (the
+account's when the folder is unknown). Readers need nothing new: a re-read id is answered as any other
+(record in the folder, removal where the message is not). The IMAP reader, when it lands, inherits
+these ids on its folders' lists. Detail: `IOS-ACTION-003` ("Retired actions read again").
+
+Keywords: release boundary, retired actions, recheckRetiredActions, appReleaseStamp, purge, re-read
+list, undecodable row, #876.

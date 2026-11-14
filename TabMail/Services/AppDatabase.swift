@@ -140,7 +140,8 @@ final class AppDatabase: Sendable {
         // The owner-approved APP-UPGRADE RETIREMENT BOUNDARY. It runs on the RAW
         // pool, before every other step in this initializer, for the reason
         // spelled out on the function itself: the queue rows a previous RELEASE
-        // left behind are retired without being decoded, so it has to happen
+        // left behind are retired without being interpreted (read only for their
+        // account, folders and ids, #876; an undecodable row never throws), so it has to happen
         // before `recoverPreviousSessionResidue` reads them back as models and
         // before anything can admit current-version work.
         //
@@ -237,10 +238,19 @@ final class AppDatabase: Sendable {
     /// THE OWNER-APPROVED APP-UPGRADE RETIREMENT BOUNDARY.
     ///
     /// On a change of installed release, every `pendingOperation` row queued by
-    /// the PREVIOUS release is deleted without being decoded, and every account
-    /// is marked full-sync-due so the server's own state is restored. The
-    /// accepted cost is that the user may have to repeat an action; the queue
-    /// normally drains in seconds, so the reachable set is small.
+    /// the PREVIOUS release is deleted, and every account is marked
+    /// full-sync-due. The accepted cost is that the user may have to repeat an
+    /// action; the queue normally drains in seconds, so the reachable set is
+    /// small.
+    ///
+    /// 🚨 THE SERVER'S STATE IS RESTORED BY A RE-READ, NOT BY THE FULL SYNC ALONE
+    /// (#876). A folder the change reader tracks gets no window listing
+    /// (ADR-IOS-111), so before the delete each retired row is read for its
+    /// account, folders and message ids ONLY, and those ids go on the folders'
+    /// re-read lists (`SyncEngine.recheckRetiredActions`); a row this release
+    /// cannot decode arms its folder's catch-up instead (or its account's).
+    /// Nothing is re-sent or replayed: no row's meaning is interpreted, which is
+    /// what "retire without decoding" protects.
     ///
     /// 🚨 THIS IS THE LIFECYCLE CARVE-OUT, NOT A FIFTH EXIT. The four exits in
     /// `Companion/Rules/Active/never-drop-user-intention.md` answer *"may the
@@ -290,12 +300,15 @@ final class AppDatabase: Sendable {
     static func retirePreviousReleaseActionQueue(
         on pool: some DatabaseWriter, currentRelease: String
     ) throws -> Bool {
-        let retiredRows = try pool.write { db -> Int? in
+        let retired = try pool.write { db -> (Int, RetiredActionRecheckSummary)? in
             let recorded = try String.fetchOne(
                 db, sql: "SELECT release FROM appReleaseStamp WHERE id = 1")
             guard recorded != currentRelease else { return nil }
             let doomed = try Int.fetchOne(
                 db, sql: "SELECT COUNT(*) FROM pendingOperation") ?? 0
+            // #876: the retired actions' optimistic local state is read again
+            // from the server (re-read lists, or the catch-up), BEFORE the delete.
+            let recheck = try SyncEngine.recheckRetiredActions(db: db)
             try db.execute(sql: "DELETE FROM pendingOperation")
             // Owner ruling 2026-11-12 (#531): the boundary retires every action
             // EXCEPT the push of an unsent draft, which is re-queued here, in the
@@ -321,23 +334,26 @@ final class AppDatabase: Sendable {
                     folderPath: folderPath, instanceEpoch: instanceEpoch)
                 try op.insert(db)
             }
-            // The existing full-sync mechanism, reused rather than reinvented:
-            // `SyncEngine.fullSync`'s source-folder reconciliation is what
-            // repairs an optimistic move whose durable operation just went away.
+            // The full sync lists every folder the change reader does not track
+            // (and every folder of an account with no change bookmark), which
+            // corrects the optimistic state of a retired action there. A tracked
+            // folder gets no window listing (ADR-IOS-111): its correction is the
+            // re-read list or the catch-up armed above, not this full sync.
             try db.execute(sql: "UPDATE account SET lastFullSyncAt = NULL")
             try db.execute(sql: """
                 INSERT INTO appReleaseStamp (id, release) VALUES (1, ?)
                 ON CONFLICT(id) DO UPDATE SET release = excluded.release
                 """, arguments: [currentRelease])
-            return doomed
+            return (doomed, recheck)
         }
-        guard let retiredRows else { return false }
+        guard let retired else { return false }
+        let (retiredRows, recheck) = retired
         // Debug-gated (project rule 12): a diagnostic, not production
         // observability. The rows are gone either way; what this answers is
         // "did the boundary fire, and how much did it take" when a user reports
         // an action that did not survive an update.
         if DebugModeManager.isLoggingEnabled() {
-            BackgroundSyncLogger.logDebug("[AppDatabase] Release boundary crossed to \(currentRelease) — retired \(retiredRows) previous-release pendingOperation row(s) and marked full sync due")
+            BackgroundSyncLogger.logDebug("[AppDatabase] Release boundary crossed to \(currentRelease) — retired \(retiredRows) previous-release pendingOperation row(s) and marked full sync due; re-read list +\(recheck.listedIds) id(s), catch-up armed on \(recheck.armedFolders) folder(s), \(recheck.undecodableRows) undecodable row(s)")
         }
         return true
     }

@@ -26,11 +26,16 @@
 the same transaction; see "Draft saves re-queued" below. The 2026-09-06 draft acceptance is kept as
 history.
 
+**AMENDED 2026-11-14 (owner ruling, GitHub #876):** the boundary now puts the retired actions' message
+ids on the re-read lists of a change-tracked account's folders (or arms the catch-up); see "Retired
+actions read again" below. The "full sync restores the server's state" sentence is kept as history.
+
 ## Subsystem and search terms
 
 Action queue; `pendingOperation`; app upgrade; app version; release boundary; `appReleaseStamp`;
 `retirePreviousReleaseActionQueue`; `currentAppRelease`; migration `v89`; blanket purge; lifecycle
-carve-out; full sync due; `lastFullSyncAt`
+carve-out; full sync due; `lastFullSyncAt`; re-read list; recheck; `recheckRetiredActions`; tracked folder;
+catch-up armed; undecodable row; #876
 
 ## Full detail
 
@@ -104,3 +109,44 @@ account and no owning `outboxMessage`. It reads `Draft` state, never the retired
 still decodes nothing it deletes. A pushed draft is not re-sent; every other action is still retired
 and keeps the accepted cost above. Tests: `AppReleaseBoundaryTests.boundaryReQueuesOnlyUnsentDrafts`,
 `NeverDropExitClosureTests.anAppUpdateReQueuesAnUnsentDraftSave` (IntentionLedger, FakeIMAPServer).
+
+**Retired actions read again, 2026-11-14 (owner ruling, GitHub #876).** The "Accepted cost" paragraph
+above says the full sync the boundary schedules restores the server's state for any optimistic local
+change a retired operation would have carried. That stopped being true for folders the change reader
+tracks: a tracked folder gets no window listing (ADR-IOS-111 decision 4), so a message archived just
+before an update stayed in the Archive locally while the server still had it in the Inbox. It first
+applies at the update after the one that introduced tracking (no folder is tracked before its first
+listing). In the same transaction, BEFORE the delete, `SyncEngine.recheckRetiredActions`
+(`TabMail/Services/Sync/SyncEngineRetiredActionRecheck.swift`) now reads each retired row for its
+account, folder(s) and message ids ONLY, and for every account that holds a change bookmark
+(`Account.lastHistoryId`, the same test the full sync uses to skip tracked folders):
+- puts the ids on the re-read list (`Folder.changeState.recheck`) of the folder the action was queued
+  on and, for a move (archive, delete, move), of its destination too (Outlook re-reads folder by
+  folder; Gmail places a re-read message by its labels in every folder), for the kinds with an
+  optimistic local effect (move kinds, read/unread, flag/unflag, user labels, replied/forwarded);
+  tags (local-only on Gmail and Outlook) and draft kinds are not listed;
+- keeps each list within `SyncConfig.changeRecheckLimit` and arms the folder's catch-up
+  (`markCatchUpLapse`) on overflow, as the change apply does;
+- for a row the current model cannot decode (unknown kind, ids that are not a JSON list), arms its
+  folder's catch-up, or every folder's of its account when the folder cannot be resolved by
+  `(accountId, folderPath)`; the same for a decoded row whose folder no longer exists. Such a row is
+  never skipped silently.
+Nothing is re-sent or replayed, and no row's meaning decides anything about any operation: the
+boundary is still not an exit. Accounts with no change bookmark (IMAP today) are unchanged: the
+boundary's full sync lists every folder. Once IMAP folders are tracked, the IMAP reader must honour
+the re-read list for these ids too.
+
+**Address.** The ids listed are the queue's own: the provider's id for the message in the folder the
+action was queued on. A move that drained re-addresses the queued rows after it to the destination id
+the server named (`MessageHeaderRekey.readdressQueuedOperations`), so a queued row names the message
+as the server knows it at that point of the queue; an unsent Outlook move still names the original id,
+which is where the server still has the message. The local row's own address after an optimistic move
+(the source id under the destination folder, on Outlook) is never used as a key. A re-read answers
+for exactly that id: found in the folder (a record), elsewhere or gone (a removal there). Folders are
+resolved by the path the row recorded, never by role (ADR-IOS-059). Undo is a reverse move, so a
+retired undo is an ordinary retired move.
+
+User-visible: after the update, an email whose queued action was cleared shows its server state again
+(for example, an email archived just before the update is back in the inbox). Tests:
+`ReleaseBoundaryRecheckTests` (Gmail archive and mark-read, Outlook move, undecodable row, overflow);
+`ChangeSeamFenceTests.retiredActionRecheckIsProviderBlind`.
