@@ -39,7 +39,7 @@ written before this was seen; for the quota case it is reversed (see the amendme
   single attachment POST and `createUploadSession` already go through `request`.
 - **The queue keeps the change.** No terminal arm claims `mailboxFull`, so it takes the transient arm: the
   row goes back to `queued`, `retryCount` grows, the account's other calendar changes wait behind it for
-  that drain (`failedAccounts`, as the 2026-11-14 ruling asked), and nothing asks the user to sign in.
+  that drain (`failedAccounts`, decided 2026-11-14), and nothing asks the user to sign in.
   `CalendarBadRequestClassificationTests`' roster pins it as not terminal.
 - **The user sees why.** The requeue writes the reserved argument `_wait_reason`
   (`PendingCalendarOperation.waitReasonKey`, a `CalendarWaitReason`, today only `mailboxFull`) and clears
@@ -47,7 +47,7 @@ written before this was seen; for the quota case it is reversed (see the amendme
   `queued` or `inFlight` row with a wait reason into `waiting`, and the inbox shows one
   `WaitingCalendarChangeBanner` per row, laid out like the failure banner, with NO button: *"A calendar
   change is waiting: <title>. Your Outlook mailbox is full. Free up space and it will go through."*
-  (wording: master ruling 2026-11-14, review r1). It goes when the
+  (wording decided 2026-11-14). It goes when the
   change is made (the row is deleted) or fails for good. The drain reloads the store when a wait reason was
   written, cleared, or its row left the queue. No column, no migration, nothing new persisted beyond the
   queue row the change already had.
@@ -56,7 +56,7 @@ written before this was seen; for the quota case it is reversed (see the amendme
   of its ACCOUNT's first queued calendar change in queue order (`createdAt`; queued or in flight), via
   `AccountManager.calendarWaitReason(accountId:)`, and adds one line, `CalendarToolHelpers.waitLine`:
   *"This change is waiting because the Outlook mailbox is full."* (per occurrence: `; waiting because …`).
-  The reason is NOT stamped on the rows held back (master-agent ruling 2026-11-14): the drain stops an
+  The reason is NOT stamped on the rows held back (decided 2026-11-14): the drain stops an
   account at its first failure (`failedAccounts`), so a change queued behind a mailbox-full change is never
   tried and waits for the same space; the head's reason is its reason too. This also covers an exdate
   edit's occurrences after the first. Rows created at the same instant (one exdate batch) are all the head,
@@ -86,6 +86,9 @@ real queue with the write refused for a full mailbox (the result says why) and w
 and a create queued behind an older mailbox-full edit (it says why; once the head's reason is cleared by a
 409, a later create does not). `CalendarEditExdatesOutlookTests.fullMailboxIsReportedForEveryOccurrence`
 asserts the clause on both occurrences of an exdate edit, the second never attempted.
+`CalendarWaitReasonQueryTests` pins the head query with fixed creation times: another account's
+mailbox-full head does not answer, an in-flight head does, a stamp on either of two rows created at the
+same instant answers, and a stamp on a row behind an unstamped head does not.
 
 Red first on main (the four-write suite, before the fix): the create, PATCH and single attachment POST
 cases were retired as `failed`/`missingPermission` with "sign in again" raised, 24 issues. The
