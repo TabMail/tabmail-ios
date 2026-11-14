@@ -317,14 +317,19 @@ extension CalDAVProvider {
     /// `ics` with `edit` written over each override VEVENT `picks` picks: the fields it set, as
     /// `edit.lines` hold them, and its start and end moved by `edit.shift`, or, when it set the
     /// end, an end at its (moved) start plus `edit.length`. Its other properties stay its own.
+    /// `refusal`: what the user is told when an override it picks can't be read (nothing written).
     static func editOverrides(
-        _ ics: String, edit: OccurrenceEdit, zones: CalendarTimeZoneContext, picks: ([ICSUnit]) throws -> Bool
+        _ ics: String, edit: OccurrenceEdit, zones: CalendarTimeZoneContext,
+        refusal: String = "A changed occurrence of the repeating event can't be read, so it can't be split.",
+        picks: ([ICSUnit]) throws -> Bool
     ) throws -> String {
         guard !edit.set.isEmpty || edit.length != nil || edit.shift != 0 else { return ics }
-        let unreadable = CalendarProviderError.notSupported("A changed occurrence of the repeating event can't be read, so it can't be split.")
+        let unreadable = CalendarProviderError.notSupported(refusal)
         return try rewriteVEvents(in: ics) { block, isMaster in
             guard !isMaster, try picks(block) else { return block }
-            let start = try startInstant(of: block, zones: zones).addingTimeInterval(edit.shift)
+            guard let unit = topLevel(block).first(where: { icsProperty($0.text)?.name == "DTSTART" }),
+                  let own = try parseICSDateTime(unit.text, zones: zones) else { throw unreadable }
+            let start = own.addingTimeInterval(edit.shift)
             var startLine: String?
             var out = try rewriteTopLevel(block) { unit, name in
                 if edit.set.contains(name) { return [] }
@@ -353,6 +358,44 @@ extension CalDAVProvider {
             out = insertBeforeSubcomponents(out, lines: added)
             return out
         }
+    }
+
+    /// The resource an edit of every occurrence writes (#718): `merged`, the stored resource
+    /// `storedICS` with `patch` merged into its series VEVENT (`CalDAVProvider.mergePatchIntoICS`),
+    /// and, when the edit is a change of the series' length (`SplitCarry.lengthChange`), every
+    /// changed occurrence (override VEVENT) given it as Google Calendar gives it (measured): it
+    /// keeps its own start and lasts the series' new length, and each field the edit set
+    /// (`fieldProperties`) is the series' new value; everything else stays its own, and a deleted
+    /// occurrence (EXDATE) stays deleted. Any other edit: `merged` as it is.
+    static func wholeSeriesResource(
+        storedICS: String, merged: String, patch: GCalEventInput, zones: CalendarTimeZoneContext
+    ) throws -> String {
+        guard SplitCarry.fields(of: patch).contains(.end) else { return merged }
+        let unreadable = CalendarProviderError.notSupported("this repeating event's start or length can't be read, so its length was not changed")
+        let stored = masterTopLevelLines(storedICS)
+        guard let line = stored.first(where: { icsProperty($0)?.name == "DTSTART" }),
+              let property = icsProperty(line), let instant = try parseICSDateTime(line, zones: zones) else { throw unreadable }
+        let start: GCalDateTime
+        if masterDTStartKind(from: storedICS) == .allDay {
+            let value = property.value.prefix(8)
+            guard value.count == 8 else { throw unreadable }
+            start = GCalDateTime(dateTime: nil, date: "\(value.prefix(4))-\(value.dropFirst(4).prefix(2))-\(value.suffix(2))", timeZone: nil)
+        } else {
+            start = GCalDateTime(dateTime: instant.iso8601String(), date: nil, timeZone: "UTC")
+        }
+        let series = GCalEvent(
+            id: nil, summary: nil, location: nil, description: nil, start: start, end: nil, attendees: nil, organizer: nil,
+            recurrence: stored.filter { icsProperty($0)?.name == "RRULE" }, transparency: nil, status: nil,
+            htmlLink: nil, created: nil, updated: nil)
+        guard SplitCarry.lengthChange(patch, series: series) else { return merged }
+        guard let length = try extractMasterDuration(from: merged, zones: zones) else { throw unreadable }
+        let fields = SplitCarry.fields(of: patch)
+        let set = fieldProperties.filter { fields.contains($0.0) }.map(\.1)
+        let lines = masterTopLevelLines(merged).filter { line in icsProperty(line).map { set.contains($0.name) } ?? false }
+        let edit = OccurrenceEdit(shownFrom: .distantPast, set: set, lines: lines, length: length, shift: 0)
+        return try editOverrides(
+            merged, edit: edit, zones: zones,
+            refusal: "A changed occurrence of the repeating event can't be read, so its length was not changed.") { _ in true }
     }
 
     /// The series' resource of a "this and following" edit at an occurrence moved past its last

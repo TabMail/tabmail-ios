@@ -5214,3 +5214,123 @@ struct SeriesEditRecordIsReservedTests {
         }
     }
 }
+
+// MARK: - CalDAV: a new length of every occurrence reaches its changed occurrences (#718)
+//
+// **INVARIANT (#718).** *A CalDAV edit of every occurrence that changes the series' length alone
+// gives each changed occurrence (override VEVENT) the new length from its own start, in the same
+// PUT, as Google Calendar does:* its start and its other properties stay its own, a field the edit
+// sets is the series' new value (Google retitles changed occurrences with the series, measured), and
+// a deleted occurrence (EXDATE) stays deleted. A start or rule change leaves the overrides alone.
+
+@Suite("CalDAV: a new length of every occurrence reaches the occurrences changed one by one (#718)", .serialized, .processGlobalState)
+struct CalDAVSeriesLengthOverridesTests {
+
+    /// The weekly CalDAV series `len-x` at 09:00 UTC from day 0, 30 minutes long: day 7's occurrence
+    /// moved to 10:00, day 14's renamed and 15 minutes long, day 21's deleted.
+    private static let series = calDAVSeries(uid: "len-x", rule: "RRULE:FREQ=WEEKLY", tzid: "Etc/UTC")
+        .replacingOccurrences(of: "SUMMARY:Standup\r\nEND:VEVENT",
+                              with: "EXDATE;TZID=Etc/UTC:\(compact(day(21)))T090000\r\nSUMMARY:Standup\r\nEND:VEVENT")
+        .replacingOccurrences(of: "END:VCALENDAR", with: [
+            "BEGIN:VEVENT", "UID:len-x", "DTSTAMP:\(compact(day(-14)))T000000Z",
+            "RECURRENCE-ID;TZID=Etc/UTC:\(compact(day(7)))T090000",
+            "DTSTART;TZID=Etc/UTC:\(compact(day(7)))T100000", "DTEND;TZID=Etc/UTC:\(compact(day(7)))T103000",
+            "SUMMARY:Standup", "END:VEVENT",
+            "BEGIN:VEVENT", "UID:len-x", "DTSTAMP:\(compact(day(-14)))T000000Z",
+            "RECURRENCE-ID;TZID=Etc/UTC:\(compact(day(14)))T090000",
+            "DTSTART;TZID=Etc/UTC:\(compact(day(14)))T090000", "DTEND;TZID=Etc/UTC:\(compact(day(14)))T091500",
+            "SUMMARY:Standup (renamed)", "END:VEVENT", "END:VCALENDAR",
+        ].joined(separator: "\r\n"))
+
+    /// The resource after `arguments` are edited through the tool on the series above, its card
+    /// shown and its PUT written.
+    private static func edited(_ arguments: [String: JSONValue], account: String) async throws -> [String] {
+        let store = FakeCalDAVStore(servesETags: true)
+        store.seed(path: "/cal/len-x.ics", ics: series)
+        let r = try await calDAVTool(store, arguments, eventId: "/cal/len-x.ics", account: account)
+        #expect(r.cards.count == 1 && r.queued.isEmpty, "cards \(r.cards.count) queued \(reasons(r.queued)); \(r.out)")
+        #expect(store.recordedPuts().count == 1, "PUTs: \(store.recordedPuts().map(\.path))")
+        return store.storedICS(path: "/cal/len-x.ics")?.components(separatedBy: "\r\n") ?? []
+    }
+
+    /// The `SUMMARY` line of each override, by its `RECURRENCE-ID` line.
+    private static func overrideSummaries(_ lines: [String]) -> [String: String] {
+        var out: [String: String] = [:]
+        var place: String?
+        for line in lines {
+            if line.hasPrefix("RECURRENCE-ID") { place = line }
+            if line == "END:VEVENT" { place = nil }
+            if let place, line.hasPrefix("SUMMARY") { out[place] = line }
+        }
+        return out
+    }
+
+    @Test("T4.1, T4.4: a new end of every occurrence gives each changed occurrence the new length from its own start, in the same PUT, and a deleted one stays deleted")
+    func calDAVOverridesTakeTheNewLength() async throws {
+        let lines = try await Self.edited([
+            "edit_scope": .string("all"), "end_iso": .string("\(day(0))T10:00:00"), "timezone": .string("UTC"),
+        ], account: "series-length-c")
+        // The series ends at 10:00 UTC on day 0, in whatever name of UTC the write labels it with.
+        let seriesEnd = lines.first { $0.hasPrefix("DTEND;TZID=") && $0.hasSuffix(":\(compact(day(0)))T100000") }
+        let endZone = seriesEnd.flatMap { $0.dropFirst("DTEND;TZID=".count).split(separator: ":").first }
+            .flatMap { CalendarTimeZoneResolver.zone(named: String($0), in: .none) }
+        #expect(endZone?.secondsFromGMT() == 0 && endZone?.nextDaylightSavingTimeTransition == nil,
+                "the series' end: \(seriesEnd ?? "none"): \(lines)")
+        for line in ["DTSTART;TZID=Etc/UTC:\(compact(day(7)))T100000", "DTEND;TZID=Etc/UTC:\(compact(day(7)))T110000",
+                     "DTSTART;TZID=Etc/UTC:\(compact(day(14)))T090000", "DTEND;TZID=Etc/UTC:\(compact(day(14)))T100000",
+                     "SUMMARY:Standup (renamed)", "EXDATE;TZID=Etc/UTC:\(compact(day(21)))T090000"] {
+            #expect(lines.contains(line), "missing \(line): \(lines)")
+        }
+        #expect(!lines.contains { $0.hasSuffix("T103000") || $0.hasSuffix("T091500") }, "an occurrence kept its old length: \(lines)")
+    }
+
+    @Test("T4.2: a move of the series' start leaves every changed occurrence as it was")
+    func calDAVStartMoveLeavesTheOverrides() async throws {
+        let lines = try await Self.edited([
+            "edit_scope": .string("all"), "start_iso": .string("\(day(0))T11:00:00"), "end_iso": .string("\(day(0))T12:00:00"),
+            "timezone": .string("UTC"),
+        ], account: "series-length-c-start")
+        for line in ["DTSTART;TZID=Etc/UTC:\(compact(day(7)))T100000", "DTEND;TZID=Etc/UTC:\(compact(day(7)))T103000",
+                     "DTSTART;TZID=Etc/UTC:\(compact(day(14)))T090000", "DTEND;TZID=Etc/UTC:\(compact(day(14)))T091500"] {
+            #expect(lines.contains(line), "missing \(line): \(lines)")
+        }
+    }
+
+    @Test("T4.3: an all-day series made two days long gives its changed occurrence two days from its own date")
+    func calDAVAllDayOverrideTakesTheNewLengthInDays() async throws {
+        let ics = [
+            "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//TabMail//Test//EN",
+            "BEGIN:VEVENT", "UID:len-ad", "DTSTAMP:\(compact(day(-14)))T000000Z",
+            "DTSTART;VALUE=DATE:\(compact(day(0)))", "DTEND;VALUE=DATE:\(compact(day(1)))",
+            "RRULE:FREQ=WEEKLY", "SUMMARY:Offsite", "END:VEVENT",
+            "BEGIN:VEVENT", "UID:len-ad", "DTSTAMP:\(compact(day(-14)))T000000Z",
+            "RECURRENCE-ID;VALUE=DATE:\(compact(day(7)))",
+            "DTSTART;VALUE=DATE:\(compact(day(8)))", "DTEND;VALUE=DATE:\(compact(day(9)))",
+            "SUMMARY:Offsite (moved)", "END:VEVENT", "END:VCALENDAR",
+        ].joined(separator: "\r\n")
+        let store = FakeCalDAVStore(servesETags: true)
+        store.seed(path: "/cal/len-ad.ics", ics: ics)
+        let r = try await calDAVTool(store, [
+            "edit_scope": .string("all"), "end_iso": .string("\(day(2))T00:00:00"), "timezone": .string("UTC"),
+        ], eventId: "/cal/len-ad.ics", account: "series-length-c-allday")
+        #expect(r.cards.count == 1 && r.queued.isEmpty, "cards \(r.cards.count) queued \(reasons(r.queued)); \(r.out)")
+        let lines = store.storedICS(path: "/cal/len-ad.ics")?.components(separatedBy: "\r\n") ?? []
+        for line in ["DTEND;VALUE=DATE:\(compact(day(2)))", "DTSTART;VALUE=DATE:\(compact(day(8)))",
+                     "DTEND;VALUE=DATE:\(compact(day(10)))", "SUMMARY:Offsite (moved)"] {
+            #expect(lines.contains(line), "missing \(line): \(lines)")
+        }
+        #expect(!lines.contains("DTEND;VALUE=DATE:\(compact(day(9)))"), "the changed occurrence kept its old length: \(lines)")
+    }
+
+    @Test("T4.5: a new end with a new title gives every changed occurrence the new title too, as Google Calendar does")
+    func calDAVEndAndTitleRetitleTheOverrides() async throws {
+        let lines = try await Self.edited([
+            "edit_scope": .string("all"), "end_iso": .string("\(day(0))T10:00:00"), "title": .string("Team standup"),
+            "timezone": .string("UTC"),
+        ], account: "series-length-c-title")
+        let summaries = Self.overrideSummaries(lines)
+        #expect(summaries.count == 2 && summaries.values.allSatisfy { $0 == "SUMMARY:Team standup" }, "overrides: \(summaries); \(lines)")
+        #expect(lines.contains("DTEND;TZID=Etc/UTC:\(compact(day(14)))T100000"), "\(lines)")
+        #expect(lines.contains("EXDATE;TZID=Etc/UTC:\(compact(day(21)))T090000"), "\(lines)")
+    }
+}
