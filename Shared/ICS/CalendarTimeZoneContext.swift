@@ -22,8 +22,19 @@ struct CalendarTimeZoneContext: Sendable, Equatable {
     /// `X-LIC-LOCATION` by `TZID`, both unquoted. The first `VTIMEZONE` with a `TZID` defines it.
     let locations: [String: String]
 
-    private init(locations: [String: String]) {
+    /// The zone a floating date-time (one with no `TZID` and no `Z`) of the resource is read in:
+    /// the device's unless a reader gives the zone its operation runs in (`readingFloating(in:)`),
+    /// as a queued write does with the zone it was queued in.
+    let floating: TimeZone
+
+    private init(locations: [String: String], floating: TimeZone = .current) {
         self.locations = locations
+        self.floating = floating
+    }
+
+    /// This context, its floating date-times read in `zone`.
+    func readingFloating(in zone: TimeZone) -> CalendarTimeZoneContext {
+        CalendarTimeZoneContext(locations: locations, floating: zone)
     }
 
     /// The context of `calendarText`, in one forward pass over its lines. Each line costs only its own
@@ -89,6 +100,7 @@ struct CalendarTimeZoneContext: Sendable, Equatable {
             }
         }
         self.locations = locations
+        self.floating = .current
     }
 
     /// The colon that ends a content line's name and parameters: the first one outside a quoted

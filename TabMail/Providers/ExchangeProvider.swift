@@ -1194,7 +1194,7 @@ actor ExchangeProvider: EmailProvider {
     /// Whether a Graph attachment is a `#microsoft.graph.fileAttachment`. A list
     /// entry of a derived type carries its `@odata.type` (OData minimal metadata),
     /// `$select` or not; an entry without one is not treated as a file.
-    private static func isFileAttachment(_ att: GraphAttachmentMeta) -> Bool {
+    nonisolated static func isFileAttachment(_ att: GraphAttachmentMeta) -> Bool {
         (att.odataType ?? "").lowercased().contains("fileattachment")
     }
 
@@ -1216,27 +1216,52 @@ actor ExchangeProvider: EmailProvider {
         return (add, unpaired.map(\.id))
     }
 
-    /// Add one file to a draft: a single POST under the documented size, else an
-    /// upload session whose byte ranges are PUT in order to its pre-authenticated
-    /// URL, with no `Authorization` header (Graph: "Attach large files to Outlook
-    /// messages"). Any failure throws; nothing is deleted on this path.
+    /// Add one file to a draft (`addFileAttachment` on the message).
     private func addDraftAttachment(_ attachment: DraftAttachment, encodedMessageId: String) async throws {
+        try await Self.addFileAttachment(
+            attachment, itemPath: "/messages/\(encodedMessageId)",
+            post: { path, body in try await self.request(path: path, method: "POST", body: body) },
+            session: testSession ?? sharedEphemeralSession, gate: mailboxGate)
+    }
+
+    /// Add one file to the Graph item at `itemPath` (a message, `/messages/{id}`, or an event,
+    /// `/events/{id}`, under the mailbox's base URL): a single POST under the documented size,
+    /// else an upload session whose byte ranges are PUT in order to its pre-authenticated URL,
+    /// with no `Authorization` header (Graph: "Attach large files to Outlook messages"; an
+    /// event takes the same two routes: `attachment: createUploadSession` documents "The item
+    /// can be a message or event", and `event: post attachments` the single POST). `post`
+    /// sends an authenticated POST under the base URL with the caller's own error mapping;
+    /// the range PUTs go through `session` and the mailbox's `gate`. Any failure throws;
+    /// nothing is deleted on this path. One place for the per-file size rule: an Outlook
+    /// draft save, an Outlook send and an Outlook split's new part (#563) all add files here.
+    ///
+    /// `inline` names a picture placed in the item's body (`isInline` and the `contentId` its
+    /// `cid:` link names), written on the single POST (`fileAttachment`) and on the upload
+    /// session's `attachmentItem`, which both document the two properties; nil (a draft) writes
+    /// neither, as before.
+    nonisolated static func addFileAttachment(
+        _ attachment: DraftAttachment,
+        itemPath: String,
+        inline: GraphInlinePlacement? = nil,
+        post: @Sendable (_ path: String, _ body: Data) async throws -> Data,
+        session: URLSession,
+        gate: HTTPConcurrencyGate
+    ) async throws {
         let total = attachment.data.count
         if total < ExchangeDraftConfig.singlePostAttachmentLimitBytes {
-            let body = try JSONSerialization.data(withJSONObject: Self.graphFileAttachment(attachment))
-            _ = try await request(path: "/messages/\(encodedMessageId)/attachments", method: "POST", body: body)
+            let body = try JSONSerialization.data(withJSONObject: Self.graphFileAttachment(attachment, inline: inline))
+            _ = try await post("\(itemPath)/attachments", body)
             return
         }
-        let sessionBody = try JSONSerialization.data(withJSONObject: [
-            "AttachmentItem": [
-                "attachmentType": "file",
-                "name": attachment.filename,
-                "contentType": attachment.mimeType,
-                "size": total,
-            ] as [String: Any],
-        ])
-        let sessionData = try await request(
-            path: "/messages/\(encodedMessageId)/attachments/createUploadSession", method: "POST", body: sessionBody)
+        var item: [String: Any] = [
+            "attachmentType": "file",
+            "name": attachment.filename,
+            "contentType": attachment.mimeType,
+            "size": total,
+        ]
+        inline?.write(into: &item)
+        let sessionBody = try JSONSerialization.data(withJSONObject: ["AttachmentItem": item])
+        let sessionData = try await post("\(itemPath)/attachments/createUploadSession", sessionBody)
         let uploadURL = try Self.validatedUploadURL(
             (try? JSONSerialization.jsonObject(with: sessionData) as? [String: Any])?["uploadUrl"] as? String)
         var offset = 0
@@ -1249,8 +1274,7 @@ actor ExchangeProvider: EmailProvider {
             put.httpBody = attachment.data.subdata(in: offset..<end)
             let response: URLResponse
             do {
-                let session = testSession ?? sharedEphemeralSession
-                (_, response) = try await mailboxGate.withSlot { try await session.data(for: put) }
+                (_, response) = try await gate.withSlot { try await session.data(for: put) }
             } catch let error as URLError {
                 // The session URL carries a pre-authenticated token, and a URLError
                 // carries its failing URL into every log line that prints the error
@@ -1888,12 +1912,19 @@ actor ExchangeProvider: EmailProvider {
     }
 
     nonisolated static func graphFileAttachment(_ attachment: DraftAttachment) -> [String: Any] {
-        [
+        graphFileAttachment(attachment, inline: nil)
+    }
+
+    /// `graphFileAttachment` with the inline placement `inline` written when there is one.
+    nonisolated static func graphFileAttachment(_ attachment: DraftAttachment, inline: GraphInlinePlacement?) -> [String: Any] {
+        var json: [String: Any] = [
             "@odata.type": "#microsoft.graph.fileAttachment",
             "name": attachment.filename,
             "contentType": attachment.mimeType,
             "contentBytes": attachment.data.base64EncodedString(),
         ]
+        inline?.write(into: &json)
+        return json
     }
 
     // MARK: - Query Helpers
@@ -2025,7 +2056,7 @@ struct GraphBody: Codable {
     let content: String?
 }
 
-private struct GraphAttachmentListResponse: Decodable {
+struct GraphAttachmentListResponse: Decodable {
     let value: [GraphAttachmentMeta]
     let odataNextLink: String?
 
@@ -2035,7 +2066,7 @@ private struct GraphAttachmentListResponse: Decodable {
     }
 }
 
-private struct GraphAttachmentMeta: Decodable {
+struct GraphAttachmentMeta: Decodable {
     let id: String
     let name: String?
     let contentType: String?
@@ -2054,7 +2085,28 @@ private struct GraphAttachmentMeta: Decodable {
     }
 }
 
-private struct GraphAttachmentDetail: Decodable {
+/// How a file sits in its item's body: `isInline` and the `contentId` the body's `cid:` link
+/// names (Graph `fileAttachment` and `attachmentItem`, both optional properties). A file that
+/// names neither is not given one.
+struct GraphInlinePlacement: Sendable, Equatable {
+    let isInline: Bool?
+    let contentId: String?
+
+    /// Nil when the attachment names neither, so nothing is written for it.
+    init?(isInline: Bool?, contentId: String?) {
+        let id = contentId?.isEmpty == false ? contentId : nil
+        guard isInline != nil || id != nil else { return nil }
+        self.isInline = isInline
+        self.contentId = id
+    }
+
+    func write(into json: inout [String: Any]) {
+        if let isInline { json["isInline"] = isInline }
+        if let contentId { json["contentId"] = contentId }
+    }
+}
+
+struct GraphAttachmentDetail: Decodable {
     let contentBytes: String?
     let contentId: String?
 }

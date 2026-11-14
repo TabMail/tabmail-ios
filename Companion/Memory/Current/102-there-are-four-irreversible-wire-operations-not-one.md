@@ -646,3 +646,17 @@ precondition, so a series changed between the card and the drain is still cut at
 
 **Negative case.** Re-adjudicate if a delete ever cuts at a place it did not show on the card, writes
 the cap without reading the series at the write, or lengthens a series that already ends earlier.
+
+**(10) The Outlook split carry's `DELETE` of an occurrence of the new part — IN the set (2026-11-12, #563; renumbered from (9) when the branch was rebuilt on #695, 2026-11-13).**
+When a "this and following" split carries the occurrences deleted one by one after it
+(`ExchangeCalendarProvider.carry`, carry mode), it sends `DELETE /me/events/{id}` for the new part's
+occurrence at each deleted place. Graph documents no per-occurrence restore, so by the property it is
+counted. What it removes is a fresh, plain occurrence of a series this same split created moments
+before, at a place the user had already deleted in the series it came from; it holds nothing of the
+user's own. Its guards: the occurrence is found among the new part's `/instances` (every page) by its
+place (`originalStart`), never by position; a place not listed is done (a 404/410 is done); the
+deletes run only in carry mode, after the split's record is kept and before the cap, so a failure
+leaves the series whole. The census count is now ten.
+
+**Negative case.** Re-adjudicate if the carry ever deletes an occurrence of a series it did not just
+create, matches an occurrence by anything other than its place, or deletes outside carry mode.

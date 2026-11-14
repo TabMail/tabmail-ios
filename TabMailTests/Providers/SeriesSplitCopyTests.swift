@@ -131,6 +131,8 @@ private enum GoogleSplitFixture {
         http.register(path: masterPath + "/instances", method: "GET",
                       response: .raw(statusCode: 200, headers: ok, body: instances(listed ?? [occurrence(recurrenceId)])))
         http.register(path: masterPath, method: "PATCH", response: .raw(statusCode: 200, headers: ok, body: stored))
+        // The series' exceptions, read by a split that carries them (#563): none.
+        http.register(path: createPath, method: "GET", response: .raw(statusCode: 200, headers: ok, body: instances([])))
         http.register(path: createPath, method: "POST") { request in
             .raw(statusCode: 200, headers: ok, body: request.body ?? Data())
         }
@@ -201,13 +203,14 @@ struct GoogleSeriesSplitCopyTests {
         ], "the new part: \(canonical(wire.created?["recurrence"]))")
     }
 
-    @Test("a new rule on the new part keeps the excluded and added dates after the split")
-    func newRuleKeepsTheTailDates() async throws {
+    @Test("a new rule on the new part resets its excluded dates and keeps its added dates after the split (#563)")
+    func newRuleResetsTheTailExcludedDates() async throws {
         var patch = GCalEventInput()
         patch.recurrence = ["RRULE:FREQ=WEEKLY;BYDAY=MO,WE"]
         let wire = try await GoogleSplitFixture.split(GoogleSplitFixture.master(), patch: patch)
+        // A new rule resets the occurrences deleted one by one, as Google Calendar does.
         #expect(wire.created?["recurrence"] as? [String] == [
-            "RRULE:FREQ=WEEKLY;BYDAY=MO,WE", "EXDATE:20990527T170000Z", "RDATE:20990529T170000Z",
+            "RRULE:FREQ=WEEKLY;BYDAY=MO,WE", "RDATE:20990529T170000Z",
         ], "the new part: \(canonical(wire.created?["recurrence"]))")
     }
 
@@ -413,6 +416,8 @@ struct GoogleSeriesSplitCopyTests {
             return .raw(statusCode: 200, headers: ok,
                         body: GoogleSplitFixture.instances(capped ? [] : [GoogleSplitFixture.occurrence(GoogleSplitFixture.recurrenceId)]))
         }
+        http.register(path: GoogleSplitFixture.createPath, method: "GET",
+                      response: .raw(statusCode: 200, headers: ok, body: GoogleSplitFixture.instances([])))
         http.register(path: GoogleSplitFixture.createPath + "/", method: "GET") { request in
             let id = String(request.url.path.split(separator: "/").last ?? "")
             guard let event = server.withLock({ state in state.created[id].map { json($0) } }) else { return .raw(statusCode: 404) }
@@ -433,7 +438,7 @@ struct GoogleSeriesSplitCopyTests {
         // there, so only the cap is finished.
         let record = try #require(records.records.first, "the split kept no record before its cap")
         #expect(try await provider.eventExists(calendarId: "primary", eventId: record.newPartId))
-        try await provider.finishSplit(calendarId: "primary", record: record, zone: GoogleSplitFixture.utc)
+        try await provider.finishSplit(calendarId: "primary", record: record, zone: GoogleSplitFixture.utc, guests: nil)
         let retryWrites = http.recordedCalls().map(\.method).filter { $0 != "GET" }.dropFirst(writes.count)
         #expect(!retryWrites.contains("POST"), "the retry wrote the new part again: \(Array(retryWrites))")
 
@@ -465,6 +470,8 @@ struct GoogleSeriesSplitCopyTests {
         // swiftlint:disable:next force_try
         let stored = try! JSONSerialization.data(withJSONObject: master)
         http.register(path: GoogleSplitFixture.masterPath, method: "GET", response: .raw(statusCode: 200, headers: ok, body: stored))
+        http.register(path: GoogleSplitFixture.masterPath + "/instances", method: "GET", response: .raw(
+            statusCode: 200, headers: ok, body: GoogleSplitFixture.instances([GoogleSplitFixture.occurrence(GoogleSplitFixture.recurrenceId)])))
         let provider = GoogleCalendarProvider(accessToken: { _ in "test-token" }, session: http.session)
         await #expect(throws: CalendarProviderError.self) {
             _ = try await provider.splitSeries(
@@ -556,6 +563,749 @@ private enum GraphSplitFixture {
     static func calendar(_ series: [String: Any], listed: Bool = true) -> FakeGraphCalendar {
         FakeGraphCalendar([series] + (listed ? [GraphFixture.event(id: "ser-1-occ", start: occurrence, online: false,
                                                                    seriesMasterId: "ser-1")] : []))
+    }
+}
+
+@Suite("Outlook split carries the occurrences after it changed or deleted one by one (#563)", .serialized)
+struct ExchangeSplitCarryTests {
+    /// The occurrence `weeks` after the series' first, at 10:00 on the device.
+    private static func week(_ weeks: Int, hour: Int = 10, plusDays: Int = 0) -> Date {
+        GraphFixture.onDevice(days: 7 * weeks + plusDays, hour: hour)
+    }
+
+    /// An exception of `ser-1` at week `place`, now at `at`.
+    private static func exception(_ place: Int, at: Date? = nil, edit: (inout [String: Any]) -> Void = { _ in }) -> [String: Any] {
+        var e = GraphFixture.event(id: "ser-1-occ-\(place)", start: at ?? week(place), online: false, seriesMasterId: "ser-1")
+        e["originalStart"] = GraphFixture.rfc3339(week(place))
+        edit(&e)
+        return e
+    }
+
+    /// The new part's (`created-1`) occurrence at week `place`, as Graph lists it once the part is made.
+    private static func part(_ place: Int) -> [String: Any] {
+        GraphFixture.event(id: "created-1-w\(place)", start: week(place), online: false, seriesMasterId: "created-1")
+    }
+
+    struct Run {
+        let graph: FakeGraphCalendar
+        let http: FakeHTTP.Scenario
+        let provider: ExchangeCalendarProvider
+        let records: SplitRecordBox
+        let error: Error?
+    }
+
+    /// Splits `ser-1` at week 1 with `patch`. `exceptions` are its changed occurrences (as Graph
+    /// expands them), `cancelled` the weeks deleted one by one (and `cancelledOn`, any other days),
+    /// `parts` the new part's occurrences.
+    private func split(
+        exceptions: [[String: Any]], cancelled: [Int] = [], cancelledOn: [Date] = [], parts: [Int], patch: GCalEventInput,
+        series: [String: Any] = GraphSplitFixture.series(range: GraphSplitFixture.noEnd),
+        configure: (FakeGraphCalendar, FakeHTTP.Scenario) -> Void = { _, _ in }
+    ) async throws -> Run {
+        let graph = FakeGraphCalendar([series, GraphFixture.event(id: "ser-1-occ", start: GraphSplitFixture.occurrence, online: false,
+                                                                  seriesMasterId: "ser-1")] + exceptions + parts.map(Self.part))
+        let http = FakeHTTP.Scenario()
+        graph.install(on: http)
+        let ok = ["Content-Type": "application/json"]
+        var expanded = series
+        expanded["exceptionOccurrences"] = exceptions
+        http.register(path: "/v1.0/me/events/ser-1?$expand=exceptionOccurrences", method: "GET",
+                      response: .raw(statusCode: 200, headers: ok, body: try JSONSerialization.data(withJSONObject: expanded)))
+        let names = ["cancelledOccurrences": (cancelled.map { Self.week($0) } + cancelledOn).map { "OID.ser-1.\(GraphFixture.deviceDay($0))" }]
+        http.register(path: "/v1.0/me/events/ser-1?$select=cancelledOccurrences", method: "GET",
+                      response: .raw(statusCode: 200, headers: ok, body: try JSONSerialization.data(withJSONObject: names)))
+        configure(graph, http)
+        let provider = GraphSplitFixture.provider(http)
+        let records = SplitRecordBox()
+        var thrown: Error?
+        do {
+            _ = try await provider.splitSeries(
+                eventId: "ser-1", recurrenceId: GraphSplitFixture.recurrenceId, recurrenceIdZone: .current, patch: patch,
+                record: records.recorder)
+        } catch {
+            thrown = error
+        }
+        return Run(graph: graph, http: http, provider: provider, records: records, error: thrown)
+    }
+
+    /// Splits `ser-1` named at its exception `named` (one of `exceptions`), which starts at `start`
+    /// now.
+    private func split(
+        named: String, start: Date, exceptions: [[String: Any]], parts: [Int], patch: GCalEventInput,
+        series: [String: Any] = GraphSplitFixture.series(range: GraphSplitFixture.noEnd), graph given: FakeGraphCalendar? = nil
+    ) async throws -> Run {
+        let graph = given ?? FakeGraphCalendar([series] + exceptions + parts.map(Self.part))
+        let http = FakeHTTP.Scenario()
+        graph.install(on: http)
+        let ok = ["Content-Type": "application/json"]
+        // The exceptions as the calendar holds them at each read, so a retry reads what was written.
+        let ids = exceptions.compactMap { $0["id"] as? String }
+        let stored = try JSONSerialization.data(withJSONObject: series)
+        http.register(path: "/v1.0/me/events/ser-1?$expand=exceptionOccurrences", method: "GET") { _ in
+            // swiftlint:disable:next force_cast force_try
+            var expanded = try! JSONSerialization.jsonObject(with: stored) as! [String: Any]
+            expanded["exceptionOccurrences"] = ids.compactMap(graph.event)
+            // swiftlint:disable:next force_try
+            return .raw(statusCode: 200, headers: ok, body: try! JSONSerialization.data(withJSONObject: expanded))
+        }
+        http.register(path: "/v1.0/me/events/ser-1?$select=cancelledOccurrences", method: "GET",
+                      response: .raw(statusCode: 200, headers: ok, body: try JSONSerialization.data(withJSONObject: ["cancelledOccurrences": [String]()])))
+        let provider = GraphSplitFixture.provider(http)
+        let records = SplitRecordBox()
+        var thrown: Error?
+        do {
+            _ = try await provider.splitSeries(
+                eventId: named, recurrenceId: GraphFixture.wall(start, in: GraphSplitFixture.zone), recurrenceIdZone: .current,
+                patch: patch, record: records.recorder)
+        } catch {
+            thrown = error
+        }
+        return Run(graph: graph, http: http, provider: provider, records: records, error: thrown)
+    }
+
+    /// The instant a Graph `start` names.
+    private static func instant(_ value: Any?) -> Date? {
+        guard let time = value as? [String: Any], let wall = time["dateTime"] as? String,
+              let zone = (time["timeZone"] as? String).flatMap({ CalendarTimeZoneResolver.zone(named: $0, in: .none) }) else { return nil }
+        return EKEventStoreHelper.parseNaiveISO(String(wall.prefix(19)), timeZone: zone)
+    }
+
+    @Test("a split named at a moved occurrence edits it and what is shown after it where they are, and keeps what is shown before it whole (owner rule)")
+    func movedSplitChangesWhatIsShownAfter() async throws {
+        // Week 1's occurrence moved two days on: the cut is week 2.
+        let named = Self.exception(1, at: Self.week(1, plusDays: 2))
+        let movedOut = Self.exception(0, at: Self.week(1, plusDays: 3))   // earlier place, shown after
+        let movedIn = Self.exception(3, at: Self.week(1, plusDays: 1))    // later place, shown before
+        let later = Self.exception(4) { $0["location"] = ["displayName": "Room 9"] }
+        let r = try await split(named: "ser-1-occ-1", start: Self.week(1, plusDays: 2), exceptions: [named, movedOut, movedIn, later],
+                                parts: [2, 3, 4], patch: Self.rename)
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error)); \(r.http.servedCallSequence())")
+        #expect(Self.instant(r.graph.created.first?["start"]) == Self.week(2), "the new part does not start at week 2: \(r.graph.created.first?["start"] ?? "none")")
+        #expect(r.graph.event("ser-1-occ-1")?["subject"] as? String == "Renamed", "the named occurrence was not edited where it is")
+        #expect(r.graph.event("ser-1-occ-0")?["subject"] as? String == "Renamed", "an occurrence shown after the named one was not edited")
+        let kept = r.graph.event("created-1-w3")
+        #expect(kept?["subject"] as? String != "Renamed" && Self.instant(kept?["start"]) == Self.week(1, plusDays: 1),
+                "an occurrence shown before the named one changed: \(kept ?? [:])")
+        let carried = r.graph.event("created-1-w4")
+        // The new part holds the title; the carry writes the occurrence's own room and never its old title.
+        #expect(Self.displayName(carried?["location"]) == "Room 9", "\(carried ?? [:])")
+        #expect(r.graph.patches("created-1-w4").allSatisfy { $0["subject"] == nil }, "the carry wrote the old title: \(r.graph.patches("created-1-w4"))")
+        #expect(!r.graph.patches("ser-1").isEmpty, "the series was not capped")
+    }
+
+    @Test("a split named at a moved occurrence ends the series the day before the CUT's day in the series' zone, never before the occurrence's original place (owner rule A, #681)")
+    func movedSplitCapsBeforeTheCut() async throws {
+        // Week 1's occurrence moved two days on: the cut is week 2, its original place week 1.
+        let named = Self.exception(1, at: Self.week(1, plusDays: 2))
+        let r = try await split(named: "ser-1-occ-1", start: Self.week(1, plusDays: 2), exceptions: [named], parts: [2], patch: Self.rename)
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error)); \(r.http.servedCallSequence())")
+        let range = try #require((r.graph.event("ser-1")?["recurrence"] as? [String: Any])?["range"] as? [String: Any])
+        let atCut = GraphFixture.capEndDate(GraphFixture.wall(Self.week(2), in: GraphSplitFixture.zone), zone: .current, keptIn: "Pacific Standard Time")
+        let atPlace = GraphFixture.capEndDate(GraphFixture.wall(Self.week(1), in: GraphSplitFixture.zone), zone: .current, keptIn: "Pacific Standard Time")
+        #expect(atCut != nil && atCut != atPlace, "non-vacuity: the cut and the original place cap alike")
+        #expect(range["type"] as? String == "endDate" && range["endDate"] as? String == atCut,
+                "the cap is not the day before the cut: \(range); \(r.http.servedCallSequence())")
+    }
+
+    @Test("a new start at a moved occurrence moves it where it is and the new part by the same amount (owner rule b, c)")
+    func movedSplitResetShifts() async throws {
+        let named = Self.exception(1, at: Self.week(1, plusDays: 2))
+        let movedIn = Self.exception(3, at: Self.week(1, plusDays: 1))
+        var patch = GCalEventInput()
+        patch.startDateTime = Self.week(1, plusDays: 2).addingTimeInterval(3_600).iso8601String()
+        patch.startTimeZone = "UTC"
+        let r = try await split(named: "ser-1-occ-1", start: Self.week(1, plusDays: 2), exceptions: [named, movedIn],
+                                parts: [2, 3], patch: patch)
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error)); \(r.http.servedCallSequence())")
+        #expect(Self.instant(r.graph.created.first?["start"]) == Self.week(2).addingTimeInterval(3_600),
+                "the new part: \(r.graph.created.first?["start"] ?? "none")")
+        #expect(Self.instant(r.graph.event("ser-1-occ-1")?["start"]) == Self.week(1, plusDays: 2).addingTimeInterval(3_600),
+                "the named occurrence did not move: \(r.graph.event("ser-1-occ-1") ?? [:])")
+        #expect(Self.instant(r.graph.event("created-1-w3")?["start"]) == Self.week(1, plusDays: 1), "the kept occurrence moved")
+    }
+
+    @Test("an occurrence edited where it is moves once: a retry after a failed cap (finishSplit) leaves it where the first attempt put it")
+    func movedSplitRetryMovesEditedOnce() async throws {
+        let named = Self.exception(1, at: Self.week(1, plusDays: 2))
+        let movedOut = Self.exception(0, at: Self.week(1, plusDays: 3))   // earlier place, shown after
+        var patch = GCalEventInput()
+        patch.startDateTime = Self.week(1, plusDays: 2).addingTimeInterval(3_600).iso8601String()
+        patch.startTimeZone = "UTC"
+        let graph = FakeGraphCalendar([GraphSplitFixture.series(range: GraphSplitFixture.noEnd), named, movedOut] + [2].map(Self.part))
+        let failed = Mutex(false)
+        // The cap is refused once, after the occurrences were edited.
+        graph.beforeWrite { method, id in
+            guard method == "PATCH", id == "ser-1", !failed.withLock({ $0 }) else { return }
+            failed.withLock { $0 = true }
+            graph.failNext("PATCH", with: 400)
+        }
+        let r = try await split(named: "ser-1-occ-1", start: Self.week(1, plusDays: 2), exceptions: [named, movedOut],
+                                parts: [2], patch: patch, graph: graph)
+        defer { r.http.close() }
+        #expect(r.error != nil, "the refused cap did not stop the split")
+        let moved = Self.week(1, plusDays: 3).addingTimeInterval(3_600)
+        #expect(Self.instant(r.graph.event("ser-1-occ-0")?["start"]) == moved, "\(r.graph.event("ser-1-occ-0") ?? [:])")
+        let record = try #require(r.records.records.first, "no record was kept before the cap")
+        try await r.provider.finishSplit(record: record, zone: .current, guests: nil)
+        #expect(Self.instant(r.graph.event("ser-1-occ-0")?["start"]) == moved,
+                "the retry moved an edited occurrence again: \(r.graph.event("ser-1-occ-0") ?? [:])")
+        #expect(Self.instant(r.graph.event("ser-1-occ-1")?["start"]) == Self.week(1, plusDays: 2).addingTimeInterval(3_600))
+        #expect(!r.graph.patches("ser-1").isEmpty, "the retry did not cap")
+    }
+
+    @Test("a split named at an occurrence moved past the series' last place makes no new part and edits it where it is (owner rule e)")
+    func movedPastTheEndEditsWhereItIs() async throws {
+        let named = Self.exception(1, at: Self.week(2, plusDays: 2))
+        let r = try await split(
+            named: "ser-1-occ-1", start: Self.week(2, plusDays: 2), exceptions: [named], parts: [], patch: Self.rename,
+            series: GraphSplitFixture.series(range: ["type": "numbered", "endDate": "0001-01-01", "numberOfOccurrences": 2]))
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error)); \(r.http.servedCallSequence())")
+        #expect(r.graph.created.isEmpty && r.graph.patches("ser-1").isEmpty, "a part was made or the series capped: \(r.http.servedCallSequence())")
+        #expect(r.graph.event("ser-1-occ-1")?["subject"] as? String == "Renamed")
+    }
+
+    /// A series of two weeks, past whose end week 1's occurrence (`ser-1-occ-1`) was moved, to
+    /// week 2 plus two days, and week 0's (`ser-1-occ-0`) to week 2 plus three days.
+    private static var pastEndSeries: [String: Any] {
+        GraphSplitFixture.series(range: ["type": "numbered", "endDate": "0001-01-01", "numberOfOccurrences": 2])
+    }
+
+    @Test("an edit past the series' end that fails part way keeps its targets: the retry moves nothing twice and finds every one")
+    func pastEndRetryMovesOnce() async throws {
+        let named = Self.exception(1, at: Self.week(2, plusDays: 2))
+        let other = Self.exception(0, at: Self.week(2, plusDays: 3))
+        var patch = Self.rename
+        patch.startDateTime = Self.week(2, plusDays: 2).addingTimeInterval(3_600).iso8601String()
+        patch.startTimeZone = "UTC"
+        let graph = FakeGraphCalendar([Self.pastEndSeries, named, other])
+        let failed = Mutex(false)
+        // The named occurrence's write is refused once, after the other one's landed.
+        graph.beforeWrite { method, id in
+            guard method == "PATCH", id == "ser-1-occ-1", !failed.withLock({ $0 }) else { return }
+            failed.withLock { $0 = true }
+            graph.failNext("PATCH", with: 400)
+        }
+        let r = try await split(named: "ser-1-occ-1", start: Self.week(2, plusDays: 2), exceptions: [named, other], parts: [],
+                                patch: patch, series: Self.pastEndSeries, graph: graph)
+        defer { r.http.close() }
+        #expect(r.error != nil, "the refused write did not stop the edit")
+        let record = try #require(r.records.records.first, "no record was kept before the first write")
+        #expect(record.isPastEnd)
+        #expect(Self.instant(r.graph.event("ser-1-occ-0")?["start"]) == Self.week(2, plusDays: 3).addingTimeInterval(3_600))
+        try await r.provider.finishShownEdit(record: record, edit: patch, guests: nil)
+        #expect(Self.instant(r.graph.event("ser-1-occ-0")?["start"]) == Self.week(2, plusDays: 3).addingTimeInterval(3_600),
+                "the retry moved an occurrence twice: \(r.graph.event("ser-1-occ-0") ?? [:])")
+        #expect(Self.instant(r.graph.event("ser-1-occ-1")?["start"]) == Self.week(2, plusDays: 2).addingTimeInterval(3_600),
+                "the retry did not move the named occurrence: \(r.http.servedCallSequence())")
+        #expect(r.graph.event("ser-1-occ-0")?["subject"] as? String == "Renamed" && r.graph.event("ser-1-occ-1")?["subject"] as? String == "Renamed")
+    }
+
+    @Test("occurrences edited where they are move in the order Graph takes, none onto a day another still holds")
+    func shownEditsAreOrderedOffHeldDays() async throws {
+        // The edit moves both a day earlier: the named one onto a free day, the other onto the named one's day.
+        let named = Self.exception(1, at: Self.week(2, plusDays: 2))
+        let other = Self.exception(0, at: Self.week(2, plusDays: 3))
+        var patch = GCalEventInput()
+        patch.startDateTime = Self.week(2, plusDays: 1).iso8601String()
+        patch.startTimeZone = "UTC"
+        let graph = FakeGraphCalendar([Self.pastEndSeries, named, other])
+        graph.refusesSameDayMoves.withLock { $0 = true }
+        let r = try await split(named: "ser-1-occ-1", start: Self.week(2, plusDays: 2), exceptions: [named, other], parts: [],
+                                patch: patch, series: Self.pastEndSeries, graph: graph)
+        defer { r.http.close() }
+        #expect(r.error == nil, "a move landed on a held day: \(String(describing: r.error)); \(r.http.servedCallSequence())")
+        #expect(Self.instant(r.graph.event("ser-1-occ-1")?["start"]) == Self.week(2, plusDays: 1)
+                    && Self.instant(r.graph.event("ser-1-occ-0")?["start"]) == Self.week(2, plusDays: 2),
+                "not both moved: \(r.http.servedCallSequence())")
+    }
+
+    @Test("a split moves the occurrences it edits on the series in the order Graph takes, none onto a day another still holds")
+    func splitEditsAreOrderedOffHeldDays() async throws {
+        // Both shown after the cut's place and kept on the series; the edit moves each a day
+        // earlier: the named one onto a free day, the other onto the named one's day.
+        let named = Self.exception(1, at: Self.week(1, plusDays: 2))
+        let other = Self.exception(0, at: Self.week(1, plusDays: 3))
+        var patch = GCalEventInput()
+        patch.startDateTime = Self.week(1, plusDays: 1).iso8601String()
+        patch.startTimeZone = "UTC"
+        // Listed with the other one first: in that order it would land on the named one's day.
+        let graph = FakeGraphCalendar([GraphSplitFixture.series(range: GraphSplitFixture.noEnd), other, named] + [2].map(Self.part))
+        graph.refusesSameDayMoves.withLock { $0 = true }
+        let r = try await split(named: "ser-1-occ-1", start: Self.week(1, plusDays: 2), exceptions: [other, named],
+                                parts: [2], patch: patch, graph: graph)
+        defer { r.http.close() }
+        #expect(r.error == nil, "a move landed on a held day: \(String(describing: r.error)); \(r.http.servedCallSequence())")
+        #expect(Self.instant(r.graph.event("ser-1-occ-1")?["start"]) == Self.week(1, plusDays: 1)
+                    && Self.instant(r.graph.event("ser-1-occ-0")?["start"]) == Self.week(1, plusDays: 2),
+                "not both moved: \(r.http.servedCallSequence())")
+    }
+
+    @Test("an occurrence shown before the named one is kept whole: the edit's guest change does not reach its own guests")
+    func movedSplitKeptItemKeepsItsGuests() async throws {
+        let extra: [String: Any] = ["emailAddress": ["address": "extra@example.com", "name": "Extra"], "type": "required",
+                                    "status": ["response": "accepted", "time": "0001-01-01T00:00:00Z"]]
+        let named = Self.exception(1, at: Self.week(1, plusDays: 2))
+        let movedIn = Self.exception(3, at: Self.week(1, plusDays: 1)) { e in
+            e["attendees"] = (e["attendees"] as? [[String: Any]] ?? []) + [extra]
+        }
+        var patch = Self.rename
+        patch.attendeeChange = AttendeeChange(adds: [.init(email: "new@example.com", name: nil)])
+        let r = try await split(named: "ser-1-occ-1", start: Self.week(1, plusDays: 2), exceptions: [named, movedIn],
+                                parts: [2, 3], patch: patch)
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error)); \(r.http.servedCallSequence())")
+        let guests = Set((r.graph.event("created-1-w3")?["attendees"] as? [[String: Any]] ?? []).compactMap {
+            ($0["emailAddress"] as? [String: Any])?["address"] as? String
+        })
+        #expect(guests.contains("extra@example.com") && !guests.contains("new@example.com"),
+                "the kept occurrence's guests changed: \(guests)")
+        #expect(r.graph.event("created-1-w3")?["subject"] as? String != "Renamed", "the kept occurrence was renamed")
+    }
+
+    private static var rename: GCalEventInput {
+        var patch = GCalEventInput()
+        patch.summary = "Renamed"
+        return patch
+    }
+
+    private static func displayName(_ value: Any?) -> String? { (value as? [String: Any])?["displayName"] as? String }
+
+    @Test("a rename from an occurrence on keeps a deleted later occurrence deleted and a changed one's own room")
+    func renameCarriesLaterExceptions() async throws {
+        let r = try await split(exceptions: [Self.exception(2) { $0["location"] = ["displayName": "Room 9"] }],
+                                cancelled: [3], parts: [2, 3], patch: Self.rename)
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error))")
+        #expect(r.http.recordedCalls().filter { $0.method == "POST" }.count == 1 && r.graph.event("created-1") != nil,
+                "no new part: \(r.http.servedCallSequence())")
+        #expect(r.graph.event("created-1-w3") == nil, "the deleted occurrence came back: \(r.http.servedCallSequence())")
+        let carried = Self.displayName(r.graph.event("created-1-w2")?["location"])
+        #expect(carried == "Room 9", "the changed occurrence lost its room: \(carried ?? "none"); \(r.http.servedCallSequence())")
+        #expect(!r.graph.patches("ser-1").isEmpty, "the series was not capped: \(r.http.servedCallSequence())")
+    }
+
+    @Test("a changed later occurrence carried onto the new part keeps its own file, before the cap; a retry after a failed copy adds it once")
+    func carriedOccurrenceKeepsItsOwnFile() async throws {
+        let minutes = Data("Minutes of week 2\n".utf8)
+        let r = try await split(exceptions: [Self.exception(2) { $0["location"] = ["displayName": "Room 9"] }],
+                                parts: [2, 3], patch: Self.rename) { graph, _ in
+            graph.attachFile("minutes.txt", contentType: "text/plain", bytes: minutes, to: "ser-1-occ-2")
+            graph.failNext("ATTACH", with: 400)
+        }
+        defer { r.http.close() }
+        #expect(r.error != nil, "the failed copy did not stop the split: \(r.http.servedCallSequence())")
+        #expect(r.graph.patches("ser-1").isEmpty, "the series was capped though the occurrence's file was not copied")
+        let record = try #require(r.records.records.first, "no record was kept")
+        try await r.provider.finishSplit(record: record, zone: .current, guests: nil)
+        let held = r.graph.files(of: "created-1-w2")
+        #expect(held.map(\.name) == ["minutes.txt"] && held.first?.bytes == minutes,
+                "the carried occurrence holds \(held.map(\.name)): \(r.http.servedCallSequence())")
+        #expect(r.graph.files(of: "created-1-w3").isEmpty, "an occurrence that was not changed got a file")
+        #expect(r.graph.files(of: "ser-1-occ-2").map(\.name) == ["minutes.txt"], "the series' occurrence lost its file")
+        // The copy lands before the cap.
+        let calls = r.http.recordedCalls()
+        let copy = try #require(calls.lastIndex { $0.method == "POST" && $0.url.contains("/events/created-1-w2/attachments") })
+        let cap = try #require(calls.lastIndex { $0.method == "PATCH" && URL(string: $0.url)?.path.hasSuffix("/events/ser-1") == true },
+                               "the retry did not cap")
+        #expect(copy < cap, "the occurrence's file was copied after the cap: \(r.http.servedCallSequence())")
+    }
+
+    @Test("a changed later occurrence the split carries that holds a linked file refuses the split before any write, as the series' own does")
+    func carriedOccurrenceLinkedFileRefusesUnwritten() async throws {
+        let r = try await split(exceptions: [Self.exception(2) { $0["location"] = ["displayName": "Room 9"] }],
+                                parts: [2, 3], patch: Self.rename) { graph, _ in
+            graph.attachFile("minutes.txt", contentType: "text/plain", bytes: Data("Minutes\n".utf8), to: "ser-1-occ-2")
+            graph.attachOther("#microsoft.graph.referenceAttachment", name: "Shared notes", to: "ser-1-occ-2")
+        }
+        defer { r.http.close() }
+        let writes = r.http.recordedCalls().filter { $0.method != "GET" }
+        #expect(writes.isEmpty, "a write was sent: \(writes.map { "\($0.method) \($0.url)" })")
+        #expect(r.graph.event("created-1") == nil && r.records.records.isEmpty, "a new part or a record was made")
+        var message: String?
+        if case .notSupported(let said)? = r.error as? CalendarProviderError { message = said }
+        #expect(message == ExchangeSplitAttachmentTests.linkedFileMessage, "the refusal: \(String(describing: r.error))")
+    }
+
+    @Test("a changed later occurrence the split carries that holds any attached Outlook item (an email, an event, a contact, any other kind) refuses the split before any write (#847, #854)",
+          arguments: ["email", "event", "contact", "post"])
+    func carriedOccurrenceUncopiedItemRefusesUnwritten(kind: String) async throws {
+        let item = ExchangeSplitAttachmentTests.item(kind)
+        let r = try await split(exceptions: [Self.exception(2) { $0["location"] = ["displayName": "Room 9"] }],
+                                parts: [2, 3], patch: Self.rename) { graph, _ in
+            graph.attachFile("minutes.txt", contentType: "text/plain", bytes: Data("Minutes\n".utf8), to: "ser-1-occ-2")
+            graph.attachItem("Week 2 \(kind)", item: item, to: "ser-1-occ-2")
+        }
+        defer { r.http.close() }
+        let writes = r.http.recordedCalls().filter { $0.method != "GET" }
+        #expect(writes.isEmpty, "\(kind): a write was sent: \(writes.map { "\($0.method) \($0.url)" })")
+        #expect(r.graph.event("created-1") == nil && r.records.records.isEmpty, "\(kind): a new part or a record was made")
+        #expect(r.graph.attachments(of: "ser-1-occ-2").count == 2, "\(kind): the occurrence's attachments changed")
+        var message: String?
+        if case .notSupported(let said)? = r.error as? CalendarProviderError { message = said }
+        #expect(message == ExchangeSplitAttachmentTests.uncopiedItemMessage, "\(kind): the refusal: \(String(describing: r.error))")
+    }
+
+    /// The refusals of a retry whose carried occurrence gained an attached Outlook item or a linked
+    /// file (#847, #834),
+    /// as the user reads them.
+    static let retryUncopiedItemMessage =
+        "This change to the repeating event wasn't finished: a later occurrence now has an attached Outlook item TabMail can't copy, so both parts show the later occurrences. Remove the item from that occurrence or finish the change in your calendar app."
+    static let retryLinkedFileMessage =
+        "This change to the repeating event wasn't finished: a later occurrence now has a linked file TabMail can't copy, so both parts show the later occurrences. Remove the file from that occurrence or finish the change in your calendar app."
+
+    /// Splits `ser-1` from week 2, carrying its changed week 2, with the cap refused once, so the
+    /// first attempt wrote everything but the cap and kept its record; then `gain` adds to the
+    /// series' week 2 occurrence, and the retry (`finishSplit`) runs. What the retry wrote, and
+    /// what it threw.
+    private func retryAfterARefusedCap(gain: (FakeGraphCalendar) -> Void) async throws -> (run: Run, writes: [String], error: Error?) {
+        let r = try await split(exceptions: [Self.exception(2) { $0["location"] = ["displayName": "Room 9"] }],
+                                parts: [2, 3], patch: Self.rename) { graph, _ in
+            let failed = Mutex(false)
+            graph.beforeWrite { method, id in
+                guard method == "PATCH", id == "ser-1", !failed.withLock({ $0 }) else { return }
+                failed.withLock { $0 = true }
+                graph.failNext("PATCH", with: 400)
+            }
+        }
+        #expect(r.error != nil && r.graph.patches("ser-1").isEmpty, "non-vacuity: the first attempt capped: \(r.http.servedCallSequence())")
+        let record = try #require(r.records.records.first, "no record was kept")
+        #expect(Self.displayName(r.graph.event("created-1-w2")?["location"]) == "Room 9",
+                "non-vacuity: the first attempt did not carry week 2: \(r.http.servedCallSequence())")
+        gain(r.graph)
+        let before = r.http.recordedCalls().count
+        var thrown: Error?
+        do {
+            try await r.provider.finishSplit(record: record, zone: .current, guests: nil)
+        } catch {
+            thrown = error
+        }
+        let writes = r.http.recordedCalls().dropFirst(before).filter { $0.method != "GET" }.map { "\($0.method) \($0.url)" }
+        return (r, writes, thrown)
+    }
+
+    @Test("a retry whose carried occurrence gained an attached Outlook item (an email, an event, a contact) or a linked file since the first attempt is refused before its first write: both parts stay as the first attempt left them, and the occurrence keeps it",
+          arguments: ["email", "event", "contact", "linked file"])
+    func retryRefusesAnItemACarriedOccurrenceGained(kind: String) async throws {
+        let (r, writes, error) = try await retryAfterARefusedCap { graph in
+            if kind == "linked file" {
+                graph.attachOther("#microsoft.graph.referenceAttachment", name: "Week 2 deck", to: "ser-1-occ-2")
+            } else {
+                graph.attachItem("Week 2 \(kind)", item: ExchangeSplitAttachmentTests.item(kind), to: "ser-1-occ-2")
+            }
+        }
+        defer { r.http.close() }
+        #expect(writes.isEmpty, "\(kind): the retry wrote \(writes)")
+        var message: String?
+        if case .notSupported(let said)? = error as? CalendarProviderError { message = said }
+        #expect(message == (kind == "linked file" ? Self.retryLinkedFileMessage : Self.retryUncopiedItemMessage),
+                "\(kind): the refusal: \(String(describing: error))")
+        #expect(r.graph.patches("ser-1").isEmpty, "\(kind): the series was capped")
+        #expect(r.graph.attachments(of: "ser-1-occ-2").count == 1, "\(kind): the occurrence's attachment changed")
+    }
+
+    @Test("a retry whose carried occurrence gained a file copies it and finishes: the cap is written")
+    func retryCopiesAFileACarriedOccurrenceGained() async throws {
+        let minutes = Data("Minutes of week 2\n".utf8)
+        let (r, writes, error) = try await retryAfterARefusedCap { graph in
+            graph.attachFile("minutes.txt", contentType: "text/plain", bytes: minutes, to: "ser-1-occ-2")
+        }
+        defer { r.http.close() }
+        #expect(error == nil, "\(String(describing: error)); \(r.http.servedCallSequence())")
+        let held = r.graph.files(of: "created-1-w2")
+        #expect(held.map(\.name) == ["minutes.txt"] && held.first?.bytes == minutes,
+                "the carried occurrence holds \(held.map(\.name))")
+        #expect(!r.graph.patches("ser-1").isEmpty, "the retry did not cap: \(writes)")
+    }
+
+    @Test("a retry of a split whose SERIES holds an attached Outlook item finishes: the cap is written, and the item stays on the old part only (#854)",
+          arguments: ["email", "event", "contact"])
+    func retryLeavesASeriesItemOnTheOldPart(kind: String) async throws {
+        let (r, writes, error) = try await retryAfterARefusedCap { graph in
+            graph.attachItem("Series \(kind)", item: ExchangeSplitAttachmentTests.item(kind), to: "ser-1")
+        }
+        defer { r.http.close() }
+        #expect(error == nil, "\(kind): \(String(describing: error)); \(r.http.servedCallSequence())")
+        #expect(!r.graph.patches("ser-1").isEmpty, "\(kind): the retry did not cap: \(writes)")
+        #expect(r.graph.attachments(of: "ser-1").compactMap { $0["name"] as? String } == ["Series \(kind)"],
+                "\(kind): the series' attachments changed: \(r.graph.attachments(of: "ser-1"))")
+        let partId = try #require(r.records.records.first?.newPartId)
+        #expect(r.graph.attachments(of: partId).isEmpty, "\(kind): the new part got \(r.graph.attachments(of: partId))")
+        #expect(!writes.contains { $0.contains("/attachments") }, "\(kind): the retry wrote an attachment: \(writes)")
+    }
+
+    @Test("a refused retry writes nothing, not even a series file the first attempt did not copy")
+    func refusedRetryCopiesNoSeriesFile() async throws {
+        let agenda = Data("Agenda for the series\n".utf8)
+        let r = try await split(exceptions: [Self.exception(2) { $0["location"] = ["displayName": "Room 9"] }],
+                                parts: [2, 3], patch: Self.rename) { graph, _ in
+            graph.attachFile("agenda.txt", contentType: "text/plain", bytes: agenda, to: "ser-1")
+            graph.failNext("ATTACH", with: 400)   // the series file's copy is refused (a 503 is retried)
+        }
+        defer { r.http.close() }
+        #expect(r.error != nil && r.graph.patches("ser-1").isEmpty,
+                "non-vacuity: the first attempt went past the failed copy: \(r.http.servedCallSequence())")
+        let record = try #require(r.records.records.first, "no record was kept")
+        #expect(r.graph.files(of: record.newPartId).isEmpty, "non-vacuity: the first attempt copied the series file")
+        r.graph.attachItem("Week 2 contact", item: ExchangeSplitAttachmentTests.item("contact"), to: "ser-1-occ-2")
+        let before = r.http.recordedCalls().count
+        var thrown: Error?
+        do {
+            try await r.provider.finishSplit(record: record, zone: .current, guests: nil)
+        } catch {
+            thrown = error
+        }
+        let writes = r.http.recordedCalls().dropFirst(before).filter { $0.method != "GET" }.map { "\($0.method) \($0.url)" }
+        #expect(writes.isEmpty, "the refused retry wrote \(writes)")
+        var message: String?
+        if case .notSupported(let said)? = thrown as? CalendarProviderError { message = said }
+        #expect(message == Self.retryUncopiedItemMessage, "the refusal: \(String(describing: thrown))")
+        #expect(r.graph.files(of: record.newPartId).isEmpty && r.graph.patches("ser-1").isEmpty,
+                "the new part got the series file or the series was capped")
+    }
+
+    @Test("a carried occurrence holding both a linked file and an attached Outlook item is refused for the linked file, on the first attempt and on a retry")
+    func linkedFileRefusalWinsOverAnUncopiedItem() async throws {
+        let first = try await split(exceptions: [Self.exception(2) { $0["location"] = ["displayName": "Room 9"] }],
+                                    parts: [2, 3], patch: Self.rename) { graph, _ in
+            graph.attachItem("Week 2 mail", item: ExchangeSplitAttachmentTests.receivedMail, to: "ser-1-occ-2")
+            graph.attachOther("#microsoft.graph.referenceAttachment", name: "Week 2 deck", to: "ser-1-occ-2")
+        }
+        defer { first.http.close() }
+        var message: String?
+        if case .notSupported(let said)? = first.error as? CalendarProviderError { message = said }
+        #expect(message == ExchangeSplitAttachmentTests.linkedFileMessage, "the first attempt's refusal: \(String(describing: first.error))")
+
+        let (r, writes, error) = try await retryAfterARefusedCap { graph in
+            graph.attachItem("Week 2 mail", item: ExchangeSplitAttachmentTests.receivedMail, to: "ser-1-occ-2")
+            graph.attachOther("#microsoft.graph.referenceAttachment", name: "Week 2 deck", to: "ser-1-occ-2")
+        }
+        defer { r.http.close() }
+        var retried: String?
+        if case .notSupported(let said)? = error as? CalendarProviderError { retried = said }
+        #expect(writes.isEmpty && retried == Self.retryLinkedFileMessage, "the retry wrote \(writes); its refusal: \(String(describing: error))")
+    }
+
+    @Test("a linked file on a changed occurrence the split does not carry (before the one named) refuses nothing")
+    func uncarriedOccurrenceLinkedFileIsLeft() async throws {
+        let r = try await split(exceptions: [Self.exception(0) { $0["location"] = ["displayName": "Room 9"] }],
+                                parts: [2, 3], patch: Self.rename) { graph, _ in
+            graph.attachOther("#microsoft.graph.referenceAttachment", name: "Shared notes", to: "ser-1-occ-0")
+        }
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error)); \(r.http.servedCallSequence())")
+        #expect(r.graph.event("created-1") != nil && !r.graph.patches("ser-1").isEmpty, "the split did not complete: \(r.http.servedCallSequence())")
+        #expect(r.graph.attachments(of: "ser-1-occ-0").count == 1, "the occurrence's link changed")
+    }
+
+    /// `series` kept in a zone the app does not recognize, with no range zone: no series zone to
+    /// date a move in.
+    private static func zoneless(_ series: [String: Any]) -> [String: Any] {
+        var e = series
+        for key in ["start", "end"] {
+            if var time = e[key] as? [String: Any] { time["timeZone"] = "Customized Time Zone"; e[key] = time }
+        }
+        if var recurrence = e["recurrence"] as? [String: Any], var range = recurrence["range"] as? [String: Any] {
+            range.removeValue(forKey: "recurrenceTimeZone")
+            recurrence["range"] = range
+            e["recurrence"] = recurrence
+        }
+        return e
+    }
+
+    @Test("a timed series that names no zone (neither its range nor the event) is refused before anything is written and no record is kept: a rename, a new time, a deletion after it and an edit past its end alike (#681)")
+    func zonelessSeriesIsRefused() async throws {
+        #expect(CalendarTimeZoneResolver.zone(named: "Customized Time Zone", in: .none) == nil, "non-vacuity: the zone is recognized")
+        let series = Self.zoneless(GraphSplitFixture.series(range: GraphSplitFixture.noEnd))
+        let runs: [(String, Run)] = [
+            ("rename", try await split(exceptions: [Self.exception(2) { $0["location"] = ["displayName": "Room 9"] }],
+                                       parts: [2], patch: Self.rename, series: series)),
+            ("new time", try await split(exceptions: [Self.exception(2, at: Self.week(2, plusDays: 1))], parts: [2], patch: Self.hourLater, series: series)),
+            ("deletion", try await split(exceptions: [], cancelled: [3], parts: [2, 3], patch: Self.rename, series: series)),
+            ("past the end", try await split(named: "ser-1-occ-1", start: Self.week(2, plusDays: 2), exceptions: [Self.exception(1, at: Self.week(2, plusDays: 2))],
+                                             parts: [], patch: Self.rename, series: Self.zoneless(Self.pastEndSeries))),
+        ]
+        for (label, r) in runs {
+            defer { r.http.close() }
+            var said: String?
+            if case .notSupported(let message)? = r.error as? CalendarProviderError { said = message }
+            #expect(said?.hasPrefix("Outlook gives no time zone for this repeating event") == true, "\(label): \(String(describing: r.error))")
+            #expect(r.records.records.isEmpty && r.http.recordedCalls().allSatisfy { $0.method == "GET" }, "\(label): \(r.http.servedCallSequence())")
+        }
+    }
+
+    /// A new start an hour later than the split's occurrence, given in UTC.
+    private static var hourLater: GCalEventInput {
+        var patch = GCalEventInput()
+        patch.startDateTime = GraphSplitFixture.occurrence.addingTimeInterval(3_600).iso8601String()
+        patch.startTimeZone = "UTC"
+        return patch
+    }
+
+    @Test("a series whose range names no zone is dated in the event's own zone (originalStartTimeZone), as its cap is: a later occurrence moved to another day and a deleted one are carried (#681, #563)")
+    func eventZoneDatesTheCarry() async throws {
+        var series = GraphSplitFixture.series(range: GraphSplitFixture.noEnd)
+        var recurrence = try #require(series["recurrence"] as? [String: Any])
+        var range = try #require(recurrence["range"] as? [String: Any])
+        range.removeValue(forKey: "recurrenceTimeZone")
+        recurrence["range"] = range
+        series["recurrence"] = recurrence
+        series["originalStartTimeZone"] = "Pacific Standard Time"
+        let r = try await split(exceptions: [Self.exception(2, at: Self.week(2, plusDays: 1))], cancelled: [3], parts: [2, 3],
+                                patch: Self.rename, series: series)
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error)); \(r.http.servedCallSequence())")
+        #expect(Self.instant(r.graph.event("created-1-w2")?["start"]) == Self.week(2, plusDays: 1),
+                "the moved occurrence was not carried: \(r.http.servedCallSequence())")
+        #expect(r.graph.event("created-1-w3") == nil, "the deleted occurrence came back: \(r.http.servedCallSequence())")
+        #expect(!r.graph.patches("ser-1").isEmpty, "the series was not capped: \(r.http.servedCallSequence())")
+    }
+
+    @Test("a series whose range zone is custom (desktop Outlook's) is refused with nothing written: no deleted date is placed in the zone the read was given in")
+    func customRangeZoneIsRefused() async throws {
+        #expect(CalendarTimeZoneResolver.zone(named: "tzone://Microsoft/Custom", in: .none) == nil, "non-vacuity: the custom zone is recognized")
+        var series = GraphSplitFixture.series(range: GraphSplitFixture.noEnd)
+        var recurrence = try #require(series["recurrence"] as? [String: Any])
+        var range = try #require(recurrence["range"] as? [String: Any])
+        range["recurrenceTimeZone"] = "tzone://Microsoft/Custom"
+        recurrence["range"] = range
+        series["recurrence"] = recurrence
+        let r = try await split(exceptions: [Self.exception(2) { $0["location"] = ["displayName": "Room 9"] }],
+                                cancelled: [3], parts: [2, 3], patch: Self.rename, series: series)
+        defer { r.http.close() }
+        #expect(r.error != nil, "the split went on: \(r.http.servedCallSequence())")
+        #expect(r.http.recordedCalls().allSatisfy { $0.method == "GET" }, "something was written: \(r.http.servedCallSequence())")
+    }
+
+    @Test("a series whose range names no zone is refused with nothing written: a deleted date or a moved occurrence is never placed in the zone the read was given in")
+    func noRangeZoneIsNotReadInTheDisplayZone() async throws {
+        var series = GraphSplitFixture.series(range: GraphSplitFixture.noEnd)
+        var recurrence = try #require(series["recurrence"] as? [String: Any])
+        var range = try #require(recurrence["range"] as? [String: Any])
+        range.removeValue(forKey: "recurrenceTimeZone")
+        recurrence["range"] = range
+        series["recurrence"] = recurrence
+        // Non-vacuity: the start is labelled with a zone TabMail recognizes, the one the read asked for.
+        #expect(CalendarTimeZoneResolver.zone(named: GraphSplitFixture.zone, in: .none) != nil)
+        let r = try await split(exceptions: [], cancelled: [3], parts: [2, 3], patch: Self.rename, series: series)
+        defer { r.http.close() }
+        #expect(r.error != nil, "the split went on: \(r.http.servedCallSequence())")
+        #expect(r.http.recordedCalls().allSatisfy { $0.method == "GET" }, "something was written: \(r.http.servedCallSequence())")
+        // A moved occurrence is dated in the series' zone too: the start's zone, only the one the read was given in, never stands in.
+        let moved = try await split(exceptions: [Self.exception(2, at: Self.week(2, plusDays: 1))], parts: [2], patch: Self.rename, series: series)
+        defer { moved.http.close() }
+        #expect(moved.error != nil, "the split went on: \(moved.http.servedCallSequence())")
+        #expect(moved.http.recordedCalls().allSatisfy { $0.method == "GET" }, "something was written: \(moved.http.servedCallSequence())")
+    }
+
+    @Test("a changed occurrence is carried WHOLE: its own importance, categories and reminder survive a rename")
+    func carryCopiesTheWholeException() async throws {
+        let r = try await split(exceptions: [Self.exception(2) { e in
+            e["importance"] = "low"
+            e["categories"] = ["Red category"]
+            e["reminderMinutesBeforeStart"] = 5
+        }], parts: [2], patch: Self.rename)
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error))")
+        let carried = r.graph.event("created-1-w2")
+        #expect(carried?["importance"] as? String == "low" && carried?["categories"] as? [String] == ["Red category"]
+                    && carried?["reminderMinutesBeforeStart"] as? Int == 5,
+                "the exception's own properties were lost: \(carried ?? [:]); \(r.http.servedCallSequence())")
+        // The title the edit set is the new part's: the carry does not write the exception's old one back.
+        #expect(r.graph.patches("created-1-w2").allSatisfy { $0["subject"] == nil }, "the carry wrote the old title: \(r.graph.patches("created-1-w2"))")
+    }
+
+    @Test("an exception listed past the first page of the new part's occurrences is still carried")
+    func carryReadsEveryPage() async throws {
+        let r = try await split(exceptions: [Self.exception(2) { $0["location"] = ["displayName": "Room 9"] }],
+                                parts: [2], patch: Self.rename) { graph, http in
+            let ok = ["Content-Type": "application/json"]
+            http.register(path: "/v1.0/me/events/created-1/instances", method: "GET") { request in
+                if request.url.absoluteString.contains("skiptoken") {
+                    let page = ["value": [graph.event("created-1-w2") ?? [:]]]
+                    // swiftlint:disable:next force_try
+                    return .raw(statusCode: 200, headers: ok, body: try! JSONSerialization.data(withJSONObject: page))
+                }
+                let first: [String: Any] = ["value": [], "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/events/created-1/instances?$skiptoken=p2"]
+                // swiftlint:disable:next force_try
+                return .raw(statusCode: 200, headers: ok, body: try! JSONSerialization.data(withJSONObject: first))
+            }
+        }
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error))")
+        #expect(Self.displayName(r.graph.event("created-1-w2")?["location"]) == "Room 9",
+                "the exception on page 2 was not carried: \(r.http.servedCallSequence())")
+    }
+
+    @Test("a carry refused for good stops the split before the cap; the retry (finishSplit) carries, then caps")
+    func carryFailureStopsBeforeTheCapAndTheRetryCarries() async throws {
+        let r = try await split(exceptions: [Self.exception(2) { $0["location"] = ["displayName": "Room 9"] }],
+                                parts: [2], patch: Self.rename) { graph, _ in graph.failNext("PATCH", with: 400) }
+        defer { r.http.close() }
+        #expect(r.error != nil, "the refused carry did not stop the split")
+        #expect(r.graph.patches("ser-1").isEmpty, "the series was capped though its carry failed: \(r.http.servedCallSequence())")
+        let record = try #require(r.records.records.first, "no record was kept before the carry")
+        try await r.provider.finishSplit(record: record, zone: .current, guests: nil)
+        #expect(Self.displayName(r.graph.event("created-1-w2")?["location"]) == "Room 9",
+                "the retry did not carry: \(r.http.servedCallSequence())")
+        #expect(!r.graph.patches("ser-1").isEmpty, "the retry did not cap: \(r.http.servedCallSequence())")
+    }
+
+    @Test("moves are ordered so none lands on a day another occurrence still holds (carryOrder)")
+    func carryOrdersMovesOffHeldDays() async throws {
+        // Week 2's moved onto week 3's day; week 3's moved a day on. Week 3 must move first.
+        let r = try await split(exceptions: [Self.exception(2, at: Self.week(3, hour: 12)),
+                                             Self.exception(3, at: Self.week(3, hour: 10, plusDays: 1))],
+                                parts: [2, 3], patch: Self.rename) { graph, _ in graph.refusesSameDayMoves.withLock { $0 = true } }
+        defer { r.http.close() }
+        #expect(r.error == nil, "a move landed on a held day: \(String(describing: r.error)); \(r.http.servedCallSequence())")
+        #expect(GraphFixture.instant(r.graph.event("created-1-w2")?["start"] as? [String: Any]) == Self.week(3, hour: 12)
+                    && GraphFixture.instant(r.graph.event("created-1-w3")?["start"] as? [String: Any]) == Self.week(3, hour: 10, plusDays: 1),
+                "not both moved: \(r.http.servedCallSequence())")
+    }
+
+    @Test("the deleted places go before the moves, so a move onto a deleted occurrence's day is taken")
+    func carryDeletesBeforeMoves() async throws {
+        // Week 2's moved onto week 3's day; week 3's deleted.
+        let r = try await split(exceptions: [Self.exception(2, at: Self.week(3, hour: 12))], cancelled: [3],
+                                parts: [2, 3], patch: Self.rename) { graph, _ in graph.refusesSameDayMoves.withLock { $0 = true } }
+        defer { r.http.close() }
+        #expect(r.error == nil, "the move went before the delete: \(String(describing: r.error)); \(r.http.servedCallSequence())")
+        #expect(r.graph.event("created-1-w3") == nil && GraphFixture.instant(r.graph.event("created-1-w2")?["start"] as? [String: Any]) == Self.week(3, hour: 12),
+                "\(r.http.servedCallSequence())")
+    }
+
+    @Test("the edit's guest change reaches a carried occurrence's OWN guests as the series' difference")
+    func carryAppliesGuestChangeToOwnGuests() async throws {
+        let extra: [String: Any] = ["emailAddress": ["address": "extra@example.com", "name": "Extra"], "type": "required",
+                                    "status": ["response": "accepted", "time": "0001-01-01T00:00:00Z"]]
+        var patch = GCalEventInput()
+        patch.attendeeChange = AttendeeChange(adds: [.init(email: "new@example.com", name: nil)])
+        let r = try await split(exceptions: [Self.exception(2) { e in
+            e["attendees"] = (e["attendees"] as? [[String: Any]] ?? []) + [extra]
+        }], parts: [2], patch: patch)
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error))")
+        let guests = Set((r.graph.event("created-1-w2")?["attendees"] as? [[String: Any]] ?? []).compactMap {
+            (($0["emailAddress"] as? [String: Any])?["address"] as? String)?.lowercased()
+        })
+        #expect(guests.contains("extra@example.com") && guests.contains("new@example.com"), "guests: \(guests)")
+    }
+
+    @Test("an end given alone gives a carried moved occurrence its own start plus the new length")
+    func endOnlySplitMovesCarriedEnd() async throws {
+        let movedTo = Self.week(2, hour: 14)
+        var patch = GCalEventInput()
+        patch.endDateTime = GraphSplitFixture.occurrence.addingTimeInterval(3_600).iso8601String()
+        let r = try await split(exceptions: [Self.exception(2, at: movedTo)], parts: [2], patch: patch)
+        defer { r.http.close() }
+        #expect(r.error == nil, "\(String(describing: r.error))")
+        let carried = r.graph.event("created-1-w2")
+        #expect(GraphFixture.instant(carried?["start"] as? [String: Any]) == movedTo && GraphFixture.instant(carried?["end"] as? [String: Any]) == movedTo.addingTimeInterval(3_600),
+                "the carried occurrence: \(carried ?? [:]); \(r.http.servedCallSequence())")
     }
 }
 
@@ -987,13 +1737,9 @@ struct ExchangeSeriesSplitCopyTests {
                     reason = thrown
                 }
                 #expect(graph.readZones("ser-1-occ") == [name], "\(label): the occurrence was not read in the series' zone: \(graph.readZones("ser-1-occ"))")
-                if moved {
-                    #expect(reason == "split at a moved occurrence", "\(label): \(reason ?? "not refused")")
-                    #expect(graph.created.isEmpty && graph.patches("ser-1").isEmpty, "\(label): written: \(http.servedCallSequence())")
-                } else {
-                    #expect(reason == nil, "\(label): refused: \(reason ?? "")")
-                    #expect(graph.created.count == 1, "\(label): no new part: \(http.servedCallSequence())")
-                }
+                // A moved occurrence is split at its place (#687), like a plain one.
+                #expect(reason == nil, "\(label): refused: \(reason ?? "")")
+                #expect(graph.created.count == 1, "\(label): no new part: \(http.servedCallSequence())")
             }
         }
     }
@@ -1357,5 +2103,310 @@ struct ExchangeNumberedSplitTests {
         #expect(http.recordedCalls().allSatisfy { $0.method == "GET" }, "\(label): written: \(http.servedCallSequence())")
         #expect(graph.created.isEmpty, "\(label): a new part was created")
         #expect(canonical(graph.event("ser-1")?["recurrence"]) == canonical(series["recurrence"]), "\(label): the series was changed")
+    }
+}
+
+@Suite("Outlook split copies the series' files onto the new part (#563)", .serialized)
+struct ExchangeSplitAttachmentTests {
+    /// A small file, sent in one POST, and one an upload session takes in more than one range: at
+    /// Graph's own edges (`GraphAttachmentLimits`), never the app's constant.
+    private static let small = Data("Agenda for the series\n".utf8)
+    private static let large = Data((0..<(max(GraphAttachmentLimits.singlePostMaxExclusive, ExchangeDraftConfig.uploadChunkBytes) + 1))
+        .map { UInt8(truncatingIfNeeded: $0 &* 31) })
+
+    /// A calendar holding the numbered series `ser-1` with the files `files` attached.
+    private static func calendar(_ files: [(name: String, bytes: Data)]) -> FakeGraphCalendar {
+        let graph = GraphSplitFixture.calendar(GraphSplitFixture.series(range: GraphSplitFixture.numbered))
+        for file in files {
+            graph.attachFile(file.name, contentType: "application/octet-stream", bytes: file.bytes, to: "ser-1")
+        }
+        return graph
+    }
+
+    private static func split(_ graph: FakeGraphCalendar, _ http: FakeHTTP.Scenario, records: SplitRecordBox) async -> Error? {
+        var patch = GCalEventInput()
+        patch.summary = "Planning (phase 2)"
+        do {
+            _ = try await GraphSplitFixture.provider(http).splitSeries(
+                calendarId: "primary", eventId: "ser-1", recurrenceId: GraphSplitFixture.recurrenceId,
+                recurrenceIdZone: .current, patch: patch, sendUpdates: "all", record: records.recorder)
+            return nil
+        } catch {
+            return error
+        }
+    }
+
+    /// The files an event holds, by name, in name order.
+    private static func files(_ graph: FakeGraphCalendar, _ id: String) -> [String: Data] {
+        Dictionary(graph.files(of: id).map { ($0.name, $0.bytes) }, uniquingKeysWith: { a, _ in a })
+    }
+
+    @Test("the new part holds every file of the series, a small one and one an upload session takes, byte for byte, before the cap")
+    func newPartKeepsTheSeriesFiles() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = Self.calendar([("agenda.txt", Self.small), ("deck.bin", Self.large)])
+        graph.install(on: http)
+        let error = await Self.split(graph, http, records: SplitRecordBox())
+        #expect(error == nil, "\(String(describing: error)); \(http.servedCallSequence())")
+        let partId = try #require(graph.created.first?["id"] as? String, "no new part was created")
+
+        // What Outlook's own split keeps on the new part (measured 2026-11-13): every file.
+        let onPart = Self.files(graph, partId)
+        #expect(onPart.keys.sorted() == ["agenda.txt", "deck.bin"], "the new part holds \(onPart.keys.sorted())")
+        #expect(onPart["agenda.txt"] == Self.small, "the small file changed on the new part")
+        #expect(onPart["deck.bin"] == Self.large, "the large file changed on the new part: \(onPart["deck.bin"]?.count ?? 0) bytes")
+        #expect(graph.attachments(of: partId).count == 2, "a file was added twice: \(graph.attachments(of: partId).count)")
+        // The series keeps its own.
+        #expect(Self.files(graph, "ser-1").keys.sorted() == ["agenda.txt", "deck.bin"])
+        // The upload session's ranges carry no bearer token.
+        #expect(!graph.uploadAuthorizations.isEmpty && graph.uploadAuthorizations.allSatisfy { $0 == nil },
+                "upload ranges: \(graph.uploadAuthorizations)")
+        // Every file lands before the series is capped, so a series capped holds a complete new part.
+        let calls = http.recordedCalls()
+        let lastFile = try #require(calls.lastIndex { $0.url.contains("AttachmentSessions") || ($0.method == "POST" && $0.url.hasSuffix("/attachments")) })
+        let cap = try #require(calls.firstIndex { $0.method == "PATCH" && URL(string: $0.url)?.path.hasSuffix("/events/ser-1") == true },
+                               "the series was not capped")
+        #expect(lastFile < cap, "a file was copied after the cap: \(http.servedCallSequence())")
+    }
+
+    @Test("a file copy that fails stops the split before the cap; the retry (finishSplit) adds only what is missing, then caps")
+    func failedCopyStopsBeforeTheCapAndTheRetryFinishes() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = Self.calendar([("agenda.txt", Self.small), ("deck.bin", Self.large)])
+        graph.install(on: http)
+        graph.failNext("PUT", with: 503)
+        let records = SplitRecordBox()
+        let error = await Self.split(graph, http, records: records)
+        #expect(error != nil, "the failed upload did not stop the split: \(http.servedCallSequence())")
+        #expect(graph.patches("ser-1").isEmpty, "the series was capped though a file was not copied: \(http.servedCallSequence())")
+        let record = try #require(records.records.first, "no record was kept before the copy")
+
+        try await GraphSplitFixture.provider(http).finishSplit(record: record, zone: .current, guests: nil)
+        let onPart = Self.files(graph, record.newPartId)
+        #expect(onPart["agenda.txt"] == Self.small && onPart["deck.bin"] == Self.large, "the retry did not copy every file: \(onPart.keys.sorted())")
+        #expect(graph.attachments(of: record.newPartId).count == 2,
+                "the retry added a file the first attempt had copied: \(graph.attachments(of: record.newPartId).compactMap { $0["name"] as? String })")
+        #expect(!graph.patches("ser-1").isEmpty, "the retry did not cap: \(http.servedCallSequence())")
+    }
+
+    @Test("an inline picture of the series reaches the new part placed inline under the same contentId, by a single POST and by an upload session")
+    func inlinePictureStaysInline() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = GraphSplitFixture.calendar(GraphSplitFixture.series(range: GraphSplitFixture.numbered))
+        graph.attachFile("logo.png", contentType: "image/png", bytes: Self.small, to: "ser-1", isInline: true, contentId: "logo@series.example.com")
+        graph.attachFile("banner.png", contentType: "image/png", bytes: Self.large, to: "ser-1", isInline: true, contentId: "banner@series.example.com")
+        graph.attachFile("agenda.txt", contentType: "text/plain", bytes: Self.small, to: "ser-1")
+        graph.install(on: http)
+        let error = await Self.split(graph, http, records: SplitRecordBox())
+        #expect(error == nil, "\(String(describing: error)); \(http.servedCallSequence())")
+        let partId = try #require(graph.created.first?["id"] as? String, "no new part was created")
+        let byName = Dictionary(graph.attachments(of: partId).compactMap { a in (a["name"] as? String).map { ($0, a) } }, uniquingKeysWith: { a, _ in a })
+        for (name, cid) in [("logo.png", "logo@series.example.com"), ("banner.png", "banner@series.example.com")] {
+            #expect(byName[name]?["isInline"] as? Bool == true, "\(name) is not inline on the new part: \(byName[name] ?? [:])")
+            #expect(byName[name]?["contentId"] as? String == cid, "\(name) lost its contentId: \(byName[name]?["contentId"] ?? "none")")
+        }
+        #expect(byName["agenda.txt"]?["isInline"] as? Bool == false && byName["agenda.txt"]?["contentId"] == nil,
+                "an ordinary file became inline: \(byName["agenda.txt"] ?? [:])")
+    }
+
+    /// The item attachments an event holds: name and item.
+    private static func items(_ graph: FakeGraphCalendar, _ id: String) -> [(name: String, item: [String: Any])] {
+        graph.attachments(of: id).compactMap { a in
+            guard a["@odata.type"] as? String == "#microsoft.graph.itemAttachment", let name = a["name"] as? String,
+                  let item = a["item"] as? [String: Any] else { return nil }
+            return (name, item)
+        }
+    }
+
+    /// A received email attached to the series, as `$expand` reads it (the keys measured
+    /// 2026-11-13), with the headers every received mail carries. It holds no file of its own.
+    static var receivedMail: [String: Any] {
+        let person: (String) -> [String: Any] = { ["emailAddress": ["name": "Person \($0)", "address": "\($0)@example.com"]] }
+        return [
+            "@odata.type": "#microsoft.graph.message", "id": "mail-1", "createdDateTime": "2099-01-01T00:00:00Z",
+            "lastModifiedDateTime": "2099-01-02T00:00:00Z", "sentDateTime": "2099-01-01T00:00:00Z", "hasAttachments": false,
+            "subject": "Quarterly numbers", "conversationId": "conv-1", "conversationIndex": "index-1",
+            "isReadReceiptRequested": false, "isRead": true, "isDraft": false, "webLink": "https://outlook.example.com/mail-1",
+            "internetMessageHeaders": (1...8).map { ["name": "X-Header-\($0)", "value": "v\($0)"] },
+            "body": ["contentType": "html", "content": "<p>The numbers</p>"], "sender": person("sender"), "from": person("sender"),
+            "toRecipients": [person("to")], "ccRecipients": [person("cc")], "flag": ["flagStatus": "notFlagged"],
+        ]
+    }
+
+    /// An event attached to the series, as `$expand` reads it (the keys measured 2026-11-13).
+    static var attachedEvent: [String: Any] { [
+        "@odata.type": "#microsoft.graph.event", "id": "ev-1", "createdDateTime": "2099-01-01T00:00:00Z",
+        "lastModifiedDateTime": "2099-01-02T00:00:00Z", "categories": ["Blue category"], "originalStartTimeZone": "UTC",
+        "originalEndTimeZone": "UTC", "reminderMinutesBeforeStart": 17, "isReminderOn": true, "hasAttachments": false,
+        "subject": "Offsite", "importance": "high", "sensitivity": "private", "isAllDay": false, "isCancelled": false,
+        "isOrganizer": true, "responseRequested": true, "showAs": "tentative", "type": "singleInstance", "isOnlineMeeting": false,
+        "isDraft": true, "body": ["contentType": "html", "content": "<p>Offsite plan</p>"],
+        "start": ["dateTime": "2099-06-01T17:00:00.0000000", "timeZone": "UTC"],
+        "end": ["dateTime": "2099-06-01T17:30:00.0000000", "timeZone": "UTC"],
+        "location": ["displayName": "Room 1", "locationType": "default", "uniqueIdType": "unknown"],
+        "organizer": ["emailAddress": ["name": "Organizer", "address": "organizer@example.com"]],
+    ] }
+
+    /// A contact attached to the series, as `$expand` reads it (the keys measured 2026-11-13).
+    static var attachedContact: [String: Any] { [
+        "@odata.type": "#microsoft.graph.contact", "id": "ct-1", "createdDateTime": "2099-01-01T00:00:00Z",
+        "lastModifiedDateTime": "2099-01-02T00:00:00Z", "fileAs": "Inner, Probe", "displayName": "Probe Inner",
+        "givenName": "Probe", "surname": "Inner", "jobTitle": "Tester", "companyName": "Company", "businessPhones": ["555-0100"],
+        "personalNotes": "notes", "emailAddresses": [["name": "Probe Inner", "address": "probe@example.com"]],
+        "primaryEmailAddress": ["name": "Probe Inner", "address": "probe@example.com"],
+    ] }
+
+    /// `receivedMail` holding a file of its own, as `$expand` reads an attached email that has one
+    /// (measured 2026-11-13: `hasAttachments` true and the file in `attachments`, with its bytes).
+    static var receivedMailWithFile: [String: Any] {
+        var mail = receivedMail
+        mail["id"] = "mail-2"
+        mail["subject"] = "Signed contract"
+        mail["hasAttachments"] = true
+        mail["attachments"] = [["@odata.type": "#microsoft.graph.fileAttachment", "id": "inner-1", "name": "contract.txt",
+                                "contentType": "text/plain", "size": 108, "isInline": false, "contentBytes": "Y29udHJhY3Q="]]
+        return mail
+    }
+
+    /// The attached Outlook item of the kind `kind`, as `$expand` reads it: "email", "email with
+    /// file", "event", "contact", or "post" (a kind no case names).
+    static func item(_ kind: String) -> [String: Any] {
+        var post = attachedContact
+        post["@odata.type"] = "#microsoft.graph.post"
+        return ["email": receivedMail, "email with file": receivedMailWithFile, "event": attachedEvent,
+                "contact": attachedContact, "post": post][kind] ?? [:]
+    }
+
+    @Test("""
+        an attached Outlook item of any kind or size on the series (an email with files of its own or none, an event, a \
+        contact, any other kind, one of 3 MB or more, one listed with no size) is not copied, read or written: the split \
+        completes with the series' files, and the old part keeps the item (#835, #845, #846, #852, #854)
+        """,
+          arguments: ["email", "email with file", "event", "contact", "post", "large contact", "unsized contact"])
+    func seriesItemIsLeftOnTheOldPart(kind: String) async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = Self.calendar([("agenda.txt", Self.small)])
+        let name = "Series \(kind)"
+        let size = kind == "large contact" ? ExchangeDraftConfig.singlePostAttachmentLimitBytes : nil
+        graph.attachItem(name, item: Self.item(kind.hasSuffix("contact") ? "contact" : kind), to: "ser-1", size: size,
+                         listsSize: kind != "unsized contact")
+        let itemId = try #require(graph.attachments(of: "ser-1").first { $0["name"] as? String == name }?["id"] as? String)
+        graph.install(on: http)
+        let error = await Self.split(graph, http, records: SplitRecordBox())
+        #expect(error == nil, "\(kind): \(String(describing: error)); \(http.servedCallSequence())")
+        let partId = try #require(graph.created.first?["id"] as? String, "\(kind): no new part was created")
+        #expect(graph.attachments(of: partId).compactMap { $0["name"] as? String } == ["agenda.txt"],
+                "\(kind): the new part holds \(graph.attachments(of: partId).compactMap { $0["name"] as? String })")
+        let posts = http.recordedCalls().filter { $0.method == "POST" && $0.url.contains("/attachments") }
+        #expect(posts.count == 1, "\(kind): a write was attempted for the item: \(posts.map(\.url))")
+        #expect(!http.recordedCalls().contains { $0.url.contains(itemId) || $0.url.lowercased().contains("itemattachment") },
+                "\(kind): the item was read: \(http.servedCallSequence())")
+        #expect(Self.items(graph, "ser-1").map(\.name) == [name] && graph.attachments(of: "ser-1").count == 2,
+                "\(kind): the series' attachments changed")
+        #expect(!graph.patches("ser-1").isEmpty, "\(kind): the series was not capped")
+    }
+
+    @Test("a series holding a linked file is refused before any write: no new part, no copy, no change, no cap, with the calendar-app message")
+    func linkedFileRefusesTheSplitUnwritten() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = Self.calendar([("agenda.txt", Self.small)])
+        graph.attachItem("Probe Inner", item: Self.attachedContact, to: "ser-1")
+        graph.attachOther("#microsoft.graph.referenceAttachment", name: "Shared deck", to: "ser-1")
+        let before = graph.attachments(of: "ser-1").count
+        graph.install(on: http)
+        let records = SplitRecordBox()
+        let error = await Self.split(graph, http, records: records)
+        let writes = http.recordedCalls().filter { $0.method != "GET" }
+        #expect(writes.isEmpty, "a write was sent: \(writes.map { "\($0.method) \($0.url)" })")
+        #expect(graph.created.isEmpty && records.records.isEmpty, "a new part or a record was made")
+        #expect(graph.attachments(of: "ser-1").count == before, "the series' attachments changed")
+        var message: String?
+        if case .notSupported(let said)? = error as? CalendarProviderError { message = said }
+        #expect(message == Self.linkedFileMessage, "the refusal: \(String(describing: error))")
+    }
+
+    /// The refusal of a split that would leave a linked file behind (#834), as the user reads it.
+    static let linkedFileMessage =
+        "This repeating event has a linked file TabMail can't copy to the new part, so it was not changed. Make the change in your calendar app."
+
+    /// The refusal of a split that carries a changed occurrence holding an attached Outlook item
+    /// (#847, #854), as the user reads it.
+    static let uncopiedItemMessage =
+        "This repeating event has an attached Outlook item TabMail can't copy to the new part, so it was not changed. Make the change in your calendar app."
+
+    @Test("a linked file the series gained after the first attempt does not stop the retry: the new part exists, so finishSplit copies the rest and caps")
+    func retryLeavesALaterLinkedFile() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = Self.calendar([("agenda.txt", Self.small)])
+        graph.install(on: http)
+        graph.failNext("PATCH", with: 400)   // the cap is refused (a 503 is retried); the record is kept
+        let records = SplitRecordBox()
+        _ = await Self.split(graph, http, records: records)
+        let record = try #require(records.records.first, "no record was kept")
+        #expect(graph.patches("ser-1").isEmpty, "non-vacuity: the first attempt capped")
+        graph.attachOther("#microsoft.graph.referenceAttachment", name: "Shared deck", to: "ser-1")
+        try await GraphSplitFixture.provider(http).finishSplit(record: record, zone: .current, guests: nil)
+        #expect(graph.attachments(of: record.newPartId).compactMap { $0["name"] as? String } == ["agenda.txt"],
+                "the new part holds \(graph.attachments(of: record.newPartId).compactMap { $0["name"] as? String })")
+        #expect(!graph.patches("ser-1").isEmpty, "the retry did not cap: \(http.servedCallSequence())")
+    }
+
+    @Test("a retry keeps two files of the same name and a file with no name: each is added once, the unnamed one as a draft names it")
+    func retryKeepsSameNamedAndUnnamedFiles() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let other = Data("A second picture, same name\n".utf8)
+        let graph = Self.calendar([("image.png", Self.small), ("image.png", Self.large)])
+        graph.attachFile(nil, contentType: "text/plain", bytes: other, to: "ser-1")
+        graph.install(on: http)
+        // The first image.png lands by a single POST; the second's upload range fails.
+        graph.failNext("PUT", with: 503)
+        let records = SplitRecordBox()
+        let error = await Self.split(graph, http, records: records)
+        #expect(error != nil, "the failed upload did not stop the split")
+        let record = try #require(records.records.first, "no record was kept")
+        #expect(graph.attachments(of: record.newPartId).count == 1, "non-vacuity: the first attempt copied \(graph.attachments(of: record.newPartId).count)")
+        try await GraphSplitFixture.provider(http).finishSplit(record: record, zone: .current, guests: nil)
+        let held = graph.files(of: record.newPartId)
+        #expect(held.filter { $0.name == "image.png" }.map(\.bytes).sorted { $0.count < $1.count } == [Self.small, Self.large],
+                "the same-named files on the new part: \(held.map { ($0.name, $0.bytes.count) })")
+        #expect(held.filter { $0.name == DraftReadConfig.unnamedAttachmentFilename }.map(\.bytes) == [other],
+                "the unnamed file: \(held.map { ($0.name, $0.bytes.count) })")
+        #expect(held.count == 3, "a file was added twice or lost: \(held.map(\.name))")
+        #expect(!graph.patches("ser-1").isEmpty, "the retry did not cap")
+    }
+
+    @Test("an attachment list Graph pages is read to its end on the series and on the new part")
+    func pagedAttachmentListIsReadToTheEnd() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = Self.calendar([("a.txt", Self.small), ("b.txt", Self.small), ("c.txt", Self.small)])
+        graph.attachmentPageSize.withLock { $0 = 1 }
+        graph.install(on: http)
+        let records = SplitRecordBox()
+        graph.failNext("PATCH", with: 503)   // the cap fails; the retry reads the new part's three pages
+        _ = await Self.split(graph, http, records: records)
+        let record = try #require(records.records.first, "no record was kept")
+        #expect(graph.files(of: record.newPartId).map(\.name).sorted() == ["a.txt", "b.txt", "c.txt"],
+                "the new part holds \(graph.files(of: record.newPartId).map(\.name))")
+        try await GraphSplitFixture.provider(http).finishSplit(record: record, zone: .current, guests: nil)
+        #expect(graph.files(of: record.newPartId).map(\.name).sorted() == ["a.txt", "b.txt", "c.txt"],
+                "the retry added a file again: \(graph.files(of: record.newPartId).map(\.name))")
+        #expect(http.recordedCalls().contains { $0.url.contains("skip=2") }, "non-vacuity: no third page was read")
+    }
+
+    @Test("a draft's file is written with no inline placement, exactly the four keys it had; a split's inline picture adds isInline and contentId")
+    func draftWireIsUnchanged() {
+        let file = DraftAttachment(filename: "a.txt", mimeType: "text/plain", data: Self.small)
+        #expect(Set(ExchangeProvider.graphFileAttachment(file).keys) == ["@odata.type", "name", "contentType", "contentBytes"])
+        #expect(GraphInlinePlacement(isInline: nil, contentId: nil) == nil && GraphInlinePlacement(isInline: nil, contentId: "") == nil)
+        let placed = ExchangeProvider.graphFileAttachment(file, inline: GraphInlinePlacement(isInline: true, contentId: "logo@example.com"))
+        #expect(placed["isInline"] as? Bool == true && placed["contentId"] as? String == "logo@example.com")
     }
 }

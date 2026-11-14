@@ -58,7 +58,7 @@ struct GoogleSplitSeriesTailTests {
         let s = iso.string(from: start)
         let e = iso.string(from: start.addingTimeInterval(3_600))
         return Data("""
-        {"id":"\(masterId)","summary":"Standup","status":"confirmed",
+        {"id":"\(masterId)","iCalUID":"\(masterId)@example.com","summary":"Standup","status":"confirmed",
          "start":{"dateTime":"\(s)","timeZone":"Pacific/Auckland"},
          "end":{"dateTime":"\(e)","timeZone":"Pacific/Auckland"},
          "recurrence":["\(rrule)"]}
@@ -105,6 +105,9 @@ struct GoogleSplitSeriesTailTests {
             statusCode: 200, headers: json,
             body: Self.instances(listed ? [["dateTime": recurrenceId + "Z", "timeZone": "Pacific/Auckland"]] : [])))
         http.register(path: Self.masterPath, method: "PATCH", response: .raw(statusCode: 200, headers: json, body: master))
+        // The series' exceptions, read by a split that carries them (#563): none.
+        http.register(path: Self.createPath, method: "GET",
+                      response: .raw(statusCode: 200, headers: json, body: Data(#"{"items":[]}"#.utf8)))
         http.register(path: Self.createPath, method: "POST",
                       response: .raw(statusCode: 200, headers: json, body: Data(#"{"id":"successor","status":"confirmed"}"#.utf8)))
         let provider = GoogleCalendarProvider(accessToken: { _ in "test-token" }, session: http.session)
@@ -147,7 +150,7 @@ struct GoogleSplitSeriesTailTests {
     func usedUpCountIsRefusedBeforeAnyWrite() async throws {
         let out = try await split(rrule: "RRULE:FREQ=WEEKLY;COUNT=3;BYDAY=MO,WE,FR")
         #expect(isRefusal(out.error), "got \(String(describing: out.error))")
-        #expect(out.wire == ["GET \(Self.masterPath)"], """
+        #expect(!out.calls.contains { $0.method != "GET" }, """
             the refusal must come before the cap PATCH: a capped master with no new series \
             loses the rest of the user's series. got \(out.wire)
             """)
@@ -159,7 +162,7 @@ struct GoogleSplitSeriesTailTests {
         let until = Self.format(try Self.aucklandDays(3, after: start), "yyyyMMdd'T'HHmmss'Z'", Self.utc)
         let out = try await split(rrule: "RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR;UNTIL=\(until)")
         #expect(isRefusal(out.error), "got \(String(describing: out.error))")
-        #expect(out.wire == ["GET \(Self.masterPath)"], "got \(out.wire)")
+        #expect(!out.calls.contains { $0.method != "GET" }, "got \(out.wire)")
     }
 
     @Test("An UNTIL after the split is carried over verbatim")
@@ -226,7 +229,7 @@ struct GoogleSplitSeriesTailTests {
                       "RRULE:FREQ=MONTHLY;BYMONTHDAY=-9223372036854775808;COUNT=3"] {
             let out = try await split(rrule: rrule)
             #expect(isRefusal(out.error), "\(rrule): got \(String(describing: out.error))")
-            #expect(out.wire == ["GET \(Self.masterPath)"], "\(rrule): got \(out.wire)")
+            #expect(!out.calls.contains { $0.method != "GET" }, "\(rrule): got \(out.wire)")
         }
     }
 
@@ -239,7 +242,7 @@ struct GoogleSplitSeriesTailTests {
             the cap would move the end of a series that already ended to the day before the \
             split, and start a new series past its end. got \(String(describing: out.error))
             """)
-        #expect(out.wire == ["GET \(Self.masterPath)"], "got \(out.wire)")
+        #expect(!out.calls.contains { $0.method != "GET" }, "got \(out.wire)")
     }
 
     @Test("An all-day COUNT series counts on its own dates")
@@ -249,7 +252,7 @@ struct GoogleSplitSeriesTailTests {
         let endDate = Self.format(first.addingTimeInterval(86_400), "yyyy-MM-dd", Self.utc)
         let splitDate = Self.format(first.addingTimeInterval(14 * 86_400), "yyyy-MM-dd", Self.utc)
         let master = Data("""
-        {"id":"\(Self.masterId)","summary":"Bins","status":"confirmed",
+        {"id":"\(Self.masterId)","iCalUID":"\(Self.masterId)@example.com","summary":"Bins","status":"confirmed",
          "start":{"date":"\(startDate)"},"end":{"date":"\(endDate)"},
          "recurrence":["RRULE:FREQ=WEEKLY;COUNT=5"]}
         """.utf8)
@@ -260,6 +263,9 @@ struct GoogleSplitSeriesTailTests {
         http.register(path: Self.masterPath + "/instances", method: "GET",
                       response: .raw(statusCode: 200, headers: json, body: Self.instances([["date": splitDate]])))
         http.register(path: Self.masterPath, method: "PATCH", response: .raw(statusCode: 200, headers: json, body: master))
+        // The series' exceptions, read by a split that carries them (#563): none.
+        http.register(path: Self.createPath, method: "GET",
+                      response: .raw(statusCode: 200, headers: json, body: Data(#"{"items":[]}"#.utf8)))
         http.register(path: Self.createPath, method: "POST",
                       response: .raw(statusCode: 200, headers: json, body: Data(#"{"id":"successor","status":"confirmed"}"#.utf8)))
         let provider = GoogleCalendarProvider(accessToken: { _ in "test-token" }, session: http.session)

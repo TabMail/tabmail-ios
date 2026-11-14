@@ -222,15 +222,16 @@ enum CalDAVOccurrences {
 
     /// The occurrence `key` names in the resource, as a listing shows it, or nil when the
     /// series has no such occurrence now (it was removed, or the series changed since the id
-    /// was listed). A cancelled occurrence comes back with status `cancelled`.
-    static func occurrence(key wanted: String, icsText: String, href: String) -> GCalEvent? {
-        let components = ICSParser.components(icsText: icsText, resourceHref: href)
+    /// was listed). A cancelled occurrence comes back with status `cancelled`. Floating times are
+    /// read in `floatingZone` (the device's unless given).
+    static func occurrence(key wanted: String, icsText: String, href: String, floatingZone: TimeZone = .current) -> GCalEvent? {
+        let components = ICSParser.components(icsText: icsText, resourceHref: href, floatingZone: floatingZone)
         let overrides = components.filter { $0.recurrenceId != nil }
         guard let master = components.first(where: { $0.recurrenceId == nil }) else {
             return overrides.first { override in override.recurrenceId.flatMap { standaloneKey(of: $0, zones: override.zones) } == wanted }
-                .map { occurrenceRow($0.event, href: href, key: wanted, recurrence: nil, frame: .floating(.current)) }
+                .map { occurrenceRow($0.event, href: href, key: wanted, recurrence: nil, frame: .floating(floatingZone)) }
         }
-        guard case .series(let series) = shape(of: master, overrides: overrides) else { return nil }
+        guard case .series(let series) = shape(of: master, overrides: overrides, floatingZone: floatingZone) else { return nil }
         return occurrence(key: wanted, in: series, overrides: overrides, href: href)
     }
 
@@ -297,10 +298,9 @@ enum CalDAVOccurrences {
         }
         let timeMin = center.addingTimeInterval(-Config.resolverWindow)
         let timeMax = center.addingTimeInterval(Config.resolverWindow)
-        let components = ICSParser.components(icsText: icsText, resourceHref: href)
+        let components = ICSParser.components(icsText: icsText, resourceHref: href, floatingZone: zone)
         let overrides = components.filter { $0.recurrenceId != nil }
         let rows: [(key: String, row: GCalEvent)]
-        var seriesFrame: Frame?
         if let master = components.first(where: { $0.recurrenceId == nil }) {
             try refuseUnknownSeriesZone(of: master, refusal: .change)
             var series: Series
@@ -317,7 +317,6 @@ enum CalDAVOccurrences {
                 series = s
             }
             if forSplit { series = series.withoutEnd }
-            seriesFrame = series.frame
             guard let found = occurrenceRows(
                 of: series, overrides: overrides, href: href, timeMin: timeMin, timeMax: timeMax, floatingZone: zone
             ) else {
@@ -356,13 +355,9 @@ enum CalDAVOccurrences {
                 throw CalendarProviderError.notSupported(
                     "TabMail can't express the occurrence recurrence_id '\(recurrenceId)' names in \(zone.identifier), so nothing was changed.")
             }
-            // A split at a moved occurrence would start at its place in the series and also
-            // change the occurrences between that place and where it was moved to, a wider
-            // write than the one asked for: refuse it.
-            if forSplit, let seriesFrame, let candidate = candidates.first(where: { $0.id == named }), isMoved(candidate, in: seriesFrame) {
-                throw CalendarProviderError.notSupported(
-                    "The occurrence recurrence_id '\(recurrenceId)' names was moved from its place in the series, so TabMail can't split the series at it. Nothing was changed. Use edit_scope this_only to change just this occurrence, or ask the user to change this and the following occurrences in their calendar app.")
-            }
+            // A split at an occurrence moved from its place splits at that place (#687), as Google
+            // Calendar does: `slot` is the key's place, and the moved occurrence goes to the new
+            // part with the other changed occurrences there.
             return (named, slot)
         case .absent:
             throw CalDAVError.notFound
@@ -525,13 +520,6 @@ enum CalDAVOccurrences {
                   day: wall.day, hour: wall.hour, minute: wall.minute, second: wall.second,
                   in: key.hasSuffix("Z") ? .gmt : frame.zone) else { return nil }
         return OccurrenceCandidate(id: key, instant: instant, dateOnly: nil)
-    }
-
-    /// CalDAV's one notion of a moved occurrence: `candidate` (keyed as `scopedEditSlot`'s are)
-    /// no longer starts where the series puts it (`seriesSlot`), compared in the series' own
-    /// frame. A key that names no slot counts as moved, so a check on it fails closed.
-    private static func isMoved(_ candidate: OccurrenceCandidate, in frame: Frame) -> Bool {
-        seriesSlot(ofKey: candidate.id, in: frame) != candidate
     }
 
     // MARK: - Series

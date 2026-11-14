@@ -388,6 +388,146 @@ Tests: `CalendarGuestChangeTests` (on each fake server after the real queue drai
 `AttendeeChangeTests` (the function), `DemoGuestChangeTests`, the card test in
 `CalendarToolResolvedAccountTests`.
 
+## Exceptions after the split (#563, #687)
+
+Google Calendar's rule, measured on a test calendar, now followed on Google, Outlook and CalDAV
+(`SplitCarry`, one provider-neutral source the card and every write call):
+- A split starts at the PLACE of the occurrence named (`originalStartTime`), not where it was moved
+  to; the series is capped before that place, and the moved occurrence is carried like any other
+  changed one (#687; the old "split at a moved occurrence" refusal is gone).
+- **Reset** (`SplitCarry.Mode.reset`) when the edit gives a start other than the place (another
+  instant or day, or the same instant in another time zone: Google's own web "this and following"
+  resets for a zone-only change, measured on the Workspace test calendar 2026-11-12; Outlook is
+  unmeasured and follows the same rule) or another rule (`ruleDayMove`, or a RRULE other than the stored one): nothing is
+  carried, deleted occurrences come back, changed ones lose their change, and the new part's EXDATE
+  lines go (RDATE stays). The card shows `CalendarToolHelpers.exceptionsResetNote`.
+- **Carry** otherwise: a deleted occurrence stays deleted (Google: an EXDATE in the create; Outlook:
+  the new part's occurrence DELETEd, 404/410 = done; CalDAV: EXDATE and overrides kept); EVERY changed
+  one is carried WHOLE (amended 2026-11-12, review C1: a fixed field diff lost a guest's own decline,
+  a colour, a reminder): everything it holds that the organizer can write, except the fields the
+  edit sets (`SplitCarry.Field`, which the new part holds already); its own times, an end given alone
+  giving its own start plus the new part's length; its guests (answers included) with the edit's
+  change applied as the series' difference. Google: `carriedJSON` = the exception's JSON minus
+  `serverOwnedEventKeys`, times, status and guests, PATCHed with `conferenceDataVersion=1` and
+  `supportsAttachments=true` as the create is. Outlook: `carriedJSON` = the exception's
+  `splitCopiedKeys` but `isAllDay`. CalDAV: the override VEVENT is kept byte for byte (`carryPatch`
+  only overwrites the set fields and, for an end given alone, DTEND).
+- **Not carried (the provider gives the organizer no way to write it):** Google: the keys the server
+  owns (`creator`, `organizer` outside an import, `hangoutLink`, `locked`, attendees' `self`/`id`/
+  `organizer`); an attendee's `responseStatus` IS written (Google documents it writable), how it
+  reaches the attendee's own copy is unmeasured. Outlook: attendees' answers (`status` is read-only
+  to an update: the new part's occurrence starts unanswered), the exception's own online meeting
+  (`onlineMeeting`/`isOnlineMeeting`: the new part has its own), its attachments (a separate
+  endpoint, not copied, as the split's own copy does not), and extensions/extended properties.
+- **Outlook reads every page** of the new part's `/instances` (`@odata.nextLink`, refused if it
+  leaves Graph, review C2). A deleted place not listed is done; a CHANGED one not listed is refused
+  before the cap. `exceptionOccurrences` is read with a plain `$expand` and no `$select`: measured,
+  not documented (Graph documents it with both).
+- The mode and set fields are on `SplitRecord` (`mode`, `fields`), so a retry (`finishSplit`) carries
+  as the first attempt did, before the cap. A carry write that fails for good stops before the cap
+  (owner ruling); the residual case is iOS #769.
+- Outlook writes the DELETEs first, then the moves in `carryOrder`, so none lands on a date another
+  occurrence still holds (`ErrorOccurrenceCrossingBoundary`).
+- Carry writes send the providers' usual update emails to attendees (owner ruling: accepted).
+- A numbered series keeps its remaining COUNT on the new part (Google's own 8 -> 11 is not copied).
+
+**Split at a moved occurrence (amended 2026-11-12, owner ruling, supersedes "starts at the PLACE"
+above):** the split cuts where the named occurrence is now shown (`SplitCarry.cut`: its current start,
+or the next rule date on or after it; COUNT/UNTIL/RDATE honoured; an all-day one on the same date
+counts as after). `SplitCarry.partition` sorts every exception by where it is shown: at or after the
+cut goes to the new part (`tail`), before it stays on the capped series untouched (`kept`, written
+whole at its own times when the cap would drop its place), and the named one is `edited`.
+(a) an occurrence at exactly the cut changes; (b) a typed start shifts the later ones by the same
+amount (`partEdit`: t -> cut + (t - namedStart)); (c) a reset leaves those shown before untouched;
+(d) deletions between its old place and the cut stay deleted, even on a reset; (e) moved past the
+series' last occurrence (`Cut.pastEnd`): no new part, only it is edited (`editShown`), a rule change
+refused; (f) all-day same date = after. The shift and per-occurrence edits are on `SplitRecord`
+(`named_place`, `named_start`, `edits`), so a retry does not shift twice. Rows queued before this
+parse without them and are read as named at the cut. Tests: `SplitCarryTests` cut/partition,
+`movedSplit*` in `CalendarEditToolSeriesScopeTests` and `ExchangeSplitCarryTests`,
+`SplitCarryTests.calDAVMovedSplit*`/`calDAVPastEnd`.
+
+**One split point per calendar (amended 2026-11-12, review of #687):** the card's repeat line
+(`dayMovedRules`) and the write (`splitSeries`) both call the calendar's own `splitPoint`, so the cut
+the card shows is the cut written (CalDAV with the resource's `RDATE` lines; Outlook from the range
+start, a missing month day on the month's last). A date or local `UNTIL` is read in the series' zone
+(`SplitCarry.endsBefore`). A floating CalDAV series is read in the operation's zone
+(`CalendarTimeZoneContext.readingFloating(in:)`, `ICSParser.components(floatingZone:)`,
+`CalDAVOccurrences.occurrence(floatingZone:)`), by the split and by its retry (`finishSplit`) alike. Outlook writes the edits of occurrences where they
+are in Graph's move order (`editOrder`, the same `moveOrder` as `carryOrder`). Past the end (e),
+Google and Outlook keep `SplitRecord.pastEnd` (`split_at` "", `new_part_id` the named occurrence,
+absolute `edits`, `edit_length`) before the first write; the queue finishes such a record with
+`finishShownEdit` without looking for the named occurrence again. Unmeasured: whether Graph keeps an
+exception moved past the capped range's new `endDate` (measure: split a weekly series at a moved
+occurrence whose earlier-placed neighbour is shown after the cut, then GET the capped series'
+`/instances` and `exceptionOccurrences`). Tests: `SplitCarryTests` (RDATE, UNTIL, floating,
+`shownEdits*`, reset keeps deleted), `ExchangeSplitCarryTests` (`pastEndRetryMovesOnce`,
+`shownEditsAreOrderedOffHeldDays`, `movedSplitRetryMovesEditedOnce`, `movedSplitKeptItemKeepsItsGuests`).
+
+**The card asks the write's cut (amended 2026-11-12, review rounds 3-4):** the card of a split named
+at a moved occurrence asks `CalendarProvider.splitCut` (each calendar's `splitPoint`, nothing written).
+Past the end it shows no reset note and refuses a rule or day change before the card
+(`SplitCarry.pastEndRuleRefusal`). `splitSeries` returns `GCalEvent?`: nil when no new part is made,
+and the queue's past-end retry answers nil, so the tool prints no `new_series_event_id`. Outlook:
+`moveOrder` neither dates nor orders a stay (no target, or a target at the instant it is at); moves are
+dated in `GCalEvent.seriesZone` (range zone, else the start's); a past-end edit is ordered before its
+record; the carry's listing window is dated in UTC; a timed series with no readable zone is refused
+before the POST only when one of its writes moves an occurrence by date (`dateSplitMoves`), so a rename
+still works. A zone-less timed series is still refused, with nothing written, when it has a deleted occurrence less than two days before the split's date in UTC, or after it (Graph's `cancelledOccurrences` names it by date only, so placing it needs the zone) or when the occurrence named was moved (its cut is placed in the zone). Zone fallback REJECTED (2026-11-12): Outlook's `start.timeZone` is only the zone a read asked for (`request` sends `Prefer: outlook.timezone`, the device's by default), so it never stands in for the series' zone (`GCalEvent.startZoneIsDisplay`, set by `toGCalEvent`; `seriesZone` is then the range zone or nil). A fallback to Graph's `originalStartTimeZone` was tried and removed: whether Graph dates `cancelledOccurrences` in the requested zone is unmeasured, and the creation zone can differ from the range zone (a series moved to another zone keeps its creation zone), so a deleted date could be placed a day off, a silent wrong delete, worse than a refusal. A timed series whose range zone is custom is refused with nothing written; an all-day one is read in its stored range name as it always was. Tests: `customRangeZoneIsRefused`, `SplitCarryTests.displayZoneNeverStandsIn`. Accepted limits (owner, 2026-11-12), all on an Outlook series whose range zone is missing or custom, none writing anything wrong; the narrower fix is tabmail-ios #806 (P4): (1) a "this and following" edit is refused when an occurrence was deleted on a date less than two days before the split's date in UTC, or after it, or when one of its writes would move an occurrence to another time (a later moved occurrence carried by an edit that keeps the time, or a time change reaching an occurrence edited where it is; a new time over a later moved occurrence is not refused: it resets it, as Google does); a deletion two or more days before the split's date in UTC, a rename, and a time change over renamed occurrences go through (`deletedSurelyBefore`, `dateSplitMoves`); (2) a whole-series time change with no occurrence named is refused, and the message names the time zone (`CalendarSeriesScope.unreadableSeriesZone`), not a date; (3) a whole-series move named from a later occurrence becomes a split there, so earlier occurrences keep the old time; (4) a "this and following" zone change keeps the later one-off changes, where Google resets them: every timed edit names a zone (`buildGCalEventInput`), so without the series' own zone a real zone change can't be told from a restated one, and resetting on every restated start would drop one-off changes the user never touched. (5) on a series that meets on back-to-back days, an occurrence deleted on the day before the split (or less than two days before the split's date in UTC) is refused for now: without the zone it can't be told from one on or after the split; #806 fixes it. Narrowed (owner, 2026-11-12): the move check is the real move list, planned before any write against the new part's times as the create gives them (`plannedPart`, `carryPlan`, `dateSplitMoves`, the same `carryOrder`/`editOrder` the writes use; `movesAnOccurrence` retired), and a deletion whose date is two or more days before the split's date in UTC (`deletedDateMarginDays`; zones run from UTC-12 to UTC+14) is left out unplaced, as the split never touches it (`deletedSurelyBefore`); a deletion less than two days before the split's UTC date, or after it, still needs the zone and is refused; a time change over a later moved occurrence goes through and resets it, as Google does. Tests: `zonelessEarlierDeletionDoesNotBlock`, `zonelessDeletionAtTheSplitIsRefused`, `zonelessLaterMoveIsRefused`, `zonelessTimeChangeOverARenameIsWritten`, `zonelessTimeChangeOverALaterMoveResets`, `zonelessRenameOverAnOccurrenceMovedAfterIsWritten`, `zonelessTimeChangeMovingAnOccurrenceWhereItIsIsRefused`, `deletedSurelyBeforeHoldsItsMargin`. Tests: `noRangeZoneIsNotReadInTheDisplayZone` (deleted and moved), `unreadableZoneTimeChangeNamesTheZone`, `unknownZoneTakesTheRefusingSide`. `MockCalendarProvider.splitCut` cuts at
+`recurrenceId` unless set. Tests: card and answer past the end on Google, Outlook and CalDAV;
+`movedSplitCardShowsTheWrittenRule`; Google `pastEndKeepsItsRecordFirstAndRetryNotifies`; queue
+`pastEndRetryWritesOnlyItsEdits`; `ExchangeSplitCarryTests` `zoneless*`, `splitEditsAreOrderedOffHeldDays`;
+`SplitCarryTests` `moveOrderNeedsNoZoneForStays`, `malformedEditLengthIsNotRead`.
+
+Tests: `SplitCarryTests`, `ExchangeSplitCarryTests` (whole copy, every page, failure before the cap
+and `finishSplit`, `carryOrder` against the fake's opt-in same-day refusal, deletes before moves,
+guests, end only), `CalendarEditToolSeriesScopeTests.renameSplitCarriesLaterExceptions` /
+`followingAtAMovedLaterOccurrenceCarriesIt` / `carryKeepsGuestAnswerAndColour` /
+`carryFailureStopsBeforeTheCapAndTheRetryCarries` / `zoneOnlySplitResets` / `outlookResetNoteFollowsTheMode`, the Google/Outlook invariant matrices (moved states now
+split at the place), `CalDAVOccurrenceWireTests.splitIsAtThePlaceInEveryFrame`.
+
+**Amendment (2026-11-13, #563): an Outlook split copies the series' FILE attachments onto the new
+part.** Supersedes "its attachments (a separate endpoint, not copied, as the split's own copy does
+not)" above for the new part (kept as written). Measured on a work test account (2026-11-13): Outlook
+web's own "this and all following" kept a 203-byte file attachment on the new part (it dropped the
+open extension and the single-value extended property, as we do). A create (`POST /events`) carries no
+attachment, so after the record and before the carry and the cap, `ExchangeCalendarProvider.copySeriesFiles`
+lists the series' attachments (`$select=id,name,contentType`, every page within Graph), reads each
+`#microsoft.graph.fileAttachment`'s bytes as a mail attachment's are (`contentBytes`, one GET by id),
+and adds it to the new part through the SAME code as an Outlook draft: `ExchangeProvider.addFileAttachment`
+(moved out of the draft-only `addDraftAttachment`, now parameterized by the item path `/messages/{id}`
+or `/events/{id}`; one POST under `ExchangeDraftConfig.singlePostAttachmentLimitBytes`, else an upload
+session whose ranges are PUT with no `Authorization`). A file the new part already holds by name (one
+to one, as a draft save pairs) is not added again, so `finishSplit` runs the same step and adds only
+what is missing. A failure throws before the carry and the cap with the record kept (the queue's usual
+split semantics: transient errors retry through `finishSplit`, a 4xx the queue retires stops the split
+with the new part made and the series uncapped, the residual of iOS #769). Not copied, open: item and
+reference attachments (left as before); an inline file (`isInline`/`contentId`) is copied as a plain
+file, since the shared add sends neither. Google already copied attachments (`supportsAttachments`);
+CalDAV keeps every `ATTACH` line byte for byte (`newPartKeepsAttachments`). Tests:
+`ExchangeSplitAttachmentTests` (small and upload-session files on the new part before the cap; a failed
+range stops before the cap and the retry adds only the missing file); `FakeGraphCalendar` models event
+attachments, the single POST, the upload session and its ranges.
+
+**Amendment (2026-11-13, #563, second): inline pictures and a carried occurrence's own files.**
+Supersedes the "Not copied, open" sentence above for inline files and per-occurrence files (kept as
+written). (1) A copied file keeps its inline placement: the list now selects `isInline`
+(`$select=id,name,contentType,isInline`, measured valid, memory 147), the GET by id gives its
+`contentId`, and `ExchangeProvider.addFileAttachment(_:itemPath:inline:)` writes both
+(`GraphInlinePlacement`) on the single POST (`fileAttachment`) and on the upload session's
+`attachmentItem`; both resources document `isInline` and `contentId` as optional properties (Microsoft
+Learn, checked 2026-11-13). The draft path passes no placement and sends exactly what it sent before.
+So the body's `cid:` link on the new part still finds its picture. (2) Each changed occurrence the carry
+writes onto the new part (`carry`, `plan.changed`) also gets that occurrence's own file attachments
+copied onto the matching instance of the new part, by the same step (`copyFiles(from:to:)`, the
+generalized `copySeriesFiles`), right after its PATCH and before the cap; pairing by name makes a retry
+add only what is missing (a file the instance already holds, inherited or copied, is not added again).
+Still not copied: item and reference attachments (cloud links). Tests (`ExchangeSplitAttachmentTests`,
+`ExchangeSplitCarryTests.carriedOccurrenceKeepsItsOwnFile`): an inline picture by POST and by upload
+session keeps `isInline` and its `contentId`; a carried occurrence's file lands before the cap and once
+after a retry; a file plus a reference and an item attachment splits and copies only the file; two
+same-named files and an unnamed one survive a retry; a paged attachment list is read to its end.
+
 ## Tests
 
 `CalDAVEventCopiesTests`, `CalDAVSplitRefusedBeforeWriteTests` and `CalDAVSplitRollbackTests`
@@ -406,3 +546,136 @@ skip.
 changed on its own keeps its status, alert, categories, link, revision, `X-` line and attendees
 through a rename, an attendee added and a move.
 See `TESTS.md`, "Repeating events — copies keep the series' properties".
+
+**Amendment (2026-11-13, #563, third): attached Outlook items are copied too; a linked file refuses the split.**
+Supersedes "Still not copied: item and reference attachments" above for items (kept as written). Owner
+decision: an attached Outlook item (`#microsoft.graph.itemAttachment`) is copied onto the new part, as
+Outlook web's own split keeps a fresh copy there (measured live 2026-11-13: v1.0 `POST /events/{id}/attachments`
+with an inline item returns 201; `GET .../attachments/{id}?$expand=microsoft.graph.itemattachment/item`
+returns the whole item). The same `copyFiles(from:to:)` step does it, by kind: it reads the item with that
+`$expand` and re-adds it in one POST as an itemAttachment, the item's server-owned properties (`id`,
+`changeKey`, `createdDateTime`, `lastModifiedDateTime`, OData annotations but `@odata.type`) left out
+(`copiedItemJSON`; this round trip of an expanded item was not measured live, only a hand-built item).
+It runs before the cap, pairs by name on a retry, and covers a carried occurrence's own items. Graph
+documents the item route "under 3 MB" and an upload session for files only (`attachmentItem`'s minimum is
+`attachmentType: file`; every example is a file), so an item of
+`ExchangeDraftConfig.singlePostAttachmentLimitBytes` or more is NOT copied and nothing of it is written;
+the split completes and the old part keeps it (owner decision 2026-11-13, option A, #835). Reference
+attachments (linked OneDrive/SharePoint files): Graph v1.0 can't create one on an event (no `sourceUrl` in
+the v1.0 schema, live 400), so a split of a series holding one is REFUSED before any write (no new part,
+no record, no copy, no cap): `splitSeries` checks the series' attachment list right before the create and
+throws `linkedFileRefusal` ("...has a linked file TabMail can't copy to the new part, so it was not changed.
+Make the change in your calendar app."; owner decision 2026-11-13, #834). Moving that refusal before the
+confirmation card is #718's. A linked file on a single changed occurrence (not the series) is not checked:
+it is not copied onto the new part's instance. Tests: `itemAttachmentIsCopied`,
+`failedItemCopyRetriesOnce`, `largeItemIsSkipped`, `linkedFileRefusesTheSplitUnwritten`,
+`carriedOccurrenceKeepsItsOwnItem`.
+
+**Amendment (2026-11-13, #563, fourth): an attached item is copied by an allow-list, decided before any write.**
+Supersedes the `copiedItemJSON` strip-list above (kept as written). Measured live on the Outlook.com test mailbox (memory 147):
+the strip-list body was refused for a received email (`internetMessageHeaders`: Graph takes at most 5, every received mail has
+more) and for an attached event (`isOrganizer`, `isDraft`: `ErrorInvalidPropertySet`), and every retry would have sent the same
+body. `copiedItemJSON` now keeps `@odata.type` and only the properties of its kind measured writable (`copiedItemKeys`: message,
+event, contact); an item of any other kind is not copied. `splitSeries` decides every copy before the create (`copyPlan`: the
+series' and each carried changed occurrence's attachment list, each item read with `$expand` and its exact POST body built),
+then writes them (`copy`); a linked file on a carried occurrence refuses the split there too, with the same `linkedFileRefusal`.
+`finishSplit` plans again before its own writes; the new part already exists there, so a linked file is left on the old part
+rather than refused. The 3 MB cutoff stays on the item's LISTED size (owner decision #835; Graph took item POSTs up to about
+18.9 MB, measured), and an item over it is not even read. OPEN (owner): an attached email that holds files of its own is
+copied without them (Graph drops them on create in every form), and a copied email reads as unsent. Tests
+(`ExchangeSplitAttachmentTests`): `attachedReceivedMailIsCopied`, `attachedEventAsReadIsCopied`, `attachedContactIsCopied`,
+`copiedItemJSONIsAnAllowList`, `itemJustUnderTheCutoffIsCopied`, `unknownItemKindIsSkippedUnwritten`, `retryLeavesALaterLinkedFile`,
+`copiedItemHasNoInlinePlacement`; `ExchangeSplitCarryTests.carriedOccurrenceLinkedFileRefusesUnwritten`,
+`uncarriedOccurrenceLinkedFileIsLeft`. `FakeGraphCalendar` refuses an item POST as Graph was measured to.
+
+**Amendment (2026-11-13, #563, fifth): only an attached contact is copied; a carried occurrence holding any other item refuses the split.**
+Supersedes the message and event halves of the fourth amendment's allow-list (kept as written). Owner rule: "wrong things should
+not be copied". Measured (memory 147): a copied email reads as an unsent draft and loses its own files; a copied event reads
+as a draft, and its meeting options (`allowNewTimeProposals`, `hideAttendees`) and separate `locations` can't be read or
+written; a contact comes back with every common property as sent. So `copiedItemJSON` copies a contact only
+(`copiedContactKeys`) and returns nil for every other kind, and `copyPlan` counts each item not copied
+(`AttachmentCopyPlan.uncopiedItems`: listed at 3 MB or more, an email, an event, any other kind). On the SERIES the old part
+keeps it and the split completes (#835, #845 an email with files, #846 any email). On a CARRIED changed occurrence the cap
+takes that occurrence off the old part, so the item would be on neither part: `splitSeries` refuses before any write with
+`uncopiedItemRefusal` ("...has an attached Outlook item TabMail can't copy to the new part, so it was not changed. Make the
+change in your calendar app."; #847), after the linked-file check. `finishSplit`'s retry does not refuse (the new part
+exists), as for a linked file. Tests: `ExchangeSplitAttachmentTests.seriesEmailOrEventIsLeftOnTheOldPart`,
+`copiedItemJSONIsContactsOnly`, `attachedContactIsCopied` (also the item read before the create),
+`unreadableItemStopsTheSplitUnwritten`; `ExchangeSplitCarryTests.carriedOccurrenceUncopiedItemRefusesUnwritten`
+(email, event, unknown kind, 3 MB contact), `carriedOccurrenceKeepsItsOwnItem` (a contact).
+
+**Amendment (2026-11-13, #563, sixth): a retry refuses what a carried occurrence gained, before its first write.**
+Reverses the fifth amendment's "`finishSplit`'s retry does not refuse" (kept as written) and the fourth's "a linked file is left
+on the old part rather than refused" for CARRIED occurrences (owner-approved option A; the panel answer was pending when this
+landed). `finishSplit` now plans, before its first write and as `splitSeries` does, the series' attachments and every changed
+occurrence it carries (`splitCarry`, shared with `writeSplitOccurrences`). A carried occurrence that gained a linked file since
+the first attempt refuses with `retryLinkedFileRefusal`, one that gained an item no copy carries with `retryUncopiedItemRefusal`
+("This change to the repeating event wasn't finished: a later occurrence now has an attached Outlook item TabMail can't copy, so
+both parts show the later occurrences. Remove the item from that occurrence or finish the change in your calendar app."); the
+linked file is checked first, as on the first attempt. The refusal is terminal (`notSupported`, the drain retires the row, as
+`newPartDeleted`): both parts keep showing the later occurrences as the first attempt left them, the item stays on the old
+occurrence, and nothing finishes the split on its own (the user removes the item and changes it in their calendar app). Why
+not the others: carrying anyway loses the item on both parts; deleting the new part is irreversible, cancels it for guests
+and can't undo the in-place edits already written. The SERIES' own linked file or uncopied item on a retry still stays on the
+old part with no refusal. Tests (`ExchangeSplitCarryTests`): `retryRefusesAnItemACarriedOccurrenceGained` (email, event,
+linked file: no write on the retry), `retryCopiesAContactACarriedOccurrenceGained`, `linkedFileRefusalWinsOverAnUncopiedItem`.
+
+**Amendment (2026-11-13, #563, seventh): only FILES are copied on a split; every attached Outlook item stays on the old part.**
+Owner ruling (#854): "stop copying contacts too. ONLY FILES are copied on a split". Reverses the fifth amendment's contact copy
+and the fourth's allow-list (both kept as written above). Why: a contact's photo can't be read or written through Graph
+(memory 147, #852), so even a contact copy is not the same item; with emails and events already left behind, a copy of one kind
+only was not worth its read and POST. `copyPlan` now lists attachments only (no `$expand` read, no 3 MB item check):
+`AttachmentCopyPlan` is `files`, `hasLinkedFile`, `holdsItem`; `copy` adds files only. Deleted: `copiedItemJSON`,
+`copiedContactKeys`, `itemCopyBody`, the `AttachmentCopy` enum (`.item`/`.file`), the item read and its "can't be read" throw,
+and the item POST. On the SERIES every attached item, of any kind or size, stays on the old part and the split completes
+(#835, #845, #846, #852, #854). A CARRIED changed occurrence holding any item (a contact included) refuses before any write,
+on the first attempt (`uncopiedItemRefusal`) and on a retry (`retryUncopiedItemRefusal`), linked file checked first (#834,
+#847); the messages are unchanged. `FakeGraphCalendar` no longer answers an item POST (nothing sends one);
+`GraphAttachmentLimits.itemPostLargestAccepted`/`itemMessageHeadersMax` removed. Tests: `ExchangeSplitAttachmentTests.seriesItemIsLeftOnTheOldPart`
+(email, email with file, event, contact, other kind, 3 MB contact, unsized contact: no read, no write, split completes);
+`ExchangeSplitCarryTests.carriedOccurrenceUncopiedItemRefusesUnwritten` (email, event, contact, other kind),
+`retryRefusesAnItemACarriedOccurrenceGained` (email, event, contact, linked file), `retryCopiesAFileACarriedOccurrenceGained`.
+Removed as dead: `itemAttachmentIsCopied`, `failedItemCopyRetriesOnce`, `attachedContactIsCopied`, `copiedItemJSONIsContactsOnly`,
+`itemJustUnderTheCutoffIsCopied`, `largeItemIsSkipped`, `unknownItemKindIsSkippedUnwritten`, `copiedItemHasNoInlinePlacement`,
+`unreadableItemStopsTheSplitUnwritten`, `carriedOccurrenceKeepsItsOwnItem`, `retryCopiesAContactACarriedOccurrenceGained`.
+
+**Amendment (2026-11-13, #563, eighth): the split was rebuilt on #681 and #823; the Outlook carry is
+dated in the cap's zone, and a series with no recognized zone is refused.** Supersedes, for Outlook, the
+zone-less carry in "Exceptions after the split" (the paragraph on a zone-less timed series, limits (1)
+and (5), `deletedSurelyBefore`, `deletedDateMarginDays`, and the rejected `originalStartTimeZone`
+fallback; kept as written). (1) The cap is `splitCapEndDate` (#681), fed the cut's wall time in the
+`recurrence_id`'s zone; `graphEndDateBefore` is gone. (2) The split, its retry (`finishSplit`), its
+carry, its move order and an edit past the series' end (`finishShownEdit`) all read the series in ONE
+zone, the one the cap is dated in: `ExchangeCalendarProvider.seriesTimeZone` (the range's
+`recurrenceTimeZone`, else the event's `originalStartTimeZone`, as `CalendarTimeZoneResolver` reads
+it; nil for an all-day series), threaded as `zone:` through `splitPoint` (into `SplitCarry.cut`),
+`seriesExceptions`, `dateSplitMoves`, `writeSplitOccurrences`, `carry` and `editShown`. It no longer
+reads `GCalEvent.seriesZone`, which for an Outlook read names the range's zone alone. #681 measured
+that Graph reads range dates in `originalStartTimeZone` when the range names none, which answers the
+"unmeasured" objection above. (3) A timed series that names no zone, or one TabMail does not
+recognize, is refused before anything is read or written, in #681's words ("Outlook gives no time zone
+for this repeating event…", or `unrecognizedTimeZone`), for every one of those paths; so no zone-less
+split is written at all, and the dead zone-less branches went with it. (4) `finishSplit` runs through
+#823's `endSeries` (refusal `.change`), with the carry as its `beforeCap` step after the
+`splitAlreadyEnded` check and before the cap; the following-delete calls the same `endSeries` with no
+carry (`.followingDelete`). Google's `finishSplit` is the same shape (`endSeries` with a `beforeCap`
+closure, the cap silent, the carry notifying guests). Limits (2) to (4) stand: they are the tool's,
+read from `getEvent` (`startZoneIsDisplay`, `unreadableSeriesZone`, #806). Open: the confirmation
+card's reset note reads `GCalEvent.seriesZone` (`CalendarEventEditTool`), so on a series whose range
+names no zone but whose event does, the card can miss a zone-only reset the write makes. Tests:
+`ExchangeSplitCarryTests.zonelessSeriesIsRefused` (rename, new time, deletion, past the end),
+`eventZoneDatesTheCarry`, `customRangeZoneIsRefused`, `noRangeZoneIsNotReadInTheDisplayZone`. Removed
+as dead: `zonelessRenameCarries`, `zonelessDeletionIsRefusedBeforeThePart`,
+`zonelessTimeChangeOverARenameIsWritten`, `zonelessTimeChangeOverALaterMoveResets`,
+`zonelessRenameOverAnOccurrenceMovedAfterIsWritten`, `zonelessTimeChangeMovingAnOccurrenceWhereItIsIsRefused`,
+`zonelessEarlierDeletionDoesNotBlock`, `zonelessDeletionAtTheSplitIsRefused`,
+`deletedSurelyBeforeHoldsItsMargin`, `zonelessLaterMoveIsRefused`, `zonelessPastEndRenameIsRefused`.
+(5) A split that changes the series' kind (#840/#841: timed to all-day or back) has a new part of the
+other kind, so no shift spans the cut and the new part's start (`SplitCarry.shift` nil). The shift is
+needed only to move an occurrence with the edit (`SplitCarry.edits`, the reset's named occurrence in
+`SplitCarry.plan`); a kind change at an occurrence never moved moves none, so it splits as main split
+it. Pinned by main's `GoogleCalendarEditKeepsKindTests.splitExplicitTrueMakesNewPartAllDay` and
+`splitExplicitFalseMakesNewPartTimed`, red when the shift was required (both refused "the new part of
+this repeating event has a time TabMail can't read"). Open: a kind change at a MOVED occurrence is
+refused for the occurrences that would move, and carries those shown before it whole at their own
+kind onto a new part of the other kind (unmeasured on Graph and Google).

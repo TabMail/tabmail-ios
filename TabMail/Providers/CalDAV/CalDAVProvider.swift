@@ -38,11 +38,23 @@ actor CalDAVProvider: CalendarProvider {
         }
         guard scope == "this_and_following" else { return [try RecurrenceDayShift.shifted(stored, by: move)] }
         guard let recurrenceId else { throw CalendarProviderError.notSupported(CalendarSeriesScope.seriesNotRead) }
-        let slot = try CalDAVOccurrences.scopedEditSlot(
-            icsText: masterICS, href: seriesHref, key: occurrenceKey, recurrenceId: recurrenceId, zone: zone, forSplit: true)
+        let point = try Self.splitPoint(
+            masterICS: masterICS, href: seriesHref, key: occurrenceKey, recurrenceId: recurrenceId, zone: zone)
+        guard let slot = point.slot else { throw CalendarProviderError.notSupported(SplitCarry.pastEndRuleRefusal) }
         let rules = try Self.splitRules(masterICS: masterICS, slot: slot, recurrenceId: recurrenceId, recurrenceIdZone: zone,
-                                        zones: CalendarTimeZoneContext(calendarText: masterICS))
+                                        zones: point.zones)
         return [try RecurrenceDayShift.shifted(rules.newRule, by: move)]
+    }
+
+    /// CalDAV's split cut (`CalendarProvider.splitCut`): `splitPoint`'s, from the stored resource
+    /// as `splitSeries` reads it.
+    func splitCut(calendarId: String, eventId: String, recurrenceId: String, zone: TimeZone) async throws -> SplitCarry.Cut {
+        let (seriesHref, occurrenceKey) = try CalDAVOccurrences.OccurrenceId.split(eventId)
+        let (data, _) = try await client.get(url: try resolveEventURL(seriesHref, calendarId: calendarId))
+        guard let masterICS = String(data: data, encoding: .utf8), !masterICS.isEmpty else {
+            throw CalDAVError.parseError("Empty response for event \(eventId)")
+        }
+        return try Self.splitPoint(masterICS: masterICS, href: seriesHref, key: occurrenceKey, recurrenceId: recurrenceId, zone: zone).cut
     }
 
     private let client: CalDAVClient
@@ -627,7 +639,7 @@ actor CalDAVProvider: CalendarProvider {
         patch: GCalEventInput,
         sendUpdates: String,
         record: SplitRecorder
-    ) async throws -> GCalEvent {
+    ) async throws -> GCalEvent? {
         // An occurrence id addresses its series' resource, and its key names the occurrence.
         // The split's new part is named from the series' href and the checked slot whichever
         // id the edit was given, so a retry and the same split asked for through the series
@@ -645,13 +657,27 @@ actor CalDAVProvider: CalendarProvider {
         // The occurrence the split starts at: one the series has, or nothing is written
         // (`CalDAVOccurrences.scopedEditSlot`, the same check `updateOccurrence` makes). Where
         // the series ends is left to `RecurrenceTail.newSeriesRule` below.
-        let slot = try CalDAVOccurrences.scopedEditSlot(
-            icsText: masterICS, href: seriesHref, key: occurrenceKey,
-            recurrenceId: recurrenceId, zone: recurrenceIdZone, forSplit: true)
+        // The split cuts the series in calendar order (owner rule, 2026-11-12): at the first place
+        // at or after where the occurrence named starts now (`SplitCarry.cut`), so it and every
+        // occurrence shown after it change, and none shown before it does. Each time the edit
+        // gives moves the new part as far from the cut as it moves the occurrence named
+        // (`SplitCarry.partEdit`).
+        let point = try Self.splitPoint(
+            masterICS: masterICS, href: seriesHref, key: occurrenceKey, recurrenceId: recurrenceId, zone: recurrenceIdZone)
+        let zones = point.zones
+        guard let slot = point.slot, case .at(let cutTime) = point.cut else {
+            _ = try await editShown(
+                url: eventURL, storedICS: masterICS, etag: etag, href: seriesHref, patch: patch,
+                namedStart: point.namedStart, shownFrom: point.shownFrom, zones: zones)
+            return nil
+        }
+        let namedStart = point.namedStart, namedPlace = point.namedPlace, namedInstants = point.namedInstants
+        guard let patch = SplitCarry.partEdit(patch, namedStart: namedStart, cut: cutTime) else {
+            throw CalendarProviderError.notSupported(Self.splitPointUnreadable)
+        }
 
         // 2. The capped series' rule and the new part's (`splitRules`), worked out before the cap
         //    PUT in step 3, so a split the series cannot take is refused with nothing written.
-        let zones = CalendarTimeZoneContext(calendarText: masterICS)
         let rules = try Self.splitRules(masterICS: masterICS, slot: slot, recurrenceId: recurrenceId,
                                         recurrenceIdZone: recurrenceIdZone, zones: zones)
         let (masterFrameRecurrenceId, newSeriesRRule, cappedRRule) =
@@ -669,7 +695,8 @@ actor CalDAVProvider: CalendarProvider {
         let newUid = GoogleCalendarProvider.deterministicSplitEventId(masterId: seriesHref, recurrenceId: slot)
         let resources = try Self.seriesSplitResources(
             storedICS: masterICS, slotNaiveISO: masterFrameRecurrenceId,
-            cappedRRule: cappedRRule, newRRule: newSeriesRRule, newUid: newUid, patch: patch, now: Date(), zones: zones)
+            cappedRRule: cappedRRule, newRRule: newSeriesRRule, newUid: newUid, patch: patch, now: Date(), zones: zones,
+            named: namedInstants)
         // Both bodies get their organizer (`withOrganizer`) before anything is written, so a lookup
         // that fails here leaves the series untouched. `putEvent` runs the same step again on each:
         // a body that has its organizer passes unchanged with no request, but when the server
@@ -713,7 +740,12 @@ actor CalDAVProvider: CalendarProvider {
         }
 
         // 4. Keep the record before the cap: a retry after this point writes the cap alone.
-        try await record(SplitRecord(seriesId: seriesHref, newPartId: newEventURL.path, splitAt: slot))
+        // The carry was made in the create itself (`seriesSplitResources`), so the record's mode
+        // and fields are only what the other calendars keep.
+        try await record(SplitRecord(
+            seriesId: seriesHref, newPartId: newEventURL.path, splitAt: slot,
+            mode: resources.mode, fields: SplitCarry.fields(of: patch),
+            namedPlace: SplitCarry.key(namedPlace), namedStart: SplitCarry.key(namedStart)))
 
         // 5. PUT the capped series back. No ETag ⇒ `.unconditional`: step 1's GET
         //    proved the series resource exists (its ICS is what we just capped),
@@ -728,6 +760,89 @@ actor CalDAVProvider: CalendarProvider {
             precondition: etag.map(CalDAVPutPrecondition.ifMatch) ?? .unconditional)
 
         return created
+    }
+
+    static let splitPointUnreadable = "where the occurrence named falls in its series can't be read, so the series can't be split at it"
+
+    /// Where a split of the stored series `masterICS` named at `recurrenceId` (read in `zone`)
+    /// cuts it: the one computation `splitSeries` writes and the card shows (`dayMovedRules`).
+    struct SplitPoint {
+        /// The resource's zone context, its floating times read in the operation's zone.
+        let zones: CalendarTimeZoneContext
+        let namedStart: GCalDateTime
+        let namedPlace: GCalDateTime
+        /// The occurrence named's start and place as instants (`instants`).
+        let namedInstants: (start: Date, place: Date)
+        var shownFrom: Date { namedInstants.start }
+        let cut: SplitCarry.Cut
+        /// The split's slot, a naive wall clock in `zone` (nil past the series' end).
+        let slot: String?
+    }
+
+    /// The split point (`SplitPoint`) of `masterICS`: the occurrence named is the one
+    /// `CalDAVOccurrences.scopedEdit` checks, and the cut is the first place of the series at or
+    /// after where it starts now (`SplitCarry.cut`, the series' RDATE lines included). Floating
+    /// times are read in `zone`, the zone the operation runs in, not the device's at the drain.
+    static func splitPoint(
+        masterICS: String, href: String, key: String?, recurrenceId: String, zone: TimeZone
+    ) throws -> SplitPoint {
+        let (namedKey, placeSlot) = try CalDAVOccurrences.scopedEdit(
+            icsText: masterICS, href: href, key: key, recurrenceId: recurrenceId, zone: zone, forSplit: true)
+        let zones = CalendarTimeZoneContext(calendarText: masterICS).readingFloating(in: zone)
+        let unreadable = CalendarProviderError.notSupported(splitPointUnreadable)
+        guard let named = CalDAVOccurrences.occurrence(key: namedKey, icsText: masterICS, href: href, floatingZone: zone),
+              let namedStart = named.start, let namedPlace = named.originalStartTime ?? named.start,
+              let series = ICSParser.components(icsText: masterICS, resourceHref: href, floatingZone: zone)
+                  .first(where: { $0.recurrenceId == nil }),
+              let startLine = masterTopLevelLines(masterICS).first(where: { icsProperty($0)?.name == "DTSTART" }) else {
+            throw unreadable
+        }
+        let seriesZone = try seriesStartZone(startLine, zones: zones) ?? zone
+        let rdates = masterTopLevelLines(masterICS).filter { icsProperty($0)?.name == "RDATE" }
+        guard let cut = SplitCarry.cut(named: named, series: series.event, rdates: rdates, zone: seriesZone, zones: zones),
+              let namedInstants = instants(start: namedStart, place: namedPlace, zone: zone) else { throw unreadable }
+        var slot: String?
+        if case .at(let cutTime) = cut {
+            guard let at = RecurrenceOccurrenceResolver.wasMoved(named)
+                ? SplitCarry.naive(of: cutTime, recurrenceId: recurrenceId, zone: zone) : placeSlot else { throw unreadable }
+            slot = at
+        }
+        return SplitPoint(zones: zones, namedStart: namedStart, namedPlace: namedPlace, namedInstants: namedInstants, cut: cut, slot: slot)
+    }
+
+    /// The instants `start` and `place` name, as `parseICSDateTime` reads a resource's times: a
+    /// date as its UTC midnight, a time as its instant. Nil when either can't be read.
+    static func instants(start: GCalDateTime, place: GCalDateTime, zone: TimeZone) -> (start: Date, place: Date)? {
+        func instant(_ time: GCalDateTime) -> Date? {
+            if let date = time.date { return GoogleCalendarProvider.splitInstant(naiveISO: String(date.prefix(10)), allDay: true, zone: zone) }
+            return time.dateTime.flatMap(Date.fromISO8601)
+        }
+        guard let s = instant(start), let p = instant(place) else { return nil }
+        return (s, p)
+    }
+
+    /// A "this and following" edit at an occurrence moved past the series' last place
+    /// (`SplitCarry.Cut.pastEnd`): no new part and no cap; the series' resource is written back
+    /// with the edit over each override shown from the one named on (`editOverrides`), under its
+    /// ETag. An edit of the rule is refused: no part is left to take it.
+    private func editShown(
+        url: URL, storedICS: String, etag: String?, href: String, patch: GCalEventInput,
+        namedStart: GCalDateTime, shownFrom: Date, zones: CalendarTimeZoneContext
+    ) async throws -> GCalEvent {
+        guard patch.recurrence == nil, patch.ruleDayMove == nil else {
+            throw CalendarProviderError.notSupported(SplitCarry.pastEndRuleRefusal)
+        }
+        guard let moved = SplitCarry.moved(by: patch, start: namedStart) else {
+            throw CalendarProviderError.notSupported("the new time can't be read, so the occurrences were not changed")
+        }
+        let edited = try Self.pastEndResource(
+            storedICS: storedICS, patch: patch, shownFrom: shownFrom, shift: moved.shift, length: moved.length, zones: zones)
+        etagCache.removeValue(forKey: href)
+        try await putEvent(url: url, body: edited, precondition: etag.map(CalDAVPutPrecondition.ifMatch) ?? .unconditional)
+        guard let event = ICSParser.parse(icsText: edited, resourceHref: url.path, etag: nil).first else {
+            throw CalDAVError.parseError("The changed event \(href) can't be read back")
+        }
+        return event
     }
 
     /// Whether the resource at `eventId` (a `SplitRecord.newPartId`, the new part's path, which
@@ -745,13 +860,34 @@ actor CalDAVProvider: CalendarProvider {
         }
     }
 
-    /// The cap of the split `record` names, written alone (`CalendarProvider.finishSplit`): the
-    /// series' half `seriesSplitResources` builds (`cappedSeriesResource`), worked out from the
-    /// series as it is now and PUT under its ETag, and nothing when the series already ends
-    /// before the split. `record.splitAt` is the checked slot `splitSeries` split at, read in
-    /// `zone`. Written by `endSeries`; CalDAV has no `sendUpdates`.
-    func finishSplit(calendarId: String, record: SplitRecord, zone: TimeZone) async throws {
-        try await endSeries(calendarId: calendarId, seriesId: record.seriesId, before: record.splitAt, zone: zone, sendUpdates: "none")
+    /// The cap of the split `record` names, written alone (`CalendarProvider.finishSplit`), by
+    /// `endSeries`: the series' half `seriesSplitResources` builds (`cappedSeriesResource`), worked
+    /// out from the series as it is now and PUT under its ETag, and nothing when the series already
+    /// ends before the split. `record.splitAt` is the checked slot `splitSeries` split at, read in
+    /// `zone`. The overrides the capped series keeps that are shown from the occurrence named on get
+    /// the edit where they are, read from the new part as it is now (`splitOccurrenceEdit`). CalDAV has
+    /// no `sendUpdates`, and a split writes the guest change with the new part, so `guests` is unused.
+    func finishSplit(calendarId: String, record: SplitRecord, zone: TimeZone, guests: AttendeeChange?) async throws {
+        try await endSeries(calendarId: calendarId, seriesId: record.seriesId, before: record.splitAt, zone: zone, finishing: record)
+    }
+
+    /// The edit a split's finish gives the overrides the capped series keeps that are shown from
+    /// the occurrence named on (`finishSplit`), read from the new part `record` names as it is now,
+    /// from the split's slot instant `slotInstant`; a floating new part is read in `zone`.
+    private func splitOccurrenceEdit(calendarId: String, record: SplitRecord, zone: TimeZone, slotInstant: Date) async throws -> OccurrenceEdit {
+        let (partData, _) = try await client.get(url: try resolveEventURL(record.newPartId, calendarId: calendarId))
+        guard let partICS = String(data: partData, encoding: .utf8), !partICS.isEmpty else {
+            throw CalDAVError.parseError("Empty response for event \(record.newPartId)")
+        }
+        let shownFrom = try record.namedStart.flatMap(SplitCarry.time).map { start -> Date in
+            guard let instant = Self.instants(start: start, place: start, zone: zone)?.start else {
+                throw CalendarProviderError.notSupported("Can't finish this change to the repeating event: where it starts can't be read. Check the event's later occurrences in your calendar app.")
+            }
+            return instant
+        } ?? slotInstant
+        return try Self.occurrenceEdit(
+            fields: record.fields, from: partICS, slotInstant: slotInstant, shownFrom: shownFrom,
+            zones: CalendarTimeZoneContext(calendarText: partICS).readingFloating(in: zone))
     }
 
     /// End the series `seriesId` just before `slot` (`CalendarProvider.endSeries`), its place in
@@ -761,6 +897,16 @@ actor CalDAVProvider: CalendarProvider {
     /// its ETag, and nothing when the series already ends before `slot`. The PUT is irreversible
     /// (memory 102). CalDAV has no `sendUpdates`, so it is unused.
     func endSeries(calendarId: String, seriesId: String, before slot: String, zone: TimeZone, sendUpdates: String) async throws {
+        try await endSeries(calendarId: calendarId, seriesId: seriesId, before: slot, zone: zone, finishing: nil)
+    }
+
+    /// `endSeries` for a delete of an occurrence and every later one (`finishing` nil) and for the
+    /// finish of the split `finishing` names (`splitOccurrenceEdit` gives the overrides shown from
+    /// the occurrence named on their edit). A floating series is read in `zone`, the operation's.
+    private func endSeries(
+        calendarId: String, seriesId: String, before slot: String, zone: TimeZone,
+        finishing record: SplitRecord?
+    ) async throws {
         let eventURL = try resolveEventURL(seriesId, calendarId: calendarId)
         let (data, getResponse) = try await client.get(url: eventURL)
         guard let storedICS = String(data: data, encoding: .utf8), !storedICS.isEmpty else {
@@ -774,7 +920,10 @@ actor CalDAVProvider: CalendarProvider {
             beforeNaiveISO: slot, allDay: Self.icsIsAllDay(storedICS), zone: zone) else {
             throw CalendarProviderError.notSupported("Invalid recurrence_id '\(slot)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
         }
-        let zones = CalendarTimeZoneContext(calendarText: storedICS)
+        // Floating times are read in the operation's zone, as a split's first attempt read them
+        // (`splitPoint`), so its retry sorts the occurrences around the named one as it did, and a
+        // delete cuts where its card showed.
+        let zones = CalendarTimeZoneContext(calendarText: storedICS).readingFloating(in: zone)
         guard let masterFrameSlot = try Self.recurrenceIdInMasterFrame(
             slot, declaredZone: zone, kind: Self.masterDTStartKind(from: storedICS), zones: zones
         ) else {
@@ -791,8 +940,12 @@ actor CalDAVProvider: CalendarProvider {
         }
         let cappedRRule = GoogleCalendarProvider.replaceOrAppendUntil(in: originalRRule, untilValue: untilValue)
         let slotInstant = try Self.splitSlot(storedICS: storedICS, slotNaiveISO: masterFrameSlot, zones: zones).instant
+        var occurrenceEdit: OccurrenceEdit?
+        if let record {
+            occurrenceEdit = try await splitOccurrenceEdit(calendarId: calendarId, record: record, zone: zone, slotInstant: slotInstant)
+        }
         let cappedSeries = try Self.cappedSeriesResource(
-            storedICS: storedICS, slotInstant: slotInstant, cappedRRule: cappedRRule, zones: zones)
+            storedICS: storedICS, slotInstant: slotInstant, cappedRRule: cappedRRule, zones: zones, edit: occurrenceEdit)
         etagCache.removeValue(forKey: seriesId)
         try await putEvent(
             url: eventURL, body: cappedSeries,
@@ -1879,8 +2032,9 @@ actor CalDAVProvider: CalendarProvider {
             // by the timezone offset) and every value written from it.
             resolvedZone = try zone(forTZID: tzid, zones: zones)
         } else {
-            // No TZID → RFC 5545 "floating time": interpret in device-local.
-            resolvedZone = .current
+            // No TZID → RFC 5545 "floating time": read in the zone the context gives (the
+            // device's unless the operation gives its own).
+            resolvedZone = zones.floating
         }
         let fmt = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss", timeZone: resolvedZone)
         return fmt.date(from: value)

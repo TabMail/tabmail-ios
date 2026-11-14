@@ -51,6 +51,40 @@ So an attached email's files have exactly one route, the plain expansion, and it
 bytes; there is no list of their metadata and no GET of one file by id. **Not measured:** whether
 Graph ever pages an expanded `item.attachments` (`attachments@odata.nextLink`).
 
+An attached item POSTed onto an EVENT (`/events/{id}/attachments`, itemAttachment), measured 2026-11-13 on the Outlook.com
+test mailbox (#563):
+
+| Request | Result |
+|---|---|
+| a message as `$expand` read it (6 `internetMessageHeaders`) | 400 `InvalidInternetMessageHeaderCollection`, at most 5 headers |
+| an event as read (`isOrganizer`, `isDraft` present) | 400 `ErrorInvalidPropertySet`, either one alone |
+| an event with `location` and `locations` | 400 `ErrorPropertyUpdate`; without `locations` 201 |
+| a message with an `attachments` array (as read, or only type/name/contentType/contentBytes/isInline) | 201, the files DROPPED |
+| a message copy, read back | `isDraft` true, no `sentDateTime`; `conversationId`, `webLink` new |
+| request size | no 3 MB or 4 MB cap: 18,863,281 bytes accepted, 19,000,000 refused (`ErrorMessageSizeExceeded`, the mailbox's message size on the stored item, about 37.7 MB) |
+| an event's start labelled Eastern | read back as the same wall clock labelled UTC (an expanded item is already UTC, so a copy round-trips) |
+
+The writable properties per kind are `ExchangeCalendarProvider.copiedItemKeys`; contacts keep every common property. (That allow-list and its successors are deleted: #854, files only.)
+
+Read back field by field (second probe): a message copy keeps subject, body, people, importance, categories, read state,
+receipts and flag, but reads as an unsent draft (`isDraft` true, no `sentDateTime`) and loses its own files. An event created
+as an item attachment reads `isDraft` true and `isOrganizer` true whether or not they were sent (the hand-made source event
+did, with neither sent); `allowNewTimeProposals` and `hideAttendees` are not kept, and an attached event's read returns
+neither them nor `locations`, so they can't be carried. A contact keeps every common property sent (34 fields), only
+reordered. Owner rule 2026-11-13 ("wrong things should not be copied"): a split copies an attached CONTACT only
+(`copiedItemJSON`, `copiedContactKeys`); an email (#845, #846) and an event are left on the series' old part, and a carried
+changed occurrence holding any item not copied refuses the split before any write (#847). See memory 142, fifth amendment.
+Superseded the same day (owner ruling #854, kept above as history): a split copies FILES only; no attached Outlook item of
+any kind, a contact included, is read or copied. On the series it stays on the old part; a carried changed occurrence holding
+one refuses the split (#847). `copiedItemJSON`/`copiedContactKeys` are deleted. See memory 142, seventh amendment.
+
+A contact's PHOTO on an attached contact (measured 2026-11-13): the expanded read has no photo property, the
+`.../microsoft.graph.itemAttachment/item/microsoft.graph.contact/photo` segment answers 405 to GET and to PUT
+`/photo/$value` ("The OData request is not supported"), and a nested `item($expand=microsoft.graph.contact/photo)` is
+accepted and dropped. So a photo can't be read, written or detected through Graph, and a copy (built from the read) carries
+none. Whether a contact attached with a photo in Outlook keeps it on the copy was not measured (none can be made through
+Graph Explorer, which holds no Contacts permission).
+
 ## The rule
 
 - List attachments with `GraphAPI.attachmentMetadataQuery` (`$select=id,name,contentType,size,isInline`),
