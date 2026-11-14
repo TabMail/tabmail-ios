@@ -33,6 +33,11 @@ import Synchronization
 ///   stored one (wall time and zone label), or an `isAllDay` that differs (a
 ///   series made all-day or timed, assumed to reset as a moved start does);
 ///   writing them back unchanged was not measured;
+/// - writing a series' `recurrence` that differs from the stored one only in its range's
+///   `endDate` (both ending on a date), with the stored start and end (measured on a work account
+///   on 2026-11-14): no reset, earlier or later. Changed occurrences keep their id, time, title and
+///   own files, deleted ones stay deleted; with `modelsExceptions`, the occurrences placed after
+///   an earlier end are gone, changed ones too (a GET by id is 404);
 /// - a `recurrence` written without `start` moves the series' start and end to
 ///   UTC midnight on the range's `startDate` (measured, see `splitSeries`);
 /// - a recurrence whose range has no `startDate` is refused with a 400
@@ -482,6 +487,53 @@ final class FakeGraphCalendar: Sendable {
         hook?()
     }
 
+    /// A series' end moved by a rule that changes only its range's end (`modelsExceptions`): each
+    /// occurrence placed after the new end, changed or plain, is gone (a GET by its id is 404), and
+    /// so is each deleted one there. Those before it are left as they are.
+    private func removeAfterEnd(of series: [String: Any]) {
+        guard let seriesId = series["id"] as? String else { return }
+        let gone = { (data: Data) -> Bool in
+            guard let occurrence = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  occurrence["seriesMasterId"] as? String == seriesId else { return false }
+            return !Self.isInSeries(occurrence, master: series)
+        }
+        let removed = events.withLock { all -> [String] in
+            let ids = all.filter { gone($0.value) }.map(\.key)
+            for id in ids { all[id] = nil }
+            return ids
+        }
+        cancelledStore.withLock { store in
+            for id in store.filter({ gone($0.value) }).map(\.key) { store[id] = nil }
+        }
+        for id in removed {
+            exceptionIds.withLock { _ = $0.remove(id) }
+            seededExceptionIds.withLock { _ = $0.remove(id) }
+            attachmentStore.withLock { $0[id] = nil }
+        }
+    }
+
+    /// Whether the recurrence `written` differs from `stored` only in its range's `endDate`, both
+    /// ranges ending on a date. Graph fills what a written pattern or range leaves out with
+    /// defaults, so only the properties `written` names are compared, the days of the week in any
+    /// order, the range's `startDate` among them.
+    private static func changesOnlyRangeEnd(_ written: Any, stored: Any?) -> Bool {
+        guard let mine = written as? [String: Any], let theirs = stored as? [String: Any],
+              let myRange = mine["range"] as? [String: Any], let theirRange = theirs["range"] as? [String: Any],
+              myRange["type"] as? String == "endDate", theirRange["type"] as? String == "endDate",
+              myRange["endDate"] as? String != theirRange["endDate"] as? String else { return false }
+        for part in ["pattern", "range"] {
+            guard let written = mine[part] as? [String: Any], let held = theirs[part] as? [String: Any] else { return false }
+            for (key, value) in written where !(part == "range" && key == "endDate") {
+                if key == "daysOfWeek" {
+                    guard Set(value as? [String] ?? []) == Set(held[key] as? [String] ?? []) else { return false }
+                } else if canonicalJSON(value) != canonicalJSON(held[key]) {
+                    return false
+                }
+            }
+        }
+        return true
+    }
+
     /// Runs once a reset is applied (`modelsExceptions`), as another client's change right after it.
     func afterReset(_ hook: @escaping @Sendable () -> Void) { resetHook.withLock { $0 = hook } }
     private let resetHook = Mutex<(@Sendable () -> Void)?>(nil)
@@ -826,7 +878,10 @@ final class FakeGraphCalendar: Sendable {
             let lengthened = stored["seriesMasterId"] == nil && Self.allDaySeriesLengthened(patch, stored: stored)
             let storedStart = stored["start"]
             patchLog.withLock { $0.append((id: parts[0], body: body)) }
-            let changesRule = patch["recurrence"].map { Self.canonicalJSON($0) != Self.canonicalJSON(stored["recurrence"]) } ?? false
+            // A rule that changes only where the series ends (both ranges ending on a date) resets
+            // nothing (measured 2026-11-14, see the type's doc); any other rule change does.
+            let endOnly = patch["recurrence"].map { Self.changesOnlyRangeEnd($0, stored: stored["recurrence"]) } ?? false
+            let changesRule = !endOnly && (patch["recurrence"].map { Self.canonicalJSON($0) != Self.canonicalJSON(stored["recurrence"]) } ?? false)
             let isSeries = stored["recurrence"] != nil && !(stored["recurrence"] is NSNull)
             let movesTime = isSeries && (["start", "end"].contains { key in
                 patch[key].map { !Self.sameTime($0, stored[key]) } ?? false
@@ -865,6 +920,7 @@ final class FakeGraphCalendar: Sendable {
             // An occurrence written becomes an exception, with its own copies of its series' attachments.
             becomeException(parts[0])
             if models, changesRule || movesTime { applyReset(to: stored, wasStart: storedStart) }
+            if models, endOnly { removeAfterEnd(of: stored) }
             if takeLoss("PATCH") { return .transportError(.networkConnectionLost) }
             return Self.json(stored)
         }

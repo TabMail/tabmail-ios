@@ -5501,6 +5501,97 @@ extension SeriesLengthKeepsExceptionsTests {
         #expect(disk.files == 0 && disk.directories == 0, "saved: \(disk.counts.withLock { $0 })")
     }
 
+    /// The date `date` falls on in the series' zone (Pacific), as `yyyy-MM-dd`.
+    private static func seriesDay(_ date: Date) -> String {
+        FixedDateFormat.formatter("yyyy-MM-dd", timeZone: GraphSeries.eventZone).string(from: date)
+    }
+
+    /// Weeks 0-6 of a series that ends on week 6: week 1 moved two hours later and renamed, week 2
+    /// deleted, week 4 renamed, week 6 deleted; weeks 0, 3 and 5 as the series has them.
+    private static let endChanges = [
+        OwnChange(), OwnChange(hours: 2, subject: "Moved"), OwnChange(deleted: true), OwnChange(),
+        OwnChange(subject: "Renamed"), OwnChange(), OwnChange(deleted: true),
+    ]
+
+    /// `outlookCalendar(endChanges)`, its range ending on week 6's date and starting on week 0's
+    /// in its zone, as Graph keeps a series that ends on a date, and a file of week 1's own.
+    private static func outlookSeriesEndingOnADate() throws -> FakeGraphCalendar {
+        let graph = outlookCalendar(endChanges)
+        var series = try #require(graph.event("ser-1"))
+        var recurrence = try #require(series["recurrence"] as? [String: Any])
+        var range = try #require(recurrence["range"] as? [String: Any])
+        range["type"] = "endDate"
+        range["startDate"] = seriesDay(week(0))
+        range["endDate"] = seriesDay(week(6))
+        recurrence["range"] = range
+        series["recurrence"] = recurrence
+        // Its start and end labelled in its own zone, as Graph keeps a series the app wrote (#719),
+        // so the write restates them as they are.
+        let wall = FixedDateFormat.formatter("yyyy-MM-dd'T'HH:mm:ss", timeZone: GraphSeries.eventZone)
+        for (key, at) in [("start", week(0)), ("end", week(0).addingTimeInterval(1_800))] {
+            series[key] = ["dateTime": wall.string(from: at) + ".0000000", "timeZone": "Pacific Standard Time"]
+        }
+        graph.store(series)
+        graph.attachFile("notes.txt", contentType: "text/plain", bytes: notes, to: "ser-1-w1")
+        return graph
+    }
+
+    /// The series' rule with only its last date changed, to week `n`'s date.
+    private static func seriesEndOnly(week n: Int) -> [String: JSONValue] {
+        ["edit_scope": .string("all"), "timezone": .string(GraphSeries.eventZone.identifier),
+         "recurrence": .dictionary(["freq": .string("WEEKLY"), "until": .string(seriesDay(week(n)))])]
+    }
+
+    @Test("Outlook: an earlier last date alone keeps the changed and deleted occurrences, and its card counts the meetings it removes, not a reset")
+    func outlookEarlierSeriesEndAloneKeepsExceptions() async throws {
+        let card = try await outlookTool(try Self.outlookSeriesEndingOnADate(), Self.seriesEndOnly(week: 3), eventId: "ser-1",
+                                         account: "series-end-only-card")
+        let changes = card.cards.first?.changes ?? []
+        let after = FixedDateFormat.formatter("MMMM d, yyyy", timeZone: GraphSeries.eventZone).string(from: Self.week(3))
+        // Weeks 4 (changed) and 5 (plain) are after the new last date; week 6 is deleted already.
+        #expect(card.cards.count == 1 && !changes.contains(CalendarToolHelpers.ruleChangeResetNote)
+                && !changes.contains(CalendarToolHelpers.exceptionsResetNote),
+                "cards \(card.cards.count): \(changes); \(card.out)")
+        #expect(changes.contains("2 meetings after \(after) are removed."), "card: \(changes)")
+
+        let graph = try Self.outlookSeriesEndingOnADate()
+        let disk = SavedOnDevice()
+        let rows = try await outlook(graph, eventId: "ser-1", Self.seriesEndOnly(week: 3), account: "series-end-only",
+                                     inspect: { disk.read() })
+        #expect(rows.isEmpty, "rows: \(reasons(rows))")
+        #expect(graph.seriesResets == 0 && graph.patchedIds == ["ser-1"], "writes: \(graph.writes); sent: \(graph.patches("ser-1")); stored before: \((try? Self.outlookSeriesEndingOnADate())?.event("ser-1") ?? [:])")
+        let range = (graph.event("ser-1")?["recurrence"] as? [String: Any])?["range"] as? [String: Any]
+        #expect(range?["endDate"] as? String == Self.seriesDay(Self.week(3)), "the range: \(range ?? [:])")
+        let moved = graph.event("ser-1-w1")
+        #expect(instant(moved?["start"]) == Self.week(1).addingTimeInterval(2 * 3_600) && moved?["subject"] as? String == "Moved",
+                "week 1: \(moved ?? [:])")
+        #expect(Self.fileList(graph, "ser-1-w1") == ["notes.txt:own notes"], "week 1: \(Self.fileList(graph, "ser-1-w1"))")
+        #expect(graph.event("ser-1-w2") == nil && graph.isDeletedOccurrence("ser-1-w2"), "week 2: \(graph.event("ser-1-w2") ?? [:])")
+        #expect(graph.event("ser-1-w3") != nil, "week 3, the new last one, is gone")
+        for n in 4...6 {
+            #expect(graph.event("ser-1-w\(n)") == nil && !graph.isDeletedOccurrence("ser-1-w\(n)"), "week \(n) is still there")
+        }
+        #expect(disk.files == 0 && disk.directories == 0, "saved: \(disk.counts.withLock { $0 })")
+    }
+
+    @Test("Outlook: a later last date alone keeps every occurrence as it is, and its card names no reset and no removal")
+    func outlookLaterSeriesEndAloneKeepsExceptions() async throws {
+        let card = try await outlookTool(try Self.outlookSeriesEndingOnADate(), Self.seriesEndOnly(week: 9), eventId: "ser-1",
+                                         account: "series-end-later-card")
+        let changes = card.cards.first?.changes ?? []
+        #expect(card.cards.count == 1 && !changes.contains(CalendarToolHelpers.ruleChangeResetNote)
+                && !changes.contains { $0.contains("removed") },
+                "cards \(card.cards.count): \(changes); \(card.out)")
+
+        let graph = try Self.outlookSeriesEndingOnADate()
+        let rows = try await outlook(graph, eventId: "ser-1", Self.seriesEndOnly(week: 9), account: "series-end-later")
+        #expect(rows.isEmpty, "rows: \(reasons(rows))")
+        #expect(graph.seriesResets == 0 && graph.patchedIds == ["ser-1"], "writes: \(graph.writes); sent: \(graph.patches("ser-1")); stored before: \((try? Self.outlookSeriesEndingOnADate())?.event("ser-1") ?? [:])")
+        #expect(graph.event("ser-1-w1")?["subject"] as? String == "Moved" && graph.event("ser-1-w4")?["subject"] as? String == "Renamed",
+                "weeks 1 and 4: \(graph.event("ser-1-w1") ?? [:]), \(graph.event("ser-1-w4") ?? [:])")
+        #expect(graph.isDeletedOccurrence("ser-1-w2") && graph.isDeletedOccurrence("ser-1-w6"), "a deleted occurrence came back")
+    }
+
     @Test("Outlook: a record this build can't read leaves the operation queued as it is, nothing written")
     func outlookUnreadableRecordLeavesTheOperation() async throws {
         let graph = Self.outlookCalendarWithOneFile()

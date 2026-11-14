@@ -533,3 +533,12 @@ then counts the files again in its delete transaction and refuses when there are
 (`AccountRemovalSavedFilesGrew`). A changed occurrence missing from the instances read is read by its own
 id: the window lists by start now, so only a 404 or 410 proves it deleted (`GuardedPatch.gone`).
 Pinned by the file cases of `SeriesLengthKeepsExceptionsTests` and by `CalendarPutBackFilesTests`.
+
+**2026-11-14 (#718, ADR-IOS-113 decision 7): a new last date alone keeps them on Outlook.** A rule that
+changes only where the series ends (Graph range `endDate` to `endDate`) resets nothing (measured on a
+work account), so the card's reset note is not shown for it (`newRangeEnd`); for an earlier end the card
+says "N meetings after <date> are removed." (`seriesEndRemoval`: the plain occurrences listed after the
+new last date plus the changed ones placed there, deleted ones not counted; read before the card, a
+failed read shows no card). Google (`recurrenceLinesDiffer`) and CalDAV (RRULE compare) still show the
+reset note for an `UNTIL` change alone (not measured on either). Pinned by
+`outlookEarlierSeriesEndAloneKeepsExceptions` and `outlookLaterSeriesEndAloneKeepsExceptions`.

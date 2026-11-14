@@ -454,7 +454,8 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         // presence, so an `all`-scope edit shows the series it writes.
         //
         // A whole-series edit may reset the occurrences the user changed one by one (#423): on
-        // Outlook any change of the series' rule, start or end does. Say so on the card. The
+        // Outlook any change of the series' rule, start or end does, but for a new length and a
+        // new last date (#718). Say so on the card. The
         // series' calendar decides, as its write does, from the series the edit writes
         // (`shown`, the series read above) and the edit as routed, which is what the queue writes; a
         // rename, or a rule equal to the stored one, which the assistant re-sends with other edits,
@@ -491,6 +492,22 @@ struct CalendarEventEditTool: AgentTool, Sendable {
                arguments, isAllDay: CalendarToolHelpers.boolArg(arguments, "all_day") ?? shown.isAllDay),
            provider.editResetsChangedOccurrences(shown, edit: edit) {
             changes.append(CalendarToolHelpers.ruleChangeResetNote)
+        } else if resolvedScope == "all", shown.recurrence?.isEmpty == false, input.recurrence != nil {
+            // A rule that changes only the series' last date keeps its changed occurrences on
+            // Outlook (#718); moved earlier, it removes the meetings after the new last date, and
+            // the card says how many (`seriesEndRemoval`, read from the series as it is now).
+            do {
+                if let removal = try await provider.seriesEndRemoval(calendarId: lookupCalId, seriesId: named.seriesId, edit: input),
+                   removal.count > 0 {
+                    changes.append(CalendarToolHelpers.seriesEndRemovalNote(removal))
+                }
+            } catch {
+                return ToolJSON.string(from: [
+                    "ok": false,
+                    "error": "calendar_event_edit failed: could not read the repeating event to check this change (\(error.localizedDescription)). The event was NOT changed. Retry.",
+                    "event_id": compoundId,
+                ] as [String: Any])
+            }
         }
         let showsOccurrence = resolvedScope != "all"
         let masterDuration: TimeInterval? = {

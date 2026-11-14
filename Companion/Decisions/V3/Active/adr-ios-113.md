@@ -76,6 +76,18 @@ its card.
    changing nothing, when there are more than the user was warned of; Settings then warns again with
    the new count. The 30-day reclaim spares a row holding bytes; the drain-start sweep
    removes only bytes whose row is gone.
+7. **Outlook: a new last date alone is no reset (2026-11-14).** Measured on a work account: a series
+   `PATCH` whose recurrence differs from the stored one only in its range's `endDate` (both ending on a
+   date), with the stored start and end, keeps every changed occurrence (id, time, title, own file)
+   and every deleted one deleted, earlier or later; an earlier end removes the occurrences placed after
+   it, changed ones with them (404 by id). So `editResetsChangedOccurrences` answers no reset for it
+   (`newRangeEnd`: the edit's rule in Graph's form, `sameRule` with the end left out), and the card
+   gives, for an earlier end, "N meetings after <date> are removed." (`seriesEndRemoval`, counted from
+   the series as it is now: the plain occurrences listed after the new last date and the changed ones
+   placed there; deleted ones are not counted). A later end gets no line. A rule that gains or loses
+   an end, or ends after a count, is still a rule change and warned of as a reset; a new length together
+   with a new last date moves the series' time and resets (no put-back). Google and CalDAV still warn
+   of a reset for any RRULE change, an `UNTIL` alone included (not measured there).
 
 **Consequences:**
 - Outlook attendees get the series update and then one update or cancellation per put-back write

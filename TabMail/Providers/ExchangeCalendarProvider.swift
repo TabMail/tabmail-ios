@@ -1094,6 +1094,58 @@ actor ExchangeCalendarProvider: CalendarProvider {
         }
     }
 
+    /// The meetings an end-only change of every occurrence removes (`CalendarProvider.seriesEndRemoval`,
+    /// #718): for an edit whose rule changes only the series' last date (`newRangeEnd`), so Graph
+    /// keeps its changed occurrences, the occurrences whose place is after the new last date in the
+    /// range's zone, the set Graph removes (measured on a work account, 2026-11-14): the plain ones
+    /// the series lists up to its stored end (`listInstances`) and the changed ones it holds
+    /// (`seriesExceptions`, wherever each was moved to). A deleted one is not counted. Zero for a
+    /// later end. Nothing is written.
+    func seriesEndRemoval(calendarId: String = "primary", seriesId: String, edit: GCalEventInput) async throws -> SeriesEndRemoval? {
+        guard edit.recurrence != nil else { return nil }
+        let existing = try await fetchForEdit(eventId: seriesId, select: Self.readSelect)
+        let series = existing.event
+        guard series.recurrence?.isEmpty == false, !editResetsChangedOccurrences(series, edit: edit),
+              let stored = existing.raw["recurrence"] as? [String: Any],
+              let storedEnd = (stored["range"] as? [String: Any])?["endDate"] as? String else { return nil }
+        // The range is dated in its own zone, as the write dates it (`graphPatchJSON`).
+        var rangeZone: TimeZone?
+        if let name = ((stored["range"] as? [String: Any])?["recurrenceTimeZone"] as? String).flatMap({ $0.isEmpty ? nil : $0 }) {
+            guard let zone = CalendarTimeZoneResolver.zone(named: name, in: .none) else {
+                throw CalendarProviderError.unrecognizedTimeZone(name, consequence: "it did not change the event")
+            }
+            rangeZone = zone
+        }
+        guard let newEnd = newRangeEnd(edit, existing: series, stored: stored, rangeZone: rangeZone),
+              let last = RecurrenceTail.Day(iso: newEnd), let storedLast = RecurrenceTail.Day(iso: storedEnd) else { return nil }
+        let after = Self.occurrenceDate(GCalDateTime(dateTime: nil, date: newEnd, timeZone: nil), seriesZone: nil)
+        guard newEnd < storedEnd else { return SeriesEndRemoval(count: 0, after: after) }
+        let zone = series.isAllDay ? nil : try rangeZone ?? Self.seriesTimeZone(existing)
+        func removed(_ place: GCalDateTime?) -> Bool {
+            guard let place, let date = Self.seriesDate(of: place, seriesZone: zone) else { return false }
+            return date > newEnd
+        }
+        let seriesZone = series.seriesZoneName
+        let changed = try await seriesExceptions(
+            seriesId: seriesId, series: series, seriesZone: seriesZone, zone: zone, refusal: Self.seriesEndUnreadable)
+            .filter { exception in
+                guard case .changed(let event) = exception.carried else { return false }
+                return removed(event.originalStartTime)
+            }
+        let window = Self.instancesWindow(first: last, last: storedLast)
+        let listed = try await listInstances(of: seriesId, window: window, seriesZone: seriesZone, refusal: Self.seriesEndUnreadable)
+        let plain = listed.filter { instance in
+            guard instance["type"] as? String == "occurrence", let original = instance["originalStart"] as? String else { return false }
+            let place = series.isAllDay
+                ? GCalDateTime(dateTime: nil, date: String(original.prefix(10)), timeZone: nil)
+                : GCalDateTime(dateTime: original, date: nil, timeZone: "UTC")
+            return removed(place)
+        }
+        return SeriesEndRemoval(count: changed.count + plain.count, after: after)
+    }
+
+    private static let seriesEndUnreadable = "the occurrences of this repeating event can't be read, so the meetings its new end removes can't be counted"
+
     func eventExists(calendarId: String = "primary", eventId: String) async throws -> Bool {
         let encodedId = try Self.encodedGraphPathSegment(eventId, context: "Graph event id")
         do {
@@ -1494,20 +1546,40 @@ actor ExchangeCalendarProvider: CalendarProvider {
             dates.append(date)
         }
         guard let first = dates.min().flatMap({ RecurrenceTail.Day(iso: $0) }), let last = dates.max().flatMap({ RecurrenceTail.Day(iso: $0) }),
-              let from = GoogleCalendarProvider.naiveInstant(first.description, zone: .gmt)?.addingTimeInterval(-2 * 86_400),
-              let to = GoogleCalendarProvider.naiveInstant(last.description, zone: .gmt)?.addingTimeInterval(3 * 86_400) else { throw unplaced }
-        let encodedPart = try Self.encodedGraphPathSegment(partId, context: "Graph event id")
+              let window = Self.instancesWindow(first: first, last: last) else { throw unplaced }
+        let instances = try await listInstances(
+            of: partId, window: window, seriesZone: seriesZone,
+            refusal: "the new part's occurrences can't be read, so the changed ones can't be carried")
+        return ListedInstances(instances: instances, allDay: series.isAllDay, zone: zone)
+    }
+
+    /// The window an instances list is read in for places dated `first` to `last`: dated in UTC,
+    /// its two days before and three after cover any zone's offset. Nil when a date can't be read.
+    nonisolated static func instancesWindow(first: RecurrenceTail.Day, last: RecurrenceTail.Day) -> (from: Date, to: Date)? {
+        guard let from = GoogleCalendarProvider.naiveInstant(first.description, zone: .gmt)?.addingTimeInterval(-2 * 86_400),
+              let to = GoogleCalendarProvider.naiveInstant(last.description, zone: .gmt)?.addingTimeInterval(3 * 86_400) else { return nil }
+        return (from, to)
+    }
+
+    /// Every occurrence of the series `seriesId` that starts in `window`, as its instances list
+    /// gives them, read with `Prefer` naming `seriesZone`. Every page is read; a page that can't be
+    /// read is refused in the caller's words (`refusal`).
+    private func listInstances(
+        of seriesId: String, window: (from: Date, to: Date)?, seriesZone: String?, refusal: String
+    ) async throws -> [[String: Any]] {
+        guard let window else { throw CalendarProviderError.notSupported(refusal) }
+        let encoded = try Self.encodedGraphPathSegment(seriesId, context: "Graph event id")
         var instances: [[String: Any]] = []
-        var next: String? = "/events/\(encodedPart)/instances?startDateTime=\(from.iso8601String())&endDateTime=\(to.iso8601String())&$top=1000"
+        var next: String? = "/events/\(encoded)/instances?startDateTime=\(window.from.iso8601String())&endDateTime=\(window.to.iso8601String())&$top=1000"
         while let path = next {
             let listed = try await request(path: path, timeZoneName: seriesZone)
             guard let page = try JSONSerialization.jsonObject(with: listed) as? [String: Any] else {
-                throw CalendarProviderError.notSupported("the new part's occurrences can't be read, so the changed ones can't be carried")
+                throw CalendarProviderError.notSupported(refusal)
             }
             instances += page["value"] as? [[String: Any]] ?? []
             next = try (page["@odata.nextLink"] as? String).map { try graphPath(ofNextLink: $0) }
         }
-        return ListedInstances(instances: instances, allDay: series.isAllDay, zone: zone)
+        return instances
     }
 
     /// A series' occurrences as `instances(around:)` read them, found by place.
@@ -2928,6 +3000,20 @@ actor ExchangeCalendarProvider: CalendarProvider {
     ) -> [String]? {
         guard let rule = patch.recurrence else { return nil }
         guard let stored else { return rule }
+        guard let rebuilt = rebuiltRule(patch, existing: existing, stored: stored, rangeZone: rangeZone),
+              Self.sameRule(rebuilt, as: stored)
+        else { return rule }
+        return nil
+    }
+
+    /// The rule of the whole-series edit `patch` in Graph's form, as the write builds it
+    /// (`seriesRuleToWrite`): merged with the series `existing` as the write merges it, written by
+    /// `toGraphEventJSON` beside that start, in `rangeZone`, with the first day of the week of
+    /// `stored` unless the rule names its own. Nil when the edit gives no rule.
+    nonisolated func rebuiltRule(
+        _ patch: GCalEventInput, existing: GCalEvent, stored: [String: Any], rangeZone: TimeZone?
+    ) -> [String: Any]? {
+        guard let rule = patch.recurrence else { return nil }
         let merged = GoogleCalendarProvider.mergeExistingEventWithPatch(existing: existing, patch: patch)
         var probe = GCalEventInput()
         probe.recurrence = rule
@@ -2935,10 +3021,27 @@ actor ExchangeCalendarProvider: CalendarProvider {
         probe.startDateTime = merged.startDateTime
         probe.startTimeZone = merged.startTimeZone
         let storedFirstDay = (stored["pattern"] as? [String: Any])?["firstDayOfWeek"] as? String
-        guard let rebuilt = toGraphEventJSON(probe, rangeZone: rangeZone, firstDayOfWeek: storedFirstDay)["recurrence"] as? [String: Any],
-              Self.sameRule(rebuilt, as: stored)
-        else { return rule }
-        return nil
+        return toGraphEventJSON(probe, rangeZone: rangeZone, firstDayOfWeek: storedFirstDay)["recurrence"] as? [String: Any]
+    }
+
+    /// The new last date (`yyyy-MM-dd`, in the range's zone) of a whole-series edit `patch` that
+    /// changes only where the series `existing` ends (#718): its rule (`rebuiltRule`) and
+    /// `stored`, the series' recurrence in Graph's form, both end on a date, on different dates,
+    /// and are otherwise the same rule (`sameRule` with the end left out). Nil for any other edit.
+    /// Graph keeps a series' changed and deleted occurrences on such a change, either way, and
+    /// removes the occurrences after an earlier end, changed ones with them (measured on a work
+    /// account, 2026-11-14). A rule that gains or loses an end, or ends after a count, is another
+    /// rule.
+    nonisolated func newRangeEnd(
+        _ patch: GCalEventInput, existing: GCalEvent, stored: [String: Any], rangeZone: TimeZone?
+    ) -> String? {
+        guard let rebuilt = rebuiltRule(patch, existing: existing, stored: stored, rangeZone: rangeZone),
+              let mine = rebuilt["range"] as? [String: Any], let theirs = stored["range"] as? [String: Any],
+              mine["type"] as? String == "endDate", theirs["type"] as? String == "endDate",
+              let end = mine["endDate"] as? String, end != theirs["endDate"] as? String,
+              Self.sameRule(rebuilt, as: stored, ignoringEnd: true)
+        else { return nil }
+        return end
     }
 
     /// Whether the whole-series edit `edit` resets the occurrences of `event` changed one by one
@@ -2951,7 +3054,9 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// own start, in the series' zone (`recurrenceTimeZoneName`, read with the event). The rule
     /// changes when the event has none, when its zone is one `CalendarTimeZoneResolver` does not
     /// recognize (the write refuses that edit), and when its Graph pattern does not come back
-    /// the same through an RRULE (`rrule(_:)`), so its RRULE does not say what is stored.
+    /// the same through an RRULE (`rrule(_:)`), so its RRULE does not say what is stored. A rule
+    /// that changes only the series' last date (`newRangeEnd`) is no reset: Graph keeps them
+    /// (measured on a work account, 2026-11-14).
     nonisolated func editResetsChangedOccurrences(_ event: GCalEvent, edit: GCalEventInput) -> Bool {
         // A change between all-day and timed changes the event as a whole: a series' changed
         // occurrences are reset, and a single event has none.
@@ -2963,7 +3068,9 @@ actor ExchangeCalendarProvider: CalendarProvider {
         if movesSeriesTime(edit, existing: event), !SplitCarry.lengthChange(edit, series: event) { return true }
         guard edit.recurrence != nil else { return false }
         guard let baseline = storedRuleBaseline(event) else { return true }
+        // A rule that changes only where the series ends keeps them (`newRangeEnd`, #718).
         return seriesRuleToWrite(edit, existing: event, stored: baseline.recurrence, rangeZone: baseline.rangeZone) != nil
+            && newRangeEnd(edit, existing: event, stored: baseline.recurrence, rangeZone: baseline.rangeZone) == nil
     }
 
     /// The card's stand-in for the recurrence Graph stores for `event` (#423): its RRULE rebuilt in
@@ -3045,14 +3152,15 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// changed `WKST` is a rule change. Whether Graph resets a series' exceptions on a change of
     /// only the first day is not measured; it is assumed to, like any other pattern change. The
     /// range's `startDate` is left out: it follows the start, and a series moved to another
-    /// date with its own rule is a date move.
-    nonisolated static func sameRule(_ rebuilt: [String: Any], as stored: [String: Any]) -> Bool {
+    /// date with its own rule is a date move. With `ignoringEnd`, the range's `endDate` is left
+    /// out too (`newRangeEnd`).
+    nonisolated static func sameRule(_ rebuilt: [String: Any], as stored: [String: Any], ignoringEnd: Bool = false) -> Bool {
         for part in ["pattern", "range"] {
             guard let mine = rebuilt[part] as? [String: Any], var theirs = stored[part] as? [String: Any] else { return false }
             if part == "pattern" {
                 theirs["index"] = Self.storedIndex(type: theirs["type"] as? String, index: theirs["index"] as? String)
             }
-            for (key, value) in mine where key != "startDate" {
+            for (key, value) in mine where key != "startDate" && !(ignoringEnd && part == "range" && key == "endDate") {
                 if key == "daysOfWeek" {
                     guard Set(value as? [String] ?? []) == Set(theirs[key] as? [String] ?? []) else { return false }
                 } else if !(value as AnyObject).isEqual(theirs[key]) {

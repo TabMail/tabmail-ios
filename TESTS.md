@@ -273,6 +273,11 @@ These tests read what each provider sent, or what the fake server ends up holdin
   reclaim spares a held failed row, the Settings wipe and a release boundary leave it, the drain-start
   sweep removes only orphans, the failure banner shows a held row until dismissed and the dismissal
   deletes its bytes, Save File's names are safe.
+- A new last date alone of an Outlook series is no reset (#718, `SeriesLengthKeepsExceptionsTests`,
+  `FakeGraphCalendar` modelling a range-end-only `PATCH` as measured): an earlier end keeps the moved
+  occurrence (time, title, own file) and the deleted one, removes the changed and plain ones after it,
+  and its card shows no reset note and "2 meetings after <date> are removed." (the deleted one after
+  the end not counted); a later end keeps everything and its card shows neither line.
 
 ## Google attendee edits — the others stay as stored
 

@@ -1282,6 +1282,14 @@ enum CalendarToolHelpers {
     /// and moved occurrences when its rule, start or end changes (#423, measured), and other
     /// calendars may when its rule does.
     static let ruleChangeResetNote = "Occurrences you changed individually may be reset."
+    /// The confirmation-card line for an edit of every occurrence that moves the series' last date
+    /// earlier and keeps its changed occurrences (`CalendarProvider.seriesEndRemoval`, #718): how
+    /// many meetings after the new last date it removes.
+    static func seriesEndRemovalNote(_ removal: SeriesEndRemoval) -> String {
+        removal.count == 1
+            ? "1 meeting after \(removal.after) is removed."
+            : "\(removal.count) meetings after \(removal.after) are removed."
+    }
     /// The card's note for an edit that resets every exception it covers: a whole series moved to
     /// another day with its rule's days, or a split whose new part moves its start or changes its
     /// rule (`SplitCarry.mode`, #563). The calendar resets them, as Google Calendar and Outlook do
