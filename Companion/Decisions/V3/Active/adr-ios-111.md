@@ -716,7 +716,7 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    forbids. Tests: `IMAPMoveIntoTrackedFolderTests` (the message held once, where the server holds
    it, under its UID, after the normal sync path).
 Tests: `IMAPChangeReaderTests`, `ChangeApplyIMAPTests`, `IMAPCatchUpTests.planTrackedFolder`,
-`IMAPChangeFuzzTests`, `ChangeSeamFenceTests`; red-first mutants recorded in the plan's ledger.
+`IMAPChangeFuzzTests`, `ChangeSeamFenceTests`; red-first mutants recorded in the mutation ledger.
 Keywords: QRESYNC, CONDSTORE, ENABLE, VANISHED, HIGHESTMODSEQ, NOMODSEQ, IMAPChangeCursor, change
 connection, untracked, addressEpochChanged, arrivals limit, imapDeltaSync deleted, presentIds, UIDPLUS,
 COPYUID, exit rule, dropChangeBookmark, move without destination proof, #751.

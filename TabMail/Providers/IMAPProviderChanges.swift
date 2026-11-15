@@ -489,10 +489,7 @@ extension IMAPProvider {
             }
             // A FETCH carries the message's whole keyword set.
             header.userLabelIdsAreAuthoritative = true
-            var record = ChangeRecord(header: header)
-            record.isReplied = header.isReplied
-            record.isForwarded = header.isForwarded
-            records.append(record)
+            records.append(ChangeRecord(header: header))
         }
         return (records, returned, deleted, unreadable)
     }
