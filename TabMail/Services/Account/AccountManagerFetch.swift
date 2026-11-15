@@ -413,11 +413,18 @@ extension AccountManager {
         return try await syncEngine.fetchOlderMessages(folders: folders)
     }
 
-    /// Sync only specific folders (on-demand when user navigates to them).
-    /// Syncs accounts in parallel — each account's folders are sequential (shared IMAP connection).
-    func syncFolders(_ folders: [Folder]) async throws {
+    /// Sync only specific folders (pull-to-refresh of the folders on screen).
+    ///
+    /// Each account connects (when it has no provider yet and is in `accounts`) and
+    /// syncs its folders in its own task; an account's folders are sequential (shared
+    /// IMAP connection). One account that cannot connect or sync never holds back or
+    /// cancels another (#689): `waitForAll` waits for every task and rethrows the
+    /// first error to finish, after every account has run. An account with no
+    /// provider that is not in `accounts` is skipped.
+    func syncFolders(_ folders: [Folder], connecting accounts: [Account]) async throws {
         let grouped = Dictionary(grouping: folders) { $0.accountId }
         let affectedAccountIds = Array(grouped.keys)
+        let accountsById = Dictionary(accounts.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         defer {
             // Clear phases for all accounts involved in this sync.
             Task { @MainActor in
@@ -428,9 +435,23 @@ extension AccountManager {
         }
         try await withThrowingTaskGroup(of: Void.self) { group in
             for (accountId, accountFolders) in grouped {
-                guard let provider = providers[accountId] else { continue }
+                let connected = providers[accountId]
+                let account = accountsById[accountId]
+                guard connected != nil || account != nil else { continue }
                 let syncEngine = self.syncEngine
                 group.addTask {
+                    var provider = connected
+                    if provider == nil, let account {
+                        do {
+                            try await self.connectAccount(account)
+                        } catch {
+                            BackgroundSyncLogger.logDebug("[SyncFolders] connect failed for account \(accountId.prefix(6)); the other accounts still sync: \(error)")
+                            throw error
+                        }
+                        provider = await self.provider(accountId: accountId)
+                    }
+                    // Removed while connecting (or connected with no mail provider): nothing to sync.
+                    guard let provider else { return }
                     // Pool creates connections on demand via checkout — no explicit connect needed.
                     for folder in accountFolders where !folder.path.isEmpty {
                         do {

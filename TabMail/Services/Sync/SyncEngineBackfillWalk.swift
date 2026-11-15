@@ -271,7 +271,7 @@ extension SyncEngine {
     /// is false. `syncableFolders` excludes such a folder from full sync, delta
     /// sync and self-heal, but ON-DEMAND NAVIGATION reaches ANY folder:
     /// `InboxView.onAppear` → `InboxViewModel.startSync()` → `performSync()` →
-    /// `AccountManager.syncFolders(_:)` (in `AccountManagerFetch.swift`, which
+    /// `AccountManager.syncFolders(_:connecting:)` (in `AccountManagerFetch.swift`, which
     /// filters on `!folder.path.isEmpty` alone — no role predicate, no favourite
     /// predicate) → `SyncEngine.syncFolderMessages` → `syncMessages` →
     /// `runSyncMessages`, carrying T1.2b's SELECT-sourced bootstrap.

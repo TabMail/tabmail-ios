@@ -7,7 +7,7 @@ import Foundation
 import GRDB
 @testable import TabMail
 
-/// On-demand folder sync (`AccountManager.syncFolders(_:)`) skips a folder whose
+/// On-demand folder sync (`AccountManager.syncFolders(_:connecting:)`) skips a folder whose
 /// sync answers HTTP 404 or 410 instead of surfacing an error and abandoning the
 /// folders after it.
 ///
@@ -66,7 +66,7 @@ struct FolderSyncGoneStatusTests {
 
         var surfaced: Error?
         do {
-            try await AccountManager.shared.syncFolders(f.folders)
+            try await AccountManager.shared.syncFolders(f.folders, connecting: [])
         } catch {
             surfaced = error
         }
@@ -84,7 +84,7 @@ struct FolderSyncGoneStatusTests {
 
         var surfaced: Error?
         do {
-            try await AccountManager.shared.syncFolders(f.folders)
+            try await AccountManager.shared.syncFolders(f.folders, connecting: [])
         } catch {
             surfaced = error
         }

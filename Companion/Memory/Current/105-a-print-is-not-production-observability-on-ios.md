@@ -195,7 +195,13 @@ build**. The error's text stays in the debug-gated logs only.
   applies to polls only, which know each failing account: there, any failure of an account in
   `authFailedAccounts` never counts. A refresh judges the one error it sees, with no per-account attribution,
   so a marked account's other (non-sign-in) error on a refresh still raises (intended). Seeing only the first error and the connect
-  loop stopping other accounts are filed separately. A poll that cannot load its accounts counts as failed.
+  loop stopping other accounts are filed separately. (The connect loop is fixed, #689, 2026-11-14: each
+  account connects and syncs in its own task inside `AccountManager.syncFolders(_:connecting:)`, so one
+  account that cannot connect or sync never stops the others; the refresh still reports one outcome,
+  the first error to finish, because the app has no per-account sync-failure state (only the sign-in
+  mark). `ThrowingTaskGroup.waitForAll` waits for every child and cancels none, so the group itself never
+  cancelled the other accounts; the only stopper was the connect loop throwing before the group ran.
+  Seeing only the first error is still #688. Pinned by `RefreshAccountIsolationTests`.) A poll that cannot load its accounts counts as failed.
   An all-failed foreground poll does not advance `lastSyncCompletedAt`. Superseded rules, kept for history:
   "only a full run with NO failure at all clears", then "a full refresh whose first error came from a marked
   account clears" (it cleared while another account was still failing). The older-messages catch writes the

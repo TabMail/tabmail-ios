@@ -1807,16 +1807,12 @@ final class InboxViewModel {
         defer { isRefreshing = false }
         error = nil
         do {
-            // Ensure providers are connected
-            for account in uniqueAccounts {
-                if await manager.provider(for: account) == nil {
-                    try await manager.connectAccount(account)
-                }
-            }
-
             // Priority: sync ONLY the currently viewed folders first.
             // e.g. unified inbox → sync inbox folders only, not sent/trash/archive.
-            try await manager.syncFolders(folders)
+            // Each account connects (if it has no provider yet) and syncs in its own
+            // task, so an account that cannot connect or sync never stops the others
+            // (#689). The run's outcome is the one error that reaches this catch.
+            try await manager.syncFolders(folders, connecting: uniqueAccounts)
 
             AccountManagerState.shared.lastSyncFailed = false
             AccountManagerState.shared.finishSyncRun(coverage: coverage, countedFailure: false, completed: true)

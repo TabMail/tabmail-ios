@@ -453,6 +453,10 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// Command fragment (uppercased) → seconds to hold the NEXT matching
         /// command's response, one entry per match. See `stallNextCommand`.
         var stalls: [String: [Double]] = [:]
+        /// `holdGreetings()` is in place: new connections wait on `greetingGate`.
+        var greetingsHeld = false
+        /// Connections that waited for their greeting under a hold.
+        var heldGreetingCount = 0
     }
 
     /// See `State.latencyInjection`'s doc comment.
@@ -525,6 +529,8 @@ final class FakeIMAPServer: @unchecked Sendable {
     private let stateLock = NSLock()
     private var state: State
     private var clientFds: [Int32] = []
+    /// Entered while `holdGreetings()` is in place; see there.
+    private let greetingGate = DispatchGroup()
 
     init(
         host: String = "localhost", port: Int = 0, username: String = "testuser", password: String = "testpass",
@@ -679,6 +685,35 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// is supplementary/diagnostic rather than the oracle's primary signal.
     func logoutFdLog() -> [Int32] {
         withState { $0.logoutFdLog }
+    }
+
+    /// Hold the greeting of every connection accepted from now on until
+    /// `releaseGreetings()`: a server slow to answer, so a client's connect stays
+    /// in progress for exactly as long as the test chooses (an ordering latch,
+    /// not a wall-clock delay). Connections accepted after the release are
+    /// greeted at once. `stop()` releases a hold still in place.
+    func holdGreetings() {
+        let start = withState { state -> Bool in
+            guard !state.greetingsHeld else { return false }
+            state.greetingsHeld = true
+            return true
+        }
+        if start { greetingGate.enter() }
+    }
+
+    /// Greet every connection waiting on `holdGreetings()`.
+    func releaseGreetings() {
+        let release = withState { state -> Bool in
+            guard state.greetingsHeld else { return false }
+            state.greetingsHeld = false
+            return true
+        }
+        if release { greetingGate.leave() }
+    }
+
+    /// How many connections have waited for their greeting under a hold.
+    func heldGreetingCount() -> Int {
+        withState { $0.heldGreetingCount }
     }
 
     /// Hold the response to the next command containing `fragment` for
@@ -1424,6 +1459,7 @@ final class FakeIMAPServer: @unchecked Sendable {
     }
 
     func stop() {
+        releaseGreetings()
         acceptSource?.cancel()
         acceptSource = nil
         let fds = takeAllClientFds()
@@ -1574,6 +1610,12 @@ final class FakeIMAPServer: @unchecked Sendable {
     }
 
     private func handleClient(fd: Int32) {
+        let held = withState { state -> Bool in
+            guard state.greetingsHeld else { return false }
+            state.heldGreetingCount += 1
+            return true
+        }
+        if held { greetingGate.wait() }
         sendLine(fd: fd, "* OK [CAPABILITY \(capabilities.joined(separator: " "))] FakeIMAP ready\r\n")
 
         var buffer = Data()

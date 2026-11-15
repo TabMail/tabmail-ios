@@ -427,7 +427,7 @@ struct EpochRebuildArmMigrationTests {
         let folder = try #require(try FolderEpochTestFixture.readFolder(
             accountId: accountId, path: "Archive-2021", pool: pool))
 
-        // The on-demand door: `AccountManager.syncFolders(_:)` → here → the merge pass.
+        // The on-demand door: `AccountManager.syncFolders(_:connecting:)` → here → the merge pass.
         let engine = SyncEngine()
         try await TestProviderRegistry.withRegisteredProvider(accountId: accountId, provider: provider) {
             try await engine.syncFolderMessages(folder: folder, provider: provider)

@@ -27,7 +27,7 @@ import Synchronization
 ///    ⚠ **The round-7 claim that this refusal was PERMANENT is retracted.**
 ///    On-demand navigation reaches ANY folder: `InboxView.onAppear` →
 ///    `InboxViewModel.startSync()` → `performSync()` →
-///    `AccountManager.syncFolders(_:)` (in the FILE `AccountManagerFetch.swift`
+///    `AccountManager.syncFolders(_:connecting:)` (in the FILE `AccountManagerFetch.swift`
 ///    — its filter is `!folder.path.isEmpty` and nothing else) →
 ///    `SyncEngine.syncFolderMessages` → `syncMessages` → `runSyncMessages`,
 ///    which carries T1.2b's SELECT-sourced bootstrap. The window was
