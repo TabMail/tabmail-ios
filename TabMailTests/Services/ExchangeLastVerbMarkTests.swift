@@ -332,8 +332,8 @@ struct ExchangeLastVerbMarkTests {
 
     // MARK: - Provider boundary (ADR-IOS-060)
 
-    /// The tags are defined once, in `Shared/API/GraphAPI.swift` (shared with the
-    /// change reader, #890), and used only inside the Exchange provider.
+    /// The tag literals are defined once, in `Shared/API/GraphAPI.swift` (shared
+    /// with the change reader, #890); no other file may spell them.
     @Test("The last-verb property tags live only in GraphAPI and the Exchange provider")
     func lastVerbTagsStayInsideExchangeProvider() throws {
         let root = DiagnosticPrintGateTests.repositoryRoot()
@@ -355,6 +355,24 @@ struct ExchangeLastVerbMarkTests {
         #expect(holders.allSatisfy {
             $0 == "Shared/API/GraphAPI.swift" || $0.hasPrefix("TabMail/Providers/ExchangeProvider")
         }, "outside GraphAPI and the Exchange provider: \(holders)")
+    }
+
+    /// #915: ComposeView hands its reply-all kind to the in-compose agent, whose
+    /// first autosave stores it. The parameter defaults to false, so only this
+    /// fence catches a dropped argument.
+    @Test("ComposeView passes its reply-all kind to the in-compose agent")
+    func composePassesReplyAllToTheAgent() throws {
+        let file = try #require(try DiagnosticPrintGateTests.appTargetSources()
+            .first { $0.relativePath == "TabMail/Views/Compose/ComposeView.swift" })
+        let code = DiagnosticPrintGateTests.codeOnly(file.source)
+        let calls = code.components(separatedBy: "DynamicIslandChat(").dropFirst()
+        #expect(calls.count == 1, "expected one in-compose agent, found \(calls.count)")
+        for call in calls {
+            let args = String(call.prefix(4000))
+            let end = args.range(of: "isExpanded:")
+            let head = end.map { String(args[..<$0.lowerBound]) } ?? args
+            #expect(head.contains("draftIsReplyAll: isReplyAll"))
+        }
     }
 
     /// Both Reply All entry points open compose in reply-all mode. The views are
