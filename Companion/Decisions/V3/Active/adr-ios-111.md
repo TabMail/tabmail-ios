@@ -523,7 +523,12 @@ are no longer pages only. Verb reads beyond a pass's allowance move to the re-re
 `changeRereadBudgetPerPass` a pass; over `changeRecheckLimit` the catch-up is armed, which does not read the
 verb, so a very large burst may leave some arrows unshown until the message changes again). Verb-only ids
 share that list, its per-pass budget and its limit with ids kept back under a user action, so a large
-burst (a web "mark all read") delays those re-reads and can overflow the list into a catch-up.
+burst (a web "mark all read") delays those re-reads and can overflow the list into a catch-up. Under the
+#903 amendment above, verb ids a pass lists (via `rereadLater`) are that pass's own additions: once
+stored they are never cut and drain `changeRereadBudgetPerPass` a pass; in a folder the catch-up checks,
+additions that would take the list over `changeRecheckLimit` are cut (the verb ids among them lose their
+arrow until the message changes again, as the catch-up armed for them does not read the verb); a folder
+the catch-up never checks keeps them all.
 
 **Encoding.** `lastVerbExpandParameter` has literal spaces: a request URL is percent-encoded once when sent,
 so a pre-encoded `%20` became `%2520` and Graph would not have expanded it. A `$batch` item's URL travels in
