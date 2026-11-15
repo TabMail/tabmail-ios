@@ -141,6 +141,13 @@ enum GraphAPI {
     /// PidTagLastVerbExecutionTime, written with the verb when the app replies
     /// or forwards (#915).
     static let lastVerbTimePropertyId = "SystemTime 0x1082"
+    /// PidTagIconIndex (PT_LONG, MAPI "PidTagIconIndex Canonical Property"):
+    /// the icon Outlook shows on the message LIST row. Outlook writes it with
+    /// the last verb; without it the list row shows no reply/forward arrow
+    /// (live check #915 B1). Values: 0x105 replied mail, 0x106 forwarded mail.
+    static let iconIndexPropertyId = "Integer 0x1080"
+    static let iconIndexRepliedMail = 0x105
+    static let iconIndexForwardedMail = 0x106
 
     /// Graph JSON batching endpoint. Each request in a batch names its URL
     /// relative to the version root, so a mailbox request starts with

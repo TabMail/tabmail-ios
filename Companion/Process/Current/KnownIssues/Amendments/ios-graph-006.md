@@ -12,7 +12,7 @@ the mark is never re-targeted by Message-ID.
 ## Subsystem and search terms
 
 Outbox; reply; reply-all; forward; Outlook; Microsoft Graph; `Integer 0x1081`
-(PidTagLastVerbExecuted); `SystemTime 0x1082`; `ExchangeProvider.performMessageAction`;
+(PidTagLastVerbExecuted); `SystemTime 0x1082`; `Integer 0x1080` (PidTagIconIndex); `ExchangeProvider.performMessageAction`;
 `patchEachMessage`; `.markReplied`; `.markForwarded`; `deleteCompletedSendAtomic`;
 `readdressQueuedOperations`; moved original; 404; authoritative no-op; `internetMessageId`; D4
 

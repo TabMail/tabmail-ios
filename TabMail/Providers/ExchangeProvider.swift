@@ -723,7 +723,9 @@ actor ExchangeProvider: EmailProvider {
 
     /// Writes MS-OXOMSG `PidTagLastVerbExecuted` (`GraphAPI.lastVerbPropertyId`,
     /// codes `GraphAPI.lastVerbReplyToSender` / `ReplyToAll` / `Forward`) and its
-    /// time (`GraphAPI.lastVerbTimePropertyId`) on the ORIGINAL. Outlook shows the
+    /// time (`GraphAPI.lastVerbTimePropertyId`), plus the list-row icon
+    /// `PidTagIconIndex` (`GraphAPI.iconIndexPropertyId`: replied mail for a
+    /// reply or reply all, forwarded mail for a forward), on the ORIGINAL. Outlook shows the
     /// reply / reply-all / forward arrow and "You replied on ..." from these, and
     /// Outlook's own clients write them when they reply or forward.
     /// `POST /sendMail` never touches the original (live check, #890 row 4), so
@@ -733,9 +735,12 @@ actor ExchangeProvider: EmailProvider {
         let formatter = ISO8601DateFormatter()
         formatter.timeZone = TimeZone(identifier: "UTC")
         formatter.formatOptions = [.withInternetDateTime]
+        let icon = verb == GraphAPI.lastVerbForward
+            ? GraphAPI.iconIndexForwardedMail : GraphAPI.iconIndexRepliedMail
         return ["singleValueExtendedProperties": [
             ["id": GraphAPI.lastVerbPropertyId, "value": String(verb)],
             ["id": GraphAPI.lastVerbTimePropertyId, "value": formatter.string(from: at)],
+            ["id": GraphAPI.iconIndexPropertyId, "value": String(icon)],
         ]]
     }
 

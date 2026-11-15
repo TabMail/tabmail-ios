@@ -21,6 +21,7 @@ struct ExchangeLastVerbMarkTests {
 
     private static let verb = "Integer 0x1081"
     private static let verbTime = "SystemTime 0x1082"
+    private static let iconIndex = "Integer 0x1080"
 
     /// A whole-second time an hour ago, so the stored ISO-8601 value is exact and
     /// differs from "now" (a mark written with the drain time would not match).
@@ -66,28 +67,39 @@ struct ExchangeLastVerbMarkTests {
         }
     }
 
-    @Test("The PATCH names exactly the two last-verb properties and nothing else")
+    /// Values are the MAPI ones (PidTagIconIndex 0x105 replied mail, 0x106
+    /// forwarded mail), spelled here as decimal Graph strings, independent of
+    /// the app's constants. Without the icon, OWA's list row shows no arrow
+    /// (live check #915 B1).
+    @Test("The PATCH names exactly the last verb, its time and the list icon, per verb")
     func patchBodyShape() async throws {
-        let http = FakeHTTP.Scenario()
-        defer { http.close() }
-        http.register(path: "/messages/original", method: "PATCH", response: .json(raw: #"{"id":"original"}"#))
-        let provider = ExchangeProvider(
-            userEmail: "owner@example.com", accessToken: { _ in "fake-graph-token" }, session: http.session)
         let at = Self.sendTime()
-        _ = try await provider.performMessageAction(.replied(all: false, at: at), at: Self.source)
+        for (action, code, icon) in [
+            (ProviderMessageAction.replied(all: false, at: at), "102", "261"),
+            (.replied(all: true, at: at), "103", "261"),
+            (.forwarded(at: at), "104", "262"),
+        ] {
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            http.register(path: "/messages/original", method: "PATCH", response: .json(raw: #"{"id":"original"}"#))
+            let provider = ExchangeProvider(
+                userEmail: "owner@example.com", accessToken: { _ in "fake-graph-token" }, session: http.session)
+            _ = try await provider.performMessageAction(action, at: Self.source)
 
-        let calls = http.recordedCalls()
-        #expect(calls.count == 1)
-        guard calls.count == 1 else { return }
-        #expect(calls[0].method == "PATCH")
-        let body = try #require(calls[0].body)
-        let json = try #require(try JSONSerialization.jsonObject(with: body) as? [String: Any])
-        #expect(Set(json.keys) == ["singleValueExtendedProperties"])
-        let properties = try #require(json["singleValueExtendedProperties"] as? [[String: String]])
-        #expect(properties == [
-            ["id": Self.verb, "value": "102"],
-            ["id": Self.verbTime, "value": Self.iso(at)],
-        ])
+            let calls = http.recordedCalls()
+            #expect(calls.count == 1)
+            guard calls.count == 1 else { return }
+            #expect(calls[0].method == "PATCH")
+            let body = try #require(calls[0].body)
+            let json = try #require(try JSONSerialization.jsonObject(with: body) as? [String: Any])
+            #expect(Set(json.keys) == ["singleValueExtendedProperties"])
+            let properties = try #require(json["singleValueExtendedProperties"] as? [[String: String]])
+            #expect(properties == [
+                ["id": Self.verb, "value": code],
+                ["id": Self.verbTime, "value": Self.iso(at)],
+                ["id": Self.iconIndex, "value": icon],
+            ])
+        }
     }
 
     @Test("Running the mark twice leaves the server exactly as running it once")
@@ -349,7 +361,7 @@ struct ExchangeLastVerbMarkTests {
         }
         #expect(sharedCount > 0, "the scan must see Shared/")
         let holders = files
-            .filter { $0.source.contains("0x1081") || $0.source.contains("0x1082") }
+            .filter { $0.source.contains("0x1081") || $0.source.contains("0x1082") || $0.source.contains("0x1080") }
             .map(\.relativePath)
         #expect(holders.contains("Shared/API/GraphAPI.swift"), "non-vacuity: GraphAPI defines them")
         #expect(holders.allSatisfy {

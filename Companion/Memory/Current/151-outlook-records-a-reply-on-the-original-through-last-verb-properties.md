@@ -10,15 +10,17 @@ original untouched: no `Integer 0x1081`, no `SystemTime 0x1082`, `lastModifiedDa
 - `Integer 0x1081` = `PidTagLastVerbExecuted`: **102** reply to sender, **103** reply all, **104** forward.
   Outlook stores only the LAST verb (a reply after a forward reads back as 102).
 - `SystemTime 0x1082` = `PidTagLastVerbExecutionTime`: when the verb ran ("You replied on ...").
-- `Integer 0x1080` = `PidTagIconIndex` (0x105 replied, 0x106 forwarded): not written; add only if a
-  live check shows an Outlook client needs it for the arrow.
+- `Integer 0x1080` = `PidTagIconIndex` (PT_LONG; 0x105 = 261 replied mail, 0x106 = 262 forwarded
+  mail; MAPI "PidTagIconIndex Canonical Property"): WRITTEN with the verb (261 for reply and reply all,
+  262 for forward). Live check B1 (2026-11-15) showed OWA's reading pane says "You replied on ..." from
+  0x1081/0x1082 alone, but the message LIST row shows no arrow without 0x1080 (coordinator ruling A).
 
 **How TabMail writes them (option B, #915):** the existing durable `.markReplied` / `.markForwarded`
 op, admitted only in `AccountManager.deleteCompletedSendAtomic` after the send is confirmed, reaches
 `ExchangeProvider.performMessageAction`, which PATCHes `/me/messages/{id}` with
-`singleValueExtendedProperties` `[0x1081, 0x1082]` (`ExchangeProvider.lastVerbPatchBody`, using the
+`singleValueExtendedProperties` `[0x1081, 0x1082, 0x1080]` (`ExchangeProvider.lastVerbPatchBody`, using the
 one shared definition in `Shared/API/GraphAPI.swift`: `lastVerbPropertyId`, `lastVerbTimePropertyId`,
-`lastVerbReplyToSender/ReplyToAll/Forward`, which #890's change reader also reads) through
+`lastVerbReplyToSender/ReplyToAll/Forward`, `iconIndexPropertyId`, `iconIndexRepliedMail/ForwardedMail`; the verb ids #890's change reader also reads) through
 `patchEachMessage`. Absolute values, so a retry is idempotent and can never
 re-send mail. The send time is `OutboxMessage.sentAt`, carried on `PendingOperation.sentAt` (v104;
 pre-v104 rows use `createdAt`, stamped in the completion transaction: `PendingOperation.verbTime`).
