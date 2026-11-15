@@ -127,7 +127,7 @@ struct IMAPActionEpochCheckpointTests {
         try await provider.connect()
         let before = server.recordedCommands()
         let actions: [ProviderMessageAction] = [.read(true), .read(false), .flagged(true), .flagged(false),
-                                                .replied, .forwarded, .userLabel(id: "Label_1", add: true),
+                                                .replied(all: false, at: Date()), .forwarded(at: Date()), .userLabel(id: "Label_1", add: true),
                                                 .userLabel(id: "Label_1", add: false), .move(destination: "Archive")]
         let epochs: [Int?] = [nil, 0, -1, Int(UInt32.max) + 1]
         for epoch in epochs {
@@ -177,9 +177,9 @@ struct IMAPActionEpochCheckpointTests {
             #expect(server.flags(in: source, uid: 7).contains("Label_1") == value)
             #expect(server.flags(in: "Projects", uid: 7).isEmpty)
         }
-        _ = try await provider.performMessageAction(.replied, at: address)
+        _ = try await provider.performMessageAction(.replied(all: false, at: Date()), at: address)
         #expect(server.flags(in: "Projects", uid: 7).isEmpty)
-        _ = try await provider.performMessageAction(.forwarded, at: address)
+        _ = try await provider.performMessageAction(.forwarded(at: Date()), at: address)
         #expect(server.flags(in: source, uid: 7).contains("\\Answered"))
         #expect(server.flags(in: source, uid: 7).contains("$Forwarded"))
         #expect(server.flags(in: "Projects", uid: 7).isEmpty, "Same UID/RFC in another exact mailbox is a bystander")

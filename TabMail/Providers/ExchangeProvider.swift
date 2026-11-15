@@ -700,9 +700,14 @@ actor ExchangeProvider: EmailProvider {
                 }
             case .flagged(let flagged):
                 try await markFlagged(ids: source.memberIds, flagged: flagged, folder: source.folderPath)
-            case .replied, .forwarded:
-                // These flags have no remote representation; local state is preserved by sync.
-                break
+            case .replied(let all, let at):
+                try await patchEachMessage(
+                    ids: source.memberIds,
+                    body: Self.lastVerbPatchBody(verb: all ? .replyAll : .reply, at: at))
+            case .forwarded(let at):
+                try await patchEachMessage(
+                    ids: source.memberIds,
+                    body: Self.lastVerbPatchBody(verb: .forward, at: at))
             case .userLabel(let id, let add):
                 if let member = source.memberIds.first {
                     try await setUserLabel(messageId: member, category: id, add: add)
@@ -713,6 +718,33 @@ actor ExchangeProvider: EmailProvider {
         } catch let disposition as ProviderMembersDispositioned {
             return ProviderActionOutcome(disposition: disposition)
         }
+    }
+
+    /// MS-OXOMSG `PidTagLastVerbExecuted` codes. Outlook shows the reply /
+    /// reply-all / forward arrow and "You replied on ..." from these, and Outlook's
+    /// own clients write them on the ORIGINAL when they reply or forward.
+    /// `POST /sendMail` never touches the original (live check, #890 row 4), so
+    /// the app writes them itself after the send completed (#915).
+    enum LastVerb: Int {
+        case reply = 102
+        case replyAll = 103
+        case forward = 104
+    }
+
+    /// Graph property tags: `Integer 0x1081` = PidTagLastVerbExecuted,
+    /// `SystemTime 0x1082` = PidTagLastVerbExecutionTime. Both absolute values, so
+    /// re-sending the same PATCH on a retry leaves the server unchanged.
+    static let lastVerbPropertyId = "Integer 0x1081"
+    static let lastVerbTimePropertyId = "SystemTime 0x1082"
+
+    static func lastVerbPatchBody(verb: LastVerb, at: Date) -> [String: Any] {
+        let formatter = ISO8601DateFormatter()
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        formatter.formatOptions = [.withInternetDateTime]
+        return ["singleValueExtendedProperties": [
+            ["id": lastVerbPropertyId, "value": String(verb.rawValue)],
+            ["id": lastVerbTimePropertyId, "value": formatter.string(from: at)],
+        ]]
     }
 
     func markRead(ids: [String], folder: String) async throws {

@@ -1383,9 +1383,9 @@ final class AccountOperationExecutor {
             // Action tags are local-only; their state was applied at admission.
             return .allMembers
         case .markReplied:
-            action = .replied
+            action = .replied(all: op.replyAll, at: op.verbTime)
         case .markForwarded:
-            action = .forwarded
+            action = .forwarded(at: op.verbTime)
         case .saveDraft:
             guard let draftId = op.draftId ?? op.messageIds.first,
                   let instanceEpoch = op.instanceEpoch,

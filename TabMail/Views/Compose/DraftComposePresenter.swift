@@ -194,6 +194,7 @@ struct DraftComposePresenter: View {
                     replyTo: prepared.replyTo,
                     account: prepared.account,
                     isForward: prepared.draft.isForward,
+                    isReplyAll: prepared.draft.isReplyAll,
                     prefillDraftId: prepared.draft.id,
                     openAuthority: prepared.openAuthority,
                     preparedDraft: prepared.draft

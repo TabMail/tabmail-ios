@@ -4426,6 +4426,28 @@ final class AppDatabase: Sendable {
                 t.add(column: "changeCursor", .text)
             }
         }
+
+        // #915: a reply-all is its own generic kind from compose to the durable
+        // mark, and the mark carries the send time. `draft.isReplyAll` keeps the
+        // mode across a save/reopen and the Undo-Send reopen (like `isForward`),
+        // `outboxMessage.isReplyAll` carries it to completion, and
+        // `pendingOperation.replyAll` / `sentAt` carry it to the provider.
+        // Every existing row is a plain reply or has no send time: defaults only,
+        // no data conversion.
+        migrator.registerTimedMigration(
+            "v104_addReplyAllAndMarkSentAt", foreignKeyChecks: .immediate
+        ) { db in
+            try db.alter(table: "draft") { t in
+                t.add(column: "isReplyAll", .boolean).notNull().defaults(to: false)
+            }
+            try db.alter(table: "outboxMessage") { t in
+                t.add(column: "isReplyAll", .boolean).notNull().defaults(to: false)
+            }
+            try db.alter(table: "pendingOperation") { t in
+                t.add(column: "replyAll", .boolean).notNull().defaults(to: false)
+                t.add(column: "sentAt", .datetime)
+            }
+        }
     }
 
     /// PORT — v2final `AppDatabase.seedDraftLastTouchedSeq`. Extracted to a static

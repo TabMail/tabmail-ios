@@ -2519,6 +2519,72 @@ struct NeverDropExitClosureTests {
         await finish(f)
     }
 
+    @Test("A completed reply-all stores \\Answered on its IMAP parent like a reply (#915)")
+    @MainActor
+    func completedReplyAllAnswersItsParentOnTheServer() async throws {
+        let parentRfc = "answered-all-parent@example.com"
+        let server = FakeIMAPServer(mailboxes: ["INBOX": [Self.message(uid: 57, id: parentRfc)]])
+        server.setUidValidity(10, for: "INBOX")
+        server.expectMutation(rfc822MessageId: parentRfc)
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(accountId: "closure-replied-all", folders: [("INBOX", .inbox, 10)])
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+
+        let parent: MessageHeader = {
+            var value = MessageHeader(
+                messageId: "57", subject: "Original", from: "Sender",
+                fromAddress: "sender@example.com", to: "me@example.com", date: Date(),
+                snippet: "original",
+                folderId: MessageIdentity.folderId(accountId: f.accountId, folderPath: "INBOX"),
+                accountId: f.accountId, folderPath: "INBOX", isInInbox: true)
+            value.rfc822MessageId = parentRfc
+            value.headerComplete = true
+            // Every synced IMAP row carries the epoch it was observed under.
+            value.observedUidValidity = 10
+            return value
+        }()
+
+        let sent: OutboxMessage = {
+            var value = OutboxMessage(
+                accountId: f.accountId,
+                draft: DraftMessage(
+                    to: ["sender@example.com"], subject: "Re: Original", body: "reply",
+                    inReplyTo: "<\(parentRfc)>"),
+                originalMessageHeaderId: parent.id,
+                isForward: false)
+            value.status = OutboxStatus.sending.rawValue
+            value.sentAt = Date()
+            value.appendedToSent = true
+            value.isReplyAll = true
+            return value
+        }()
+        try await f.pool.writeWithoutTransaction { db in
+            try parent.insert(db)
+            try sent.insert(db)
+        }
+
+        _ = try await f.pool.write { db in
+            try AccountManager.deleteCompletedSendAtomic(outboxId: sent.id, db: db)
+        }
+        await AccountManager.shared.drainPendingQueue()
+
+        #expect(
+            server.flags(in: "INBOX", uid: 57).contains("\\Answered"),
+            "the reply flag must reach the server: \(server.flags(in: "INBOX", uid: 57))"
+        )
+        let parentId = parent.id
+        let flaggedParent = try await f.pool.read { db in
+            try MessageHeader.fetchOne(db, key: parentId)
+        }
+        #expect(flaggedParent?.isReplied == true)
+        #expect(try operations(f.pool).isEmpty)
+        #expect(server.wrongMessageViolations().isEmpty)
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
     // MARK: - AUDIT ROUND 2 / MUST FIX 3 — the refusal must refuse BOTH halves
 
     /// 🚨 AUDIT ROUND 2. The negative case the test above scopes out.

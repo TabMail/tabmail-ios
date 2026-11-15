@@ -94,6 +94,7 @@ private func insertDraft(
     stampProviderMessageId: String? = nil,
     stampUidValidity: Int? = nil,
     isForward: Bool = false,
+    isReplyAll: Bool = false,
     epoch: String
 ) async throws -> Draft {
     var draft = Draft(
@@ -106,6 +107,7 @@ private func insertDraft(
     draft.replyToProviderMessageId = stampProviderMessageId
     draft.replyToUidValidity = stampUidValidity
     draft.instanceEpoch = epoch
+    draft.isReplyAll = isReplyAll
     let toInsert = draft
     try await pool.write { db in try toInsert.insert(db) }
     return toInsert
@@ -148,6 +150,7 @@ private func driveSend(
     claim: ComposeDraftGuards.PersistedReplyTargetClaim?,
     subject: String = "Re: Original subject",
     isForward: Bool = false,
+    isReplyAll: Bool = false,
     instanceEpoch: String
 ) async throws -> (blocked: Bool, outboxId: String?) {
     let target: MessageHeader?
@@ -166,7 +169,7 @@ private func driveSend(
         threadId: threadHeaders.threadId)
     let result = try await AccountManager.persistQueuedSend(
         draft: outbound, accountId: "acc1", replyToHeaderId: target?.id,
-        isForward: isForward, serverDraftId: nil,
+        isForward: isForward, isReplyAll: isReplyAll, serverDraftId: nil,
         draftId: draftId, instanceEpoch: instanceEpoch)
     return (false, result.outboxId)
 }
@@ -448,6 +451,51 @@ struct ComposeSendReplyTargetTests {
                 "a forward must never record its parent as replied-to")
         #expect(state.parent?.actionTag == .reply,
                 "a forward must not clear a Reply action tag the user never acted on")
+    }
+
+    /// #915, the `IOS-OUTBOX-004` invariant for Reply All: a reply-all that is
+    /// undone and re-sent is still recorded as a reply-all, so delivery marks the
+    /// original reply-all (Outlook's 103) and not a plain reply. Driven through the
+    /// production reopen; asserts the queued send's recorded mode.
+    @Test("A reply-all reopened through Undo-Send is re-sent as a reply-all")
+    func replyAllReopenedThroughUndoIsResentAsReplyAll() async throws {
+        let (dir, pool, previous) = try makeReplyTargetTestDatabase()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+        let parent = try await insertHeader(
+            pool, uid: "42", rfc822MessageId: "orig@example.com",
+            references: ["root@example.com"], observedUidValidity: 100)
+        let draftId = "reply:acc1:orig@example.com"
+        try await insertDraft(
+            pool, id: draftId, replyToId: parent.id,
+            stampProviderMessageId: "42", stampUidValidity: 100,
+            isReplyAll: true, epoch: "E1")
+
+        let snapshot = PendingSendService.ReopenSnapshot(
+            id: "outbox-undo-reply-all",
+            authority: PendingSendService.RetainedDraftAuthority(
+                draftId: draftId, accountId: "acc1", instanceEpoch: "E1"))
+        let reopened = UndoReopenCompose.composeView(for: snapshot)
+        #expect(!reopened.isForward)
+
+        let claim = try await loadClaim(pool, draftId: draftId)
+        let outcome = try await driveSend(
+            pool: pool, draftId: draftId, composeParameter: nil, claim: claim,
+            isForward: reopened.isForward, isReplyAll: reopened.isReplyAll,
+            instanceEpoch: "E1")
+
+        #expect(!outcome.blocked)
+        let state = try await pool.read { db -> (outbox: [OutboxMessage], parent: MessageHeader?) in
+            (try OutboxMessage.fetchAll(db), try MessageHeader.fetchOne(db, key: parent.id))
+        }
+        #expect(state.outbox.count == 1)
+        guard state.outbox.count == 1 else { return }
+        #expect(state.outbox[0].isReplyAll,
+                "the queued send must stay a reply-all; delivery reads this to mark the original reply-all")
+        #expect(!state.outbox[0].isForward)
+        #expect(state.parent?.isReplied == true)
     }
 }
 

@@ -76,6 +76,7 @@ extension MessageDetailView {
         let recipients = buildReplyAllRecipients(for: msg, allAccounts: allAccounts)
         return ComposeView(
             replyTo: msg,
+            isReplyAll: true,
             prefillTo: recipients.to.isEmpty ? nil : recipients.to,
             prefillCc: recipients.cc.isEmpty ? nil : recipients.cc
         )

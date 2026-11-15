@@ -66,6 +66,10 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         /// PidTagLastVerbExecuted (`Integer 0x1081`), set by another client's
         /// reply or forward; nil = never acted on.
         var lastVerb: Int? = nil
+        /// `singleValueExtendedProperties` the server holds, by property id
+        /// (e.g. `Integer 0x1081`). A PATCH sets each named property and leaves
+        /// the others alone; a move carries them with the message (#915).
+        var extendedProperties: [String: String] = [:]
     }
 
     struct State: Sendable {
@@ -484,6 +488,11 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
     /// message category, so "did the user's label reach the server, and did it
     /// leave the server's other categories alone" is exactly a question about
     /// this array.
+    /// The extended properties the server holds for `providerMessageId`.
+    func extendedProperties(providerMessageId: String) -> [String: String]? {
+        state.value.withLock { $0.messagesByProviderId[providerMessageId]?.extendedProperties }
+    }
+
     func categories(providerMessageId: String) -> [String]? {
         state.value.withLock { $0.messagesByProviderId[providerMessageId]?.categories }
     }
@@ -663,6 +672,15 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
                     message.categories = categories
                     model.delta.log(folderId: message.folderId, messageId: providerId, kind: .categories)
                 }
+                if let properties = body["singleValueExtendedProperties"] as? [[String: Any]] {
+                    for property in properties {
+                        guard let id = property["id"] as? String,
+                              let value = property["value"] as? String else { continue }
+                        message.extendedProperties[id] = value
+                        // One server: the last verb the reader expands is the one a PATCH wrote.
+                        if id == "Integer 0x1081" { message.lastVerb = Int(value) }
+                    }
+                }
                 model.messagesByProviderId[providerId] = message
                 return true
             }
@@ -778,7 +796,9 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
                 isRead: prior.isRead,
                 isFlagged: prior.isFlagged,
                 receivedAt: prior.receivedAt,
-                categories: prior.categories
+                categories: prior.categories,
+                lastVerb: prior.lastVerb,
+                extendedProperties: prior.extendedProperties
             )
             model.messagesByProviderId[movedId] = next
             model.delta.log(folderId: prior.folderId, messageId: providerId, kind: .removed)

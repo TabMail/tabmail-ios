@@ -1004,6 +1004,8 @@ struct ComposeView: View {
         /// replied.
         let resolvedReplyTarget: MessageHeader?
         let isForward: Bool
+        /// The reply was opened as Reply All (#915).
+        let isReplyAll: Bool
         /// The guided tutorial's practice reply: sent with no undo hold.
         let isTutorialPracticeReply: Bool
         let outbound: DraftMessage
@@ -1145,6 +1147,9 @@ struct ComposeView: View {
     var suggestedBody: String?
     var account: Account?
     var isForward: Bool = false
+    /// Opened as Reply All (#915). Persisted on the draft row and the outbox row
+    /// so the original is marked reply-all on the providers that record it.
+    var isReplyAll: Bool = false
     var prefillTo: [String]?
     var prefillCc: [String]?
     var prefillBcc: [String]?
@@ -1191,6 +1196,7 @@ struct ComposeView: View {
         suggestedBody: String? = nil,
         account: Account? = nil,
         isForward: Bool = false,
+        isReplyAll: Bool = false,
         prefillTo: [String]? = nil,
         prefillCc: [String]? = nil,
         prefillBcc: [String]? = nil,
@@ -1208,6 +1214,7 @@ struct ComposeView: View {
         self.suggestedBody = suggestedBody
         self.account = account
         self.isForward = isForward
+        self.isReplyAll = isReplyAll
         self.prefillTo = prefillTo
         self.prefillCc = prefillCc
         self.prefillBcc = prefillBcc
@@ -2488,7 +2495,9 @@ struct ComposeView: View {
                 // contradicts. Scoped to this path deliberately — a row whose
                 // `isForward` was already flipped by the superseded bug must still open
                 // normally everywhere else.
-                guard draft.isForward == isForward else {
+                // Same for Reply All (#915): the retained row's `isReplyAll` is the
+                // mode the resend is recorded under.
+                guard draft.isForward == isForward, draft.isReplyAll == isReplyAll else {
                     draftReadState = .error
                     sendError = "This draft did not finish loading. Close and reopen it to try again."
                     return
@@ -2972,6 +2981,7 @@ struct ComposeView: View {
         // bails before sending the update. `existing` was read fail-closed above.
         let draftToSave: Draft = {
             if var e = existing {
+                e.isReplyAll = isReplyAll
                 e.toJSON = Draft.encodeStringArray(capTo)
                 e.ccJSON = Draft.encodeStringArray(capCc)
                 e.bccJSON = Draft.encodeStringArray(capBcc)
@@ -2995,6 +3005,7 @@ struct ComposeView: View {
                 createdAt: now,
                 updatedAt: now
             )
+            d.isReplyAll = isReplyAll
             d.attachmentsDirName = stagingDirName
             // T5.8 — stamp the reply target's ADDRESS beside its (mutable) PK, from
             // the SAME header `replyToId` was taken from one line above. Written only
@@ -3553,6 +3564,7 @@ struct ComposeView: View {
             replyToUidValidity: replyTo?.observedUidValidity,
             resolvedReplyTarget: sendTarget,
             isForward: isForward,
+            isReplyAll: isReplyAll,
             isTutorialPracticeReply: isPracticeReply,
             outbound: outbound)
 
@@ -3638,6 +3650,7 @@ struct ComposeView: View {
                 createdAt: draftRecord?.createdAt ?? nowEpoch,
                 updatedAt: nowEpoch
             )
+            ownedDraft.isReplyAll = snapshot.isReplyAll
             // Preserve v24 server-sync fields if present.
             ownedDraft.serverDraftId = draftRecord?.serverDraftId
             ownedDraft.serverPushStatus = draftRecord?.serverPushStatus
@@ -3706,6 +3719,7 @@ struct ComposeView: View {
                 // previously skipped the parent bookkeeping entirely.
                 replyToHeaderId: snapshot.resolvedReplyTarget?.id,
                 isForward: snapshot.isForward,
+                isReplyAll: snapshot.isReplyAll,
                 serverDraftId: draftRecord?.serverDraftId,
                 draftUidValidity: draftRecord?.serverDraftUidValidity,
                 draftServerFolderPath: draftRecord?.serverDraftFolderPath,
