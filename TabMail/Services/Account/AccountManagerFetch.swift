@@ -420,7 +420,10 @@ extension AccountManager {
     /// IMAP connection). One account that cannot connect or sync never holds back or
     /// cancels another (#689): `waitForAll` waits for every task and rethrows the
     /// first error to finish, after every account has run. An account with no
-    /// provider that is not in `accounts` is skipped.
+    /// provider that is not in `accounts` is skipped. After its folders, each
+    /// account in `accounts` runs one change read (`SyncEngine.backgroundDeltaSync`,
+    /// #902); an account not in `accounts`, or one whose connect or re-list failed,
+    /// gets no change read.
     func syncFolders(_ folders: [Folder], connecting accounts: [Account]) async throws {
         let grouped = Dictionary(grouping: folders) { $0.accountId }
         let affectedAccountIds = Array(grouped.keys)
@@ -476,6 +479,26 @@ extension AccountManager {
                     }
                     // AI processing is now event-driven via ActiveBodyQueue → ActiveAIQueue.
                     // New headers from syncFolderMessages are automatically enqueued.
+
+                    // Then one "what changed" read for the account (#902): the same pass
+                    // the background sync runs, so a change made elsewhere to older mail
+                    // or to a folder not on screen shows with this pull. Its deadline is
+                    // taken here, once, and bounds it as a timeout too, as for the
+                    // background and foreground passes (a wait behind a running pass of
+                    // the same account counts). The pass reports a failed read in its
+                    // result (the refresh still succeeds, as in the background); a
+                    // timeout or what it rethrows (a database error, a failed retry
+                    // after a connection error) fails the refresh.
+                    if let account {
+                        let timeout = SyncConfig.perAccountSyncTimeoutSeconds
+                        let deadline = Date().addingTimeInterval(timeout)
+                        let (changed, reason) = try await withTimeout(seconds: timeout) {
+                            try await syncEngine.backgroundDeltaSync(account: account, deadline: deadline)
+                        }
+                        if DebugModeManager.isLoggingEnabled() {
+                            BackgroundSyncLogger.logDebug("[SyncFolders] change read for account \(accountId.prefix(6)): changed=\(changed) reason=\(reason)")
+                        }
+                    }
                 }
             }
             try await group.waitForAll()

@@ -372,6 +372,7 @@ actor SyncEngine {
     // MARK: - Background-Safe Delta Sync
 
     /// Lightweight delta-only sync for background execution (BGAppRefreshTask, silent push).
+    /// Also the change read of pull-to-refresh (`AccountManager.syncFolders`, #902).
     /// Only fetches new headers and enqueues to body/AI/embedding queues.
     /// Does NOT start backfill, bulk index, embedding rebuild, or full sync fallback.
     /// Designed to complete well within iOS's ~30s background budget.

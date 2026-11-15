@@ -201,7 +201,7 @@ build**. The error's text stays in the debug-gated logs only.
   the first error to finish, because the app has no per-account sync-failure state (only the sign-in
   mark). `ThrowingTaskGroup.waitForAll` waits for every child and cancels none, so the group itself never
   cancelled the other accounts; the only stopper was the connect loop throwing before the group ran.
-  Seeing only the first error is still #688. Pinned by `RefreshAccountIsolationTests`.) A poll that cannot load its accounts counts as failed.
+  Seeing only the first error is still #688. Pinned by `RefreshAccountIsolationTests`. Since #902 (2026-11-15) each account's task, after its folders, also runs one change read, the same pass the background sync runs (`SyncEngine.backgroundDeltaSync`, deadline `perAccountSyncTimeoutSeconds` taken at that point and enforced by `withTimeout`, as for the other two callers); with the background meaning: a read failure the pass swallows leaves the refresh successful, a timeout or what it rethrows (database error, failed connection retry) fails it. An account the caller did not pass in `connecting:` gets the re-list only. Pinned by `RefreshChangeReadTests`.) A poll that cannot load its accounts counts as failed.
   An all-failed foreground poll does not advance `lastSyncCompletedAt`. Superseded rules, kept for history:
   "only a full run with NO failure at all clears", then "a full refresh whose first error came from a marked
   account clears" (it cleared while another account was still failing). The older-messages catch writes the
