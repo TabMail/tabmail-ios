@@ -252,6 +252,10 @@ final class AgentToolRouter {
         let bcc: [String]
         let subject: String?
         let body: String?
+        /// A `.reply` built from the reply-all recipient set (the AI reply
+        /// tool). Carried into ComposeView so the send records reply-all on
+        /// the original, like the Reply All button (#915).
+        let isReplyAll: Bool
 
         /// Fires once when the user's compose session reaches a terminal state
         /// (send / cancel / persist-failure). Invoked on MainActor from
@@ -272,6 +276,7 @@ final class AgentToolRouter {
             bcc: [String],
             subject: String?,
             body: String?,
+            isReplyAll: Bool = false,
             onOutcome: @escaping @MainActor (ComposeOutcome) -> Void = { _ in },
             outcomeState: ComposeOutcomeState = ComposeOutcomeState()
         ) {
@@ -282,6 +287,7 @@ final class AgentToolRouter {
             self.bcc = bcc
             self.subject = subject
             self.body = body
+            self.isReplyAll = isReplyAll
             self.onOutcome = onOutcome
             self.outcomeState = outcomeState
         }

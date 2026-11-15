@@ -83,6 +83,7 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         /// verb without touching the `/move` that precedes it in the same lane.
         var patchFailuresRemaining = 0
         var patchFailureTransport: URLError.Code?
+        var patchFailureStatus: Int?
         /// When true EVERY mutating verb answers 503, for as long as it is set —
         /// a permanent fault, as opposed to the one-shot budgets above. Modeled
         /// as its own flag rather than a huge budget so a test asserts "the lane
@@ -248,17 +249,19 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         state.value.withLock { $0.mutationFailuresRemaining += 1 }
     }
 
-    /// Fail the next PATCH (and only a PATCH) with 503 by default, or a transport error.
+    /// Fail the next PATCH (and only a PATCH) with 503 by default, a transport
+    /// error, or the given HTTP status (a permanent refusal such as 400/403).
     ///
     /// `failNextMutation()` is consumed by whichever mutating verb happens to
     /// arrive first, which in a move-then-flag lane is the MOVE. This seam exists
     /// so a test can fail the FOLLOWER while letting its predecessor's move
     /// succeed — the shape that proves a re-addressed follower stays queued at its
     /// NEW id rather than being retried at the dead one.
-    func failNextPatch(transportError: URLError.Code? = nil) {
+    func failNextPatch(transportError: URLError.Code? = nil, status: Int? = nil) {
         state.value.withLock {
             $0.patchFailuresRemaining += 1
             $0.patchFailureTransport = transportError
+            $0.patchFailureStatus = status
         }
     }
 
@@ -643,6 +646,9 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
             guard !patchFailed else {
                 if let error = state.value.withLock({ $0.patchFailureTransport }) {
                     return .transportError(error)
+                }
+                if let status = state.value.withLock({ $0.patchFailureStatus }) {
+                    return .status(status)
                 }
                 return .graphUnavailableBeyondRetry
             }

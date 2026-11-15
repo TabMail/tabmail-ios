@@ -2148,6 +2148,7 @@ struct InboxView: View {
             ComposeView(
                 replyTo: req.replyTo,
                 suggestedBody: req.body,
+                isReplyAll: req.isReplyAll,
                 prefillTo: req.to.isEmpty ? nil : req.to,
                 prefillCc: req.cc.isEmpty ? nil : req.cc,
                 prefillBcc: req.bcc.isEmpty ? nil : req.bcc,

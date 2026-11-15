@@ -303,6 +303,58 @@ struct ExchangeLastVerbMarkTests {
         await finish(f)
     }
 
+    /// #915: a permanent Graph refusal of the mark (400, 403) drops the mark at
+    /// once, logged, and the account's next queued action runs in the SAME drain;
+    /// a transient refusal (503) keeps the ordinary retry.
+    @Test("A permanent refusal drops the mark at once; the next action runs straight away")
+    @MainActor
+    func permanentRefusalDropsTheMarkAndTheQueueMoves() async throws {
+        for (status, permanent) in [(400, true), (403, true), (503, false)] {
+            let server = Self.server()
+            defer { server.close() }
+            let f = try fixture()
+            await AccountManager.shared.registerProviderForTesting(
+                accountId: f.accountId, provider: server.provider())
+            let parent = original(f)
+            let sent = completedSend(f, originalId: parent.id, isForward: false, isReplyAll: false, sentAt: Self.sendTime())
+            try await f.pool.writeWithoutTransaction { db in
+                try parent.insert(db)
+                try sent.insert(db)
+            }
+            _ = try await f.pool.write { db in
+                try AccountManager.deleteCompletedSendAtomic(outboxId: sent.id, db: db)
+            }
+            // Queued after the mark: an unrelated action on the same account.
+            try await f.pool.writeWithoutTransaction { db in
+                var read = PendingOperation(
+                    type: .markRead, messageIds: ["bystander"], accountId: f.accountId, folderPath: "INBOX")
+                try read.insert(db)
+            }
+            if status == 503 { server.failNextPatch() } else { server.failNextPatch(status: status) }
+            server.clearMutationLog()
+
+            await AccountManager.shared.drainPendingQueue()
+
+            let left = try await f.pool.read { db in try PendingOperation.fetchAll(db) }
+            let bystanderRead = server.snapshots(rfc822MessageId: "bystander@example.com").first?.isRead
+            if permanent {
+                #expect(left.isEmpty, "status \(status): the mark is dropped, not held for retry")
+                #expect(bystanderRead == true, "status \(status): the next action ran in the same drain")
+                #expect(server.mutationLog().filter { $0 == "PATCH original" }.count == 1,
+                        "status \(status): one attempt, never retried")
+                #expect(server.extendedProperties(providerMessageId: "original")?.isEmpty == true)
+                server.clearMutationLog()
+                await AccountManager.shared.drainPendingQueue()
+                #expect(!server.mutationLog().contains("PATCH original"), "status \(status): not retried later")
+            } else {
+                let marks = left.filter { $0.type == .markReplied }
+                #expect(marks.count == 1, "503: the mark stays queued")
+                #expect(marks.first?.retryCount == 1, "503: one ordinary retry charged")
+            }
+            await finish(f)
+        }
+    }
+
     // MARK: - Reply-all mode on the draft row
 
     /// The user's latest compose entry decides reply vs reply-all for one `reply:`
@@ -359,6 +411,23 @@ struct ExchangeLastVerbMarkTests {
             let call = try #require(body.range(of: "ComposeView("))
             let close = try #require(body.range(of: ")\n    }", range: call.upperBound..<body.endIndex))
             #expect(body[call.upperBound..<close.lowerBound].contains("isReplyAll: true"))
+        }
+    }
+
+    /// Both agent compose hosts carry the request's reply-all flag into
+    /// ComposeView for `.reply`, so an AI reply-all records 103 (#915).
+    @Test("Every agent compose host passes the request's reply-all flag")
+    func agentComposeHostsPassReplyAll() throws {
+        let files = try DiagnosticPrintGateTests.appTargetSources()
+        let bodies = files.flatMap { file -> [String] in
+            file.source.components(separatedBy: "func composeViewForAgentRequest(_ req: AgentToolRouter.ComposeRequest)").dropFirst()
+                .map { String($0) }
+        }
+        #expect(bodies.count == 2, "expected the inbox and message-detail hosts, found \(bodies.count)")
+        for body in bodies {
+            let reply = try #require(body.range(of: "case .reply:"))
+            let forward = try #require(body.range(of: "case .forward:", range: reply.upperBound..<body.endIndex))
+            #expect(body[reply.upperBound..<forward.lowerBound].contains("isReplyAll: req.isReplyAll"))
         }
     }
 

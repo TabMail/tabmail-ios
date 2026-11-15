@@ -80,6 +80,32 @@ struct EmailReplyToolTests {
         #expect(result.contains("sent successfully"))
     }
 
+    /// #915: the tool fills the reply-all recipient set, so the send must
+    /// record reply-all (103) on the Outlook original, like the Reply All button.
+    @Test("The AI reply request is flagged reply-all")
+    func requestIsReplyAll() async throws {
+        let (ctx, db, translator, router) = try makeContext()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        let header = try TestDatabase.insertMessageHeader(db, messageId: "msgRA", subject: "Hello")
+        await translator.seed(header.id, as: 1)
+
+        let tool = EmailReplyTool(context: ctx)
+        let task = Task { @MainActor () -> String in
+            try await tool.execute(arguments: ["unique_id": .int(1)])
+        }
+        guard let req = await waitForPendingCompose(on: router) else {
+            Issue.record("Helper did not populate pendingCompose")
+            task.cancel()
+            _ = try? await task.value
+            return
+        }
+        #expect(req.mode == .reply)
+        #expect(req.isReplyAll)
+        req.onOutcome(.cancelled)
+        _ = try await task.value
+    }
+
     @Test("User dismissing compose → tool resolves with 'closed the compose window'")
     func blockingContractCancelled() async throws {
         let (ctx, db, translator, router) = try makeContext()
