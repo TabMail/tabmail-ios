@@ -273,26 +273,31 @@ struct ChatSwipeTests {
                 "every recognizer event goes through `deliver`")
     }
 
-    @Test("The chat slides left for Trash then Archive, with a full swipe, acting on the whole chat")
+    @Test("The chat slides left for Trash then Archive, with a full swipe, acting on the whole chat; with no Inbox copy, Trash only and no full swipe")
     func chatSwipeWiring() throws {
         let text = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
-        #expect(text.contains("id: Self.chatSwipeId, edge: .trailing, buttons: chatSwipeButtons, allowsFullSwipe: true, openId: $openSwipeId"))
-        let buttons = try Self.body(of: "private var chatSwipeButtons: [ChatSwipeButton] {", in: text)
+        #expect(text.contains("let offersArchive = viewModel.chatHasInboxCopy"))
+        #expect(text.contains("id: Self.chatSwipeId, edge: .trailing, buttons: chatSwipeButtons(offersArchive: offersArchive), allowsFullSwipe: offersArchive, openId: $openSwipeId"),
+                "the full swipe runs only while Archive is at the edge")
+        #expect(text.contains("ForEach(chatSwipeButtons(offersArchive: offersArchive)) { button in Button(\"\\(button.title) chat\", action: button.action) }"),
+                "VoiceOver's actions are the swipe's buttons")
+        let buttons = try Self.body(of: "private func chatSwipeButtons(offersArchive: Bool) -> [ChatSwipeButton] {", in: text)
         // The inbox row's word for a move to Trash.
         let delete = try #require(buttons.range(of: "title: \"Trash\""))
         let archive = try #require(buttons.range(of: "title: \"Archive\""))
         #expect(delete.lowerBound < archive.lowerBound, "Archive sits at the edge, so a full swipe archives")
         #expect(buttons.contains("{ deleteChat() }"))
-        #expect(buttons.contains("{ archiveChat() }"))
-        #expect(try Self.body(of: "private func archiveChat() {", in: text)
-            .contains("if viewModel.archiveChat(viewModel.chatRows) { dismissChat(destinationFolderId: nil) }"))
-        #expect(try Self.body(of: "private func deleteChat() {", in: text)
-            .contains("if viewModel.deleteChat(viewModel.chatRows) { dismissChat(destinationFolderId: nil) }"))
+        #expect(buttons.contains("if offersArchive { buttons.append(ChatSwipeButton(title: \"Archive\", systemImage: \"archivebox\", tint: Theme.archive) { archiveChat() }) }"))
+        let archiveBody = try Self.body(of: "private func archiveChat() {", in: text)
+        #expect(archiveBody.contains("let moved = viewModel.archiveChat(viewModel.chatRows) if !moved.isEmpty { dismissChat(moved: moved, destinationFolderId: nil) }"))
+        let deleteBody = try Self.body(of: "private func deleteChat() {", in: text)
+        #expect(deleteBody.contains("let moved = viewModel.deleteChat(viewModel.chatRows) if !moved.isEmpty { dismissChat(moved: moved, destinationFolderId: nil) }"))
         let move = try Self.body(of: "private func moveChat(toFolderPath path: String) {", in: text)
-        #expect(move.contains("if viewModel.moveChat(viewModel.chatRows, toFolderPath: path) {"))
-        #expect(move.contains("dismissChat(destinationFolderId: MessageIdentity.folderId(accountId: opened.accountId, folderPath: path))"))
-        let dismissal = try Self.body(of: "private func dismissChat(destinationFolderId: String?) {", in: text)
-        #expect(dismissal.contains("name: .messageDismissedFromDetail, object: viewModel.messageId"))
+        #expect(move.contains("let moved = viewModel.moveChat(viewModel.chatRows, toFolderPath: path) if !moved.isEmpty {"))
+        #expect(move.contains("dismissChat(moved: moved, destinationFolderId: MessageIdentity.folderId(accountId: opened.accountId, folderPath: path))"))
+        let dismissal = try Self.body(of: "private func dismissChat(moved: Set<String>, destinationFolderId: String?) {", in: text)
+        #expect(dismissal.contains("if moved.contains(viewModel.messageId) { NotificationCenter.default.post( name: .messageDismissedFromDetail, object: viewModel.messageId"),
+                "the list behind hides the opened row only if it moved")
         #expect(dismissal.contains("dismiss()"))
     }
 

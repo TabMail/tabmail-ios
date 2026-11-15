@@ -556,6 +556,25 @@ same AI result, kept as long as the email itself is shown.
    left where they are, per copy. The action set is that snapshot, never a lookup by Message-ID at
    action or drain time (ADR-IOS-068 D4): a copy the thread did not load (Spam), or one that arrived
    after the chat loaded, is not moved. Test: `ChatCopiesTests.wholeChatActionMovesEveryCopy`.
+   *Amended 2026-11-15:* which rows of that snapshot each action takes is decided per row from its
+   folder (`MessageDetailViewModel.ChatMoveSource`). Archive takes the Inbox copies (role `.inbox`, in
+   every account). Move takes the copies in the folder the chat was opened from: a system folder by
+   its role, in every account; a user folder, a Gmail label included, by its own folder id. Trash
+   takes every row. Sent copies, drafts and rows already at the destination are still left where
+   they are. A copy filed or labeled elsewhere therefore stays where it is: on Gmail, archiving the
+   Inbox copy removes only the INBOX label, so the message keeps its other labels; on IMAP and
+   Outlook a filed copy is a separate message and stays in its folder. This replaces "every row the
+   chat loaded" above for Archive and Move. The role only decides which rows qualify; each row is
+   still moved by its own id (ADR-IOS-068 D4 and clause 6), and nothing above `EmailProvider`
+   checks the provider. A chat with no Inbox copy (opened from a label, Archive or search) offers
+   no Archive: no swipe button, no "Archive chat" VoiceOver action, and no full swipe
+   (`MessageDetailViewModel.chatHasInboxCopy`, `ChatSwipeReveal(allowsFullSwipe:)`), so the gesture
+   that archives elsewhere never trashes there. The actions return the ids they moved, and the
+   list behind is told to hide the opened row only if it moved (`ChatThreadView.dismissChat`):
+   archiving a chat opened on a label leaves that row in the label's list. Tests:
+   `ChatCopiesTests.wholeChatArchiveLeavesFiledCopies`, `chatWithNoInboxCopyOffersNoArchive`,
+   `archiveFromALabelKeepsTheListRow`, `wholeChatActionMovesEveryCopy`;
+   `MessageDetailThreadActionTests.moveChatTakesTheOpenedFolder`, `archiveChatAcrossFolders`.
    *Amended 2026-11-15:* "Unread from here" and "Read up to here" change, with each email they
    target, its copies from the same snapshot (`MessageDetailViewModel.setRead`: the
    `threadCopies` rows that `excludeCopies` left out under that email's Message-ID), each by its

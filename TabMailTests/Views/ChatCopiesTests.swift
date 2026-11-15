@@ -17,7 +17,9 @@ import UIKit
 /// delivered to two of the user's accounts. THE SYSTEM PROPERTIES pinned here:
 ///  1. Once the chat has opened, no email of the thread is unread, in any folder or account.
 ///  2. After a whole-chat Archive or Delete, no email of the thread is left in any Inbox; the
-///     user's Sent copy stays in Sent.
+///     user's Sent copy stays in Sent. A whole-chat Archive takes the chat out of the Inbox only: a
+///     labeled or filed copy (a Gmail label, a folder of the user's) stays where it is, and a chat
+///     with no Inbox copy offers no Archive. The list behind hides the opened row only if it moved.
 ///  3. The chat acts on the rows of its thread as it loaded them, each by its own row, never on
 ///     whatever else carries the same Message-ID (ADR-IOS-068 D4: a Message-ID is never mutation
 ///     authority): a copy the thread does not reach (Spam), and one that arrives after the chat
@@ -45,9 +47,17 @@ struct ChatCopiesTests {
         let newest: MessageHeader
         /// A copy of the reply in Spam: the thread never reaches it.
         let replySpam: MessageHeader
+        /// The reply under the user's "Projects" label (the same Gmail message as `replyOwn`), and
+        /// filed in the second account's "Clients" folder. Nil when the thread is filed only.
+        let replyProjects: MessageHeader?
+        let replyClients: MessageHeader?
 
         /// Every row the chat loads.
-        var loaded: [MessageHeader] { [postSent, postEcho, replyOwn, replySecond, newest] }
+        var loaded: [MessageHeader] {
+            [postSent, postEcho, replyOwn, replySecond, newest] + [replyProjects, replyClients].compactMap { $0 }
+        }
+        /// The loaded rows in an Inbox.
+        var inInbox: [MessageHeader] { loaded.filter { $0.folderPath == "INBOX" } }
     }
 
     private static func header(
@@ -67,10 +77,13 @@ struct ChatCopiesTests {
         return header
     }
 
-    private static func insertThread(pool: DatabasePool) throws -> Thread {
+    /// `filedOnly`: the chat has no Inbox copy. The emails the Inbox would hold are under the
+    /// "Projects" label in the first account and filed in "Clients" in the second.
+    private static func insertThread(pool: DatabasePool, filedOnly: Bool) throws -> Thread {
         for (account, folders) in [
-            (own, [("INBOX", FolderRole.inbox), ("Sent", .sent), ("Archive", .archive), ("Trash", .trash), ("Spam", .spam)]),
-            (second, [("INBOX", .inbox), ("Archive", .archive), ("Trash", .trash)]),
+            (own, [("INBOX", FolderRole.inbox), ("Sent", .sent), ("Archive", .archive), ("Trash", .trash), ("Spam", .spam),
+                   ("Projects", .custom)]),
+            (second, [("INBOX", .inbox), ("Archive", .archive), ("Trash", .trash), ("Clients", .custom)]),
         ] {
             _ = try FolderEpochTestFixture.makeAccount(id: account, provider: .gmail, pool: pool)
             for (path, role) in folders {
@@ -82,21 +95,29 @@ struct ChatCopiesTests {
         let post = "<copies-post@example.com>"
         let reply = "<copies-reply@example.com>"
         let newest = "<copies-newest@example.com>"
+        let inbox = filedOnly ? "Projects" : "INBOX"
+        let secondInbox = filedOnly ? "Clients" : "INBOX"
         let thread = Thread(
             postSent: header("post-sent", rfc: post, inReplyTo: nil, accountId: own, folder: "Sent",
                              from: me, date: now.addingTimeInterval(-3600), isRead: true),
             // The list's copy. One second older only so that the chat shows the Sent copy and hides
             // this one, as the review's case had it.
-            postEcho: header("post-echo", rfc: post, inReplyTo: nil, accountId: own, folder: "INBOX",
+            postEcho: header("post-echo", rfc: post, inReplyTo: nil, accountId: own, folder: inbox,
                              from: me, date: now.addingTimeInterval(-3601), isRead: false),
-            replyOwn: header("reply-own", rfc: reply, inReplyTo: post, accountId: own, folder: "INBOX",
+            replyOwn: header("reply-own", rfc: reply, inReplyTo: post, accountId: own, folder: inbox,
                              from: "sam@example.com", date: now.addingTimeInterval(-1800), isRead: false),
-            replySecond: header("reply-second", rfc: reply, inReplyTo: post, accountId: second, folder: "INBOX",
+            replySecond: header("reply-second", rfc: reply, inReplyTo: post, accountId: second, folder: secondInbox,
                                 from: "sam@example.com", date: now.addingTimeInterval(-1800), isRead: false),
-            newest: header("newest", rfc: newest, inReplyTo: reply, accountId: own, folder: "INBOX",
+            newest: header("newest", rfc: newest, inReplyTo: reply, accountId: own, folder: inbox,
                            from: "jordan@example.com", date: now.addingTimeInterval(-600), isRead: false),
             replySpam: header("reply-spam", rfc: reply, inReplyTo: post, accountId: own, folder: "Spam",
-                              from: "sam@example.com", date: now.addingTimeInterval(-1800), isRead: false))
+                              from: "sam@example.com", date: now.addingTimeInterval(-1800), isRead: false),
+            replyProjects: filedOnly ? nil
+                : header("reply-own", rfc: reply, inReplyTo: post, accountId: own, folder: "Projects",
+                         from: "sam@example.com", date: now.addingTimeInterval(-1800), isRead: false),
+            replyClients: filedOnly ? nil
+                : header("reply-second", rfc: reply, inReplyTo: post, accountId: second, folder: "Clients",
+                         from: "sam@example.com", date: now.addingTimeInterval(-1800), isRead: false))
         try pool.write { db in
             for row in thread.loaded + [thread.replySpam] { try row.insert(db) }
         }
@@ -120,9 +141,11 @@ struct ChatCopiesTests {
         HostedAccessibility.elements(under: view).filter { $0.accessibilityLabel?.contains(" said: ") == true }.count
     }
 
-    /// Opens the chat on the thread's newest email, waits until its thread has loaded and the read
-    /// flips have been written, runs `then`, and tears everything down.
+    /// Opens the chat on the thread's newest email (or on `opening`), waits until its thread has
+    /// loaded and the read flips have been written, runs `then`, and tears everything down.
     private func withOpenChat(
+        filedOnly: Bool = false,
+        opening: @MainActor (Thread) -> MessageHeader = { $0.newest },
         _ then: @MainActor (Thread, UIView) async throws -> Void
     ) async throws {
         try await HostedAccessibility.withAutomation {
@@ -133,13 +156,14 @@ struct ChatCopiesTests {
             defer {
                 InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
             }
-            let thread = try Self.insertThread(pool: pool)
+            let thread = try Self.insertThread(pool: pool, filedOnly: filedOnly)
+            let opened = opening(thread)
 
             let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
             let window = UIWindow(windowScene: scene)
             window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
             let controller = UIHostingController(rootView: NavigationStack {
-                ChatThreadView(messageId: thread.newest.id)
+                ChatThreadView(messageId: opened.id)
             })
             window.rootViewController = controller
             window.makeKeyAndVisible()
@@ -192,7 +216,17 @@ struct ChatCopiesTests {
         return false
     }
 
-    @Test("A whole-chat Archive or Delete moves every copy of its emails out of every Inbox, and nothing its thread did not hold",
+    /// Waits (bounded) until each row is in its folder, then takes the write-queue barrier.
+    private static func settle(_ places: [String: String]) async throws {
+        for _ in 0..<80 {
+            let now = try await rows(Array(places.keys))
+            if places.allSatisfy({ now[$0.key]?.folderPath == $0.value }) { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        await AccountManager.shared.awaitWriteQueueDrain()
+    }
+
+    @Test("A whole-chat Archive takes the Inbox copies and a Trash every copy, out of every Inbox, and nothing its thread did not hold",
           arguments: WholeChatAction.allCases)
     func wholeChatActionMovesEveryCopy(action: WholeChatAction) async throws {
         try await withOpenChat { thread, view in
@@ -201,26 +235,104 @@ struct ChatCopiesTests {
             try await AppDatabase.dbPool.write { db in try late.insert(db) }
 
             #expect(Self.perform(action.rawValue, in: view), "a bubble offers \(action.rawValue)")
-            let moved = thread.loaded.filter { $0.id != thread.postSent.id }
-            for _ in 0..<80 {
-                let now = try await Self.rows(moved.map(\.id))
-                if moved.allSatisfy({ now[$0.id]?.folderPath == action.destination($0.accountId) }) { break }
-                try await Task.sleep(for: .milliseconds(50))
-            }
-            await AccountManager.shared.awaitWriteQueueDrain()
+            // Archive takes the Inbox copies; Trash takes every copy but the user's Sent one.
+            let moved = action == .archive ? thread.inInbox : thread.loaded.filter { $0.id != thread.postSent.id }
+            let stays = thread.loaded.filter { row in !moved.contains { $0.id == row.id } }
+            var places = Dictionary(uniqueKeysWithValues: stays.map { ($0.id, $0.folderPath) })
+            for row in moved { places[row.id] = action.destination(row.accountId) }
+            try await Self.settle(places)
 
             let found = try await Self.rows((thread.loaded + [thread.replySpam, late]).map(\.id))
             for row in moved {
                 #expect(found[row.id]?.folderPath == action.destination(row.accountId),
-                        "\(row.messageId) in \(row.accountId) went to its own account's \(action.destination(row.accountId))")
+                        "\(row.messageId) in \(row.accountId)/\(row.folderPath) went to its own account's \(action.destination(row.accountId))")
+            }
+            for row in stays {
+                #expect(found[row.id]?.folderPath == row.folderPath, "\(row.messageId) in \(row.accountId)/\(row.folderPath) stays")
             }
             #expect(found[thread.postSent.id]?.folderPath == "Sent", "the user's Sent copy stays in Sent")
-            #expect(!thread.loaded.contains { found[$0.id]?.isInInbox == true }, "no email of the thread is left in any Inbox")
+            #expect(!thread.loaded.contains { found[$0.id]?.isInInbox == true || found[$0.id]?.folderPath == "INBOX" },
+                    "no email of the thread is left in any Inbox")
             #expect(found[thread.replySpam.id]?.folderPath == "Spam" && found[thread.replySpam.id]?.isRead == false,
                     "a copy the thread never reached is not moved by its Message-ID")
             #expect(found[late.id]?.folderPath == "INBOX" && found[late.id]?.isRead == false,
                     "a copy that arrived after the chat loaded is not acted on by its Message-ID")
         }
+    }
+
+    @Test("A whole-chat Archive takes the chat out of every Inbox and leaves its labeled and filed copies where they are")
+    func wholeChatArchiveLeavesFiledCopies() async throws {
+        try await withOpenChat { thread, view in
+            let projects = try #require(thread.replyProjects)
+            let clients = try #require(thread.replyClients)
+            let late = Self.lateCopy(of: thread)
+            try await AppDatabase.dbPool.write { db in try late.insert(db) }
+
+            #expect(Self.perform(WholeChatAction.archive.rawValue, in: view), "a bubble offers Archive chat")
+            var places = [String: String]()
+            for row in thread.inInbox { places[row.id] = "Archive" }
+            try await Self.settle(places)
+
+            let found = try await Self.rows((thread.loaded + [thread.replySpam, late]).map(\.id))
+            #expect(found[projects.id]?.folderPath == "Projects", "the copy under the Projects label keeps its label")
+            #expect(found[clients.id]?.folderPath == "Clients", "the copy filed in Clients stays in Clients")
+            #expect(thread.inInbox.count == 4, "control: the chat has four Inbox rows")
+            for row in thread.inInbox {
+                #expect(found[row.id]?.folderPath == "Archive", "\(row.messageId) in \(row.accountId) left the Inbox for its own account's Archive")
+            }
+            #expect(!thread.loaded.contains { found[$0.id]?.isInInbox == true || found[$0.id]?.folderPath == "INBOX" },
+                    "no loaded row is left in an Inbox")
+            #expect(found[thread.postSent.id]?.folderPath == "Sent", "the user's Sent copy stays in Sent")
+            #expect(found[thread.replySpam.id]?.folderPath == "Spam", "a copy the thread never reached is not moved")
+            #expect(found[late.id]?.folderPath == "INBOX", "a copy that arrived after the chat loaded is not moved")
+        }
+    }
+
+    @Test("A chat with no Inbox copy offers no Archive, and its Trash still takes every copy")
+    func chatWithNoInboxCopyOffersNoArchive() async throws {
+        try await withOpenChat(filedOnly: true) { thread, view in
+            #expect(thread.inInbox.isEmpty, "control: no row of the chat is in an Inbox")
+            #expect(!Self.perform(WholeChatAction.archive.rawValue, in: view),
+                    "no bubble offers Archive chat: \(Self.offeredActions(in: view))")
+            #expect(Self.perform(WholeChatAction.delete.rawValue, in: view), "a bubble offers Trash chat")
+            let moved = thread.loaded.filter { $0.id != thread.postSent.id }
+            try await Self.settle(Dictionary(uniqueKeysWithValues: moved.map { ($0.id, "Trash") }))
+            let found = try await Self.rows(thread.loaded.map(\.id))
+            for row in moved {
+                #expect(found[row.id]?.folderPath == "Trash", "\(row.messageId) in \(row.accountId)/\(row.folderPath) went to Trash")
+            }
+            #expect(found[thread.postSent.id]?.folderPath == "Sent", "the user's Sent copy stays in Sent")
+        }
+    }
+
+    @Test("Archiving a chat opened on a label hides no row of that label's list: the opened copy did not move")
+    func archiveFromALabelKeepsTheListRow() async throws {
+        try await withOpenChat(opening: { $0.replyProjects ?? $0.newest }) { thread, view in
+            let projects = try #require(thread.replyProjects)
+            let dismissed = DismissedIds()
+            let observer = NotificationCenter.default.addObserver(
+                forName: .messageDismissedFromDetail, object: nil, queue: nil
+            ) { note in
+                if let id = note.object as? String { dismissed.add(id) }
+            }
+            defer { NotificationCenter.default.removeObserver(observer) }
+
+            #expect(Self.perform(WholeChatAction.archive.rawValue, in: view), "a bubble offers Archive chat")
+            try await Self.settle(Dictionary(uniqueKeysWithValues: thread.inInbox.map { ($0.id, "Archive") }))
+            let found = try await Self.rows(thread.loaded.map(\.id))
+            #expect(thread.inInbox.allSatisfy { found[$0.id]?.folderPath == "Archive" }, "control: the Inbox copies were archived")
+            #expect(found[projects.id]?.folderPath == "Projects", "control: the opened copy stays under its label")
+            #expect(!dismissed.ids.contains(projects.id),
+                    "the label's list is not told to hide the opened row, which is still there: \(dismissed.ids)")
+        }
+    }
+
+    /// The ids `.messageDismissedFromDetail` named, from the posting thread.
+    private final class DismissedIds: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stored: [String] = []
+        func add(_ id: String) { lock.withLock { stored.append(id) } }
+        var ids: [String] { lock.withLock { stored } }
     }
 
     // MARK: - The read swipes

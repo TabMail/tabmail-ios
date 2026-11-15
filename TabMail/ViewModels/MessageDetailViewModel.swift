@@ -2063,22 +2063,49 @@ final class MessageDetailViewModel {
         moveMessages([msg], toFolderPath: toFolderPath)
     }
 
-    /// A whole-chat Archive, Delete or Move: every row the chat loaded (`chatRows`), so every copy
-    /// of each email it shows, each by its own id and never by Message-ID (ADR-IOS-068 D4), wherever
-    /// it is filed and in whichever account, except sent copies and drafts, which stay
-    /// where they are, and those already in a `skippedRole` folder or in their destination. Each
-    /// email goes to `destination` in its own account (owner 2026-11-06); an account without one
-    /// keeps its emails where they are. The move is one action with one undo entry; Undo puts each
-    /// email back in its own folder. False when nothing moved, so the chat stays open.
+    /// Which rows of a chat a whole-chat action takes, decided per row from the snapshot's own
+    /// folder (ADR-IOS-114 decision 12). A folder role only decides which rows qualify; each row is
+    /// still moved by its own id, never by a role or a Message-ID (ADR-IOS-068 D4 and clause 6).
+    enum ChatMoveSource: Equatable {
+        /// Rows in a folder with this role, in every account (Archive takes the Inbox copies).
+        case role(FolderRole)
+        /// Rows in this one folder (a Move from a user folder, a Gmail label included).
+        case folder(id: String)
+        /// Every row (Trash).
+        case everyRow
+
+        func takes(role: FolderRole?, folderId: String) -> Bool {
+            switch self {
+            case .role(let wanted): return role == wanted
+            case .folder(let id): return folderId == id
+            case .everyRow: return true
+            }
+        }
+    }
+
+    /// Whether any row the chat loaded is in an Inbox: the chat offers Archive only then, since a
+    /// whole-chat Archive takes only the Inbox copies.
+    var chatHasInboxCopy: Bool {
+        chatRows.contains { lookupFolderRole($0.folderId) == .inbox }
+    }
+
+    /// A whole-chat Archive, Delete or Move over the rows the chat loaded (`chatRows`), each by its
+    /// own id and never by Message-ID (ADR-IOS-068 D4), in whichever account: the rows `source`
+    /// takes, except sent copies and drafts, which stay where they are, and rows already in their
+    /// destination. A copy filed elsewhere (a Gmail label, an IMAP folder) stays where it is unless
+    /// `source` takes it. Each email goes to `destination` in its own account (owner 2026-11-06);
+    /// an account without one keeps its emails where they are. The move is one action with one
+    /// undo entry; Undo puts each email back in its own folder. Returns the ids it moved: empty
+    /// when nothing moved, so the chat stays open.
     private func recordChatMove(
-        _ members: [MessageHeader], skippedRole: FolderRole?, roleMove: Bool,
+        _ members: [MessageHeader], source: ChatMoveSource, roleMove: Bool,
         destination: (_ accountId: String) -> Folder?
-    ) -> Bool {
+    ) -> Set<String> {
         let groups: [MoveGroup] = UndoableAction.byAccount(members).compactMap { share in
             guard let accountId = share.first?.accountId, let folder = destination(accountId) else { return nil }
             let movable = share.filter { member in
                 let role = lookupFolderRole(member.folderId)
-                return role != .sent && role != .drafts && (skippedRole == nil || role != skippedRole)
+                return role != .sent && role != .drafts && source.takes(role: role, folderId: member.folderId)
                     && member.folderPath != folder.path
             }
             guard !movable.isEmpty else { return nil }
@@ -2087,23 +2114,29 @@ final class MessageDetailViewModel {
             }
             return MoveGroup(msgs: movable, toPath: folder.path, toFolderId: folder.id, destIsInbox: folder.role == .inbox)
         }
-        guard !groups.isEmpty else { return false }
+        guard !groups.isEmpty else { return [] }
         recordMove(groups, roleMove: roleMove)
-        return true
+        return Set(groups.flatMap { $0.msgs.map(\.id) })
     }
 
-    func archiveChat(_ members: [MessageHeader]) -> Bool {
-        recordChatMove(members, skippedRole: .archive, roleMove: true) { lookupFolder(accountId: $0, role: .archive) }
+    /// Takes the chat out of every Inbox: only the Inbox copies move, so a labeled or filed copy
+    /// stays where it is (on Gmail, archiving the Inbox copy removes only the INBOX label).
+    func archiveChat(_ members: [MessageHeader]) -> Set<String> {
+        recordChatMove(members, source: .role(.inbox), roleMove: true) { lookupFolder(accountId: $0, role: .archive) }
     }
 
-    func deleteChat(_ members: [MessageHeader]) -> Bool {
-        recordChatMove(members, skippedRole: .trash, roleMove: true) { lookupFolder(accountId: $0, role: .trash) }
+    func deleteChat(_ members: [MessageHeader]) -> Set<String> {
+        recordChatMove(members, source: .everyRow, roleMove: true) { lookupFolder(accountId: $0, role: .trash) }
     }
 
-    /// The opened email's account offers `path`; another account's emails go to its folder at
-    /// the same path, if it has one.
-    func moveChat(_ members: [MessageHeader], toFolderPath path: String) -> Bool {
-        recordChatMove(members, skippedRole: nil, roleMove: false) { lookupFolder(accountId: $0, path: path) }
+    /// Moves the copies in the folder the chat was opened from: a system folder by its role, in
+    /// every account; a user folder (a Gmail label included) by itself. The opened email's account
+    /// offers `path`; another account's emails go to its folder at the same path, if it has one.
+    func moveChat(_ members: [MessageHeader], toFolderPath path: String) -> Set<String> {
+        guard let opened = message else { return [] }
+        let role = lookupFolderRole(opened.folderId)
+        let source: ChatMoveSource = if let role, role != .custom { .role(role) } else { .folder(id: opened.folderId) }
+        return recordChatMove(members, source: source, roleMove: false) { lookupFolder(accountId: $0, path: path) }
     }
 
     /// Moves emails that share one folder as ONE action — see `archiveMessages(_:)`.

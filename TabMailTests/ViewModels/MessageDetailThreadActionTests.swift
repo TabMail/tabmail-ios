@@ -7,16 +7,17 @@ import GRDB
 import Testing
 @testable import TabMail
 
-/// The chat's whole-thread actions: Archive, Delete and Move act on every email the
-/// chat shows, wherever it is filed (sent copies and drafts stay put), as ONE action — one undo
-/// entry, never a loop of single-email actions — and one Undo puts each email back in its own
-/// folder; and the read swipes set each email's read state.
+/// The chat's whole-thread actions, as ONE action — one undo entry, never a loop of single-email
+/// actions — where one Undo puts each email back in its own folder: Archive takes the chat's Inbox
+/// copies, Move the copies in the folder the chat was opened from, and Delete every email (sent
+/// copies and drafts stay put); and the read swipes set each email's read state.
 @Suite("Detail view acts on a whole chat as one action", .serialized, .processGlobalState)
 struct MessageDetailThreadActionTests {
     private static let inboxPath = "INBOX"
     private static let archivePath = "Archive"
     private static let trashPath = "Trash"
     private static let projectsPath = "Projects"
+    private static let clientsPath = "Clients"
     private static let sentPath = "Sent"
     private static let draftsPath = "Drafts"
 
@@ -39,6 +40,7 @@ struct MessageDetailThreadActionTests {
             try Folder(name: "Archive", path: Self.archivePath, role: .archive, accountId: "acc1").insert(db)
             try Folder(name: "Trash", path: Self.trashPath, role: .trash, accountId: "acc1").insert(db)
             try Folder(name: "Projects", path: Self.projectsPath, role: .custom, accountId: "acc1").insert(db)
+            try Folder(name: "Clients", path: Self.clientsPath, role: .custom, accountId: "acc1").insert(db)
             try Folder(name: "Sent", path: Self.sentPath, role: .sent, accountId: "acc1").insert(db)
             try Folder(name: "Drafts", path: Self.draftsPath, role: .drafts, accountId: "acc1").insert(db)
         }
@@ -177,15 +179,17 @@ struct MessageDetailThreadActionTests {
             var iterator = gateStream.makeAsyncIterator()
             _ = await iterator.next()
         }
-        #expect(archive ? vm.archiveChat([b, a]) : vm.deleteChat([b, a]))
+        // Archive takes the Inbox email; Delete takes both.
+        let moved = archive ? [a.id] : ids
+        #expect(!(archive ? vm.archiveChat([b, a]) : vm.deleteChat([b, a])).isEmpty)
         #expect(vm.threadMessages.first?.isRead == onAtStart, "the card shows the setting as it was at the start")
         UserDefaults.standard.set(!onAtStart, forKey: AccountManager.markReadOnArchiveDeleteKey)
         gate.finish()
 
         let destination = archive ? Self.archivePath : Self.trashPath
-        try await settle(pool, ids: ids, in: destination)
-        let done = try await rows(pool, ids)
-        #expect(done.count == 2)
+        try await settle(pool, ids: moved, in: destination)
+        let done = try await rows(pool, moved)
+        #expect(done.count == moved.count)
         #expect(done.allSatisfy { $0.folderPath == destination && $0.isRead == onAtStart },
                 "every email's read state follows the setting as it was when the action started")
         let reads = try await opsInDrainOrder(pool).filter { $0.type == .markRead }
@@ -237,13 +241,15 @@ struct MessageDetailThreadActionTests {
 
     /// A chat whose emails are filed in five places: the Inbox, Archive, a custom folder, Sent and Drafts.
     @MainActor
-    private func mixedChat(_ pool: DatabasePool, _ tag: String) throws -> (all: [MessageHeader], sent: MessageHeader, draft: MessageHeader) {
+    private func mixedChat(_ pool: DatabasePool, _ tag: String) throws
+        -> (all: [MessageHeader], inbox: MessageHeader, archived: MessageHeader, filed: MessageHeader,
+            sent: MessageHeader, draft: MessageHeader) {
         let inbox = try insertHeader(pool, messageId: "\(tag)-inbox")
         let archived = try insertHeader(pool, messageId: "\(tag)-archived", folderPath: Self.archivePath, isRead: true)
         let filed = try insertHeader(pool, messageId: "\(tag)-filed", folderPath: Self.projectsPath, isRead: true)
         let sent = try insertHeader(pool, messageId: "\(tag)-sent", folderPath: Self.sentPath, isRead: true)
         let draft = try insertHeader(pool, messageId: "\(tag)-draft", folderPath: Self.draftsPath, isRead: true)
-        return ([inbox, archived, filed, sent, draft], sent, draft)
+        return ([inbox, archived, filed, sent, draft], inbox, archived, filed, sent, draft)
     }
 
     @Test("Deleting a chat filed in several folders deletes every email but sent copies and drafts, and one Undo puts each back in its own folder")
@@ -259,7 +265,7 @@ struct MessageDetailThreadActionTests {
         let before = try await folders(pool, ids)
         let vm = openChat(pool, focused: chat.all[0], others: Array(chat.all.dropFirst()))
 
-        #expect(vm.deleteChat(chat.all))
+        #expect(!vm.deleteChat(chat.all).isEmpty)
         #expect(UndoService.shared.undoStack.count == 1, "one undo entry for the whole chat")
 
         var deleted = before
@@ -272,7 +278,7 @@ struct MessageDetailThreadActionTests {
         #expect(try await folders(pool, ids) == before, "one Undo puts each email back where it was")
     }
 
-    @Test("Archiving a chat filed in several folders archives the rest, and one Undo puts each back in its own folder")
+    @Test("Archiving a chat filed in several folders archives its Inbox email and leaves the filed ones where they are, and one Undo puts it back")
     @MainActor
     func archiveChatAcrossFolders() async throws {
         let (pool, dir, previous) = try makeEnv()
@@ -285,11 +291,11 @@ struct MessageDetailThreadActionTests {
         let before = try await folders(pool, ids)
         let vm = openChat(pool, focused: chat.all[0], others: Array(chat.all.dropFirst()))
 
-        #expect(vm.archiveChat(chat.all))
+        #expect(vm.archiveChat(chat.all) == [chat.inbox.id], "Archive takes only the Inbox email")
         #expect(UndoService.shared.undoStack.count == 1)
 
         var archived = before
-        for id in ids where id != chat.sent.id && id != chat.draft.id { archived[id] = Self.archivePath }
+        archived[chat.inbox.id] = Self.archivePath
         try await settle(pool, archived)
         #expect(try await folders(pool, ids) == archived)
 
@@ -330,7 +336,7 @@ struct MessageDetailThreadActionTests {
         let ids = [unknown.id, stamped.id]
         let vm = openChat(pool, focused: stamped, others: [unknown])
 
-        #expect(vm.archiveChat([stamped, unknown]))
+        #expect(!vm.archiveChat([stamped, unknown]).isEmpty)
         #expect(UndoService.shared.undoStack.count == 1, "one undo entry for the whole chat")
         let commands = UndoService.shared.undoStack.first?.commands ?? []
         #expect(commands.count == 2, "one command per source epoch: \(commands.map { $0.members.map(\.originalHeaderId) })")
@@ -351,26 +357,56 @@ struct MessageDetailThreadActionTests {
         #expect(restored.allSatisfy { $0.folderPath == Self.inboxPath }, "one Undo leaves both emails in the Inbox")
     }
 
-    @Test("Moving a chat filed in several folders moves every email but sent copies and drafts, and one Undo puts each back")
+    enum OpenedFrom: String, CaseIterable, Sendable {
+        case inbox, archive, label
+    }
+
+    @Test("Moving a chat takes the emails in the folder it was opened from and leaves the rest where they are, and one Undo puts them back",
+          arguments: OpenedFrom.allCases)
     @MainActor
-    func moveChatAcrossFolders() async throws {
+    func moveChatTakesTheOpenedFolder(from openedFrom: OpenedFrom) async throws {
         let (pool, dir, previous) = try makeEnv()
         defer { teardown(previous: previous, pool: pool, dir: dir) }
         clearOverlay()
         UndoService.shared.dismissAll()
 
-        let chat = try mixedChat(pool, "mixmov")
-        let ids = chat.all.map(\.id)
+        let chat = try mixedChat(pool, "mixmov-\(openedFrom.rawValue)")
+        // A second email in the opened folder, so the move takes more than the opened one.
+        let sibling: MessageHeader
+        let opened: MessageHeader
+        let destination: String
+        switch openedFrom {
+        case .inbox:
+            opened = chat.inbox
+            sibling = try insertHeader(pool, messageId: "mixmov-inbox-2")
+            destination = Self.clientsPath
+        case .archive:
+            opened = chat.archived
+            sibling = try insertHeader(pool, messageId: "mixmov-archive-2", folderPath: Self.archivePath, isRead: true)
+            destination = Self.inboxPath
+        case .label:
+            opened = chat.filed
+            sibling = try insertHeader(pool, messageId: "mixmov-label-2", folderPath: Self.projectsPath, isRead: true)
+            destination = Self.clientsPath
+        }
+        let all = chat.all + [sibling]
+        let ids = all.map(\.id)
         let before = try await folders(pool, ids)
-        let vm = openChat(pool, focused: chat.all[0], others: Array(chat.all.dropFirst()))
+        let vm = openChat(pool, focused: opened, others: all.filter { $0.id != opened.id })
 
-        #expect(vm.moveChat(chat.all, toFolderPath: Self.projectsPath))
+        #expect(vm.moveChat(all, toFolderPath: destination) == [opened.id, sibling.id],
+                "the move takes the emails in the folder the chat was opened from")
         #expect(UndoService.shared.undoStack.count == 1)
 
         var moved = before
-        for id in ids where id != chat.sent.id && id != chat.draft.id { moved[id] = Self.projectsPath }
+        moved[opened.id] = destination
+        moved[sibling.id] = destination
         try await settle(pool, moved)
-        #expect(try await folders(pool, ids) == moved)
+        #expect(try await folders(pool, ids) == moved, "every other email stays where it is")
+        if openedFrom == .inbox {
+            #expect(try await folders(pool, [chat.filed.id])[chat.filed.id] == Self.projectsPath,
+                    "the copy under the Projects label keeps its label")
+        }
 
         await UndoService.shared.undo()
         try await settle(pool, before)
@@ -420,16 +456,16 @@ struct MessageDetailThreadActionTests {
         var after = before
         switch action {
         case .archive:
-            #expect(vm.archiveChat([opened, other]))
+            #expect(!vm.archiveChat([opened, other]).isEmpty)
             after = [opened.id: Self.archivePath, other.id: Self.otherArchivePath]
         case .delete:
-            #expect(vm.deleteChat([opened, other]))
+            #expect(!vm.deleteChat([opened, other]).isEmpty)
             after = [opened.id: Self.trashPath, other.id: Self.otherTrashPath]
         case .move:
-            #expect(vm.moveChat([opened, other], toFolderPath: Self.projectsPath))
+            #expect(!vm.moveChat([opened, other], toFolderPath: Self.projectsPath).isEmpty)
             after = [opened.id: Self.projectsPath, other.id: Self.projectsPath]
         case .moveWithNoSuchFolder:
-            #expect(vm.moveChat([opened, other], toFolderPath: Self.projectsPath))
+            #expect(!vm.moveChat([opened, other], toFolderPath: Self.projectsPath).isEmpty)
             after[opened.id] = Self.projectsPath
         }
         #expect(UndoService.shared.undoStack.count == 1)
@@ -454,10 +490,10 @@ struct MessageDetailThreadActionTests {
         let binned = try insertHeader(pool, messageId: "only-bin", folderPath: Self.trashPath, isRead: true)
         let vm = openChat(pool, focused: sent, others: [draft, binned])
 
-        #expect(vm.archiveChat([sent, draft]) == false)
-        #expect(vm.deleteChat([sent, draft, binned]) == false)
-        #expect(vm.moveChat([sent, draft], toFolderPath: Self.projectsPath) == false)
-        #expect(vm.archiveChat([]) == false)
+        #expect(vm.archiveChat([sent, draft]).isEmpty)
+        #expect(vm.deleteChat([sent, draft, binned]).isEmpty)
+        #expect(vm.moveChat([sent, draft], toFolderPath: Self.projectsPath).isEmpty)
+        #expect(vm.archiveChat([]).isEmpty)
         #expect(UndoService.shared.undoStack.isEmpty)
     }
 
