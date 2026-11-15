@@ -678,7 +678,11 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
                               let value = property["value"] as? String else { continue }
                         message.extendedProperties[id] = value
                         // One server: the last verb the reader expands is the one a PATCH wrote.
-                        if id == "Integer 0x1081" { message.lastVerb = Int(value) }
+                        if id == "Integer 0x1081" {
+                            message.lastVerb = Int(value)
+                            // Graph reports the client's own change in the delta, as any other.
+                            model.delta.log(folderId: message.folderId, messageId: providerId, kind: .lastVerb)
+                        }
                     }
                 }
                 model.messagesByProviderId[providerId] = message
