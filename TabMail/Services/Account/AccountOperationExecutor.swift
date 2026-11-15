@@ -1070,18 +1070,7 @@ final class AccountOperationExecutor {
                     && !(error is DatabaseError) && !opaqueAuth
                     && !SyncEngine.isConnectionError(error)
                 if chargeRetry {
-                    // #915: the replied/forwarded mark is cosmetic. A refusal the
-                    // transient classifier does not claim (400, 403, a property
-                    // write the server will not take) ends it now, logged, instead
-                    // of holding the account's queue through the retry budget.
-                    // 429/5xx stay on the ordinary retry; connection errors never
-                    // reach here.
-                    // Provider-neutral: IMAP lifts only LOGIN-time temporary codes
-                    // into ProviderTemporaryRefusal, so an IMAP STORE/SELECT `NO`
-                    // also drops the mark at once.
-                    let isMark = currentOp.type == .markReplied || currentOp.type == .markForwarded
-                    return await settleProviderFailure(currentOp, using: manager,
-                        permanentRefusal: isMark && !SyncEngine.isTransientError(error) ? error : nil)
+                    return await settleProviderFailure(currentOp, using: manager)
                 }
             }
             return .retryLater(scope: .account, chargeRetry: chargeRetry)
@@ -1092,13 +1081,12 @@ final class AccountOperationExecutor {
     /// and terminal deletion share one transaction; the scheduler must not charge
     /// again. A refused transaction keeps this one event in the existing owner.
     private func settleProviderFailure(_ op: PendingOperation,
-        using manager: isolated AccountManager,
-        permanentRefusal: Error? = nil) async -> QueueAttemptDisposition {
+        using manager: isolated AccountManager) async -> QueueAttemptDisposition {
         do {
             let retired: Bool? = try await retryWrite(manager.dbPool, label: "Queue provider failure") { db in
                 guard let live = try PendingOperation.fetchOne(db, key: op.id),
                       live.status != PendingStatus.cancelled.rawValue else { return nil }
-                if permanentRefusal != nil || live.retryCount >= SyncConfig.pendingOperationServerRefusalRetryLimit - 1 {
+                if live.retryCount >= SyncConfig.pendingOperationServerRefusalRetryLimit - 1 {
                     return try PendingOperation.deleteOne(db, key: live.id)
                 }
                 try db.execute(sql: "UPDATE pendingOperation SET retryCount = retryCount + 1 WHERE id = ?",
@@ -1108,13 +1096,6 @@ final class AccountOperationExecutor {
             retainedSettlement = nil
             guard let retired else { return .completed }
             guard retired else { return .retryLater(scope: .account, chargeRetry: false) }
-            if let permanentRefusal {
-                BackgroundSyncLogger.logError(
-                    "Message action \(op.type.rawValue) dropped: the server permanently refused the mark (\(permanentRefusal)).",
-                    source: "actionQueue")
-                manager.dropDeferredMoveSuccessors(for: op.id)
-                return .completed
-            }
             BackgroundSyncLogger.logError(
                 "Message action \(op.type.rawValue) retired after reaching the provider failure retry limit (\(SyncConfig.pendingOperationServerRefusalRetryLimit)); repeat the gesture to try again.",
                 source: "actionQueue")

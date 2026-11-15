@@ -303,63 +303,6 @@ struct ExchangeLastVerbMarkTests {
         await finish(f)
     }
 
-    /// #915: a permanent Graph refusal of the mark (400, 403) drops the mark at
-    /// once, logged, and the account's next queued action runs in the SAME drain;
-    /// a transient refusal (503) keeps the ordinary retry.
-    @Test("A permanent refusal drops the mark at once; the next action runs straight away")
-    @MainActor
-    func permanentRefusalDropsTheMarkAndTheQueueMoves() async throws {
-        let line = "permanently refused the mark"
-        for (status, permanent, isForward) in [(400, true, false), (403, true, false), (400, true, true), (503, false, false)] {
-            let server = Self.server()
-            defer { server.close() }
-            let f = try fixture()
-            await AccountManager.shared.registerProviderForTesting(
-                accountId: f.accountId, provider: server.provider())
-            let parent = original(f)
-            let sent = completedSend(f, originalId: parent.id, isForward: isForward, isReplyAll: false, sentAt: Self.sendTime())
-            try await f.pool.writeWithoutTransaction { db in
-                try parent.insert(db)
-                try sent.insert(db)
-            }
-            _ = try await f.pool.write { db in
-                try AccountManager.deleteCompletedSendAtomic(outboxId: sent.id, db: db)
-            }
-            // Queued after the mark: an unrelated action on the same account.
-            try await f.pool.writeWithoutTransaction { db in
-                var read = PendingOperation(
-                    type: .markRead, messageIds: ["bystander"], accountId: f.accountId, folderPath: "INBOX")
-                try read.insert(db)
-            }
-            if status == 503 { server.failNextPatch() } else { server.failNextPatch(status: status) }
-            server.clearMutationLog()
-            let logged = AppLogStore.read(channel: .error).components(separatedBy: line).count
-
-            await AccountManager.shared.drainPendingQueue()
-
-            let droppedLines = AppLogStore.read(channel: .error).components(separatedBy: line).count - logged
-            let left = try await f.pool.read { db in try PendingOperation.fetchAll(db) }
-            let bystanderRead = server.snapshots(rfc822MessageId: "bystander@example.com").first?.isRead
-            if permanent {
-                #expect(left.isEmpty, "status \(status) forward=\(isForward): the mark is dropped, not held for retry")
-                #expect(droppedLines == 1, "status \(status): the drop is logged as a permanent refusal")
-                #expect(bystanderRead == true, "status \(status): the next action ran in the same drain")
-                #expect(server.mutationLog().filter { $0 == "PATCH original" }.count == 1,
-                        "status \(status): one attempt, never retried")
-                #expect(server.extendedProperties(providerMessageId: "original")?.isEmpty == true)
-                server.clearMutationLog()
-                await AccountManager.shared.drainPendingQueue()
-                #expect(!server.mutationLog().contains("PATCH original"), "status \(status): not retried later")
-            } else {
-                let marks = left.filter { $0.type == .markReplied }
-                #expect(marks.count == 1, "503: the mark stays queued")
-                #expect(droppedLines == 0, "503: not logged as a permanent refusal")
-                #expect(marks.first?.retryCount == 1, "503: one ordinary retry charged")
-            }
-            await finish(f)
-        }
-    }
-
     // MARK: - Reply-all mode on the draft row
 
     /// The user's latest compose entry decides reply vs reply-all for one `reply:`
