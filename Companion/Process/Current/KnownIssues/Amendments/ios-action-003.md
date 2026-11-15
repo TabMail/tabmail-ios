@@ -187,6 +187,14 @@ server; the phone keeps showing L, which the server never got, until the message
 merge's missing label and answered-state reconciliation for stored rows is an older, separate gap in
 the change apply and is tracked on its own; once it is fixed, these kinds belong on the list.
 
+**Corrected (2026-11-14, #903): a retired user-label change in a tracked folder.** Since #882 the
+merge replaces a stored row's user labels from a record that knows them (Gmail label, Outlook
+category), so `addUserLabel`/`removeUserLabel` joined `SyncEngine.retiredActionKindsReadAgain`: their
+ids go on the re-read list of the folder they were queued on, and the next read shows the server's
+label set again (the retired op no longer shields it). The paragraph above stays as history for the
+label kinds; replied/forwarded marks are still not corrected (the merge does not write them).
+Tests: `ReleaseBoundaryRecheckTests` (Gmail and Outlook, add and remove).
+
 **Corrected (2026-11-14, master-agent ruling: a stuck state, not an edge): an older message in a
 folder outside the synced set.** Such a folder is now listed and its list is read (above). *Superseded
 same day:* "Not corrected, accepted (2026-11-14): an older message in a folder outside the syncable

@@ -38,11 +38,16 @@ import GRDB
 // - a draft delete: its folder's catch-up is armed (`markCatchUpLapse`), which
 //   loads the server draft back. Its address is a draft resource, not a message
 //   id, so it never goes on a list.
-// - a user-label change or a replied/forwarded mark: nothing. Neither the re-read
-//   (`mergeChangeRecord` writes read, flag, tag, identity and references into a
-//   stored row) nor the catch-up (read, flag, removals, missing mail) corrects a
-//   stored row's labels or answered state, so listing them would settle the id
-//   with nothing corrected. Registered in IOS-ACTION-003.
+// - a user-label change (Gmail label, Outlook category): its ids go on the
+//   re-read list of the folder it was queued on. The re-read's record carries
+//   the message's whole label set when the reader knows it, and the merge
+//   replaces the stored set with it (#882), so the label the gesture added or
+//   removed shows as the server has it again (#903). The retired op no longer
+//   shields the labels: the boundary deleted it.
+// - a replied/forwarded mark: nothing. Neither the re-read nor the catch-up
+//   (read, flag, removals, missing mail) corrects a stored row's answered
+//   state, so listing it would settle the id with nothing corrected.
+//   Registered in IOS-ACTION-003.
 // - tags (local-only on these providers, ADR-IOS-036) and draft saves (re-queued
 //   by the boundary): nothing.
 // - a row whose kind or ids do not read (an older release's kind, ids that are
@@ -74,10 +79,11 @@ struct RetiredActionRecheckSummary: Sendable, Equatable {
 
 extension SyncEngine {
 
-    /// Kinds whose optimistic local effect a re-read corrects: a move's folder
-    /// and a read or flag change.
+    /// Kinds whose optimistic local effect a re-read corrects: a move's folder,
+    /// a read or flag change, and a user-label change (#903).
     nonisolated static let retiredActionKindsReadAgain: Set<OperationType> = [
         .archive, .delete, .move, .markRead, .markUnread, .markFlagged, .markUnflagged,
+        .addUserLabel, .removeUserLabel,
     ]
 
     /// Inside the release boundary's transaction, BEFORE its delete: put the

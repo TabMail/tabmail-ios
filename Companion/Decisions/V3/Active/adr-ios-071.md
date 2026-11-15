@@ -110,6 +110,11 @@ or interpreted, nothing about any operation is decided, and an undecodable row i
 Accounts with no bookmark (IMAP today) are unchanged. Detail and the address reasoning:
 `IOS-ACTION-003` ("Retired actions read again").
 
+**2026-11-14 amendment (#903): user-label changes are read again.** Once #882 made the merge
+replace a stored row's user labels, a retired `addUserLabel`/`removeUserLabel` lists its ids on its
+source folder's re-read list like a read/flag change; the "not corrected" sentence above now holds
+only for replied/forwarded marks.
+
 **Relates:** ADR-IOS-068, ADR-IOS-069, ADR-IOS-070 (migration immutability precedent),
 `KNOWN_ISSUES.md` (`IOS-ACTION-001`, `IOS-ACTION-003`), migrations
 `v74_purgeLegacyPendingOperations` and `v89_createAppReleaseStamp`,

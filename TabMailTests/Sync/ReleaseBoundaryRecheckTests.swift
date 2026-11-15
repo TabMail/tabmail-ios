@@ -60,10 +60,11 @@ struct ReleaseBoundaryRecheckTests {
 
     static func queue(
         _ pool: DatabasePool, _ type: OperationType, ids: [String], accountId: String,
-        from path: String, to destination: String? = nil
+        from path: String, to destination: String? = nil, userLabelId: String? = nil
     ) throws {
         var op = PendingOperation(
-            type: type, messageIds: ids, accountId: accountId, folderPath: path, destinationPath: destination)
+            type: type, messageIds: ids, accountId: accountId, folderPath: path, destinationPath: destination,
+            userLabelId: userLabelId)
         try pool.write { db in try op.insert(db) }
     }
 
@@ -150,6 +151,114 @@ struct ReleaseBoundaryRecheckTests {
             #expect(Self.outlookListings(w) == listingsBefore, "no folder listing")
             #expect(try w.recheck(w.inbox).isEmpty)
             #expect(try w.recheck(w.archive).isEmpty)
+        }
+    }
+
+    // MARK: - User labels (#903)
+
+    /// The stored user labels of a row, by provider label id.
+    static func storedLabels(_ pool: DatabasePool, headerId: String) throws -> Set<String> {
+        try pool.read { db in
+            Set(try String.fetchAll(db, sql: """
+                SELECT ul.providerLabelId FROM messageUserLabel mul JOIN userLabel ul ON ul.id = mul.userLabelId
+                WHERE mul.messageId = ?
+                """, arguments: [headerId]))
+        }
+    }
+
+    /// The optimistic local effect of a label gesture: the row's label set changes.
+    static func setLabelOptimistically(
+        _ pool: DatabasePool, accountId: String, headerId: String, providerLabelId: String, add: Bool
+    ) throws {
+        try pool.write { db in
+            let label = UserLabel(accountId: accountId, providerLabelId: providerLabelId, name: providerLabelId, isSystem: false)
+            try label.insert(db, onConflict: .ignore)
+            let labelId = try #require(try String.fetchOne(
+                db, sql: "SELECT id FROM userLabel WHERE accountId = ? AND providerLabelId = ?",
+                arguments: [accountId, providerLabelId]))
+            if add {
+                try MessageUserLabel(messageId: headerId, userLabelId: labelId).insert(db, onConflict: .ignore)
+            } else {
+                try db.execute(sql: "DELETE FROM messageUserLabel WHERE messageId = ? AND userLabelId = ?",
+                               arguments: [headerId, labelId])
+            }
+        }
+    }
+
+    @Test("Gmail: a label removal and a label add cleared at the update show the server's labels after the next sync, with no folder listed")
+    func gmailRetiredLabelChangesAreReadAgain() async throws {
+        try await Gmail.withWorld(seeds: [
+            Gmail.seed("rb-unlabel", labels: ["INBOX", Gmail.userLabelId]),
+            Gmail.seed("rb-label", labels: ["INBOX"]),
+        ]) { w in
+            try await w.foregroundPassWithFullSyncDue()
+            #expect(try Self.tracking(w.pool, folderId: w.inbox.id), "precondition: the Inbox is tracked")
+            let unlabel = try #require(try w.row("rb-unlabel", in: w.inbox), "precondition: listed")
+            let label = try #require(try w.row("rb-label", in: w.inbox), "precondition: listed")
+            #expect(try Self.storedLabels(w.pool, headerId: unlabel.id) == [Gmail.userLabelId], "precondition: labelled here as on the server")
+            #expect(try Self.storedLabels(w.pool, headerId: label.id).isEmpty, "precondition: no label here or on the server")
+
+            // The gestures' optimistic effects, queued and never sent.
+            try Self.setLabelOptimistically(w.pool, accountId: w.accountId, headerId: unlabel.id,
+                                            providerLabelId: Gmail.userLabelId, add: false)
+            try Self.queue(w.pool, .removeUserLabel, ids: ["rb-unlabel"], accountId: w.accountId,
+                           from: w.inbox.path, userLabelId: Gmail.userLabelId)
+            try Self.setLabelOptimistically(w.pool, accountId: w.accountId, headerId: label.id,
+                                            providerLabelId: Gmail.userLabelId, add: true)
+            try Self.queue(w.pool, .addUserLabel, ids: ["rb-label"], accountId: w.accountId,
+                           from: w.inbox.path, userLabelId: Gmail.userLabelId)
+
+            #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: Self.nextRelease()))
+            #expect(try w.pendingOps().isEmpty, "the boundary retired the queue")
+
+            let listingsBefore = GmailChangeReadingTests.windowListings(w)
+            let catchUpsBefore = GmailChangeReadingTests.catchUpListings(w).count
+            try await w.foregroundPassWithFullSyncDue()
+
+            #expect(try Self.storedLabels(w.pool, headerId: unlabel.id) == [Gmail.userLabelId],
+                    "the removed label shows again, as on the server")
+            #expect(try Self.storedLabels(w.pool, headerId: label.id).isEmpty,
+                    "the added label is gone again, as on the server")
+            #expect(GmailChangeReadingTests.windowListings(w) == listingsBefore, "no window listing")
+            #expect(GmailChangeReadingTests.catchUpListings(w).count == catchUpsBefore, "no catch-up listing")
+            #expect(try Self.recheck(w.pool, folderId: w.inbox.id).isEmpty)
+        }
+    }
+
+    @Test("Outlook: a category removal and a category add cleared at the update show the server's categories after the next sync, with no folder listed")
+    func outlookRetiredCategoryChangesAreReadAgain() async throws {
+        try await Outlook.withWorld(seeds: [
+            Outlook.seed("ob-unlabel", in: Outlook.inbox, daysAgo: 1, categories: ["Receipts"]),
+            Outlook.seed("ob-label", in: Outlook.inbox, daysAgo: 1),
+        ]) { w in
+            try await w.foregroundPass()
+            try await w.foregroundPass()
+            #expect(try Self.tracking(w.pool, folderId: w.folderId(w.inbox)), "precondition: the Inbox is tracked")
+            let unlabel = try #require(try w.row("ob-unlabel", in: w.inbox), "precondition: listed")
+            let label = try #require(try w.row("ob-label", in: w.inbox), "precondition: listed")
+            #expect(try Self.storedLabels(w.pool, headerId: unlabel.id) == ["Receipts"], "precondition: categorised here as on the server")
+            #expect(try Self.storedLabels(w.pool, headerId: label.id).isEmpty, "precondition: no category here or on the server")
+
+            try Self.setLabelOptimistically(w.pool, accountId: w.accountId, headerId: unlabel.id,
+                                            providerLabelId: "Receipts", add: false)
+            try Self.queue(w.pool, .removeUserLabel, ids: ["ob-unlabel"], accountId: w.accountId,
+                           from: w.inbox, userLabelId: "Receipts")
+            try Self.setLabelOptimistically(w.pool, accountId: w.accountId, headerId: label.id,
+                                            providerLabelId: "Receipts", add: true)
+            try Self.queue(w.pool, .addUserLabel, ids: ["ob-label"], accountId: w.accountId,
+                           from: w.inbox, userLabelId: "Receipts")
+
+            #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: Self.nextRelease()))
+
+            let listingsBefore = Self.outlookListings(w)
+            try await w.foregroundPass()
+
+            #expect(try Self.storedLabels(w.pool, headerId: unlabel.id) == ["Receipts"],
+                    "the removed category shows again, as on the server")
+            #expect(try Self.storedLabels(w.pool, headerId: label.id).isEmpty,
+                    "the added category is gone again, as on the server")
+            #expect(Self.outlookListings(w) == listingsBefore, "no folder listing")
+            #expect(try w.recheck(w.inbox).isEmpty)
         }
     }
 
@@ -249,10 +358,10 @@ struct ReleaseBoundaryRecheckTests {
         }
     }
 
-    /// Kinds no repair path corrects in a stored row (labels, replied/forwarded),
+    /// Kinds no repair path corrects in a stored row (replied/forwarded),
     /// local-only tags, and draft saves: nothing is listed and no catch-up armed.
-    @Test("Retired tag, label, replied, forwarded and draft-save actions put nothing on a re-read list and arm no catch-up",
-          arguments: [OperationType.setTag, .removeTag, .addUserLabel, .removeUserLabel, .markReplied, .markForwarded, .saveDraft])
+    @Test("Retired tag, replied, forwarded and draft-save actions put nothing on a re-read list and arm no catch-up",
+          arguments: [OperationType.setTag, .removeTag, .markReplied, .markForwarded, .saveDraft])
     func kindsLeftOutAreNotListed(kind: OperationType) async throws {
         try await Gmail.withWorld(seeds: []) { w in
             try await Self.seedCatchUpStates(w.pool, accountId: w.accountId)
@@ -266,8 +375,9 @@ struct ReleaseBoundaryRecheckTests {
 
     /// The kinds a re-read corrects: the source lists the id, and a move's
     /// destination too; no catch-up is armed.
-    @Test("Every retired move and read/flag kind lists its ids in the source, and a move's in its destination",
-          arguments: [OperationType.archive, .delete, .move, .markRead, .markUnread, .markFlagged, .markUnflagged])
+    @Test("Every retired move, read/flag and user-label kind lists its ids in the source, and a move's in its destination",
+          arguments: [OperationType.archive, .delete, .move, .markRead, .markUnread, .markFlagged, .markUnflagged,
+                      .addUserLabel, .removeUserLabel])
     func kindsReadAgainAreListed(kind: OperationType) async throws {
         try await Gmail.withWorld(seeds: []) { w in
             try await Self.seedCatchUpStates(w.pool, accountId: w.accountId)
