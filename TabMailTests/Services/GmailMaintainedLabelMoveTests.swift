@@ -44,7 +44,7 @@ struct GmailMaintainedLabelMoveTests {
             current = appDatabase
             return old
         }
-        let epoch: Int? = provider == .gmail ? nil : 10
+        let epoch: Int? = provider.contentKeySpace == .uidAddressed ? 10 : nil
         try pool.writeWithoutTransaction { db in
             var account = Account(
                 emailAddress: "\(accountId)@example.com", displayName: "Labels", provider: provider)
@@ -440,19 +440,24 @@ struct GmailMaintainedLabelMoveTests {
         }
     }
 
-    /// Control: the refusal is Gmail's alone. On IMAP, Sent is an ordinary
-    /// mailbox and a move into it is queued.
-    @Test("An IMAP move into a folder at the same path is still queued")
+    /// Control: the refusal is Gmail's alone. On every other mail provider, a
+    /// folder at the same path as Gmail's Sent or Drafts label is an ordinary
+    /// folder and a move into it is queued.
+    @Test("On every other mail provider a move into a folder named SENT or DRAFT is still queued",
+          arguments: [AccountProvider.imap, .icloud, .outlook], ["SENT", "DRAFT"])
     @MainActor
-    func moveIntoSentIsQueuedOnIMAP() async throws {
-        let f = try fixture(accountId: "imap-sent-move", provider: .imap)
-        let seeded = try seedHeader(f, providerId: "41", folderPath: "INBOX", epoch: 10)
+    func moveIntoSentOrDraftIsQueuedElsewhere(provider: AccountProvider, destination: String) async throws {
+        let f = try fixture(accountId: "\(provider.rawValue)-move-\(destination)", provider: provider)
+        let epoch: Int? = provider.contentKeySpace == .uidAddressed ? 10 : nil
+        let seeded = try seedHeader(f, providerId: "41", folderPath: "INBOX", epoch: epoch)
 
-        let admission = await AccountManager.shared.move([seeded], to: "SENT")
+        let admission = await AccountManager.shared.move([seeded], to: destination)
 
-        #expect(admission.perID[seeded.id] == .durablyAdmitted)
-        let ops = try await f.pool.read { db in try PendingOperation.fetchCount(db) }
-        #expect(ops == 1)
+        #expect(admission.perID[seeded.id] == .durablyAdmitted,
+                "\(provider) refused a move into \(destination)")
+        let queued = try await f.pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(queued.count == 1 && queued.first?.destinationPath == destination,
+                "\(provider) queued \(queued.map { $0.destinationPath ?? "nil" })")
         await finish(f)
     }
 }

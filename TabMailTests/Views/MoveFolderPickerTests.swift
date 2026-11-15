@@ -7,7 +7,7 @@ import Foundation
 import GRDB
 @testable import TabMail
 
-@Suite("MoveFolderPicker.partition")
+@Suite("MoveFolderPicker")
 struct MoveFolderPickerTests {
 
     private func makeFolder(_ name: String, path: String, role: FolderRole, accountId: String = "a1", isFavorite: Bool = false) -> Folder {
@@ -22,7 +22,7 @@ struct MoveFolderPickerTests {
             makeFolder("Inbox", path: "INBOX", role: .inbox),
             makeFolder("Sent", path: "SENT", role: .sent)
         ]
-        let result = MoveFolderPicker.partition(folders: folders, currentFolderPath: "INBOX", provider: .imap)
+        let result = MoveFolderPicker.partition(folders: folders, currentFolderPath: "INBOX")
         #expect(result.favorites.isEmpty)
         #expect(result.others.map(\.path) == ["SENT"])
     }
@@ -38,7 +38,7 @@ struct MoveFolderPickerTests {
             makeFolder("Archive", path: "ARCHIVE", role: .archive),
             makeFolder("Drafts", path: "DRAFTS", role: .drafts)
         ]
-        let result = MoveFolderPicker.partition(folders: folders, currentFolderPath: "", provider: .imap)
+        let result = MoveFolderPicker.partition(folders: folders, currentFolderPath: "")
         #expect(result.favorites.isEmpty)
         // Role order: inbox, archive, sent, drafts, trash, spam, custom
         #expect(result.others.map(\.path) == ["INBOX", "ARCHIVE", "SENT", "DRAFTS", "TRASH", "SPAM", "CUSTOM"])
@@ -53,7 +53,7 @@ struct MoveFolderPickerTests {
             makeFolder("ProjectX", path: "ProjectX", role: .custom, isFavorite: true),
             makeFolder("Archive", path: "ARCHIVE", role: .archive, isFavorite: true)
         ]
-        let result = MoveFolderPicker.partition(folders: folders, currentFolderPath: "", provider: .imap)
+        let result = MoveFolderPicker.partition(folders: folders, currentFolderPath: "")
         guard result.favorites.count == 2 else {
             Issue.record("Expected 2 favorites, got \(result.favorites.count)")
             return
@@ -70,7 +70,7 @@ struct MoveFolderPickerTests {
             makeFolder("ProjectX", path: "ProjectX", role: .custom, isFavorite: true),
             makeFolder("Inbox", path: "INBOX", role: .inbox)
         ]
-        let result = MoveFolderPicker.partition(folders: folders, currentFolderPath: "ProjectX", provider: .imap)
+        let result = MoveFolderPicker.partition(folders: folders, currentFolderPath: "ProjectX")
         #expect(result.favorites.isEmpty)
         #expect(result.others.map(\.path) == ["INBOX"])
     }
@@ -81,31 +81,30 @@ struct MoveFolderPickerTests {
             makeFolder("Inbox", path: "INBOX", role: .inbox, isFavorite: true),
             makeFolder("Sent", path: "SENT", role: .sent, isFavorite: true)
         ]
-        let result = MoveFolderPicker.partition(folders: folders, currentFolderPath: "", provider: .imap)
+        let result = MoveFolderPicker.partition(folders: folders, currentFolderPath: "")
         #expect(result.favorites.map(\.path) == ["INBOX", "SENT"])
         #expect(result.others.isEmpty)
     }
 
     @Test("Empty input → empty partitions")
     func emptyInput() {
-        let result = MoveFolderPicker.partition(folders: [], currentFolderPath: "", provider: .imap)
+        let result = MoveFolderPicker.partition(folders: [], currentFolderPath: "")
         #expect(result.favorites.isEmpty)
         #expect(result.others.isEmpty)
     }
 
-    @Test("On Gmail, Sent and Drafts are never offered as a destination; elsewhere they are")
-    func gmailOmitsTheLabelsGmailKeeps() {
-        let folders = [
-            makeFolder("Inbox", path: "INBOX", role: .inbox),
-            makeFolder("Sent", path: "SENT", role: .sent),
-            makeFolder("Drafts", path: "DRAFT", role: .drafts),
-            makeFolder("Trash", path: "TRASH", role: .trash),
-            makeFolder("Projects", path: "Label_7", role: .custom, isFavorite: true),
-        ]
-        let gmail = MoveFolderPicker.partition(folders: folders, currentFolderPath: "INBOX", provider: .gmail)
-        #expect((gmail.favorites + gmail.others).map(\.path) == ["Label_7", "TRASH"])
-        let imap = MoveFolderPicker.partition(folders: folders, currentFolderPath: "INBOX", provider: .imap)
-        #expect((imap.favorites + imap.others).map(\.path) == ["Label_7", "SENT", "DRAFT", "TRASH"])
+    /// The provider capability both the picker and the move admission ask.
+    /// Gmail keeps its Sent and Drafts labels itself and refuses a move into
+    /// them; every other provider takes a move into any folder, including one
+    /// at the same path.
+    @Test("Only Gmail refuses a move into its Sent or Drafts; every other provider refuses no folder")
+    func onlyGmailRefusesTheLabelsItKeeps() {
+        let paths = ["INBOX", "SENT", "DRAFT", "Sent", "Drafts", "sent", "draft", "TRASH", "Label_7", ""]
+        for provider in AccountProvider.allCases {
+            let refused = Set(paths.filter { provider.refusesMoveDestination(path: $0) })
+            let expected: Set<String> = provider == .gmail ? ["SENT", "DRAFT"] : []
+            #expect(refused == expected, "\(provider) refused \(refused.sorted())")
+        }
     }
 
     @Test("folderOrder produces the documented role ordering")
@@ -117,14 +116,15 @@ struct MoveFolderPickerTests {
 
     /// The picker reads each account's own provider from the database: a Gmail
     /// account's picker hides Sent and Drafts (Gmail keeps those labels itself,
-    /// and a move into them is refused), while another account with folders at
-    /// the same paths keeps them.
+    /// and a move into them is refused), while every other provider's account
+    /// with folders at the same paths keeps them.
     @Test("The picker hides Sent and Drafts for a Gmail account read from the database, and only for it")
     func loadReadsTheAccountsProvider() throws {
         let db = try TestDatabase.make()
         let paths = ["INBOX", "SENT", "DRAFT", "TRASH", "Label_7"]
         let roles: [FolderRole] = [.inbox, .sent, .drafts, .trash, .custom]
-        for (accountId, provider) in [("picker-gmail", AccountProvider.gmail), ("picker-imap", AccountProvider.imap)] {
+        for provider in AccountProvider.allCases {
+            let accountId = "picker-\(provider.rawValue)"
             try TestDatabase.insertAccount(db, id: accountId, email: "\(accountId)@example.com", provider: provider)
             try db.write { database in
                 for (path, role) in zip(paths, roles) {
@@ -133,12 +133,14 @@ struct MoveFolderPickerTests {
             }
         }
 
-        let gmail = try db.read { try MoveFolderPicker.load(accountId: "picker-gmail", currentFolderPath: "INBOX", db: $0) }
-        let imap = try db.read { try MoveFolderPicker.load(accountId: "picker-imap", currentFolderPath: "INBOX", db: $0) }
-
-        let gmailPaths = Set((gmail.favorites + gmail.others).map(\.path))
-        let imapPaths = Set((imap.favorites + imap.others).map(\.path))
-        #expect(gmailPaths == ["TRASH", "Label_7"], "Gmail picker offered \(gmailPaths.sorted())")
-        #expect(imapPaths == ["SENT", "DRAFT", "TRASH", "Label_7"], "IMAP picker offered \(imapPaths.sorted())")
+        for provider in AccountProvider.allCases {
+            let picker = try db.read {
+                try MoveFolderPicker.load(accountId: "picker-\(provider.rawValue)", currentFolderPath: "INBOX", db: $0)
+            }
+            let offered = Set((picker.favorites + picker.others).map(\.path))
+            let expected: Set<String> = provider == .gmail
+                ? ["TRASH", "Label_7"] : ["SENT", "DRAFT", "TRASH", "Label_7"]
+            #expect(offered == expected, "\(provider) picker offered \(offered.sorted())")
+        }
     }
 }

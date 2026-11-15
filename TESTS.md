@@ -413,9 +413,13 @@ lands when the first member is an invalid or missing id;
 the agent's draft delete lands; a move the server refuses stays queued rather
 than counted as done; a delete from Sent, and its Undo, that Gmail refuses with a
 503 or an unclassified 400 on trash/untrash stays queued with the server
-unchanged and lands once the failure clears; a user move into Sent or Drafts is refused on Gmail and
-queued on IMAP. `MoveFolderPickerTests.gmailOmitsTheLabelsGmailKeeps` covers the
-picker. That an "Invalid label" refusal stays queued rather than being
+unchanged and lands once the failure clears; a user move into Sent or Drafts is refused on Gmail, and
+a move into a folder named SENT or DRAFT is queued on IMAP, iCloud and Outlook
+(`moveIntoSentOrDraftIsQueuedElsewhere`). Admission and the move picker both ask
+`AccountProvider.refusesMoveDestination(path:)`:
+`MoveFolderPickerTests.onlyGmailRefusesTheLabelsItKeeps` checks it over every
+provider, and `MoveFolderPickerTests.loadReadsTheAccountsProvider` covers the
+picker for an account of every provider. That an "Invalid label" refusal stays queued rather than being
 recorded as done is pinned end to end by
 `GmailMaintainedLabelMoveTests` ("A move Gmail refuses with Invalid label stays
 queued rather than being recorded as done").

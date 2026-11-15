@@ -1513,13 +1513,12 @@ extension AccountManager {
                 for (_, msgs) in grouped {
                     let accountId = msgs[0].accountId
                     let folderPath = msgs[0].folderPath
-                    // Gmail keeps Sent and Drafts itself: no request can move a
-                    // message into either (`GmailProvider.gmailMaintainedLabelIds`),
-                    // so such a move is refused here rather than queued as a
-                    // change Gmail would refuse. An Undo back to Sent or Drafts
-                    // is queued by `undoMove`, not here.
-                    if GmailProvider.gmailMaintainedLabelIds.contains(destinationPath),
-                       try Account.fetchOne(db, key: accountId)?.provider == .gmail {
+                    // A folder the provider refuses as a destination (Gmail's
+                    // Sent and Drafts) is refused here rather than queued as a
+                    // change the provider would refuse. An Undo back to Sent or
+                    // Drafts is queued by `undoMove`, not here.
+                    if try Account.fetchOne(db, key: accountId)?.provider
+                        .refusesMoveDestination(path: destinationPath) == true {
                         admission.set(.terminalStale, ids: msgs.map(\.id))
                         continue
                     }
