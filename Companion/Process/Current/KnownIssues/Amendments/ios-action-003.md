@@ -160,8 +160,12 @@ throw and stop `AppDatabase.init`), and for every account that holds a change bo
   which loads the server draft back so the delete can be redone; its address is a draft resource
   (Gmail) and never goes on a list. Without this the server draft stayed on the server and other
   devices while the phone never showed it again;
-- each list stays within `SyncConfig.changeRecheckLimit`; overflow arms the folder's catch-up, as the
-  change apply does;
+- over `SyncConfig.changeRecheckLimit`, a folder the catch-up checks (`SyncEngine.isSyncable`) keeps
+  its first ids and its catch-up is armed; a folder the catch-up never checks (a custom folder that is
+  not a favourite) keeps every id, read in turn within the per-pass budget, since nothing else would
+  repair a dropped one. The change apply does the same (ADR-IOS-111, amendment 2026-11-14 "every
+  listed folder is read", rule 3). *Superseded 2026-11-14 (review round 4):* "each list stays within
+  `SyncConfig.changeRecheckLimit`; overflow arms the folder's catch-up, as the change apply does";
 - a row whose kind or ids do not read (an older release's kind, ids that are not a JSON list) arms its
   folder's catch-up, or every folder's of its account when the folder cannot be resolved by
   `(accountId, folderPath)`; the same for a move or read/flag row whose folder no longer exists. Such a
@@ -218,5 +222,8 @@ a folder that is gone, a draft delete whose Drafts folder is gone, every named f
 duplicate ids, overflow, rollback on a throw; end to end with OLDER messages: an Outlook Inbox whose
 read is a baseline, the baseline gate holding for an unlisted id, Gmail custom labels (move, read,
 flag), a Gmail synced but untracked Inbox, an Outlook custom non-favourite folder (read change, move
-back), an Outlook untracked synced source; Outlook read change);
+back), an Outlook untracked synced source; Outlook read change; more ids than the list limit in a
+custom folder all kept and read across passes, the apply's overflow cut only where the catch-up
+checks, the custom folder's read changing no coverage, an Inbox-only pass leaving its list, a failing
+custom read holding back nothing else, the custom read within the request allowance);
 `ChangeSeamFenceTests.retiredActionRecheckIsProviderBlind`.

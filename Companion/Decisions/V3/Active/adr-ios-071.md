@@ -97,7 +97,9 @@ columns ONLY (account, folder path(s), kind, ids; no model decode) and, for ever
 change bookmark, puts the ids of a move or read/flag change on the re-read lists of the source folder
 and (moves) the destination folder, whatever that folder's tracking or synced state (every listed
 folder's list is read, and an explicit re-read answer applies whatever the window: ADR-IOS-111,
-amendment 2026-11-14), within `SyncConfig.changeRecheckLimit`; *superseded same day:* "when the change
+amendment 2026-11-14), within `SyncConfig.changeRecheckLimit` in a folder the catch-up checks (any
+other folder keeps every id: ADR-IOS-111, same amendment, rule 3; *superseded same day:* "within
+`SyncConfig.changeRecheckLimit`" for every folder); *superseded same day:* "when the change
 reader reads that folder (the syncable set, `SyncEngine.isSyncable`, tracked or not; a window
 listing's date-bounded stale sweep does not correct an older message)"
 (overflow arms that folder's catch-up). A retired draft delete arms its folder's catch-up. A row this

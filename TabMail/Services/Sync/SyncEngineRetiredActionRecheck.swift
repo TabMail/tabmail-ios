@@ -50,7 +50,9 @@ import GRDB
 //   account when its folder does not resolve. The same for a move or read/flag
 //   row whose folder no longer exists. Never skipped silently.
 // A list over `SyncConfig.changeRecheckLimit` keeps its first ids and arms the
-// folder's catch-up, as the apply does.
+// folder's catch-up only in a folder the catch-up checks (`isSyncable`), as the
+// apply does; a folder the catch-up never checks keeps every id, since arming
+// would repair nothing there (each pass still reads at most the per-pass budget).
 //
 // The ids are the queue's own: the provider's id for the message in the folder
 // the action was queued on. A drained move re-addresses the queued rows after it
@@ -86,17 +88,25 @@ extension SyncEngine {
         let bookmarked = Set(try rawStrings(db, "SELECT id FROM account WHERE lastHistoryId IS NOT NULL"))
         guard !bookmarked.isEmpty else { return summary }
 
-        // Folder (id, change state) by (account, path), read once per pair.
+        // Folder (id, change state, whether the catch-up checks it) by
+        // (account, path), read once per pair. A role this release cannot read
+        // counts as not checked, so that folder keeps every id.
         var foldersByKey: [String: RetiredActionFolder?] = [:]
         var foldersById: [String: RetiredActionFolder] = [:]
         func folder(accountId: String, path: String) throws -> RetiredActionFolder? {
             let key = "\(accountId)\u{1F}\(path)"
             if let cached = foldersByKey[key] { return cached }
             let row = try Row.fetchOne(
-                db, sql: "SELECT id, changeState FROM folder WHERE accountId = ? AND path = ?",
+                db, sql: "SELECT id, changeState, role, isFavorite FROM folder WHERE accountId = ? AND path = ?",
                 arguments: [accountId, path])
             let found = row.flatMap { row in
-                Self.rawString(row, "id").map { RetiredActionFolder(id: $0, changeState: Self.rawString(row, "changeState")) }
+                Self.rawString(row, "id").map { id in
+                    RetiredActionFolder(
+                        id: id, changeState: Self.rawString(row, "changeState"),
+                        catchUpChecks: Self.rawString(row, "role").flatMap(FolderRole.init(rawValue:)).map {
+                            Self.isSyncable(role: $0, isFavorite: Bool.fromDatabaseValue(row["isFavorite"] as DatabaseValue) ?? false)
+                        } ?? false)
+                }
             }
             foldersByKey[key] = found
             if let found { foldersById[found.id] = found }
@@ -161,7 +171,7 @@ extension SyncEngine {
                 state.recheck.append(id)
                 summary.listedIds += 1
             }
-            if state.recheck.count > SyncConfig.changeRecheckLimit {
+            if state.recheck.count > SyncConfig.changeRecheckLimit, named.catchUpChecks {
                 state.recheck = Array(state.recheck.prefix(SyncConfig.changeRecheckLimit))
                 armFolderIds.insert(folderId)
             }
@@ -194,8 +204,11 @@ extension SyncEngine {
     }
 }
 
-/// A folder as the boundary reads it: its id and its raw change state only.
+/// A folder as the boundary reads it: its id, its raw change state, and whether
+/// the catch-up checks it (`SyncEngine.isSyncable`), which decides whether ids
+/// over the list's limit may be left to that catch-up.
 private struct RetiredActionFolder {
     let id: String
     let changeState: String?
+    let catchUpChecks: Bool
 }

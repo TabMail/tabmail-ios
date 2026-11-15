@@ -16,8 +16,9 @@ import Testing
 /// invariant pinned here: once the boundary has run and the next sync has read
 /// the changes, every message a retired action touched is where the server has
 /// it, with the server's read state, and no folder was listed to get there. A row
-/// the current model cannot decode, or a re-read list that is full, arms the
-/// folder's catch-up instead.
+/// the current model cannot decode, or a re-read list that is full in a folder
+/// the catch-up checks, arms the folder's catch-up instead; a folder the catch-up
+/// never checks keeps every id.
 ///
 /// Worlds: a real `GmailProvider` against `StatefulGmailActionServer`
 /// (`GmailDeltaApplyInvariantTests.World`) and a real `ExchangeProvider` against
@@ -578,6 +579,181 @@ struct ReleaseBoundaryRecheckTests {
             #expect(try w.recheck(w.archive).isEmpty)
             #expect(Self.outlookListings(w) == listingsBefore, "no folder was listed")
             #expect(try w.cursor(customPath) == nil, "the custom folder's read changed no bookmark")
+        }
+    }
+
+    // MARK: - A folder the catch-up never checks
+
+    static let customPath = "fld-projects"
+
+    /// Adds a custom, non-favourite folder to an Outlook world, on the server and
+    /// locally, as the folder list would have stored it.
+    static func addCustomFolder(_ w: Outlook.World) async throws -> Folder {
+        w.server.addFolder(id: customPath, name: "Projects")
+        let custom = Folder(name: "Projects", path: customPath, role: .custom, accountId: w.accountId)
+        try await w.pool.write { db in try custom.insert(db) }
+        #expect(!SyncEngine.isSyncable(role: custom.role, isFavorite: custom.isFavorite),
+                "precondition: the catch-up never checks this folder")
+        return custom
+    }
+
+    static func setRecheck(_ w: Outlook.World, _ path: String, _ ids: [String]) async throws {
+        let folderId = w.folderId(path)
+        try await w.pool.write { db in
+            try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?",
+                           arguments: [FolderChangeState(recheck: ids).encoded, folderId])
+        }
+    }
+
+    /// The robustness rule behind the list limit: ids are dropped only where the
+    /// catch-up will find them. A folder the catch-up never checks keeps every
+    /// retired id, and the change passes read them all, each pass within its
+    /// re-read budget.
+    @Test("Outlook: more retired ids than the list limit in a custom folder are all kept, and every one is read again across passes")
+    func customFolderKeepsEveryRetiredIdAndReadsThemAll() async throws {
+        let count = SyncConfig.changeRecheckLimit + SyncConfig.changeRereadBudgetPerPass
+        let ids = (0..<count).map { String(format: "many-%03d", $0) }
+        try await Outlook.withWorld(seeds: ids.map { Outlook.seed($0, in: Self.customPath, daysAgo: Self.olderThanHeldDays) }) { w in
+            let custom = try await Self.addCustomFolder(w)
+            try await w.baselineAll()
+            let old = Outlook.daysAgo(Self.olderThanHeldDays)
+            for id in ids { try w.insertRow(id, in: Self.customPath, date: old, isRead: true) }
+            try Self.queue(w.pool, .markRead, ids: ids, accountId: w.accountId, from: Self.customPath)
+
+            #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: Self.nextRelease()))
+            #expect(try w.recheck(Self.customPath) == ids, "every id is kept: no catch-up would find a dropped one")
+            #expect(try Self.lapseCount(w.pool, folderId: custom.id) == nil)
+
+            let passes = count / SyncConfig.changeRereadBudgetPerPass + 2
+            for _ in 0..<passes {
+                let listedBefore = try w.recheck(Self.customPath).count
+                if listedBefore == 0 { break }
+                let fetchesBefore = w.messageFetches()
+                try await w.delta()
+                let fetched = w.messageFetches() - fetchesBefore
+                #expect(fetched > 0 && fetched <= SyncConfig.changeRereadBudgetPerPass,
+                        "one pass reads at most its re-read budget (\(fetched))")
+                #expect(try w.recheck(Self.customPath).count < listedBefore, "every pass makes progress")
+            }
+            #expect(try w.recheck(Self.customPath).isEmpty, "every id was read again")
+            let stillRead = try ids.filter { try w.row($0, in: Self.customPath)?.isRead != false }
+            #expect(stillRead.isEmpty, "every message shows the server's unread state: \(stillRead.prefix(5))")
+        }
+    }
+
+    @Test("A re-read list over the limit keeps every id in a folder the catch-up never checks, and is cut, arming the catch-up, in one it checks")
+    func applyOverflowDropsOnlyWhereTheCatchUpChecks() async throws {
+        try await Outlook.withWorld { w in
+            let custom = try await Self.addCustomFolder(w)
+            let ids = (0...SyncConfig.changeRecheckLimit).map { "ov-\($0)" }
+            let archiveId = w.folderId(w.archive)
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET catchUpState = '{}' WHERE accountId = ?", arguments: [w.accountId])
+            }
+            let customResult = try await w.pool.write { db in
+                try SyncEngine.applyFolderChanges(FolderChanges(folderId: custom.id, status: .notRun, rereadLater: ids), db: db)
+            }
+            #expect(try w.recheck(Self.customPath).count == ids.count, "the custom folder keeps every id")
+            #expect(!customResult.armedCatchUp)
+            #expect(try Self.lapseCount(w.pool, folderId: custom.id) == nil)
+
+            let archiveResult = try await w.pool.write { db in
+                try SyncEngine.applyFolderChanges(FolderChanges(folderId: archiveId, status: .tracked, rereadLater: ids), db: db)
+            }
+            #expect(try w.recheck(w.archive).count == SyncConfig.changeRecheckLimit, "a folder the catch-up checks keeps its first ids")
+            #expect(archiveResult.armedCatchUp)
+            #expect(try Self.lapseCount(w.pool, folderId: archiveId) == 1, "and its catch-up finds the rest")
+        }
+    }
+
+    /// The custom folder's read is the server's answer about listed messages,
+    /// never a read of the folder: it reports `.notRun`, so the pass neither
+    /// covers nor lists that folder.
+    @Test("Outlook: a custom folder's re-read starts no tracking, makes no listing due, and leaves its catch-up and bookmark alone")
+    func customFolderReadChangesNoCoverage() async throws {
+        try await Outlook.withWorld(seeds: [Outlook.seed("c-read", in: Self.customPath, daysAgo: Self.olderThanHeldDays)]) { w in
+            let custom = try await Self.addCustomFolder(w)
+            try await w.baselineAll()
+            try w.insertRow("c-read", in: Self.customPath, date: Outlook.daysAgo(Self.olderThanHeldDays), isRead: true)
+            try await Self.setRecheck(w, Self.customPath, ["c-read"])
+            let fullSyncAt = Date().addingTimeInterval(-3_600)
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE account SET lastFullSyncAt = ? WHERE id = ?", arguments: [fullSyncAt, w.accountId])
+                try db.execute(sql: "UPDATE folder SET catchUpState = '{\"seen\":1}' WHERE id = ?", arguments: [custom.id])
+            }
+
+            let outcome = try #require(try await SyncEngine().readAndApplyChanges(
+                account: try w.account(), provider: w.provider, scope: .all))
+            #expect(try w.row("c-read", in: Self.customPath)?.isRead == false, "precondition: the re-read applied")
+            #expect(!outcome.trackableFolderIds.contains(custom.id), "the read does not make the folder trackable")
+            #expect(try Self.tracking(w.pool, folderId: custom.id) == false)
+            let storedFullSyncAt = try w.account().lastFullSyncAt
+            let stored = try w.folder(Self.customPath)
+            #expect(storedFullSyncAt.map { abs($0.timeIntervalSince(fullSyncAt)) < 1 } == true, "the full sync stays as it was")
+            #expect(stored.catchUpState == "{\"seen\":1}", "the catch-up state is untouched")
+            #expect(stored.changeCursor == nil, "no bookmark")
+        }
+    }
+
+    @Test("Outlook: an Inbox-only pass leaves a custom folder's re-read list for a whole-account pass")
+    func inboxOnlyPassLeavesTheCustomList() async throws {
+        try await Outlook.withWorld(seeds: [Outlook.seed("i-read", in: Self.customPath, daysAgo: Self.olderThanHeldDays)]) { w in
+            _ = try await Self.addCustomFolder(w)
+            try await w.baselineAll()
+            try w.insertRow("i-read", in: Self.customPath, date: Outlook.daysAgo(Self.olderThanHeldDays), isRead: true)
+            try await Self.setRecheck(w, Self.customPath, ["i-read"])
+            let fetchesBefore = w.messageFetches()
+
+            try await w.read(scope: .inboxOnly)
+            #expect(w.messageFetches() == fetchesBefore, "no message of the custom folder is fetched")
+            #expect(try w.recheck(Self.customPath) == ["i-read"], "the id stays listed")
+            #expect(try w.row("i-read", in: Self.customPath)?.isRead == true)
+
+            try await w.read(scope: .all)
+            #expect(try w.recheck(Self.customPath).isEmpty)
+            #expect(try w.row("i-read", in: Self.customPath)?.isRead == false)
+        }
+    }
+
+    @Test("Outlook: a custom folder whose re-read fails keeps its ids, and the other folders' changes and the pass stand")
+    func failingCustomReadHoldsBackNothingElse() async throws {
+        try await Outlook.withWorld(seeds: [Outlook.seed("f-read", in: Self.customPath, daysAgo: Self.olderThanHeldDays)]) { w in
+            _ = try await Self.addCustomFolder(w)
+            try await w.baselineAll()
+            try w.insertRow("f-read", in: Self.customPath, date: Outlook.daysAgo(Self.olderThanHeldDays), isRead: true)
+            try await Self.setRecheck(w, Self.customPath, ["f-read"])
+            w.server.deliver(Outlook.seed("f-new", in: Outlook.inbox, daysAgo: 0))
+            w.server.failBatches([.transportError(.networkConnectionLost)])
+
+            try await w.read()
+            #expect(try w.row("f-new", in: w.inbox) != nil, "the Inbox's new message lands")
+            #expect(try w.cursor(w.inbox)?.phase == .tracking)
+            #expect(try w.recheck(Self.customPath) == ["f-read"], "precondition: the custom read failed; the id stays listed")
+            #expect(try w.row("f-read", in: Self.customPath)?.isRead == true)
+
+            try await w.read()
+            #expect(try w.recheck(Self.customPath).isEmpty, "the next pass reads it")
+            #expect(try w.row("f-read", in: Self.customPath)?.isRead == false)
+        }
+    }
+
+    @Test("Outlook: a custom folder's re-read stays within the pass's request allowance; the ids not read stay listed")
+    func customReadStaysWithinTheAllowance() async throws {
+        let ids = (0..<(SyncConfig.graphBatchMaxRequests * 2 + 5)).map { String(format: "al-%02d", $0) }
+        try await Outlook.withWorld(seeds: ids.map { Outlook.seed($0, in: Self.customPath) }) { w in
+            _ = try await Self.addCustomFolder(w)
+            try await w.baselineAll()
+            try await Self.setRecheck(w, Self.customPath, ids)
+            let fetchesBefore = w.messageFetches()
+            // Allowance: the folder-list page, one page per synced folder, and at
+            // most one batch; the custom folder's list is read last.
+            let syncedFolders = 5
+            try await w.read(now: Date(), requests: 1 + syncedFolders + SyncConfig.graphBatchMaxRequests)
+            let fetched = w.messageFetches() - fetchesBefore
+            #expect(fetched > 0 && fetched <= SyncConfig.graphBatchMaxRequests, "at most one batch, as allowed (\(fetched))")
+            let left = try w.recheck(Self.customPath)
+            #expect(left.count == ids.count - fetched, "the ids not read stay listed")
+            #expect(Set(left).isSubset(of: Set(ids)))
         }
     }
 

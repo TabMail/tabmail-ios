@@ -41,7 +41,10 @@ import GRDB
 //   applies what it carries and settles nothing, and the reader reads a listed
 //   message in full), and so is every message the provider could not read
 //   (`rereadLater`).
-//   Over `SyncConfig.changeRecheckLimit` ids, the folder's catch-up is armed;
+//   Over `SyncConfig.changeRecheckLimit` ids, a folder the catch-up checks
+//   (`SyncEngine.isSyncable`) keeps its first ids and its catch-up is armed; a
+//   folder the catch-up never checks keeps every id, since nothing else would
+//   repair a dropped one (each pass still reads at most the per-pass budget);
 // - the folder's own bookmark (`Folder.changeCursor`) is written in the same
 //   transaction. A refused one is cleared with the folder's coverage, a lapse
 //   mark for its catch-up and the account's full sync made due; a folder whose
@@ -119,7 +122,10 @@ extension SyncEngine {
         var recheck = state.recheck.filter { !declined.contains($0) && !settled.contains($0) }
         recheck += state.recheck.filter { declined.contains($0) }
         for id in declined.sorted() where !recheck.contains(id) { recheck.append(id) }
-        if recheck.count > SyncConfig.changeRecheckLimit {
+        // Ids are dropped only where the catch-up will find them: arming it does
+        // nothing for a folder it never checks, so that folder keeps them all.
+        if recheck.count > SyncConfig.changeRecheckLimit,
+           Self.isSyncable(role: folder.role, isFavorite: folder.isFavorite) {
             recheck = Array(recheck.prefix(SyncConfig.changeRecheckLimit))
             try markCatchUpLapse(folderId: folder.id, db: db)
             result.armedCatchUp = true
