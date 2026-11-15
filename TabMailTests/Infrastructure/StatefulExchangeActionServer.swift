@@ -479,6 +479,11 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         }
     }
 
+    /// The extended properties the server holds for `providerMessageId`.
+    func extendedProperties(providerMessageId: String) -> [String: String]? {
+        state.value.withLock { $0.messagesByProviderId[providerMessageId]?.extendedProperties }
+    }
+
     /// The Graph categories the server currently holds for `providerMessageId`,
     /// or `nil` if no such resource exists. Deliberately NOT folded into
     /// `Snapshot`: that type is `Equatable` and compared whole by an existing
@@ -488,11 +493,6 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
     /// message category, so "did the user's label reach the server, and did it
     /// leave the server's other categories alone" is exactly a question about
     /// this array.
-    /// The extended properties the server holds for `providerMessageId`.
-    func extendedProperties(providerMessageId: String) -> [String: String]? {
-        state.value.withLock { $0.messagesByProviderId[providerMessageId]?.extendedProperties }
-    }
-
     func categories(providerMessageId: String) -> [String]? {
         state.value.withLock { $0.messagesByProviderId[providerMessageId]?.categories }
     }

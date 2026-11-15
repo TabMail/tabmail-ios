@@ -220,6 +220,116 @@ struct ExchangeLastVerbMarkTests {
         }
     }
 
+    /// Reply, then archive in TabMail with the archive queued first: the move
+    /// re-addresses the queued mark to the moved message's new Graph id, so the
+    /// mark lands on the archived original.
+    @Test("An in-app archive queued before the mark carries the mark to the moved original")
+    @MainActor
+    func inAppMoveCarriesTheMark() async throws {
+        let server = Self.server()
+        defer { server.close() }
+        let f = try fixture()
+        await AccountManager.shared.registerProviderForTesting(
+            accountId: f.accountId, provider: server.provider())
+        let parent = original(f)
+        let sentAt = Self.sendTime()
+        let sent = completedSend(f, originalId: parent.id, isForward: false, isReplyAll: true, sentAt: sentAt)
+        let archive = PendingOperation(
+            type: .move, messageIds: ["original"], accountId: f.accountId,
+            folderPath: "INBOX", destinationPath: "Archive")
+        try await f.pool.writeWithoutTransaction { db in
+            try parent.insert(db)
+            try sent.insert(db)
+            var queued = archive
+            try queued.insert(db)
+        }
+        _ = try await f.pool.write { db in
+            try AccountManager.deleteCompletedSendAtomic(outboxId: sent.id, db: db)
+        }
+        await AccountManager.shared.drainPendingQueue()
+
+        let moved = server.snapshots(rfc822MessageId: "original@example.com")
+        #expect(moved.count == 1)
+        guard moved.count == 1 else { await finish(f); return }
+        #expect(moved[0].folderId == "Archive")
+        #expect(moved[0].providerMessageId != "original", "precondition: the move reallocated the id")
+        let stored = server.extendedProperties(providerMessageId: moved[0].providerMessageId)
+        #expect(stored?[Self.verb] == "103")
+        #expect(stored?[Self.verbTime] == Self.iso(sentAt))
+        let left = try await f.pool.read { db in try PendingOperation.fetchCount(db) }
+        #expect(left == 0)
+        await finish(f)
+    }
+
+    /// `IOS-GRAPH-006` (accepted): another client moves the original before the
+    /// mark drains. The mark names a dead id, Graph answers 404, and the op leaves
+    /// the queue as an authoritative no-op: no other message is written, nothing
+    /// is re-sent, and the local replied flag is never cleared.
+    @Test("An original moved by another client before the mark drains: 404 no-op, nothing else written")
+    @MainActor
+    func externallyMovedOriginalIsANoOp() async throws {
+        let server = Self.server()
+        defer { server.close() }
+        let f = try fixture()
+        await AccountManager.shared.registerProviderForTesting(
+            accountId: f.accountId, provider: server.provider())
+        let parent = original(f)
+        let sent = completedSend(f, originalId: parent.id, isForward: false, isReplyAll: false, sentAt: Self.sendTime())
+        try await f.pool.writeWithoutTransaction { db in
+            try parent.insert(db)
+            try sent.insert(db)
+        }
+        _ = try await f.pool.write { db in
+            try AccountManager.deleteCompletedSendAtomic(outboxId: sent.id, db: db)
+        }
+        // Another client archives the original (a separate provider: not the queue).
+        _ = try await server.provider().performMessageAction(.move(destination: "Archive"), at: Self.source)
+        server.clearMutationLog()
+
+        await AccountManager.shared.drainPendingQueue()
+
+        #expect(server.mutationLog() == ["PATCH original"], "one attempt at the dead id, nothing else")
+        for snapshot in server.snapshots(rfc822MessageId: "original@example.com")
+            + server.snapshots(rfc822MessageId: "bystander@example.com") {
+            #expect(server.extendedProperties(providerMessageId: snapshot.providerMessageId)?.isEmpty == true)
+        }
+        let state = try await f.pool.read { db in
+            (try PendingOperation.fetchCount(db), try MessageHeader.fetchOne(db, key: parent.id)?.isReplied)
+        }
+        #expect(state.0 == 0)
+        // The 404 confirms the old id gone, so the local row may be removed until
+        // sync brings the moved message back; it is never re-marked as unreplied.
+        #expect(state.1 != false)
+        await finish(f)
+    }
+
+    // MARK: - Reply-all mode on the draft row
+
+    /// The user's latest compose entry decides reply vs reply-all for one `reply:`
+    /// key, in both directions, through the production save merge.
+    @Test("A draft save records the compose's reply-all mode, both ways")
+    func draftSaveRecordsReplyAllMode() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        func draft(replyAll: Bool, updatedAt: Double) -> Draft {
+            var value = Draft(
+                id: "reply:acc1:orig@example.com", accountId: "acc1",
+                toJSON: "[]", ccJSON: "[]", bccJSON: "[]", subject: "Re: s", body: "b",
+                replyToId: nil, isForward: false, editHistoryJSON: nil,
+                createdAt: 1, updatedAt: updatedAt)
+            value.isReplyAll = replyAll
+            return value
+        }
+        try db.write { db in
+            _ = try DraftStore.applySave(draft(replyAll: true, updatedAt: 1), db: db)
+            #expect(try Draft.fetchOne(db, key: "reply:acc1:orig@example.com")?.isReplyAll == true)
+            _ = try DraftStore.applySave(draft(replyAll: false, updatedAt: 2), db: db)
+            #expect(try Draft.fetchOne(db, key: "reply:acc1:orig@example.com")?.isReplyAll == false)
+            _ = try DraftStore.applySave(draft(replyAll: true, updatedAt: 3), db: db)
+            #expect(try Draft.fetchOne(db, key: "reply:acc1:orig@example.com")?.isReplyAll == true)
+        }
+    }
+
     // MARK: - Provider boundary (ADR-IOS-060)
 
     @Test("The last-verb property tags live only inside the Exchange provider")

@@ -207,7 +207,9 @@ struct PendingOperation: Codable, FetchableRecord, MutablePersistableRecord, Ide
     /// was stamped in the same completion transaction that confirmed the send
     /// (`deleteCompletedSendAtomic`), so it is that row's send-completion time.
     /// Not a fallback: for these rows `createdAt` IS the confirmed-send time,
-    /// to within one transaction (reviewed for #915).
+    /// to within one transaction (reviewed for #915). In a released build the
+    /// arm is unreachable, because `AppDatabase.retirePreviousReleaseActionQueue`
+    /// retires every queued action on a release upgrade; it serves dev databases.
     var verbTime: Date { sentAt ?? createdAt }
 
     /// Decoded message IDs from JSON storage
