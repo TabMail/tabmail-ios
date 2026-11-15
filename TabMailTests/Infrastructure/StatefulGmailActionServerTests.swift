@@ -604,6 +604,21 @@ struct StatefulGmailActionServerTests {
     /// a message carrying that id has an incomplete user-label set. System
     /// labels never make a set incomplete; a label the catalog learns makes it
     /// complete again.
+    /// #882: Gmail's system label ids never make a message's user-label set
+    /// incomplete. The whole set is pinned: dropping a member would leave every
+    /// message carrying it unknown (re-read each pass), and adding a user-label
+    /// shape would hide a label created after the catalog loaded.
+    @Test("Gmail's system label ids are exactly the reserved system labels")
+    func systemLabelIdsAreTheReservedSet() {
+        let expected: Set<String> = [
+            "INBOX", "SENT", "DRAFT", "TRASH", "SPAM", "STARRED",
+            "UNREAD", "IMPORTANT", "CHAT",
+            "CATEGORY_PERSONAL", "CATEGORY_SOCIAL", "CATEGORY_PROMOTIONS", "CATEGORY_UPDATES", "CATEGORY_FORUMS",
+        ]
+        #expect(expected.count == 14)
+        #expect(GmailProvider.systemLabelIds == expected)
+    }
+
     @Test("a user-label set is complete only when the catalog knows every label id on the message")
     func userLabelSetCompleteOnlyWhenEveryIdIsKnown() {
         var catalog = GmailUserLabelCatalogState()
