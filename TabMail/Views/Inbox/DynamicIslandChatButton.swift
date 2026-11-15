@@ -1937,6 +1937,10 @@ struct DynamicIslandChat: View {
             existing.bccJSON = Draft.encodeStringArray(recipients.bcc)
             existing.subject = subject
             existing.body = body
+            // #915: the compose's current entry decides reply vs reply-all on every
+            // save, as on Save and Send; a row loaded from the other entry under the
+            // shared `reply:` key must not keep its old kind.
+            existing.isReplyAll = draftIsReplyAll && !existing.isForward
             existing.editHistoryJSON = editHistJSON
             existing.updatedAt = now
             savedAccountId = existing.accountId

@@ -168,4 +168,62 @@ struct AgentAutoSaveRecipientsTests {
             #expect(row.isReplyAll == replyAll)
         }
     }
+
+    /// #915: a later agent autosave carries the CURRENT compose's kind. The same
+    /// `reply:` key is first saved from one entry, then the other entry's agent
+    /// saves over it; the row must follow the compose now open, both ways.
+    @Test("A later agent autosave stores the current compose's reply-all kind")
+    func laterAutosaveFollowsTheCompose() async throws {
+        let accountId = "acct-\(UUID().uuidString)"
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var config = Configuration()
+        config.foreignKeysEnabled = true
+        let pool = try DatabasePool(path: dir.appendingPathComponent("test.sqlite").path, configuration: config)
+        let appDb = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let prev = current
+            current = appDb
+            return prev
+        }
+        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir) }
+        try await pool.writeWithoutTransaction { db in
+            var acc = Account(emailAddress: "sender@example.com", displayName: "Sender", provider: .imap)
+            acc.id = accountId
+            try acc.insert(db)
+            var drafts = Folder(name: "Drafts", path: "Drafts", role: .drafts, accountId: accountId)
+            drafts.lastKnownUidValidity = 1
+            try drafts.insert(db)
+        }
+        let ctx = ComposeEditContext(
+            recipients: ["to@example.com"],
+            toRecipients: ["to@example.com"], ccRecipients: [], bccRecipients: [],
+            toDisplayNames: [:], ccDisplayNames: [:], bccDisplayNames: [:],
+            senderName: "Sender", senderEmail: "sender@example.com", mode: "edit_reply",
+            compositionPrompt: "", kbText: "", relatedDate: "", relatedSubject: "",
+            relatedFrom: "", relatedTo: "", relatedCc: "", bodyText: "")
+        // A compose reopened on an existing row admits saves after that row's epoch.
+        func chat(_ key: String, replyAll: Bool, after predecessor: String? = nil) -> DynamicIslandChat {
+            DynamicIslandChat(
+                composeContext: ctx,
+                draftId: key,
+                draftIsReplyAll: replyAll,
+                composeGenerationCursor: ComposeGenerationCursor(
+                    newEpoch: UUID().uuidString, initialExpectedPredecessor: predecessor),
+                composeRecipients: { (["to@example.com"], [], []) },
+                composeMutationAllowed: true,
+                isExpanded: .constant(false))
+        }
+        for (first, then) in [(false, true), (true, false)] {
+            let draftKey = "draft-\(UUID().uuidString)"
+            #expect(await chat(draftKey, replyAll: first).autoSaveDraft(
+                draftKey: draftKey, subject: "Re: Subject", body: "First") == nil)
+            let firstEpoch = try await pool.read { db in try Draft.fetchOne(db, key: draftKey)?.instanceEpoch }
+            #expect(await chat(draftKey, replyAll: then, after: firstEpoch).autoSaveDraft(
+                draftKey: draftKey, subject: "Re: Subject", body: "Second") == nil)
+            let row = try #require(try await pool.read { db in try Draft.fetchOne(db, key: draftKey) })
+            #expect(row.body == "Second", "precondition: the later save updated the row")
+            #expect(row.isReplyAll == then, "first=\(first): the row follows the compose now open")
+        }
+    }
 }
