@@ -90,6 +90,12 @@ struct ChatThreadView: View {
     @State private var unreadAtOpen: Set<String> = []
     @State private var seenIds: Set<String> = []
     @State private var didInitialScroll = false
+    /// Whether the chat is on screen (`onAppear` to `onDisappear`): a pushed screen covers it.
+    @State private var isOnScreen = false
+    /// Emails whose bubble has come on screen during this presentation. With the newest
+    /// `ChatViewConfig.summaryWindow`, the emails the chat checks for their summary. Only which rows
+    /// are checked: whether a row still needs its summary is read from the database at each check.
+    @State private var shownIds: Set<String> = []
     @State private var highlightedId: String?
     @State private var showsJumpButton = false
     @State private var cardMessage: MessageHeader?
@@ -186,15 +192,20 @@ struct ChatThreadView: View {
             context = loaded
             scrollOnceLoaded()
         }
+        .task(id: SummaryWatch(memberIds: members.map(\.id), landed: didInitialScroll, onScreen: isOnScreen)) {
+            await followSummaries()
+        }
         .onChange(of: viewModel.threadCopies.map(\.id)) { _, _ in noteCopies() }
         .onChange(of: memberKey) { _, _ in noteMembers() }
         .onChange(of: viewModel.hasLoadedThread) { _, _ in scrollOnceLoaded() }
         .onAppear {
             viewModel.isViewVisible = true
+            isOnScreen = true
             Task { await viewModel.loadBody() }
         }
         .onDisappear {
             viewModel.isViewVisible = false
+            isOnScreen = false
             chatExpanded = false
             ICSCalendarImporter.dismiss()
         }
@@ -205,6 +216,12 @@ struct ChatThreadView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .emailPillTapped).receive(on: DispatchQueue.main)) { _ in
             withAnimation(Self.pillSpring) { chatExpanded = false }
+        }
+        // The queue was rebuilt from the database (every sync start, AI re-enable): what it held
+        // for this chat may be gone, so the shown chat checks its rows again.
+        .onReceive(NotificationCenter.default.publisher(for: .aiQueueRebuilt).receive(on: DispatchQueue.main)) { _ in
+            guard didInitialScroll, isOnScreen else { return }
+            askForSummaries()
         }
         .onChange(of: AgentToolRouter.shared.pendingCompose?.id) { _, newId in
             guard newId != nil else { return }
@@ -320,7 +337,9 @@ struct ChatThreadView: View {
             onOpen: { cardMessage = item.header })
         .id(item.id)
         .onScrollVisibilityChange { shown in
-            if shown { askAsShown(item, in: thread) }
+            guard shown else { return }
+            shownIds.insert(item.id)
+            askAsShown(item, in: thread)
         }
     }
 
@@ -389,7 +408,6 @@ struct ChatThreadView: View {
         // be missing and the chat opens at the bottom.
         noteMembers()
         let thread = thread
-        askForNewest(thread)
         if highlightsOpenedMessage, let opened = viewModel.message,
            let item = thread.items.first(where: { ChatThread.copyKey($0.header) == ChatThread.copyKey(opened) }) {
             scrollTarget = ScrollTarget(id: item.id, anchor: .center)
@@ -407,13 +425,47 @@ struct ChatThreadView: View {
 
     // MARK: - Summaries (owner 2026-11-09)
 
-    /// On open, once: the newest `ChatViewConfig.summaryWindow` emails, newest first, wherever the
-    /// chat lands. The chat view setting is read once per request, here and in `askAsShown`.
-    private func askForNewest(_ thread: ChatThread) {
+    /// What the summary observation follows: the chat's emails, once the open has landed, while the
+    /// chat is on screen. A change restarts it, and its first value checks every row in scope again.
+    private struct SummaryWatch: Equatable {
+        let memberIds: [String]
+        let landed: Bool
+        let onScreen: Bool
+    }
+
+    /// While the chat is shown, after the landing, its emails' bodies and summaries are observed in
+    /// the database (`ChatSummaryState`). The first value, at the open and each time the chat is
+    /// shown again, asks for every row in scope; each later value asks for the rows whose state
+    /// changed, so a body that lands by any writer gets its summary asked for at the front. Nothing
+    /// is kept for a row that still waits: every ask reads the rows again (`enqueueChatSummaries`).
+    private func followSummaries() async {
+        guard didInitialScroll, isOnScreen else { return }
+        let ids = members.map(\.id)
+        var previous: [ChatSummaryState]?
+        do {
+            for try await states in ChatSummaryState.changes(ids: ids) {
+                guard !Task.isCancelled else { return }
+                askForSummaries(only: previous.map { ChatSummaryState.changedIds(states, since: $0) })
+                previous = states
+            }
+        } catch {
+            BackgroundSyncLogger.logDebug("[Chat] summary observation ended: \(error)")
+        }
+    }
+
+    /// Asks for the summaries of the rows in scope, newest first: the newest
+    /// `ChatViewConfig.summaryWindow` emails and every email shown during this presentation
+    /// (`shownIds`). `only`: just these of them. The queue reads each row again and asks only for
+    /// what is missing. The chat view setting is read once per request, here and in `askAsShown`.
+    private func askForSummaries(only changed: Set<String>? = nil) {
         guard ChatViewConfig.isActive else { return }
-        let newest = thread.items.suffix(ChatViewConfig.summaryWindow).reversed().map(\.header)
-        guard !newest.isEmpty else { return }
-        Task { await ActiveAIQueue.shared.enqueueChatSummaries(newest) }
+        let items = thread.items
+        let newest = Set(items.suffix(ChatViewConfig.summaryWindow).map(\.id))
+        let scope = items.reversed()
+            .filter { (newest.contains($0.id) || shownIds.contains($0.id)) && changed?.contains($0.id) != false }
+            .map(\.header)
+        guard !scope.isEmpty else { return }
+        Task { await ActiveAIQueue.shared.enqueueChatSummaries(scope) }
     }
 
     /// An email older than the newest `ChatViewConfig.summaryWindow` asks for its own summary when

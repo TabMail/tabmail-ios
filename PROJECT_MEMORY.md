@@ -44,7 +44,7 @@ Search the topic text below as subsystem keywords. Each link is mandatory when i
 | "Searchable but can't open / no snippet / not in its folder" — GRDB-side stuck headers (NOT FTS orphans), IMAP (under investigation 2026-06-22) | [read in full](Companion/Memory/Current/018-searchable-but-can-t-open-no-snippet-not-in-its-folder-grdb-side-stuck-h.md) |
 | Stale-detection window MUST match the fetch's ordering dimension — IMAP Archive "missing months" data-loss (CONFIRMED ROOT CAUSE + FIXED 2026-06-23) | [read in full](Companion/Memory/Current/019-stale-detection-window-must-match-the-fetch-s-ordering-dimension-imap-ar.md) |
 | GRDB Persistence | [read in full](Companion/Memory/Current/020-grdb-persistence.md) |
-| GRDB ValueObservation — DO NOT put on `messageHeader` | [read in full](Companion/Memory/Current/021-grdb-valueobservation-do-not-put-on-messageheader.md) |
+| GRDB ValueObservation — DO NOT put on `messageHeader` (the shown chat's summary observation, `ChatSummaryState`, is the one exception) | [read in full](Companion/Memory/Current/021-grdb-valueobservation-do-not-put-on-messageheader.md) |
 | AI Priority Processing (ADR-IOS-013) | [read in full](Companion/Memory/Current/022-ai-priority-processing-adr-ios-013.md) |
 | IMAP Message IDs & UID Resolution | [read in full](Companion/Memory/Current/023-imap-message-ids-uid-resolution.md) |
 | iOS Keychain Persistence | [read in full](Companion/Memory/Current/024-ios-keychain-persistence.md) |

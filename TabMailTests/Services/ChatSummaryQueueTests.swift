@@ -275,7 +275,7 @@ struct ChatSummaryQueueTests {
         try await writePeerSummary(msg.id, pool: pool)
         await queue.finishInFlightForTesting(next)
         #expect(!(await chatSummaryQueued(queue, msg.id)),
-                "recovery resets the queue: a request made before it is not acted on after it (the next open asks again)")
+                "recovery resets the queue: a request made before it is not acted on after it (the shown chat asks again once the queue is rebuilt)")
     }
 
     // MARK: - 4. Opening a thread
@@ -356,8 +356,12 @@ struct ChatSummaryQueueTests {
         jobs = await queue.queuedJobsForTesting
         #expect(jobs.prefix(3).map(\.headerId) == [a.id, c.id, b.id])
 
-        // A body that lands puts its email's job at the front.
-        await queue.chatBodyArrived(headerId: bodilessOne.id)
+        // A body that lands: the shown chat's observation asks for that email alone, and its job
+        // goes to the front.
+        try await pool.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET bodyComplete = 1 WHERE id = ?", arguments: [bodilessOne.id])
+        }
+        await queue.enqueueChatSummaries([bodilessOne], requestBodies: { _ in })
         jobs = await queue.queuedJobsForTesting
         #expect(jobs.first.map { $0.headerId == bodilessOne.id && $0.forChat } == true,
                 "the landed body's job comes first: \(jobs.map(\.headerId))")

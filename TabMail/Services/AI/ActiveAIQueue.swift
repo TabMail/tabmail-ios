@@ -206,8 +206,8 @@ actor ActiveAIQueue {
 
     /// Chat summaries (`forChat`) whose model call completed and wrote a summary but no
     /// text message (`.answeredWithoutTextMessage`: an image-only email, an invite).
-    /// GRDB still shows the chat job undone, so without this set every chat open, walk
-    /// and drain would ask again, and each ask is a model call. A sync cannot change
+    /// GRDB still shows the chat job undone, so without this set every chat open, re-show,
+    /// queue-rebuild re-check, walk and drain would ask again, and each ask is a model call. A sync cannot change
     /// the model's answer, so `rearmUnattributableJobs()` leaves this set alone: no
     /// launch-time, foreground, push-wake or suspension-recovery pass clears it. It
     /// starts empty in a new process, and AI re-enable (`aiReenabled`) empties it;
@@ -471,14 +471,15 @@ actor ActiveAIQueue {
     /// never completes is not kept past the next recovery.
     private var chatOffersOnInFlightTwin: Set<AIJob> = []
 
-    /// Summaries for the emails an open chat asks for (ADR-IOS-114, owner 2026-11-09): on open
-    /// its newest `ChatViewConfig.summaryWindow`, newest first, and later each older email that
-    /// comes on screen. Each one that lacks a summary with a text message, the user's own included,
+    /// Summaries for the emails a shown chat asks for (ADR-IOS-114, owner 2026-11-09): its newest
+    /// `ChatViewConfig.summaryWindow` and the emails shown, newest first, at the open, each re-show
+    /// and each queue rebuild; each that changed in the database; and each older email as it comes
+    /// on screen. Each one that lacks a summary with a text message, the user's own included,
     /// goes to the FRONT of the queues in the order given: every request goes in front of the
     /// earlier ones. A member with its body gets a chat summary job now; one without goes to the
     /// front of the body queue (`ActiveBodyQueue`; tests pass `requestBodies`), and nothing is kept
-    /// for it: a later ask reads it from the database once it has its body. The caller checks
-    /// `ChatViewConfig`.
+    /// for it: the shown chat observes the row and asks again once its body lands, whatever writes
+    /// it. The caller checks `ChatViewConfig`.
     func enqueueChatSummaries(
         _ members: [MessageHeader],
         requestBodies: (@Sendable ([MessageHeader]) async -> Void)? = nil
@@ -632,6 +633,10 @@ actor ActiveAIQueue {
         } catch {
             activeAILog("[ActiveAI] Chat walk failed: \(error)")
         }
+        // The walk reaches only the threads of the newest Inbox rows. A shown chat, in any folder,
+        // checks its own rows again: what the queue held for it before the rebuild (a cancel
+        // empties it) is asked again from the database.
+        NotificationCenter.default.post(name: .aiQueueRebuilt, object: nil)
     }
 
     /// The durable arbiter behind every direct-path redrive. Internal so the
@@ -734,8 +739,9 @@ actor ActiveAIQueue {
         }
         inFlightTasks.removeAll()
         storage.cancelAllInFlight()
-        // Chat offers waiting on an in-flight twin are forgotten too: the next open or walk asks
-        // again, reading what is still missing from the database.
+        // Chat offers waiting on an in-flight twin are forgotten too: the next walk, and the shown
+        // chat once the queue is rebuilt (`.aiQueueRebuilt`), ask again, reading what is still
+        // missing from the database.
         chatOffersOnInFlightTwin.removeAll()
         backoff.removeAll()
         backoffRetryCount.removeAll()

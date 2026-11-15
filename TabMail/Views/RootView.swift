@@ -1126,6 +1126,10 @@ extension Notification.Name {
     /// Posted when a single message's data changes (AI processing, reply/forward flags, tag updates, etc.).
     /// Object is the message ID (String) so observers can refresh that message in-place from GRDB.
     static let messageDataDidChange = Notification.Name("messageDataDidChange")
+    /// Posted when the AI queue has been rebuilt from the database (the end of
+    /// `ActiveAIQueue.repopulateFromDatabase` with the chat view on: every sync start, AI re-enable,
+    /// the AI redrives). A shown chat checks its emails' summaries again.
+    static let aiQueueRebuilt = Notification.Name("aiQueueRebuilt")
     /// Posted when AI processing fails for a message (network error, empty response, etc.).
     /// Object is the header ID (String) so SummaryBubbleView can show failure state.
     static let aiDidFailForMessage = Notification.Name("aiDidFailForMessage")
