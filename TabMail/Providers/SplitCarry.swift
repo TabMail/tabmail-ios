@@ -592,35 +592,33 @@ enum SplitCarry {
         return live
     }
 
-    /// Whether a write that moves a repeating event's start from `from` to `to` leaves its added
-    /// dates behind (#894, owner rulings 2026-11-14): `recurrence`, the event's recurrence as the
-    /// write leaves it (a split's new part: only the lines at or after the cut), holds a live added
-    /// date (`liveAddedDates`, read with `zones`, as dates when `isAllDay`), the start moves (a new
-    /// time or date, or the other kind), and the calendar does not move added dates with the event
-    /// (`movesAddedDates`, `CalendarProvider.movesAddedDatesWithSeries`). The event's meetings would
-    /// then differ from what was asked: the added ones stay at their old time. False on a calendar
-    /// that moves them or with no live added date (nothing more read); nil when an added date or
-    /// either start can't be read. A split asks it from its cut to its new part's start; an edit of
-    /// every occurrence from the series' start to the start it writes (`start(of:on:)`).
+    /// Whether a write that moves a repeating event's start leaves its added dates behind (#894,
+    /// owner rulings 2026-11-14): the write moves the start (`moves`, as the write decides it: a
+    /// new time or date, the other kind, or for Google the same instant in another zone; nil when
+    /// a start can't be read), `recurrence`, the event's recurrence as the write leaves it (a
+    /// split's new part: only the lines at or after the cut; an edit of every occurrence: the lines
+    /// its write sends), holds a live added date (`liveAddedDates`, read with `zones`, as dates when
+    /// `isAllDay`), and the calendar does not move added dates with the event (`movesAddedDates`,
+    /// `CalendarProvider.movesAddedDatesWithSeries`). The event's meetings would then differ from
+    /// what was asked: the added ones stay at their old time. False on a calendar that moves them,
+    /// for a write that moves no start, or with no live added date: the move is decided first, so a
+    /// change of title, place or length never reads an added date. Nil when the move can't be
+    /// decided or an added or excluded date can't be read, with a date added.
     static func leavesAddedDatesBehind(
-        from: GCalDateTime?, to: GCalDateTime?, recurrence: [String], isAllDay: Bool, zones: CalendarTimeZoneContext,
-        movesAddedDates: Bool
+        moves: Bool?, recurrence: [String], isAllDay: Bool, zones: CalendarTimeZoneContext, movesAddedDates: Bool
     ) -> Bool? {
-        guard !movesAddedDates, recurrence.contains(where: isAddedDates) else { return false }
+        guard !movesAddedDates, moves != false, recurrence.contains(where: isAddedDates) else { return false }
         guard let live = liveAddedDates(recurrence, isAllDay: isAllDay, zones: zones) else { return nil }
         guard !live.isEmpty else { return false }
-        guard let from, let to else { return nil }
-        if (from.date == nil) != (to.date == nil) { return true }
-        guard let same = sameTime(to, from) else { return nil }
-        return !same
+        return moves
     }
 
-    /// The start an edit of every occurrence `edit` writes to `series`: the edit's own when it
-    /// gives one (a date, or a time with its zone), else the series' stored start.
-    static func start(of edit: GCalEventInput, on series: GCalEvent) -> GCalDateTime? {
-        if let date = edit.startDate { return GCalDateTime(dateTime: nil, date: date, timeZone: nil) }
-        if let dateTime = edit.startDateTime { return GCalDateTime(dateTime: dateTime, date: nil, timeZone: edit.startTimeZone) }
-        return series.start
+    /// Whether a start moves from `from` to `to`: the other kind, or another date or instant. Nil
+    /// when either can't be read. A split's check of its new part against its cut.
+    static func startMoves(from: GCalDateTime?, to: GCalDateTime?) -> Bool? {
+        guard let from, let to else { return nil }
+        if (from.date == nil) != (to.date == nil) { return true }
+        return sameTime(to, from).map { !$0 }
     }
 
     /// Whether a split of `series` at `cut` starts its new part on a date added to the series

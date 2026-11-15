@@ -370,13 +370,23 @@ final class FakeGoogleCalendar: Sendable {
     /// Whether `occurrence` (built by `anyInstance`) starts on a date added to `series` (`RDATE`)
     /// that no excluded date (`EXDATE`) cancels: Google gives an added date an instance of its own,
     /// with an id like any other (`<series id>_<UTC start>Z`). Read here, apart from the code under
-    /// test, in the two forms Google writes and the tests seed (`RDATE:<UTC times>`,
-    /// `RDATE;VALUE=DATE:<dates>`, comma-separated); a `TZID` form is not read.
+    /// test, in the forms Google writes and the tests seed, comma-separated: `RDATE:<UTC times>`,
+    /// `RDATE;VALUE=DATE:<dates>`, and `RDATE;TZID=<zone>:<wall clocks>`, each wall clock read in
+    /// its zone (`TimeZone(identifier:)`) as the UTC time Google names the instance by; a value in
+    /// a zone that does not resolve is no date. `EXDATE` lines alike.
     private static func onAddedDate(_ series: [String: Any], occurrence: [String: Any]) -> Bool {
         let lines = series["recurrence"] as? [String] ?? []
         func values(_ name: String) -> Set<String> {
-            Set(lines.filter { $0.uppercased().hasPrefix(name) && !$0.uppercased().contains("TZID=") }
-                .flatMap { line in line.split(separator: ":").last.map { $0.split(separator: ",").map(String.init) } ?? [] })
+            Set(lines.filter { $0.uppercased().hasPrefix(name) }.flatMap { line -> [String] in
+                let halves = line.split(separator: ":", maxSplits: 1).map(String.init)
+                guard halves.count == 2 else { return [] }
+                let values = halves[1].split(separator: ",").map(String.init)
+                guard let tzid = halves[0].split(separator: ";").first(where: { $0.uppercased().hasPrefix("TZID=") }) else { return values }
+                guard let zone = TimeZone(identifier: String(tzid.dropFirst("TZID=".count))) else { return [] }
+                let wall = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss", timeZone: zone)
+                let utc = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss'Z'", timeZone: .gmt)
+                return values.compactMap { wall.date(from: $0).map(utc.string(from:)) }
+            })
         }
         let start = occurrence["start"] as? [String: Any]
         let key: String

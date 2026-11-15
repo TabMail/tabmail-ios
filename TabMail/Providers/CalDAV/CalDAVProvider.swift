@@ -829,7 +829,7 @@ actor CalDAVProvider: CalendarProvider {
         // the one check every split plan makes, decided by the calendar's capability.
         let newPart = ICSParser.parse(icsText: resources.newPart, resourceHref: eventURL.path, etag: nil).first
         try Self.refuseAddedDatesLeftBehind(
-            from: cutTime, to: newPart?.start, recurrence: Self.masterTopLevelLines(resources.newPart),
+            moves: SplitCarry.startMoves(from: cutTime, to: newPart?.start), recurrence: Self.masterTopLevelLines(resources.newPart),
             isAllDay: newPart?.isAllDay ?? false, zones: zones,
             unreadable: "The new part of the repeating event could not be built, so it was not split.")
         return .split(SplitPlan(

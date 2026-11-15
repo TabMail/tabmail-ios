@@ -274,11 +274,17 @@ its card.
      a provider CAPABILITY, never a provider type above the provider boundary (ADR-IOS-060):
      `CalendarProvider.movesAddedDatesWithSeries` (Google false, CalDAV true, protocol default false;
      Outlook has no `RDATE`), read THROUGH THE PROTOCOL by the one check, the protocol extension's
-     `refuseAddedDatesLeftBehind(from:to:recurrence:isAllDay:zones:unreadable:)`, which asks the pure
-     `SplitCarry.leavesAddedDatesBehind(from:to:recurrence:isAllDay:zones:movesAddedDates:)`: false
-     on a calendar that moves them or with no LIVE added date in the recurrence the write leaves
-     (`liveAddedDates`), nil (refused with the write's "can't read" text) when a start or a date
-     can't be read. Run in the same `splitPlan`s after the new part is built (Google from the create
+     `refuseAddedDatesLeftBehind(moves:recurrence:isAllDay:zones:unreadable:)`, which asks the pure
+     `SplitCarry.leavesAddedDatesBehind(moves:recurrence:isAllDay:zones:movesAddedDates:)`: false
+     on a calendar that moves them, for a write that moves no start, or with no LIVE added date in
+     the recurrence the write leaves (`liveAddedDates`), nil (refused with the write's "can't read"
+     text) when the move can't be decided or a date can't be read. The move is decided FIRST and by
+     the write (amended r2): a write that moves no start reads no added date, so a title, place or
+     length change is never refused for an added date that can't be read. A split's move is
+     `SplitCarry.startMoves(from: cut, to: newPart.start)` (another time, day or kind); a new rule
+     alone moves no start, and neither does a new zone on Google, whose new part always repeats in
+     the series' own zone (`mergeMasterAndPatch`), so its added dates keep their place among its
+     meetings and the change is written. Run in the same `splitPlan`s after the new part is built (Google from the create
      body `written` and `recurrenceParts.tail`; CalDAV from `resources.newPart`), so the card check
      and the queue refuse alike. An added date only before the cut stays with the series and the
      move is written. On Google the new part's recurrence is read AS WRITTEN: a reset drops its
@@ -292,10 +298,18 @@ its card.
      `this_and_following` change named at the first occurrence, which `route` makes a whole-series
      edit. Google's write (`patchEvent` with `keepStoredDates`) keeps every `RDATE` line as written,
      so each added meeting would stay at the old time. Decided from the series and the capability by
-     `CalendarProvider.refuseEveryOccurrenceMove(series:edit:)` (from the series' start to the start
-     the edit writes, `SplitCarry.start(of:on:)`), called by Google's `refuseSeriesWrite`
-     (`.everyOccurrence`, on the series as read for the card, no request) and by `patchEvent` on the
-     series it just read, before its PATCH, so the card and the queue refuse alike. A change of
+     `GoogleCalendarProvider.refuseEveryOccurrenceMove(series:edit:written:)`, called by Google's
+     `refuseSeriesWrite` (`.everyOccurrence`, on the series as read for the card, no request) and by
+     `patchEvent` on the series it just read, before its PATCH, so the card and the queue refuse
+     alike. Amended r2: (a) the added dates are read from the recurrence the PATCH WRITES, the one
+     helper `GoogleCalendarProvider.writtenRecurrence(_:edit:keepStoredDates:)` that `patchEvent`
+     writes and both checks read: a move to another day of a rule naming its weekdays turns the rule
+     and drops every `EXDATE` (`turned`), so an added date the user deleted would come back at its
+     old time, and such a move is refused (the r1 version read the stored recurrence and wrote it);
+     (b) the start moves as the write decides it sends one (`movesSeriesTime` by `googleStart`):
+     another date, instant or kind, or the same instant in another zone (`googleZone`), which Google
+     repeats the series in while an added date keeps its instant, so a meeting would be off the asked
+     wall clock across a clock change. A change of
      title, place or length alone moves no start and is written. CalDAV moves added dates with the
      start (`shiftSeriesAnchoredValues`; a change of kind converts them), so there it is written.
      The earlier "Not covered" note for this case is withdrawn.
@@ -311,9 +325,17 @@ its card.
      at the queue; a title, place or length of every meeting, a length of the following meetings,
      and a move of every meeting whose only added date was deleted, written; the same move on CalDAV
      written with the added date moved; a meeting on the added date changed on its own carried onto
-     the new part's own occurrence there, the Google fake giving an added date its instance id) and
+     the new part's own occurrence there, the Google fake giving an added date its instance id; r2:
+     a move of every meeting to another day of a rule naming its weekday whose added date was
+     deleted, in UTC and `TZID` form, refused before the card and at the queue; a move of every
+     meeting to the same instant in another zone refused, and of the following meetings written in
+     the series' zone with the series' meetings; a new title
+     of every meeting written though an added date can't be read; the carried changed meeting with
+     the added date in `TZID` form; the fake reading `TZID` added and excluded dates as Google does) and
      `SplitCarryTests.cutsAtAddedDateReadsTheSeries`, `cancelledAddedDateIsNoPlace`,
-     `leavesAddedDatesBehindReadsTheMove`, `startOfAnEditOfEveryOccurrence`. `GoogleSeriesSplitCopyTests` reschedule cases
+     `cutSkipsACancelledAddedDate`, `liveAddedDatesReadEveryExcludedDate` (several `EXDATE` lines
+     and values), `liveAddedDatesOfAnAllDaySeries` (`RDATE;VALUE=DATE` cancelled by
+     `EXDATE;VALUE=DATE`), `leavesAddedDatesBehindReadsTheMove`, `startMovesReadsTheTwoStarts`. `GoogleSeriesSplitCopyTests` reschedule cases
      and `splitOntoAnotherDayDropsExcludedDates` now use a series with no added date after the cut.
 
 **Consequences:**

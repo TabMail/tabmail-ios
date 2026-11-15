@@ -492,6 +492,22 @@ deleted added date comes back live and the move stays refused. The message moved
 meeting on an added date is carried onto the new part's own occurrence there
 (`<part id>_<UTC start>Z`, which Google gives an added date); the Google fake now gives an added date
 its instance id (`FakeGoogleCalendar.onAddedDate`), and `SplitAtAnAddedDateTests` pins what is written.
+Review r2 (2026-11-14): r1 checked the STORED recurrence, but a Google move of every meeting to another
+day of a rule naming its weekday turns the rule and drops every `EXDATE` (`turned`), so a deleted added
+date came back at its old time, unrefused. The check now reads the recurrence the PATCH writes, from the
+one helper `GoogleCalendarProvider.writtenRecurrence` that `patchEvent` writes and the card's
+`refuseSeriesWrite` reads (`refuseEveryOccurrenceMove(series:edit:written:)`, now Google's own). The
+move is decided FIRST and by the write: Google's `movesSeriesTime` by `googleStart`, so the same instant
+in another zone is a move (Google repeats the series there while an added date keeps its instant); a
+split's move is `SplitCarry.startMoves` (a new rule alone, or on Google a new zone, moves no start:
+Google's new part repeats in the series' own zone); a write that moves no start
+reads no added date (`leavesAddedDatesBehind(moves:…)`), so a rename is never refused for an added date
+that can't be read. `SplitCarry.start(of:on:)` was removed. The Google fake reads `TZID` added and
+excluded dates. Tests: `googleEveryOccurrenceDayMoveBringingBackADeletedAddedDateIsRefused` (UTC and
+`TZID`), `googleEveryOccurrenceZoneChangeIsRefused`, `googleZoneChangeOfTheFollowingMeetingsKeepsTheMeetings`,
+`googleEveryOccurrenceRenameWithAnUnreadableAddedDateIsWritten`, `fakeReadsZonedAddedAndExcludedDates`,
+`SplitCarryTests.cutSkipsACancelledAddedDate`, `liveAddedDatesReadEveryExcludedDate`,
+`liveAddedDatesOfAnAllDaySeries`, `startMovesReadsTheTwoStarts`.
 
 **The card asks the write's cut (amended 2026-11-12, review rounds 3-4):** the card of a split named
 at a moved occurrence asks `CalendarProvider.splitCut` (each calendar's `splitPoint`, nothing written).

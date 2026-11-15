@@ -209,49 +209,82 @@ struct SplitCarryTests {
         // One of two added dates cancelled: the other still counts.
         #expect(SplitCarry.cutsAtAddedDate(
             .at(Self.instant(Self.at(17))), series: try Self.weeklyUntil42(["RDATE:\(Self.ical(16)),\(Self.ical(17))", cancelled16])) == true)
-        // A meeting moved from day 14 to day 15: the first place after it is the rule's day 21, not the deleted day 16.
-        let moved = try Self.occurrence(place: 14, start: Self.at(15), end: Self.at(15, "09:30:00"))
-        #expect(SplitCarry.cut(named: moved, series: try Self.weeklyUntil42([added16, cancelled16])) == .at(Self.instant(Self.at(21))))
-        #expect(SplitCarry.cut(named: moved, series: try Self.weeklyUntil42([added16])) == .at(Self.instant(Self.at(16))))
         // An excluded date that can't be read, with a date added: nil, never a silent no.
         #expect(SplitCarry.cutsAtAddedDate(cut16, series: try Self.weeklyUntil42([added16, "EXDATE:NOTADATE"])) == nil)
     }
 
-    @Test("a write that moves the start leaves the live added dates behind only on a calendar that does not move them (#894)")
-    func leavesAddedDatesBehindReadsTheMove() throws {
-        let from = Self.instant(Self.at(14))
-        let later = Self.instant(Self.at(14, "10:00:00"))
-        let date = GCalDateTime(dateTime: nil, date: String(Self.at(14).prefix(10)), timeZone: nil)
-        let rule = "RRULE:FREQ=WEEKLY", added = "RDATE:\(Self.ical(16))"
-        func behind(_ to: GCalDateTime?, _ lines: [String], from: GCalDateTime? = from, moves: Bool = false) -> Bool? {
-            SplitCarry.leavesAddedDatesBehind(from: from, to: to, recurrence: lines, isAllDay: false, zones: .none, movesAddedDates: moves)
-        }
-        #expect(behind(later, [rule, added]) == true, "a new time")
-        #expect(behind(date, [rule, added]) == true, "the other kind")
-        #expect(behind(from, [rule, added]) == false, "the start stays")
-        #expect(behind(Self.instant(Self.at(14)), [rule, added]) == false, "the same instant spelled again")
-        #expect(behind(later, [rule, added], moves: true) == false, "a calendar that moves them")
-        #expect(behind(later, [rule]) == false, "no added date")
-        #expect(behind(later, [rule, added, "EXDATE:\(Self.ical(16))"]) == false, "the only added date was deleted")
-        #expect(behind(later, [rule, "RDATE:\(Self.ical(16)),\(Self.ical(23))", "EXDATE:\(Self.ical(16))"]) == true, "one of two deleted")
-        // A start that can't be read, or an added or excluded date that can't: nil, never a silent no.
-        #expect(behind(nil, [rule, added]) == nil)
-        #expect(behind(later, [rule, added], from: nil) == nil)
-        #expect(behind(later, [rule, "RDATE:NOTADATE"]) == nil)
-        #expect(behind(later, [rule, added, "EXDATE:NOTADATE"]) == nil)
+    @Test("a moved meeting's cut skips an added date an excluded date cancels (#894): it lands on the next real place")
+    func cutSkipsACancelledAddedDate() throws {
+        let added16 = "RDATE:\(Self.ical(16))", cancelled16 = "EXDATE:\(Self.ical(16))"
+        // A meeting moved from day 14 to day 15: the first place after it is the rule's day 21, not the deleted day 16.
+        let moved = try Self.occurrence(place: 14, start: Self.at(15), end: Self.at(15, "09:30:00"))
+        #expect(SplitCarry.cut(named: moved, series: try Self.weeklyUntil42([added16, cancelled16])) == .at(Self.instant(Self.at(21))))
+        #expect(SplitCarry.cut(named: moved, series: try Self.weeklyUntil42([added16])) == .at(Self.instant(Self.at(16))))
+        // Day 16 cancelled, day 17 still added: the cut is day 17.
+        #expect(SplitCarry.cut(named: moved, series: try Self.weeklyUntil42(["RDATE:\(Self.ical(16)),\(Self.ical(17))", cancelled16]))
+                == .at(Self.instant(Self.at(17))))
     }
 
-    @Test("the start an edit of every occurrence writes: its own date or time, else the series'")
-    func startOfAnEditOfEveryOccurrence() throws {
-        let series = try Self.event(Self.series)
-        #expect(SplitCarry.start(of: GCalEventInput(), on: series) == series.start)
-        var timed = GCalEventInput()
-        timed.startDateTime = Self.at(0, "10:00:00")
-        timed.startTimeZone = "UTC"
-        #expect(SplitCarry.start(of: timed, on: series) == GCalDateTime(dateTime: Self.at(0, "10:00:00"), date: nil, timeZone: "UTC"))
-        var allDay = GCalEventInput()
-        allDay.startDate = String(Self.at(0).prefix(10))
-        #expect(SplitCarry.start(of: allDay, on: series) == GCalDateTime(dateTime: nil, date: String(Self.at(0).prefix(10)), timeZone: nil))
+    @Test("the live added dates are those no excluded date cancels, read across every EXDATE line and value (#894)")
+    func liveAddedDatesReadEveryExcludedDate() throws {
+        let rule = "RRULE:FREQ=WEEKLY", added = "RDATE:\(Self.ical(16)),\(Self.ical(23))"
+        func live(_ lines: [String]) -> [Date]? {
+            SplitCarry.liveAddedDates(lines, isAllDay: false, zones: .none)?.compactMap { $0.dateTime.flatMap(Date.fromISO8601) }
+        }
+        let only23 = [Date.fromISO8601(Self.at(23))].compactMap { $0 }
+        // The cancelling EXDATE line first, another after it: the later line does not bring day 16 back.
+        #expect(live([rule, added, "EXDATE:\(Self.ical(16))", "EXDATE:\(Self.ical(30))"]) == only23)
+        // The cancelling value second in one EXDATE line.
+        #expect(live([rule, added, "EXDATE:\(Self.ical(30)),\(Self.ical(16))"]) == only23)
+        // An excluded date at another time on the same day cancels nothing.
+        #expect(live([rule, added, "EXDATE:\(Self.ical(16, "10:00:00"))"])?.count == 2)
+    }
+
+    @Test("an all-day series' added dates (RDATE;VALUE=DATE) are dates, and an EXDATE;VALUE=DATE cancels them (#894)")
+    func liveAddedDatesOfAnAllDaySeries() throws {
+        func date(_ days: Int) -> String { String(Self.at(days).prefix(10)) }
+        func value(_ days: Int) -> String { String(Self.ical(days).prefix(8)) }
+        let lines = ["RRULE:FREQ=WEEKLY", "RDATE;VALUE=DATE:\(value(16)),\(value(23))", "EXDATE;VALUE=DATE:\(value(16))"]
+        #expect(SplitCarry.liveAddedDates(lines, isAllDay: true, zones: .none) == [GCalDateTime(dateTime: nil, date: date(23), timeZone: nil)])
+        #expect(SplitCarry.liveAddedDates(Array(lines.prefix(2)), isAllDay: true, zones: .none)
+                == [GCalDateTime(dateTime: nil, date: date(16), timeZone: nil), GCalDateTime(dateTime: nil, date: date(23), timeZone: nil)])
+        #expect(SplitCarry.leavesAddedDatesBehind(
+            moves: true, recurrence: [lines[0], lines[1], "EXDATE;VALUE=DATE:\(value(16)),\(value(23))"], isAllDay: true, zones: .none,
+            movesAddedDates: false) == false, "every added date cancelled")
+    }
+
+    @Test("a write that moves the start leaves the live added dates behind only on a calendar that does not move them (#894)")
+    func leavesAddedDatesBehindReadsTheMove() throws {
+        let rule = "RRULE:FREQ=WEEKLY", added = "RDATE:\(Self.ical(16))"
+        func behind(_ moves: Bool?, _ lines: [String], calendarMoves: Bool = false) -> Bool? {
+            SplitCarry.leavesAddedDatesBehind(moves: moves, recurrence: lines, isAllDay: false, zones: .none, movesAddedDates: calendarMoves)
+        }
+        #expect(behind(true, [rule, added]) == true, "a move")
+        #expect(behind(false, [rule, added]) == false, "the start stays")
+        #expect(behind(true, [rule, added], calendarMoves: true) == false, "a calendar that moves them")
+        #expect(behind(true, [rule]) == false, "no added date")
+        #expect(behind(true, [rule, added, "EXDATE:\(Self.ical(16))"]) == false, "the only added date was deleted")
+        #expect(behind(true, [rule, "RDATE:\(Self.ical(16)),\(Self.ical(23))", "EXDATE:\(Self.ical(16))"]) == true, "one of two deleted")
+        // A write that moves no start reads no added date: one that can't be read refuses nothing.
+        #expect(behind(false, [rule, "RDATE:NOTADATE"]) == false)
+        #expect(behind(false, [rule, added, "EXDATE:NOTADATE"]) == false)
+        // A move that can't be decided, or an added or excluded date that can't be read: nil, never a silent no.
+        #expect(behind(nil, [rule, added]) == nil)
+        #expect(behind(nil, [rule]) == false, "no added date: nothing to leave behind")
+        #expect(behind(true, [rule, "RDATE:NOTADATE"]) == nil)
+        #expect(behind(true, [rule, added, "EXDATE:NOTADATE"]) == nil)
+    }
+
+    @Test("a split's start moves to another time, day or kind; the same instant spelled again is no move")
+    func startMovesReadsTheTwoStarts() throws {
+        let from = Self.instant(Self.at(14))
+        #expect(SplitCarry.startMoves(from: from, to: Self.instant(Self.at(14, "10:00:00"))) == true)
+        #expect(SplitCarry.startMoves(from: from, to: GCalDateTime(dateTime: nil, date: String(Self.at(14).prefix(10)), timeZone: nil)) == true)
+        #expect(SplitCarry.startMoves(from: from, to: Self.instant(Self.at(14))) == false)
+        #expect(SplitCarry.startMoves(from: from, to: GCalDateTime(dateTime: "\(String(Self.at(14).prefix(10)))T10:00:00+01:00", date: nil, timeZone: "Europe/Paris")) == false,
+                "the same instant written with an offset")
+        #expect(SplitCarry.startMoves(from: nil, to: from) == nil)
+        #expect(SplitCarry.startMoves(from: from, to: nil) == nil)
     }
 
     @Test("a UTC UNTIL before the next place leaves no cut; one at it keeps the place")
