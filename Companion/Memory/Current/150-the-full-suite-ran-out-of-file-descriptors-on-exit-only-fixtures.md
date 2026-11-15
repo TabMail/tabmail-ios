@@ -83,6 +83,40 @@ Round 1 hardening of the proof:
   scan of 10,240 slots costs about 2 ms (host benchmark, 30 to 1,000 open descriptors), and runs at
   most once per registry transition that has a released group.
 
+  Superseded by iOS #898 (below): the soft limit is NOT pinned; it is only ever raised.
+
+## iOS #898: the soft limit is not a fixed number (2026-11-14)
+
+The first full suite on the fix (bd199344, 12,794 tests, one launch, no descriptor errors) failed
+one test: the budget test asserted the soft limit was at most 10,240, and it was 12,544. Nothing in
+our code or our packages calls `setrlimit` besides `prepareFileDescriptorBudget`. CFNetwork does:
+the first `URLSession` task in a process adds 2,304 to the soft `RLIMIT_NOFILE` (host probe: 256 ->
+2,560, 4,096 -> 6,400, 10,240 -> 12,544, 12,544 -> 14,848; the host cache images that import
+`setrlimit` include CFNetwork, CoreFoundation, Foundation, Network and WebKit, and only the
+`URLSession` probe moved the limit).
+
+The descriptor walk was not wrong: it reads `getdtablesize()` (the current soft limit) on every
+scan, so it covered descriptors above 10,240. What was wrong was the assumption around it: the round-1
+change that SET the soft limit to exactly the budget could LOWER a limit another component had
+raised, and a descriptor numbered above the new limit would then be outside the walk. The rule now:
+`prepareFileDescriptorBudget` only raises (`budgetedSoftLimit(current:hard:)` = max(current,
+min(budget, hard))). A descriptor can only be opened below the soft limit of its moment, so while
+the limit never decreases every open descriptor is below the current one and the walk is complete.
+Never lower `RLIMIT_NOFILE` in the test host, and never assert it equals or stays under the budget.
+
+Tests: the #898 regression test is "the budget step leaves a ceiling another component raised
+untouched": `applyFileDescriptorBudget` (the body of the once-guarded `prepareFileDescriptorBudget`)
+given a soft limit of 12,544 and an unlimited hard limit writes nothing (it failed red-first with the
+shipped `rlim_cur = target`). `budgetedSoftLimit` is also pinned directly, including the hard-limit cap.
+The walk test (with the ceiling raised above the budget, the walk sees a descriptor numbered above
+10,240) is NOT the regression test, since the shipped walk already passed it: it guards against the
+walk being tied to a fixed number.
+
+Accepted residual race (review r1): CFNetwork's raise and the budget step are both read-then-write, so
+if they interleave once at startup the later write can put back a lower value. One pair of system
+calls per process, test host only. If it ever matters, enumerate the open descriptors themselves
+(for example `/dev/fd`) instead of a limit-derived range.
+
 ## Proof
 
 - Red first (fix inverted: exit-only groups held strongly again; the teardown invariant suite plus
