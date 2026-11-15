@@ -2522,6 +2522,9 @@ struct IMAPProviderPoolFuzzTests {
             return 3
         }
 
+        /// Percent of planned ops whose task is cancelled at a seeded point.
+        static let cancelPercent = 30
+
         /// Concurrent operations per round.
         static var opsPerRound: Int {
             if let raw = ProcessInfo.processInfo.environment["POOL_FUZZ_OPS"],
@@ -2695,6 +2698,11 @@ struct IMAPProviderPoolFuzzTests {
         func allViolations() -> [String] { violations.withLock { $0 } }
     }
 
+    /// Provider calls that surfaced a raw `IMAPConnectionAbortedError`.
+    private final class AbortLeaks: Sendable {
+        let names = Mutex<[String]>([])
+    }
+
     // MARK: - Operations
 
     private enum FuzzOp: Sendable {
@@ -2734,15 +2742,26 @@ struct IMAPProviderPoolFuzzTests {
         }
     }
 
-    /// Every outcome is DISCARDED on purpose — see the suite's doc comment.
-    private static func execute(_ op: FuzzOp, provider: IMAPProvider, server: FakeIMAPServer) async {
+    /// Every outcome is DISCARDED on purpose — see the suite's doc comment — except
+    /// one property: no provider call may surface SwiftMail's raw
+    /// `IMAPConnectionAbortedError` (what a command queued behind a cancelled one
+    /// gets). The provider boundary maps it to a connection loss; a raw abort would
+    /// reach the sync engine as a generic, banner-raising failure.
+    private static func execute(
+        _ op: FuzzOp, provider: IMAPProvider, server: FakeIMAPServer, abortLeaks: AbortLeaks
+    ) async {
+        func checked(_ name: String, _ call: () async throws -> Void) async {
+            do { try await call() } catch {
+                if error is IMAPConnectionAbortedError { abortLeaks.names.withLock { $0.append(name) } }
+            }
+        }
         switch op {
         case .fetchMessages(let folder):
-            _ = try? await provider.fetchMessages(folder: folder, limit: 3, offset: 0)
+            await checked("fetchMessages(\(folder))") { _ = try await provider.fetchMessages(folder: folder, limit: 3, offset: 0) }
         case .folderStatus(let folder):
-            _ = try? await provider.folderStatus(path: folder)
+            await checked("folderStatus(\(folder))") { _ = try await provider.folderStatus(path: folder) }
         case .fetchFolders:
-            _ = try? await provider.fetchFolders()
+            await checked("fetchFolders") { _ = try await provider.fetchFolders() }
         case .connect:
             try? await provider.connect()
         case .markDirty:
@@ -2931,27 +2950,47 @@ struct IMAPProviderPoolFuzzTests {
         // ── Plan, then fire. The plan is drawn from the seed; the SCHEDULE is
         // whatever the runtime produces.
         var planner = SplitMix64(seed: roundSeed)
-        var plan: [(op: FuzzOp, startMs: Int)] = []
+        // Seeded task cancellation: with the pinned SwiftMail, cancelling a task
+        // mid-command closes that transport and aborts commands queued behind it,
+        // so some ops' tasks are cancelled at a seeded point after they start.
+        var plan: [(op: FuzzOp, startMs: Int, cancelAfterMs: Int?)] = []
         for _ in 0..<FuzzConfig.opsPerRound {
             let op = planOp(&planner)
-            plan.append((op, planner.pick(FuzzConfig.startSpreadMs)))
+            let startMs = planner.pick(FuzzConfig.startSpreadMs)
+            let cancelAfterMs: Int? = planner.pick(100) < FuzzConfig.cancelPercent
+                ? planner.pick(FuzzConfig.startSpreadMs) : nil
+            plan.append((op, startMs, cancelAfterMs))
         }
 
+        let abortLeaks = AbortLeaks()
         var tasks: [Task<Void, Never>] = []
+        var cancellers: [Task<Void, Never>] = []
         for entry in plan {
             let op = entry.op
             let startMs = entry.startMs
-            tasks.append(Task {
+            let task = Task {
                 if startMs > 0 {
                     try? await Task.sleep(for: .milliseconds(startMs))
                 }
-                await execute(op, provider: provider, server: server)
-            })
+                await execute(op, provider: provider, server: server, abortLeaks: abortLeaks)
+            }
+            tasks.append(task)
+            if let cancelAfterMs = entry.cancelAfterMs {
+                cancellers.append(Task {
+                    try? await Task.sleep(for: .milliseconds(startMs + cancelAfterMs))
+                    task.cancel()
+                })
+            }
         }
 
         var unfinished = 0
         for task in tasks {
             if await !joinBounded(task) { unfinished += 1 }
+        }
+        for canceller in cancellers { _ = await joinBounded(canceller) }
+        let leaked = abortLeaks.names.withLock { $0 }
+        if !leaked.isEmpty {
+            Issue.record("\(label): raw IMAPConnectionAbortedError crossed the provider boundary from \(leaked)")
         }
         if unfinished > 0 {
             Issue.record("\(label): \(unfinished) of \(tasks.count) operations never finished within \(FuzzConfig.opTimeoutSeconds)s — the pool left a caller parked with nothing that could ever wake it (deadlock/starvation, the failure mode this contract exists to exclude)")

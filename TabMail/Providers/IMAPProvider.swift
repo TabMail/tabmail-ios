@@ -1116,15 +1116,12 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             #endif
             guard generation == acquiredGeneration else {
                 if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Stale generation for \(folder) after error — discarding connection silently") }
-                throw error
+                throw Self.providerError(from: error)
             }
-            let desc = "\(error)"
-            let isUnhealthy = SyncEngine.isConnectionError(error)
-                || desc.contains("PayloadTooLargeError")
-                || desc.contains("IMAPDecoderError")
+            let isUnhealthy = Self.pooledConnectionUnusable(after: error)
             if isUnhealthy { parseAndApplyServerLimit(from: error) }
             await releaseFolderConnection(folder: folder, healthy: !isUnhealthy)
-            throw error
+            throw Self.providerError(from: error)
         }
     }
 
@@ -1693,12 +1690,34 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             #endif
             return
         }
-        let desc = "\(error)"
-        let isUnhealthy = SyncEngine.isConnectionError(error)
-            || desc.contains("PayloadTooLargeError")
-            || desc.contains("IMAPDecoderError")
+        let isUnhealthy = Self.pooledConnectionUnusable(after: error)
         if isUnhealthy { parseAndApplyServerLimit(from: error) }
         await releaseActionConnection(healthy: !isUnhealthy)
+    }
+
+    /// Whether a pooled connection must be dropped after `error`.
+    ///
+    /// `IMAPConnectionAbortedError` is what SwiftMail gives a command queued behind
+    /// one whose task was cancelled: the transport is already closed, so it is a
+    /// connection loss like any other. A cancelled caller's own `CancellationError`
+    /// is NOT unhealthy: every pinned-folder operation and every selecting action
+    /// SELECTs before its command, and SwiftMail reconnects a closed transport inside
+    /// the next command, so reuse costs one reconnect, while dropping would cost a
+    /// reconnect just to LOG OUT. The no-select action lane (LIST, STATUS) needs no
+    /// selection; its one side effect is that the first STATUS after such a
+    /// reconnect may omit UIDNEXT/HIGHESTMODSEQ (SwiftMail picks STATUS attributes
+    /// from the capabilities before it reconnects), which the next poll restores.
+    nonisolated static func pooledConnectionUnusable(after error: Error) -> Bool {
+        if error is IMAPConnectionAbortedError { return true }
+        return SyncEngine.isConnectionError(error)
+            || "\(error)".contains("PayloadTooLargeError")
+    }
+
+    /// Maps a SwiftMail connection abort to the provider-neutral
+    /// `ProviderError.notConnected` at the provider boundary, so the sync engine
+    /// treats it as a connection loss (quiet reconnect, no error banner).
+    nonisolated static func providerError(from error: Error) -> Error {
+        error is IMAPConnectionAbortedError ? ProviderError.notConnected : error
     }
 
     /// Execute a user-initiated operation on the reserved action connection.
@@ -1775,7 +1794,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 }
                 throw IMAPActionMailboxAbsent()
             }
-            throw error
+            throw Self.providerError(from: error)
         }
         #if DEBUG
         // T0.6(a) test seam — action-pool sibling of
@@ -1819,7 +1838,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         } catch {
             await releaseActionConnectionAfterFailure(
                 error, server: server, acquiredGeneration: acquiredGeneration)
-            throw error
+            throw Self.providerError(from: error)
         }
     }
 
@@ -1874,14 +1893,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 if DebugModeManager.isLoggingEnabled() {
                     BackgroundSyncLogger.logDebug("[IMAP] Stale generation for action connection (no-select) — discarding release after error")
                 }
-                throw error
+                throw Self.providerError(from: error)
             }
-            let desc = "\(error)"
-            let isUnhealthy = SyncEngine.isConnectionError(error)
-                || desc.contains("PayloadTooLargeError")
-                || desc.contains("IMAPDecoderError")
+            let isUnhealthy = Self.pooledConnectionUnusable(after: error)
             await releaseActionConnection(healthy: !isUnhealthy)
-            throw error
+            throw Self.providerError(from: error)
         }
     }
 
