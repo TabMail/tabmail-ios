@@ -971,7 +971,9 @@ struct ReleaseBoundaryRecheckTests {
             try w.insertRow("f-read", in: Self.customPath, date: Outlook.daysAgo(Self.olderThanHeldDays), isRead: true)
             try await Self.setRecheck(w, Self.customPath, ["f-read"])
             w.server.deliver(Outlook.seed("f-new", in: Outlook.inbox, daysAgo: 0))
-            w.server.failBatches([.transportError(.networkConnectionLost)])
+            // Two batches fail: the Inbox new message's last-verb read (#890), then
+            // the custom folder's re-read.
+            w.server.failBatches([.transportError(.networkConnectionLost), .transportError(.networkConnectionLost)])
 
             try await w.read()
             #expect(try w.row("f-new", in: w.inbox) != nil, "the Inbox's new message lands")

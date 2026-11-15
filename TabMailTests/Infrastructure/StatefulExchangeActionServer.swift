@@ -63,6 +63,9 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         var isFlagged: Bool
         let receivedAt: Date
         var categories: [String] = []
+        /// PidTagLastVerbExecuted (`Integer 0x1081`), set by another client's
+        /// reply or forward; nil = never acted on.
+        var lastVerb: Int? = nil
     }
 
     struct State: Sendable {
@@ -515,6 +518,7 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
             let queryItems = components?.queryItems ?? []
             let filter = queryItems.first(where: { $0.name == "$filter" })?.value
             let rfc822MessageId = Self.rfcIdentity(fromLookupURL: request.url)
+            let expandVerb = Self.expandsLastVerb(request.url.absoluteString)
             if let filter, filter.contains("receivedDateTime") {
                 return Self.serveDateFilteredListing(request, folderId: folderId, state: state)
             }
@@ -564,7 +568,7 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
                     }
                 // Unpaged (the default), and every `$filter` lookup: no link.
                 guard let pageSize = model.listPageSize, filter == nil else {
-                    return (matches.dropFirst(skip).prefix(top).map(Self.graphRow), nil)
+                    return (matches.dropFirst(skip).prefix(top).map { Self.graphRow($0, expandLastVerb: expandVerb) }, nil)
                 }
                 var start = 0
                 if let skipToken {
@@ -584,7 +588,7 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
                     link?.queryItems = [URLQueryItem(name: "$skiptoken", value: token)]
                     nextLink = link?.url?.absoluteString
                 }
-                return (matches[start..<end].map(Self.graphRow), nextLink)
+                return (matches[start..<end].map { Self.graphRow($0, expandLastVerb: expandVerb) }, nextLink)
             }
             guard let page else {
                 return .bytes(Self.unclassifiedBadRequestBody(), contentType: "application/json", statusCode: 400)
@@ -616,7 +620,8 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
             if let injectedStatus { return .status(injectedStatus) }
             let message = state.value.withLock { $0.messagesByProviderId[providerId] }
             guard let message else { return .status(404) }
-            let body = (try? JSONSerialization.data(withJSONObject: Self.graphRow(message))) ?? Data()
+            let body = (try? JSONSerialization.data(withJSONObject: Self.graphRow(
+                message, expandLastVerb: Self.expandsLastVerb(request.url.absoluteString)))) ?? Data()
             if let hook = state.value.withLock({ $0.catchUp.afterGet[providerId] }) { hook() }
             return .bytes(body, contentType: "application/json")
         }
@@ -854,6 +859,21 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         else { return nil }
         return String(filter[filter.index(after: opening)..<closing])
             .replacingOccurrences(of: "''", with: "'")
+    }
+
+    /// Whether a message request expands the last verb, as Graph serves
+    /// `singleValueExtendedProperties` only when asked for.
+    static func expandsLastVerb(_ url: String) -> Bool {
+        let decoded = url.removingPercentEncoding ?? url
+        return decoded.contains("$expand=singleValueExtendedProperties") && decoded.contains("Integer 0x1081")
+    }
+
+    static func graphRow(_ message: Message, expandLastVerb: Bool) -> [String: Any] {
+        var row = graphRow(message)
+        if expandLastVerb, let verb = message.lastVerb {
+            row["singleValueExtendedProperties"] = [["id": "Integer 0x1081", "value": String(verb)]]
+        }
+        return row
     }
 
     static func graphRow(_ message: Message) -> [String: Any] {
