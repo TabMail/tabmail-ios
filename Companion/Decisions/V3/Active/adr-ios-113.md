@@ -239,12 +239,15 @@ its card.
    lands there when the change names the added date, or when it names a moved meeting and the first
    place at or after where that meeting is now is an added date (`SplitCarry.cut` counts added dates
    as places). Such a split is refused before anything is written, with #880's message from its one
-   source (`CalendarSeriesEndRemoval.AddedDates.reason`): "calendar_event_edit failed: this repeating
+   source (`CalendarProviderError.addedDatesReason`, in the provider layer; the tool's
+   `CalendarSeriesEndRemoval.AddedDates` says it too, amended r1): "calendar_event_edit failed: this repeating
    event has extra dates added outside its repeat pattern, and TabMail can't change the repeat pattern
    of such an event yet. The event was NOT changed."
    - **Decided from what the series holds, never from the calendar:** one provider-neutral predicate
      `SplitCarry.cutsAtAddedDate(cut, series:, rdates:, zone:, zones:)`: true when the cut equals one
-     of the series' added dates (read as `SplitCarry.cut` reads them) and the rule's own first place
+     of the series' LIVE added dates (read as `SplitCarry.cut` reads them, `SplitCarry.liveAddedDates`:
+     an added date an `EXDATE` cancels is no meeting and no place, so no cut lands on it and none is
+     refused there; amended r1) and the rule's own first place
      at or after the cut (`ruleCut`, `UNTIL`/`COUNT` honoured) is not the cut. An added date on a rule
      place at the same time is not refused (the new part's start is on its rule). False with no added
      date (nothing more read) and past the end; nil when an added date or the rule can't be read,
@@ -270,22 +273,47 @@ its card.
      (`seriesSplitResources`), so there the change is written. Decided from the series' contents and
      a provider CAPABILITY, never a provider type above the provider boundary (ADR-IOS-060):
      `CalendarProvider.movesAddedDatesWithSeries` (Google false, CalDAV true, protocol default false;
-     Outlook has no `RDATE`) and the pure `SplitCarry.leavesAddedDatesBehind(cut:newPartStart:
-     holdsAddedDates:movesAddedDates:)`, false with no added date in the new part or on a calendar
-     that moves them, nil (refused with "can't read") when the new part's start can't be read. Run in
-     the same `splitPlan`s after the new part is built (Google from the create body `written` and
-     `recurrenceParts.tail`; CalDAV from `resources.newPart`), so the card check and the queue refuse
-     alike. An added date only before the cut stays with the series and the move is written. Not
-     covered: a change of every occurrence's time on Google (`all`, or `this_and_following` at the
-     first occurrence, which is the whole series) also leaves added dates at their old time.
+     Outlook has no `RDATE`), read THROUGH THE PROTOCOL by the one check, the protocol extension's
+     `refuseAddedDatesLeftBehind(from:to:recurrence:isAllDay:zones:unreadable:)`, which asks the pure
+     `SplitCarry.leavesAddedDatesBehind(from:to:recurrence:isAllDay:zones:movesAddedDates:)`: false
+     on a calendar that moves them or with no LIVE added date in the recurrence the write leaves
+     (`liveAddedDates`), nil (refused with the write's "can't read" text) when a start or a date
+     can't be read. Run in the same `splitPlan`s after the new part is built (Google from the create
+     body `written` and `recurrenceParts.tail`; CalDAV from `resources.newPart`), so the card check
+     and the queue refuse alike. An added date only before the cut stays with the series and the
+     move is written. On Google the new part's recurrence is read AS WRITTEN: a reset drops its
+     excluded dates (`withoutExcludedDates`), so an added date deleted on the series would come back
+     live at its old time, and the move is refused (amended r1).
+   - **A move of every occurrence (amended 2026-11-14, review r1, coordinator ruling under owner
+     ruling A).** An edit of every occurrence that moves the series' start (a new time or day, or
+     all-day/timed), on Google, of a series holding a live added date, is refused the same way, with
+     the same message and nothing written. That covers `edit_scope` "all" (named at the series, its
+     first occurrence or a later one, `route` moving the new time back to the first date) and a
+     `this_and_following` change named at the first occurrence, which `route` makes a whole-series
+     edit. Google's write (`patchEvent` with `keepStoredDates`) keeps every `RDATE` line as written,
+     so each added meeting would stay at the old time. Decided from the series and the capability by
+     `CalendarProvider.refuseEveryOccurrenceMove(series:edit:)` (from the series' start to the start
+     the edit writes, `SplitCarry.start(of:on:)`), called by Google's `refuseSeriesWrite`
+     (`.everyOccurrence`, on the series as read for the card, no request) and by `patchEvent` on the
+     series it just read, before its PATCH, so the card and the queue refuse alike. A change of
+     title, place or length alone moves no start and is written. CalDAV moves added dates with the
+     start (`shiftSeriesAnchoredValues`; a change of kind converts them), so there it is written.
+     The earlier "Not covered" note for this case is withdrawn.
    - Splits at a regular meeting are unchanged. Outlook has no `RDATE`. Full support is #881.
    - Pinned by `SplitAtAnAddedDateTests` (Google and CalDAV, named at the added date and at a moved
      meeting cut there, before the card and at the queue, nothing written; a split at a regular
      meeting of the same series written, the meetings its two parts show read back by the app's
      expander against the series' own; a move to a new time or day with an added date after the cut
      refused on Google before the card and at the queue, written on CalDAV with the added date moved,
-     and written on Google when the only added date is before the cut) and
-     `SplitCarryTests.cutsAtAddedDateReadsTheSeries`. `GoogleSeriesSplitCopyTests` reschedule cases
+     and written on Google when the only added date is before the cut; r1: a split made all-day,
+     a move with a deleted added date after the cut, every move of every meeting (new time, new day,
+     from the first meeting on, from a later meeting, all-day) refused on Google before the card and
+     at the queue; a title, place or length of every meeting, a length of the following meetings,
+     and a move of every meeting whose only added date was deleted, written; the same move on CalDAV
+     written with the added date moved; a meeting on the added date changed on its own carried onto
+     the new part's own occurrence there, the Google fake giving an added date its instance id) and
+     `SplitCarryTests.cutsAtAddedDateReadsTheSeries`, `cancelledAddedDateIsNoPlace`,
+     `leavesAddedDatesBehindReadsTheMove`, `startOfAnEditOfEveryOccurrence`. `GoogleSeriesSplitCopyTests` reschedule cases
      and `splitOntoAnotherDayDropsExcludedDates` now use a series with no added date after the cut.
 
 **Consequences:**

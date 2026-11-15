@@ -795,7 +795,7 @@ actor CalDAVProvider: CalendarProvider {
         // written, in #880's words (#894; full support is #881).
         switch point.cutsAtAddedDate {
         case nil: throw CalendarProviderError.notSupported(Self.splitPointUnreadable)
-        case true?: throw CalendarProviderError.notSupported(CalendarSeriesEndRemoval.AddedDates.reason)
+        case true?: throw CalendarProviderError.notSupported(CalendarProviderError.addedDatesReason)
         case false?: break
         }
         let namedStart = point.namedStart, namedPlace = point.namedPlace, namedInstants = point.namedInstants
@@ -827,14 +827,11 @@ actor CalDAVProvider: CalendarProvider {
         // A new part moved off its cut keeps its added dates where they were on a calendar that
         // does not move them with it (#894): CalDAV moves them, so this refuses nothing here; it is
         // the one check every split plan makes, decided by the calendar's capability.
-        let newPartLines = Self.masterTopLevelLines(resources.newPart)
-        switch SplitCarry.leavesAddedDatesBehind(
-            cut: cutTime, newPartStart: ICSParser.parse(icsText: resources.newPart, resourceHref: eventURL.path, etag: nil).first?.start,
-            holdsAddedDates: newPartLines.contains(where: SplitCarry.isAddedDates), movesAddedDates: Self.movesAddedDatesWithSeries) {
-        case nil: throw CalendarProviderError.notSupported("The new part of the repeating event could not be built, so it was not split.")
-        case true?: throw CalendarProviderError.notSupported(CalendarSeriesEndRemoval.AddedDates.reason)
-        case false?: break
-        }
+        let newPart = ICSParser.parse(icsText: resources.newPart, resourceHref: eventURL.path, etag: nil).first
+        try Self.refuseAddedDatesLeftBehind(
+            from: cutTime, to: newPart?.start, recurrence: Self.masterTopLevelLines(resources.newPart),
+            isAllDay: newPart?.isAllDay ?? false, zones: zones,
+            unreadable: "The new part of the repeating event could not be built, so it was not split.")
         return .split(SplitPlan(
             seriesHref: seriesHref, eventURL: eventURL, etag: etag, slot: slot, namedStart: namedStart,
             namedPlace: namedPlace, patch: patch, newUid: newUid, resources: resources))

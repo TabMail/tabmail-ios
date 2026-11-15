@@ -358,12 +358,39 @@ final class FakeGoogleCalendar: Sendable {
     /// The occurrence `id` (`<series id>_<UTC start>Z`, or `<series id>_<date>` for an all-day
     /// series) of a stored series, as Google gives it before it is changed: the series' fields at
     /// its place, lasting as long as the series. Nil (a 404) when `id` names no occurrence of a
-    /// stored series: no series, or a start its rule does not place an occurrence at (`onRule`), as
-    /// Google answers an instance id off the rule.
+    /// stored series: no series, or a start neither its rule (`onRule`) nor one of its live added
+    /// dates (`onAddedDate`) places an occurrence at, as Google answers an instance id off the rule.
     private static func instance(_ id: String, of event: (String) -> [String: Any]?) -> [String: Any]? {
         guard let occurrence = anyInstance(id, of: event), let seriesId = occurrence["recurringEventId"] as? String,
-              let series = event(seriesId), onRule(series, occurrence: occurrence) else { return nil }
+              let series = event(seriesId),
+              onRule(series, occurrence: occurrence) || onAddedDate(series, occurrence: occurrence) else { return nil }
         return occurrence
+    }
+
+    /// Whether `occurrence` (built by `anyInstance`) starts on a date added to `series` (`RDATE`)
+    /// that no excluded date (`EXDATE`) cancels: Google gives an added date an instance of its own,
+    /// with an id like any other (`<series id>_<UTC start>Z`). Read here, apart from the code under
+    /// test, in the two forms Google writes and the tests seed (`RDATE:<UTC times>`,
+    /// `RDATE;VALUE=DATE:<dates>`, comma-separated); a `TZID` form is not read.
+    private static func onAddedDate(_ series: [String: Any], occurrence: [String: Any]) -> Bool {
+        let lines = series["recurrence"] as? [String] ?? []
+        func values(_ name: String) -> Set<String> {
+            Set(lines.filter { $0.uppercased().hasPrefix(name) && !$0.uppercased().contains("TZID=") }
+                .flatMap { line in line.split(separator: ":").last.map { $0.split(separator: ",").map(String.init) } ?? [] })
+        }
+        let start = occurrence["start"] as? [String: Any]
+        let key: String
+        if let date = start?["date"] as? String {
+            key = date.replacingOccurrences(of: "-", with: "")
+        } else {
+            guard let at = (start?["dateTime"] as? String).flatMap({ Date.fromISO8601($0) }) else { return false }
+            let fmt = DateFormatter()
+            fmt.locale = Locale(identifier: "en_US_POSIX")
+            fmt.timeZone = .gmt
+            fmt.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+            key = fmt.string(from: at)
+        }
+        return values("RDATE").contains(key) && !values("EXDATE").contains(key)
     }
 
     /// Whether the series `series` places an occurrence where `occurrence` (built by `anyInstance`)

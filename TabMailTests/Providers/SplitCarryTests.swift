@@ -201,6 +201,59 @@ struct SplitCarryTests {
         #expect(SplitCarry.cutsAtAddedDate(date(14), series: allDaySeries) == false)
     }
 
+    @Test("an added date an excluded date cancels is no added date (#894): no cut lands on it and none is refused there")
+    func cancelledAddedDateIsNoPlace() throws {
+        let added16 = "RDATE:\(Self.ical(16))", cancelled16 = "EXDATE:\(Self.ical(16))"
+        let cut16 = SplitCarry.Cut.at(Self.instant(Self.at(16)))
+        #expect(SplitCarry.cutsAtAddedDate(cut16, series: try Self.weeklyUntil42([added16, cancelled16])) == false)
+        // One of two added dates cancelled: the other still counts.
+        #expect(SplitCarry.cutsAtAddedDate(
+            .at(Self.instant(Self.at(17))), series: try Self.weeklyUntil42(["RDATE:\(Self.ical(16)),\(Self.ical(17))", cancelled16])) == true)
+        // A meeting moved from day 14 to day 15: the first place after it is the rule's day 21, not the deleted day 16.
+        let moved = try Self.occurrence(place: 14, start: Self.at(15), end: Self.at(15, "09:30:00"))
+        #expect(SplitCarry.cut(named: moved, series: try Self.weeklyUntil42([added16, cancelled16])) == .at(Self.instant(Self.at(21))))
+        #expect(SplitCarry.cut(named: moved, series: try Self.weeklyUntil42([added16])) == .at(Self.instant(Self.at(16))))
+        // An excluded date that can't be read, with a date added: nil, never a silent no.
+        #expect(SplitCarry.cutsAtAddedDate(cut16, series: try Self.weeklyUntil42([added16, "EXDATE:NOTADATE"])) == nil)
+    }
+
+    @Test("a write that moves the start leaves the live added dates behind only on a calendar that does not move them (#894)")
+    func leavesAddedDatesBehindReadsTheMove() throws {
+        let from = Self.instant(Self.at(14))
+        let later = Self.instant(Self.at(14, "10:00:00"))
+        let date = GCalDateTime(dateTime: nil, date: String(Self.at(14).prefix(10)), timeZone: nil)
+        let rule = "RRULE:FREQ=WEEKLY", added = "RDATE:\(Self.ical(16))"
+        func behind(_ to: GCalDateTime?, _ lines: [String], from: GCalDateTime? = from, moves: Bool = false) -> Bool? {
+            SplitCarry.leavesAddedDatesBehind(from: from, to: to, recurrence: lines, isAllDay: false, zones: .none, movesAddedDates: moves)
+        }
+        #expect(behind(later, [rule, added]) == true, "a new time")
+        #expect(behind(date, [rule, added]) == true, "the other kind")
+        #expect(behind(from, [rule, added]) == false, "the start stays")
+        #expect(behind(Self.instant(Self.at(14)), [rule, added]) == false, "the same instant spelled again")
+        #expect(behind(later, [rule, added], moves: true) == false, "a calendar that moves them")
+        #expect(behind(later, [rule]) == false, "no added date")
+        #expect(behind(later, [rule, added, "EXDATE:\(Self.ical(16))"]) == false, "the only added date was deleted")
+        #expect(behind(later, [rule, "RDATE:\(Self.ical(16)),\(Self.ical(23))", "EXDATE:\(Self.ical(16))"]) == true, "one of two deleted")
+        // A start that can't be read, or an added or excluded date that can't: nil, never a silent no.
+        #expect(behind(nil, [rule, added]) == nil)
+        #expect(behind(later, [rule, added], from: nil) == nil)
+        #expect(behind(later, [rule, "RDATE:NOTADATE"]) == nil)
+        #expect(behind(later, [rule, added, "EXDATE:NOTADATE"]) == nil)
+    }
+
+    @Test("the start an edit of every occurrence writes: its own date or time, else the series'")
+    func startOfAnEditOfEveryOccurrence() throws {
+        let series = try Self.event(Self.series)
+        #expect(SplitCarry.start(of: GCalEventInput(), on: series) == series.start)
+        var timed = GCalEventInput()
+        timed.startDateTime = Self.at(0, "10:00:00")
+        timed.startTimeZone = "UTC"
+        #expect(SplitCarry.start(of: timed, on: series) == GCalDateTime(dateTime: Self.at(0, "10:00:00"), date: nil, timeZone: "UTC"))
+        var allDay = GCalEventInput()
+        allDay.startDate = String(Self.at(0).prefix(10))
+        #expect(SplitCarry.start(of: allDay, on: series) == GCalDateTime(dateTime: nil, date: String(Self.at(0).prefix(10)), timeZone: nil))
+    }
+
     @Test("a UTC UNTIL before the next place leaves no cut; one at it keeps the place")
     func cutPastUTCUntil() throws {
         let moved = try Self.occurrence(place: 7, start: Self.at(9), end: Self.at(9, "09:30:00"))

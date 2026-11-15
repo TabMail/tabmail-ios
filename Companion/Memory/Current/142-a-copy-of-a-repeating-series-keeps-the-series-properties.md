@@ -467,7 +467,7 @@ occurrence whose earlier-placed neighbour is shown after the cut, then GET the c
 **A cut on an added date is refused (amended 2026-11-14, #894, owner ruling):** the new part keeps
 the series' rule, so a cut on an `RDATE` the rule gives no place at (named there, or a moved meeting
 cut there) would start it off its rule and lose or invent meetings. Google's and CalDAV's `splitPlan`
-refuse it before any write with #880's message (`CalendarSeriesEndRemoval.AddedDates.reason`), by the
+refuse it before any write with #880's message (now `CalendarProviderError.addedDatesReason`), by the
 neutral `SplitCarry.cutsAtAddedDate`; the card's check and the queued write both run that plan.
 `finishSplit` is not checked (a record exists only after the plan passed). ADR-IOS-113 decision 9.
 Tests: `SplitAtAnAddedDateTests`, `SplitCarryTests.cutsAtAddedDateReadsTheSeries`.
@@ -478,6 +478,20 @@ leaves an added date at its old time. Decided by the capability `CalendarProvide
 `splitPlan`s; CalDAV writes it with the added date moved. Not covered: a whole-series time change on
 Google also leaves added dates behind. Google fixtures that reschedule a split use a series with no added
 date after the cut (`GoogleSplitFixture.noLaterAddedDate`).
+Review r1 (2026-11-14, coordinator ruling under owner ruling A): the "Not covered" case is now refused.
+An edit of every occurrence on Google that moves the series' start (new time, day, all-day/timed; "all"
+from any occurrence, or `this_and_following` at the first occurrence) of a series holding a live added
+date is refused before the card (`refuseSeriesWrite` `.everyOccurrence`) and in `patchEvent` before its
+PATCH, same message, by `CalendarProvider.refuseEveryOccurrenceMove`; title, place and length go
+through. The capability is read through the protocol by the one check `refuseAddedDatesLeftBehind`
+(protocol extension), which every split plan calls too. Only LIVE added dates count
+(`SplitCarry.liveAddedDates`: an `RDATE` an `EXDATE` cancels is no meeting and no place, so `cut` no
+longer lands on it), but a Google split's new part is read as written: a reset drops its `EXDATE`s, so a
+deleted added date comes back live and the move stays refused. The message moved to the provider layer
+(`CalendarProviderError.addedDatesReason`; `CalendarSeriesEndRemoval.AddedDates` reads it). A changed
+meeting on an added date is carried onto the new part's own occurrence there
+(`<part id>_<UTC start>Z`, which Google gives an added date); the Google fake now gives an added date
+its instance id (`FakeGoogleCalendar.onAddedDate`), and `SplitAtAnAddedDateTests` pins what is written.
 
 **The card asks the write's cut (amended 2026-11-12, review rounds 3-4):** the card of a split named
 at a moved occurrence asks `CalendarProvider.splitCut` (each calendar's `splitPoint`, nothing written).

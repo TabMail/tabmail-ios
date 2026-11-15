@@ -7436,6 +7436,169 @@ struct SplitAtAnAddedDateTests {
         #expect(series == Self.following(at: "09", [0, 7]), "the series shows \(AddedDateSeries.describe(series))")
     }
 
+    @Test("Google: a split that makes the following meetings all-day, with a date added after the cut, is refused in #880's plain message before the card and at the queue, nothing written")
+    func googleKindChangeLeavingAnAddedDateBehindIsRefused() async throws {
+        let args: [String: JSONValue] = [
+            "edit_scope": .string("this_and_following"), "recurrence_id": .string("\(day(14))T09:00:00"),
+            "all_day": .bool(true), "start_iso": .string(day(14)), "end_iso": .string(day(15)), "timezone": .string("UTC"),
+        ]
+        let seed = AddedDateSeries.google([GoogleSeries.instance(day(14))])
+        let r = try await googleTool(args, eventId: GoogleSeries.instanceId(day(14)), account: "added-date-g-kind", seed: seed)
+        #expect(r.run.cards.isEmpty && r.run.queued.isEmpty && r.calendar.writes.isEmpty,
+                "cards \(r.run.cards.count) queued \(r.run.queued.count); \(Self.written(r.calendar)); \(r.run.out)")
+        #expect(Self.error(in: r.run.out) == Self.refusal, "\(r.run.out)")
+        let q = try await google(seed, eventId: GoogleSeries.instanceId(day(14)), args, account: "added-date-g-kind-queue")
+        #expect(q.calendar.writes.isEmpty, "\(Self.written(q.calendar))")
+        #expect(q.rows.count == 1 && q.rows.first?.status == PendingStatus.failed.rawValue
+                && q.rows.first?.failureReason?.contains(CalendarSeriesEndRemoval.AddedDates().localizedDescription) == true,
+                "rows: \(reasons(q.rows))")
+    }
+
+    @Test("Google: a move of the following meetings is refused even when the added date after the cut was deleted (EXDATE): the new part's reset drops its excluded dates, so the deleted meeting would come back at the old time")
+    func googleMoveWithACancelledAddedDateAfterTheCutIsRefused() async throws {
+        let seed = AddedDateSeries.google(
+            [GoogleSeries.instance(day(14))],
+            recurrence: [AddedDateSeries.rule, AddedDateSeries.added, "EXDATE:\(compact(day(16)))T090000Z"])
+        let r = try await googleTool(Self.move(to: "\(day(14))T10:00:00"), eventId: GoogleSeries.instanceId(day(14)),
+                                     account: "added-date-g-move-cancelled", seed: seed)
+        #expect(r.run.cards.isEmpty && r.run.queued.isEmpty && r.calendar.writes.isEmpty,
+                "cards \(r.run.cards.count) queued \(r.run.queued.count); \(Self.written(r.calendar)); \(r.run.out)")
+        #expect(Self.error(in: r.run.out) == Self.refusal, "\(r.run.out)")
+    }
+
+    @Test("Google: a new length of the following meetings alone, with a date added after the cut, is written: the added date keeps its start and takes the new length")
+    func googleLengthOfTheFollowingMeetingsIsWritten() async throws {
+        let args: [String: JSONValue] = [
+            "edit_scope": .string("this_and_following"), "recurrence_id": .string("\(day(14))T09:00:00"),
+            "end_iso": .string("\(day(14))T10:00:00"), "timezone": .string("UTC"),
+        ]
+        let r = try await googleTool(args, eventId: GoogleSeries.instanceId(day(14)), account: "added-date-g-length",
+                                     seed: AddedDateSeries.google([GoogleSeries.instance(day(14))]))
+        let partId = GoogleCalendarProvider.deterministicSplitEventId(masterId: GoogleSeries.id, recurrenceId: "\(day(14))T09:00:00")
+        let part = AddedDateSeries.meetings(google: r.calendar.event(partId))
+        let series = AddedDateSeries.meetings(google: r.calendar.event(GoogleSeries.id))
+        #expect(r.run.queued.isEmpty && Self.error(in: r.run.out).isEmpty, "rows: \(reasons(r.run.queued)); \(r.run.out)")
+        #expect(part == Array(AddedDateSeries.meetings.dropFirst(2)), "the new part shows \(AddedDateSeries.describe(part))")
+        #expect(instant(r.calendar.event(partId)?["end"]) == utcAt("\(day(14))T10:00:00"), "end: \(r.calendar.event(partId)?["end"] ?? "none")")
+        #expect(series == Array(AddedDateSeries.meetings.prefix(2)), "the series shows \(AddedDateSeries.describe(series))")
+    }
+
+    @Test("Google: a meeting on the added date changed on its own is carried onto the new part's own occurrence there, keeping its time and place and taking the change")
+    func googleChangedMeetingOnTheAddedDateIsCarried() async throws {
+        var changed = GoogleSeries.moved(day(16), start: "\(day(16))T11:00:00", end: "\(day(16))T11:30:00")
+        changed["location"] = "Room 9"
+        let r = try await googleTool(Self.rename("\(day(14))T09:00:00"), eventId: GoogleSeries.instanceId(day(14)),
+                                     account: "added-date-g-carry", seed: AddedDateSeries.google([GoogleSeries.instance(day(14)), changed]))
+        let partId = GoogleCalendarProvider.deterministicSplitEventId(masterId: GoogleSeries.id, recurrenceId: "\(day(14))T09:00:00")
+        let carriedId = "\(partId)_\(compact(day(16)))T090000Z"
+        let carried = r.calendar.event(carriedId)
+        #expect(r.run.queued.isEmpty && Self.error(in: r.run.out).isEmpty, "rows: \(reasons(r.run.queued)); \(r.run.out)")
+        #expect(r.calendar.writes.contains("PATCH \(carriedId)"), "not carried: \(r.calendar.writes)")
+        #expect(instant(carried?["start"]) == utcAt("\(day(16))T11:00:00") && instant(carried?["end"]) == utcAt("\(day(16))T11:30:00"),
+                "the carried meeting is at \(carried?["start"] ?? "none")")
+        #expect(carried?["location"] as? String == "Room 9" && carried?["summary"] as? String == "Renamed", "carried: \(carried ?? [:])")
+        #expect(AddedDateSeries.meetings(google: r.calendar.event(partId)) == Array(AddedDateSeries.meetings.dropFirst(2)),
+                "the new part shows \(AddedDateSeries.describe(AddedDateSeries.meetings(google: r.calendar.event(partId))))")
+        #expect(r.calendar.event(GoogleSeries.instanceId(day(16)))?["status"] as? String == "cancelled",
+                "the series still shows its own changed meeting: \(r.calendar.event(GoogleSeries.instanceId(day(16))) ?? [:])")
+    }
+
+    // MARK: A move of every occurrence (coordinator ruling under owner ruling A, 2026-11-14)
+
+    /// An edit of every occurrence that moves the series' start, as the assistant names it: the id it
+    /// gives and its arguments. Each becomes a whole-series write (`CalendarSeriesScope.route`).
+    static let everyOccurrenceMoves = ["a new time", "a new day", "from the first meeting on", "from a later meeting", "all-day"]
+
+    private static func everyOccurrence(_ how: String) -> (eventId: String, arguments: [String: JSONValue]) {
+        switch how {
+        case "a new time":
+            return (GoogleSeries.id, ["edit_scope": .string("all"), "start_iso": .string("\(day(0))T10:00:00"), "timezone": .string("UTC")])
+        case "a new day":
+            return (GoogleSeries.first, ["edit_scope": .string("all"), "start_iso": .string("\(day(1))T09:00:00"), "timezone": .string("UTC")])
+        case "from the first meeting on":
+            return (GoogleSeries.first, ["edit_scope": .string("this_and_following"), "recurrence_id": .string("\(day(0))T09:00:00"),
+                                         "start_iso": .string("\(day(0))T10:00:00"), "timezone": .string("UTC")])
+        case "from a later meeting":
+            return (GoogleSeries.later, ["edit_scope": .string("all"), "start_iso": .string("\(day(7))T10:00:00"), "timezone": .string("UTC")])
+        default:
+            return (GoogleSeries.first, ["edit_scope": .string("all"), "all_day": .bool(true), "start_iso": .string(day(0)),
+                                         "end_iso": .string(day(1)), "timezone": .string("UTC")])
+        }
+    }
+
+    @Test("Google: a move of every meeting (new time, day or kind) of a series with an added date shows no card, writes nothing, and says #880's plain message: Google would leave the added date where it was",
+          arguments: Self.everyOccurrenceMoves)
+    func googleEveryOccurrenceMoveIsRefused(_ how: String) async throws {
+        let edit = Self.everyOccurrence(how)
+        let r = try await googleTool(edit.arguments, eventId: edit.eventId, account: "added-date-g-all-\(how.filter(\.isLetter))",
+                                     seed: AddedDateSeries.google([]))
+        #expect(r.run.cards.isEmpty && r.run.queued.isEmpty && r.calendar.writes.isEmpty,
+                "\(how): cards \(r.run.cards.count) queued \(r.run.queued.count); writes \(r.calendar.writes); \(r.run.out)")
+        #expect(Self.error(in: r.run.out) == Self.refusal, "\(how): \(r.run.out)")
+    }
+
+    @Test("Google: the queued write refuses that move of every meeting too, nothing written", arguments: Self.everyOccurrenceMoves)
+    func googleQueuedEveryOccurrenceMoveIsRefused(_ how: String) async throws {
+        let edit = Self.everyOccurrence(how)
+        let r = try await google(AddedDateSeries.google([]), eventId: edit.eventId, edit.arguments,
+                                 account: "added-date-g-all-queue-\(how.filter(\.isLetter))")
+        #expect(r.calendar.writes.isEmpty, "\(how): writes \(r.calendar.writes)")
+        #expect(r.rows.count == 1 && r.rows.first?.status == PendingStatus.failed.rawValue
+                && r.rows.first?.failureReason?.contains(CalendarSeriesEndRemoval.AddedDates().localizedDescription) == true,
+                "\(how): rows: \(reasons(r.rows))")
+    }
+
+    @Test("Google: a new title, place or length of every meeting of a series with an added date is written, and the series shows the same meetings",
+          arguments: ["title", "location", "length"])
+    func googleEveryOccurrenceChangeThatMovesNothingIsWritten(_ field: String) async throws {
+        var args: [String: JSONValue] = ["edit_scope": .string("all"), "timezone": .string("UTC")]
+        switch field {
+        case "title": args["title"] = .string("Renamed")
+        case "location": args["location"] = .string("Room 9")
+        default: args["end_iso"] = .string("\(day(0))T10:00:00")
+        }
+        let r = try await googleTool(args, eventId: GoogleSeries.id, account: "added-date-g-all-\(field)", seed: AddedDateSeries.google([]))
+        let series = r.calendar.event(GoogleSeries.id)
+        #expect(r.run.queued.isEmpty && Self.error(in: r.run.out).isEmpty, "\(field): rows \(reasons(r.run.queued)); \(r.run.out)")
+        #expect(r.calendar.writes == ["PATCH \(GoogleSeries.id)"], "\(field): writes \(r.calendar.writes)")
+        switch field {
+        case "title": #expect(series?["summary"] as? String == "Renamed", "\(series ?? [:])")
+        case "location": #expect(series?["location"] as? String == "Room 9", "\(series ?? [:])")
+        default: #expect(instant(series?["end"]) == utcAt("\(day(0))T10:00:00"), "\(series?["end"] ?? "none")")
+        }
+        let shown = AddedDateSeries.meetings(google: series)
+        #expect(shown == AddedDateSeries.meetings, "\(field): the series shows \(AddedDateSeries.describe(shown))")
+    }
+
+    @Test("Google: a move of every meeting is written when the series' only added date was deleted (EXDATE): a deleted added date is no meeting to leave behind")
+    func googleEveryOccurrenceMoveWithACancelledAddedDateIsWritten() async throws {
+        // The series ends at the end of day 42, so its last meeting stays inside its end at 10:00.
+        let rule = "RRULE:FREQ=WEEKLY;UNTIL=\(compact(day(42)))T235959Z"
+        let seed = AddedDateSeries.google([], recurrence: [rule, AddedDateSeries.added, "EXDATE:\(compact(day(16)))T090000Z"])
+        let r = try await googleTool(Self.everyOccurrence("a new time").arguments, eventId: GoogleSeries.id,
+                                     account: "added-date-g-all-cancelled", seed: seed)
+        let shown = AddedDateSeries.meetings(google: r.calendar.event(GoogleSeries.id))
+        #expect(r.run.queued.isEmpty && Self.error(in: r.run.out).isEmpty, "rows: \(reasons(r.run.queued)); \(r.run.out)")
+        #expect(shown == Self.following(at: "10", [0, 7, 14, 21, 28, 35, 42]), "the series shows \(AddedDateSeries.describe(shown))")
+    }
+
+    @Test("CalDAV: a move of every meeting of a series with an added date is written, the added date moved with the rest")
+    func calDAVEveryOccurrenceMoveMovesTheAddedDate() async throws {
+        // The series in a named zone: a whole-series time change of a series kept in UTC with no zone
+        // name is refused before the card for its zone (#806), which is not what this test is about.
+        let ics = AddedDateSeries.calDAV()
+            .replacingOccurrences(of: "DTSTART:\(compact(day(0)))T090000Z", with: "DTSTART;TZID=Etc/UTC:\(compact(day(0)))T090000")
+            .replacingOccurrences(of: "DTEND:\(compact(day(0)))T093000Z", with: "DTEND;TZID=Etc/UTC:\(compact(day(0)))T093000")
+            .replacingOccurrences(of: AddedDateSeries.added, with: "RDATE;TZID=Etc/UTC:\(compact(day(16)))T090000")
+        let store = FakeCalDAVStore(servesETags: true)
+        store.seed(path: AddedDateSeries.path, ics: ics)
+        let r = try await calDAVTool(store, ["edit_scope": .string("all"), "start_iso": .string("\(day(0))T10:00:00"), "timezone": .string("UTC")],
+                                     eventId: AddedDateSeries.path, account: "added-date-c-all-move")
+        let shown = AddedDateSeries.meetings(ics: store.storedICS(path: AddedDateSeries.path) ?? "", href: AddedDateSeries.path)
+        #expect(Self.error(in: r.out).isEmpty, "\(r.out)")
+        #expect(shown == Self.following(at: "10", [0, 7, 14, 16, 21, 28, 35, 42]), "the series shows \(AddedDateSeries.describe(shown))")
+    }
+
     // MARK: CalDAV
 
     @Test("CalDAV: a change from a date added outside the repeat pattern on shows no card, writes nothing, and says #880's plain message")
