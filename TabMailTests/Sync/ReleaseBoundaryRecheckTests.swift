@@ -253,7 +253,7 @@ struct ReleaseBoundaryRecheckTests {
             #expect(try Self.storedLabels(w.pool, headerId: label.id) == ["Receipts"], "precondition: the add shows locally")
 
             #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: Self.nextRelease()))
-            #expect(try w.pool.read { db in try PendingOperation.fetchCount(db) } == 0, "the boundary retired the queue")
+            #expect(try await w.pool.read { db in try PendingOperation.fetchCount(db) } == 0, "the boundary retired the queue")
 
             let listingsBefore = Self.outlookListings(w)
             try await w.foregroundPass()
