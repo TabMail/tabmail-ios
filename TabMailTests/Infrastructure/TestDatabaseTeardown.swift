@@ -388,13 +388,20 @@ enum TestDatabaseTeardown {
     /// hard ceiling (`budgetedSoftLimit`).
     ///
     /// Never lowering is what keeps the descriptor walk in
-    /// `openDescriptorPaths` complete: a descriptor can only be opened below
-    /// the soft ceiling of its moment, so while the ceiling only grows every
-    /// open descriptor lies below the current one. Other code raises it too:
+    /// `openDescriptorPaths` complete, as long as nothing else in the process
+    /// lowers the ceiling either: a descriptor can only be opened below the
+    /// soft ceiling of its moment, so while the ceiling only grows every open
+    /// descriptor lies below the current one. Other code raises it too:
     /// CFNetwork adds 2,304 to the soft ceiling when the process starts its
     /// first `URLSession` task, which took the full suite from 10,240 to
     /// 12,544 (iOS #898). The ceiling is therefore not a fixed number, and
     /// nothing may assume it stays at this budget.
+    ///
+    /// Known residual race, accepted: CFNetwork's raise is a read-then-write,
+    /// and so is this budget step. If the two interleave once at startup, the
+    /// later write can put back a lower value than the earlier one set (for
+    /// example 256 read, 10,240 set here, then 2,560 written by CFNetwork).
+    /// The window is one pair of system calls per process, test host only.
     ///
     /// This budget is for CONCURRENT fixtures, not for accumulation: until
     /// iOS #885 the registry held every exit-only group's connections until
@@ -415,14 +422,7 @@ enum TestDatabaseTeardown {
                 Darwin.getrlimit(RLIMIT_NOFILE, &limits) == 0,
                 "Unable to read the XCTest host file-descriptor limit"
             )
-            let target = min(requestedFileDescriptorBudget, limits.rlim_max)
-            precondition(
-                target >= minimumFileDescriptorBudget,
-                "XCTest host hard file-descriptor limit is below the required fixture budget"
-            )
-            let softLimit = budgetedSoftLimit(current: limits.rlim_cur, hard: limits.rlim_max)
-            if limits.rlim_cur != softLimit {
-                limits.rlim_cur = softLimit
+            if applyFileDescriptorBudget(&limits) {
                 precondition(
                     Darwin.setrlimit(RLIMIT_NOFILE, &limits) == 0,
                     "Unable to raise the XCTest host file-descriptor limit"
@@ -430,6 +430,21 @@ enum TestDatabaseTeardown {
             }
             prepared = true
         }
+    }
+
+    /// Applies the budget to `limits` (the process's current ones) and
+    /// returns whether the soft ceiling changed and must be written back.
+    /// It only ever raises the soft ceiling (`budgetedSoftLimit`).
+    static func applyFileDescriptorBudget(_ limits: inout rlimit) -> Bool {
+        let target = min(requestedFileDescriptorBudget, limits.rlim_max)
+        precondition(
+            target >= minimumFileDescriptorBudget,
+            "XCTest host hard file-descriptor limit is below the required fixture budget"
+        )
+        let softLimit = budgetedSoftLimit(current: limits.rlim_cur, hard: limits.rlim_max)
+        guard limits.rlim_cur != softLimit else { return false }
+        limits.rlim_cur = softLimit
+        return true
     }
 
     /// The soft ceiling the budget asks for: the budget (capped by the hard
@@ -698,10 +713,12 @@ enum TestDatabaseTeardown {
     ///
     /// The scan covers the whole descriptor table as it is at the time of the
     /// scan: `getdtablesize()` is read on every scan and is the current soft
-    /// descriptor ceiling (capped by the kernel's per-process maximum). The
-    /// ceiling is never lowered (`prepareFileDescriptorBudget`), so every open
-    /// descriptor lies below it and the scan cannot miss one, even after
-    /// other code raised the ceiling above the budget (iOS #898).
+    /// descriptor ceiling (capped by the kernel's per-process maximum). Our
+    /// code never lowers that ceiling (`prepareFileDescriptorBudget`), and
+    /// other code in the test host only raises it (CFNetwork, iOS #898), so
+    /// every open descriptor lies below it and the scan sees them all. That
+    /// rests on nothing lowering the ceiling; the one known exception is the
+    /// startup race described at `prepareFileDescriptorBudget`.
     private static func openDescriptorPaths() -> Set<String> {
         var paths: Set<String> = []
         var buffer = [UInt8](repeating: 0, count: Int(MAXPATHLEN))
@@ -1470,9 +1487,42 @@ struct TestDatabaseTeardownInvariantTests {
         #expect(TestDatabaseTeardown.budgetedSoftLimit(current: raised, hard: Self.unlimitedHardCeiling) == raised)
         #expect(TestDatabaseTeardown.budgetedSoftLimit(current: 4_096, hard: Self.unlimitedHardCeiling) == budget)
         #expect(TestDatabaseTeardown.budgetedSoftLimit(current: 4_096, hard: raised) == budget)
+        // A hard ceiling below the budget caps the request.
+        #expect(TestDatabaseTeardown.budgetedSoftLimit(current: 256, hard: 8_192) == 8_192)
     }
 
-    @Test("the descriptor walk sees a descriptor numbered above the budget once the ceiling is raised")
+    /// The iOS #898 regression test: the budget step the process runs at
+    /// startup must leave a ceiling another component already raised alone.
+    @Test("the budget step leaves a ceiling another component raised untouched")
+    func budgetStepNeverLowersARaisedCeiling() {
+        let budget = TestDatabaseTeardown.requestedFileDescriptorBudget
+        let raised = budget + Self.raisedSoftLimitHeadroom
+        var raisedLimits = rlimit(rlim_cur: raised, rlim_max: Self.unlimitedHardCeiling)
+        #expect(!TestDatabaseTeardown.applyFileDescriptorBudget(&raisedLimits))
+        #expect(raisedLimits.rlim_cur == raised)
+
+        var inheritedLimits = rlimit(rlim_cur: 256, rlim_max: Self.unlimitedHardCeiling)
+        #expect(TestDatabaseTeardown.applyFileDescriptorBudget(&inheritedLimits))
+        #expect(inheritedLimits.rlim_cur == budget)
+    }
+
+    /// Whether this host's hard ceiling lets the walk test raise the soft
+    /// ceiling above the budget.
+    static var hardCeilingAllowsRaisedSoftCeiling: Bool {
+        var limits = rlimit()
+        guard Darwin.getrlimit(RLIMIT_NOFILE, &limits) == 0 else { return false }
+        return limits.rlim_max
+            >= TestDatabaseTeardown.requestedFileDescriptorBudget + raisedSoftLimitHeadroom
+    }
+
+    /// Guards against the walk being tied to a fixed number (such as the
+    /// budget) instead of the ceiling at the time of the scan. It is not the
+    /// iOS #898 regression test: the shipped walk already read the current
+    /// ceiling and passes it; `budgetStepNeverLowersARaisedCeiling` is.
+    @Test(
+        "the descriptor walk sees a descriptor numbered above the budget once the ceiling is raised",
+        .enabled(if: TestDatabaseTeardownInvariantTests.hardCeilingAllowsRaisedSoftCeiling)
+    )
     func descriptorWalkCoversARaisedCeiling() throws {
         TestDatabaseTeardown.prepareProcess()
         let budget = TestDatabaseTeardown.requestedFileDescriptorBudget

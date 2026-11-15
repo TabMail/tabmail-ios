@@ -104,8 +104,18 @@ min(budget, hard))). A descriptor can only be opened below the soft limit of its
 the limit never decreases every open descriptor is below the current one and the walk is complete.
 Never lower `RLIMIT_NOFILE` in the test host, and never assert it equals or stays under the budget.
 
-Tests: the budget never lowers a raised ceiling (`budgetedSoftLimit`); with the ceiling raised above
-the budget, the walk sees a descriptor numbered above 10,240 on a fixture's file.
+Tests: the #898 regression test is "the budget step leaves a ceiling another component raised
+untouched": `applyFileDescriptorBudget` (the body of the once-guarded `prepareFileDescriptorBudget`)
+given a soft limit of 12,544 and an unlimited hard limit writes nothing (it failed red-first with the
+shipped `rlim_cur = target`). `budgetedSoftLimit` is also pinned directly, including the hard-limit cap.
+The walk test (with the ceiling raised above the budget, the walk sees a descriptor numbered above
+10,240) is NOT the regression test, since the shipped walk already passed it: it guards against the
+walk being tied to a fixed number.
+
+Accepted residual race (review r1): CFNetwork's raise and the budget step are both read-then-write, so
+if they interleave once at startup the later write can put back a lower value. One pair of system
+calls per process, test host only. If it ever matters, enumerate the open descriptors themselves
+(for example `/dev/fd`) instead of a limit-derived range.
 
 ## Proof
 
