@@ -344,6 +344,24 @@ struct ExchangeLastVerbMarkTests {
                 "outside the Exchange provider: \(holders)")
     }
 
+    /// Both Reply All entry points open compose in reply-all mode. The views are
+    /// not constructible in a unit test (one is private, one needs a live view
+    /// model), so the fence reads each `replyAllComposeView` body.
+    @Test("Every Reply All entry point opens compose with isReplyAll: true")
+    func replyAllEntryPointsSetTheMode() throws {
+        let files = try DiagnosticPrintGateTests.appTargetSources()
+        let bodies = files.flatMap { file -> [String] in
+            file.source.components(separatedBy: "func replyAllComposeView(for msg: MessageHeader)").dropFirst()
+                .map { String($0.prefix(600)) }
+        }
+        #expect(bodies.count == 2, "expected the inbox and message-detail entry points, found \(bodies.count)")
+        for body in bodies {
+            let call = try #require(body.range(of: "ComposeView("))
+            let close = try #require(body.range(of: ")\n    }", range: call.upperBound..<body.endIndex))
+            #expect(body[call.upperBound..<close.lowerBound].contains("isReplyAll: true"))
+        }
+    }
+
     // MARK: - Migration v104
 
     @Test("v104 adds the reply-all and send-time columns with plain-reply defaults")
