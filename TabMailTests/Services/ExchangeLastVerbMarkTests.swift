@@ -309,14 +309,15 @@ struct ExchangeLastVerbMarkTests {
     @Test("A permanent refusal drops the mark at once; the next action runs straight away")
     @MainActor
     func permanentRefusalDropsTheMarkAndTheQueueMoves() async throws {
-        for (status, permanent) in [(400, true), (403, true), (503, false)] {
+        let line = "permanently refused the mark"
+        for (status, permanent, isForward) in [(400, true, false), (403, true, false), (400, true, true), (503, false, false)] {
             let server = Self.server()
             defer { server.close() }
             let f = try fixture()
             await AccountManager.shared.registerProviderForTesting(
                 accountId: f.accountId, provider: server.provider())
             let parent = original(f)
-            let sent = completedSend(f, originalId: parent.id, isForward: false, isReplyAll: false, sentAt: Self.sendTime())
+            let sent = completedSend(f, originalId: parent.id, isForward: isForward, isReplyAll: false, sentAt: Self.sendTime())
             try await f.pool.writeWithoutTransaction { db in
                 try parent.insert(db)
                 try sent.insert(db)
@@ -332,13 +333,16 @@ struct ExchangeLastVerbMarkTests {
             }
             if status == 503 { server.failNextPatch() } else { server.failNextPatch(status: status) }
             server.clearMutationLog()
+            let logged = AppLogStore.read(channel: .error).components(separatedBy: line).count
 
             await AccountManager.shared.drainPendingQueue()
 
+            let droppedLines = AppLogStore.read(channel: .error).components(separatedBy: line).count - logged
             let left = try await f.pool.read { db in try PendingOperation.fetchAll(db) }
             let bystanderRead = server.snapshots(rfc822MessageId: "bystander@example.com").first?.isRead
             if permanent {
-                #expect(left.isEmpty, "status \(status): the mark is dropped, not held for retry")
+                #expect(left.isEmpty, "status \(status) forward=\(isForward): the mark is dropped, not held for retry")
+                #expect(droppedLines == 1, "status \(status): the drop is logged as a permanent refusal")
                 #expect(bystanderRead == true, "status \(status): the next action ran in the same drain")
                 #expect(server.mutationLog().filter { $0 == "PATCH original" }.count == 1,
                         "status \(status): one attempt, never retried")
@@ -349,6 +353,7 @@ struct ExchangeLastVerbMarkTests {
             } else {
                 let marks = left.filter { $0.type == .markReplied }
                 #expect(marks.count == 1, "503: the mark stays queued")
+                #expect(droppedLines == 0, "503: not logged as a permanent refusal")
                 #expect(marks.first?.retryCount == 1, "503: one ordinary retry charged")
             }
             await finish(f)

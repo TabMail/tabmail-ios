@@ -38,6 +38,14 @@ it; Graph immutable ids (#117) are the structural fix.
 Not yet measured live: whether Outlook on the web / mobile render the arrow from a client-written
 0x1081 (row B1 of the #915 design's live check).
 
+Coordinator rulings (2026-11-15): the AI reply tool (`EmailReplyTool`) builds the reply-all set, so its
+`ComposeRequest.isReplyAll` records reply-all (103) like the Reply All button. A mark refused with anything
+`SyncEngine.isTransientError` does not claim (400, 403, an IMAP STORE/SELECT `NO`) is retired on its first
+counted failure through `AccountOperationExecutor.settleProviderFailure(permanentRefusal:)`, logged, never
+retried, and the account's next action runs in the same drain; 429/5xx keep the ten-count retry and
+uncharged classes (connection, refresh failure, cancellation) are unchanged. The marks are cosmetic, so this
+exit-5 shortening is accepted. Known gap: a retained settlement replay forgets the refusal and counts it once.
+
 Tests: `ExchangeLastVerbMarkTests`, `ProviderMessageActionTests.graphCommandsPreserveNativeIdentityAndDestination`,
 `ComposeSendReplyTargetTests.replyAllReopenedThroughUndoIsResentAsReplyAll`,
 `NeverDropExitClosureTests.completedReplyAllAnswersItsParentOnTheServer`.

@@ -1076,6 +1076,9 @@ final class AccountOperationExecutor {
                     // of holding the account's queue through the retry budget.
                     // 429/5xx stay on the ordinary retry; connection errors never
                     // reach here.
+                    // Provider-neutral: IMAP lifts only LOGIN-time temporary codes
+                    // into ProviderTemporaryRefusal, so an IMAP STORE/SELECT `NO`
+                    // also drops the mark at once.
                     let isMark = currentOp.type == .markReplied || currentOp.type == .markForwarded
                     return await settleProviderFailure(currentOp, using: manager,
                         permanentRefusal: isMark && !SyncEngine.isTransientError(error) ? error : nil)
