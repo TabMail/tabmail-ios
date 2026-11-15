@@ -756,7 +756,8 @@ actor GmailProvider: EmailProvider {
     /// wherever it is moved, so no request ever names them: a sent message moved
     /// out of Sent stays in Sent as well, as it does in Gmail itself. A user move
     /// INTO Sent or Drafts is refused before it is queued
-    /// (`AccountManager.move`, `MoveFolderPicker`).
+    /// (`AccountProvider.refusesMoveDestination`, which `AccountManager.move`
+    /// and `MoveFolderPicker` ask).
     nonisolated static let gmailMaintainedLabelIds: Set<String> = ["SENT", "DRAFT"]
 
     func move(ids: [String], from source: String, to destination: String) async throws {

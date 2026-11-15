@@ -87,6 +87,23 @@ enum AccountProvider: String, Codable, Sendable, CaseIterable {
         case .caldav: return .stableProviderId
         }
     }
+
+    /// Whether this provider refuses every move INTO the folder at `path`. The
+    /// move admission (`AccountManager.move`) and the move picker
+    /// (`MoveFolderPicker.load`) ask this, so neither names a provider
+    /// (ADR-IOS-060, decision 8). Gmail keeps its Sent and Drafts labels itself
+    /// and refuses any request that adds them
+    /// (`GmailProvider.gmailMaintainedLabelIds`); every other provider takes a
+    /// move into any of its folders, including one at the same path.
+    ///
+    /// ⚑ Exhaustive with no `default:` clause, like `contentKeySpace`: a new
+    /// provider must decide this explicitly.
+    func refusesMoveDestination(path: String) -> Bool {
+        switch self {
+        case .gmail: return GmailProvider.gmailMaintainedLabelIds.contains(path)
+        case .outlook, .imap, .icloud, .caldav: return false
+        }
+    }
 }
 
 struct Account: Codable, FetchableRecord, PersistableRecord, Identifiable, Sendable, Equatable {
