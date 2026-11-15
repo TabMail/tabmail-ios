@@ -422,7 +422,8 @@ extension AccountManager {
     /// first error to finish, after every account has run. An account with no
     /// provider that is not in `accounts` is skipped. After its folders, each
     /// account in `accounts` runs one change read (`SyncEngine.backgroundDeltaSync`,
-    /// #902); an account not in `accounts` gets the re-list only.
+    /// #902); an account not in `accounts`, or one whose connect or re-list failed,
+    /// gets no change read.
     func syncFolders(_ folders: [Folder], connecting accounts: [Account]) async throws {
         let grouped = Dictionary(grouping: folders) { $0.accountId }
         let affectedAccountIds = Array(grouped.keys)
@@ -482,8 +483,9 @@ extension AccountManager {
                     // Then one "what changed" read for the account (#902): the same pass
                     // the background sync runs, so a change made elsewhere to older mail
                     // or to a folder not on screen shows with this pull. Its deadline is
-                    // taken here, once; the pass reports its own failure in its result
-                    // and never fails the refresh.
+                    // taken here, once. The pass reports a failed read in its result
+                    // (the refresh still succeeds); only what it rethrows (a database
+                    // error, a failed retry after a connection error) fails the refresh.
                     if let account {
                         let deadline = Date().addingTimeInterval(SyncConfig.perAccountSyncTimeoutSeconds)
                         let (changed, reason) = try await syncEngine.backgroundDeltaSync(account: account, deadline: deadline)
