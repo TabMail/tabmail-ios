@@ -207,6 +207,8 @@ struct ReleaseBoundaryRecheckTests {
                                             providerLabelId: Gmail.userLabelId, add: true)
             try Self.queue(w.pool, .addUserLabel, ids: ["rb-label"], accountId: w.accountId,
                            from: w.inbox.path, userLabelId: Gmail.userLabelId)
+            #expect(try Self.storedLabels(w.pool, headerId: unlabel.id).isEmpty, "precondition: the removal shows locally")
+            #expect(try Self.storedLabels(w.pool, headerId: label.id) == [Gmail.userLabelId], "precondition: the add shows locally")
 
             #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: Self.nextRelease()))
             #expect(try w.pendingOps().isEmpty, "the boundary retired the queue")
@@ -247,8 +249,11 @@ struct ReleaseBoundaryRecheckTests {
                                             providerLabelId: "Receipts", add: true)
             try Self.queue(w.pool, .addUserLabel, ids: ["ob-label"], accountId: w.accountId,
                            from: w.inbox, userLabelId: "Receipts")
+            #expect(try Self.storedLabels(w.pool, headerId: unlabel.id).isEmpty, "precondition: the removal shows locally")
+            #expect(try Self.storedLabels(w.pool, headerId: label.id) == ["Receipts"], "precondition: the add shows locally")
 
             #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: Self.nextRelease()))
+            #expect(try w.pool.read { db in try PendingOperation.fetchCount(db) } == 0, "the boundary retired the queue")
 
             let listingsBefore = Self.outlookListings(w)
             try await w.foregroundPass()

@@ -168,7 +168,7 @@ throw and stop `AppDatabase.init`), and for every account that holds a change bo
   `SyncConfig.changeRecheckLimit`; overflow arms the folder's catch-up, as the change apply does";
 - a row whose kind or ids do not read (an older release's kind, ids that are not a JSON list) arms its
   folder's catch-up, or every folder's of its account when the folder cannot be resolved by
-  `(accountId, folderPath)`; the same for a move or read/flag row whose folder no longer exists. Such a
+  `(accountId, folderPath)`; the same for a move, read/flag or (since #903) user-label row whose folder no longer exists. Such a
   row is never skipped silently;
 - tags (local-only on Gmail and Outlook, ADR-IOS-036) and draft saves (re-queued above): nothing.
 Nothing is re-sent or replayed, and no row's meaning decides anything about any operation: the

@@ -361,7 +361,8 @@ before the label catalog had loaded, so its label sets were not complete.
 
 **Not changed.** The full sync's existing-row merge and the catch-up still only insert label rows. The
 release-boundary re-read list does not yet name label or replied kinds; that list is another change, and
-once both are merged the label kind belongs on it.
+once both are merged the label kind belongs on it. *(Done 2026-11-14, #903: the user-label kinds are on
+the release-boundary re-read list; replied/forwarded are still not.)*
 
 **Trade-off.** A label change raced by the user's own label action lands one pass later (the re-read),
 as read and flag already do. An Outlook record that keeps omitting `categories` keeps the message on the
