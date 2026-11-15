@@ -12,10 +12,8 @@ actor SyncEngine {
     private(set) var workQueues: [String: ProviderWorkQueue] = [:]
 
     /// Roles to sync messages for (inbox gets most, others get fewer)
-    nonisolated static let syncedPrimaryRoles: Set<FolderRole> = [.inbox]
-    nonisolated static let syncedSecondaryRoles: Set<FolderRole> = [.sent, .drafts, .trash, .archive, .spam]
-    let primaryRoles = SyncEngine.syncedPrimaryRoles
-    let secondaryRoles = SyncEngine.syncedSecondaryRoles
+    let primaryRoles: Set<FolderRole> = [.inbox]
+    let secondaryRoles: Set<FolderRole> = [.sent, .drafts, .trash, .archive, .spam]
 
     var headerBackfillTasks: [String: Task<Void, Never>] = [:]
 

@@ -100,9 +100,11 @@
 > A folder the change reader tracks gets no window listing, so the boundary's full sync no longer
 > restores the server's state there. Before the delete, the same transaction reads each retired row
 > for its raw account, folder, kind and id columns only (`SyncEngine.recheckRetiredActions`) and puts
-> the ids of a move or read/flag change on the re-read lists of the folders the change reader reads
-> (the syncable set, tracked or not; source, and destination for a move) of every account holding a
-> change bookmark; a full list, a retired draft delete or a row
+> the ids of a move or read/flag change on the re-read lists of every folder the action named (source,
+> and destination for a move, whatever the folder's tracking or synced state; every listed folder is
+> read and its answer applies whatever the window, ADR-IOS-111) of every account holding a change
+> bookmark (*superseded same day:* "of the folders the change reader reads (the syncable set, tracked
+> or not; source, and destination for a move)"); a full list, a retired draft delete or a row
 > this release cannot decode arms the folder's (or the account's) catch-up. It re-sends, replays and decides nothing about any operation, so the carve-out's three
 > properties still hold and it is still not an exit. Detail: `IOS-ACTION-003`.
 >

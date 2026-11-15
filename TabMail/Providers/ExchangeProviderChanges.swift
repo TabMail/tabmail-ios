@@ -27,6 +27,12 @@ import Foundation
 ///   as gone, or reported unreadable (`rereadLater`); a page cut short is read
 ///   again on the next pass, which fetches only what is still missing.
 ///
+/// **Re-read lists.** Every listed folder's list is read (`reread`): a synced
+/// folder's after its delta, also during its baseline; on a `.all` pass, a folder
+/// outside the synced set has its list read alone, with no delta and no bookmark
+/// or coverage change (`.notRun`). Each listed message is read by id and
+/// answered for that folder by its `parentFolderId`.
+///
 /// **Network.** A state baseline on an expensive network (cellular, a hotspot)
 /// waits, at most `SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds` counted from
 /// when the folder first needed it, then runs on any network, as the catch-up
@@ -76,6 +82,22 @@ extension ExchangeProvider {
         var results: [String: FolderChanges] = [:]
         for folder in Self.foldersToRead(request) {
             results[folder.id] = try await readFolder(folder, request: request, allowance: &allowance)
+        }
+        // A folder outside the synced set has no delta read, but its re-read
+        // list is read: each listed message by id, answered for this folder (a
+        // record where the server holds it, a removal where it does not). It
+        // changes no bookmark and no coverage (`.notRun`).
+        if request.scope == .all {
+            for folder in request.folders where !folder.isSynced && results[folder.id] == nil {
+                guard let asked = request.recheck[folder.id], !asked.isEmpty else { continue }
+                var changes = FolderChanges(folderId: folder.id, status: .notRun)
+                var collected = CollectedChanges()
+                try await reread(asked, folder: folder, context: context, allowance: &allowance,
+                                 collected: &collected, changes: &changes)
+                changes.records = collected.records
+                changes.removals = collected.removals
+                results[folder.id] = changes
+            }
         }
         let folders = request.folders.map { results[$0.id] ?? FolderChanges(folderId: $0.id, status: .notRun) }
         if DebugModeManager.isLoggingEnabled() {

@@ -579,7 +579,9 @@ extension SyncEngine {
         let primary = self.primaryRoles
         let secondary = self.secondaryRoles
         return folders.filter { folder in
-            Self.isSyncable(role: folder.role, isFavorite: folder.isFavorite)
+            primary.contains(folder.role) ||
+            secondary.contains(folder.role) ||
+            folder.isFavorite
         }.sorted { a, b in
             func priority(_ f: Folder) -> Int {
                 if primary.contains(f.role) { return 0 }
@@ -589,12 +591,6 @@ extension SyncEngine {
             }
             return priority(a) < priority(b)
         }
-    }
-
-    /// Whether a folder is in the syncable set (`syncableFoldersInOrder`): a main
-    /// role or a favourite.
-    nonisolated static func isSyncable(role: FolderRole, isFavorite: Bool) -> Bool {
-        syncedPrimaryRoles.contains(role) || syncedSecondaryRoles.contains(role) || isFavorite
     }
 
     // MARK: - Message Sync

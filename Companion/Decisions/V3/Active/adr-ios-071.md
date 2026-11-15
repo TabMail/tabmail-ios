@@ -95,9 +95,11 @@ reader tracks gets no window listing (ADR-IOS-111), so that no longer holds ther
 transaction, before the delete, `SyncEngine.recheckRetiredActions` reads each retired row's raw
 columns ONLY (account, folder path(s), kind, ids; no model decode) and, for every account holding a
 change bookmark, puts the ids of a move or read/flag change on the re-read lists of the source folder
-and (moves) the destination folder when the change reader reads that folder (the syncable set,
-`SyncEngine.isSyncable`, tracked or not; a window listing's date-bounded stale sweep does not correct
-an older message), within `SyncConfig.changeRecheckLimit`
+and (moves) the destination folder, whatever that folder's tracking or synced state (every listed
+folder's list is read, and an explicit re-read answer applies whatever the window: ADR-IOS-111,
+amendment 2026-11-14), within `SyncConfig.changeRecheckLimit`; *superseded same day:* "when the change
+reader reads that folder (the syncable set, `SyncEngine.isSyncable`, tracked or not; a window
+listing's date-bounded stale sweep does not correct an older message)"
 (overflow arms that folder's catch-up). A retired draft delete arms its folder's catch-up. A row this
 release cannot decode arms its folder's catch-up, or its account's when the folder is unknown; it is
 never skipped silently. User-label and replied/forwarded changes are not corrected (no repair path

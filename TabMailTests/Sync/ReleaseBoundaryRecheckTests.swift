@@ -385,8 +385,8 @@ struct ReleaseBoundaryRecheckTests {
         }
     }
 
-    @Test("Outlook: a retired move lists its id in a synced folder that is not tracked yet, and nothing in a folder outside the syncable set")
-    func listedOnlyWhereTheReaderReads() async throws {
+    @Test("Outlook: a retired move lists its id in every folder it named, tracked, synced or neither")
+    func listedInEveryNamedFolder() async throws {
         try await Outlook.withWorld { w in
             let custom = Folder(name: "Projects", path: "fld-custom", role: .custom, accountId: w.accountId)
             try await w.pool.write { db in
@@ -401,7 +401,7 @@ struct ReleaseBoundaryRecheckTests {
             #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: Self.nextRelease()))
             #expect(try w.recheck(w.inbox) == ["u-custom", "u-archive"])
             #expect(try w.recheck(w.archive) == ["u-archive"], "the reader reads a synced folder's list, tracked or not")
-            #expect(try w.recheck(custom.path).isEmpty, "a folder no reader reads never gets an id that would stick")
+            #expect(try w.recheck(custom.path) == ["u-custom"], "a folder outside the synced set is listed too: its list is read on its own")
             #expect(try Self.armedFolderIds(w.pool, accountId: w.accountId).isEmpty)
         }
     }
@@ -431,6 +431,153 @@ struct ReleaseBoundaryRecheckTests {
             #expect(try w.row("ut-move", in: w.archive) == nil, "and no longer shown in the Archive")
             #expect(try w.recheck(w.inbox).isEmpty)
             #expect(try w.recheck(w.archive).isEmpty)
+        }
+    }
+
+    // MARK: - Older messages, outside every listing window
+
+    /// Days back for a message older than every world's held range (the Outlook
+    /// world holds 30 days; a Gmail folder's window listing is date-bounded).
+    static let olderThanHeldDays: Double = 90
+
+    /// Part (i): a source folder whose read is a baseline. A baseline record is
+    /// gated by the held range, but one answering a listed id is the server's
+    /// answer about that message and restores it.
+    @Test("Outlook: an older message archived before the update comes back to an Inbox whose read is a baseline")
+    func olderMessageReturnsToABaseliningInbox() async throws {
+        try await Outlook.withWorld(seeds: [Outlook.seed("b-old", in: Outlook.inbox, daysAgo: Self.olderThanHeldDays)]) { w in
+            try await w.read()
+            #expect(try w.account().lastHistoryId != nil, "precondition: the account holds a change bookmark")
+            try w.insertRow("b-old", in: w.inbox, date: Outlook.daysAgo(Self.olderThanHeldDays))
+            let held = try #require(try w.row("b-old", in: w.inbox), "precondition: held")
+            #expect(try w.folder(w.inbox).oldestSyncedDate.map { held.date < $0 } == true,
+                    "precondition: the message is older than the Inbox's held range")
+            // The Inbox starts a new baseline on its next read.
+            let inboxId = w.folderId(w.inbox)
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET changeCursor = NULL, changeState = NULL WHERE id = ?", arguments: [inboxId])
+            }
+
+            try Self.moveRowOptimistically(w.pool, headerId: held.id, to: try w.folder(w.archive))
+            try Self.queue(w.pool, .archive, ids: ["b-old"], accountId: w.accountId, from: w.inbox, to: w.archive)
+            #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: Self.nextRelease()))
+
+            #expect(try w.cursor(w.inbox) == nil, "precondition: the Inbox's next read is a baseline")
+            try await w.read()
+            #expect(try w.row("b-old", in: w.inbox) != nil, "the older message is back in the Inbox, as on the server")
+            #expect(try w.row("b-old", in: w.archive) == nil, "and no longer shown in the Archive")
+            #expect(try w.recheck(w.inbox).isEmpty)
+            #expect(try w.recheck(w.archive).isEmpty)
+        }
+    }
+
+    /// The held-range gate stays for everything else: only a listed id passes.
+    @Test("Outlook: during a baseline, an older message whose id is listed is inserted and one whose id is not listed is not")
+    func baselineGateHoldsForAnUnlistedId() async throws {
+        try await Outlook.withWorld(seeds: [
+            Outlook.seed("n-listed", in: Outlook.inbox, daysAgo: Self.olderThanHeldDays),
+            Outlook.seed("n-unlisted", in: Outlook.inbox, daysAgo: Self.olderThanHeldDays),
+        ]) { w in
+            let inboxId = w.folderId(w.inbox)
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?",
+                               arguments: [FolderChangeState(recheck: ["n-listed"]).encoded, inboxId])
+            }
+            #expect(try w.cursor(w.inbox) == nil, "precondition: the Inbox's first read is a baseline")
+            try await w.read()
+            #expect(try w.row("n-listed", in: w.inbox) != nil, "a record answering a listed id applies whatever the range")
+            #expect(try w.row("n-unlisted", in: w.inbox) == nil, "a baseline record for an unlisted older message stays the backfill's")
+            #expect(try w.recheck(w.inbox).isEmpty)
+        }
+    }
+
+    /// Part (ii): folders outside the synced set are listed. Gmail reads every
+    /// list and answers every folder by the message's labels.
+    @Test("Gmail: an older message moved between two custom labels, and read and flag changes inside one, show the server's state again")
+    func gmailCustomLabelsAreReadAgain() async throws {
+        let old = Gmail.daysAgo(Self.olderThanHeldDays)
+        try await Gmail.withWorld(seeds: [
+            Gmail.seed("g-move", labels: [Gmail.userLabelId], date: old),
+            Gmail.seed("g-read", labels: [Gmail.userLabelId, "UNREAD"], date: old),
+            Gmail.seed("g-flag", labels: [Gmail.userLabelId], date: old),
+        ]) { w in
+            let other = Folder(name: "Receipts", path: "Label_2", role: .custom, accountId: w.accountId)
+            let labelId = w.label.id
+            try await w.pool.write { db in
+                try other.insert(db)
+                try db.execute(sql: "UPDATE folder SET isFavorite = 0 WHERE id = ?", arguments: [labelId])
+            }
+            let moved = try w.insertRow("g-move", in: w.label, date: old)
+            try w.insertRow("g-read", in: w.label, date: old, isRead: true)
+            try w.insertRow("g-flag", in: w.label, date: old, isFlagged: true)
+
+            try Self.moveRowOptimistically(w.pool, headerId: moved.id, to: other)
+            try Self.queue(w.pool, .move, ids: ["g-move"], accountId: w.accountId, from: w.label.path, to: other.path)
+            try Self.queue(w.pool, .markRead, ids: ["g-read"], accountId: w.accountId, from: w.label.path)
+            try Self.queue(w.pool, .markFlagged, ids: ["g-flag"], accountId: w.accountId, from: w.label.path)
+            #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: Self.nextRelease()))
+            #expect(try Self.recheck(w.pool, folderId: w.label.id) == ["g-move", "g-read", "g-flag"])
+            #expect(try Self.recheck(w.pool, folderId: other.id) == ["g-move"])
+
+            try await w.delta()
+            #expect(try w.row("g-move", in: w.label) != nil, "the message is back in its label, as on the server")
+            #expect(try w.row("g-move", in: other) == nil, "and no longer shown in the other label")
+            #expect(try w.row("g-read", in: w.label)?.isRead == false, "unread again, as on the server")
+            #expect(try w.row("g-flag", in: w.label)?.isFlagged == false, "not flagged, as on the server")
+            #expect(try Self.recheck(w.pool, folderId: w.label.id).isEmpty)
+            #expect(try Self.recheck(w.pool, folderId: other.id).isEmpty)
+        }
+    }
+
+    @Test("Gmail: an older message archived from an Inbox that is synced but not tracked comes back to the Inbox")
+    func gmailUntrackedSyncedInboxIsRestored() async throws {
+        let old = Gmail.daysAgo(Self.olderThanHeldDays)
+        try await Gmail.withWorld(seeds: [Gmail.seed("gu-old", labels: ["INBOX"], date: old)]) { w in
+            try await Self.setTracking(w.pool, folderIds: [w.allMail.id])
+            #expect(try Self.tracking(w.pool, folderId: w.inbox.id) == false, "precondition: the Inbox is not tracked")
+            let held = try w.insertRow("gu-old", in: w.inbox, date: old)
+            try Self.moveRowOptimistically(w.pool, headerId: held.id, to: w.allMail)
+            try Self.queue(w.pool, .archive, ids: ["gu-old"], accountId: w.accountId, from: w.inbox.path, to: w.allMail.path)
+            #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: Self.nextRelease()))
+
+            try await w.delta()
+            #expect(try w.row("gu-old", in: w.inbox) != nil, "the message is back in the Inbox, as on the server")
+            #expect(try w.row("gu-old", in: w.allMail) == nil, "and no longer shown in All Mail")
+        }
+    }
+
+    /// Part (iii): Outlook reads a non-synced folder's list on its own, by id.
+    @Test("Outlook: in a custom folder that is not a favourite, an older message's read change and its move out show the server's state again")
+    func outlookCustomFolderIsReadAgain() async throws {
+        let customPath = "fld-projects"
+        try await Outlook.withWorld(seeds: [
+            Outlook.seed("o-read", in: customPath, daysAgo: Self.olderThanHeldDays),
+            Outlook.seed("o-move", in: customPath, daysAgo: Self.olderThanHeldDays),
+        ]) { w in
+            w.server.addFolder(id: customPath, name: "Projects")
+            let custom = Folder(name: "Projects", path: customPath, role: .custom, accountId: w.accountId)
+            try await w.pool.write { db in try custom.insert(db) }
+            try await w.baselineAll()
+            #expect(try w.account().lastHistoryId != nil, "precondition: the account holds a change bookmark")
+            let old = Outlook.daysAgo(Self.olderThanHeldDays)
+            try w.insertRow("o-read", in: customPath, date: old, isRead: true)
+            try w.insertRow("o-move", in: customPath, date: old)
+            let moved = try #require(try w.row("o-move", in: customPath))
+
+            try Self.moveRowOptimistically(w.pool, headerId: moved.id, to: try w.folder(w.archive))
+            try Self.queue(w.pool, .move, ids: ["o-move"], accountId: w.accountId, from: customPath, to: w.archive)
+            try Self.queue(w.pool, .markRead, ids: ["o-read"], accountId: w.accountId, from: customPath)
+            #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: Self.nextRelease()))
+            let listingsBefore = Self.outlookListings(w)
+
+            try await w.read()
+            #expect(try w.row("o-read", in: customPath)?.isRead == false, "unread again, as on the server")
+            #expect(try w.row("o-move", in: customPath) != nil, "the message is back in the custom folder, as on the server")
+            #expect(try w.row("o-move", in: w.archive) == nil, "and no longer shown in the Archive")
+            #expect(try w.recheck(customPath).isEmpty)
+            #expect(try w.recheck(w.archive).isEmpty)
+            #expect(Self.outlookListings(w) == listingsBefore, "no folder was listed")
+            #expect(try w.cursor(customPath) == nil, "the custom folder's read changed no bookmark")
         }
     }
 
