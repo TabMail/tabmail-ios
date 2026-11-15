@@ -368,7 +368,9 @@ struct ExchangeLastVerbMarkTests {
     func agentComposeHostsPassReplyAll() throws {
         let files = try DiagnosticPrintGateTests.appTargetSources()
         let bodies = files.flatMap { file -> [String] in
-            file.source.components(separatedBy: "func composeViewForAgentRequest(_ req: AgentToolRouter.ComposeRequest)").dropFirst()
+            // Comments masked: a commented-out argument must not satisfy the fence.
+            DiagnosticPrintGateTests.codeOnly(file.source)
+                .components(separatedBy: "func composeViewForAgentRequest(_ req: AgentToolRouter.ComposeRequest)").dropFirst()
                 .map { String($0) }
         }
         #expect(bodies.count == 2, "expected the inbox and message-detail hosts, found \(bodies.count)")
