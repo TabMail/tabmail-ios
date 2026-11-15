@@ -100,6 +100,28 @@ and that capture was a lapse, so a new account listed every folder twice for the
 pass starts a new bookmark and lists every folder. (Amended 2026-11-12: they also clear
 `Folder.changeCursor`, a folder's own bookmark.)
 
+**Amended 2026-11-14 (tabmail-ios #501, #848): one reset list.** The two resets wrote their own column
+lists and disagreed: the Settings wipe (`SettingsView.localIndexWipeStatements`) kept
+`lastKnownUidNext`, `lastFullSyncAt` and every empty-path folder row (`WHERE path != ''`), and neither
+reset cleared `catchUpState` (the older-mail check, ADR-IOS-107) or `lastKnownHighestModSeq`. Both now
+call `SyncEngine.resetSyncStateTxn(_:accountId:)` (nil = every account) inside their own single
+transaction; it is the only place that names the columns a reset clears. Per folder:
+`backfillComplete = 0`, `oldestSyncedDate`, `lastKnownUidNext`, `lastKnownHighestModSeq`,
+`backfillUidCursor`, `backfillPageToken`, `backfillPageHeldSince`, `changeState`, `changeCursor`,
+`catchUpState`, on every folder row of the account(s), empty path included. Per account:
+`lastHistoryId` and `lastFullSyncAt`, for both resets, so the next pass runs the full sync whatever the
+change reader decides. `lastKnownHighestModSeq` is in the list because a kept value lets the full sync
+skip a non-Inbox IMAP folder whose MODSEQ has not moved (`shouldSkipFolderFetch`), and the folder has
+just lost its rows; the UIDVALIDITY purge, the other "rebuild the folder" path, clears it too. Kept on
+purpose: `lastKnownUidValidity` and `uidValidityResetPendingAt` (ADR-IOS-061: the epoch and the
+reaction's quarantine flag, which a reset does not change) and `backfillVersion` (trigger-owned). Not
+joined, because they mean something else: the UIDVALIDITY purge (`uidValidityResetPurgeTxn`, one
+folder, re-anchors `oldestSyncedDate` and zeroes the counts), Smart Reindex (`resetCrawlState`, keeps
+the mail), the frozen migrations and the one-time `StartupMigrations` re-walks. Tests:
+`SettingsSyncStateResetTests` derive the sync-state columns from the `folder` schema (every column but
+the identity, display and epoch ones named with a reason), so a column added later is checked until it
+is cleared or named as kept.
+
 **Not done here (open):** the Outlook and IMAP readers (superseded 2026-11-12 for Outlook: see the
 amendment below); action tags are NOT read from Gmail labels (ADR-IOS-036
 keeps action tags local); the history record limit (#491), the gate skip of the history request (#584) and
