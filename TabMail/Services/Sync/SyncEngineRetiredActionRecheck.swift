@@ -52,8 +52,8 @@ import GRDB
 //   by the boundary): nothing.
 // - a row whose kind or ids do not read (an older release's kind, ids that are
 //   not a JSON list): its folder's catch-up is armed, or every folder's of the
-//   account when its folder does not resolve. The same for a move or read/flag
-//   row whose folder no longer exists. Never skipped silently.
+//   account when its folder does not resolve. The same for a move, read/flag or
+//   user-label row whose folder no longer exists. Never skipped silently.
 // A list over `SyncConfig.changeRecheckLimit` keeps its first ids and arms the
 // folder's catch-up only in a folder the catch-up checks (`isSyncable`), as the
 // apply does; a folder the catch-up never checks keeps every id, since arming
