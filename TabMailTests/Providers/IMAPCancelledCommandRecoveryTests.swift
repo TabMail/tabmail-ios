@@ -17,9 +17,6 @@ struct IMAPCancelledCommandRecoveryTests {
 
     // MARK: - Provider boundary
 
-    /// Red-first (2026-11-15): before the boundary mapping, an abort reached the
-    /// sync engine raw and `SyncEngine.isConnectionError` answered false for it,
-    /// so it was classified as a user-facing failure instead of a reconnect.
     @Test("an aborted SwiftMail command reaches the sync engine as a connection loss")
     func abortIsAConnectionLossAtTheBoundary() {
         let surfaced = IMAPProvider.providerError(from: IMAPConnectionAbortedError())
@@ -93,6 +90,108 @@ struct IMAPCancelledCommandRecoveryTests {
         // The other account's pool is untouched by this account's cancel.
         let otherFlags = try await otherProvider.listFlagsInUIDRange(folder: "INBOX", from: 1, to: 100)
         #expect(otherFlags.flags.keys.contains(9))
+    }
+
+    // MARK: - An abort reaching each lane
+
+    /// The lane a holder runs on while a keepalive NOOP is cancelled ahead of it.
+    enum Lane: String, CaseIterable, Sendable {
+        case folder       // withFolderConnection
+        case actionSelect // withActionConnectionSelection (SELECT leg)
+        case actionStatus // withActionConnectionNoSelect
+    }
+
+    /// A keepalive NOOP is on the wire when a holder checks the same connection out
+    /// and queues its first command behind it; the keepalive task is then cancelled.
+    /// SwiftMail closes the transport and fails the queued command with
+    /// `IMAPConnectionAbortedError`. What the holder's caller sees must be a
+    /// connection loss (no banner), and the lane's next operation must succeed.
+    ///
+    /// Red-first (2026-11-15): with the new SwiftMail pin and the base app code, each
+    /// lane surfaced the raw abort, which `InboxErrorBanner.text(for:)` turns into the
+    /// generic banner.
+    @Test("an abort queued behind a cancelled keepalive NOOP surfaces as a quiet connection loss on every lane", arguments: Lane.allCases)
+    func abortBehindCancelledKeepaliveIsQuiet(_ lane: Lane) async throws {
+        let server = FakeIMAPServer(
+            username: "abort-\(lane.rawValue)-\(UUID().uuidString.lowercased())",
+            mailboxes: ["INBOX": [Self.message(uid: 5, id: "abort-probe@example.com")]]
+        )
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(for: server)
+        defer { Self.awaitDisconnect(provider) }
+
+        // Pin the connection the lane uses.
+        switch lane {
+        case .folder:
+            _ = try await provider.fetchMessages(folder: "INBOX", limit: 1, offset: 0)
+        case .actionSelect, .actionStatus:
+            try await provider.connect()
+            // One completed action op stamps the lane as recently used, so the
+            // holder's acquire skips its own liveness NOOP and goes straight to
+            // its command.
+            _ = try await provider.folderStatus(path: "INBOX")
+        }
+
+        // Hold the keepalive's NOOP reply so the holder's command queues behind it.
+        let noopsBefore = Self.count("NOOP", in: server)
+        server.stallNextCommand(containing: "NOOP", seconds: 5)
+        let keepalive = Task { await provider.keepAlivePinnedConnectionsForTesting() }
+        #expect(await Self.waitFor { Self.count("NOOP", in: server) > noopsBefore }, "setup: the keepalive NOOP never reached the server")
+
+        let holder = Task { () -> Error? in
+            do {
+                switch lane {
+                case .folder:
+                    _ = try await provider.listFlagsInUIDRange(folder: "INBOX", from: 1, to: 100)
+                case .actionSelect:
+                    _ = try await provider.search(query: "probe", folder: "INBOX")
+                case .actionStatus:
+                    _ = try await provider.folderStatus(path: "INBOX")
+                }
+                return nil
+            } catch {
+                return error
+            }
+        }
+        // The holder has checked the connection out and its command is queued in
+        // SwiftMail behind the NOOP (nothing new can reach the server meanwhile).
+        try await Task.sleep(for: .milliseconds(300))
+        keepalive.cancel()
+        _ = await keepalive.value
+
+        let surfaced = await holder.value
+        guard let surfaced else {
+            Issue.record("setup: the holder's command was not queued behind the NOOP (it succeeded); commands: \(server.recordedCommands().suffix(8))")
+            return
+        }
+        #expect(!(surfaced is IMAPConnectionAbortedError), "the raw SwiftMail abort crossed the provider boundary")
+        #expect(SyncEngine.isConnectionError(surfaced), "an abort must read as a connection loss, got \(surfaced)")
+        #expect(InboxErrorBanner.text(for: surfaced) == nil, "an abort raised an error banner: \(surfaced)")
+
+        // The lane recovers on its next use.
+        switch lane {
+        case .folder:
+            let flags = try await provider.listFlagsInUIDRange(folder: "INBOX", from: 1, to: 100)
+            #expect(flags.flags.keys.contains(5))
+        case .actionSelect:
+            _ = try await provider.search(query: "probe", folder: "INBOX")
+        case .actionStatus:
+            _ = try await provider.folderStatus(path: "INBOX")
+        }
+    }
+
+    private static func count(_ fragment: String, in server: FakeIMAPServer) -> Int {
+        server.recordedCommands().filter { $0.uppercased().contains(fragment) }.count
+    }
+
+    private static func waitFor(_ condition: () -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(5)
+        while !condition() {
+            if Date() >= deadline { return false }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return true
     }
 
     // MARK: - Helpers

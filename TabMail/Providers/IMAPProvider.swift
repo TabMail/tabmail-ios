@@ -1116,7 +1116,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             #endif
             guard generation == acquiredGeneration else {
                 if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Stale generation for \(folder) after error — discarding connection silently") }
-                throw error
+                throw Self.providerError(from: error)
             }
             let isUnhealthy = Self.pooledConnectionUnusable(after: error)
             if isUnhealthy { parseAndApplyServerLimit(from: error) }
@@ -1700,16 +1700,17 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// `IMAPConnectionAbortedError` is what SwiftMail gives a command queued behind
     /// one whose task was cancelled: the transport is already closed, so it is a
     /// connection loss like any other. A cancelled caller's own `CancellationError`
-    /// is NOT unhealthy: every pinned-folder and action operation SELECTs before its
-    /// command, and SwiftMail reconnects a closed transport inside the next command,
-    /// so reuse costs one reconnect, while dropping would cost a reconnect just to
-    /// LOG OUT.
+    /// is NOT unhealthy: every pinned-folder operation and every selecting action
+    /// SELECTs before its command, and SwiftMail reconnects a closed transport inside
+    /// the next command, so reuse costs one reconnect, while dropping would cost a
+    /// reconnect just to LOG OUT. The no-select action lane (LIST, STATUS) needs no
+    /// selection; its one side effect is that the first STATUS after such a
+    /// reconnect may omit UIDNEXT/HIGHESTMODSEQ (SwiftMail picks STATUS attributes
+    /// from the capabilities before it reconnects), which the next poll restores.
     nonisolated static func pooledConnectionUnusable(after error: Error) -> Bool {
         if error is IMAPConnectionAbortedError { return true }
-        let desc = "\(error)"
         return SyncEngine.isConnectionError(error)
-            || desc.contains("PayloadTooLargeError")
-            || desc.contains("IMAPDecoderError")
+            || "\(error)".contains("PayloadTooLargeError")
     }
 
     /// Maps a SwiftMail connection abort to the provider-neutral
@@ -1892,7 +1893,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 if DebugModeManager.isLoggingEnabled() {
                     BackgroundSyncLogger.logDebug("[IMAP] Stale generation for action connection (no-select) — discarding release after error")
                 }
-                throw error
+                throw Self.providerError(from: error)
             }
             let isUnhealthy = Self.pooledConnectionUnusable(after: error)
             await releaseActionConnection(healthy: !isUnhealthy)
