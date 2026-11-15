@@ -224,6 +224,7 @@ read is a baseline, the baseline gate holding for an unlisted id, Gmail custom l
 flag), a Gmail synced but untracked Inbox, an Outlook custom non-favourite folder (read change, move
 back), an Outlook untracked synced source; Outlook read change; more ids than the list limit in a
 custom folder all kept and read across passes, the apply's overflow cut only where the catch-up
-checks, the custom folder's read changing no coverage, an Inbox-only pass leaving its list, a failing
+checks, an unreadable role keeping every id, a favourite custom folder cut with its catch-up
+armed, the custom folder's read changing no coverage, an Inbox-only pass leaving its list, a failing
 custom read holding back nothing else, the custom read within the request allowance);
 `ChangeSeamFenceTests.retiredActionRecheckIsProviderBlind`.

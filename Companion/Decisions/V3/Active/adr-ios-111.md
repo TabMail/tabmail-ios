@@ -446,7 +446,8 @@ stuck states, not edges (master-agent ruling, 2026-11-14).
 Tests: `ReleaseBoundaryRecheckTests` (`olderMessageReturnsToABaseliningInbox`,
 `baselineGateHoldsForAnUnlistedId`, `gmailCustomLabelsAreReadAgain`, `outlookCustomFolderIsReadAgain`,
 `listedInEveryNamedFolder`; rule 3 and the custom-folder read: `customFolderKeepsEveryRetiredIdAndReadsThemAll`,
-`applyOverflowDropsOnlyWhereTheCatchUpChecks`, `customFolderReadChangesNoCoverage`,
+`applyOverflowDropsOnlyWhereTheCatchUpChecks`, `unreadableRoleKeepsEveryRetiredId`,
+`favouriteCustomFolderIsCutAndArmed`, `customFolderReadChangesNoCoverage`,
 `inboxOnlyPassLeavesTheCustomList`, `failingCustomReadHoldsBackNothingElse`,
 `customReadStaysWithinTheAllowance`).
 

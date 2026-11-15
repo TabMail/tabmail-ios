@@ -666,6 +666,57 @@ struct ReleaseBoundaryRecheckTests {
         }
     }
 
+    /// The folder's re-read list read by raw SQL, for a row whose role the model
+    /// cannot decode.
+    static func rawRecheck(_ pool: DatabasePool, folderId: String) throws -> [String] {
+        FolderChangeState(raw: try pool.read { db in
+            try String.fetchOne(db, sql: "SELECT changeState FROM folder WHERE id = ?", arguments: [folderId])
+        }).recheck
+    }
+
+    @Test("A folder whose role this release cannot read keeps every retired id over the list limit, and no catch-up is armed")
+    func unreadableRoleKeepsEveryRetiredId() async throws {
+        try await Outlook.withWorld { w in
+            let folder = Folder(name: "Later", path: "fld-later", role: .custom, accountId: w.accountId)
+            try await w.pool.write { db in
+                try folder.insert(db)
+                try db.execute(sql: "UPDATE folder SET role = 'roleFromALaterRelease' WHERE id = ?", arguments: [folder.id])
+                try db.execute(sql: "UPDATE account SET lastHistoryId = 'bookmark' WHERE id = ?", arguments: [w.accountId])
+            }
+            try await Self.seedCatchUpStates(w.pool, accountId: w.accountId)
+            let ids = (0..<(SyncConfig.changeRecheckLimit + 5)).map { "later-\($0)" }
+            try Self.queue(w.pool, .markRead, ids: ids, accountId: w.accountId, from: folder.path)
+
+            #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: Self.nextRelease()))
+            #expect(try Self.rawRecheck(w.pool, folderId: folder.id) == ids, "an unreadable role counts as not checked: every id is kept")
+            #expect(try Self.lapseCount(w.pool, folderId: folder.id) == nil)
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET role = ? WHERE id = ?", arguments: [FolderRole.custom.rawValue, folder.id])
+            }
+        }
+    }
+
+    @Test("A favourite custom folder over the list limit keeps its first retired ids and its catch-up is armed")
+    func favouriteCustomFolderIsCutAndArmed() async throws {
+        try await Outlook.withWorld { w in
+            var folder = Folder(name: "Starred", path: "fld-starred", role: .custom, accountId: w.accountId)
+            folder.isFavorite = true
+            let favourite = folder
+            try await w.pool.write { db in
+                try favourite.insert(db)
+                try db.execute(sql: "UPDATE account SET lastHistoryId = 'bookmark' WHERE id = ?", arguments: [w.accountId])
+            }
+            #expect(SyncEngine.isSyncable(role: favourite.role, isFavorite: favourite.isFavorite), "precondition: the catch-up checks it")
+            try await Self.seedCatchUpStates(w.pool, accountId: w.accountId)
+            let ids = (0..<(SyncConfig.changeRecheckLimit + 5)).map { "star-\($0)" }
+            try Self.queue(w.pool, .markRead, ids: ids, accountId: w.accountId, from: favourite.path)
+
+            #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: Self.nextRelease()))
+            #expect(try w.recheck(favourite.path) == Array(ids.prefix(SyncConfig.changeRecheckLimit)), "the list keeps its first ids")
+            #expect(try Self.lapseCount(w.pool, folderId: favourite.id) == 1, "the catch-up finds the rest")
+        }
+    }
+
     /// The custom folder's read is the server's answer about listed messages,
     /// never a read of the folder: it reports `.notRun`, so the pass neither
     /// covers nor lists that folder.
