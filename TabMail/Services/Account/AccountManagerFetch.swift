@@ -483,12 +483,18 @@ extension AccountManager {
                     // Then one "what changed" read for the account (#902): the same pass
                     // the background sync runs, so a change made elsewhere to older mail
                     // or to a folder not on screen shows with this pull. Its deadline is
-                    // taken here, once. The pass reports a failed read in its result
-                    // (the refresh still succeeds); only what it rethrows (a database
-                    // error, a failed retry after a connection error) fails the refresh.
+                    // taken here, once, and bounds it as a timeout too, as for the
+                    // background and foreground passes (a wait behind a running pass of
+                    // the same account counts). The pass reports a failed read in its
+                    // result (the refresh still succeeds, as in the background); a
+                    // timeout or what it rethrows (a database error, a failed retry
+                    // after a connection error) fails the refresh.
                     if let account {
-                        let deadline = Date().addingTimeInterval(SyncConfig.perAccountSyncTimeoutSeconds)
-                        let (changed, reason) = try await syncEngine.backgroundDeltaSync(account: account, deadline: deadline)
+                        let timeout = SyncConfig.perAccountSyncTimeoutSeconds
+                        let deadline = Date().addingTimeInterval(timeout)
+                        let (changed, reason) = try await withTimeout(seconds: timeout) {
+                            try await syncEngine.backgroundDeltaSync(account: account, deadline: deadline)
+                        }
                         if DebugModeManager.isLoggingEnabled() {
                             BackgroundSyncLogger.logDebug("[SyncFolders] change read for account \(accountId.prefix(6)): changed=\(changed) reason=\(reason)")
                         }

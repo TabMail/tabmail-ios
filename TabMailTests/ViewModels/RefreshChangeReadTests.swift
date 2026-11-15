@@ -139,4 +139,23 @@ struct RefreshChangeReadTests {
             }
         }
     }
+
+    /// The pull keeps the background pass's meaning (coordinator ruling Q1 = a):
+    /// a read failure the pass rethrows (a connection error whose retry fails too)
+    /// fails the pull, and the healthy account's change still lands.
+    @Test("a change read that fails again on its retry fails the pull, beside a healthy account")
+    func rethrownChangeReadFailureFailsThePull() async throws {
+        try await withAccounts(2) { pool, members in
+            guard members.count == 2 else { return }
+            let failing = members[0]
+            let healthy = members[1]
+            await failing.mock.setChangeReader { _, _ in throw ProviderError.notConnected }
+            await Self.markOldRead(healthy)
+            await InboxViewModel(folders: members.map(\.inbox)).refreshSync()
+            let healthyRead = try Self.oldIsRead(healthy, pool)
+            #expect(healthyRead == true, "the healthy account's change did not land")
+            #expect(AccountManagerState.shared.lastSyncFailed,
+                    "a change read that failed on its retry was hidden by the pull")
+        }
+    }
 }
