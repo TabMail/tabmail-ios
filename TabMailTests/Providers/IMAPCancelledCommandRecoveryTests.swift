@@ -110,10 +110,15 @@ struct IMAPCancelledCommandRecoveryTests {
     /// Red-first (2026-11-15): with the new SwiftMail pin and the base app code, each
     /// lane surfaced the raw abort, which `InboxErrorBanner.text(for:)` turns into the
     /// generic banner.
-    @Test("an abort queued behind a cancelled keepalive NOOP surfaces as a quiet connection loss on every lane", arguments: Lane.allCases)
-    func abortBehindCancelledKeepaliveIsQuiet(_ lane: Lane) async throws {
+    ///
+    /// With `afterTeardown`, `markDirty()` runs before the cancel, so the abort lands
+    /// on the lane's stale-generation exit (the shape a `disconnect()` racing a
+    /// keepalive produces) instead of its ordinary one.
+    @Test("an abort queued behind a cancelled keepalive NOOP surfaces as a quiet connection loss on every lane",
+          arguments: Lane.allCases, [false, true])
+    func abortBehindCancelledKeepaliveIsQuiet(_ lane: Lane, afterTeardown: Bool) async throws {
         let server = FakeIMAPServer(
-            username: "abort-\(lane.rawValue)-\(UUID().uuidString.lowercased())",
+            username: "abort-\(lane.rawValue)-\(afterTeardown)-\(UUID().uuidString.lowercased())",
             mailboxes: ["INBOX": [Self.message(uid: 5, id: "abort-probe@example.com")]]
         )
         try server.start()
@@ -157,6 +162,7 @@ struct IMAPCancelledCommandRecoveryTests {
         // The holder has checked the connection out and its command is queued in
         // SwiftMail behind the NOOP (nothing new can reach the server meanwhile).
         try await Task.sleep(for: .milliseconds(300))
+        if afterTeardown { await provider.markDirty() }
         keepalive.cancel()
         _ = await keepalive.value
 
