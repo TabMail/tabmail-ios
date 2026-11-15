@@ -402,13 +402,17 @@ struct OutlookCatchUpTests {
             // A change the delta never delivered: the phone holds a stale state.
             try Self.setLocal(w, "f-1", in: w.archive, isRead: false, isFlagged: false)
 
-            let unreadable = (0...SyncConfig.changeRecheckLimit).map { String(format: "rr-%04d", $0) }
+            // A full stored list, then a pass whose own additions take it over
+            // the limit: only those additions are cut (#903), and that arms the listing.
+            let unreadable = (0..<SyncConfig.changeRecheckLimit).map { String(format: "rr-%04d", $0) }
             for id in unreadable { w.server.answerBatchItem(providerMessageId: id, status: 500, body: nil) }
-            let overflowing = FolderChangeState(tracking: true, recheck: unreadable).encoded
+            let full = FolderChangeState(tracking: true, recheck: unreadable).encoded
+            let archiveId = w.folderId(w.archive)
             try await w.pool.write { db in
-                try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [overflowing, w.folderId(w.archive)])
+                try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [full, archiveId])
+                _ = try SyncEngine.applyFolderChanges(
+                    FolderChanges(folderId: archiveId, status: .tracked, rereadLater: ["rr-new"]), db: db)
             }
-            try await w.read()
             #expect(try Self.state(w, w.archive)?.lapsedSinceLastListing == true, "precondition: the overflow armed a listing")
 
             #expect(try await Self.untilListed(w, engine, w.archive, after: first) != nil)

@@ -30,7 +30,8 @@ and that capture was a lapse, so a new account listed every folder twice for the
    (`addressEpoch == nil`). Inserts carry today's header builder, AI-cache restore, reply-detect, orphan
    reclaim, the Drafts AND Sent placeholder dedup with label and body carry, references and user labels,
    and the Sent reply-parent mark. No provider cast and no provider test in those two files (pinned by `ChangeSeamFenceTests`).
-3. **The re-read list.** Every change the apply keeps back under a shield, and every message the reader
+3. **The re-read list.** *(Its over-the-limit cut is amended 2026-11-15, #903: only a pass's own
+   additions are cut; a stored id never is. See the amendment at the end.)* Every change the apply keeps back under a shield, and every message the reader
    names in a folder's `FolderChanges.rereadLater` (one it could not read this pass), is put on the folder's
    `Folder.changeState.recheck` (v102, engine-owned JSON, message ids only); a folder whose only change is
    such an id is still written, or the bookmark would move past a change kept nowhere. The next request passes it; the
@@ -361,7 +362,8 @@ before the label catalog had loaded, so its label sets were not complete.
 
 **Not changed.** The full sync's existing-row merge and the catch-up still only insert label rows. The
 release-boundary re-read list does not yet name label or replied kinds; that list is another change, and
-once both are merged the label kind belongs on it.
+once both are merged the label kind belongs on it. *(Done 2026-11-14, #903: the user-label kinds are on
+the release-boundary re-read list; replied/forwarded are still not.)*
 
 **Trade-off.** A label change raced by the user's own label action lands one pass later (the re-read),
 as read and flag already do. An Outlook record that keeps omitting `categories` keeps the message on the
@@ -423,7 +425,8 @@ answer in that folder, for a message of any age:
    wherever its date falls, also below `oldestSyncedDate` (ruled acceptable: that is where the row was
    before the gesture, and the backfill upserts by id). The bypass is strictly for a listed id; a
    baseline record for an unlisted older message is still not inserted. Removals were never gated.
-3. **A list is cut only where the catch-up will find the rest** (added same day, review round 4). Over
+3. **A list is cut only where the catch-up will find the rest** (added same day, review round 4;
+   *amended 2026-11-15, #903: a stored id is never cut, see the amendment below*). Over
    `SyncConfig.changeRecheckLimit`, a folder the catch-up checks (`SyncEngine.isSyncable`: a main role
    or a favourite, the same set `syncableFoldersInOrder` gives the full sync and the catch-up run)
    keeps its first ids and its catch-up is armed, as decision 3 says. A folder the catch-up never
@@ -454,3 +457,27 @@ Tests: `ReleaseBoundaryRecheckTests` (`olderMessageReturnsToABaseliningInbox`,
 Keywords: re-read list, recheck, non-synced folder, custom folder, notRun, baseline gate, held range,
 oldestSyncedDate, heldRangeApplies, explicit re-read answer, changeRecheckLimit, overflow, isSyncable,
 catch-up coverage, #876.
+
+### Amendment 2026-11-15: a stored id is never cut; only a pass's own additions are (#903)
+
+Decision (coordinator ruling, option B): the re-read list's limit (`SyncConfig.changeRecheckLimit`)
+no longer cuts ids already stored.
+1. The release boundary (`recheckRetiredActions`) keeps every retired id, in every folder, and arms
+   no catch-up for them. The set is finite and written once; each pass reads at most
+   `changeRereadBudgetPerPass` ids, so a long list drains over passes.
+2. In the change apply (`applyFolderChanges`), in a folder the catch-up checks, when THIS pass's own
+   additions (declined or `rereadLater` ids not already listed) take the list over the limit, only
+   those additions are cut, keeping as many as fit after the stored ids, and the folder's catch-up is
+   armed for them. A list already over the limit is never cut back by a later pass. A folder the
+   catch-up never checks stays uncapped; ordering is unchanged.
+Why: the catch-up never corrects user labels, so a retired label id cut to the catch-up stayed wrong
+for good; draining corrects every kind. The reader's own bursts keep the old bound and the old
+whole-folder check. *Superseded by this amendment:* rule 3's "in a folder the catch-up checks, the
+list keeps its first ids and arms the catch-up" for ids already stored, and its application at the
+release boundary.
+Tests: `ReleaseBoundaryRecheckTests` (`manyRetiredLabelIdsDrainInACheckedFolder`,
+`applyCutsOnlyThisPassesAdditions`, `overflowKeepsEveryRetiredId`,
+`favouriteCustomFolderKeepsEveryRetiredId`), `OutlookCatchUpTests.recheckOverflowHealsAFlag`,
+`ChangeApplyTests.recheckOverflowArmsCatchUp`.
+Keywords: changeRecheckLimit, overflow, stored ids never cut, this pass's additions, retired ids
+drain, #903.

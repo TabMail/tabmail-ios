@@ -160,7 +160,10 @@ throw and stop `AppDatabase.init`), and for every account that holds a change bo
   which loads the server draft back so the delete can be redone; its address is a draft resource
   (Gmail) and never goes on a list. Without this the server draft stayed on the server and other
   devices while the phone never showed it again;
-- over `SyncConfig.changeRecheckLimit`, a folder the catch-up checks (`SyncEngine.isSyncable`) keeps
+- *(2026-11-15, #903: every retired id is kept in every folder and no catch-up is armed for them;
+  the passes drain the list within the per-pass budget, and the apply cuts only a pass's own
+  additions, ADR-IOS-111 amendment 2026-11-15. The rest of this item is history.)* Over
+  `SyncConfig.changeRecheckLimit`, a folder the catch-up checks (`SyncEngine.isSyncable`) keeps
   its first ids and its catch-up is armed; a folder the catch-up never checks (a custom folder that is
   not a favourite) keeps every id, read in turn within the per-pass budget, since nothing else would
   repair a dropped one. The change apply does the same (ADR-IOS-111, amendment 2026-11-14 "every
@@ -168,7 +171,7 @@ throw and stop `AppDatabase.init`), and for every account that holds a change bo
   `SyncConfig.changeRecheckLimit`; overflow arms the folder's catch-up, as the change apply does";
 - a row whose kind or ids do not read (an older release's kind, ids that are not a JSON list) arms its
   folder's catch-up, or every folder's of its account when the folder cannot be resolved by
-  `(accountId, folderPath)`; the same for a move or read/flag row whose folder no longer exists. Such a
+  `(accountId, folderPath)`; the same for a move, read/flag or (since #903) user-label row whose folder no longer exists. Such a
   row is never skipped silently;
 - tags (local-only on Gmail and Outlook, ADR-IOS-036) and draft saves (re-queued above): nothing.
 Nothing is re-sent or replayed, and no row's meaning decides anything about any operation: the
@@ -186,6 +189,14 @@ server; the phone keeps showing L, which the server never got, until the message
 (a move, a Settings reset). Recoverable by one ordinary gesture (remove or re-add the label). The
 merge's missing label and answered-state reconciliation for stored rows is an older, separate gap in
 the change apply and is tracked on its own; once it is fixed, these kinds belong on the list.
+
+**Corrected (2026-11-14, #903): a retired user-label change in a tracked folder.** Since #882 the
+merge replaces a stored row's user labels from a record that knows them (Gmail label, Outlook
+category), so `addUserLabel`/`removeUserLabel` joined `SyncEngine.retiredActionKindsReadAgain`: their
+ids go on the re-read list of the folder they were queued on, and the next read shows the server's
+label set again (the retired op no longer shields it). The paragraph above stays as history for the
+label kinds; replied/forwarded marks are still not corrected (the merge does not write them).
+Tests: `ReleaseBoundaryRecheckTests` (Gmail and Outlook, add and remove).
 
 **Corrected (2026-11-14, master-agent ruling: a stuck state, not an edge): an older message in a
 folder outside the synced set.** Such a folder is now listed and its list is read (above). *Superseded

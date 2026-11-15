@@ -42,7 +42,8 @@ import GRDB
 //   message in full), and so is every message the provider could not read
 //   (`rereadLater`).
 //   Over `SyncConfig.changeRecheckLimit` ids, a folder the catch-up checks
-//   (`SyncEngine.isSyncable`) keeps its first ids and its catch-up is armed; a
+//   (`SyncEngine.isSyncable`) keeps every id already stored and only as many of
+//   this pass's additions as fit, and its catch-up is armed for the cut ones; a
 //   folder the catch-up never checks keeps every id, since nothing else would
 //   repair a dropped one (each pass still reads at most the per-pass budget);
 // - the folder's own bookmark (`Folder.changeCursor`) is written in the same
@@ -122,13 +123,24 @@ extension SyncEngine {
         var recheck = state.recheck.filter { !declined.contains($0) && !settled.contains($0) }
         recheck += state.recheck.filter { declined.contains($0) }
         for id in declined.sorted() where !recheck.contains(id) { recheck.append(id) }
+        // Over the limit, only this pass's own additions are cut, never an id
+        // already stored (a long list of retired ids drains over passes, #903).
         // Ids are dropped only where the catch-up will find them: arming it does
         // nothing for a folder it never checks, so that folder keeps them all.
         if recheck.count > SyncConfig.changeRecheckLimit,
            Self.isSyncable(role: folder.role, isFavorite: folder.isFavorite) {
-            recheck = Array(recheck.prefix(SyncConfig.changeRecheckLimit))
-            try markCatchUpLapse(folderId: folder.id, db: db)
-            result.armedCatchUp = true
+            let stored = Set(before.recheck)
+            let room = max(0, SyncConfig.changeRecheckLimit - recheck.filter(stored.contains).count)
+            var added = 0
+            recheck = recheck.filter { id in
+                guard !stored.contains(id) else { return true }
+                added += 1
+                return added <= room
+            }
+            if added > room {
+                try markCatchUpLapse(folderId: folder.id, db: db)
+                result.armedCatchUp = true
+            }
         }
         state.recheck = recheck
 
