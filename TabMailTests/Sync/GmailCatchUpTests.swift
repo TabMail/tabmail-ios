@@ -1254,8 +1254,8 @@ struct GmailCatchUpTests {
             "TabMail/Services/Sync/SyncEngineBackfill.swift": (2, "the fast-sync reset"),
             "TabMail/Services/Sync/SyncEngineBackfillWalk.swift": (
                 3, "the IMAP walk's completions, compare-and-set on the version through `writeUIDWalkPosition` (2); the walk's refused-token restart (compare-and-set on the saved token) (1)"),
-            "TabMail/Views/Settings/SettingsView.swift": (2, "the Settings reset"),
-            "TabMail/Views/Settings/AccountDetailView.swift": (1, "the account's re-sync reset"),
+            "TabMail/Services/Sync/SyncEngineResetSyncState.swift": (
+                2, "the one sync-state reset both Settings resets call (Reset message data, Delete All Email Index Data)"),
         ]
         // A write: a GRDB column assignment, or a SQL or Swift assignment of a
         // literal (`= 0`, `= NULL`, `= ?`, `= false`). The text of a line from

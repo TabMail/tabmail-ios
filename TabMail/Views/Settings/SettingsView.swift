@@ -627,21 +627,6 @@ struct SettingsView: View {
         "DELETE FROM chatHistory",
         "DELETE FROM pendingOperation WHERE type != '\(OperationType.saveDraft.rawValue)'",
         "DELETE FROM pendingRender",
-        // Reset folder cursors so backfill re-walks from top
-        """
-        UPDATE folder SET
-            backfillComplete = 0,
-            oldestSyncedDate = NULL,
-            backfillUidCursor = NULL,
-            backfillPageToken = NULL,
-            backfillPageHeldSince = NULL,
-            changeState = NULL,
-            changeCursor = NULL
-        WHERE path != ''
-        """,
-        // The change bookmarks go with the rows (ADR-IOS-111): a tracked folder
-        // gets no window listing, so a kept bookmark would leave it empty.
-        "UPDATE account SET lastHistoryId = NULL",
     ]
 
     private func nukeDatabase() async {
@@ -716,11 +701,15 @@ struct SettingsView: View {
         BackgroundSyncLogger.logDebug("[NukeDB] Sync restarted — backfill will re-walk all folders")
     }
 
-    /// Execute the user-visible local-index deletion as one transaction.
+    /// Execute the user-visible local-index deletion as one transaction: the
+    /// deletes above, then every account's sync state through the one list both
+    /// Settings resets share, so each folder's backfill re-walks from the top and
+    /// the change bookmarks go with the rows (ADR-IOS-111).
     nonisolated static func localIndexWipeTxn(_ db: Database) throws {
         for sql in localIndexWipeStatements {
             try db.execute(sql: sql)
         }
+        try SyncEngine.resetSyncStateTxn(db, accountId: nil)
     }
 
     private var storageUsageText: String {

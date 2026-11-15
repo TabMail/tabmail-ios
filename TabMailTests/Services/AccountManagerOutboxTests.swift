@@ -311,16 +311,14 @@ struct OutboxMessageDatabaseConfigTests {
 /// state: Outbox sends, user-authored drafts, bodies, attachments and FTS content
 /// are never dropped under it."*
 ///
-/// These tests execute the PRODUCTION statement list against the PRODUCTION
+/// These tests execute the PRODUCTION wipe transaction against the PRODUCTION
 /// schema, so they cannot drift from what the gesture actually runs.
 @Suite("Local index wipe — Outbox survival")
 struct LocalIndexWipeOutboxTests {
 
     private func runWipe(_ db: DatabaseQueue) throws {
         try db.write { connection in
-            for sql in SettingsView.localIndexWipeStatements {
-                try connection.execute(sql: sql)
-            }
+            try SettingsView.localIndexWipeTxn(connection)
         }
     }
 
@@ -476,16 +474,14 @@ struct LocalIndexWipeOutboxTests {
 /// resources, and the statement list contains no calendar table at all. So it
 /// addresses nothing the wipe destroys.
 ///
-/// Executes the PRODUCTION statement list against the PRODUCTION schema, so it
+/// Executes the PRODUCTION wipe transaction against the PRODUCTION schema, so it
 /// cannot drift from what the gesture actually runs.
 @Suite("Local index wipe — queued calendar intentions")
 struct LocalIndexWipeCalendarTests {
 
     private func runWipe(_ db: DatabaseQueue) throws {
         try db.write { connection in
-            for sql in SettingsView.localIndexWipeStatements {
-                try connection.execute(sql: sql)
-            }
+            try SettingsView.localIndexWipeTxn(connection)
         }
     }
 
