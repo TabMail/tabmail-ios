@@ -616,3 +616,107 @@ Keywords: Gmail history resume, per-record resume, readHistory, historyPage, His
 history record id, startHistoryId, cut, stop point, bookmark, time budget, changeReadClock, historyMaxChanges,
 historyMaxPages, too-long history, refusal, re-list, notification extension, page cap with no record,
 empty history pages, #491, #429, #938.
+
+### Amendment 2026-11-15: the IMAP reader (QRESYNC, per folder) (#751)
+
+Decision (coordinator rulings 2026-11-15): IMAP reads changes through the seam with RFC 7162
+QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChanges.swift`).
+1. **Capability gate.** QRESYNC is used only when the server advertises `QRESYNC`, `ENABLE` and
+   `UIDPLUS` (`IMAPProvider.qresyncUsable`, capabilities fetched once when the change session opens):
+   QRESYNC can only be switched on through ENABLE (RFC 5161), and without UIDPLUS (RFC 4315 COPYUID)
+   every move into a tracked folder would land without a proven destination UID (exit rule, item 11). CONDSTORE is never inferred from QRESYNC nor the
+   other way. `ENABLE QRESYNC` is sent once per session, on the change connection only (the pool's
+   reserved connections go 2 -> 3). A server without the pair, an ENABLE that is not acknowledged,
+   or a mailbox answering `NOMODSEQ` leaves the folder `.untracked(UntrackedObservation)`: no
+   ENABLE is sent, no pass fails on it, and its bookmark and coverage are cleared.
+2. **Bookmark.** `Folder.changeCursor` holds `IMAPChangeCursor` JSON (`uidValidity`,
+   `highestModSeq`, `uidNext`, `failingSince`): server metadata, no content (ADR-004). It is never an
+   epoch writer; `Folder.lastKnownUidValidity` stays the epoch authority. A folder holding rows under
+   an unknown UIDVALIDITY starts no bookmark (IOS-EPOCH-001). A first read is a plain SELECT,
+   `.baselineReady` with `FolderChanges.armCatchUpOnCommit` (the folder's catch-up is armed once when
+   the bookmark commits, R35).
+3. **A read.** STATUS first; an unchanged HIGHESTMODSEQ is `.tracked` with no SELECT. Otherwise
+   `SELECT (QRESYNC (uidvalidity modseq))` with its own timeout (`imapChangeSelectTimeoutSeconds`).
+   Removals are VANISHED ranges intersected with the folder's held rows (never expanded) and
+   `\Deleted` changes; changed flags on held rows are partial records (read, flag, answered,
+   `$Forwarded`, keywords as user labels); new UIDs and changed-not-held UIDs inside the held range
+   are fetched in full and counted against `imapChangeArrivalsLimit` (100); over it the bookmark is
+   refused (`.tooFarBehind`) and nothing is fetched (Q12 ruling A: the refusal arms the folder's
+   whole-folder catch-up, and the next baseline arms it once more at commit, so older-mail changes made
+   while the old bookmark lived are caught up). Arrivals do not rely on the SELECT's FETCH stream:
+   RFC 7162 §3.2.5.1 says only "The server sends the client any pending flag changes (using FETCH
+   responses that MUST contain UIDs) and expunges those that have occurred in this mailbox since the
+   provided modification sequence", which does not name new messages; so every UID from the
+   bookmark's UIDNEXT to the served one is asked for with `UID SEARCH UID <range> ALL` (r1 #5). A UID
+   the header FETCH does not return goes on the re-read list (removed only when `UID SEARCH` proves it
+   gone), so the bookmark never moves past a lost arrival (r1 #1). STATUS fields the server leaves out
+   are unknown, not 0: an untracked folder is then unreadable for the pass (r1 #3). STATUS is never
+   sent for the mailbox selected on the change connection; it is selected again instead (r1 #7). A
+   folder whose read the apply's binding check rejected is not trackable that pass (r1 #2). No Message-ID pairing: a moved message is inserted
+   under its own UID and the leftover copy leaves through its own removal (ADR-IOS-068 D4).
+4. **Epoch.** A UIDVALIDITY other than the bookmark's (STATUS or SELECT) is
+   `.refused(.addressEpochChanged(served))`: the apply clears the bookmark and the re-read list and,
+   only against a KNOWN stored epoch that differs, arms `uidValidityResetPendingAt`; the turnover
+   reaction runs after the folder transaction and is re-driven at the next pass start
+   (`redriveArmedTurnovers`). Every read carries `FolderChanges.addressEpoch`; the apply's binding
+   check writes nothing (not even the bookmark) when the folder stores another epoch.
+5. **Untracked folders** report a STATUS observation; the engine compares it with the folder row and
+   re-lists a changed folder through the shared listing path (`refreshUntrackedFolder`, the former
+   `imapDeltaSync` per-folder logic). `imapDeltaSync` and the engine's IMAPProvider cast are deleted;
+   the ADR-IOS-051 count walk goes through `EmailProvider.presentIds(folder:uids:)`.
+6. **Recheck.** Every listed folder's re-read list is read (synced or not), answered whatever the
+   window, without moving the bookmark or tracking; a UID the FETCH does not return is a removal only
+   when `UID SEARCH` on the same selection confirms it gone.
+7. **Merge.** Answered and forwarded are raised, never lowered; an answered message tagged reply
+   becomes none with a queued tag write (ReplyDetect), stamped through `MessageHeader.setActionTag`,
+   and skipped while the user's own `.setTag`/`.removeTag` for the message is pending
+   (`PendingOperationSnapshot.tag`) (r2 #3).
+8. **Coverage.** A tracked IMAP folder gets no window listing, no full-sync count walk, no self-heal;
+   its catch-up lists only its first listing, a listing in progress, or a lapse since its last
+   completed listing. STATUS counts are still read for every folder the full sync discovers (no
+   folder loses its counts).
+9. **Failure lapse** (r2 #1, #2). A folder whose read keeps failing keeps its bookmark with
+   `failingSince` and is refused (`.failingTooLong`, listed again) after
+   `changeReadFailureLapseSeconds`. This covers a SELECT or FETCH that times out (the session is
+   dropped, but the folder being read is stamped first) and a pass whose change session never opens
+   (connect, CAPABILITY or ENABLE failing: every work folder is stamped). A connection lost mid-pass
+   stamps no folder not yet read.
+10. **Accepted cost.** A server advertising QRESYNC without CONDSTORE gets no HIGHESTMODSEQ in STATUS,
+   so every tracked folder does a QRESYNC SELECT each pass (no fast path). Work, not loss (r2).
+11. **Exit rule: a move that leaves a folder's view possibly wrong** (2026-11-15). ADR-IOS-073
+   consequence 3 says an atomic move without safe `COPYUID` "can leave an optimistic row unaddressed
+   and recoverable by ordinary sync". For a tracked folder ordinary sync is the change reader, which
+   never removes or restores such a row (no window listing, count walk or self-heal, item 8). So
+   whenever `MessageHeaderRekey.finishMove` retires an IMAP move member without re-keying its row, it
+   drops, in the same transaction, the bookmark of every folder whose local view that leaves possibly
+   wrong (`SyncEngine.dropChangeBookmark`: the same effect as a refused read, like the over-100 rule;
+   the folder is listed again by the full sync, which becomes due, and its tracking restarts with the
+   older-mail catch-up armed):
+   - no proven destination UID (COPYUID left out, or declined because it is not one-to-one; also a
+     move the server refused or whose folder is gone, which retire with no destination): the folder
+     the row sits in, and the source folder, which the optimistic move emptied while a refused move
+     left the message there. A refused move does not put the row back in the source; the source's
+     listing does;
+   - the row was moved on before this move retired (a chained move): the folder the row now sits in,
+     which holds it under this move's source UID; with no proof, the source as well;
+   - a proven destination under a UIDVALIDITY the folder does not share: the folder the row sits in
+     (the reader would also refuse that folder; dropped here for uniformity).
+   Both routes are covered, the atomic UID MOVE and the owned COPY sequence on servers without MOVE
+   (both retire through `finishMove`). A move that retires with no provider result to apply (the
+   retry-limit exit, the UIDVALIDITY-changed refusal, the single-message not-found drop, the
+   claim-time retire, and the UIDVALIDITY turnover reaction's exit-4 drop) deletes its row through `AccountOperationExecutor.deleteRetiringOperation`,
+   which runs `finishMove` with no destination in the same transaction, so the same rule applies;
+   which exits exist and when they fire is unchanged. One drop mechanism: a refused read's apply
+   calls `dropChangeBookmark` too. A bookmark dropped between a read and its apply is not written
+   back (`FolderChanges.readFrom`), and `commitChangeBaseline` tracks a folder with a bookmark of
+   its own only while, in the same write, it still stores exactly the bookmark this pass left it
+   (`ChangePassOutcome.folderBookmarkLeft`), whatever the read returned (a first read, a "nothing
+   changed" read). A retirement whose row is no longer at its key drops the source too. Nothing is deleted and no queued operation is touched:
+   removing the placeholder would drop queued user actions that name it, which the never-drop rule
+   forbids. Tests: `IMAPMoveIntoTrackedFolderTests` (the message held once, where the server holds
+   it, under its UID, after the normal sync path).
+Tests: `IMAPChangeReaderTests`, `ChangeApplyIMAPTests`, `IMAPCatchUpTests.planTrackedFolder`,
+`IMAPChangeFuzzTests`, `ChangeSeamFenceTests`; red-first mutants recorded in the plan's ledger.
+Keywords: QRESYNC, CONDSTORE, ENABLE, VANISHED, HIGHESTMODSEQ, NOMODSEQ, IMAPChangeCursor, change
+connection, untracked, addressEpochChanged, arrivals limit, imapDeltaSync deleted, presentIds, UIDPLUS,
+COPYUID, exit rule, dropChangeBookmark, move without destination proof, #751.

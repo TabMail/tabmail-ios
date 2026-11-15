@@ -27,6 +27,10 @@ import GRDB
 //   `rereadLater`). A replied/forwarded mark the record carries is set, never
 //   cleared (a reader that does not know it says false; the phone's own reply
 //   marks its parent before the server shows it; Outlook's last verb, #890);
+// - a folder read under a generation of its ids (`FolderChanges.addressEpoch`)
+//   other than the one it stores applies nothing (the binding epoch check); a
+//   renumbered folder (`ChangeRefusal.addressEpochChanged`) loses its bookmark,
+//   coverage and re-read list and has its turnover reaction armed;
 // - a record from a baseline (`FolderChangeStatus.isBaseline`: the folder's
 //   messages as they are, not changes) inserts only a message dated within the
 //   folder's held range (`Folder.oldestSyncedDate`); with no held range yet it
@@ -58,6 +62,17 @@ struct FolderChangeApplyResult {
     var discoveredParents: [String] = []
     var wroteRows = false
     var armedCatchUp = false
+    /// The folder's path when this transaction armed its turnover reaction
+    /// (`ChangeRefusal.addressEpochChanged`); the engine runs the reaction after
+    /// the transaction commits.
+    var armedTurnoverPath: String?
+    /// Nothing was written, not even the bookmark: the folder is gone, its
+    /// turnover reaction is pending, or the read was under another epoch than
+    /// the folder stores (the binding check). Such a folder is not trackable
+    /// this pass.
+    var rejected = false
+    /// The folder bookmark stored when the transaction ends (nil = none).
+    var storedCursor: String?
 }
 
 extension SyncEngine {
@@ -65,8 +80,24 @@ extension SyncEngine {
     nonisolated static func applyFolderChanges(_ changes: FolderChanges, db: Database) throws -> FolderChangeApplyResult {
         var result = FolderChangeApplyResult()
         guard let folder = try Folder.fetchOne(db, key: changes.folderId),
-              folder.uidValidityResetPendingAt == nil else { return result }
+              folder.uidValidityResetPendingAt == nil else {
+            result.rejected = true
+            return result
+        }
         let accountId = folder.accountId
+
+        // The binding epoch check (compare-and-set, ADR-IOS-104): what was read
+        // under one generation of the folder's ids applies only while the folder
+        // still stores that generation. The turnover reaction runs outside the
+        // per-account semaphore and can stamp a new one between the read and
+        // this transaction; then nothing is written, not even the bookmark.
+        if let epoch = changes.addressEpoch, folder.lastKnownUidValidity != epoch {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Sync] change apply: folder \(folder.name) read under generation \(epoch), stores \(folder.lastKnownUidValidity.map(String.init) ?? "none") — nothing applied")
+            }
+            result.rejected = true
+            return result
+        }
 
         // Shields, read INSIDE this transaction.
         let snapshot = try PendingOperationSnapshot.load(accountId: accountId, db: db)
@@ -145,16 +176,39 @@ extension SyncEngine {
         state.recheck = recheck
 
         // The folder's own bookmark and coverage.
-        var cursor = changes.cursor ?? folder.changeCursor
+        // A bookmark dropped since the read was issued stays dropped: the read's
+        // new one is not written (its records still apply). Only a drop is
+        // checked (issued with one, none stored now): a reader's own later page
+        // of the same folder moves the bookmark forward, never to none.
+        let bookmarkMoved = changes.readFrom.map { $0.cursor != nil && folder.changeCursor == nil } ?? false
+        var cursor = bookmarkMoved ? folder.changeCursor : (changes.cursor ?? folder.changeCursor)
         switch changes.status {
-        case .refused:
+        case .refused(let reason):
             // This folder only: its bookmark is gone, so it is not covered, its
             // catch-up gets one whole-folder check, and the account's full sync
             // lists it. Its next read starts a new baseline.
+            try dropChangeBookmark(folderId: folder.id, onlyIfHeld: false, db: db)
             cursor = nil
             state.tracking = false
-            try markCatchUpLapse(folderId: folder.id, db: db)
-            try db.execute(sql: "UPDATE account SET lastFullSyncAt = NULL WHERE id = ?", arguments: [accountId])
+            if case .addressEpochChanged(let served) = reason {
+                // The re-read ids name messages of the dead generation.
+                state.recheck = []
+                // Arm the turnover reaction durably, as the STATUS trigger's
+                // reaction does at its step 1; the engine runs it after this
+                // transaction (and the next pass re-drives it after a crash). Only
+                // against a KNOWN stored generation that differs: a folder already
+                // on the served one has nothing to reset.
+                if let stored = folder.lastKnownUidValidity, stored != served {
+                    try db.execute(
+                        sql: "UPDATE folder SET uidValidityResetPendingAt = ? WHERE id = ? AND uidValidityResetPendingAt IS NULL",
+                        arguments: [Date(), folder.id])
+                    result.armedTurnoverPath = folder.path
+                }
+            }
+        case .untracked:
+            // No bookmark can cover the folder: the engine lists it when it changed.
+            cursor = nil
+            state.tracking = false
         case .baselining:
             state.tracking = false
         case .baselineReady:
@@ -171,7 +225,26 @@ extension SyncEngine {
         if state != before {
             try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [state.encoded, folder.id])
         }
+        result.storedCursor = cursor
         return result
+    }
+
+    /// Drop one folder's change bookmark outside a read, as a refused read
+    /// does (`.refused` above): the bookmark is cleared, the folder is no longer
+    /// covered, its catch-up gets one whole-folder check, and the account's full
+    /// sync lists it; its next read starts a new baseline. The re-read list is
+    /// kept. A folder with no bookmark is left as it is.
+    /// `onlyIfHeld: false` (a refused read) ends the folder's tracking even when
+    /// it holds no bookmark (a refused baseline).
+    nonisolated static func dropChangeBookmark(folderId: String, onlyIfHeld: Bool = true, db: Database) throws {
+        guard let folder = try Folder.fetchOne(db, key: folderId),
+              !onlyIfHeld || folder.changeCursor != nil else { return }
+        var state = FolderChangeState(raw: folder.changeState)
+        state.tracking = false
+        try db.execute(sql: "UPDATE folder SET changeCursor = NULL, changeState = ? WHERE id = ?",
+                       arguments: [state.encoded, folderId])
+        try markCatchUpLapse(folderId: folderId, db: db)
+        try db.execute(sql: "UPDATE account SET lastFullSyncAt = NULL WHERE id = ?", arguments: [folder.accountId])
     }
 
     /// Arm one folder's catch-up: the same lapse mark `lapseDeltaCursor` sets on
@@ -277,9 +350,15 @@ extension SyncEngine {
         if let rfc822 = record.rfc822MessageId { existing.rfc822MessageId = rfc822 }
         if let references = record.references { existing.referencesJSON = MessageHeader.encodeReferences(references) }
         // Replied/forwarded: set when the server shows it, never cleared.
+        // Not while the user's own tag change is pending: theirs is the one the
+        // server must end up with.
         if record.isReplied && !existing.isReplied {
             existing.isReplied = true
-            try replyDetect(&existing, accountId: folder.accountId, folderPath: folder.path, context: "change merge", db: db)
+            let userTagPending = snapshot.tag.containsAnyKey(messageId: existing.stableId, rfc822MessageId: rfc822)
+                || snapshot.tag.contains(record.messageId)
+            if !userTagPending {
+                try replyDetect(&existing, accountId: folder.accountId, folderPath: folder.path, context: "change merge", db: db)
+            }
         }
         if record.isForwarded { existing.isForwarded = true }
         try existing.update(db)
@@ -293,8 +372,8 @@ extension SyncEngine {
         _ header: inout MessageHeader, accountId: String, folderPath: String, context: String, db: Database
     ) throws {
         guard header.actionTag == .reply else { return }
-        header.actionTag = ActionTag.none
-        header.tagSortOrder = ActionTag.none.sortOrder
+        // Stamped like any tag write.
+        header.setActionTag(ActionTag.none)
         var tagOp = PendingOperation(
             type: .setTag, messageIds: [header.stableId], accountId: accountId,
             folderPath: folderPath, tagValue: ActionTag.none.rawValue)

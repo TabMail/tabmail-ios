@@ -441,6 +441,10 @@ struct ChangeApplyTests {
             try w.insertRow("u1", in: w.inboxId, path: "INBOX")
             try w.insertOp(.markRead, ids: ["u1"], path: "Archive")
             let inboxId = w.inboxId
+            // The folder stores the generation the read names (the binding check).
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET lastKnownUidValidity = 7 WHERE id = ?", arguments: [inboxId])
+            }
             await w.script([{ _, request in Self.tracked(request, addressEpoch: 7, removals: [inboxId: ["u1"]]) }])
             try await w.pass()
             #expect(try w.row("u1", in: w.inboxId) == nil, "the same id in another folder is another message")

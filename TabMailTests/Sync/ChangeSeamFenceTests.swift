@@ -27,7 +27,7 @@ struct ChangeSeamFenceTests {
         let files = try Self.sources().filter {
             $0.relativePath.hasPrefix("TabMail/Services/Sync/SyncEngineChanges")
         }
-        #expect(files.count == 2, "precondition: both change files were read")
+        #expect(files.count == 3, "precondition: the three change files were read")
         let forbidden = [
             "GmailProvider", "ExchangeProvider", "IMAPProvider", "DemoProvider",
             ".provider ==", ".provider !=", "provider as?", "provider as!", "case .gmail", "case .outlook", "case .imap",
@@ -75,7 +75,7 @@ struct ChangeSeamFenceTests {
         #expect(apply.contains("static func applyFolderChanges(_ changes: FolderChanges, db: Database)"))
         let calls = pass.components(separatedBy: "applyFolderChanges(").count - 1
         #expect(calls == 1)
-        #expect(pass.contains("dbPool.write { db in try Self.applyFolderChanges(changes, db: db) }"))
+        #expect(pass.contains("dbPool.write { db in try Self.applyFolderChanges(applying, db: db) }"))
         // And the shields come before any row is written in it.
         let shieldIndex = try #require(apply.range(of: "AccountManager.shared.liveRecentlyCompleted()"))
         let firstWrite = try #require(apply.range(of: "deleteConfirmedGhostHeadersReportingProtected("))
@@ -85,8 +85,8 @@ struct ChangeSeamFenceTests {
     @Test("the full sync's window listing skips every tracked folder")
     func noWindowListingForTrackedFolders() throws {
         let fullSync = try Self.file(try Self.sources(), "TabMail/Services/Sync/SyncEngineFullSync.swift")
-        #expect(fullSync.contains("? Set(syncableFolders.filter { FolderChangeState(raw: $0.changeState).tracking }.map(\\.id))"),
-                "a tracked folder is skipped while the account holds a bookmark")
+        #expect(fullSync.contains("FolderChangeState(raw: $0.changeState).tracking && (holdsChangeBookmark || $0.changeCursor != nil)"),
+                "a tracked folder is skipped while the account, or the folder itself, holds a bookmark")
         #expect(fullSync.contains("&& !trackedFolderIds.contains(folder.id) {"),
                 "the per-folder listing loop's predicate excludes tracked folders")
     }

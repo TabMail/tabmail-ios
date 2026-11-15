@@ -29,7 +29,8 @@ private actor TestPrimaryProvider {
 
     // Server limit
     var serverConnectionLimit: Int?
-    private static let reservedConnections = 2
+    /// The production value (action + IDLE + change reader), never a copy.
+    private static let reservedConnections = IMAPProvider.reservedConnections
 
     // Test hooks
     var createShouldFail = false
@@ -42,7 +43,7 @@ private actor TestPrimaryProvider {
             let activeReserved = idleServer != nil ? Self.reservedConnections : Self.reservedConnections - 1
             return max(1, limit - activeReserved)
         }
-        return 18  // SyncConfig.imapMaxConnectionCeiling - 2
+        return SyncConfig.imapMaxConnectionCeiling - Self.reservedConnections
     }
 
     private func createServer() throws -> String {
@@ -189,21 +190,21 @@ private actor TestPrimaryProvider {
 
 @Suite("Primary Connection — Reserved Slots")
 struct PrimaryConnectionReservedTests {
-    @Test("Without IDLE: limit 5 gives 4 folder slots (only action reserved)")
+    @Test("Without IDLE: limit 5 gives 3 folder slots (action + change reader reserved)")
     func withoutIdleLimit5() async {
         let provider = TestPrimaryProvider()
         await provider.setServerLimit(5)
-        // No IDLE → reserved = 1 (action only)
-        #expect(await provider.maxFolderConnections == 4)
+        // No IDLE → reserved = 2 (action + change reader)
+        #expect(await provider.maxFolderConnections == 3)
     }
 
-    @Test("With IDLE: limit 5 gives 3 folder slots (action + IDLE reserved)")
+    @Test("With IDLE: limit 5 gives 2 folder slots (action + IDLE + change reader reserved)")
     func withIdleLimit5() async {
         let provider = TestPrimaryProvider()
         await provider.setServerLimit(5)
         await provider.startIdle()
-        // IDLE active → reserved = 2 (action + IDLE)
-        #expect(await provider.maxFolderConnections == 3)
+        // IDLE active → reserved = 3 (action + IDLE + change reader)
+        #expect(await provider.maxFolderConnections == 2)
     }
 
     @Test("With IDLE: limit 3 gives 1 folder slot (minimum)")
@@ -229,7 +230,7 @@ struct LRUEvictionOnLimitTests {
     @Test("Evicts oldest folder connection when server rejects with limit error")
     func evictsOldestOnLimitError() async throws {
         let provider = TestPrimaryProvider()
-        await provider.setServerLimit(3) // 2 folder slots + action (no IDLE)
+        await provider.setServerLimit(4) // 2 folder slots + action + change reader (no IDLE)
 
         // Fill both folder slots
         let base = Date()
@@ -288,7 +289,7 @@ struct LRUEvictionOnLimitTests {
     @Test("Eviction skips in-use connections")
     func evictionSkipsInUse() async throws {
         let provider = TestPrimaryProvider()
-        await provider.setServerLimit(3) // 2 folder slots (no IDLE)
+        await provider.setServerLimit(4) // 2 folder slots (no IDLE)
 
         // Create two connections, keep first in use
         _ = try await provider.createFolderConnection(folder: "INBOX")
@@ -409,7 +410,7 @@ struct ConnectionPriorityTests {
     @Test("Action always gets connection even when folder connections are full")
     func actionAlwaysGetsConnection() async throws {
         let provider = TestPrimaryProvider()
-        await provider.setServerLimit(3) // 2 folder + action (no IDLE)
+        await provider.setServerLimit(4) // 2 folder + action + change reader (no IDLE)
 
         // Fill all folder slots
         _ = try await provider.createFolderConnection(folder: "INBOX")
@@ -424,7 +425,7 @@ struct ConnectionPriorityTests {
     @Test("Folder connections respect server limit minus reserved")
     func folderRespectsLimit() async throws {
         let provider = TestPrimaryProvider()
-        await provider.setServerLimit(3) // 2 folder slots (no IDLE)
+        await provider.setServerLimit(4) // 2 folder slots (no IDLE)
 
         _ = try await provider.createFolderConnection(folder: "INBOX")
         await provider.releaseFolderConnection(folder: "INBOX")
@@ -514,7 +515,7 @@ struct IMAPEvictionEdgeCaseTests {
     @Test("All in-use — limit error propagates without eviction")
     func allInUseNoEviction() async {
         let provider = TestPrimaryProvider()
-        await provider.setServerLimit(3) // 2 folder slots (no IDLE)
+        await provider.setServerLimit(4) // 2 folder slots (no IDLE)
 
         // Fill slots and keep them in-use
         _ = try! await provider.createFolderConnection(folder: "INBOX")
@@ -537,7 +538,7 @@ struct IMAPEvictionEdgeCaseTests {
     @Test("LRU ordering correct — oldest timestamp evicted first")
     func lruOrderingCorrect() async throws {
         let provider = TestPrimaryProvider()
-        await provider.setServerLimit(4) // 3 folder slots (no IDLE)
+        await provider.setServerLimit(5) // 3 folder slots (no IDLE)
 
         // Create and release all three, then set timestamps after release
         // (release overwrites lastUsed, so we set custom timestamps last)
@@ -627,19 +628,18 @@ struct IdleEdgeCaseTests {
     @Test("Folder eviction falls back to IDLE when no folder LRU available")
     func folderEvictionFallsBackToIdle() async throws {
         let provider = TestPrimaryProvider()
-        await provider.setServerLimit(5) // With IDLE: 5 - 2 = 3 folder slots
+        await provider.setServerLimit(5) // With IDLE: 5 - 3 = 2 folder slots
         await provider.startIdle()
         #expect(await provider.idleServer != nil)
-        #expect(await provider.maxFolderConnections == 3)
+        #expect(await provider.maxFolderConnections == 2)
 
-        // Fill all 3 folder slots AND keep them in-use
+        // Fill both folder slots AND keep them in-use
         _ = try await provider.createFolderConnection(folder: "INBOX")
         _ = try await provider.createFolderConnection(folder: "Sent")
-        _ = try await provider.createFolderConnection(folder: "Archive")
 
-        // 4th folder — no folder LRU available (all in use), should evict IDLE
+        // 3rd folder — no folder LRU available (all in use), should evict IDLE
         _ = try await provider.createFolderConnection(folder: "Drafts")
-        // IDLE was evicted to make room (maxFolderConnections went 3→4)
+        // IDLE was evicted to make room (maxFolderConnections went 2→3)
         #expect(await provider.idleServer == nil)
         #expect(await provider.folderServers["Drafts"] != nil)
     }
@@ -759,5 +759,22 @@ extension TestPrimaryProvider {
 
     func setCreateShouldFailWithLimit(_ value: Bool) {
         createShouldFailWithLimitError = value
+    }
+}
+
+// MARK: - Tests: the production pool's reserved slots
+
+@Suite("IMAPProvider pool — reserved slots (production actor)")
+struct IMAPProviderReservedSlotsTests {
+    @Test("Action, IDLE and the change reader are reserved: limit 6 without IDLE leaves 4 folder slots; no limit leaves ceiling - 3")
+    func productionReservesThree() async {
+        let username = "rsv-\(UUID().uuidString.lowercased())"
+        IMAPProvider.persistServerLimit(6, host: "127.0.0.1", username: username)
+        let limited = IMAPProvider(host: "127.0.0.1", port: 1, username: username, password: "x",
+                                   smtpHost: "127.0.0.1", smtpPort: 587, useTLS: false)
+        #expect(await limited.poolMaxConnections() == 4)
+        let unlimited = IMAPProvider(host: "127.0.0.1", port: 1, username: "rsv-none-\(UUID().uuidString.lowercased())", password: "x",
+                                     smtpHost: "127.0.0.1", smtpPort: 587, useTLS: false)
+        #expect(await unlimited.poolMaxConnections() == SyncConfig.imapMaxConnectionCeiling - 3)
     }
 }

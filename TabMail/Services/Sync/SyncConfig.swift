@@ -965,4 +965,17 @@ enum SyncConfig {
     /// the reader starts the folder again from a new baseline. A connection loss,
     /// a cancellation, an authorization failure or a throttle never counts.
     static let changeReadFailureLapseSeconds: TimeInterval = 3_600
+    /// IMAP change reader (#751): most messages one folder's read fetches headers
+    /// for in one pass (new arrivals plus changed messages the folder does not
+    /// hold). Over it the folder's bookmark is refused (`.tooFarBehind`): a window
+    /// listing plus one catch-up check is the cheaper path. Same order of work as
+    /// Gmail's `GmailAPI.historyMaxChanges`.
+    static let imapChangeArrivalsLimit = 100
+    /// IMAP change reader: longest the `SELECT … (QRESYNC …)` may take. Its answer
+    /// lists every change since the bookmark, so it gets more than one ordinary
+    /// request (`changeReadRequestTimeoutSeconds`); it is capped by the pass's
+    /// read budget left plus one ordinary request, so the pass still ends by the
+    /// caller's deadline. A folder whose SELECT keeps timing out is started again
+    /// after `changeReadFailureLapseSeconds`.
+    static let imapChangeSelectTimeoutSeconds: TimeInterval = 15
 }

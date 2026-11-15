@@ -151,6 +151,17 @@ final class FakeIMAPServer: @unchecked Sendable {
         case verifiedPartialCompletion
     }
 
+    struct QResyncMailbox {
+        var epoch: Int
+        var highestModSeq: Int
+        var modSeqByUID: [Int: Int]
+        var flagsByUID: [Int: Set<String>]
+        var expunged: [(uid: Int, modSeq: Int)] = []
+        var maxUID: Int
+        /// The modseq at which each message was first seen.
+        var addedModSeq: [Int: Int] = [:]
+    }
+
     private struct State {
         var messagesByMailbox: [String: [Message]]
         var flagsByMailbox: [String: [Int: Set<String>]] = [:]
@@ -208,6 +219,36 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// STATUS cannot tell this from a server bumping it at mutation time.
         var highestModSeqByMailbox: [String: Int] = [:]
         var modSeqFingerprintByMailbox: [String: String] = [:]
+        /// QRESYNC (RFC 7162 §3.2) model, used only when the fake advertises
+        /// `QRESYNC`: per mailbox, each message's MODSEQ and the expunge log. It is
+        /// brought up to date lazily, at every STATUS and SELECT, by diffing the
+        /// mailbox against the last observation: a new or re-flagged message and
+        /// an expunge each get the next modseq. A client cannot tell this from a
+        /// server assigning modseqs at mutation time. Reset (the history dropped)
+        /// when the mailbox's UIDVALIDITY changes.
+        var qresyncByMailbox: [String: QResyncMailbox] = [:]
+        /// STATUS attributes a mailbox's answer leaves out (a server may omit one).
+        var statusOmittedAttributesByMailbox: [String: Set<String>] = [:]
+        /// Mailboxes whose QRESYNC SELECT reports no FETCH for messages added
+        /// since the client's modseq (RFC 7162 §3.2.5.1 requires flag changes and
+        /// expunges only).
+        var qresyncOmitsArrivalsMailboxes: Set<String> = []
+        /// Mailboxes whose SELECT answers `[NOMODSEQ]` (no modseqs kept).
+        var noModSeqMailboxes: Set<String> = []
+        /// Mailboxes whose `VANISHED (EARLIER)` reports every UID up to the
+        /// highest ever seen, not only the expunged ones (a server without an
+        /// exact expunge history; RFC 7162 §3.2.5 lets it send a superset).
+        var lossyExpungeHistoryMailboxes: Set<String> = []
+        /// `ENABLE QRESYNC` is answered with an empty `* ENABLED` (not acknowledged).
+        var ignoresEnableQResync = false
+        /// Every `ENABLE QRESYNC` a connection sent, by connection (its fd), and
+        /// every QRESYNC SELECT answered, by connection: the wire oracle for
+        /// "QRESYNC is enabled once per session, on one connection only".
+        var enableQResyncCountByConnection: [Int32: Int] = [:]
+        var qresyncSelectCountByConnection: [Int32: Int] = [:]
+        /// SELECT with a QRESYNC parameter on a connection that never enabled it
+        /// (answered BAD, RFC 7162 §3.2.5).
+        var qresyncSelectWithoutEnableCount = 0
         /// Mailboxes whose SELECT/EXAMINE response OMITS the
         /// `* OK [UIDVALIDITY n]` line entirely (T1.2b, `suppressSelectUidValidity`).
         /// RFC 3501 §6.3.1 says a server SHOULD send it, not MUST, and SwiftMail
@@ -635,6 +676,18 @@ final class FakeIMAPServer: @unchecked Sendable {
     func flags(in mailbox: String, uid: Int) -> Set<String> {
         withState { state in
             state.flagsByMailbox[mailbox]?[uid] ?? []
+        }
+    }
+
+    /// Test convenience: the UIDs currently holding `rfc822MessageId` in
+    /// `mailbox` (bracket-or-bare match).
+    func uids(in mailbox: String, rfc822MessageId: String) -> [Int] {
+        withState { state in
+            let bracketSet = CharacterSet(charactersIn: "<>")
+            let target = rfc822MessageId.trimmingCharacters(in: bracketSet)
+            return (state.messagesByMailbox[mailbox] ?? [])
+                .filter { $0.messageID.trimmingCharacters(in: bracketSet) == target }
+                .map(\.uid)
         }
     }
 
@@ -1282,6 +1335,11 @@ final class FakeIMAPServer: @unchecked Sendable {
         withState { $0.messagesByMailbox[mailbox] = messages }
     }
 
+    /// Test seam: the messages currently in `mailbox`, in mailbox order.
+    func messages(in mailbox: String) -> [Message] {
+        withState { $0.messagesByMailbox[mailbox] ?? [] }
+    }
+
     /// Two-tier fuzzer (Testing Rule 11), tier-2 seam: every message
     /// CURRENTLY in `mailbox` paired with its current flags, in mailbox
     /// order. Lets a caller simulate a UIDVALIDITY reset FAITHFULLY —
@@ -1648,6 +1706,8 @@ final class FakeIMAPServer: @unchecked Sendable {
         var buffer = Data()
         var authenticated = false
         var selectedMailbox: String?
+        // Per connection (RFC 5161: ENABLE lasts for the session only).
+        var qresyncEnabled = false
         let readBuf = UnsafeMutablePointer<UInt8>.allocate(capacity: 65536)
         defer { readBuf.deallocate() }
 
@@ -1799,7 +1859,8 @@ final class FakeIMAPServer: @unchecked Sendable {
                 if let stallSeconds { usleep(UInt32(stallSeconds * 1_000_000)) }
                 let response = handleCommand(
                     tag: tag, command: command, args: args, fd: fd,
-                    authenticated: &authenticated, selectedMailbox: &selectedMailbox
+                    authenticated: &authenticated, selectedMailbox: &selectedMailbox,
+                    qresyncEnabled: &qresyncEnabled
                 )
                 let disconnectAfterCommit = withState { state -> Bool in
                     guard recordedCommand.uppercased().hasPrefix("UID MOVE "),
@@ -1849,7 +1910,7 @@ final class FakeIMAPServer: @unchecked Sendable {
 
     // MARK: - Command Handling
 
-    private func handleCommand(tag: String, command: String, args: String, fd: Int32, authenticated: inout Bool, selectedMailbox: inout String?) -> String {
+    private func handleCommand(tag: String, command: String, args: String, fd: Int32, authenticated: inout Bool, selectedMailbox: inout String?, qresyncEnabled: inout Bool) -> String {
         switch command {
         case "CAPABILITY":
             return "* CAPABILITY \(capabilities.joined(separator: " "))\r\n\(tag) OK CAPABILITY completed\r\n"
@@ -1863,10 +1924,30 @@ final class FakeIMAPServer: @unchecked Sendable {
                 _ = state.everLoggedInFds.insert(fd)
             }
             return "\(tag) OK LOGIN completed\r\n"
+        case "ENABLE":
+            guard authenticated else { return "\(tag) NO Not authenticated\r\n" }
+            let wantsQResync = args.uppercased().split(separator: " ").contains("QRESYNC")
+            guard wantsQResync, capabilities.contains("QRESYNC") else {
+                return "* ENABLED\r\n\(tag) OK ENABLE completed\r\n"
+            }
+            let ignored = withState { state -> Bool in
+                state.enableQResyncCountByConnection[fd, default: 0] += 1
+                return state.ignoresEnableQResync
+            }
+            if ignored { return "* ENABLED\r\n\(tag) OK ENABLE completed\r\n" }
+            qresyncEnabled = true
+            return "* ENABLED QRESYNC\r\n\(tag) OK ENABLE completed\r\n"
         case "SELECT", "EXAMINE":
             guard authenticated else { return "\(tag) NO Not authenticated\r\n" }
             // Spaces inside a quoted mailbox are address bytes, not delimiters.
-            let mailbox = Self.firstQuoted(args) ?? args.trimmingCharacters(in: .whitespaces)
+            // A SELECT parameter list follows the name (RFC 4466).
+            let mailbox = Self.firstQuoted(args)
+                ?? String(args.trimmingCharacters(in: .whitespaces).split(separator: " ").first ?? "")
+            let resync = Self.qresyncParameter(args)
+            if resync != nil, !qresyncEnabled {
+                withState { $0.qresyncSelectWithoutEnableCount += 1 }
+                return "\(tag) BAD QRESYNC not enabled\r\n"
+            }
             if let includeNonexistentCode = withState({ $0.deletedMailboxes[mailbox] }) {
                 // Deliberately two distinct real-world shapes: `[NONEXISTENT]`
                 // (RFC 5530 §3) is a fast-path HINT the adapter may use, but
@@ -1890,7 +1971,38 @@ final class FakeIMAPServer: @unchecked Sendable {
                 )
             }
             let count = messages.count
-            let uidnext = (messages.map(\.uid).max() ?? 0) + 1
+            var uidnext = (messages.map(\.uid).max() ?? 0) + 1
+            var qresyncLines = ""
+            if capabilities.contains("QRESYNC") {
+                qresyncLines = withState { state -> String in
+                    let model = Self.observeQResync(mailbox, state: &state)
+                    uidnext = model.maxUID + 1
+                    guard qresyncEnabled else { return "" }
+                    if state.noModSeqMailboxes.contains(mailbox) { return "* OK [NOMODSEQ] No modseqs\r\n" }
+                    var lines = "* OK [HIGHESTMODSEQ \(model.highestModSeq)] Highest\r\n"
+                    guard let resync, resync.uidValidity == model.epoch else { return lines }
+                    state.qresyncSelectCountByConnection[fd, default: 0] += 1
+                    let vanished: [Int]
+                    if state.lossyExpungeHistoryMailboxes.contains(mailbox) {
+                        let live = Set(model.modSeqByUID.keys)
+                        vanished = model.maxUID > 0 ? (1...model.maxUID).filter { !live.contains($0) } : []
+                    } else {
+                        vanished = model.expunged.filter { $0.modSeq > resync.modSeq }.map(\.uid)
+                    }
+                    if !vanished.isEmpty {
+                        lines += "* VANISHED (EARLIER) \(Self.uidSetString(vanished))\r\n"
+                    }
+                    let sortedUIDs = messages.map(\.uid).sorted()
+                    for (index, uid) in sortedUIDs.enumerated() {
+                        guard let modSeq = model.modSeqByUID[uid], modSeq > resync.modSeq else { continue }
+                        if state.qresyncOmitsArrivalsMailboxes.contains(mailbox),
+                           (model.addedModSeq[uid] ?? 0) > resync.modSeq { continue }
+                        let flagList = (model.flagsByUID[uid] ?? []).sorted().joined(separator: " ")
+                        lines += "* \(index + 1) FETCH (UID \(uid) FLAGS (\(flagList)) MODSEQ (\(modSeq)))\r\n"
+                    }
+                    return lines
+                }
+            }
             // `suppressSelectUidValidity` drops the line entirely rather than
             // sending `UIDVALIDITY 0` — a real server never sends 0 (it is an
             // `nz-number`), so omission is the only faithful way to reach the
@@ -1906,7 +2018,7 @@ final class FakeIMAPServer: @unchecked Sendable {
             return """
             * \(count) EXISTS\r
             * 0 RECENT\r
-            \(uidValidityLine)\(uidNextLine)* FLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)\r
+            \(uidValidityLine)\(uidNextLine)\(qresyncLines)* FLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)\r
             * OK [PERMANENTFLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft \\*)] Flags permitted\r
             \(tag) OK [READ-WRITE] SELECT completed\r
 
@@ -2027,6 +2139,99 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// with `CONDSTORE` among its capabilities does answer it, from the
     /// `highestModSeqByMailbox` model. Does NOT change the connection's selected
     /// mailbox — that is the whole point of STATUS.
+    /// Bring a mailbox's QRESYNC model up to date with its messages (see
+    /// `State.qresyncByMailbox`). Returns the current model.
+    @discardableResult
+    private static func observeQResync(_ mailbox: String, state: inout State) -> QResyncMailbox {
+        let messages = state.messagesByMailbox[mailbox] ?? []
+        let flags = state.flagsByMailbox[mailbox] ?? [:]
+        let epoch = state.uidValidityByMailbox[mailbox] ?? 1
+        let currentUIDs = Set(messages.map(\.uid))
+        let currentMax = messages.map(\.uid).max() ?? 0
+        guard var model = state.qresyncByMailbox[mailbox], model.epoch == epoch else {
+            let start = (state.qresyncByMailbox[mailbox]?.highestModSeq ?? 0) + 1
+            var modSeqs: [Int: Int] = [:]
+            var flagSets: [Int: Set<String>] = [:]
+            for uid in currentUIDs {
+                modSeqs[uid] = start
+                flagSets[uid] = flags[uid] ?? []
+            }
+            var model = QResyncMailbox(
+                epoch: epoch, highestModSeq: start, modSeqByUID: modSeqs, flagsByUID: flagSets,
+                maxUID: currentMax)
+            model.addedModSeq = modSeqs
+            state.qresyncByMailbox[mailbox] = model
+            return model
+        }
+        var next: Int?
+        func bump() -> Int {
+            if let next { return next }
+            let value = model.highestModSeq + 1
+            next = value
+            return value
+        }
+        for uid in currentUIDs.sorted() {
+            let current = flags[uid] ?? []
+            if model.flagsByUID[uid] != current || model.modSeqByUID[uid] == nil {
+                if model.modSeqByUID[uid] == nil { model.addedModSeq[uid] = bump() }
+                model.modSeqByUID[uid] = bump()
+                model.flagsByUID[uid] = current
+            }
+        }
+        for uid in model.modSeqByUID.keys.sorted() where !currentUIDs.contains(uid) {
+            model.expunged.append((uid, bump()))
+            model.modSeqByUID.removeValue(forKey: uid)
+            model.flagsByUID.removeValue(forKey: uid)
+        }
+        if let next { model.highestModSeq = next }
+        model.maxUID = max(model.maxUID, currentMax)
+        state.qresyncByMailbox[mailbox] = model
+        return model
+    }
+
+    private static func uidSetString(_ uids: [Int]) -> String {
+        let sorted = uids.sorted()
+        var parts: [String] = []
+        var index = 0
+        while index < sorted.count {
+            let start = sorted[index]
+            var end = start
+            while index + 1 < sorted.count && sorted[index + 1] == end + 1 {
+                index += 1
+                end = sorted[index]
+            }
+            parts.append(start == end ? "\(start)" : "\(start):\(end)")
+            index += 1
+        }
+        return parts.joined(separator: ",")
+    }
+
+    /// Test seams for the QRESYNC model.
+    func setNoModSeq(_ on: Bool, for mailbox: String) {
+        withState { if on { $0.noModSeqMailboxes.insert(mailbox) } else { $0.noModSeqMailboxes.remove(mailbox) } }
+    }
+    func setLossyExpungeHistory(_ on: Bool, for mailbox: String) {
+        withState { if on { $0.lossyExpungeHistoryMailboxes.insert(mailbox) } else { $0.lossyExpungeHistoryMailboxes.remove(mailbox) } }
+    }
+    func setStatusOmits(_ attributes: Set<String>, for mailbox: String) {
+        withState { $0.statusOmittedAttributesByMailbox[mailbox] = attributes }
+    }
+    func setQResyncOmitsArrivals(_ on: Bool, for mailbox: String) {
+        withState { if on { $0.qresyncOmitsArrivalsMailboxes.insert(mailbox) } else { $0.qresyncOmitsArrivalsMailboxes.remove(mailbox) } }
+    }
+    func setIgnoresEnableQResync(_ on: Bool) {
+        withState { $0.ignoresEnableQResync = on }
+    }
+    /// The oracle reads: ENABLE QRESYNC per connection, QRESYNC SELECTs per
+    /// connection, and QRESYNC SELECTs refused for want of ENABLE.
+    var enableQResyncCountByConnection: [Int32: Int] { withState { $0.enableQResyncCountByConnection } }
+    var qresyncSelectCountByConnection: [Int32: Int] { withState { $0.qresyncSelectCountByConnection } }
+    var qresyncSelectWithoutEnableCount: Int { withState { $0.qresyncSelectWithoutEnableCount } }
+    /// The current HIGHESTMODSEQ of a mailbox in the QRESYNC model (observes it).
+    func qresyncHighestModSeq(for mailbox: String) -> Int {
+        withState { Self.observeQResync(mailbox, state: &$0).highestModSeq }
+    }
+
     private func handleStatus(tag: String, args: String) -> String {
         guard let openParen = args.firstIndex(of: "(") else {
             return "\(tag) BAD STATUS requires an attribute list\r\n"
@@ -2043,11 +2248,18 @@ final class FakeIMAPServer: @unchecked Sendable {
             .map { $0.uppercased() }
 
         let condStore = capabilities.contains("CONDSTORE")
+        let qresyncModel = capabilities.contains("QRESYNC")
         let (count, unseen, uidNext, uidValidity, highestModSeq) = withState { state -> (Int, Int, Int, Int, Int) in
             let messages = state.messagesByMailbox[mailbox] ?? []
             let flags = state.flagsByMailbox[mailbox] ?? [:]
             let unseen = messages.filter { !(flags[$0.uid]?.contains("\\Seen") ?? false) }.count
             var highestModSeq = 0
+            if qresyncModel {
+                let model = Self.observeQResync(mailbox, state: &state)
+                return (
+                    messages.count, unseen, model.maxUID + 1,
+                    state.uidValidityByMailbox[mailbox] ?? 1, model.highestModSeq)
+            }
             if condStore {
                 let fingerprint = messages.map(\.uid).sorted().map { uid in
                     "\(uid):\((flags[uid] ?? []).sorted().joined(separator: ","))"
@@ -2068,8 +2280,9 @@ final class FakeIMAPServer: @unchecked Sendable {
             )
         }
 
+        let omitted = withState { $0.statusOmittedAttributesByMailbox[mailbox] ?? [] }
         var parts: [String] = []
-        for attribute in requested {
+        for attribute in requested where !omitted.contains(attribute) {
             switch attribute {
             case "MESSAGES": parts.append("MESSAGES \(count)")
             case "RECENT": parts.append("RECENT 0")
@@ -2081,6 +2294,14 @@ final class FakeIMAPServer: @unchecked Sendable {
             }
         }
         return "* STATUS \"\(mailbox)\" (\(parts.joined(separator: " ")))\r\n\(tag) OK STATUS completed\r\n"
+    }
+
+    /// The `(QRESYNC (uidvalidity modseq …))` SELECT parameter, if any.
+    private static func qresyncParameter(_ args: String) -> (uidValidity: Int, modSeq: Int)? {
+        guard let range = args.range(of: "QRESYNC (", options: .caseInsensitive) else { return nil }
+        let numbers = args[range.upperBound...].split(whereSeparator: { $0 == " " || $0 == ")" })
+        guard numbers.count >= 2, let uidValidity = Int(numbers[0]), let modSeq = Int(numbers[1]) else { return nil }
+        return (uidValidity, modSeq)
     }
 
     /// RFC 3501 §6.3.11 APPEND — `mailbox [(flags)] ["date-time"] {N}<literal>`.

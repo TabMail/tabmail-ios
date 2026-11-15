@@ -331,6 +331,13 @@ protocol EmailProvider: Sendable {
     /// (HTTP providers); IMAP overrides to `.uid`. See `StaleWindowMode`.
     var staleWindowMode: StaleWindowMode { get }
 
+    /// Which of these ids (numeric, in a provider whose ids are `.uid`-windowed)
+    /// the folder still holds, with the generation of the id space the answer
+    /// was given under (`0` = not reported: nothing may be decided). The
+    /// count-mismatch deletion walk's presence proof (ADR-IOS-051 phase 2). A
+    /// provider without numeric ids does not answer (nil).
+    func presentIds(folder: String, uids: [UInt32]) async throws -> UIDExistenceResult?
+
     /// Whether this provider can act on a local placeholder id (`sent-…`,
     /// `draft-…`, see `isSyntheticPlaceholderId`). A server has no record of
     /// one, so every provider that talks to a server says `false` and
@@ -715,6 +722,9 @@ extension EmailProvider {
     /// HTTP providers (Gmail, Exchange) return most-recent-by-date → date window.
     /// IMAP overrides to `.uid`.
     var staleWindowMode: StaleWindowMode { .date }
+
+    /// No numeric ids: no presence answer.
+    func presentIds(folder: String, uids: [UInt32]) async throws -> UIDExistenceResult? { nil }
 
     /// Default sequential implementation. IMAP overrides with batched single-connection fetch.
     ///

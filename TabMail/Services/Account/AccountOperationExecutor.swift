@@ -410,6 +410,25 @@ final class AccountOperationExecutor {
         return false
     }
 
+    /// Delete an operation that retires WITHOUT a provider result to apply (a
+    /// retry-limit exit, an epoch refusal, a not-found drop, a claim-time
+    /// retire). A `.move` goes through `MessageHeaderRekey.finishMove` with no
+    /// destination first, in the same transaction, so its exit rule drops the
+    /// change bookmark of every IMAP folder the optimistic move left possibly
+    /// wrong (ADR-IOS-111 item 11). It re-keys and deletes nothing. Returns
+    /// whether the operation row was deleted.
+    @discardableResult
+    nonisolated static func deleteRetiringOperation(_ op: PendingOperation, db: Database) throws -> Bool {
+        if op.type == .move {
+            let accountScopedIds = try accountScopedIdAccountIds(db).contains(op.accountId)
+            _ = try MessageHeaderRekey.finishMove(
+                // `true` matters only on IMAP; on Gmail and Outlook nothing is re-keyed with no destination.
+                op, destinations: [], addressChangesOnMove: true,
+                accountScopedIds: accountScopedIds, db: db)
+        }
+        return try PendingOperation.deleteOne(db, key: op.id)
+    }
+
     nonisolated static func commitFullRetirement(
         _ op: PendingOperation, executed: ExecutedOperation, db: Database
     ) throws -> MoveFinishResult {
@@ -694,8 +713,8 @@ final class AccountOperationExecutor {
             // separately under a different attempt.
             if case ProviderError.uidValidityChanged = error {
                 do {
-                    try await retryWrite(manager.dbPool, label: "Queue") { db in
-                        _ = try PendingOperation.deleteOne(db, key: currentOp.id)
+                    try await retryWrite(manager.dbPool, label: "Queue") { db -> Void in
+                        try Self.deleteRetiringOperation(currentOp, db: db)
                     }
                     manager.dropDeferredMoveSuccessors(for: currentOp.id)
                     return .completed
@@ -782,8 +801,8 @@ final class AccountOperationExecutor {
                 // Single-message conflict — drop (server wins)
                 queueLog("[Queue] Conflict: \(opType) — message not found, dropping")
                 do {
-                    try await retryWrite(manager.dbPool, label: "Queue") { db in
-                        _ = try PendingOperation.deleteOne(db, key: currentOp.id)
+                    try await retryWrite(manager.dbPool, label: "Queue") { db -> Void in
+                        try Self.deleteRetiringOperation(currentOp, db: db)
                     }
                 } catch {
                     // ⚠️ `.blockedOnCommit`, not `.completed` — the SAME shape as the
@@ -1087,7 +1106,7 @@ final class AccountOperationExecutor {
                 guard let live = try PendingOperation.fetchOne(db, key: op.id),
                       live.status != PendingStatus.cancelled.rawValue else { return nil }
                 if live.retryCount >= SyncConfig.pendingOperationServerRefusalRetryLimit - 1 {
-                    return try PendingOperation.deleteOne(db, key: live.id)
+                    return try Self.deleteRetiringOperation(live, db: db)
                 }
                 try db.execute(sql: "UPDATE pendingOperation SET retryCount = retryCount + 1 WHERE id = ?",
                     arguments: [live.id])

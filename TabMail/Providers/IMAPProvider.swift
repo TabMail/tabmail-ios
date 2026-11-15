@@ -328,7 +328,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// CLEARS on an unreported one), so a race between two writers of the same
     /// path can only manufacture a MISMATCH — refuse, which is safe — and never
     /// agreement. The widening is monotonically safety-increasing for it.
-    private func selectMailboxTracked(_ server: IMAPServer, folder: String) async throws -> Mailbox.Selection {
+    func selectMailboxTracked(_ server: IMAPServer, folder: String) async throws -> Mailbox.Selection {
         let selection = try await server.selectMailbox(folder)
         let observed = selection.uidValidity.value
         // Assignment, not an `if` — a `0` (unreported) must ERASE any earlier
@@ -764,7 +764,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// disconnect()** (D-15 / R9-F1). Zombie tasks from a previous generation
     /// skip their release logic instead of accidentally removing new
     /// connections.
-    private var generation: Int = 0
+    var generation: Int = 0
 
     // MARK: - Action Connection
     // Dedicated connection for user-initiated actions (move, flag, mark read, draft, etc.).
@@ -812,12 +812,36 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// Whether IDLE should be running (set by startIdle/stopIdle).
     private var idleEnabled = false
 
+    // MARK: - Change connection (#751, ADR-IOS-111)
+    /// The change reader's own connection (`IMAPProviderChanges.swift`): the only
+    /// one that sends `ENABLE QRESYNC` (once per session, when it is opened), so
+    /// no other connection ever gets VANISHED instead of EXPUNGE. It never
+    /// reconnects inside a command (`setReconnectsInsideCommands(false)`): a
+    /// session that ends mid-pass fails the rest of the pass instead of carrying
+    /// on in a new session without QRESYNC or a selection. Counted in
+    /// `reservedConnections`. Written only by `withChangeConnection`,
+    /// `dropChangeServer`, `disconnect()` and `markDirty()`.
+    var changeServer: IMAPServer?
+    /// `ENABLE QRESYNC` was acknowledged on `changeServer`'s session.
+    var changeServerQResync = false
+    var changeServerLastUsed: Date?
+    /// One pass at a time uses the change connection.
+    var changeLaneBusy = false
+    var changeLaneWaiters: [CheckedContinuation<Void, Never>] = []
+    /// Where the next pass starts among the non-inbox folders, so a tight budget
+    /// never starves the same folder.
+    var changeRotation = 0
+    /// The mailbox last selected on the change connection, nil when none or
+    /// unknown: STATUS is not sent for it (RFC 3501 §6.3.10).
+    var changeSelectedPath: String?
+
     // MARK: - Server Limit
-    /// Server-declared connection limit. Folder connections capped at limit - 2
-    /// (reserve 1 for action, 1 for IDLE). IDLE slot is evictable when scarce.
+    /// Server-declared connection limit. Folder connections capped at limit - 3
+    /// (reserve 1 for action, 1 for IDLE, 1 for the change reader). IDLE slot is
+    /// evictable when scarce.
     private var serverConnectionLimit: Int?
-    /// Connections reserved from server limit (action + IDLE).
-    private static let reservedConnections = 2
+    /// Connections reserved from server limit (action + IDLE + change reader).
+    static let reservedConnections = 3
 
     // MARK: - Keepalive
     private var keepAliveTask: Task<Void, Never>?
@@ -956,7 +980,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     ///
     /// `diagSite` labels the creator for the object-lifecycle oracle above —
     /// no default on purpose: every new call site must identify itself.
-    private func createServer(diagSite: String) async throws -> IMAPServer {
+    func createServer(diagSite: String) async throws -> IMAPServer {
         let server = IMAPServer(
             host: host,
             port: port,
@@ -2592,6 +2616,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
 
         let capturedFolderServers = folderServers
         let capturedActionServer = actionServer
+        let capturedChangeServer = changeServer
+        changeServer = nil
+        changeServerQResync = false
+        changeSelectedPath = nil
         let capturedFolderWaiters = folderWaiters
         let capturedFolderCapacityWaiters = folderCapacityWaiters
         let capturedActionWaiters = actionWaiters
@@ -2665,6 +2693,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             noteLogoutAttempt(server)
             try? await server.logout()
         }
+        // The change reader's connection (a pass holding it fails its next command).
+        if let server = capturedChangeServer {
+            noteLogoutAttempt(server)
+            try? await server.logout()
+        }
     }
 
     /// Fire-and-forget teardown logout used by `markDirty()` and, for the IDLE
@@ -2679,7 +2712,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// keeps ONE conditional. `generation` and the hook are read SYNCHRONOUSLY
     /// on the actor before the `Task` is created — the same capture-list
     /// semantics the reference relies on.
-    private func detachedTeardownLogout(_ server: IMAPServer, sendDoneFirst: Bool = false) {
+    func detachedTeardownLogout(_ server: IMAPServer, sendDoneFirst: Bool = false) {
         noteLogoutAttempt(server)
         #if DEBUG
         let hook = beforeLogoutTestHook
@@ -2717,6 +2750,15 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         #if DEBUG
         logMut("markDirty() BUMP")
         #endif
+
+        // The change reader's connection: a pass holding it fails its next
+        // command (it never reconnects inside one) and drops it.
+        if let server = changeServer {
+            detachedTeardownLogout(server)
+            changeServer = nil
+            changeServerQResync = false
+            changeSelectedPath = nil
+        }
 
         // Nuke ALL folder connections (both idle and in-use)
         for (folder, server) in folderServers {
@@ -6879,6 +6921,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// the caller can abort when the folder's UID numbering was invalidated
     /// (a UIDVALIDITY change makes every local UID meaningless — deleting on
     /// a "not found" result would then be unsafe).
+    /// `EmailProvider.presentIds(folder:uids:)`: this SEARCH's answer.
+    func presentIds(folder: String, uids: [UInt32]) async throws -> UIDExistenceResult? {
+        try await searchExistingUIDs(folder: folder, uids: uids)
+    }
+
     func searchExistingUIDs(folder: String, uids: [UInt32]) async throws -> UIDExistenceResult {
         guard !uids.isEmpty else { return UIDExistenceResult(found: [], uidValidity: 0) }
         try Task.checkCancellation()
@@ -7288,7 +7335,20 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// fetch cycle will retry — by then the server should have indexed the message.
     /// `keepEmptySubject`: a draft copy's subject is the draft's own, so an absent
     /// one reads as empty rather than as the "(no subject)" a list shows (#217).
-    private func mapMessageInfo(_ info: MessageInfo, keepEmptySubject: Bool = false) -> MessageHeaderInfo? {
+    /// User label keywords from a message's flags (non-tm_*, non-standard custom
+    /// keywords, lowercased). The one mapping the header builder and the change
+    /// reader's flag records share.
+    nonisolated static func userLabelKeywords(_ flags: [Flag]) -> [String] {
+        var keywords: [String] = []
+        for flag in flags {
+            if case .custom(let keyword) = flag, !UserLabelStore.isExcludedKeyword(keyword) {
+                keywords.append(keyword.lowercased())
+            }
+        }
+        return keywords
+    }
+
+    func mapMessageInfo(_ info: MessageInfo, keepEmptySubject: Bool = false) -> MessageHeaderInfo? {
         // Shared with the NSE (`NSEIMAPConnection.mapInfoToMetadata`), so both
         // targets list a message under the same sender.
         let from = IMAPFetchMapping.sender(from: info)
@@ -7317,15 +7377,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         // the user-label filter below (see `UserLabelStore.isExcludedKeyword`).
         let tag: ActionTag? = nil
 
-        // Extract user label keywords from custom flags (non-tm_*, non-standard)
-        var userLabelKeywords: [String] = []
-        for flag in info.flags {
-            if case .custom(let keyword) = flag {
-                if !UserLabelStore.isExcludedKeyword(keyword) {
-                    userLabelKeywords.append(keyword.lowercased())
-                }
-            }
-        }
+        let userLabelKeywords = Self.userLabelKeywords(info.flags)
 
         let subject = info.subject ?? (keepEmptySubject ? "" : "(no subject)")
         // `messageId` + `rfc822MessageId` go through the shared

@@ -57,6 +57,7 @@ struct IMAPCatchUpTests {
         _ name: String, serverUIDs: [Int], localUIDs: [Int],
         storedEpoch: UInt32? = IMAPCatchUpTests.epoch,
         otherMailboxes: [String: [Int]] = [:],
+        capabilities: [String] = IMAPCatchUpTests.capabilities,
         _ body: (World) async throws -> Void
     ) async throws {
         var mailboxes: [String: [FakeIMAPServer.Message]] = ["INBOX": [], path: serverUIDs.map(message)]
@@ -808,6 +809,85 @@ struct IMAPCatchUpTests {
             await Self.pass(world, context: Self.unlimited(expensive: true))
             #expect(try Self.rows(world)["2"]?.isRead == true, "after the limit the network no longer holds the folder back")
             #expect(try Self.state(world)?.lastCompletedAt != nil)
+        }
+    }
+
+    @Test("The plan for a folder its change bookmark covers: listed only first, while a listing runs, or after a lapse (ADR-IOS-111)")
+    func planTrackedFolder() {
+        let now = Date()
+        let fresh = now.addingTimeInterval(-60)
+        let stale = now.addingTimeInterval(-2 * SyncConfig.catchUpFullCheckIntervalSeconds)
+        typealias P = IMAPProvider
+        func state(_ completed: Date?, lapses: Int? = nil, listed: Int? = nil,
+                   listing: IMAPCatchUpState.Listing? = nil) -> IMAPCatchUpState {
+            var s = IMAPCatchUpState(epoch: 1, completionStamp: 5, lastCompletedAt: completed, listing: listing, createdAt: nil)
+            s.lapseCount = lapses
+            s.listedLapseCount = listed
+            return s
+        }
+        // Neither a moved MODSEQ nor the daily interval lists a tracked folder.
+        #expect(P.catchUpPlan(state: state(fresh), freshModSeq: 9, isExpensiveNetwork: false, now: now, isTracked: true) == .none)
+        #expect(P.catchUpPlan(state: state(stale), freshModSeq: 5, isExpensiveNetwork: false, now: now, isTracked: true) == .none)
+        // Its first listing still runs.
+        #expect(P.catchUpPlan(state: state(nil), freshModSeq: 5, isExpensiveNetwork: false, now: now, isTracked: true)
+                == .list(.init(firstStamp: 5, nextUid: 1)))
+        // A listing in progress continues.
+        let resuming = IMAPCatchUpState.Listing(firstStamp: 3, nextUid: 2001)
+        #expect(P.catchUpPlan(state: state(fresh, listing: resuming), freshModSeq: 5, isExpensiveNetwork: false, now: now, isTracked: true)
+                == .list(resuming))
+        // A lapse after the last completed listing lists it, recording the lapse count it covers.
+        #expect(P.catchUpPlan(state: state(fresh, lapses: 2, listed: 1), freshModSeq: 5, isExpensiveNetwork: false, now: now, isTracked: true)
+                == .list(.init(firstStamp: 5, nextUid: 1, lapseCountAtStart: 2)))
+        #expect(P.catchUpPlan(state: state(fresh, lapses: 2, listed: 2), freshModSeq: 5, isExpensiveNetwork: false, now: now, isTracked: true) == .none,
+                "a lapse already covered by a completed listing lists nothing")
+        // An untracked folder lists on a lapse too, inside the daily interval.
+        #expect(P.catchUpPlan(state: state(fresh, lapses: 1, listed: 0), freshModSeq: 5, isExpensiveNetwork: false, now: now)
+                == .list(.init(firstStamp: 5, nextUid: 1, lapseCountAtStart: 1)))
+    }
+
+    @Test("Over the arrivals limit: the bookmark drops, and the folder's catch-up applies an older flag change and expunge made meanwhile (Q12)")
+    func tooFarBehindArmsTheCatchUp() async throws {
+        let caps = FakeIMAPServer.defaultCapabilities + ["ENABLE", "CONDSTORE", "QRESYNC"]
+        try await Self.withWorld("q12-acct", serverUIDs: [1, 2, 3, 4, 5], localUIDs: [1, 2, 3, 4, 5], capabilities: caps) { world in
+            // The folder's catch-up has completed once (its state exists).
+            await Self.pass(world)
+            #expect(try Self.state(world)?.lastCompletedAt != nil, "precondition: a completed catch-up")
+
+            let local = IMAPChangeReaderTests.LocalRows()
+            local.set(world.folderId, [1, 2, 3, 4, 5])
+            func read() async throws -> FolderChanges {
+                let cursor = try await world.pool.read { db in try Folder.fetchOne(db, key: world.folderId)?.changeCursor }
+                let request = ChangeRequest(
+                    folders: [ChangeFolder(id: world.folderId, path: Self.path, role: .archive,
+                                           cursor: cursor, isSynced: true, addressEpoch: Int(Self.epoch))],
+                    scope: .all, recheck: [:], context: ChangeContext(onProgress: { _ in }), localRows: local)
+                let set = try #require(try await world.provider.fetchChanges(since: ChangeCursor(account: nil), request: request))
+                return try #require(set.folders.first)
+            }
+            func apply(_ changes: FolderChanges) throws {
+                _ = try world.pool.write { db in try SyncEngine.applyFolderChanges(changes, db: db) }
+            }
+            // The bookmark starts.
+            try apply(try await read())
+            let started = try await world.pool.read { db in try Folder.fetchOne(db, key: world.folderId)?.changeCursor }
+            #expect(started != nil)
+
+            // Another client: over 100 arrivals, a read on 2 and an expunge of 3.
+            let arrivals = Array(6...(6 + SyncConfig.imapChangeArrivalsLimit))
+            world.server.setMessages(([1, 2, 4, 5] + arrivals).map(Self.message), in: Self.path)
+            world.server.setFlags(["\\Seen"], in: Self.path, uid: 2)
+            let refused = try await read()
+            guard case .refused(.tooFarBehind) = refused.status else {
+                Issue.record("expected tooFarBehind, got \(refused.status)"); return
+            }
+            try apply(refused)
+
+            // The catch-up (its MODSEQ check left out: the stored HIGHESTMODSEQ is
+            // not refreshed here, so only the arming can list the folder).
+            await Self.pass(world)
+            let rows = try Self.rows(world)
+            #expect(rows["2"]?.isRead == true, "the older flag change is applied")
+            #expect(rows["3"] == nil, "the older expunge is applied")
         }
     }
 

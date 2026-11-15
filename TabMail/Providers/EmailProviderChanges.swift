@@ -48,15 +48,22 @@ struct ChangeFolder: Sendable, Equatable {
     /// only: the apply checks the range again inside the folder's transaction, so
     /// a stale value costs at most a wasted read.
     var heldSince: Date?
+    /// The generation of the folder's id space as the device stores it
+    /// (`Folder.lastKnownUidValidity`), nil when none is known. A reader whose ids
+    /// carry a generation starts no bookmark for a folder that holds rows under an
+    /// unknown one (IOS-EPOCH-001); the apply checks it again inside the folder's
+    /// transaction.
+    var addressEpoch: Int?
 
     init(id: String, path: String, role: FolderRole,
-         cursor: String? = nil, isSynced: Bool = false, heldSince: Date? = nil) {
+         cursor: String? = nil, isSynced: Bool = false, heldSince: Date? = nil, addressEpoch: Int? = nil) {
         self.id = id
         self.path = path
         self.role = role
         self.cursor = cursor
         self.isSynced = isSynced
         self.heldSince = heldSince
+        self.addressEpoch = addressEpoch
     }
 }
 
@@ -153,6 +160,23 @@ enum ChangeRefusal: Sendable, Equatable {
     /// The folder's reads kept failing for longer than the provider waits
     /// before it starts the folder again.
     case failingTooLong
+    /// The folder's id space was renumbered: the server now serves this
+    /// generation (an IMAP UIDVALIDITY), not the one the bookmark was read in.
+    /// Nothing read under it applies; the apply arms the folder's turnover
+    /// reaction (ADR-IOS-061) in the same transaction.
+    case addressEpochChanged(Int)
+}
+
+/// What a reader observed about a folder it cannot track (a server without
+/// change tracking, or a mailbox that keeps none): the folder's counters as the
+/// server reported them, so the engine can tell whether the folder changed and
+/// list it.
+struct UntrackedObservation: Sendable, Equatable {
+    let messageCount: Int
+    let uidNext: Int
+    let highestModSeq: Int?
+    /// Nil when the server did not report one.
+    let uidValidity: Int?
 }
 
 enum FolderChangeStatus: Sendable {
@@ -175,11 +199,14 @@ enum FolderChangeStatus: Sendable {
     case failed(any Error)
     /// The read skipped this folder.
     case notRun
+    /// The folder cannot be tracked by a bookmark: the engine lists it when the
+    /// observation says it changed. Its bookmark and coverage are cleared.
+    case untracked(UntrackedObservation)
 
     var isTrackable: Bool {
         switch self {
         case .tracked, .baselineReady: return true
-        case .baselining, .refused, .failed, .notRun: return false
+        case .baselining, .refused, .failed, .notRun, .untracked: return false
         }
     }
 
@@ -188,7 +215,7 @@ enum FolderChangeStatus: Sendable {
     var isBaseline: Bool {
         switch self {
         case .baselining, .baselineReady: return true
-        case .tracked, .refused, .failed, .notRun: return false
+        case .tracked, .refused, .failed, .notRun, .untracked: return false
         }
     }
 }
@@ -271,6 +298,16 @@ struct FolderChanges: Sendable {
     /// transaction as its records, so a crash resumes from the last applied
     /// page. Nil = keep the stored one. A refusal clears it whatever this says.
     var cursor: String?
+    /// The folder's catch-up gets one whole-folder check once the folder
+    /// becomes tracked (`SyncEngine.commitChangeBaseline`): a bookmark that
+    /// starts sees nothing older than itself (ADR-IOS-111 R35).
+    var armCatchUpOnCommit = false
+    /// Set by the engine, never by a reader: the folder bookmark the read was
+    /// issued with. A bookmark dropped between the read and the apply
+    /// (`SyncEngine.dropChangeBookmark`) is never written back. Nil = not
+    /// checked.
+    var readFrom: ReadFrom?
+    struct ReadFrom: Sendable { let cursor: String? }
 
     init(folderId: String, status: FolderChangeStatus, addressEpoch: Int? = nil,
          records: [ChangeRecord] = [], removals: [String] = [], rereadLater: [String] = [],
@@ -320,8 +357,7 @@ extension ChangeSet {
 }
 
 extension EmailProvider {
-    /// Default: no change reader. IMAP keeps its own change path until its
-    /// reader lands.
+    /// Default: no change reader (Demo and test providers).
     func fetchChanges(since cursor: ChangeCursor, request: ChangeRequest) async throws -> ChangeSet? {
         nil
     }

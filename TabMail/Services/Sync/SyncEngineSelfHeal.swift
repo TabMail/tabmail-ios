@@ -54,10 +54,13 @@ extension SyncEngine {
                 BackgroundSyncLogger.logDebug("[SelfHeal] Failed to load folders: \(error)")
                 return
             }
+            // A folder a change bookmark covers is not healed on a timer: its
+            // changes arrive exactly through the change read (ADR-IOS-111).
             syncableFolders = folders.filter { folder in
-                primaryRoles.contains(folder.role) ||
-                secondaryRoles.contains(folder.role) ||
-                folder.isFavorite
+                (primaryRoles.contains(folder.role) ||
+                 secondaryRoles.contains(folder.role) ||
+                 folder.isFavorite)
+                && !(FolderChangeState(raw: folder.changeState).tracking && folder.changeCursor != nil)
             }
         }
         BackgroundSyncLogger.logDebug("[SelfHeal] Starting for \(account.emailAddress): \(syncableFolders.count) folders")
