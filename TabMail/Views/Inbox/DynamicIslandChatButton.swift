@@ -56,15 +56,15 @@ struct DynamicIslandChat: View {
     var onSendReadyReply: (() -> Void)?
     /// The user's own words went from the field to the agent.
     var onFieldSend: ((String) -> Void)?
-    @Environment(\.hasTabMailSession) private var hasTabMailSession
+    @Environment(\.hasTabMailSession) var hasTabMailSession
     /// Reply field: the words sent to the agent, shown pulsing while it works.
-    @State private var fieldSentText: String?
+    @State var fieldSentText: String?
     /// The input's words and the reply field's state. `ChatFieldFill.apply` is the only way the words
     /// change; the ready AI Reply is shown, never written into them (`ChatFieldFill`).
     @State private var fieldFill = ChatFieldFill()
     /// The user's own words in the input (`ChatFieldFill.words`), read-only here.
-    private var inputText: String { fieldFill.words }
-    @State private var fieldPulse = false
+    var inputText: String { fieldFill.words }
+    @State var fieldPulse = false
     @State private var inputSelection: TextSelection?
     @State private var dictation = DictationController()
     /// Dictation for a user opted out of AI: Apple's recognition on this iPhone only (`PillDictationMode`).
@@ -79,7 +79,7 @@ struct DynamicIslandChat: View {
     @State private var autoStartTask: Task<Void, Never>?
     /// Send was tapped while dictating: the dictation's text is sent as soon as it lands.
     @State private var sendWhenDictated = false
-    @State private var workingStatus = ""
+    @State var workingStatus = ""
     @State private var statusQueue: [String] = []
     @State private var statusTickTask: Task<Void, Never>?
     @State private var lastStatusChangeTime: Date = .distantPast
@@ -862,7 +862,7 @@ struct DynamicIslandChat: View {
     }
 
     /// The mic: dictation into the input (backend, or on this iPhone when opted out of AI).
-    private var micButton: some View {
+    var micButton: some View {
         Button {
             // The newest gesture wins: a delayed auto-start still waiting must not start after this tap.
             autoStartTask?.cancel()
@@ -901,7 +901,7 @@ struct DynamicIslandChat: View {
     }
 
     /// The input field, with the dictation waveform over it while listening.
-    private func inputField(placeholder: String) -> some View {
+    func inputField(placeholder: String) -> some View {
         // Dictating: the field's text dims behind the waveform. Tap it to stop listening; the
         // text is appended when it comes back.
         TextField(placeholder, text: typedText, selection: $inputSelection, axis: .vertical)
@@ -924,7 +924,7 @@ struct DynamicIslandChat: View {
 
     /// Send, or Stop while the agent works, Retry after a failure, the spinner while transcribing.
     @ViewBuilder
-    private var trailingButton: some View {
+    var trailingButton: some View {
         if isWorking {
             // Stop button — handle stop entirely here (not in Task catch)
             // because URLSession throws URLError.cancelled, not CancellationError
@@ -993,84 +993,6 @@ struct DynamicIslandChat: View {
             .disabled(!canTapSend)
             .accessibilityIdentifier("chatSend")
         }
-    }
-
-    /// The chat view's reply field (`ChatReplyField`): [mic] [field] [Send] on the newest email.
-    /// The field's top line says AI Reply while it holds the ready reply; while the agent
-    /// works, the line above says what it is doing and the words pulse.
-    /// In the tutorial the field is filled in and read-only, as the inbox chat's input is.
-    @ViewBuilder
-    private func replyFieldBar(_ field: ChatReplyField) -> some View {
-        if TutorialCoordinator.shared.isRunning && !(isWorking && fieldSentText != nil) {
-            TutorialChatInputBar(
-                prompt: Self.tutorialFieldText(field),
-                isWorking: isWorking,
-                label: field.tutorialMove == .sendReadyReply ? "AI Reply" : nil,
-                send: { sendTutorialField(field) })
-            .accessibilityIdentifier("chatReplyField")
-        } else {
-            liveReplyFieldBar(field)
-        }
-    }
-
-    /// The tutorial's filled-in words in the chat's field: the ready AI Reply, or the request.
-    static func tutorialFieldText(_ field: ChatReplyField) -> String? {
-        switch field.tutorialMove {
-        case .sendReadyReply: return field.readyText
-        case .ask(let prompt): return prompt.rawValue
-        case nil: return nil
-        }
-    }
-
-    /// Send in the tutorial's field: the AI Reply goes to its compose card; the request goes to
-    /// the script, pulsing in the field as a real request does.
-    private func sendTutorialField(_ field: ChatReplyField) {
-        switch field.tutorialMove {
-        case .sendReadyReply:
-            onSendReadyReply?()
-        case .ask(let prompt):
-            fieldSentText = prompt.rawValue
-            onFieldSend?(prompt.rawValue)
-            TutorialCoordinator.shared.chatPromptSent(prompt)
-            let send = message.map { ChatFieldSend(message: $0, onlyTo: field.onlyTo, isNoReply: field.isNoReply) }
-            sendAgentChat(prompt.rawValue, script: prompt, field: send)
-        case nil:
-            break
-        }
-    }
-
-    private func liveReplyFieldBar(_ field: ChatReplyField) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            if isWorking, fieldSentText != nil {
-                Text(workingStatus.isEmpty ? "Thinking..." : workingStatus)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity)
-                    .transition(.opacity)
-            }
-            HStack(spacing: 10) {
-                micButton
-                VStack(alignment: .leading, spacing: 2) {
-                    if holdsReadyReply {
-                        Text("AI Reply")
-                            .font(.caption2)
-                            .fontWeight(.semibold)
-                            .foregroundStyle(.secondary)
-                    }
-                    if isWorking, let sent = fieldSentText {
-                        Text(sent)
-                            .lineLimit(1...6)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .opacity(fieldPulse ? ChatViewLayout.fieldPulseOpacity : 1)
-                    } else {
-                        inputField(placeholder: hasTabMailSession ? field.placeholder : "Sign in to reply or ask")
-                    }
-                }
-                trailingButton
-            }
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
     }
 
     private var signInBar: some View {
@@ -1675,7 +1597,7 @@ struct DynamicIslandChat: View {
 
     /// What the input shows: the user's words, or the ready AI Reply while there are none
     /// (`ChatFieldFill.shown`).
-    private var fieldText: String {
+    var fieldText: String {
         fieldFill.shown(ready: replyField?.readyText, busy: isDictating || isWorking, email: fieldEmail)
     }
 
@@ -1687,11 +1609,6 @@ struct DynamicIslandChat: View {
     /// A dictation is recording, transcribing, or starting: its words are coming to the field.
     private var isDictating: Bool {
         dictation.isActive || speech.isRecording || speech.isStarting
-    }
-
-    /// The field shows the ready AI Reply, untouched (its top line says AI Reply).
-    private var holdsReadyReply: Bool {
-        inputText.isEmpty && !fieldText.isEmpty
     }
 
     // MARK: - Compose inline edit
@@ -2398,7 +2315,7 @@ struct DynamicIslandChat: View {
     /// `script`: a guided-tutorial prompt, answered by `TutorialChatScript`
     /// on the device instead of the AI.
     /// `field`: the reply field's send as it started; nil for a send from the panel.
-    private func sendAgentChat(_ text: String, script: TutorialCoordinator.ChatPrompt? = nil, field: ChatFieldSend? = nil) {
+    func sendAgentChat(_ text: String, script: TutorialCoordinator.ChatPrompt? = nil, field: ChatFieldSend? = nil) {
         // If on the "new session" page in multi-session mode, start a fresh session
         if hasSessionHistory, activeSessionIndex < loadedSessions.count,
            loadedSessions[activeSessionIndex].id == "__new__" {

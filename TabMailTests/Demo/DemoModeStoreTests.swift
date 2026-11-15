@@ -302,7 +302,7 @@ struct DemoAuthConstantsTests {
     /// admission and bring an ended demo's turn back (#231).
     @Test func eachChatWriteCarriesTheAdmissionCapturedWithItsSessionId() throws {
         let source = try pillSource()
-        for method in ["private func sendComposeEdit(", "private func sendAgentChat(", "private func resumeAgentChat("] {
+        for method in ["private func sendComposeEdit(", "func sendAgentChat(", "private func resumeAgentChat("] {
             let start = try #require(source.range(of: method), "\(method)")
             let rest = source[start.upperBound...]
             // The statement on its own line, not an `if let sid = currentSessionId` test.

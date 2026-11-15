@@ -410,7 +410,7 @@ struct ChatReplyFieldTests {
         #expect(Self.count("message.map(ChatThread.copyKey)", in: text) == 1)
         #expect(Self.count("dictation.isActive || speech.isRecording || speech.isStarting", in: text) == 1)
         // ONE API: the view only reads the words; every change is a `fieldFill.apply`.
-        #expect(Self.count("private var inputText: String { fieldFill.words }", in: text) == 1)
+        #expect(Self.count("var inputText: String { fieldFill.words }", in: text) == 1)
         #expect(Self.count("var inputText", in: text) == 1)
         #expect(Self.count("fieldFill.", in: text)
                 == Self.count("fieldFill.apply(", in: text) + Self.count("fieldFill.shown(", in: text) + Self.count("fieldFill.words", in: text),

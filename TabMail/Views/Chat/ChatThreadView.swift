@@ -5,65 +5,6 @@
 import GRDB
 import SwiftUI
 
-/// Opens a message from any open path (a folder, search, a notification, a reminder, an email
-/// reference): a draft in the draft editor, as from Drafts (the chat leaves drafts out);
-/// anything else as a chat when the chat view is on, else in today's detail. The chat view
-/// setting is snapshotted once per open, so a Settings change applies to the next open.
-struct MessageOpenView: View {
-    let messageId: String
-    var expectedRfc822MessageId: String?
-    var opensWithSkeletonDwell = false
-    /// Opened from search or a notification: the chat scrolls to this email and its bubble
-    /// glows briefly.
-    var highlightsMessage = false
-    @State private var opensInChat = ChatViewConfig.opensInChat
-
-    /// Where an open goes.
-    enum Route: Equatable {
-        /// A message in a Drafts folder: the draft editor (`DraftComposePresenter`).
-        case draftEditor(MessageHeader)
-        case chat
-        case detail
-    }
-
-    /// The open's route: a Drafts-folder message goes to the draft editor whatever the chat view
-    /// setting; anything else, a message not found included, to the chat or today's detail. One
-    /// read transaction, so the header and its folder agree. A search result carries the
-    /// Message-ID it found (`expectedRfc822MessageId`): a header that no longer has it is not the
-    /// draft searched for, so it goes to the chat or the detail, which refuse a replaced message.
-    nonisolated static func route(
-        messageId: String, expectedRfc822MessageId: String? = nil, opensInChat: Bool, pool: PrioritizedDatabase
-    ) -> Route {
-        let expected = ExpectedMessageIdentity(capturedRfc822MessageId: expectedRfc822MessageId)
-        let draft: MessageHeader? = try? pool.read { db in
-            guard let header = try MessageHeader.fetchOne(db, key: messageId),
-                  expected?.matches(header) ?? true,
-                  try Folder.fetchOne(db, key: header.folderId)?.role == .drafts else { return nil }
-            return header
-        }
-        if let draft { return .draftEditor(draft) }
-        return opensInChat ? .chat : .detail
-    }
-
-    var body: some View {
-        switch Self.route(messageId: messageId, expectedRfc822MessageId: expectedRfc822MessageId,
-                          opensInChat: opensInChat, pool: AppDatabase.dbPool) {
-        case .draftEditor(let header):
-            DraftComposePresenter(source: .header(header))
-        case .chat:
-            ChatThreadView(
-                messageId: messageId,
-                expectedRfc822MessageId: expectedRfc822MessageId,
-                highlightsOpenedMessage: highlightsMessage)
-        case .detail:
-            MessageDetailView(
-                messageId: messageId,
-                opensWithSkeletonDwell: opensWithSkeletonDwell,
-                expectedRfc822MessageId: expectedRfc822MessageId)
-        }
-    }
-}
-
 extension ChatViewConfig {
     /// Whether an open goes to the chat now. Demo mode with AI declined counts as AI off. A
     /// tutorial run follows what it teaches, decided when it started (`teachesChat`).
@@ -800,61 +741,6 @@ struct ChatThreadView: View {
                 replyTo: req.replyTo, suggestedBody: req.body, isForward: true,
                 prefillTo: req.to, prefillCc: req.cc, prefillBcc: req.bcc, onAgentOutcome: onOutcome)
         }
-    }
-}
-
-/// The chat's header: who the reply goes to, the subject, the thread's labels.
-struct ChatHeaderView: View {
-    let thread: ChatThread
-    let subject: String
-    let labels: [UserLabel]
-    /// Tapping the names changes who gets the reply.
-    var onTapNames: (() -> Void)? = nil
-
-    var body: some View {
-        VStack(spacing: 4) {
-            HStack(spacing: -8) {
-                ForEach(Array(thread.replyPeople.prefix(ChatViewLayout.headerNameCount + 1).enumerated()), id: \.offset) { _, person in
-                    ChatAvatar(person: person, size: ChatViewLayout.headerAvatarSize)
-                        .overlay(Circle().stroke(Palette.previewPaneBg, lineWidth: 2))
-                }
-            }
-            if !thread.replyPeople.isEmpty {
-                Button { onTapNames?() } label: {
-                    HStack(spacing: 2) {
-                        Text(ChatThread.headerTitle(thread.replyPeople))
-                            .font(.subheadline)
-                            .fontWeight(.semibold)
-                            .foregroundStyle(Theme.textPrimary)
-                            .lineLimit(1)
-                        Image(systemName: "chevron.right")
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(Theme.textSecondary)
-                    }
-                }
-                .buttonStyle(.plain)
-                .disabled(onTapNames == nil)
-                .accessibilityHint("Changes who gets your reply")
-            }
-            Text(subject)
-                .font(.caption)
-                .foregroundStyle(Theme.textSecondary)
-                .lineLimit(1)
-            if !labels.isEmpty {
-                HStack(spacing: 4) {
-                    ForEach(UserLabelDisplaySegment.expand(labels)) { segment in
-                        UserLabelChip(name: segment.displayName)
-                    }
-                }
-                .frame(maxWidth: .infinity)
-                .clipped()
-            }
-        }
-        .padding(.horizontal)
-        .padding(.bottom, 8)
-        .frame(maxWidth: .infinity)
-        .background(.bar)
-        .accessibilityElement(children: .contain)
     }
 }
 

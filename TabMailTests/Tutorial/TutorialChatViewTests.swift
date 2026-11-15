@@ -541,10 +541,11 @@ struct TutorialChatViewWiringTests {
 
     @Test("The field's Send: the AI Reply opens compose, the request goes to the scripted agent")
     func fieldSendWiring() throws {
+        let field = try Self.source("TabMail/Views/Inbox/DynamicIslandChat+ReplyField.swift")
+        #expect(Self.count("TutorialChatInputBar( prompt: Self.tutorialFieldText(field), isWorking: isWorking, label: field.tutorialMove == .sendReadyReply ? \"AI Reply\" : nil, send: { sendTutorialField(field) })", in: field) == 1)
+        #expect(Self.count("case .sendReadyReply: onSendReadyReply?()", in: field) == 1)
+        #expect(Self.count("TutorialCoordinator.shared.chatPromptSent(prompt) let send = message.map { ChatFieldSend(message: $0, onlyTo: field.onlyTo, isNoReply: field.isNoReply) } sendAgentChat(prompt.rawValue, script: prompt, field: send)", in: field) == 1)
         let pill = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
-        #expect(Self.count("TutorialChatInputBar( prompt: Self.tutorialFieldText(field), isWorking: isWorking, label: field.tutorialMove == .sendReadyReply ? \"AI Reply\" : nil, send: { sendTutorialField(field) })", in: pill) == 1)
-        #expect(Self.count("case .sendReadyReply: onSendReadyReply?()", in: pill) == 1)
-        #expect(Self.count("TutorialCoordinator.shared.chatPromptSent(prompt) let send = message.map { ChatFieldSend(message: $0, onlyTo: field.onlyTo, isNoReply: field.isNoReply) } sendAgentChat(prompt.rawValue, script: prompt, field: send)", in: pill) == 1)
         #expect(Self.count("if let status = script?.workingStatus { enqueueStatus(status) }", in: pill) == 1, "Saving template shows while it works")
         #expect(Self.count("if (isInboxChat || replyField != nil) && TutorialCoordinator.shared.highlightsChatClose {", in: pill) == 1,
                 "the chat's sheet rings its close as the inbox chat's does")
