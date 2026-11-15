@@ -4,8 +4,8 @@ order	status	source_lines	sha256	path	title
 2	active	45-64	eea280c33ba0bd6009fca0353a2374e53b8a8a0f505a6584d7e9e0f4fdfe02c1	Companion/Decisions/Active/adr-ios-002.md	ADR-IOS-002: User Activity Prioritization
 3	active	65-83	f1be2d5a693d08ecfea4cb2cfbd46c59eab2aeadd776a8f1c26f79edb330c212	Companion/Decisions/Active/adr-ios-003.md	ADR-IOS-003: Pending Operation Queue for Crash Recovery
 4	superseded	84-95	283add9ea8b6cc7d5834ec47dbf9bfad372bc31a905865391c78dfacd4f9a151	Companion/Decisions/Superseded/adr-ios-004.md	ADR-IOS-004: ~~First Compute Wins for Cross-Instance Action Tags~~ (SUPERSEDED by ADR-IOS-036)
-5	active	96-118	e723dfde810996a82c74b99447f8914876c86ee63399fc328f77da1c7b95754d	Companion/Decisions/Active/adr-ios-005.md	ADR-IOS-005: Progressive Background Backfill
-6	active	119-147	39e38245b2a782c57f47e7fc58bb54e0fc02c08620f1e2916e837a8ca31077b3	Companion/Decisions/Active/adr-ios-006.md	ADR-IOS-006: Storage-Budget Retention with Progressive Crawling
+5	active	96-118	f3a8b7e6875183871d5ce93adde0f3031854f8acb72507f7c69340cbf5e50c4a	Companion/Decisions/Active/adr-ios-005.md	ADR-IOS-005: Progressive Background Backfill
+6	active	119-147	16dd7c20260933d794f1d883ab00a11f007c7b03243aefac43e7a148f351214a	Companion/Decisions/Active/adr-ios-006.md	ADR-IOS-006: Storage-Budget Retention with Progressive Crawling
 7	active	148-177	0d0d50f26cda9aa429610e2337e0abd66e7ea0ddc6cf1ecbd341c9541a53955a	Companion/Decisions/Active/adr-ios-007.md	ADR-IOS-007: Hybrid FTS5 + Vector Search (Local)
 8	active	178-207	38e3f3dee78e9efaa60a5683a9b3f0e72785d4164506c0b76d983b52e16e5ccc	Companion/Decisions/Active/adr-ios-008.md	ADR-IOS-008: AI Processing Must Replicate TB Addon Architecture
 9	active	208-233	7213e0f9e642b70bdfbc7756381a0cad4e3cc3230f7ac6315c73c1f3b2630763	Companion/Decisions/Active/adr-ios-009.md	ADR-IOS-009: Two-Tier Delta + Full Sync
@@ -37,7 +37,7 @@ order	status	source_lines	sha256	path	title
 35	active	1016-1063	67f3ca058ff9204c02fe0e1c20d418c2c502c70b958232b9ddc7f116adddb141	Companion/Decisions/Active/adr-ios-034.md	ADR-IOS-034: Memory Index Moves to Per-Turn Granularity (Supersedes v2 Session-Document Model)
 36	active	1064-1119	11d26eb846e2e96a27e8d66afa0a782bb31ff06bec8b73e95f47fc204dfb2cac	Companion/Decisions/Active/adr-ios-036.md	ADR-IOS-036: Action Tags Are Local-Only (Supersedes ADR-IOS-004)
 37	active	1120-1161	a84441a5f2dfbebcbb076019b634adf27b6f9f8a430bf2d245be5add03bc6ecf	Companion/Decisions/Active/adr-ios-037.md	ADR-IOS-037: NSE/Main-App AI Ownership Lease (Cross-Process Coordination)
-38	active	1162-1383	95d6e6ade0f80b5499ee4174a34f707508435e2c274a2895d57b64a20b88b2f4	Companion/Decisions/Active/adr-ios-038.md	ADR-IOS-038: Demo Mode — Custom JWT + Local Mock Provider + Pre-Baked AI Cache
+38	active	1162-1383	55cb0e1642afe555844149a441079fa49d785267b3f5d393c8f98645158f6a0d	Companion/Decisions/Active/adr-ios-038.md	ADR-IOS-038: Demo Mode — Custom JWT + Local Mock Provider + Pre-Baked AI Cache
 39	active	1384-1498	1165249945f5a6cd1334b4e2fd823926af7ba928fe00b94de3330d270e0bef39	Companion/Decisions/Active/adr-ios-039.md	ADR-IOS-039: Idempotent HTML Render Fit + Scroll-Phase Height Freeze
 40	active	1499-1550	14ec5e69cd1af3299e6ace6e6f1f7baf91ddd59a75aa5c6059b1331a6084848b	Companion/Decisions/Active/adr-ios-040.md	ADR-IOS-040: Zero (BYOK) Plan in the IAP Plan Picker — Three-Tier, Display-Only Naming
 41	active	1551-1582	cb9f358b678b0a62fb8510b4fab42ac929b6d461bbf4645e2a6b8a78ec023429	Companion/Decisions/Active/adr-ios-041.md	ADR-IOS-041: GRDB Database Suspension — 0xdead10cc Defense
@@ -49,7 +49,7 @@ order	status	source_lines	sha256	path	title
 47	active	1711-1740	88f511c30c1ac867e022b47667bf93d3f4fb0a40843a6fc6e017fc77c0cffc54	Companion/Decisions/Active/adr-ios-047.md	ADR-IOS-047: Two-Phase NSE Merge — Header+Snippet Visibility Is Decoupled From the Body-Blob Write
 48	active	1741-1786	4693be00457f130b42927935f3d2d750337387d309557390076931a4b685dea5	Companion/Decisions/Active/adr-ios-049.md	ADR-IOS-049: Instant Inbox Insert — Render NSE-Staged Mail In-Memory, Before the Durable Merge Write
 49	active	1787-1812	fa3c8a3c2788c43ee01e85004d520c50d7bcb820df1a59d201890b683ca17306	Companion/Decisions/Active/adr-ios-050.md	ADR-IOS-050: `bodyComplete` Is the FTS-Indexed Truth — Display-Cache Eviction Never Touches It
-50	active	1813-1838	655f1905e5207b415c2f19cea3d0c14a1e895b000e36b154d61e8b90ce986aa4	Companion/Decisions/Active/adr-ios-051.md	ADR-IOS-051: Evidence-Triggered IMAP External-Deletion Reconcile (VANISHED + Count-Mismatch UID Walk)
+50	active	1813-1838	9fe8fae85eb474ce38079aee92dfac8d052b02e9b23ee6d35c890e6778f86103	Companion/Decisions/Active/adr-ios-051.md	ADR-IOS-051: Evidence-Triggered IMAP External-Deletion Reconcile (VANISHED + Count-Mismatch UID Walk)
 51	active	1839-1863	877b156303ebb0375b3e0275e6fcc79bfb6c6604561777a913a9c242b8f03b2c	Companion/Decisions/Active/adr-ios-052.md	ADR-IOS-052: Presentation-Time ICS Sanitizer for Incoming Invites
 52	active	1864-1889	7597e0e39f91a93847674d131e88a43f7b89aec6f0d8bbca0bb2668e38bfe747	Companion/Decisions/Active/adr-ios-053.md	ADR-IOS-053: Owned, Level-Triggered Delivery for FSM Tool UI Requests (Supersedes the delivery mechanism of ADR-IOS-024 and ADR-IOS-030)
 53	active	1890-1908	ac593fa99851394ba1a2c8906c361d9b9a516401255664c64a33d74ac520bf0f	Companion/Decisions/Active/adr-ios-054.md	ADR-IOS-054: Programmatic Message Opens Use a Real `navigationDestination(item:)` Push — Never the Inbox `List(selection:)` Binding

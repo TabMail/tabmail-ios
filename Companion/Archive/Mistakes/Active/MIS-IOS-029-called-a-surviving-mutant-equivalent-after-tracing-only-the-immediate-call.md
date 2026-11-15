@@ -45,7 +45,7 @@ its 12,000 B budget). The index keeps a shortened line; this is the line it repl
 <!-- BEGIN VERBATIM INDEX LINE MIS-IOS-029 2026-11-09 -->
 
 ```text
-- **MIS-IOS-029** — declared a surviving mutant "equivalent" after tracing only the state at the call, then deleted the guard; a queued prompt-store write across a demo start/end was refused. A survivor is a missing test until one fails on it; argue over every state an operation can wait through ([detail](Companion/Mistakes/Active/MIS-IOS-029-called-a-surviving-mutant-equivalent-after-tracing-only-the-immediate-call.md)).
+- **MIS-IOS-029** — declared a surviving mutant "equivalent" after tracing only the state at the call, then deleted the guard; a queued prompt-store write across a demo start/end was refused. A survivor is a missing test until one fails on it; argue over every state an operation can wait through ([detail](Companion/Archive/Mistakes/Active/MIS-IOS-029-called-a-surviving-mutant-equivalent-after-tracing-only-the-immediate-call.md)).
 ```
 
 <!-- END VERBATIM INDEX LINE MIS-IOS-029 2026-11-09 -->

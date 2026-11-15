@@ -94,7 +94,7 @@ so its index-relative link is not re-resolved from this directory, because the i
 accumulated recurrence detail that exists nowhere else in this file.
 
 ```text
-- **[MIS-IOS-014](Companion/Mistakes/Active/MIS-IOS-014-wrote-a-red-first-proof-that-could-not-run-red.md)** — wrote a red-first proof that **could not run red**: fixtures SIZED from an in-situ measurement (`count: budget - 4`) asked for a NEGATIVE length once the inverted code bisected to 0, and `String(repeating:count:)` **TRAPS** — uncatchable, host died, `xcodebuild` relaunched 5x and buried 101 real `✘`. Rule-9 class with **no bracket in the line**, and invisible in every GREEN run. *Tell: "nothing is hardcoded, every constant is measured in situ" — a derived length depends on the code under test.* **`guard` the measurement before building anything sized from it; `Fatal error` in the log or >1 `Test run with` line = not evidence.** (×1)
+- **[MIS-IOS-014](Companion/Archive/Mistakes/Active/MIS-IOS-014-wrote-a-red-first-proof-that-could-not-run-red.md)** — wrote a red-first proof that **could not run red**: fixtures SIZED from an in-situ measurement (`count: budget - 4`) asked for a NEGATIVE length once the inverted code bisected to 0, and `String(repeating:count:)` **TRAPS** — uncatchable, host died, `xcodebuild` relaunched 5x and buried 101 real `✘`. Rule-9 class with **no bracket in the line**, and invisible in every GREEN run. *Tell: "nothing is hardcoded, every constant is measured in situ" — a derived length depends on the code under test.* **`guard` the measurement before building anything sized from it; `Fatal error` in the log or >1 `Test run with` line = not evidence.** (×1)
 ```
 
 ---
@@ -107,7 +107,7 @@ block so its index-relative link is not re-resolved from this directory, because
 line had accumulated recurrence detail that exists nowhere else in this file.
 
 ```text
-- **[MIS-IOS-014](Companion/Mistakes/Active/MIS-IOS-014-wrote-a-red-first-proof-that-could-not-run-red.md)** — wrote a red-first proof that **could not run red**: fixtures SIZED from an in-situ measurement (`count: budget - 4`) asked for a NEGATIVE length once the inverted code bisected to 0, and `String(repeating:count:)` **TRAPS** — the host died, `xcodebuild` relaunched 5× and buried 101 real `✘`. Invisible in every GREEN run. *Tell: "nothing is hardcoded, every constant is measured in situ" — a derived length depends on the code under test.* **`guard` the measurement first; `Fatal error` in the log or >1 `Test run with` line = not evidence.** (×1)
+- **[MIS-IOS-014](Companion/Archive/Mistakes/Active/MIS-IOS-014-wrote-a-red-first-proof-that-could-not-run-red.md)** — wrote a red-first proof that **could not run red**: fixtures SIZED from an in-situ measurement (`count: budget - 4`) asked for a NEGATIVE length once the inverted code bisected to 0, and `String(repeating:count:)` **TRAPS** — the host died, `xcodebuild` relaunched 5× and buried 101 real `✘`. Invisible in every GREEN run. *Tell: "nothing is hardcoded, every constant is measured in situ" — a derived length depends on the code under test.* **`guard` the measurement first; `Fatal error` in the log or >1 `Test run with` line = not evidence.** (×1)
 ```
 
 ---
@@ -120,5 +120,5 @@ block so its index-relative link is not re-resolved from this directory, because
 line had accumulated recurrence detail that exists nowhere else in this file.
 
 ```text
-- **[MIS-IOS-014](Companion/Mistakes/Active/MIS-IOS-014-wrote-a-red-first-proof-that-could-not-run-red.md)** — wrote a red-first proof that **could not run red**: fixtures SIZED in situ (`count: budget - 4`) asked for a NEGATIVE length once the inverted code bisected to 0, and `String(repeating:count:)` **TRAPS** — the host died and buried 101 real `✘`. *Tell: "every constant is measured in situ".* **`Fatal error`, or >1 `Test run with` line, = not evidence.** (×1)
+- **[MIS-IOS-014](Companion/Archive/Mistakes/Active/MIS-IOS-014-wrote-a-red-first-proof-that-could-not-run-red.md)** — wrote a red-first proof that **could not run red**: fixtures SIZED in situ (`count: budget - 4`) asked for a NEGATIVE length once the inverted code bisected to 0, and `String(repeating:count:)` **TRAPS** — the host died and buried 101 real `✘`. *Tell: "every constant is measured in situ".* **`Fatal error`, or >1 `Test run with` line, = not evidence.** (×1)
 ```
