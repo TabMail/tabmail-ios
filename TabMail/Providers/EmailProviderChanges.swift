@@ -40,7 +40,9 @@ struct ChangeFolder: Sendable, Equatable {
     /// `FolderChanges.cursor`, in that folder's transaction.
     var cursor: String?
     /// The folder is in the full sync's syncable set
-    /// (`SyncEngine.syncableFoldersInOrder`): a per-folder reader reads only these.
+    /// (`SyncEngine.syncableFoldersInOrder`): a per-folder reader reads changes
+    /// only for these. A folder's re-read list (`ChangeRequest.recheck`) is read
+    /// whatever this says.
     var isSynced: Bool
     /// The start of the folder's held range (`Folder.oldestSyncedDate`). A hint
     /// only: the apply checks the range again inside the folder's transaction, so
@@ -97,8 +99,11 @@ struct ChangeRequest: Sendable {
     let folders: [ChangeFolder]
     let scope: ChangeScope
     /// Folder id -> message ids a change was declined for under the user's own
-    /// action on an earlier pass. The reader reads their current state again and
-    /// reports them as ordinary records or removals.
+    /// action on an earlier pass, or that an action retired at the release
+    /// boundary named. The reader reads their current state again and reports
+    /// them as ordinary records or removals, for every listed folder (synced or
+    /// not; a per-folder reader on a `.all` pass), and the apply takes such a
+    /// record whatever the folder's held range.
     let recheck: [String: [String]]
     let context: ChangeContext
     /// Which messages a folder holds: ids and the two flags, never content

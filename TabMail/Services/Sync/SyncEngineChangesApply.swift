@@ -30,7 +30,10 @@ import GRDB
 // - a record from a baseline (`FolderChangeStatus.isBaseline`: the folder's
 //   messages as they are, not changes) inserts only a message dated within the
 //   folder's held range (`Folder.oldestSyncedDate`); with no held range yet it
-//   inserts nothing, and mail older than the range is the backfill's;
+//   inserts nothing, and mail older than the range is the backfill's. A record
+//   that answers an id on the folder's own re-read list is not a listing but the
+//   server's answer about that one message, and applies whatever the range
+//   (ADR-IOS-111, amendment 2026-11-14 "an explicit re-read answer");
 // - every change kept back is put on the folder's re-read list
 //   (`FolderChangeState.recheck`), read again on later passes (in turn, within
 //   `SyncConfig.changeRereadBudgetPerPass`) until a record carrying its read
@@ -38,7 +41,10 @@ import GRDB
 //   applies what it carries and settles nothing, and the reader reads a listed
 //   message in full), and so is every message the provider could not read
 //   (`rereadLater`).
-//   Over `SyncConfig.changeRecheckLimit` ids, the folder's catch-up is armed;
+//   Over `SyncConfig.changeRecheckLimit` ids, a folder the catch-up checks
+//   (`SyncEngine.isSyncable`) keeps its first ids and its catch-up is armed; a
+//   folder the catch-up never checks keeps every id, since nothing else would
+//   repair a dropped one (each pass still reads at most the per-pass budget);
 // - the folder's own bookmark (`Folder.changeCursor`) is written in the same
 //   transaction. A refused one is cleared with the folder's coverage, a lapse
 //   mark for its catch-up and the account's full sync made due; a folder whose
@@ -87,9 +93,13 @@ extension SyncEngine {
             }
         }
 
+        // The folder's re-read list as stored, read inside this transaction: a
+        // record for one of its ids answers it.
+        let listed = Set(FolderChangeState(raw: folder.changeState).recheck)
         for record in changes.records {
             let applied = try applyChangeRecord(
-                record, folder: folder, addressEpoch: changes.addressEpoch, fromBaseline: changes.status.isBaseline,
+                record, folder: folder, addressEpoch: changes.addressEpoch,
+                heldRangeApplies: changes.status.isBaseline && !listed.contains(record.messageId),
                 snapshot: snapshot, recentlyCompleted: recentlyCompleted, result: &result, db: db)
             if !applied {
                 declined.insert(record.messageId)
@@ -112,7 +122,10 @@ extension SyncEngine {
         var recheck = state.recheck.filter { !declined.contains($0) && !settled.contains($0) }
         recheck += state.recheck.filter { declined.contains($0) }
         for id in declined.sorted() where !recheck.contains(id) { recheck.append(id) }
-        if recheck.count > SyncConfig.changeRecheckLimit {
+        // Ids are dropped only where the catch-up will find them: arming it does
+        // nothing for a folder it never checks, so that folder keeps them all.
+        if recheck.count > SyncConfig.changeRecheckLimit,
+           Self.isSyncable(role: folder.role, isFavorite: folder.isFavorite) {
             recheck = Array(recheck.prefix(SyncConfig.changeRecheckLimit))
             try markCatchUpLapse(folderId: folder.id, db: db)
             result.armedCatchUp = true
@@ -165,7 +178,7 @@ extension SyncEngine {
 
     /// One record in one folder. Returns false when a shield kept the change back.
     private nonisolated static func applyChangeRecord(
-        _ record: ChangeRecord, folder: Folder, addressEpoch: Int?, fromBaseline: Bool,
+        _ record: ChangeRecord, folder: Folder, addressEpoch: Int?, heldRangeApplies: Bool,
         snapshot: PendingOperationSnapshot, recentlyCompleted: [String: Date],
         result: inout FolderChangeApplyResult, db: Database
     ) throws -> Bool {
@@ -181,8 +194,10 @@ extension SyncEngine {
         guard let info = record.header else { return true }
         // A baseline lists the folder as it is: a message older than the held
         // range, or any message before the folder has one, is not inserted (the
-        // window listing sets the range, the backfill takes older mail).
-        if fromBaseline {
+        // window listing sets the range, the backfill takes older mail). Not for
+        // a record answering a listed id: that message's place is put back
+        // wherever its date falls (`heldRangeApplies` is false for it).
+        if heldRangeApplies {
             guard let heldSince = folder.oldestSyncedDate, info.providerOrderDate >= heldSince else { return true }
         }
         // A record without the read state or the flag would store a default for

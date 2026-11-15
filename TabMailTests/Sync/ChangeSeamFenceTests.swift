@@ -39,6 +39,18 @@ struct ChangeSeamFenceTests {
         }
     }
 
+    @Test("the release boundary's re-read of retired actions names no concrete provider and tests no account provider (#876)")
+    func retiredActionRecheckIsProviderBlind() throws {
+        let source = try Self.file(try Self.sources(), "TabMail/Services/Sync/SyncEngineRetiredActionRecheck.swift")
+        for term in [
+            "GmailProvider", "ExchangeProvider", "IMAPProvider", "DemoProvider",
+            ".provider ==", ".provider !=", "provider as?", "provider as!", "case .gmail", "case .outlook", "case .imap",
+            "SELECT provider", "provider FROM",
+        ] {
+            #expect(!source.contains(term), "the boundary's re-read names \(term)")
+        }
+    }
+
     @Test("the change readers only read: no database in a reader file")
     func readersOnlyRead() throws {
         let files = try Self.sources().filter { $0.relativePath.hasSuffix("ProviderChanges.swift") }

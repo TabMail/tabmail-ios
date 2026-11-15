@@ -26,11 +26,16 @@
 the same transaction; see "Draft saves re-queued" below. The 2026-09-06 draft acceptance is kept as
 history.
 
+**AMENDED 2026-11-14 (owner ruling, GitHub #876):** the boundary now puts the retired actions' message
+ids on the re-read lists of a change-tracked account's folders (or arms the catch-up); see "Retired
+actions read again" below. The "full sync restores the server's state" sentence is kept as history.
+
 ## Subsystem and search terms
 
 Action queue; `pendingOperation`; app upgrade; app version; release boundary; `appReleaseStamp`;
 `retirePreviousReleaseActionQueue`; `currentAppRelease`; migration `v89`; blanket purge; lifecycle
-carve-out; full sync due; `lastFullSyncAt`
+carve-out; full sync due; `lastFullSyncAt`; re-read list; recheck; `recheckRetiredActions`; tracked folder;
+catch-up armed; undecodable row; #876
 
 ## Full detail
 
@@ -104,3 +109,122 @@ account and no owning `outboxMessage`. It reads `Draft` state, never the retired
 still decodes nothing it deletes. A pushed draft is not re-sent; every other action is still retired
 and keeps the accepted cost above. Tests: `AppReleaseBoundaryTests.boundaryReQueuesOnlyUnsentDrafts`,
 `NeverDropExitClosureTests.anAppUpdateReQueuesAnUnsentDraftSave` (IntentionLedger, FakeIMAPServer).
+
+**Retired actions read again, 2026-11-14 (owner ruling, GitHub #876).** The "Accepted cost" paragraph
+above says the full sync the boundary schedules restores the server's state for any optimistic local
+change a retired operation would have carried. That stopped being true for folders the change reader
+tracks: a tracked folder gets no window listing (ADR-IOS-111 decision 4), so a message archived just
+before an update stayed in the Archive locally while the server still had it in the Inbox. It first
+applies at the update after the one that introduced tracking (no folder is tracked before its first
+listing). In the same transaction, BEFORE the delete, `SyncEngine.recheckRetiredActions`
+(`TabMail/Services/Sync/SyncEngineRetiredActionRecheck.swift`) now reads each retired row's RAW
+columns only (account, folder path(s), kind, message ids; no model decode, so nothing it reads can
+throw and stop `AppDatabase.init`), and for every account that holds a change bookmark
+(`Account.lastHistoryId`):
+- a move (archive, delete, move) or a read/flag change (read, unread, flag, unflag): its ids go on the
+  re-read list (`Folder.changeState.recheck`) of the folder it was queued on and, for a move, of its
+  destination too, whatever that folder's tracking or synced state. Every reader reads every listed
+  folder's list (ADR-IOS-111, amendment 2026-11-14 "every listed folder is read; an explicit re-read
+  answer applies whatever the window"): Gmail reads all lists and answers every folder by the
+  message's labels; Outlook reads a synced folder's list after its delta, also during its baseline,
+  and on a `.all` pass reads the list of a folder outside the synced set (a custom, non-favourite
+  folder) on its own, by id, with no bookmark or coverage change. The apply takes a record that
+  answers a listed id whatever the folder's held range, also during a baseline. So an older message
+  (outside every listing window) gets its server state back in every folder the action named: its read
+  state and flag, and its place (the optimistic row in the destination is removed, the message comes
+  back to the source). The full sync's window listing would not do it: its stale sweep is
+  date-bounded on Gmail and Outlook, and it never lists a folder outside the synced set;
+  *Superseded (same day, twice):* (1) "but ONLY of a folder whose change state is tracked. An untracked
+  folder gets nothing: the full sync window-lists every untracked syncable folder, and a folder
+  outside the syncable set (an Outlook custom, non-favourite folder) is listed when it is opened. An id
+  put on such a folder's list would never be read by a per-folder reader, would stick, and would take
+  part of every pass's re-read budget for good"; (2) the text that replaced it:
+  > - a move (archive, delete, move) or a read/flag change (read, unread, flag, unflag): its ids go on the
+  >   re-read list (`Folder.changeState.recheck`) of the folder it was queued on and, for a move, of its
+  >   destination too (Outlook re-reads folder by folder; Gmail places a re-read message by its labels in
+  >   every folder), but ONLY of a folder the change reader reads: one in the syncable set
+  >   (`SyncEngine.isSyncable`, main roles and favourites, the folders `ChangeFolder.isSynced` marks),
+  >   tracked or not. Outlook reads every synced folder's list, also while that folder is still in its
+  >   baseline; Gmail reads every list. An untracked syncable folder is NOT left to the full sync: on Gmail
+  >   and Outlook its window listing's stale sweep is date-bounded, so an older message's optimistic row
+  >   would survive it (an old message archived just before the update would show in both the Inbox and
+  >   the Archive until the Archive's catch-up ran). A folder outside the syncable set (a custom,
+  >   non-favourite folder) gets nothing: a per-folder reader never reads its list, so an id there would
+  >   stick and take part of every pass's re-read budget for good. Such a folder is corrected when it is
+  >   opened, within that listing's window only; an older message's optimistic row there stays until the
+  >   user acts on it (accepted, below);
+  Both were wrong in part: an id there would stick only on Outlook (Gmail reads every list), and an
+  Outlook folder whose read is a baseline gated a re-read answer by its held range, so an older message
+  moved out of it never came back. Neither gap is accepted any more; both are corrected as above;
+- a draft delete arms its folder's catch-up (`markCatchUpLapse`, folder found by the recorded path),
+  which loads the server draft back so the delete can be redone; its address is a draft resource
+  (Gmail) and never goes on a list. Without this the server draft stayed on the server and other
+  devices while the phone never showed it again;
+- over `SyncConfig.changeRecheckLimit`, a folder the catch-up checks (`SyncEngine.isSyncable`) keeps
+  its first ids and its catch-up is armed; a folder the catch-up never checks (a custom folder that is
+  not a favourite) keeps every id, read in turn within the per-pass budget, since nothing else would
+  repair a dropped one. The change apply does the same (ADR-IOS-111, amendment 2026-11-14 "every
+  listed folder is read", rule 3). *Superseded 2026-11-14 (review round 4):* "each list stays within
+  `SyncConfig.changeRecheckLimit`; overflow arms the folder's catch-up, as the change apply does";
+- a row whose kind or ids do not read (an older release's kind, ids that are not a JSON list) arms its
+  folder's catch-up, or every folder's of its account when the folder cannot be resolved by
+  `(accountId, folderPath)`; the same for a move or read/flag row whose folder no longer exists. Such a
+  row is never skipped silently;
+- tags (local-only on Gmail and Outlook, ADR-IOS-036) and draft saves (re-queued above): nothing.
+Nothing is re-sent or replayed, and no row's meaning decides anything about any operation: the
+boundary is still not an exit. Accounts with no change bookmark (IMAP today) are unchanged: the
+boundary's full sync lists every folder. Once IMAP folders are tracked, the IMAP reader must honour
+the re-read list for these ids too.
+
+**Not corrected, accepted (2026-11-14): a retired user-label change or replied/forwarded mark in a
+tracked folder.** Neither repair path writes these into a stored row: the change apply's merge
+(`mergeChangeRecord`) writes the read state, the flag, the server tag, identity and references only,
+and the catch-up (`applyCatchUpTransaction`) writes the read state and the flag, removes and loads.
+So these kinds are not listed (a re-read would settle the id with nothing corrected) and no catch-up
+is armed for them. Example: on Gmail the user adds label L and updates before the action reaches the
+server; the phone keeps showing L, which the server never got, until the message is next stored again
+(a move, a Settings reset). Recoverable by one ordinary gesture (remove or re-add the label). The
+merge's missing label and answered-state reconciliation for stored rows is an older, separate gap in
+the change apply and is tracked on its own; once it is fixed, these kinds belong on the list.
+
+**Corrected (2026-11-14, master-agent ruling: a stuck state, not an edge): an older message in a
+folder outside the synced set.** Such a folder is now listed and its list is read (above). *Superseded
+same day:* "Not corrected, accepted (2026-11-14): an older message in a folder outside the syncable
+set. A retired move into (or out of) a custom, non-favourite folder lists nothing there, because no
+per-folder reader reads that folder's list. Opening the folder lists it, but its stale sweep is
+date-bounded on Gmail and Outlook, so the optimistic row of a message older than that window stays in
+that folder until the user acts on it; the synced side of the move is still read again. This predates
+#876 (the boundary's full sync never listed such a folder) and is recoverable by one ordinary gesture
+(move the message again)."
+
+**Address.** The ids listed are the queue's own: the provider's id for the message in the folder the
+action was queued on. A move that drained re-addresses the queued rows after it to the destination id
+the server named (`MessageHeaderRekey.readdressQueuedOperations`), so a queued row names the message
+as the server knows it at that point of the queue; an unsent Outlook move still names the original id,
+which is where the server still has the message. The local row's own address after an optimistic move
+(the source id under the destination folder, on Outlook) is never used as a key. A re-read answers
+for exactly that id: found in the folder (a record), elsewhere or gone (a removal there). Folders are
+resolved by the path the row recorded, never by role (ADR-IOS-059). Undo is a reverse move, so a
+retired undo is an ordinary retired move.
+
+**Accepted window (Outlook, the IOS-GRAPH-005 crash window, #116/#117):** an attempted Outlook move
+whose 2xx the server applied but whose retirement the app never committed (process death inside that
+one write) still names the dead source id, because Graph ids change on move. Its re-read answers 404
+in both folders, so the optimistic destination row is removed, and the message under its new id comes
+back only through the destination folder's change read (the delta reports it as moved in). Recoverable
+by sync, but for that row the listed id is not one the server can answer for as the message.
+
+User-visible: after the update, an email whose queued action was cleared shows its server state again
+(for example, an email archived just before the update is back in the inbox). Tests:
+`ReleaseBoundaryRecheckTests` (Gmail archive and mark-read, Outlook move, kinds left out, draft delete,
+every kind read again, no-bookmark account untouched, unreadable kind or ids, an unknown kind alone,
+a folder that is gone, a draft delete whose Drafts folder is gone, every named folder listed, no
+duplicate ids, overflow, rollback on a throw; end to end with OLDER messages: an Outlook Inbox whose
+read is a baseline, the baseline gate holding for an unlisted id, Gmail custom labels (move, read,
+flag), a Gmail synced but untracked Inbox, an Outlook custom non-favourite folder (read change, move
+back), an Outlook untracked synced source; Outlook read change; more ids than the list limit in a
+custom folder all kept and read across passes, the apply's overflow cut only where the catch-up
+checks, an unreadable role keeping every id, a favourite custom folder cut with its catch-up
+armed, the custom folder's read changing no coverage, an Inbox-only pass leaving its list, a failing
+custom read holding back nothing else, the custom read within the request allowance);
+`ChangeSeamFenceTests.retiredActionRecheckIsProviderBlind`.

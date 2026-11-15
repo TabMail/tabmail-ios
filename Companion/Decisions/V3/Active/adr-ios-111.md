@@ -374,3 +374,83 @@ PendingOperationSnapshot.userLabel, carriesKeptBackFields, settle set labels, us
 label catalog, isUserLabelCatalogLoaded, inboxOnly push pass, isCompleteUserLabelSet, listedLabelIds,
 systemLabelIds, reextractUserLabels, unknown label id, label created after catalog, catalog reload,
 replied, forwarded, PidTagLastVerbExecuted, ReplyParentResolver, #882.
+
+### Amendment 2026-11-14: the release boundary fills the re-read list (#876)
+
+Decision 4 took the window listing away from tracked folders, and with it the correction the release
+boundary relied on for actions it retires (ADR-IOS-071). The boundary now writes the re-read list
+itself: before its delete it reads each retired row's raw columns only and appends the ids of a move or
+read/flag change to `Folder.changeState.recheck` of the source folder and, for a move, the destination
+folder, whatever that folder's tracking or synced state (see the next amendment: every listed folder
+is read, and an explicit re-read answer applies whatever the window). *Superseded within this
+amendment, same day, twice:* (1) "only where that folder is tracked"; (2) "only where the change
+reader reads that folder: the syncable set (`SyncEngine.isSyncable`, the folders
+`ChangeFolder.isSynced` marks), tracked or not. [...] a folder outside the syncable set is never read
+by a per-folder reader, and an id there would hold part of every pass's re-read budget". (2) held only
+for Outlook (Gmail reads every list), and it left an older message stuck in a custom non-favourite
+folder, which the master-agent ruled a stuck state, not an edge. For every account holding a
+change bookmark (`SyncEngine.recheckRetiredActions`,
+provider-blind, pinned by `ChangeSeamFenceTests.retiredActionRecheckIsProviderBlind`). The cap and the
+overflow rule are decision 3's. A row the release cannot decode arms its folder's catch-up (the
+account's when the folder is unknown). A re-read id is answered as any other (record in the folder,
+removal where the message is not); the Outlook reader now also reads the list of a folder outside the
+synced set (next amendment). *Superseded same day:* "Readers need nothing new". The IMAP reader, when it lands, inherits
+these ids on its folders' lists. Detail: `IOS-ACTION-003` ("Retired actions read again").
+
+Keywords: release boundary, retired actions, recheckRetiredActions, appReleaseStamp, purge, re-read
+list, undecodable row, #876.
+
+### Amendment 2026-11-14: every listed folder is read; an explicit re-read answer applies whatever the window (#876)
+
+Two rules of the re-read list (decision 3), so that an id on a folder's list always gets the server's
+answer in that folder, for a message of any age:
+
+1. **A per-folder reader reads every listed folder's list.** A reader that reads folder by folder reads
+   a synced folder's list after its delta, also during its baseline (as before), and, on a `.all`
+   pass, the list of every folder outside the synced set whose list is not empty, on its own: each
+   listed message read by id and answered for that folder (a record where the server holds it, a
+   removal where it does not), returned as `.notRun`, so no bookmark and no coverage change.
+   `ChangeFolder.isSynced` now decides only which folders' CHANGES are read, never whose list is.
+   Outlook: `ExchangeProvider.fetchChanges` runs `reread` (one GET per id, by `parentFolderId`) for
+   those folders. Gmail already read every list (account-wide `messages.get`, every folder answered by
+   the message's labels). An `.inboxOnly` pass still reads the Inbox only; the other lists wait for the
+   next `.all` pass.
+2. **An explicit re-read answer applies whatever the window.** A baseline record is the folder as it
+   is, gated by the held range (`Folder.oldestSyncedDate`; older mail is the backfill's). A record
+   whose id is on the folder's own re-read list, read inside the folder's transaction, is the server's
+   answer about that one message, so the gate does not apply to it
+   (`SyncEngine.applyFolderChanges` passes `heldRangeApplies` false for it): it is inserted or merged
+   wherever its date falls, also below `oldestSyncedDate` (ruled acceptable: that is where the row was
+   before the gesture, and the backfill upserts by id). The bypass is strictly for a listed id; a
+   baseline record for an unlisted older message is still not inserted. Removals were never gated.
+3. **A list is cut only where the catch-up will find the rest** (added same day, review round 4). Over
+   `SyncConfig.changeRecheckLimit`, a folder the catch-up checks (`SyncEngine.isSyncable`: a main role
+   or a favourite, the same set `syncableFoldersInOrder` gives the full sync and the catch-up run)
+   keeps its first ids and its catch-up is armed, as decision 3 says. A folder the catch-up never
+   checks keeps every id: arming its catch-up is a no-op there (`markCatchUpLapse` updates only a
+   non-NULL state, and the catch-up run never takes that folder), so a dropped id would stay wrong for
+   good. Both the change apply (`applyFolderChanges`) and the release boundary
+   (`recheckRetiredActions`) apply this rule. The cost stays bounded: each pass reads at most
+   `changeRereadBudgetPerPass` ids within its request allowance, and the list holds only distinct ids
+   of that folder. A role this release cannot read counts as not checked (every id kept).
+   Chosen over dropping the cap everywhere: in a checked folder, one whole-folder check is cheaper than
+   reading hundreds of ids fifty a pass, and that path is unchanged.
+
+Why: the release boundary (#876) lists retired ids on every folder the action named. Without rule 1
+an Outlook folder outside the synced set never had its list read (the ids stuck, and the optimistic
+row of an older message stayed for good: the full sync never lists such a folder, and opening it
+lists only a date window); without rule 2 an Outlook folder whose read was a baseline settled a
+listed id without restoring the message (the record was gated, then counted as applied). Both are
+stuck states, not edges (master-agent ruling, 2026-11-14).
+
+Tests: `ReleaseBoundaryRecheckTests` (`olderMessageReturnsToABaseliningInbox`,
+`baselineGateHoldsForAnUnlistedId`, `gmailCustomLabelsAreReadAgain`, `outlookCustomFolderIsReadAgain`,
+`listedInEveryNamedFolder`; rule 3 and the custom-folder read: `customFolderKeepsEveryRetiredIdAndReadsThemAll`,
+`applyOverflowDropsOnlyWhereTheCatchUpChecks`, `unreadableRoleKeepsEveryRetiredId`,
+`favouriteCustomFolderIsCutAndArmed`, `customFolderReadChangesNoCoverage`,
+`inboxOnlyPassLeavesTheCustomList`, `failingCustomReadHoldsBackNothingElse`,
+`customReadStaysWithinTheAllowance`).
+
+Keywords: re-read list, recheck, non-synced folder, custom folder, notRun, baseline gate, held range,
+oldestSyncedDate, heldRangeApplies, explicit re-read answer, changeRecheckLimit, overflow, isSyncable,
+catch-up coverage, #876.

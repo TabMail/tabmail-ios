@@ -96,6 +96,18 @@
 > `outboxMessage`. It reads `Draft` state only, never the retired rows, so "retire without decoding"
 > still holds. Every other action is still retired. A pushed draft is not re-sent.
 >
+> **2026-11-14 amendment (owner ruling, GitHub #876): the boundary has retired actions read again.**
+> A folder the change reader tracks gets no window listing, so the boundary's full sync no longer
+> restores the server's state there. Before the delete, the same transaction reads each retired row
+> for its raw account, folder, kind and id columns only (`SyncEngine.recheckRetiredActions`) and puts
+> the ids of a move or read/flag change on the re-read lists of every folder the action named (source,
+> and destination for a move, whatever the folder's tracking or synced state; every listed folder is
+> read and its answer applies whatever the window, ADR-IOS-111) of every account holding a change
+> bookmark (*superseded same day:* "of the folders the change reader reads (the syncable set, tracked
+> or not; source, and destination for a move)"); a full list, a retired draft delete or a row
+> this release cannot decode arms the folder's (or the account's) catch-up. It re-sends, replays and decides nothing about any operation, so the carve-out's three
+> properties still hold and it is still not an exit. Detail: `IOS-ACTION-003`.
+>
 > **2026-09-06 amendment: ordinary message actions have a fifth runtime exit.** This latest
 > amendment supersedes the earlier four-exit enumeration and its statement that exit 4 is the
 > only failure exit; all earlier text is retained as history. Exit 5 is **the counted provider
