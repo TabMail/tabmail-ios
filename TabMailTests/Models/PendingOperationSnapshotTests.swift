@@ -75,6 +75,19 @@ struct PendingOperationSnapshotTests {
         #expect(!s.flag.contains("g"))
     }
 
+    @Test("Snapshot classifies user label ops apart from read/flag ops")
+    func snapshot_userLabel() {
+        let ops = [
+            PendingOperation(type: .addUserLabel,    messageIds: ["a"], accountId: "acc1", folderPath: "INBOX", userLabelId: "l1"),
+            PendingOperation(type: .removeUserLabel, messageIds: ["b"], accountId: "acc1", folderPath: "INBOX", userLabelId: "l1"),
+            PendingOperation(type: .markRead,        messageIds: ["c"], accountId: "acc1", folderPath: "INBOX"),
+        ]
+        let s = PendingOperationSnapshot(ops: ops)
+        #expect(s.userLabel == ["a", "b"])
+        #expect(!s.flag.contains("a"))
+        #expect(!s.flag.contains("b"))
+    }
+
     @Test("Snapshot 'all' includes every op type")
     func snapshot_all() {
         let ops = [

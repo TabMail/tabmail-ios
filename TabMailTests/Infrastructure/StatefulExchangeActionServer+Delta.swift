@@ -173,6 +173,17 @@ extension StatefulExchangeActionServer {
         }
     }
 
+    /// Another client (Outlook web or desktop) sets the message's categories, the
+    /// whole array, as Graph's PATCH does.
+    func setCategoriesFromOtherClient(providerMessageId: String, categories: [String]) {
+        state.value.withLock { model in
+            guard var message = model.messagesByProviderId[providerMessageId] else { return }
+            message.categories = categories
+            model.messagesByProviderId[providerMessageId] = message
+            model.delta.log(folderId: message.folderId, messageId: providerMessageId, kind: .categories)
+        }
+    }
+
     // MARK: - Folder tree
 
     /// Adds a folder to the tree `fetchFolders` lists and the mail-folder delta

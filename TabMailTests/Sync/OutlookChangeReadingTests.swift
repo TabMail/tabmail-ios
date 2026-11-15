@@ -200,10 +200,10 @@ struct OutlookChangeReadingTests {
     }
 
     static func seed(_ id: String, in folderId: String, daysAgo days: Double = 3, isRead: Bool = false,
-                     isFlagged: Bool = false) -> StatefulExchangeActionServer.Seed {
+                     isFlagged: Bool = false, categories: [String] = []) -> StatefulExchangeActionServer.Seed {
         StatefulExchangeActionServer.Seed(
             rfc822MessageId: "\(id)@example.com", providerMessageId: id, folderId: folderId,
-            isRead: isRead, isFlagged: isFlagged, receivedAt: daysAgo(days))
+            isRead: isRead, isFlagged: isFlagged, receivedAt: daysAgo(days), categories: categories)
     }
 
     static func withWorld(
@@ -947,7 +947,9 @@ struct OutlookChangeReadingTests {
     func recordWithoutOneFieldChangesOnlyWhatItCarries(folder path: String, field: String) async throws {
         let omitsFlag = field == "flag"
         // Leaving out the flag, the change carried is a read change; otherwise a flag change.
-        let seed = Self.seed("o-1", in: path, isRead: !omitsFlag, isFlagged: omitsFlag)
+        // The server holds the stored label, so a record that carries the
+        // categories changes none (#882: the categories replace the stored set).
+        let seed = Self.seed("o-1", in: path, isRead: !omitsFlag, isFlagged: omitsFlag, categories: ["Project"])
         try await Self.withWorld(seeds: [seed]) { w in
             try w.insertRow("o-1", in: path, isRead: !omitsFlag, isFlagged: omitsFlag)
             try await w.baselineAll()
@@ -957,8 +959,10 @@ struct OutlookChangeReadingTests {
                 row.referencesJSON = MessageHeader.encodeReferences(["<root-1@example.com>"])
                 try row.update(db)
                 let label = UserLabel(accountId: w.accountId, providerLabelId: "Project", name: "Project", isSystem: false)
-                try label.insert(db)
-                try MessageUserLabel(messageId: row.id, userLabelId: label.id).insert(db)
+                // The baseline read already stored the server's label (#882); the
+                // rows are written here too so the precondition holds either way.
+                try label.insert(db, onConflict: .ignore)
+                try MessageUserLabel(messageId: row.id, userLabelId: label.id).insert(db, onConflict: .ignore)
             }
             func snapshot() throws -> [String: String] {
                 let row = try #require(try w.row("o-1", in: path))
@@ -987,6 +991,85 @@ struct OutlookChangeReadingTests {
             let changed = Set(before.keys.filter { before[$0] != after[$0] })
             #expect(changed == [omitsFlag ? "isRead" : "isFlagged"],
                     "without \(field): \(changed.sorted().map { "\($0) \(before[$0] ?? "nil") -> \(after[$0] ?? "nil")" })")
+        }
+    }
+
+    // MARK: - Categories on a stored message (#882)
+
+    func labels(_ w: World, _ messageId: String, in path: String) throws -> Set<String> {
+        let rowId = try #require(try w.row(messageId, in: path)).id
+        return try w.pool.read { db in
+            Set(try String.fetchAll(db, sql: """
+                SELECT ul.providerLabelId FROM messageUserLabel mul JOIN userLabel ul ON ul.id = mul.userLabelId
+                WHERE mul.messageId = ?
+                """, arguments: [rowId]))
+        }
+    }
+
+    @Test("A category change made in Outlook web reaches a stored message, in the Inbox and in the Archive",
+          arguments: [inbox, archive])
+    func categoryChangeReachesStoredMessage(folder path: String) async throws {
+        try await Self.withWorld(seeds: [Self.seed("c-1", in: path, categories: ["Old"])]) { w in
+            try w.insertRow("c-1", in: path)
+            try await w.baselineAll()
+            #expect(try labels(w, "c-1", in: path) == ["Old"], "precondition: the baseline record holds the server's set")
+
+            w.server.setCategoriesFromOtherClient(providerMessageId: "c-1", categories: ["New", "tm_reply"])
+            try await w.read()
+            #expect(try labels(w, "c-1", in: path) == ["New"], "the server's categories replace the stored set; a legacy tm_ one is no label")
+
+            w.server.setCategoriesFromOtherClient(providerMessageId: "c-1", categories: [])
+            try await w.read()
+            #expect(try labels(w, "c-1", in: path).isEmpty, "an empty array removes them all")
+        }
+    }
+
+    @Test("A record that leaves out the categories keeps the stored labels and does not settle a kept-back message")
+    func recordWithoutCategoriesSettlesNothing() async throws {
+        try await Self.withWorld(seeds: [Self.seed("c-2", in: Self.archive, categories: ["Mine"])]) { w in
+            try w.insertRow("c-2", in: w.archive)
+            try await w.baselineAll()
+            #expect(try labels(w, "c-2", in: w.archive) == ["Mine"], "precondition")
+            // Listed for a re-read, as a change kept back under the user's label op leaves it.
+            var state = FolderChangeState(raw: try w.folder(w.archive).changeState)
+            state.recheck = ["c-2"]
+            let encoded = state.encoded
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [encoded, w.folderId(w.archive)])
+            }
+            w.server.omitDeltaFields(["categories"], providerMessageId: "c-2")
+            // The full re-read this pass would settle it rightly; holding it shows
+            // that the delta record alone does not.
+            w.server.answerBatchItem(providerMessageId: "c-2", status: 503, body: nil)
+            w.server.setFlagFromOtherClient(providerMessageId: "c-2", isFlagged: true)
+            try await w.read()
+            #expect(try w.row("c-2", in: w.archive)?.isFlagged == true, "precondition: the record applied")
+            #expect(try labels(w, "c-2", in: w.archive) == ["Mine"])
+            #expect(try w.recheck(w.archive) == ["c-2"], "a record without the categories leaves it listed")
+        }
+    }
+
+    @Test("A listed message whose delta record leaves out the categories is read again in full in the same pass")
+    func listedRecordWithoutCategoriesIsRereadInFull() async throws {
+        try await Self.withWorld(seeds: [Self.seed("c-3", in: Self.archive, categories: ["Mine"])]) { w in
+            try w.insertRow("c-3", in: w.archive)
+            try await w.baselineAll()
+            #expect(try labels(w, "c-3", in: w.archive) == ["Mine"], "precondition")
+            // Listed for a re-read, as a change kept back under the user's label op leaves it.
+            var state = FolderChangeState(raw: try w.folder(w.archive).changeState)
+            state.recheck = ["c-3"]
+            let encoded = state.encoded
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [encoded, w.folderId(w.archive)])
+            }
+            // The categories changed meanwhile; the delta record does not carry them.
+            w.server.setCategoriesFromOtherClient(providerMessageId: "c-3", categories: ["Theirs"])
+            w.server.omitDeltaFields(["categories"], providerMessageId: "c-3")
+            let batchedBefore = w.batchedIds().count
+            try await w.read()
+            #expect(w.batchedIds().dropFirst(batchedBefore).contains("c-3"), "the message is read again in full")
+            #expect(try labels(w, "c-3", in: w.archive) == ["Theirs"], "and the full read lands the categories")
+            #expect(try w.recheck(w.archive).isEmpty, "and settles it")
         }
     }
 

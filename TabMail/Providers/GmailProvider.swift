@@ -28,6 +28,11 @@ import SwiftMail
 ///    "the catalog has not loaded yet". Before the first complete catalog the
 ///    extracted set is empty for the SECOND reason, and any consumer that
 ///    treats an empty remote set as an exact remote truth must fail closed.
+///  - `listedLabelIds` (#882) is every id the last `/labels` response listed,
+///    of any type. A loaded catalog still does not know a label created after it
+///    loaded, so a message carrying an id that is neither listed nor a Gmail
+///    system label has an INCOMPLETE user-label set
+///    (`isCompleteUserLabelSet`), even with `isAuthoritative` true.
 struct GmailUserLabelCatalogState: Sendable {
     struct Request: Sendable, Equatable {
         fileprivate let generation: Int
@@ -36,6 +41,7 @@ struct GmailUserLabelCatalogState: Sendable {
 
     private(set) var knownUserLabelIds: Set<String> = []
     private(set) var legacyTmLabelIds: Set<String> = []
+    private(set) var listedLabelIds: Set<String> = []
     private(set) var isAuthoritative = false
     private var mutationRevision = 0
     private var nextRequestGeneration = 0
@@ -52,13 +58,16 @@ struct GmailUserLabelCatalogState: Sendable {
     mutating func apply(
         userLabelIds: Set<String>,
         legacyTmLabelIds: Set<String>,
+        listedLabelIds: Set<String>,
         request: Request
     ) {
         guard request.generation > latestAppliedRequestGeneration else { return }
         if mutationRevision == request.mutationRevision {
             knownUserLabelIds = userLabelIds
+            self.listedLabelIds = listedLabelIds
         } else {
             knownUserLabelIds.formUnion(userLabelIds)
+            self.listedLabelIds.formUnion(listedLabelIds)
         }
         self.legacyTmLabelIds = legacyTmLabelIds
         isAuthoritative = true
@@ -67,7 +76,20 @@ struct GmailUserLabelCatalogState: Sendable {
 
     mutating func recordKnownUserLabel(_ labelId: String) {
         knownUserLabelIds.insert(labelId)
+        listedLabelIds.insert(labelId)
         mutationRevision &+= 1
+    }
+
+    /// Whether the user labels extracted from `labelIds` are the message's
+    /// whole set: the catalog has loaded and knows every id on the message
+    /// (listed by `/labels`, or one of Gmail's system labels,
+    /// `GmailProvider.systemLabelIds`). An id it does not know is a label
+    /// created after the catalog loaded, which `extractUserLabelIds` would
+    /// drop (#882).
+    func isCompleteUserLabelSet(_ labelIds: [String]?) -> Bool {
+        isAuthoritative && (labelIds ?? []).allSatisfy {
+            listedLabelIds.contains($0) || GmailProvider.systemLabelIds.contains($0)
+        }
     }
 
     /// Extract user label IDs from a Gmail message's `labelIds`, keeping only
@@ -138,6 +160,38 @@ actor GmailProvider: EmailProvider {
     /// only IDs learned from a complete successful catalog response.
     private var userLabelCatalog = GmailUserLabelCatalogState()
 
+    /// The user-label catalog has loaded (`GmailUserLabelCatalogState.isAuthoritative`).
+    /// A parsed message's user labels are its complete set only when the catalog
+    /// also knows every id on it (`isCompleteUserLabelSet`).
+    var isUserLabelCatalogLoaded: Bool { userLabelCatalog.isAuthoritative }
+
+    /// Gmail's system labels hidden from the folder list.
+    nonisolated static let hiddenSystemLabelIds: Set<String> = [
+        "UNREAD", "IMPORTANT",
+        "CHAT", "CATEGORY_PERSONAL", "CATEGORY_SOCIAL",
+        "CATEGORY_PROMOTIONS", "CATEGORY_UPDATES", "CATEGORY_FORUMS"
+    ]
+
+    /// Gmail's system label ids (Gmail API, "Manage labels": the reserved
+    /// system labels). Never a user label, so one on a message never makes
+    /// its user-label set incomplete, whether or not `/labels` listed it.
+    nonisolated static let systemLabelIds: Set<String> = hiddenSystemLabelIds
+        .union(allMailExcludedLabelIds)
+        .union(["STARRED"])
+
+    /// The details again with their user labels extracted by the catalog as it
+    /// is now (after a reload in the same pass).
+    func reextractUserLabels(_ batch: GmailDetailBatch) -> GmailDetailBatch {
+        var out = batch
+        out.details = batch.details.map { detail in
+            var header = detail.header
+            header.userLabelIds = userLabelCatalog.extractUserLabelIds(from: detail.labelIds)
+            header.userLabelIdsAreAuthoritative = userLabelCatalog.isCompleteUserLabelSet(detail.labelIds)
+            return GmailMessageDetail(header: header, labelIds: detail.labelIds)
+        }
+        return out
+    }
+
     /// Test-only session override. Production call sites omit; tests register
     /// `FakeHTTP` URLProtocol on this session to intercept Gmail API calls.
     private let testSession: URLSession?
@@ -178,11 +232,7 @@ actor GmailProvider: EmailProvider {
         let response = try JSONDecoder().decode(GmailLabelsResponse.self, from: data)
 
         // System labels we explicitly skip (internal Gmail labels, not user-visible)
-        let hiddenSystemLabels: Set<String> = [
-            "UNREAD", "IMPORTANT",
-            "CHAT", "CATEGORY_PERSONAL", "CATEGORY_SOCIAL",
-            "CATEGORY_PROMOTIONS", "CATEGORY_UPDATES", "CATEGORY_FORUMS"
-        ]
+        let hiddenSystemLabels = Self.hiddenSystemLabelIds
 
         var folders: [FolderInfo] = []
         var discoveredLegacyTmLabelIds: Set<String> = []
@@ -226,6 +276,7 @@ actor GmailProvider: EmailProvider {
         userLabelCatalog.apply(
             userLabelIds: discoveredUserLabelIds,
             legacyTmLabelIds: discoveredLegacyTmLabelIds,
+            listedLabelIds: Set(response.labels.map(\.id)),
             request: catalogRequest
         )
 
@@ -1988,7 +2039,7 @@ actor GmailProvider: EmailProvider {
             actionTag: nil,
             providerDate: metadata.providerDate,
             userLabelIds: userLabelCatalog.extractUserLabelIds(from: metadata.providerLabels),
-            userLabelIdsAreAuthoritative: userLabelCatalog.isAuthoritative
+            userLabelIdsAreAuthoritative: userLabelCatalog.isCompleteUserLabelSet(metadata.providerLabels)
         )
     }
 
@@ -2012,6 +2063,7 @@ actor GmailProvider: EmailProvider {
         userLabelCatalog.apply(
             userLabelIds: discoveredUserLabelIds,
             legacyTmLabelIds: discoveredLegacyTmLabelIds,
+            listedLabelIds: Set(response.labels.map(\.id)),
             request: catalogRequest
         )
         guard let match = userLabels.first(where: {

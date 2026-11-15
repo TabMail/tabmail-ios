@@ -14,8 +14,10 @@ import Testing
 /// recent completions. Invariants, checked continuously:
 /// - a row whose message has a queued op for the whole pass is never removed by it;
 /// - a message whose op completes during a read is not inserted by that pass;
+/// - a row whose message has a queued user-label op for the whole pass keeps
+///   its user labels through it (#882);
 /// - after quiescence (no op, no completion) every message the reader ever
-///   reported matches the model: membership and flags.
+///   reported matches the model: membership, flags and user labels.
 @Suite("Change apply: seeded fuzz", .serialized, .processGlobalState)
 struct ChangeApplyFuzzTests {
     static let seeds: [UInt64] = [1, 2, 3, 5, 8, 13, 21, 34]
@@ -33,7 +35,11 @@ struct ChangeApplyFuzzTests {
         }
     }
 
-    struct ModelMessage: Sendable { var folders: Set<String>; var isRead: Bool; var isFlagged: Bool }
+    static let labelIds = ["Label_A", "Label_B"]
+
+    struct ModelMessage: Sendable {
+        var folders: Set<String>; var isRead: Bool; var isFlagged: Bool; var labels: Set<String> = []
+    }
 
     final class Model: Sendable {
         let messages: Mutex<[String: ModelMessage]>
@@ -45,12 +51,29 @@ struct ChangeApplyFuzzTests {
     }
 
     static func info(_ id: String, _ m: ModelMessage) -> MessageHeaderInfo {
-        MessageHeaderInfo(
+        var info = MessageHeaderInfo(
             messageId: id, rfc822MessageId: "\(id)-fuzz@example.com", inReplyTo: nil, references: [],
             threadId: nil, subject: "fuzz \(id)", from: "Sender", fromAddress: "sender@example.com",
             to: "recipient@example.com", cc: "", bcc: "", replyTo: nil,
             date: Date().addingTimeInterval(-86_400), snippet: "fuzz", isRead: m.isRead, isFlagged: m.isFlagged,
             hasAttachments: false, isReplied: false, isForwarded: false, actionTag: nil)
+        // Both readers send the message's whole label set (#882).
+        info.userLabelIds = m.labels.sorted()
+        info.userLabelIdsAreAuthoritative = true
+        return info
+    }
+
+    static func labels(_ w: ChangeApplyTests.World, rowIds: [String]) async throws -> [String: Set<String>] {
+        try await w.pool.read { db in
+            var sets: [String: Set<String>] = [:]
+            for rowId in rowIds {
+                sets[rowId] = Set(try String.fetchAll(db, sql: """
+                    SELECT ul.providerLabelId FROM messageUserLabel mul JOIN userLabel ul ON ul.id = mul.userLabelId
+                    WHERE mul.messageId = ?
+                    """, arguments: [rowId]))
+            }
+            return sets
+        }
     }
 
     @Test("The apply keeps queued intentions, honours completions during a read, and converges", arguments: seeds)
@@ -96,9 +119,12 @@ struct ChangeApplyFuzzTests {
                 // Another client changes a message.
                 let id = "fz\(Int.random(in: 0..<Self.messageCount, using: &rng))"
                 model.messages.withLock { messages in
-                    switch Int.random(in: 0..<3, using: &rng) {
+                    switch Int.random(in: 0..<4, using: &rng) {
                     case 0: messages[id]?.isRead.toggle()
                     case 1: messages[id]?.isFlagged.toggle()
+                    case 2:
+                        let label = Self.labelIds.randomElement(using: &rng)!
+                        if messages[id]?.labels.remove(label) == nil { messages[id]?.labels.insert(label) }
                     default: messages[id]?.folders = [paths.randomElement(using: &rng)!]
                     }
                 }
@@ -108,8 +134,12 @@ struct ChangeApplyFuzzTests {
                 let target = "fz\(Int.random(in: 0..<Self.messageCount, using: &rng))"
                 switch Int.random(in: 0..<4, using: &rng) {
                 case 0 where queued[target] == nil:
+                    let labelOp = Bool.random(using: &rng)
                     let op = try await w.pool.write { db in
-                        var op = PendingOperation(type: .markRead, messageIds: [target], accountId: accountId, folderPath: "INBOX")
+                        var op = labelOp
+                            ? PendingOperation(type: .addUserLabel, messageIds: [target], accountId: accountId,
+                                               folderPath: "INBOX", userLabelId: Self.labelIds[0])
+                            : PendingOperation(type: .markRead, messageIds: [target], accountId: accountId, folderPath: "INBOX")
                         try op.insert(db)
                         return op
                     }
@@ -132,6 +162,12 @@ struct ChangeApplyFuzzTests {
                     try MessageHeader.filter(Column("accountId") == accountId).fetchAll(db)
                         .filter { queuedIds.contains($0.messageId) }.map(\.id)
                 }
+                let labelQueuedIds = Set(queued.filter { $0.value.type == .addUserLabel }.keys)
+                let labelProtectedRows = try await w.pool.read { db in
+                    try MessageHeader.filter(Column("accountId") == accountId).fetchAll(db)
+                        .filter { labelQueuedIds.contains($0.messageId) }.map(\.id)
+                }
+                let labelsBefore = try await Self.labels(w, rowIds: labelProtectedRows)
                 let completing = model.completeDuringRead.withLock { $0 }
                 let rowsBefore = try await w.pool.read { db in
                     Set(try MessageHeader.filter(Column("accountId") == accountId).fetchAll(db).map(\.id))
@@ -142,6 +178,11 @@ struct ChangeApplyFuzzTests {
                 }
                 for row in protectedRows {
                     #expect(rowsAfter.contains(row), "seed \(seed): a row with a queued op was removed: \(row)")
+                }
+                let labelsAfter = try await Self.labels(w, rowIds: labelProtectedRows)
+                for row in labelProtectedRows {
+                    #expect(labelsAfter[row] == labelsBefore[row],
+                            "seed \(seed): a queued label op's row lost its labels to the read: \(row)")
                 }
                 if let completing {
                     let inserted = rowsAfter.subtracting(rowsBefore).filter { $0.hasSuffix(":\(completing)") }
@@ -164,6 +205,8 @@ struct ChangeApplyFuzzTests {
                     #expect((row != nil) == message.folders.contains(path), "seed \(seed): \(id) in \(path)")
                     if let row {
                         #expect(row.isRead == message.isRead && row.isFlagged == message.isFlagged, "seed \(seed): \(id) flags")
+                        let stored = try await Self.labels(w, rowIds: [row.id])[row.id]
+                        #expect(stored == message.labels, "seed \(seed): \(id) labels in \(path)")
                     }
                 }
             }

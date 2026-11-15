@@ -385,6 +385,10 @@ extension ExchangeProvider {
         var change = ChangeRecord(messageId: record.id)
         change.isRead = record.isRead
         if let flag = record.flag { change.isFlagged = flag.flagStatus == "flagged" }
+        // A Graph category IS the user label; the record's `categories`, when
+        // sent, is the message's whole set (Graph replaces the array as a whole).
+        // The same legacy `tm_*` filter as `parseGraphMessage`.
+        change.userLabelIds = record.categories.map { $0.filter { !Self.isLegacyActionTagCategory($0) } }
         return change
     }
 
@@ -712,10 +716,10 @@ struct CollectedChanges {
     var records: [ChangeRecord] { order.compactMap { recordsById[$0] } }
     var removals: [String] { order.filter { removed.contains($0) } }
     /// Messages this read has answered for the re-read list: removed, or with a
-    /// record carrying the read state and the flag. A message with only a
-    /// partial record is still read again in full.
+    /// record carrying every field the apply keeps back (read state, flag, user
+    /// labels). A message with only a partial record is still read again in full.
     var answeredIds: Set<String> {
-        Set(recordsById.filter { $0.value.carriesReadAndFlag }.keys).union(removed)
+        Set(recordsById.filter { $0.value.carriesKeptBackFields }.keys).union(removed)
     }
 }
 
