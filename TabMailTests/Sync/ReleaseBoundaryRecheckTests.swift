@@ -408,15 +408,18 @@ struct ReleaseBoundaryRecheckTests {
 
     /// The case the full sync cannot repair: its stale sweep is date-bounded on
     /// Outlook, so the listing is set aside here (only the change read runs), as
-    /// it would miss an older message's row in a large folder.
-    @Test("Outlook: a retired move into a synced folder that is not tracked yet is corrected there by the change read alone")
-    func untrackedSyncedDestinationIsCorrectedByTheRead() async throws {
+    /// it would miss an older message in a large folder. The move's source is
+    /// synced but not tracked yet, its destination is tracked: the destination's
+    /// re-read removes the optimistic row there, and only the source's re-read
+    /// puts the message back where the server has it.
+    @Test("Outlook: a retired move out of a synced folder that is not tracked yet puts the message back there by the change read alone")
+    func untrackedSyncedSourceIsRestoredByTheRead() async throws {
         try await Outlook.withWorld(seeds: [Outlook.seed("ut-move", in: Outlook.inbox, daysAgo: 1)]) { w in
             try w.insertRow("ut-move", in: w.inbox, date: Outlook.daysAgo(1))
             try await w.baselineAll()
             #expect(try w.account().lastHistoryId != nil, "precondition: the account holds a change bookmark")
-            try await Self.setTracking(w.pool, folderIds: [w.folderId(w.inbox)])
-            #expect(try Self.tracking(w.pool, folderId: w.folderId(w.archive)) == false, "precondition: the Archive is not tracked")
+            try await Self.setTracking(w.pool, folderIds: [w.folderId(w.archive)])
+            #expect(try Self.tracking(w.pool, folderId: w.folderId(w.inbox)) == false, "precondition: the Inbox is not tracked")
             let moved = try #require(try w.row("ut-move", in: w.inbox), "precondition: held")
 
             try Self.moveRowOptimistically(w.pool, headerId: moved.id, to: try w.folder(w.archive))
@@ -424,8 +427,8 @@ struct ReleaseBoundaryRecheckTests {
             #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: Self.nextRelease()))
 
             try await w.read()
-            #expect(try w.row("ut-move", in: w.inbox) != nil, "the message is back in the Inbox, as on the server")
-            #expect(try w.row("ut-move", in: w.archive) == nil, "and no longer shown in the untracked Archive")
+            #expect(try w.row("ut-move", in: w.inbox) != nil, "the message is back in the untracked Inbox, as on the server")
+            #expect(try w.row("ut-move", in: w.archive) == nil, "and no longer shown in the Archive")
             #expect(try w.recheck(w.inbox).isEmpty)
             #expect(try w.recheck(w.archive).isEmpty)
         }
