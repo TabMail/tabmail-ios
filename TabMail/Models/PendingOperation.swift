@@ -206,6 +206,8 @@ struct PendingOperation: Codable, FetchableRecord, MutablePersistableRecord, Ide
     /// since v104. A row admitted before v104 has no `sentAt`; its `createdAt`
     /// was stamped in the same completion transaction that confirmed the send
     /// (`deleteCompletedSendAtomic`), so it is that row's send-completion time.
+    /// Not a fallback: for these rows `createdAt` IS the confirmed-send time,
+    /// to within one transaction (reviewed for #915).
     var verbTime: Date { sentAt ?? createdAt }
 
     /// Decoded message IDs from JSON storage

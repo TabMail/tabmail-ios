@@ -30,9 +30,10 @@ fenced by `ExchangeLastVerbMarkTests.lastVerbTagsStayInsideExchangeProvider`).
 **Original moved:** an in-app move re-addresses queued followers (`MessageHeaderRekey`
 `readdressQueuedOperations`) and re-keys the header, so reply-then-archive inside TabMail marks the
 moved message. A move made elsewhere before the mark drains leaves a stale Graph id → 404 →
-authoritative no-op (the mark is lost on Outlook; local `isReplied` stays). Resolving it by
-`internetMessageId` was proposed and is held: it conflicts with ADR-IOS-068 D4 (no search result is
-a mutation target).
+authoritative no-op (the mark is lost on Outlook; local `isReplied` stays). Registered as
+`IOS-GRAPH-006` (accepted, 2026-11-15). Resolving it by `internetMessageId` was proposed and
+REJECTED by ruling: ADR-IOS-068 D4 stays (no search result is a mutation target). Do not re-propose
+it; Graph immutable ids (#117) are the structural fix.
 
 Not yet measured live: whether Outlook on the web / mobile render the arrow from a client-written
 0x1081 (row B1 of the #915 design's live check).
