@@ -16,16 +16,18 @@ original untouched: no `Integer 0x1081`, no `SystemTime 0x1082`, `lastModifiedDa
 **How TabMail writes them (option B, #915):** the existing durable `.markReplied` / `.markForwarded`
 op, admitted only in `AccountManager.deleteCompletedSendAtomic` after the send is confirmed, reaches
 `ExchangeProvider.performMessageAction`, which PATCHes `/me/messages/{id}` with
-`singleValueExtendedProperties` `[0x1081, 0x1082]` (`ExchangeProvider.lastVerbPatchBody`,
-`LastVerb`) through `patchEachMessage`. Absolute values, so a retry is idempotent and can never
+`singleValueExtendedProperties` `[0x1081, 0x1082]` (`ExchangeProvider.lastVerbPatchBody`, using the
+one shared definition in `Shared/API/GraphAPI.swift`: `lastVerbPropertyId`, `lastVerbTimePropertyId`,
+`lastVerbReplyToSender/ReplyToAll/Forward`, which #890's change reader also reads) through
+`patchEachMessage`. Absolute values, so a retry is idempotent and can never
 re-send mail. The send time is `OutboxMessage.sentAt`, carried on `PendingOperation.sentAt` (v104;
 pre-v104 rows use `createdAt`, stamped in the completion transaction: `PendingOperation.verbTime`).
 Reply-all is a generic kind from compose to the op: `ComposeView.isReplyAll` (set by the Reply All
 entries) → `Draft.isReplyAll` (kept on save and on the Undo-Send reopen, like `isForward`,
 `IOS-OUTBOX-004`) → `OutboxMessage.isReplyAll` → `PendingOperation.replyAll` →
 `ProviderMessageAction.replied(all:at:)`. IMAP maps reply-all to `\Answered` like reply; Gmail has
-no remote representation. The tags and codes stay inside `ExchangeProvider*` (ADR-IOS-060 boundary;
-fenced by `ExchangeLastVerbMarkTests.lastVerbTagsStayInsideExchangeProvider`).
+no remote representation. The tags stay in `GraphAPI.swift` and `ExchangeProvider*` (ADR-IOS-060 boundary;
+fenced over `TabMail/` and `Shared/` by `ExchangeLastVerbMarkTests.lastVerbTagsStayInsideExchangeProvider`).
 
 **Original moved:** an in-app move re-addresses queued followers (`MessageHeaderRekey`
 `readdressQueuedOperations`) and re-keys the header, so reply-then-archive inside TabMail marks the

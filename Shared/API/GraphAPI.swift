@@ -138,6 +138,9 @@ enum GraphAPI {
     static let lastVerbReplyToSender = 102
     static let lastVerbReplyToAll = 103
     static let lastVerbForward = 104
+    /// PidTagLastVerbExecutionTime, written with the verb when the app replies
+    /// or forwards (#915).
+    static let lastVerbTimePropertyId = "SystemTime 0x1082"
 
     /// Graph JSON batching endpoint. Each request in a batch names its URL
     /// relative to the version root, so a mailbox request starts with

@@ -332,16 +332,29 @@ struct ExchangeLastVerbMarkTests {
 
     // MARK: - Provider boundary (ADR-IOS-060)
 
-    @Test("The last-verb property tags live only inside the Exchange provider")
+    /// The tags are defined once, in `Shared/API/GraphAPI.swift` (shared with the
+    /// change reader, #890), and used only inside the Exchange provider.
+    @Test("The last-verb property tags live only in GraphAPI and the Exchange provider")
     func lastVerbTagsStayInsideExchangeProvider() throws {
-        let files = try DiagnosticPrintGateTests.appTargetSources()
+        let root = DiagnosticPrintGateTests.repositoryRoot()
+        var files = try DiagnosticPrintGateTests.appTargetSources()
         #expect(files.count > 100, "the scan must see the app target")
+        let shared = root.appendingPathComponent("Shared")
+        let enumerator = try #require(FileManager.default.enumerator(at: shared, includingPropertiesForKeys: nil))
+        var sharedCount = 0
+        for case let url as URL in enumerator where url.pathExtension == "swift" {
+            let relative = String(url.standardizedFileURL.path.dropFirst(root.standardizedFileURL.path.count + 1))
+            files.append(.init(relativePath: relative, source: try String(contentsOf: url, encoding: .utf8)))
+            sharedCount += 1
+        }
+        #expect(sharedCount > 0, "the scan must see Shared/")
         let holders = files
             .filter { $0.source.contains("0x1081") || $0.source.contains("0x1082") }
             .map(\.relativePath)
-        #expect(!holders.isEmpty, "non-vacuity: the Exchange provider writes them")
-        #expect(holders.allSatisfy { $0.hasPrefix("TabMail/Providers/ExchangeProvider") },
-                "outside the Exchange provider: \(holders)")
+        #expect(holders.contains("Shared/API/GraphAPI.swift"), "non-vacuity: GraphAPI defines them")
+        #expect(holders.allSatisfy {
+            $0 == "Shared/API/GraphAPI.swift" || $0.hasPrefix("TabMail/Providers/ExchangeProvider")
+        }, "outside GraphAPI and the Exchange provider: \(holders)")
     }
 
     /// Both Reply All entry points open compose in reply-all mode. The views are
