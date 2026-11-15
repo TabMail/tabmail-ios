@@ -7,6 +7,10 @@ import Foundation
 /// CalDAV calendar provider conforming to CalendarProvider protocol.
 /// Uses CalDAVClient for HTTP operations and ICSParser for response parsing.
 actor CalDAVProvider: CalendarProvider {
+    /// `CalendarProvider.movesAddedDatesWithSeries`: yes. A split's new part moved off its cut
+    /// moves its `RDATE` values by the same amount (`shiftSeriesAnchoredValues`, #558, #894).
+    static let movesAddedDatesWithSeries = true
+
     /// A CalDAV edit replaces only the master's RRULE line, with the edit's own, and keeps the
     /// rest of the series as stored; so the rule changes when the edit's RRULE differs from the
     /// stored one (`GoogleCalendarProvider.canonicalRRULE`), and an edit with none changes nothing.
@@ -786,6 +790,14 @@ actor CalDAVProvider: CalendarProvider {
                 url: eventURL, storedICS: masterICS, etag: etag, href: seriesHref, patch: patch,
                 namedStart: point.namedStart, shownFrom: point.shownFrom, zones: zones))
         }
+        // A cut on a date added outside the repeat pattern (`RDATE`) would start the new part off
+        // the rule it keeps, so it would lose meetings or make some up: refused before anything is
+        // written, in #880's words (#894; full support is #881).
+        switch point.cutsAtAddedDate {
+        case nil: throw CalendarProviderError.notSupported(Self.splitPointUnreadable)
+        case true?: throw CalendarProviderError.notSupported(CalendarProviderError.addedDatesReason)
+        case false?: break
+        }
         let namedStart = point.namedStart, namedPlace = point.namedPlace, namedInstants = point.namedInstants
         guard let patch = SplitCarry.partEdit(patch, namedStart: namedStart, cut: cutTime, zone: point.seriesZone) else {
             throw CalendarProviderError.notSupported(Self.splitPointUnreadable)
@@ -812,6 +824,14 @@ actor CalDAVProvider: CalendarProvider {
             storedICS: masterICS, slotNaiveISO: masterFrameRecurrenceId,
             cappedRRule: cappedRRule, newRRule: newSeriesRRule, newUid: newUid, patch: patch, now: Date(), zones: zones,
             named: namedInstants)
+        // A new part moved off its cut keeps its added dates where they were on a calendar that
+        // does not move them with it (#894): CalDAV moves them, so this refuses nothing here; it is
+        // the one check every split plan makes, decided by the calendar's capability.
+        let newPart = ICSParser.parse(icsText: resources.newPart, resourceHref: eventURL.path, etag: nil).first
+        try Self.refuseAddedDatesLeftBehind(
+            moves: SplitCarry.startMoves(from: cutTime, to: newPart?.start), recurrence: Self.masterTopLevelLines(resources.newPart),
+            isAllDay: newPart?.isAllDay ?? false, zones: zones,
+            unreadable: "The new part of the repeating event could not be built, so it was not split.")
         return .split(SplitPlan(
             seriesHref: seriesHref, eventURL: eventURL, etag: etag, slot: slot, namedStart: namedStart,
             namedPlace: namedPlace, patch: patch, newUid: newUid, resources: resources))
@@ -874,6 +894,9 @@ actor CalDAVProvider: CalendarProvider {
         let slot: String?
         /// The zone the series' places are wall clocks in: its start's, else the operation's.
         let seriesZone: TimeZone
+        /// Whether the cut is a date added outside the series' rule (`SplitCarry.cutsAtAddedDate`,
+        /// #894), nil when that can't be read.
+        let cutsAtAddedDate: Bool?
     }
 
     /// The split point (`SplitPoint`) of `masterICS`: the occurrence named is the one
@@ -904,7 +927,10 @@ actor CalDAVProvider: CalendarProvider {
                 ? SplitCarry.naive(of: cutTime, recurrenceId: recurrenceId, zone: zone) : placeSlot else { throw unreadable }
             slot = at
         }
-        return SplitPoint(zones: zones, namedStart: namedStart, namedPlace: namedPlace, namedInstants: namedInstants, cut: cut, slot: slot, seriesZone: seriesZone)
+        let onAddedDate = SplitCarry.cutsAtAddedDate(cut, series: series.event, rdates: rdates, zone: seriesZone, zones: zones)
+        return SplitPoint(
+            zones: zones, namedStart: namedStart, namedPlace: namedPlace, namedInstants: namedInstants, cut: cut, slot: slot,
+            seriesZone: seriesZone, cutsAtAddedDate: onAddedDate)
     }
 
     /// The instants `start` and `place` name, as `parseICSDateTime` reads a resource's times: a

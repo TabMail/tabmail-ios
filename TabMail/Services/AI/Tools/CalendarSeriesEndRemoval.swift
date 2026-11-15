@@ -29,11 +29,12 @@ enum CalendarSeriesEndRemoval {
 
     /// The series has dates added to it on their own (`RDATE`), which this count does not read
     /// (#881). Unlike `Unreadable`, a retry fails the same way every time, so the edit tool says
-    /// plainly the change can't be made yet and asks for no retry (#880).
+    /// plainly the change can't be made yet and asks for no retry (#880). Its text is the one text
+    /// for every refusal of a series with added dates, kept in the provider layer
+    /// (`CalendarProviderError.addedDatesReason`), where a split cut at one and a start moved away
+    /// from them are refused in it too (#894).
     struct AddedDates: LocalizedError {
-        var errorDescription: String? {
-            "this repeating event has extra dates added outside its repeat pattern, and TabMail can't change the repeat pattern of such an event yet"
-        }
+        var errorDescription: String? { CalendarProviderError.addedDatesReason }
     }
 
     /// What the whole-series edit `edit` of `series` (`seriesId`, read on `calendarId`) removes by

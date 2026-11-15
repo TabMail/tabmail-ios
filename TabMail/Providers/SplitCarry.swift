@@ -485,7 +485,7 @@ enum SplitCarry {
         let start: GCalDateTime
         /// The zone its places are wall clocks in (nil for an all-day series).
         let zone: TimeZone?
-        /// Its added places (`RDATE`).
+        /// Its added places (`RDATE`), those no `EXDATE` cancels (`liveAddedDates`).
         var added: [GCalDateTime] = []
         var anchor: RecurrenceTail.Anchor = .dtstart
         var missingDay: RecurrenceTail.MissingMonthDay = .skip
@@ -530,21 +530,137 @@ enum SplitCarry {
         guard let namedStart = named.start, let namedPlace = named.originalStartTime ?? named.start else { return nil }
         let moved = RecurrenceOccurrenceResolver.wasMoved(named)
         guard moved else { return .at(namedPlace) }
-        let lines = (series.recurrence ?? []) + rdates
-        guard let rule = lines.first(where: isRule), let start = series.start else { return nil }
-        var added: [GCalDateTime] = []
-        for line in lines where line.uppercased().hasPrefix("RDATE") {
-            guard (try? CalDAVProvider.filterDateList(line, zones: zones, keep: { instant in
-                added.append(series.isAllDay
-                    ? GCalDateTime(dateTime: nil, date: naive(instant, in: .gmt).prefix(10).description, timeZone: nil)
-                    : GCalDateTime(dateTime: instant.iso8601String(), date: nil, timeZone: "UTC"))
-                return true
-            })) != nil else { return nil }
+        guard let pattern = pattern(of: series, rdates: rdates, zone: zone, zones: zones, anchor: anchor, missingDay: missingDay) else {
+            return nil
         }
-        let pattern = Pattern(
+        return cut(namedStart: namedStart, namedPlace: namedPlace, moved: true, pattern: pattern)
+    }
+
+    /// The pattern of `series` (`Pattern`) as a split reads it: its RRULE, its first start, and its
+    /// live added dates (`RDATE`, in its `recurrence` lines and `rdates`, read with `zones`, less
+    /// those an `EXDATE` cancels: `liveAddedDates`, #894), its places
+    /// wall clocks in `zone`, the series' own (`seriesZone`) when not given. Nil when the series
+    /// has no rule or start, or an added or excluded date can't be read.
+    private static func pattern(
+        of series: GCalEvent, rdates: [String], zone: TimeZone?, zones: CalendarTimeZoneContext,
+        anchor: RecurrenceTail.Anchor, missingDay: RecurrenceTail.MissingMonthDay
+    ) -> Pattern? {
+        let lines = (series.recurrence ?? []) + rdates
+        guard let rule = lines.first(where: isRule), let start = series.start,
+              let added = liveAddedDates(lines, isAllDay: series.isAllDay, zones: zones) else { return nil }
+        return Pattern(
             rule: rule, start: start, zone: series.isAllDay ? nil : zone ?? series.seriesZone,
             added: added, anchor: anchor, missingDay: missingDay)
-        return cut(namedStart: namedStart, namedPlace: namedPlace, moved: true, pattern: pattern)
+    }
+
+    /// Whether `line` is a line of added dates (`RDATE`).
+    static func isAddedDates(_ line: String) -> Bool { line.uppercased().hasPrefix("RDATE") }
+
+    /// Whether `line` is a line of excluded dates (`EXDATE`).
+    private static func isExcludedDates(_ line: String) -> Bool { line.uppercased().hasPrefix("EXDATE") }
+
+    /// The live added dates of the recurrence `lines` (#894): each date an `RDATE` line adds that
+    /// no `EXDATE` line cancels (RFC 5545 §3.8.5.1: an excluded date removes an added one too), so
+    /// an added date the user deleted is no meeting and no place of the series. Read with `zones`,
+    /// as dates for an all-day series (`isAllDay`), else as instants. Excluded dates are read only
+    /// when a date is added. Nil when an added or excluded date can't be read.
+    static func liveAddedDates(_ lines: [String], isAllDay: Bool, zones: CalendarTimeZoneContext) -> [GCalDateTime]? {
+        func dates(_ of: (String) -> Bool) -> [GCalDateTime]? {
+            var read: [GCalDateTime] = []
+            for line in lines where of(line) {
+                guard (try? CalDAVProvider.filterDateList(line, zones: zones, keep: { instant in
+                    read.append(isAllDay
+                        ? GCalDateTime(dateTime: nil, date: naive(instant, in: .gmt).prefix(10).description, timeZone: nil)
+                        : GCalDateTime(dateTime: instant.iso8601String(), date: nil, timeZone: "UTC"))
+                    return true
+                })) != nil else { return nil }
+            }
+            return read
+        }
+        guard let added = dates(isAddedDates) else { return nil }
+        guard !added.isEmpty else { return [] }
+        guard let excluded = dates(isExcludedDates) else { return nil }
+        var live: [GCalDateTime] = []
+        for date in added {
+            var cancelled = false
+            for gone in excluded {
+                guard let same = sameTime(date, gone) else { return nil }
+                cancelled = cancelled || same
+            }
+            if !cancelled { live.append(date) }
+        }
+        return live
+    }
+
+    /// Whether a write that moves a repeating event's start leaves its added dates behind (#894,
+    /// owner rulings 2026-11-14): the write moves the start (`moves`, as the write decides it: a
+    /// new time or date, the other kind, or for Google the same instant in another zone; nil when
+    /// a start can't be read), `recurrence`, the event's recurrence as the write leaves it (a
+    /// split's new part: only the lines at or after the cut; an edit of every occurrence: the lines
+    /// its write sends), holds a live added date (`liveAddedDates`, read with `zones`, as dates when
+    /// `isAllDay`), and the calendar does not move added dates with the event (`movesAddedDates`,
+    /// `CalendarProvider.movesAddedDatesWithSeries`). The event's meetings would then differ from
+    /// what was asked: the added ones stay at their old time. False on a calendar that moves them,
+    /// for a write that moves no start, or with no live added date: the move is decided first, so a
+    /// change of title, place or length never reads an added date. Nil when the move can't be
+    /// decided or an added or excluded date can't be read, with a date added.
+    static func leavesAddedDatesBehind(
+        moves: Bool?, recurrence: [String], isAllDay: Bool, zones: CalendarTimeZoneContext, movesAddedDates: Bool
+    ) -> Bool? {
+        guard !movesAddedDates, moves != false, recurrence.contains(where: isAddedDates) else { return false }
+        guard let live = liveAddedDates(recurrence, isAllDay: isAllDay, zones: zones) else { return nil }
+        guard !live.isEmpty else { return false }
+        return moves
+    }
+
+    /// Whether a start moves from `from` to `to`: the other kind, or another date or instant. Nil
+    /// when either can't be read. A split's check of its new part against its cut.
+    static func startMoves(from: GCalDateTime?, to: GCalDateTime?) -> Bool? {
+        guard let from, let to else { return nil }
+        if (from.date == nil) != (to.date == nil) { return true }
+        return sameTime(to, from).map { !$0 }
+    }
+
+    /// Whether a split of `series` at `cut` starts its new part on a date added to the series
+    /// outside its repeat pattern (#894): the cut is one of its live added dates (`RDATE`, read as
+    /// `cut` reads them; one an `EXDATE` cancels is no meeting and no place) and not a place its
+    /// rule gives. The new part keeps the series' rule
+    /// (`RecurrenceTail.newSeriesRule`) and would start off it (RFC 5545 §3.8.5.3: a start the rule
+    /// does not give leaves its occurrences undefined; §3.3.10: the start counts toward `COUNT`), so
+    /// it would lose meetings or make some up: such a split is refused before anything is written,
+    /// on every calendar that holds added dates, from what the series holds. False past the end and
+    /// for a series with no added date (nothing more is read); nil when the series can't be read.
+    static func cutsAtAddedDate(
+        _ cut: Cut, series: GCalEvent, rdates: [String] = [], zone: TimeZone? = nil,
+        zones: CalendarTimeZoneContext = .none,
+        anchor: RecurrenceTail.Anchor = .dtstart, missingDay: RecurrenceTail.MissingMonthDay = .skip
+    ) -> Bool? {
+        guard case .at(let at) = cut,
+              ((series.recurrence ?? []) + rdates).contains(where: isAddedDates) else { return false }
+        guard let pattern = pattern(of: series, rdates: rdates, zone: zone, zones: zones, anchor: anchor, missingDay: missingDay) else {
+            return nil
+        }
+        var onAddedDate = false
+        for added in pattern.added {
+            guard let same = sameTime(added, at) else { return nil }
+            onAddedDate = onAddedDate || same
+        }
+        guard onAddedDate else { return false }
+        // The rule's own place at or after the cut: the cut is the rule's when it is that place.
+        switch ruleCut(after: at, pattern: pattern) {
+        case nil: return nil
+        case .pastEnd?: return true
+        case .at(let place)?:
+            guard let same = sameTime(place, at) else { return nil }
+            return !same
+        }
+    }
+
+    /// Whether `a` and `b` are the same time: the same date, or the same instant. Nil when either
+    /// can't be read or they are of different kinds.
+    private static func sameTime(_ a: GCalDateTime, _ b: GCalDateTime) -> Bool? {
+        guard let after = isInTail(a, split: b), let before = isInTail(b, split: a) else { return nil }
+        return after && before
     }
 
     /// The naive wall clock (`yyyy-MM-dd'T'HH:mm:ss`, or the date for an all-day series written

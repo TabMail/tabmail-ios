@@ -173,6 +173,18 @@ protocol CalendarProvider: Sendable {
     /// naming the field, with nothing sent; the provider's writer refuses it the same way. Default:
     /// nil (Google and CalDAV store the rule as written).
     func recurrenceRuleRefusal(_ rrule: String) -> String?
+
+    /// Whether this calendar moves a repeating event's added dates (`RDATE`) with the event when a
+    /// write moves its start: a split's new part given a new time or date, or every occurrence
+    /// given one (#894). CalDAV does (`shiftSeriesAnchoredValues` moves them by the same amount, and
+    /// a change of kind converts them); Google does not (its write re-anchors only the start and
+    /// end, and the added dates stay at their old time, so a new part moved off its cut shows them
+    /// at the old time, one of them twice when it is the cut). A write that moves the start of an
+    /// event holding live added dates in the recurrence it writes is refused before anything is
+    /// written on a calendar that does not (`refuseAddedDatesLeftBehind`,
+    /// `SplitCarry.leavesAddedDatesBehind`, owner rulings 2026-11-14). A capability, read through this protocol by that one check, never a provider
+    /// type check. Default: false (refuse), for a calendar that was not checked.
+    static var movesAddedDatesWithSeries: Bool { get }
 }
 
 /// A write of a repeating series as the queue will make it, for the calendar's check before the
@@ -219,6 +231,13 @@ enum CalendarProviderError: Error {
     /// is. A final answer: a retry can't restore them.
     case seriesPutBackIncomplete(String)
 
+    /// THE refusal of a change TabMail can't make yet to a repeating event with dates added outside
+    /// its repeat pattern (`RDATE`, #880, #894): a rule change, a split cut on an added date, and a
+    /// start moved on a calendar that leaves added dates behind. One text for all of them; the tool
+    /// layer's `CalendarSeriesEndRemoval.AddedDates` says it too.
+    static let addedDatesReason =
+        "this repeating event has extra dates added outside its repeat pattern, and TabMail can't change the repeat pattern of such an event yet"
+
     /// What an edit is told for `seriesNotInThisCalendar` (#729's wording).
     static let seriesNotInThisCalendarReason =
         "The series of this repeating event is not in this calendar, which holds only changed occurrences of it (an invitation to single occurrences of someone else's series), so it can't be changed as a whole or split here. One of those occurrences can be changed on its own: edit_scope this_only, with the event_id listed for it and its start_iso as recurrence_id"
@@ -258,6 +277,28 @@ extension CalendarProvider {
         String(recurrenceId.prefix(10))
     }
     func recurrenceRuleRefusal(_ rrule: String) -> String? { nil }
+    static var movesAddedDatesWithSeries: Bool { false }
+
+    /// THE check of a write that moves a repeating event's start while the event holds dates added
+    /// outside its repeat pattern (#894, owner rulings 2026-11-14): refused before anything is
+    /// written, in #880's words (`CalendarProviderError.addedDatesReason`), when this calendar does
+    /// not move added dates with the event (`movesAddedDatesWithSeries`, read here through the
+    /// protocol) and `SplitCarry.leavesAddedDatesBehind` says the write moves the start (`moves`,
+    /// decided by the write as it decides what it sends; nil when a start can't be read) with a
+    /// live added date in `recurrence`, the recurrence as the write leaves it. A write that moves
+    /// no start reads no added date. `unreadable` is the write's own text for a time it can't
+    /// read. Every split plan and every edit of every occurrence that can move the start calls it.
+    static func refuseAddedDatesLeftBehind(
+        moves: Bool?, recurrence: [String], isAllDay: Bool,
+        zones: CalendarTimeZoneContext = .none, unreadable: String
+    ) throws {
+        switch SplitCarry.leavesAddedDatesBehind(
+            moves: moves, recurrence: recurrence, isAllDay: isAllDay, zones: zones, movesAddedDates: movesAddedDatesWithSeries) {
+        case nil: throw CalendarProviderError.notSupported(unreadable)
+        case true?: throw CalendarProviderError.notSupported(CalendarProviderError.addedDatesReason)
+        case false?: break
+        }
+    }
     func occurrence(calendarId: String, eventId: String, recurrenceId: String, recurrenceIdZone: TimeZone) async throws -> GCalEvent {
         throw CalendarProviderError.notSupported("Changing one occurrence of a repeating event, or the occurrences from one on, is not yet supported on this calendar provider. Edit the whole series instead.")
     }
@@ -487,6 +528,10 @@ enum RecurrenceOccurrenceResolver {
 /// Mirrors `GmailProvider` actor pattern — same `accessToken` closure, same retry logic.
 /// Google handles invitations natively via `sendUpdates=all` — no ICS generation needed.
 actor GoogleCalendarProvider: CalendarProvider {
+    /// `CalendarProvider.movesAddedDatesWithSeries`: no. `splitNewPartJSON` and `patchEvent`
+    /// re-anchor only the start and end; the new part's `RDATE` values stay where they were (#894).
+    static let movesAddedDatesWithSeries = false
+
     private let accessToken: @Sendable (_ forceRefresh: Bool) async throws -> String
     private let baseURL = "https://www.googleapis.com/calendar/v3"
     /// Test-only transport override. `nil` on every production path, where
@@ -734,13 +779,12 @@ actor GoogleCalendarProvider: CalendarProvider {
         // recurrence silently rewrote start/end. Defense-in-depth.
         let (existing, existingJSON) = try await getEventAndJSON(calendarId: calendarId, eventId: eventId)
         var edit = event
-        if keepStoredDates, let rule = event.recurrence {
-            edit.recurrence = Self.recurrence(existing.recurrence, withRuleFrom: rule)
-        }
-        // A move to another day turns the days the stored rule names (`RecurrenceDayShift`), and
-        // its excluded dates go with the old days (`turned`).
-        if edit.recurrence == nil, let move = event.ruleDayMove, let stored = existing.recurrence {
-            edit.recurrence = try Self.turned(stored, by: move)
+        edit.recurrence = try Self.writtenRecurrence(existing.recurrence, edit: event, keepStoredDates: keepStoredDates)
+        // An edit of every occurrence that moves the series' start leaves its added dates at their
+        // old time here (Google keeps an `RDATE` as written): refused before the PATCH, as the
+        // card's check refuses it (`refuseSeriesWrite`, #894), on the recurrence this PATCH writes.
+        if keepStoredDates, existing.recurrence?.isEmpty == false {
+            try Self.refuseEveryOccurrenceMove(series: existing, edit: event, written: edit.recurrence)
         }
         let merged = Self.mergeExistingEventWithPatch(existing: existing, patch: edit)
         let encodedCalId = try Self.encodedPathSegment(calendarId, "Google calendar id")
@@ -1108,6 +1152,17 @@ actor GoogleCalendarProvider: CalendarProvider {
         guard let place = point.place, case .at(let splitPlace) = point.cut else {
             return .shown(try await shownPlan(calendarId: calendarId, master: master, masterId: eventId, named: found, patch: patch))
         }
+        // A cut on a date added outside the repeat pattern (`RDATE`) would start the new part off
+        // the rule it keeps, so it would lose meetings or make some up: refused before anything is
+        // written, in #880's words (#894; full support is #881).
+        switch SplitCarry.cutsAtAddedDate(point.cut, series: master) {
+        case nil:
+            throw CalendarProviderError.notSupported("where the occurrence named falls in its series can't be read, so the series can't be split at it")
+        case true?:
+            throw CalendarProviderError.notSupported(CalendarProviderError.addedDatesReason)
+        case false?:
+            break
+        }
         guard let partPatch = SplitCarry.partEdit(patch, namedStart: namedStart, cut: splitPlace, zone: master.isAllDay ? nil : master.seriesZone) else {
             throw CalendarProviderError.notSupported("where the occurrence named falls in its series can't be read, so the series can't be split at it")
         }
@@ -1195,6 +1250,17 @@ actor GoogleCalendarProvider: CalendarProvider {
               let edits = SplitCarry.edits(of: parts.edited, shift: SplitCarry.shift(cut: splitPlace, newPart: written), length: SplitCarry.length(of: written), fields: fields) else {
             throw CalendarProviderError.notSupported("the new part of this repeating event has a time TabMail can't read, so it was not split")
         }
+        // A new part moved off its cut keeps its added dates at their old time on a calendar that
+        // does not move them with it: refused before anything is written, in #880's words (#894).
+        // Read from the new part's recurrence as written: a reset drops its excluded dates
+        // (`withoutExcludedDates`), so an added date cancelled on the series is live there again.
+        // The new part's start moves off its cut to another time, day or kind. A new rule alone
+        // moves no start, and neither does a new zone: the new part repeats in the series' own zone
+        // (`mergeMasterAndPatch`), so its added dates keep their place among its meetings.
+        try Self.refuseAddedDatesLeftBehind(
+            moves: SplitCarry.startMoves(from: splitPlace, to: written.start),
+            recurrence: recurrenceParts.tail, isAllDay: master.isAllDay,
+            unreadable: "the new part of this repeating event has a time TabMail can't read, so it was not split")
 
         return .split(SplitPlan(
             masterId: eventId, master: master, masterJSON: masterJSON, place: place, splitPlace: splitPlace,
@@ -1236,11 +1302,20 @@ actor GoogleCalendarProvider: CalendarProvider {
     }
 
     /// `CalendarProvider.refuseSeriesWrite`. A split runs its write's plan (`splitPlan`). An edit of
-    /// every occurrence is `updateEvent`, and a delete of an occurrence and every later one plans
-    /// nothing a card could check before its read: no request.
+    /// every occurrence runs the check its write (`patchEvent`) makes before its PATCH
+    /// (`refuseEveryOccurrenceMove`, #894) on the series as already read and the recurrence the
+    /// PATCH would write (`writtenRecurrence`), with no request. A delete of an occurrence and every
+    /// later one plans nothing a card could check before its read.
     func refuseSeriesWrite(calendarId: String = "primary", write: SeriesWrite) async throws {
-        guard case .split(let eventId, let recurrenceId, let zone, let edit) = write else { return }
-        _ = try await splitPlan(calendarId: calendarId, eventId: eventId, recurrenceId: recurrenceId, recurrenceIdZone: zone, patch: edit)
+        switch write {
+        case .everyOccurrence(_, let series, let edit):
+            try Self.refuseEveryOccurrenceMove(
+                series: series, edit: edit, written: Self.writtenRecurrence(series.recurrence, edit: edit, keepStoredDates: true))
+        case .split(let eventId, let recurrenceId, let zone, let edit):
+            _ = try await splitPlan(calendarId: calendarId, eventId: eventId, recurrenceId: recurrenceId, recurrenceIdZone: zone, patch: edit)
+        case .followingDelete:
+            return
+        }
     }
 
     /// One exception of a series from a split on, as Google lists it: the neutral value the
@@ -1946,6 +2021,33 @@ actor GoogleCalendarProvider: CalendarProvider {
             }
         }
         return (capped, tail)
+    }
+
+    /// THE recurrence a write of `edit` to a series whose recurrence is `stored` writes, nil when it
+    /// writes none and the stored one stays: the one computation `patchEvent` writes and the check
+    /// of an edit of every occurrence reads (`refuseEveryOccurrenceMove`, #894). With
+    /// `keepStoredDates` (an edit), a rule in `edit` replaces only the stored rule
+    /// (`recurrence(_:withRuleFrom:)`, #513); without it (a split's cap), `edit.recurrence` is
+    /// written as given. A move to another day with no rule given turns the days the stored rule
+    /// names (`RecurrenceDayShift`), and its excluded dates go with the old days (`turned`).
+    static func writtenRecurrence(_ stored: [String]?, edit: GCalEventInput, keepStoredDates: Bool) throws -> [String]? {
+        if let given = edit.recurrence { return keepStoredDates ? recurrence(stored, withRuleFrom: given) : given }
+        if let move = edit.ruleDayMove, let stored { return try turned(stored, by: move) }
+        return nil
+    }
+
+    /// The check of an edit of every occurrence `edit` of the Google series `series` before its
+    /// PATCH (#894): `refuseAddedDatesLeftBehind` on the recurrence the PATCH leaves (`written`,
+    /// from `writtenRecurrence`, else the stored one), so an added date whose excluded date a day
+    /// move drops (`turned`) is live again and counts. The start moves as the write decides it
+    /// sends one (`movesSeriesTime` by `googleStart`): another date, instant or kind, or the same
+    /// instant in another zone, which Google repeats the series in while its added dates keep
+    /// their instants. A change of title, place or length moves no start and reads no added date.
+    static func refuseEveryOccurrenceMove(series: GCalEvent, edit: GCalEventInput, written: [String]?) throws {
+        try refuseAddedDatesLeftBehind(
+            moves: movesSeriesTime(edit, existing: series, as: googleStart), recurrence: written ?? series.recurrence ?? [],
+            isAllDay: series.isAllDay,
+            unreadable: "this repeating event has a time TabMail can't read, so every occurrence was not moved")
     }
 
     /// `recurrence` with the days of each RRULE line turned by `move` (`RecurrenceDayShift`), and

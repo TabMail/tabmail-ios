@@ -358,12 +358,49 @@ final class FakeGoogleCalendar: Sendable {
     /// The occurrence `id` (`<series id>_<UTC start>Z`, or `<series id>_<date>` for an all-day
     /// series) of a stored series, as Google gives it before it is changed: the series' fields at
     /// its place, lasting as long as the series. Nil (a 404) when `id` names no occurrence of a
-    /// stored series: no series, or a start its rule does not place an occurrence at (`onRule`), as
-    /// Google answers an instance id off the rule.
+    /// stored series: no series, or a start neither its rule (`onRule`) nor one of its live added
+    /// dates (`onAddedDate`) places an occurrence at, as Google answers an instance id off the rule.
     private static func instance(_ id: String, of event: (String) -> [String: Any]?) -> [String: Any]? {
         guard let occurrence = anyInstance(id, of: event), let seriesId = occurrence["recurringEventId"] as? String,
-              let series = event(seriesId), onRule(series, occurrence: occurrence) else { return nil }
+              let series = event(seriesId),
+              onRule(series, occurrence: occurrence) || onAddedDate(series, occurrence: occurrence) else { return nil }
         return occurrence
+    }
+
+    /// Whether `occurrence` (built by `anyInstance`) starts on a date added to `series` (`RDATE`)
+    /// that no excluded date (`EXDATE`) cancels: Google gives an added date an instance of its own,
+    /// with an id like any other (`<series id>_<UTC start>Z`). Read here, apart from the code under
+    /// test, in the forms Google writes and the tests seed, comma-separated: `RDATE:<UTC times>`,
+    /// `RDATE;VALUE=DATE:<dates>`, and `RDATE;TZID=<zone>:<wall clocks>`, each wall clock read in
+    /// its zone (`TimeZone(identifier:)`) as the UTC time Google names the instance by; a value in
+    /// a zone that does not resolve is no date. `EXDATE` lines alike.
+    private static func onAddedDate(_ series: [String: Any], occurrence: [String: Any]) -> Bool {
+        let lines = series["recurrence"] as? [String] ?? []
+        func values(_ name: String) -> Set<String> {
+            Set(lines.filter { $0.uppercased().hasPrefix(name) }.flatMap { line -> [String] in
+                let halves = line.split(separator: ":", maxSplits: 1).map(String.init)
+                guard halves.count == 2 else { return [] }
+                let values = halves[1].split(separator: ",").map(String.init)
+                guard let tzid = halves[0].split(separator: ";").first(where: { $0.uppercased().hasPrefix("TZID=") }) else { return values }
+                guard let zone = TimeZone(identifier: String(tzid.dropFirst("TZID=".count))) else { return [] }
+                let wall = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss", timeZone: zone)
+                let utc = FixedDateFormat.formatter("yyyyMMdd'T'HHmmss'Z'", timeZone: .gmt)
+                return values.compactMap { wall.date(from: $0).map(utc.string(from:)) }
+            })
+        }
+        let start = occurrence["start"] as? [String: Any]
+        let key: String
+        if let date = start?["date"] as? String {
+            key = date.replacingOccurrences(of: "-", with: "")
+        } else {
+            guard let at = (start?["dateTime"] as? String).flatMap({ Date.fromISO8601($0) }) else { return false }
+            let fmt = DateFormatter()
+            fmt.locale = Locale(identifier: "en_US_POSIX")
+            fmt.timeZone = .gmt
+            fmt.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+            key = fmt.string(from: at)
+        }
+        return values("RDATE").contains(key) && !values("EXDATE").contains(key)
     }
 
     /// Whether the series `series` places an occurrence where `occurrence` (built by `anyInstance`)
