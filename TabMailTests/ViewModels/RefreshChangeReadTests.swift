@@ -74,6 +74,8 @@ struct RefreshChangeReadTests {
             state.lastSyncCompletedAt = saved.1
             state.lastSyncFailed = saved.2
         }
+        state.syncErrorBanner = nil
+        state.lastSyncFailed = false
         var thrown: Error?
         do { try await body(pool, members) } catch { thrown = error }
         for member in members {
@@ -136,6 +138,11 @@ struct RefreshChangeReadTests {
                 #expect(healthyRead == true,
                         "the healthy account's change did not land (failing account first: \(failingFirst))")
                 #expect(failingRead == false)
+                // A read failure the pass swallows keeps the background meaning:
+                // the pull still succeeds (coordinator ruling Q1 = a).
+                #expect(!AccountManagerState.shared.lastSyncFailed,
+                        "a change-read failure the pass reports in its result failed the pull")
+                #expect(AccountManagerState.shared.syncErrorBanner == nil)
             }
         }
     }
@@ -156,6 +163,54 @@ struct RefreshChangeReadTests {
             #expect(healthyRead == true, "the healthy account's change did not land")
             #expect(AccountManagerState.shared.lastSyncFailed,
                     "a change read that failed on its retry was hidden by the pull")
+        }
+    }
+
+    /// Records the order of the mock's calls across tasks.
+    private actor CallLog {
+        private(set) var calls: [String] = []
+        func add(_ call: String) { calls.append(call) }
+    }
+
+    @Test("the pull re-lists the folder on screen first, then reads what changed")
+    func reListsBeforeTheChangeRead() async throws {
+        try await withAccounts(1) { pool, members in
+            let member = try #require(members.first)
+            let log = CallLog()
+            await member.mock.setFetchMessagesHook { _ in await log.add("list") }
+            let archiveId = member.archiveId
+            await member.mock.setChangeReader { _, request in
+                await log.add("changes")
+                var record = ChangeRecord(messageId: "old")
+                record.isRead = true
+                return ChangeSet(account: .set("200"), folderList: nil, folders: request.folders.map {
+                    FolderChanges(folderId: $0.id, status: .tracked, addressEpoch: nil,
+                                  records: $0.id == archiveId ? [record] : [], removals: [])
+                })
+            }
+            await InboxViewModel(folders: [member.inbox]).refreshSync()
+            let calls = await log.calls
+            #expect(calls.first == "list" && calls.contains("changes"),
+                    "the change read ran before the re-list, or not at all: \(calls)")
+            let read = try Self.oldIsRead(member, pool)
+            #expect(read == true)
+        }
+    }
+
+    @Test("an account whose re-list fails gets no change read")
+    func failedReListSkipsTheChangeRead() async throws {
+        try await withAccounts(1) { _, members in
+            let member = try #require(members.first)
+            await member.mock.setFetchMessagesThrows(NSError(domain: "com.example.test", code: 13))
+            let log = CallLog()
+            await member.mock.setChangeReader { _, _ in
+                await log.add("changes")
+                return ChangeSet(account: .keep, folderList: nil, folders: [])
+            }
+            await InboxViewModel(folders: [member.inbox]).refreshSync()
+            let calls = await log.calls
+            #expect(calls.isEmpty, "the change read ran after the account's re-list failed")
+            #expect(AccountManagerState.shared.lastSyncFailed)
         }
     }
 }
