@@ -107,7 +107,8 @@
 > or not; source, and destination for a move)"); a full list, a retired draft delete or a row
 > this release cannot decode arms the folder's (or the account's) catch-up. It re-sends, replays and decides nothing about any operation, so the carve-out's three
 > properties still hold and it is still not an exit. Detail: `IOS-ACTION-003`.
-> *2026-11-14 (#903):* a user-label change's ids are listed on its source folder the same way.
+> *2026-11-14 (#903):* a user-label change's ids are listed on its source folder the same way, and
+> every retired id is kept (no "full list" catch-up for them; the passes drain the list).
 >
 > **2026-09-06 amendment: ordinary message actions have a fifth runtime exit.** This latest
 > amendment supersedes the earlier four-exit enumeration and its statement that exit 4 is the

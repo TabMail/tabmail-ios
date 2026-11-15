@@ -54,10 +54,12 @@ import GRDB
 //   not a JSON list): its folder's catch-up is armed, or every folder's of the
 //   account when its folder does not resolve. The same for a move, read/flag or
 //   user-label row whose folder no longer exists. Never skipped silently.
-// A list over `SyncConfig.changeRecheckLimit` keeps its first ids and arms the
-// folder's catch-up only in a folder the catch-up checks (`isSyncable`), as the
-// apply does; a folder the catch-up never checks keeps every id, since arming
-// would repair nothing there (each pass still reads at most the per-pass budget).
+// Every retired id is kept, whatever `SyncConfig.changeRecheckLimit`: the set
+// is finite and written once, and each pass reads at most the per-pass budget
+// (`SyncConfig.changeRereadBudgetPerPass`), so a long list drains over passes.
+// The catch-up is not armed for them (it never corrects labels). The apply
+// never cuts an id already stored; it cuts only a pass's own additions that
+// take a list over the limit (ADR-IOS-111, amendment 2026-11-15, #903).
 //
 // The ids are the queue's own: the provider's id for the message in the folder
 // the action was queued on. A drained move re-addresses the queued rows after it
@@ -94,24 +96,18 @@ extension SyncEngine {
         let bookmarked = Set(try rawStrings(db, "SELECT id FROM account WHERE lastHistoryId IS NOT NULL"))
         guard !bookmarked.isEmpty else { return summary }
 
-        // Folder (id, change state, whether the catch-up checks it) by
-        // (account, path), read once per pair. A role this release cannot read
-        // counts as not checked, so that folder keeps every id.
+        // Folder (id, change state) by (account, path), read once per pair.
         var foldersByKey: [String: RetiredActionFolder?] = [:]
         var foldersById: [String: RetiredActionFolder] = [:]
         func folder(accountId: String, path: String) throws -> RetiredActionFolder? {
             let key = "\(accountId)\u{1F}\(path)"
             if let cached = foldersByKey[key] { return cached }
             let row = try Row.fetchOne(
-                db, sql: "SELECT id, changeState, role, isFavorite FROM folder WHERE accountId = ? AND path = ?",
+                db, sql: "SELECT id, changeState FROM folder WHERE accountId = ? AND path = ?",
                 arguments: [accountId, path])
             let found = row.flatMap { row in
                 Self.rawString(row, "id").map { id in
-                    RetiredActionFolder(
-                        id: id, changeState: Self.rawString(row, "changeState"),
-                        catchUpChecks: Self.rawString(row, "role").flatMap(FolderRole.init(rawValue:)).map {
-                            Self.isSyncable(role: $0, isFavorite: Bool.fromDatabaseValue(row["isFavorite"] as DatabaseValue) ?? false)
-                        } ?? false)
+                    RetiredActionFolder(id: id, changeState: Self.rawString(row, "changeState"))
                 }
             }
             foldersByKey[key] = found
@@ -177,10 +173,6 @@ extension SyncEngine {
                 state.recheck.append(id)
                 summary.listedIds += 1
             }
-            if state.recheck.count > SyncConfig.changeRecheckLimit, named.catchUpChecks {
-                state.recheck = Array(state.recheck.prefix(SyncConfig.changeRecheckLimit))
-                armFolderIds.insert(folderId)
-            }
             if state != before {
                 try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?",
                                arguments: [state.encoded, folderId])
@@ -210,11 +202,8 @@ extension SyncEngine {
     }
 }
 
-/// A folder as the boundary reads it: its id, its raw change state, and whether
-/// the catch-up checks it (`SyncEngine.isSyncable`), which decides whether ids
-/// over the list's limit may be left to that catch-up.
+/// A folder as the boundary reads it: its id and its raw change state.
 private struct RetiredActionFolder {
     let id: String
     let changeState: String?
-    let catchUpChecks: Bool
 }

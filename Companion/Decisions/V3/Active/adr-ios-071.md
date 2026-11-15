@@ -113,7 +113,10 @@ Accounts with no bookmark (IMAP today) are unchanged. Detail and the address rea
 **2026-11-14 amendment (#903): user-label changes are read again.** Once #882 made the merge
 replace a stored row's user labels, a retired `addUserLabel`/`removeUserLabel` lists its ids on its
 source folder's re-read list like a read/flag change; the "not corrected" sentence above now holds
-only for replied/forwarded marks.
+only for replied/forwarded marks. 2026-11-15 (#903): every retired id is kept, whatever
+`SyncConfig.changeRecheckLimit`, and no catch-up is armed for them ("within
+`SyncConfig.changeRecheckLimit` ... overflow arms that folder's catch-up" above is superseded); the
+change passes drain the list (ADR-IOS-111 amendment 2026-11-15).
 
 **Relates:** ADR-IOS-068, ADR-IOS-069, ADR-IOS-070 (migration immutability precedent),
 `KNOWN_ISSUES.md` (`IOS-ACTION-001`, `IOS-ACTION-003`), migrations

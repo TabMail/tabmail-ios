@@ -160,7 +160,10 @@ throw and stop `AppDatabase.init`), and for every account that holds a change bo
   which loads the server draft back so the delete can be redone; its address is a draft resource
   (Gmail) and never goes on a list. Without this the server draft stayed on the server and other
   devices while the phone never showed it again;
-- over `SyncConfig.changeRecheckLimit`, a folder the catch-up checks (`SyncEngine.isSyncable`) keeps
+- *(2026-11-15, #903: every retired id is kept in every folder and no catch-up is armed for them;
+  the passes drain the list within the per-pass budget, and the apply cuts only a pass's own
+  additions, ADR-IOS-111 amendment 2026-11-15. The rest of this item is history.)* Over
+  `SyncConfig.changeRecheckLimit`, a folder the catch-up checks (`SyncEngine.isSyncable`) keeps
   its first ids and its catch-up is armed; a folder the catch-up never checks (a custom folder that is
   not a favourite) keeps every id, read in turn within the per-pass budget, since nothing else would
   repair a dropped one. The change apply does the same (ADR-IOS-111, amendment 2026-11-14 "every

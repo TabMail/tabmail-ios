@@ -316,8 +316,8 @@ struct ReleaseBoundaryRecheckTests {
         }
     }
 
-    @Test("Retired ids beyond the re-read list's limit keep the list at its limit and arm the folder's catch-up")
-    func overflowArmsTheCatchUp() async throws {
+    @Test("Retired ids beyond the re-read list's limit are all kept and arm no catch-up (#903: they drain over passes)")
+    func overflowKeepsEveryRetiredId() async throws {
         try await Gmail.withWorld(seeds: []) { w in
             try await Self.seedCatchUpStates(w.pool, accountId: w.accountId)
             let limit = SyncConfig.changeRecheckLimit
@@ -331,8 +331,8 @@ struct ReleaseBoundaryRecheckTests {
 
             #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: Self.nextRelease()))
             let after = try Self.recheck(w.pool, folderId: inboxId)
-            #expect(after == listed + ["new-a"], "the list keeps its first \(limit) ids")
-            #expect(try Self.lapseCount(w.pool, folderId: inboxId) == 1, "the catch-up finds the rest")
+            #expect(after == listed + ["new-a", "new-b", "new-c"], "every retired id is kept past the \(limit) limit")
+            #expect(try Self.lapseCount(w.pool, folderId: inboxId) == nil, "no catch-up is armed for retired ids")
             #expect(try Self.lapseCount(w.pool, folderId: w.allMail.id) == nil)
         }
     }
@@ -781,6 +781,88 @@ struct ReleaseBoundaryRecheckTests {
         }
     }
 
+    /// #903: a stored list over the limit (the boundary's retired ids) is never
+    /// cut by a later pass; only that pass's own additions are, and the
+    /// catch-up is armed for them.
+    @Test("A pass that adds ids to a stored list over the limit keeps every stored id and cuts only its own additions, arming the catch-up")
+    func applyCutsOnlyThisPassesAdditions() async throws {
+        try await Outlook.withWorld { w in
+            let archiveId = w.folderId(w.archive)
+            let limit = SyncConfig.changeRecheckLimit
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET catchUpState = '{}' WHERE accountId = ?", arguments: [w.accountId])
+            }
+
+            // Already over the limit: no room, every new id is cut.
+            let stored = (0..<(limit + 10)).map { "stored-\($0)" }
+            try await Self.setRecheck(w, w.archive, stored)
+            let full = try await w.pool.write { db in
+                try SyncEngine.applyFolderChanges(
+                    FolderChanges(folderId: archiveId, status: .tracked, rereadLater: ["stored-0", "new-0", "new-1"]), db: db)
+            }
+            let afterFull = try w.recheck(w.archive)
+            #expect(Set(afterFull) == Set(stored), "every stored id is kept and no new id fits")
+            #expect(afterFull.count == stored.count)
+            #expect(full.armedCatchUp)
+            #expect(try Self.lapseCount(w.pool, folderId: archiveId) == 1, "the catch-up is armed for the cut additions")
+
+            // Room for one: the first new id is kept, the rest cut.
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET catchUpState = '{}' WHERE id = ?", arguments: [archiveId])
+            }
+            let near = (0..<(limit - 1)).map { "near-\($0)" }
+            try await Self.setRecheck(w, w.archive, near)
+            let partial = try await w.pool.write { db in
+                try SyncEngine.applyFolderChanges(
+                    FolderChanges(folderId: archiveId, status: .tracked, rereadLater: ["add-0", "add-1", "add-2"]), db: db)
+            }
+            #expect(try w.recheck(w.archive) == near + ["add-0"], "stored ids first, then as many additions as fit")
+            #expect(partial.armedCatchUp)
+            #expect(try Self.lapseCount(w.pool, folderId: archiveId) == 1)
+        }
+    }
+
+    /// #903: more retired label ids than the list limit in a folder the
+    /// catch-up checks are all kept and drained by the change passes, each
+    /// within its re-read budget, until every message shows the server's labels.
+    @Test("Outlook: more retired category ids than the list limit in the Inbox are all read again across passes, with no catch-up armed")
+    func manyRetiredLabelIdsDrainInACheckedFolder() async throws {
+        let count = SyncConfig.changeRecheckLimit + SyncConfig.changeRereadBudgetPerPass
+        let ids = (0..<count).map { String(format: "lbl-%03d", $0) }
+        try await Outlook.withWorld(seeds: ids.map { Outlook.seed($0, in: Outlook.inbox, daysAgo: 1, categories: ["Receipts"]) }) { w in
+            for id in ids { try w.insertRow(id, in: w.inbox, date: Outlook.daysAgo(1)) }
+            try await w.baselineAll()
+            let inboxId = w.folderId(w.inbox)
+            #expect(SyncEngine.isSyncable(role: .inbox, isFavorite: false), "precondition: the catch-up checks the Inbox")
+            let headerIds = try ids.map { try #require(try w.row($0, in: w.inbox), "precondition: stored").id }
+            #expect(try Self.storedLabels(w.pool, headerId: headerIds[0]) == ["Receipts"], "precondition: the server's category is stored")
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET catchUpState = '{}' WHERE accountId = ?", arguments: [w.accountId])
+            }
+            for headerId in headerIds {
+                try Self.setLabelOptimistically(w.pool, accountId: w.accountId, headerId: headerId,
+                                                providerLabelId: "Receipts", add: false)
+            }
+            try Self.queue(w.pool, .removeUserLabel, ids: ids, accountId: w.accountId, from: w.inbox, userLabelId: "Receipts")
+
+            #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: Self.nextRelease()))
+            #expect(try w.recheck(w.inbox) == ids, "every retired id is kept past the list limit")
+            #expect(try Self.lapseCount(w.pool, folderId: inboxId) == nil, "no catch-up is armed for them")
+
+            let passes = count / SyncConfig.changeRereadBudgetPerPass + 2
+            for _ in 0..<passes {
+                let listedBefore = try w.recheck(w.inbox).count
+                if listedBefore == 0 { break }
+                try await w.delta()
+                #expect(try w.recheck(w.inbox).count < listedBefore, "every pass makes progress")
+            }
+            #expect(try w.recheck(w.inbox).isEmpty, "every id was read again")
+            let unlabelled = try zip(ids, headerIds).filter { try Self.storedLabels(w.pool, headerId: $0.1) != ["Receipts"] }.map(\.0)
+            #expect(unlabelled.isEmpty, "every message shows the server's category again: \(unlabelled.prefix(5))")
+            #expect(try Self.lapseCount(w.pool, folderId: inboxId) == nil, "no catch-up was armed for the retired ids")
+        }
+    }
+
     /// The folder's re-read list read by raw SQL, for a row whose role the model
     /// cannot decode.
     static func rawRecheck(_ pool: DatabasePool, folderId: String) throws -> [String] {
@@ -811,8 +893,8 @@ struct ReleaseBoundaryRecheckTests {
         }
     }
 
-    @Test("A favourite custom folder over the list limit keeps its first retired ids and its catch-up is armed")
-    func favouriteCustomFolderIsCutAndArmed() async throws {
+    @Test("A favourite custom folder over the list limit keeps every retired id and arms no catch-up")
+    func favouriteCustomFolderKeepsEveryRetiredId() async throws {
         try await Outlook.withWorld { w in
             var folder = Folder(name: "Starred", path: "fld-starred", role: .custom, accountId: w.accountId)
             folder.isFavorite = true
@@ -827,8 +909,8 @@ struct ReleaseBoundaryRecheckTests {
             try Self.queue(w.pool, .markRead, ids: ids, accountId: w.accountId, from: favourite.path)
 
             #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: Self.nextRelease()))
-            #expect(try w.recheck(favourite.path) == Array(ids.prefix(SyncConfig.changeRecheckLimit)), "the list keeps its first ids")
-            #expect(try Self.lapseCount(w.pool, folderId: favourite.id) == 1, "the catch-up finds the rest")
+            #expect(try w.recheck(favourite.path) == ids, "every retired id is kept")
+            #expect(try Self.lapseCount(w.pool, folderId: favourite.id) == nil, "no catch-up is armed for retired ids")
         }
     }
 

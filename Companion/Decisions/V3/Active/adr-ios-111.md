@@ -455,3 +455,27 @@ Tests: `ReleaseBoundaryRecheckTests` (`olderMessageReturnsToABaseliningInbox`,
 Keywords: re-read list, recheck, non-synced folder, custom folder, notRun, baseline gate, held range,
 oldestSyncedDate, heldRangeApplies, explicit re-read answer, changeRecheckLimit, overflow, isSyncable,
 catch-up coverage, #876.
+
+### Amendment 2026-11-15: a stored id is never cut; only a pass's own additions are (#903)
+
+Decision (coordinator ruling, option B): the re-read list's limit (`SyncConfig.changeRecheckLimit`)
+no longer cuts ids already stored.
+1. The release boundary (`recheckRetiredActions`) keeps every retired id, in every folder, and arms
+   no catch-up for them. The set is finite and written once; each pass reads at most
+   `changeRereadBudgetPerPass` ids, so a long list drains over passes.
+2. In the change apply (`applyFolderChanges`), in a folder the catch-up checks, when THIS pass's own
+   additions (declined or `rereadLater` ids not already listed) take the list over the limit, only
+   those additions are cut, keeping as many as fit after the stored ids, and the folder's catch-up is
+   armed for them. A list already over the limit is never cut back by a later pass. A folder the
+   catch-up never checks stays uncapped; ordering is unchanged.
+Why: the catch-up never corrects user labels, so a retired label id cut to the catch-up stayed wrong
+for good; draining corrects every kind. The reader's own bursts keep the old bound and the old
+whole-folder check. *Superseded by this amendment:* rule 3's "in a folder the catch-up checks, the
+list keeps its first ids and arms the catch-up" for ids already stored, and its application at the
+release boundary.
+Tests: `ReleaseBoundaryRecheckTests` (`manyRetiredLabelIdsDrainInACheckedFolder`,
+`applyCutsOnlyThisPassesAdditions`, `overflowKeepsEveryRetiredId`,
+`favouriteCustomFolderKeepsEveryRetiredId`), `OutlookCatchUpTests.recheckOverflowHealsAFlag`,
+`ChangeApplyTests.recheckOverflowArmsCatchUp`.
+Keywords: changeRecheckLimit, overflow, stored ids never cut, this pass's additions, retired ids
+drain, #903.

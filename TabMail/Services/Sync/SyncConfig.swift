@@ -926,8 +926,10 @@ enum SyncConfig {
     /// user's own action on the message was in flight. Each id is read again on
     /// later passes, in turn within `changeRereadBudgetPerPass`, until it
     /// applies. Over this many, in a folder the catch-up checks
-    /// (`SyncEngine.isSyncable`), the extra ids are not kept and the folder's
-    /// catch-up is armed instead, so a whole-folder check finds them. A folder
+    /// (`SyncEngine.isSyncable`), a pass's own extra additions are not kept and
+    /// the folder's catch-up is armed instead, so a whole-folder check finds
+    /// them; an id already stored is never cut, so a longer list (the release
+    /// boundary's retired ids, #903) drains over passes. A folder
     /// the catch-up never checks has no limit: it keeps every id, read in turn
     /// within the per-pass budget.
     static let changeRecheckLimit = 200
