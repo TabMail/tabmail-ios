@@ -1006,3 +1006,11 @@ start and is unchanged.
 Tests: `OutlookCatchUpTests` (removals, loads, lapses, bounds, paging, same-second groups, the gate's
 timing, completed actions), `OutlookChangeFuzzTests` (catch-up schedules with faults, lapses, clock
 jumps and user actions; the completed-action invariant), `StatefulExchangeActionServerCatchUpTests`.
+
+**Amended 2026-11-14 (tabmail-ios #848): a Settings reset clears `catchUpState`.** "Reset message data"
+and "Delete All Email Index Data" now clear `Folder.catchUpState` with the folder's other sync progress,
+through the one reset list `SyncEngine.resetSyncStateTxn` (ADR-IOS-111 amendment of the same date).
+Before, a check part-way through a folder went on from its saved place in a folder the reset had
+emptied, fetching that stretch's older mail at the check's pace alongside the reset's re-download. A
+cleared state is the first-check state of a new folder, which every provider's `catchUpPlan` already
+handles. Test: `SettingsSyncStateResetTests`.
