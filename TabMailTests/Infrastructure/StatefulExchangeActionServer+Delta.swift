@@ -538,6 +538,12 @@ extension StatefulExchangeActionServer {
             var responses: [[String: Any]] = []
             for item in requests {
                 let id = item["id"] as? String ?? ""
+                // An item URL travels in the JSON body: nothing encodes it on
+                // the way, so a literal space is a malformed request.
+                if let raw = item["url"] as? String, raw.contains(" ") {
+                    responses.append(["id": id, "status": 400])
+                    continue
+                }
                 guard let path = item["url"] as? String,
                       let url = URL(string: "https://graph.microsoft.com/v1.0" + path),
                       let providerId = messageId(from: url, move: false) else {

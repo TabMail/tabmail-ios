@@ -30,8 +30,9 @@ import Foundation
 /// **Last verb (replied, forwarded; #890).** The delta cannot carry Outlook's
 /// PidTagLastVerbExecuted (`$expand` on delta is a 400), so in a tracking round
 /// every message whose record is taken from the page is also read by id
-/// (`fetchMessageDetails`, which expands it) after the page's missing headers,
-/// within the allowance. Those reads never hold the page: a message whose verb
+/// (`fetchMessageDetails`, which expands it) after EVERY folder's delta in the
+/// pass, out of the allowance left, so they never delay paging or new mail, and
+/// they never hold a page: a message whose verb
 /// was not read (budget, throttle, failed batch, unusable answer) goes on the
 /// re-read list, whose full read carries it. Only the replied and forwarded
 /// marks join the record. A baseline reads none (it lists the folder as it is).
@@ -89,8 +90,20 @@ extension ExchangeProvider {
         }
 
         var results: [String: FolderChanges] = [:]
+        var verbIdsByFolder: [(folder: ChangeFolder, ids: [String])] = []
         for folder in Self.foldersToRead(request) {
-            results[folder.id] = try await readFolder(folder, request: request, allowance: &allowance)
+            let read = try await readFolder(folder, request: request, allowance: &allowance)
+            results[folder.id] = read.changes
+            if !read.verbIds.isEmpty { verbIdsByFolder.append((folder, read.verbIds)) }
+        }
+        // Last verbs (#890) are read only after every folder's delta, out of the
+        // allowance left, so they never delay paging or new mail. Those not read
+        // here go on the folder's re-read list, whose full read carries them.
+        for (folder, ids) in verbIdsByFolder {
+            guard var changes = results[folder.id] else { continue }
+            changes.rereadLater += try await readLastVerbs(
+                ids, folder: folder, context: context, allowance: &allowance, changes: &changes)
+            results[folder.id] = changes
         }
         // A folder outside the synced set has no delta read, but its re-read
         // list is read: each listed message by id, answered for this folder (a
@@ -152,14 +165,17 @@ extension ExchangeProvider {
 
     // MARK: - One folder
 
+    /// One folder's delta and re-read list, and the ids whose last verb the
+    /// caller reads after every folder's delta (#890).
     private func readFolder(
         _ folder: ChangeFolder, request: ChangeRequest, allowance: inout ChangeReadAllowance
-    ) async throws -> FolderChanges {
+    ) async throws -> (changes: FolderChanges, verbIds: [String]) {
         let context = request.context
         let stored = OutlookFolderCursor(raw: folder.cursor)
         var state = stored ?? OutlookFolderCursor.fresh(role: folder.role, now: context.clock())
         var changes = FolderChanges(folderId: folder.id, status: .notRun)
         var collected = CollectedChanges()
+        var verbOrder: [String] = []
 
         // A state baseline on an expensive network waits, within its bound.
         if state.phase == .baseline, state.select == .state, context.isExpensiveNetwork,
@@ -167,7 +183,7 @@ extension ExchangeProvider {
             BackgroundSyncLogger.logDebug("[Exchange] change read: folder \(folder.id.suffix(12)) baseline waits for a non-expensive network")
             changes.status = .baselining
             changes.cursor = state != stored ? state.encoded : nil
-            return changes
+            return (changes, [])
         }
 
         var ending = FolderReadEnding.cut
@@ -211,7 +227,7 @@ extension ExchangeProvider {
             // their last verb (replied, forwarded) is read by id, since the
             // delta cannot carry it (#890). A baseline lists the folder as it
             // is, not changes, so it reads none.
-            var verbIds: Set<String> = []
+            var verbIds: Set<String> = []  // this page's
             for record in page.records {
                 if record.removed != nil {
                     // A baseline lists the folder as it is: it never removes.
@@ -275,11 +291,10 @@ extension ExchangeProvider {
                 break
             }
 
-            // The page passes: the last verbs it could not read here are read
-            // from the re-read list on a later pass, so they never hold it.
-            let verbOrder = page.records.map(\.id).filter { verbIds.contains($0) }
-            changes.rereadLater += try await readLastVerbs(
-                verbOrder, folder: folder, context: context, allowance: &allowance, collected: &collected)
+            // The page passes; its last verbs are read after every folder's delta.
+            for id in page.records.map(\.id) where verbIds.contains(id) && !verbOrder.contains(id) {
+                verbOrder.append(id)
+            }
 
             // Every header the page needed is in: the bookmark passes it.
             guard let next = page.nextLink ?? page.deltaLink else {
@@ -311,8 +326,11 @@ extension ExchangeProvider {
                              collected: &collected, changes: &changes)
         }
 
-        return Self.finish(
+        let finished = Self.finish(
             changes, collected: collected, state: state, stored: stored, ending: ending, now: context.clock())
+        // Only records that travel with the result need their verb.
+        let carried = Set(finished.records.map(\.messageId))
+        return (finished, verbOrder.filter { carried.contains($0) })
     }
 
     /// The folder's result from how its read ended. Records and the bookmark
@@ -403,13 +421,13 @@ extension ExchangeProvider {
     }
 
     /// Reads the last verb (replied, forwarded) of messages whose records came
-    /// from a delta page, in `$batch`es within the allowance, and joins it to
-    /// those records. Returns the ids not read: past the budget or allowance, a
+    /// from a delta page, in `$batch`es within the allowance, and sets those
+    /// records' marks. Returns the ids not read: past the budget or allowance, a
     /// failed batch, a throttle or an unusable answer. A message gone or now in
     /// another folder needs nothing (that folder's round reports it).
     private func readLastVerbs(
         _ ids: [String], folder: ChangeFolder, context: ChangeContext, allowance: inout ChangeReadAllowance,
-        collected: inout CollectedChanges
+        changes: inout FolderChanges
     ) async throws -> [String] {
         var pending = ids[...]
         var notRead: [String] = []
@@ -424,8 +442,13 @@ extension ExchangeProvider {
                 let batch = try await withTimeout(seconds: SyncConfig.changeReadRequestTimeoutSeconds) {
                     try await self.fetchMessageDetails(ids: chunk)
                 }
-                for detail in batch.details where detail.parentFolderId == folder.path {
-                    collected.addLastVerb(of: detail.header)
+                let verbs = Dictionary(
+                    batch.details.filter { $0.parentFolderId == folder.path }.map { ($0.header.messageId, $0.header) },
+                    uniquingKeysWith: { first, _ in first })
+                for index in changes.records.indices {
+                    guard let header = verbs[changes.records[index].messageId] else { continue }
+                    changes.records[index].isReplied = header.isReplied
+                    changes.records[index].isForwarded = header.isForwarded
                 }
                 notRead += batch.unreadable + batch.unanswered.keys
             } catch {
@@ -792,15 +815,6 @@ struct CollectedChanges {
         if recordsById[id] == nil, !removed.contains(id) { order.append(id) }
         recordsById[id] = nil
         removed.insert(id)
-    }
-
-    /// The last verb of a message whose record came from the delta page: its
-    /// replied and forwarded marks join that record, nothing else does.
-    mutating func addLastVerb(of header: MessageHeaderInfo) {
-        guard var record = recordsById[header.messageId] else { return }
-        record.isReplied = header.isReplied
-        record.isForwarded = header.isForwarded
-        recordsById[header.messageId] = record
     }
 
     var records: [ChangeRecord] { order.compactMap { recordsById[$0] } }

@@ -193,6 +193,43 @@ extension OutlookChangeReadingTests {
         }
     }
 
+    @Test("Last verbs never delay paging: after a burst of changes, new Inbox mail lands with the allowance its pages need")
+    func verbReadsNeverDelayNewMail() async throws {
+        let pageSize = SyncConfig.graphChangeReadPageSize
+        let ids = (0..<(pageSize + pageSize / 2)).map { String(format: "r-%03d", $0) }
+        try await Self.withWorld(seeds: ids.map { Self.seed($0, in: Self.inbox) }) { w in
+            for id in ids { try w.insertRow(id, in: w.inbox) }
+            try await w.baselineAll()
+            for id in ids { w.server.setReadFromOtherClient(providerMessageId: id, isRead: true) }
+            w.server.deliver(Self.seed("zz-new", in: Self.inbox, daysAgo: 0))
+            // Exactly the Inbox round's pages: no room for any by-id read.
+            let pages = (ids.count + 1 + pageSize - 1) / pageSize
+            try await w.read(scope: .inboxOnly, requests: pages)
+            #expect(try w.row("zz-new", in: w.inbox) != nil, "the new message landed in the first pass")
+            #expect(try w.cursor(w.inbox)?.phase == .tracking)
+            #expect(Set(try w.recheck(w.inbox)) == Set(ids + ["zz-new"]), "every unread last verb waits on the re-read list")
+        }
+    }
+
+    @Test("A baseline reads no last verb")
+    func baselineReadsNoVerb() async throws {
+        try await Self.withWorld(seeds: [Self.seed("b-1", in: Self.inbox), Self.seed("b-2", in: Self.archive)]) { w in
+            w.server.setLastVerbFromOtherClient(providerMessageId: "b-1", verb: GraphAPI.lastVerbReplyToSender)
+            try w.insertRow("b-1", in: w.inbox)
+            try w.insertRow("b-2", in: w.archive)
+            try await w.baselineAll()
+            #expect(w.batchedIds().isEmpty, "a baseline lists the folder as it is: no by-id read")
+        }
+    }
+
+    @Test("A batch item's URL carries the last-verb expand with its spaces encoded")
+    func batchItemURLEncodesSpaces() {
+        let url = GraphAPI.batchItemURL(path: "/messages/m-1", query: GraphAPI.metadataSelection.withLastVerb.queryParameter)
+        #expect(!url.contains(" "))
+        #expect(url.hasPrefix("/me/messages/m-1?$select="))
+        #expect(url.hasSuffix("&$expand=singleValueExtendedProperties($filter=id%20eq%20'Integer%200x1081')"))
+    }
+
     @Test("The last verb is read only with a request that may expand it, never on a message delta")
     func deltaNeverExpands() async throws {
         try await Self.withWorld(seeds: [Self.seed("a-1", in: Self.archive)]) { w in

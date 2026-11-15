@@ -503,14 +503,14 @@ replies (`ReplyParentResolver`, the outbox) and no read may clear that mark (pin
    never expand. The verb stays inside the Exchange provider; above the seam only the generic marks travel.
 2. **The reader reads the verb of every changed message in a tracking round.** Each record taken from a
    delta page (a held message's state record, an Inbox header record) is also read by id
-   (`readLastVerbs`, `fetchMessageDetails` in `$batch`es), after the page's missing headers and within the
-   request allowance. These reads NEVER hold the page: a message whose verb was not read (budget or
+   (`readLastVerbs`, `fetchMessageDetails` in `$batch`es) after EVERY folder's delta in the pass, out of
+   the allowance left, so they never delay paging or new mail (review round 1: read inline, one page of
+   changes spent a short pass's whole allowance and held new mail behind it). These reads NEVER hold the page: a message whose verb was not read (budget or
    allowance spent, a failed batch, a throttle, an unusable answer) goes on the folder's re-read list
    (`rereadLater`), whose full read carries the verb. (First draft held the page like a missing header;
    that wedged: a page of more changes than one pass's allowance could never pass, and a cut page's
    landed messages became held, needing verb reads again. Found by the existing long-round and burst
-   tests.) Only the replied and forwarded marks join the record (`CollectedChanges.addLastVerb`); an
-   inserted record takes them too. A baseline reads none.
+   tests.) Only the replied and forwarded marks join the record; an inserted record takes them too. A baseline reads none.
 3. **The merge only sets.** `ChangeRecord.isReplied` / `isForwarded` (false = not known or not shown) set a
    stored row's mark and never clear it: the phone's own reply marks its parent before the server shows
    it, and Outlook keeps only the LAST verb, so a forward after a reply reads as not replied. A newly set
@@ -521,7 +521,9 @@ replies (`ReplyParentResolver`, the outbox) and no read may clear that mark (pin
 now costs one `$batch` item per tracking round, charged against the request allowance; in-step folders
 are no longer pages only. Verb reads beyond a pass's allowance move to the re-read list (at most
 `changeRereadBudgetPerPass` a pass; over `changeRecheckLimit` the catch-up is armed, which does not read the
-verb, so a very large burst may leave some arrows unshown until the message changes again).
+verb, so a very large burst may leave some arrows unshown until the message changes again). Verb-only ids
+share that list, its per-pass budget and its limit with ids kept back under a user action, so a large
+burst (a web "mark all read") delays those re-reads and can overflow the list into a catch-up.
 
 **Encoding.** `lastVerbExpandParameter` has literal spaces: a request URL is percent-encoded once when sent,
 so a pre-encoded `%20` became `%2520` and Graph would not have expanded it. A `$batch` item's URL travels in
@@ -535,5 +537,5 @@ out of scope).
 Tests: `OutlookLastVerbTests.swift` (extension of `OutlookChangeReadingTests`).
 
 Keywords: last verb, PidTagLastVerbExecuted, 0x1081, replied, answered, forwarded, reply arrow,
-singleValueExtendedProperties, $expand, expandsLastVerb, addLastVerb, readLastVerbs, batchItemURL,
+singleValueExtendedProperties, $expand, expandsLastVerb, readLastVerbs, batchItemURL,
 double encoding, ReplyDetect, #890.
