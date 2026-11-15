@@ -839,8 +839,6 @@ enum BodyFetchProcessor {
                     windowExempt: aiWindowExempt)
             }
             if enableAI {
-                // A chat-view member that was waiting for its body (any folder) gets its summary.
-                await ActiveAIQueue.shared.chatBodyArrived(headerId: item.headerId)
                 await ActiveEmbeddingQueue.shared.enqueue(headerId: item.headerId)
             } else {
                 await BackfillEmbeddingQueue.shared.enqueue(headerId: item.headerId)

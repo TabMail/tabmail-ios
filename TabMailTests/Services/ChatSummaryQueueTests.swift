@@ -295,17 +295,6 @@ struct ChatSummaryQueueTests {
                 "members with a body and no done chat summary get a job, Sent and Archive included; done and no-content members get none; the bodiless one waits")
         #expect(jobs.allSatisfy { $0.jobType == .summary && $0.forChat && $0.windowExempt })
         #expect(await requests.ids == [bodiless.id])
-
-        // The body lands: the waiting member gets its job, once.
-        await queue.chatBodyArrived(headerId: bodiless.id)
-        await queue.chatBodyArrived(headerId: bodiless.id)
-        let afterBody = await queue.queuedJobsForTesting.filter { $0.headerId == bodiless.id }
-        #expect(afterBody.count == 1)
-        #expect(afterBody.allSatisfy { $0.jobType == .summary && $0.forChat })
-
-        // A body for a message nobody asked for adds nothing.
-        await queue.chatBodyArrived(headerId: "\(acc)|never-asked")
-        #expect(await queue.queuedJobsForTesting.count == 3)
     }
 
     @Test("Opening reads the members' current state, not the caller's copies")

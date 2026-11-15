@@ -14,7 +14,8 @@ import Testing
 ///  1. A summary of the user's own email (from one of their addresses, or in a Sent folder) tells
 ///     the backend so (`is_sent_by_user: true`), so its text message is in the user's voice; any
 ///     other email's request has no such field.
-///  2. A real body write releases the chat summary that waited for it, on the shared queue, once.
+///  2. (Changed 2026-11-15.) The queue keeps no list of chat members waiting for their body: a
+///     member whose body lands later is asked for when a later ask reads it from the database.
 ///  3. The executor refuses an ordinary summary outside the Inbox (no model call, nothing written)
 ///     even when its admission was window-exempt; the same setup in the Inbox calls and writes.
 ///  4. A chat summary is finished only with its text message, at every site that decides it
@@ -24,7 +25,7 @@ import Testing
 ///     completed and wrote a summary but no text message ends the job for the process: such an
 ///     email costs one model call per process, however often the chat asks and whatever sync starts
 ///     (launch, push wake) follow; AI re-enable asks once more; never one every backoff.
-///  5. Chat members waiting for a body are forgotten when the queue is cancelled.
+///  5. (Removed 2026-11-15, with the list of chat members waiting for their body.)
 @Suite("Chat summary execution", .serialized, .processGlobalState)
 struct ChatSummaryExecutionTests {
 
@@ -120,58 +121,6 @@ struct ChatSummaryExecutionTests {
                         "\(header.messageId): the job really ran and stored the result")
             }
         }
-    }
-
-    // MARK: - 2. A body write releases the waiting chat summary
-
-    @Test("A real body write releases the chat summary waiting for it, on the shared queue, once")
-    func bodyWriteReleasesTheWaitingSummary() async throws {
-        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
-        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
-        _ = try FolderEpochTestFixture.makeAccount(id: "flush", provider: .gmail, pool: pool)
-        try FolderEpochTestFixture.insertFolder(accountId: "flush", path: "Sent", role: .sent, pool: pool)
-        let header = Self.header("flush-body", accountId: "flush", folder: "Sent", bodyComplete: false)
-        try await pool.write { try header.insert($0) }
-        try await Self.index(header, body: nil)
-        let key = ContentKey(rawValue: header.id)
-        let queue = ActiveAIQueue.shared
-        await queue.setDispatchSuppressedForTesting(true)
-        await queue.clearForTesting()
-        await ActiveEmbeddingQueue.shared.clearForTesting()
-        func cleanUp() async {
-            await queue.clearForTesting()
-            await queue.setDispatchSuppressedForTesting(false)
-            await ActiveEmbeddingQueue.shared.clearForTesting()
-            try? await SearchIndex.shared.removeMessages(contentKeys: [key])
-        }
-        do {
-            try await releasesOnce(header, key: key, queue: queue, pool: pool)
-        } catch {
-            await cleanUp()
-            throw error
-        }
-        await cleanUp()
-    }
-
-    private func releasesOnce(_ header: MessageHeader, key: ContentKey, queue: ActiveAIQueue, pool: DatabasePool) async throws {
-        let asked = Mutex<[String]>([])
-        await queue.enqueueChatSummaries([header], requestBodies: { rows in asked.withLock { $0.append(contentsOf: rows.map(\.id)) } })
-        #expect(asked.withLock { $0 } == [header.id], "the bodiless member went to the body queue")
-        #expect(await queue.queuedJobsForTesting.isEmpty, "no summary before its body")
-
-        let item = BodyFetchProcessor.ProcessedItem(
-            contentKey: key, headerId: header.id, accountId: header.accountId,
-            isInInbox: false, body: "The real body arrived", snippet: "The real body arrived")
-        await BodyFetchProcessor.flushBatch([item], enableAI: true)
-        #expect(try await pool.read { try MessageHeader.fetchOne($0, key: header.id)?.bodyComplete } == true,
-                "the real writer stored the body")
-        #expect(try await SearchIndex.shared.bodyText(contentKey: key) == "The real body arrived")
-        let released = await queue.queuedJobsForTesting.filter { $0.headerId == header.id }
-        #expect(released.count == 1)
-        #expect(released.allSatisfy { $0.jobType == .summary && $0.forChat && $0.windowExempt })
-
-        await BodyFetchProcessor.flushBatch([item], enableAI: true)
-        #expect(await queue.queuedJobsForTesting.filter { $0.headerId == header.id }.count == 1, "a second write adds nothing")
     }
 
     // MARK: - 3. The executor's folder scope
@@ -455,30 +404,5 @@ struct ChatSummaryExecutionTests {
             #expect(http.recordedCalls().count == 1,
                     "a push wake in the same process asks no more: \(http.recordedCalls().count) summary calls")
         }
-    }
-
-    // MARK: - 5. Waiting chat members are forgotten on cancel
-
-    @Test("A chat member waiting for its body is released by the body, unless the queue was cancelled first",
-          arguments: [false, true])
-    func cancelForgetsWaitingMembers(cancelFirst: Bool) async throws {
-        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
-        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
-        _ = try FolderEpochTestFixture.makeAccount(id: "wait", provider: .gmail, pool: pool)
-        try FolderEpochTestFixture.insertFolder(accountId: "wait", path: "INBOX", role: .inbox, pool: pool)
-        let header = Self.header("wait-body", accountId: "wait", folder: "INBOX", bodyComplete: false)
-        try await pool.write { try header.insert($0) }
-        let queue = ActiveAIQueue()
-        await queue.setDispatchSuppressedForTesting(true)
-        let asked = Mutex<[String]>([])
-        await queue.enqueueChatSummaries([header], requestBodies: { rows in asked.withLock { $0.append(contentsOf: rows.map(\.id)) } })
-        #expect(asked.withLock { $0 } == [header.id], "the member waits for its body")
-        #expect(await queue.queuedJobsForTesting.isEmpty)
-
-        if cancelFirst { await queue.cancelAllInFlight() }
-        await queue.chatBodyArrived(headerId: header.id)
-        let released = await queue.queuedJobsForTesting.filter { $0.headerId == header.id }
-        #expect(released.count == (cancelFirst ? 0 : 1),
-                cancelFirst ? "a cancel forgets the waiting member" : "without a cancel the body releases it")
     }
 }

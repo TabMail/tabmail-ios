@@ -464,23 +464,18 @@ actor ActiveAIQueue {
 
     // MARK: - Chat view summaries
 
-    /// Chat members asked for (`enqueueChatSummaries`) whose body was not downloaded yet, by header
-    /// id. `chatBodyArrived` hands each back once `BodyFetchProcessor.flushBatch` has written its
-    /// body. In memory only: a relaunch forgets them, and the next open or walk asks again. Entries
-    /// leave when their body lands, and all of them on `cancelAllInFlight` (resume recovery, a
-    /// background task's end), so a body that never lands is not kept past the next recovery.
-    private var chatAwaitingBody: [String: String] = [:]
-
     /// Chat offers that found their ordinary twin in flight (`admitOrUpgrade`). The executor holds
     /// the twin by value, so it cannot be upgraded; `jobCompleted` admits the offer once the twin
-    /// leaves flight, whatever its outcome. In memory only, and emptied on `cancelAllInFlight` like
-    /// `chatAwaitingBody`, so an offer whose twin never completes is not kept past the next recovery.
+    /// leaves flight, whatever its outcome. It waits only on a job of this queue, so it lasts at
+    /// most one flight. In memory only, and emptied on `cancelAllInFlight`, so an offer whose twin
+    /// never completes is not kept past the next recovery.
     private var chatOffersOnInFlightTwin: Set<AIJob> = []
 
     /// Opening a thread: summaries for every email of it that lacks one with a text message, the
     /// user's own included. A member with its body gets a chat summary job now; one without goes to
-    /// the body queue (`ActiveBodyQueue`; tests pass `requestBodies`) and gets its job when the body lands. The caller checks
-    /// `ChatViewConfig`.
+    /// the body queue (`ActiveBodyQueue`; tests pass `requestBodies`), and nothing is kept for it: it
+    /// gets its job when a later ask reads it from the database with its body (the next open, or
+    /// the walk). The caller checks `ChatViewConfig`.
     func enqueueChatSummaries(
         _ members: [MessageHeader],
         requestBodies: (@Sendable ([MessageHeader]) async -> Void)? = nil
@@ -495,7 +490,6 @@ actor ActiveAIQueue {
             if member.bodyComplete {
                 ready.append((member.id, member.accountId))
             } else {
-                chatAwaitingBody[member.id] = member.accountId
                 needBody.append(member)
             }
         }
@@ -507,13 +501,6 @@ actor ActiveAIQueue {
             }
         }
         enqueueChatSummaryJobs(ready, origin: "open")
-    }
-
-    /// `BodyFetchProcessor.flushBatch`, for every body it wrote: a chat member waiting for its body
-    /// gets its summary job now.
-    func chatBodyArrived(headerId: String) {
-        guard let accountId = chatAwaitingBody.removeValue(forKey: headerId) else { return }
-        enqueueChatSummaryJobs([(headerId, accountId)], origin: "body")
     }
 
     /// Admit chat summary jobs (summary only, window-exempt, any folder).
@@ -715,9 +702,8 @@ actor ActiveAIQueue {
         }
         inFlightTasks.removeAll()
         storage.cancelAllInFlight()
-        // Chat members waiting for a body, and chat offers waiting on an in-flight twin, are
-        // forgotten too: the next open or walk asks again.
-        chatAwaitingBody.removeAll()
+        // Chat offers waiting on an in-flight twin are forgotten too: the next open or walk asks
+        // again, reading what is still missing from the database.
         chatOffersOnInFlightTwin.removeAll()
         backoff.removeAll()
         backoffRetryCount.removeAll()
