@@ -43,6 +43,8 @@
 > **Reintroducing RFC-keyed expansion on any mutation path is BANNED** — it re-opens exactly the hole
 > `IOS-IMAP-002` closed and is a D4 violation. Equally, do not read the current non-expanding
 > behaviour as a regression to be "restored".
+>
+> Index keywords (moved from the index row): Graph (Outlook) ids change on every move.
 <!-- COMPANION-CURRENT-NOTE-END -->
 
 ### IMAP Message IDs & UID Resolution

@@ -81,7 +81,7 @@ block so its index-relative link is not re-resolved from this directory, because
 line had accumulated recurrence detail that exists nowhere else in this file.
 
 ```text
-- **[MIS-IOS-018](Companion/Mistakes/Active/MIS-IOS-018-extended-a-processing-bound-into-display-semantics.md)** — a PROCESSING bound (newest-100 AI window, `recentInboxWindowContains`) leaked into DISPLAY: a suppression notice replaced summary bubbles whose content already EXISTED (`7a31f1d22`/`v1.7.11`; reversed by ADR-IOS-078). **Existence beats eligibility — check "does the artifact exist?" BEFORE any policy branch in a display decision.** ***Tell: making a queue policy "legible" by hiding/replacing UI in the same commit.*** (×1)
+- **[MIS-IOS-018](Companion/Archive/Mistakes/Active/MIS-IOS-018-extended-a-processing-bound-into-display-semantics.md)** — a PROCESSING bound (newest-100 AI window, `recentInboxWindowContains`) leaked into DISPLAY: a suppression notice replaced summary bubbles whose content already EXISTED (`7a31f1d22`/`v1.7.11`; reversed by ADR-IOS-078). **Existence beats eligibility — check "does the artifact exist?" BEFORE any policy branch in a display decision.** ***Tell: making a queue policy "legible" by hiding/replacing UI in the same commit.*** (×1)
 ```
 
 ---
@@ -94,5 +94,5 @@ block so its index-relative link is not re-resolved from this directory, because
 line had accumulated recurrence detail that exists nowhere else in this file.
 
 ```text
-- **[MIS-IOS-018](Companion/Mistakes/Active/MIS-IOS-018-extended-a-processing-bound-into-display-semantics.md)** — a PROCESSING bound (newest-100 AI window, `recentInboxWindowContains`) leaked into DISPLAY: a suppression notice replaced summary bubbles whose content already EXISTED (`7a31f1d22`/`v1.7.11`; reversed by ADR-IOS-078). **Existence beats eligibility.** ***Tell: making a queue policy "legible" by hiding UI.*** (×1)
+- **[MIS-IOS-018](Companion/Archive/Mistakes/Active/MIS-IOS-018-extended-a-processing-bound-into-display-semantics.md)** — a PROCESSING bound (newest-100 AI window, `recentInboxWindowContains`) leaked into DISPLAY: a suppression notice replaced summary bubbles whose content already EXISTED (`7a31f1d22`/`v1.7.11`; reversed by ADR-IOS-078). **Existence beats eligibility.** ***Tell: making a queue policy "legible" by hiding UI.*** (×1)
 ```

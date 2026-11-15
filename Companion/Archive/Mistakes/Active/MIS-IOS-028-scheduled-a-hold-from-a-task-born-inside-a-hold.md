@@ -43,7 +43,7 @@ its 12,000 B budget). The index keeps a shortened line; this is the line it repl
 <!-- BEGIN VERBATIM INDEX LINE MIS-IOS-028 2026-11-09 -->
 
 ```text
-- **MIS-IOS-028** — scheduled a later `withPromptStore` from a `Task` created INSIDE a hold; the task inherited the `PromptSemaphore.holding` task-local and was refused as nested (silently, debug log only); create it under `$holding.withValue(nil)`, and give every refusal test a positive control. [detail](Companion/Mistakes/Active/MIS-IOS-028-scheduled-a-hold-from-a-task-born-inside-a-hold.md)
+- **MIS-IOS-028** — scheduled a later `withPromptStore` from a `Task` created INSIDE a hold; the task inherited the `PromptSemaphore.holding` task-local and was refused as nested (silently, debug log only); create it under `$holding.withValue(nil)`, and give every refusal test a positive control. [detail](Companion/Archive/Mistakes/Active/MIS-IOS-028-scheduled-a-hold-from-a-task-born-inside-a-hold.md)
 ```
 
 <!-- END VERBATIM INDEX LINE MIS-IOS-028 2026-11-09 -->

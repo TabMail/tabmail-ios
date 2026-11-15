@@ -404,7 +404,7 @@ so its index-relative link is not re-resolved from this directory, because the i
 accumulated recurrence detail that exists nowhere else in this file.
 
 ```text
-- **[MIS-IOS-009](Companion/Mistakes/Active/MIS-IOS-009-amended-a-hash-pinned-fragment-and-killed-the-verifier.md)** — edited a hash-pinned fragment in place, killed `compact_companion_docs.rb verify`, and hid later checks; inspect manifest grammar, use the correct wrapper/re-pin convention, escape GFM table pipes, and re-resolve links after routing. **×6 broke it again the DAY AFTER ×5's repair** — one bullet appended to pinned memory `037` by `458863e86`, found by an unrelated subagent's incidental `verify`, never by a gate; **`ruby … | tail` masks rc in zsh — run it UNPIPED**; and the finder had checked two manifests but not `Decisions/V3/manifest.tsv`, the convention needing the OPPOSITE repair. (×6)
+- **[MIS-IOS-009](Companion/Archive/Mistakes/Active/MIS-IOS-009-amended-a-hash-pinned-fragment-and-killed-the-verifier.md)** — edited a hash-pinned fragment in place, killed `compact_companion_docs.rb verify`, and hid later checks; inspect manifest grammar, use the correct wrapper/re-pin convention, escape GFM table pipes, and re-resolve links after routing. **×6 broke it again the DAY AFTER ×5's repair** — one bullet appended to pinned memory `037` by `458863e86`, found by an unrelated subagent's incidental `verify`, never by a gate; **`ruby … | tail` masks rc in zsh — run it UNPIPED**; and the finder had checked two manifests but not `Decisions/V3/manifest.tsv`, the convention needing the OPPOSITE repair. (×6)
 ```
 
 ---
@@ -481,7 +481,7 @@ block so its index-relative link is not re-resolved from this directory, because
 line had accumulated recurrence detail that exists nowhere else in this file.
 
 ```text
-- **[MIS-IOS-009](Companion/Mistakes/Active/MIS-IOS-009-amended-a-hash-pinned-fragment-and-killed-the-verifier.md)** — edited a hash-pinned fragment in place, killed `compact_companion_docs.rb verify`, and hid every later check behind its `abort`. **×6 broke it again the DAY AFTER ×5's repair**, found by an unrelated subagent's incidental `verify`, never by a gate. **`ruby … | tail` masks rc in zsh — run it UNPIPED.** ⚠️ **TWO pinning conventions decide the repair:** `{Memory,Decisions}/manifest.tsv` hash the **stripped** body and must NEVER be re-pinned; `ported-manifest.tsv` / `amendments-manifest.tsv` / `Decisions/V3/manifest.tsv` hash the **raw** file and MUST be re-pinned. ⚠️ **a GLOB in a comment aborts it too** — `Companion/…/ios-*.md` is not a file. (×7)
+- **[MIS-IOS-009](Companion/Archive/Mistakes/Active/MIS-IOS-009-amended-a-hash-pinned-fragment-and-killed-the-verifier.md)** — edited a hash-pinned fragment in place, killed `compact_companion_docs.rb verify`, and hid every later check behind its `abort`. **×6 broke it again the DAY AFTER ×5's repair**, found by an unrelated subagent's incidental `verify`, never by a gate. **`ruby … | tail` masks rc in zsh — run it UNPIPED.** ⚠️ **TWO pinning conventions decide the repair:** `{Memory,Decisions}/manifest.tsv` hash the **stripped** body and must NEVER be re-pinned; `ported-manifest.tsv` / `amendments-manifest.tsv` / `Decisions/V3/manifest.tsv` hash the **raw** file and MUST be re-pinned. ⚠️ **a GLOB in a comment aborts it too** — `Companion/…/ios-*.md` is not a file. (×7)
 ```
 
 ---
