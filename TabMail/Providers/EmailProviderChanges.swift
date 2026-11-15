@@ -205,6 +205,12 @@ struct ChangeRecord: Sendable {
     var userLabelIds: [String]?
     var rfc822MessageId: String?
     var references: [String]?
+    /// The server shows the message replied to / forwarded. Only true is news:
+    /// the merge never clears a stored mark (the phone's own reply marks its
+    /// parent before any server shows it, and Outlook keeps only the LAST verb,
+    /// so a forward after a reply reads as "not replied").
+    var isReplied = false
+    var isForwarded = false
 
     /// A full record built from a fetched header. Its user labels are the
     /// message's whole set only when the header says so
@@ -219,6 +225,8 @@ struct ChangeRecord: Sendable {
         self.userLabelIds = header.userLabelIdsAreAuthoritative ? header.userLabelIds : nil
         self.rfc822MessageId = header.rfc822MessageId
         self.references = header.references
+        self.isReplied = header.isReplied
+        self.isForwarded = header.isForwarded
     }
 
     init(messageId: String) {

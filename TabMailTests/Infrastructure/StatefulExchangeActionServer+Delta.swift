@@ -29,7 +29,7 @@ import Synchronization
 /// Every message change, the client's own included, is logged, as Graph reports
 /// both.
 struct DeltaModel: Sendable {
-    enum Kind: Sendable { case created, read, flag, categories, removed }
+    enum Kind: Sendable { case created, read, flag, categories, lastVerb, removed }
 
     struct Entry: Sendable {
         let seq: Int
@@ -170,6 +170,19 @@ extension StatefulExchangeActionServer {
             message.isFlagged = isFlagged
             model.messagesByProviderId[providerMessageId] = message
             model.delta.log(folderId: message.folderId, messageId: providerMessageId, kind: .flag)
+        }
+    }
+
+    /// Another client replies to or forwards the message: Outlook sets its last
+    /// verb (102 reply, 103 reply all, 104 forward). Measured 2026-11-14: the
+    /// message delta reports the message as changed (its change key moved) but
+    /// cannot carry the property.
+    func setLastVerbFromOtherClient(providerMessageId: String, verb: Int) {
+        state.value.withLock { model in
+            guard var message = model.messagesByProviderId[providerMessageId] else { return }
+            message.lastVerb = verb
+            model.messagesByProviderId[providerMessageId] = message
+            model.delta.log(folderId: message.folderId, messageId: providerMessageId, kind: .lastVerb)
         }
     }
 
@@ -336,6 +349,8 @@ extension StatefulExchangeActionServer {
             .flatMap { Int($0) } ?? 10
         let query = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?.queryItems ?? []
         let tokenValue = query.first { $0.name == "$skiptoken" || $0.name == "$deltatoken" }?.value
+        // Measured 2026-11-14: `$expand` on a message delta is a 400.
+        if query.contains(where: { $0.name == "$expand" }) { return .status(400) }
         return state.value.withLock { model -> FakeHTTP.CannedResponse in
             if !model.delta.pageFailures.isEmpty {
                 model.delta.pageFailuresServed += 1
@@ -549,7 +564,8 @@ extension StatefulExchangeActionServer {
                                       "body": ["error": ["code": "ErrorItemNotFound", "message": "Not found"]]])
                     continue
                 }
-                responses.append(["id": id, "status": 200, "body": graphRow(message)])
+                responses.append(["id": id, "status": 200,
+                                  "body": graphRow(message, expandLastVerb: expandsLastVerb(path))])
             }
             let data = (try? JSONSerialization.data(withJSONObject: ["responses": responses])) ?? Data()
             return .bytes(data, contentType: "application/json")

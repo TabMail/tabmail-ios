@@ -24,9 +24,9 @@ import GRDB
 //   the stored one, kept back while the user's label action is pending or just
 //   completed; a record whose label set is not known (nil) keeps the stored
 //   labels (the reader lists a message whose set it could not complete,
-//   `rereadLater`). Replied/forwarded marks are not written: no reader carries them
-//   (Gmail's API and Graph expose no answered state the app maps; a reply sent
-//   elsewhere marks its parent through the Sent folder, `ReplyParentResolver`);
+//   `rereadLater`). A replied/forwarded mark the record carries is set, never
+//   cleared (a reader that does not know it says false; the phone's own reply
+//   marks its parent before the server shows it; Outlook's last verb, #890);
 // - a record from a baseline (`FolderChangeStatus.isBaseline`: the folder's
 //   messages as they are, not changes) inserts only a message dated within the
 //   folder's held range (`Folder.oldestSyncedDate`); with no held range yet it
@@ -276,9 +276,32 @@ extension SyncEngine {
         }
         if let rfc822 = record.rfc822MessageId { existing.rfc822MessageId = rfc822 }
         if let references = record.references { existing.referencesJSON = MessageHeader.encodeReferences(references) }
+        // Replied/forwarded: set when the server shows it, never cleared.
+        if record.isReplied && !existing.isReplied {
+            existing.isReplied = true
+            try replyDetect(&existing, accountId: folder.accountId, folderPath: folder.path, context: "change merge", db: db)
+        }
+        if record.isForwarded { existing.isForwarded = true }
         try existing.update(db)
         result.wroteRows = true
         return !keptBack
+    }
+
+    /// ReplyDetect: an already-replied message tagged "reply" becomes "none".
+    /// The AI cache keeps the model's value; only the row and the server tag change.
+    private nonisolated static func replyDetect(
+        _ header: inout MessageHeader, accountId: String, folderPath: String, context: String, db: Database
+    ) throws {
+        guard header.actionTag == .reply else { return }
+        header.actionTag = ActionTag.none
+        header.tagSortOrder = ActionTag.none.sortOrder
+        var tagOp = PendingOperation(
+            type: .setTag, messageIds: [header.stableId], accountId: accountId,
+            folderPath: folderPath, tagValue: ActionTag.none.rawValue)
+        try tagOp.insert(db)
+        if DebugModeManager.isLoggingEnabled() {
+            print("[ReplyDetect] \(context): reply→none for \(header.messageId) (already replied)")
+        }
     }
 
     /// Make a stored row's user-label rows the server's set (`providerLabelIds`):
@@ -345,23 +368,13 @@ extension SyncEngine {
         header.isRead = info.isRead
         header.isFlagged = info.isFlagged
         header.hasAttachments = info.hasAttachments
-        header.isReplied = info.isReplied
-        header.isForwarded = info.isForwarded
+        header.isReplied = info.isReplied || record.isReplied
+        header.isForwarded = info.isForwarded || record.isForwarded
         header.actionTag = info.actionTag
         header.tagSortOrder = info.actionTag?.sortOrder ?? 99
         try MessageAICache.restoreIfCached(into: &header, accountId: accountId, folderPath: folder.path, db: db)
-        // ReplyDetect: an already-replied message tagged "reply" becomes "none".
-        // The AI cache keeps the model's value; only the row and the server tag change.
-        if header.isReplied && header.actionTag == .reply {
-            header.actionTag = ActionTag.none
-            header.tagSortOrder = ActionTag.none.sortOrder
-            var tagOp = PendingOperation(
-                type: .setTag, messageIds: [header.stableId], accountId: accountId,
-                folderPath: folder.path, tagValue: ActionTag.none.rawValue)
-            try tagOp.insert(db)
-            if DebugModeManager.isLoggingEnabled() {
-                print("[ReplyDetect] change insert: reply→none for \(header.messageId) (already replied)")
-            }
+        if header.isReplied {
+            try replyDetect(&header, accountId: accountId, folderPath: folder.path, context: "change insert", db: db)
         }
 
         // An orphaned row with the same id but another folderId (left by a no-op

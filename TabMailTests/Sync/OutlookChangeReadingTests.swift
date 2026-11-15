@@ -248,7 +248,7 @@ struct OutlookChangeReadingTests {
 
     // MARK: - The state set for every folder but the Inbox
 
-    @Test("A read or flag change on a held Archive message lands from the delta record, with no message fetch")
+    @Test("A read or flag change on a held Archive message lands from the delta record, with no header fetch")
     func stateChangeLandsWithoutAFetch() async throws {
         try await Self.withWorld(seeds: [Self.seed("a-1", in: Self.archive), Self.seed("a-2", in: Self.archive)]) { w in
             try w.insertRow("a-1", in: w.archive)
@@ -262,7 +262,8 @@ struct OutlookChangeReadingTests {
 
             #expect(try w.row("a-1", in: w.archive)?.isRead == true, "the read change landed")
             #expect(try w.row("a-2", in: w.archive)?.isFlagged == true, "the flag change landed")
-            #expect(w.messageFetches() == 0, "a change to a held message needs no fetch")
+            // Each changed message is read once by id, for its last verb only (#890).
+            #expect(w.messageFetches() == 2, "a change to a held message needs no header fetch")
         }
     }
 
@@ -279,14 +280,14 @@ struct OutlookChangeReadingTests {
         }
     }
 
-    @Test("A new Inbox message is inserted from its delta record, with no message fetch")
+    @Test("A new Inbox message is inserted from its delta record, with no header fetch")
     func newInboxMessageNeedsNoFetch() async throws {
         try await Self.withWorld { w in
             try await w.baselineAll()
             w.server.deliver(Self.seed("new-1", in: Self.inbox, daysAgo: 0))
             try await w.read()
             #expect(try w.row("new-1", in: w.inbox) != nil)
-            #expect(w.messageFetches() == 0)
+            #expect(w.messageFetches() == 1, "one read by id, for its last verb only (#890)")
         }
     }
 
@@ -403,8 +404,11 @@ struct OutlookChangeReadingTests {
             try await w.read(now: now.addingTimeInterval(60))
             #expect(try w.rowIds(in: w.archive) == Set(ids), "every message of the page landed")
             #expect(try w.cursor(w.archive)?.next != tracked.next, "and then the page was passed")
+            // Each header fetched once; the second read finds the first batch's
+            // messages held and reads their last verb (#890).
             let fetched = w.batchedIds()
-            #expect(fetched.count == ids.count && Set(fetched) == Set(ids), "each header fetched once")
+            #expect(fetched.count == ids.count + SyncConfig.graphBatchMaxRequests && Set(fetched) == Set(ids),
+                    "each header fetched once, plus the held messages' last verbs")
         }
     }
 

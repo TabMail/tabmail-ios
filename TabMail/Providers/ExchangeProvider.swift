@@ -23,16 +23,21 @@ enum ExchangeGraphMessageRequest: CaseIterable, Hashable, Sendable {
     /// `GraphAPI.stateSelection` and never reach the parser.
     case readChanges
 
+    /// The listings and the change reader's message reads also expand
+    /// Outlook's last verb, so a message replied to or forwarded on another
+    /// device shows it (#890). The message delta (`readChanges`) cannot.
     var selection: GraphMessageSelection {
         switch self {
-        case .fetchMessages, .search, .fetchMessageHeaders, .fetchOlderMessages, .readChanges:
+        case .search, .readChanges:
             GraphAPI.headerOnlySelection
+        case .fetchMessages, .fetchMessageHeaders, .fetchOlderMessages:
+            GraphAPI.headerOnlySelection.withLastVerb
         case .fetchSingleBackfill:
             GraphAPI.backfillSelection
         case .fetchMessage:
             GraphAPI.fullSelection
         case .fetchMessageDetails:
-            GraphAPI.metadataSelection
+            GraphAPI.metadataSelection.withLastVerb
         }
     }
 }
@@ -1549,7 +1554,7 @@ actor ExchangeProvider: EmailProvider {
                 let encodedId = try Self.encodedGraphPathSegment(id, context: "Graph message id")
                 requests.append([
                     "id": String(index), "method": "GET",
-                    "url": "\(GraphAPI.batchItemPathPrefix)/messages/\(encodedId)?\(selection.queryParameter)",
+                    "url": GraphAPI.batchItemURL(path: "/messages/\(encodedId)", query: selection.queryParameter),
                 ])
             }
             let body = try JSONSerialization.data(withJSONObject: ["requests": requests])
@@ -1814,8 +1819,10 @@ actor ExchangeProvider: EmailProvider {
             isRead: metadata.isRead,
             isFlagged: metadata.isFlagged,
             hasAttachments: metadata.hasAttachments,
-            isReplied: false,
-            isForwarded: false,
+            isReplied: msg.lastVerbExecuted.map {
+                $0 == GraphAPI.lastVerbReplyToSender || $0 == GraphAPI.lastVerbReplyToAll
+            } ?? false,
+            isForwarded: msg.lastVerbExecuted == GraphAPI.lastVerbForward,
             actionTag: nil,
             // A Graph message `category` IS Outlook's user label. The data was
             // already on the wire and already decoded — the four parser-bound
@@ -2045,6 +2052,21 @@ struct GraphMessage: Codable {
     let bodyPreview: String?
     let body: GraphBody?
     let parentFolderId: String?
+    /// Present only when the request expanded it (`GraphAPI.lastVerbExpandParameter`).
+    var singleValueExtendedProperties: [GraphExtendedProperty]? = nil
+
+    /// PidTagLastVerbExecuted, when the request expanded it and Outlook has one.
+    var lastVerbExecuted: Int? {
+        singleValueExtendedProperties?
+            .first { $0.id.caseInsensitiveCompare(GraphAPI.lastVerbPropertyId) == .orderedSame }
+            .flatMap { $0.value.flatMap { Int($0) } }
+    }
+}
+
+/// One single-value extended property of a Graph message (`id`, `value` as a string).
+struct GraphExtendedProperty: Codable {
+    let id: String
+    let value: String?
 }
 
 // Visible to tests via @testable import.

@@ -14,13 +14,19 @@ import Foundation
 /// names are discrete comma-separated identifiers.
 struct GraphMessageSelection: Sendable {
     let fields: [String]
+    /// Whether the request also expands Outlook's last verb
+    /// (`GraphAPI.lastVerbExpandParameter`). Never on a message delta: Graph
+    /// answers `$expand` on delta with 400.
+    var expandsLastVerb = false
 
     var fieldList: String {
         fields.joined(separator: ",")
     }
 
     var queryParameter: String {
-        "$select=\(fieldList)"
+        expandsLastVerb
+            ? "$select=\(fieldList)&\(GraphAPI.lastVerbExpandParameter)"
+            : "$select=\(fieldList)"
     }
 
     func contains(_ field: String) -> Bool {
@@ -28,7 +34,12 @@ struct GraphMessageSelection: Sendable {
     }
 
     func appending(_ fields: String...) -> GraphMessageSelection {
-        GraphMessageSelection(fields: self.fields + fields)
+        GraphMessageSelection(fields: self.fields + fields, expandsLastVerb: expandsLastVerb)
+    }
+
+    /// The same fields, with Outlook's last verb expanded.
+    var withLastVerb: GraphMessageSelection {
+        GraphMessageSelection(fields: fields, expandsLastVerb: true)
     }
 }
 
@@ -106,11 +117,40 @@ enum GraphAPI {
         "id", "receivedDateTime", "isRead", "flag"
     ])
 
+    // MARK: - Last verb (replied / forwarded)
+    //
+    // Outlook keeps the last action taken on a message in the MAPI property
+    // PidTagLastVerbExecuted (`Integer 0x1081`). Measured 2026-11-14 on a test
+    // account: a reply from Outlook on the web sets it to 102, and the message
+    // delta reports the message as changed but cannot carry the property
+    // (`$expand` on delta is a 400, a `$select` of it is ignored), so the change
+    // reader reads it with a GET of each changed message.
+
+    /// The property id as Graph names it.
+    static let lastVerbPropertyId = "Integer 0x1081"
+    /// `$expand` of that one property. Its spaces are literal, as in every other
+    /// query this app builds: a request URL is percent-encoded once when it is
+    /// sent (a pre-encoded `%20` would be encoded again), and a `$batch` item's
+    /// URL is encoded where it is built (`batchItemURL`).
+    static let lastVerbExpandParameter =
+        "$expand=singleValueExtendedProperties($filter=id eq '\(lastVerbPropertyId)')"
+    /// PidTagLastVerbExecuted values: reply to sender, reply to all, forward.
+    static let lastVerbReplyToSender = 102
+    static let lastVerbReplyToAll = 103
+    static let lastVerbForward = 104
+
     /// Graph JSON batching endpoint. Each request in a batch names its URL
     /// relative to the version root, so a mailbox request starts with
     /// `batchItemPathPrefix`.
     static let batchURL = "https://graph.microsoft.com/v1.0/$batch"
     static let batchItemPathPrefix = "/me"
+
+    /// A `$batch` item's relative URL for `path` (already path-encoded ids) and
+    /// `query`, with the query's spaces percent-encoded: the item URL is sent
+    /// inside the JSON body, so nothing encodes it on the way.
+    static func batchItemURL(path: String, query: String) -> String {
+        "\(batchItemPathPrefix)\(path)?\(query.replacingOccurrences(of: " ", with: "%20"))"
+    }
 
     /// Attachment metadata, without the bytes. Listed without `$select`, Graph
     /// returns every file attachment's bytes (`contentBytes`, base64) with the

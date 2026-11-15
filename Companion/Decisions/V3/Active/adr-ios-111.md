@@ -481,3 +481,59 @@ Tests: `ReleaseBoundaryRecheckTests` (`manyRetiredLabelIdsDrainInACheckedFolder`
 `ChangeApplyTests.recheckOverflowArmsCatchUp`.
 Keywords: changeRecheckLimit, overflow, stored ids never cut, this pass's additions, retired ids
 drain, #903.
+
+### Amendment 2026-11-14: Outlook reads the last verb; the merge sets replied and forwarded (#890)
+
+**Context.** Decision 6 of the #882 amendment left replied and forwarded unread: a reply made in Outlook
+on the web, the desktop or another phone never showed its arrow in TabMail. Outlook keeps the last action
+on a message in PidTagLastVerbExecuted (`Integer 0x1081`: 102 reply to sender, 103 reply to all, 104
+forward). Measured 2026-11-14 on a test account: a reply from Outlook on the web sets it to 102 and the
+Inbox message delta reports the message as changed, but the delta cannot carry the property (`$expand`
+on delta is a 400, a `$select` of it is ignored). Also measured: a reply sent the way the app sends it
+(Graph `sendMail`) does NOT set it: the original's 0x1081/0x1082, lastModified and changeKey stay and the
+delta reports nothing. So the absence of the verb never means "not replied": the phone marks its own
+replies (`ReplyParentResolver`, the outbox) and no read may clear that mark (pinned by
+`appReplyMarkSurvivesAnOriginalWithNoVerb`). Marking the original on the server is a separate issue (#915).
+
+**Decision.**
+1. **Read by id, never on the delta.** `GraphMessageSelection.expandsLastVerb` adds
+   `GraphAPI.lastVerbExpandParameter` to the listings (`fetchMessages`, `fetchOlderMessages`,
+   `fetchMessageHeaders`) and to `fetchMessageDetails`; `parseGraphMessage` maps the verb to
+   `MessageHeaderInfo.isReplied` / `isForwarded`. The delta selections (`readChanges`, `stateSelection`)
+   never expand. The verb stays inside the Exchange provider; above the seam only the generic marks travel.
+2. **The reader reads the verb of every changed message in a tracking round.** Each record taken from a
+   delta page (a held message's state record, an Inbox header record) is also read by id
+   (`readLastVerbs`, `fetchMessageDetails` in `$batch`es), after the page's missing headers and within the
+   request allowance. These reads NEVER hold the page: a message whose verb was not read (budget or
+   allowance spent, a failed batch, a throttle, an unusable answer) goes on the folder's re-read list
+   (`rereadLater`), whose full read carries the verb. (First draft held the page like a missing header;
+   that wedged: a page of more changes than one pass's allowance could never pass, and a cut page's
+   landed messages became held, needing verb reads again. Found by the existing long-round and burst
+   tests.) Only the replied and forwarded marks join the record (`CollectedChanges.addLastVerb`); an
+   inserted record takes them too. A baseline reads none.
+3. **The merge only sets.** `ChangeRecord.isReplied` / `isForwarded` (false = not known or not shown) set a
+   stored row's mark and never clear it: the phone's own reply marks its parent before the server shows
+   it, and Outlook keeps only the LAST verb, so a forward after a reply reads as not replied. A newly set
+   replied mark runs ReplyDetect (a `reply` tag becomes `none`), as the insert and the full sync's merge do.
+   This supersedes decision 6 of the #882 amendment. The full sync's merge already only upgraded.
+
+**Costs.** Every message another client changes (read, flagged, categorised, replied, new in the Inbox)
+now costs one `$batch` item per tracking round, charged against the request allowance; in-step folders
+are no longer pages only. Verb reads beyond a pass's allowance move to the re-read list (at most
+`changeRereadBudgetPerPass` a pass; over `changeRecheckLimit` the catch-up is armed, which does not read the
+verb, so a very large burst may leave some arrows unshown until the message changes again).
+
+**Encoding.** `lastVerbExpandParameter` has literal spaces: a request URL is percent-encoded once when sent,
+so a pre-encoded `%20` became `%2520` and Graph would not have expanded it. A `$batch` item's URL travels in
+the JSON body unencoded, so `GraphAPI.batchItemURL` encodes its spaces.
+
+**Limits.** A message replied to elsewhere before its folder's change bookmark began tracking shows the
+arrow only if the full sync's window listing lists it or it changes again; the Outlook catch-up listing
+does not read the verb. The arrow is never written to the server (Mail.Send and phone-sent replies are
+out of scope).
+
+Tests: `OutlookLastVerbTests.swift` (extension of `OutlookChangeReadingTests`).
+
+Keywords: last verb, PidTagLastVerbExecuted, 0x1081, replied, answered, forwarded, reply arrow,
+singleValueExtendedProperties, $expand, expandsLastVerb, addLastVerb, readLastVerbs, batchItemURL,
+double encoding, ReplyDetect, #890.

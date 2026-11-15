@@ -27,6 +27,15 @@ import Foundation
 ///   as gone, or reported unreadable (`rereadLater`); a page cut short is read
 ///   again on the next pass, which fetches only what is still missing.
 ///
+/// **Last verb (replied, forwarded; #890).** The delta cannot carry Outlook's
+/// PidTagLastVerbExecuted (`$expand` on delta is a 400), so in a tracking round
+/// every message whose record is taken from the page is also read by id
+/// (`fetchMessageDetails`, which expands it) after the page's missing headers,
+/// within the allowance. Those reads never hold the page: a message whose verb
+/// was not read (budget, throttle, failed batch, unusable answer) goes on the
+/// re-read list, whose full read carries it. Only the replied and forwarded
+/// marks join the record. A baseline reads none (it lists the folder as it is).
+///
 /// **Re-read lists.** Every listed folder's list is read (`reread`): a synced
 /// folder's after its delta, also during its baseline; on a `.all` pass, a folder
 /// outside the synced set has its list read alone, with no delta and no bookmark
@@ -198,6 +207,11 @@ extension ExchangeProvider {
                 break
             }
             var missing: [String] = []
+            // A tracking round's changed messages taken from the page itself:
+            // their last verb (replied, forwarded) is read by id, since the
+            // delta cannot carry it (#890). A baseline lists the folder as it
+            // is, not changes, so it reads none.
+            var verbIds: Set<String> = []
             for record in page.records {
                 if record.removed != nil {
                     // A baseline lists the folder as it is: it never removes.
@@ -206,6 +220,7 @@ extension ExchangeProvider {
                 }
                 if held.contains(record.id) || state.select == .header {
                     collected.add(Self.changeRecord(record, header: page.headers[record.id]))
+                    if state.phase == .tracking { verbIds.insert(record.id) }
                 } else if Self.needsHeader(record, phase: state.phase, heldSince: folder.heldSince) {
                     missing.append(record.id)
                 }
@@ -259,6 +274,12 @@ extension ExchangeProvider {
                 ending = heldError.map { .failed($0, counted: heldCounted) } ?? .cut
                 break
             }
+
+            // The page passes: the last verbs it could not read here are read
+            // from the re-read list on a later pass, so they never hold it.
+            let verbOrder = page.records.map(\.id).filter { verbIds.contains($0) }
+            changes.rereadLater += try await readLastVerbs(
+                verbOrder, folder: folder, context: context, allowance: &allowance, collected: &collected)
 
             // Every header the page needed is in: the bookmark passes it.
             guard let next = page.nextLink ?? page.deltaLink else {
@@ -379,6 +400,44 @@ extension ExchangeProvider {
             for id in batch.gone { collected.remove(id) }
             changes.rereadLater += batch.unreadable
         }
+    }
+
+    /// Reads the last verb (replied, forwarded) of messages whose records came
+    /// from a delta page, in `$batch`es within the allowance, and joins it to
+    /// those records. Returns the ids not read: past the budget or allowance, a
+    /// failed batch, a throttle or an unusable answer. A message gone or now in
+    /// another folder needs nothing (that folder's round reports it).
+    private func readLastVerbs(
+        _ ids: [String], folder: ChangeFolder, context: ChangeContext, allowance: inout ChangeReadAllowance,
+        collected: inout CollectedChanges
+    ) async throws -> [String] {
+        var pending = ids[...]
+        var notRead: [String] = []
+        while !pending.isEmpty {
+            let width = min(pending.count, SyncConfig.graphBatchMaxRequests, allowance.requestsLeft)
+            guard width > 0, context.hasBudget() else { break }
+            let chunk = Array(pending.prefix(width))
+            pending = pending.dropFirst(width)
+            allowance.charge(width)
+            context.onProgress(width)
+            do {
+                let batch = try await withTimeout(seconds: SyncConfig.changeReadRequestTimeoutSeconds) {
+                    try await self.fetchMessageDetails(ids: chunk)
+                }
+                for detail in batch.details where detail.parentFolderId == folder.path {
+                    collected.addLastVerb(of: detail.header)
+                }
+                notRead += batch.unreadable + batch.unanswered.keys
+            } catch {
+                if error is CancellationError || Task.isCancelled { throw error }
+                notRead += chunk
+            }
+        }
+        notRead += pending
+        if !notRead.isEmpty, DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[Exchange] change read: \(notRead.count) last verb(s) left for a re-read")
+        }
+        return notRead
     }
 
     // MARK: - Records
@@ -733,6 +792,15 @@ struct CollectedChanges {
         if recordsById[id] == nil, !removed.contains(id) { order.append(id) }
         recordsById[id] = nil
         removed.insert(id)
+    }
+
+    /// The last verb of a message whose record came from the delta page: its
+    /// replied and forwarded marks join that record, nothing else does.
+    mutating func addLastVerb(of header: MessageHeaderInfo) {
+        guard var record = recordsById[header.messageId] else { return }
+        record.isReplied = header.isReplied
+        record.isForwarded = header.isForwarded
+        recordsById[header.messageId] = record
     }
 
     var records: [ChangeRecord] { order.compactMap { recordsById[$0] } }
