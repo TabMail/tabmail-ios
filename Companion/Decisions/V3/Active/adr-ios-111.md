@@ -30,7 +30,8 @@ and that capture was a lapse, so a new account listed every folder twice for the
    (`addressEpoch == nil`). Inserts carry today's header builder, AI-cache restore, reply-detect, orphan
    reclaim, the Drafts AND Sent placeholder dedup with label and body carry, references and user labels,
    and the Sent reply-parent mark. No provider cast and no provider test in those two files (pinned by `ChangeSeamFenceTests`).
-3. **The re-read list.** Every change the apply keeps back under a shield, and every message the reader
+3. **The re-read list.** *(Its over-the-limit cut is amended 2026-11-15, #903: only a pass's own
+   additions are cut; a stored id never is. See the amendment at the end.)* Every change the apply keeps back under a shield, and every message the reader
    names in a folder's `FolderChanges.rereadLater` (one it could not read this pass), is put on the folder's
    `Folder.changeState.recheck` (v102, engine-owned JSON, message ids only); a folder whose only change is
    such an id is still written, or the bookmark would move past a change kept nowhere. The next request passes it; the
@@ -424,7 +425,8 @@ answer in that folder, for a message of any age:
    wherever its date falls, also below `oldestSyncedDate` (ruled acceptable: that is where the row was
    before the gesture, and the backfill upserts by id). The bypass is strictly for a listed id; a
    baseline record for an unlisted older message is still not inserted. Removals were never gated.
-3. **A list is cut only where the catch-up will find the rest** (added same day, review round 4). Over
+3. **A list is cut only where the catch-up will find the rest** (added same day, review round 4;
+   *amended 2026-11-15, #903: a stored id is never cut, see the amendment below*). Over
    `SyncConfig.changeRecheckLimit`, a folder the catch-up checks (`SyncEngine.isSyncable`: a main role
    or a favourite, the same set `syncableFoldersInOrder` gives the full sync and the catch-up run)
    keeps its first ids and its catch-up is armed, as decision 3 says. A folder the catch-up never

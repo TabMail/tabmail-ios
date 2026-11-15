@@ -49,8 +49,8 @@ struct FolderChangeState: Codable, Equatable, Sendable {
     var tracking: Bool = false
     /// Message ids a change was declined for under the user's own action, read
     /// again on later passes, at most `SyncConfig.changeRereadBudgetPerPass` per
-    /// pass and in turn, until the change applies (cap
-    /// `SyncConfig.changeRecheckLimit`).
+    /// pass and in turn, until the change applies. `SyncConfig.changeRecheckLimit`
+    /// bounds only a pass's own additions; an id already stored is never cut (#903).
     var recheck: [String] = []
 
     init(tracking: Bool = false, recheck: [String] = []) {
