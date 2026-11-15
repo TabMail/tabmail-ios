@@ -411,6 +411,35 @@ struct GmailChangeReadingTests {
         }
     }
 
+    @Test("the reader rethrows when a reload of the label list is cut short by cancellation")
+    func cancelledReloadRethrowsFromTheReader() async throws {
+        try await Pins.withWorld(seeds: [Pins.seed("lbl-12", labels: ["INBOX", Pins.userLabelId])]) { w in
+            w.server.setUserLabel(id: "Label_new", name: "New")
+            w.server.applyLabelChange(providerMessageId: "lbl-12", add: ["Label_new"])
+            w.server.failLabelListings(true)
+            let cursor = try w.account().lastHistoryId
+            let request = Self.request(w, scope: .inboxOnly)
+            let provider = w.provider
+            let (gate, open) = AsyncStream<Void>.makeStream()
+            let task = Task {
+                for await _ in gate { break }
+                return try await provider.fetchChanges(since: ChangeCursor(account: cursor), request: request)
+            }
+            // The read is cancelled while the reload is in flight: the reader
+            // must not hand back a change set as if the read had finished (the
+            // engine's own writes would also stop, but the reader's contract is
+            // to end the read).
+            w.server.onLabelListing { task.cancel() }
+            open.yield()
+            open.finish()
+            let result = await task.result
+            w.server.onLabelListing(nil)
+            if case .success = result {
+                Issue.record("a read cancelled during the label-list reload returned a change set")
+            }
+        }
+    }
+
     @Test("a push pass whose label list cannot load fails, keeps its bookmark and changes nothing")
     func labelListFailureFailsThePushPass() async throws {
         try await Pins.withWorld(seeds: [Pins.seed("lbl-8", labels: ["INBOX", "UNREAD", Pins.userLabelId])]) { w in
