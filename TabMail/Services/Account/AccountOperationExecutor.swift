@@ -1097,7 +1097,11 @@ final class AccountOperationExecutor {
             guard let retired else { return .completed }
             guard retired else { return .retryLater(scope: .account, chargeRetry: false) }
             BackgroundSyncLogger.logError(
-                "Message action \(op.type.rawValue) retired after reaching the provider failure retry limit (\(SyncConfig.pendingOperationServerRefusalRetryLimit)); repeat the gesture to try again.",
+                "Message action \(op.type.rawValue) retired after reaching the provider failure retry limit (\(SyncConfig.pendingOperationServerRefusalRetryLimit)); "
+                    + (op.type == .markReplied || op.type == .markForwarded
+                        // A mark is not a gesture to repeat: repeating it would mean sending again.
+                        ? "the replied/forwarded mark on the original message could not be set; the sent message is not affected."
+                        : "repeat the gesture to try again."),
                 source: "actionQueue")
             manager.dropDeferredMoveSuccessors(for: op.id)
             return .completed

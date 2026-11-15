@@ -1673,6 +1673,7 @@ struct ComposeView: View {
                         composeContext: buildComposeEditContext(),
                         draftId: draftId,
                         draftReplyToId: replyTo?.id,
+                        draftIsReplyAll: isReplyAll,
                         // T5.8 — the reply target's ADDRESS travels with its PK, from
                         // the SAME header, so a Draft row first created by the agent's
                         // auto-save is stamped exactly like one created by Save/Send.
