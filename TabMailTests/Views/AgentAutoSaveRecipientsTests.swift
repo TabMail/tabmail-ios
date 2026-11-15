@@ -169,9 +169,9 @@ struct AgentAutoSaveRecipientsTests {
         }
     }
 
-    /// #915: a later agent autosave carries the CURRENT compose's kind. The same
-    /// `reply:` key is first saved from one entry, then the other entry's agent
-    /// saves over it; the row must follow the compose now open, both ways.
+    /// #915: a later agent autosave carries the CURRENT compose's kind. One draft
+    /// key (in the app, the shared `reply:` key) is first saved from one entry,
+    /// then the other entry's agent saves over it; the row must follow the compose now open, both ways.
     @Test("A later agent autosave stores the current compose's reply-all kind")
     func laterAutosaveFollowsTheCompose() async throws {
         let accountId = "acct-\(UUID().uuidString)"

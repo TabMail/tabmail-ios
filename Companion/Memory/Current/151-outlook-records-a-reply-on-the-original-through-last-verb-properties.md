@@ -23,7 +23,7 @@ one shared definition in `Shared/API/GraphAPI.swift`: `lastVerbPropertyId`, `las
 re-send mail. The send time is `OutboxMessage.sentAt`, carried on `PendingOperation.sentAt` (v104;
 pre-v104 rows use `createdAt`, stamped in the completion transaction: `PendingOperation.verbTime`).
 Reply-all is a generic kind from compose to the op: `ComposeView.isReplyAll` (set by the Reply All
-entries) → `Draft.isReplyAll` (kept on save and on the Undo-Send reopen, like `isForward`,
+entries) → `Draft.isReplyAll` (every draft writer, Save, Send and each agent autosave, stores the open compose's entry kind, so under the shared `reply:` key the latest entry decides; kept on the Undo-Send reopen, like `isForward`,
 `IOS-OUTBOX-004`) → `OutboxMessage.isReplyAll` → `PendingOperation.replyAll` →
 `ProviderMessageAction.replied(all:at:)`. IMAP maps reply-all to `\Answered` like reply; Gmail has
 no remote representation. The tags stay in `GraphAPI.swift` and `ExchangeProvider*` (ADR-IOS-060 boundary;
@@ -44,6 +44,6 @@ The AI reply tool (`EmailReplyTool`) builds the reply-all recipient set, so its
 `AgentToolRouter.ComposeRequest.isReplyAll` records reply-all (103) like the Reply All button. A refused
 mark leaves the queue only through the ordinary exit-5 counted-failure limit, like every other action.
 
-Tests: `EmailReplyToolTests.requestIsReplyAll`, `ExchangeLastVerbMarkTests`, `ProviderMessageActionTests.graphCommandsPreserveNativeIdentityAndDestination`,
+Tests: `EmailReplyToolTests.requestIsReplyAll`, `AgentAutoSaveRecipientsTests.laterAutosaveFollowsTheCompose`, `OutlookChangeReadingTests.appReplyMarkIsWrittenAndReadBack`, `ExchangeLastVerbMarkTests`, `ProviderMessageActionTests.graphCommandsPreserveNativeIdentityAndDestination`,
 `ComposeSendReplyTargetTests.replyAllReopenedThroughUndoIsResentAsReplyAll`,
 `NeverDropExitClosureTests.completedReplyAllAnswersItsParentOnTheServer`.

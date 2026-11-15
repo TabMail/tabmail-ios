@@ -358,7 +358,7 @@ struct ExchangeLastVerbMarkTests {
     }
 
     /// #915: ComposeView hands its reply-all kind to the in-compose agent, whose
-    /// first autosave stores it. The parameter defaults to false, so only this
+    /// every autosave stores it. The parameter defaults to false, so only this
     /// fence catches a dropped argument.
     @Test("ComposeView passes its reply-all kind to the in-compose agent")
     func composePassesReplyAllToTheAgent() throws {
