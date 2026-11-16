@@ -533,6 +533,11 @@ same AI result, kept as long as the email itself is shown.
    keeps it. Tests: `ChatThreadViewLifecycleTests.swipeHoldsTheFreezeUntilSettled`,
    `summaryWaitsForTheSwipe` (a real summary write under a held pan, with a no-swipe control),
    `teardownLetsGo`.
+   *Amended 2026-11-16:* the hold keeps state only for swipes that hold the finger or still settle:
+   each settle has its own token, and an id leaves once it settles, is taken again, or lets go at
+   once (every bubble that leaves the screen lets go of its id), so the state stays bounded and a
+   reused id's newer swipe is never released by an earlier settle. Before, a counter per id grew
+   with every bubble ever shown. Test: `swipeHoldKeepsNoStateOnceSettled`.
    VoiceOver reaches every button as a named action. Archive, Trash and Move act on every email the
    chat shows, wherever it is filed ("always the whole thread", 2026-11-04), except the user's sent
    copies and drafts, which stay in their folders, and emails already at the destination

@@ -209,14 +209,18 @@ final class ChatSwipeHold {
     static let shared = ChatSwipeHold()
 
     private var held = Set<String>()
-    /// Bumped by every begin and release of an id, so a pending settle of an earlier swipe on that
-    /// id does nothing.
-    private var generations: [String: Int] = [:]
+    /// The swipes that let go and still settle, each with its own settle's token: a settle whose
+    /// token a newer begin or release replaced does nothing, and an id leaves once it settles, is
+    /// taken again, or lets go at once, so nothing is kept for a swipe that is over.
+    private var settling: [String: UUID] = [:]
     private var ownsGate = false
+
+    /// Test-only: every id the hold keeps state for.
+    var trackedIdsForTesting: Set<String> { held.union(settling.keys) }
 
     /// The swipe `id` took the finger.
     func begin(_ id: String) {
-        generations[id, default: 0] += 1
+        settling[id] = nil
         guard held.insert(id).inserted, held.count == 1, !PreviewFreezeGate.shared.isFrozen else { return }
         ownsGate = true
         PreviewFreezeGate.shared.begin()
@@ -224,18 +228,19 @@ final class ChatSwipeHold {
 
     /// The swipe `id` let go: it holds while it settles, `delay`, unless it is taken again.
     func release(_ id: String, after delay: Duration) {
-        generations[id, default: 0] += 1
-        let generation = generations[id]
+        guard held.contains(id) else { return }
+        let token = UUID()
+        settling[id] = token
         Task { @MainActor in
             try? await Task.sleep(for: delay)
-            guard self.generations[id] == generation else { return }
+            guard self.settling[id] == token else { return }
             self.releaseNow(id)
         }
     }
 
     /// The swipe `id` holds nothing more: cancelled, settled, or its view gone.
     func releaseNow(_ id: String) {
-        generations[id, default: 0] += 1
+        settling[id] = nil
         guard held.remove(id) != nil, held.isEmpty, ownsGate else { return }
         ownsGate = false
         PreviewFreezeGate.shared.end()

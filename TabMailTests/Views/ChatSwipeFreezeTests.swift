@@ -85,6 +85,38 @@ extension ChatThreadViewLifecycleTests {
         gate.end()
     }
 
+    @Test("The swipe hold keeps state only for swipes that hold or settle, and a reused id keeps its newer hold")
+    func swipeHoldKeepsNoStateOnceSettled() async throws {
+        let hold = ChatSwipeHold.shared
+        let gate = PreviewFreezeGate.shared
+        #expect(hold.trackedIdsForTesting.isEmpty, "control: no swipe holds anything")
+
+        // Every bubble that leaves the screen lets go of its id, swiped or not.
+        for index in 0..<50 { hold.releaseNow("teardown-\(index)") }
+        // Swipes that let go and settle.
+        for index in 0..<20 {
+            Self.swipe(.began, on: "settled-\(index)")
+            Self.swipe(.ended, on: "settled-\(index)")
+        }
+        #expect(hold.trackedIdsForTesting.count == 20, "control: each let-go swipe is settling")
+        try await Task.sleep(for: Self.settled)
+        #expect(!gate.isFrozen, "control: settled, the data goes through")
+        #expect(hold.trackedIdsForTesting.isEmpty, "nothing is kept for a swipe that settled or a view that went: \(hold.trackedIdsForTesting.count)")
+
+        // An id reused while its earlier swipe's settle is pending: the newer swipe keeps holding.
+        Self.swipe(.began, on: "reused")
+        Self.swipe(.ended, on: "reused")
+        hold.releaseNow("reused")
+        #expect(!gate.isFrozen, "control: the view went, the hold let go")
+        Self.swipe(.began, on: "reused")
+        try await Task.sleep(for: Self.settled)
+        #expect(gate.isFrozen, "the earlier swipe's settle never releases the newer swipe")
+        Self.swipe(.ended, on: "reused")
+        try await Task.sleep(for: Self.settled)
+        #expect(!gate.isFrozen)
+        #expect(hold.trackedIdsForTesting.isEmpty)
+    }
+
     private static let freezeAccount = "acc-chat-swipe-freeze"
     private static let freezeText = "Thursday suits me."
 
