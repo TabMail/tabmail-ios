@@ -154,6 +154,8 @@ struct ChatCopiesTests {
             await queue.setDispatchSuppressedForTesting(true)
             await queue.clearForTesting()
             defer {
+                // A whole-chat action pushes one Undo, process-wide state that outlives this chat.
+                UndoService.shared.dismissAll()
                 InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
             }
             let thread = try Self.insertThread(pool: pool, filedOnly: filedOnly)
@@ -325,6 +327,9 @@ struct ChatCopiesTests {
             #expect(!dismissed.ids.contains(projects.id),
                     "the label's list is not told to hide the opened row, which is still there: \(dismissed.ids)")
         }
+        // The archive's Undo is process-wide state: the chat this test opened leaves none for the
+        // next suite (a suite that reads the undo stack saw this one's entry).
+        #expect(UndoService.shared.undoStack.isEmpty, "the chat leaves no undo entry behind")
     }
 
     /// The ids `.messageDismissedFromDetail` named, from the posting thread.
