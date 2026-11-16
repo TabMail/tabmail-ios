@@ -200,6 +200,17 @@ struct ChatReplyTarget: Equatable {
     }
 }
 
+/// A request sent from the chat's reply field, as it was when sent (ADR-IOS-114 decision 11): the
+/// email the field replies to and who the user chose in Reply to. It travels with the request
+/// (`ToolInvocation.fieldReply`, then `ComposeRequest.fieldReply` on a reply to that email), so the
+/// chat that shows the compose card never decides who it goes to from its own state at that moment.
+struct ChatFieldReply: Sendable, Equatable {
+    /// The email the field replies to (`ChatThread.copyKey`: copies of one email are one).
+    let emailKey: String
+    /// The addresses chosen in Reply to; nil: Reply All.
+    let onlyTo: [String]?
+}
+
 /// How a reply from the chat opens compose: Reply All or a plain reply, and to whom, read together
 /// from who the chat's reply goes to (`ChatReplyTarget`), so the kind the send records on the
 /// original (`ComposeView.isReplyAll`, #915) is the kind the "Replying only to" line shows. Read once,
@@ -210,29 +221,32 @@ struct ChatReplyCompose: Equatable {
     let cc: [String]
     let bcc: [String]
 
-    /// The reply to `message`. `agent`: the agent's reply request and whether it was asked for in the
-    /// collapsed field (not the open chat sheet); nil for the ready AI Reply.
-    /// - The ready AI Reply is a Reply All to the newest email's people exactly when nobody was chosen
-    ///   in Reply to (`target.only == nil`). With people chosen, it and a reply asked for in the field
-    ///   are a plain reply to only them, with no Cc or Bcc.
-    /// - The agent's reply with nobody chosen keeps the agent's recipients, and is a Reply All only
-    ///   when those recipients (To, Cc and Bcc) contain the whole Reply All audience, people the agent
-    ///   added included; asked for in the open sheet, also only when the agent opened it as one.
-    static func make(
-        replyTo message: MessageHeader?, target: ChatReplyTarget,
-        agent: (request: AgentToolRouter.ComposeRequest, fromField: Bool)?, accounts: [Account]
-    ) -> ChatReplyCompose {
-        if let only = target.only, agent?.fromField ?? true {
+    /// The ready AI Reply to `message`: a Reply All to the newest email's people exactly when nobody
+    /// is chosen in Reply to (`target.only == nil`); with people chosen, a plain reply to only them,
+    /// with no Cc or Bcc.
+    static func make(replyTo message: MessageHeader?, target: ChatReplyTarget, accounts: [Account]) -> ChatReplyCompose {
+        if let only = target.only {
             return ChatReplyCompose(isReplyAll: false, to: only.map(\.address), cc: [], bcc: [])
         }
         let audience = message.map { buildReplyAllRecipients(for: $0, allAccounts: accounts) }
-        guard let agent else {
-            return ChatReplyCompose(isReplyAll: audience != nil, to: audience?.to ?? [], cc: audience?.cc ?? [], bcc: [])
+        return ChatReplyCompose(isReplyAll: audience != nil, to: audience?.to ?? [], cc: audience?.cc ?? [], bcc: [])
+    }
+
+    /// The agent's reply, read from its request alone, never from the chat showing the card: whether
+    /// its sheet is open, or who that chat would reply to now, decides nothing.
+    /// - Asked for in the reply field with people chosen (`fieldReply.onlyTo`, as they were when it
+    ///   was sent): a plain reply to only them, with no Cc or Bcc.
+    /// - Otherwise the agent's recipients, a Reply All only when they (To, Cc and Bcc) contain the
+    ///   whole Reply All audience, people the agent added included; asked for anywhere but the
+    ///   field, also only when the agent opened it as one.
+    static func make(agent req: AgentToolRouter.ComposeRequest, accounts: [Account]) -> ChatReplyCompose {
+        if let only = req.fieldReply?.onlyTo {
+            return ChatReplyCompose(isReplyAll: false, to: only, cc: [], bcc: [])
         }
-        let req = agent.request
+        let audience = req.replyTo.map { buildReplyAllRecipients(for: $0, allAccounts: accounts) }
         let addresses = { (list: [String]) in Set(list.map { $0.lowercased() }) }
         let toWholeAudience = audience.map { addresses(req.to + req.cc + req.bcc).isSuperset(of: addresses($0.to + $0.cc)) } == true
-        let isReplyAll = toWholeAudience && (agent.fromField || req.isReplyAll)
+        let isReplyAll = toWholeAudience && (req.fieldReply != nil || req.isReplyAll)
         return ChatReplyCompose(isReplyAll: isReplyAll, to: req.to, cc: req.cc, bcc: req.bcc)
     }
 

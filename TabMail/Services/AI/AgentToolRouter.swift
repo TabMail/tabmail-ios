@@ -256,6 +256,10 @@ final class AgentToolRouter {
         /// tool). Carried into ComposeView so the send records reply-all on
         /// the original, like the Reply All button (#915).
         let isReplyAll: Bool
+        /// A reply asked for in the chat's reply field, to the email the field replies to: who the
+        /// user chose in Reply to when the request was sent (ADR-IOS-114 decision 11). Nil for
+        /// every other request, whose compose keeps the recipients above.
+        let fieldReply: ChatFieldReply?
 
         /// Fires once when the user's compose session reaches a terminal state
         /// (send / cancel / persist-failure). Invoked on MainActor from
@@ -277,6 +281,7 @@ final class AgentToolRouter {
             subject: String?,
             body: String?,
             isReplyAll: Bool = false,
+            fieldReply: ChatFieldReply? = nil,
             onOutcome: @escaping @MainActor (ComposeOutcome) -> Void = { _ in },
             outcomeState: ComposeOutcomeState = ComposeOutcomeState()
         ) {
@@ -288,6 +293,7 @@ final class AgentToolRouter {
             self.subject = subject
             self.body = body
             self.isReplyAll = isReplyAll
+            self.fieldReply = fieldReply
             self.onOutcome = onOutcome
             self.outcomeState = outcomeState
         }

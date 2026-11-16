@@ -488,6 +488,20 @@ same AI result, kept as long as the email itself is shown.
    `ChatReplyCompose.make` checks containment once for every agent reply. Tests:
    `ChatReplyFieldTests.agentReplyThatAddsPeopleIsStillReplyAll`,
    `agentReplyFromTheFieldFollowsTheTarget`, `agentReplyFromTheSheetKeepsItsRecipients`.
+   **Who a field reply is for travels with its request (2026-11-16, current):** whether a reply was
+   asked for in the field, and who was chosen in Reply to, are read once, as the field's send
+   starts, and travel with the request (`ChatFieldReply`: `ToolInvocation.fieldReply`, stamped on
+   the `ComposeRequest` by the reply tool only for a reply to the email the field replies to). The
+   agent's compose card is read from its request alone (`ChatReplyCompose.make(agent:)`): with
+   people chosen when it was sent, a plain reply to only them; otherwise the agent's recipients,
+   under the containment rule above. The chat that shows the card decides nothing from its own state
+   at that moment. Before this, the chat replaced any agent reply's recipients with its current
+   choice whenever its sheet was closed as the card arrived, so a reply asked for in the open sheet
+   whose sheet closed while the card waited, or a reply about another chat's email delivered to this
+   chat, went only to this chat's chosen people. Tests: `ChatReplyComposeOriginTests` (a held real
+   reply, the chat opened and its Reply to chosen through the sheet: `panelClosedBeforeDelivery`,
+   `requestFromAnotherChat`, `fieldRequestAboutAnotherEmail`, `fieldRequestUsesItsCapturedChoice`,
+   `fieldRequestToEveryoneKeepsItsRecipients`).
 
 **Release order:** an iOS build at protocol 2.0.0 must not reach users before the backend change
 (its protocol 2.0.0 JSON shape) is deployed to production: an older backend sends 2.0.0 the labelled text, which this
@@ -525,4 +539,5 @@ Send and its gate), `ChatThreadViewLifecycleTests.aJoiningEmailAsks`,
 `newestBubbleClearsATallField` and `sentReplyTakesTheTurn`.
 Decision 11: `ChatThreadTests.repliedOnlyTo`,
 `someoneNewIsNotOnly`, `userIsOnePerson`; `ChatReplyFieldTests` (`changedRecipientsRoute`,
-`agentMessageOnlyTo`, `replyTarget`, `replyToChoice`, `accessibilityOnlyTo`, `recipientsWiring`).
+`agentMessageOnlyTo`, `replyTarget`, `replyToChoice`, `accessibilityOnlyTo`, `recipientsWiring`);
+`ChatReplyComposeOriginTests` (who gets the agent's reply, by where its request came from).

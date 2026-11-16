@@ -2455,6 +2455,11 @@ struct DynamicIslandChat: View {
         // Captured with the session id: a demo turn is written only while its demo runs.
         let admission = DemoModeStore.shared.chatAdmission
         let capturedSessionKey = sessionKey
+        // Sent from the reply field: who the reply goes to, as chosen now, travels with the request
+        // (its words and the agent's compose card), whatever the chat shows when the card arrives.
+        let onlyTo = fromReplyField ? replyField?.onlyTo : nil
+        let fieldReply = fromReplyField
+            ? message.map { ChatFieldReply(emailKey: ChatThread.copyKey($0), onlyTo: onlyTo?.map(\.address)) } : nil
 
         activeChatTask = Task {
             // Ensure email context is registered before building enrichedText.
@@ -2497,7 +2502,7 @@ struct DynamicIslandChat: View {
             if let numericId = contextNumericId, fromReplyField {
                 enrichedText = ChatReplyField.agentMessage(
                     emailNumericId: numericId, text: text, isNoReply: replyField?.isNoReply ?? false,
-                    onlyTo: replyField?.onlyTo)
+                    onlyTo: onlyTo)
             } else if let numericId = contextNumericId {
                 enrichedText = "Regarding [Email](\(numericId)): \(text)"
             } else {
@@ -2539,7 +2544,8 @@ struct DynamicIslandChat: View {
                 // THIS session so any FSM tool's card is delivered to (and rendered
                 // by) the session that launched the turn — never a global slot that
                 // other mounted pills race for.
-                let invocation = ToolInvocation(uiSink: SessionUISink(session: session), sessionKey: sessionKey)
+                let invocation = ToolInvocation(
+                    uiSink: SessionUISink(session: session), sessionKey: sessionKey, fieldReply: fieldReply)
                 let response: ChatResponse?
                 response = try await TutorialChatScript.response(for: script, invocation: invocation) {
                     try await AIService.shared.sendChatMessage(

@@ -273,12 +273,10 @@ struct ChatThreadView: View {
         }
         .onChange(of: AgentToolRouter.shared.pendingCompose?.id) { _, newId in
             guard newId != nil, let req = AgentToolRouter.shared.pendingCompose else { return }
-            // Asked from the field (not the open sheet): the agent's closing words open nothing.
-            fieldComposeOpened = !chatExpanded
-            // A reply asked for in the field goes to the people chosen in Reply to.
-            let reply = ChatReplyCompose.make(
-                replyTo: req.replyTo, target: replyTarget, agent: (req, fieldComposeOpened), accounts: context.accounts)
-            agentCompose = ChatAgentCard(request: req, reply: reply)
+            // Asked for in a reply field: the agent's closing words open nothing. Who the card goes
+            // to travels with the request (`fieldReply`); this chat's own state decides nothing.
+            fieldComposeOpened = req.fieldReply != nil
+            agentCompose = ChatAgentCard(request: req, reply: ChatReplyCompose.make(agent: req, accounts: context.accounts))
             AgentToolRouter.shared.pendingCompose = nil
         }
         .sheet(item: $cardMessage) { msg in
@@ -582,7 +580,7 @@ struct ChatThreadView: View {
                     onlyTo: replyTarget.only),
                 onSendReadyReply: {
                     readyReply = ChatReadyReply(message: newest, compose: ChatReplyCompose.make(
-                        replyTo: newest, target: replyTarget, agent: nil, accounts: context.accounts))
+                        replyTo: newest, target: replyTarget, accounts: context.accounts))
                 },
                 onFieldSend: { _ in fieldComposeOpened = false })
         }
