@@ -268,9 +268,11 @@ struct ChatSwipeTests {
         #expect(ended.contains("switch drag.letGo(velocity: velocity, finished: finished, sign: sign, revealWidth: revealWidth, width: width, allowsFull: allowsFullSwipe) {"))
         let changed = try Self.body(of: "private func changed(_ translation: CGFloat) {", in: text)
         #expect(changed.contains("drag.moved(translation, sign: sign, revealWidth: revealWidth, width: width, allowsFull: allowsFullSwipe)"))
-        #expect(text.contains("changed: changed, ended: ended))"), "the reveal hands the pan its drag")
-        #expect(text.contains("func handleUIGestureRecognizerAction(_ recognizer: UIPanGestureRecognizer, context: Context) { Self.deliver(recognizer, changed: changed, ended: ended) }"),
-                "every recognizer event goes through `deliver`")
+        #expect(text.contains("holdId: id, shouldBegin: { velocityX in openId == id || (openId == nil && velocityX * sign > 0) }, changed: changed, ended: ended))"),
+                "the reveal hands the pan its drag, held under its id")
+        #expect(text.contains("func handleUIGestureRecognizerAction(_ recognizer: UIPanGestureRecognizer, context: Context) { Self.handle(recognizer, holding: holdId, changed: changed, ended: ended) }"),
+                "every recognizer event goes through `handle` (the freeze, ChatSwipeFreezeTests) and `deliver`")
+        #expect(text.contains(".onDisappear { ChatSwipeHold.shared.releaseNow(id) }"))
     }
 
     @Test("The chat slides left for Trash then Archive, with a full swipe, acting on the whole chat; with no Inbox copy, Trash only and no full swipe")

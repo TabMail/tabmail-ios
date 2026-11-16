@@ -120,7 +120,7 @@ struct ChatSwipeReveal: ViewModifier {
     private var sign: CGFloat { edge == .trailing ? -1 : 1 }
     private var revealWidth: CGFloat { CGFloat(buttons.count) * ChatViewLayout.swipeButtonWidth }
     private var edgeButton: ChatSwipeButton? { edge == .trailing ? buttons.last : buttons.first }
-    private static let spring = Animation.spring(response: 0.35, dampingFraction: 0.86)
+    private static let spring = Animation.spring(response: ChatViewLayout.swipeSpringResponse, dampingFraction: 0.86)
 
     func body(content: Content) -> some View {
         content
@@ -138,8 +138,10 @@ struct ChatSwipeReveal: ViewModifier {
             }
             .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
             .gesture(ChatHorizontalPan(
-                shouldBegin: { velocityX in openId == id || (openId == nil && velocityX * sign > 0) },
+                holdId: id, shouldBegin: { velocityX in openId == id || (openId == nil && velocityX * sign > 0) },
                 changed: changed, ended: ended))
+            // A swipe torn down mid-drag or while it settles lets the data it held through.
+            .onDisappear { ChatSwipeHold.shared.releaseNow(id) }
             .onChange(of: openId) { _, now in
                 if now != id, drag.offset != 0 { withAnimation(Self.spring) { drag.offset = 0 } }
             }
@@ -196,9 +198,55 @@ struct ChatSwipeReveal: ViewModifier {
     }
 }
 
+/// The chat's swipes under the user-interaction freeze rule: from the moment a swipe takes the
+/// finger until it has let go and settled, data that lands waits, so nothing the user is acting on
+/// moves under the finger. It drives the app's one freeze, `PreviewFreezeGate`, whose readers
+/// (`MessageDetailViewModel`, the sync status) keep what lands and apply it on release. Each swipe
+/// holds under its reveal's id; the gate is held while any swipe holds, and only when this began
+/// it (a preview that froze it first keeps it).
+@MainActor
+final class ChatSwipeHold {
+    static let shared = ChatSwipeHold()
+
+    private var held = Set<String>()
+    /// Bumped by every begin and release of an id, so a pending settle of an earlier swipe on that
+    /// id does nothing.
+    private var generations: [String: Int] = [:]
+    private var ownsGate = false
+
+    /// The swipe `id` took the finger.
+    func begin(_ id: String) {
+        generations[id, default: 0] += 1
+        guard held.insert(id).inserted, held.count == 1, !PreviewFreezeGate.shared.isFrozen else { return }
+        ownsGate = true
+        PreviewFreezeGate.shared.begin()
+    }
+
+    /// The swipe `id` let go: it holds while it settles, `delay`, unless it is taken again.
+    func release(_ id: String, after delay: Duration) {
+        generations[id, default: 0] += 1
+        let generation = generations[id]
+        Task { @MainActor in
+            try? await Task.sleep(for: delay)
+            guard self.generations[id] == generation else { return }
+            self.releaseNow(id)
+        }
+    }
+
+    /// The swipe `id` holds nothing more: cancelled, settled, or its view gone.
+    func releaseNow(_ id: String) {
+        generations[id, default: 0] += 1
+        guard held.remove(id) != nil, held.isEmpty, ownsGate else { return }
+        ownsGate = false
+        PreviewFreezeGate.shared.end()
+    }
+}
+
 /// A horizontal pan that starts only when `shouldBegin` accepts its first motion, so vertical
 /// scrolling stays the scroll view's.
 struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
+    /// What the swipe holds the interaction freeze under (`ChatSwipeHold`): its reveal's id.
+    let holdId: String
     let shouldBegin: (CGFloat) -> Bool
     let changed: (CGFloat) -> Void
     /// The drag's last velocity, and whether the user finished it (false when the system cancelled
@@ -236,7 +284,17 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
     }
 
     func handleUIGestureRecognizerAction(_ recognizer: UIPanGestureRecognizer, context: Context) {
-        Self.deliver(recognizer, changed: changed, ended: ended)
+        Self.handle(recognizer, holding: holdId, changed: changed, ended: ended)
+    }
+
+    /// Every event of the swipe's pan: it holds the interaction freeze from the moment it begins
+    /// until it has let go and settled (`ChatSwipeHold`), and hands the event on (`deliver`).
+    @MainActor
+    static func handle(_ recognizer: UIPanGestureRecognizer, holding id: String, changed: (CGFloat) -> Void,
+                       ended: (CGFloat, Bool) -> Void) {
+        if recognizer.state == .began { ChatSwipeHold.shared.begin(id) }
+        deliver(recognizer, changed: changed, ended: ended)
+        if finished(recognizer.state) != nil { ChatSwipeHold.shared.release(id, after: ChatViewLayout.swipeSettleHold) }
     }
 
     /// Hands a pan's event on: its horizontal travel while it moves; its velocity, and whether the

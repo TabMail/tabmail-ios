@@ -524,6 +524,15 @@ same AI result, kept as long as the email itself is shown.
    Only a drag the user finished acts: one the system cancels or fails (a call, a system
    gesture) closes the reveal and runs nothing, however far it went (`ChatHorizontalPan.finished`,
    `ChatSwipe.settle(finished:)`; review, 2026-11-05).
+   *Amended 2026-11-16 (the user-interaction freeze rule):* from the moment a swipe's pan begins
+   until it has let go and settled (`ChatViewLayout.swipeSettleHold`: the spring, then the rule's
+   200ms cooldown), data that lands waits: the pan drives the app's one freeze, `PreviewFreezeGate`,
+   whose readers keep what lands and apply it on release (`ChatSwipeHold`, through
+   `ChatHorizontalPan.handle`). A cancelled or failed pan releases the same way, and a reveal that
+   goes away mid-drag releases at once. Several swipes hold it together; a preview that froze first
+   keeps it. Tests: `ChatThreadViewLifecycleTests.swipeHoldsTheFreezeUntilSettled`,
+   `summaryWaitsForTheSwipe` (a real summary write under a held pan, with a no-swipe control),
+   `teardownLetsGo`.
    VoiceOver reaches every button as a named action. Archive, Trash and Move act on every email the
    chat shows, wherever it is filed ("always the whole thread", 2026-11-04), except the user's sent
    copies and drafts, which stay in their folders, and emails already at the destination

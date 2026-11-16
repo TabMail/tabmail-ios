@@ -83,4 +83,9 @@ enum ChatViewLayout {
     static let swipeFullFraction: CGFloat = 0.6
     /// A let-go faster than this (points a second) opens or closes the swipe whatever its distance.
     static let swipeFlickVelocity: CGFloat = 600
+    /// How long a let-go swipe keeps holding data that lands (`ChatSwipeHold`): the swipe's spring
+    /// (`swipeSpringResponse`) settling, then the interaction freeze's 200ms cooldown.
+    static let swipeSettleHold: Duration = .milliseconds(550)
+    /// The response of the spring a let-go swipe settles with, in seconds.
+    static let swipeSpringResponse: Double = 0.35
 }
