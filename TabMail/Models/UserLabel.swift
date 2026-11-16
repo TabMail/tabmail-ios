@@ -90,7 +90,7 @@ struct MessageUserLabelWithUserLabel: FetchableRecord, Decodable, Sendable {
 
 // MARK: - Helper Types
 
-/// Thrown when Gmail API createLabel takes too long (10s timeout).
+/// Thrown when Gmail API createLabel takes too long (`GmailAPI.labelCreateTimeout`).
 struct UserLabelCreationTimeoutError: Error, LocalizedError {
     var errorDescription: String? { "Label creation timed out. Please try again." }
 }

@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import GRDB
 
 /// PORT — reduced from v2final `DraftSaveOutcome` / `CreatedId` (82c9ce5c9).
 /// A created address is provider-native; no display/header identifier may be
@@ -516,6 +517,29 @@ protocol EmailProvider: Sendable {
     func catchUp(
         folders: [Folder], localRows: any CatchUpLocalRowReader, context: CatchUpContext
     ) async -> [CatchUpFolderResult]
+
+    // MARK: User labels (#500; the type and its notes in `EmailProviderUserLabels.swift`)
+    //
+    // STATIC on purpose: reached through `AccountProvider.emailProviderType`, so a
+    // provider whose labels need no server (IMAP keywords, Outlook categories)
+    // answers with NO connected instance: signed out, still starting, or between
+    // a sign-out and a sign-in.
+
+    /// The label a "create label" gesture applies for the typed `name`.
+    /// `connected` is the account's registered provider, nil when none is; a
+    /// provider that creates labels on its server throws when it is nil.
+    static func userLabel(named name: String, connected: (any EmailProvider)?) async throws -> ProviderUserLabel
+
+    /// The account's user labels as the folder list carries them, or nil when the
+    /// provider keeps no label catalog there. nil leaves the stored labels as they
+    /// are; an empty list means the provider has NO labels, and the sync removes
+    /// every stored one.
+    static func userLabelCatalog(from folders: [FolderInfo]) -> [ProviderUserLabel]?
+
+    /// Which of a pushed message's raw provider labels (as the notification
+    /// extension staged them) are the user's own labels: bare provider label ids
+    /// in, bare provider label ids out. Runs inside the merge's write transaction.
+    static func storedUserLabelIds(fromPushed rawLabels: [String], accountId: String, db: Database) throws -> [String]
 }
 
 /// #217: draft copies (`fetchDraftCopy`).

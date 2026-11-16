@@ -365,10 +365,6 @@ final class UserLabelMenuModel {
     func createAndApply(name: String) async -> Bool {
         do {
             let accountId = messageSnapshot.accountId
-            let labelId: String
-            // The name the row is stored under: the typed one, or Gmail's own
-            // spelling when Gmail already has a label by this name.
-            var labelName = name
 
             // Provider gate — an account whose adapter cannot mutate labels
             // remotely must not even get the local `UserLabel` row created below:
@@ -378,78 +374,24 @@ final class UserLabelMenuModel {
             // create that did not happen.
             guard let account = try await AppDatabase.dbPool.read({ db in
                 try Account.fetchOne(db, key: accountId)
-            }), Self.supportsRemoteUserLabels(account.provider) else { return false }
+            }), Self.supportsRemoteUserLabels(account.provider),
+                  let providerType = account.provider.emailProviderType
+            else { return false }
 
-            switch account.provider {
-            case .gmail:
-                // Gmail: create label on server synchronously (with timeout)
-                let provider = await AccountManager.shared.providers[accountId]
-                guard let gmail = provider as? GmailProvider else { return false }
-                let label = try await withThrowingTaskGroup(of: (id: String, name: String).self) { group in
-                    group.addTask {
-                        do {
-                            return (try await gmail.createLabel(name: name, visible: true), name)
-                        } catch where httpStatus(of: error) == 409 {
-                            // Gmail already has a label by this name (compared
-                            // without case): apply that one, under its name.
-                            guard let existing = try await gmail.findLabelByName(name) else { throw error }
-                            return existing
-                        }
-                    }
-                    group.addTask {
-                        try await Task.sleep(for: .seconds(10))
-                        throw UserLabelCreationTimeoutError()
-                    }
-                    let result = try await group.next()!
-                    group.cancelAll()
-                    return result
-                }
-                labelId = label.id
-                labelName = label.name
-            case .imap, .icloud:
-                // IMAP: keyword name (lowercased) IS the ID — no server call needed
-                labelId = name.lowercased()
-            case .outlook:
-                // Outlook: the Graph category's DISPLAY NAME is the ID. Mints
-                // locally like the IMAP arm above rather than blocking on a
-                // catalog round-trip like the Gmail arm, because Graph has no
-                // catalog to call: PATCHing a category name onto a message is
-                // what makes it exist there (`ExchangeProvider.setUserLabel`).
-                //
-                // 🚨 VERBATIM — deliberately NOT `.lowercased()`, the one place
-                // this arm diverges from the IMAP arm it otherwise copies. IMAP
-                // lowercases because RFC 3501 keywords are case-INsensitive;
-                // Graph category names are case-SENSITIVE display strings that
-                // must round-trip byte-identically. The read path
-                // (`ExchangeProvider.parseGraphMessage`) maps the server's
-                // `categories` strings verbatim into `userLabelIds`, and the sync
-                // arms mint a `UserLabel` from each, so lowercasing here would
-                // make the user's `Receipts` and the server's echoed `Receipts`
-                // derive two different `UserLabel.id`s — one category, two menu
-                // rows.
-                //
-                // `tm_*` never reaches here: `UserLabelStore.isReservedName`
-                // refuses that prefix at this function's only caller, which is
-                // deliberate — the server would accept such a category and
-                // `ExchangeProvider.stripLegacyCategories` would later silently
-                // delete it.
-                labelId = name
-            case .caldav:
-                // Unreachable — the gate above already returned for CalDAV.
-                // Spelled as an explicit case rather than `default:` for the same
-                // reason `supportsRemoteUserLabels(_:)` is exhaustive: a sixth
-                // provider must be a compile error here, not a silent keyword-id
-                // guess.
-                return false
-            }
+            // The provider turns the typed name into the label to apply (#500):
+            // its id and the name it is stored under, which may be the provider's
+            // own spelling of a label it already has. A provider whose labels need
+            // no server answers with no connected provider (signed out, still
+            // starting); one that creates labels on its server throws without one.
+            let connected = await AccountManager.shared.provider(accountId: accountId)
+            let label = try await providerType.userLabel(named: name, connected: connected)
 
-            // `labelId` is the BARE provider value — a Gmail label id from
-            // `createLabel`, or the lowercased IMAP keyword. The deterministic
+            // `providerLabelId` is the BARE provider value. The deterministic
             // initializer mints the account-prefixed surrogate primary key from it
             // (D10 / `IOS-LABEL-001`).
             let newLabel = UserLabel(
-                accountId: accountId, providerLabelId: labelId,
-                name: labelName, isSystem: false
+                accountId: accountId, providerLabelId: label.providerLabelId,
+                name: label.name, isSystem: false
             )
 
             // Insert locally

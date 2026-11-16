@@ -104,6 +104,23 @@ enum AccountProvider: String, Codable, Sendable, CaseIterable {
         case .outlook, .imap, .icloud, .caldav: return false
         }
     }
+
+    /// The `EmailProvider` type that holds this account kind's own rules, for
+    /// the static requirements (user labels, #500). Reached from the account
+    /// kind alone, so a rule that needs no server answers with no connected
+    /// provider. The same types `AccountManager.connectAccount` creates for each
+    /// kind; nil for CalDAV, which carries no mail.
+    ///
+    /// ⚑ Exhaustive with no `default:` clause, like `contentKeySpace`: a new
+    /// provider must decide this explicitly.
+    var emailProviderType: (any EmailProvider.Type)? {
+        switch self {
+        case .gmail: return GmailProvider.self
+        case .outlook: return ExchangeProvider.self
+        case .imap, .icloud: return IMAPProvider.self
+        case .caldav: return nil
+        }
+    }
 }
 
 struct Account: Codable, FetchableRecord, PersistableRecord, Identifiable, Sendable, Equatable {
