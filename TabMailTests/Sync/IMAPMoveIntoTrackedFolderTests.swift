@@ -543,14 +543,14 @@ struct IMAPMoveIntoTrackedFolderTests {
         }
     }
 
-    @Test("A row the change reader takes back at its own address (left in another folder) is actionable on that message")
+    @Test("A row left in another folder under a UID the server has since given to a different message is not taken back, and no action reaches that message")
     @MainActor
-    func reclaimedRowIsActionable() async throws {
+    func unprovenOrphanIsNotReclaimed() async throws {
         try await Self.withWorld("reclaim", capabilities: FakeIMAPServer.defaultCapabilities + Self.qresync,
                                  archive: [50], local: ["Archive": [50]], tracked: ["INBOX", "Archive"]) { _ in } _: { w in
-            // The row keyed at INBOX/88 sits in Archive with no epoch (a move that
-            // never happened on the server), and INBOX's bookmark predates UID 88,
-            // so the change pass reads 88 as new and takes the row back.
+            // The row keyed at INBOX/88 sits in Archive with no epoch, and INBOX
+            // now holds a different message at 88 (a reused UID after a turnover);
+            // INBOX's bookmark predates 88, so the change pass reads it as new.
             let rowId = "\(w.accountId):INBOX:88"
             let archiveId = "\(w.accountId):Archive"
             let inboxId = "\(w.accountId):INBOX"
@@ -560,14 +560,32 @@ struct IMAPMoveIntoTrackedFolderTests {
                                arguments: [archiveId, rowId])
                 try db.execute(sql: "UPDATE folder SET changeCursor = ? WHERE id = ?", arguments: [cursor, inboxId])
             }
+            w.server.setMessages([Self.message(uid: 88, id: "tracked-reused-88@example.com")], in: "INBOX")
+            let before = try #require(try await w.pool.read { db in try MessageHeader.fetchOne(db, key: rowId) })
             try await w.changePass()
             let row = try #require(try await w.pool.read { db in try MessageHeader.fetchOne(db, key: rowId) })
-            #expect(row.folderPath == "INBOX", "setup: the change pass takes the row back")
-            #expect(row.observedUidValidity == Self.epoch, "its address carries the epoch the read was bound to")
+            #expect(row.folderPath == "Archive" && row.observedUidValidity == nil, "the row is untouched")
+            #expect(row.subject == before.subject && row.rfc822MessageId == before.rfc822MessageId)
             await AccountManager.shared.markRead([row])
             try await w.drain()
-            #expect(w.server.flags(in: "INBOX", uid: 88).contains("\\Seen"), "the message is marked read on the server")
+            #expect(!w.server.flags(in: "INBOX", uid: 88).contains("\\Seen"), "the message now at INBOX/88 is untouched")
             #expect(w.server.wrongMessageViolations().isEmpty)
+        }
+    }
+
+    @Test("$Forwarded on a held message reaches the row through the change reader and stays when a later read lacks it")
+    @MainActor
+    func forwardedWireThroughApply() async throws {
+        try await Self.withWorld("forwarded", capabilities: FakeIMAPServer.defaultCapabilities + Self.qresync,
+                                 archive: [50], local: ["Archive": [50]], tracked: ["INBOX", "Archive"]) { _ in } _: { w in
+            w.server.setFlags(["$Forwarded"], in: "INBOX", uid: 88)
+            try await w.changePass()
+            #expect(try w.seeded().isForwarded, "the server's $Forwarded is applied")
+            w.server.setFlags(["\\Seen"], in: "INBOX", uid: 88)
+            try await w.changePass()
+            let row = try w.seeded()
+            #expect(row.isRead, "precondition: the later read applied")
+            #expect(row.isForwarded, "a read without $Forwarded never clears it")
         }
     }
 

@@ -312,6 +312,13 @@ extension SyncEngine {
             // A pending destructive op owns this identity.
             return false
         }
+        if snapshot.tag.containsAnyKey(messageId: info.messageId, rfc822MessageId: rfc822)
+            || snapshot.tag.contains(info.messageId) {
+            // The user's pending tag change owns this message's tag: no row is
+            // inserted or taken back (cache restoration and ReplyDetect would
+            // write a tag of their own); it is read again once the op drains.
+            return false
+        }
         if recentlyCompleted[info.messageId] != nil {
             // The queue completed an op on this message within the TTL, so the
             // server state just read may be stale. 🚨 NOT removable: it is what
@@ -488,13 +495,27 @@ extension SyncEngine {
             if snapshot.destructive.containsAnyKey(messageId: orphaned.messageId, rfc822MessageId: orphaned.rfc822MessageId) {
                 return false
             }
+            // Taken back only when it owns this address by the listing's own rule
+            // (`providerAddressOwnershipProven`). On IMAP a row in another folder
+            // never does: a row left there by a move that did not happen is
+            // listed again (the exit rule drops both folders' bookmarks), and one
+            // from before a UIDVALIDITY turnover must not be bound to a reused
+            // UID. It is left untouched and the id read again.
+            guard providerAddressOwnershipProven(
+                row: orphaned, accountId: accountId, folderPath: folder.path, folderId: folder.id,
+                messageId: header.messageId, canonicalId: header.id,
+                windowMode: addressEpoch == nil ? .date : .uid, sourceBoundEpoch: addressEpoch)
+            else {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Sync] change apply: \(header.id) in \(orphaned.folderPath) does not own \(folder.path)/\(header.messageId); read again")
+                }
+                return false
+            }
             if DebugModeManager.isLoggingEnabled() {
                 print("[Sync] change apply reclaiming orphaned row \(header.id): folderId \(orphaned.folderId) → \(folder.id)")
             }
             orphaned.folderId = folder.id
             orphaned.folderPath = folder.path
-            // The canonical key proves the address: stamped with the epoch the
-            // read was bound to, as a new row is (no listing comes to a tracked folder).
             orphaned.observedUidValidity = addressEpoch
             orphaned.isInInbox = folder.role == .inbox
             orphaned.messageId = header.messageId

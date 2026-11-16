@@ -217,8 +217,9 @@ extension IMAPProvider {
         _ folder: ChangeFolder, server: IMAPServer, qresync: Bool, request: ChangeRequest
     ) async throws -> FolderChanges {
         let context = request.context
-        let recheckIds = request.scope == .all
-            ? (request.recheck[folder.id] ?? []).compactMap { UInt32($0) }.filter { $0 > 0 } : []
+        // Both scopes answer the folder's re-read list: the scope narrows which
+        // folders are read (`changeReadOrder`), never what a read folder answers.
+        let recheckIds = (request.recheck[folder.id] ?? []).compactMap { UInt32($0) }.filter { $0 > 0 }
         let readsChanges = folder.isSynced || (request.scope == .inboxOnly && folder.role == .inbox)
 
         guard readsChanges else {
