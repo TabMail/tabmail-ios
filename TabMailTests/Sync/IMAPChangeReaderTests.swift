@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import SwiftMail
 import Synchronization
 import Testing
 @testable import TabMail
@@ -794,6 +795,24 @@ struct IMAPChangeReaderTests {
         #expect(IMAPProvider.heldRangeStart(folder(true, nil)) == 1, "a completed walk: every UID")
         #expect(IMAPProvider.heldRangeStart(folder(false, 40)) == 41, "a walk in progress: above its position")
         #expect(IMAPProvider.heldRangeStart(folder(false, nil)) == nil, "no walk yet: none")
+    }
+
+    @Test("Arrivals: a compact SEARCH answer of billions of UIDs is walked only up to one past the limit, never expanded")
+    func arrivalsAreBoundedBeforeExpansion() {
+        let limit = SyncConfig.imapChangeArrivalsLimit
+        let huge = MessageIdentifierSet<UID>(UID(1)...UID(4_000_000_000))
+        let start = ContinuousClock.now
+        let taken = IMAPProvider.arrivals(in: huge, from: 10, excluding: [11], room: limit)
+        #expect(ContinuousClock.now - start < .seconds(1), "bounded work: the answer is never expanded")
+        #expect(taken.count == limit + 1, "one past the room, enough to refuse")
+        #expect(taken.first == 10, "from the bookmark's UIDNEXT, in UID order")
+        #expect(!taken.contains(11), "an excluded UID is skipped")
+        #expect(taken == Array(10...UInt32(limit + 11)).filter { $0 != 11 })
+        // Within the room: every eligible UID across ranges, in order, none below `from`.
+        var sparse = MessageIdentifierSet<UID>()
+        sparse.insert(ranges: 2...4, 8...9, 20...20)
+        #expect(IMAPProvider.arrivals(in: sparse, from: 3, excluding: [8], room: limit) == [3, 4, 9, 20])
+        #expect(IMAPProvider.arrivals(in: sparse, from: 21, excluding: [], room: limit).isEmpty)
     }
 
     @Test("The oldest held message, deleted elsewhere and then un-deleted, comes back on the next pass")

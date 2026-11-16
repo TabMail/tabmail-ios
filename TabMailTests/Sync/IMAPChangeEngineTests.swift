@@ -200,6 +200,49 @@ struct IMAPChangeEngineTests {
         }
     }
 
+    @Test("Keyword labels set elsewhere on a held message: added, kept through a flag-only change, and removed")
+    func keywordLabelsFollowTheServer() async throws {
+        try await Self.withWorld("eng-keywords", capabilities: Self.qresync,
+                                 serverUIDs: [1, 2, 3], localUIDs: [1, 2, 3], tracked: true) { w in
+            let accountId = w.account.id
+            let folderId = w.folderId
+            func account() throws -> Account { try #require(try w.pool.read { db in try Account.fetchOne(db, key: accountId) }) }
+            func pass() async throws {
+                _ = try await w.engine.performChangePass(account: try account(), provider: w.provider, inboxOnly: true)
+            }
+            func labels(_ uid: Int) throws -> [String] {
+                try w.pool.read { db in
+                    try String.fetchAll(db, sql: """
+                        SELECT ul.providerLabelId FROM messageUserLabel mul
+                        JOIN userLabel ul ON ul.id = mul.userLabelId
+                        JOIN messageHeader h ON h.id = mul.messageId
+                        WHERE h.folderId = ? AND h.messageId = ? ORDER BY ul.providerLabelId
+                        """, arguments: [folderId, String(uid)])
+                }
+            }
+            func isRead(_ uid: Int) throws -> Bool? {
+                try w.pool.read { db in
+                    try Bool.fetchOne(db, sql: "SELECT isRead FROM messageHeader WHERE folderId = ? AND messageId = ?",
+                                      arguments: [folderId, String(uid)])
+                }
+            }
+            try await pass()
+            #expect(try labels(2).isEmpty, "setup: no label yet")
+            w.server.setFlags(["project"], in: Self.path, uid: 2)
+            try await pass()
+            #expect(try labels(2) == ["project"], "a keyword added elsewhere is the message's label")
+            w.server.setFlags(["project", "\\Seen"], in: Self.path, uid: 2)
+            try await pass()
+            #expect(try isRead(2) == true, "setup: the flag-only change applied")
+            #expect(try labels(2) == ["project"], "a flag-only change keeps the label")
+            w.server.setFlags(["\\Seen"], in: Self.path, uid: 2)
+            try await pass()
+            #expect(try labels(2).isEmpty, "a keyword removed elsewhere removes the label")
+            #expect(try isRead(2) == true, "the read state is untouched by the label removal")
+            #expect(try labels(1).isEmpty && labels(3).isEmpty, "no other message gains a label")
+        }
+    }
+
     // MARK: - The count walk's presence answer
 
     @Test("A provider that cannot say which ids exist: the count walk deletes nothing")

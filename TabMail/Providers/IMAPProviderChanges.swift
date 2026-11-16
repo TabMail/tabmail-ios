@@ -217,6 +217,28 @@ extension IMAPProvider {
         return folder.olderMailCursor.map { $0 + 1 }
     }
 
+    /// The arrivals in a UID SEARCH answer, in UID order: every UID from `from`
+    /// up that is not in `excluding`, and at most `room + 1` of them. The answer
+    /// is walked range by range and never expanded: a compact `ALL 1:4000000000`
+    /// costs one range, and the walk stops at the first UID past the room, which
+    /// is enough for the caller to refuse the bookmark as too far behind.
+    nonisolated static func arrivals(
+        in found: MessageIdentifierSet<UID>, from: UInt32, excluding: Set<UInt32>, room: Int
+    ) -> [UInt32] {
+        var out: [UInt32] = []
+        for range in found.ranges {
+            let lower = max(range.lowerBound, Int(from))
+            guard lower <= range.upperBound else { continue }
+            for value in lower...range.upperBound {
+                let uid = UInt32(value)
+                guard !excluding.contains(uid) else { continue }
+                out.append(uid)
+                if out.count > room { return out }
+            }
+        }
+        return out
+    }
+
     /// The QRESYNC SELECT's timeout: its own setting, never past the read
     /// budget by more than one ordinary request's timeout.
     nonisolated static func changeSelectTimeout(secondsLeft: TimeInterval) -> TimeInterval {
@@ -334,10 +356,10 @@ extension IMAPProvider {
             }
             let listed = Set(toFetch)
             let deletedArrivals = Set(changed.filter { $0.key.value >= cursor.uidNext && $0.value.contains(.deleted) }.map(\.key.value))
-            for uid in found.asSet.toArray().map(\.value).sorted()
-            where uid >= cursor.uidNext && !listed.contains(uid) && !deletedArrivals.contains(uid) {
-                toFetch.append(uid)
-            }
+            toFetch += Self.arrivals(
+                in: found.asSet, from: cursor.uidNext, excluding: listed.union(deletedArrivals),
+                room: SyncConfig.imapChangeArrivalsLimit - toFetch.count
+            )
         }
         guard toFetch.count <= SyncConfig.imapChangeArrivalsLimit else {
             return FolderChanges(folderId: folder.id, status: .refused(.tooFarBehind))
