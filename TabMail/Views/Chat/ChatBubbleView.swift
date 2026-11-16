@@ -28,9 +28,11 @@ struct ChatBubbleView: View {
                     }
                     bubble
                     if let names = extras?.attachmentNames, !names.isEmpty {
-                        ForEach(Array(names.enumerated()), id: \.offset) { _, name in
+                        let chips = Self.attachmentChips(names)
+                        ForEach(Array(chips.names.enumerated()), id: \.offset) { _, name in
                             attachmentChip(name)
                         }
+                        if chips.more > 0 { moreChip(chips.more) }
                     }
                     if let invite = extras?.invite {
                         ChatInviteCard(invite: invite)
@@ -108,18 +110,41 @@ struct ChatBubbleView: View {
         return item.isOwn ? "You said: \(words)" : "\(item.sender.name) said: \(words)"
     }
 
-    private func attachmentChip(_ name: String) -> some View {
+    /// The chips a bubble shows: up to `chipCount` attachment names, then how many more, as the
+    /// header shows its names (`ChatThread.headerTitle`).
+    static func attachmentChips(_ names: [String], chipCount: Int = ChatViewLayout.attachmentChipCount) -> (names: [String], more: Int) {
+        (Array(names.prefix(chipCount)), max(0, names.count - chipCount))
+    }
+
+    /// "+N": opens the email's card, which lists every attachment.
+    private func moreChip(_ more: Int) -> some View {
         Button(action: onOpen) {
-            HStack(spacing: 4) {
-                Image(systemName: "paperclip")
-                Text(name).lineLimit(1).truncationMode(.middle)
+            chipLabel {
+                Text("+\(more)")
             }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(more) more attachments")
+    }
+
+    private func chipLabel<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+        content()
             .font(.caption)
             .foregroundStyle(Theme.textPrimary)
             .padding(.horizontal, 10)
             .padding(.vertical, 5)
             .background(Capsule().fill(Palette.boxBg))
             .overlay(Capsule().stroke(Palette.separator, lineWidth: 0.5))
+    }
+
+    private func attachmentChip(_ name: String) -> some View {
+        Button(action: onOpen) {
+            chipLabel {
+                HStack(spacing: 4) {
+                    Image(systemName: "paperclip")
+                    Text(name).lineLimit(1).truncationMode(.middle)
+                }
+            }
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Attachment \(name)")

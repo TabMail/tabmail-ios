@@ -55,6 +55,8 @@ enum ChatViewLayout {
     static let headerAvatarSize: CGFloat = 32
     /// The header lists this many names, then "+N".
     static let headerNameCount = 2
+    /// A bubble shows this many attachment chips, then one "+N" chip for the rest.
+    static let attachmentChipCount = 2
     /// A row counts as shown once this share of it is visible (`ChatRowVisibility`)...
     static let shownShareOfRow: CGFloat = 0.5
     /// ...or once it fills this share of the chat's visible height, so a row taller than the screen

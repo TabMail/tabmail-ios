@@ -174,6 +174,9 @@ same AI result, kept as long as the email itself is shown.
    the email card (today's `MessageDetailView` in a sheet). `ChatThreadContext` reads the Drafts/Sent
    folders, the label union (`UserLabel.union`, shared with `ThreadGroup.displayInfo`), top-level
    attachment names and an addable invite (`ChatInvite`; the card stands for its calendar file).
+   *Amended 2026-11-16:* a bubble shows at most `ChatViewLayout.attachmentChipCount` (2) attachment
+   chips, then one "+N" chip for the rest, as the header shows its names (`ChatThread.headerTitle`).
+   "+N" opens the email's card, which lists every attachment. Tests: `ChatBubbleActionTests`.
    The inbox row shows the text message when the chat view is on (`MessageSnapshot.preview`).
    A bubble with no text message yet reads "Summarizing"; an email with nothing to summarize is
    done without one (`MessageHeader.noContentSummary`, which `summaryDone` counts as done), so its
