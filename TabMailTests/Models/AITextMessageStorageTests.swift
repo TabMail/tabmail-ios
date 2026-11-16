@@ -26,8 +26,11 @@ struct AITextMessageStorageTests {
         }
         let applied = try db.read { try String.fetchAll($0, sql: "SELECT identifier FROM grdb_migrations") }
         #expect(applied.contains("v105_addAITextMessages"))
-        // The chat view's migrations are numbered after main's newest and run in that order.
-        let order = ["v103_addFolderChangeCursor", "v105_addAITextMessages", "v106_repairAICacheMessageIds"]
+        // The chat view's migrations are numbered after main's newest (v104) and run in that order.
+        let order = [
+            "v103_addFolderChangeCursor", "v104_addReplyAllAndMarkSentAt",
+            "v105_addAITextMessages", "v106_repairAICacheMessageIds",
+        ]
         #expect(applied.filter { order.contains($0) } == order)
     }
 
