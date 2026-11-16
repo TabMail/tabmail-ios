@@ -11,8 +11,11 @@
 - Context: every request names the thread's NEWEST email (`MessageDetailViewModel.chatNewest` on the
   email screen, `ChatThread.newest` in the chat view); writes go to that email's current key. A request
   running when a newer email lands keeps its context; nothing special is done.
+  *Changed 2026-11-16:* only the chat view uses the newest email. The email screen's pill is about
+  the OPEN email, as before the thread chat (`chatContextMessage ?? message`); `chatNewest` is
+  deleted. Its turns still go under that email's current thread key, so the thread stays one chat.
 - Reader: `ThreadChatReader` is the ONE place that builds both what the pill shows (`messages(keys:)`)
-  and the model history (`history(keys:)`). Its keys (`keys(newest:)`) are the newest email's own key
+  and the model history (`history(keys:)`). Its keys (`keys(about:)`, was `keys(newest:)`) are the chat's email's own key
   first, then every other key among the thread's members (`ThreadDetection.related`, all accounts,
   copies included). Turns merge by time; each session keeps its own live card; the budget is
   `ChatStore.maxExchanges` / `charsPerExchange`, newest first. Never send `sessionTurns` alone for an

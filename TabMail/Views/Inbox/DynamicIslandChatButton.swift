@@ -109,8 +109,8 @@ struct DynamicIslandChat: View {
 
     // Session state lives in ChatPillState (survives SwiftUI view recreation).
     // Forwarding computed properties keep existing code unchanged.
-    /// About an email: its thread's chat (ADR-IOS-114). The pill is given the thread's newest
-    /// email, so this is that email's current thread key, where a send writes.
+    /// About an email: its thread's chat (ADR-IOS-114), at the current thread key of the email the
+    /// pill is given (the chat view's newest email, the email screen's open one), where a send writes.
     private var sessionKey: String {
         if composeContext != nil, let cursor = composeGenerationCursor {
             return ActiveAgentTracker.composeSessionKey(
@@ -548,7 +548,7 @@ struct DynamicIslandChat: View {
                 // so a stored turn's pills resolve as they are.
                 if let msg = message {
                     Task {
-                        await loadThreadChat(newest: msg)
+                        await loadThreadChat(about: msg)
                         contextEmailNumericId = await ChatIdTranslator.shared.toNumericId(msg.id)
                         BackgroundSyncLogger.logDebug("[DynamicIslandChat] Registered context email id=\(msg.id) → numeric=\(contextEmailNumericId!)")
                     }
@@ -649,7 +649,7 @@ struct DynamicIslandChat: View {
         // card raised in any key of the thread opens the sheet while collapsed (ADR-IOS-114).
         .task(id: message?.id) {
             guard let message else { return }
-            await loadThreadChat(newest: message)
+            await loadThreadChat(about: message)
         }
         .onChange(of: shownMessages.last?.actionConfirmation != nil) { _, hasCard in
             guard hasCard, replyField != nil, !isExpanded else { return }
@@ -1236,11 +1236,11 @@ struct DynamicIslandChat: View {
         ThreadChatReader.chatMessages(for: session.turns)
     }
 
-    /// Finds the keys of `newest`'s thread chat and reads their stored turns (ADR-IOS-114).
-    private func loadThreadChat(newest: MessageHeader) async {
-        let keys = await ThreadChatReader.keys(newest: newest)
-        // The pill may be about a newer email by now; the next load is for that one.
-        if message?.id == newest.id { threadKeys = keys }
+    /// Finds the keys of `email`'s thread chat and reads their stored turns (ADR-IOS-114).
+    private func loadThreadChat(about email: MessageHeader) async {
+        let keys = await ThreadChatReader.keys(about: email)
+        // The pill may be about another email by now; the next load is for that one.
+        if message?.id == email.id { threadKeys = keys }
         await ThreadChatReader.load(keys: keys)
     }
 
@@ -2442,7 +2442,7 @@ struct DynamicIslandChat: View {
             // this turn is added. Inbox: this session's turns.
             let history: [ChatTurn]
             if let msg = message {
-                let keys = await ThreadChatReader.keys(newest: msg)
+                let keys = await ThreadChatReader.keys(about: msg)
                 await ThreadChatReader.load(keys: keys)
                 history = ThreadChatReader.history(keys: keys)
             } else {

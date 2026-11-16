@@ -34,15 +34,6 @@ final class MessageDetailViewModel {
     /// opened email's included. Shown nowhere; the chat acts on them with the email it shows.
     private(set) var threadCopies: [MessageHeader] = []
 
-    /// The thread's newest email, the one its TabMail chat is about wherever the chat opens
-    /// (ADR-IOS-114): as the chat view's `ChatThread.newest`, drafts left out, latest by date
-    /// then id. Nil while nothing but drafts is loaded.
-    var chatNewest: MessageHeader? {
-        ((message.map { [$0] } ?? []) + threadMessages)
-            .filter { !folderMoveIsForbidden($0) }
-            .max { ($0.date, $0.id) < ($1.date, $1.id) }
-    }
-
     /// Every row the chat loaded: the opened email, the thread's emails and their copies. A
     /// whole-chat action acts on exactly these, each by its own id, never on whatever else shares
     /// a Message-ID (ADR-IOS-068 D4).

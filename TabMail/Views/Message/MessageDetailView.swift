@@ -592,7 +592,7 @@ struct MessageDetailView: View {
                 .offset(y: showSideButtons ? 0 : 30)
                 .allowsHitTesting(showSideButtons)
 
-                DynamicIslandChat(message: viewModel.chatNewest ?? message, isExpanded: $chatExpanded, isInputFocused: $chatInputFocused, isWorking: $chatWorking, onAgentReply: { text in
+                DynamicIslandChat(message: chatContextMessage ?? message, isExpanded: $chatExpanded, isInputFocused: $chatInputFocused, isWorking: $chatWorking, onAgentReply: { text in
                     showAgentToast(text)
                 })
 
@@ -663,9 +663,9 @@ struct MessageDetailView: View {
 
     // MARK: - Agent Toast
 
-    /// Session key of the chat the pill shows: the thread's, about its newest email (ADR-IOS-114).
+    /// Session key of the chat the pill shows: the thread's, about the open email (ADR-IOS-114).
     private var messageSessionKey: String? {
-        (viewModel.chatNewest ?? viewModel.message).map(ChatThreadKey.key(for:))
+        (chatContextMessage ?? viewModel.message).map(ChatThreadKey.key(for:))
     }
 
     private func showAgentToast(_ text: String) {

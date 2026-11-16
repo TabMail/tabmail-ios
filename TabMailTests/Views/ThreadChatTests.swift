@@ -11,7 +11,8 @@ import Testing
 import UIKit
 @testable import TabMail
 
-/// ADR-IOS-114: one TabMail chat per email thread, about the thread's newest email.
+/// ADR-IOS-114: one TabMail chat per email thread; the chat view's requests are about the thread's
+/// newest email, the email screen's about the email that is open.
 ///
 /// THE SYSTEM PROPERTIES pinned here, each through the real pill and a fake backend that reads
 /// what a request sends:
@@ -21,7 +22,8 @@ import UIKit
 ///  (b) A question sent about a newer email carries the exchange held about an earlier email of
 ///      the same thread to the model.
 ///  (c) The email screen, opened on an older email of a thread, shows the whole thread's chat,
-///      names the thread's newest email in its card and in every new request.
+///      and names that open email in its card and in every new request; the chat view, opened
+///      on the same older email, names the thread's newest email.
 ///  (d) Two threads joined by a newer email: the chat shows both histories.
 ///  (e) Upgrading keeps each email's chat as one thread chat: two emails' chats read as one,
 ///      a chat whose email is gone stays as it was, demo chats stay demo chats.
@@ -355,13 +357,13 @@ struct ThreadChatTests {
 
     // MARK: - (c) The email screen
 
-    @Test("The email screen opened on an older email shows the whole thread's chat, its card shows the newest email, and a question names the newest email")
-    func emailScreenUsesTheNewestEmail() async throws {
+    @Test("The email screen opened on an older email shows the whole thread's chat, its card shows that email, and a question names that email")
+    func emailScreenUsesTheOpenEmail() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted Send")
-        try await HostedAccessibility.withAutomation { try await emailScreenUsesTheNewestEmailBody() }
+        try await HostedAccessibility.withAutomation { try await emailScreenUsesTheOpenEmailBody() }
     }
 
-    private func emailScreenUsesTheNewestEmailBody() async throws {
+    private func emailScreenUsesTheOpenEmailBody() async throws {
         let (pool, directory, previous) = try Self.install()
         defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
         let older = Self.header("301", from: "Ann Example", rfc: "screen-1@example.com", thread: "screen-thread", minutesAgo: 30)
@@ -389,8 +391,8 @@ struct ThreadChatTests {
                 #expect(Self.shows("Answer 2", in: view), "the exchange about the newer email: \(Self.labels(view).prefix(40))")
                 let card = HostedAccessibility.elements(under: view)
                     .first { HostedAccessibility.identifier(of: $0) == "chatEmailCard" }?.accessibilityLabel ?? ""
-                #expect(card.contains("Bea Example"), "the card shows the newest email: \(card)")
-                #expect(!card.contains("Ann Example"), "\(card)")
+                #expect(card.contains("Ann Example"), "the card shows the open email: \(card)")
+                #expect(!card.contains("Bea Example"), "never the thread's newest: \(card)")
 
                 try await Self.ask("Is it confirmed", in: view, backend: backend)
             }
@@ -403,10 +405,49 @@ struct ThreadChatTests {
         let olderNumber = await ChatIdTranslator.shared.toNumericId(older.id)
         let question = Self.text(sent.last ?? [:])
         #expect(question.contains("Is it confirmed"), "control: the question is last: \(question)")
-        #expect(question.contains("[Email](\(newestNumber))"), "it names the newest email: \(question)")
-        #expect(!question.contains("[Email](\(olderNumber))"), "never the email on screen: \(question)")
+        #expect(question.contains("[Email](\(olderNumber))"), "it names the open email: \(question)")
+        #expect(!question.contains("[Email](\(newestNumber))"), "never the thread's newest: \(question)")
         let history = sent.dropLast().map(Self.text).joined(separator: "\n")
         #expect(history.contains("Answer 1") && history.contains("Answer 2"), "the whole thread's chat goes with it: \(history)")
+    }
+
+    @Test("The chat view opened on an older email of a thread asks about the thread's newest email")
+    func chatViewUsesTheNewestEmail() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted Send")
+        try await HostedAccessibility.withAutomation { try await chatViewUsesTheNewestEmailBody() }
+    }
+
+    private func chatViewUsesTheNewestEmailBody() async throws {
+        let (pool, directory, previous) = try Self.install()
+        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
+        let older = Self.header("311", from: "Ann Example", rfc: "view-1@example.com", thread: "view-thread", minutesAgo: 30)
+        let newest = Self.header(
+            "312", from: "Bea Example", rfc: "view-2@example.com", inReplyTo: "view-1@example.com",
+            thread: "view-thread", minutesAgo: 1)
+        try Self.insert(older, newest, pool: pool)
+        let accounts = try await pool.read { try Account.fetchAll($0) }
+        let backend = Backend()
+        try await Self.withBackend(backend, chatView: true) {
+            let navigationStore = NavigationStore()
+            navigationStore.accounts = accounts
+            let chat = NavigationStack { ChatThreadView(messageId: older.id) }
+                .environment(navigationStore)
+                .environment(\.hasTabMailSession, true)
+            try await Self.mount(chat) { view in
+                try await Self.wait { Self.shows("Bea Example", in: view) }
+                try await Self.settle()
+                try await Self.ask("Is it confirmed", in: view, backend: backend)
+            }
+        }
+        let bodies = backend.bodies
+        #expect(bodies.count == 1)
+        guard bodies.count == 1 else { return }
+        let question = Self.text(try Self.messages(bodies[0]).last ?? [:])
+        let newestNumber = await ChatIdTranslator.shared.toNumericId(newest.id)
+        let olderNumber = await ChatIdTranslator.shared.toNumericId(older.id)
+        #expect(question.contains("Is it confirmed"), "control: the question is last: \(question)")
+        #expect(question.contains("[Email](\(newestNumber))"), "it names the newest email: \(question)")
+        #expect(!question.contains("[Email](\(olderNumber))"), "never the email it was opened on: \(question)")
     }
 
     // MARK: - (d) Joined threads

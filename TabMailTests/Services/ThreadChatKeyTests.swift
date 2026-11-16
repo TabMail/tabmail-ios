@@ -83,7 +83,7 @@ struct ThreadChatKeyTests {
         let sameThread = Self.header("2", rfc: "s@example.com", thread: "t-1", minutesAgo: 5)
         let joined = Self.header("1", rfc: "j@example.com", thread: "t-2", minutesAgo: 9)
         let copy = Self.header("9", account: "key-other", rfc: "n@example.com", thread: "t-1", minutesAgo: 1)
-        let keys = ThreadChatReader.keys(newest: newest, members: [joined, sameThread, copy, joined])
+        let keys = ThreadChatReader.keys(about: newest, members: [joined, sameThread, copy, joined])
         #expect(keys == [
             ChatThreadKey.key(for: newest), ChatThreadKey.key(for: joined), ChatThreadKey.key(for: copy),
         ])

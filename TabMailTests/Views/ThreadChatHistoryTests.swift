@@ -143,7 +143,7 @@ extension ThreadChatTests {
         ChatPillState.shared.removeAllSessions()
         defer { ChatPillState.shared.removeAllSessions() }
 
-        let keys = await ThreadChatReader.keys(newest: newer)
+        let keys = await ThreadChatReader.keys(about: newer)
         #expect(keys == [ownKey, otherKey], "control: the newest email's key first")
         await ThreadChatReader.load(keys: keys)
         // A request about the older email raised a card after its last turn, before "newer 2".

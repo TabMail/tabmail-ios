@@ -59,29 +59,29 @@ enum ChatThreadKey {
 /// account, or two threads a newer email joins. The chat is every key's turns, merged by time,
 /// so joined chats read as one with no re-keying. Each key keeps its own in-process session,
 /// where its live state stays: a confirmation card raised by a request about one email shows,
-/// in place, in the chat of the thread's newest email.
+/// in place, in the chat about another email of the thread.
 @MainActor
 enum ThreadChatReader {
 
-    /// The keys of `newest`'s chat: its own first, then those of every other email of the thread
-    /// the chat shows (`ThreadDetection.related`, every account, copies included).
-    static func keys(newest: MessageHeader) async -> [String] {
+    /// The keys of the chat about `email`: its own first, then those of every other email of the
+    /// thread the chat shows (`ThreadDetection.related`, every account, copies included).
+    static func keys(about email: MessageHeader) async -> [String] {
         let pool = AppDatabase.rawPool
         let members: [MessageHeader] = await Task.detached {
             do {
-                let related = try ThreadDetection.related(to: newest, in: pool)
+                let related = try ThreadDetection.related(to: email, in: pool)
                 return related.messages + related.copies
             } catch {
                 BackgroundSyncLogger.logDebug("[ThreadChat] Thread lookup failed, own key only: \(error)")
                 return []
             }
         }.value
-        return keys(newest: newest, members: members)
+        return keys(about: email, members: members)
     }
 
-    nonisolated static func keys(newest: MessageHeader, members: [MessageHeader]) -> [String] {
+    nonisolated static func keys(about email: MessageHeader, members: [MessageHeader]) -> [String] {
         var seen = Set<String>()
-        return ([newest] + members).map(ChatThreadKey.key(for:)).filter { seen.insert($0).inserted }
+        return ([email] + members).map(ChatThreadKey.key(for:)).filter { seen.insert($0).inserted }
     }
 
     /// Reads each key's stored turns into its session, once per session.

@@ -689,8 +689,15 @@ same AI result, kept as long as the email itself is shown.
      request already running when a newer email lands finishes with the context it was sent with;
      nothing else is done about it. The email screen keeps the email the user picked
      (`chatContextMessage`) for its own bottom-bar actions. The chat view's panel card is unchanged.
+     *Amended 2026-11-16:* the newest email is the context in the chat view only. The email
+     screen's Chat pill is about the email that is open, as before the thread chat: its requests
+     name that email (`chatContextMessage`, else the screen's email), its top card shows it, and its
+     turns are written under that email's current thread key, so the thread's chat is still one
+     chat, read whole by `ThreadChatReader`. `MessageDetailViewModel.chatNewest` is deleted. Tests:
+     `ThreadChatTests.emailScreenUsesTheOpenEmail`, `chatViewUsesTheNewestEmail`.
    - **One reader** (`ThreadChatReader`), for what the pill shows and for the history a request sends,
-     on both surfaces. Its keys are the newest email's own and those of every other email of the
+     on both surfaces. Its keys are the own key of the email the chat is about (the chat view's
+     newest, the email screen's open one, 2026-11-16) and those of every other email of the
      thread on the device (`ThreadDetection.related`, every account, copies included), so a copy in
      another account or two threads a newer email joins read as one chat with no re-keying. It merges
      their turns by time (a stable k-way merge, so a session's own order is kept), shows each key's
