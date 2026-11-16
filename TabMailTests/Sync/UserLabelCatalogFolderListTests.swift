@@ -94,6 +94,25 @@ struct UserLabelCatalogFolderListTests {
                 "another account's label with the same id was renamed")
     }
 
+    @Test("Gmail: when the last user label is deleted on the server, an empty catalog removes the stored label and its associations; another account's label stays")
+    func gmailEmptyCatalogRemovesTheLastLabel() throws {
+        let s = try seeded(.gmail, accountId: "catalog-gmail-empty", providerLabelId: "Label_7", name: "Receipts")
+        let other = try TestDatabase.insertAccount(s.db, id: "catalog-gmail-empty-other", email: "catalog-gmail-empty-other@example.com", provider: .gmail)
+        let otherLabel = UserLabel(accountId: other.id, providerLabelId: "Label_7", name: "Receipts", isSystem: false)
+        try s.db.write { db in try otherLabel.insert(db) }
+        #expect(try associations(s.db, messageId: s.header.id) == [s.label.id], "setup: the label is not on the message")
+
+        // Gmail lists only its system folders: the label catalog is EMPTY, not absent.
+        let folders = [folder("INBOX", "INBOX", .inbox)]
+        #expect(GmailProvider.userLabelCatalog(from: folders) == [], "setup: the folder list still holds a label")
+        try s.db.write { db in _ = try SyncEngine.applyFolderList(folders, account: s.account, db: db) }
+
+        #expect(try labels(s.db, accountId: s.account.id).isEmpty, "the label Gmail no longer has is still stored")
+        #expect(try associations(s.db, messageId: s.header.id).isEmpty, "the deleted label is still on the message")
+        #expect(try s.db.read { db in try MessageHeader.fetchOne(db, key: s.header.id) } != nil, "the message itself was removed")
+        #expect(try labels(s.db, accountId: other.id)["Label_7"] != nil, "another account's label was removed")
+    }
+
     @Test("IMAP, iCloud and Outlook: a folder list leaves the account's labels and their associations untouched", arguments: [AccountProvider.imap, .icloud, .outlook])
     func providersWithoutACatalogKeepTheirLabels(_ provider: AccountProvider) throws {
         let s = try seeded(provider, accountId: "catalog-\(provider.rawValue)", providerLabelId: "receipts", name: "receipts")
