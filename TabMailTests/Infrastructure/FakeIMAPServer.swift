@@ -399,6 +399,12 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// messages, the FETCH over a range covering all N returns fewer than N.
         /// Empty for every pre-existing test.
         var fetchRecordSuppressedByMailbox: [String: Set<Int>] = [:]
+        /// Per-mailbox compact answers for the next UID SEARCHes, in order
+        /// (`answerNextUIDSearch(in:all:)`): each is sent as an RFC 4731
+        /// `* ESEARCH ... UID ALL <set>` and consumed. Empty for every
+        /// pre-existing test.
+        var compactUIDSearchAnswersByMailbox: [String: [String]] = [:]
+        var compactUIDSearchAnswersServed = 0
         /// Invariant test layer (2026-07-16) — wrong-message wire oracle,
         /// deliverable 1. The rfc822 Message-ID(s) the CURRENT test's user
         /// intention(s) target, registered via `expectMutation(rfc822MessageId:)`.
@@ -1368,6 +1374,19 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// failure it leaves the client with no id for the missing message at all.
     func suppressFetchRecord(in mailbox: String, uids: Set<Int>) {
         withState { $0.fetchRecordSuppressedByMailbox[mailbox] = uids }
+    }
+
+    /// Test seam: answer the next UID SEARCH in this mailbox, whatever it asks,
+    /// with a compact RFC 4731 `* ESEARCH (TAG ...) UID ALL <set>`, for example
+    /// `1:50000000`: a sequence set a real server may send, which the client
+    /// must not expand. Consumed by one SEARCH.
+    func answerNextUIDSearch(in mailbox: String, all set: String) {
+        withState { $0.compactUIDSearchAnswersByMailbox[mailbox, default: []].append(set) }
+    }
+
+    /// How many `answerNextUIDSearch(in:all:)` answers have been sent.
+    func compactUIDSearchAnswersServed() -> Int {
+        withState { $0.compactUIDSearchAnswersServed }
     }
 
     /// Test seam (T1.2b): make this mailbox's SELECT/EXAMINE omit the
@@ -2581,6 +2600,16 @@ final class FakeIMAPServer: @unchecked Sendable {
         case "FETCH":
             return handleFetch(tag: tag, args: subargs, uidMode: true, mailbox: mailbox)
         case "SEARCH":
+            let compact: String? = withState { state in
+                guard var queue = state.compactUIDSearchAnswersByMailbox[mailbox], !queue.isEmpty else { return nil }
+                let next = queue.removeFirst()
+                state.compactUIDSearchAnswersByMailbox[mailbox] = queue
+                state.compactUIDSearchAnswersServed += 1
+                return next
+            }
+            if let compact {
+                return "* ESEARCH (TAG \"\(tag)\") UID ALL \(compact)\r\n\(tag) OK UID SEARCH completed\r\n"
+            }
             // Honor HEADER "Message-ID" "<...>" criterion when present; otherwise
             // return all UIDs (legacy behavior). Minimal filter to support
             // IMAPProvider's remaining exact-identity probe paths.
