@@ -547,13 +547,14 @@ deletions over two pages applied with no fetch. A pass that stops early resumes:
 stores the id of the last record read and the next pass reads from it to the end; a stop point that is
 not a numeric history id past the cursor (equal, lower, not a number) is refused like an expired
 history. A message already read is read again only when a record written during the pass (an id past
-the first page's `historyId`) names it; one named by several records the first page covered is fetched
-once. A page without `history`, Gmail's answer to a quiet poll, is an empty delta that moves the cursor.
+the first page's `historyId`) names it, and the newer answer is what the pass stores; one named by
+several records the first page covered is fetched once. A page without `history`, Gmail's answer to a quiet poll, is an empty delta that moves the cursor.
 
 `GmailDeltaApplyInvariantTests` P18 holds the resume end to end on the stateful fake, whose `/history`
 pages the recorded changes (`serveHistoryPages(of:onPage:)`) and whose read budget runs on a clock the
 test moves (`SyncEngine(changeReadClock:)`): a pass whose budget runs out stops after a record, applies
-what it took, and the next pass reads from there with no listing and no new bookmark; a history of
+what it took, and the next pass reads from there with no listing and no new bookmark; a budget spent by
+a later message read stops the pass at the next record of the same page; a history of
 short pages is read to its end over passes with no refusal, stopped by the budget or by the page
 limit; a message added before a cut and archived, labelled and read after it shows the server's state;
 one conversation-wide record naming more messages than one budget covers is applied whole, and the

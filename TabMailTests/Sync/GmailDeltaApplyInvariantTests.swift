@@ -886,6 +886,43 @@ struct GmailDeltaApplyInvariantTests {
         }
     }
 
+    /// The budget is checked before every record, not only the first: records
+    /// on one page are taken until a later message read spends it, and the
+    /// pass stops at the next record.
+    @Test("P18: a budget spent by a later message read stops the pass at the next record of the same page")
+    func budgetSpentLaterInThePageCuts() async throws {
+        try await Self.withWorld(seeds: []) { w in
+            let start = try #require(try w.account().lastHistoryId)
+            let window = GmailAPI.maxConcurrentRequests
+            let ids = (0..<(2 * window + 1)).map { "p18-bulk-\($0)" }
+            for id in ids { w.server.addMessage(Self.seed(id, labels: ["INBOX"], date: Self.daysAgo(0.1))) }
+            let records = Self.recordIds(after: start, upTo: w.server.currentHistoryId())
+            try #require(records.count == ids.count, "fixture: one record per arrival, all on one page")
+            // The first window of messages is read once its last record is
+            // taken; that read spends the budget.
+            let clock = TestClock()
+            w.server.onGet(providerMessageId: ids[0]) { clock.spendBudget() }
+            let listingsBefore = w.listingRequestCount()
+
+            let cut = try await w.delta(on: SyncEngine(changeReadClock: { clock.read() }))
+
+            #expect(cut.succeeded)
+            #expect(try w.account().lastHistoryId == records[window - 1], "the pass stops after the record whose read spent the budget")
+            for id in ids.prefix(window) {
+                #expect(try w.row(id, in: w.inbox) != nil, "\(id), taken before the budget ran out, is shown")
+            }
+            for id in ids.dropFirst(window) {
+                #expect(try w.row(id, in: w.inbox) == nil, "\(id) is past the cut")
+            }
+
+            w.server.onGet(providerMessageId: ids[0], nil)
+            try await w.completedDelta()
+            #expect(w.historyStartIds().last == records[window - 1], "the next pass reads from the cut")
+            for id in ids { #expect(try w.row(id, in: w.inbox) != nil, "\(id) is shown once the history is read") }
+            #expect(w.listingRequestCount() == listingsBefore, "no listing")
+        }
+    }
+
     @Test("P18: a message added before a cut and relabelled after it shows the server's state once the next pass reads on")
     func addThenRelabelAcrossTheCutConverges() async throws {
         try await Self.withWorld(seeds: []) { w in

@@ -111,12 +111,13 @@ struct GmailHistoryPaginationTests {
         return #"{ "historyId": "\#(historyId)", "history": [ \#(records.joined(separator: ", ")) ]\#(token) }"#
     }
 
-    private static func messageJSON(id: String) -> String {
-        """
+    private static func messageJSON(id: String, labelIds: [String] = ["INBOX"]) -> String {
+        let labels = labelIds.map { "\"\($0)\"" }.joined(separator: ", ")
+        return """
         {
           "id": "\(id)",
           "threadId": "thread-\(id)",
-          "labelIds": ["INBOX"],
+          "labelIds": [\(labels)],
           "snippet": "",
           "internalDate": "\(Int64(Date().timeIntervalSince1970 * 1000))",
           "payload": {
@@ -549,8 +550,9 @@ struct GmailHistoryPaginationTests {
 
     /// A message already read in this pass is read again when a later record,
     /// written after the pass's first page was served (an id past that page's
-    /// `historyId`), names it: the first answer may predate that change. Page 1
-    /// names a full window of messages, so they are read before page 2 is.
+    /// `historyId`), names it: the first answer may predate that change, and the
+    /// newer answer is what the pass stores. Page 1 names a full window of
+    /// messages, so they are read before page 2 is.
     @Test("A message named again by a record written during the pass is read again")
     func messageChangedDuringThePassIsReadAgain() async throws {
         try await Self.withAppDB { pool in
@@ -566,8 +568,17 @@ struct GmailHistoryPaginationTests {
                 }
                 return .json(raw: Self.historyPage(historyId: "1002", addedIds: firstWindow, nextPageToken: "page-2"))
             }
-            for id in firstWindow {
+            for id in firstWindow.dropFirst() {
                 scenario.register(path: "/messages/\(id)", method: "GET", response: .json(raw: Self.messageJSON(id: id)))
+            }
+            // The first answer predates the star; the second carries it.
+            let twiceAnswers = Mutex(0)
+            scenario.register(path: "/messages/twice", method: "GET") { _ in
+                let answer = twiceAnswers.withLock { count -> Int in
+                    count += 1
+                    return count
+                }
+                return .json(raw: Self.messageJSON(id: "twice", labelIds: answer == 1 ? ["INBOX"] : ["INBOX", "STARRED"]))
             }
             let provider = GmailProvider(
                 userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: scenario.session)
@@ -575,6 +586,9 @@ struct GmailHistoryPaginationTests {
             let outcome = try await SyncEngine().performDeltaSync(account: account, provider: provider)
 
             #expect(outcome.succeeded)
+            let headerId = MessageIdentity.headerId(accountId: Self.accountId, folderPath: "INBOX", messageId: "twice")
+            let stored = try await pool.read { db in try MessageHeader.fetchOne(db, key: headerId) }
+            #expect(stored?.isFlagged == true, "the pass stores the answer read after the change, not the first one")
             let twiceGETs = scenario.recordedCalls().filter { $0.method == "GET" && $0.url.contains("/messages/twice") }.count
             #expect(twiceGETs == 2, "the change written during the pass is read")
             #expect(Self.detailGETs(scenario) == firstWindow.count + 1, "no other message is read again")
