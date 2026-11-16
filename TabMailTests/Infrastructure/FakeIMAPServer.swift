@@ -175,6 +175,10 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// `setMaxLoggedInSessions`: a LOGIN past this many live sessions is
         /// refused with Dovecot's connection-limit wording. Nil = no limit.
         var maxLoggedInSessions: Int?
+        /// `refuseNextLogins`: how many coming LOGINs are refused with the same
+        /// wording whatever the live count, so a retry after an eviction is
+        /// refused too (a slot taken by another client meanwhile).
+        var forcedLoginRefusals = 0
         var refusedLoginCount = 0
         var postResponseMailboxResets: [PostResponseMailboxReset] = []
         /// Mailboxes SELECT must reject as gone. Value = whether the NO
@@ -812,7 +816,14 @@ final class FakeIMAPServer: @unchecked Sendable {
         withState { $0.maxLoggedInSessions = max }
     }
 
-    /// How many LOGINs `setMaxLoggedInSessions` refused.
+    /// Refuse the next `count` LOGINs with the connection-limit wording, even
+    /// with room under the limit (needs `setMaxLoggedInSessions`, whose limit
+    /// the wording names): another client took the slot an eviction freed.
+    func refuseNextLogins(_ count: Int) {
+        withState { $0.forcedLoginRefusals = count }
+    }
+
+    /// How many LOGINs `setMaxLoggedInSessions` or `refuseNextLogins` refused.
     func refusedLoginCount() -> Int {
         withState { $0.refusedLoginCount }
     }
@@ -1950,6 +1961,11 @@ final class FakeIMAPServer: @unchecked Sendable {
             return "* CAPABILITY \(capabilities.joined(separator: " "))\r\n\(tag) OK CAPABILITY completed\r\n"
         case "LOGIN":
             let limitRefusal = withState { state -> String? in
+                if state.forcedLoginRefusals > 0, let max = state.maxLoggedInSessions {
+                    state.forcedLoginRefusals -= 1
+                    state.refusedLoginCount += 1
+                    return "[UNAVAILABLE] Maximum number of connections from user+IP exceeded (mail_max_userip_connections=\(max))"
+                }
                 guard let max = state.maxLoggedInSessions, state.loggedInFds.count >= max else { return nil }
                 state.refusedLoginCount += 1
                 return "[UNAVAILABLE] Maximum number of connections from user+IP exceeded (mail_max_userip_connections=\(max))"

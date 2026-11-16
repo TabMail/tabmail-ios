@@ -279,6 +279,32 @@ struct IMAPChangeReaderTests {
         }
     }
 
+    @Test("Changed but not held, no new UID: the limit holds for these fetches too; one over refuses and fetches no header",
+          arguments: [0, 1])
+    func changedNotHeldObeysTheLimit(over: Int) async throws {
+        let limit = SyncConfig.imapChangeArrivalsLimit
+        let count = limit + over
+        try await Self.withWorld(inbox: Array(1...count)) { w in
+            let cursor = try await Self.baseline(w)
+            // Un-deleted elsewhere in bulk: changed, inside the held range, held no longer here.
+            w.local.remove(w.inboxId, Array(1...count))
+            for uid in 1...count { w.server.setFlags(["\\Seen"], in: Self.inboxPath, uid: uid) }
+            let fetchesBefore = w.server.recordedCommands().filter { $0.uppercased().contains("UID FETCH") }.count
+            let changes = try await Self.inbox(w, Self.read(w, cursors: [w.inboxId: cursor]))
+            let fetches = w.server.recordedCommands().filter { $0.uppercased().contains("UID FETCH") }.count - fetchesBefore
+            if over == 0 {
+                #expect(Self.isTracked(changes.status), "exactly the limit is read: \(changes.status)")
+                #expect(changes.records.filter { $0.header != nil }.count == limit)
+            } else {
+                guard case .refused(.tooFarBehind) = changes.status else {
+                    Issue.record("expected refused(tooFarBehind), got \(changes.status)"); return
+                }
+                #expect(changes.records.isEmpty)
+                #expect(fetches == 0, "no header is fetched over the limit")
+            }
+        }
+    }
+
     @Test("Superset VANISHED: a server without an exact expunge history removes only held, gone messages")
     func lossyVanishedIsSafe() async throws {
         try await Self.withWorld(inbox: [1, 2, 3, 5]) { w in
@@ -928,6 +954,33 @@ struct IMAPChangeReaderTests {
             }
             #expect(w.server.refusedLoginCount() >= 1, "the limit was reached and learned")
             #expect(await w.provider.detectedServerLimit() == 2)
+        }
+    }
+
+    @Test("Opening the change connection: a retry refused again fails the pass after two logins, keeps no session and keeps the failure time")
+    func changeOpenRefusedTwiceFailsThePass() async throws {
+        try await Self.withLimitedWorld(maxSessions: 2) { w in
+            let cursor = try await Self.baseline(w)
+            func logins() -> Int { w.server.recordedCommands().filter { $0.uppercased().hasPrefix("LOGIN") }.count }
+            let start = Date()
+            var stamped = cursor
+            for (pass, now) in [start, start.addingTimeInterval(1)].enumerated() {
+                // A folder connection: it evicts the idle change connection and is itself evictable.
+                _ = try await w.provider.fetchMessages(folder: Self.inboxPath, limit: 10, offset: 0)
+                #expect(await w.provider.changeServer == nil, "pass \(pass) setup: the change connection is closed")
+                w.server.refuseNextLogins(2)
+                let refusedBefore = w.server.refusedLoginCount()
+                let loginsBefore = logins()
+                let changes = try await Self.inbox(w, Self.read(w, cursors: [w.inboxId: stamped], context: Self.fixedClock(now)))
+                #expect(logins() - loginsBefore == 2, "pass \(pass): one login and one retry, no third")
+                #expect(w.server.refusedLoginCount() - refusedBefore == 2, "pass \(pass): both refused")
+                #expect(await w.provider.changeServer == nil, "pass \(pass): no change session is kept")
+                guard case .failed = changes.status else { Issue.record("pass \(pass): expected failed, got \(changes.status)"); return }
+                #expect(changes.records.isEmpty)
+                #expect(try #require(IMAPChangeCursor.decode(changes.cursor)).failingSince == start,
+                        "pass \(pass): the failure time is the first failure's")
+                stamped = try #require(changes.cursor)
+            }
         }
     }
 
