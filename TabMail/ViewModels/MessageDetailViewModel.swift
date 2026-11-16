@@ -2074,7 +2074,7 @@ final class MessageDetailViewModel {
         /// Every row (Trash).
         case everyRow
 
-        func takes(role: FolderRole?, folderId: String) -> Bool {
+        func takes(role: FolderRole, folderId: String) -> Bool {
             switch self {
             case .role(let wanted): return role == wanted
             case .folder(let id): return folderId == id
@@ -2096,15 +2096,18 @@ final class MessageDetailViewModel {
     /// `source` takes it. Each email goes to `destination` in its own account (owner 2026-11-06);
     /// an account without one keeps its emails where they are. The move is one action with one
     /// undo entry; Undo puts each email back in its own folder. Returns the ids it moved: empty
-    /// when nothing moved, so the chat stays open.
+    /// when nothing moved, so the chat stays open. A row whose folder role cannot be read (no
+    /// Folder row) may be a sent copy or a draft, so it stays; if the roles cannot be read at all,
+    /// nothing moves.
     private func recordChatMove(
         _ members: [MessageHeader], source: ChatMoveSource, roleMove: Bool,
         destination: (_ accountId: String) -> Folder?
     ) -> Set<String> {
+        guard let roles = lookupFolderRoles(Set(members.map(\.folderId))) else { return [] }
         let groups: [MoveGroup] = UndoableAction.byAccount(members).compactMap { share in
             guard let accountId = share.first?.accountId, let folder = destination(accountId) else { return nil }
             let movable = share.filter { member in
-                let role = lookupFolderRole(member.folderId)
+                guard let role = roles[member.folderId] else { return false }
                 return role != .sent && role != .drafts && source.takes(role: role, folderId: member.folderId)
                     && member.folderPath != folder.path
             }
@@ -2132,10 +2135,10 @@ final class MessageDetailViewModel {
     /// Moves the copies in the folder the chat was opened from: a system folder by its role, in
     /// every account; a user folder (a Gmail label included) by itself. The opened email's account
     /// offers `path`; another account's emails go to its folder at the same path, if it has one.
+    /// An opened folder whose role cannot be read moves nothing: it is not known to be a user folder.
     func moveChat(_ members: [MessageHeader], toFolderPath path: String) -> Set<String> {
-        guard let opened = message else { return [] }
-        let role = lookupFolderRole(opened.folderId)
-        let source: ChatMoveSource = if let role, role != .custom { .role(role) } else { .folder(id: opened.folderId) }
+        guard let opened = message, let role = lookupFolderRole(opened.folderId) else { return [] }
+        let source: ChatMoveSource = role == .custom ? .folder(id: opened.folderId) : .role(role)
         return recordChatMove(members, source: source, roleMove: false) { lookupFolder(accountId: $0, path: path) }
     }
 
@@ -2199,6 +2202,14 @@ final class MessageDetailViewModel {
 
     private func lookupFolderRole(_ folderId: String) -> FolderRole? {
         try? dbPool.read { db in try Folder.fetchOne(db, key: folderId)?.role }
+    }
+
+    /// The roles of the folders `folderIds` name, in one read: a folder with no Folder row has
+    /// none. Nil when the read fails.
+    private func lookupFolderRoles(_ folderIds: Set<String>) -> [String: FolderRole]? {
+        try? dbPool.read { db in
+            Dictionary(try Folder.fetchAll(db, keys: Array(folderIds)).map { ($0.id, $0.role) }) { first, _ in first }
+        }
     }
 
     /// Whether ordinary Archive/Move controls must be inert for this row.

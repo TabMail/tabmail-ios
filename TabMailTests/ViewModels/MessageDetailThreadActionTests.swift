@@ -477,6 +477,127 @@ struct MessageDetailThreadActionTests {
         #expect(try await folders(pool, ids) == before, "one Undo puts every email back")
     }
 
+    /// A second account whose system folders have other names, with a user folder named "Sent" and
+    /// one named "Projects" like the first account's.
+    @MainActor
+    private func addRenamedAccount(_ pool: DatabasePool) async throws {
+        try await pool.writeWithoutTransaction { db in
+            var acc = Account(emailAddress: "other@example.com", displayName: "Other", provider: .gmail)
+            acc.id = "acc2"
+            try acc.insert(db)
+            try Folder(name: "INBOX", path: Self.inboxPath, role: .inbox, accountId: "acc2").insert(db)
+            try Folder(name: "Archive", path: Self.otherArchivePath, role: .archive, accountId: "acc2").insert(db)
+            try Folder(name: "Trash", path: Self.otherTrashPath, role: .trash, accountId: "acc2").insert(db)
+            try Folder(name: "Sent Items", path: Self.otherSentPath, role: .sent, accountId: "acc2").insert(db)
+            try Folder(name: "Sent", path: Self.sentPath, role: .custom, accountId: "acc2").insert(db)
+            try Folder(name: "Projects", path: Self.projectsPath, role: .custom, accountId: "acc2").insert(db)
+            try Folder(name: "Clients", path: Self.clientsPath, role: .custom, accountId: "acc2").insert(db)
+        }
+    }
+
+    private static let otherSentPath = "Sent Items"
+
+    @Test("A chat's system folders are known by their role in each account, whatever their names")
+    @MainActor
+    func systemFoldersByRoleAcrossAccounts() async throws {
+        let (pool, dir, previous) = try makeEnv()
+        defer { teardown(previous: previous, pool: pool, dir: dir) }
+        clearOverlay()
+        UndoService.shared.dismissAll()
+        try await addRenamedAccount(pool)
+
+        let archived = try insertHeader(pool, messageId: "role-archived", folderPath: Self.archivePath, isRead: true)
+        let otherArchived = try insertHeader(pool, messageId: "role-other-archived", folderPath: Self.otherArchivePath, isRead: true, accountId: "acc2")
+        let sent = try insertHeader(pool, messageId: "role-sent", folderPath: Self.sentPath, isRead: true)
+        let otherSent = try insertHeader(pool, messageId: "role-other-sent", folderPath: Self.otherSentPath, isRead: true, accountId: "acc2")
+        let userSent = try insertHeader(pool, messageId: "role-user-sent", folderPath: Self.sentPath, isRead: true, accountId: "acc2")
+        let all = [archived, otherArchived, sent, otherSent, userSent]
+        let ids = all.map(\.id)
+        let before = try await folders(pool, ids)
+
+        // Moved from Archive: the other account's Archive, under its own name, goes too.
+        let vm = openChat(pool, focused: archived, others: Array(all.dropFirst()))
+        #expect(vm.moveChat(all, toFolderPath: Self.clientsPath) == [archived.id, otherArchived.id])
+        var moved = before
+        moved[archived.id] = Self.clientsPath
+        moved[otherArchived.id] = Self.clientsPath
+        try await settle(pool, moved)
+        #expect(try await folders(pool, ids) == moved)
+        await UndoService.shared.undo()
+        try await settle(pool, before)
+
+        // Deleted: each account's sent copies stay, whatever the folder's name; a user folder named
+        // "Sent" is no sent folder.
+        #expect(vm.deleteChat(all) == [archived.id, otherArchived.id, userSent.id])
+        var deleted = before
+        deleted[archived.id] = Self.trashPath
+        deleted[otherArchived.id] = Self.otherTrashPath
+        deleted[userSent.id] = Self.otherTrashPath
+        try await settle(pool, deleted)
+        #expect(try await folders(pool, ids) == deleted)
+    }
+
+    @Test("Moving a chat from a user folder leaves the other account's folder of the same name untouched")
+    @MainActor
+    func sameNamedFolderInAnotherAccountStays() async throws {
+        let (pool, dir, previous) = try makeEnv()
+        defer { teardown(previous: previous, pool: pool, dir: dir) }
+        clearOverlay()
+        UndoService.shared.dismissAll()
+        try await addRenamedAccount(pool)
+
+        let filed = try insertHeader(pool, messageId: "same-name-own", folderPath: Self.projectsPath, isRead: true)
+        let foreign = try insertHeader(pool, messageId: "same-name-foreign", folderPath: Self.projectsPath, isRead: true, accountId: "acc2")
+        let ids = [filed.id, foreign.id]
+        let before = try await folders(pool, ids)
+        let vm = openChat(pool, focused: filed, others: [foreign])
+
+        #expect(vm.moveChat([filed, foreign], toFolderPath: Self.clientsPath) == [filed.id])
+        var moved = before
+        moved[filed.id] = Self.clientsPath
+        try await settle(pool, moved)
+        #expect(try await folders(pool, ids) == moved, "the other account's Projects is another folder")
+    }
+
+    @Test("A row whose folder role cannot be read is never moved, an unknown opened folder moves nothing, and one Undo restores only what moved")
+    @MainActor
+    func unknownRoleFailsClosed() async throws {
+        let (pool, dir, previous) = try makeEnv()
+        defer { teardown(previous: previous, pool: pool, dir: dir) }
+        clearOverlay()
+        UndoService.shared.dismissAll()
+
+        // "Sent Mail" has no Folder row: its role cannot be read, so it may be a sent folder.
+        let unknownPath = "Sent Mail"
+        let inbox = try insertHeader(pool, messageId: "unknown-inbox")
+        let filed = try insertHeader(pool, messageId: "unknown-filed", folderPath: Self.projectsPath, isRead: true)
+        let unknown = try insertHeader(pool, messageId: "unknown-role", folderPath: unknownPath, isRead: true)
+        let outside = try insertHeader(pool, messageId: "unknown-outside")
+        let chat = [inbox, filed, unknown]
+        let ids = (chat + [outside]).map(\.id)
+        let before = try await folders(pool, ids)
+
+        // Opened from the folder with no role: nothing to go by, so nothing moves.
+        let fromUnknown = openChat(pool, focused: unknown, others: [inbox, filed])
+        #expect(fromUnknown.moveChat(chat, toFolderPath: Self.clientsPath).isEmpty)
+        #expect(UndoService.shared.undoStack.isEmpty)
+
+        let vm = openChat(pool, focused: inbox, others: [filed, unknown])
+        #expect(vm.deleteChat(chat) == [inbox.id, filed.id], "the row with no readable role stays")
+        var deleted = before
+        deleted[inbox.id] = Self.trashPath
+        deleted[filed.id] = Self.trashPath
+        try await settle(pool, deleted)
+        #expect(try await folders(pool, ids) == deleted)
+
+        await UndoService.shared.undo()
+        try await settle(pool, before)
+        #expect(try await folders(pool, ids) == before, "one Undo puts back what moved, and nothing else")
+        #expect(try await opsInDrainOrder(pool).allSatisfy { op in
+            !op.messageIds.contains(unknown.messageId) && !op.messageIds.contains(outside.messageId)
+        }, "no queued work names the row with no role or the email outside the chat")
+    }
+
     @Test("A chat of only sent copies and drafts, or already all in Trash, records nothing")
     @MainActor
     func chatWithNothingToMove() async throws {

@@ -589,6 +589,13 @@ same AI result, kept as long as the email itself is shown.
    `ChatCopiesTests.wholeChatArchiveLeavesFiledCopies`, `chatWithNoInboxCopyOffersNoArchive`,
    `archiveFromALabelKeepsTheListRow`, `wholeChatActionMovesEveryCopy`;
    `MessageDetailThreadActionTests.moveChatTakesTheOpenedFolder`, `archiveChatAcrossFolders`.
+   *Amended 2026-11-16:* the roles are read once for the action (`lookupFolderRoles`) and fail
+   closed. A row whose folder role cannot be read (no Folder row) may be a sent copy or a draft, so
+   it stays where it is; if the read fails, nothing moves. A Move opened from a folder whose role
+   cannot be read moves nothing, since that folder is not known to be a user folder. Before, an
+   unknown role passed the sent and draft check, so Trash took such a row, and an unknown opened
+   folder was moved as a user folder. Tests: `MessageDetailThreadActionTests.unknownRoleFailsClosed`,
+   `systemFoldersByRoleAcrossAccounts`, `sameNamedFolderInAnotherAccountStays`.
    *Amended 2026-11-15:* "Unread from here" and "Read up to here" change, with each email they
    target, its copies from the same snapshot (`MessageDetailViewModel.setRead`: the
    `threadCopies` rows that `excludeCopies` left out under that email's Message-ID), each by its
