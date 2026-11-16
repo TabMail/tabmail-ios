@@ -931,11 +931,13 @@ struct IMAPChangeReaderTests {
     /// A provider against a server allowing `maxSessions` logged-in sessions,
     /// under a username of its own (the learned limit is kept per user).
     static func withLimitedWorld(
-        maxSessions: Int, _ body: (World) async throws -> Void
+        maxSessions: Int, extraMailboxes: [String] = [], _ body: (World) async throws -> Void
     ) async throws {
+        var mailboxes: [String: [FakeIMAPServer.Message]] = [inboxPath: [1, 2, 3].map(message), archivePath: []]
+        for extra in extraMailboxes { mailboxes[extra] = [] }
         let server = FakeIMAPServer(
             username: "budget-\(UUID().uuidString.lowercased())", capabilities: qresyncCapabilities,
-            mailboxes: [inboxPath: [1, 2, 3].map(message), archivePath: []])
+            mailboxes: mailboxes)
         server.setUidValidity(epoch, for: inboxPath)
         server.setUidValidity(epoch, for: archivePath)
         server.setMaxLoggedInSessions(maxSessions)
@@ -1058,6 +1060,31 @@ struct IMAPChangeReaderTests {
             #expect(await w.provider.changeServer == nil, "the idle change connection made room")
             #expect(w.server.refusedLoginCount() == refusedBefore,
                     "the login waited for the evicted session's logout and was not refused")
+        }
+    }
+
+    @Test("Capacity eviction of several connections: the login waits for every evicted session's logout, answered at different times")
+    func capacityEvictionWaitsForEveryLogout() async throws {
+        try await Self.withLimitedWorld(maxSessions: 10, extraMailboxes: ["Drafts", "Sent"]) { w in
+            for path in [Self.inboxPath, Self.archivePath, "Drafts"] {
+                _ = try await w.provider.fetchMessages(folder: path, limit: 10, offset: 0)
+            }
+            #expect(w.server.liveSessionCount() == 4, "setup: the action and three folder connections")
+            // The server now allows two: the next login is refused, the provider
+            // learns the limit and its one retry is refused again.
+            w.server.setMaxLoggedInSessions(2)
+            do {
+                _ = try await w.provider.fetchMessages(folder: "Sent", limit: 10, offset: 0)
+                Issue.record("setup: the retry should be refused with three sessions still open")
+            } catch {}
+            // Two folder connections are left over the learned limit: the next
+            // fetch evicts both before its login, and their LOGOUTs answer late.
+            w.server.stallNextCommand(containing: "LOGOUT", seconds: 0.3)
+            w.server.stallNextCommand(containing: "LOGOUT", seconds: 0.6)
+            let refusedBefore = w.server.refusedLoginCount()
+            let sent = try await w.provider.fetchMessages(folder: "Sent", limit: 10, offset: 0)
+            #expect(sent.isEmpty, "the folder fetch completes")
+            #expect(w.server.refusedLoginCount() == refusedBefore, "the login waited for both logouts and was not refused")
         }
     }
 

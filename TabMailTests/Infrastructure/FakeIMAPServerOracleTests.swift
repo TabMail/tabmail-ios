@@ -1124,6 +1124,34 @@ struct FakeIMAPServerOracleTests {
         _ = try client.command(tag: "h7", "LOGOUT")
     }
 
+    /// The session limit admits exactly as many concurrent LOGINs as it has
+    /// room for: the check and the session's count are one step, so two
+    /// connections can never both take the last slot.
+    @Test("concurrent LOGINs against a one-session limit: exactly one is admitted")
+    func concurrentLoginsTakeTheLastSlotOnce() throws {
+        let attempts = 32
+        let server = FakeIMAPServer(mailboxes: ["INBOX": []])
+        server.setMaxLoggedInSessions(1)
+        try server.start()
+        defer { server.stop() }
+        var clients: [RawIMAPClient] = []
+        defer { for client in clients { client.close() } }
+        for _ in 0..<attempts {
+            let client = try RawIMAPClient(port: server.port)
+            try client.readGreeting()
+            clients.append(client)
+        }
+        for (index, client) in clients.enumerated() {
+            try client.send(tag: "c\(index)", "LOGIN \(server.username) \(server.password)")
+        }
+        var admitted = 0
+        for (index, client) in clients.enumerated() {
+            if try client.readTagged("c\(index)").contains("c\(index) OK") { admitted += 1 }
+        }
+        #expect(admitted == 1, "admitted \(admitted) LOGINs under a one-session limit")
+        #expect(server.liveSessionCount() == 1)
+    }
+
     /// `stop()` while a connection's thread is still answering (a stalled
     /// command) must not free that connection's descriptor: the number would go
     /// to a socket opened afterwards (a later test's connection), and the late
@@ -1222,6 +1250,11 @@ private final class RawIMAPClient {
     /// Send `tag SPACE line CRLF` without reading the answer.
     func send(tag: String, _ line: String) throws {
         try write("\(tag) \(line)\r\n")
+    }
+
+    /// Read through the tagged response to a command sent with `send`.
+    func readTagged(_ tag: String) throws -> String {
+        try readUntil { $0.contains("\r\n\(tag) ") || $0.hasPrefix("\(tag) ") }
     }
 
     /// Send `tag SPACE line CRLF` and read through the matching tagged response.

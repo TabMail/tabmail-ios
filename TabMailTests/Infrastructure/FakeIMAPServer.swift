@@ -1986,25 +1986,27 @@ final class FakeIMAPServer: @unchecked Sendable {
         case "CAPABILITY":
             return "* CAPABILITY \(capabilities.joined(separator: " "))\r\n\(tag) OK CAPABILITY completed\r\n"
         case "LOGIN":
+            // Admission and the session's count in ONE lock: two concurrent
+            // LOGINs can never both take the last slot under the limit.
             let limitRefusal = withState { state -> String? in
                 if state.forcedLoginRefusals > 0, let max = state.maxLoggedInSessions {
                     state.forcedLoginRefusals -= 1
                     state.refusedLoginCount += 1
                     return "[UNAVAILABLE] Maximum number of connections from user+IP exceeded (mail_max_userip_connections=\(max))"
                 }
-                guard let max = state.maxLoggedInSessions, state.loggedInFds.count >= max else { return nil }
-                state.refusedLoginCount += 1
-                return "[UNAVAILABLE] Maximum number of connections from user+IP exceeded (mail_max_userip_connections=\(max))"
-            }
-            if let limitRefusal { return "\(tag) NO \(limitRefusal)\r\n" }
-            authenticated = true
-            withState { state in
+                if let max = state.maxLoggedInSessions, state.loggedInFds.count >= max {
+                    state.refusedLoginCount += 1
+                    return "[UNAVAILABLE] Maximum number of connections from user+IP exceeded (mail_max_userip_connections=\(max))"
+                }
                 _ = state.loggedInFds.insert(fd)
                 // R12-F1: recorded separately from `loggedInFds` — see that
                 // field's doc comment for why (it gets cleared early by
                 // LOGOUT/kill, so it can't answer "did this fd EVER log in").
                 _ = state.everLoggedInFds.insert(fd)
+                return nil
             }
+            if let limitRefusal { return "\(tag) NO \(limitRefusal)\r\n" }
+            authenticated = true
             return "\(tag) OK LOGIN completed\r\n"
         case "ENABLE":
             guard authenticated else { return "\(tag) NO Not authenticated\r\n" }
