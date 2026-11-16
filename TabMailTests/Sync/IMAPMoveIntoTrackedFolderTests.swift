@@ -519,6 +519,60 @@ struct IMAPMoveIntoTrackedFolderTests {
         }
     }
 
+    // MARK: - Change apply -> action admission
+
+    @Test("A new message the change reader brings into a tracked folder is actionable on that message")
+    @MainActor
+    func arrivalIsActionable() async throws {
+        let arrival = "tracked-arrival@example.com"
+        try await Self.withWorld("arrival", capabilities: FakeIMAPServer.defaultCapabilities + Self.qresync,
+                                 archive: [50], local: ["Archive": [50]], tracked: ["INBOX", "Archive"]) { server in
+            server.expectMutation(rfc822MessageId: arrival)
+        } _: { w in
+            w.server.setMessages([Self.message(uid: 88, id: Self.target), Self.message(uid: 89, id: arrival)], in: "INBOX")
+            try await w.changePass()
+            let rowId = "\(w.accountId):INBOX:89"
+            let row = try #require(try await w.pool.read { db in try MessageHeader.fetchOne(db, key: rowId) },
+                                   "setup: the change pass inserts the new message")
+            #expect(row.observedUidValidity == Self.epoch, "its address carries the epoch the read was bound to")
+            await AccountManager.shared.markRead([row])
+            try await w.drain()
+            #expect(w.server.flags(in: "INBOX", uid: 89).contains("\\Seen"), "the new message is marked read on the server")
+            #expect(!w.server.flags(in: "INBOX", uid: 88).contains("\\Seen"), "and no other message is")
+            #expect(w.server.wrongMessageViolations().isEmpty)
+        }
+    }
+
+    @Test("An optimistically moved row under the same UID as a different message in the destination: the bystander's change never lands on it, and the user's action never reaches the bystander")
+    @MainActor
+    func optimisticMoveUidCollision() async throws {
+        try await Self.withWorld("collision", capabilities: FakeIMAPServer.defaultCapabilities + Self.qresync,
+                                 archive: [50, 88], local: ["Archive": [50]], tracked: ["INBOX", "Archive"]) { _ in } _: { w in
+            // The move is queued, not yet on the wire: the row shows in Archive
+            // under its INBOX UID 88, which in Archive is the bystander's.
+            await AccountManager.shared.unregisterProviderForTesting(accountId: w.accountId)
+            await AccountManager.shared.move([try w.seeded()], to: "Archive")
+            // Another device flags the bystander.
+            w.server.setFlags(["\\Flagged"], in: "Archive", uid: 88)
+            try await w.changePass()
+            let moved = try w.seeded()
+            #expect(!moved.isFlagged, "the bystander's flag is not applied to the moved message")
+            #expect(moved.observedUidValidity == nil, "the moved row is not given the destination's epoch")
+            // The user marks the message they see read.
+            await AccountManager.shared.markRead([moved])
+            await AccountManager.shared.registerProviderForTesting(accountId: w.accountId, provider: w.provider)
+            try await w.drain()
+            try await w.normalSync()
+            #expect(!w.server.flags(in: "Archive", uid: 88).contains("\\Seen"), "the bystander is untouched")
+            #expect(w.server.wrongMessageViolations().isEmpty)
+            let onServer = ["INBOX", "Archive"].flatMap { path in w.server.uids(in: path, rfc822MessageId: Self.target).map { (path, $0) } }
+            if let (path, uid) = onServer.first {
+                #expect(w.server.flags(in: path, uid: uid).contains("\\Seen"), "the message the user read is read on the server")
+            }
+            #expect(w.server.flags(in: "Archive", uid: 88).contains("\\Flagged"))
+        }
+    }
+
     /// Admits the move with no provider registered (nothing drains), then makes
     /// `between` happen, then lets the queue drain.
     @MainActor

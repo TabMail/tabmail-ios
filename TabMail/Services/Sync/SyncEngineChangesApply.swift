@@ -268,9 +268,28 @@ extension SyncEngine {
         result: inout FolderChangeApplyResult, db: Database
     ) throws -> Bool {
         let rfc822 = record.rfc822MessageId ?? record.header?.rfc822MessageId
-        if var existing = try MessageHeader
+        // The row this record describes must own the address: on IMAP a UID is
+        // mailbox-local, so an optimistically moved row that still carries its
+        // source UID (and no epoch) can sit here under the same number as a
+        // different message. Such a row is not merged or stamped; the record is
+        // read again (`providerAddressOwnershipProven`, the listing's own rule).
+        let canonicalId = MessageIdentity.headerId(
+            accountId: folder.accountId, folderPath: folder.path, messageId: record.messageId)
+        let candidates = try MessageHeader
             .filter(Column("messageId") == record.messageId && Column("folderId") == folder.id)
-            .fetchOne(db) {
+            .fetchAll(db)
+        if var existing = candidates.first(where: { $0.id == canonicalId }) ?? candidates.first {
+            // A nil address epoch means ids that are stable across the account.
+            guard providerAddressOwnershipProven(
+                row: existing, accountId: folder.accountId, folderPath: folder.path,
+                folderId: folder.id, messageId: record.messageId, canonicalId: canonicalId,
+                windowMode: addressEpoch == nil ? .date : .uid, sourceBoundEpoch: addressEpoch)
+            else {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Sync] change apply: \(existing.id) does not own \(folder.path)/\(record.messageId); read again")
+                }
+                return false
+            }
             return try mergeChangeRecord(
                 record, into: &existing, folder: folder, addressEpoch: addressEpoch,
                 snapshot: snapshot, recentlyCompleted: recentlyCompleted, result: &result, db: db)
@@ -299,7 +318,8 @@ extension SyncEngine {
             // stops a just-completed message from reappearing in its source.
             return false
         }
-        return try insertChangeRecord(info, record: record, folder: folder, snapshot: snapshot, result: &result, db: db)
+        return try insertChangeRecord(
+            info, record: record, folder: folder, addressEpoch: addressEpoch, snapshot: snapshot, result: &result, db: db)
     }
 
     /// The existing-row merge: PRESENT fields only; flags and the server tag
@@ -413,8 +433,8 @@ extension SyncEngine {
     /// reclaim, Drafts/Sent placeholder dedup (with label and body carry), the
     /// references and user-label rows, and the Sent reply-parent mark.
     private nonisolated static func insertChangeRecord(
-        _ info: MessageHeaderInfo, record: ChangeRecord, folder: Folder, snapshot: PendingOperationSnapshot,
-        result: inout FolderChangeApplyResult, db: Database
+        _ info: MessageHeaderInfo, record: ChangeRecord, folder: Folder, addressEpoch: Int?,
+        snapshot: PendingOperationSnapshot, result: inout FolderChangeApplyResult, db: Database
     ) throws -> Bool {
         let accountId = folder.accountId
         if folder.role == .drafts {
@@ -436,6 +456,9 @@ extension SyncEngine {
             isInInbox: folder.role == .inbox,
             providerDate: info.providerOrderDate
         )
+        // The epoch the read was bound to: the new row's address is actionable
+        // as the listing's would be.
+        header.observedUidValidity = addressEpoch
         header.rfc822MessageId = info.rfc822MessageId
         header.inReplyTo = info.inReplyTo
         header.referencesJSON = MessageHeader.encodeReferences(info.references)
