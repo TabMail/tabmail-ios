@@ -561,8 +561,8 @@ short pages is read to its end over passes with no refusal, stopped by the budge
 limit; a message added before a cut and archived, labelled and read after it shows the server's state;
 one conversation-wide record naming more messages than one budget covers is applied whole, and the
 pass stops after it. With `serveEmptyHistoryPages` (every page empty, each with a `nextPageToken`,
-#938): a foreground pass that reaches `GmailAPI.historyMaxPages` without taking a record is refused,
-lists the folders, shows the mail the history did not deliver and stores a fresh bookmark the next pass
+#938): in a synced account whose folders are tracked (so the full sync lists none of them by itself), a
+foreground pass that reaches `GmailAPI.historyMaxPages` without taking a record is refused, lists the folders, shows the mail the history did not deliver and stores a fresh bookmark the next pass
 reads from; a pass whose budget runs out one page short of the cap keeps its bookmark with no listing,
 and the next pass reads the history from it.
 

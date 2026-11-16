@@ -994,10 +994,16 @@ struct GmailDeltaApplyInvariantTests {
     /// has nothing to resume after, and a history that kept answering that way
     /// would hold every later pass on the same bookmark. It is refused like an
     /// expired history (#938): the bookmark is cleared, and the same foreground
-    /// pass lists the folders and stores a fresh one.
+    /// pass lists the folders and stores a fresh one. The folders are tracked
+    /// first, as in a synced account, so the full sync lists none of them
+    /// unless the refusal untracks them: the mail the history did not deliver
+    /// shows only through that listing, never by moving the bookmark on.
     @Test("P18: a pass that reaches the page cap without taking a record re-lists and stores a fresh bookmark")
     func pageCapWithNoRecordReLists() async throws {
         try await Self.withWorld(seeds: []) { w in
+            try await w.foregroundPassWithFullSyncDue()
+            let inboxState = try await w.pool.read { db in try Folder.fetchOne(db, key: w.inbox.id)?.changeState }
+            try #require(FolderChangeState(raw: inboxState).tracking, "fixture: a synced account's Inbox is tracked")
             let start = try #require(try w.account().lastHistoryId)
             w.server.addMessage(Self.seed("p18-cap", labels: ["INBOX"], date: Self.daysAgo(0.1)))
             let fresh = w.server.currentHistoryId()

@@ -720,11 +720,12 @@ struct GmailHistoryPaginationTests {
         }
     }
 
-    /// A pass that takes no record keeps its bookmark (ADR-IOS-111, #491): here
-    /// the first page holds no record but has a next page, and the budget is
-    /// spent before that page. Storing the first page's id would skip the
-    /// records on the pages not read. The next pass reads them.
-    @Test("A pass that takes no record keeps its cursor, and the next pass reads the rest")
+    /// A pass whose budget runs out before it takes a record keeps its bookmark
+    /// (ADR-IOS-111, #491): here the first page holds no record but has a next
+    /// page, and the budget is spent before that page. Storing the first page's
+    /// id would skip the records on the pages not read. The next pass reads
+    /// them. (A pass that reaches the page cap with no record is refused, #938.)
+    @Test("A pass whose budget runs out before it takes a record keeps its cursor, and the next pass reads the rest")
     func passThatTakesNoRecordKeepsTheCursor() async throws {
         try await Self.withAppDB { pool in
             let account = try Self.makeAccount(pool: pool)
