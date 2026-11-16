@@ -112,13 +112,13 @@ struct ChatThreadContextTests {
     func loadNeverReadsTheHTML() async throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
         let statements = Mutex<[String]>([])
         var config = Configuration()
         config.prepareDatabase { db in
             db.trace { event in statements.withLock { $0.append("\(event)") } }
         }
         let pool = try DatabasePool(path: dir.appendingPathComponent("t.sqlite").path, configuration: config)
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         _ = try AppDatabase(dbPool: pool)
         _ = try FolderEpochTestFixture.makeAccount(id: "acc1", provider: .imap, pool: pool)
         try FolderEpochTestFixture.insertFolder(accountId: "acc1", path: "INBOX", role: .inbox, pool: pool)
@@ -153,9 +153,9 @@ struct ChatThreadContextTests {
     func loadFailureFinishes() async throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
         // No migrations: every table is missing.
         let pool = try DatabasePool(path: dir.appendingPathComponent("empty.sqlite").path)
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: dir) }
 
         let context = await ChatThreadContext.load(members: [Self.header("1")], pool: PrioritizedDatabase(pool: pool))
 
@@ -407,5 +407,12 @@ struct ChatThreadContextTests {
         #expect(MessageSnapshot(from: header).preview(chatViewActive: true) == "snippet")
         header.summaryTextMessage = nil
         #expect(MessageSnapshot(from: header).preview(chatViewActive: true) == "snippet")
+    }
+
+    @Test("Every database these tests open is closed before its directory is removed")
+    func databasesCloseBeforeTheirDirectoriesGo() throws {
+        let source = try String(contentsOf: URL(fileURLWithPath: #filePath), encoding: .utf8)
+        let unlink = "FileManager.default." + "removeItem("
+        #expect(!source.contains(unlink), "a raw directory removal unlinks the database under an open connection")
     }
 }
