@@ -216,8 +216,8 @@ struct ChatReplyCompose: Equatable {
     ///   in Reply to (`target.only == nil`). With people chosen, it and a reply asked for in the field
     ///   are a plain reply to only them, with no Cc or Bcc.
     /// - The agent's reply with nobody chosen keeps the agent's recipients, and is a Reply All only
-    ///   when those recipients (To, Cc and Bcc) are the whole Reply All audience; asked for in the
-    ///   open sheet, also only when the agent opened it as one.
+    ///   when those recipients (To, Cc and Bcc) contain the whole Reply All audience, people the agent
+    ///   added included; asked for in the open sheet, also only when the agent opened it as one.
     static func make(
         replyTo message: MessageHeader?, target: ChatReplyTarget,
         agent: (request: AgentToolRouter.ComposeRequest, fromField: Bool)?, accounts: [Account]
@@ -231,7 +231,7 @@ struct ChatReplyCompose: Equatable {
         }
         let req = agent.request
         let addresses = { (list: [String]) in Set(list.map { $0.lowercased() }) }
-        let toWholeAudience = audience.map { addresses(req.to + req.cc + req.bcc) == addresses($0.to + $0.cc) } == true
+        let toWholeAudience = audience.map { addresses(req.to + req.cc + req.bcc).isSuperset(of: addresses($0.to + $0.cc)) } == true
         let isReplyAll = toWholeAudience && (agent.fromField || req.isReplyAll)
         return ChatReplyCompose(isReplyAll: isReplyAll, to: req.to, cc: req.cc, bcc: req.bcc)
     }

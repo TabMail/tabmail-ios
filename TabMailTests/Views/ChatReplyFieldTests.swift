@@ -562,7 +562,7 @@ struct ChatReplyFieldTests {
                 "Replying only to David: nobody else, seen or hidden")
 
         let toEveryone = Self.card(req.replyTo, target: .replyAll, agent: (req, true), accounts: accounts)
-        #expect(!toEveryone.isReplyAll, "nobody chosen, but the agent added people: not the Reply All audience")
+        #expect(toEveryone.isReplyAll, "nobody chosen, the agent added people but kept everyone: Reply All")
         #expect(toEveryone.prefillTo == req.to && toEveryone.prefillCc == req.cc && toEveryone.prefillBcc == req.bcc,
                 "nobody chosen: the card keeps the agent's recipients")
     }
@@ -583,6 +583,29 @@ struct ChatReplyFieldTests {
                 "the card goes to the agent's recipients only")
     }
 
+    @Test("A reply the agent widens is still Reply All: its recipients contain the whole audience, from the field and the sheet")
+    func agentReplyThatAddsPeopleIsStillReplyAll() async throws {
+        let (widened, accounts) = try await Self.agentReplyRequest([
+            "add_cc": .array([.string("extra@example.com")]),
+            "add_bcc": .array([.string("hidden@example.com")]),
+        ])
+        #expect(widened.to.contains("sender@example.com") && widened.cc.contains("extra@example.com") && widened.bcc == ["hidden@example.com"],
+                "the agent added a Cc and a Bcc and kept everyone")
+        for fromField in [true, false] {
+            let compose = Self.card(widened.replyTo, target: .replyAll, agent: (widened, fromField), accounts: accounts)
+            #expect(compose.isReplyAll, "everyone in the Reply All audience is on it, plus people the agent added: Reply All")
+            #expect(compose.prefillTo == widened.to && compose.prefillCc == widened.cc && compose.prefillBcc == widened.bcc,
+                    "the card keeps the agent's recipients")
+        }
+
+        let (widenedNarrowed, otherAccounts) = try await Self.agentReplyRequest([
+            "add_cc": .array([.string("extra@example.com")]),
+            "remove_recipients": .array([.string("team@example.com")]),
+        ])
+        let swapped = Self.card(widenedNarrowed.replyTo, target: .replyAll, agent: (widenedNarrowed, true), accounts: otherAccounts)
+        #expect(!swapped.isReplyAll, "someone added but someone dropped: a plain reply")
+    }
+
     @Test("A reply the agent writes in the open sheet keeps its recipients, and is Reply All only to the whole audience")
     func agentReplyFromTheSheetKeepsItsRecipients() async throws {
         let chosen = ChatReplyTarget(only: [Self.david])
@@ -595,7 +618,7 @@ struct ChatReplyFieldTests {
 
         let (widened, widenedAccounts) = try await Self.agentReplyRequest(["add_cc": .array([.string("extra@example.com")])])
         let compose = Self.card(widened.replyTo, target: chosen, agent: (widened, false), accounts: widenedAccounts)
-        #expect(!compose.isReplyAll, "someone added: not the Reply All audience")
+        #expect(compose.isReplyAll, "someone added, everyone kept: Reply All")
         #expect(compose.prefillTo == widened.to && compose.prefillCc == widened.cc, "the open chat keeps everyone the agent chose")
 
         let (narrowed, narrowedAccounts) = try await Self.agentReplyRequest(["remove_recipients": .array([.string("team@example.com")])])

@@ -477,7 +477,17 @@ same AI result, kept as long as the email itself is shown.
    agent's recipients, and when the agent left someone out or added someone it opens as a plain
    reply. Before this, such a reply opened as Reply All whatever the agent's recipients were.
    `ChatReplyCompose.make` checks the audience once for every agent reply. Test:
-   `ChatReplyFieldTests.agentReplyFromTheFieldIsReplyAllOnlyToTheWholeAudience`.
+   `ChatReplyFieldTests.agentReplyFromTheFieldIsReplyAllOnlyToTheWholeAudience`. (History: the
+   containment rule of 2026-11-16 below replaces this equal-audience rule.)
+   **Reply All when the recipients contain the whole audience (2026-11-16, current):** a chat reply
+   records Reply All when its recipients (To, Cc and Bcc, compared case-insensitively) contain
+   everyone in the full Reply All audience, whether or not the agent added people. This matches what
+   Outlook's own apps record; the kind drives the Outlook last-verb marker on the original. A reply
+   that drops anyone in the audience stays a plain reply; from the open sheet the agent must also have
+   opened it as a Reply All, as before. Before this, a reply the agent widened was a plain reply.
+   `ChatReplyCompose.make` checks containment once for every agent reply. Tests:
+   `ChatReplyFieldTests.agentReplyThatAddsPeopleIsStillReplyAll`,
+   `agentReplyFromTheFieldFollowsTheTarget`, `agentReplyFromTheSheetKeepsItsRecipients`.
 
 **Release order:** an iOS build at protocol 2.0.0 must not reach users before the backend change
 (its protocol 2.0.0 JSON shape) is deployed to production: an older backend sends 2.0.0 the labelled text, which this
