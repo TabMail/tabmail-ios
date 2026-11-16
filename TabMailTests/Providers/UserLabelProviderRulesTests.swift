@@ -86,4 +86,24 @@ struct UserLabelProviderRulesTests {
             #expect(outlook == ["$Forwarded", "Work", "Receipts"])
         }
     }
+
+    /// Gmail label ids are per account (`Label_N`), so another account knowing
+    /// an id as a user label must not make it one here.
+    @Test("Pushed Gmail labels: only ids this account's catalog knows as user labels are kept, never another account's")
+    func pushedGmailLabelsStayInTheirAccount() throws {
+        let db = try TestDatabase.make()
+        let a = try TestDatabase.insertAccount(db, id: "push-gmail-a", email: "push-gmail-a@example.com", provider: .gmail)
+        let b = try TestDatabase.insertAccount(db, id: "push-gmail-b", email: "push-gmail-b@example.com", provider: .gmail)
+        try db.write { db in
+            try UserLabel(accountId: a.id, providerLabelId: "Label_1", name: "Work", isSystem: false).insert(db)
+            try UserLabel(accountId: a.id, providerLabelId: "CATEGORY_FORUMS", name: "Forums", isSystem: true).insert(db)
+            try UserLabel(accountId: b.id, providerLabelId: "Label_2", name: "Home", isSystem: false).insert(db)
+        }
+        let raw = ["INBOX", "Label_1", "Label_2", "CATEGORY_FORUMS", "Label_3"]
+        try db.read { db in
+            #expect(try GmailProvider.storedUserLabelIds(fromPushed: raw, accountId: a.id, db: db) == ["Label_1"])
+            #expect(try GmailProvider.storedUserLabelIds(fromPushed: raw, accountId: b.id, db: db) == ["Label_2"])
+            #expect(try GmailProvider.storedUserLabelIds(fromPushed: [], accountId: a.id, db: db).isEmpty)
+        }
+    }
 }

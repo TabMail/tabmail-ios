@@ -17,7 +17,9 @@ import GRDB
 // failure is refused the same way, even when Gmail does list a label by that
 // name, so only the 409 leads to the lookup. The control case shows a free name
 // still creates a new label, so the conflict cannot be satisfied by a fake that
-// refuses every create.
+// refuses every create. A create Gmail does not answer fails the gesture at the
+// label deadline (`GmailAPI.labelCreateTimeout`) with nothing written, and an
+// answered one does not wait for that deadline.
 
 @Suite("Gmail label create: a name Gmail already has applies the existing label", .serialized, .processGlobalState)
 struct UserLabelCreateExistingNameTests {
@@ -95,6 +97,8 @@ struct UserLabelCreateExistingNameTests {
         let modifyCalls: Int
         /// The account's operations still queued after the drain.
         let queued: Int
+        /// How long the create gesture itself took.
+        let elapsed: Duration
     }
 
     /// Opens the menu, creates `name` through it, drains the queue, and returns
@@ -116,7 +120,10 @@ struct UserLabelCreateExistingNameTests {
         model.loadLabels()
         #expect(model.supportsRemoteUserLabels)
         #expect(model.sortedLabels.map(\.providerLabelId) == (listedProviderLabelId.map { [$0] } ?? []))
+        let clock = ContinuousClock()
+        let start = clock.now
         let created = await model.createAndApply(name: name)
+        let elapsed = clock.now - start
         await AccountManager.shared.drainPendingQueue()
 
         let (stored, queued) = try await f.pool.read { db in
@@ -126,7 +133,7 @@ struct UserLabelCreateExistingNameTests {
         await AccountManager.shared.unregisterProviderForTesting(accountId: f.accountId)
         return Outcome(created: created, stored: stored, menu: model.sortedLabels,
                        appliedIds: model.appliedIds, added: gmail.modifyLog().last?.addLabelIds,
-                       modifyCalls: gmail.modifyLog().count, queued: queued)
+                       modifyCalls: gmail.modifyLog().count, queued: queued, elapsed: elapsed)
     }
 
     /// The single entry for `providerLabelId` in `labels`, or nil when there is
@@ -205,5 +212,32 @@ struct UserLabelCreateExistingNameTests {
         let listed = only("Label_99", in: result.menu)
         #expect(listed?.name == "Invoices")
         #expect(listed.map { result.appliedIds.contains($0.id) } == true)
+        // An answered create does not wait out the deadline it raced.
+        #expect(result.elapsed < GmailAPI.labelCreateTimeout / 2, "the gesture took \(result.elapsed)")
+    }
+
+    @Test("A create Gmail does not answer fails the gesture at the label deadline, and nothing is written")
+    @MainActor
+    func unansweredCreateFailsAtTheDeadline() async throws {
+        // Gmail never answers the create while the gesture waits; the answer is
+        // released only after the test, so the deadline is the only way out.
+        let release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        let result = try await createAndApply("Invoices", accountId: "label-create-timeout") {
+            $0.http.register(path: "https://gmail.googleapis.com/gmail/v1/users/me/labels", method: "POST") { _ in
+                .parked {
+                    _ = release.wait(timeout: .now() + .seconds(60))
+                    return .status(500)
+                }
+            }
+        }
+        #expect(!result.created, "an unanswered create was turned into a label application")
+        #expect(result.elapsed >= GmailAPI.labelCreateTimeout, "the gesture gave up after \(result.elapsed)")
+        #expect(result.elapsed < GmailAPI.labelCreateTimeout * 2, "the gesture outlived its deadline: \(result.elapsed)")
+        #expect(result.stored.isEmpty, "stored rows: \(result.stored.map { "\($0.providerLabelId)=\($0.name)" })")
+        #expect(result.menu.isEmpty, "menu: \(result.menu.map { "\($0.providerLabelId)=\($0.name)" })")
+        #expect(result.appliedIds.isEmpty)
+        #expect(result.queued == 0, "queued operations: \(result.queued)")
+        #expect(result.modifyCalls == 0, "Gmail was asked to change the message \(result.modifyCalls) times")
     }
 }

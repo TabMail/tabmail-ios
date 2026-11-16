@@ -109,7 +109,9 @@ enum AccountProvider: String, Codable, Sendable, CaseIterable {
     /// the static requirements (user labels, #500). Reached from the account
     /// kind alone, so a rule that needs no server answers with no connected
     /// provider. The same types `AccountManager.connectAccount` creates for each
-    /// kind; nil for CalDAV, which carries no mail.
+    /// kind; nil for CalDAV, which carries no mail. Every mail provider owns user
+    /// labels, so nil is also the label menu's refusal: no label is shown,
+    /// created, applied or removed on such an account.
     ///
     /// ⚑ Exhaustive with no `default:` clause, like `contentKeySpace`: a new
     /// provider must decide this explicitly.

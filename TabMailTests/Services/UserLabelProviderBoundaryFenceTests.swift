@@ -31,13 +31,18 @@ struct UserLabelProviderBoundaryFenceTests {
     static let mergeFile = "TabMail/Services/NSEDataBridge.swift"
 
     /// The label menu: no provider cast or type check, no concrete provider
-    /// type, no branch on the account kind, no label-name normalization.
+    /// type, no branch on the account kind (whatever it is spelled as), no
+    /// label-name normalization.
     static let menuRules: [Rule] = [
         Rule(pattern: #"\bas\s*[?!]"#, why: "a cast"),
         Rule(pattern: #"\bis\s+[A-Z]\w*"#, why: "a type check"),
         Rule(pattern: #"\btype\s*\(\s*of:"#, why: "a type check"),
         Rule(pattern: #"\b(Gmail|IMAP|Exchange|Demo|CalDAV)Provider\b"#, why: "a concrete provider type"),
         Rule(pattern: #"\baccount\.provider\s*(==|!=)|\bswitch\s+account\.provider\b"#, why: "a branch on the account kind"),
+        // An account kind named at all: a `case` arm of a switch on any
+        // spelling of the kind (an alias, a parameter), or a comparison with one.
+        Rule(pattern: #"\.(gmail|outlook|imap|icloud|caldav)\b"#, why: "an account kind named"),
+        Rule(pattern: #""(gmail|outlook|imap|imap_new_mail|icloud|caldav)""#, why: "an account kind named by its raw value"),
         Rule(pattern: #"\.(lowercased|uppercased)\s*\("#, why: "label-name normalization"),
     ]
 
@@ -92,10 +97,16 @@ struct UserLabelProviderBoundaryFenceTests {
             "if provider is GmailProvider { }",
             "switch account.provider {",
             "labelId = name.lowercased()",
+            "case .gmail, .imap, .icloud, .outlook: return true",
+            "let kind = account.provider; switch kind { case .caldav: return false }",
+            "nonisolated static func supports(_ provider: AccountProvider) -> Bool { provider != .caldav }",
+            #"if account.provider.rawValue == "gmail" { }"#,
         ]
         for shape in menuShapes {
             #expect(!Self.violations(in: Self.code(of: shape), file: "probe", rules: Self.menuRules).isEmpty, "not caught: \(shape)")
         }
+        // The provider-blind capability check the menu does use is not caught.
+        #expect(Self.violations(in: "guard let account, account.provider.emailProviderType != nil else { return false }", file: "probe", rules: Self.menuRules).isEmpty)
         #expect(!Self.violations(in: "if account.provider == .gmail {", file: "probe", rules: Self.fullSyncRules).isEmpty)
         #expect(!Self.violations(in: "let s = UserLabelStore.isGmailSystemLabel(id: a)", file: "probe", rules: Self.syncDirectoryRules).isEmpty)
         #expect(!Self.violations(in: #"case "imap_new_mail", "imap", "icloud":"#, file: "probe", rules: Self.mergeRules).isEmpty)

@@ -11,9 +11,11 @@ import GRDB
 extension ExchangeProvider {
 
     /// Mints locally like IMAP rather than blocking on a catalog round-trip like
-    /// Gmail, because Graph has no catalog to call: PATCHing a category name onto
-    /// a message is what makes it exist there (`ExchangeProvider.setUserLabel`).
-    /// Needs no connected provider.
+    /// Gmail, because a message category needs no catalog entry: PATCHing a
+    /// category name onto a message is what puts it there
+    /// (`ExchangeProvider.setUserLabel`). Outlook's master category list is not
+    /// written (it needs a further permission; `IOS-LABEL-002`). Needs no
+    /// connected provider.
     ///
     /// 🚨 VERBATIM — deliberately NOT `.lowercased()`, the one place this
     /// diverges from IMAP's rule it otherwise copies. IMAP lowercases because

@@ -74,6 +74,26 @@ struct UserLabelCatalogFolderListTests {
                 "the removed label's association with the message survived")
     }
 
+    @Test("Gmail: a label renamed on the server is renamed in place, keeping its associations; another account's label is untouched")
+    func gmailRenameUpdatesTheStoredLabel() throws {
+        let s = try seeded(.gmail, accountId: "catalog-gmail-rename", providerLabelId: "Label_7", name: "Old name")
+        let other = try TestDatabase.insertAccount(s.db, id: "catalog-gmail-other", email: "catalog-gmail-other@example.com", provider: .gmail)
+        let otherLabel = UserLabel(accountId: other.id, providerLabelId: "Label_7", name: "Old name", isSystem: false)
+        try s.db.write { db in try otherLabel.insert(db) }
+
+        let folders = [folder("INBOX", "INBOX", .inbox), folder("New name", "Label_7")]
+        try s.db.write { db in _ = try SyncEngine.applyFolderList(folders, account: s.account, db: db) }
+
+        let stored = try labels(s.db, accountId: s.account.id)
+        #expect(Set(stored.keys) == ["Label_7"], "stored: \(stored.keys.sorted())")
+        #expect(stored["Label_7"]?.id == s.label.id, "the renamed label got a new row")
+        #expect(stored["Label_7"]?.name == "New name", "the stored label kept the old name")
+        #expect(try associations(s.db, messageId: s.header.id) == [s.label.id],
+                "the renamed label lost its association with the message")
+        #expect(try labels(s.db, accountId: other.id)["Label_7"]?.name == "Old name",
+                "another account's label with the same id was renamed")
+    }
+
     @Test("IMAP, iCloud and Outlook: a folder list leaves the account's labels and their associations untouched", arguments: [AccountProvider.imap, .icloud, .outlook])
     func providersWithoutACatalogKeepTheirLabels(_ provider: AccountProvider) throws {
         let s = try seeded(provider, accountId: "catalog-\(provider.rawValue)", providerLabelId: "receipts", name: "receipts")
