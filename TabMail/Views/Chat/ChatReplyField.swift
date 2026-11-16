@@ -211,6 +211,19 @@ struct ChatFieldReply: Sendable, Equatable {
     let onlyTo: [String]?
 }
 
+/// A send from the chat's reply field, read once as it starts: the email it is about, who the user
+/// chose in Reply to, and whether that email takes replies. The send's words and its request are
+/// built from it, and a resume or a retry of that send carries it, so neither reads the field again.
+struct ChatFieldSend {
+    let message: MessageHeader
+    let onlyTo: [ChatThread.Person]?
+    let isNoReply: Bool
+
+    var fieldReply: ChatFieldReply {
+        ChatFieldReply(emailKey: ChatThread.copyKey(message), onlyTo: onlyTo?.map(\.address))
+    }
+}
+
 /// How a reply from the chat opens compose: Reply All or a plain reply, and to whom, read together
 /// from who the chat's reply goes to (`ChatReplyTarget`), so the kind the send records on the
 /// original (`ComposeView.isReplyAll`, #915) is the kind the "Replying only to" line shows. Read once,

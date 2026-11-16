@@ -147,13 +147,13 @@ struct ChatHistoryWriteFailureTests {
         }
         session.chatMessages.append(ChatMessage(role: .user, content: "Hello", timestamp: Date()))
         await session.appendTurn(turn(), admission: nil)
-        session.lastFailedMessage = "Hello"
+        session.lastFailedSend = .init(text: "Hello", field: nil)
         session.chatMessages.append(ChatMessage(role: .agent, content: "Couldn't connect.", timestamp: Date()))
         #expect(warnings(session) == [ChatPillState.Session.historySaveFailedWarning])
 
         // The retry takes the failed send once; the re-send shows the message again.
         let retried = session.takeFailedSendForRetry()
-        #expect(retried == "Hello")
+        #expect(retried?.text == "Hello")
         #expect(session.takeFailedSendForRetry() == nil)
         session.chatMessages.append(ChatMessage(role: .user, content: "Hello", timestamp: Date()))
 

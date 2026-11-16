@@ -439,9 +439,9 @@ struct ChatReplyFieldTests {
         let send = try Self.body(of: "private func sendFromReplyField(_ text: String, _ field: ChatReplyField) {", in: text)
         #expect(Self.count("if ChatReplyField.route(text: text, readyText: field.readyText, recipientsChanged: field.onlyTo != nil) == .readyReply { onSendReadyReply?() return }", in: send) == 1)
         #expect(Self.count("onFieldSend?(text)", in: send) == 1)
-        #expect(Self.count("sendAgentChat(text, fromReplyField: true)", in: send) == 1)
+        #expect(Self.count("sendAgentChat(text, field: send)", in: send) == 1)
         #expect(Self.count("sendFromReplyField(", in: text) == 2, "Send reaches it")
-        #expect(Self.count("enrichedText = ChatReplyField.agentMessage( emailNumericId: numericId, text: text, isNoReply: replyField?.isNoReply ?? false, onlyTo: onlyTo)", in: text) == 1)
+        #expect(Self.count("enrichedText = ChatReplyField.agentMessage( emailNumericId: numericId, text: text, isNoReply: field.isNoReply, onlyTo: field.onlyTo)", in: text) == 1)
         #expect(Self.count("enqueueStatus(isReplyField ? ChatReplyField.statusLine(label) : label)", in: text) == 1)
     }
 
@@ -669,10 +669,19 @@ struct ChatReplyFieldTests {
 
         let island = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
         #expect(Self.count("ChatReplyField.route(text: text, readyText: field.readyText, recipientsChanged: field.onlyTo != nil)", in: island) == 1)
-        #expect(Self.count("let onlyTo = fromReplyField ? replyField?.onlyTo : nil", in: island) == 1,
+        #expect(Self.count("let send = message.map { ChatFieldSend(message: $0, onlyTo: field.onlyTo, isNoReply: field.isNoReply) }", in: island) == 1,
                 "the people chosen are read once, as the field's send starts")
-        #expect(Self.count("ChatFieldReply(emailKey: ChatThread.copyKey($0), onlyTo: onlyTo?.map(\\.address))", in: island) == 1)
+        #expect(Self.count("let fieldReply = field?.fieldReply", in: island) == 1)
         #expect(Self.count("uiSink: SessionUISink(session: session), sessionKey: sessionKey, fieldReply: fieldReply)", in: island) == 1,
                 "and travel with the request to the agent's tools")
+        // A recovered send keeps them: the resume carries the cut-off send's request, the retry the
+        // failed send as it was sent (ChatReplyRecoveryTests sends both through the real chat).
+        #expect(Self.count("pendingResume = .init(request: resumable.resumeRequest, fieldReply: fieldReply)", in: island) == 1)
+        #expect(Self.count("uiSink: SessionUISink(session: session), sessionKey: sessionKey, fieldReply: resume.fieldReply)", in: island) == 1)
+        #expect(Self.count("pendingResume = .init(request: resumable.resumeRequest, fieldReply: resume.fieldReply)", in: island) == 1)
+        #expect(Self.count("lastFailedSend = .init(text: text, field: field)", in: island) == 1)
+        #expect(Self.count("sendAgentChat(failed.text, field: failed.field)", in: island) == 1)
+        #expect(Self.count("replyField?.onlyTo", in: island) == 0 && Self.count("replyField?.isNoReply", in: island) == 0,
+                "no send reads the field's choice later")
     }
 }

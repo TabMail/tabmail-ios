@@ -60,7 +60,7 @@ final class ChatPillState {
         for (_, session) in sessions {
             session.activeChatTask?.cancel()
             session.activeChatTask = nil
-            session.pendingResumeRequest = nil
+            session.pendingResume = nil
         }
         sessions.removeAll()
         if count > 0 {
@@ -95,14 +95,28 @@ final class ChatPillState {
     final class Session {
         var chatMessages: [ChatMessage] = []
         var lastChatActivity: Date?
-        var lastFailedMessage: String?
+        /// The send that failed outright, for the retry button: its words, and the reply field's
+        /// send as it started when the field sent it (nil: the panel sent it).
+        var lastFailedSend: FailedSend?
         /// Saved checkpoint for a turn that was cut off in transit (connection lost
         /// mid-stream). Holds the failed round's request with its preserved
         /// `conversation_state`, so "tap to retry" resumes from completed tool work
-        /// instead of restarting. Deliberately SEPARATE from `lastFailedMessage`
+        /// instead of restarting. Deliberately SEPARATE from `lastFailedSend`
         /// (the fork/resend pathways) — resume continues an in-flight turn, it does
-        /// not re-send the user's message.
-        var pendingResumeRequest: CompletionsRequest?
+        /// not re-send the user's message. Kept in memory only.
+        var pendingResume: PendingResume?
+
+        struct FailedSend {
+            let text: String
+            let field: ChatFieldSend?
+        }
+
+        /// The cut-off turn's request and, when the reply field sent it, the field's request as it
+        /// was sent (`ChatFieldReply`): the resumed turn's tools get the same one.
+        struct PendingResume {
+            let request: CompletionsRequest
+            let fieldReply: ChatFieldReply?
+        }
         /// Buffer 1 (display): shown on the "new session" page. Swapped from Buffer 2
         /// on pill expand for instant display. Stable while being shown.
         var activeReminders: [Reminder] = []
@@ -191,13 +205,13 @@ final class ChatPillState {
         /// that send from the chat, from its user message down, so the re-send shows
         /// it once. The send is found by its user message, not by counting from the
         /// end, because a warning can sit between the user message and the error.
-        func takeFailedSendForRetry() -> String? {
-            guard let text = lastFailedMessage else { return nil }
-            lastFailedMessage = nil
+        func takeFailedSendForRetry() -> FailedSend? {
+            guard let failed = lastFailedSend else { return nil }
+            lastFailedSend = nil
             if let userIndex = chatMessages.lastIndex(where: { $0.role == .user }) {
                 chatMessages.removeSubrange(userIndex...)
             }
-            return text
+            return failed
         }
 
         /// Observe inbox message reminder count changes via GRDB ValueObservation.

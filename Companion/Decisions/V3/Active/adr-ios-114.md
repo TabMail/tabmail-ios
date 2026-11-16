@@ -502,6 +502,16 @@ same AI result, kept as long as the email itself is shown.
    reply, the chat opened and its Reply to chosen through the sheet: `panelClosedBeforeDelivery`,
    `requestFromAnotherChat`, `fieldRequestAboutAnotherEmail`, `fieldRequestUsesItsCapturedChoice`,
    `fieldRequestToEveryoneKeepsItsRecipients`).
+   *Amended 2026-11-16:* a recovered send keeps its origin and choice. The field's send is read once
+   as it starts (`ChatFieldSend`: the email, the people chosen, whether the email takes replies).
+   A turn cut off in transit keeps its `ChatFieldReply` beside its checkpoint
+   (`ChatPillState.Session.pendingResume`, in memory only), and the resumed turn's tools get it.
+   Retry after a failed send re-sends the send as it was (`Session.lastFailedSend`): from the
+   field, with the same email and choice, or from the sheet; it never reads the field again. Before
+   this, a resumed turn lost the field's request, so its compose card took the agent's recipients
+   instead of the people chosen, and Retry re-read the field (its current choice, or a sheet send when the sheet was open). Tests:
+   `ChatReplyRecoveryTests` (connection lost then resumed, and a server failure then Retry, the
+   choice changed in between).
 
 **Release order:** an iOS build at protocol 2.0.0 must not reach users before the backend change
 (its protocol 2.0.0 JSON shape) is deployed to production: an older backend sends 2.0.0 the labelled text, which this

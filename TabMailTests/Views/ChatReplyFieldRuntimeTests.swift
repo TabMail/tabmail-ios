@@ -449,7 +449,8 @@ struct ChatReplyFieldRuntimeTests {
         let text = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
         let start = try #require(text.range(of: "private func sendAgentChat("))
         let send = String(text[start.upperBound...])
-        #expect(send.contains("var contextNumericId = await Self.contextNumber(sendingAbout: message, known: contextEmailNumericId)"))
+        // A field send, or its retry, names the email the field's send started on.
+        #expect(send.contains("var contextNumericId = await Self.contextNumber(sendingAbout: field?.message ?? message, known: contextEmailNumericId)"))
     }
 
     /// The text from `start` to the next `private func`.

@@ -1989,10 +1989,10 @@ struct DictationOptOutFlagTests {
         let composeReady = try slice(source, from: "private var composeReadyToSend: Bool {", to: "private var canTapSend: Bool")
         #expect(composeReady.contains("!isComposeMode || (composeMutationAllowed && composeAttachmentSnapshotReady)"))
         // While dictating, the slot is send even after a failed turn: retry doesn't take it over.
-        #expect(source.contains("} else if !isWorking && !dictation.isActive && (pendingResumeRequest != nil || lastFailedMessage != nil)"))
+        #expect(source.contains("} else if !isWorking && !dictation.isActive && (pendingResume != nil || lastFailedSend != nil)"))
         #expect(!source.contains("Image(systemName: \"stop.circle.fill\") .font(.title2) .foregroundStyle(Theme.accent)"))
 
-        let transcribing = try slice(source, from: "} else if dictation.phase == .transcribing {", to: "} else if !isWorking && !dictation.isActive && (pendingResumeRequest != nil")
+        let transcribing = try slice(source, from: "} else if dictation.phase == .transcribing {", to: "} else if !isWorking && !dictation.isActive && (pendingResume != nil")
         #expect(transcribing.contains("DictationSpinner(isRetrying: dictation.isRetrying)"))
         #expect(!transcribing.contains("Button"))
 
