@@ -9,7 +9,8 @@ import Foundation
 struct GmailHistoryRead {
     /// The bookmark to store: the first page's `historyId` when the history was
     /// read to its end, the id of the last record taken when the pass stopped
-    /// early. Nil when no record was taken (the bookmark stays).
+    /// early. Nil when the time budget ran out before a record was taken (the
+    /// bookmark stays).
     var bookmark: String?
     /// The history was read to its end.
     var complete = false
@@ -48,8 +49,9 @@ struct GmailHistoryRead {
 ///   resumes there with nothing listed again.
 ///
 /// Nil when the history can no longer be read from the bookmark: Gmail answers
-/// 404 (expired), or the record to resume after does not carry a numeric id
-/// past the bookmark. A page that cannot be read throws.
+/// 404 (expired), the record to resume after does not carry a numeric id past
+/// the bookmark, or `GmailAPI.historyMaxPages` pages were read without taking a
+/// record (#938). A page that cannot be read throws.
 extension GmailProvider {
     func readHistory(
         since start: String, recheck: Set<String>, context: ChangeContext
@@ -105,6 +107,15 @@ extension GmailProvider {
                 break
             }
             pageToken = next
+        }
+        // The page cap reached with no record taken: there is nothing to resume
+        // after, and a history that kept answering this way would hold every
+        // pass on this bookmark until it expires. Refused like an expired
+        // history, so the pass re-lists (#938). A pass stopped by its time
+        // budget keeps its bookmark.
+        if !read.complete, lastTaken == nil, pagesRead >= GmailAPI.historyMaxPages {
+            BackgroundSyncLogger.logDebug("[Gmail] readHistory: \(pagesRead) pages from \(start) without a record")
+            return nil
         }
         await readQueued(&queue, into: &read, context: context)
         guard read.failure == nil else { return read }

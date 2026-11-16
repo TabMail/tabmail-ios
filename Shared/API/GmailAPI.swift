@@ -58,7 +58,8 @@ enum GmailAPI {
 
     /// Most `users.history.list` pages read in one call or one change pass.
     /// The app's change reader stops there and resumes after the last record
-    /// it read on its next pass (`GmailProvider.readHistory`). The notification
+    /// it read on its next pass (`GmailProvider.readHistory`); a pass that took
+    /// no record by then is refused like an expired history. The notification
     /// extension's `historyList` answers a longer history like an expired
     /// history id (nil): its cursor must never move past pages that were not
     /// read, and a cap that threw instead would fail the same way on every retry.

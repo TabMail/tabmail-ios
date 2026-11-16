@@ -287,6 +287,9 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         var historyPageSize = GmailAPI.historyPageSize
         /// Called as each `/history` page is served.
         var historyPageHook: (@Sendable () -> Void)?
+        /// Every `/history` page holds no record and still carries a
+        /// `nextPageToken` (`serveEmptyHistoryPages`).
+        var historyPagesEmpty = false
 
         /// Record the label difference between `before` and `after` as history,
         /// as Gmail does for every label change it applies. Labels the message
@@ -564,6 +567,17 @@ final class StatefulGmailActionServer: @unchecked Sendable {
     func serveHistoryPages(of size: Int, onPage: (@Sendable () -> Void)? = nil) {
         state.value.withLock {
             $0.historyPageSize = size
+            $0.historyPageHook = onPage
+        }
+    }
+
+    /// While `empty`, every `/history` page holds no record and carries a
+    /// `nextPageToken`, however many pages are read: data the Gmail docs do not
+    /// describe, which never lets a reader take a record. `onPage` runs as each
+    /// page is served. An expired history is still answered `404`.
+    func serveEmptyHistoryPages(_ empty: Bool, onPage: (@Sendable () -> Void)? = nil) {
+        state.value.withLock {
+            $0.historyPagesEmpty = empty
             $0.historyPageHook = onPage
         }
     }
@@ -1204,12 +1218,17 @@ final class StatefulGmailActionServer: @unchecked Sendable {
             let start = queryItems.first(where: { $0.name == "startHistoryId" })?.value.flatMap(Int.init) ?? 0
             let after = queryItems.first(where: { $0.name == "pageToken" })?.value
                 .flatMap { Int($0.replacingOccurrences(of: "after-", with: "")) } ?? start
-            let (events, historyId, expired, pageSize, pageHook) = state.value.withLock { model in
+            let (events, historyId, expired, pageSize, pageHook, empty) = state.value.withLock { model in
                 (model.history.filter { $0.id > max(start, after) }, model.historyId, start < model.historyFloor,
-                 model.historyPageSize, model.historyPageHook)
+                 model.historyPageSize, model.historyPageHook, model.historyPagesEmpty)
             }
             if expired { return .status(404) }
             pageHook?()
+            if empty {
+                // No `history` (Gmail's shape for a page without records), and
+                // a token to a next page all the same.
+                return .json(raw: #"{ "historyId": "\#(historyId)", "nextPageToken": "empty-after-\#(max(start, after))" }"#)
+            }
             let served = events.prefix(pageSize)
             let records = served.map { event -> [String: Any] in
                 let messages: [[String: Any]] = event.messages.map { named in [
