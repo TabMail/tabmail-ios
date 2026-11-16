@@ -14,11 +14,15 @@ import Foundation
 ///   and every folder is `.baselineReady`. The engine lists the folders and only
 ///   then stores the candidate, so a change made during the listing is read by
 ///   the next pass.
-/// - The history cannot be read (expired, or longer than one pass takes on, which
-///   `fetchHistory` reports alike): every folder `.refused`, the bookmark cleared.
-/// - Otherwise: a deleted message is a removal in every folder; every other
+/// - The history cannot be read from the bookmark (expired): every folder
+///   `.refused`, the bookmark cleared.
+/// - Otherwise the history is read record by record within the pass's time
+///   budget (`readHistory`, #491). A pass that runs out of time stops after a
+///   record and stores that record's id, so the next pass resumes there with
+///   nothing listed again; a pass that reads to the end stores the history's
+///   current id. A deleted message is a removal in every folder; every other
 ///   changed message, and every message the engine asks to re-read, is fetched
-///   once and is a record in each folder its labels put it in and a removal in
+///   and is a record in each folder its labels put it in and a removal in
 ///   every other folder. A message that is asked to be re-read and is gone is a
 ///   removal everywhere. A message whose own answer cannot be used is put on
 ///   every folder's `rereadLater` and the rest of the pass lands, bookmark
@@ -29,7 +33,7 @@ import Foundation
 ///   when a message carries a label id it does not know; a set still
 ///   incomplete is unknown (nil) (#882).
 ///
-/// `inboxOnly` changes nothing but the folder list: the history is one call for
+/// `inboxOnly` changes nothing but the folder list: the history is one read for
 /// the whole account. A turn that starts with no read budget left reads nothing.
 extension GmailProvider {
     func fetchChanges(since cursor: ChangeCursor, request: ChangeRequest) async throws -> ChangeSet? {
@@ -49,56 +53,31 @@ extension GmailProvider {
             return .uniform(request, account: .candidate(candidate), status: .baselineReady, folderList: folderList)
         }
 
-        BackgroundSyncLogger.logDebug("[Sync] Gmail delta: fetching history since \(historyId) for \(userEmail)")
-        guard let history = try await fetchHistory(since: historyId) else {
-            // Expired (404) or longer than one pass takes on (over
-            // `GmailAPI.historyMaxChanges` records or changed messages, or
-            // `GmailAPI.historyMaxPages` pages): the changes in the gap reach no
-            // read, so the engine re-lists and starts a new bookmark.
-            BackgroundSyncLogger.logDebug("[Sync] Gmail delta: history expired or too long for \(userEmail)")
-            BackgroundSyncLogger.log("gmailDelta: \(userEmail) historyExpiredOrTooLong")
+        BackgroundSyncLogger.logDebug("[Sync] Gmail delta: reading history since \(historyId) for \(userEmail)")
+        let recheck = Set(request.recheck.values.flatMap { $0 })
+        guard let history = try await readHistory(since: historyId, recheck: recheck, context: request.context) else {
+            // Expired (404), or a stop point that is not a history id past the
+            // bookmark: the changes in the gap reach no read, so the engine
+            // re-lists and starts a new bookmark.
+            BackgroundSyncLogger.logDebug("[Sync] Gmail delta: history expired for \(userEmail)")
+            BackgroundSyncLogger.log("gmailDelta: \(userEmail) historyExpired")
             return .uniform(request, account: .clear, status: .refused(.expired), folderList: folderList)
         }
 
-        let deltaLog = "gmailDelta: \(userEmail) hid=\(historyId)→\(history.newHistoryId) +\(history.messagesAdded.count) -\(history.messagesDeleted.count) ~\(history.labelsAdded.count + history.labelsRemoved.count)"
+        let deltaLog = "gmailDelta: \(userEmail) hid=\(historyId)→\(history.bookmark ?? "keep") records=\(history.recordCount) complete=\(history.complete) read=\(history.requested.count) -\(history.deleted.count)"
         BackgroundSyncLogger.logDebug("[Sync] \(deltaLog)")
         BackgroundSyncLogger.log(deltaLog)
 
-        let deleted = Set(history.messagesDeleted.map(\.messageId))
-        var changed = Set(history.messagesAdded.map(\.messageId))
-        changed.formUnion(history.labelsAdded.map(\.messageId))
-        changed.formUnion(history.labelsRemoved.map(\.messageId))
-        changed.subtract(deleted)
-        let recheck = Set(request.recheck.values.flatMap { $0 }).subtracting(deleted)
-        let toFetch = changed.union(recheck)
-
-        if deleted.isEmpty && toFetch.isEmpty {
-            return .uniform(request, account: .set(history.newHistoryId), status: .tracked, folderList: folderList)
+        let failure = history.failure
+        let account: AccountCursorUpdate = failure == nil ? history.bookmark.map { .set($0) } ?? .keep : .keep
+        let deleted = history.deleted
+        if deleted.isEmpty && history.requested.isEmpty {
+            return .uniform(request, account: account, status: .tracked, folderList: folderList)
         }
 
-        var batch = GmailDetailBatch()
-        var failure: (any Error)?
-        // A record's user labels are the message's whole set only once the
-        // label catalog has loaded (`userLabelIdsAreAuthoritative`). A pass with
-        // scope `.all` loaded it above; a push or background pass in a new
-        // process loads it here, so a label change it reads reaches a stored
-        // message. A failed load is a failure about the account: nothing is
-        // fetched and the bookmark stays, so the next pass reads these again.
-        if !toFetch.isEmpty, !isUserLabelCatalogLoaded {
-            do {
-                _ = try await fetchFolders()
-            } catch {
-                failure = error
-            }
-        }
-        if !toFetch.isEmpty, failure == nil {
-            request.context.onProgress(toFetch.count)
-            do {
-                batch = try await fetchMessageDetails(ids: Array(toFetch))
-            } catch {
-                failure = error
-            }
-        }
+        var batch = GmailDetailBatch(
+            details: history.details.keys.sorted().compactMap { history.details[$0] },
+            unreadable: history.unreadable.sorted())
         // A message carrying a label id the catalog does not know (a label
         // created on the server after the catalog loaded): reload the catalog
         // once this pass and extract the labels again. A label still unknown
@@ -127,7 +106,7 @@ extension GmailProvider {
         let unreadable = Set(batch.unreadable).sorted()
         if failure == nil {
             let answered = Set(details.map(\.header.messageId)).union(unreadable)
-            removedEverywhere.formUnion(recheck.subtracting(answered))
+            removedEverywhere.formUnion(recheck.subtracting(deleted).subtracting(answered))
         }
 
         let folders = request.folders.map { folder -> FolderChanges in
@@ -148,8 +127,6 @@ extension GmailProvider {
             }
             return changes
         }
-        return ChangeSet(
-            account: failure == nil ? .set(history.newHistoryId) : .keep,
-            folderList: folderList, folders: folders)
+        return ChangeSet(account: account, folderList: folderList, folders: folders)
     }
 }

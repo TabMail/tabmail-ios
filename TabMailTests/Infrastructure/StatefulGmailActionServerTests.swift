@@ -907,7 +907,8 @@ struct StatefulGmailActionServerTests {
     ///
     /// **What THIS case pins, precisely.** `deleteDraft`'s happy path — the
     /// first `/drafts/{id}` DELETE returning 2xx and returning immediately —
-    /// plus `fetchHistory`'s `AuthedHTTP` construction. It does NOT pin
+    /// plus the history read's `AuthedHTTP` construction (`readHistory`, which
+    /// replaced `fetchHistory`, #491). It does NOT pin
     /// `deleteDraft`'s other three request sites, and it structurally cannot:
     /// a 204 here returns before the resource 401 retry or contained-message path is
     /// reached. Worse, this shape cannot even pin the FIRST DELETE on its own —
@@ -924,8 +925,8 @@ struct StatefulGmailActionServerTests {
     /// contained-message POST and its 401 retry. Between the three tests all five
     /// changed Gmail lines have a leg that goes red when that one line loses
     /// its `session:`.
-    @Test("GmailProvider.deleteDraft's 2xx path and .fetchHistory route through the injected session")
-    func deleteDraftAndFetchHistoryUseTheInjectedSession() async throws {
+    @Test("GmailProvider.deleteDraft's 2xx path and .readHistory route through the injected session")
+    func deleteDraftAndReadHistoryUseTheInjectedSession() async throws {
         let providerMessageId = "gmail-session-escape-1"
         let server = StatefulGmailActionServer(messages: [.init(
             rfc822MessageId: "gmail-session-escape@example.com",
@@ -949,12 +950,13 @@ struct StatefulGmailActionServerTests {
 
         try await provider.deleteDraft(identity: .gmail(resourceId: providerMessageId))
 
-        let history = try await provider.fetchHistory(since: cursor)
-        #expect(history != nil, "fetchHistory returned nil — the canned delta never arrived, so the request did not reach the fake")
+        let history = try await provider.readHistory(since: cursor, recheck: [], context: ChangeContext(onProgress: { _ in }))
+        #expect(history != nil, "readHistory returned nil — the canned delta never arrived, so the request did not reach the fake")
         guard let history else { return }
-        #expect(history.newHistoryId == server.currentHistoryId())
-        #expect(history.messagesAdded.count == 1)
-        #expect(history.messagesAdded.first?.messageId == "gmail-history-added-1")
+        #expect(history.complete)
+        #expect(history.bookmark == server.currentHistoryId())
+        #expect(history.requested == ["gmail-history-added-1"])
+        #expect(history.details["gmail-history-added-1"] != nil)
 
         #expect(
             draftDelete.served == [204],
@@ -964,6 +966,8 @@ struct StatefulGmailActionServerTests {
             server.http.servedCallSequence() == [
                 "DELETE /gmail/v1/users/me/drafts/\(providerMessageId)",
                 "GET /gmail/v1/users/me/history",
+                "GET /gmail/v1/users/me/labels",
+                "GET /gmail/v1/users/me/messages/gmail-history-added-1",
             ],
             "unexpected served sequence: \(server.http.servedCallSequence())"
         )

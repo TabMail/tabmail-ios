@@ -85,7 +85,7 @@ struct GmailChangeReadingTests {
         }
     }
 
-    @Test("Reader: an expired or over-long history refuses every folder and clears the bookmark")
+    @Test("Reader: an expired history refuses every folder and clears the bookmark")
     func readerRefusal() async throws {
         try await Pins.withWorld(seeds: [Pins.seed("rr-1", labels: ["INBOX"])]) { w in
             let cursor = w.server.currentHistoryId()
@@ -94,12 +94,6 @@ struct GmailChangeReadingTests {
             let expired = try await Self.read(w, cursor: cursor)
             #expect(expired.account == .clear)
             #expect(expired.folders.allSatisfy { if case .refused = $0.status { return true } else { return false } })
-        }
-        try await Pins.withWorld(seeds: [Pins.seed("rr-2", labels: ["INBOX"])]) { w in
-            let cursor = w.server.currentHistoryId()
-            w.server.answerHistoryTooLong(true)
-            let tooLong = try await Self.read(w, cursor: cursor)
-            #expect(tooLong.account == .clear)
         }
     }
 

@@ -95,6 +95,21 @@ struct GmailDeltaApplyInvariantTests {
             _ = try await engine.sync(account: try account())
         }
 
+        /// One production delta pass on `engine` (its read budget on its clock).
+        @discardableResult
+        func delta(on engine: SyncEngine) async throws -> (succeeded: Bool, hadChanges: Bool) {
+            try await engine.performDeltaSync(account: try account(), provider: provider)
+        }
+
+        /// Requests that start over without the bookmark: a folder listing
+        /// (`messages.list`) or a new history id (`/profile`).
+        func listingRequestCount() -> Int {
+            server.http.recordedCalls().filter { call in
+                guard let path = URL(string: call.url)?.path else { return false }
+                return path.hasSuffix("/messages") || path.hasSuffix("/profile")
+            }.count
+        }
+
         func historyRequestCount() -> Int {
             server.http.recordedCalls().filter { URL(string: $0.url)?.path.hasSuffix("/history") == true }.count
         }
@@ -745,7 +760,7 @@ struct GmailDeltaApplyInvariantTests {
         }
     }
 
-    // MARK: - P17, P18: cursor recovery (#456)
+    // MARK: - P17, P18: cursor recovery (#456) and resume (#491)
 
     @Test("P17: an expired bookmark recovers end to end: cleared, background reads wait, the foreground pass lists and stores a new bookmark, the next read reads from it")
     func expiredCursorRecovers() async throws {
@@ -774,26 +789,167 @@ struct GmailDeltaApplyInvariantTests {
         }
     }
 
-    @Test("P18: a history longer than one read takes is refused like an expired one")
-    func overLongHistoryRecovers() async throws {
-        try await Self.withWorld(seeds: [Self.seed("p18-msg", labels: ["INBOX", "UNREAD"])]) { w in
-            try w.insertRow("p18-msg", in: w.inbox, isRead: false)
-            for _ in 0..<((GmailAPI.historyMaxChanges / 2) + 1) {
-                w.server.applyLabelChange(providerMessageId: "p18-msg", add: ["STARRED"])
-                w.server.applyLabelChange(providerMessageId: "p18-msg", remove: ["STARRED"])
+    /// A clock a test moves by hand, for a pass's read budget
+    /// (`SyncEngine(changeReadClock:)`).
+    final class TestClock: Sendable {
+        private let now = Mutex(Date())
+        func read() -> Date { now.withLock { $0 } }
+        /// Move past any read budget a pass started before now.
+        func spendBudget() {
+            now.withLock { $0 = $0.addingTimeInterval(SyncConfig.changeReadBudgetSeconds + 1) }
+        }
+    }
+
+    /// The history ids of the records the fake's history holds after `start`,
+    /// in order (each change the fake applies is one record).
+    static func recordIds(after start: String, upTo end: String) -> [String] {
+        guard let first = Int(start), let last = Int(end), last > first else { return [] }
+        return ((first + 1)...last).map(String.init)
+    }
+
+    @Test("P18: a pass whose read budget runs out stops after a record, keeps what it read, and the next pass resumes there with no listing")
+    func cutOffPassResumes() async throws {
+        try await Self.withWorld(seeds: []) { w in
+            let start = try #require(try w.account().lastHistoryId)
+            for id in ["p18-a", "p18-b", "p18-c"] {
+                w.server.addMessage(Self.seed(id, labels: ["INBOX", "UNREAD"], date: Self.daysAgo(0.1)))
             }
-            w.server.applyLabelChange(providerMessageId: "p18-msg", remove: ["UNREAD"])
+            let records = Self.recordIds(after: start, upTo: w.server.currentHistoryId())
+            try #require(records.count == 3, "fixture: one record per arrival")
+            // Gmail may serve short pages; the budget runs out as page 1 is served.
+            let clock = TestClock()
+            let pagesServed = Mutex(0)
+            w.server.serveHistoryPages(of: 1) {
+                pagesServed.withLock { $0 += 1 }
+                clock.spendBudget()
+            }
+            let listingsBefore = w.listingRequestCount()
 
-            let refused = try await w.delta()
-            #expect(refused.succeeded == false, "the history is too long for one delta")
-            let historyAfterRefusal = w.historyRequestCount()
-            let waiting = try await w.delta()
-            #expect(waiting.succeeded == false)
-            #expect(w.historyRequestCount() == historyAfterRefusal, "background reads wait for the foreground pass")
+            let cut = try await w.delta(on: SyncEngine(changeReadClock: { clock.read() }))
 
-            try await w.foregroundPassWithFullSyncDue()
-            #expect(try w.row("p18-msg", in: w.inbox)?.isRead == true, "the full pass shows the server's state")
-            #expect(try w.account().lastHistoryId == w.server.currentHistoryId(), "and stores a bookmark the next read can use")
+            #expect(cut.succeeded, "a pass that ran out of time is not a failure")
+            #expect(pagesServed.withLock { $0 } == 1, "no page starts once the budget is spent")
+            #expect(try w.account().lastHistoryId == records[0], "the bookmark is the last record the pass took")
+            #expect(try w.row("p18-a", in: w.inbox) != nil, "the record it took is applied")
+            #expect(try w.row("p18-b", in: w.inbox) == nil, "no record is taken past the budget")
+
+            let resumed = try await w.delta(on: SyncEngine(changeReadClock: { clock.read() }))
+            #expect(resumed.succeeded)
+            #expect(w.historyStartIds().last == records[0], "the next pass reads from where the last one stopped")
+            try await w.completedDelta()
+            for id in ["p18-a", "p18-b", "p18-c"] {
+                #expect(try w.row(id, in: w.inbox) != nil, "\(id) is shown once the history is read")
+            }
+            #expect(w.listingRequestCount() == listingsBefore, "no pass listed a folder or started a new bookmark")
+        }
+    }
+
+    /// Gmail may return pages shorter than `maxResults`, so a short history can
+    /// span many pages. A pass that stops at a page (its budget spent, or
+    /// `GmailAPI.historyMaxPages` read) stops like any cut: nothing is refused,
+    /// and the passes that follow read the history to its end.
+    @Test("P18: a history of short pages is read to its end over passes, with no refusal",
+          arguments: ["budget", "page cap"])
+    func shortPagesReadFully(stop: String) async throws {
+        try await Self.withWorld(seeds: [Self.seed("p18-held", labels: ["INBOX", "UNREAD"])]) { w in
+            try w.insertRow("p18-held", in: w.inbox, isRead: false)
+            let start = try #require(try w.account().lastHistoryId)
+            let arrivals = stop == "budget" ? 3 : GmailAPI.historyMaxPages + 2
+            for index in 0..<arrivals {
+                w.server.addMessage(Self.seed("p18-short-\(index)", labels: ["INBOX"], date: Self.daysAgo(0.1)))
+            }
+            w.server.applyLabelChange(providerMessageId: "p18-held", remove: ["UNREAD"])
+            let records = Self.recordIds(after: start, upTo: w.server.currentHistoryId())
+            try #require(records.count == arrivals + 1, "fixture: one record per change")
+            let clock = TestClock()
+            w.server.serveHistoryPages(of: 1) {
+                if stop == "budget" { clock.spendBudget() }
+            }
+            let listingsBefore = w.listingRequestCount()
+            let engine = SyncEngine(changeReadClock: { clock.read() })
+
+            var passes = 0
+            while try w.account().lastHistoryId != w.server.currentHistoryId(), passes <= records.count {
+                let outcome = try await w.delta(on: engine)
+                passes += 1
+                #expect(outcome.succeeded, "pass \(passes) was refused")
+                #expect(try w.account().lastHistoryId != nil, "pass \(passes) cleared the bookmark")
+            }
+
+            #expect(passes == (stop == "budget" ? records.count : 2), "each pass reads as far as it may")
+            #expect(try w.account().lastHistoryId == w.server.currentHistoryId(), "the history is read to its end")
+            for index in 0..<arrivals {
+                #expect(try w.row("p18-short-\(index)", in: w.inbox) != nil, "arrival \(index) is shown")
+            }
+            #expect(try w.row("p18-held", in: w.inbox)?.isRead == true, "and the last change")
+            #expect(w.listingRequestCount() == listingsBefore, "no pass listed a folder or started a new bookmark")
+        }
+    }
+
+    @Test("P18: a message added before a cut and relabelled after it shows the server's state once the next pass reads on")
+    func addThenRelabelAcrossTheCutConverges() async throws {
+        try await Self.withWorld(seeds: []) { w in
+            let start = try #require(try w.account().lastHistoryId)
+            w.server.addMessage(Self.seed("p18-moved", labels: ["INBOX", "UNREAD"], date: Self.daysAgo(0.1)))
+            w.server.addMessage(Self.seed("p18-later", labels: ["INBOX"], date: Self.daysAgo(0.1)))
+            let records = Self.recordIds(after: start, upTo: w.server.currentHistoryId())
+            try #require(records.count == 2, "fixture: one record per arrival")
+            // One page holds both records; the budget runs out as it is served.
+            let clock = TestClock()
+            w.server.serveHistoryPages(of: GmailAPI.historyPageSize) { clock.spendBudget() }
+
+            try await w.delta(on: SyncEngine(changeReadClock: { clock.read() }))
+            try #require(try w.account().lastHistoryId == records[0], "precondition: the pass stopped after the first record")
+            #expect(try w.row("p18-moved", in: w.inbox) != nil, "the arrival before the cut is shown")
+            #expect(try w.row("p18-later", in: w.inbox) == nil, "no record is taken past the budget, even on the same page")
+
+            // After the cut: the message is read, archived and labelled.
+            w.server.applyLabelChange(
+                providerMessageId: "p18-moved", add: [Self.userLabelId], remove: ["INBOX", "UNREAD"])
+            let listingsBefore = w.listingRequestCount()
+            w.server.serveHistoryPages(of: GmailAPI.historyPageSize)
+            try await w.completedDelta()
+
+            #expect(w.historyStartIds().last == records[0], "the next pass reads from the cut")
+            #expect(try w.row("p18-moved", in: w.inbox) == nil, "the archive after the cut is applied")
+            #expect(try w.row("p18-moved", in: w.label)?.isRead == true, "and the label and the read change")
+            #expect(try w.row("p18-moved", in: w.allMail) != nil)
+            #expect(try w.row("p18-later", in: w.inbox) != nil, "and the record left past the cut")
+            #expect(w.listingRequestCount() == listingsBefore, "no listing")
+        }
+    }
+
+    /// One record is the smallest step a pass can resume from, and a
+    /// conversation-wide change names every message in the conversation. A
+    /// record naming more messages than the read budget covers is read whole:
+    /// that pass runs over, and nothing is refused.
+    @Test("P18: one record naming more messages than one budget covers is applied whole, and the pass stops after it")
+    func recordOverTheBudgetIsAppliedWhole() async throws {
+        let ids = (0...GmailAPI.historyMaxChanges).map { "p18-conv-\($0)" }
+        try await Self.withWorld(seeds: ids.map { Self.seed($0, labels: ["INBOX"]) }) { w in
+            for id in ids { try w.insertRow(id, in: w.inbox, isRead: true) }
+            let start = try #require(try w.account().lastHistoryId)
+            w.server.applyConversationLabelChange(providerMessageIds: ids, add: ["STARRED"])
+            w.server.addMessage(Self.seed("p18-after", labels: ["INBOX"], date: Self.daysAgo(0.1)))
+            let records = Self.recordIds(after: start, upTo: w.server.currentHistoryId())
+            try #require(records.count == 2, "fixture: one conversation record, then one arrival")
+            // The budget runs out while the conversation's first message is read.
+            let clock = TestClock()
+            w.server.onGet(providerMessageId: ids[0]) { clock.spendBudget() }
+            let listingsBefore = w.listingRequestCount()
+
+            let outcome = try await w.delta(on: SyncEngine(changeReadClock: { clock.read() }))
+
+            #expect(outcome.succeeded, "a record over the budget is not refused")
+            #expect(try w.account().lastHistoryId == records[0], "the pass stops after the record it read whole")
+            let flagged = try ids.filter { try w.row($0, in: w.inbox)?.isFlagged == true }
+            #expect(flagged.count == ids.count, "every message the record names is applied (\(flagged.count) of \(ids.count))")
+            #expect(try w.row("p18-after", in: w.inbox) == nil, "no record is taken past the budget")
+
+            w.server.onGet(providerMessageId: ids[0], nil)
+            try await w.completedDelta()
+            #expect(try w.row("p18-after", in: w.inbox) != nil, "the next pass reads on")
+            #expect(w.listingRequestCount() == listingsBefore, "no listing")
         }
     }
 

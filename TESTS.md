@@ -530,22 +530,34 @@ account would not, and still names the parent in its headers. Both cases run wit
 stored attachment, so the multipart upload is held to the same binding and keeps the body and the
 attachment bytes.
 
-## Gmail history pages and the delta work bound
+## Gmail history pages and the resumable read
 
 `GmailHistoryPaginationTests` drives production `SyncEngine.performDeltaSync` end to end against a
 real `GmailProvider` on `FakeHTTP`. The property: the Gmail delta applies every history record after
-the stored cursor before the cursor moves, and never moves it past a page it did not read. Covered:
-every page applied with the first page's `historyId` as the cursor and the page token percent-encoded
-on the wire; each of three page requests carrying the original query, a `maxResults` Gmail accepts and
-only the current page token; a deletion on a later page applied (the deleted row removed, a bystander
-kept, a message added then deleted never fetched or kept); a later page that fails (error status,
-transport failure, cancellation, or a 200 whose body is not a history page) applies nothing and keeps
-the cursor; a later-page 404 and a history past the page limit clear the cursor for the full sync. The
-work bound, which stops a delta from committing to more message GETs than the sync deadline can
-carry: the record budget on its own (records that name nothing to fetch), and the distinct-message
-budget for every record kind that makes the delta fetch a message, on one page and across pages,
-each at exactly the budget (applied) and one past it (no GET, cursor cleared); a message named by two records on different pages counts once. A page without
-`history`, Gmail's answer to a quiet poll, is an empty delta that moves the cursor.
+the stored cursor before the cursor moves past it, and never moves it past a record it did not read.
+Covered: every page applied with the first page's `historyId` as the cursor and the page token
+percent-encoded on the wire; each of three page requests carrying the original query, a `maxResults`
+Gmail accepts and only the current page token; a deletion on a later page applied (the deleted row
+removed, a bystander kept, a message added then deleted never fetched or kept); a later page that fails
+(error status, transport failure, cancellation, or a 200 whose body is not a history page) applies
+nothing and keeps the cursor; a later-page 404 clears the cursor for the full sync. No fixed count
+bounds a pass (#491): a history naming more messages than one default page, over three pages, applied
+in one pass; every message of every record kind fetched, on one page and across pages; three hundred
+deletions over two pages applied with no fetch. A pass that stops early resumes: at the page limit it
+stores the id of the last record read and the next pass reads from it to the end; a stop point that is
+not a numeric history id past the cursor (equal, lower, not a number) is refused like an expired
+history. A message already read is read again only when a record written during the pass (an id past
+the first page's `historyId`) names it; one named by several records the first page covered is fetched
+once. A page without `history`, Gmail's answer to a quiet poll, is an empty delta that moves the cursor.
+
+`GmailDeltaApplyInvariantTests` P18 holds the resume end to end on the stateful fake, whose `/history`
+pages the recorded changes (`serveHistoryPages(of:onPage:)`) and whose read budget runs on a clock the
+test moves (`SyncEngine(changeReadClock:)`): a pass whose budget runs out stops after a record, applies
+what it took, and the next pass reads from there with no listing and no new bookmark; a history of
+short pages is read to its end over passes with no refusal, stopped by the budget or by the page
+limit; a message added before a cut and archived, labelled and read after it shows the server's state;
+one conversation-wide record naming more messages than one budget covers is applied whole, and the
+pass stops after it.
 
 ## Gmail search text on the wire
 

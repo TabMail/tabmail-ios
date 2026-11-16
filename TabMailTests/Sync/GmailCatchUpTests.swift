@@ -3676,7 +3676,7 @@ struct GmailCatchUpTests {
             world.server.applyLabelChange(providerMessageId: "o0", remove: ["UNREAD"])
             world.server.applyLabelChange(providerMessageId: "o1", remove: [inboxPath])
             world.server.removeMessage(providerMessageId: "o2")
-            world.server.answerHistoryTooLong(true)
+            world.server.expireHistory()
 
             try await Self.syncPass(world)
             try await Self.backfillCycles(world)
@@ -3689,7 +3689,6 @@ struct GmailCatchUpTests {
             let captured = try #require(try Self.cursor(world))
             #expect(captured == world.server.currentHistoryId())
 
-            world.server.answerHistoryTooLong(false)
             world.server.applyLabelChange(providerMessageId: "r0", add: ["UNREAD"])
             let accountId = world.accountId
             let account = try #require(try await world.pool.read { db in try Account.fetchOne(db, key: accountId) })

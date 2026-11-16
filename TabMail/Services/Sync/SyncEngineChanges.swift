@@ -162,7 +162,8 @@ extension SyncEngine {
         let folders = try await dbPool.read { db in
             try Folder.filter(Column("accountId") == accountId).fetchAll(db)
         }
-        let readEnd = Self.changeReadEnd(turnStart: Date(), callerDeadline: deadline)
+        let clock = changeReadClock
+        let readEnd = Self.changeReadEnd(turnStart: clock(), callerDeadline: deadline)
         let synced = Set(syncableFoldersInOrder(folders).map(\.id))
         // At most `SyncConfig.changeRereadBudgetPerPass` distinct ids are read
         // again in one pass, so full re-read lists never push a pass past the
@@ -176,7 +177,7 @@ extension SyncEngine {
             if !asked.isEmpty { recheck[folder.id] = asked }
         }
         let context = ChangeContext(
-            deadline: readEnd, clock: { Date() }, isExpensiveNetwork: NetworkMonitor.checkExpensive(),
+            deadline: readEnd, clock: clock, isExpensiveNetwork: NetworkMonitor.checkExpensive(),
             onProgress: { count in
                 guard count > 0 else { return }
                 Task { @MainActor in

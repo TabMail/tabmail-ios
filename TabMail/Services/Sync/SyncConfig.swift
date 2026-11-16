@@ -939,7 +939,7 @@ enum SyncConfig {
     /// (`backgroundPerAccountTimeoutSeconds`) at `GmailAPI.maxConcurrentRequests`
     /// gets at a time and typical latency; full lists (`changeRecheckLimit` per
     /// folder) would overrun it. The history's own changed messages are bounded
-    /// separately (`GmailAPI.historyMaxChanges`).
+    /// by the read's time budget (`GmailProvider.readHistory`).
     static let changeRereadBudgetPerPass = 50
     /// Longest a change read may read for in one pass, from the start of its turn.
     /// Leaves the foreground pass's `perAccountSyncTimeoutSeconds` (60 s) room for

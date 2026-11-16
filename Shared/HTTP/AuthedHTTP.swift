@@ -78,7 +78,7 @@ struct AuthedHTTP: Sendable {
     }
 
     /// Raw request — exposes 404 status via `HTTPAuthedResult` instead of throwing,
-    /// so callers like Gmail `fetchHistory` can distinguish "history expired" (404)
+    /// so callers like Gmail `historyPage` can distinguish "history expired" (404)
     /// from "real error".
     func requestAllowing404(url: String, method: String = "GET", body: Data? = nil) async throws -> HTTPAuthedResult {
         var token = try await currentOrRefresh()
