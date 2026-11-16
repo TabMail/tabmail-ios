@@ -493,7 +493,9 @@ extension SyncEngine {
             }
             orphaned.folderId = folder.id
             orphaned.folderPath = folder.path
-            orphaned.observedUidValidity = nil
+            // The canonical key proves the address: stamped with the epoch the
+            // read was bound to, as a new row is (no listing comes to a tracked folder).
+            orphaned.observedUidValidity = addressEpoch
             orphaned.isInInbox = folder.role == .inbox
             orphaned.messageId = header.messageId
             orphaned.isRead = header.isRead

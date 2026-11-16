@@ -543,6 +543,34 @@ struct IMAPMoveIntoTrackedFolderTests {
         }
     }
 
+    @Test("A row the change reader takes back at its own address (left in another folder) is actionable on that message")
+    @MainActor
+    func reclaimedRowIsActionable() async throws {
+        try await Self.withWorld("reclaim", capabilities: FakeIMAPServer.defaultCapabilities + Self.qresync,
+                                 archive: [50], local: ["Archive": [50]], tracked: ["INBOX", "Archive"]) { _ in } _: { w in
+            // The row keyed at INBOX/88 sits in Archive with no epoch (a move that
+            // never happened on the server), and INBOX's bookmark predates UID 88,
+            // so the change pass reads 88 as new and takes the row back.
+            let rowId = "\(w.accountId):INBOX:88"
+            let archiveId = "\(w.accountId):Archive"
+            let inboxId = "\(w.accountId):INBOX"
+            let cursor = IMAPChangeCursor(uidValidity: UInt32(Self.epoch), highestModSeq: 1, uidNext: 88).encoded
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE messageHeader SET folderId = ?, folderPath = 'Archive', isInInbox = 0, observedUidValidity = NULL WHERE id = ?",
+                               arguments: [archiveId, rowId])
+                try db.execute(sql: "UPDATE folder SET changeCursor = ? WHERE id = ?", arguments: [cursor, inboxId])
+            }
+            try await w.changePass()
+            let row = try #require(try await w.pool.read { db in try MessageHeader.fetchOne(db, key: rowId) })
+            #expect(row.folderPath == "INBOX", "setup: the change pass takes the row back")
+            #expect(row.observedUidValidity == Self.epoch, "its address carries the epoch the read was bound to")
+            await AccountManager.shared.markRead([row])
+            try await w.drain()
+            #expect(w.server.flags(in: "INBOX", uid: 88).contains("\\Seen"), "the message is marked read on the server")
+            #expect(w.server.wrongMessageViolations().isEmpty)
+        }
+    }
+
     @Test("An optimistically moved row under the same UID as a different message in the destination: the bystander's change never lands on it, and the user's action never reaches the bystander")
     @MainActor
     func optimisticMoveUidCollision() async throws {
