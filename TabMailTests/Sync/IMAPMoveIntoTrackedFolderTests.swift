@@ -291,6 +291,9 @@ struct IMAPMoveIntoTrackedFolderTests {
             await AccountManager.shared.move([try w.seeded()], to: "Archive")
             await AccountManager.shared.move([try w.seeded()], to: "C")
             try await w.drain()
+            // Before the change pass too: the pass may itself refuse a bookmark
+            // here, which would hide a retirement that left one trusted.
+            try w.expectListedAgainNotTracked(["INBOX", "Archive"], "chained (retired)")
             try await w.changePass()
             try w.expectListedAgainNotTracked(["INBOX", "Archive"], "chained")
             try await w.normalSync()
@@ -441,10 +444,57 @@ struct IMAPMoveIntoTrackedFolderTests {
         } _: { w in
             await AccountManager.shared.move([try w.seeded()], to: "Archive")
             try await w.drain()
+            // Before the change pass too: the pass may itself refuse a bookmark
+            // here, which would hide a retirement that left one trusted.
+            try w.expectListedAgainNotTracked(["INBOX", "Archive"], "not-found (retired)")
             try await w.changePass()
             try w.expectListedAgainNotTracked(["INBOX", "Archive"], "not-found")
             try await w.normalSync()
             try w.expectHeldOnceWhereTheServerHoldsIt("not-found")
+        }
+    }
+
+    @Test("A move the provider answers \"message not found\": the folders it leaves possibly wrong are no longer trusted, and their listing is due")
+    @MainActor
+    func notFoundAnswerRetirement() async throws {
+        try await Self.withWorld("not-found-answer", capabilities: FakeIMAPServer.defaultCapabilities + Self.qresync,
+                                 archive: [50], local: ["Archive": [50]], tracked: ["INBOX", "Archive"]) { _ in } _: { w in
+            // A provider that answers the move with "not found" (a single-member
+            // conflict: dropped, server wins).
+            let answering = MockEmailProvider(staleWindowMode: .uid)
+            for path in ["INBOX", "Archive"] { await answering.setMockedUidValidity(UInt32(Self.epoch), folderPath: path) }
+            await answering.setMoveThrows(ProviderError.messageNotFound)
+            await AccountManager.shared.unregisterProviderForTesting(accountId: w.accountId)
+            await AccountManager.shared.registerProviderForTesting(accountId: w.accountId, provider: answering)
+            await AccountManager.shared.move([try w.seeded()], to: "Archive")
+            try await w.drain()
+            let leftOps = try await w.pool.read { db in try PendingOperation.fetchCount(db) }
+            #expect(leftOps == 0, "setup: the conflict retired the move")
+            try w.expectListedAgainNotTracked(["INBOX", "Archive"], "not-found-answer")
+            await AccountManager.shared.unregisterProviderForTesting(accountId: w.accountId)
+            await AccountManager.shared.registerProviderForTesting(accountId: w.accountId, provider: w.provider)
+            try await w.normalSync()
+            try w.expectHeldOnceWhereTheServerHoldsIt("not-found-answer")
+        }
+    }
+
+    @Test("A chained move whose first hop is proven and second is not: the folder the second hop left is no longer trusted")
+    @MainActor
+    func chainedSecondHopUnproven() async throws {
+        try await Self.withWorld("chained-second", capabilities: FakeIMAPServer.defaultCapabilities + Self.qresync,
+                                 archive: [50], local: ["Archive": [50]], tracked: ["INBOX", "Archive", "C"],
+                                 folders: ["INBOX", "Archive", "C"]) { server in
+            // The first hop lands at Archive/51 with proof; the hop out of it has none.
+            server.withholdMoveCOPYUID(forSourceUIDs: Set(51...500))
+            server.stallNextCommand(containing: "UID MOVE", seconds: 1)
+        } _: { w in
+            await AccountManager.shared.move([try w.seeded()], to: "Archive")
+            await AccountManager.shared.move([try w.seeded()], to: "C")
+            try await w.drain()
+            try w.expectListedAgainNotTracked(["Archive"], "chained-second (retired)")
+            try await w.changePass()
+            try await w.normalSync()
+            try w.expectHeldOnceWhereTheServerHoldsIt("chained-second")
         }
     }
 
