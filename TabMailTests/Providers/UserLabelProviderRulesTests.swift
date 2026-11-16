@@ -101,9 +101,12 @@ struct UserLabelProviderRulesTests {
         }
         let raw = ["INBOX", "Label_1", "Label_2", "CATEGORY_FORUMS", "Label_3"]
         try db.read { db in
-            #expect(try GmailProvider.storedUserLabelIds(fromPushed: raw, accountId: a.id, db: db) == ["Label_1"])
-            #expect(try GmailProvider.storedUserLabelIds(fromPushed: raw, accountId: b.id, db: db) == ["Label_2"])
-            #expect(try GmailProvider.storedUserLabelIds(fromPushed: [], accountId: a.id, db: db).isEmpty)
+            let inA = try GmailProvider.storedUserLabelIds(fromPushed: raw, accountId: a.id, db: db)
+            #expect(inA == ["Label_1"])
+            let inB = try GmailProvider.storedUserLabelIds(fromPushed: raw, accountId: b.id, db: db)
+            #expect(inB == ["Label_2"])
+            let none = try GmailProvider.storedUserLabelIds(fromPushed: [], accountId: a.id, db: db)
+            #expect(none.isEmpty)
         }
     }
 }
