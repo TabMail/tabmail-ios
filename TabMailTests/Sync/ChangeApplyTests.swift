@@ -737,4 +737,17 @@ struct ChangeApplyTests {
             #expect(outcome.fromReader == false && outcome.succeeded == false)
         }
     }
+
+    @Test("A change state stored before the self-heal mark reads back as stored, unmarked; a marked state is stored and reads back marked")
+    func changeStateWithoutTheSelfHealMarkReadsBack() throws {
+        let stored = FolderChangeState(raw: #"{"v":1,"tracking":true,"recheck":["5"]}"#)
+        #expect(stored.tracking, "the tracking a stored state carries is kept")
+        #expect(stored.recheck == ["5"])
+        #expect(!stored.selfHealDue)
+        var marked = FolderChangeState()
+        marked.selfHealDue = true
+        let encoded = try #require(marked.encoded, "an untracked state owed a self-heal pass is stored")
+        let readBack = FolderChangeState(raw: encoded)
+        #expect(readBack.selfHealDue && !readBack.tracking)
+    }
 }

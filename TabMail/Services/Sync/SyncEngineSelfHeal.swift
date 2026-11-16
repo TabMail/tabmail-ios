@@ -23,9 +23,13 @@ extension SyncEngine {
     /// completed pass: the hourly stamp goes back to what it was before this
     /// pass, so the next sync's self-heal runs again and loads them, rather than
     /// leaving them missing for the rest of the hour.
-    func selfHealRecentMessages(account: Account, forceSingleFolder: Folder? = nil) async {
+    ///
+    /// Returns whether the pass ran and healed every folder it covered
+    /// completely (no folder's check failed, every repaired message landed).
+    @discardableResult
+    func selfHealRecentMessages(account: Account, forceSingleFolder: Folder? = nil) async -> Bool {
         guard account.provider == .imap,
-              let provider = providers[account.id] as? IMAPProvider else { return }
+              let provider = providers[account.id] as? IMAPProvider else { return false }
 
         // Rate limit: once per hour (bypassed for single-folder forced heal)
         let rateLimitKey = "selfHeal_lastRun_\(account.id)"
@@ -35,7 +39,7 @@ extension SyncEngine {
             let hourAgo = Date().timeIntervalSince1970 - 3600
             guard lastRun < hourAgo else {
                 BackgroundSyncLogger.logDebug("[SelfHeal] Skipping — last run \(Int(Date().timeIntervalSince1970 - lastRun))s ago")
-                return
+                return false
             }
             previousRun = lastRun
             UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: rateLimitKey)
@@ -52,7 +56,7 @@ extension SyncEngine {
                 }
             } catch {
                 BackgroundSyncLogger.logDebug("[SelfHeal] Failed to load folders: \(error)")
-                return
+                return false
             }
             // A folder a change bookmark covers is not healed on a timer: its
             // changes arrive exactly through the change read (ADR-IOS-111).
@@ -72,6 +76,7 @@ extension SyncEngine {
 
         var totalRepaired = 0
         var anyInsertFailed = false
+        var anyFolderFailed = false
 
         for folder in syncableFolders {
             do {
@@ -85,6 +90,7 @@ extension SyncEngine {
                 if !healed.allLanded { anyInsertFailed = true }
             } catch {
                 // Don't abort other folders if one fails
+                anyFolderFailed = true
                 BackgroundSyncLogger.logDebug("[SelfHeal] Error for \(folder.name): \(error)")
             }
         }
@@ -97,6 +103,49 @@ extension SyncEngine {
         if anyInsertFailed, let previousRun {
             UserDefaults.standard.set(previousRun, forKey: rateLimitKey)
             BackgroundSyncLogger.logDebug("[SelfHeal] A write of repaired messages failed for \(account.emailAddress) — the next sync runs self-heal again")
+        }
+        return !anyInsertFailed && !anyFolderFailed
+    }
+
+    /// ADR-IOS-111 exit rule: each folder a move retired without proof dropped
+    /// the bookmark of (`FolderChangeState.selfHealDue`) gets ONE self-heal pass,
+    /// scoped to that folder, before it is tracked again. Runs in the full sync,
+    /// after its listings and before `commitChangeBaseline`, which keeps a folder
+    /// still owed its pass untracked. The window listing reaches only the newest
+    /// messages: a message the move left in the folder below it is found only by
+    /// this pass (the same 90-day reach as every self-heal). The mark is cleared
+    /// only after a complete pass, and only while the folder still holds the
+    /// bookmark it held when the pass began: a bookmark dropped again during the
+    /// pass (another unproven move) keeps the mark for the next full sync.
+    func healFoldersAfterAnUnprovenMove(account: Account) async {
+        let accountId = account.id
+        let due: [Folder]
+        do {
+            due = try await dbPool.read { db in
+                try Folder.filter(Column("accountId") == accountId).fetchAll(db)
+            }.filter { FolderChangeState(raw: $0.changeState).selfHealDue }
+        } catch {
+            BackgroundSyncLogger.logDebug("[SelfHeal] Failed to load the folders owed a pass after an unproven move: \(error)")
+            return
+        }
+        for folder in due {
+            let healed = await selfHealRecentMessages(account: account, forceSingleFolder: folder)
+            guard healed else {
+                BackgroundSyncLogger.logDebug("[SelfHeal] \(folder.name): the pass after an unproven move did not complete — it runs again at the next full sync")
+                continue
+            }
+            do {
+                try await dbPool.write { db in
+                    guard let current = try Folder.fetchOne(db, key: folder.id),
+                          current.changeCursor == folder.changeCursor else { return }
+                    var state = FolderChangeState(raw: current.changeState)
+                    guard state.selfHealDue else { return }
+                    state.selfHealDue = false
+                    try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [state.encoded, folder.id])
+                }
+            } catch {
+                BackgroundSyncLogger.logDebug("[SelfHeal] \(folder.name): failed to clear the pass owed after an unproven move: \(error)")
+            }
         }
     }
 

@@ -636,6 +636,12 @@ actor SyncEngine {
             // due: the next foreground pass lists the folders still untracked
             // (tracked ones get no window listing) instead of waiting for the
             // next scheduled full sync.
+            // A folder an unproven move dropped the bookmark of gets its one
+            // self-heal pass before the baseline below may track it again.
+            await queue.execute(priority: .headerFetch) {
+                await self.healFoldersAfterAnUnprovenMove(account: account)
+            }
+
             var listingDone = true
             if let changePass, changePass.fromReader {
                 // The reader's bookmark was read BEFORE these listings; store a
@@ -663,7 +669,7 @@ actor SyncEngine {
                 await self.sweepStaleActionTags(account: account, provider: provider)
             }
             await queue.execute(priority: .bodyFetch) {
-                await self.selfHealRecentMessages(account: account)
+                _ = await self.selfHealRecentMessages(account: account)
             }
         }
 

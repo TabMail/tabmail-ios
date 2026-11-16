@@ -743,10 +743,12 @@ enum MessageHeaderRekey {
                 newObservedUidValidity: migrated.observedUidValidity))
         }
         // ADR-IOS-111 (IMAP reader, exit rule): every folder this retirement
-        // leaves possibly wrong ends its tracking, in this transaction.
+        // leaves possibly wrong ends its tracking, in this transaction, and is
+        // owed one self-heal pass before it is tracked again (a message the
+        // move left there below the listing window is reached only by it).
         if !accountScopedIds {
             for folderId in possiblyWrongFolderIds.sorted() {
-                try SyncEngine.dropChangeBookmark(folderId: folderId, db: db)
+                try SyncEngine.dropChangeBookmark(folderId: folderId, selfHealDue: true, db: db)
             }
         }
         result.readdressedOperationIds = try readdressQueuedOperations(

@@ -3036,6 +3036,14 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         disconnectPostWipeTestHook = hook
     }
 
+    /// Fires in `evictIdleConnection`'s teardown right BEFORE DONE is sent: a
+    /// test holds DONE back here to give the IDLE listener every chance to act
+    /// on the eviction before the session's IDLE is ended.
+    var idleEvictionBeforeDoneTestHook: (@Sendable () async -> Void)?
+    func setIdleEvictionBeforeDoneTestHookForTesting(_ hook: (@Sendable () async -> Void)?) {
+        idleEvictionBeforeDoneTestHook = hook
+    }
+
     /// Fires inside `launchIdleConnection`'s Task right after `createServer()`
     /// succeeds but BEFORE `claimIdleServerSlot` — the D-20 plant race window.
     var idleLaunchPlantRaceTestHook: (@Sendable () async -> Void)?
@@ -3518,13 +3526,30 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// Evict the IDLE connection to free a server slot, adding its DONE and
     /// logout to `logouts`.
     /// Returns true if an IDLE connection was evicted, false if none was active.
+    ///
+    /// DONE completes (its tagged OK, or `SyncConfig.imapIdleEvictionDoneWaitSeconds`)
+    /// before the listener is cancelled and before the LOGOUT. A listener
+    /// cancelled first ends its stream at once and logs the session out itself
+    /// (`onIdleStreamEnded`); that LOGOUT can reach the connection ahead of
+    /// DONE and then waits for an IDLE nobody ends, so the session stays logged
+    /// in past the eviction's wait and the login that needed its slot is refused.
     private func evictIdleConnection(_ logouts: inout [Task<Void, Never>]) -> Bool {
         guard let server = idleServer else { return false }
         if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP:IDLE] Evicting IDLE connection to free server slot") }
-        idleListenerTask?.cancel()
+        let listener = idleListenerTask
         idleListenerTask = nil
         noteLogoutAttempt(server)
-        logouts.append(Task { try? await server.done(); try? await server.logout() })
+        #if DEBUG
+        let beforeDone = idleEvictionBeforeDoneTestHook
+        #endif
+        logouts.append(Task {
+            #if DEBUG
+            if let beforeDone { await beforeDone() }
+            #endif
+            _ = try? await withTimeout(seconds: SyncConfig.imapIdleEvictionDoneWaitSeconds) { try await server.done() }
+            listener?.cancel()
+            try? await server.logout()
+        })
         idleServer = nil
         // Will relaunch after delay if idleEnabled is still true
         if idleEnabled {

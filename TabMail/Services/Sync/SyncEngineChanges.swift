@@ -52,10 +52,27 @@ struct FolderChangeState: Codable, Equatable, Sendable {
     /// pass and in turn, until the change applies. `SyncConfig.changeRecheckLimit`
     /// bounds only a pass's own additions; an id already stored is never cut (#903).
     var recheck: [String] = []
+    /// A move retired without proof dropped this folder's bookmark
+    /// (`MessageHeaderRekey.finishMove`, ADR-IOS-111 exit rule): the folder gets
+    /// ONE self-heal pass (`healFoldersAfterAnUnprovenMove`) before it is tracked
+    /// again. The window listing reaches only the newest messages, so one the
+    /// move left in the folder below it would otherwise stay missing.
+    var selfHealDue: Bool = false
 
     init(tracking: Bool = false, recheck: [String] = []) {
         self.tracking = tracking
         self.recheck = recheck
+    }
+
+    private enum CodingKeys: String, CodingKey { case v, tracking, recheck, selfHealDue }
+
+    /// `selfHealDue` is absent from a state stored before it existed.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        v = try container.decode(Int.self, forKey: .v)
+        tracking = try container.decode(Bool.self, forKey: .tracking)
+        recheck = try container.decode([String].self, forKey: .recheck)
+        selfHealDue = try container.decodeIfPresent(Bool.self, forKey: .selfHealDue) ?? false
     }
 
     /// The stored JSON; unreadable or absent = the untracked default.
@@ -68,9 +85,10 @@ struct FolderChangeState: Codable, Equatable, Sendable {
         self = decoded
     }
 
-    /// The JSON to store; nil for the default (untracked, nothing to re-read).
+    /// The JSON to store; nil for the default (untracked, nothing to re-read,
+    /// no self-heal due).
     var encoded: String? {
-        guard tracking || !recheck.isEmpty,
+        guard tracking || !recheck.isEmpty || selfHealDue,
               let data = try? JSONEncoder().encode(self) else { return nil }
         return String(data: data, encoding: .utf8)
     }
@@ -410,7 +428,9 @@ extension SyncEngine {
                 let left = outcome.folderBookmarkLeft[folderId]
                 if let left, left == nil || folder.changeCursor != left { continue }
                 var state = FolderChangeState(raw: folder.changeState)
-                guard !state.tracking else { continue }
+                // A folder still owed its self-heal pass after an unproven move
+                // stays untracked: the next full sync lists it and heals it again.
+                guard !state.tracking, !state.selfHealDue else { continue }
                 state.tracking = true
                 if let left, let bookmark = left {
                     try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ? AND changeCursor = ?", arguments: [state.encoded, folderId, bookmark])

@@ -629,6 +629,11 @@ enum SyncConfig {
     /// logout that never answers cannot hold the login: after it the login goes
     /// ahead and the server's answer decides.
     static let imapEvictionLogoutWaitSeconds: TimeInterval = 5
+    /// Longest an evicted IDLE connection waits for its DONE to be answered
+    /// before its LOGOUT (`IMAPProvider.evictIdleConnection`). Below
+    /// `imapEvictionLogoutWaitSeconds`, so the LOGOUT still fits in the login's
+    /// wait for it.
+    static let imapIdleEvictionDoneWaitSeconds: TimeInterval = 2
 
     // MARK: - Provider Work Queue Concurrency
     /// Max concurrent operations for Gmail API providers.

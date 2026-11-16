@@ -241,12 +241,15 @@ extension SyncEngine {
     /// sync lists it; its next read starts a new baseline. The re-read list is
     /// kept. A folder with no bookmark is left as it is.
     /// `onlyIfHeld: false` (a refused read) ends the folder's tracking even when
-    /// it holds no bookmark (a refused baseline).
-    nonisolated static func dropChangeBookmark(folderId: String, onlyIfHeld: Bool = true, db: Database) throws {
+    /// it holds no bookmark (a refused baseline). `selfHealDue: true` (a move
+    /// retired without proof) also owes the folder one self-heal pass before it
+    /// is tracked again (`FolderChangeState.selfHealDue`).
+    nonisolated static func dropChangeBookmark(folderId: String, onlyIfHeld: Bool = true, selfHealDue: Bool = false, db: Database) throws {
         guard let folder = try Folder.fetchOne(db, key: folderId),
               !onlyIfHeld || folder.changeCursor != nil else { return }
         var state = FolderChangeState(raw: folder.changeState)
         state.tracking = false
+        if selfHealDue { state.selfHealDue = true }
         try db.execute(sql: "UPDATE folder SET changeCursor = NULL, changeState = ? WHERE id = ?",
                        arguments: [state.encoded, folderId])
         try markCatchUpLapse(folderId: folderId, db: db)

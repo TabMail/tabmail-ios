@@ -641,7 +641,15 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    most `SyncConfig.imapEvictionLogoutWaitSeconds`): the server counts a session until its LOGOUT is
    answered, so a login sent right after a detached logout was refused again (found 2026-11-16 by a
    fake server that counts sessions; IDLE's DONE + LOGOUT lost that race every time). Each caller
-   keeps and awaits only its own evictions' logouts; nothing is stored on the provider. So a server that allows two connections still runs a
+   keeps and awaits only its own evictions' logouts; nothing is stored on the provider. An evicted
+   IDLE connection ends its IDLE first (`evictIdleConnection`, coordinator ruling 2026-11-16): DONE
+   completes (its tagged OK, or at most `SyncConfig.imapIdleEvictionDoneWaitSeconds`: a DONE still
+   unanswered then is cancelled, and SwiftMail closes the connection on that cancellation, which
+   ends the session), then the listener is cancelled and the session logs out. A listener cancelled first ended its stream at once
+   and logged the session out itself, and that LOGOUT could reach the connection ahead of DONE and wait
+   for an IDLE nobody ended, past the login's wait, so the login was refused (a test flake, made
+   deterministic by holding DONE back, `idleEvictionEndsIdleBeforeTheLogout`; the bound:
+   `idleEvictionDoneWaitIsBounded`). So a server that allows two connections still runs a
    pass, a folder fetch and an action (the regression c4 found: the change connection had been a
    third, unevictable one). A server without the pair, an ENABLE that is not acknowledged,
    or a mailbox answering `NOMODSEQ` leaves the folder `.untracked(UntrackedObservation)`: no
@@ -744,12 +752,24 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    (`ChangePassOutcome.folderBookmarkLeft`), whatever the read returned (a first read, a "nothing
    changed" read). A retirement whose row is no longer at its key drops the source too. Nothing is deleted and no queued operation is touched:
    removing the placeholder would drop queued user actions that name it, which the never-drop rule
-   forbids. Tests: `IMAPMoveIntoTrackedFolderTests` (the message held once, where the server holds
-   it, under its UID, after the normal sync path).
+   forbids. The window listing reaches only the newest messages, and the IMAP older-mail catch-up
+   only updates or removes rows it holds, so a message such a move left in a folder below the window
+   (a move that retired with no effect, its source message older than the window, with backfill
+   complete) would stay missing. So a bookmark this rule drops also owes the folder ONE self-heal
+   pass before it is tracked again (coordinator ruling 2026-11-16, option a): `dropChangeBookmark`
+   sets `FolderChangeState.selfHealDue`; the full sync, after its listings and before
+   `commitChangeBaseline`, runs the existing self-heal scoped to that one folder
+   (`healFoldersAfterAnUnprovenMove` → `selfHealRecentMessages(forceSingleFolder:)`, main's 90-day
+   reach, no hourly limit); `commitChangeBaseline` leaves a folder with the mark untracked; the mark
+   is cleared after a complete pass, while the folder still holds the bookmark it held when the pass
+   began (a pass that fails, or a bookmark dropped again meanwhile, keeps it for the next full
+   sync). Tests: `IMAPMoveIntoTrackedFolderTests` (the message held once, where the server holds
+   it, under its UID, after the normal sync path; `retiredMoveBelowTheWindowIsHealedBeforeTracking`).
 Tests: `IMAPChangeReaderTests`, `ChangeApplyIMAPTests`, `IMAPCatchUpTests.planTrackedFolder`,
 `IMAPChangeFuzzTests`, `ChangeSeamFenceTests`; red-first mutants recorded in the mutation ledger.
 Keywords: QRESYNC, CONDSTORE, ENABLE, VANISHED, HIGHESTMODSEQ, NOMODSEQ, IMAPChangeCursor, change
 connection, untracked, addressEpochChanged, arrivals limit, imapDeltaSync deleted, presentIds, UIDPLUS,
 COPYUID, exit rule, dropChangeBookmark, move without destination proof, connection budget,
 evictChangeConnectionIfIdle, createChangeServer, max_userip_connections, eviction order, heldRangeStart,
-olderMailComplete, olderMailCursor, backfillUidCursor, un-deleted, pass-start NOOP, #751.
+olderMailComplete, olderMailCursor, backfillUidCursor, un-deleted, pass-start NOOP, selfHealDue,
+healFoldersAfterAnUnprovenMove, evictIdleConnection, IDLE DONE before LOGOUT, #751.

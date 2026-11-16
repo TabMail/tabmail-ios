@@ -512,6 +512,9 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// Command fragment (uppercased) → seconds to hold the NEXT matching
         /// command's response, one entry per match. See `stallNextCommand`.
         var stalls: [String: [Double]] = [:]
+        /// Seconds to hold the answer to the NEXT IDLE `DONE`, one entry per
+        /// DONE. See `delayNextIdleDoneReply`.
+        var idleDoneReplyDelays: [Double] = []
         /// `holdGreetings()` is in place: new connections wait on `greetingGate`.
         var greetingsHeld = false
         /// Connections that waited for their greeting under a hold.
@@ -817,6 +820,13 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// `seconds`: a stalled link, for a caller that must bound how long it waits.
     func stallNextCommand(containing fragment: String, seconds: Double) {
         withState { $0.stalls[fragment.uppercased(), default: []].append(seconds) }
+    }
+
+    /// Test seam: hold the tagged answer to the NEXT IDLE `DONE` for `seconds`
+    /// (a server slow to end IDLE). `stallNextCommand` cannot reach DONE: it is
+    /// an IDLE continuation line, never a tagged command.
+    func delayNextIdleDoneReply(seconds: Double) {
+        withState { $0.idleDoneReplyDelays.append(seconds) }
     }
 
     func consumedInjectedFailureCount() -> Int {
@@ -1765,6 +1775,22 @@ final class FakeIMAPServer: @unchecked Sendable {
         DispatchQueue.global().async { self.handleClient(fd: clientFd) }
     }
 
+    /// Waits `seconds` before an answer while watching the connection. False
+    /// when the client closed it meanwhile (the caller ends the session).
+    private static func holdAnswer(fd: Int32, seconds: Double) -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            var watched = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            let waitMs = Int32(max(1, min(50, deadline.timeIntervalSinceNow * 1_000)))
+            guard poll(&watched, 1, waitMs) > 0 else { continue }
+            var byte: UInt8 = 0
+            if recv(fd, &byte, 1, MSG_PEEK) <= 0 { return false }
+            // Bytes are waiting: they are read after the answer.
+            usleep(10_000)
+        }
+        return true
+    }
+
     private func handleClient(fd: Int32) {
         let held = withState { state -> Bool in
             guard state.greetingsHeld else { return false }
@@ -1841,10 +1867,14 @@ final class FakeIMAPServer: @unchecked Sendable {
                     // here). Lets a test assert the "teardown sends DONE
                     // for an active IDLE session" invariant (the
                     // markDirty-IDLE fix's pin).
-                    withState { state in
+                    let doneDelay = withState { state -> Double? in
                         state.commandLog.append("DONE")
                         _ = state.idlingFds.remove(fd)
+                        return state.idleDoneReplyDelays.isEmpty ? nil : state.idleDoneReplyDelays.removeFirst()
                     }
+                    // Held like a slow server holds it: a client that closes the
+                    // connection meanwhile ends the session at once.
+                    if let doneDelay, !Self.holdAnswer(fd: fd, seconds: doneDelay) { break clientLoop }
                     sendLine(fd: fd, "\(tag) OK IDLE terminated\r\n")
                     idleTag = nil
                     continue

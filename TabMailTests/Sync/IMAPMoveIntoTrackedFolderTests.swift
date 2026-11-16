@@ -147,15 +147,16 @@ struct IMAPMoveIntoTrackedFolderTests {
 
     /// `tracked`: the folders holding a bookmark at the server's numbers, as a
     /// committed baseline leaves it. `local`: the rows the device holds per folder
-    /// (the target is seeded in INBOX at UID 88).
+    /// (the target is seeded in INBOX at UID 88). `inbox`: other messages INBOX
+    /// holds on the server, besides the target.
     @MainActor
     static func withWorld(
         _ name: String, capabilities: [String], archive: [Int], local: [String: [Int]],
-        tracked: Set<String>, folders: [String] = ["INBOX", "Archive"],
+        tracked: Set<String>, folders: [String] = ["INBOX", "Archive"], inbox: [Int] = [],
         _ configure: (FakeIMAPServer) -> Void = { _ in },
         _ body: (World) async throws -> Void
     ) async throws {
-        var mailboxes: [String: [FakeIMAPServer.Message]] = ["INBOX": [message(uid: 88, id: target)], "Archive": archive.map(filler)]
+        var mailboxes: [String: [FakeIMAPServer.Message]] = ["INBOX": [message(uid: 88, id: target)] + inbox.map(filler), "Archive": archive.map(filler)]
         if folders.contains("C") { mailboxes["C"] = [] }
         let server = FakeIMAPServer(capabilities: capabilities, mailboxes: mailboxes)
         for mailbox in mailboxes.keys { server.setUidValidity(epoch, for: mailbox) }
@@ -364,6 +365,119 @@ struct IMAPMoveIntoTrackedFolderTests {
             try await w.normalSync()
             try w.expectHeldOnceWhereTheServerHoldsIt("retry-limit")
         }
+    }
+
+    @Test("A move retired with no effect, its message below the source's listing window: one self-heal pass brings it back before the source is tracked again")
+    @MainActor
+    func retiredMoveBelowTheWindowIsHealedBeforeTracking() async throws {
+        // No window listing reaches the target, and its older mail is all
+        // loaded (backfill complete), so nothing else walks back to it.
+        try await Self.withRetiredBelowTheWindow("retired-below-window") { w in
+            try w.expectListedAgainNotTracked(["INBOX", "Archive"], "retired below the window")
+            for pass in 1...3 {
+                try await w.normalSync()
+                try w.expectHeldOnceWhereTheServerHoldsIt("retired below the window, pass \(pass)")
+                #expect(FolderChangeState(raw: try w.folder("INBOX").changeState).tracking,
+                        "retired below the window, pass \(pass): INBOX is tracked again")
+            }
+        }
+    }
+
+    /// The world of `retiredMoveBelowTheWindowIsHealedBeforeTracking`: INBOX
+    /// holds more than one window, the device the newest window and the
+    /// target (UID 88, older than every other message), backfill complete; the
+    /// move to Archive keeps failing until the retry limit retires it.
+    @MainActor
+    static func withRetiredBelowTheWindow(_ name: String, _ body: (World) async throws -> Void) async throws {
+        var caps = FakeIMAPServer.defaultCapabilities + Self.qresync
+        caps.removeAll { $0 == "MOVE" }
+        let inbox = Array(1000..<(1000 + SyncConfig.syncMessageLimit + 10))
+        try await Self.withWorld(name, capabilities: caps, archive: [50],
+                                 local: ["Archive": [50], "INBOX": Array(inbox.suffix(SyncConfig.syncMessageLimit))],
+                                 tracked: ["INBOX", "Archive"], inbox: inbox) { server in
+            for _ in 0..<SyncConfig.pendingOperationServerRefusalRetryLimit {
+                server.failNextCommand(containing: "UID COPY", message: "Server busy")
+            }
+        } _: { w in
+            let accountId = w.accountId
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET backfillComplete = 1 WHERE accountId = ?", arguments: [accountId])
+            }
+            await AccountManager.shared.move([try w.seeded()], to: "Archive")
+            try await w.drain()
+            #expect(w.server.uids(in: "INBOX", rfc822MessageId: Self.target) == [88], "\(name) setup: the move never ran")
+            try await body(w)
+        }
+    }
+
+    @Test("A self-heal pass owed after an unproven move that fails keeps the folder untracked and still owed it; the next full sync heals and tracks it")
+    @MainActor
+    func failedSelfHealKeepsTheFolderUntracked() async throws {
+        try await Self.withRetiredBelowTheWindow("heal-fails") { w in
+            // Only INBOX is owed its pass here (the move owed Archive one too),
+            // so the next date SEARCH, which is refused once, is INBOX's pass.
+            let archiveId = "\(w.accountId):Archive"
+            var archiveState = FolderChangeState(raw: try w.folder("Archive").changeState)
+            archiveState.selfHealDue = false
+            let archiveEncoded = archiveState.encoded
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [archiveEncoded, archiveId])
+            }
+            let failuresBefore = w.server.consumedInjectedFailureCount()
+            w.server.failNextCommand(containing: "SINCE", message: "Server busy")
+            try await w.normalSync()
+            #expect(w.server.consumedInjectedFailureCount() == failuresBefore + 1, "setup: the self-heal's search was refused")
+            let inbox = try w.folder("INBOX")
+            #expect(FolderChangeState(raw: inbox.changeState).selfHealDue, "INBOX is still owed its self-heal pass")
+            #expect(!FolderChangeState(raw: inbox.changeState).tracking, "INBOX is not tracked before that pass")
+            // The next scheduled full sync.
+            let accountId = w.accountId
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE account SET lastFullSyncAt = NULL WHERE id = ?", arguments: [accountId])
+            }
+            try await w.normalSync()
+            try w.expectHeldOnceWhereTheServerHoldsIt("heal fails, then runs")
+            let healed = try w.folder("INBOX")
+            #expect(!FolderChangeState(raw: healed.changeState).selfHealDue, "the pass ran: nothing is owed")
+            #expect(FolderChangeState(raw: healed.changeState).tracking, "INBOX is tracked again")
+        }
+    }
+
+    @Test("A bookmark dropped again while the owed self-heal pass runs keeps the pass owed")
+    @MainActor
+    func bookmarkDroppedDuringTheSelfHealKeepsItOwed() async throws {
+        try await Self.withRetiredBelowTheWindow("heal-raced") { w in
+            // The change pass stores INBOX a new bookmark; the full sync is still due.
+            try await w.changePass()
+            let inboxId = "\(w.accountId):INBOX"
+            #expect(try w.folder("INBOX").changeCursor != nil, "setup: INBOX holds a new bookmark")
+            #expect(FolderChangeState(raw: try w.folder("INBOX").changeState).selfHealDue, "setup: INBOX is owed its pass")
+            let start = w.server.recordedCommands().count
+            w.server.stallNextCommand(containing: "SINCE", seconds: 1)
+            let account = try w.account()
+            let engine = w.engine
+            let heal = Task { await engine.healFoldersAfterAnUnprovenMove(account: account) }
+            #expect(await Self.eventually {
+                w.server.recordedCommands().dropFirst(start).contains { $0.uppercased().contains("SINCE") }
+            }, "setup: the pass is under way")
+            // Another unproven move drops the bookmark again meanwhile.
+            try await w.pool.write { db in
+                try SyncEngine.dropChangeBookmark(folderId: inboxId, selfHealDue: true, db: db)
+            }
+            await heal.value
+            #expect(FolderChangeState(raw: try w.folder("INBOX").changeState).selfHealDue,
+                    "the pass that began before the drop does not settle what the drop owes")
+        }
+    }
+
+    @MainActor
+    static func eventually(timeout: TimeInterval = 5, _ condition: () -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return condition()
     }
 
     @Test("A move retired because the source's UIDVALIDITY changed: one copy, where the server holds it, after the normal sync")

@@ -1039,6 +1039,67 @@ struct IMAPChangeReaderTests {
         }
     }
 
+    @Test("IDLE eviction: the session's IDLE is ended before its logout, so the login made after it is never refused")
+    func idleEvictionEndsIdleBeforeTheLogout() async throws {
+        try await Self.withLimitedWorld(maxSessions: 3) { w in
+            await w.provider.startIdle { _, _ in }
+            #expect(await Self.eventuallyAsync { await w.provider.currentIdleServerForTesting() != nil }, "setup: IDLE is open")
+            let cursor = try await Self.baseline(w)
+            // Learn the limit (3); the idle change connection makes room.
+            _ = try await w.provider.fetchMessages(folder: Self.inboxPath, limit: 10, offset: 0)
+            // DONE is held back past the moment the eviction ends IDLE's turn,
+            // so the IDLE listener has every chance to act first.
+            let doneHeldBack: Duration = .milliseconds(300)
+            await w.provider.setIdleEvictionBeforeDoneTestHookForTesting { try? await Task.sleep(for: doneHeldBack) }
+            // A pass holds the change connection: a folder fetch needing a slot takes IDLE's.
+            let start = w.server.recordedCommands().count
+            w.server.stallNextCommand(containing: "NOOP", seconds: 1)
+            let pass = Task { try await Self.inbox(w, Self.read(w, cursors: [w.inboxId: cursor])) }
+            #expect(await Self.eventually {
+                w.server.recordedCommands().dropFirst(start).contains { $0.uppercased().hasPrefix("NOOP") }
+            }, "setup: the pass holds the change connection")
+            #expect(await w.provider.currentIdleServerForTesting() != nil, "setup: IDLE holds the third slot")
+            let refusedBefore = w.server.refusedLoginCount()
+            let archive = try? await w.provider.fetchMessages(folder: Self.archivePath, limit: 10, offset: 0)
+            #expect(archive != nil, "the folder fetch that took IDLE's slot completes")
+            #expect(w.server.refusedLoginCount() - refusedBefore <= 1,
+                    "at most the one refusal that makes IDLE give up its slot; the login after it is never refused")
+            #expect(await w.provider.currentIdleServerForTesting() == nil, "IDLE made room")
+            let changes = try await pass.value
+            #expect(Self.isTracked(changes.status), "the pass completes: \(changes.status)")
+            await w.provider.setIdleEvictionBeforeDoneTestHookForTesting(nil)
+            await w.provider.stopIdle()
+        }
+    }
+
+    @Test("IDLE eviction: a DONE the server does not answer within the bound closes the session, so the login made after it is never refused")
+    func idleEvictionDoneWaitIsBounded() async throws {
+        try await Self.withLimitedWorld(maxSessions: 3) { w in
+            await w.provider.startIdle { _, _ in }
+            #expect(await Self.eventuallyAsync { await w.provider.currentIdleServerForTesting() != nil }, "setup: IDLE is open")
+            let cursor = try await Self.baseline(w)
+            _ = try await w.provider.fetchMessages(folder: Self.inboxPath, limit: 10, offset: 0)
+            // The server answers DONE only after the login's whole wait for the logout.
+            let doneAnswered = SyncConfig.imapEvictionLogoutWaitSeconds + 2
+            w.server.delayNextIdleDoneReply(seconds: doneAnswered)
+            let start = w.server.recordedCommands().count
+            w.server.stallNextCommand(containing: "NOOP", seconds: 1)
+            let pass = Task { try await Self.inbox(w, Self.read(w, cursors: [w.inboxId: cursor])) }
+            #expect(await Self.eventually {
+                w.server.recordedCommands().dropFirst(start).contains { $0.uppercased().hasPrefix("NOOP") }
+            }, "setup: the pass holds the change connection")
+            let refusedBefore = w.server.refusedLoginCount()
+            let began = Date()
+            let archive = try? await w.provider.fetchMessages(folder: Self.archivePath, limit: 10, offset: 0)
+            #expect(archive != nil, "the folder fetch that took IDLE's slot completes")
+            #expect(Date().timeIntervalSince(began) < doneAnswered, "it did not wait for the DONE answer")
+            #expect(w.server.refusedLoginCount() - refusedBefore <= 1,
+                    "at most the one refusal that makes IDLE give up its slot; the login after it is never refused")
+            _ = try await pass.value
+            await w.provider.stopIdle()
+        }
+    }
+
     @Test("Capacity eviction: a folder login made after the idle change connection was evicted waits for its logout, so it is never refused")
     func capacityEvictionWaitsForTheLogout() async throws {
         try await Self.withLimitedWorld(maxSessions: 3) { w in
