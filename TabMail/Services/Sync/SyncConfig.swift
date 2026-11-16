@@ -622,11 +622,12 @@ enum SyncConfig {
     /// with `max_userip_connections=N`. The rejection locks maxConnections to N - reserved.
     /// Most IMAP servers allow 10-20 per user; enterprise can go higher.
     static let imapMaxConnectionCeiling: Int = 20
-    /// Longest a login retried after a connection-limit refusal waits for the
-    /// logout of the connection evicted to make room (`IMAPProvider.awaitEvictionLogouts`).
-    /// The server counts that session until its LOGOUT is answered, so retrying
-    /// sooner is refused again. Bounded so a logout that never answers cannot
-    /// hold the retry: after it the retry goes ahead and the server's answer decides.
+    /// Longest a login made after an eviction (to make room under the server's
+    /// connection limit) waits for the evicted connections' logouts
+    /// (`IMAPProvider.awaitEvictionLogouts`). The server counts a session until
+    /// its LOGOUT is answered, so logging in sooner is refused. Bounded so a
+    /// logout that never answers cannot hold the login: after it the login goes
+    /// ahead and the server's answer decides.
     static let imapEvictionLogoutWaitSeconds: TimeInterval = 5
 
     // MARK: - Provider Work Queue Concurrency

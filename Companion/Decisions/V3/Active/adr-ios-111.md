@@ -635,11 +635,13 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    takes the folder connection's refusal handling (`createChangeServer`): a login refused with the
    server's limit (Dovecot's `max_userip_connections` wording) learns the limit, evicts the LRU folder
    connection (else IDLE) and retries once; a second refusal fails the pass through the existing
-   failure handling (item 9). No other fallback. Both limit retries (folder and change connection)
-   first wait for the evicted connection's LOGOUT to be answered (`awaitEvictionLogouts`, at most
-   `SyncConfig.imapEvictionLogoutWaitSeconds`): the server counts a session until then, so a retry
-   sent right after a detached logout was refused again (found 2026-11-16 by a fake server that
-   counts sessions; IDLE's DONE + LOGOUT lost that race every time). So a server that allows two connections still runs a
+   failure handling (item 9). No other fallback. Every login made after an eviction (a folder
+   connection after the capacity loop evicted, and both limit retries, folder and change connection)
+   first waits for the LOGOUTs of the connections that same call evicted (`awaitEvictionLogouts`, at
+   most `SyncConfig.imapEvictionLogoutWaitSeconds`): the server counts a session until its LOGOUT is
+   answered, so a login sent right after a detached logout was refused again (found 2026-11-16 by a
+   fake server that counts sessions; IDLE's DONE + LOGOUT lost that race every time). Each caller
+   keeps and awaits only its own evictions' logouts; nothing is stored on the provider. So a server that allows two connections still runs a
    pass, a folder fetch and an action (the regression c4 found: the change connection had been a
    third, unevictable one). A server without the pair, an ENABLE that is not acknowledged,
    or a mailbox answering `NOMODSEQ` leaves the folder `.untracked(UntrackedObservation)`: no
@@ -652,7 +654,9 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    once, in the same transaction that stores the new bookmark. Once a bookmark is stored the catch-up
    runs no periodic check, so the arm is never left to the later commit of tracking: a pass with no
    listing, a failed listing or a crash in between would otherwise leave the bookmark without it).
-3. **A read.** STATUS first; an unchanged HIGHESTMODSEQ is `.tracked` with no SELECT. Otherwise
+3. **A read.** STATUS first; an unchanged HIGHESTMODSEQ under the bookmark's UIDVALIDITY (both in the
+   STATUS answer) is `.tracked` with no SELECT; a MODSEQ means nothing outside its UIDVALIDITY, so a
+   STATUS without UIDVALIDITY never takes this shortcut (Codex c7, 2026-11-16). Otherwise
    `SELECT (QRESYNC (uidvalidity modseq))` with its own timeout (`imapChangeSelectTimeoutSeconds`).
    Removals are VANISHED ranges intersected with the folder's held rows (never expanded) and
    `\Deleted` changes; changed flags on held rows are partial records (read, flag, answered,

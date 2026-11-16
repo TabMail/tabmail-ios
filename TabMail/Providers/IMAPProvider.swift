@@ -1326,10 +1326,14 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         // change at all; `wakeOneFolderCapacityWaiter`'s call sites are
         // enumerated in the contract above and every one of them either freed a
         // slot or abandoned capacity it had itself just freed.
+        // The logouts of the connections this call evicts: awaited before its
+        // own LOGIN (`awaitEvictionLogouts`).
+        var evictionLogouts: [Task<Void, Never>] = []
         while folderServers.count >= maxFolderConnections {
             // Eviction order: the change reader's connection between passes,
             // then the least recently used folder connection, then IDLE.
-            guard evictChangeConnectionIfIdle() || evictLRUFolder() || evictIdleConnection() else {
+            guard evictChangeConnectionIfIdle(&evictionLogouts) || evictLRUFolder(&evictionLogouts)
+                || evictIdleConnection(&evictionLogouts) else {
                 // All connections in use and IDLE already evicted — wait for ANY folder to free up
                 if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] All \(folderServers.count) folder connections in use — waiting") }
                 // T3.7 PORT (D-14) — `v2final:…:IMAPProvider
@@ -1386,6 +1390,8 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         // Compiled out of Release; `nil` in every non-test context.
         if let hook = createFolderConnectionCreationTestHook { await hook() }
         #endif
+        // The server counts an evicted session until its LOGOUT is answered.
+        await awaitEvictionLogouts(evictionLogouts)
 
         let t0 = CFAbsoluteTimeGetCurrent()
         // T3.7 PORT (D-13 / R11-H2) — visible across BOTH the primary attempt
@@ -1456,7 +1462,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
 
             // Connection limit hit — evict the change reader's connection between
             // passes, else the LRU folder (or IDLE as last resort), and retry once
-            if isLimitError && (evictChangeConnectionIfIdle() || evictLRUFolder() || evictIdleConnection()) {
+            var retryLogouts: [Task<Void, Never>] = []
+            if isLimitError && (evictChangeConnectionIfIdle(&retryLogouts) || evictLRUFolder(&retryLogouts)
+                || evictIdleConnection(&retryLogouts)) {
                 if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Connection limit hit for \(folder) — evicted LRU, retrying") }
                 #if DEBUG
                 // T3.7 test seam (D-11 / R8-F2): fires right after eviction
@@ -1470,7 +1478,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 // result, never the primary attempt's (already logged out
                 // above, if it ever logged in).
                 createdServer = nil
-                await awaitEvictionLogouts()
+                await awaitEvictionLogouts(retryLogouts)
                 do {
                     let server = try await createServer(diagSite: "folderRetry")
                     createdServer = server
@@ -1524,10 +1532,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         }
     }
 
-    /// Evict the least recently used folder connection that is NOT in use.
+    /// Evict the least recently used folder connection that is NOT in use,
+    /// adding its logout to `logouts`.
     /// Returns true if a connection was evicted, false if all are in use.
-    @discardableResult
-    private func evictLRUFolder() -> Bool {
+    private func evictLRUFolder(_ logouts: inout [Task<Void, Never>]) -> Bool {
         // T3.7 PORT (D-18) — `v2final:…:IMAPProvider.evictLRUFolder`'s
         // candidate filter. `folderLastUsed` is DOUBLE-KEYED: it also carries
         // `"__action__"`, the action pool's own liveness timestamp, which never
@@ -1550,25 +1558,19 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         folderLastUsed.removeValue(forKey: folder)
         if let server {
             noteLogoutAttempt(server)
-            evictionLogouts.append(Task { try? await server.logout() })
+            logouts.append(Task { try? await server.logout() })
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Evicted LRU pinned connection for \(folder)") }
         }
         return true
     }
 
-    /// Logouts of connections evicted to make room under the server's limit,
-    /// not yet awaited. The server counts a session until its LOGOUT is
-    /// answered, so a login retried right after an eviction is refused again
-    /// unless it waits for them (`awaitEvictionLogouts`).
-    private var evictionLogouts: [Task<Void, Never>] = []
-
-    /// Wait, at most `SyncConfig.imapEvictionLogoutWaitSeconds`, for every
-    /// evicted connection's logout to be answered, so the slot it held is free
-    /// before a refused login is retried. A logout that does not answer in time
-    /// leaves the retry to the server's answer, as before.
-    func awaitEvictionLogouts() async {
-        let pending = evictionLogouts
-        evictionLogouts.removeAll()
+    /// Wait, at most `SyncConfig.imapEvictionLogoutWaitSeconds`, for the
+    /// logouts of the connections a caller evicted to make room, so the slots
+    /// they held are free before it logs in. The server counts a session until
+    /// its LOGOUT is answered: a login right after an eviction is otherwise
+    /// refused at the limit. Each caller awaits only its own evictions. A logout
+    /// that does not answer in time leaves the login to the server's answer.
+    private func awaitEvictionLogouts(_ pending: [Task<Void, Never>]) async {
         guard !pending.isEmpty else { return }
         _ = try? await withTimeout(seconds: SyncConfig.imapEvictionLogoutWaitSeconds) {
             for logout in pending { await logout.value }
@@ -3262,7 +3264,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// Test seam: direct pass-through to the private `evictLRUFolder()`, so a
     /// test can exercise eviction without first driving the pool to capacity.
     @discardableResult
-    func evictLRUFolderForTesting() -> Bool { evictLRUFolder() }
+    func evictLRUFolderForTesting() -> Bool {
+        var logouts: [Task<Void, Never>] = []
+        return evictLRUFolder(&logouts)
+    }
 
     /// Test seam: direct pass-through to the private
     /// `keepAlivePinnedConnections()`, so a test can run exactly one keepalive
@@ -3510,16 +3515,16 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         }
     }
 
-    /// Evict the IDLE connection to free a server slot.
+    /// Evict the IDLE connection to free a server slot, adding its DONE and
+    /// logout to `logouts`.
     /// Returns true if an IDLE connection was evicted, false if none was active.
-    @discardableResult
-    private func evictIdleConnection() -> Bool {
+    private func evictIdleConnection(_ logouts: inout [Task<Void, Never>]) -> Bool {
         guard let server = idleServer else { return false }
         if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP:IDLE] Evicting IDLE connection to free server slot") }
         idleListenerTask?.cancel()
         idleListenerTask = nil
         noteLogoutAttempt(server)
-        evictionLogouts.append(Task { try? await server.done(); try? await server.logout() })
+        logouts.append(Task { try? await server.done(); try? await server.logout() })
         idleServer = nil
         // Will relaunch after delay if idleEnabled is still true
         if idleEnabled {
@@ -3532,16 +3537,15 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     }
 
     /// Evict the change reader's connection to free a server slot, only between
-    /// passes (never while a pass holds or is opening it). The next pass opens a
-    /// new session. Returns true if it was evicted.
-    @discardableResult
-    func evictChangeConnectionIfIdle() -> Bool {
+    /// passes (never while a pass holds or is opening it), adding its logout to
+    /// `logouts`. The next pass opens a new session. Returns true if it was evicted.
+    func evictChangeConnectionIfIdle(_ logouts: inout [Task<Void, Never>]) -> Bool {
         guard let server = changeServer, !changeLaneBusy else { return false }
         if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAPChanges] Evicting the idle change connection to free a server slot") }
         changeServer = nil
         changeServerQResync = false
         changeSelectedPath = nil
-        evictionLogouts.append(detachedTeardownLogout(server))
+        logouts.append(detachedTeardownLogout(server))
         return true
     }
 
@@ -3557,9 +3561,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         } catch {
             let isLimitError = "\(error)".contains("max_userip_connections")
             parseAndApplyServerLimit(from: error)
-            guard isLimitError, evictLRUFolder() || evictIdleConnection() else { throw error }
+            var logouts: [Task<Void, Never>] = []
+            guard isLimitError, evictLRUFolder(&logouts) || evictIdleConnection(&logouts) else { throw error }
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAPChanges] Connection limit hit opening the change connection — evicted, retrying") }
-            await awaitEvictionLogouts()
+            await awaitEvictionLogouts(logouts)
             do {
                 return try await createServer(diagSite: "changeRetry")
             } catch {

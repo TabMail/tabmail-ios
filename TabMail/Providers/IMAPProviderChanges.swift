@@ -281,9 +281,12 @@ extension IMAPProvider {
         if let served = observation.uidValidity, served != Int(cursor.uidValidity) {
             return FolderChanges(folderId: folder.id, status: .refused(.addressEpochChanged(served)))
         }
-        // An unchanged HIGHESTMODSEQ: nothing changed. A STATUS without one is
-        // never read as "unchanged".
-        if let modseq = observation.highestModSeq, UInt64(modseq) == cursor.highestModSeq, recheckIds.isEmpty {
+        // An unchanged HIGHESTMODSEQ under the bookmark's own UIDVALIDITY:
+        // nothing changed. A STATUS without either is never read as "unchanged":
+        // a MODSEQ means nothing outside its UIDVALIDITY (a renumbered folder can
+        // restart at the same value); the QRESYNC SELECT below reports both.
+        if observation.uidValidity == Int(cursor.uidValidity), let modseq = observation.highestModSeq,
+           UInt64(modseq) == cursor.highestModSeq, recheckIds.isEmpty {
             return FolderChanges(
                 folderId: folder.id, status: .tracked,
                 cursor: cursor.failingSince == nil ? nil : IMAPChangeCursor(

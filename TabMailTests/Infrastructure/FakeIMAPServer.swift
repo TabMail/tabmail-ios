@@ -239,6 +239,9 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// server assigning modseqs at mutation time. Reset (the history dropped)
         /// when the mailbox's UIDVALIDITY changes.
         var qresyncByMailbox: [String: QResyncMailbox] = [:]
+        /// `setUidValidity(_:for:highestModSeq:)`: the HIGHESTMODSEQ the next
+        /// epoch's model starts at, in place of one past the old epoch's.
+        var qresyncModSeqStartByMailbox: [String: Int] = [:]
         /// STATUS attributes a mailbox's answer leaves out (a server may omit one).
         var statusOmittedAttributesByMailbox: [String: Set<String>] = [:]
         /// Mailboxes whose QRESYNC SELECT reports no FETCH for messages added
@@ -1060,6 +1063,16 @@ final class FakeIMAPServer: @unchecked Sendable {
         withState { $0.uidValidityByMailbox[mailbox] = value }
     }
 
+    /// A renumbered mailbox whose MODSEQ restarted: the new UIDVALIDITY's
+    /// HIGHESTMODSEQ is `highestModSeq`, which may equal the old epoch's (RFC
+    /// 7162 gives a MODSEQ meaning only under its UIDVALIDITY).
+    func setUidValidity(_ value: Int, for mailbox: String, highestModSeq: Int) {
+        withState { state in
+            state.uidValidityByMailbox[mailbox] = value
+            state.qresyncModSeqStartByMailbox[mailbox] = highestModSeq
+        }
+    }
+
     /// Test-only authority read for id-reset disposition witnesses. The
     /// production parser observes the same default (`1`) when a fixture has
     /// not overridden a mailbox, and the state lock makes the read atomic
@@ -1747,9 +1760,9 @@ final class FakeIMAPServer: @unchecked Sendable {
         setsockopt(clientFd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
         trackClientFd(clientFd)
 
-        DispatchQueue.global().async { [weak self] in
-            self?.handleClient(fd: clientFd)
-        }
+        // Strong: only `handleClient` closes a connection's fd (`stop()` shuts it
+        // down), so the worker must run even if the server is released first.
+        DispatchQueue.global().async { self.handleClient(fd: clientFd) }
     }
 
     private func handleClient(fd: Int32) {
@@ -2220,7 +2233,8 @@ final class FakeIMAPServer: @unchecked Sendable {
         let currentUIDs = Set(messages.map(\.uid))
         let currentMax = messages.map(\.uid).max() ?? 0
         guard var model = state.qresyncByMailbox[mailbox], model.epoch == epoch else {
-            let start = (state.qresyncByMailbox[mailbox]?.highestModSeq ?? 0) + 1
+            let start = state.qresyncModSeqStartByMailbox.removeValue(forKey: mailbox)
+                ?? (state.qresyncByMailbox[mailbox]?.highestModSeq ?? 0) + 1
             var modSeqs: [Int: Int] = [:]
             var flagSets: [Int: Set<String>] = [:]
             for uid in currentUIDs {

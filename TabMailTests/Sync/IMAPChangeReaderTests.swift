@@ -751,9 +751,10 @@ struct IMAPChangeReaderTests {
         w.server.recordedCommands().filter { $0.uppercased().hasPrefix("LOGOUT") }.count
     }
 
-    /// Polls `condition` (detached logouts land asynchronously).
-    static func eventually(_ condition: () -> Bool) async -> Bool {
-        for _ in 0..<200 {
+    /// Polls `condition` for up to `timeout` seconds (detached logouts land asynchronously).
+    static func eventually(timeout: TimeInterval = 2, _ condition: () -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
             if condition() { return true }
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
@@ -1033,6 +1034,87 @@ struct IMAPChangeReaderTests {
             #expect(await w.provider.changeServer != nil, "the change connection was kept through the pass")
             #expect(await w.provider.currentIdleServerForTesting() == nil, "IDLE made room instead")
             await w.provider.stopIdle()
+        }
+    }
+
+    @Test("Capacity eviction: a folder login made after the idle change connection was evicted waits for its logout, so it is never refused")
+    func capacityEvictionWaitsForTheLogout() async throws {
+        try await Self.withLimitedWorld(maxSessions: 3) { w in
+            _ = try await Self.baseline(w)
+            // Learn the limit (3): the inbox login is refused once, the idle change connection makes room.
+            w.server.refuseNextLogins(1)
+            _ = try await w.provider.fetchMessages(folder: Self.inboxPath, limit: 10, offset: 0)
+            // Action, inbox and change connection: the limit is full again.
+            _ = try await Self.inbox(w, Self.read(w))
+            #expect(await w.provider.changeServer != nil, "setup: the change connection is open")
+            #expect(w.server.liveSessionCount() == 3, "setup: three sessions")
+
+            // The archive fetch evicts the idle change connection before its login
+            // (the pool is full); that connection's LOGOUT answers late.
+            w.server.stallNextCommand(containing: "LOGOUT", seconds: 0.5)
+            let refusedBefore = w.server.refusedLoginCount()
+            let archive = try await w.provider.fetchMessages(folder: Self.archivePath, limit: 10, offset: 0)
+            #expect(archive.isEmpty, "the folder fetch completes")
+            #expect(await w.provider.changeServer == nil, "the idle change connection made room")
+            #expect(w.server.refusedLoginCount() == refusedBefore,
+                    "the login waited for the evicted session's logout and was not refused")
+        }
+    }
+
+    @Test("Limit retry: an evicted connection whose LOGOUT never answers holds the folder login only up to the wait bound; the next fetch works")
+    func folderRetryWaitIsBounded() async throws {
+        try await Self.withLimitedWorld(maxSessions: 2) { w in
+            _ = try await Self.baseline(w)
+            // Action and change connection fill the limit; the inbox login is refused
+            // and the idle change connection is evicted, its LOGOUT stalled past the bound.
+            let stall = SyncConfig.imapEvictionLogoutWaitSeconds + 2
+            w.server.stallNextCommand(containing: "LOGOUT", seconds: stall)
+            let start = Date()
+            do {
+                _ = try await w.provider.fetchMessages(folder: Self.inboxPath, limit: 10, offset: 0)
+                Issue.record("the retry logged in while the evicted session still counted")
+            } catch {
+                #expect("\(error)".contains("max_userip_connections"), "the server's refusal decides: \(error)")
+            }
+            #expect(Date().timeIntervalSince(start) < stall, "the retry went ahead before the stalled logout answered")
+            #expect(await Self.eventually(timeout: stall) { w.server.liveSessionCount() == 1 }, "setup: the stalled logout answered")
+            let fetched = try await w.provider.fetchMessages(folder: Self.inboxPath, limit: 10, offset: 0)
+            #expect(fetched.count == 3, "the next fetch works")
+        }
+    }
+
+    @Test("Change-connection retry: an evicted connection whose LOGOUT never answers holds the pass only up to the wait bound; the next pass works")
+    func changeRetryWaitIsBounded() async throws {
+        try await Self.withLimitedWorld(maxSessions: 2) { w in
+            // Action and an idle inbox connection fill the limit.
+            _ = try await w.provider.fetchMessages(folder: Self.inboxPath, limit: 10, offset: 0)
+            let stall = SyncConfig.imapEvictionLogoutWaitSeconds + 2
+            w.server.stallNextCommand(containing: "LOGOUT", seconds: stall)
+            let start = Date()
+            let first = try await Self.inbox(w, Self.read(w))
+            guard case .failed = first.status else { Issue.record("expected failed, got \(first.status)"); return }
+            #expect(Date().timeIntervalSince(start) < stall, "the retry went ahead before the stalled logout answered")
+            #expect(await Self.eventually(timeout: stall) { w.server.liveSessionCount() == 1 }, "setup: the stalled logout answered")
+            let next = try await Self.inbox(w, Self.read(w))
+            guard case .baselineReady = next.status else { Issue.record("the next pass: expected baselineReady, got \(next.status)"); return }
+        }
+    }
+
+    @Test("Epoch: a STATUS without UIDVALIDITY never reads a renumbered folder whose HIGHESTMODSEQ restarted at the same value as unchanged")
+    func coincidingModSeqUnderANewEpochRefuses() async throws {
+        try await Self.withWorld(inbox: [1, 2]) { w in
+            let cursor = try await Self.baseline(w)
+            let bookmark = try #require(IMAPChangeCursor.decode(cursor))
+            w.server.setStatusOmits(["UIDVALIDITY"], for: Self.inboxPath)
+            w.server.setUidValidity(Self.epoch + 1, for: Self.inboxPath, highestModSeq: Int(bookmark.highestModSeq))
+            #expect(w.server.qresyncHighestModSeq(for: Self.inboxPath) == Int(bookmark.highestModSeq),
+                    "setup: the new epoch's HIGHESTMODSEQ equals the bookmark's")
+            await w.provider.markDirty()
+            let changes = try await Self.inbox(w, Self.read(w, cursors: [w.inboxId: cursor]))
+            guard case .refused(.addressEpochChanged(let served)) = changes.status else {
+                Issue.record("expected refused(addressEpochChanged), got \(changes.status)"); return
+            }
+            #expect(served == Self.epoch + 1)
         }
     }
 
