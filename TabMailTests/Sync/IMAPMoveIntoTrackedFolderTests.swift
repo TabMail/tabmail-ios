@@ -683,6 +683,32 @@ struct IMAPMoveIntoTrackedFolderTests {
         }
     }
 
+    @Test("A message moved into a tracked folder and then marked \\Deleted elsewhere is no longer shown after the change pass, and stays hidden on the next one")
+    @MainActor
+    func movedInMessageDeletedElsewhereIsNotShown() async throws {
+        try await Self.withWorld("moved-in-deleted", capabilities: FakeIMAPServer.defaultCapabilities + Self.qresync,
+                                 archive: [50], local: ["Archive": [50]], tracked: ["INBOX", "Archive"]) { _ in } _: { w in
+            await AccountManager.shared.move([try w.seeded()], to: "Archive")
+            try await w.drain()
+            let onServer = w.server.uids(in: "Archive", rfc822MessageId: Self.target)
+            #expect(onServer.count == 1, "setup: the server holds the moved message once in Archive")
+            guard let uid = onServer.first else { return }
+            #expect(try w.heldTarget().map { "\($0.folderPath)/\($0.messageId)" } == ["Archive/\(uid)"],
+                    "setup: the device shows it in Archive under the server's UID")
+            #expect(try w.folder("Archive").changeCursor != nil, "setup: Archive keeps its bookmark through the proven move")
+
+            // Another client marks it \Deleted and does not expunge it.
+            w.server.setFlags(["\\Deleted"], in: "Archive", uid: uid)
+            try await w.changePass()
+            #expect(try w.heldTarget().isEmpty, "a message the server holds as \\Deleted is not shown")
+            #expect(w.server.uids(in: "Archive", rfc822MessageId: Self.target) == [uid], "setup: the server still holds it")
+
+            try await w.changePass()
+            #expect(try w.heldTarget().isEmpty, "the next change pass does not bring it back")
+            #expect(w.server.wrongMessageViolations().isEmpty)
+        }
+    }
+
     @Test("A proven destination under a UIDVALIDITY the folder does not share: the listing is due at once, and one copy after the normal sync")
     @MainActor
     func destinationEpochDisagreement() async throws {

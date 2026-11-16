@@ -1220,4 +1220,23 @@ struct IMAPChangeReaderTests {
             #expect(Self.uidFetches(w, since: start).isEmpty, "the deleted arrival is not fetched: \(Self.uidFetches(w, since: start))")
         }
     }
+
+    @Test("A held message at or above the bookmark's UIDNEXT (a moved-in row) marked \\Deleted is a removal; an unheld one beside it is not")
+    func deletedHeldArrivalIsRemoved() async throws {
+        try await Self.withWorld(inbox: [1, 2]) { w in
+            let cursor = try await Self.baseline(w)
+            // 3 came in by a move the device already re-keyed to it; 4 is new.
+            w.server.setMessages([1, 2, 3, 4].map(Self.message), in: Self.inboxPath)
+            w.local.set(w.inboxId, [1, 2, 3])
+            w.server.setFlags(["\\Deleted"], in: Self.inboxPath, uid: 3)
+            w.server.setFlags(["\\Deleted"], in: Self.inboxPath, uid: 4)
+            let start = w.server.recordedCommands().count
+            let changes = try await Self.inbox(w, Self.read(w, cursors: [w.inboxId: cursor]))
+            #expect(Self.isTracked(changes.status))
+            #expect(changes.removals.contains("3"), "the held message the server holds as \\Deleted is removed: \(changes.removals)")
+            #expect(!changes.removals.contains("4"), "a message the folder does not hold is not reported")
+            #expect(!changes.records.contains { $0.messageId == "3" || $0.messageId == "4" })
+            #expect(Self.uidFetches(w, since: start).isEmpty, "neither is fetched: \(Self.uidFetches(w, since: start))")
+        }
+    }
 }

@@ -24,9 +24,11 @@ import SwiftMail
 //   - `VANISHED (EARLIER)` and live VANISHED become removals, intersected with the
 //     folder's local rows range by range, never expanded (a server may report a
 //     superset, RFC 7162 §3.2.5);
-//   - changed FLAGS below the bookmark's UIDNEXT become partial records (the
-//     whole flag and keyword set); a `\Deleted` one becomes a removal of the
-//     local row (IOS-IMAP-001 D3); a changed message the folder does not hold,
+//   - a changed message marked `\Deleted` becomes a removal of the folder's row
+//     for it wherever its UID sits (IOS-IMAP-001 D3), at or above the bookmark's
+//     UIDNEXT too (a moved-in row re-keyed there); one it does not hold is ignored;
+//   - other changed FLAGS below the bookmark's UIDNEXT become partial records (the
+//     whole flag and keyword set); a changed message the folder does not hold,
 //     inside the range the older-mail walk has downloaded (`heldRangeStart`,
 //     never the lowest row held now), is fetched in full (an un-deleted one);
 //   - UIDs at or above the bookmark's UIDNEXT are arrivals, fetched in full on
@@ -327,22 +329,25 @@ extension IMAPProvider {
 
         // Changed flags and arrivals.
         let changed = resync.changedFlags
-        let belowCursor = changed.keys.map(\.value).filter { $0 < cursor.uidNext }
-        let held = try await heldIdSet(belowCursor, folderId: folder.id, request: request)
+        // Held rows are looked up below the bookmark's UIDNEXT and, for a
+        // `\Deleted` message, at or above it too: a moved-in row is re-keyed to
+        // its destination UID there before the folder's next read.
+        let heldCandidates = changed.filter { $0.key.value < cursor.uidNext || $0.value.contains(.deleted) }.map(\.key.value)
+        let held = try await heldIdSet(heldCandidates, folderId: folder.id, request: request)
         let heldFrom = Self.heldRangeStart(folder)
         var toFetch: [UInt32] = []
         for (uid, flags) in changed.sorted(by: { $0.key.value < $1.key.value }) {
             let value = uid.value
-            let deleted = flags.contains(.deleted)
-            if value >= cursor.uidNext {
-                if !deleted { toFetch.append(value) }
+            if flags.contains(.deleted) {
+                // A message the server holds as `\Deleted` is never shown: the
+                // folder's row for it goes, wherever its UID sits. One it does not
+                // hold is neither fetched nor inserted.
+                if held.contains(value) { changes.removals.append(String(value)) }
+            } else if value >= cursor.uidNext {
+                toFetch.append(value)
             } else if held.contains(value) {
-                if deleted {
-                    changes.removals.append(String(value))
-                } else {
-                    changes.records.append(Self.flagRecord(uid: value, flags: flags))
-                }
-            } else if !deleted, let heldFrom, Int(value) >= heldFrom {
+                changes.records.append(Self.flagRecord(uid: value, flags: flags))
+            } else if let heldFrom, Int(value) >= heldFrom {
                 // Changed, not held, within the held range: un-deleted, or removed
                 // locally by an earlier read. Only its full record can bring it back.
                 toFetch.append(value)

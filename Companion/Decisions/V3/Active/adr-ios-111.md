@@ -667,11 +667,13 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    STATUS without UIDVALIDITY never takes this shortcut (Codex c7, 2026-11-16). Otherwise
    `SELECT (QRESYNC (uidvalidity modseq))` with its own timeout (`imapChangeSelectTimeoutSeconds`).
    Removals are VANISHED ranges intersected with the folder's held rows (never expanded) and
-   `\Deleted` changes; changed flags on held rows are partial records (read, flag, answered,
+   `\Deleted` changes on any row the folder holds, at or above the bookmark's UIDNEXT too (a
+   moved-in row re-keyed to its destination UID there; a message the server holds as `\Deleted` is
+   never shown); changed flags on held rows are partial records (read, flag, answered,
    `$Forwarded`, keywords as user labels); new UIDs and changed-not-held UIDs inside the held range
    are fetched in full and counted against `imapChangeArrivalsLimit` (100); over it the bookmark is
    refused (`.tooFarBehind`) and nothing is fetched (Q12 ruling A: the refusal arms the folder's
-   whole-folder catch-up, and the next baseline arms it once more at commit, so older-mail changes made
+   whole-folder catch-up, and the next baseline arms it once more with its bookmark (item 2), so older-mail changes made
    while the old bookmark lived are caught up). Arrivals do not rely on the SELECT's FETCH stream:
    RFC 7162 §3.2.5.1 says only "The server sends the client any pending flag changes (using FETCH
    responses that MUST contain UIDs) and expunges those that have occurred in this mailbox since the
