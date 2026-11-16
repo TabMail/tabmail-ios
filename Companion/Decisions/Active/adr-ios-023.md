@@ -40,4 +40,10 @@
 - ChatHistoryView and Settings Chat History are unaffected — full history accessible from Settings
 - Session state survives SwiftUI view recreation via `ChatPillState` singleton
 
+**Note (2026-11-16, ADR-IOS-114 decision 14):** the Chat pill on an email no longer holds that email's
+own session: it shows and continues its thread's chat (every email of the thread, all accounts,
+merged by time, `ThreadChatReader`), and every request names the thread's newest email, also when
+the email screen shows an older one. Old thread chats are cleared by thread, and a thread with any
+Inbox email keeps its chat. Inbox sessions, their swipe pages and compose sessions are unchanged.
+
 ---
