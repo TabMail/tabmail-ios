@@ -64,10 +64,13 @@ struct ChangeFolder: Sendable, Equatable {
 /// by the engine when the pass's turn starts (root rule: snapshot settings at
 /// operation start). The reader never re-reads the network state itself.
 struct ChangeContext: Sendable {
-    /// No request may START at or after this instant. The engine sets it from
-    /// the caller's own deadline, leaving room for one request to finish and for
-    /// the apply (`SyncEngine.changeReadEnd`), so what a pass reads lands before
-    /// the caller gives up on it.
+    /// No new unit of reading may START at or after this instant: a request, or
+    /// on Gmail a history page or record. Gmail finishes the reads of a record
+    /// it has taken, and of the messages still queued, past it (ADR-IOS-111,
+    /// #491). The engine sets it from the caller's own deadline, leaving room for
+    /// one round of requests to finish and for the apply
+    /// (`SyncEngine.changeReadEnd`), so what a pass reads lands before the
+    /// caller gives up on it.
     let deadline: Date
     /// The clock the budget is measured on; injectable for tests.
     let clock: @Sendable () -> Date
@@ -86,7 +89,8 @@ struct ChangeContext: Sendable {
         self.onProgress = onProgress
     }
 
-    /// Checked before EVERY request: false once the read budget is spent.
+    /// Checked before every new unit of reading: false once the read budget is
+    /// spent.
     func hasBudget() -> Bool { clock() < deadline }
 
     /// The read budget left, in seconds (never negative).

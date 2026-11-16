@@ -28,3 +28,21 @@ struct DeltaLabelChange: Sendable {
     /// still in inbox").
     let currentLabels: [String]
 }
+
+/// One Gmail `users.history.list` page, record by record, for a reader that
+/// can stop after any record and resume there (`startHistoryId` = that
+/// record's id returns the records after it).
+struct HistoryPage: Sendable {
+    /// The page's `historyId`: the mailbox's current history id when it was served.
+    let historyId: String
+    /// In Gmail's order, increasing id.
+    let records: [HistoryRecord]
+    /// Nil on the last page.
+    let nextPageToken: String?
+}
+
+/// One history record: its id and the changes it names (`changes.cursor` is empty).
+struct HistoryRecord: Sendable {
+    let id: String
+    let changes: HistoryDelta
+}

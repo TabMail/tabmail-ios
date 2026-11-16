@@ -1471,56 +1471,6 @@ actor GmailProvider: EmailProvider {
 
     // MARK: - Incremental Sync
 
-    func fetchHistory(since historyId: String) async throws -> HistoryResponse? {
-        BackgroundSyncLogger.log("gmail.fetchHistory: START hid=\(historyId) email=\(userEmail)")
-
-        // Route through Shared/API/GmailAPI — single implementation for main app
-        // and NSE. 404 (historyId expired), and history over
-        // `GmailAPI.historyMaxChanges` records or changed messages or
-        // `GmailAPI.historyMaxPages` pages, surface as nil so callers fall
-        // back to full sync.
-        let http = AuthedHTTP(
-            auth: AccountAuthSource(accountId: userEmail, accessToken: accessToken),
-            retry: .gmail, logLabel: "Gmail", session: testSession
-        )
-
-        let delta: HistoryDelta?
-        do {
-            delta = try await GmailAPI.historyList(
-                http: http,
-                startHistoryId: historyId,
-                historyTypes: ["messageAdded", "messageDeleted", "labelAdded", "labelRemoved"],
-                labelId: nil
-            )
-        } catch {
-            BackgroundSyncLogger.log("gmail.fetchHistory: ERROR \(error)")
-            throw ProviderError.networkError(underlying: error)
-        }
-        guard let delta else {
-            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Gmail] History expired or too long (historyId: \(historyId)) — need full sync") }
-            BackgroundSyncLogger.log("gmail.fetchHistory: history expired or too long")
-            return nil
-        }
-
-        BackgroundSyncLogger.log("gmail.fetchHistory: decoded newHid=\(delta.cursor) adds=\(delta.added.count) dels=\(delta.removed.count) labAdds=\(delta.labelsAdded.count) labRms=\(delta.labelsRemoved.count)")
-
-        // Convert shared HistoryDelta → main-app HistoryResponse at the boundary.
-        let added = delta.added.map { HistoryMessageRef(messageId: $0.providerMessageId, labelIds: $0.providerLabels) }
-        let deleted = delta.removed.map { HistoryMessageRef(messageId: $0.providerMessageId, labelIds: $0.providerLabels) }
-        let labelsAdded = delta.labelsAdded.map { HistoryLabelChange(messageId: $0.providerMessageId, labelIds: $0.labelIds) }
-        let labelsRemoved = delta.labelsRemoved.map { HistoryLabelChange(messageId: $0.providerMessageId, labelIds: $0.labelIds) }
-
-        if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Gmail] History: +\(added.count) added, -\(deleted.count) deleted, \(labelsAdded.count) label adds, \(labelsRemoved.count) label removes") }
-
-        return HistoryResponse(
-            newHistoryId: delta.cursor,
-            messagesAdded: added,
-            messagesDeleted: deleted,
-            labelsAdded: labelsAdded,
-            labelsRemoved: labelsRemoved
-        )
-    }
-
     func fetchMessageHeaders(ids: [String]) async throws -> [MessageHeaderInfo] {
         var headers: [MessageHeaderInfo] = []
         for id in ids {
@@ -1653,9 +1603,10 @@ actor GmailProvider: EmailProvider {
     // MARK: - HTTP
 
     /// Lazily-built `AuthedHTTP` for Gmail. Shared 401-retry + rate-limit policy;
-    /// auth via `AccountAuthSource` wrapping the existing closure.
+    /// auth via `AccountAuthSource` wrapping the existing closure. Also the
+    /// history read's client (`readHistory`).
     private var authedHTTPCached: AuthedHTTP?
-    private var authedHTTP: AuthedHTTP {
+    var authedHTTP: AuthedHTTP {
         if let cached = authedHTTPCached { return cached }
         let built = AuthedHTTP(
             auth: AccountAuthSource(accountId: userEmail, accessToken: accessToken),

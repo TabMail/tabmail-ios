@@ -116,10 +116,11 @@ final class StatefulGmailActionServer: @unchecked Sendable {
 
     private struct HistoryEvent: Sendable {
         let id: Int
-        let providerMessageId: String
+        /// The messages the change named, each with its labels after the
+        /// change. One message, except for a conversation-wide change
+        /// (`applyConversationLabelChange`).
+        let messages: [(providerMessageId: String, labels: [String])]
         let change: HistoryChange
-        /// The message's labels after the change.
-        let labels: [String]
     }
 
     private struct State: Sendable {
@@ -281,8 +282,11 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         var badRequestedPageTokens: [String] = []
         /// `/history` answers `404` (expired) for any `startHistoryId` below this.
         var historyFloor = 0
-        /// `/history` answers with more records than one delta takes on.
-        var historyTooLong = false
+        /// Most records one `/history` page holds; a longer history continues
+        /// on the next page (`nextPageToken`).
+        var historyPageSize = GmailAPI.historyPageSize
+        /// Called as each `/history` page is served.
+        var historyPageHook: (@Sendable () -> Void)?
 
         /// Record the label difference between `before` and `after` as history,
         /// as Gmail does for every label change it applies. Labels the message
@@ -299,7 +303,7 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         mutating func record(_ providerMessageId: String, _ change: HistoryChange, labels: Set<String>) {
             historyId += 1
             history.append(HistoryEvent(
-                id: historyId, providerMessageId: providerMessageId, change: change, labels: labels.sorted()))
+                id: historyId, messages: [(providerMessageId, labels.sorted())], change: change))
         }
     }
 
@@ -525,6 +529,23 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         }
     }
 
+    /// Another client adds `labels` to a whole conversation at once: ONE
+    /// history record names every message in `providerMessageIds`, as Gmail's
+    /// does for a conversation-wide change. Every message must lack every label.
+    func applyConversationLabelChange(providerMessageIds: [String], add labels: Set<String>) {
+        state.value.withLock { model in
+            var named: [(providerMessageId: String, labels: [String])] = []
+            for id in providerMessageIds {
+                guard var message = model.messagesByProviderId[id] else { continue }
+                message.labels.formUnion(labels)
+                model.messagesByProviderId[id] = message
+                named.append((id, message.labels.sorted()))
+            }
+            model.historyId += 1
+            model.history.append(HistoryEvent(id: model.historyId, messages: named, change: .labelsAdded(labels.sorted())))
+        }
+    }
+
     /// The mailbox's current `historyId`, the cursor a synced client holds.
     func currentHistoryId() -> String {
         state.value.withLock { String($0.historyId) }
@@ -536,10 +557,15 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         state.value.withLock { $0.historyFloor = $0.historyId }
     }
 
-    /// While on, `/history` answers with more records than one delta takes on
-    /// (`GmailAPI.historyMaxChanges`), as after a burst of changes.
-    func answerHistoryTooLong(_ on: Bool) {
-        state.value.withLock { $0.historyTooLong = on }
+    /// `/history` serves at most `size` records per page (Gmail may return
+    /// pages shorter than `maxResults`), each page but the last with a
+    /// `nextPageToken`. `onPage` runs as each page is served (a test advances
+    /// its clock there).
+    func serveHistoryPages(of size: Int, onPage: (@Sendable () -> Void)? = nil) {
+        state.value.withLock {
+            $0.historyPageSize = size
+            $0.historyPageHook = onPage
+        }
     }
 
     /// Serve `/profile` with the mailbox's history id.
@@ -1165,46 +1191,42 @@ final class StatefulGmailActionServer: @unchecked Sendable {
             return .bytes(body, contentType: "application/json")
         }
         // `history.list`: every recorded change newer than `startHistoryId`,
-        // one record each, with the mailbox's current `historyId`. Each record's
-        // message carries its labels after the change, as Gmail's does. A cursor
-        // below the floor `expireHistory()` set is answered `404` (expired); with
-        // `answerHistoryTooLong(true)` the answer holds more records than one
-        // delta takes on. A cursor older than the fake's first id is otherwise
+        // one record each (its `id` the history id the change took), in
+        // increasing id, with the mailbox's current `historyId`. Each record's
+        // message carries its labels after the change, as Gmail's does. A page
+        // holds at most `serveHistoryPages(of:)` records; its `nextPageToken`
+        // names the last record served, and the next page starts after it. A
+        // cursor below the floor `expireHistory()` set is answered `404`
+        // (expired). A cursor older than the fake's first id is otherwise
         // answered (no expiry unless asked).
         http.register(path: "/history", method: "GET") { [state] request in
-            let start = (URLComponents(url: request.url, resolvingAgainstBaseURL: false)?.queryItems ?? [])
-                .first(where: { $0.name == "startHistoryId" })?.value.flatMap(Int.init) ?? 0
-            let (events, historyId, expired, tooLong) = state.value.withLock { model in
-                (model.history.filter { $0.id > start }, model.historyId, start < model.historyFloor, model.historyTooLong)
+            let queryItems = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+            let start = queryItems.first(where: { $0.name == "startHistoryId" })?.value.flatMap(Int.init) ?? 0
+            let after = queryItems.first(where: { $0.name == "pageToken" })?.value
+                .flatMap { Int($0.replacingOccurrences(of: "after-", with: "")) } ?? start
+            let (events, historyId, expired, pageSize, pageHook) = state.value.withLock { model in
+                (model.history.filter { $0.id > max(start, after) }, model.historyId, start < model.historyFloor,
+                 model.historyPageSize, model.historyPageHook)
             }
             if expired { return .status(404) }
-            let records: [[String: Any]]
-            if tooLong {
-                records = (0...GmailAPI.historyMaxChanges).map { index in
-                    ["id": String(historyId), "labelsAdded": [[
-                        "message": ["id": "history-burst-\(index)", "threadId": "thread-history-burst-\(index)", "labelIds": ["UNREAD"]],
-                        "labelIds": ["UNREAD"],
-                    ]]]
+            pageHook?()
+            let served = events.prefix(pageSize)
+            let records = served.map { event -> [String: Any] in
+                let messages: [[String: Any]] = event.messages.map { named in [
+                    "id": named.providerMessageId, "threadId": "thread-\(named.providerMessageId)", "labelIds": named.labels,
+                ] }
+                var record: [String: Any] = ["id": String(event.id)]
+                switch event.change {
+                case .messageAdded: record["messagesAdded"] = messages.map { ["message": $0] }
+                case .messageDeleted: record["messagesDeleted"] = messages.map { ["message": $0] }
+                case .labelsAdded(let labels): record["labelsAdded"] = messages.map { ["message": $0, "labelIds": labels] }
+                case .labelsRemoved(let labels): record["labelsRemoved"] = messages.map { ["message": $0, "labelIds": labels] }
                 }
-            } else {
-                records = events.map { event -> [String: Any] in
-                    let message: [String: Any] = [
-                        "id": event.providerMessageId, "threadId": "thread-\(event.providerMessageId)", "labelIds": event.labels,
-                    ]
-                    var record: [String: Any] = ["id": String(event.id)]
-                    switch event.change {
-                    case .messageAdded: record["messagesAdded"] = [["message": message]]
-                    case .messageDeleted: record["messagesDeleted"] = [["message": message]]
-                    case .labelsAdded(let labels): record["labelsAdded"] = [["message": message, "labelIds": labels]]
-                    case .labelsRemoved(let labels): record["labelsRemoved"] = [["message": message, "labelIds": labels]]
-                    }
-                    return record
-                }
+                return record
             }
-            let body = (try? JSONSerialization.data(withJSONObject: [
-                "history": records,
-                "historyId": String(historyId),
-            ])) ?? Data()
+            var json: [String: Any] = ["history": Array(records), "historyId": String(historyId)]
+            if events.count > served.count, let last = served.last { json["nextPageToken"] = "after-\(last.id)" }
+            let body = (try? JSONSerialization.data(withJSONObject: json)) ?? Data()
             return .bytes(body, contentType: "application/json")
         }
         http.register(path: "/messages/", method: "GET") { [state] request in

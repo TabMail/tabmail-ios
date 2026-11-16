@@ -795,25 +795,6 @@ func httpStatus(of error: Error) -> Int? {
     return (underlying as NSError).code
 }
 
-/// Result of a Gmail history.list call — tells us exactly what changed since last sync
-struct HistoryResponse: Sendable {
-    let newHistoryId: String
-    let messagesAdded: [HistoryMessageRef]
-    let messagesDeleted: [HistoryMessageRef]
-    let labelsAdded: [HistoryLabelChange]
-    let labelsRemoved: [HistoryLabelChange]
-}
-
-struct HistoryMessageRef: Sendable {
-    let messageId: String
-    let labelIds: [String]
-}
-
-struct HistoryLabelChange: Sendable {
-    let messageId: String
-    let labelIds: [String]
-}
-
 /// Lightweight body-only fetch result for FTS indexing.
 /// Skips header parsing, attachment metadata, and inline image resolution.
 struct TextBodyFetchResult: Sendable {

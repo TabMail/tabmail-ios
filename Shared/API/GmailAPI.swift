@@ -56,29 +56,28 @@ enum GmailAPI {
     /// default is 100), to keep the number of round trips low.
     static let historyPageSize = 500
 
-    /// Most `users.history.list` pages read in one call. With
-    /// `historyMaxChanges` in force this binds only when Gmail returns many
-    /// sparse pages. History longer than this is answered like an expired
-    /// history id (nil, so the caller runs a full sync): the cursor must never
-    /// move past pages that were not read, and a cap that threw instead would
-    /// fail the same way on every retry.
+    /// Most `users.history.list` pages read in one call or one change pass.
+    /// The app's change reader stops there and resumes after the last record
+    /// it read on its next pass (`GmailProvider.readHistory`). The notification
+    /// extension's `historyList` answers a longer history like an expired
+    /// history id (nil): its cursor must never move past pages that were not
+    /// read, and a cap that threw instead would fail the same way on every retry.
     static let historyMaxPages = 40
 
-    /// Most history records, and most distinct changed messages, one delta
-    /// takes on. The app's delta fetches each changed message with its own
-    /// GET, `maxConcurrentRequests` at a time, and saves those messages and the
-    /// new cursor only after the GETs, all under the per-account sync deadline, so a delta bigger
-    /// than the deadline can carry times out before its cursor moves and fails
-    /// the same way on every poll. One record can name many
-    /// messages (a conversation-wide archive or label change names each
-    /// message in it), so the messages are counted, not only the records.
-    /// The value is Gmail's default page size, the delta the app took on before
-    /// it read further pages. A larger delta is answered like an expired
-    /// history id (nil): the caller clears its cursor and the full sync runs
-    /// instead. Reading stops at the page that crosses either bound.
+    /// Most history records, and most distinct changed messages, the
+    /// notification extension's `historyList` takes on; a longer history is
+    /// answered like an expired history id (nil), and reading stops at the page
+    /// that crosses either bound. One record can name many messages (a
+    /// conversation-wide archive or label change names each message in it), so
+    /// the messages are counted, not only the records. The value is Gmail's
+    /// default page size. The app's change reader has no such count: it reads
+    /// record by record within its pass's time budget and resumes where it
+    /// stopped on the next pass (`GmailProvider.readHistory`, #491).
     static let historyMaxChanges = 100
 
-    /// `users.history.list` — incremental changes since `startHistoryId`.
+    /// `users.history.list` — incremental changes since `startHistoryId`, read
+    /// whole. The notification extension's read; the app's change reader reads
+    /// page by page (`historyPage`).
     /// `historyTypes` filters which events are returned (Gmail default = all four).
     /// `labelId` restricts to a single label (e.g. "INBOX"); pass nil for mailbox-wide.
     ///
@@ -136,6 +135,42 @@ enum GmailAPI {
             pageToken = next
         }
         return nil
+    }
+
+    /// One `users.history.list` page after `startHistoryId` (`pageToken` nil =
+    /// the first page), `historyPageSize` records at most, record by record.
+    /// The app's change reader reads the history page by page with this and may
+    /// stop after any record (`GmailProvider.readHistory`); the notification
+    /// extension reads it whole through `historyList`. Nil when Gmail responds 404
+    /// (the history id has expired; the caller runs a full sync). Any other
+    /// error throws.
+    static func historyPage(
+        http: AuthedHTTP,
+        startHistoryId: String,
+        pageToken: String?,
+        historyTypes: [String] = ["messageAdded", "messageDeleted", "labelAdded", "labelRemoved"]
+    ) async throws -> HistoryPage? {
+        var query: [String] = ["startHistoryId=\(startHistoryId)", "maxResults=\(historyPageSize)"]
+        for t in historyTypes { query.append("historyTypes=\(t)") }
+        if let pageToken {
+            guard let encoded = StrictPercentEncoding.component(pageToken) else {
+                throw HTTPError.invalidURL("history.list pageToken")
+            }
+            query.append("pageToken=\(encoded)")
+        }
+        let res = try await http.requestAllowing404(url: "\(baseURL)/history?" + query.joined(separator: "&"))
+        if res.statusCode == 404 { return nil }
+        guard let data = res.data,
+              let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw HTTPError.networkError(statusCode: res.statusCode)
+        }
+        let records = (json["history"] as? [[String: Any]] ?? []).map { record in
+            HistoryRecord(id: record["id"] as? String ?? "", changes: GmailParse.parseHistory(["history": [record]]))
+        }
+        let next = json["nextPageToken"] as? String
+        return HistoryPage(
+            historyId: json["historyId"] as? String ?? "", records: records,
+            nextPageToken: next?.isEmpty == false ? next : nil)
     }
 
     /// `users.messages.get` with `format=metadata` — headers only, no body.

@@ -127,7 +127,9 @@ is cleared or named as kept.
 amendment below); action tags are NOT read from Gmail labels (ADR-IOS-036
 keeps action tags local); the history record limit (#491), the gate skip of the history request (#584) and
 the extension's own history path (#455) are unchanged. `fetchHistory` cannot tell an expired history from an
-over-long one, so Gmail reports both as `.refused(.expired)`.
+over-long one, so Gmail reports both as `.refused(.expired)`. *(Superseded 2026-11-16 for the record limit,
+#491: see the amendment "Gmail resumes its history read" at the end. `fetchHistory` is deleted; only an
+expired history is refused.)*
 
 **Trade-offs:** No cross-check: a reader bug is no longer corrected by the 15-minute listing for a tracked
 folder; the guards are the pinned tests, the fuzz and the fences, and "Reset message data" clears the
@@ -546,3 +548,63 @@ Tests: `OutlookLastVerbTests.swift` (extension of `OutlookChangeReadingTests`).
 Keywords: last verb, PidTagLastVerbExecuted, 0x1081, replied, answered, forwarded, reply arrow,
 singleValueExtendedProperties, $expand, expandsLastVerb, readLastVerbs, batchItemURL,
 double encoding, ReplyDetect, #890.
+
+### Amendment 2026-11-16: Gmail resumes its history read (#491)
+
+**Context.** Gmail's reader read the whole history through `GmailAPI.historyList` and refused it
+(`.refused(.expired)`: bookmark cleared, every folder untracked, the same pass re-lists) when it held more
+than `GmailAPI.historyMaxChanges` records or changed messages or ran past `historyMaxPages` pages. That
+rule came from #429 (memory 041), where a 20,000-record delta timed out before its cursor moved and failed
+the same way on every poll; resuming from a record was never weighed. A web bulk archive of a few hundred
+messages, or a long background gap, therefore re-listed every folder. The Outlook amendment of 2026-11-13
+already made a round's length never a failure and saved progress page by page.
+
+**Decision.**
+1. **Record by record within the time budget.** `GmailProvider.readHistory`
+   (`GmailProviderHistoryRead.swift`) reads `GmailAPI.historyPage` (`maxResults` 500, all four history
+   types, no label filter). The first page of a pass is always read; a later page starts only while the
+   pass's budget lasts (`ChangeContext.hasBudget`), and at most `historyMaxPages` pages are read. Before
+   each record but the pass's first, the budget is checked; when it is spent the pass stops before that
+   record. No fixed record or message count bounds the app's read (`historyMaxChanges` binds only the
+   notification extension).
+2. **One record is read whole.** A record's added and relabelled messages are queued and read
+   `GmailAPI.maxConcurrentRequests` at a time (`fetchMessageDetails`), and at the end of the read. A record
+   naming more messages than the budget covers (a conversation-wide change) is read whole; that pass runs
+   over. There is no special refusal for it.
+3. **Two bookmark values.** A read that reaches a page with no `nextPageToken` stores the first page's
+   `historyId`, as before. A read that stops early (budget or page cap) stores the `id` of the last record
+   it took; `users.history.list` returns the records after `startHistoryId` in increasing id, so the next
+   pass resumes with the first record not yet taken and nothing is listed again. A pass that took no record
+   keeps its bookmark.
+4. **Boundary validation.** The stop point must be a numeric id greater than the numeric bookmark the pass
+   read from; otherwise the read is refused as for an expired history. A 404 is still `.refused(.expired)`
+   with the same-pass re-list (decision 6 unchanged).
+5. **Write order unchanged.** The folder transactions are written first and the bookmark after them, in its
+   own transaction. A failure about the account while reading messages keeps the bookmark (`.failed`); a page
+   that cannot be read throws. A crash between the two re-reads the same records, which is harmless: the
+   reader writes each message's current server state, not what a record says.
+6. **Re-reads during a pass.** A record whose id is past the first page's `historyId` was written after the
+   pass's first reads began, so a message it names that was already read is read again; a message named
+   again by a record the first page covered is not.
+7. **Injected clock.** `SyncEngine(changeReadClock:)` (the wall clock in the app) is the clock of
+   `changeReadEnd` and `ChangeContext.clock`, so tests drive the budget deterministically.
+8. **Out of scope: the notification extension.** It keeps `GmailAPI.historyList` (read whole, nil past
+   `historyMaxChanges` or `historyMaxPages`, its own cursor map). It does not resume.
+9. **Deleted:** `GmailProvider.fetchHistory`, `HistoryResponse`, `HistoryMessageRef`, `HistoryLabelChange`;
+   the fake's `answerHistoryTooLong`.
+
+This supersedes, for the app's Gmail reader, the #429 rule that a history too long for one delta is
+refused like an expired one (memory 041), and the "Not done here" line about the record limit above.
+
+**Costs.** A backlog lands over several passes rather than through one re-list; each pass applies what it
+read. A resume id is as old as the oldest change not yet applied and ages like any bookmark (a 404 past
+Gmail's retention re-lists). A pass with a very large record runs past its budget by that record's reads.
+
+Tests: `GmailDeltaApplyInvariantTests` P18 (cut and resume with no listing; short pages over passes, by
+budget and by page limit; add then relabel across the cut; a record over the budget applied whole),
+`GmailHistoryPaginationTests` (page limit stops and resumes, stop-point validation, re-read of a message a
+record written during the pass names, long and deletion histories in one pass).
+
+Keywords: Gmail history resume, per-record resume, readHistory, historyPage, HistoryPage, HistoryRecord,
+history record id, startHistoryId, cut, stop point, bookmark, time budget, changeReadClock, historyMaxChanges,
+historyMaxPages, too-long history, refusal, re-list, notification extension, #491, #429.

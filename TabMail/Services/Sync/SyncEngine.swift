@@ -65,6 +65,15 @@ actor SyncEngine {
     /// we see even when the query returns 0 rows.
     var recoverIncompleteExplainLogged = false
 
+    /// The clock a change pass's read budget is measured on (`ChangeContext.clock`,
+    /// `changeReadEnd`). The wall clock in the app; a test injects its own so a
+    /// read that runs past its budget needs no real waiting.
+    nonisolated let changeReadClock: @Sendable () -> Date
+
+    init(changeReadClock: @escaping @Sendable () -> Date = { Date() }) {
+        self.changeReadClock = changeReadClock
+    }
+
     /// GRDB DatabasePool for foreground SYNC — full / delta / pull-down / on-demand /
     /// pagination — at `.normal` (`AppDatabase.syncPool`), so it beats the deep
     /// background FILLING queues in `DatabaseWriteQueue` but still yields to the merge
