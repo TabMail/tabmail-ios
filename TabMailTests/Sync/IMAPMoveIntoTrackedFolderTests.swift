@@ -517,6 +517,8 @@ struct IMAPMoveIntoTrackedFolderTests {
         case shortFetch
         /// The FETCH answers none of the missing messages.
         case emptyFetch
+        /// The date SEARCH answer is too large to read.
+        case searchTooLarge
         /// The SELECT the pass gates on reports no UIDVALIDITY.
         case epochNotObserved
         /// The server's UIDVALIDITY differs from the folder's stamp.
@@ -579,6 +581,14 @@ struct IMAPMoveIntoTrackedFolderTests {
             case .emptyFetch:
                 server.suppressFetchRecord(in: "INBOX", uids: [88])
                 await engine.healFoldersAfterAnUnprovenMove(account: account)
+            case .searchTooLarge:
+                // Every date SEARCH is too large, down to the one-day split the
+                // provider cannot divide further, so the refusal reaches the pass.
+                let refusedBefore = server.consumedInjectedFailureCount()
+                server.failEveryCommand(containing: "SINCE", message: "PayloadTooLargeError")
+                await engine.healFoldersAfterAnUnprovenMove(account: account)
+                #expect(server.consumedInjectedFailureCount() - refusedBefore > 1, "setup: the search split its window and was refused again")
+                #expect(!sentSince("UID FETCH"), "setup: the pass stopped at the search")
             case .epochNotObserved:
                 server.suppressSelectUidValidity(for: "INBOX")
                 await engine.healFoldersAfterAnUnprovenMove(account: account)
@@ -605,6 +615,7 @@ struct IMAPMoveIntoTrackedFolderTests {
             }
             #expect(FolderChangeState(raw: try w.folder("INBOX").changeState).selfHealDue,
                     "\(shape): a pass that fell short keeps INBOX owed its pass")
+            #expect(!FolderChangeState(raw: try w.folder("INBOX").changeState).tracking, "\(shape): INBOX is not tracked")
             func inboxHoldsTheTarget() throws -> Bool {
                 try pool.read { db in
                     try MessageHeader.filter(Column("folderId") == inboxId && Column("messageId") == "88").fetchCount(db) == 1
@@ -614,6 +625,7 @@ struct IMAPMoveIntoTrackedFolderTests {
 
             switch shape {
             case .shortFetch, .emptyFetch: server.suppressFetchRecord(in: "INBOX", uids: [])
+            case .searchTooLarge: server.stopFailingCommands(containing: "SINCE")
             case .epochNotObserved: server.restoreSelectUidValidity(for: "INBOX")
             case .epochMoved, .fetchEpochMoved: server.setUidValidity(Self.epoch, for: "INBOX")
             case .insertFailed:
@@ -828,16 +840,22 @@ struct IMAPMoveIntoTrackedFolderTests {
             let rowId = "\(w.accountId):INBOX:88"
             let archiveId = "\(w.accountId):Archive"
             let inboxId = "\(w.accountId):INBOX"
-            // Below the server's HIGHESTMODSEQ too, so the read is not "unchanged".
-            let cursor = IMAPChangeCursor(uidValidity: UInt32(Self.epoch), highestModSeq: 0, uidNext: 88).encoded
+            // At the server's HIGHESTMODSEQ now; the flag set below moves the
+            // server past it, so the read is not "unchanged".
+            let modSeq = w.server.qresyncHighestModSeq(for: "INBOX")
+            let cursor = IMAPChangeCursor(uidValidity: UInt32(Self.epoch), highestModSeq: UInt64(modSeq), uidNext: 88).encoded
             try await w.pool.write { db in
                 try db.execute(sql: "UPDATE messageHeader SET folderId = ?, folderPath = 'Archive', isInInbox = 0, observedUidValidity = NULL WHERE id = ?",
                                arguments: [archiveId, rowId])
                 try db.execute(sql: "UPDATE folder SET changeCursor = ? WHERE id = ?", arguments: [cursor, inboxId])
             }
             w.server.setMessages([Self.message(uid: 88, id: "tracked-reused-88@example.com")], in: "INBOX")
+            w.server.setFlags(["\\Flagged"], in: "INBOX", uid: 88)
+            #expect(w.server.qresyncHighestModSeq(for: "INBOX") > modSeq, "setup: the server moved past the bookmark")
             let before = try #require(try await w.pool.read { db in try MessageHeader.fetchOne(db, key: rowId) })
             try await w.changePass()
+            #expect(FolderChangeState(raw: try w.folder("INBOX").changeState).recheck.contains("88"),
+                    "the read reached the row and declined it: 88 is read again")
             let row = try #require(try await w.pool.read { db in try MessageHeader.fetchOne(db, key: rowId) })
             #expect(row.folderPath == "Archive" && row.observedUidValidity == nil, "the row is untouched")
             #expect(row.subject == before.subject && row.rfc822MessageId == before.rfc822MessageId)

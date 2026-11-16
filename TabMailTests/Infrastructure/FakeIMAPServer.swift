@@ -123,6 +123,9 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// Two-tier fuzzer (Testing Rule 11) seam — see
         /// `killConnectionOnNextCommand(containing:)`'s doc comment.
         var killConnection: Bool = false
+        /// `failEveryCommand(containing:message:)`: answers every match, never
+        /// consumed, until `stopFailingCommands(containing:)`.
+        var persistent: Bool = false
     }
 
     /// One deterministic mailbox reset applied only after the matching
@@ -873,6 +876,22 @@ final class FakeIMAPServer: @unchecked Sendable {
             state.injectedFailureCountdowns[fragment.uppercased(), default: []]
                 .append(InjectedFailure(skip: max(0, onMatch - 1), message: message))
         }
+    }
+
+    /// Answer every command containing `fragment` with NO `message` until
+    /// `stopFailingCommands(containing:)`, so a caller that splits and retries
+    /// on that answer (the date SEARCH halves its window on a too-large answer)
+    /// is refused all the way down.
+    func failEveryCommand(containing fragment: String, message: String) {
+        withState { state in
+            state.injectedFailureCountdowns[fragment.uppercased(), default: []]
+                .append(InjectedFailure(skip: 0, message: message, persistent: true))
+        }
+    }
+
+    /// Drop every failure injected for `fragment`, persistent or not.
+    func stopFailingCommands(containing fragment: String) {
+        withState { $0.injectedFailureCountdowns[fragment.uppercased()] = nil }
     }
 
     /// Apply one complete mailbox epoch replacement immediately after the
@@ -1899,6 +1918,10 @@ final class FakeIMAPServer: @unchecked Sendable {
                     else { return nil }
                     if countdowns[0].skip == 0 {
                         let failure = countdowns[0]
+                        if failure.persistent {
+                            state.consumedInjectedFailureCount += 1
+                            return failure
+                        }
                         countdowns.removeFirst()
                         state.injectedFailureCountdowns[key] = countdowns
                         state.consumedInjectedFailureCount += 1
