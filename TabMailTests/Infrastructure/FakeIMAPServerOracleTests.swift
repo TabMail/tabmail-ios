@@ -1123,6 +1123,52 @@ struct FakeIMAPServerOracleTests {
 
         _ = try client.command(tag: "h7", "LOGOUT")
     }
+
+    /// `stop()` while a connection's thread is still answering (a stalled
+    /// command) must not free that connection's descriptor: the number would go
+    /// to a socket opened afterwards (a later test's connection), and the late
+    /// answer, written into it, reaches a client that never sent its tag.
+    /// Every free low descriptor number is taken with socket pairs right after
+    /// `stop()`, so a freed one is among them; any byte at a pair's other end
+    /// is that late answer.
+    @Test("stop() keeps a stalled connection's descriptor: its late answer reaches no socket opened after it")
+    func stopNeverHandsALateAnswerToALaterSocket() async throws {
+        let stallSeconds = 1.0
+        let server = FakeIMAPServer(mailboxes: ["INBOX": []])
+        try server.start()
+        let client = try RawIMAPClient(port: server.port)
+        defer { client.close() }
+        try client.readGreeting()
+        _ = try client.command(tag: "z1", "LOGIN \(server.username) \(server.password)")
+        server.stallNextCommand(containing: "NOOP", seconds: stallSeconds)
+        try client.send(tag: "z2", "NOOP")
+        let deadline = Date().addingTimeInterval(stallSeconds)
+        while !server.recordedCommands().contains("NOOP"), Date() < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(server.recordedCommands().contains("NOOP"), "setup: the server is stalling the NOOP")
+        server.stop()
+
+        var pairs: [[Int32]] = []
+        defer { for pair in pairs { Darwin.close(pair[0]); Darwin.close(pair[1]) } }
+        for _ in 0..<64 {
+            var pair: [Int32] = [0, 0]
+            guard socketpair(AF_UNIX, SOCK_STREAM, 0, &pair) == 0 else { break }
+            for end in pair { _ = fcntl(end, F_SETFL, fcntl(end, F_GETFL) | O_NONBLOCK) }
+            pairs.append(pair)
+        }
+        try await Task.sleep(for: .seconds(stallSeconds + 0.5))
+
+        var stray = ""
+        var chunk = [UInt8](repeating: 0, count: 4096)
+        for pair in pairs {
+            for end in pair {
+                let received = chunk.withUnsafeMutableBytes { Darwin.read(end, $0.baseAddress, 4096) }
+                if received > 0 { stray += String(decoding: chunk[0..<received], as: UTF8.self) }
+            }
+        }
+        #expect(stray.isEmpty, "a stopped server's late answer reached a socket opened after stop(): \(stray)")
+    }
 }
 
 /// A minimal raw-socket IMAP client: enough to log in, select, and issue a
@@ -1171,6 +1217,11 @@ private final class RawIMAPClient {
     /// Consume the server's `* OK …` connection greeting.
     func readGreeting() throws {
         _ = try readUntil { $0.hasPrefix("* OK") }
+    }
+
+    /// Send `tag SPACE line CRLF` without reading the answer.
+    func send(tag: String, _ line: String) throws {
+        try write("\(tag) \(line)\r\n")
     }
 
     /// Send `tag SPACE line CRLF` and read through the matching tagged response.

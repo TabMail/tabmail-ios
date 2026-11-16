@@ -631,6 +631,15 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// (observed repeatedly once a test disconnected its provider mid-test
     /// and kept doing GRDB work before `stop()`). Untracking under the lock
     /// BEFORE closing makes whichever side arrives second a no-op.
+    ///
+    /// Only the connection's own `handleClient` closes its fd; `stop()` shuts
+    /// the socket down instead (`shutdownAllClientFds`). A `stop()` that
+    /// closed the fd freed its NUMBER while the connection's thread could
+    /// still be answering (a stalled command, `stallNextCommand`): the number
+    /// went to a socket of a later test, the late answer was written into it
+    /// and the thread went on reading that socket's commands (seen
+    /// 2026-11-16: a stalled SELECT's `A008 OK` reached the next test's change
+    /// connection as an unknown tag).
     private func trackClientFd(_ fd: Int32) {
         stateLock.lock()
         clientFds.append(fd)
@@ -671,14 +680,28 @@ final class FakeIMAPServer: @unchecked Sendable {
         if wasTracked { close(fd) }
     }
 
-    /// Snapshot-and-clear for `stop()` — the returned fds are no longer
-    /// tracked, so a concurrent `closeClientFd` from a client loop no-ops.
-    private func takeAllClientFds() -> [Int32] {
+    /// For `stop()`: mark every open connection test-initiated, then shut its
+    /// socket down, under `stateLock`, so every fd is still open (a
+    /// `closeClientFd` untracks under the same lock before it closes). The
+    /// connection's thread sees end-of-file (or a failed write) and closes
+    /// the fd itself, so its number stays taken until no thread uses it.
+    private func shutdownAllClientFds() {
         stateLock.lock()
         let fds = clientFds
-        clientFds.removeAll()
         stateLock.unlock()
-        return fds
+        // R12-F1 exclusion (ii): mark these fds test-initiated BEFORE the
+        // shutdown — this is test teardown ending every still-open connection
+        // (including perfectly healthy, still-in-use ones), not an abandoned
+        // session a production leak forgot to log out. `handleClient`'s
+        // client-loop-exit path runs `closeClientFd(fd)` once it sees the
+        // socket shut, and its `sessionsEndedWithoutLogout` bookkeeping needs
+        // the exclusion in place by then.
+        withState { state in
+            for fd in fds { _ = state.testInitiatedCloseFds.insert(fd) }
+        }
+        stateLock.lock()
+        for fd in clientFds { _ = shutdown(fd, SHUT_RDWR) }
+        stateLock.unlock()
     }
 
     func messageIDs(in mailbox: String) -> [String] {
@@ -1592,21 +1615,7 @@ final class FakeIMAPServer: @unchecked Sendable {
         releaseGreetings()
         acceptSource?.cancel()
         acceptSource = nil
-        let fds = takeAllClientFds()
-        // R12-F1 exclusion (ii): mark these fds test-initiated BEFORE the
-        // raw `close(fd)` below — this is test teardown tearing down every
-        // still-open connection (including perfectly healthy, still-in-use
-        // ones), not an abandoned session a production leak forgot to log
-        // out. `handleClient`'s client-loop-exit path still runs
-        // `closeClientFd(fd)` asynchronously once it notices the socket
-        // closed (this only cleared `clientFds`, so that later call is a
-        // close no-op but still does the `sessionsEndedWithoutLogout`
-        // bookkeeping) — marking here, before that happens, is what lets it
-        // see the exclusion.
-        withState { state in
-            for fd in fds { _ = state.testInitiatedCloseFds.insert(fd) }
-        }
-        for fd in fds { close(fd) }
+        shutdownAllClientFds()
     }
 
     // MARK: - Message Builder
@@ -1732,6 +1741,10 @@ final class FakeIMAPServer: @unchecked Sendable {
             }
         }
         guard clientFd >= 0 else { return }
+        // A late answer written after `stop()` shut the socket down fails with
+        // EPIPE instead of raising SIGPIPE in the test host.
+        var noSigPipe: Int32 = 1
+        setsockopt(clientFd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
         trackClientFd(clientFd)
 
         DispatchQueue.global().async { [weak self] in

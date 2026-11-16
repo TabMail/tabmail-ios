@@ -635,7 +635,11 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    takes the folder connection's refusal handling (`createChangeServer`): a login refused with the
    server's limit (Dovecot's `max_userip_connections` wording) learns the limit, evicts the LRU folder
    connection (else IDLE) and retries once; a second refusal fails the pass through the existing
-   failure handling (item 9). No other fallback. So a server that allows two connections still runs a
+   failure handling (item 9). No other fallback. Both limit retries (folder and change connection)
+   first wait for the evicted connection's LOGOUT to be answered (`awaitEvictionLogouts`, at most
+   `SyncConfig.imapEvictionLogoutWaitSeconds`): the server counts a session until then, so a retry
+   sent right after a detached logout was refused again (found 2026-11-16 by a fake server that
+   counts sessions; IDLE's DONE + LOGOUT lost that race every time). So a server that allows two connections still runs a
    pass, a folder fetch and an action (the regression c4 found: the change connection had been a
    third, unevictable one). A server without the pair, an ENABLE that is not acknowledged,
    or a mailbox answering `NOMODSEQ` leaves the folder `.untracked(UntrackedObservation)`: no

@@ -447,6 +447,26 @@ struct IMAPChangeReaderTests {
         }
     }
 
+    @Test("Epoch: a server whose STATUS leaves UIDVALIDITY out has a new UIDVALIDITY refused by the QRESYNC SELECT (RFC 7162 §3.2.5)")
+    func epochChangeSeenOnlyBySelectRefuses() async throws {
+        try await Self.withWorld(inbox: [1, 2]) { w in
+            let cursor = try await Self.baseline(w)
+            w.server.setStatusOmits(["UIDVALIDITY"], for: Self.inboxPath)
+            w.server.setUidValidity(Self.epoch + 1, for: Self.inboxPath)
+            w.server.setFlags(["\\Seen"], in: Self.inboxPath, uid: 1)
+            // A new session has nothing selected, so the inbox is observed by STATUS.
+            await w.provider.markDirty()
+            let changes = try await Self.inbox(w, Self.read(w, cursors: [w.inboxId: cursor]))
+            guard case .refused(.addressEpochChanged(let served)) = changes.status else {
+                Issue.record("expected refused(addressEpochChanged), got \(changes.status)"); return
+            }
+            #expect(served == Self.epoch + 1)
+            #expect(changes.records.isEmpty && changes.removals.isEmpty)
+            #expect(w.server.recordedCommands().contains { $0.uppercased().contains("QRESYNC (") },
+                    "the refusal came from the QRESYNC SELECT, not from STATUS")
+        }
+    }
+
     @Test("No QRESYNC: a CONDSTORE-only server leaves every folder untracked with its STATUS observation and sends no ENABLE")
     func noQResyncIsUntracked() async throws {
         try await Self.withWorld(capabilities: FakeIMAPServer.defaultCapabilities + ["CONDSTORE"], inbox: [1, 2]) { w in
@@ -943,7 +963,7 @@ struct IMAPChangeReaderTests {
                 let fetched = try await w.provider.fetchMessages(folder: Self.inboxPath, limit: 10, offset: 0)
                 #expect(Set(fetched.map(\.messageId)) == ["1", "2", "3"], "round \(round): the folder fetch completes")
                 #expect(await w.provider.changeServer == nil, "round \(round): the idle change connection was evicted")
-                try await w.provider.markRead(ids: ["2"], folder: Self.inboxPath)
+                try await w.provider.markRead(ids: ["2"], folder: Self.inboxPath, admittedUidValidity: UInt32(Self.epoch))
                 #expect(w.server.flags(in: Self.inboxPath, uid: 2).contains("\\Seen"), "round \(round): the action completes")
                 w.server.setFlags(round == 0 ? ["\\Flagged"] : [], in: Self.inboxPath, uid: 3)
                 // The next pass needs a login again: the idle folder connection makes room.
@@ -1004,6 +1024,8 @@ struct IMAPChangeReaderTests {
             #expect(await Self.eventually {
                 w.server.recordedCommands().dropFirst(start).contains { $0.uppercased().hasPrefix("NOOP") }
             }, "setup: the pass holds the change connection")
+            #expect(await w.provider.currentIdleServerForTesting() != nil,
+                    "opening the change connection evicted the folder connection, not IDLE")
             let archive = try await w.provider.fetchMessages(folder: Self.archivePath, limit: 10, offset: 0)
             #expect(archive.isEmpty, "the folder fetch completes")
             let changes = try await pass.value

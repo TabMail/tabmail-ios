@@ -194,7 +194,10 @@ struct IMAPMoveIntoTrackedFolderTests {
             state.tracking = true
             let encodedState = state.encoded
             let uidNext = (mailboxes[path]?.map(\.uid).max() ?? 0) + 1
-            let cursor = IMAPChangeCursor(uidValidity: UInt32(epoch), highestModSeq: 1, uidNext: UInt32(uidNext)).encoded
+            // The bookmark a real read would have stored: the server's HIGHESTMODSEQ
+            // now, before the test changes anything (a change made later moves it).
+            let modSeq = server.qresyncHighestModSeq(for: path)
+            let cursor = IMAPChangeCursor(uidValidity: UInt32(epoch), highestModSeq: UInt64(modSeq), uidNext: UInt32(uidNext)).encoded
             try await pool.write { db in
                 try db.execute(sql: "UPDATE folder SET changeCursor = ?, changeState = ? WHERE id = ?",
                                arguments: [cursor, encodedState, "\(accountId):\(path)"])
@@ -554,7 +557,8 @@ struct IMAPMoveIntoTrackedFolderTests {
             let rowId = "\(w.accountId):INBOX:88"
             let archiveId = "\(w.accountId):Archive"
             let inboxId = "\(w.accountId):INBOX"
-            let cursor = IMAPChangeCursor(uidValidity: UInt32(Self.epoch), highestModSeq: 1, uidNext: 88).encoded
+            // Below the server's HIGHESTMODSEQ too, so the read is not "unchanged".
+            let cursor = IMAPChangeCursor(uidValidity: UInt32(Self.epoch), highestModSeq: 0, uidNext: 88).encoded
             try await w.pool.write { db in
                 try db.execute(sql: "UPDATE messageHeader SET folderId = ?, folderPath = 'Archive', isInInbox = 0, observedUidValidity = NULL WHERE id = ?",
                                arguments: [archiveId, rowId])
@@ -604,18 +608,32 @@ struct IMAPMoveIntoTrackedFolderTests {
             let moved = try w.seeded()
             #expect(!moved.isFlagged, "the bystander's flag is not applied to the moved message")
             #expect(moved.observedUidValidity == nil, "the moved row is not given the destination's epoch")
-            // The user marks the message they see read.
+            // The user marks the message they see read while its move is still
+            // queued. Its address is unknown until the move lands, so the read is
+            // refused (fail closed, the design since the address fix): nothing is
+            // queued and the row stays unread, so no action can reach Archive/88.
             await AccountManager.shared.markRead([moved])
+            #expect(try await w.pool.read { db in try PendingOperation.filter(Column("type") == "markRead").fetchCount(db) } == 0,
+                    "a read on an address not yet known is never queued")
+            #expect(try !w.seeded().isRead, "the refused read leaves the row unread, as the user can see")
             await AccountManager.shared.registerProviderForTesting(accountId: w.accountId, provider: w.provider)
             try await w.drain()
             try await w.normalSync()
             #expect(!w.server.flags(in: "Archive", uid: 88).contains("\\Seen"), "the bystander is untouched")
             #expect(w.server.wrongMessageViolations().isEmpty)
+            // Recoverable by one ordinary gesture: once the move has landed, the
+            // same read reaches the message the user saw, and only it.
+            let landed = try w.seeded()
+            await AccountManager.shared.markRead([landed])
+            try await w.drain()
             let onServer = ["INBOX", "Archive"].flatMap { path in w.server.uids(in: path, rfc822MessageId: Self.target).map { (path, $0) } }
+            #expect(onServer.count == 1, "one copy of the moved message: \(onServer)")
             if let (path, uid) = onServer.first {
-                #expect(w.server.flags(in: path, uid: uid).contains("\\Seen"), "the message the user read is read on the server")
+                #expect(w.server.flags(in: path, uid: uid).contains("\\Seen"), "the repeated read reaches the message the user read")
             }
+            #expect(!w.server.flags(in: "Archive", uid: 88).contains("\\Seen"), "the bystander is still untouched")
             #expect(w.server.flags(in: "Archive", uid: 88).contains("\\Flagged"))
+            #expect(w.server.wrongMessageViolations().isEmpty)
         }
     }
 

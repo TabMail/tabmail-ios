@@ -74,7 +74,10 @@ struct IMAPChangeEngineTests {
             var state = FolderChangeState(raw: nil)
             state.tracking = true
             let encodedState = state.encoded
-            let cursor = IMAPChangeCursor(uidValidity: UInt32(serverEpoch), highestModSeq: 1, uidNext: UInt32((serverUIDs.max() ?? 0) + 1)).encoded
+            // The bookmark a real read would have stored: the server's HIGHESTMODSEQ
+            // now, before the test changes anything (a change made later moves it).
+            let modSeq = server.qresyncHighestModSeq(for: path)
+            let cursor = IMAPChangeCursor(uidValidity: UInt32(serverEpoch), highestModSeq: UInt64(modSeq), uidNext: UInt32((serverUIDs.max() ?? 0) + 1)).encoded
             try await pool.write { db in
                 try db.execute(sql: "UPDATE folder SET changeCursor = ?, changeState = ? WHERE id = ?",
                                arguments: [cursor, encodedState, "\(name):\(path)"])

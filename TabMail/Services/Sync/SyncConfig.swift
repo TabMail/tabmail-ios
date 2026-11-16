@@ -622,6 +622,12 @@ enum SyncConfig {
     /// with `max_userip_connections=N`. The rejection locks maxConnections to N - reserved.
     /// Most IMAP servers allow 10-20 per user; enterprise can go higher.
     static let imapMaxConnectionCeiling: Int = 20
+    /// Longest a login retried after a connection-limit refusal waits for the
+    /// logout of the connection evicted to make room (`IMAPProvider.awaitEvictionLogouts`).
+    /// The server counts that session until its LOGOUT is answered, so retrying
+    /// sooner is refused again. Bounded so a logout that never answers cannot
+    /// hold the retry: after it the retry goes ahead and the server's answer decides.
+    static let imapEvictionLogoutWaitSeconds: TimeInterval = 5
 
     // MARK: - Provider Work Queue Concurrency
     /// Max concurrent operations for Gmail API providers.
@@ -962,8 +968,11 @@ enum SyncConfig {
     // bookmark. Foreground pass (60 s): min(20, 60 - W - 5).
     /// How long a folder's change reads may keep failing on answers from the
     /// server (5xx, a page that cannot be read, a next link that repeats) before
-    /// the reader starts the folder again from a new baseline. A connection loss,
-    /// a cancellation, an authorization failure or a throttle never counts.
+    /// the reader starts the folder again from a new baseline. On Outlook a
+    /// connection loss, a cancellation, an authorization failure or a throttle
+    /// never counts. On IMAP (ADR-IOS-111 #751 item 9) a change session that
+    /// never opens and a request that times out mid-answer do count: either
+    /// leaves the session's state unknown, and lapsing costs one listing.
     static let changeReadFailureLapseSeconds: TimeInterval = 3_600
     /// IMAP change reader (#751): most messages one folder's read fetches headers
     /// for in one pass (new arrivals plus changed messages the folder does not

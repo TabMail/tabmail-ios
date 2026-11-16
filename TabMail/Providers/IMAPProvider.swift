@@ -328,7 +328,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// CLEARS on an unreported one), so a race between two writers of the same
     /// path can only manufacture a MISMATCH — refuse, which is safe — and never
     /// agreement. The widening is monotonically safety-increasing for it.
-    func selectMailboxTracked(_ server: IMAPServer, folder: String) async throws -> Mailbox.Selection {
+    private func selectMailboxTracked(_ server: IMAPServer, folder: String) async throws -> Mailbox.Selection {
         let selection = try await server.selectMailbox(folder)
         let observed = selection.uidValidity.value
         // Assignment, not an `if` — a `0` (unreported) must ERASE any earlier
@@ -985,7 +985,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     ///
     /// `diagSite` labels the creator for the object-lifecycle oracle above —
     /// no default on purpose: every new call site must identify itself.
-    func createServer(diagSite: String) async throws -> IMAPServer {
+    private func createServer(diagSite: String) async throws -> IMAPServer {
         let server = IMAPServer(
             host: host,
             port: port,
@@ -1470,6 +1470,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 // result, never the primary attempt's (already logged out
                 // above, if it ever logged in).
                 createdServer = nil
+                await awaitEvictionLogouts()
                 do {
                     let server = try await createServer(diagSite: "folderRetry")
                     createdServer = server
@@ -1549,10 +1550,29 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         folderLastUsed.removeValue(forKey: folder)
         if let server {
             noteLogoutAttempt(server)
-            Task { try? await server.logout() }
+            evictionLogouts.append(Task { try? await server.logout() })
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Evicted LRU pinned connection for \(folder)") }
         }
         return true
+    }
+
+    /// Logouts of connections evicted to make room under the server's limit,
+    /// not yet awaited. The server counts a session until its LOGOUT is
+    /// answered, so a login retried right after an eviction is refused again
+    /// unless it waits for them (`awaitEvictionLogouts`).
+    private var evictionLogouts: [Task<Void, Never>] = []
+
+    /// Wait, at most `SyncConfig.imapEvictionLogoutWaitSeconds`, for every
+    /// evicted connection's logout to be answered, so the slot it held is free
+    /// before a refused login is retried. A logout that does not answer in time
+    /// leaves the retry to the server's answer, as before.
+    func awaitEvictionLogouts() async {
+        let pending = evictionLogouts
+        evictionLogouts.removeAll()
+        guard !pending.isEmpty else { return }
+        _ = try? await withTimeout(seconds: SyncConfig.imapEvictionLogoutWaitSeconds) {
+            for logout in pending { await logout.value }
+        }
     }
 
     private func releaseFolderConnection(folder: String, healthy: Bool) async {
@@ -2728,20 +2748,21 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// keeps ONE conditional. `generation` and the hook are read SYNCHRONOUSLY
     /// on the actor before the `Task` is created — the same capture-list
     /// semantics the reference relies on.
-    func detachedTeardownLogout(_ server: IMAPServer, sendDoneFirst: Bool = false) {
+    @discardableResult
+    func detachedTeardownLogout(_ server: IMAPServer, sendDoneFirst: Bool = false) -> Task<Void, Never> {
         noteLogoutAttempt(server)
         #if DEBUG
         let hook = beforeLogoutTestHook
         let logoutGeneration = generation
         let beforeDoneHook = idleTeardownBeforeDoneTestHook
-        Task {
+        return Task {
             if let hook { hook(server, logoutGeneration) }
             if sendDoneFirst, let beforeDoneHook { await beforeDoneHook() }
             if sendDoneFirst { try? await server.done() }
             try? await server.logout()
         }
         #else
-        Task {
+        return Task {
             if sendDoneFirst { try? await server.done() }
             try? await server.logout()
         }
@@ -3493,9 +3514,13 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// Returns true if an IDLE connection was evicted, false if none was active.
     @discardableResult
     private func evictIdleConnection() -> Bool {
-        guard idleServer != nil else { return false }
+        guard let server = idleServer else { return false }
         if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP:IDLE] Evicting IDLE connection to free server slot") }
-        tearDownIdleConnection()
+        idleListenerTask?.cancel()
+        idleListenerTask = nil
+        noteLogoutAttempt(server)
+        evictionLogouts.append(Task { try? await server.done(); try? await server.logout() })
+        idleServer = nil
         // Will relaunch after delay if idleEnabled is still true
         if idleEnabled {
             Task { [weak self] in
@@ -3516,15 +3541,16 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         changeServer = nil
         changeServerQResync = false
         changeSelectedPath = nil
-        detachedTeardownLogout(server)
+        evictionLogouts.append(detachedTeardownLogout(server))
         return true
     }
 
     /// Open the change reader's connection (`changeSession`) under the same
     /// refusal handling as a folder connection: a login refused for the
     /// server's connection limit learns the limit, evicts the least recently
-    /// used idle folder connection (else IDLE) and tries once more. A second
-    /// refusal is the pass's failure (`fetchChanges`' existing handling).
+    /// used idle folder connection (else IDLE), waits for its logout
+    /// (`awaitEvictionLogouts`) and tries once more. A second refusal is the
+    /// pass's failure (`fetchChanges`' existing handling).
     func createChangeServer() async throws -> IMAPServer {
         do {
             return try await createServer(diagSite: "change")
@@ -3533,6 +3559,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             parseAndApplyServerLimit(from: error)
             guard isLimitError, evictLRUFolder() || evictIdleConnection() else { throw error }
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAPChanges] Connection limit hit opening the change connection — evicted, retrying") }
+            await awaitEvictionLogouts()
             do {
                 return try await createServer(diagSite: "changeRetry")
             } catch {
