@@ -498,6 +498,27 @@ struct IMAPMoveIntoTrackedFolderTests {
         }
     }
 
+    @Test("A chained move whose second hop has no proof, Archive untracked: one copy after the next pass, and C's view matches the server")
+    @MainActor
+    func chainedSecondHopUnprovenIntoTrackedFolder() async throws {
+        try await Self.withWorld("chained-into-c", capabilities: FakeIMAPServer.defaultCapabilities + Self.qresync,
+                                 archive: [50], local: ["Archive": [50]], tracked: ["INBOX", "C"],
+                                 folders: ["INBOX", "Archive", "C"]) { server in
+            // The first hop is proven; every hop out of Archive has no COPYUID.
+            server.withholdMoveCOPYUID(forSourceUIDs: Set(51...500))
+            server.stallNextCommand(containing: "UID MOVE", seconds: 1)
+        } _: { w in
+            await AccountManager.shared.move([try w.seeded()], to: "Archive")
+            await AccountManager.shared.move([try w.seeded()], to: "C")
+            try await w.drain()
+            try await w.normalSync()
+            try w.expectHeldOnceWhereTheServerHoldsIt("chained-into-c")
+            let cRows = Set(try w.heldTarget().filter { $0.folderPath == "C" }.map(\.messageId))
+            let cServer = Set(w.server.uids(in: "C", rfc822MessageId: Self.target).map(String.init))
+            #expect(cRows == cServer, "C's view \(cRows) matches the server's \(cServer)")
+        }
+    }
+
     /// Admits the move with no provider registered (nothing drains), then makes
     /// `between` happen, then lets the queue drain.
     @MainActor
