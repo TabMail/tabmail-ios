@@ -109,21 +109,26 @@ struct DynamicIslandChat: View {
 
     // Session state lives in ChatPillState (survives SwiftUI view recreation).
     // Forwarding computed properties keep existing code unchanged.
-    /// Stable key for the message, using stableId pattern (rfc822MessageId for IMAP,
-    /// messageId for Gmail/Exchange). Falls back to message.id if stableId unavailable.
-    /// This survives IMAP MOVE operations where UIDs change.
-    private var stableMessageKey: String? {
-        guard let msg = message else { return nil }
-        return "\(msg.accountId):\(msg.stableId)"
-    }
-
+    /// About an email: its thread's chat (ADR-IOS-114). The pill is given the thread's newest
+    /// email, so this is that email's current thread key, where a send writes.
     private var sessionKey: String {
         if composeContext != nil, let cursor = composeGenerationCursor {
             return ActiveAgentTracker.composeSessionKey(
                 draftId: draftId ?? "default", epoch: cursor.newEpoch)
         }
-        if let key = stableMessageKey { return "msg:\(key)" }
+        if let message { return ChatThreadKey.key(for: message) }
         return "inbox"
+    }
+    /// The keys of the thread's chat (`ThreadChatReader.keys`), own key first.
+    @State private var threadKeys: [String] = []
+    /// The keys this pill's chat reads: about an email, the thread's; else its own session.
+    private var chatKeys: [String] {
+        guard message != nil else { return [sessionKey] }
+        return threadKeys.first == sessionKey ? threadKeys : [sessionKey] + threadKeys.filter { $0 != sessionKey }
+    }
+    /// What the chat shows: about an email, the whole thread's chat (`ThreadChatReader`).
+    private var shownMessages: [ChatMessage] {
+        message != nil ? ThreadChatReader.messages(keys: chatKeys) : chatMessages
     }
     private var session: ChatPillState.Session { ChatPillState.shared.session(for: sessionKey) }
     private var chatMessages: [ChatMessage] {
@@ -537,63 +542,13 @@ struct DynamicIslandChat: View {
                     loadSessionHistory()
                 }
 
-                // Message-detail: load existing session from GRDB if in-memory is empty.
-                // This restores previous chat when reopening the same email.
-                // Uses stableMessageKey (rfc822MessageId for IMAP) so chat survives folder moves.
-                if let msg = message, chatMessages.isEmpty, let stableKey = stableMessageKey {
-                    let msgSessionId = DemoModeStore.scopedSessionId("msg:\(stableKey)")
+                // About an email: read the thread's stored chat (every key of the thread, once
+                // per session) and register the email for [Email](N) references. An email's
+                // number follows it across moves (`ChatIdTranslator.remapRealId` at the move),
+                // so a stored turn's pills resolve as they are.
+                if let msg = message {
                     Task {
-                        if let session = try? await ChatStore.shared.loadContextSession(sessionId: msgSessionId) {
-                            if chatMessages.isEmpty { // Double-check (avoid race)
-                                currentSessionId = msgSessionId
-                                sessionTurns = session.turns
-                                chatMessages = messagesForSession(session)
-                                if let emailCtx = session.emailContext {
-                                    sessionEmailContexts[msgSessionId] = emailCtx
-                                    // If the message moved (IMAP MOVE → new PK), remap the
-                                    // ChatIdTranslator entry so old pills point to the current PK.
-                                    // Without this, old [Email](N) pills in loaded turns would
-                                    // reference a dead PK, and new messages would get a different
-                                    // numeric ID — causing inconsistent email references for the LLM.
-                                    if emailCtx.messageHeaderId != msg.id {
-                                        // Remap ChatIdTranslator so old pills point to current PK
-                                        let remapped = await ChatIdTranslator.shared.remapRealId(
-                                            from: emailCtx.messageHeaderId, to: msg.id
-                                        )
-                                        // Update in-memory context with current PK for future eviction
-                                        let updatedCtx = EmailContextSnapshot(
-                                            messageHeaderId: msg.id,
-                                            subject: msg.subject,
-                                            from: msg.from
-                                        )
-                                        sessionEmailContexts[msgSessionId] = updatedCtx
-                                        // Update persisted emailContextJSON on first turn (best-effort)
-                                        if let json = ChatStore.encodeEmailContext(updatedCtx),
-                                           let firstTurnId = session.turns.first?.id {
-                                            try? await AppDatabase.dbPool.write { db in
-                                                try db.execute(
-                                                    sql: "UPDATE chatTurn SET emailContextJSON = ? WHERE id = ?",
-                                                    arguments: [json, firstTurnId]
-                                                )
-                                            }
-                                        }
-                                        if remapped > 0 {
-                                            BackgroundSyncLogger.logDebug("[DynamicIslandChat] Remapped email context: \(emailCtx.messageHeaderId) → \(msg.id)")
-                                        }
-                                    }
-                                }
-                                BackgroundSyncLogger.logDebug("[DynamicIslandChat] Loaded msg-detail session from GRDB (\(session.turns.count) turns)")
-                            }
-                        }
-                        // Register viewed email in ID mapping (MessageDetailView context).
-                        // This ensures the email has a stable numeric ID for [Email](N) references.
-                        // After remap above, toNumericId returns the SAME numeric ID as old turns.
-                        contextEmailNumericId = await ChatIdTranslator.shared.toNumericId(msg.id)
-                        BackgroundSyncLogger.logDebug("[DynamicIslandChat] Registered context email id=\(msg.id) → numeric=\(contextEmailNumericId!)")
-                    }
-                } else if let msg = message {
-                    // No session to load — just register the email ID for fresh sessions.
-                    Task {
+                        await loadThreadChat(newest: msg)
                         contextEmailNumericId = await ChatIdTranslator.shared.toNumericId(msg.id)
                         BackgroundSyncLogger.logDebug("[DynamicIslandChat] Registered context email id=\(msg.id) → numeric=\(contextEmailNumericId!)")
                     }
@@ -690,7 +645,13 @@ struct DynamicIslandChat: View {
             // Words written after the send this completes are newer, and stay (`ChatFieldFill`).
             fieldFill.apply(.completed)
         }
-        .onChange(of: chatMessages.last?.actionConfirmation != nil) { _, hasCard in
+        // The thread's chat, read as the pill appears and whenever it is about a newer email, so a
+        // card raised in any key of the thread opens the sheet while collapsed (ADR-IOS-114).
+        .task(id: message?.id) {
+            guard let message else { return }
+            await loadThreadChat(newest: message)
+        }
+        .onChange(of: shownMessages.last?.actionConfirmation != nil) { _, hasCard in
             guard hasCard, replyField != nil, !isExpanded else { return }
             fieldFill.apply(.confirmationCard)
             fieldSentText = nil
@@ -1037,7 +998,7 @@ struct DynamicIslandChat: View {
                 sessionTabView
             } else {
                 singleSessionScrollView(
-                    messages: chatMessages,
+                    messages: shownMessages,
                     isLive: true,
                     showIndexingWarning: true,
                     reminders: page.reminders,
@@ -1046,7 +1007,7 @@ struct DynamicIslandChat: View {
             }
         }
         .onChange(of: isExpanded) { _, expanded in
-            if expanded && !chatMessages.isEmpty {
+            if expanded && !shownMessages.isEmpty {
                 scrollPosition.scrollTo(edge: .bottom)
             }
         }
@@ -1055,7 +1016,7 @@ struct DynamicIslandChat: View {
                 scrollPosition.scrollTo(edge: .bottom)
             }
         }
-        .onChange(of: chatMessages.count) {
+        .onChange(of: shownMessages.count) {
             scrollPosition.scrollTo(edge: .bottom)
         }
         .onChange(of: isWorking) {
@@ -1184,8 +1145,11 @@ struct DynamicIslandChat: View {
                         .popoverTip(msg.role == .user && !messages[(index + 1)...].contains(where: { $0.role == .user }) ? ChatForkTip() : nil, arrowEdge: .trailing)
                         .contextMenu {
                             if !isWorking && msg.role == .user {
-                                if isLive {
-                                    let hasLaterUserMsg = messages[(index + 1)...].contains { $0.role == .user }
+                                // The live list can be a thread's merged chat (ADR-IOS-114); a turn is
+                                // rewound or re-sent in its own session, so the menu works on that
+                                // session's index and offers nothing for another session's turn.
+                                if isLive, let index = chatMessages.firstIndex(where: { $0.id == msg.id }) {
+                                    let hasLaterUserMsg = chatMessages[(index + 1)...].contains { $0.role == .user }
                                     if isComposeMode {
                                         // Compose: single-session; rewind in-place (mutates draft back to snapshot).
                                         if !hasLaterUserMsg {
@@ -1211,7 +1175,7 @@ struct DynamicIslandChat: View {
                                             forkFromMessage(text: msg.content, atIndex: index)
                                         }
                                     }
-                                } else {
+                                } else if !isLive {
                                     Button("Fork and re-send", systemImage: "arrow.uturn.right") {
                                         forkFromMessage(text: msg.content, atIndex: index, sourceMessages: messages, sourceTurns: sessionTurnsForFork, sourceReminders: reminders)
                                     }
@@ -1269,19 +1233,15 @@ struct DynamicIslandChat: View {
 
     /// Convert a loaded ChatSession's turns into ChatMessage array for display.
     private func messagesForSession(_ session: ChatStore.ChatSession) -> [ChatMessage] {
-        session.turns.compactMap { turn -> ChatMessage? in
-            switch turn.role {
-            case "user":
-                let displayText = turn.renderedContent ?? turn.userMessage ?? turn.content
-                return ChatMessage(role: .user, content: displayText, timestamp: Date(timeIntervalSince1970: turn.timestamp / 1000))
-            case "assistant":
-                guard turn.type == "normal" else { return nil }
-                let displayText = turn.renderedContent ?? turn.content
-                return ChatMessage(role: .agent, content: displayText, timestamp: Date(timeIntervalSince1970: turn.timestamp / 1000))
-            default:
-                return nil
-            }
-        }
+        ThreadChatReader.chatMessages(for: session.turns)
+    }
+
+    /// Finds the keys of `newest`'s thread chat and reads their stored turns (ADR-IOS-114).
+    private func loadThreadChat(newest: MessageHeader) async {
+        let keys = await ThreadChatReader.keys(newest: newest)
+        // The pill may be about a newer email by now; the next load is for that one.
+        if message?.id == newest.id { threadKeys = keys }
+        await ThreadChatReader.load(keys: keys)
     }
 
     /// Load past sessions from GRDB for swipe navigation (inbox context only).
@@ -2358,14 +2318,14 @@ struct DynamicIslandChat: View {
         }
 
         // Generate a sessionId for this session if not yet created.
-        // Message-detail: deterministic "msg:{accountId}:{stableId}" (tied to email, survives IMAP MOVE).
+        // Message-detail: the thread's key, "thread:{accountId}:{threadId}" (ADR-IOS-114).
         // Inbox: random UUID (new session each time).
         // In demo mode every sessionId gets the "demo:" prefix (via
         // scopedSessionId) so demo turns are wiped on exit and never mix with
         // the user's session history.
         if currentSessionId == nil {
-            if let key = stableMessageKey {
-                currentSessionId = DemoModeStore.scopedSessionId("msg:\(key)")
+            if let msg = message {
+                currentSessionId = DemoModeStore.scopedSessionId(ChatThreadKey.key(for: msg))
             } else {
                 currentSessionId = DemoModeStore.scopedSessionId(UUID().uuidString)
             }
@@ -2477,6 +2437,18 @@ struct DynamicIslandChat: View {
                 enrichedText = text
             }
 
+            // The history this request sends. About an email: the thread's whole chat, every
+            // key's stored turns merged by time within the budget (ADR-IOS-114), read before
+            // this turn is added. Inbox: this session's turns.
+            let history: [ChatTurn]
+            if let msg = message {
+                let keys = await ThreadChatReader.keys(newest: msg)
+                await ThreadChatReader.load(keys: keys)
+                history = ThreadChatReader.history(keys: keys)
+            } else {
+                history = sessionTurns
+            }
+
             // Step 1: Persist user turn (crash resilience: persist BEFORE network call).
             // renderedContent stores the user's raw text (without the enriched prefix)
             // so ChatHistoryView doesn't show "Regarding [Email](N):".
@@ -2502,9 +2474,8 @@ struct DynamicIslandChat: View {
                 }
             }
 
-            // Step 2: Send via completions API with current session turns as history.
-            // Only THIS session's turns — no expired/archived history from past sessions.
-            let history = sessionTurns
+            // Step 2: Send via completions API with the history read above.
+            // No expired/archived history from past inbox sessions.
             sessionTurns.append(userTurn)
 
             do {

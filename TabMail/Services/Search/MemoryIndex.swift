@@ -137,6 +137,7 @@ actor MemoryIndex {
                     let c = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM memory_meta WHERE embeddingComplete = 1") ?? 0
                     let rows = try Row.fetchAll(db, sql: """
                         SELECT CASE
+                            WHEN sessionId LIKE 'thread:%' THEN 'thread'
                             WHEN sessionId LIKE 'msg:%' THEN 'msg'
                             WHEN sessionId LIKE 'compose:%' THEN 'compose'
                             WHEN sessionId IS NULL THEN 'null'

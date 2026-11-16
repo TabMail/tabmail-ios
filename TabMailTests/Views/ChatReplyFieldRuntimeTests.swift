@@ -250,7 +250,7 @@ struct ChatReplyFieldRuntimeTests {
             try await Self.settle()
             #expect(!host.expanded, "control: the field starts collapsed")
             // The pill's own session, as the agent's tool delivers its card to it.
-            let session = ChatPillState.shared.session(for: "msg:\(host.message.accountId):\(host.message.stableId)")
+            let session = ChatPillState.shared.session(for: ChatThreadKey.key(for: host.message))
             session.chatMessages.append(ChatMessage(role: .agent, content: "Done.", timestamp: Date()))
             try await Self.settle()
             #expect(!host.expanded, "control: an answer without a card leaves the field collapsed")

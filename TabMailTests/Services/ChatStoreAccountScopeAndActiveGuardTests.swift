@@ -165,43 +165,34 @@ struct ChatStoreAccountScopedResolutionTests {
         #expect(resolved == moved.id)
     }
 
-    // MARK: isMessageInInbox (consumer 2 — msg-detail session eviction)
+    // MARK: isThreadInInbox (consumer 2 — thread session eviction)
 
-    @Test("Session eviction never reads inbox membership from another account's copy")
+    @Test("Session eviction never reads inbox membership from another account's email of the same thread id")
     func inboxMembershipRefusesTheOtherAccount() throws {
         let db = try makeDB()
-        // The message is in account B's INBOX. Account A has no copy.
+        // The thread's email is in account B's INBOX. Account A has none.
         _ = try TestDatabase.insertMessageHeader(
             db, messageId: "11", folderId: "acc2:INBOX", accountId: "acc2",
             folderPath: "INBOX", isInInbox: true, rfc822MessageId: "shared@example.com")
-        try db.write { try Self.anchorTurn(sessionId: "msg:acc1:shared@example.com").insert($0) }
+        try db.write { try $0.execute(sql: "UPDATE messageHeader SET computedThreadId = 'shared-thread'") }
 
-        let inInbox = try db.read { try ChatStore.isMessageInInbox(sessionId: "msg:acc1:shared@example.com", db: $0) }
+        let inInbox = try db.read { try ChatStore.isThreadInInbox(sessionId: "thread:acc1:shared-thread", db: $0) }
         #expect(inInbox == false)
     }
 
-    @Test("Session eviction still sees the session account's own inbox copy")
+    @Test("Session eviction still sees the session account's own inbox email of the thread")
     func inboxMembershipFindsTheSameAccountCopy() throws {
         let db = try makeDB()
         _ = try TestDatabase.insertMessageHeader(
             db, messageId: "11", folderId: "acc1:INBOX", accountId: "acc1",
             folderPath: "INBOX", isInInbox: true, rfc822MessageId: "shared@example.com")
-        try db.write { try Self.anchorTurn(sessionId: "msg:acc1:shared@example.com").insert($0) }
+        try db.write { try $0.execute(sql: "UPDATE messageHeader SET computedThreadId = 'shared-thread'") }
 
-        // Non-vacuity: a session whose message IS in its own inbox stays exempt.
-        let inInbox = try db.read { try ChatStore.isMessageInInbox(sessionId: "msg:acc1:shared@example.com", db: $0) }
+        // Non-vacuity: a thread whose email IS in its own inbox stays exempt.
+        let inInbox = try db.read { try ChatStore.isThreadInInbox(sessionId: "thread:acc1:shared-thread", db: $0) }
         #expect(inInbox == true)
     }
 
-    /// A msg-detail session's first turn carrying NO `emailContextJSON`, so resolution
-    /// must go through the session key's stable-identity anchor (the scoped path).
-    private static func anchorTurn(sessionId: String) -> ChatTurn {
-        ChatTurn(
-            id: "anchor-\(UUID().uuidString)", timestamp: Date().timeIntervalSince1970 * 1000,
-            role: "user", content: "chat_converse", userMessage: "what is this about",
-            type: "normal", chars: 20, renderedContent: nil, sessionId: sessionId,
-            remindersSnapshot: nil, emailContextJSON: nil, thinkingContent: nil)
-    }
 }
 
 // MARK: - (b) Budget sweeps exempt an open compose

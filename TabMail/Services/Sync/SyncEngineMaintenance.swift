@@ -704,7 +704,7 @@ extension SyncEngine {
     ///      BY\s+messageHeader_unreadSweep' TabMail/ Shared/
     ///      TabMailNotificationService/` → **no output, exit 1**.
     ///   2. **Non-vacuity, so a broken regex cannot pass as a clean result.**
-    ///      The same command without the index name returns exactly **12 hint
+    ///      The same command without the index name returns exactly **13 hint
     ///      occurrences** — `messageHeader_folderId_messageId`
     ///      (`MessageContentStore.ownersSQL`), `messageHeader_rfc822MessageId`
     ///      (`MessageContentStore.ownersSQL`, `ChatStore.findByStableIdSQL`,
@@ -713,8 +713,10 @@ extension SyncEngine {
     ///      `AccountManager.inboxEntryAITargetSQL`,
     ///      `SyncEngine.optimisticDedupSQL`,
     ///      `ReplyParentResolver.parentLookupSQL`, `Draft.replyTargetLookupSQL`,
-    ///      `InboxView.stableIdRfcLookupSQL`, and
-    ///      `AccountManager.optimisticSentDedupSQL`), and
+    ///      `AppDatabase.rekeyChatSessionsByThreadSQL`, and
+    ///      `AccountManager.optimisticSentDedupSQL`),
+    ///      `messageHeader_accountId_messageId`
+    ///      (`AppDatabase.rekeyChatSessionsByThreadSQL`), and
     ///      `messageHeader_triage_display` (`InboxListReader`). Every named index is
     ///      built by a SHIPPED migration (`v64`, `v1`, `v38`), none deferred. Check
     ///      1 is meaningful only when check 2 is non-empty. Re-count occurrences

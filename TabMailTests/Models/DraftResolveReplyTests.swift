@@ -62,13 +62,12 @@ struct DraftKeyParsingTests {
         #expect(stableId == "complex:id:with:colons@host.com")
     }
 
-    @Test("ActiveAgentTracker.messageStableId parsing matches draftKey format")
-    @MainActor func trackerParsingConsistency() {
-        // The session key for message-detail is "msg:{accountId}:{stableId}"
-        // This should parse correctly via ActiveAgentTracker.messageStableId
-        let result = ActiveAgentTracker.messageStableId(from: "msg:acct1:rfc822@example.com")
+    @Test("ChatThreadKey parsing splits at the first colon, as draftKey does")
+    func trackerParsingConsistency() {
+        // An email's chat session key is "thread:{accountId}:{threadId}" (ADR-IOS-114)
+        let result = ChatThreadKey.parse("thread:acct1:rfc822@example.com")
         #expect(result?.accountId == "acct1")
-        #expect(result?.stableId == "rfc822@example.com")
+        #expect(result?.threadId == "rfc822@example.com")
     }
 }
 

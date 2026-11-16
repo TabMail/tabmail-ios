@@ -21,7 +21,7 @@ extension Notification.Name {
 final class ActiveAgentTracker {
     static let shared = ActiveAgentTracker()
 
-    /// Session keys with active agent work. E.g. "inbox", "msg:acct:stableId", "compose:draftId".
+    /// Session keys with active agent work. E.g. "inbox", "thread:acct:threadId", "compose:draftId".
     private(set) var workingSessions: Set<String> = []
 
     /// Last response text per session key (for toast when agent finishes while user is on a different view).
@@ -55,9 +55,9 @@ final class ActiveAgentTracker {
         _pendingResponses.removeValue(forKey: sessionKey)
     }
 
-    /// Check if a message-detail session is working for a given stableId.
-    func isMessageWorking(accountId: String, stableId: String) -> Bool {
-        workingSessions.contains("msg:\(accountId):\(stableId)")
+    /// Whether the chat of a thread (`ChatThreadKey`) is working.
+    func isThreadWorking(_ threadKey: String) -> Bool {
+        workingSessions.contains(threadKey)
     }
 
     /// Whether any compose session is working (for compose button glow).
@@ -100,15 +100,5 @@ final class ActiveAgentTracker {
     /// Whether any non-inbox session is working (message-detail or compose).
     var anyBackgroundWorking: Bool {
         workingSessions.contains { $0 != "inbox" }
-    }
-
-    /// Extract the message stableId from a "msg:accountId:stableId" session key, if applicable.
-    static func messageStableId(from sessionKey: String) -> (accountId: String, stableId: String)? {
-        guard sessionKey.hasPrefix("msg:") else { return nil }
-        let rest = String(sessionKey.dropFirst(4))
-        guard let colonIdx = rest.firstIndex(of: ":") else { return nil }
-        let accountId = String(rest[rest.startIndex..<colonIdx])
-        let stableId = String(rest[rest.index(after: colonIdx)...])
-        return (accountId, stableId)
     }
 }

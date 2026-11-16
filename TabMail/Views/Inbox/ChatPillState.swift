@@ -137,12 +137,44 @@ final class ChatPillState {
         var sessionEmailContexts: [String: EmailContextSnapshot] = [:]
         var editHistory: [InlineEditTurn] = []
         /// Current session's turns for multi-turn API history.
-        /// Only includes turns from THIS session (not expired/archived history).
+        /// Only includes turns from THIS session (not expired/archived history). A thread's
+        /// chat sends every key's turns of the thread (`ThreadChatReader.history`).
         var sessionTurns: [ChatTurn] = []
         /// Active chat task for this session. Stored here (not @State) so it survives
         /// SwiftUI view recreation when the user navigates away and back.
         @ObservationIgnored
         var activeChatTask: Task<Void, Never>?
+        /// The one read of this session's stored turns (`loadStoredTurns`).
+        @ObservationIgnored
+        private var storedTurnsLoad: Task<Void, Never>?
+
+        /// Reads the turns stored under `sessionId` into this session, once: they go in front of
+        /// anything already here (a send made before the read), each turn once. Every caller
+        /// waits for the same read, so a send's history never misses the stored turns.
+        func loadStoredTurns(sessionId: String) async {
+            if storedTurnsLoad == nil {
+                storedTurnsLoad = Task { @MainActor in
+                    let stored: ChatStore.ChatSession?
+                    do {
+                        stored = try await ChatStore.shared.loadContextSession(sessionId: sessionId)
+                    } catch {
+                        BackgroundSyncLogger.logDebug("[ChatPillState] Failed to load stored turns of \(sessionId.prefix(40)): \(error)")
+                        return
+                    }
+                    guard let stored else { return }
+                    let known = Set(sessionTurns.map(\.id))
+                    let earlier = stored.turns.filter { !known.contains($0.id) }
+                    sessionTurns = earlier + sessionTurns
+                    chatMessages = ThreadChatReader.chatMessages(for: earlier) + chatMessages
+                    if currentSessionId == nil { currentSessionId = sessionId }
+                    if let context = stored.emailContext, sessionEmailContexts[sessionId] == nil {
+                        sessionEmailContexts[sessionId] = context
+                    }
+                    BackgroundSyncLogger.logDebug("[ChatPillState] Loaded \(earlier.count) stored turns of \(sessionId.prefix(40))")
+                }
+            }
+            await storedTurnsLoad?.value
+        }
 
         // --- Multi-session state (inbox context only) ---
 

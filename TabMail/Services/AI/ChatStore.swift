@@ -97,7 +97,7 @@ actor ChatStore {
     /// - have `role IN ('user', 'assistant')`,
     /// - are not demo turns (`demo:` sessions).
     ///
-    /// Includes inbox, `msg:%`, and `compose:%` sessions. Demo history is left
+    /// Includes inbox, `thread:%` (and leftover `msg:%`), and `compose:%` sessions. Demo history is left
     /// out: it is discarded when its demo ends, so there is nothing to repair,
     /// and a demo turn loaded here could be indexed after its demo's cleanup
     /// and come back in the next demo's memory (#231).
@@ -117,6 +117,7 @@ actor ChatStore {
             // Scope breakdown for diagnosis.
             let scopeRows = try Row.fetchAll(db, sql: """
                 SELECT CASE
+                    WHEN sessionId LIKE 'thread:%' THEN 'thread'
                     WHEN sessionId LIKE 'msg:%' THEN 'msg'
                     WHEN sessionId LIKE 'compose:%' THEN 'compose'
                     WHEN sessionId IS NULL THEN 'null'
@@ -484,17 +485,19 @@ actor ChatStore {
     /// SQL predicate scoping the inbox-session list per mode. Demo chat
     /// sessions always carry the `demo:` sessionId prefix (see
     /// `DemoModeStore.scopedSessionId`): in demo mode ONLY demo sessions are
-    /// listed (minus demo msg/compose contexts, which have their own load
-    /// paths); in normal mode demo sessions are excluded entirely.
+    /// listed (minus demo thread/compose contexts, which have their own load
+    /// paths); in normal mode demo sessions are excluded entirely. A `msg:`
+    /// session is a per-email chat `v107` found no email for (ADR-IOS-114); it
+    /// stays out of the list as it always has.
     /// Static + pure so tests can run it against an in-memory DB.
     nonisolated static func inboxSessionScopeSQL(demoActive: Bool) -> String {
         demoActive
-            ? "sessionId LIKE 'demo:%' AND sessionId NOT LIKE 'demo:msg:%' AND sessionId NOT LIKE 'demo:compose:%'"
-            : "sessionId NOT LIKE 'demo:%' AND sessionId NOT LIKE 'msg:%' AND sessionId NOT LIKE 'compose:%'"
+            ? "sessionId LIKE 'demo:%' AND sessionId NOT LIKE 'demo:thread:%' AND sessionId NOT LIKE 'demo:msg:%' AND sessionId NOT LIKE 'demo:compose:%'"
+            : "sessionId NOT LIKE 'demo:%' AND sessionId NOT LIKE 'thread:%' AND sessionId NOT LIKE 'msg:%' AND sessionId NOT LIKE 'compose:%'"
     }
 
     /// Load the last K distinct **inbox** sessions, ordered newest-last (rightmost in swipe UI).
-    /// Excludes message-detail sessions (sessionId LIKE 'msg:%') and compose sessions
+    /// Excludes thread sessions (sessionId LIKE 'thread:%', and leftover 'msg:%') and compose sessions
     /// (sessionId LIKE 'compose:%') — those are loaded separately via loadContextSession().
     /// `demoActive` scopes the list to demo-only / demo-free (see inboxSessionScopeSQL).
     func loadSessions(limit: Int, demoActive: Bool) throws -> [ChatSession] {
@@ -717,13 +720,12 @@ actor ChatStore {
     ///
     /// ~1000× in the regime that matters and no cost in the other, because the
     /// hint names the index the planner picks anyway once it has statistics.
-    /// It is reachable there: `evictMessageDetailSessionsImpl` loops every
-    /// `msg:%` session INSIDE `dbPool.write`, `isMessageInInbox` falls through
-    /// to this function exactly when the PK lookup fails (i.e. on the sessions
-    /// that sweep targets), and in `SyncEngine.runWALMaintenance` chat eviction
-    /// runs BEFORE the one-shot whole-DB `ANALYZE` — so the first maintenance
-    /// pass after a fresh install runs this loop stats-poor while holding the
-    /// single writer.
+    /// It was reachable there: `evictMessageDetailSessionsImpl` looped every
+    /// `msg:%` session INSIDE `dbPool.write` and fell through to this function
+    /// when the PK lookup failed, and in `SyncEngine.runWALMaintenance` chat
+    /// eviction runs BEFORE the one-shot whole-DB `ANALYZE`. Since `v107`
+    /// (ADR-IOS-114) eviction checks a thread by `ChatThreadKey.memberSQL`;
+    /// this function now serves `resolveMessageHeaderId`.
     ///
     /// ⚠️ Fail-safe: a migration that renames or drops the index makes this
     /// statement THROW rather than silently walk. The callers treat a throw as
@@ -865,10 +867,12 @@ actor ChatStore {
         }
     }
 
-    // MARK: - Message-Detail Session Eviction
+    // MARK: - Thread Session Eviction
 
-    /// Evict old message-detail chat sessions beyond the limit.
-    /// Sessions for messages still in inbox are exempt (kept indefinitely).
+    /// Evict old thread chat sessions beyond the limit (ADR-IOS-114).
+    /// A thread with any email still in the Inbox is exempt (kept indefinitely)
+    /// and does not count toward the limit. A leftover `msg:` chat, one `v107`
+    /// found no email for, has no Inbox email and is cleared like any other.
     @discardableResult
     func evictMessageDetailSessions(limit: Int) throws -> Int {
         try Self.evictMessageDetailSessionsImpl(dbPool: AppDatabase.dbPool, limit: limit)
@@ -884,7 +888,7 @@ actor ChatStore {
             let sessionRows = try Row.fetchAll(db, sql: """
                 SELECT sessionId, MAX(timestamp) as maxTs
                 FROM chatTurn
-                WHERE sessionId LIKE 'msg:%'
+                WHERE sessionId LIKE 'thread:%' OR sessionId LIKE 'msg:%'
                 GROUP BY sessionId
                 ORDER BY maxTs DESC
             """)
@@ -893,7 +897,7 @@ actor ChatStore {
             var evicted = 0
             for row in sessionRows {
                 let sid: String = row["sessionId"]
-                if try isMessageInInbox(sessionId: sid, db: db) { continue }
+                if try isThreadInInbox(sessionId: sid, db: db) { continue }
                 kept += 1
                 if kept > limit {
                     // Delete session turns. History (chatHistory) is a separate table
@@ -904,33 +908,22 @@ actor ChatStore {
             }
             if evicted > 0 {
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[ChatStore] Evicted \(evicted) message-detail sessions (limit=\(limit))")
+                    print("[ChatStore] Evicted \(evicted) thread chat sessions (limit=\(limit))")
                 }
             }
             return evicted
         }
     }
 
-    /// Check if the message for a msg-detail session is still in inbox.
-    /// Strategy 1: emailContextJSON PK lookup. Strategy 2: the session's stable-identity
-    /// anchor, re-resolved ACCOUNT-SCOPED (see `findByStableId`) — a session in account A
-    /// must never decide its inbox membership from account B's copy of the same RFC id.
-    static func isMessageInInbox(sessionId: String, db: Database) throws -> Bool {
-        let firstTurn = try ChatTurn
-            .filter(Column("sessionId") == sessionId)
-            .order(Column("timestamp").asc)
-            .fetchOne(db)
-        if let json = firstTurn?.emailContextJSON,
-           let ctx = decodeEmailContext(json),
-           let header = try MessageHeader.fetchOne(db, key: ctx.messageHeaderId) {
-            return header.isInInbox
-        }
-        if let (acct, anchor) = extractAccountAndStableId(from: sessionId),
-           let header = try findByStableId(anchor, accountId: acct, db: db) {
-            return header.isInInbox
-        }
-        return false
+    /// Whether any email of a thread session's thread is in the Inbox: a row of the
+    /// key's account and thread with `isInInbox` (`ChatThreadKey.memberSQL`).
+    static func isThreadInInbox(sessionId: String, db: Database) throws -> Bool {
+        guard let (accountId, threadId) = ChatThreadKey.parse(sessionId) else { return false }
+        return try Bool.fetchOne(db, sql: isThreadInInboxSQL, arguments: [accountId, threadId, threadId]) ?? false
     }
+
+    /// The statement `isThreadInInbox` runs, named so its plan is tested.
+    static let isThreadInInboxSQL = "SELECT EXISTS(SELECT 1 FROM messageHeader WHERE \(ChatThreadKey.memberSQL) AND isInInbox = 1)"
 
     // MARK: - Compose Session Eviction
 

@@ -30,6 +30,7 @@ struct AITextMessageStorageTests {
         let order = [
             "v103_addFolderChangeCursor", "v104_addReplyAllAndMarkSentAt",
             "v105_addAITextMessages", "v106_repairAICacheMessageIds",
+            "v107_rekeyChatSessionsByThread",
         ]
         #expect(applied.filter { order.contains($0) } == order)
     }
