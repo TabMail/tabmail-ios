@@ -192,8 +192,25 @@ struct PendingOperation: Codable, FetchableRecord, MutablePersistableRecord, Ide
     var draftId: String?
     /// Namespace discriminator for persisted provider-native delete addresses.
     var draftDeleteAddressKind: String?
+    /// `.markReplied` only: the user's send was a reply-all (v104). Generic; a
+    /// provider with one "answered" flag treats it as a plain reply.
+    var replyAll: Bool = false
+    /// `.markReplied` / `.markForwarded` only: when the user's send completed
+    /// (`OutboxMessage.sentAt`), so every retry records the same time (v104).
+    /// NULL on rows admitted before v104 and on every other type.
+    var sentAt: Date?
     /// PendingStatus rawValue — stored as String for GRDB compatibility
     var status: String
+
+    /// The time a reply/forward mark records. `sentAt` for every row admitted
+    /// since v104. A row admitted before v104 has no `sentAt`; its `createdAt`
+    /// was stamped in the same completion transaction that confirmed the send
+    /// (`deleteCompletedSendAtomic`), so it is that row's send-completion time.
+    /// Not a fallback: for these rows `createdAt` IS the confirmed-send time,
+    /// to within one transaction (reviewed for #915). In a released build the
+    /// arm is unreachable, because `AppDatabase.retirePreviousReleaseActionQueue`
+    /// retires every queued action on a release upgrade; it serves dev databases.
+    var verbTime: Date { sentAt ?? createdAt }
 
     /// Decoded message IDs from JSON storage
     var messageIds: [String] {
@@ -218,7 +235,9 @@ struct PendingOperation: Codable, FetchableRecord, MutablePersistableRecord, Ide
         draftServerUidValidity: Int? = nil,
         instanceEpoch: String? = nil,
         draftId: String? = nil,
-        draftDeleteAddressKind: DraftDeleteAddressKind? = nil
+        draftDeleteAddressKind: DraftDeleteAddressKind? = nil,
+        replyAll: Bool = false,
+        sentAt: Date? = nil
     ) {
         self.id = UUID().uuidString
         self.type = type
@@ -243,6 +262,8 @@ struct PendingOperation: Codable, FetchableRecord, MutablePersistableRecord, Ide
         self.instanceEpoch = instanceEpoch
         self.draftId = draftId
         self.draftDeleteAddressKind = draftDeleteAddressKind?.rawValue
+        self.replyAll = replyAll
+        self.sentAt = sentAt
         self.status = PendingStatus.queued.rawValue
     }
 

@@ -148,6 +148,9 @@ struct EmailReplyTool: AgentTool, Sendable {
                 bcc: bcc,
                 subject: generatedSubject,
                 body: generatedBody,
+                // Recipients start from the reply-all set, so the send
+                // records reply-all on the original (#915).
+                isReplyAll: true,
                 onOutcome: onOutcome,
                 outcomeState: state
             )

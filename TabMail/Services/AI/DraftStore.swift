@@ -185,6 +185,9 @@ actor DraftStore {
         merged.editHistoryJSON = draft.editHistoryJSON
         merged.updatedAt = draft.updatedAt
         merged.attachmentsDirName = draft.attachmentsDirName
+        // The user's latest compose entry decides reply vs reply-all (#915); a
+        // reply and a reply-all to one message share one `reply:` key.
+        merged.isReplyAll = draft.isReplyAll
         merged.pushAttemptVersion = current.pushAttemptVersion + 1
         // `"unconfirmed"` is NO LONGER WRITTEN by any code path — the provider-throw
         // arm now restores `"dirty"` and rethrows — but the remap is KEPT so a dev

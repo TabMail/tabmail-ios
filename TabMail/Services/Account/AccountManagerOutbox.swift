@@ -108,6 +108,7 @@ extension AccountManager {
         from account: Account,
         replyToHeaderId: String? = nil,
         isForward: Bool = false,
+        isReplyAll: Bool = false,
         serverDraftId: String? = nil,
         draftUidValidity: Int? = nil,
         draftServerFolderPath: String? = nil,
@@ -121,6 +122,7 @@ extension AccountManager {
             accountId: account.id,
             replyToHeaderId: replyToHeaderId,
             isForward: isForward,
+            isReplyAll: isReplyAll,
             serverDraftId: serverDraftId,
             draftUidValidity: draftUidValidity,
             draftServerFolderPath: draftServerFolderPath,
@@ -200,6 +202,7 @@ extension AccountManager {
         accountId: String,
         replyToHeaderId: String?,
         isForward: Bool,
+        isReplyAll: Bool = false,
         serverDraftId: String?,
         draftUidValidity: Int? = nil,
         draftServerFolderPath: String? = nil,
@@ -217,6 +220,8 @@ extension AccountManager {
             originalMessageHeaderId: replyToHeaderId,
             isForward: isForward
         )
+        // A forward is never a reply-all; the forward mode wins if both arrive.
+        outbox.isReplyAll = isReplyAll && !isForward
         outbox.serverDraftId = serverDraftId
         outbox.draftServerUidValidity = draftUidValidity
         outbox.draftServerFolderPath = draftServerFolderPath
@@ -1184,18 +1189,23 @@ extension AccountManager {
                         messageIds: flagAdmission.providerIds,
                         accountId: original.accountId,
                         folderPath: original.folderPath,
-                        observedUidValidity: flagAdmission.observedUidValidity)
+                        observedUidValidity: flagAdmission.observedUidValidity,
+                        sentAt: outbox.sentAt)
                     try markForwardedOp.insert(db)
                 }
             } else {
                 if let flagAdmission {
                     original.isReplied = true
+                    // #915: reply-all and the send time travel as generic payload;
+                    // the provider decides what they mean on its wire.
                     var markRepliedOp = PendingOperation(
                         type: .markReplied,
                         messageIds: flagAdmission.providerIds,
                         accountId: original.accountId,
                         folderPath: original.folderPath,
-                        observedUidValidity: flagAdmission.observedUidValidity)
+                        observedUidValidity: flagAdmission.observedUidValidity,
+                        replyAll: outbox.isReplyAll,
+                        sentAt: outbox.sentAt)
                     try markRepliedOp.insert(db)
                 }
                 // ⚑ DELIBERATELY OUTSIDE the admission guard. An action tag is

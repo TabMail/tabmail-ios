@@ -2123,6 +2123,7 @@ struct InboxView: View {
         let recipients = buildReplyAllRecipients(for: msg, allAccounts: navigationStore.accounts)
         return ComposeView(
             replyTo: msg,
+            isReplyAll: true,
             prefillTo: recipients.to.isEmpty ? nil : recipients.to,
             prefillCc: recipients.cc.isEmpty ? nil : recipients.cc
         )
@@ -2147,6 +2148,7 @@ struct InboxView: View {
             ComposeView(
                 replyTo: req.replyTo,
                 suggestedBody: req.body,
+                isReplyAll: req.isReplyAll,
                 prefillTo: req.to.isEmpty ? nil : req.to,
                 prefillCc: req.cc.isEmpty ? nil : req.cc,
                 prefillBcc: req.bcc.isEmpty ? nil : req.bcc,

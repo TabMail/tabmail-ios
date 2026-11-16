@@ -21,6 +21,10 @@ struct DynamicIslandChat: View {
     let composeContext: ComposeEditContext?
     let draftId: String?
     let draftReplyToId: String?  // MessageHeader.id of the email being replied to (for draft eviction)
+    /// The compose's reply-all kind (#915), stored on the row the agent's first
+    /// autosave creates, like `draftReplyToId`, so a draft reopened after the app
+    /// ends still sends as reply-all.
+    let draftIsReplyAll: Bool
     /// T5.8 — the reply target's PROVIDER id (`MessageHeader.messageId`) and observed
     /// UIDVALIDITY, captured from the SAME header `draftReplyToId` came from. Stamped
     /// onto the `Draft` row this view creates so the durable address survives the
@@ -215,6 +219,7 @@ struct DynamicIslandChat: View {
         composeContext: ComposeEditContext? = nil,
         draftId: String? = nil,
         draftReplyToId: String? = nil,
+        draftIsReplyAll: Bool = false,
         draftReplyToProviderMessageId: String? = nil,
         draftReplyToUidValidity: Int? = nil,
         composeGenerationCursor: ComposeGenerationCursor? = nil,
@@ -236,6 +241,7 @@ struct DynamicIslandChat: View {
         self.composeContext = composeContext
         self.draftId = draftId
         self.draftReplyToId = draftReplyToId
+        self.draftIsReplyAll = draftIsReplyAll
         self.draftReplyToProviderMessageId = draftReplyToProviderMessageId
         self.draftReplyToUidValidity = draftReplyToUidValidity
         self.composeGenerationCursor = composeGenerationCursor
@@ -1931,6 +1937,10 @@ struct DynamicIslandChat: View {
             existing.bccJSON = Draft.encodeStringArray(recipients.bcc)
             existing.subject = subject
             existing.body = body
+            // #915: the compose's current entry decides reply vs reply-all on every
+            // save, as on Save and Send; a row loaded from the other entry under the
+            // shared `reply:` key must not keep its old kind.
+            existing.isReplyAll = draftIsReplyAll && !existing.isForward
             existing.editHistoryJSON = editHistJSON
             existing.updatedAt = now
             savedAccountId = existing.accountId
@@ -1997,6 +2007,7 @@ struct DynamicIslandChat: View {
             // draft's whole life (the update path preserves, it does not re-derive).
             draft.replyToProviderMessageId = draftReplyToProviderMessageId
             draft.replyToUidValidity = draftReplyToUidValidity
+            draft.isReplyAll = draftIsReplyAll && !draft.isForward
             // Immutable copy for the escaping admission closure, mirroring the
             // `existingToSave` binding in the update branch above (a captured `var`
             // is a concurrency hazard, not merely a style point).

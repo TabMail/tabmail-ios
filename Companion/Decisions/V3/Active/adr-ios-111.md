@@ -538,6 +538,8 @@ the JSON body unencoded, so `GraphAPI.batchItemURL` encodes its spaces.
 arrow only if the full sync's window listing lists it or it changes again; the Outlook catch-up listing
 does not read the verb. The arrow is never written to the server (Mail.Send and phone-sent replies are
 out of scope).
+*Amended 2026-11-15 (#915):* the app now writes the verb on the original after a confirmed send
+(memory 151); the reader sees that echo as a mark already set locally, so it changes nothing.
 
 Tests: `OutlookLastVerbTests.swift` (extension of `OutlookChangeReadingTests`).
 

@@ -40,6 +40,7 @@ struct UndoReopenCompose: View {
         return ComposeView(
             account: reopened?.account,
             isForward: reopened?.draft?.isForward ?? false,
+            isReplyAll: reopened?.draft?.isReplyAll ?? false,
             prefillDraftId: snapshot.authority.draftId,
             retainedDraftAuthority: snapshot.authority
         )

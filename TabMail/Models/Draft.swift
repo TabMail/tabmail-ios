@@ -66,6 +66,10 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
     var pushAttemptVersion: Int = 0
     /// Mailbox component of the strong IMAP draft address.
     var serverDraftFolderPath: String? = nil
+    /// v104: the reply was opened as Reply All (#915). Shares the `reply:` key
+    /// with a plain reply; only the mark recorded on the original differs.
+    /// Restored on every reopen, like `isForward`, so a resend keeps its mode.
+    var isReplyAll: Bool = false
 
     /// v72: the IMAP UIDVALIDITY epoch `serverDraftId` was MINTED under — the
     /// value the SELECT that carried the draft's APPEND reported, returned by the

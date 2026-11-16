@@ -837,8 +837,13 @@ enum ProviderMessageAction: Sendable {
     case move(destination: String)
     case read(Bool)
     case flagged(Bool)
-    case replied
-    case forwarded
+    /// The user's reply to this message was sent. `all` is true for a reply-all.
+    /// `at` is when the send completed (`OutboxMessage.sentAt`), carried on the
+    /// durable op so every retry records the same time. Providers that keep one
+    /// "answered" flag (IMAP `\Answered`, Gmail none) ignore both.
+    case replied(all: Bool, at: Date)
+    /// The user's forward of this message was sent; `at` as for `replied`.
+    case forwarded(at: Date)
     case userLabel(id: String, add: Bool)
 }
 

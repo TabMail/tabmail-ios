@@ -33,7 +33,7 @@ struct ProviderMessageActionTests {
         #expect(server.snapshot(providerMessageId: "bystander")?.labels == ["INBOX", "UNREAD"])
         #expect(server.modifyLog().allSatisfy { $0.providerMessageId == "target" })
         let before = server.modifyLog().count
-        for action in [ProviderMessageAction.replied, .forwarded] {
+        for action in [ProviderMessageAction.replied(all: false, at: Date()), .forwarded(at: Date())] {
             let outcome = try await provider.performMessageAction(action, at: source)
             #expect(outcome.dispositionedMemberIds == ["target"])
         }
@@ -57,12 +57,16 @@ struct ProviderMessageActionTests {
             _ = try await provider.performMessageAction(.userLabel(id: "Label_1", add: value), at: source)
             #expect(server.categories(providerMessageId: "target")?.contains("Label_1") == value)
         }
+        // #915: reply/forward marks are PATCHes of the original's last verb, on the
+        // addressed message only — never the RFC bystander.
         let before = server.mutationLog()
-        for action in [ProviderMessageAction.replied, .forwarded] {
+        for action in [ProviderMessageAction.replied(all: false, at: Date()), .forwarded(at: Date())] {
             let outcome = try await provider.performMessageAction(action, at: source)
             #expect(outcome.dispositionedMemberIds == ["target"])
         }
-        #expect(server.mutationLog() == before)
+        #expect(server.mutationLog() == before + ["PATCH target", "PATCH target"])
+        #expect(server.extendedProperties(providerMessageId: "target")?["Integer 0x1081"] == "104")
+        #expect(server.extendedProperties(providerMessageId: "bystander")?.isEmpty == true)
         let move = try await provider.performMessageAction(.move(destination: "Archive"), at: source)
         #expect(move.addressChangesOnMove)
         #expect(move.dispositionedMemberIds == ["target"])
@@ -129,7 +133,7 @@ struct ProviderMessageActionTests {
     @Test("Demo explicitly settles unrepresented remote flags and labels")
     func demoExplicitNoOps() async throws {
         let provider: any EmailProvider = DemoProvider(accountId: "demo-action-test")
-        for action in [ProviderMessageAction.replied, .forwarded, .userLabel(id: "Label_1", add: true), .userLabel(id: "Label_1", add: false)] {
+        for action in [ProviderMessageAction.replied(all: false, at: Date()), .forwarded(at: Date()), .userLabel(id: "Label_1", add: true), .userLabel(id: "Label_1", add: false)] {
             let outcome = try await provider.performMessageAction(action, at: .init(
                 memberIds: ["one", "two"], folderPath: "Source", admittedUidValidity: nil))
             #expect(outcome.dispositionedMemberIds == ["one", "two"])

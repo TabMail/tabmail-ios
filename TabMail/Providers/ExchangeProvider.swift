@@ -700,9 +700,15 @@ actor ExchangeProvider: EmailProvider {
                 }
             case .flagged(let flagged):
                 try await markFlagged(ids: source.memberIds, flagged: flagged, folder: source.folderPath)
-            case .replied, .forwarded:
-                // These flags have no remote representation; local state is preserved by sync.
-                break
+            case .replied(let all, let at):
+                try await patchEachMessage(
+                    ids: source.memberIds,
+                    body: Self.lastVerbPatchBody(
+                        verb: all ? GraphAPI.lastVerbReplyToAll : GraphAPI.lastVerbReplyToSender, at: at))
+            case .forwarded(let at):
+                try await patchEachMessage(
+                    ids: source.memberIds,
+                    body: Self.lastVerbPatchBody(verb: GraphAPI.lastVerbForward, at: at))
             case .userLabel(let id, let add):
                 if let member = source.memberIds.first {
                     try await setUserLabel(messageId: member, category: id, add: add)
@@ -713,6 +719,29 @@ actor ExchangeProvider: EmailProvider {
         } catch let disposition as ProviderMembersDispositioned {
             return ProviderActionOutcome(disposition: disposition)
         }
+    }
+
+    /// Writes MS-OXOMSG `PidTagLastVerbExecuted` (`GraphAPI.lastVerbPropertyId`,
+    /// codes `GraphAPI.lastVerbReplyToSender` / `ReplyToAll` / `Forward`) and its
+    /// time (`GraphAPI.lastVerbTimePropertyId`), plus the list-row icon
+    /// `PidTagIconIndex` (`GraphAPI.iconIndexPropertyId`: replied mail for a
+    /// reply or reply all, forwarded mail for a forward), on the ORIGINAL. Outlook shows the
+    /// reply / reply-all / forward arrow and "You replied on ..." from these, and
+    /// Outlook's own clients write them when they reply or forward.
+    /// `POST /sendMail` never touches the original (live check, #890 row 4), so
+    /// the app writes them itself after the send completed (#915). Both values are
+    /// absolute, so re-sending the same PATCH on a retry leaves the server unchanged.
+    static func lastVerbPatchBody(verb: Int, at: Date) -> [String: Any] {
+        let formatter = ISO8601DateFormatter()
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        formatter.formatOptions = [.withInternetDateTime]
+        let icon = verb == GraphAPI.lastVerbForward
+            ? GraphAPI.iconIndexForwardedMail : GraphAPI.iconIndexRepliedMail
+        return ["singleValueExtendedProperties": [
+            ["id": GraphAPI.lastVerbPropertyId, "value": String(verb)],
+            ["id": GraphAPI.lastVerbTimePropertyId, "value": formatter.string(from: at)],
+            ["id": GraphAPI.iconIndexPropertyId, "value": String(icon)],
+        ]]
     }
 
     func markRead(ids: [String], folder: String) async throws {

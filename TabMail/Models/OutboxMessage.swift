@@ -38,6 +38,9 @@ struct OutboxMessage: Codable, FetchableRecord, PersistableRecord, Identifiable,
     var originalMessageHeaderId: String?
     /// Whether this is a forward (vs reply)
     var isForward: Bool
+    /// The reply was a Reply All (v104, #915): completion queues the reply mark
+    /// with `replyAll`, which Outlook records as reply-all and IMAP as `\Answered`.
+    var isReplyAll: Bool = false
     /// Timestamp set immediately after provider.send() succeeds, BEFORE the DB delete.
     /// Allows reconcileOutbox to distinguish "crashed mid-send" from "crashed after
     /// send succeeded" — the latter is deleted (not re-queued) to prevent double-sends.

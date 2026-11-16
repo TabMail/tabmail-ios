@@ -79,6 +79,48 @@ extension OutlookChangeReadingTests {
         }
     }
 
+    /// #915 + #890 end to end: the app sends a reply-all, the completed send's
+    /// mark PATCHes 103 on the original (and Graph reports that change in the
+    /// delta), and the change reader then reads the verb back: the arrow stays,
+    /// as a reply, never as a forward.
+    @Test("The app's own reply mark is written, reported in the delta, and read back with the arrow kept")
+    func appReplyMarkIsWrittenAndReadBack() async throws {
+        try await Self.withWorld(seeds: [Self.seed("o-1", in: Self.inbox)]) { w in
+            try w.insertRow("o-1", in: w.inbox)
+            try await w.baselineAll()
+            let parent = try #require(try w.row("o-1", in: w.inbox))
+            var sent = OutboxMessage(
+                accountId: w.accountId,
+                draft: DraftMessage(to: ["sender@example.com"], subject: "Re: Original", body: "text",
+                                    inReplyTo: "<o-1@example.com>"),
+                originalMessageHeaderId: parent.id,
+                isForward: false)
+            sent.isReplyAll = true
+            sent.status = OutboxStatus.sending.rawValue
+            sent.sentAt = Date()
+            sent.appendedToSent = true
+            let outbox = sent
+            try await w.pool.write { db in try outbox.insert(db) }
+            _ = try await w.pool.write { db in
+                try AccountManager.deleteCompletedSendAtomic(outboxId: outbox.id, db: db)
+            }
+            await AccountManager.shared.registerProviderForTesting(accountId: w.accountId, provider: w.provider)
+            await AccountManager.shared.drainPendingQueue()
+            await AccountManager.shared.unregisterProviderForTesting(accountId: w.accountId)
+            #expect(w.server.extendedProperties(providerMessageId: "o-1")?["Integer 0x1081"] == "103",
+                    "precondition: the mark reached the server")
+            let left = try await w.pool.read { db in try PendingOperation.fetchCount(db) }
+            #expect(left == 0)
+
+            let before = w.batchedIds().count
+            try await w.read()
+            #expect(w.batchedIds().count > before, "the reader read the original's verb back from the delta")
+            let row = try #require(try w.row("o-1", in: w.inbox))
+            #expect(row.isReplied == true, "the arrow is kept")
+            #expect(row.isForwarded == false, "a reply-all is not a forward")
+        }
+    }
+
     @Test("A mark the phone holds is never cleared: not by a later forward, not by a read change")
     func markIsNeverCleared() async throws {
         try await Self.withWorld(seeds: [Self.seed("m-1", in: Self.inbox), Self.seed("m-2", in: Self.inbox)]) { w in
