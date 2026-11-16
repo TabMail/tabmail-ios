@@ -460,6 +460,17 @@ same AI result, kept as long as the email itself is shown.
    not "only" (the new person joins the chat's people), and an email is never "only" for someone who
    joined after it; a new newest email resets the choice to Reply All; with recipients chosen the
    agent's own recipient changes are replaced by the chosen people on the compose card.
+   **Reply All is recorded as the reply goes (2026-11-15):** the ready AI Reply and a reply asked
+   for in the field open compose as Reply All (`ComposeView.isReplyAll`, which the send records on
+   the original) exactly when nobody is chosen in Reply to; with people chosen they open as a plain
+   reply to only them, with no Cc or Bcc. A reply the agent writes in the open sheet keeps the
+   agent's recipients and opens as Reply All only when the agent opened it as one and those
+   recipients are the whole Reply All audience. One helper decides the kind and the recipients
+   together (`ChatReplyCompose.make`), once, as the card opens, so a newer email resetting the
+   choice does not change an open card. Before this, the ready AI Reply always went to everyone and
+   neither card opened as Reply All. Tests: `ChatReplyFieldTests` (`readyReplyToEveryoneIsReplyAll`,
+   `readyReplyToChosenIsPlainReply`, `agentReplyFromTheFieldFollowsTheTarget`,
+   `agentReplyFromTheSheetKeepsItsRecipients`).
 
 **Release order:** an iOS build at protocol 2.0.0 must not reach users before the backend change
 (its protocol 2.0.0 JSON shape) is deployed to production: an older backend sends 2.0.0 the labelled text, which this

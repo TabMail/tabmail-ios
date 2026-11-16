@@ -200,17 +200,70 @@ struct ChatReplyTarget: Equatable {
     }
 }
 
-/// A compose card the agent opens in the chat. `fromField`: it was asked for in the collapsed reply
-/// field, not in the open chat sheet.
-enum ChatAgentCompose {
-    /// Who a reply goes to: asked for in the field with people chosen in Reply to, only them,
-    /// with no Cc or Bcc; otherwise the agent's own recipients.
-    static func replyRecipients(
-        fromField: Bool, target: ChatReplyTarget, request req: AgentToolRouter.ComposeRequest
-    ) -> (to: [String], cc: [String], bcc: [String]) {
-        guard fromField, let only = target.only else { return (req.to, req.cc, req.bcc) }
-        return (only.map(\.address), [], [])
+/// How a reply from the chat opens compose: Reply All or a plain reply, and to whom, read together
+/// from who the chat's reply goes to (`ChatReplyTarget`), so the kind the send records on the
+/// original (`ComposeView.isReplyAll`, #915) is the kind the "Replying only to" line shows. Read once,
+/// as the card opens: a newer email resetting the target must not change an open card's kind.
+struct ChatReplyCompose: Equatable {
+    let isReplyAll: Bool
+    let to: [String]
+    let cc: [String]
+    let bcc: [String]
+
+    /// The reply to `message`. `agent`: the agent's reply request and whether it was asked for in the
+    /// collapsed field (not the open chat sheet); nil for the ready AI Reply.
+    /// - The ready AI Reply, and a reply asked for in the field, are a Reply All to the newest
+    ///   email's people exactly when nobody was chosen in Reply to (`target.only == nil`); with people
+    ///   chosen, a plain reply to only them, with no Cc or Bcc.
+    /// - A reply asked for in the open sheet keeps the agent's recipients, and is a Reply All only
+    ///   when the agent opened it as one and those recipients are the whole Reply All audience.
+    static func make(
+        replyTo message: MessageHeader?, target: ChatReplyTarget,
+        agent: (request: AgentToolRouter.ComposeRequest, fromField: Bool)?, accounts: [Account]
+    ) -> ChatReplyCompose {
+        if let only = target.only, agent?.fromField ?? true {
+            return ChatReplyCompose(isReplyAll: false, to: only.map(\.address), cc: [], bcc: [])
+        }
+        let audience = message.map { buildReplyAllRecipients(for: $0, allAccounts: accounts) }
+        guard let agent else {
+            return ChatReplyCompose(isReplyAll: audience != nil, to: audience?.to ?? [], cc: audience?.cc ?? [], bcc: [])
+        }
+        let req = agent.request
+        let isReplyAll: Bool
+        if agent.fromField {
+            isReplyAll = audience != nil
+        } else {
+            let addresses = { (list: [String]) in Set(list.map { $0.lowercased() }) }
+            isReplyAll = req.isReplyAll && audience.map { addresses(req.to + req.cc + req.bcc) == addresses($0.to + $0.cc) } == true
+        }
+        return ChatReplyCompose(isReplyAll: isReplyAll, to: req.to, cc: req.cc, bcc: req.bcc)
     }
+
+    /// The compose card, opened in this kind, as main's Reply All entries open it.
+    @MainActor
+    func composeView(
+        replyTo message: MessageHeader?, suggestedBody: String? = nil,
+        onAgentOutcome: @escaping @MainActor (ComposeOutcome) -> Void
+    ) -> ComposeView {
+        ComposeView(
+            replyTo: message, suggestedBody: suggestedBody, isReplyAll: isReplyAll,
+            prefillTo: to.isEmpty ? nil : to, prefillCc: cc.isEmpty ? nil : cc,
+            prefillBcc: bcc.isEmpty ? nil : bcc, onAgentOutcome: onAgentOutcome)
+    }
+}
+
+/// The ready AI Reply's compose card: the email it answers and how it opens.
+struct ChatReadyReply: Identifiable {
+    let message: MessageHeader
+    let compose: ChatReplyCompose
+    var id: MessageHeader.ID { message.id }
+}
+
+/// A compose card the agent opens in the chat, with how a reply opens, read as it opened.
+struct ChatAgentCard: Identifiable {
+    let request: AgentToolRouter.ComposeRequest
+    let reply: ChatReplyCompose
+    var id: UUID { request.id }
 }
 
 /// A reply in the outbox the chat does not show as an email yet, shown as the user's bubble at the

@@ -110,9 +110,9 @@ struct ChatThreadView: View {
     @State private var pillHeight = ChatViewLayout.pillStartHeight
     @State private var chatInputFocused = false
     @State private var chatWorking = false
-    /// The ready AI Reply's compose card: the email it answers.
-    @State private var readyReplyMessage: MessageHeader?
-    @State private var agentCompose: AgentToolRouter.ComposeRequest?
+    /// The ready AI Reply's compose card: the email it answers, and how it opens.
+    @State private var readyReply: ChatReadyReply?
+    @State private var agentCompose: ChatAgentCard?
     /// A compose card opened for the field's last request, so the agent's closing words open
     /// no sheet.
     @State private var fieldComposeOpened = false
@@ -169,7 +169,7 @@ struct ChatThreadView: View {
     }
 
     private var isAnyPresentation: Bool {
-        cardMessage != nil || readyReplyMessage != nil || agentCompose != nil
+        cardMessage != nil || readyReply != nil || agentCompose != nil
             || forwardMessage != nil || showsReplyTo
     }
 
@@ -272,10 +272,13 @@ struct ChatThreadView: View {
             askForSummaries()
         }
         .onChange(of: AgentToolRouter.shared.pendingCompose?.id) { _, newId in
-            guard newId != nil else { return }
+            guard newId != nil, let req = AgentToolRouter.shared.pendingCompose else { return }
             // Asked from the field (not the open sheet): the agent's closing words open nothing.
             fieldComposeOpened = !chatExpanded
-            agentCompose = AgentToolRouter.shared.pendingCompose
+            // A reply asked for in the field goes to the people chosen in Reply to.
+            let reply = ChatReplyCompose.make(
+                replyTo: req.replyTo, target: replyTarget, agent: (req, fieldComposeOpened), accounts: context.accounts)
+            agentCompose = ChatAgentCard(request: req, reply: reply)
             AgentToolRouter.shared.pendingCompose = nil
         }
         .sheet(item: $cardMessage) { msg in
@@ -285,14 +288,11 @@ struct ChatThreadView: View {
             }
             .presentationDragIndicator(.visible)
         }
-        .fullScreenCover(item: $readyReplyMessage) { msg in
-            // Today's reply compose, Reply All, with the AI Reply in its suggestion box.
-            let recipients = buildReplyAllRecipients(for: msg, allAccounts: context.accounts)
-            ComposeView(
-                replyTo: msg,
-                prefillTo: recipients.to.isEmpty ? nil : recipients.to,
-                prefillCc: recipients.cc.isEmpty ? nil : recipients.cc,
-                onAgentOutcome: { outcome in composeEnded(outcome, replyTo: msg) })
+        .fullScreenCover(item: $readyReply) { ready in
+            // Today's reply compose, with the AI Reply in its suggestion box: Reply All, or a reply
+            // to only the people chosen in Reply to.
+            ready.compose.composeView(
+                replyTo: ready.message, onAgentOutcome: { outcome in composeEnded(outcome, replyTo: ready.message) })
         }
         .fullScreenCover(item: $agentCompose) { composeView(for: $0) }
         .fullScreenCover(item: $forwardMessage) { ComposeView(replyTo: $0, isForward: true) }
@@ -580,7 +580,10 @@ struct ChatThreadView: View {
                     isNoReply: isNoReply,
                     clearCount: fieldClearCount,
                     onlyTo: replyTarget.only),
-                onSendReadyReply: { readyReplyMessage = newest },
+                onSendReadyReply: {
+                    readyReply = ChatReadyReply(message: newest, compose: ChatReplyCompose.make(
+                        replyTo: newest, target: replyTarget, agent: nil, accounts: context.accounts))
+                },
                 onFieldSend: { _ in fieldComposeOpened = false })
         }
         .padding(.horizontal, chatExpanded ? 0 : 12)
@@ -641,7 +644,8 @@ struct ChatThreadView: View {
     }
 
     @ViewBuilder
-    private func composeView(for req: AgentToolRouter.ComposeRequest) -> some View {
+    private func composeView(for card: ChatAgentCard) -> some View {
+        let req = card.request
         let onOutcome: @MainActor (ComposeOutcome) -> Void = { outcome in
             req.onOutcome(outcome)
             composeEnded(outcome, replyTo: req.mode == .reply ? req.replyTo : nil)
@@ -653,13 +657,7 @@ struct ChatThreadView: View {
                 prefillTo: req.to, prefillCc: req.cc, prefillBcc: req.bcc, prefillSubject: req.subject,
                 onAgentOutcome: onOutcome)
         case .reply:
-            // A reply asked for in the field goes to the people chosen in Reply to.
-            let (to, cc, bcc) = ChatAgentCompose.replyRecipients(
-                fromField: fieldComposeOpened, target: replyTarget, request: req)
-            ComposeView(
-                replyTo: req.replyTo, suggestedBody: req.body,
-                prefillTo: to.isEmpty ? nil : to, prefillCc: cc.isEmpty ? nil : cc,
-                prefillBcc: bcc.isEmpty ? nil : bcc, onAgentOutcome: onOutcome)
+            card.reply.composeView(replyTo: req.replyTo, suggestedBody: req.body, onAgentOutcome: onOutcome)
         case .forward:
             ComposeView(
                 replyTo: req.replyTo, suggestedBody: req.body, isForward: true,
