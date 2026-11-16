@@ -609,7 +609,8 @@ budget and by page limit; add then relabel across the cut; a record over the bud
 `GmailHistoryPaginationTests` (page limit stops and resumes, stop-point validation, re-read of a message a
 record written during the pass names, long and deletion histories in one pass). #938: P18 "page cap
 without taking a record re-lists" and "budget runs out before a record keeps its bookmark, one page short of
-the cap" (`StatefulGmailActionServer.serveEmptyHistoryPages`).
+the cap" (`StatefulGmailActionServer.serveEmptyHistoryPages`); `GmailHistoryPaginationTests` "a history whose
+last page is the last one the cap allows is complete with no record, and not refused".
 
 Keywords: Gmail history resume, per-record resume, readHistory, historyPage, HistoryPage, HistoryRecord,
 history record id, startHistoryId, cut, stop point, bookmark, time budget, changeReadClock, historyMaxChanges,

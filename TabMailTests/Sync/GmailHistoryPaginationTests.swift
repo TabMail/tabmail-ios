@@ -511,6 +511,53 @@ struct GmailHistoryPaginationTests {
         #expect(try Self.cursor(pool: pool) == String(lastRecord), "a read to the end stores its first page's id")
     }
 
+    /// A history read to its end on the last page the cap allows is complete,
+    /// even when no page held a record: the pass stores the first page's
+    /// `historyId`, starts nothing over, and the next pass reads from it. Only
+    /// a cap reached with a next page still to read and no record taken is
+    /// refused (#938).
+    @Test("A history whose last page is the last one the cap allows is complete with no record, and not refused")
+    func emptyHistoryEndingAtThePageCapIsComplete() async throws {
+        try await Self.withAppDB { pool in
+            let account = try Self.makeAccount(pool: pool)
+            let pagesServed = Mutex(0)
+            let starts = Mutex<[String]>([])
+            let scenario = FakeHTTP.Scenario()
+            Self.registerAccountRoutes(on: scenario, pool: pool)
+            defer { scenario.close() }
+            // Every page is empty; every page but the cap's last has a next page.
+            scenario.register(path: "/history", method: "GET") { request in
+                if Self.pageToken(of: request) == nil {
+                    let items = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+                    starts.withLock { $0.append(items.first(where: { $0.name == "startHistoryId" })?.value ?? "") }
+                }
+                let page = pagesServed.withLock { count -> Int in
+                    count += 1
+                    return count
+                }
+                let token = page < GmailAPI.historyMaxPages ? #", "nextPageToken": "empty-\#(page)""# : ""
+                return .json(raw: #"{ "historyId": "1009"\#(token) }"#)
+            }
+            let provider = GmailProvider(
+                userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: scenario.session)
+
+            let outcome = try await SyncEngine().performDeltaSync(account: account, provider: provider)
+
+            #expect(pagesServed.withLock { $0 } == GmailAPI.historyMaxPages,
+                    "precondition: the history ends on the last page the cap allows")
+            #expect(outcome.succeeded, "a history read to its end is not refused")
+            #expect(try Self.cursor(pool: pool) == "1009", "a read to the end stores its first page's id")
+            #expect(!scenario.recordedCalls().contains { $0.url.contains("/profile") },
+                    "a complete read starts nothing over without its bookmark")
+            #expect(Self.detailGETs(scenario) == 0)
+
+            let nextAccount = try #require(try await pool.read { db in try Account.fetchOne(db, key: Self.accountId) })
+            let next = try await SyncEngine().performDeltaSync(account: nextAccount, provider: provider)
+            #expect(next.succeeded)
+            #expect(starts.withLock { $0 } == [Self.startCursor, "1009"], "the next pass reads from the stored id")
+        }
+    }
+
     /// The id a pass stores when it stops early must be a history id past the
     /// cursor it read from (`users.history.list` returns the records after
     /// `startHistoryId`, in increasing id). One that is not is a history the
