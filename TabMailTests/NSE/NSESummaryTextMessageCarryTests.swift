@@ -53,17 +53,28 @@ struct NSESummaryTextMessageCarryTests {
         return (dir, queue)
     }
 
+    /// A directory removed while a connection still has its SQLite files open leaves that
+    /// connection on unlinked files, which other tests' databases can then collide with. Every
+    /// staging database here goes through `TestDatabaseTeardown`, which closes first.
+    @Test("Every staging database these tests open is closed before its directory is removed")
+    func stagingDirectoriesCloseBeforeTheyAreRemoved() throws {
+        let source = try String(contentsOf: URL(fileURLWithPath: #filePath), encoding: .utf8)
+        let unlink = "FileManager.default." + "removeItem("
+        #expect(!source.contains(unlink), "a raw directory removal skips the close")
+        #expect(!source.contains("Self.decode(try " + "DatabaseQueue("), "a connection opened inline is never closed")
+    }
+
     @Test("A fresh staging schema has the column")
     func freshSchemaHasColumn() throws {
         let (dir, queue) = try Self.makeStaging()
-        defer { try? FileManager.default.removeItem(at: dir) }
+        defer { TestDatabaseTeardown.retire(queue: queue, directory: dir) }
         #expect(try Self.columns(queue).contains("summaryTextMessage"))
     }
 
     @Test("Staging writers, decoder and merge carry the text message; a legacy row decodes nil")
     func roundTrip() throws {
         let (dir, queue) = try Self.makeStaging()
-        defer { try? FileManager.default.removeItem(at: dir) }
+        defer { TestDatabaseTeardown.retire(queue: queue, directory: dir) }
         // The schema an older app shipped, with a row staged under it.
         try queue.write { db in
             try db.execute(sql: "ALTER TABLE nse_processed_message DROP COLUMN summaryTextMessage")
@@ -128,12 +139,16 @@ struct NSESummaryTextMessageCarryTests {
     @Test("Opening an older build's staging database adds the column this build writes")
     func openUpgradesOlderDatabase() throws {
         let (dir, queue) = try Self.makeStaging()
-        defer { try? FileManager.default.removeItem(at: dir) }
+        // The older build's connection closes before the open; the one the open returns is retired.
+        var queues = [queue]
+        defer { TestDatabaseTeardown.retire(pools: [], queues: queues, directory: dir) }
         try queue.write { try $0.execute(sql: "ALTER TABLE nse_processed_message DROP COLUMN summaryTextMessage") }
         #expect(!(try Self.columns(queue)).contains("summaryTextMessage"), "precondition: old schema")
         try queue.close()
+        queues = []
 
         let opened = try #require(NSEStagingDB.open(path: dir.appendingPathComponent("nse_staging.sqlite").path))
+        queues.append(opened)
 
         let columns = try Self.columns(opened)
         #expect(columns.contains("summaryTextMessage"))
@@ -152,7 +167,7 @@ struct NSESummaryTextMessageCarryTests {
     @Test("A terminal write without a text message stages nil (a peer hit or AI off)")
     func terminalWithoutTextMessage() throws {
         let (dir, queue) = try Self.makeStaging()
-        defer { try? FileManager.default.removeItem(at: dir) }
+        defer { TestDatabaseTeardown.retire(queue: queue, directory: dir) }
         let meta = Self.metadata("peer-1")
         NSEStagingDB.stageHeader(db: queue, accountId: "acc1", accountEmail: "user@example.com",
                                  provider: "gmail", message: meta, historyId: "1")
@@ -325,8 +340,10 @@ struct NSESummaryTextMessageCarryTests {
     @MainActor
     @Test("A push through the extension stages the summary's text message")
     func pushStagesTextMessage() async throws {
-        let (dir, _) = try Self.makeStaging()
-        defer { try? FileManager.default.removeItem(at: dir) }
+        let (dir, queue) = try Self.makeStaging()
+        // The extension opens its own connection to the staging file, owned by work this test
+        // cannot close; the directory goes once every connection to it is gone.
+        defer { TestDatabaseTeardown.registerForProcessExit(pools: [], queues: [queue], directory: dir) }
         let stagingPath = dir.appendingPathComponent("nse_staging.sqlite").path
         let accountId = "nse-text-" + UUID().uuidString
         let suiteName = "nse-text." + UUID().uuidString
@@ -398,7 +415,7 @@ struct NSESummaryTextMessageCarryTests {
         service.serviceExtensionTimeWillExpire()
 
         #expect(prompts.withLock { $0 }.first == "system_prompt_summary")
-        let staged = try Self.decode(try DatabaseQueue(path: stagingPath), id: "\(accountId):synthetic-message")
+        let staged = try Self.decode(queue, id: "\(accountId):synthetic-message")
         #expect(staged.summaryBlurb == "Lunch on Friday.")
         #expect(staged.actionTag == "reply")
         #expect(staged.summaryTextMessage == "Lunch Friday?")
