@@ -52,27 +52,33 @@ struct FolderChangeState: Codable, Equatable, Sendable {
     /// pass and in turn, until the change applies. `SyncConfig.changeRecheckLimit`
     /// bounds only a pass's own additions; an id already stored is never cut (#903).
     var recheck: [String] = []
-    /// A move retired without proof dropped this folder's bookmark
-    /// (`MessageHeaderRekey.finishMove`, ADR-IOS-111 exit rule): the folder gets
-    /// ONE self-heal pass (`healFoldersAfterAnUnprovenMove`) before it is tracked
-    /// again. The window listing reaches only the newest messages, so one the
-    /// move left in the folder below it would otherwise stay missing.
-    var selfHealDue: Bool = false
+    /// How many moves retired without proof have left this folder possibly
+    /// wrong since its last complete self-heal pass (`MessageHeaderRekey.finishMove`,
+    /// ADR-IOS-111 exit rule), whether or not it held a bookmark then. While it is
+    /// above zero the folder gets ONE self-heal pass at each full sync
+    /// (`healFoldersAfterAnUnprovenMove`) and is not tracked. The window listing
+    /// reaches only the newest messages, so one the move left in the folder below
+    /// it would otherwise stay missing. A count, not a flag: a pass clears it only
+    /// when no retirement was added while the pass ran.
+    var selfHealOwed: Int = 0
+
+    /// The folder is owed a self-heal pass before it is tracked again.
+    var selfHealDue: Bool { selfHealOwed > 0 }
 
     init(tracking: Bool = false, recheck: [String] = []) {
         self.tracking = tracking
         self.recheck = recheck
     }
 
-    private enum CodingKeys: String, CodingKey { case v, tracking, recheck, selfHealDue }
+    private enum CodingKeys: String, CodingKey { case v, tracking, recheck, selfHealOwed }
 
-    /// `selfHealDue` is absent from a state stored before it existed.
+    /// `selfHealOwed` is absent from a state stored before it existed.
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         v = try container.decode(Int.self, forKey: .v)
         tracking = try container.decode(Bool.self, forKey: .tracking)
         recheck = try container.decode([String].self, forKey: .recheck)
-        selfHealDue = try container.decodeIfPresent(Bool.self, forKey: .selfHealDue) ?? false
+        selfHealOwed = try container.decodeIfPresent(Int.self, forKey: .selfHealOwed) ?? 0
     }
 
     /// The stored JSON; unreadable or absent = the untracked default.

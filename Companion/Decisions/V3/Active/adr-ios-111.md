@@ -757,13 +757,18 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    (a move that retired with no effect, its source message older than the window, with backfill
    complete) would stay missing. So a bookmark this rule drops also owes the folder ONE self-heal
    pass before it is tracked again (coordinator ruling 2026-11-16, option a): `dropChangeBookmark`
-   sets `FolderChangeState.selfHealDue`; the full sync, after its listings and before
+   counts one more retirement in `FolderChangeState.selfHealOwed`, whether or not the folder held a
+   bookmark (a folder awaiting its first baseline is tracked after its next listing, which does not
+   reach below the window either; without a bookmark only the mark is written, no listing is made
+   due); the full sync, after its listings and before
    `commitChangeBaseline`, runs the existing self-heal scoped to that one folder
    (`healFoldersAfterAnUnprovenMove` → `selfHealRecentMessages(forceSingleFolder:)`, main's 90-day
    reach, no hourly limit); `commitChangeBaseline` leaves a folder with the mark untracked; the mark
-   is cleared after a complete pass, while the folder still holds the bookmark it held when the pass
-   began (a pass that fails, or a bookmark dropped again meanwhile, keeps it for the next full
-   sync). Tests: `IMAPMoveIntoTrackedFolderTests` (the message held once, where the server holds
+   is cleared only after a COMPLETE pass (`SelfHealFolderOutcome.complete`: no failed check, no
+   epoch refusal, no search too large, every UID found missing answered by the FETCH and landed),
+   and only while the count is still the one the pass began with (a pass that fails or is short, or
+   a retirement added meanwhile, keeps it for the next full sync). A folder whose pass never
+   completes stays untracked and listed, as on main. Tests: `IMAPMoveIntoTrackedFolderTests` (the message held once, where the server holds
    it, under its UID, after the normal sync path; `retiredMoveBelowTheWindowIsHealedBeforeTracking`).
 Tests: `IMAPChangeReaderTests`, `ChangeApplyIMAPTests`, `IMAPCatchUpTests.planTrackedFolder`,
 `IMAPChangeFuzzTests`, `ChangeSeamFenceTests`; red-first mutants recorded in the mutation ledger.
@@ -771,5 +776,5 @@ Keywords: QRESYNC, CONDSTORE, ENABLE, VANISHED, HIGHESTMODSEQ, NOMODSEQ, IMAPCha
 connection, untracked, addressEpochChanged, arrivals limit, imapDeltaSync deleted, presentIds, UIDPLUS,
 COPYUID, exit rule, dropChangeBookmark, move without destination proof, connection budget,
 evictChangeConnectionIfIdle, createChangeServer, max_userip_connections, eviction order, heldRangeStart,
-olderMailComplete, olderMailCursor, backfillUidCursor, un-deleted, pass-start NOOP, selfHealDue,
+olderMailComplete, olderMailCursor, backfillUidCursor, un-deleted, pass-start NOOP, selfHealDue, selfHealOwed, SelfHealFolderOutcome,
 healFoldersAfterAnUnprovenMove, evictIdleConnection, IDLE DONE before LOGOUT, #751.

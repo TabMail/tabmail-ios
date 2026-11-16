@@ -387,14 +387,16 @@ struct IMAPMoveIntoTrackedFolderTests {
     /// holds more than one window, the device the newest window and the
     /// target (UID 88, older than every other message), backfill complete; the
     /// move to Archive keeps failing until the retry limit retires it.
+    /// `tracked`: the folders holding a bookmark before the move.
     @MainActor
-    static func withRetiredBelowTheWindow(_ name: String, _ body: (World) async throws -> Void) async throws {
+    static func withRetiredBelowTheWindow(_ name: String, tracked: Set<String> = ["INBOX", "Archive"],
+                                          _ body: (World) async throws -> Void) async throws {
         var caps = FakeIMAPServer.defaultCapabilities + Self.qresync
         caps.removeAll { $0 == "MOVE" }
         let inbox = Array(1000..<(1000 + SyncConfig.syncMessageLimit + 10))
         try await Self.withWorld(name, capabilities: caps, archive: [50],
                                  local: ["Archive": [50], "INBOX": Array(inbox.suffix(SyncConfig.syncMessageLimit))],
-                                 tracked: ["INBOX", "Archive"], inbox: inbox) { server in
+                                 tracked: tracked, inbox: inbox) { server in
             for _ in 0..<SyncConfig.pendingOperationServerRefusalRetryLimit {
                 server.failNextCommand(containing: "UID COPY", message: "Server busy")
             }
@@ -418,7 +420,7 @@ struct IMAPMoveIntoTrackedFolderTests {
             // so the next date SEARCH, which is refused once, is INBOX's pass.
             let archiveId = "\(w.accountId):Archive"
             var archiveState = FolderChangeState(raw: try w.folder("Archive").changeState)
-            archiveState.selfHealDue = false
+            archiveState.selfHealOwed = 0
             let archiveEncoded = archiveState.encoded
             try await w.pool.write { db in
                 try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [archiveEncoded, archiveId])
@@ -467,6 +469,161 @@ struct IMAPMoveIntoTrackedFolderTests {
             await heal.value
             #expect(FolderChangeState(raw: try w.folder("INBOX").changeState).selfHealDue,
                     "the pass that began before the drop does not settle what the drop owes")
+        }
+    }
+
+    @Test("A move retired with no effect out of a folder that held no bookmark yet: the folder is owed its pass, no listing is made due, and it is tracked only with the message back")
+    @MainActor
+    func retiredMoveOutOfAnUnbookmarkedFolderIsHealedBeforeTracking() async throws {
+        try await Self.withRetiredBelowTheWindow("retired-unbookmarked", tracked: ["Archive"]) { w in
+            let inbox = try w.folder("INBOX")
+            #expect(inbox.changeCursor == nil, "setup: INBOX held no bookmark")
+            #expect(FolderChangeState(raw: inbox.changeState).selfHealDue, "INBOX is owed its self-heal pass")
+            for pass in 1...3 {
+                try await w.normalSync()
+                try w.expectHeldOnceWhereTheServerHoldsIt("retired unbookmarked, pass \(pass)")
+            }
+            #expect(FolderChangeState(raw: try w.folder("INBOX").changeState).tracking, "INBOX is tracked after its pass")
+        }
+    }
+
+    @Test("An unbookmarked folder owed a pass: a retirement added while the pass runs keeps the pass owed")
+    @MainActor
+    func retirementDuringTheSelfHealOfAnUnbookmarkedFolderKeepsItOwed() async throws {
+        try await Self.withRetiredBelowTheWindow("heal-raced-unbookmarked", tracked: ["Archive"]) { w in
+            let inboxId = "\(w.accountId):INBOX"
+            #expect(try w.folder("INBOX").changeCursor == nil, "setup: INBOX holds no bookmark")
+            let start = w.server.recordedCommands().count
+            w.server.stallNextCommand(containing: "SINCE", seconds: 1)
+            let account = try w.account()
+            let engine = w.engine
+            let heal = Task { await engine.healFoldersAfterAnUnprovenMove(account: account) }
+            #expect(await Self.eventually {
+                w.server.recordedCommands().dropFirst(start).contains { $0.uppercased().contains("SINCE") }
+            }, "setup: the pass is under way")
+            try await w.pool.write { db in
+                try SyncEngine.dropChangeBookmark(folderId: inboxId, selfHealDue: true, db: db)
+            }
+            await heal.value
+            #expect(FolderChangeState(raw: try w.folder("INBOX").changeState).selfHealDue,
+                    "the pass that began before the retirement does not settle what it owes")
+        }
+    }
+
+    /// One way an owed self-heal pass falls short of every message missing in
+    /// its reach, and how the test puts it right again.
+    enum IncompleteHeal: String, CaseIterable, Sendable {
+        /// The FETCH leaves out the target (the folder's other missing messages land).
+        case shortFetch
+        /// The FETCH answers none of the missing messages.
+        case emptyFetch
+        /// The SELECT the pass gates on reports no UIDVALIDITY.
+        case epochNotObserved
+        /// The server's UIDVALIDITY differs from the folder's stamp.
+        case epochMoved
+        /// The UIDVALIDITY moves between the gate and the FETCH.
+        case fetchEpochMoved
+        /// The write of the repaired messages fails.
+        case insertFailed
+        /// The folder's stamp moves while the FETCH is on the network.
+        case insertRefused
+    }
+
+    @Test("An owed self-heal pass that falls short keeps the folder owed it; the same pass with the obstacle gone settles it",
+          arguments: IncompleteHeal.allCases)
+    @MainActor
+    func incompleteOwedHealKeepsTheMark(_ shape: IncompleteHeal) async throws {
+        try await Self.withRetiredBelowTheWindow("heal-\(shape.rawValue)") { w in
+            let inboxId = "\(w.accountId):INBOX"
+            let archiveId = "\(w.accountId):Archive"
+            // Only INBOX is owed its pass here.
+            var archiveState = FolderChangeState(raw: try w.folder("Archive").changeState)
+            archiveState.selfHealOwed = 0
+            let archiveEncoded = archiveState.encoded
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [archiveEncoded, archiveId])
+            }
+            let account = try w.account()
+            let engine = w.engine
+            let server = w.server
+            let pool = w.pool
+            // The normal sync first, as in production: its listing takes the
+            // placeholder the move left in Archive away. Its owed pass is kept
+            // short (the FETCH leaves the target out), so INBOX is still owed it.
+            server.suppressFetchRecord(in: "INBOX", uids: [88])
+            try await w.normalSync()
+            server.suppressFetchRecord(in: "INBOX", uids: [])
+            #expect(FolderChangeState(raw: try w.folder("INBOX").changeState).selfHealDue, "setup: INBOX is still owed its pass")
+            let start = server.recordedCommands().count
+            func setStamp(_ value: Int) async throws {
+                try await pool.write { db in
+                    try db.execute(sql: "UPDATE folder SET lastKnownUidValidity = ? WHERE id = ?", arguments: [value, inboxId])
+                }
+            }
+            func sentSince(_ fragment: String) -> Bool {
+                server.recordedCommands().dropFirst(start).contains { $0.uppercased().contains(fragment) }
+            }
+            switch shape {
+            case .shortFetch:
+                // Two messages missing; the FETCH answers only the other one.
+                let other = 1000 + SyncConfig.syncMessageLimit + 9
+                try await pool.write { db in
+                    try db.execute(sql: "DELETE FROM messageHeader WHERE folderId = ? AND messageId = ?", arguments: [inboxId, "\(other)"])
+                }
+                server.suppressFetchRecord(in: "INBOX", uids: [88])
+                await engine.healFoldersAfterAnUnprovenMove(account: account)
+                let otherLanded = try await pool.read { db in
+                    try MessageHeader.filter(Column("folderId") == inboxId && Column("messageId") == "\(other)").fetchCount(db)
+                }
+                #expect(otherLanded == 1, "setup: the FETCH answered the other missing message")
+            case .emptyFetch:
+                server.suppressFetchRecord(in: "INBOX", uids: [88])
+                await engine.healFoldersAfterAnUnprovenMove(account: account)
+            case .epochNotObserved:
+                server.suppressSelectUidValidity(for: "INBOX")
+                await engine.healFoldersAfterAnUnprovenMove(account: account)
+            case .epochMoved:
+                server.setUidValidity(Self.epoch + 1, for: "INBOX")
+                await engine.healFoldersAfterAnUnprovenMove(account: account)
+            case .fetchEpochMoved:
+                server.stallNextCommand(containing: "SINCE", seconds: 1)
+                let heal = Task { await engine.healFoldersAfterAnUnprovenMove(account: account) }
+                #expect(await Self.eventually { sentSince("SINCE") }, "setup: the search is under way")
+                server.setUidValidity(Self.epoch + 1, for: "INBOX")
+                await heal.value
+            case .insertFailed:
+                try await pool.write { db in
+                    try db.execute(sql: "CREATE TRIGGER refuse_heal BEFORE INSERT ON messageHeader BEGIN SELECT RAISE(ABORT, 'refused'); END")
+                }
+                await engine.healFoldersAfterAnUnprovenMove(account: account)
+            case .insertRefused:
+                server.stallNextCommand(containing: "UID FETCH", seconds: 1)
+                let heal = Task { await engine.healFoldersAfterAnUnprovenMove(account: account) }
+                #expect(await Self.eventually { sentSince("UID FETCH") }, "setup: the FETCH is under way")
+                try await setStamp(Self.epoch + 1)
+                await heal.value
+            }
+            #expect(FolderChangeState(raw: try w.folder("INBOX").changeState).selfHealDue,
+                    "\(shape): a pass that fell short keeps INBOX owed its pass")
+            func inboxHoldsTheTarget() throws -> Bool {
+                try pool.read { db in
+                    try MessageHeader.filter(Column("folderId") == inboxId && Column("messageId") == "88").fetchCount(db) == 1
+                }
+            }
+            #expect(try !inboxHoldsTheTarget(), "\(shape): setup: INBOX does not hold the target yet")
+
+            switch shape {
+            case .shortFetch, .emptyFetch: server.suppressFetchRecord(in: "INBOX", uids: [])
+            case .epochNotObserved: server.restoreSelectUidValidity(for: "INBOX")
+            case .epochMoved, .fetchEpochMoved: server.setUidValidity(Self.epoch, for: "INBOX")
+            case .insertFailed:
+                try await pool.write { db in try db.execute(sql: "DROP TRIGGER refuse_heal") }
+            case .insertRefused: try await setStamp(Self.epoch)
+            }
+            await engine.healFoldersAfterAnUnprovenMove(account: account)
+            #expect(!FolderChangeState(raw: try w.folder("INBOX").changeState).selfHealDue,
+                    "\(shape): the complete pass settles what INBOX was owed")
+            #expect(try inboxHoldsTheTarget(), "\(shape): the complete pass brought the target back to INBOX")
         }
     }
 

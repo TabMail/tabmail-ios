@@ -25,7 +25,8 @@ extension SyncEngine {
     /// leaving them missing for the rest of the hour.
     ///
     /// Returns whether the pass ran and healed every folder it covered
-    /// completely (no folder's check failed, every repaired message landed).
+    /// completely: no folder's check failed or was refused, and every message
+    /// found missing landed (`SelfHealFolderOutcome.complete`).
     @discardableResult
     func selfHealRecentMessages(account: Account, forceSingleFolder: Folder? = nil) async -> Bool {
         guard account.provider == .imap,
@@ -77,6 +78,7 @@ extension SyncEngine {
         var totalRepaired = 0
         var anyInsertFailed = false
         var anyFolderFailed = false
+        var anyFolderIncomplete = false
 
         for folder in syncableFolders {
             do {
@@ -88,6 +90,7 @@ extension SyncEngine {
                 )
                 totalRepaired += healed.repaired
                 if !healed.allLanded { anyInsertFailed = true }
+                if !healed.complete { anyFolderIncomplete = true }
             } catch {
                 // Don't abort other folders if one fails
                 anyFolderFailed = true
@@ -104,7 +107,7 @@ extension SyncEngine {
             UserDefaults.standard.set(previousRun, forKey: rateLimitKey)
             BackgroundSyncLogger.logDebug("[SelfHeal] A write of repaired messages failed for \(account.emailAddress) — the next sync runs self-heal again")
         }
-        return !anyInsertFailed && !anyFolderFailed
+        return !anyFolderFailed && !anyFolderIncomplete
     }
 
     /// ADR-IOS-111 exit rule: each folder a move retired without proof dropped
@@ -114,9 +117,11 @@ extension SyncEngine {
     /// still owed its pass untracked. The window listing reaches only the newest
     /// messages: a message the move left in the folder below it is found only by
     /// this pass (the same 90-day reach as every self-heal). The mark is cleared
-    /// only after a complete pass, and only while the folder still holds the
-    /// bookmark it held when the pass began: a bookmark dropped again during the
-    /// pass (another unproven move) keeps the mark for the next full sync.
+    /// only after a complete pass (every message missing in the reach landed, no
+    /// epoch refusal, no short answer), and only while it still counts the
+    /// retirements it counted when the pass began: one added during the pass
+    /// (another unproven move, whose message the pass may have missed) keeps the
+    /// mark for the next full sync.
     func healFoldersAfterAnUnprovenMove(account: Account) async {
         let accountId = account.id
         let due: [Folder]
@@ -134,13 +139,13 @@ extension SyncEngine {
                 BackgroundSyncLogger.logDebug("[SelfHeal] \(folder.name): the pass after an unproven move did not complete — it runs again at the next full sync")
                 continue
             }
+            let owedAtStart = FolderChangeState(raw: folder.changeState).selfHealOwed
             do {
                 try await dbPool.write { db in
-                    guard let current = try Folder.fetchOne(db, key: folder.id),
-                          current.changeCursor == folder.changeCursor else { return }
+                    guard let current = try Folder.fetchOne(db, key: folder.id) else { return }
                     var state = FolderChangeState(raw: current.changeState)
-                    guard state.selfHealDue else { return }
-                    state.selfHealDue = false
+                    guard state.selfHealOwed == owedAtStart else { return }
+                    state.selfHealOwed = 0
                     try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [state.encoded, folder.id])
                 }
             } catch {
@@ -149,10 +154,22 @@ extension SyncEngine {
         }
     }
 
+    /// What one folder's self-heal check did.
+    struct SelfHealFolderOutcome {
+        /// Messages fetched and inserted.
+        var repaired: Int
+        /// Every write chunk landed (false: a chunk's transaction failed, so some
+        /// of the missing messages are still missing).
+        var allLanded: Bool
+        /// Every message the server holds in the reach is held locally after this
+        /// check: false when an epoch term refused, the search was too large, or
+        /// the FETCH answered fewer messages than were missing. The hourly pass
+        /// ignores it (its next run re-derives the diff); the pass owed after an
+        /// unproven move keeps its mark on it (`healFoldersAfterAnUnprovenMove`).
+        var complete: Bool
+    }
+
     /// Compare IMAP UIDs vs GRDB for a single folder in the given date range.
-    /// Returns the number of messages repaired (fetched and inserted), and
-    /// whether every write chunk of them landed (false: a chunk's transaction
-    /// failed, so some of the missing messages are still missing).
     ///
     /// 🚨 **ROUND 13, BLOCKER 2 — THIS PASS IS EPOCH-GUARDED, AND IT HAS TO BE.**
     /// Its whole method is *diff a live UID list against the local `messageId`
@@ -227,7 +244,7 @@ extension SyncEngine {
         account: Account,
         provider: IMAPProvider,
         since: Date
-    ) async throws -> (repaired: Int, allLanded: Bool) {
+    ) async throws -> SelfHealFolderOutcome {
         let folderId = folder.id
 
         // Step 0 — THE ADMISSION GATE (term 1). The stamp is re-read here rather
@@ -236,7 +253,7 @@ extension SyncEngine {
         // A folder whose row has gone away is not healable at all.
         guard let currentFolder = try await dbPool.read({ db in
             try Folder.fetchOne(db, key: folderId)
-        }) else { return (0, true) }
+        }) else { return SelfHealFolderOutcome(repaired: 0, allLanded: true, complete: true) }
         let storedEpoch = Self.knownUidValidity(currentFolder.lastKnownUidValidity)
             .flatMap { UInt32(exactly: $0) }
         // BOUND to its own SELECT (`getUidNextWithEpoch` returns the epoch that
@@ -258,7 +275,7 @@ extension SyncEngine {
             if DebugModeManager.isLoggingEnabled() {
                 BackgroundSyncLogger.logDebug("[SelfHeal] \(folder.name) skipped: rows are stamped UIDVALIDITY \(String(describing: storedEpoch)) but this pass observed none")
             }
-            return (0, true)
+            return SelfHealFolderOutcome(repaired: 0, allLanded: true, complete: false)
         case .refuseEpochMismatch:
             // The mailbox was re-created since these rows were written. There is
             // no correct repair to run HERE — only the purge-and-resync reaction —
@@ -276,7 +293,7 @@ extension SyncEngine {
             if DebugModeManager.isLoggingEnabled() {
                 BackgroundSyncLogger.logDebug("[SelfHeal] \(folder.name) skipped: rows belong to UIDVALIDITY \(String(describing: storedEpoch)), server is at \(String(describing: healEpoch))")
             }
-            return (0, true)
+            return SelfHealFolderOutcome(repaired: 0, allLanded: true, complete: false)
         }
 
         // Step 1: SEARCH — get all UIDs in the date range from IMAP
@@ -289,11 +306,11 @@ extension SyncEngine {
             let desc = "\(error)"
             if desc.contains("PayloadTooLargeError") {
                 // Too many UIDs to compare — skip this folder (backfill handles it)
-                return (0, true)
+                return SelfHealFolderOutcome(repaired: 0, allLanded: true, complete: false)
             }
             throw error
         }
-        guard !remoteUIDs.isEmpty else { return (0, true) }
+        guard !remoteUIDs.isEmpty else { return SelfHealFolderOutcome(repaired: 0, allLanded: true, complete: true) }
 
         // Step 2: Find which UIDs we're missing locally
         let missingUIDs: [UInt32] = try await dbPool.read { db in
@@ -312,7 +329,7 @@ extension SyncEngine {
             return remoteUIDs.filter { !existingIds.contains(String($0)) }
         }
 
-        guard !missingUIDs.isEmpty else { return (0, true) }
+        guard !missingUIDs.isEmpty else { return SelfHealFolderOutcome(repaired: 0, allLanded: true, complete: true) }
         BackgroundSyncLogger.logDebug("[SelfHeal] \(folder.name): found \(missingUIDs.count) missing UIDs out of \(remoteUIDs.count) remote (last 90 days). Missing: \(missingUIDs.sorted().prefix(20))")
 
         // Step 3: Fetch missing headers from IMAP, together with the epoch the
@@ -325,15 +342,16 @@ extension SyncEngine {
             interBatchDelay: profile.imapInterBatchDelay
         )
 
-        if headers.count < missingUIDs.count {
-            if DebugModeManager.isLoggingEnabled() {
-                let fetched = Set(headers.map(\.messageId))
-                let stillMissing = missingUIDs.filter { !fetched.contains(String($0)) }
-                BackgroundSyncLogger.logDebug("[SelfHeal] \(folder.name): IMAP FETCH returned \(headers.count)/\(missingUIDs.count). Permanently missing UIDs: \(stillMissing.sorted().prefix(20))")
-            }
+        // A short answer leaves this check incomplete: a UID the SEARCH named and
+        // the FETCH did not answer is still missing locally.
+        let fetched = Set(headers.map(\.messageId))
+        let stillMissing = missingUIDs.filter { !fetched.contains(String($0)) }
+        let answeredEveryMissing = stillMissing.isEmpty
+        if !answeredEveryMissing, DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[SelfHeal] \(folder.name): IMAP FETCH returned \(headers.count)/\(missingUIDs.count). Permanently missing UIDs: \(stillMissing.sorted().prefix(20))")
         }
 
-        guard !headers.isEmpty else { return (0, true) }
+        guard !headers.isEmpty else { return SelfHealFolderOutcome(repaired: 0, allLanded: true, complete: false) }
 
         // TERM 2 — LOAD-BEARING. These headers may only enter a folder whose rows
         // share their numbering, and the only evidence of their numbering is the
@@ -352,7 +370,7 @@ extension SyncEngine {
             if DebugModeManager.isLoggingEnabled() {
                 BackgroundSyncLogger.logDebug("[SelfHeal] \(folder.name): discarding \(headers.count) fetched headers — served under UIDVALIDITY \(String(describing: fetchEpoch)), this pass gated on \(String(describing: healEpoch))")
             }
-            return (0, true)
+            return SelfHealFolderOutcome(repaired: 0, allLanded: true, complete: false)
         }
 
         // Step 4: Insert into GRDB (reuse backfill insert which handles dedup).
@@ -388,7 +406,7 @@ extension SyncEngine {
             if DebugModeManager.isLoggingEnabled() {
                 BackgroundSyncLogger.logDebug("[SelfHeal] \(folder.name): insert refused — the folder no longer holds the UIDVALIDITY this pass premised (\(String(describing: storedEpoch))), \(headers.count) headers discarded")
             }
-            return (0, true)
+            return SelfHealFolderOutcome(repaired: 0, allLanded: true, complete: false)
         case .landed(let inserted, let ftsRecords, _, let allLanded):
             if inserted > 0 {
                 BackgroundSyncLogger.logDebug("[SelfHeal] \(folder.name): repaired \(inserted) messages")
@@ -403,7 +421,7 @@ extension SyncEngine {
             if !allLanded {
                 BackgroundSyncLogger.logDebug("[SelfHeal] \(folder.name): a write of the repaired messages failed — they stay missing for the next pass")
             }
-            return (inserted, allLanded)
+            return SelfHealFolderOutcome(repaired: inserted, allLanded: allLanded, complete: allLanded && answeredEveryMissing)
         }
     }
 }

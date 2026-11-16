@@ -745,7 +745,7 @@ struct ChangeApplyTests {
         #expect(stored.recheck == ["5"])
         #expect(!stored.selfHealDue)
         var marked = FolderChangeState()
-        marked.selfHealDue = true
+        marked.selfHealOwed = 1
         let encoded = try #require(marked.encoded, "an untracked state owed a self-heal pass is stored")
         let readBack = FolderChangeState(raw: encoded)
         #expect(readBack.selfHealDue && !readBack.tracking)

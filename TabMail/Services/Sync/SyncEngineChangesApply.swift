@@ -239,17 +239,24 @@ extension SyncEngine {
     /// does (`.refused` above): the bookmark is cleared, the folder is no longer
     /// covered, its catch-up gets one whole-folder check, and the account's full
     /// sync lists it; its next read starts a new baseline. The re-read list is
-    /// kept. A folder with no bookmark is left as it is.
+    /// kept. A folder with no bookmark is otherwise left as it is.
     /// `onlyIfHeld: false` (a refused read) ends the folder's tracking even when
     /// it holds no bookmark (a refused baseline). `selfHealDue: true` (a move
     /// retired without proof) also owes the folder one self-heal pass before it
-    /// is tracked again (`FolderChangeState.selfHealDue`).
+    /// is tracked again (`FolderChangeState.selfHealOwed`), with or without a
+    /// bookmark: a folder awaiting its first baseline is tracked after its next
+    /// listing, which does not reach below the window either.
     nonisolated static func dropChangeBookmark(folderId: String, onlyIfHeld: Bool = true, selfHealDue: Bool = false, db: Database) throws {
-        guard let folder = try Folder.fetchOne(db, key: folderId),
-              !onlyIfHeld || folder.changeCursor != nil else { return }
+        guard let folder = try Folder.fetchOne(db, key: folderId) else { return }
         var state = FolderChangeState(raw: folder.changeState)
+        if selfHealDue { state.selfHealOwed += 1 }
+        guard !onlyIfHeld || folder.changeCursor != nil else {
+            if selfHealDue {
+                try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [state.encoded, folderId])
+            }
+            return
+        }
         state.tracking = false
-        if selfHealDue { state.selfHealDue = true }
         try db.execute(sql: "UPDATE folder SET changeCursor = NULL, changeState = ? WHERE id = ?",
                        arguments: [state.encoded, folderId])
         try markCatchUpLapse(folderId: folderId, db: db)
