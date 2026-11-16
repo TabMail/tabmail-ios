@@ -221,6 +221,12 @@ extension SyncEngine {
         }
         if cursor != folder.changeCursor {
             try db.execute(sql: "UPDATE folder SET changeCursor = ? WHERE id = ?", arguments: [cursor, folder.id])
+            // R35: a bookmark that starts sees nothing older than itself, and once
+            // one is stored the catch-up runs no periodic check. Its one
+            // whole-folder check is armed with it, in this transaction.
+            if changes.armCatchUpWithBookmark, cursor != nil {
+                try markCatchUpLapse(folderId: folder.id, db: db)
+            }
         }
         if state != before {
             try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [state.encoded, folder.id])

@@ -633,8 +633,10 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    `highestModSeq`, `uidNext`, `failingSince`): server metadata, no content (ADR-004). It is never an
    epoch writer; `Folder.lastKnownUidValidity` stays the epoch authority. A folder holding rows under
    an unknown UIDVALIDITY starts no bookmark (IOS-EPOCH-001). A first read is a plain SELECT,
-   `.baselineReady` with `FolderChanges.armCatchUpOnCommit` (the folder's catch-up is armed once when
-   the bookmark commits, R35).
+   `.baselineReady` with `FolderChanges.armCatchUpWithBookmark` (R35: the folder's catch-up is armed
+   once, in the same transaction that stores the new bookmark. Once a bookmark is stored the catch-up
+   runs no periodic check, so the arm is never left to the later commit of tracking: a pass with no
+   listing, a failed listing or a crash in between would otherwise leave the bookmark without it).
 3. **A read.** STATUS first; an unchanged HIGHESTMODSEQ is `.tracked` with no SELECT. Otherwise
    `SELECT (QRESYNC (uidvalidity modseq))` with its own timeout (`imapChangeSelectTimeoutSeconds`).
    Removals are VANISHED ranges intersected with the folder's held rows (never expanded) and

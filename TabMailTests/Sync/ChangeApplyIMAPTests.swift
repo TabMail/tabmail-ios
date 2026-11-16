@@ -107,13 +107,14 @@ struct ChangeApplyIMAPTests {
         try await Base.withWorld { w in
             try Self.setEpoch(w, w.inboxId, nil)
             let inboxId = w.inboxId
+            try Self.setCompletedCatchUp(w, [inboxId])
             let baseline: @Sendable (ChangeCursor, ChangeRequest) -> ChangeSet = { _, request in
                 ChangeSet(account: .keep, folderList: nil, folders: request.folders.map {
                     var changes = FolderChanges(
                         folderId: $0.id, status: $0.id == inboxId ? .baselineReady : .notRun,
                         addressEpoch: $0.id == inboxId ? Self.storedEpoch : nil,
                         cursor: $0.id == inboxId ? "baseline-cursor" : nil)
-                    changes.armCatchUpOnCommit = $0.id == inboxId
+                    changes.armCatchUpWithBookmark = $0.id == inboxId
                     return changes
                 })
             }
@@ -122,7 +123,7 @@ struct ChangeApplyIMAPTests {
             // Pass 1: the folder stores no epoch, so the read is rejected whole.
             let first = try await w.outcome()
             #expect(!first.trackableFolderIds.contains(inboxId))
-            #expect(!first.catchUpOnCommit.contains(inboxId))
+            #expect(try Self.lapses(w, inboxId) == 0, "a rejected read arms nothing")
             try await SyncEngine().commitChangeBaseline(account: try w.account(), outcome: first, listedFolderIds: [inboxId])
             #expect(!(try w.state(inboxId)).tracking, "never tracked without a written bookmark")
             #expect(try Self.folder(w, inboxId).changeCursor == nil)
@@ -133,30 +134,54 @@ struct ChangeApplyIMAPTests {
             }
             let second = try await w.outcome()
             #expect(second.trackableFolderIds.contains(inboxId))
-            #expect(second.catchUpOnCommit.contains(inboxId))
+            #expect(try Self.lapses(w, inboxId) == 1, "the stored bookmark arms its catch-up")
             #expect(try Self.folder(w, inboxId).changeCursor == "baseline-cursor")
         }
     }
 
-    @Test("A bookmark that starts with the catch-up arm marks the folder's catch-up once at commit; one without does not")
-    func catchUpOnCommitArms() async throws {
+    static func setCompletedCatchUp(_ w: Base.World, _ folderIds: [String]) throws {
+        let completed = IMAPCatchUpState(epoch: 1, completionStamp: 5, lastCompletedAt: Date(), listing: nil, createdAt: nil)
+        try w.pool.write { db in
+            for id in folderIds {
+                try db.execute(sql: "UPDATE folder SET catchUpState = ? WHERE id = ?", arguments: [completed.encoded(), id])
+            }
+        }
+    }
+
+    static func lapses(_ w: Base.World, _ id: String) throws -> Int {
+        let raw = try w.pool.read { db in try Folder.fetchOne(db, key: id)?.catchUpState }
+        return IMAPCatchUpState.decode(raw)?.lapseCount ?? 0
+    }
+
+    @Test("A bookmark that starts with the catch-up arm marks the folder's catch-up in the transaction that stores it, with no commit of tracking; one without does not, and the commit adds nothing")
+    func catchUpArmedWithTheBookmark() async throws {
         try await Base.withWorld { w in
-            let completed = IMAPCatchUpState(epoch: 1, completionStamp: 5, lastCompletedAt: Date(), listing: nil, createdAt: nil)
-            try await w.pool.write { db in
-                try db.execute(sql: "UPDATE folder SET catchUpState = ? WHERE id IN (?, ?)",
-                               arguments: [completed.encoded(), w.inboxId, w.archiveId])
+            try Self.setEpoch(w, w.inboxId, Self.storedEpoch)
+            try Self.setEpoch(w, w.archiveId, Self.storedEpoch)
+            try Self.setCompletedCatchUp(w, [w.inboxId, w.archiveId])
+            let inboxId = w.inboxId
+            let baseline: @Sendable (ChangeCursor, ChangeRequest) -> ChangeSet = { _, request in
+                ChangeSet(account: .keep, folderList: nil, folders: request.folders.map {
+                    var changes = FolderChanges(
+                        folderId: $0.id, status: .baselineReady, addressEpoch: Self.storedEpoch,
+                        cursor: "baseline-\($0.id)")
+                    changes.armCatchUpWithBookmark = $0.id == inboxId
+                    return changes
+                })
             }
-            var outcome = ChangePassOutcome()
-            outcome.trackableFolderIds = [w.inboxId, w.archiveId]
-            outcome.catchUpOnCommit = [w.inboxId]
+            await w.script([baseline])
+            // The pass reads and applies; nothing commits tracking (a background
+            // pass, a listing that fails, or a crash before the commit).
+            let outcome = try await w.outcome()
+            #expect(try Self.folder(w, w.inboxId).changeCursor == "baseline-\(w.inboxId)", "setup: the bookmark is stored")
+            #expect(try Self.lapses(w, w.inboxId) == 1, "armed with the stored bookmark")
+            #expect(try Self.lapses(w, w.archiveId) == 0, "a bookmark without the arm arms nothing")
+            #expect(!(try w.state(w.inboxId)).tracking)
+            // The commit of tracking arms nothing more.
             try await SyncEngine().commitChangeBaseline(account: try w.account(), outcome: outcome, listedFolderIds: [w.inboxId, w.archiveId])
-            func lapses(_ id: String) throws -> Int {
-                let raw = try w.pool.read { db in try Folder.fetchOne(db, key: id)?.catchUpState }
-                return IMAPCatchUpState.decode(raw)?.lapseCount ?? 0
-            }
-            #expect(try lapses(w.inboxId) == 1)
-            #expect(try lapses(w.archiveId) == 0)
             #expect(try w.state(w.inboxId).tracking && w.state(w.archiveId).tracking)
+            #expect(try Self.lapses(w, w.inboxId) == 1)
+            #expect(try Self.lapses(w, w.archiveId) == 0)
         }
     }
 

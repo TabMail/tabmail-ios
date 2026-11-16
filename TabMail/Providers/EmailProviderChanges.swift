@@ -298,10 +298,13 @@ struct FolderChanges: Sendable {
     /// transaction as its records, so a crash resumes from the last applied
     /// page. Nil = keep the stored one. A refusal clears it whatever this says.
     var cursor: String?
-    /// The folder's catch-up gets one whole-folder check once the folder
-    /// becomes tracked (`SyncEngine.commitChangeBaseline`): a bookmark that
-    /// starts sees nothing older than itself (ADR-IOS-111 R35).
-    var armCatchUpOnCommit = false
+    /// The folder's catch-up gets one whole-folder check, armed in the same
+    /// transaction that stores this new bookmark (`SyncEngine.applyFolderChanges`):
+    /// a bookmark that starts sees nothing older than itself (ADR-IOS-111 R35),
+    /// and once one is stored the catch-up runs no periodic check. Stored with
+    /// the bookmark, so a pass with no listing, a failed listing or a crash
+    /// before tracking starts never leaves the bookmark without its check.
+    var armCatchUpWithBookmark = false
     /// Set by the engine, never by a reader: the folder bookmark the read was
     /// issued with. A bookmark dropped between the read and the apply
     /// (`SyncEngine.dropChangeBookmark`) is never written back. Nil = not

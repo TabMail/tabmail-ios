@@ -376,7 +376,7 @@ extension IMAPProvider {
         var changes = FolderChanges(
             folderId: folder.id, status: .baselineReady, addressEpoch: Int(served),
             cursor: IMAPChangeCursor(uidValidity: served, highestModSeq: modseq, uidNext: uidNext).encoded)
-        changes.armCatchUpOnCommit = true
+        changes.armCatchUpWithBookmark = true
         if !ids.isEmpty, request.context.hasBudget() {
             let answer = try await rereadIds(ids, server: server, context: request.context)
             changes.records += answer.records

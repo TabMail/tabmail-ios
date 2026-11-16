@@ -97,9 +97,6 @@ struct ChangePassOutcome: Sendable {
     /// The folders need a listing in this pass (a refusal, a candidate or a
     /// completed baseline).
     var needsListing = false
-    /// Folders whose catch-up gets one whole-folder check once they become
-    /// tracked (`FolderChanges.armCatchUpOnCommit`).
-    var catchUpOnCommit: Set<String> = []
     /// The folder bookmark this pass left each folder with: the one its apply
     /// wrote or kept, or the one its read was issued with when nothing was
     /// applied. Present only for a folder that had one on either side (a folder
@@ -284,7 +281,6 @@ extension SyncEngine {
             case .refused, .baselineReady: outcome.needsListing = true
             case .tracked, .baselining, .notRun, .untracked: break
             }
-            if changes.armCatchUpOnCommit { outcome.catchUpOnCommit.insert(changes.folderId) }
             if case .notRun = changes.status {} else { readFolders += 1 }
             // A folder with only a message to read later still writes: its re-read
             // list is the only place that message's change survives the bookmark
@@ -300,7 +296,6 @@ extension SyncEngine {
                 // Nothing written, not even the bookmark: the folder is not
                 // tracked on the strength of this read, and arms nothing.
                 outcome.trackableFolderIds.remove(changes.folderId)
-                outcome.catchUpOnCommit.remove(changes.folderId)
             }
             newHeaders += applied.newHeaders
             removedIds += applied.removedIds
@@ -421,12 +416,6 @@ extension SyncEngine {
                     guard db.changesCount > 0 else { continue }
                 } else {
                     try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [state.encoded, folderId])
-                }
-                // R35: the bookmark starts now; one whole-folder check covers what
-                // changed in older mail before it (a no-op on a folder whose
-                // catch-up has no state yet: its first listing is due anyway).
-                if outcome.catchUpOnCommit.contains(folderId) {
-                    try Self.markCatchUpLapse(folderId: folderId, db: db)
                 }
             }
         }

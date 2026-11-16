@@ -148,7 +148,7 @@ struct IMAPChangeReaderTests {
             guard case .baselineReady = changes.status else {
                 Issue.record("expected baselineReady, got \(changes.status)"); return
             }
-            #expect(changes.armCatchUpOnCommit)
+            #expect(changes.armCatchUpWithBookmark)
             #expect(changes.records.isEmpty && changes.removals.isEmpty)
             #expect(changes.addressEpoch == Self.epoch)
             let cursor = try #require(IMAPChangeCursor.decode(changes.cursor))
@@ -505,6 +505,19 @@ struct IMAPChangeReaderTests {
             guard case .notRun = archive.status else {
                 Issue.record("expected the archive notRun on a push pass, got \(archive.status)"); return
             }
+        }
+    }
+
+    @Test("Scope: a push pass answers the inbox's re-read list, on an unchanged bookmark too; a gone message is removed")
+    func inboxOnlyAnswersInboxRecheck() async throws {
+        try await Self.withWorld(inbox: [1, 2, 3]) { w in
+            let cursor = try await Self.baseline(w)
+            // Nothing changed since the bookmark: only the re-read list names 2 and 5.
+            let changes = try await Self.inbox(w, Self.read(w, cursors: [w.inboxId: cursor], scope: .inboxOnly,
+                                                            recheck: [w.inboxId: ["2", "5"]]))
+            #expect(Self.isTracked(changes.status), "\(changes.status)")
+            #expect(changes.records.map(\.messageId) == ["2"], "the held message is read again")
+            #expect(changes.removals == ["5"], "the gone one is removed")
         }
     }
 

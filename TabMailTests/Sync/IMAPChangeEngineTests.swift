@@ -142,6 +142,40 @@ struct IMAPChangeEngineTests {
         }
     }
 
+    // MARK: - A bookmark started with no listing (R35)
+
+    @Test("A bookmark a pass with no listing starts still gets its whole-folder check: an older message read elsewhere before it is read here after the next foreground sync")
+    func bookmarkStartedWithoutListingKeepsItsCatchUp() async throws {
+        // More than one window: the device holds every UID, the window listing
+        // reaches only the newest, so only the catch-up reaches UID 1000.
+        let uids = Array(1000..<(1000 + SyncConfig.syncMessageLimit + 10))
+        try await Self.withWorld("eng-r35", capabilities: Self.qresync, serverUIDs: uids, localUIDs: uids) { w in
+            let accountId = w.account.id
+            func account() throws -> Account { try #require(try w.pool.read { db in try Account.fetchOne(db, key: accountId) }) }
+            func oldest() throws -> MessageHeader? {
+                let folderId = w.folderId
+                return try w.pool.read { db in
+                    try MessageHeader.filter(Column("folderId") == folderId && Column("messageId") == "1000").fetchOne(db)
+                }
+            }
+            // The folder's catch-up has completed once, as an untracked folder's has.
+            _ = await w.engine.runCatchUpRun(account: try account(), run: .snapshot(deadline: Date().addingTimeInterval(30)))
+            #expect(IMAPCatchUpState.decode(try w.folder().catchUpState)?.lastCompletedAt != nil, "setup: the catch-up completed")
+            #expect(try oldest()?.isRead == false, "setup: unread here")
+            // Another device reads the oldest message, then a pass with no listing
+            // (a background pass) starts the bookmark after that change.
+            w.server.setFlags(["\\Seen"], in: Self.path, uid: 1000)
+            _ = try await w.engine.performChangePass(account: try account(), provider: w.provider, inboxOnly: true)
+            #expect(IMAPChangeCursor.decode(try w.folder().changeCursor) != nil, "setup: the bookmark is stored")
+            #expect(!FolderChangeState(raw: try w.folder().changeState).tracking, "setup: not tracked yet")
+            // The next foreground sync and catch-up run.
+            _ = try? await w.engine.sync(account: try account())
+            _ = await w.engine.runCatchUpRun(account: try account(), run: .snapshot(deadline: Date().addingTimeInterval(30)))
+            #expect(FolderChangeState(raw: try w.folder().changeState).tracking, "setup: the foreground sync tracks the folder")
+            #expect(try oldest()?.isRead == true, "the change made before the bookmark reaches the row")
+        }
+    }
+
     // MARK: - The count walk's presence answer
 
     @Test("A provider that cannot say which ids exist: the count walk deletes nothing")
