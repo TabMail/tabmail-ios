@@ -336,7 +336,11 @@ struct ChatThreadView: View {
             isHighlighted: highlightedId == item.id,
             onOpen: { cardMessage = item.header })
         .id(item.id)
-        .onScrollVisibilityChange { shown in
+        // Shown by one rule for every height (`ChatRowVisibility`), measured against the scroll
+        // view, so a row taller than the screen is shown too.
+        .onGeometryChange(for: Bool.self) { proxy in
+            ChatRowVisibility.isShown(proxy)
+        } action: { shown in
             guard shown else { return }
             shownIds.insert(item.id)
             askAsShown(item, in: thread)
@@ -641,5 +645,25 @@ struct ChatHeaderView: View {
         .frame(maxWidth: .infinity)
         .background(.bar)
         .accessibilityElement(children: .combine)
+    }
+}
+
+/// When a chat row counts as shown: its visible part is at least `ChatViewLayout.shownShareOfRow`
+/// of the row, or at least `ChatViewLayout.shownShareOfViewport` of the chat's visible height. One
+/// rule for every row height: a short row needs half of itself, and a row taller than twice the
+/// screen, which can never show half of itself, counts once it fills half the screen.
+enum ChatRowVisibility {
+    static func isShown(visibleHeight: CGFloat, rowHeight: CGFloat, viewportHeight: CGFloat) -> Bool {
+        guard visibleHeight > 0 else { return false }
+        return visibleHeight >= rowHeight * ChatViewLayout.shownShareOfRow
+            || visibleHeight >= viewportHeight * ChatViewLayout.shownShareOfViewport
+    }
+
+    /// The row's visible part, read against the enclosing scroll view's bounds.
+    static func isShown(_ proxy: GeometryProxy) -> Bool {
+        guard let viewport = proxy.bounds(of: .scrollView) else { return false }
+        let visible = viewport.intersection(CGRect(origin: .zero, size: proxy.size))
+        return isShown(visibleHeight: visible.isNull ? 0 : visible.height,
+                       rowHeight: proxy.size.height, viewportHeight: viewport.height)
     }
 }

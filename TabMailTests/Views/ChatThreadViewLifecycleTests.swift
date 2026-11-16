@@ -34,11 +34,15 @@ struct ChatThreadViewLifecycleTests {
     private static var newest: [Int] { Array((length - ChatViewConfig.summaryWindow..<length).reversed()) }
 
     private static func rfc(_ index: Int) -> String { "<life-\(index)@example.com>" }
+    /// Lines in the tall bubble: about seven screens of text on the test's phone.
+    private static let tallLineCount = 160
 
     /// A 40-email chain, e0 (oldest) to e39 (newest), all in the Inbox with their bodies and no
     /// summaries, ten minutes apart (no time stamps between them). `unreadFrom`: emails from this
     /// index on are unread.
-    private static func insertThread(unreadFrom: Int?, pool: DatabasePool) throws -> [MessageHeader] {
+    /// `tall`: this email's bubble holds `tallText`, many times the screen's height, with no summary
+    /// stored yet, so it still asks for one.
+    private static func insertThread(unreadFrom: Int?, tall: Int? = nil, pool: DatabasePool) throws -> [MessageHeader] {
         _ = try FolderEpochTestFixture.makeAccount(id: account, provider: .gmail, pool: pool)
         try FolderEpochTestFixture.insertFolder(accountId: account, path: "INBOX", role: .inbox, pool: pool)
         let now = Date()
@@ -55,6 +59,7 @@ struct ChatThreadViewLifecycleTests {
             header.headerComplete = true
             header.bodyComplete = true
             header.isRead = unreadFrom.map { index < $0 } ?? true
+            if index == tall { header.summaryTextMessage = tallText(index) }
             let row = header
             try pool.write { db in
                 try row.insert(db)
@@ -63,6 +68,11 @@ struct ChatThreadViewLifecycleTests {
             headers.append(header)
         }
         return headers
+    }
+
+    /// A text message of many lines, starting "Plans N" as the bubble's label reads it.
+    private static func tallText(_ index: Int) -> String {
+        (["Plans \(index)"] + (1...Self.tallLineCount).map { "Line \($0) of a long note." }).joined(separator: "\n")
     }
 
     private struct Opened {
@@ -119,17 +129,17 @@ struct ChatThreadViewLifecycleTests {
     /// Opens the chat on `headers[openedIndex]` and waits until the queue and the scroll settle;
     /// `then` runs after that, and the queue is read again once it settles.
     private func open(
-        unreadFrom: Int?, openedIndex: Int, highlights: Bool, landsAway: Bool = false,
+        unreadFrom: Int?, openedIndex: Int, highlights: Bool, landsAway: Bool = false, tall: Int? = nil,
         then action: (@MainActor (UIScrollView) async throws -> Void)? = nil
     ) async throws -> Opened {
         try await HostedAccessibility.withAutomation {
             try await openWithAutomation(unreadFrom: unreadFrom, openedIndex: openedIndex,
-                                         highlights: highlights, landsAway: landsAway, then: action)
+                                         highlights: highlights, landsAway: landsAway, tall: tall, then: action)
         }
     }
 
     private func openWithAutomation(
-        unreadFrom: Int?, openedIndex: Int, highlights: Bool, landsAway: Bool,
+        unreadFrom: Int?, openedIndex: Int, highlights: Bool, landsAway: Bool, tall: Int?,
         then action: (@MainActor (UIScrollView) async throws -> Void)?
     ) async throws -> Opened {
         let saved = ChatSummaryQueueTests.SavedChatViewState()
@@ -142,7 +152,7 @@ struct ChatThreadViewLifecycleTests {
             InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
         }
         saved.setChatView(on: true)
-        let headers = try Self.insertThread(unreadFrom: unreadFrom, pool: pool)
+        let headers = try Self.insertThread(unreadFrom: unreadFrom, tall: tall, pool: pool)
 
         let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let window = UIWindow(windowScene: scene)
@@ -249,6 +259,81 @@ struct ChatThreadViewLifecycleTests {
         #expect(opened.fullyShown.isSubset(of: Set(opened.queued)), "every email on screen is asked for: \(opened.queued)")
         let middle = ChatViewConfig.summaryWindow + 5..<(Self.length - ChatViewConfig.summaryWindow - 5)
         #expect(!opened.older.contains { middle.contains($0) }, "the emails jumped past ask nothing: \(opened.queued)")
+        Self.expectOpenRequest(opened)
+    }
+
+    /// Moves the chat's content by `distance` points (positive scrolls toward the bottom), as a drag
+    /// that lets go without momentum.
+    private static func scroll(_ scroll: UIScrollView, by distance: CGFloat) {
+        scroll.setContentOffset(CGPoint(x: 0, y: scroll.contentOffset.y + distance), animated: false)
+        scroll.layoutIfNeeded()
+    }
+
+    /// The screen frame of email `index`'s bubble, read from the whole window `view` is in (the
+    /// hosting view holds the elements, not the scroll view).
+    private static func bubbleFrame(_ index: Int, in view: UIView) -> CGRect? {
+        bubbleFrames(in: view.window ?? view).first { $0.index == index }?.frame
+    }
+
+    final class Measured { var bubbleHeight: CGFloat = 0; var screenHeight: CGFloat = 0; var askedAtSliver = false }
+
+    @Test("A row is shown once half of it, or half of the screen, is visible: one rule for every height")
+    func visibilityRule() {
+        let screen: CGFloat = 800
+        let short: CGFloat = 100
+        let rowShare = ChatViewLayout.shownShareOfRow
+        let screenShare = ChatViewLayout.shownShareOfViewport
+        #expect(!ChatRowVisibility.isShown(visibleHeight: short * rowShare - 1, rowHeight: short, viewportHeight: screen))
+        #expect(ChatRowVisibility.isShown(visibleHeight: short * rowShare, rowHeight: short, viewportHeight: screen))
+        let tall = 3 * screen
+        #expect(!ChatRowVisibility.isShown(visibleHeight: screen * screenShare - 1, rowHeight: tall, viewportHeight: screen))
+        #expect(ChatRowVisibility.isShown(visibleHeight: screen * screenShare, rowHeight: tall, viewportHeight: screen),
+                "a row taller than the screen counts once it fills half of it")
+        #expect(ChatRowVisibility.isShown(visibleHeight: screen, rowHeight: tall, viewportHeight: screen))
+        #expect(!ChatRowVisibility.isShown(visibleHeight: 0, rowHeight: 0, viewportHeight: screen), "nothing visible is never shown")
+    }
+
+    @Test("A row more than twice the screen's height asks for its summary once scrolled into; the rows jumped past ask nothing")
+    func tallRowAsksOnceScrolledInto() async throws {
+        let tall = 15
+        let measured = Measured()
+        let opened = try await open(unreadFrom: nil, openedIndex: Self.length - 1, highlights: false, tall: tall) { scroll in
+            let frame = try #require(Self.bubbleFrame(tall, in: scroll), "control: the tall row is laid out")
+            let screen = scroll.convert(scroll.bounds, to: nil)
+            measured.bubbleHeight = frame.height
+            measured.screenHeight = screen.height
+            // In one move, as a fast drag lands: the row's middle at the screen's middle.
+            Self.scroll(scroll, by: frame.midY - screen.midY)
+        }
+        #expect(measured.bubbleHeight > 2 * measured.screenHeight,
+                "control: the bubble is more than twice the screen: \(measured.bubbleHeight) vs \(measured.screenHeight)")
+        #expect(opened.partlyShown == [tall], "control: only the tall row is on screen: \(opened.partlyShown.sorted())")
+        #expect(opened.older == [tall], "the tall row asks, and nothing it was scrolled past does: \(opened.queued)")
+        Self.expectOpenRequest(opened)
+    }
+
+    @Test("A short row asks only once half of it is on screen")
+    func shortRowAsksAtHalf() async throws {
+        let target = 20
+        let measured = Measured()
+        let opened = try await open(unreadFrom: nil, openedIndex: Self.length - 1, highlights: false) { scroll in
+            let screen = scroll.convert(scroll.bounds, to: nil)
+            let frame = try #require(Self.bubbleFrame(target, in: scroll), "control: the row is laid out")
+            // A fifth of the bubble inside the top of the scroll view.
+            Self.scroll(scroll, by: frame.maxY - frame.height / 5 - screen.minY)
+            // The accessibility frames follow the scroll once SwiftUI has laid out again.
+            try await Task.sleep(for: .milliseconds(600))
+            let sliver = try #require(Self.bubbleFrame(target, in: scroll))
+            #expect(abs(sliver.maxY - screen.minY - sliver.height / 5) < 2, "control: a fifth of it shows: \(sliver) in \(screen)")
+            let jobs = try await Self.settledQueue(ActiveAIQueue.shared)
+            measured.askedAtSliver = jobs.contains(MessageIdentity.headerId(accountId: Self.account, folderPath: "INBOX", messageId: "life\(target)"))
+            // The whole bubble inside the area below the bars and the header.
+            let visible = screen.inset(by: scroll.adjustedContentInset)
+            Self.scroll(scroll, by: sliver.minY - visible.minY - 20)
+        }
+        #expect(!measured.askedAtSliver, "a fifth of a short row is not enough")
+        #expect(opened.fullyShown.contains(target), "control: the row is on screen: \(opened.fullyShown.sorted())")
+        #expect(opened.older.contains(target), "the row asks once it is on screen: \(opened.queued)")
         Self.expectOpenRequest(opened)
     }
 

@@ -203,6 +203,13 @@ same AI result, kept as long as the email itself is shown.
      no hand-scroll flag. *Amended 2026-11-15:* the observation and the re-check after a queue
      rebuild ask too, and the chat keeps the ids of the rows that came on screen (`shownIds`) to know
      which rows to check. There is still no settle wait and no hand-scroll flag.
+     *Amended 2026-11-16:* a row comes on screen by one rule for every height
+     (`ChatRowVisibility`, per-row `onGeometryChange` against the scroll view's bounds): its visible
+     part is at least `ChatViewLayout.shownShareOfRow` (half) of the row, or at least
+     `ChatViewLayout.shownShareOfViewport` (half) of the chat's visible height.
+     `onScrollVisibilityChange` needed half of the row, which a row taller than twice the screen
+     never shows, so such a row never asked. Tests: `ChatThreadViewLifecycleTests.visibilityRule`,
+     `tallRowAsksOnceScrolledInto`, `shortRowAsksAtHalf`.
    - **Summaries follow the database while a chat is shown (2026-11-15).** From its landing, while
      it is on screen, the chat observes its emails' body, summary and text message in the database
      (`ChatSummaryState`: one GRDB `ValueObservation` per shown chat, run by
@@ -248,7 +255,7 @@ same AI result, kept as long as the email itself is shown.
      `scrollTo` target while they measure (memory 036); with real heights, one `scrollTo` lands.
      Threads are short, and the AI work is bounded by what the chat asks for, not by the rows it
      builds. In a plain stack `onAppear` fires for every row at once, which is why the per-row ask
-     uses `onScrollVisibilityChange`.
+     uses `onScrollVisibilityChange` (`onGeometryChange` with `ChatRowVisibility` since 2026-11-16).
    - `defaultScrollAnchor(.bottom)` opens at the newest email. The landing `scrollTo` is issued once
      the thread is loaded, and again on every container or content size change until a scroll of
      any kind begins (memory 036: a first scroll can be dropped while the screen settles). The first
