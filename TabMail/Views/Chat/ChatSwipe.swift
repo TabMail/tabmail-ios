@@ -105,7 +105,9 @@ struct ChatSwipeButton: Identifiable {
 }
 
 /// Slides its content to reveal buttons at `edge`. Only one reveal is open at a time:
-/// `openId` names it, and a drag elsewhere is ignored until it closes.
+/// `openId` names it, and a drag elsewhere is ignored until it closes. VoiceOver's actions for the
+/// buttons are named by the call site, on the element they belong to: actions on a view of several
+/// elements (a bubble and its chips) reorder what VoiceOver reads in it.
 struct ChatSwipeReveal: ViewModifier {
     let id: String
     let edge: HorizontalEdge
@@ -144,11 +146,6 @@ struct ChatSwipeReveal: ViewModifier {
             .onDisappear { ChatSwipeHold.shared.releaseNow(id) }
             .onChange(of: openId) { _, now in
                 if now != id, drag.offset != 0 { withAnimation(Self.spring) { drag.offset = 0 } }
-            }
-            .accessibilityActions {
-                ForEach(buttons) { button in
-                    Button(button.title, action: button.action)
-                }
             }
     }
 

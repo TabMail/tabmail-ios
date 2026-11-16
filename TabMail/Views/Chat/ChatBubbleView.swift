@@ -11,6 +11,8 @@ struct ChatBubbleView: View {
     let isGroup: Bool
     let extras: ChatMemberExtras?
     let isHighlighted: Bool
+    /// VoiceOver's actions for this email's swipe and the chat's, on the bubble itself.
+    var actions: [ChatSwipeButton] = []
     let onOpen: () -> Void
 
     @State private var showsOnlyList = false
@@ -133,6 +135,11 @@ struct ChatBubbleView: View {
         .accessibilityLabel(accessibilityText)
         .accessibilityHint("Opens the email")
         .accessibilityAddTraits(.isButton)
+        .accessibilityActions {
+            ForEach(actions) { action in
+                Button(action.title, action: action.action)
+            }
+        }
     }
 
     /// VoiceOver: what is on screen, in order.

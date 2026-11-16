@@ -538,7 +538,12 @@ same AI result, kept as long as the email itself is shown.
    once (every bubble that leaves the screen lets go of its id), so the state stays bounded and a
    reused id's newer swipe is never released by an earlier settle. Before, a counter per id grew
    with every bubble ever shown. Test: `swipeHoldKeepsNoStateOnceSettled`.
-   VoiceOver reaches every button as a named action. Archive, Trash and Move act on every email the
+   VoiceOver reaches every button as a named action. *Amended 2026-11-16:* a bubble's own buttons
+   and the chat's ("Archive chat", "Trash chat") are actions of the bubble itself
+   (`ChatBubbleView.actions`), not of its whole row: actions on a row of several elements made
+   VoiceOver read the bubble between its own attachment chips. Tests: `chipsStopAtTheCap`,
+   `chatSwipeWiring`.
+   Archive, Trash and Move act on every email the
    chat shows, wherever it is filed ("always the whole thread", 2026-11-04), except the user's sent
    copies and drafts, which stay in their folders, and emails already at the destination
    (`MessageDetailViewModel.archiveChat` / `deleteChat` / `moveChat`), and close the chat as closing

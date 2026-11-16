@@ -370,6 +370,11 @@ struct ChatThreadView: View {
                 .modifier(ChatSwipeReveal(
                     id: Self.chatSwipeId, edge: .trailing, buttons: chatSwipeButtons(offersArchive: offersArchive),
                     allowsFullSwipe: offersArchive, openId: $openSwipeId))
+                .accessibilityActions {
+                    ForEach(chatSwipeButtons(offersArchive: offersArchive)) { button in
+                        Button(button.title, action: button.action)
+                    }
+                }
             }
             .safeAreaInset(edge: .top, spacing: 0) {
                 ChatHeaderView(thread: thread, subject: subject(thread), labels: context.labels) {
@@ -412,15 +417,13 @@ struct ChatThreadView: View {
             isGroup: thread.isGroup,
             extras: context.extras[item.id],
             isHighlighted: highlightedId == item.id,
+            actions: bubbleSwipeButtons(item, thread: thread) + chatSwipeButtons(offersArchive: offersArchive).map { button in
+                ChatSwipeButton(title: "\(button.title) chat", systemImage: button.systemImage, tint: button.tint, action: button.action)
+            },
             onOpen: { cardMessage = item.header })
         .modifier(ChatSwipeReveal(
             id: item.id, edge: .leading, buttons: bubbleSwipeButtons(item, thread: thread),
             allowsFullSwipe: false, openId: $openSwipeId))
-        .accessibilityActions {
-            ForEach(chatSwipeButtons(offersArchive: offersArchive)) { button in
-                Button("\(button.title) chat", action: button.action)
-            }
-        }
         .id(item.id)
         // Shown by one rule for every height (`ChatRowVisibility`), measured against the scroll
         // view, so a row taller than the screen is shown too.

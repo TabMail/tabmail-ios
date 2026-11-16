@@ -281,8 +281,15 @@ struct ChatSwipeTests {
         #expect(text.contains("let offersArchive = viewModel.chatHasInboxCopy"))
         #expect(text.contains("id: Self.chatSwipeId, edge: .trailing, buttons: chatSwipeButtons(offersArchive: offersArchive), allowsFullSwipe: offersArchive, openId: $openSwipeId"),
                 "the full swipe runs only while Archive is at the edge")
-        #expect(text.contains("ForEach(chatSwipeButtons(offersArchive: offersArchive)) { button in Button(\"\\(button.title) chat\", action: button.action) }"),
-                "VoiceOver's actions are the swipe's buttons")
+        #expect(text.contains("actions: bubbleSwipeButtons(item, thread: thread) + chatSwipeButtons(offersArchive: offersArchive).map { button in ChatSwipeButton(title: \"\\(button.title) chat\", systemImage: button.systemImage, tint: button.tint, action: button.action) },"),
+                "VoiceOver's actions are the swipe's buttons, on the bubble")
+        // On the bubble itself, never on the whole row: actions on a view of several elements
+        // reorder what VoiceOver reads in it (the bubble came between its own chips).
+        let bubble = try Self.source("TabMail/Views/Chat/ChatBubbleView.swift")
+        #expect(bubble.contains(".accessibilityAddTraits(.isButton) .accessibilityActions { ForEach(actions) { action in Button(action.title, action: action.action) } }"))
+        #expect(!text.contains("allowsFullSwipe: false, openId: $openSwipeId)) .accessibilityActions"), "no actions on the whole row")
+        let swipe = try Self.source("TabMail/Views/Chat/ChatSwipe.swift")
+        #expect(!swipe.contains(".accessibilityActions"), "the reveal names no actions on what it slides")
         let buttons = try Self.body(of: "private func chatSwipeButtons(offersArchive: Bool) -> [ChatSwipeButton] {", in: text)
         // The inbox row's word for a move to Trash.
         let delete = try #require(buttons.range(of: "title: \"Trash\""))
