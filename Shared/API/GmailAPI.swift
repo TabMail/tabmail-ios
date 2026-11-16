@@ -21,6 +21,11 @@ enum GmailAPI {
     /// folder still lands in ~3-4s) while staying well under the cap. Tunable.
     static let maxConcurrentRequests = 6
 
+    /// How long the label menu waits for Gmail to create a label (and, when Gmail
+    /// already has one by that name, to find it) before the gesture fails with
+    /// `UserLabelCreationTimeoutError`. The user is waiting on the sheet.
+    static let labelCreateTimeout: Duration = .seconds(10)
+
     /// `?format=metadata&metadataHeaders=...` query for `users.messages.get`.
     /// Single source of truth: both `GmailAPI.messageMetadata` (NSE-owned
     /// fetch path) and every `GmailProvider` call site that assembles the

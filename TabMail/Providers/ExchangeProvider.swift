@@ -1867,7 +1867,7 @@ actor ExchangeProvider: EmailProvider {
             // 🚨 VERBATIM — do NOT lowercase. IMAP lowercases because RFC 3501
             // keywords are case-INsensitive; Graph category names are
             // case-SENSITIVE display strings. The write path
-            // (`UserLabelMenuModel.createAndApply`'s `.outlook` arm) mints the
+            // (`ExchangeProvider.userLabel(named:connected:)`) mints the
             // user's typed name unchanged, so this must map the server's echo
             // unchanged too — otherwise `Receipts` typed here and `Receipts`
             // echoed back derive two different `UserLabel.id`s and the menu grows

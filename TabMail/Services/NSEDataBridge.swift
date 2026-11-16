@@ -2954,85 +2954,27 @@ enum NSEDataBridge {
     /// Apply the provider-specific filter that `GmailProvider.extractUserLabelIds`,
     /// `IMAPProvider.buildMessageHeaderInfo`, and `ExchangeProvider.parseGraphMessage`
     /// each apply locally. Called inside the merge's GRDB write tx so the
-    /// Gmail path can query the main `userLabel` table synchronously.
+    /// Gmail rule can query the main `userLabel` table synchronously.
     ///
-    /// **Gmail** — since label IDs are opaque (`Label_N`), we can't tell user
-    /// vs system vs `tm_*` by the ID alone. Instead we take the path main-
-    /// app already walks: look up each ID in the `userLabel` table. Only
-    /// real user labels (rows with `isSystem=false`) are kept. tm_* labels
-    /// aren't in that table (main-app `extractUserLabelIds` filters them
-    /// out before insert). System labels are either absent or have
-    /// `isSystem=true`. Zero extra I/O — the transaction already has `db`.
-    /// Cold-start caveat: if this device's main-app hasn't yet called
-    /// `fetchFolders`, `userLabel` is empty and no user labels materialize
-    /// on the NSE row until sync runs. Push subscription normally follows
-    /// a sync, so this is mostly hypothetical.
-    ///
-    /// **IMAP** — plain custom-keyword names. Strip `tm_*` and every
-    /// exclusion `UserLabelStore.isExcludedKeyword` knows about.
-    ///
-    /// **Outlook** — a Graph message `category` IS Outlook's user label. Keep
-    /// every category except the reserved `tm_*` namespace, through the SAME
-    /// predicate `ExchangeProvider.parseGraphMessage` filters with and
-    /// `stripLegacyCategories` DELETES with (ADR-IOS-036: action tags are
-    /// local-only). Names are kept VERBATIM, unlike IMAP's lowercasing.
+    /// The rules are the providers' own (`EmailProvider.storedUserLabelIds`,
+    /// #500): Gmail keeps the ids its stored catalog knows as user labels, IMAP
+    /// drops excluded keywords and lowercases, Outlook drops the reserved `tm_*`
+    /// categories and keeps names verbatim. A payload naming no mail provider
+    /// keeps no labels.
     fileprivate static func filterUserLabels(
         provider: String, rawLabels: [String],
         accountId: String, db: GRDB.Database
     ) throws -> [String] {
-        switch provider {
-        case "gmail":
-            // Query userLabel for known non-system user labels on this
-            // account. A single `IN` query covers all staged labelIds.
-            //
-            // 🚨 MATCHES AND RETURNS `providerLabelId`, NOT `id` (D10 /
-            // `IOS-LABEL-001`). `rawLabels` are the provider's own label ids
-            // straight off the push payload, and `userLabel.id` is now the
-            // account-prefixed surrogate — matching against it would find
-            // nothing and silently strip every Gmail user label from every
-            // NSE-delivered message. This function's contract, on every
-            // provider arm, is "bare provider label ids in, bare provider
-            // label ids out"; the caller re-mints the surrogate.
-            //
-            // A6: `providerLabelId` is unindexed, so this is a scan of
-            // `userLabel` rather than the previous primary-key probe. That
-            // table holds a user's labels — tens of rows, one small page —
-            // and an index to serve one NSE-merge lookup is not justified.
-            guard !rawLabels.isEmpty else { return [] }
-            let placeholders = rawLabels.map { _ in "?" }.joined(separator: ",")
-            let args: [DatabaseValueConvertible] = [accountId] + rawLabels
-            let known = try String.fetchAll(db, sql: """
-                SELECT providerLabelId FROM userLabel
-                WHERE accountId = ? AND isSystem = 0 AND providerLabelId IN (\(placeholders))
-                """, arguments: StatementArguments(args))
-            let knownSet = Set(known)
-            return rawLabels.filter { knownSet.contains($0) }
-        case "imap_new_mail", "imap", "icloud":
-            // IMAP: strip system flags + tm_* + any other excluded keyword.
-            return rawLabels.filter { !UserLabelStore.isExcludedKeyword($0) }
-                .map { $0.lowercased() }  // Matches IMAPProvider's lowercase normalization.
-        case "outlook":
-            // Parity with `ExchangeProvider.parseGraphMessage`, which maps
-            // `categories` straight into `userLabelIds` through this same
-            // predicate (`e265428ff`). Before that commit both sides returned
-            // `[]` and this arm was correct; afterwards it was the only path
-            // still dropping them, so an NSE-delivered Outlook message carried
-            // no label rows until the next main-app sync.
-            //
-            // ONE predicate, not a second copy: `isLegacyActionTagCategory` is
-            // also what `stripLegacyCategories` uses to DELETE `tm_*`
-            // categories from the server, so a category that path erases can
-            // never be surfaced here as a label the user owns.
-            //
-            // 🚨 VERBATIM — do NOT lowercase. The IMAP arm above lowercases
-            // because RFC 3501 keywords are case-INsensitive; Graph category
-            // names are case-SENSITIVE display strings, and the main-app read
-            // and write paths both keep them unchanged. Lowercasing here would
-            // mint a second `UserLabel.id` for one category.
-            return rawLabels.filter { !ExchangeProvider.isLegacyActionTagCategory($0) }
-        default:
-            return []
-        }
+        guard let providerType = stagedAccountProvider(provider)?.emailProviderType else { return [] }
+        return try providerType.storedUserLabelIds(fromPushed: rawLabels, accountId: accountId, db: db)
+    }
+
+    /// The account kind a staged message's push-payload provider name stands
+    /// for. The names are `AccountProvider` raw values (`gmail`, `outlook`),
+    /// except IMAP's new-mail push, `imap_new_mail`, which serves IMAP and
+    /// iCloud alike (both follow `IMAPProvider`'s rules). Any other name is nil.
+    static func stagedAccountProvider(_ name: String) -> AccountProvider? {
+        name == "imap_new_mail" ? .imap : AccountProvider(rawValue: name)
     }
 
     // MARK: - Clear Notification on Read

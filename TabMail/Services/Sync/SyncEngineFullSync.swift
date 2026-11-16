@@ -107,8 +107,8 @@ extension SyncEngine {
     }
 
     /// Apply the provider's folder list: upsert name, counts and the IMAP status
-    /// values, bootstrap epochs, insert new folders, remove vanished ones, and (Gmail)
-    /// sync the user-label rows. Runs inside one write transaction.
+    /// values, bootstrap epochs, insert new folders, remove vanished ones, and (a
+    /// provider with a label catalog in its folder list) sync the user-label rows. Runs inside one write transaction.
     ///
     /// Fix B task 4: folders whose CONDSTORE HIGHESTMODSEQ is unchanged since last sync
     /// — RFC 7162 guarantees nothing changed (add/delete/flag), so the per-folder fetch
@@ -224,30 +224,25 @@ extension SyncEngine {
             try folder.delete(db)
         }
 
-        // Sync user labels from the folder list (Gmail: user labels appear as custom folders).
-        // One UserLabel per Gmail label. Nested labels (e.g., "Work/Projects/Alpha") are stored
-        // with their full name — splitting into segments happens at display time in the chip view.
-        if account.provider == .gmail {
+        // Sync user labels from the provider's label catalog in the folder list
+        // (`EmailProvider.userLabelCatalog`, #500; Gmail: user labels appear as custom
+        // folders). nil = the provider keeps no catalog there: the stored labels stay.
+        if let catalog = account.provider.emailProviderType?.userLabelCatalog(from: remoteFolders) {
             let existingLabelIds = try String.fetchSet(db,
                 UserLabel.select(Column("id")).filter(Column("accountId") == account.id)
             )
             var seenLabelIds: Set<String> = []
 
-            for info in remoteFolders {
-                let labelId = info.path
-                // Skip tm_* labels (handled by ActionTag) and system/auto-created labels
-                if UserLabelStore.isExcludedKeyword(info.name) { continue }
-
-                let isSystem = UserLabelStore.isGmailSystemLabel(id: labelId, name: info.name)
+            for entry in catalog {
                 let row = UserLabel(
-                    accountId: account.id, providerLabelId: labelId,
-                    name: info.name, isSystem: isSystem
+                    accountId: account.id, providerLabelId: entry.providerLabelId,
+                    name: entry.name, isSystem: entry.isSystem
                 )
                 try row.save(db) // upsert
                 // 🚨 THE SWEEP BELOW COMPARES DB IDS, SO THIS MUST BE THE DB ID.
                 // `existingLabelIds` is read from `userLabel.id`, which is the
                 // account-prefixed surrogate (D10 / `IOS-LABEL-001`). Recording the
-                // BARE `labelId` here would make `staleLabelIds` the whole existing
+                // BARE `entry.providerLabelId` here would make `staleLabelIds` the whole existing
                 // set on every single sync — i.e. delete every label row this account
                 // has, and (via `messageUserLabel`'s `onDelete: .cascade`) every
                 // association with it. This is the most dangerous consumer of the

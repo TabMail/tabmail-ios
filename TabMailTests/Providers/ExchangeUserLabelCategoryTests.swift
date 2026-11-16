@@ -402,8 +402,15 @@ struct OutlookUserLabelMenuTests {
         #expect(model.sortedLabels.isEmpty)
 
         #expect(await model.applyLabel(label) == false)
-        let ops = try await f.pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(await model.removeLabel(label) == false)
+        #expect(await model.createAndApply(name: "Invoices") == false)
+        let (ops, rows) = try await f.pool.read { db in
+            (try PendingOperation.fetchAll(db), try UserLabel.fetchAll(db))
+        }
         #expect(ops.isEmpty, "a label op was queued for a provider that can never execute it")
+        #expect(rows.map(\.id) == [label.id], "a label row was created for a provider that can never carry it")
+        #expect(model.sortedLabels.isEmpty)
+        #expect(model.appliedIds.isEmpty)
     }
 
     // MARK: 3b — the verbatim round trip (D-B's decisive argument)
@@ -498,19 +505,47 @@ struct OutlookUserLabelMenuTests {
         #expect(row.name == "Receipts", "the DISPLAY name is never normalized")
     }
 
-    /// The capability ladder as a CLOSURE over every provider, not as the one
-    /// case that changed. `AccountProvider` is not `CaseIterable` (and adding
-    /// the conformance is a production change out of this scope), so the list is
-    /// spelled out here; the compile-time guard against a sixth provider is
-    /// `supportsRemoteUserLabels(_:)`'s own exhaustive `default:`-free switch,
-    /// and this is its behavioural counterpart.
-    @Test("Exactly one provider refuses remote user labels: CalDAV")
-    func exactlyCaldavRefusesRemoteUserLabels() {
-        let everyProvider: [AccountProvider] = [.gmail, .outlook, .imap, .icloud, .caldav]
-        let refusing = everyProvider.filter {
-            !UserLabelMenuModel.supportsRemoteUserLabels($0)
+    /// iCloud is an IMAP account: it lowercases its keyword like IMAP, with no
+    /// connected provider (nothing is registered in this fixture), so a label
+    /// is created while the account is offline, signed out or still starting.
+    @Test("iCloud lowercases its keyword id, with no connected provider")
+    @MainActor
+    func icloudLowercasesWithNoConnectedProvider() async throws {
+        let f = try fixture(accountId: "labels-icloud", provider: .icloud)
+        defer { restore(f) }
+
+        let header = try insertHeader(f, messageId: "43")
+        let model = UserLabelMenuModel(messageSnapshot: MessageSnapshot(from: header))
+        #expect(await model.createAndApply(name: "Receipts"),
+                "creating a label on iCloud needed a connected provider")
+
+        let rows = try await f.pool.read { db in try UserLabel.fetchAll(db) }
+        #expect(rows.count == 1)
+        guard rows.count == 1 else { return }
+        #expect(rows[0].providerLabelId == "receipts")
+        #expect(rows[0].name == "Receipts", "the DISPLAY name is never normalized")
+        #expect(model.sortedLabels.map(\.id) == [rows[0].id], "the created label is not in the menu")
+    }
+
+    /// Gmail creates its label on the server, so with no connected Gmail
+    /// provider the gesture fails and nothing is written: no label row, no menu
+    /// entry, no queued change.
+    @Test("Gmail with no connected provider: the create fails and nothing is written")
+    @MainActor
+    func gmailWithNoConnectedProviderWritesNothing() async throws {
+        let f = try fixture(accountId: "labels-gmail-offline", provider: .gmail)
+        defer { restore(f) }
+
+        let header = try insertHeader(f, messageId: "gmail-offline-1")
+        let model = UserLabelMenuModel(messageSnapshot: MessageSnapshot(from: header))
+        #expect(await model.createAndApply(name: "Receipts") == false)
+
+        let (rows, queued) = try await f.pool.read { db in
+            (try UserLabel.fetchCount(db), try PendingOperation.fetchCount(db))
         }
-        #expect(refusing == [.caldav],
-                "the set of providers without remote user labels changed: \(refusing)")
+        #expect(rows == 0, "a label row was stored with no Gmail label behind it")
+        #expect(queued == 0, "a label change was queued with no Gmail label behind it")
+        #expect(model.sortedLabels.isEmpty)
+        #expect(model.appliedIds.isEmpty)
     }
 }

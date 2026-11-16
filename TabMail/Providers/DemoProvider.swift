@@ -349,3 +349,22 @@ actor DemoProvider: EmailProvider {
             .trimmingCharacters(in: .whitespaces)
     }
 }
+
+// MARK: - User labels (#500)
+
+/// The demo account is an IMAP account (`DemoSeed`), so its user labels follow
+/// IMAP's rules; `AccountProvider.emailProviderType` already routes a `.imap`
+/// account to `IMAPProvider`, and these forward to the same rules.
+extension DemoProvider {
+    static func userLabel(named name: String, connected: (any EmailProvider)?) async throws -> ProviderUserLabel {
+        try await IMAPProvider.userLabel(named: name, connected: connected)
+    }
+
+    static func userLabelCatalog(from folders: [FolderInfo]) -> [ProviderUserLabel]? {
+        IMAPProvider.userLabelCatalog(from: folders)
+    }
+
+    static func storedUserLabelIds(fromPushed rawLabels: [String], accountId: String, db: Database) throws -> [String] {
+        try IMAPProvider.storedUserLabelIds(fromPushed: rawLabels, accountId: accountId, db: db)
+    }
+}
