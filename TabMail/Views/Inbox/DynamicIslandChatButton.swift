@@ -351,6 +351,9 @@ struct DynamicIslandChat: View {
                     .padding(10)
                     .background(Palette.boxBg)
                     .clipShape(RoundedRectangle(cornerRadius: 8))
+                    // One element for VoiceOver: the email the chat is about.
+                    .accessibilityElement(children: .combine)
+                    .accessibilityIdentifier("chatEmailCard")
                     .padding(.horizontal, 14)
                 } else if let draftSubject, !draftSubject.isEmpty {
                     HStack {
@@ -2513,7 +2516,7 @@ struct DynamicIslandChat: View {
                     uiSink: SessionUISink(session: session), sessionKey: sessionKey, fieldReply: fieldReply)
                 let response: ChatResponse?
                 response = try await TutorialChatScript.response(for: script, invocation: invocation) {
-                    try await AIService.shared.sendChatMessage(
+                    try await ChatPillState.shared.aiService.sendChatMessage(
                         userText: enrichedText,
                         history: history,
                         onSSEEvent: makeCompletionsSSEHandler(idleLabel: "Thinking..."),
@@ -2679,7 +2682,7 @@ struct DynamicIslandChat: View {
 
         activeChatTask = Task {
             do {
-                let response = try await AIService.shared.resumeChatMessage(
+                let response = try await ChatPillState.shared.aiService.resumeChatMessage(
                     request: resume.request,
                     onSSEEvent: makeCompletionsSSEHandler(idleLabel: "Thinking..."),
                     invocation: ToolInvocation(

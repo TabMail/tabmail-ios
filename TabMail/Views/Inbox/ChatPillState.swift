@@ -31,6 +31,12 @@ final class ChatPillState {
     @ObservationIgnored
     private var sessions: [String: Session] = [:]
 
+    /// The service the pills' agent requests go to. Tests install one built on a `FakeHTTP`
+    /// session (precedent: `AIService(backendClient:)`) to read what a request sends and answer
+    /// it; production uses `AIService.shared`.
+    @ObservationIgnored
+    var aiService: AIService = .shared
+
     func session(for key: String) -> Session {
         if let existing = sessions[key] { return existing }
         let new = Session()
