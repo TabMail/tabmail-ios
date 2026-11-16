@@ -385,6 +385,23 @@ struct IMAPChangeReaderTests {
         }
     }
 
+    @Test("Epoch: a new UIDVALIDITY is refused even when the server's HIGHESTMODSEQ equals the bookmark's")
+    func epochChangeWithEqualModSeqRefuses() async throws {
+        try await Self.withWorld(inbox: [1, 2]) { w in
+            _ = try await Self.baseline(w)
+            w.server.setUidValidity(Self.epoch + 1, for: Self.inboxPath)
+            // A bookmark under the old numbering whose modseq happens to be the
+            // new numbering's: "unchanged" would read the folder under the wrong epoch.
+            let served = w.server.qresyncHighestModSeq(for: Self.inboxPath)
+            let cursor = IMAPChangeCursor(uidValidity: UInt32(Self.epoch), highestModSeq: UInt64(served), uidNext: 3).encoded
+            let changes = try await Self.inbox(w, Self.read(w, cursors: [w.inboxId: cursor]))
+            guard case .refused(.addressEpochChanged(let epoch)) = changes.status else {
+                Issue.record("expected refused(addressEpochChanged), got \(changes.status)"); return
+            }
+            #expect(epoch == Self.epoch + 1)
+        }
+    }
+
     @Test("No QRESYNC: a CONDSTORE-only server leaves every folder untracked with its STATUS observation and sends no ENABLE")
     func noQResyncIsUntracked() async throws {
         try await Self.withWorld(capabilities: FakeIMAPServer.defaultCapabilities + ["CONDSTORE"], inbox: [1, 2]) { w in

@@ -1493,6 +1493,23 @@ struct IMAPProviderPoolInvariantTests {
 
     // MARK: Invariant 10: a capacity-starved acquire is woken by ANY freed slot (D-14 / R10-F1)
 
+    /// Every connection the provider may open together stays within the server's
+    /// declared limit: the folder connections plus the action connection and the
+    /// change reader's own (IDLE off).
+    @Test("the folder pool leaves room for the action and change-reader connections under the server's limit")
+    func folderPoolLeavesRoomForActionAndChangeConnections() async throws {
+        let server = FakeIMAPServer(username: Self.uniqueUsername(), mailboxes: ["INBOX": []])
+        try server.start()
+        defer { server.stop() }
+        let limit = 5
+        IMAPProvider.persistServerLimit(limit, host: "127.0.0.1", username: server.username)
+        let provider = Self.provider(for: server)
+        defer { awaitDisconnect(provider) }
+        let folders = await provider.poolMaxConnections()
+        #expect(folders + 2 <= limit, "\(folders) folder connections + action + change reader exceed the limit \(limit)")
+        #expect(folders >= 1)
+    }
+
     /// **The property.** An acquire that reaches the connection cap with nothing
     /// evictable must park where the event it is waiting for can reach it. The
     /// event is *some OTHER folder's slot freeing*; `folderWaiters[its own

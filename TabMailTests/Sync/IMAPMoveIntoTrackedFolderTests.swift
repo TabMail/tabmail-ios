@@ -96,6 +96,26 @@ struct IMAPMoveIntoTrackedFolderTests {
 
         func fullSyncDue() throws -> Bool { try account().lastFullSyncAt == nil }
 
+        /// The change pass alone (the tracked path; no listing). It runs after the
+        /// completed move's protection has lapsed, as `normalSync` does.
+        func changePass() async throws {
+            await AccountManager.shared.clearRecentlyCompletedForTesting()
+            _ = try await engine.performChangePass(account: try account(), provider: provider)
+        }
+
+        /// After a retirement without proof, before any listing: no folder in
+        /// `paths` is still trusted through a bookmark (its copy may be wrong, so
+        /// only a listing can say what it holds), and that listing is due.
+        func expectListedAgainNotTracked(_ paths: [String], _ label: String, sourceLocation: SourceLocation = #_sourceLocation) throws {
+            for path in paths {
+                let folder = try folder(path)
+                // A new baseline may be read; it is trusted only after the listing.
+                #expect(!FolderChangeState(raw: folder.changeState).tracking,
+                        "\(label): \(path) is no longer trusted through a bookmark", sourceLocation: sourceLocation)
+            }
+            #expect(try fullSyncDue(), "\(label): the listing is due", sourceLocation: sourceLocation)
+        }
+
         /// The property: once locally, in the folder the server holds it in,
         /// under that UID.
         func expectHeldOnceWhereTheServerHoldsIt(_ label: String, sourceLocation: SourceLocation = #_sourceLocation) throws {
@@ -246,6 +266,11 @@ struct IMAPMoveIntoTrackedFolderTests {
             await AccountManager.shared.move([try w.seeded()], to: "Archive")
             try await w.drain()
             #expect(try w.fullSyncDue())
+            // The older-mail check alone heals it: no window listing reaches it.
+            await AccountManager.shared.clearRecentlyCompletedForTesting()
+            _ = await w.engine.runCatchUpRun(account: try w.account(), run: .snapshot(deadline: Date().addingTimeInterval(30)))
+            #expect(try w.heldTarget().allSatisfy { $0.folderPath != "Archive" || w.server.uids(in: "Archive", rfc822MessageId: Self.target).contains(Int($0.messageId) ?? -1) },
+                    "below-window: the older-mail check leaves no Archive row the server does not hold")
             try await w.normalSync()
             try w.expectHeldOnceWhereTheServerHoldsIt("below-window")
         }
@@ -266,6 +291,8 @@ struct IMAPMoveIntoTrackedFolderTests {
             await AccountManager.shared.move([try w.seeded()], to: "Archive")
             await AccountManager.shared.move([try w.seeded()], to: "C")
             try await w.drain()
+            try await w.changePass()
+            try w.expectListedAgainNotTracked(["INBOX", "Archive"], "chained")
             try await w.normalSync()
             try w.expectHeldOnceWhereTheServerHoldsIt("chained")
         }
@@ -326,6 +353,8 @@ struct IMAPMoveIntoTrackedFolderTests {
             await AccountManager.shared.move([try w.seeded()], to: "Archive")
             try await w.drain()
             #expect(w.server.uids(in: "INBOX", rfc822MessageId: Self.target) == [88], "setup: the move never ran")
+            try await w.changePass()
+            try w.expectListedAgainNotTracked(["INBOX", "Archive"], "retry-limit")
             try await w.normalSync()
             try w.expectHeldOnceWhereTheServerHoldsIt("retry-limit")
         }
@@ -339,6 +368,8 @@ struct IMAPMoveIntoTrackedFolderTests {
             w.server.setUidValidity(Self.epoch + 1, for: "INBOX")
             await AccountManager.shared.move([try w.seeded()], to: "Archive")
             try await w.drain()
+            try await w.changePass()
+            try w.expectListedAgainNotTracked(["INBOX", "Archive"], "uidvalidity")
             try await w.normalSync()
             try await w.normalSync()
             try w.expectHeldOnceWhereTheServerHoldsIt("uidvalidity")
@@ -410,6 +441,8 @@ struct IMAPMoveIntoTrackedFolderTests {
         } _: { w in
             await AccountManager.shared.move([try w.seeded()], to: "Archive")
             try await w.drain()
+            try await w.changePass()
+            try w.expectListedAgainNotTracked(["INBOX", "Archive"], "not-found")
             try await w.normalSync()
             try w.expectHeldOnceWhereTheServerHoldsIt("not-found")
         }
@@ -440,6 +473,8 @@ struct IMAPMoveIntoTrackedFolderTests {
                     try db.execute(sql: "UPDATE folder SET lastKnownUidValidity = ? WHERE id = ?", arguments: [Self.epoch + 3, inboxId])
                 }
             }
+            try await w.changePass()
+            try w.expectListedAgainNotTracked(["INBOX", "Archive"], "claim-retire")
             try await w.normalSync()
             try await w.normalSync()
             try w.expectHeldOnceWhereTheServerHoldsIt("claim-retire")
@@ -455,9 +490,10 @@ struct IMAPMoveIntoTrackedFolderTests {
             await AccountManager.shared.move([try w.seeded()], to: "Archive")
             w.server.setUidValidity(Self.epoch + 4, for: "INBOX")
             await AccountManager.shared.registerProviderForTesting(accountId: w.accountId, provider: w.provider)
-            // The sync sees the turnover first; its reaction drops the queued move.
-            try await w.normalSync()
+            // The change pass sees the turnover first; its reaction drops the queued move.
+            try await w.changePass()
             try await w.drain()
+            try w.expectListedAgainNotTracked(["Archive"], "turnover")
             try await w.normalSync()
             try w.expectHeldOnceWhereTheServerHoldsIt("turnover")
         }
@@ -525,7 +561,9 @@ struct IMAPMoveIntoTrackedFolderTests {
           arguments: [AccountProvider.gmail, .outlook])
     func accountScopedRetirementKeepsBookmarks(_ provider: AccountProvider) throws {
         try Self.withBookmarkedFolders(provider) { pool, accountId in
-            let op = PendingOperation(type: .move, messageIds: ["m-1"], accountId: accountId,
+            // The optimistic move left the row in Archive under the provider id.
+            try FolderEpochTestFixture.insertHeaders(accountId: accountId, path: "Archive", uids: [1], pool: pool)
+            let op = PendingOperation(type: .move, messageIds: ["1"], accountId: accountId,
                                       folderPath: "INBOX", destinationPath: "Archive")
             try pool.write { db in
                 var row = op
