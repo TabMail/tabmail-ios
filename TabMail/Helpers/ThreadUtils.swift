@@ -164,6 +164,11 @@ enum ThreadUtils {
 
     /// One date-ASC pass of fragment-merge. Returns rows updated this pass.
     /// Exposed for tests; production callers want `runFragmentMergeToFixpoint`.
+    ///
+    /// It rewrites `computedThreadId` on existing rows, and a thread's TabMail chat is keyed by
+    /// that id (ADR-IOS-114 decision 14). Its only caller is `v54`, which runs before `v107`
+    /// creates thread keys, so it moves no chat. `ThreadIdWriteFenceTests` fails any other caller:
+    /// a new one must move the thread chats to their new key.
     static func runFragmentMergeOnce(db: Database) throws -> Int {
         let rows = try Row.fetchAll(db, sql: """
             SELECT id, rfc822MessageId, inReplyTo, referencesJSON, computedThreadId

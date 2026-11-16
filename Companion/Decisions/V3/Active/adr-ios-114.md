@@ -718,12 +718,19 @@ same AI result, kept as long as the email itself is shown.
      it was; no cap is added. Turn ids do not change, so memory index entries (`memory_meta`) still
      name their turns. Each email lookup is a hinted index search (`messageHeader_rfc822MessageId`,
      `messageHeader_accountId_messageId`), with or without planner statistics.
-   - **Limitation.** A later migration that rewrites `computedThreadId` (as `v54` merged fragments)
-     must move thread chats with it; at runtime the reader already joins the keys of a thread's emails.
+   - **No write changes a thread id under a chat; a fence keeps it so (2026-11-16).** The one write
+     of `computedThreadId` to an existing email is the fragment merge
+     (`ThreadUtils.runFragmentMergeOnce`), and its only caller is `v54`, which runs before `v107`
+     creates thread keys, so it never strands a chat and no chat-moving code exists.
+     `ThreadIdWriteFenceTests` fails any caller of the merge other than a migration registered
+     before v107, and any other write of `computedThreadId` to an existing row (a migration from
+     v107 on included); its message says the new caller must move the thread chats to their new key.
    - **Tests:** `ThreadChatTests` (a card raised for an earlier email answered after a newer one
      lands, also across accounts; a newer email's question carries the earlier exchange; the email
      screen on an older email shows the thread's chat, the newest email's card and context; two joined
      threads; the upgrade; eviction keeps a thread with an Inbox email; inbox chats unchanged),
+     `ThreadIdWriteFenceTests` (the fragment merge's callers and the write sites of
+     `computedThreadId`, with planted violations),
      `ThreadChatKeyTests` (key round trip, reader keys, merge, budget, migration key equals the runtime
      key, migration plan and time, thread-in-Inbox plan, toast).
 

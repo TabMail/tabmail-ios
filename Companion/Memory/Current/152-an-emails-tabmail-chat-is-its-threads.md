@@ -28,4 +28,9 @@
   `chatHistory`; rows whose email was not on the device keep their `msg:` key; thread eviction counts
   and clears those leftovers as chats with no Inbox email, as before. Memory index rows keep their old `sessionId` text; their
   turn ids are unchanged.
-- Trap: a migration that rewrites `computedThreadId` must also move thread chat keys.
+- Trap, fenced (2026-11-16): a chat is keyed by `computedThreadId`, so rewriting it on an existing
+  row strands that thread's chat. The only such write is the fragment merge
+  (`ThreadUtils.runFragmentMergeOnce`), run only by `v54`, before `v107` made thread keys, so nothing
+  moves chats. `ThreadIdWriteFenceTests` fails any other caller of the merge (anything but a
+  migration before v107) and any other write of `computedThreadId` to an existing row; a new one
+  must move the thread chats to their new key in the same change.
