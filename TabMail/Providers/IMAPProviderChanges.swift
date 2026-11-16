@@ -43,7 +43,8 @@ import SwiftMail
 // - a folder's re-read list (`ChangeRequest.recheck`, every listed folder on a
 //   `.all` pass) is read on that folder's selection: a UID the FETCH did not
 //   return is removed only when `UID SEARCH` on the same selection confirms it is
-//   gone (a short FETCH is a real server shape, MIS-IOS-002).
+//   gone (a short FETCH is a real server shape, MIS-IOS-002); that answer is asked
+//   about each missing UID, never expanded.
 // Nothing here writes the database, and nothing here sends a STORE, COPY, MOVE or
 // EXPUNGE. A connection lost or timed out mid-pass fails the folders not yet read
 // (`.failed`, bookmark kept); the folder whose request timed out, and every folder
@@ -563,16 +564,30 @@ extension IMAPProvider {
             let found: ExtendedSearchResult<UID> = try await withTimeout(seconds: SyncConfig.changeReadRequestTimeoutSeconds) {
                 try await server.extendedSearch(identifierSet: missingSet, criteria: [.all])
             }
-            let present = Set(found.asSet.toArray().map(\.value))
-            for uid in missing {
-                if present.contains(uid) {
-                    unreadable.append(String(uid))
-                } else {
-                    removals.append(String(uid))
-                }
-            }
+            let confirmed = Self.confirmMissing(missing, present: found.asSet)
+            unreadable += confirmed.unreadable
+            removals += confirmed.removals
         }
         return (fetched.records, removals, unreadable)
+    }
+
+    /// The confirming SEARCH's answer for the UIDs a FETCH did not return: one
+    /// the server still has is read again, one it does not is removed. The
+    /// answer is asked about each missing UID and never expanded: a compact
+    /// answer such as `1:4000000000` costs only the missing list's length.
+    nonisolated static func confirmMissing(
+        _ missing: [UInt32], present: MessageIdentifierSet<UID>
+    ) -> (unreadable: [String], removals: [String]) {
+        var unreadable: [String] = []
+        var removals: [String] = []
+        for uid in missing {
+            if present.contains(UID(uid)) {
+                unreadable.append(String(uid))
+            } else {
+                removals.append(String(uid))
+            }
+        }
+        return (unreadable, removals)
     }
 
     /// A partial record from a message's whole flag set.

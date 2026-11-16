@@ -862,6 +862,24 @@ struct IMAPChangeReaderTests {
         #expect(IMAPProvider.arrivals(in: sparse, from: 21, excluding: [], room: limit).isEmpty)
     }
 
+    @Test("Re-read confirmation: a compact SEARCH answer spanning millions of UIDs is asked per missing UID, never expanded")
+    func confirmingSearchAnswerIsNeverExpanded() {
+        let huge = MessageIdentifierSet<UID>(UID(1)...UID(50_000_000))
+        let start = ContinuousClock.now
+        let answer = IMAPProvider.confirmMissing([7, 49_999_999, 50_000_001], present: huge)
+        #expect(ContinuousClock.now - start < .seconds(1), "bounded work: the answer is never expanded")
+        #expect(answer.unreadable == ["7", "49999999"], "still on the server: read again")
+        #expect(answer.removals == ["50000001"], "not on the server: removed")
+        // A sparse answer: membership across ranges, in the missing list's order.
+        var sparse = MessageIdentifierSet<UID>()
+        sparse.insert(ranges: 2...4, 9...9)
+        let mixed = IMAPProvider.confirmMissing([9, 5, 3, 1], present: sparse)
+        #expect(mixed.unreadable == ["9", "3"])
+        #expect(mixed.removals == ["5", "1"])
+        let none = IMAPProvider.confirmMissing([], present: huge)
+        #expect(none.unreadable.isEmpty && none.removals.isEmpty)
+    }
+
     @Test("The oldest held message, deleted elsewhere and then un-deleted, comes back on the next pass")
     func undeletedOldestHeldComesBack() async throws {
         try await Self.withWorld(inbox: [1, 2, 3]) { w in
@@ -1225,18 +1243,20 @@ struct IMAPChangeReaderTests {
     func deletedHeldArrivalIsRemoved() async throws {
         try await Self.withWorld(inbox: [1, 2]) { w in
             let cursor = try await Self.baseline(w)
-            // 3 came in by a move the device already re-keyed to it; 4 is new.
-            w.server.setMessages([1, 2, 3, 4].map(Self.message), in: Self.inboxPath)
-            w.local.set(w.inboxId, [1, 2, 3])
-            w.server.setFlags(["\\Deleted"], in: Self.inboxPath, uid: 3)
-            w.server.setFlags(["\\Deleted"], in: Self.inboxPath, uid: 4)
+            // 3 (at the bookmark's UIDNEXT) and 5 (above it) came in by moves the
+            // device already re-keyed to them; 4 is new.
+            #expect(IMAPChangeCursor.decode(cursor)?.uidNext == 3, "setup: 3 sits at the bookmark's UIDNEXT, 5 above it")
+            w.server.setMessages([1, 2, 3, 4, 5].map(Self.message), in: Self.inboxPath)
+            w.local.set(w.inboxId, [1, 2, 3, 5])
+            for uid in [3, 4, 5] { w.server.setFlags(["\\Deleted"], in: Self.inboxPath, uid: uid) }
             let start = w.server.recordedCommands().count
             let changes = try await Self.inbox(w, Self.read(w, cursors: [w.inboxId: cursor]))
             #expect(Self.isTracked(changes.status))
             #expect(changes.removals.contains("3"), "the held message the server holds as \\Deleted is removed: \(changes.removals)")
+            #expect(changes.removals.contains("5"), "above UIDNEXT too: \(changes.removals)")
             #expect(!changes.removals.contains("4"), "a message the folder does not hold is not reported")
-            #expect(!changes.records.contains { $0.messageId == "3" || $0.messageId == "4" })
-            #expect(Self.uidFetches(w, since: start).isEmpty, "neither is fetched: \(Self.uidFetches(w, since: start))")
+            #expect(!changes.records.contains { ["3", "4", "5"].contains($0.messageId) })
+            #expect(Self.uidFetches(w, since: start).isEmpty, "none is fetched: \(Self.uidFetches(w, since: start))")
         }
     }
 }

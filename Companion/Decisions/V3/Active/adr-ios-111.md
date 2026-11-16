@@ -706,7 +706,8 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    the ADR-IOS-051 count walk goes through `EmailProvider.presentIds(folder:uids:)`.
 6. **Recheck.** Every listed folder's re-read list is read (synced or not), answered whatever the
    window, without moving the bookmark or tracking; a UID the FETCH does not return is a removal only
-   when `UID SEARCH` on the same selection confirms it gone.
+   when `UID SEARCH` on the same selection confirms it gone (its answer is asked about each missing
+   UID, never expanded).
 7. **Merge.** Answered and forwarded are raised, never lowered; an answered message tagged reply
    becomes none with a queued tag write (ReplyDetect), stamped through `MessageHeader.setActionTag`,
    and skipped while the user's own `.setTag`/`.removeTag` for the message is pending
