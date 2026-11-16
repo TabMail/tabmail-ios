@@ -635,6 +635,93 @@ struct GmailHistoryPaginationTests {
         }
     }
 
+    /// A message read earlier in a pass and deleted by a later record of the
+    /// same pass is gone: the answer read before the deletion is not stored.
+    /// Page 1 names a full window of messages, so they are read before page 2
+    /// deletes one of them.
+    @Test("A message read earlier in the pass and deleted by a later record is not stored")
+    func messageReadThenDeletedInThePassIsNotStored() async throws {
+        try await Self.withAppDB { pool in
+            let account = try Self.makeAccount(pool: pool)
+            let firstWindow = ["read-then-deleted"] + (1..<GmailAPI.maxConcurrentRequests).map { "kept-\($0)" }
+            let scenario = FakeHTTP.Scenario()
+            Self.registerAccountRoutes(on: scenario, pool: pool)
+            defer { scenario.close() }
+            scenario.register(path: "/history", method: "GET") { request in
+                if Self.pageToken(of: request) == "page-2" {
+                    return .json(raw: Self.deletionPage(historyId: "1007", deletedIds: ["read-then-deleted"]))
+                }
+                return .json(raw: Self.historyPage(historyId: "1006", addedIds: firstWindow, nextPageToken: "page-2"))
+            }
+            for id in firstWindow {
+                scenario.register(path: "/messages/\(id)", method: "GET", response: .json(raw: Self.messageJSON(id: id)))
+            }
+            let provider = GmailProvider(
+                userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: scenario.session)
+
+            let outcome = try await SyncEngine().performDeltaSync(account: account, provider: provider)
+
+            #expect(outcome.succeeded)
+            #expect(scenario.recordedCalls().contains { $0.url.contains("/messages/read-then-deleted") },
+                    "precondition: the message was read before its deletion")
+            #expect(try !Self.headerExists("read-then-deleted", pool: pool),
+                    "a message deleted later in the pass was stored from its earlier answer")
+            for id in firstWindow.dropFirst() {
+                #expect(try Self.headerExists(id, pool: pool))
+            }
+            #expect(try Self.cursor(pool: pool) == "1006")
+        }
+    }
+
+    /// A pass that takes no record keeps its bookmark (ADR-IOS-111, #491): here
+    /// the first page holds no record but has a next page, and the budget is
+    /// spent before that page. Storing the first page's id would skip the
+    /// records on the pages not read. The next pass reads them.
+    @Test("A pass that takes no record keeps its cursor, and the next pass reads the rest")
+    func passThatTakesNoRecordKeepsTheCursor() async throws {
+        try await Self.withAppDB { pool in
+            let account = try Self.makeAccount(pool: pool)
+            let tokensSeen = Mutex<[String?]>([])
+            let budgetSpent = Mutex(false)
+            let now = Mutex(Date())
+            let scenario = FakeHTTP.Scenario()
+            Self.registerAccountRoutes(on: scenario, pool: pool)
+            defer { scenario.close() }
+            scenario.register(path: "/history", method: "GET") { request in
+                let token = Self.pageToken(of: request)
+                tokensSeen.withLock { $0.append(token) }
+                if token == "page-2" {
+                    return .json(raw: Self.recordPage(historyId: "1009", recordIds: ["1008"], nextPageToken: nil))
+                }
+                // The first pass's read budget is spent as its first page is served.
+                if budgetSpent.withLock({ $0 }) {
+                    now.withLock { $0 = $0.addingTimeInterval(SyncConfig.changeReadBudgetSeconds + 1) }
+                }
+                return .json(raw: #"{ "historyId": "1009", "nextPageToken": "page-2" }"#)
+            }
+            scenario.register(path: "/messages/added-1008", method: "GET",
+                              response: .json(raw: Self.messageJSON(id: "added-1008")))
+            let provider = GmailProvider(
+                userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: scenario.session)
+
+            budgetSpent.withLock { $0 = true }
+            _ = try await SyncEngine(changeReadClock: { now.withLock { $0 } })
+                .performDeltaSync(account: account, provider: provider)
+
+            #expect(tokensSeen.withLock { $0 } == [nil], "no page starts after the budget is spent")
+            #expect(try Self.cursor(pool: pool) == Self.startCursor,
+                    "a pass that took no record must keep its cursor, not skip the pages it did not read")
+
+            budgetSpent.withLock { $0 = false }
+            let resumedAccount = try #require(try await pool.read { db in try Account.fetchOne(db, key: Self.accountId) })
+            let second = try await SyncEngine().performDeltaSync(account: resumedAccount, provider: provider)
+
+            #expect(second.succeeded)
+            #expect(try Self.headerExists("added-1008", pool: pool), "the record on the page not read is applied")
+            #expect(try Self.cursor(pool: pool) == "1009", "a read to the end stores its first page's id")
+        }
+    }
+
     /// A message that is both added and relabelled, on different pages, by
     /// records the first page already covered (ids up to its `historyId`), is
     /// fetched once: one answer read after the first page holds both changes.

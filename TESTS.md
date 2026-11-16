@@ -548,7 +548,9 @@ stores the id of the last record read and the next pass reads from it to the end
 not a numeric history id past the cursor (equal, lower, not a number) is refused like an expired
 history. A message already read is read again only when a record written during the pass (an id past
 the first page's `historyId`) names it, and the newer answer is what the pass stores; one named by
-several records the first page covered is fetched once. A page without `history`, Gmail's answer to a quiet poll, is an empty delta that moves the cursor.
+several records the first page covered is fetched once. A message read earlier in the pass and
+deleted by a later record of the same pass is not stored. A pass that takes no record (an empty first
+page with a next page, the budget spent before it) keeps its cursor, and the next pass reads the rest. A page without `history`, Gmail's answer to a quiet poll, is an empty delta that moves the cursor.
 
 `GmailDeltaApplyInvariantTests` P18 holds the resume end to end on the stateful fake, whose `/history`
 pages the recorded changes (`serveHistoryPages(of:onPage:)`) and whose read budget runs on a clock the
