@@ -56,9 +56,10 @@ extension GmailProvider {
         BackgroundSyncLogger.logDebug("[Sync] Gmail delta: reading history since \(historyId) for \(userEmail)")
         let recheck = Set(request.recheck.values.flatMap { $0 })
         guard let history = try await readHistory(since: historyId, recheck: recheck, context: request.context) else {
-            // Expired (404), or a stop point that is not a history id past the
-            // bookmark: the changes in the gap reach no read, so the engine
-            // re-lists and starts a new bookmark.
+            // Expired (404), a stop point that is not a history id past the
+            // bookmark, or the page cap reached with no record taken: the
+            // changes in the gap reach no read, so the engine re-lists and
+            // starts a new bookmark.
             BackgroundSyncLogger.logDebug("[Sync] Gmail delta: history expired for \(userEmail)")
             BackgroundSyncLogger.log("gmailDelta: \(userEmail) historyExpired")
             return .uniform(request, account: .clear, status: .refused(.expired), folderList: folderList)

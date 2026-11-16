@@ -990,6 +990,77 @@ struct GmailDeltaApplyInvariantTests {
         }
     }
 
+    /// A pass that reads `GmailAPI.historyMaxPages` pages and takes no record
+    /// has nothing to resume after, and a history that kept answering that way
+    /// would hold every later pass on the same bookmark. It is refused like an
+    /// expired history (#938): the bookmark is cleared, and the same foreground
+    /// pass lists the folders and stores a fresh one. The folders are tracked
+    /// first, as in a synced account, so the full sync lists none of them
+    /// unless the refusal untracks them: the mail the history did not deliver
+    /// shows only through that listing, never by moving the bookmark on.
+    @Test("P18: a pass that reaches the page cap without taking a record re-lists and stores a fresh bookmark")
+    func pageCapWithNoRecordReLists() async throws {
+        try await Self.withWorld(seeds: []) { w in
+            try await w.foregroundPassWithFullSyncDue()
+            let inboxState = try await w.pool.read { db in try Folder.fetchOne(db, key: w.inbox.id)?.changeState }
+            try #require(FolderChangeState(raw: inboxState).tracking, "fixture: a synced account's Inbox is tracked")
+            let start = try #require(try w.account().lastHistoryId)
+            w.server.addMessage(Self.seed("p18-cap", labels: ["INBOX"], date: Self.daysAgo(0.1)))
+            let fresh = w.server.currentHistoryId()
+            try #require(fresh != start, "fixture: the mailbox moved past the bookmark")
+            let pagesServed = Mutex(0)
+            w.server.serveEmptyHistoryPages(true) { pagesServed.withLock { $0 += 1 } }
+            let listingsBefore = w.listingRequestCount()
+
+            try await w.foregroundPassWithFullSyncDue()
+
+            #expect(pagesServed.withLock { $0 } == GmailAPI.historyMaxPages, "the pass read up to the page cap")
+            #expect(try w.account().lastHistoryId == fresh,
+                    "a pass that took no record by the page cap stores a fresh bookmark, not the one it could not read past")
+            #expect(w.listingRequestCount() > listingsBefore, "the pass lists the folders")
+            #expect(try w.row("p18-cap", in: w.inbox) != nil, "the listing shows the mail the history did not deliver")
+
+            w.server.serveEmptyHistoryPages(false)
+            try await w.completedDelta()
+            #expect(w.historyStartIds().last == fresh, "the next pass reads from the fresh bookmark")
+        }
+    }
+
+    /// A pass whose read budget runs out before it takes a record keeps its
+    /// bookmark, however many empty pages it read: running out of time is
+    /// transient, and the next pass reads on from the same place with no
+    /// listing. Only the page cap refuses (#938).
+    @Test("P18: a pass whose budget runs out before it takes a record keeps its bookmark, one page short of the cap")
+    func budgetWithNoRecordKeepsTheBookmark() async throws {
+        try await Self.withWorld(seeds: []) { w in
+            let start = try #require(try w.account().lastHistoryId)
+            w.server.addMessage(Self.seed("p18-later-page", labels: ["INBOX"], date: Self.daysAgo(0.1)))
+            let clock = TestClock()
+            let pagesServed = Mutex(0)
+            let lastPage = GmailAPI.historyMaxPages - 1
+            w.server.serveEmptyHistoryPages(true) {
+                let served = pagesServed.withLock { count -> Int in
+                    count += 1
+                    return count
+                }
+                if served == lastPage { clock.spendBudget() }
+            }
+            let listingsBefore = w.listingRequestCount()
+
+            try await w.delta(on: SyncEngine(changeReadClock: { clock.read() }))
+
+            #expect(pagesServed.withLock { $0 } == lastPage, "no page starts once the budget is spent")
+            #expect(try w.account().lastHistoryId == start, "a pass that ran out of time before a record keeps its bookmark")
+            #expect(w.listingRequestCount() == listingsBefore, "running out of time does not re-list")
+
+            w.server.serveEmptyHistoryPages(false)
+            try await w.completedDelta()
+            #expect(w.historyStartIds().last == start, "the next pass reads from the same bookmark")
+            #expect(try w.row("p18-later-page", in: w.inbox) != nil, "and applies the history")
+            #expect(w.listingRequestCount() == listingsBefore, "no listing")
+        }
+    }
+
     // MARK: - P19: a shielded change converges
 
     @Test("P19: a change skipped under a pending op shows one foreground pass after the op drains")

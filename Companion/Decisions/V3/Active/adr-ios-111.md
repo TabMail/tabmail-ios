@@ -575,10 +575,14 @@ already made a round's length never a failure and saved progress page by page.
    `historyId`, as before. A read that stops early (budget or page cap) stores the `id` of the last record
    it took; `users.history.list` returns the records after `startHistoryId` in increasing id, so the next
    pass resumes with the first record not yet taken and nothing is listed again. A pass that took no record
-   keeps its bookmark.
+   keeps its bookmark. *Amended 2026-11-16 (#938):* a pass that reads `historyMaxPages` pages without
+   taking a record is refused like an expired history (`.refused(.expired)`: bookmark cleared, the same
+   pass re-lists and stores a fresh bookmark), as every page-cap pass was before #491; a pass whose time
+   budget runs out before it takes a record still keeps its bookmark.
 4. **Boundary validation.** The stop point must be a numeric id greater than the numeric bookmark the pass
    read from; otherwise the read is refused as for an expired history. A 404 is still `.refused(.expired)`
-   with the same-pass re-list (decision 6 unchanged).
+   with the same-pass re-list (decision 6 unchanged). So is the page cap reached with no record taken
+   (#938, decision 3).
 5. **Write order unchanged.** The folder transactions are written first and the bookmark after them, in its
    own transaction. A failure about the account while reading messages keeps the bookmark (`.failed`); a page
    that cannot be read throws. A crash between the two re-reads the same records, which is harmless: the
@@ -603,8 +607,12 @@ Gmail's retention re-lists). A pass with a very large record runs past its budge
 Tests: `GmailDeltaApplyInvariantTests` P18 (cut and resume with no listing; short pages over passes, by
 budget and by page limit; add then relabel across the cut; a record over the budget applied whole),
 `GmailHistoryPaginationTests` (page limit stops and resumes, stop-point validation, re-read of a message a
-record written during the pass names, long and deletion histories in one pass).
+record written during the pass names, long and deletion histories in one pass). #938: P18 "page cap
+without taking a record re-lists" and "budget runs out before a record keeps its bookmark, one page short of
+the cap" (`StatefulGmailActionServer.serveEmptyHistoryPages`); `GmailHistoryPaginationTests` "a history whose
+last page is the last one the cap allows is complete with no record, and not refused".
 
 Keywords: Gmail history resume, per-record resume, readHistory, historyPage, HistoryPage, HistoryRecord,
 history record id, startHistoryId, cut, stop point, bookmark, time budget, changeReadClock, historyMaxChanges,
-historyMaxPages, too-long history, refusal, re-list, notification extension, #491, #429.
+historyMaxPages, too-long history, refusal, re-list, notification extension, page cap with no record,
+empty history pages, #491, #429, #938.

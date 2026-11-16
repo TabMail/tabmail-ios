@@ -550,7 +550,7 @@ history. A message already read is read again only when a record written during 
 the first page's `historyId`) names it, and the newer answer is what the pass stores; one named by
 several records the first page covered is fetched once. A message read earlier in the pass and
 deleted by a later record of the same pass is not stored. A pass that takes no record (an empty first
-page with a next page, the budget spent before it) keeps its cursor, and the next pass reads the rest. A page without `history`, Gmail's answer to a quiet poll, is an empty delta that moves the cursor.
+page with a next page, the budget spent before it) keeps its cursor, and the next pass reads the rest. A history of empty pages whose last page is the last one `GmailAPI.historyMaxPages` allows is complete, not refused (#938): the first page's id is stored, nothing starts over, and the next pass reads from it. A page without `history`, Gmail's answer to a quiet poll, is an empty delta that moves the cursor.
 
 `GmailDeltaApplyInvariantTests` P18 holds the resume end to end on the stateful fake, whose `/history`
 pages the recorded changes (`serveHistoryPages(of:onPage:)`) and whose read budget runs on a clock the
@@ -560,7 +560,11 @@ a later message read stops the pass at the next record of the same page; a histo
 short pages is read to its end over passes with no refusal, stopped by the budget or by the page
 limit; a message added before a cut and archived, labelled and read after it shows the server's state;
 one conversation-wide record naming more messages than one budget covers is applied whole, and the
-pass stops after it.
+pass stops after it. With `serveEmptyHistoryPages` (every page empty, each with a `nextPageToken`,
+#938): in a synced account whose folders are tracked (so the full sync lists none of them by itself), a
+foreground pass that reaches `GmailAPI.historyMaxPages` without taking a record is refused, lists the folders, shows the mail the history did not deliver and stores a fresh bookmark the next pass
+reads from; a pass whose budget runs out one page short of the cap keeps its bookmark with no listing,
+and the next pass reads the history from it.
 
 ## Gmail search text on the wire
 
