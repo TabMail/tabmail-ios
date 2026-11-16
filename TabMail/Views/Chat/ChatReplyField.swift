@@ -212,11 +212,12 @@ struct ChatReplyCompose: Equatable {
 
     /// The reply to `message`. `agent`: the agent's reply request and whether it was asked for in the
     /// collapsed field (not the open chat sheet); nil for the ready AI Reply.
-    /// - The ready AI Reply, and a reply asked for in the field, are a Reply All to the newest
-    ///   email's people exactly when nobody was chosen in Reply to (`target.only == nil`); with people
-    ///   chosen, a plain reply to only them, with no Cc or Bcc.
-    /// - A reply asked for in the open sheet keeps the agent's recipients, and is a Reply All only
-    ///   when the agent opened it as one and those recipients are the whole Reply All audience.
+    /// - The ready AI Reply is a Reply All to the newest email's people exactly when nobody was chosen
+    ///   in Reply to (`target.only == nil`). With people chosen, it and a reply asked for in the field
+    ///   are a plain reply to only them, with no Cc or Bcc.
+    /// - The agent's reply with nobody chosen keeps the agent's recipients, and is a Reply All only
+    ///   when those recipients (To, Cc and Bcc) are the whole Reply All audience; asked for in the
+    ///   open sheet, also only when the agent opened it as one.
     static func make(
         replyTo message: MessageHeader?, target: ChatReplyTarget,
         agent: (request: AgentToolRouter.ComposeRequest, fromField: Bool)?, accounts: [Account]
@@ -229,13 +230,9 @@ struct ChatReplyCompose: Equatable {
             return ChatReplyCompose(isReplyAll: audience != nil, to: audience?.to ?? [], cc: audience?.cc ?? [], bcc: [])
         }
         let req = agent.request
-        let isReplyAll: Bool
-        if agent.fromField {
-            isReplyAll = audience != nil
-        } else {
-            let addresses = { (list: [String]) in Set(list.map { $0.lowercased() }) }
-            isReplyAll = req.isReplyAll && audience.map { addresses(req.to + req.cc + req.bcc) == addresses($0.to + $0.cc) } == true
-        }
+        let addresses = { (list: [String]) in Set(list.map { $0.lowercased() }) }
+        let toWholeAudience = audience.map { addresses(req.to + req.cc + req.bcc) == addresses($0.to + $0.cc) } == true
+        let isReplyAll = toWholeAudience && (agent.fromField || req.isReplyAll)
         return ChatReplyCompose(isReplyAll: isReplyAll, to: req.to, cc: req.cc, bcc: req.bcc)
     }
 

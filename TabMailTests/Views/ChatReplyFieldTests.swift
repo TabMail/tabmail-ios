@@ -562,9 +562,25 @@ struct ChatReplyFieldTests {
                 "Replying only to David: nobody else, seen or hidden")
 
         let toEveryone = Self.card(req.replyTo, target: .replyAll, agent: (req, true), accounts: accounts)
-        #expect(toEveryone.isReplyAll, "nobody chosen: Reply All")
+        #expect(!toEveryone.isReplyAll, "nobody chosen, but the agent added people: not the Reply All audience")
         #expect(toEveryone.prefillTo == req.to && toEveryone.prefillCc == req.cc && toEveryone.prefillBcc == req.bcc,
-                "Reply All keeps the agent's recipients")
+                "nobody chosen: the card keeps the agent's recipients")
+    }
+
+    @Test("A reply the agent writes from the field with nobody chosen is Reply All only when it goes to the whole audience")
+    func agentReplyFromTheFieldIsReplyAllOnlyToTheWholeAudience() async throws {
+        let (everyone, accounts) = try await Self.agentReplyRequest([:])
+        let whole = Self.card(everyone.replyTo, target: .replyAll, agent: (everyone, true), accounts: accounts)
+        #expect(whole.isReplyAll, "the agent's reply goes to the whole audience: Reply All")
+        #expect(whole.prefillTo == everyone.to && whole.prefillCc == (everyone.cc.isEmpty ? nil : everyone.cc))
+
+        let (narrowed, narrowedAccounts) = try await Self.agentReplyRequest(["remove_recipients": .array([.string("team@example.com")])])
+        #expect(narrowed.to == ["sender@example.com"] && narrowed.cc.isEmpty && narrowed.bcc.isEmpty,
+                "the agent itself left team@example.com out")
+        let fewer = Self.card(narrowed.replyTo, target: .replyAll, agent: (narrowed, true), accounts: narrowedAccounts)
+        #expect(!fewer.isReplyAll, "someone left out by the agent: a plain reply, never recorded as Reply All")
+        #expect(fewer.prefillTo == ["sender@example.com"] && fewer.prefillCc == nil && fewer.prefillBcc == nil,
+                "the card goes to the agent's recipients only")
     }
 
     @Test("A reply the agent writes in the open sheet keeps its recipients, and is Reply All only to the whole audience")

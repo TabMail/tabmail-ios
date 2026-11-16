@@ -471,6 +471,13 @@ same AI result, kept as long as the email itself is shown.
    neither card opened as Reply All. Tests: `ChatReplyFieldTests` (`readyReplyToEveryoneIsReplyAll`,
    `readyReplyToChosenIsPlainReply`, `agentReplyFromTheFieldFollowsTheTarget`,
    `agentReplyFromTheSheetKeepsItsRecipients`).
+   **Reply All only to the whole audience (2026-11-16):** a chat reply records Reply All only when
+   its recipients (To, Cc and Bcc, compared case-insensitively) equal the full Reply All audience.
+   This now holds for a reply the agent writes from the field with nobody chosen too: it keeps the
+   agent's recipients, and when the agent left someone out or added someone it opens as a plain
+   reply. Before this, such a reply opened as Reply All whatever the agent's recipients were.
+   `ChatReplyCompose.make` checks the audience once for every agent reply. Test:
+   `ChatReplyFieldTests.agentReplyFromTheFieldIsReplyAllOnlyToTheWholeAudience`.
 
 **Release order:** an iOS build at protocol 2.0.0 must not reach users before the backend change
 (its protocol 2.0.0 JSON shape) is deployed to production: an older backend sends 2.0.0 the labelled text, which this
