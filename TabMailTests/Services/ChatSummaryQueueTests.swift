@@ -161,7 +161,8 @@ struct ChatSummaryQueueTests {
         }
         #expect(!ActiveAIQueue.inScope(draft, chatAllowed: allowed[0], for: chatJob(draft)), "the executor's scope refuses it")
 
-        // The open, a joining email and a row on screen all ask through `enqueueChatSummaries`.
+        // The shown chat (its open, its database observation and re-checks, a joining email) and a
+        // row on screen all ask through `enqueueChatSummaries`.
         let queue = ActiveAIQueue()
         await queue.setDispatchSuppressedForTesting(true)
         let requests = BodyRequests()
@@ -170,9 +171,6 @@ struct ChatSummaryQueueTests {
         #expect(Set(await queue.queuedJobsForTesting.map(\.headerId)) == [sent.id, filed.id],
                 "no job for a draft of either account, nor for an unknown folder; controls: Sent and a folder with no role")
         #expect(await requests.ids == [archived.id], "no body is fetched to summarize a draft; control: Archive")
-        // A body landing for the draft asks nothing: it never waited.
-        await queue.chatBodyArrived(headerId: otherDraft.id)
-        #expect(!(await queue.queuedJobsForTesting.map(\.headerId)).contains(otherDraft.id))
         // The walk never offers it either (`walkLeavesDraftsOut`); a job that reaches the executor
         // by any other way is refused there (`ChatSummaryExecutionTests.chatSummaryRefusesADraft`).
     }

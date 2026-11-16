@@ -379,8 +379,9 @@ struct ChatSummaryExecutionTests {
             let service = AIService(backendClient: BackendClient(llmSession: http.session), peerProbe: { _ in nil })
             let queue = ActiveAIQueue()
             await queue.setDispatchSuppressedForTesting(true)
-            // The chat asks (an open, a row on screen, a joining email, the walk all ask through the
-            // same admission), then the drain runs what is queued and finishes it as it does.
+            // The chat asks (an open, its observation and re-checks, a row on screen, a joining
+            // email, the walk all ask through the same admission), then the drain runs what is
+            // queued and finishes it as it does.
             func askAndDrain() async {
                 await queue.enqueueChatSummaries([email])
                 for job in await queue.takePendingIntoFlightForTesting() {

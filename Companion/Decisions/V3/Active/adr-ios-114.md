@@ -367,10 +367,11 @@ same AI result, kept as long as the email itself is shown.
    AI cache under the row's `sentMessageId` in its Sent folder), "Summarizing" until then. Once the
    provider takes the email the send stamps `sentAt`, then writes the optimistic Sent copy
    (`insertOptimisticSentHeader`) under the row's Message-ID, then may delete the row once the
-   Sent append is done. The chat does not observe the database (it reloads its emails on
-   `.nseMergeDidCommit`), so a sent row keeps its bubble until its copy is one of the chat's
-   emails: when the copy is in the database (`ChatUnsentReply.filed`) or a shown row leaves the
-   outbox, the chat reloads its emails (`MessageDetailViewModel.reloadThread`), the copy's
+   Sent append is done. The chat's list of emails is not observed (it reloads its emails on
+   `.nseMergeDidCommit`; decision 9's observation, from 2026-11-15, reads only their summary
+   state), so a sent row keeps its bubble until its copy is one of the chat's emails: when the copy
+   is in the database (`ChatUnsentReply.filed`) or a shown row leaves the outbox, the chat reloads
+   its emails (`MessageDetailViewModel.reloadThread`), the copy's
    Message-ID joins the chat's set and the bubble ends, the copy showing as an ordinary email with
    "Sent" under it. A sent row without its Message-ID cannot be handed over and shows nothing. Ending
    the bubble at the `sentAt` write, as the rebuild first did, left neither on screen until the
@@ -381,8 +382,11 @@ same AI result, kept as long as the email itself is shown.
    `ComposeOutcome.sent(outboxId:)` are deleted; a sent compose card only empties the field
    (`composeEnded`). A reply sent outside the chat to one of its emails shows the same way. An
    email that joins the open chat (a Sent copy the provider filed under a Message-ID of its own has
-   no summary from Send) asks for its summary like the open's newest (`noteMembers`). The summary
-   at Send (`SentEmailSummary`) and the Message-ID at the queue write are unchanged.
+   no summary from Send) asks for its summary like the open's newest (`noteMembers`).
+   *Amended 2026-11-15:* `noteMembers` no longer asks. A joining email changes the chat's member
+   ids, which restarts the summary observation (decision 9), and its first value asks for the
+   newest emails, the joining one first. The summary at Send (`SentEmailSummary`) and the
+   Message-ID at the queue write are unchanged.
    **Superseded by the rebuild (2026-11-09), kept for history:**
    **The Sending bubble follows its queued email (decided 2026-11-07):** a reply sent from
    the chat (the ready AI Reply, or an agent compose) reports its queued email's outbox row

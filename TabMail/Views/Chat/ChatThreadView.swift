@@ -421,14 +421,13 @@ struct ChatThreadView: View {
     }
 
     /// Records each email the first time it shows, then marks it read. Its unread state at
-    /// that moment places the Unread line. An email that joins the open chat is its newest,
-    /// so it asks for its summary as the open asked for the newest (owner 2026-11-09): a Sent copy
-    /// the provider filed under a Message-ID of its own has no summary from Send. A draft that joins
-    /// is passed on like any member; the queue never asks for one (`chatSummaryAllowed`).
+    /// that moment places the Unread line. An email that joins the open chat (a Sent copy the
+    /// provider filed under a Message-ID of its own has no summary from Send) changes the member
+    /// ids, which restarts the summary observation (`followSummaries`): its first value asks for the
+    /// newest emails, the joining one first. A draft that joins is not one of the chat's emails and
+    /// is never asked for.
     private func noteMembers() {
-        var joined: [MessageHeader] = []
         for member in members where seenIds.insert(member.id).inserted {
-            if didInitialScroll { joined.append(member) }
             if !member.isRead { unreadAtOpen.insert(member.id) }
             if member.id == viewModel.message?.id {
                 // Its own unstructured Task, as in today's detail: a cancelled `.task` must not
@@ -438,9 +437,6 @@ struct ChatThreadView: View {
                 viewModel.markReadIfNeeded(member)
             }
         }
-        if !joined.isEmpty, ChatViewConfig.isActive {
-            Task { await ActiveAIQueue.shared.enqueueChatSummaries(joined) }
-        }
     }
 
     /// The first scroll, once the thread and its extras are in: to the opened email when it came
@@ -449,8 +445,7 @@ struct ChatThreadView: View {
         guard !didInitialScroll, viewModel.hasLoadedThread, context.isLoaded else { return }
         // The thread's emails arrive with `hasLoadedThread`, and SwiftUI runs that change and the
         // members change in either order: record their unread state first, or the Unread line can
-        // be missing and the chat opens at the bottom. Before the open counts as done, so these
-        // emails are the open's, not ones that joined.
+        // be missing and the chat opens at the bottom.
         noteMembers()
         didInitialScroll = true
         let thread = thread

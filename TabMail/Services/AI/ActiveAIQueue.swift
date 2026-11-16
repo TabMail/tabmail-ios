@@ -163,12 +163,12 @@ actor ActiveAIQueue {
 
     /// Whether a chat summary may be asked for this email: never for a draft. A draft's text is the
     /// user's unsent words, and they never leave the device for a summary (ADR-IOS-114 decision 8),
-    /// whichever caller asks: the open, an email joining an open chat, a row coming on screen, the
-    /// walk, a landed body or a twin's hand-back. Decided from the email's OWN folder role, read
-    /// with the row, so it never depends on what a screen loaded (the chat's context reads only its
-    /// members' accounts' folders). An email whose folder row is missing is refused too (fail
-    /// closed): its role is unknown, and the next sync writes the folder and a later ask or walk
-    /// asks again.
+    /// whichever caller asks: the shown chat (its open, its database observation and its re-checks,
+    /// an email joining it), a row coming on screen, the walk or a twin's hand-back. Decided from
+    /// the email's OWN folder role, read with the row, so it never depends on what a screen loaded
+    /// (the chat's context reads only its members' accounts' folders). An email whose folder row is
+    /// missing is refused too (fail closed): its role is unknown, and the next sync writes the
+    /// folder and a later ask or walk asks again.
     nonisolated static func chatSummaryAllowed(_ message: MessageHeader, db: Database) throws -> Bool {
         guard let folder = try Folder.fetchOne(db, key: message.folderId) else { return false }
         return folder.role != .drafts

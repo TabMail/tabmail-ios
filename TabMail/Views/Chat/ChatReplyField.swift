@@ -179,8 +179,8 @@ struct ChatFieldFill {
 /// "Sending". Its text is the summary made at Send (`SentEmailSummary`), "Summarizing" until then.
 ///
 /// The hand-over to the sent email: once the provider takes the email the send stamps `sentAt`, then
-/// writes the optimistic Sent copy under the row's Message-ID. The chat does not observe the
-/// database, so the row keeps its bubble until its Sent copy is one of the chat's emails; once the
+/// writes the optimistic Sent copy under the row's Message-ID. The chat's list of emails is not
+/// observed, so the row keeps its bubble until its Sent copy is one of the chat's emails; once the
 /// copy is in the database (`filed`) the chat reloads its emails, the copy's Message-ID joins
 /// `messageIds`, and the bubble ends (ending it at the `sentAt` write would leave neither the bubble
 /// nor the copy on screen). Undo, a discard or the send's own cleanup deletes the row, and the bubble goes.
