@@ -101,22 +101,40 @@ struct IMAPChangeReaderTests {
 
     // MARK: - Helpers
 
-    static func folders(_ w: World, cursors: [String: String?] = [:], archiveSynced: Bool = false) -> [ChangeFolder] {
-        [
+    /// The folders' older-mail download progress. The world's device holds every
+    /// message the server starts with, so by default the walk has completed.
+    enum OlderMail {
+        case complete
+        case walkedDownTo(Int)
+        case notStarted
+    }
+
+    static func folders(_ w: World, cursors: [String: String?] = [:], archiveSynced: Bool = false,
+                        olderMail: OlderMail = .complete) -> [ChangeFolder] {
+        let complete: Bool
+        let walkCursor: Int?
+        switch olderMail {
+        case .complete: (complete, walkCursor) = (true, nil)
+        case .walkedDownTo(let position): (complete, walkCursor) = (false, position)
+        case .notStarted: (complete, walkCursor) = (false, nil)
+        }
+        return [
             ChangeFolder(id: w.inboxId, path: inboxPath, role: .inbox,
-                         cursor: cursors[w.inboxId] ?? nil, isSynced: true, addressEpoch: epoch),
+                         cursor: cursors[w.inboxId] ?? nil, isSynced: true, addressEpoch: epoch,
+                         olderMailComplete: complete, olderMailCursor: walkCursor),
             ChangeFolder(id: w.archiveId, path: archivePath, role: .archive,
-                         cursor: cursors[w.archiveId] ?? nil, isSynced: archiveSynced, addressEpoch: epoch),
+                         cursor: cursors[w.archiveId] ?? nil, isSynced: archiveSynced, addressEpoch: epoch,
+                         olderMailComplete: complete, olderMailCursor: walkCursor),
         ]
     }
 
     static func read(
         _ w: World, cursors: [String: String?] = [:], scope: ChangeScope = .all,
-        recheck: [String: [String]] = [:], archiveSynced: Bool = false,
+        recheck: [String: [String]] = [:], archiveSynced: Bool = false, olderMail: OlderMail = .complete,
         context: ChangeContext = ChangeContext(onProgress: { _ in })
     ) async throws -> ChangeSet {
         let request = ChangeRequest(
-            folders: folders(w, cursors: cursors, archiveSynced: archiveSynced),
+            folders: folders(w, cursors: cursors, archiveSynced: archiveSynced, olderMail: olderMail),
             scope: scope, recheck: recheck, context: context, localRows: w.local)
         return try #require(try await w.provider.fetchChanges(since: ChangeCursor(account: nil), request: request))
     }
@@ -695,6 +713,15 @@ struct IMAPChangeReaderTests {
         return condition()
     }
 
+    /// `eventually` for a condition read from an actor.
+    static func eventuallyAsync(_ condition: () async -> Bool) async -> Bool {
+        for _ in 0..<200 {
+            if await condition() { return true }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return await condition()
+    }
+
     @Test("markDirty and disconnect drop the change connection and log it out; the next pass opens a new session")
     func teardownDropsChangeConnection() async throws {
         for teardown in ["markDirty", "disconnect"] {
@@ -743,17 +770,175 @@ struct IMAPChangeReaderTests {
         }
     }
 
-    @Test("A changed message older than the oldest held one is ignored: no record, no fetch")
-    func changedBelowLowestHeldIsIgnored() async throws {
-        try await Self.withWorld(inbox: [1, 2, 3, 4, 5, 6]) { w in
-            w.local.set(w.inboxId, [5, 6])
+    @Test("A changed message below what the older-mail walk has downloaded is ignored: no record, no fetch (the walk's to download)")
+    func changedBelowTheWalkIsIgnored() async throws {
+        for olderMail in [IMAPChangeReaderTests.OlderMail.walkedDownTo(4), .notStarted] {
+            try await Self.withWorld(inbox: [1, 2, 3, 4, 5, 6]) { w in
+                w.local.set(w.inboxId, [5, 6])
+                let cursor = try await Self.baseline(w)
+                w.server.setFlags(["\\Seen"], in: Self.inboxPath, uid: 2)
+                let start = w.server.recordedCommands().count
+                let changes = try await Self.inbox(w, Self.read(w, cursors: [w.inboxId: cursor], olderMail: olderMail))
+                #expect(Self.isTracked(changes.status))
+                #expect(!changes.records.contains { $0.messageId == "2" }, "\(olderMail)")
+                #expect(Self.uidFetches(w, since: start).isEmpty, "\(olderMail): nothing below the held range is fetched: \(Self.uidFetches(w, since: start))")
+            }
+        }
+    }
+
+    @Test("The held range starts where the older-mail walk is, never at the lowest row held now")
+    func heldRangeStartComesFromTheWalk() {
+        func folder(_ complete: Bool, _ walkCursor: Int?) -> ChangeFolder {
+            ChangeFolder(id: "f", path: "INBOX", role: .inbox, olderMailComplete: complete, olderMailCursor: walkCursor)
+        }
+        #expect(IMAPProvider.heldRangeStart(folder(true, nil)) == 1, "a completed walk: every UID")
+        #expect(IMAPProvider.heldRangeStart(folder(false, 40)) == 41, "a walk in progress: above its position")
+        #expect(IMAPProvider.heldRangeStart(folder(false, nil)) == nil, "no walk yet: none")
+    }
+
+    @Test("The oldest held message, deleted elsewhere and then un-deleted, comes back on the next pass")
+    func undeletedOldestHeldComesBack() async throws {
+        try await Self.withWorld(inbox: [1, 2, 3]) { w in
             let cursor = try await Self.baseline(w)
-            w.server.setFlags(["\\Seen"], in: Self.inboxPath, uid: 2)
+            w.server.setFlags(["\\Deleted"], in: Self.inboxPath, uid: 1)
+            let first = try await Self.inbox(w, Self.read(w, cursors: [w.inboxId: cursor]))
+            #expect(first.removals == ["1"], "setup: the deleted message is removed")
+            // The apply removed the row: the device's lowest held message is now 2.
+            w.local.remove(w.inboxId, [1])
+            w.server.setFlags([], in: Self.inboxPath, uid: 1)
+            let second = try await Self.inbox(w, Self.read(w, cursors: [w.inboxId: first.cursor]))
+            #expect(Self.isTracked(second.status))
+            let record = try #require(second.records.first { $0.messageId == "1" }, "the un-deleted message is read again")
+            #expect(record.header != nil, "a full record, so the apply inserts it")
+        }
+    }
+
+    @Test("A pass-start NOOP that keeps failing: every tracked folder keeps its failure time and lapses to the listing")
+    func failingNoopLapses() async throws {
+        try await Self.withWorld(inbox: [1], archive: [1]) { w in
+            let bookmark = IMAPChangeCursor(uidValidity: UInt32(Self.epoch), highestModSeq: 1, uidNext: 2).encoded
+            let cursors: [String: String?] = [w.inboxId: bookmark, w.archiveId: bookmark]
+            let start = Date()
+            w.server.failNextCommand(containing: "NOOP")
+            let first = try await Self.read(w, cursors: cursors, archiveSynced: true, context: Self.fixedClock(start))
+            var stamped: [String: String?] = [:]
+            for id in [w.inboxId, w.archiveId] {
+                let folder = try Self.status(first, id)
+                guard case .failed = folder.status else { Issue.record("pass 1 \(id): expected failed, got \(folder.status)"); return }
+                #expect(try #require(IMAPChangeCursor.decode(folder.cursor)).failingSince == start,
+                        "pass 1 \(id): the failure time is kept")
+                stamped[id] = folder.cursor
+            }
+
+            w.server.failNextCommand(containing: "NOOP")
+            let later = start.addingTimeInterval(SyncConfig.changeReadFailureLapseSeconds)
+            let second = try await Self.read(w, cursors: stamped, archiveSynced: true, context: Self.fixedClock(later))
+            for id in [w.inboxId, w.archiveId] {
+                let folder = try Self.status(second, id)
+                guard case .refused(.failingTooLong) = folder.status else {
+                    Issue.record("pass 2 \(id): expected refused(failingTooLong), got \(folder.status)"); return
+                }
+            }
+        }
+    }
+
+    @Test("A server that answers STATUS from a cached view: the pass-start NOOP lets a change made elsewhere be seen")
+    func staleStatusIsRefreshedByTheNoop() async throws {
+        try await Self.withWorld(inbox: [1, 2], archive: [1]) { w in
+            w.server.setStatusStaleUntilNoop(true)
+            // Both folders read once: the change connection's cached view now
+            // holds the inbox's STATUS, and the archive is the one selected.
+            let first = try await Self.read(w, archiveSynced: true)
+            let inboxCursor = try #require(try Self.inbox(w, first).cursor)
+            let archiveCursor = try #require(first.folders.first { $0.folderId == w.archiveId }?.cursor)
+            #expect(await w.provider.changeSelectedPath == Self.archivePath, "setup: the inbox is read by STATUS next")
+            w.server.setFlags(["\\Seen"], in: Self.inboxPath, uid: 1)
+            let second = try await Self.inbox(w, Self.read(w, cursors: [w.inboxId: inboxCursor, w.archiveId: archiveCursor],
+                                                           archiveSynced: true))
+            #expect(Self.isTracked(second.status))
+            #expect(second.records.first { $0.messageId == "1" }?.isRead == true, "the read made elsewhere is seen")
+        }
+    }
+
+    // MARK: - c4 #3: the connection budget
+
+    /// A provider against a server allowing `maxSessions` logged-in sessions,
+    /// under a username of its own (the learned limit is kept per user).
+    static func withLimitedWorld(
+        maxSessions: Int, _ body: (World) async throws -> Void
+    ) async throws {
+        let server = FakeIMAPServer(
+            username: "budget-\(UUID().uuidString.lowercased())", capabilities: qresyncCapabilities,
+            mailboxes: [inboxPath: [1, 2, 3].map(message), archivePath: []])
+        server.setUidValidity(epoch, for: inboxPath)
+        server.setUidValidity(epoch, for: archivePath)
+        server.setMaxLoggedInSessions(maxSessions)
+        try server.start()
+        defer { server.stop() }
+        let provider = IMAPProvider(
+            host: "127.0.0.1", port: server.port,
+            username: server.username, password: server.password,
+            smtpHost: "127.0.0.1", smtpPort: 587, useTLS: false)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+        let world = World(server: server, provider: provider, local: LocalRows())
+        world.local.set(world.inboxId, [1, 2, 3])
+        try await body(world)
+        #expect(server.wrongMessageViolations().isEmpty)
+        #expect(server.liveSessionCount() <= maxSessions)
+    }
+
+    @Test("A server allowing two connections: a change pass, a folder fetch and an action all complete, again and again")
+    func twoConnectionServerRunsEverything() async throws {
+        try await Self.withLimitedWorld(maxSessions: 2) { w in
+            // The action connection (connect) and the change connection.
+            var cursor = try await Self.baseline(w)
+            for round in 0..<2 {
+                // The folder fetch needs a third login: the idle change connection makes room.
+                let fetched = try await w.provider.fetchMessages(folder: Self.inboxPath, limit: 10, offset: 0)
+                #expect(Set(fetched.map(\.messageId)) == ["1", "2", "3"], "round \(round): the folder fetch completes")
+                #expect(await w.provider.changeServer == nil, "round \(round): the idle change connection was evicted")
+                try await w.provider.markRead(ids: ["2"], folder: Self.inboxPath)
+                #expect(w.server.flags(in: Self.inboxPath, uid: 2).contains("\\Seen"), "round \(round): the action completes")
+                w.server.setFlags(round == 0 ? ["\\Flagged"] : [], in: Self.inboxPath, uid: 3)
+                // The next pass needs a login again: the idle folder connection makes room.
+                let changes = try await Self.inbox(w, Self.read(w, cursors: [w.inboxId: cursor]))
+                #expect(Self.isTracked(changes.status), "round \(round): the change pass completes: \(changes.status)")
+                #expect(changes.records.first { $0.messageId == "3" }?.isFlagged == (round == 0), "round \(round): the change is read")
+                cursor = try #require(changes.cursor)
+            }
+            #expect(w.server.refusedLoginCount() >= 1, "the limit was reached and learned")
+            #expect(await w.provider.detectedServerLimit() == 2)
+        }
+    }
+
+    @Test("Eviction order: an idle change connection makes room before IDLE, never during a pass")
+    func idleChangeConnectionIsEvictedBeforeIdle() async throws {
+        try await Self.withLimitedWorld(maxSessions: 3) { w in
+            await w.provider.startIdle { _, _ in }
+            #expect(await Self.eventuallyAsync { await w.provider.currentIdleServerForTesting() != nil }, "setup: IDLE is open")
+            let cursor = try await Self.baseline(w)
+            #expect(await w.provider.changeServer != nil, "setup: action, IDLE and the change connection fill the limit")
+            let fetched = try await w.provider.fetchMessages(folder: Self.inboxPath, limit: 10, offset: 0)
+            #expect(fetched.count == 3, "the folder fetch completes")
+            #expect(await w.provider.changeServer == nil, "the idle change connection was evicted")
+            #expect(await w.provider.currentIdleServerForTesting() != nil, "IDLE kept its connection")
+
+            // During a pass the change connection is never evicted: a folder
+            // fetch that needs a slot then takes IDLE's, and the pass completes.
             let start = w.server.recordedCommands().count
-            let changes = try await Self.inbox(w, Self.read(w, cursors: [w.inboxId: cursor]))
-            #expect(Self.isTracked(changes.status))
-            #expect(!changes.records.contains { $0.messageId == "2" })
-            #expect(Self.uidFetches(w, since: start).isEmpty, "nothing below the held range is fetched: \(Self.uidFetches(w, since: start))")
+            w.server.stallNextCommand(containing: "NOOP", seconds: 1)
+            let pass = Task { try await Self.inbox(w, Self.read(w, cursors: [w.inboxId: cursor])) }
+            #expect(await Self.eventually {
+                w.server.recordedCommands().dropFirst(start).contains { $0.uppercased().hasPrefix("NOOP") }
+            }, "setup: the pass holds the change connection")
+            let archive = try await w.provider.fetchMessages(folder: Self.archivePath, limit: 10, offset: 0)
+            #expect(archive.isEmpty, "the folder fetch completes")
+            let changes = try await pass.value
+            #expect(Self.isTracked(changes.status), "the pass completes on its connection: \(changes.status)")
+            #expect(await w.provider.changeServer != nil, "the change connection was kept through the pass")
+            #expect(await w.provider.currentIdleServerForTesting() == nil, "IDLE made room instead")
+            await w.provider.stopIdle()
         }
     }
 

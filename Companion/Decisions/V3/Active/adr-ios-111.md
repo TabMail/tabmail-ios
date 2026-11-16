@@ -625,8 +625,19 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    `UIDPLUS` (`IMAPProvider.qresyncUsable`, capabilities fetched once when the change session opens):
    QRESYNC can only be switched on through ENABLE (RFC 5161), and without UIDPLUS (RFC 4315 COPYUID)
    every move into a tracked folder would land without a proven destination UID (exit rule, item 11). CONDSTORE is never inferred from QRESYNC nor the
-   other way. `ENABLE QRESYNC` is sent once per session, on the change connection only (the pool's
-   reserved connections go 2 -> 3). A server without the pair, an ENABLE that is not acknowledged,
+   other way. `ENABLE QRESYNC` is sent once per session, on the change connection only. **Connection
+   budget** (coordinator ruling 2026-11-16, option a, c4 finding 3): the change connection counts
+   against the server's limit only while it is open, like IDLE (`maxFolderConnections`; the pool's
+   reserved count stays 2, action + IDLE). When a slot is needed, the eviction order is: the change
+   connection if it is idle between passes (never while a pass holds or opens it,
+   `evictChangeConnectionIfIdle`), then the least recently used folder connection, then IDLE; this
+   holds for the folder pool's capacity loop and its limit-error retry. Opening the change connection
+   takes the folder connection's refusal handling (`createChangeServer`): a login refused with the
+   server's limit (Dovecot's `max_userip_connections` wording) learns the limit, evicts the LRU folder
+   connection (else IDLE) and retries once; a second refusal fails the pass through the existing
+   failure handling (item 9). No other fallback. So a server that allows two connections still runs a
+   pass, a folder fetch and an action (the regression c4 found: the change connection had been a
+   third, unevictable one). A server without the pair, an ENABLE that is not acknowledged,
    or a mailbox answering `NOMODSEQ` leaves the folder `.untracked(UntrackedObservation)`: no
    ENABLE is sent, no pass fails on it, and its bookmark and coverage are cleared.
 2. **Bookmark.** `Folder.changeCursor` holds `IMAPChangeCursor` JSON (`uidValidity`,
@@ -654,7 +665,16 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    gone), so the bookmark never moves past a lost arrival (r1 #1). STATUS fields the server leaves out
    are unknown, not 0: an untracked folder is then unreadable for the pass (r1 #3). STATUS is never
    sent for the mailbox selected on the change connection; it is selected again instead (r1 #7). A
-   folder whose read the apply's binding check rejected is not trackable that pass (r1 #2). No Message-ID pairing: a moved message is inserted
+   folder whose read the apply's binding check rejected is not trackable that pass (r1 #2). **The
+   held range for a changed-not-held UID** (coordinator ruling 2026-11-16, c4 finding 1) comes from
+   the folder's older-mail download progress, carried in `ChangeFolder.olderMailComplete` /
+   `olderMailCursor` (`Folder.backfillComplete` / `backfillUidCursor`), never from the rows the folder
+   holds now (`IMAPProvider.heldRangeStart`): every UID once the walk completed, above its position
+   while it runs, none before it starts (a UID below is the walk's to download). The lowest held row
+   had been used before; when that row was removed through `\Deleted` elsewhere and later un-deleted,
+   the UID fell below the new lowest row and never came back. Before every pass the change session
+   sends a NOOP (some servers answer STATUS from a cached view); the session counts as open only after
+   it answers (item 9). No Message-ID pairing: a moved message is inserted
    under its own UID and the leftover copy leaves through its own removal (ADR-IOS-068 D4).
 4. **Epoch.** A UIDVALIDITY other than the bookmark's (STATUS or SELECT) is
    `.refused(.addressEpochChanged(served))`: the apply clears the bookmark and the re-read list and,
@@ -681,7 +701,8 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    `failingSince` and is refused (`.failingTooLong`, listed again) after
    `changeReadFailureLapseSeconds`. This covers a SELECT or FETCH that times out (the session is
    dropped, but the folder being read is stamped first) and a pass whose change session never opens
-   (connect, CAPABILITY or ENABLE failing: every work folder is stamped). A connection lost mid-pass
+   (connect, CAPABILITY, ENABLE or the pass-start NOOP failing: every work folder is stamped; c4
+   finding 2, a NOOP that always fails had wedged the folders without a failure time). A connection lost mid-pass
    stamps no folder not yet read.
 10. **Accepted cost.** A server advertising QRESYNC without CONDSTORE gets no HIGHESTMODSEQ in STATUS,
    so every tracked folder does a QRESYNC SELECT each pass (no fast path). Work, not loss (r2).
@@ -721,4 +742,6 @@ Tests: `IMAPChangeReaderTests`, `ChangeApplyIMAPTests`, `IMAPCatchUpTests.planTr
 `IMAPChangeFuzzTests`, `ChangeSeamFenceTests`; red-first mutants recorded in the mutation ledger.
 Keywords: QRESYNC, CONDSTORE, ENABLE, VANISHED, HIGHESTMODSEQ, NOMODSEQ, IMAPChangeCursor, change
 connection, untracked, addressEpochChanged, arrivals limit, imapDeltaSync deleted, presentIds, UIDPLUS,
-COPYUID, exit rule, dropChangeBookmark, move without destination proof, #751.
+COPYUID, exit rule, dropChangeBookmark, move without destination proof, connection budget,
+evictChangeConnectionIfIdle, createChangeServer, max_userip_connections, eviction order, heldRangeStart,
+olderMailComplete, olderMailCursor, backfillUidCursor, un-deleted, pass-start NOOP, #751.

@@ -818,9 +818,12 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// no other connection ever gets VANISHED instead of EXPUNGE. It never
     /// reconnects inside a command (`setReconnectsInsideCommands(false)`): a
     /// session that ends mid-pass fails the rest of the pass instead of carrying
-    /// on in a new session without QRESYNC or a selection. Counted in
-    /// `reservedConnections`. Written only by `withChangeConnection`,
-    /// `dropChangeServer`, `disconnect()` and `markDirty()`.
+    /// on in a new session without QRESYNC or a selection. Counted in the
+    /// connection budget only while it is open, like IDLE, and evicted first
+    /// when a slot is needed, but only between passes
+    /// (`evictChangeConnectionIfIdle`). Written only by `withChangeConnection`,
+    /// `dropChangeServer`, `evictChangeConnectionIfIdle`, `disconnect()` and
+    /// `markDirty()`.
     var changeServer: IMAPServer?
     /// `ENABLE QRESYNC` was acknowledged on `changeServer`'s session.
     var changeServerQResync = false
@@ -836,12 +839,14 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     var changeSelectedPath: String?
 
     // MARK: - Server Limit
-    /// Server-declared connection limit. Folder connections capped at limit - 3
-    /// (reserve 1 for action, 1 for IDLE, 1 for the change reader). IDLE slot is
-    /// evictable when scarce.
+    /// Server-declared connection limit. Folder connections capped at limit - 2
+    /// (reserve 1 for action, 1 for IDLE), and one less while the change reader's
+    /// connection is open. The IDLE and change-reader slots are evictable when
+    /// scarce (the change reader's first, and only between passes).
     private var serverConnectionLimit: Int?
-    /// Connections reserved from server limit (action + IDLE + change reader).
-    static let reservedConnections = 3
+    /// Connections reserved from server limit (action + IDLE). The change
+    /// reader's connection counts only while it is open (`maxFolderConnections`).
+    private static let reservedConnections = 2
 
     // MARK: - Keepalive
     private var keepAliveTask: Task<Void, Never>?
@@ -1023,14 +1028,18 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         now.timeIntervalSince(lastUsed ?? .distantPast) > SyncConfig.imapPoolLivenessCheckSeconds
     }
 
-    /// Max folder connections (server limit minus reserved for action + IDLE).
-    /// When IDLE is evicted, the freed slot becomes available for folders.
+    /// Max folder connections (server limit minus reserved for action + IDLE +
+    /// the change reader). IDLE and the change reader count only while open:
+    /// when either is evicted, or closed, the freed slot becomes available for
+    /// folders. Without a known limit IDLE always counts (the ceiling is this
+    /// app's own cap).
     private var maxFolderConnections: Int {
+        let changeOpen = changeServer != nil ? 1 : 0
         if let limit = serverConnectionLimit {
             let activeReserved = idleServer != nil ? Self.reservedConnections : Self.reservedConnections - 1
-            return max(1, limit - activeReserved)
+            return max(1, limit - activeReserved - changeOpen)
         }
-        return SyncConfig.imapMaxConnectionCeiling - Self.reservedConnections
+        return SyncConfig.imapMaxConnectionCeiling - Self.reservedConnections - changeOpen
     }
 
     /// Parse server connection limit from error message.
@@ -1300,6 +1309,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         //       a real `folderServers` entry — that is D-18's whole point) or
         //       `evictIdleConnection()` freed a reserved slot, RAISING
         //       `maxFolderConnections` by one. Either way the measure drops.
+        //       `evictChangeConnectionIfIdle()` raises it by one as well, except
+        //       at the `max(1, …)` floor; there it cannot fire twice in a row
+        //       (the slot is nil after it, and nothing between two iterations
+        //       awaits), so the next iteration takes one of the other arms.
         //   (b) the capacity waiter's resume tail ADOPTS this folder's
         //       connection ⇒ `return` (leaves the loop).
         //   (c) the resume tail finds the folder owned/being created elsewhere
@@ -1314,7 +1327,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         // enumerated in the contract above and every one of them either freed a
         // slot or abandoned capacity it had itself just freed.
         while folderServers.count >= maxFolderConnections {
-            guard evictLRUFolder() || evictIdleConnection() else {
+            // Eviction order: the change reader's connection between passes,
+            // then the least recently used folder connection, then IDLE.
+            guard evictChangeConnectionIfIdle() || evictLRUFolder() || evictIdleConnection() else {
                 // All connections in use and IDLE already evicted — wait for ANY folder to free up
                 if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] All \(folderServers.count) folder connections in use — waiting") }
                 // T3.7 PORT (D-14) — `v2final:…:IMAPProvider
@@ -1439,8 +1454,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             let isLimitError = "\(error)".contains("max_userip_connections")
             parseAndApplyServerLimit(from: error)
 
-            // Connection limit hit — evict LRU folder (or IDLE as last resort) and retry once
-            if isLimitError && (evictLRUFolder() || evictIdleConnection()) {
+            // Connection limit hit — evict the change reader's connection between
+            // passes, else the LRU folder (or IDLE as last resort), and retry once
+            if isLimitError && (evictChangeConnectionIfIdle() || evictLRUFolder() || evictIdleConnection()) {
                 if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Connection limit hit for \(folder) — evicted LRU, retrying") }
                 #if DEBUG
                 // T3.7 test seam (D-11 / R8-F2): fires right after eviction
@@ -3488,6 +3504,42 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             }
         }
         return true
+    }
+
+    /// Evict the change reader's connection to free a server slot, only between
+    /// passes (never while a pass holds or is opening it). The next pass opens a
+    /// new session. Returns true if it was evicted.
+    @discardableResult
+    func evictChangeConnectionIfIdle() -> Bool {
+        guard let server = changeServer, !changeLaneBusy else { return false }
+        if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAPChanges] Evicting the idle change connection to free a server slot") }
+        changeServer = nil
+        changeServerQResync = false
+        changeSelectedPath = nil
+        detachedTeardownLogout(server)
+        return true
+    }
+
+    /// Open the change reader's connection (`changeSession`) under the same
+    /// refusal handling as a folder connection: a login refused for the
+    /// server's connection limit learns the limit, evicts the least recently
+    /// used idle folder connection (else IDLE) and tries once more. A second
+    /// refusal is the pass's failure (`fetchChanges`' existing handling).
+    func createChangeServer() async throws -> IMAPServer {
+        do {
+            return try await createServer(diagSite: "change")
+        } catch {
+            let isLimitError = "\(error)".contains("max_userip_connections")
+            parseAndApplyServerLimit(from: error)
+            guard isLimitError, evictLRUFolder() || evictIdleConnection() else { throw error }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAPChanges] Connection limit hit opening the change connection — evicted, retrying") }
+            do {
+                return try await createServer(diagSite: "changeRetry")
+            } catch {
+                parseAndApplyServerLimit(from: error)
+                throw error
+            }
+        }
     }
 
     func fetchFolders() async throws -> [FolderInfo] {

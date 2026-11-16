@@ -168,6 +168,14 @@ final class FakeIMAPServer: @unchecked Sendable {
         var commandLog: [String] = []
         var injectedFailureCountdowns: [String: [InjectedFailure]] = [:]
         var consumedInjectedFailureCount = 0
+        /// `setStatusStaleUntilNoop`: each connection's STATUS answers as of its
+        /// last NOOP (or its first STATUS), per mailbox and attribute list.
+        var statusStaleUntilNoop = false
+        var staleStatusByFd: [Int32: [String: String]] = [:]
+        /// `setMaxLoggedInSessions`: a LOGIN past this many live sessions is
+        /// refused with Dovecot's connection-limit wording. Nil = no limit.
+        var maxLoggedInSessions: Int?
+        var refusedLoginCount = 0
         var postResponseMailboxResets: [PostResponseMailboxReset] = []
         /// Mailboxes SELECT must reject as gone. Value = whether the NO
         /// response carries the RFC 5530 `[NONEXISTENT]` response code (the
@@ -638,6 +646,8 @@ final class FakeIMAPServer: @unchecked Sendable {
         withState { state in
             _ = state.loggedInFds.remove(fd)
             _ = state.idlingFds.remove(fd)
+            // A later connection may reuse the fd: it starts with no cached view.
+            _ = state.staleStatusByFd.removeValue(forKey: fd)
             // R12-F1: the REAL abandoned-logged-in-session oracle. Deliberately
             // keyed off `everLoggedInFds`/`loggedOutFds`, NOT the `loggedInFds`
             // removal just above — `loggedInFds` is ALREADY cleared by the
@@ -781,6 +791,30 @@ final class FakeIMAPServer: @unchecked Sendable {
 
     func consumedInjectedFailureCount() -> Int {
         withState { $0.consumedInjectedFailureCount }
+    }
+
+    /// A server that answers STATUS from a cached view (some real ones do): each
+    /// connection's STATUS for a mailbox keeps answering what it answered first
+    /// until that connection sends a NOOP. A client that reads changes with
+    /// STATUS must NOOP first, or it sees an earlier state.
+    func setStatusStaleUntilNoop(_ on: Bool) {
+        withState { state in
+            state.statusStaleUntilNoop = on
+            state.staleStatusByFd = [:]
+        }
+    }
+
+    /// A server that allows at most `max` logged-in sessions at once (Dovecot's
+    /// `mail_max_userip_connections`): a LOGIN past it is refused with
+    /// Dovecot's wording, which the provider learns the limit from. A session
+    /// leaves the count when it logs out or closes. Nil removes the limit.
+    func setMaxLoggedInSessions(_ max: Int?) {
+        withState { $0.maxLoggedInSessions = max }
+    }
+
+    /// How many LOGINs `setMaxLoggedInSessions` refused.
+    func refusedLoginCount() -> Int {
+        withState { $0.refusedLoginCount }
     }
 
     func failNextCommand(containing fragment: String, message: String = "Injected test failure") {
@@ -1915,6 +1949,12 @@ final class FakeIMAPServer: @unchecked Sendable {
         case "CAPABILITY":
             return "* CAPABILITY \(capabilities.joined(separator: " "))\r\n\(tag) OK CAPABILITY completed\r\n"
         case "LOGIN":
+            let limitRefusal = withState { state -> String? in
+                guard let max = state.maxLoggedInSessions, state.loggedInFds.count >= max else { return nil }
+                state.refusedLoginCount += 1
+                return "[UNAVAILABLE] Maximum number of connections from user+IP exceeded (mail_max_userip_connections=\(max))"
+            }
+            if let limitRefusal { return "\(tag) NO \(limitRefusal)\r\n" }
             authenticated = true
             withState { state in
                 _ = state.loggedInFds.insert(fd)
@@ -2025,7 +2065,7 @@ final class FakeIMAPServer: @unchecked Sendable {
             """
         case "STATUS":
             guard authenticated else { return "\(tag) NO Not authenticated\r\n" }
-            return handleStatus(tag: tag, args: args)
+            return handleStatus(tag: tag, args: args, fd: fd)
         case "UID":
             guard let selectedMailbox else { return "\(tag) NO No mailbox selected\r\n" }
             return handleUID(tag: tag, args: args, mailbox: selectedMailbox)
@@ -2096,6 +2136,8 @@ final class FakeIMAPServer: @unchecked Sendable {
             }
             return "\(tag) OK EXPUNGE completed\r\n"
         case "NOOP":
+            // A NOOP brings this connection's cached STATUS view up to date.
+            withState { _ = $0.staleStatusByFd.removeValue(forKey: fd) }
             return "\(tag) OK NOOP completed\r\n"
         case "LOGOUT":
             withState {
@@ -2232,7 +2274,23 @@ final class FakeIMAPServer: @unchecked Sendable {
         withState { Self.observeQResync(mailbox, state: &$0).highestModSeq }
     }
 
-    private func handleStatus(tag: String, args: String) -> String {
+    private func handleStatus(tag: String, args: String, fd: Int32) -> String {
+        let response = currentStatusLine(tag: tag, args: args)
+        // `setStatusStaleUntilNoop`: an answered STATUS line is this connection's
+        // view of the mailbox until its next NOOP.
+        guard response.hasPrefix("* STATUS"), let lineEnd = response.range(of: "\r\n") else { return response }
+        let line = String(response[..<lineEnd.upperBound])
+        let cached = withState { state -> String? in
+            guard state.statusStaleUntilNoop else { return nil }
+            if let earlier = state.staleStatusByFd[fd]?[args] { return earlier }
+            state.staleStatusByFd[fd, default: [:]][args] = line
+            return nil
+        }
+        guard let cached else { return response }
+        return "\(cached)\(tag) OK STATUS completed\r\n"
+    }
+
+    private func currentStatusLine(tag: String, args: String) -> String {
         guard let openParen = args.firstIndex(of: "(") else {
             return "\(tag) BAD STATUS requires an attribute list\r\n"
         }

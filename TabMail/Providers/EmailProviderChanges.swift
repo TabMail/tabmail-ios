@@ -54,9 +54,21 @@ struct ChangeFolder: Sendable, Equatable {
     /// unknown one (IOS-EPOCH-001); the apply checks it again inside the folder's
     /// transaction.
     var addressEpoch: Int?
+    /// How far the folder's older-mail download has come, as the device stores
+    /// it (`Folder.backfillComplete`, `Folder.backfillUidCursor`): the range of
+    /// ids the device holds the folder in, whatever rows it holds now. A reader
+    /// with numeric ids takes the start of the held range from this, never from
+    /// the rows: a removal moves the lowest row, and a message restored on the
+    /// server later must still come back.
+    var olderMailComplete: Bool
+    /// The older-mail walk's position: it walks down from the top, so every id
+    /// above this one has been downloaded. Nil = the walk has not started (or
+    /// has completed, `olderMailComplete`).
+    var olderMailCursor: Int?
 
     init(id: String, path: String, role: FolderRole,
-         cursor: String? = nil, isSynced: Bool = false, heldSince: Date? = nil, addressEpoch: Int? = nil) {
+         cursor: String? = nil, isSynced: Bool = false, heldSince: Date? = nil, addressEpoch: Int? = nil,
+         olderMailComplete: Bool = false, olderMailCursor: Int? = nil) {
         self.id = id
         self.path = path
         self.role = role
@@ -64,6 +76,8 @@ struct ChangeFolder: Sendable, Equatable {
         self.isSynced = isSynced
         self.heldSince = heldSince
         self.addressEpoch = addressEpoch
+        self.olderMailComplete = olderMailComplete
+        self.olderMailCursor = olderMailCursor
     }
 }
 

@@ -1494,9 +1494,10 @@ struct IMAPProviderPoolInvariantTests {
     // MARK: Invariant 10: a capacity-starved acquire is woken by ANY freed slot (D-14 / R10-F1)
 
     /// Every connection the provider may open together stays within the server's
-    /// declared limit: the folder connections plus the action connection and the
-    /// change reader's own (IDLE off).
-    @Test("the folder pool leaves room for the action and change-reader connections under the server's limit")
+    /// declared limit: the folder connections plus the action connection, and
+    /// the change reader's own while it is open (IDLE off). Closed, it takes no
+    /// slot (ADR-IOS-111, connection budget).
+    @Test("the folder pool leaves room for the action connection, and for the change reader's while it is open, under the server's limit")
     func folderPoolLeavesRoomForActionAndChangeConnections() async throws {
         let server = FakeIMAPServer(username: Self.uniqueUsername(), mailboxes: ["INBOX": []])
         try server.start()
@@ -1505,9 +1506,17 @@ struct IMAPProviderPoolInvariantTests {
         IMAPProvider.persistServerLimit(limit, host: "127.0.0.1", username: server.username)
         let provider = Self.provider(for: server)
         defer { awaitDisconnect(provider) }
-        let folders = await provider.poolMaxConnections()
-        #expect(folders + 2 <= limit, "\(folders) folder connections + action + change reader exceed the limit \(limit)")
-        #expect(folders >= 1)
+        let closed = await provider.poolMaxConnections()
+        #expect(closed + 1 <= limit, "\(closed) folder connections + action exceed the limit \(limit)")
+        #expect(closed == limit - 1, "a closed change connection takes no slot")
+        let request = ChangeRequest(
+            folders: [ChangeFolder(id: "pool:INBOX", path: "INBOX", role: .inbox, isSynced: true)],
+            scope: .all, recheck: [:], context: ChangeContext(onProgress: { _ in }))
+        _ = try await provider.fetchChanges(since: ChangeCursor(account: nil), request: request)
+        #expect(await provider.changeServer != nil, "setup: the pass left the change connection open")
+        let open = await provider.poolMaxConnections()
+        #expect(open + 2 <= limit, "\(open) folder connections + action + change reader exceed the limit \(limit)")
+        #expect(open >= 1)
     }
 
     /// **The property.** An acquire that reaches the connection cap with nothing

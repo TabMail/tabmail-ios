@@ -205,7 +205,8 @@ extension SyncEngine {
                 ChangeFolder(
                     id: $0.id, path: $0.path, role: $0.role, cursor: $0.changeCursor,
                     isSynced: synced.contains($0.id), heldSince: $0.oldestSyncedDate,
-                    addressEpoch: Self.knownUidValidity($0.lastKnownUidValidity))
+                    addressEpoch: Self.knownUidValidity($0.lastKnownUidValidity),
+                    olderMailComplete: $0.backfillComplete, olderMailCursor: $0.backfillUidCursor)
             },
             scope: scope, recheck: recheck, context: context,
             localRows: SyncEngineCatchUpRowReader(pool: dbPool))

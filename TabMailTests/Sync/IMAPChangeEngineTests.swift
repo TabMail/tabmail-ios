@@ -176,6 +176,30 @@ struct IMAPChangeEngineTests {
         }
     }
 
+    // MARK: - The held range comes from the older-mail walk
+
+    @Test("The oldest held message, deleted elsewhere and then un-deleted, is shown on the device again on the next pass")
+    func undeletedOldestMessageComesBack() async throws {
+        try await Self.withWorld("eng-undelete", capabilities: Self.qresync,
+                                 serverUIDs: [1, 2, 3], localUIDs: [1, 2, 3], tracked: true) { w in
+            let accountId = w.account.id
+            let folderId = w.folderId
+            func account() throws -> Account { try #require(try w.pool.read { db in try Account.fetchOne(db, key: accountId) }) }
+            // The older-mail walk has downloaded the whole folder.
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET backfillComplete = 1, backfillUidCursor = NULL WHERE id = ?", arguments: [folderId])
+            }
+            _ = try await w.engine.performChangePass(account: try account(), provider: w.provider, inboxOnly: true)
+            #expect(try w.uids() == ["1", "2", "3"], "setup: the bookmark is current")
+            w.server.setFlags(["\\Deleted"], in: Self.path, uid: 1)
+            _ = try await w.engine.performChangePass(account: try account(), provider: w.provider, inboxOnly: true)
+            #expect(try w.uids() == ["2", "3"], "setup: the deleted message left the device")
+            w.server.setFlags([], in: Self.path, uid: 1)
+            _ = try await w.engine.performChangePass(account: try account(), provider: w.provider, inboxOnly: true)
+            #expect(try w.uids() == ["1", "2", "3"], "the un-deleted message is shown again")
+        }
+    }
+
     // MARK: - The count walk's presence answer
 
     @Test("A provider that cannot say which ids exist: the count walk deletes nothing")

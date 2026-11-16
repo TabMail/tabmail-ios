@@ -8,8 +8,8 @@ import Testing
 
 /// Seeded fuzzer for the IMAP change reader (Testing Rule 11): the real
 /// `IMAPProvider.fetchChanges` against `FakeIMAPServer`'s QRESYNC model, with
-/// another client changing the mailbox between reads (flags, `\Deleted`,
-/// expunges, arrivals), seeded per-command latency, injected SELECT failures and
+/// another client changing the mailbox between reads (flags, `\Deleted` and
+/// un-deleting, expunges, arrivals), seeded per-command latency, injected SELECT failures and
 /// cut budgets. The device side is a mirror applied from what the reader reports.
 ///
 /// Invariants, checked after every read:
@@ -79,7 +79,14 @@ struct IMAPChangeFuzzTests {
                     // Another client changes the mailbox.
                     for _ in 0..<rng.pick(FuzzConfig.maxChangesPerRound + 1) {
                         var uids = w.server.messages(in: R.inboxPath).map(\.uid)
-                        switch rng.pick(5) {
+                        let deleted = uids.filter { w.server.flags(in: R.inboxPath, uid: $0).contains("\\Deleted") }
+                        switch rng.pick(6) {
+                        case 5 where !deleted.isEmpty:
+                            // Un-deleted elsewhere: it is shown again and must come back.
+                            let uid = deleted[rng.pick(deleted.count)]
+                            var flags = w.server.flags(in: R.inboxPath, uid: uid)
+                            flags.remove("\\Deleted")
+                            w.server.setFlags(flags, in: R.inboxPath, uid: uid)
                         case 0 where !uids.isEmpty:
                             let uid = uids[rng.pick(uids.count)]
                             var flags = w.server.flags(in: R.inboxPath, uid: uid)

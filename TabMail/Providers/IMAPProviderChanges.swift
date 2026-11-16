@@ -27,7 +27,8 @@ import SwiftMail
 //   - changed FLAGS below the bookmark's UIDNEXT become partial records (the
 //     whole flag and keyword set); a `\Deleted` one becomes a removal of the
 //     local row (IOS-IMAP-001 D3); a changed message the folder does not hold,
-//     at or above its lowest local UID, is fetched in full (an un-deleted one);
+//     inside the range the older-mail walk has downloaded (`heldRangeStart`,
+//     never the lowest row held now), is fetched in full (an un-deleted one);
 //   - UIDs at or above the bookmark's UIDNEXT are arrivals, fetched in full on
 //     the same selection; more than `SyncConfig.imapChangeArrivalsLimit` refuses
 //     with `.tooFarBehind`; a `\Deleted` arrival is not inserted;
@@ -44,7 +45,8 @@ import SwiftMail
 // Nothing here writes the database, and nothing here sends a STORE, COPY, MOVE or
 // EXPUNGE. A connection lost or timed out mid-pass fails the folders not yet read
 // (`.failed`, bookmark kept); the folder whose request timed out, and every folder
-// of a pass whose session never opened, keeps its failure time and lapses after
+// of a pass whose session never opened (its pass-start NOOP included), keeps its
+// failure time and lapses after
 // `SyncConfig.changeReadFailureLapseSeconds`; a budget run out leaves them `.notRun`.
 
 /// IMAP's opaque per-folder change bookmark, stored as JSON in
@@ -116,12 +118,15 @@ extension IMAPProvider {
         var sessionOpened = false
         do {
             try await withChangeConnection { server, qresync in
-                sessionOpened = true
                 // Let the session catch up with other connections' changes before
                 // the STATUS reads (some servers answer STATUS from a cached view).
                 try await withTimeout(seconds: SyncConfig.changeReadRequestTimeoutSeconds) {
                     _ = try await server.noop()
                 }
+                // Open only once the NOOP has answered: a session whose NOOP keeps
+                // failing is one that cannot be used, under the lapse rule below,
+                // never a connection lost mid-pass that leaves no failure time.
+                sessionOpened = true
                 for (index, folder) in work.enumerated() {
                     guard context.hasBudget() else { break }
                     do {
@@ -149,8 +154,8 @@ extension IMAPProvider {
             }
         } catch {
             for folder in work where results[folder.id] == nil {
-                // No session could be opened (connect, CAPABILITY or ENABLE
-                // failed): every folder's read failed, under the same lapse rule,
+                // No session could be opened (connect, CAPABILITY, ENABLE or the
+                // pass-start NOOP failed): every folder's read failed, under the same lapse rule,
                 // so a change connection the server always refuses never freezes
                 // the tracked folders.
                 results[folder.id] = sessionOpened
@@ -197,6 +202,19 @@ extension IMAPProvider {
         }
         cursor.failingSince = since
         return FolderChanges(folderId: folder.id, status: .failed(error), cursor: cursor.encoded)
+    }
+
+    /// The lowest UID of the range the device holds the folder in, from the
+    /// older-mail walk's progress (`ChangeFolder.olderMailComplete`,
+    /// `olderMailCursor`): every UID once the walk has completed; above its
+    /// position while it runs (it walks down from UIDNEXT); nil before it starts.
+    /// A UID below this is the walk's to download, not the change reader's.
+    /// Never the lowest row the folder holds now: a message removed through
+    /// `\Deleted` elsewhere moves that row, and once un-deleted it would fall
+    /// outside the range for good while the bookmark moves past it.
+    nonisolated static func heldRangeStart(_ folder: ChangeFolder) -> Int? {
+        if folder.olderMailComplete { return 1 }
+        return folder.olderMailCursor.map { $0 + 1 }
     }
 
     /// The QRESYNC SELECT's timeout: its own setting, never past the read
@@ -286,7 +304,7 @@ extension IMAPProvider {
         let changed = resync.changedFlags
         let belowCursor = changed.keys.map(\.value).filter { $0 < cursor.uidNext }
         let held = try await heldIdSet(belowCursor, folderId: folder.id, request: request)
-        let lowestHeld = try await request.localRows?.firstNumericId(folderId: folder.id, atLeast: 1)
+        let heldFrom = Self.heldRangeStart(folder)
         var toFetch: [UInt32] = []
         for (uid, flags) in changed.sorted(by: { $0.key.value < $1.key.value }) {
             let value = uid.value
@@ -299,7 +317,7 @@ extension IMAPProvider {
                 } else {
                     changes.records.append(Self.flagRecord(uid: value, flags: flags))
                 }
-            } else if !deleted, let lowestHeld, Int(value) >= lowestHeld {
+            } else if !deleted, let heldFrom, Int(value) >= heldFrom {
                 // Changed, not held, within the held range: un-deleted, or removed
                 // locally by an earlier read. Only its full record can bring it back.
                 toFetch.append(value)
@@ -604,7 +622,7 @@ extension IMAPProvider {
             }
         }
         let generationAtStart = generation
-        let fresh = try await createServer(diagSite: "change")
+        let fresh = try await createChangeServer()
         await fresh.setReconnectsInsideCommands(false)
         var qresync = false
         do {
