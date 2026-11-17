@@ -286,6 +286,13 @@ struct IMAPMoveIntoTrackedFolderTests {
                 let moved = try #require(try w.heldTarget().first)
                 await AccountManager.shared.move([moved], to: "INBOX")
             }
+            // The cancel ends the move through the exit rule: both folders the
+            // optimistic move left possibly wrong lose their bookmark at once.
+            for path in ["INBOX", "Archive"] {
+                let folder = try w.folder(path)
+                #expect(folder.changeCursor == nil, "\(label): \(path)'s bookmark is dropped by the cancel")
+                #expect(!FolderChangeState(raw: folder.changeState).tracking, "\(label): \(path) is no longer tracked after the cancel")
+            }
             try await w.drain()
             let queued = try await w.pool.read { db in try PendingOperation.fetchCount(db) }
             #expect(queued == 0, "\(label) setup: the cancelled move left nothing queued")
