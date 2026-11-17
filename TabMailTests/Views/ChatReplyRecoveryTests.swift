@@ -17,7 +17,8 @@ import UIKit
 /// Reply to keeps that choice through its recovery. Whether the connection was lost and the turn is
 /// resumed, or the request failed and is sent again with Retry, the agent's reply goes to the people
 /// chosen when the request was first sent, as a plain reply with no Cc, whatever Reply to shows
-/// when the user recovers it.
+/// when the user recovers it; with nobody chosen, it stays a Reply All. A newer send from the field
+/// ends the earlier request's recovery.
 ///
 /// Each case opens the chat for real in a window with its requests going to a fake backend, picks
 /// "only David" in Reply to as the user does, sends from the field, fails the first request, changes
@@ -53,7 +54,8 @@ struct ChatReplyRecoveryTests {
     }
 
     /// The fake backend: the first request fails as `failure`; a later request with no saved state
-    /// asks for `email_reply` on the email it names; one carrying the tool's result is answered "Done".
+    /// asks for `email_reply` on the email it names (unless `asksForReply` is false); one carrying
+    /// the tool's result is answered "Done".
     final class Backend: @unchecked Sendable {
         let http = FakeHTTP.Scenario()
         final class Record: Sendable {
@@ -61,7 +63,7 @@ struct ChatReplyRecoveryTests {
         }
         private let record = Record()
 
-        init(failure: Failure) {
+        init(failure: Failure, asksForReply: Bool = true) {
             http.register(path: "/completions/chat", method: "POST") { [record] request in
                 let body = String(decoding: request.body ?? Data(), as: UTF8.self)
                 let count = record.bodies.withLock { bodies in
@@ -75,7 +77,7 @@ struct ChatReplyRecoveryTests {
                     }
                 }
                 let final: [String: Any]
-                if body.contains("conversation_state") {
+                if body.contains("conversation_state") || !asksForReply {
                     final = ["assistant": "Done"]
                 } else {
                     let number = Self.emailNumber(in: body) ?? 0
@@ -182,6 +184,9 @@ struct ChatReplyRecoveryTests {
         let chat = Chat(controller: controller, email: email, accounts: [accountRow])
         try await Self.waitUntil { Self.namesButton(in: chat.view) != nil }
         #expect(Self.namesButton(in: chat.view) != nil, "control: the chat shows its header: \(HostedAccessibility.labels(in: chat.view).prefix(12))")
+        // The field can come on screen after the header; every case types into it.
+        try await Self.waitUntil { Self.type("", in: chat.view) }
+        #expect(Self.type("", in: chat.view), "control: the chat shows its reply field")
         do {
             try await body(chat)
         } catch {
@@ -302,6 +307,85 @@ struct ChatReplyRecoveryTests {
                 }
                 #expect(Self.addresses(card["to"]) == ["david@example.com"], "only David: \(card)")
                 #expect(Self.addresses(card["cc"]).isEmpty && Self.addresses(card["bcc"]).isEmpty, "nobody else: \(card)")
+            }
+        }
+    }
+
+    @Test("A field request with nobody chosen, recovered after a failure, replies to everyone whatever Reply to shows when recovered",
+          arguments: Failure.allCases)
+    func recoveredFieldRequestKeepsReplyAll(failure: Failure) async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted chat")
+        let backend = Backend(failure: failure)
+        try await HostedAccessibility.withAutomation {
+            try await withChat(backend, tag: "all-\(failure.rawValue)") { chat in
+                let router = AgentToolRouter.shared
+                // Nobody chosen: the field's reply goes to everyone.
+                #expect(Self.replyingOnlyTo(in: chat.view) == nil, "control: nobody is chosen: \(HostedAccessibility.labels(in: chat.view).prefix(16))")
+                #expect(Self.type("Tell them Friday works", in: chat.view), "control: the field takes words")
+                try await Task.sleep(for: .milliseconds(300))
+                #expect(HostedAccessibility.activate("chatSend", in: chat.view),
+                        "control: the field's Send takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
+                try await Self.waitUntil { backend.bodies.count == 1 && !ActiveAgentTracker.shared.anyWorking }
+                #expect(backend.bodies.count == 1, "control: the request went out once and failed")
+                #expect(backend.bodies.first?.contains("a reply goes only to") == false, "control: the request named nobody")
+
+                // Reply to changes before the recovery: only David.
+                try await Self.toggle(["alex@example.com", "sam@example.com"], in: chat)
+                #expect(Self.replyingOnlyTo(in: chat.view) != nil, "control: the chat now replies only to David")
+
+                #expect(Self.type("", in: chat.view), "control: the field is emptied")
+                try await Self.waitUntil { HostedAccessibility.identifiers(in: chat.view).contains("chatRetry") }
+                router.composePresentationDidBegin()
+                #expect(HostedAccessibility.activate("chatRetry", in: chat.view),
+                        "control: the field offers Retry: \(HostedAccessibility.identifiers(in: chat.view))")
+                try await Self.waitUntil { router.composeQueueDepth == 1 }
+                #expect(router.composeQueueDepth == 1, "control: the recovered turn asked for a reply")
+                let request = try #require(router.firstQueuedRequestForTesting)
+                #expect(request.fieldReply == ChatFieldReply(emailKey: ChatThread.copyKey(chat.email), onlyTo: nil),
+                        "the reply carries the choice made when the request was sent, nobody: \(String(describing: request.fieldReply))")
+                let reply = ChatReplyCompose.make(agent: request, accounts: chat.accounts)
+                #expect(reply.isReplyAll, "a Reply All: \(reply)")
+
+                // The card the chat opens goes to everyone on the email.
+                router.composePresentationDidEnd()
+                var card: [String: String] = [:]
+                try await Self.waitUntil {
+                    card = Self.composeRecipients(chat.controller.presentedViewController?.view)
+                    return card["to"]?.isEmpty == false
+                }
+                #expect(Self.addresses(card["to"]).union(Self.addresses(card["cc"])) == ["alex@example.com", "david@example.com", "sam@example.com"],
+                        "everyone: \(card)")
+            }
+        }
+    }
+
+    @Test("A newer send from the field ends an earlier failed request's recovery", arguments: Failure.allCases)
+    func newerSendEndsTheRecovery(failure: Failure) async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted chat")
+        let backend = Backend(failure: failure, asksForReply: false)
+        try await HostedAccessibility.withAutomation {
+            try await withChat(backend, tag: "newer-\(failure.rawValue)") { chat in
+                #expect(Self.type("Tell them Friday works", in: chat.view), "control: the field takes words")
+                try await Task.sleep(for: .milliseconds(300))
+                #expect(HostedAccessibility.activate("chatSend", in: chat.view),
+                        "control: the field's Send takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
+                try await Self.waitUntil { backend.bodies.count == 1 && !ActiveAgentTracker.shared.anyWorking }
+                #expect(Self.type("", in: chat.view), "control: the field is emptied")
+                try await Self.waitUntil { HostedAccessibility.identifiers(in: chat.view).contains("chatRetry") }
+                #expect(HostedAccessibility.identifiers(in: chat.view).contains("chatRetry"), "control: the failed request can be recovered")
+
+                // A newer request from the field, which succeeds.
+                #expect(Self.type("Thanks", in: chat.view), "control: the field takes words")
+                try await Task.sleep(for: .milliseconds(300))
+                #expect(HostedAccessibility.activate("chatSend", in: chat.view),
+                        "control: the field's Send takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
+                try await Self.waitUntil { backend.bodies.count == 2 && !ActiveAgentTracker.shared.anyWorking }
+                #expect(backend.bodies.count == 2 && backend.bodies.last?.contains("Thanks") == true, "control: the newer request went out")
+
+                #expect(Self.type("", in: chat.view), "control: the field is emptied")
+                try await Task.sleep(for: .milliseconds(500))
+                #expect(!HostedAccessibility.identifiers(in: chat.view).contains("chatRetry"),
+                        "the earlier request can no longer be recovered: \(HostedAccessibility.identifiers(in: chat.view))")
             }
         }
     }
