@@ -636,6 +636,30 @@ struct MessageDetailThreadActionTests {
         try await settle(pool, deleted)
     }
 
+    @Test("A chat offers Archive when any email it loaded is in an Inbox, wherever that email is in the chat, and not when none is or the roles cannot be read")
+    @MainActor
+    func inboxCopyDecidesArchive() async throws {
+        let (pool, dir, previous) = try makeEnv()
+        defer { teardown(previous: previous, pool: pool, dir: dir) }
+
+        let filed = try insertHeader(pool, messageId: "offer-filed", folderPath: Self.projectsPath, isRead: true)
+        let sent = try insertHeader(pool, messageId: "offer-sent", folderPath: Self.sentPath, isRead: true)
+        let inbox = try insertHeader(pool, messageId: "offer-inbox")
+        // The Inbox email is the chat's last row, after two that are not in an Inbox.
+        let offered = openChat(pool, focused: filed, others: [sent, inbox])
+        #expect(offered.chatRows.map(\.id) == [filed.id, sent.id, inbox.id], "control: the chat loaded all three")
+        #expect(offered.chatHasInboxCopy, "an Inbox email anywhere in the chat offers Archive")
+
+        let notOffered = openChat(pool, focused: filed, others: [sent])
+        #expect(!notOffered.chatHasInboxCopy, "a chat with no Inbox email offers no Archive")
+
+        // Every folder read fails, as it does on a database error: no Archive is offered.
+        try await pool.write { try $0.execute(sql: "ALTER TABLE folder RENAME TO folderUnreadable") }
+        #expect(!offered.chatHasInboxCopy, "unreadable roles offer no Archive")
+        try await pool.write { try $0.execute(sql: "ALTER TABLE folderUnreadable RENAME TO folder") }
+        #expect(offered.chatHasInboxCopy, "control: readable roles offer it again")
+    }
+
     @Test("A chat of only sent copies and drafts, or already all in Trash, records nothing")
     @MainActor
     func chatWithNothingToMove() async throws {

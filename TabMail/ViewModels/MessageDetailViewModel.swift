@@ -2084,9 +2084,10 @@ final class MessageDetailViewModel {
     }
 
     /// Whether any row the chat loaded is in an Inbox: the chat offers Archive only then, since a
-    /// whole-chat Archive takes only the Inbox copies.
+    /// whole-chat Archive takes only the Inbox copies. One read for every row's folder, since the
+    /// chat view asks on each evaluation; a failed read offers no Archive.
     var chatHasInboxCopy: Bool {
-        chatRows.contains { lookupFolderRole($0.folderId) == .inbox }
+        lookupFolderRoles(Set(chatRows.map(\.folderId)))?.values.contains(.inbox) ?? false
     }
 
     /// A whole-chat Archive, Delete or Move over the rows the chat loaded (`chatRows`), each by its
