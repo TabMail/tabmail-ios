@@ -169,7 +169,13 @@ struct FolderResetGenerationTests {
         await AccountManager.shared.awaitWriteQueueDrain()
         let provider = try await connectedProvider(env)
         await AccountManager.shared.registerProviderForTesting(accountId: env.accountId, provider: provider)
-        await AccountManager.shared.drainPendingQueue()
+        // A drain already running (started by the action itself) makes this call
+        // return at once, so drain until no operation is left (bounded).
+        for _ in 0..<100 {
+            await AccountManager.shared.drainPendingQueue()
+            if try await ops(env).isEmpty { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
         try? await provider.disconnect()
     }
 
