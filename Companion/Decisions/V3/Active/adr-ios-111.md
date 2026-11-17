@@ -496,7 +496,7 @@ drain, #903.
 
 ### Amendment 2026-11-17: an overflow in a folder holding its own bookmark re-baselines it (#751)
 
-Decision (master-agent ruling): item 2 of the #903 amendment above is amended for a folder that holds
+Decision (coordinator ruling, 2026-11-17): item 2 of the #903 amendment above is amended for a folder that holds
 its own change bookmark (`Folder.changeCursor`). There, when this pass's own additions are cut, the
 folder's bookmark is also dropped (`cutDropsBookmark` in `SyncEngine.applyFolderChanges`, through
 `dropChangeBookmark`, which arms the catch-up as well): the folder is listed again and its next read
@@ -681,14 +681,15 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    answered, so a login sent right after a detached logout was refused again (found 2026-11-16 by a
    fake server that counts sessions; IDLE's DONE + LOGOUT lost that race every time). Each caller
    keeps and awaits only its own evictions' logouts; nothing is stored on the provider. An evicted
-   IDLE connection ends its IDLE first (`evictIdleConnection`, 2026-11-16): DONE
-   completes (its tagged OK, or at most `SyncConfig.imapIdleEvictionDoneWaitSeconds`: a DONE still
-   unanswered then is cancelled, and SwiftMail closes the connection on that cancellation, which
-   ends the session), then the listener is cancelled and the session logs out. A listener cancelled first ended its stream at once
-   and logged the session out itself, and that LOGOUT could reach the connection ahead of DONE and wait
-   for an IDLE nobody ended, past the login's wait, so the login was refused (a test flake, made
-   deterministic by holding DONE back, `idleEvictionEndsIdleBeforeTheLogout`; the bound:
-   `idleEvictionDoneWaitIsBounded`). So a server that allows two connections still runs a
+   IDLE connection ends its IDLE first (`evictIdleConnection`, 2026-11-16; order amended 2026-11-17):
+   the listener is cancelled first (a cancelled listener returns without logging out, as on main's
+   `tearDownIdleConnection`), then DONE completes (its tagged OK, or at most
+   `SyncConfig.imapIdleEvictionDoneWaitSeconds`: a DONE still unanswered then is cancelled, and SwiftMail
+   closes the connection on that cancellation, which ends the session), then the session logs out, once.
+   Before, a listener still running took the stream DONE ended as a server-side end and logged the session
+   out a second time; earlier still, a LOGOUT could reach the connection ahead of DONE and wait for an IDLE
+   nobody ended, past the login's wait, so the login was refused (made deterministic by holding DONE back,
+   `idleEvictionEndsIdleBeforeTheLogout`; the bound: `idleEvictionDoneWaitIsBounded`). So a server that allows two connections still runs a
    pass, a folder fetch and an action (before this, the change connection had been a
    third, unevictable one). A server without the pair, an ENABLE that is not acknowledged,
    or a mailbox answering `NOMODSEQ` leaves the folder `.untracked(UntrackedObservation)`: no
