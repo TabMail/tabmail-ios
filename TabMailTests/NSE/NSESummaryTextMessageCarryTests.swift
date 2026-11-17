@@ -62,6 +62,15 @@ struct NSESummaryTextMessageCarryTests {
         let unlink = "FileManager.default." + "removeItem("
         #expect(!source.contains(unlink), "a raw directory removal skips the close")
         #expect(!source.contains("Self.decode(try " + "DatabaseQueue("), "a connection opened inline is never closed")
+        // Each test that opens a database hands it to `TestDatabaseTeardown`.
+        let opens = ["Self.makeStaging" + "()", "makeAppDB" + "()"]
+        let tests = source.components(separatedBy: "@Test" + "(").dropFirst()
+        #expect(tests.contains { test in opens.contains { test.contains($0) } }, "control: the tests that open a database are found")
+        let unowned = tests.filter { test in opens.contains { test.contains($0) } && !test.contains("TestDatabaseTeardown" + ".") }
+        #expect(unowned.isEmpty, "a test opens a database it never hands over: \(unowned.map { $0.prefix(90) })")
+        // The upgrade test's second connection, the one the open returns, is handed over too.
+        let upgrade = try #require(tests.first { $0.contains("func " + "openUpgradesOlderDatabase") })
+        #expect(upgrade.contains("queues.append(opened)"), "the opened connection is retired with the directory")
     }
 
     @Test("A fresh staging schema has the column")
