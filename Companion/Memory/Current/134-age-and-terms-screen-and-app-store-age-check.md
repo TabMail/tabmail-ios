@@ -69,17 +69,27 @@ ADR-034.
   `AppStoreAgeCheck.SignificantUpdate` decides, `acknowledgeSignificantUpdate` (iOS 26.4+, run after
   an `.allowed` check) acts. It stores only the last handled major.minor under
   `AppStoreAgeCheck.significantUpdateVersion`. The first run records the version without showing
-  anything (nothing to compare); a new major.minor asks Apple's `requiredRegulatoryFeatures` and, if
-  required, shows `showSignificantUpdateAcknowledgment` before recording; a failure records nothing
-  and asks again on the next foreground.
+  anything (nothing to compare). A new major.minor first asks `isEligibleForAgeFeatures`: the version
+  is recorded only where the rules apply. Where they do not (including a device with no Apple
+  Account), nothing is shown and nothing is recorded, so a device the rules apply to later still gets
+  this version's notice (2026-11-17, issue #972: with no Apple Account, Apple's
+  `requiredRegulatoryFeatures` still listed the notice, and its acknowledgment extension failed with
+  `missingDSID`, drew nothing, and its full-screen host took every tap at every launch). Where the
+  rules apply it asks `requiredRegulatoryFeatures` and, if required, shows
+  `showSignificantUpdateAcknowledgment` before recording; a failure records nothing and asks again on
+  the next foreground. `acknowledge(acknowledged:current:isRegulated:requiresNotice:show:record:)` is
+  the seam; `acknowledgeSignificantUpdate` passes Apple's calls.
 
 Tests: `AgeAndTermsConsentTests`, `AppStoreAgeCheckSimulationTests` (simulated App Store answers),
 `AgeIneligibleDeletionTokenTests` (refusal handshake through the real token path),
 `SignificantUpdateStorageTests` (first-run record and repeat),
+`SignificantUpdateAcknowledgmentTests` (Apple's answers through `acknowledge`: no notice and no record
+where the rules do not apply, shown then recorded once they do, failures record nothing),
 `AgeAndTermsPushGateTests`, `AgeAndTermsDeviceSyncGateTests`.
 Not covered by a test (view wiring; owner smoke list): `ConsentGateView.leave` (OK waits for the
 deletion request, resends on no answer, shows the connection message, signs out only after an answer),
 `RootView.checkAppStoreAge` applying `shown(previous:checked:)`, RootView's `canStartAccountServices` handler
 starting Device Sync and push after sign-in or consent, the eligible path clearing the entered
-date from the view's state, and the Apple-facing arm of `acknowledgeSignificantUpdate` (asking
-`requiredRegulatoryFeatures` and showing the notice needs a regulated-region sandbox account).
+date from the view's state, and Apple's real calls inside `acknowledgeSignificantUpdate` (their
+answers are tested through `acknowledge`; showing the real notice needs a regulated-region sandbox
+account).

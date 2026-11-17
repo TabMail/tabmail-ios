@@ -251,6 +251,104 @@ struct SignificantUpdateStorageTests {
     }
 }
 
+/// The significant update step with Apple's answers given, since Apple's
+/// acknowledgment needs a regulated-region account. Invariant: Apple's notice
+/// is asked for only where Apple says the age rules apply, and a version is
+/// recorded only where they apply (or on the first run); a device where they
+/// do not apply, such as one with no Apple Account, is shown nothing and keeps
+/// its stored version, so it is asked again once the rules apply.
+@Suite("Significant update: Apple's notice only where the rules apply")
+@MainActor
+struct SignificantUpdateAcknowledgmentTests {
+    struct Failure: Error {}
+
+    @MainActor
+    final class Calls {
+        var regionAsked = 0
+        var noticeAsked = 0
+        var shown: [String] = []
+        var recorded: [String] = []
+        /// The order of `show` and `record`, to check the version is recorded after the notice.
+        var events: [String] = []
+    }
+
+    private func run(
+        acknowledged: String?, current: String,
+        regulated: Result<Bool, Failure>, required: Result<Bool, Failure> = .success(true),
+        showFails: Bool = false
+    ) async -> Calls {
+        let calls = Calls()
+        await AppStoreAgeCheck.acknowledge(
+            acknowledged: acknowledged, current: current,
+            isRegulated: { calls.regionAsked += 1; return try regulated.get() },
+            requiresNotice: { calls.noticeAsked += 1; return try required.get() },
+            show: { version in
+                calls.events.append("show")
+                if showFails { throw Failure() }
+                calls.shown.append(version)
+            },
+            record: { version in calls.events.append("record"); calls.recorded.append(version) }
+        )
+        return calls
+    }
+
+    /// What Apple answered on a device with no Apple Account: the rules do not
+    /// apply, yet a notice is listed as required. Showing it there covered the
+    /// app with an empty screen that took every tap.
+    @Test func whereTheRulesDoNotApplyNothingIsShownAndNothingRecorded() async {
+        let calls = await run(acknowledged: "1.7", current: "1.8.0", regulated: .success(false), required: .success(true))
+        #expect(calls.shown.isEmpty, "no Apple notice where the age rules do not apply")
+        #expect(calls.recorded.isEmpty, "the stored version is kept, so the device is asked again later")
+    }
+
+    @Test func theSameDeviceOnceTheRulesApplyIsShownTheNoticeThenRecorded() async {
+        let before = await run(acknowledged: "1.7", current: "1.8.0", regulated: .success(false))
+        #expect(before.shown.isEmpty && before.recorded.isEmpty)
+        // Nothing was recorded, so the stored version is still "1.7".
+        let after = await run(acknowledged: "1.7", current: "1.8.0", regulated: .success(true), required: .success(true))
+        #expect(after.shown == ["1.8"])
+        #expect(after.recorded == ["1.8"])
+        #expect(after.events == ["show", "record"], "recorded only after the notice")
+    }
+
+    @Test func whereTheRulesApplyButNoNoticeIsRequiredTheVersionIsRecorded() async {
+        let calls = await run(acknowledged: "1.7", current: "1.8.0", regulated: .success(true), required: .success(false))
+        #expect(calls.shown.isEmpty)
+        #expect(calls.recorded == ["1.8"])
+    }
+
+    @Test func aFailedRegionQuestionShowsAndRecordsNothing() async {
+        let calls = await run(acknowledged: "1.7", current: "1.8.0", regulated: .failure(Failure()))
+        #expect(calls.shown.isEmpty)
+        #expect(calls.recorded.isEmpty)
+        #expect(calls.noticeAsked == 0)
+    }
+
+    @Test func aFailedNoticeQuestionShowsAndRecordsNothing() async {
+        let calls = await run(acknowledged: "1.7", current: "1.8.0", regulated: .success(true), required: .failure(Failure()))
+        #expect(calls.shown.isEmpty)
+        #expect(calls.recorded.isEmpty)
+    }
+
+    @Test func aFailedNoticeRecordsNothing() async {
+        let calls = await run(acknowledged: "1.7", current: "1.8.0", regulated: .success(true), showFails: true)
+        #expect(calls.events == ["show"])
+        #expect(calls.recorded.isEmpty, "asked again on the next foreground")
+    }
+
+    @Test func theFirstRunOnlyRecordsAndTheSameVersionDoesNothing() async {
+        let first = await run(acknowledged: nil, current: "1.8.2", regulated: .success(true))
+        #expect(first.recorded == ["1.8"])
+        #expect(first.shown.isEmpty && first.regionAsked == 0 && first.noticeAsked == 0)
+
+        let same = await run(acknowledged: "1.8", current: "1.8.2", regulated: .success(true))
+        #expect(same.events.isEmpty && same.regionAsked == 0 && same.noticeAsked == 0)
+
+        let notAVersion = await run(acknowledged: "1.7", current: "x", regulated: .success(true))
+        #expect(notAVersion.events.isEmpty && notAVersion.regionAsked == 0)
+    }
+}
+
 /// Apple's age sheet does not run in the Simulator (Apple DTS), so these give
 /// `AppStoreAgeCheck.decide` the answers iOS would give and check what the app
 /// then shows (owner 2026-10-09: simulated answers stand in for a device test).
