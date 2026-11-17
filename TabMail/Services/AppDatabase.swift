@@ -4526,7 +4526,9 @@ final class AppDatabase: Sendable {
     /// (`messageHeader_rfc822MessageId`, `messageHeader_accountId_messageId`) because without
     /// statistics, the state an upgrade runs in, SQLite walks the account
     /// (`ChatStore.findByStableIdSQL`). Copies pick the Inbox one, then the lowest id, as the
-    /// app did. A session with no email has a NULL new key and is left alone.
+    /// app did. A session with no email has a NULL new key and is left alone. The `thread:` prefix
+    /// is written here, not read from `ChatThreadKey.prefix`: a migration must not change with app
+    /// code, and the v107 key test fails if the two ever differ.
     static func rekeyChatSessionsByThreadSQL(table: String) -> String {
         let uid = "h.messageId != '' AND h.messageId NOT GLOB '*[^0-9]*' AND CAST(h.messageId AS INTEGER) BETWEEN 0 AND 4294967295"
         let threadId = "CASE WHEN h.computedThreadId = '' THEN h.id ELSE h.computedThreadId END"
@@ -4534,7 +4536,7 @@ final class AppDatabase: Sendable {
             UPDATE \(table) SET sessionId = m.newId
             FROM (
                 SELECT s.oldId AS oldId,
-                       s.scope || '\(ChatThreadKey.prefix)' || s.acct || ':' || COALESCE(
+                       s.scope || 'thread:' || s.acct || ':' || COALESCE(
                            (SELECT \(threadId) FROM messageHeader AS h INDEXED BY messageHeader_rfc822MessageId
                              WHERE h.rfc822MessageId = s.stable AND h.accountId = s.acct AND \(uid)
                              ORDER BY h.isInInbox DESC, h.id ASC LIMIT 1),
