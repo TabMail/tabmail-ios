@@ -496,7 +496,10 @@ actor AccountManager {
     /// Serial queue for ALL local DB writes from user actions.
     /// Ensures writes commit in the same order the user performed them,
     /// eliminating races between concurrent Tasks (e.g., markRead + move).
-    private var writeQueue: [@Sendable () async -> Void] = []
+    /// Each closure carries the `FolderResetGeneration` stamp taken when it was
+    /// enqueued; the drain runs it under that stamp, so an admission inside it
+    /// refuses a folder whose id reset finished after the gesture.
+    private var writeQueue: [(stamp: UInt64, work: @Sendable () async -> Void)] = []
     private var isDrainingLocalWrites = false
 
     /// Synchronous admission ledger for callers that cannot `await` the actor
@@ -507,12 +510,46 @@ actor AccountManager {
     private struct WriteAdmissions: Sendable {
         var nextToken: UInt64 = 0
         var notYetEnqueued: Set<UInt64> = []
+        #if DEBUG
+        var waitersForTesting = 0
+        #endif
     }
     private let writeAdmissions = Mutex(WriteAdmissions())
 
+    #if DEBUG
+    /// Test seam: publish a synchronous admission that has not reached the
+    /// FIFO yet, as an in-flight `enqueueWriteFromSynchronousContext` hop
+    /// does, until `releaseWriteAdmissionForTesting`.
+    nonisolated func holdWriteAdmissionForTesting() -> UInt64 {
+        writeAdmissions.withLock { admissions -> UInt64 in
+            admissions.nextToken &+= 1
+            admissions.notYetEnqueued.insert(admissions.nextToken)
+            return admissions.nextToken
+        }
+    }
+
+    nonisolated func releaseWriteAdmissionForTesting(_ token: UInt64) {
+        _ = writeAdmissions.withLock { $0.notYetEnqueued.remove(token) }
+    }
+
+    /// Test seam: awaited by every synchronous enqueue's actor hop before it
+    /// appends, so a test can hold the hop open.
+    nonisolated let enqueueHopHoldForTesting = Mutex<(@Sendable () async -> Void)?>(nil)
+
+    /// Test seam: calls of `enqueueWriteAfterPriorAdmissions` currently
+    /// waiting for earlier admissions.
+    nonisolated func writeAdmissionWaitersForTesting() -> Int {
+        writeAdmissions.withLock { $0.waitersForTesting }
+    }
+    #endif
+
     /// Enqueue a local DB write. Executes FIFO. Never blocks caller.
     func enqueueWrite(_ work: @escaping @Sendable () async -> Void) {
-        writeQueue.append(work)
+        enqueueWrite(work, stamp: FolderResetGeneration.stampForNewWork())
+    }
+
+    private func enqueueWrite(_ work: @escaping @Sendable () async -> Void, stamp: UInt64) {
+        writeQueue.append((stamp, work))
         if !isDrainingLocalWrites {
             isDrainingLocalWrites = true
             Task { await drainLocalWrites() }
@@ -526,6 +563,8 @@ actor AccountManager {
     nonisolated func enqueueWriteFromSynchronousContext(
         _ work: @escaping @Sendable () async -> Void
     ) {
+        // Stamped here, synchronously at gesture time, not after the actor hop.
+        let stamp = FolderResetGeneration.stampForNewWork()
         let token = writeAdmissions.withLock { admissions -> UInt64 in
             admissions.nextToken &+= 1
             let token = admissions.nextToken
@@ -533,7 +572,10 @@ actor AccountManager {
             return token
         }
         Task {
-            await self.enqueueWrite(work)
+            #if DEBUG
+            if let hold = enqueueHopHoldForTesting.withLock({ $0 }) { await hold() }
+            #endif
+            await self.enqueueWrite(work, stamp: stamp)
             _ = writeAdmissions.withLock { admissions in
                 admissions.notYetEnqueued.remove(token)
             }
@@ -542,8 +584,10 @@ actor AccountManager {
 
     private func drainLocalWrites() async {
         while !writeQueue.isEmpty {
-            let work = writeQueue.removeFirst()
-            await work()
+            let next = writeQueue.removeFirst()
+            await FolderResetGeneration.$gestureStamp.withValue(next.stamp) {
+                await next.work()
+            }
         }
         isDrainingLocalWrites = false
     }
@@ -592,13 +636,19 @@ actor AccountManager {
     func enqueueWriteAfterPriorAdmissions(
         _ work: @escaping @Sendable () async -> Void
     ) async {
+        // Stamped at entry, before the wait for earlier admissions.
+        let stamp = FolderResetGeneration.stampForNewWork()
         let admissionCeiling = writeAdmissions.withLock { $0.nextToken }
+        #if DEBUG
+        writeAdmissions.withLock { $0.waitersForTesting += 1 }
+        defer { writeAdmissions.withLock { $0.waitersForTesting -= 1 } }
+        #endif
         while writeAdmissions.withLock({ admissions in
             admissions.notYetEnqueued.contains { $0 <= admissionCeiling }
         }) {
             await Task.yield()
         }
-        enqueueWrite(work)
+        enqueueWrite(work, stamp: stamp)
     }
 
     /// Races `awaitWriteQueueDrain()` against a deadline: returns as soon as
@@ -1037,6 +1087,11 @@ actor AccountManager {
         /// gotten as their own cycle pre-coalescing — see `executeIntentCycle`'s
         /// retry loop (round-2 audit).
         var generation: Int = 0
+        /// The OLDEST `FolderResetGeneration` stamp among the intents that
+        /// joined this cycle; the executor's writes run under it, so an intent
+        /// taken before a folder's id reset cannot ride a newer cycle past the
+        /// refusal. Distinct from `generation`, which only counts joins.
+        var resetStamp: UInt64 = .max
     }
     private let pendingIntentCycles = Mutex<[String: IntentCycle]>([:])
 
@@ -1061,9 +1116,11 @@ actor AccountManager {
     /// + `enqueueWrite` directly.
     nonisolated func registerGestureIntent(id: String, _ intent: GestureIntent) {
         var mutation = PendingMutation()
+        let stamp = FolderResetGeneration.stampForNewWork()
         let isNewCycle = pendingIntentCycles.withLock { cycles -> Bool in
             let isNew = cycles[id] == nil
             var cycle = cycles[id] ?? IntentCycle()
+            cycle.resetStamp = min(cycle.resetStamp, stamp)
             switch intent {
             case .isRead(let target, let baseline):
                 if cycle.isReadBaseline == nil { cycle.isReadBaseline = baseline }
@@ -1182,41 +1239,47 @@ actor AccountManager {
         // releases — the exact symptom class this register exists to kill.
         // Bonus: a write the DB already reflects is skipped as redundant
         // (no PendingOperation, no remote round-trip).
-        var wroteAnything = false
-        if let target = cycle.isReadTarget, target != header.isRead {
-            if target { await markRead([header]) } else { await markUnread([header]) }
-            wroteAnything = true
-        }
-        if let target = cycle.isFlaggedTarget, target != header.isFlagged {
-            await markFlagged([header], flagged: target)
-            wroteAnything = true
-        }
-        if case let .some(target) = cycle.actionTagTarget {
-            if !header.isInInbox {
-                // Tags are inbox-scoped (ADR-IOS-036) and F6 clears actionTag
-                // the moment a row leaves the inbox — both tag-gesture UI
-                // entry points are gated on isInInbox, so a legitimate tag
-                // intent whose RESOLVED header has already left the inbox
-                // means a move (e.g. archive/delete) ran after this gesture:
-                // closure-reorder race, since both enqueue via unstructured
-                // Tasks with no FIFO ordering guarantee between them. The
-                // move is the LATER user action, and its tag-clear wins —
-                // this matches serial-replay ordering. Skip reinstating a
-                // stale tag on a row that already left the inbox.
-                BackgroundSyncLogger.logInbox("[AccountManager] executeIntentCycle — skipping tag write for \(id), header left inbox (isInInbox=false)")
-            } else if target != header.actionTag {
-                // previousTag semantics: `applyManualTag` reads
-                // `message.actionTag` as the "before" value for the LLM
-                // auto-teach signal (originalAction). Feed it the
-                // gesture-time visualized baseline, not drain-time DB
-                // truth — a concurrent AI auto-tag landing in the
-                // gesture→drain gap must not masquerade as the tag the user
-                // overrode.
-                var tagHeader = header
-                tagHeader.actionTag = cycle.actionTagBaseline ?? nil  // outer .some guaranteed when touched
-                await applyManualTag(tagHeader, tag: target)
+        // The write section runs under the cycle's oldest stamp, not the stamp
+        // of the queue item (the first joiner's), so every joined intent is
+        // checked against the folder's id resets.
+        let wroteAnything = await FolderResetGeneration.$gestureStamp.withValue(cycle.resetStamp) { () async -> Bool in
+            var wroteAnything = false
+            if let target = cycle.isReadTarget, target != header.isRead {
+                if target { await markRead([header]) } else { await markUnread([header]) }
                 wroteAnything = true
             }
+            if let target = cycle.isFlaggedTarget, target != header.isFlagged {
+                await markFlagged([header], flagged: target)
+                wroteAnything = true
+            }
+            if case let .some(target) = cycle.actionTagTarget {
+                if !header.isInInbox {
+                    // Tags are inbox-scoped (ADR-IOS-036) and F6 clears actionTag
+                    // the moment a row leaves the inbox — both tag-gesture UI
+                    // entry points are gated on isInInbox, so a legitimate tag
+                    // intent whose RESOLVED header has already left the inbox
+                    // means a move (e.g. archive/delete) ran after this gesture:
+                    // closure-reorder race, since both enqueue via unstructured
+                    // Tasks with no FIFO ordering guarantee between them. The
+                    // move is the LATER user action, and its tag-clear wins —
+                    // this matches serial-replay ordering. Skip reinstating a
+                    // stale tag on a row that already left the inbox.
+                    BackgroundSyncLogger.logInbox("[AccountManager] executeIntentCycle — skipping tag write for \(id), header left inbox (isInInbox=false)")
+                } else if target != header.actionTag {
+                    // previousTag semantics: `applyManualTag` reads
+                    // `message.actionTag` as the "before" value for the LLM
+                    // auto-teach signal (originalAction). Feed it the
+                    // gesture-time visualized baseline, not drain-time DB
+                    // truth — a concurrent AI auto-tag landing in the
+                    // gesture→drain gap must not masquerade as the tag the user
+                    // overrode.
+                    var tagHeader = header
+                    tagHeader.actionTag = cycle.actionTagBaseline ?? nil  // outer .some guaranteed when touched
+                    await applyManualTag(tagHeader, tag: target)
+                    wroteAnything = true
+                }
+            }
+            return wroteAnything
         }
         // Cancel-out (every touched field's target already matches the row):
         // nothing ran above — no local write, no unreadCount churn, no badge

@@ -849,6 +849,14 @@ extension AccountManager {
                     _ = try PendingOperation.deleteOne(db, key: op.id)
                     BackgroundSyncLogger.log("[UIDValidity] dropped address-only op \(op.type.rawValue) \(op.id.prefix(8)) on \(folderId) — recorded under UIDVALIDITY \(op.observedUidValidity.map(String.init) ?? "?"), server now \(fresh); its UIDs belong to the epoch the server discarded (exit 4)")
                 }
+                // Before the new epoch becomes admissible: every gesture stamped
+                // earlier (queued work, a surface read before the reset) is
+                // refused for this folder, because the resync re-seats different
+                // emails at its ids. Only on this stamping path, so an idempotent
+                // re-drive does not refuse gestures taken after the real stamp. A
+                // rolled-back transaction leaves the bump in place, which only
+                // refuses more pre-reset work.
+                FolderResetGeneration.recordReset(folderId: folderId)
                 folder.lastKnownUidValidity = Int(fresh)
                 folder.uidValidityResetPendingAt = nil
                 try folder.update(db)
