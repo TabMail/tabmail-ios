@@ -743,13 +743,23 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    times out ends the pass instead (2026-11-17): the reader has closed its side, but a server that
    stopped answering counts that session until it notices, and the client has no signal for when it
    does, so a new login could hold two sessions against the account's connection limit. The folders
-   not yet read wait for the next pass. A session dropped while its connection still answers (a
+   not yet read wait for the next pass, which reads them first and the folder that timed out last
+   (2026-11-17), so a folder whose read times out on every pass never keeps the account's other
+   folders from being read. The inbox keeps first place until its read has timed out on
+   `SyncConfig.imapChangeInboxTimeoutsBeforeReadLast` (2) passes in a row, and a successful inbox
+   read starts that count again (2026-11-17): one passing timeout never delays new mail behind the
+   other folders (with every other folder changed, that delay is about four round trips per folder,
+   up to the 20 s read budget), and an inbox that keeps timing out holds the others back for at most
+   two passes. A session dropped while its connection still answers (a
    liveness NOOP answered with an error) logs in again only once its LOGOUT has been answered,
-   waited for at most `imapEvictionLogoutWaitSeconds`; a liveness NOOP that times out reopens the
+   waited for at most `imapEvictionLogoutWaitSeconds`; a LOGOUT that times out, in that wait or in
+   the IMAP library's own command timeout, has not ended the session and ends the pass; a liveness NOOP that times out reopens the
    session once, before any folder is read. A session that cannot be opened again
    mid-pass, a read that timed out, a dropped one whose LOGOUT does not end in time, or a teardown
-   (`markDirty`, `disconnect`, after which no session is opened in that pass) fails the folders not
-   yet read with no failure time.
+   (`markDirty`, `disconnect`) fails the folders not yet read with no failure time. A teardown ends
+   the pass wherever it lands, while a session is awaited or opened included: no new session logs in
+   for that pass, and since it is the app's own act it leaves no failure time even before the pass's
+   first session has opened (2026-11-17).
 10. **Accepted cost.** A server advertising QRESYNC without CONDSTORE gets no HIGHESTMODSEQ in STATUS,
    so every tracked folder does a QRESYNC SELECT each pass (no fast path). Work, not loss.
 11. **Exit rule: a move that leaves a folder's view possibly wrong** (2026-11-15). ADR-IOS-073

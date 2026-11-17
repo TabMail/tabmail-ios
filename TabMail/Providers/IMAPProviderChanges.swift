@@ -137,8 +137,9 @@ extension IMAPProvider {
         let generationAtStart = generation
         while next < work.count, !budgetSpent {
             var closedByServer = false
+            var timedOut: String?
             do {
-                try await withChangeConnection { server, qresync in
+                try await withChangeConnection(openingIn: generationAtStart) { server, qresync in
                     // Let the session catch up with other connections' changes before
                     // the STATUS reads (some servers answer STATUS from a cached view).
                     try await withTimeout(seconds: SyncConfig.changeReadRequestTimeoutSeconds) {
@@ -151,9 +152,12 @@ extension IMAPProvider {
                     while next < work.count {
                         guard context.hasBudget() else { budgetSpent = true; return }
                         let folder = work[next]
+                        changeReadFirst.remove(folder.id)
+                        if changeReadLast == folder.id { changeReadLast = nil }
                         do {
                             results[folder.id] = try await self.readChangeFolder(
                                 folder, server: server, qresync: qresync, request: request)
+                            if folder.role == .inbox { changeInboxTimeouts = 0 }
                         } catch {
                             // The folder's read failed, whatever the cause: it keeps its
                             // failure time, so a folder whose SELECT or FETCH always
@@ -166,6 +170,10 @@ extension IMAPProvider {
                                 // read on a new session. Timed out: the pass ends.
                                 next += 1
                                 closedByServer = !(error is TimeoutError)
+                                if error is TimeoutError {
+                                    timedOut = folder.id
+                                    if folder.role == .inbox { changeInboxTimeouts += 1 }
+                                }
                                 throw error
                             }
                         }
@@ -177,6 +185,13 @@ extension IMAPProvider {
                     BackgroundSyncLogger.logDebug("[IMAPChanges] session ended on \(error)")
                 }
                 if closedByServer, generation == generationAtStart { continue }
+                if let timedOut {
+                    // The next pass reads the folders left unread first and the one
+                    // that timed out last (the inbox stays first until its read has
+                    // timed out on several passes in a row).
+                    changeReadFirst.formUnion(work[next...].map(\.id))
+                    changeReadLast = timedOut
+                }
                 for folder in work[next...] where results[folder.id] == nil {
                     // No session could be opened (connect, CAPABILITY, ENABLE or the
                     // pass-start NOOP failed). On the pass's first session every
@@ -184,9 +199,10 @@ extension IMAPProvider {
                     // connection the server always refuses never freezes the tracked
                     // folders. After a session was opened (one that cannot be opened
                     // again, a read that timed out, a dropped one that did not end in
-                    // time, or a teardown that ended the pass) the folders not yet
-                    // read fail with no failure time and are read on the next pass.
-                    results[folder.id] = sessionOpened
+                    // time), or after a teardown that ended the pass at any point, the
+                    // folders not yet read fail with no failure time and are read on
+                    // the next pass.
+                    results[folder.id] = sessionOpened || generation != generationAtStart
                         ? FolderChanges(folderId: folder.id, status: .failed(error))
                         : Self.failedFolder(folder, error: error, now: context.clock())
                 }
@@ -200,7 +216,11 @@ extension IMAPProvider {
 
     /// The folders this pass reads, in order: on a `.all` pass every synced folder
     /// and every folder with a re-read list, inbox first, the rest rotated by one
-    /// each pass; on `.inboxOnly` the inbox only.
+    /// each pass; on `.inboxOnly` the inbox only. After a pass that ended on a
+    /// read that timed out, the folders it left unread come first and the folder
+    /// that timed out comes last, except that the inbox stays first until its read
+    /// has timed out on several passes in a row
+    /// (`readFirst(_:first:last:inboxTimeouts:)`).
     func changeReadOrder(_ request: ChangeRequest) -> [ChangeFolder] {
         let candidates = request.folders.filter { folder in
             guard !folder.path.isEmpty else { return false }
@@ -214,7 +234,24 @@ extension IMAPProvider {
         guard !rest.isEmpty else { return inbox }
         let start = changeRotation % rest.count
         changeRotation &+= 1
-        return inbox + Array(rest[start...] + rest[..<start])
+        return Self.readFirst(
+            inbox + Array(rest[start...] + rest[..<start]),
+            first: changeReadFirst, last: changeReadLast, inboxTimeouts: changeInboxTimeouts)
+    }
+
+    /// `order` with the folders in `first` moved to the front and the folder
+    /// `last` moved to the end, each group keeping its order. The inbox stays at
+    /// the front until its read has timed out on
+    /// `SyncConfig.imapChangeInboxTimeoutsBeforeReadLast` passes in a row
+    /// (`inboxTimeouts`): one timeout never delays new mail behind the others.
+    nonisolated static func readFirst(
+        _ order: [ChangeFolder], first: Set<String>, last: String?, inboxTimeouts: Int
+    ) -> [ChangeFolder] {
+        let lead = order.filter { first.contains($0.id) && $0.id != last }
+        let middle = order.filter { !first.contains($0.id) && $0.id != last }
+        let moved = lead + middle + order.filter { $0.id == last }
+        guard inboxTimeouts < SyncConfig.imapChangeInboxTimeoutsBeforeReadLast else { return moved }
+        return moved.filter { $0.role == .inbox } + moved.filter { $0.role != .inbox }
     }
 
     /// A folder-level failure: the bookmark is kept, with the time its reads
@@ -651,8 +688,13 @@ extension IMAPProvider {
     /// opened on first use with reconnects inside commands off and, on a server
     /// advertising QRESYNC, `ENABLE QRESYNC` once for the session; `qresync` says
     /// whether the server acknowledged it. A failure that leaves the session
-    /// unusable drops the connection; the next pass opens a new session.
+    /// unusable drops the connection; the next pass opens a new session. A
+    /// session is used or opened only while `generation` is still
+    /// `passGeneration`, the generation the pass started in: after a teardown
+    /// (`markDirty`, `disconnect`) at any suspension of the pass, no session logs
+    /// in for it.
     func withChangeConnection<T>(
+        openingIn passGeneration: Int,
         _ body: (IMAPServer, Bool) async throws -> T
     ) async throws -> T {
         while changeLaneBusy {
@@ -664,7 +706,7 @@ extension IMAPProvider {
             if !changeLaneWaiters.isEmpty { changeLaneWaiters.removeFirst().resume() }
         }
 
-        let (server, qresync) = try await changeSession()
+        let (server, qresync) = try await changeSession(passGeneration)
         do {
             let result = try await body(server, qresync)
             changeServerLastUsed = Date()
@@ -675,8 +717,10 @@ extension IMAPProvider {
         }
     }
 
-    /// The live change session, or a new one.
-    private func changeSession() async throws -> (IMAPServer, Bool) {
+    /// The live change session, or a new one, for a pass that started in
+    /// `passGeneration`.
+    private func changeSession(_ passGeneration: Int) async throws -> (IMAPServer, Bool) {
+        guard generation == passGeneration else { throw ProviderError.notConnected }
         if let server = changeServer {
             guard Self.shouldCheckConnectionLiveness(lastUsed: changeServerLastUsed, now: Date()) else {
                 return (server, changeServerQResync)
@@ -696,7 +740,8 @@ extension IMAPProvider {
         // is reopened. A timed-out folder read never gets here: it ends the pass
         // (`fetchChanges`).
         guard await droppedChangeSessionEnded() else { throw ProviderError.notConnected }
-        let generationAtStart = generation
+        // Torn down while the liveness check or the LOGOUT was awaited: no login.
+        guard generation == passGeneration else { throw ProviderError.notConnected }
         let fresh = try await createChangeServer()
         await fresh.setReconnectsInsideCommands(false)
         var qresync = false
@@ -714,7 +759,7 @@ extension IMAPProvider {
             detachedTeardownLogout(fresh)
             throw error
         }
-        guard generation == generationAtStart, changeServer == nil else {
+        guard generation == passGeneration, changeServer == nil else {
             // Torn down while opening (markDirty/disconnect): never plant.
             detachedTeardownLogout(fresh)
             throw ProviderError.notConnected
@@ -753,19 +798,23 @@ extension IMAPProvider {
             changeServerQResync = false
             changeSelectedPath = nil
         }
-        changeLogout = detachedTeardownLogout(server)
+        changeLogout = detachedTeardownLogoutEnded(server)
     }
 
     /// Wait, at most `SyncConfig.imapEvictionLogoutWaitSeconds`, for the LOGOUT
     /// of the change session dropped last: true once it has ended (answered, or
-    /// failed on a connection already closed). The server counts a session
-    /// until then, against the account's connection limit.
+    /// failed on a connection already closed); false when it is still running
+    /// or timed out, in this wait or in the IMAP library's own command timeout.
+    /// The server counts a session until it has ended, against the account's
+    /// connection limit.
     private func droppedChangeSessionEnded() async -> Bool {
         guard let logout = changeLogout else { return true }
-        let ended = (try? await withTimeout(seconds: SyncConfig.imapEvictionLogoutWaitSeconds) {
+        guard let ended = try? await withTimeout(seconds: SyncConfig.imapEvictionLogoutWaitSeconds, operation: {
             await logout.value
-        }) != nil
-        if ended, changeLogout == logout { changeLogout = nil }
+        }) else { return false }
+        // Settled either way: a LOGOUT that timed out ends this pass only, and the
+        // next pass opens a session.
+        if changeLogout == logout { changeLogout = nil }
         return ended
     }
 }

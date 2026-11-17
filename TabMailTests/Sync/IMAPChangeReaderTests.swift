@@ -790,6 +790,348 @@ struct IMAPChangeReaderTests {
         }
     }
 
+    @Test("A dropped change session whose LOGOUT is not answered within the wait ends the pass: no new session logs in")
+    func unansweredLogoutEndsThePass() async throws {
+        try await Self.withWorld(inbox: [1, 2]) { w in
+            let cursor = try await Self.baseline(w)
+            await w.provider.setChangeServerLastUsedForTesting(.distantPast)
+            w.server.failNextCommand(containing: "NOOP")
+            w.server.stallNextCommand(containing: "LOGOUT", seconds: SyncConfig.imapEvictionLogoutWaitSeconds + 1)
+            w.server.resetPeakSessionCount()
+            let sessionsBefore = w.server.peakSessionCount()
+            let loginsBefore = Self.logins(w)
+            let start = Date()
+            let changes = try await Self.inbox(w, Self.read(w, cursors: [w.inboxId: cursor], context: Self.fixedClock(start)))
+            #expect(w.server.recordedCommands().contains { $0.uppercased().hasPrefix("LOGOUT") }, "setup: the dropped session logged out")
+            #expect(Self.logins(w) == loginsBefore, "a session logged in while the dropped one still counted: \(Self.logins(w) - loginsBefore)")
+            #expect(w.server.peakSessionCount() <= sessionsBefore,
+                    "sessions counted by the server: \(w.server.peakSessionCount()), before: \(sessionsBefore)")
+            guard case .failed = changes.status else { Issue.record("expected failed, got \(changes.status)"); return }
+            #expect(try #require(IMAPChangeCursor.decode(changes.cursor)).failingSince == start,
+                    "no session could be opened in the pass: the folder keeps a failure time")
+        }
+    }
+
+    @Test("A teardown while a dropped session's LOGOUT is awaited: no session logs in for that pass, and its folders fail with no failure time")
+    func teardownDuringLogoutWaitOpensNoSession() async throws {
+        try await Self.withWorld(inbox: [1, 2]) { w in
+            let cursor = try await Self.baseline(w)
+            await w.provider.setChangeServerLastUsedForTesting(.distantPast)
+            w.server.failNextCommand(containing: "NOOP")
+            w.server.stallNextCommand(containing: "LOGOUT", seconds: SyncConfig.imapEvictionLogoutWaitSeconds / 2)
+            let provider = w.provider
+            let fired = Locked(false)
+            // The dropped session's LOGOUT is the first one: a teardown starts
+            // while the pass waits for it.
+            await provider.setBeforeLogoutTestHookForTesting { _, _ in
+                guard !fired.get() else { return }
+                fired.set(true)
+                Task { await provider.markDirty() }
+            }
+            let loginsBefore = Self.logins(w)
+            let changes = try await Self.inbox(w, Self.read(w, cursors: [w.inboxId: cursor]))
+            await provider.setBeforeLogoutTestHookForTesting(nil)
+            #expect(fired.get(), "setup: the dropped session logged out")
+            #expect(Self.logins(w) == loginsBefore, "a session logged in after the teardown: \(Self.logins(w) - loginsBefore)")
+            guard case .failed = changes.status else { Issue.record("expected failed, got \(changes.status)"); return }
+            #expect(changes.cursor == nil, "a teardown leaves no failure time")
+        }
+    }
+
+    @Test("The read budget running out between two folders ends the pass: nothing more is sent and the folders not yet read are not run")
+    func budgetSpentBetweenFoldersEndsThePass() async throws {
+        try await Self.withWorld(inbox: [1, 2], archive: [1]) { w in
+            let first = try await Self.read(w, archiveSynced: true)
+            let inboxCursor = try #require(try Self.inbox(w, first).cursor)
+            let archiveCursor = try #require(first.folders.first { $0.folderId == w.archiveId }?.cursor)
+            // The inbox: a changed flag (a held-row lookup). The archive: an arrival.
+            w.server.setFlags(["\\Seen"], in: Self.inboxPath, uid: 1)
+            w.server.setMessages([1, 2].map(Self.message), in: Self.archivePath)
+            let start = Date()
+            let now = Locked(start)
+            let server = w.server
+            let sentAtExpiry = Locked(0)
+            // The budget runs out during the inbox's read. Should the pass go on,
+            // its next NOOP is answered by a closed connection, so it cannot spin.
+            w.local.runOnceAtNextHeldLookup {
+                now.set(start.addingTimeInterval(SyncConfig.changeReadRequestTimeoutSeconds * 100))
+                sentAtExpiry.set(server.recordedCommands().count)
+                server.killConnectionOnNextCommand(containing: "NOOP")
+            }
+            let set = try await Self.read(
+                w, cursors: [w.inboxId: inboxCursor, w.archiveId: archiveCursor], archiveSynced: true,
+                context: ChangeContext(
+                    deadline: start.addingTimeInterval(SyncConfig.changeReadRequestTimeoutSeconds * 10),
+                    clock: { now.get() }, onProgress: { _ in }))
+            let after = w.server.recordedCommands().dropFirst(sentAtExpiry.get())
+            #expect(!after.contains { ["NOOP", "STATUS", "SELECT"].contains(where: $0.uppercased().hasPrefix) },
+                    "sent after the budget ran out: \(Array(after))")
+            let archive = try Self.status(set, w.archiveId)
+            guard case .notRun = archive.status else { Issue.record("archive: expected notRun, got \(archive.status)"); return }
+            #expect(archive.cursor == nil && archive.records.isEmpty)
+        }
+    }
+
+    /// Stall the inbox's next STATUS past its timeout (the mailbox name is sent
+    /// as an atom or a quoted string; the form not sent stays unused).
+    static func stallInboxStatus(_ w: World) {
+        for fragment in ["STATUS INBOX ", "STATUS \"INBOX\""] {
+            w.server.stallNextCommand(containing: fragment, seconds: SyncConfig.changeReadRequestTimeoutSeconds + 1)
+        }
+    }
+
+    /// One `.all` pass over the inbox and the archive (new mail up to `newest`)
+    /// whose inbox read times out on its STATUS. The inbox is observed by STATUS:
+    /// the previous pass's timeout dropped the session, or it selected the
+    /// archive last.
+    static func passWithInboxTimingOut(
+        _ w: World, inboxCursor: String, archiveCursor: String, newest: Int, start: Date
+    ) async throws -> ChangeSet {
+        w.server.setMessages((1...newest).map(Self.message), in: Self.archivePath)
+        Self.stallInboxStatus(w)
+        return try await Self.read(
+            w, cursors: [w.inboxId: inboxCursor, w.archiveId: archiveCursor], archiveSynced: true,
+            context: Self.fixedClock(start))
+    }
+
+    /// Pass 1 of the inbox timeout tests: the inbox changed and its QRESYNC
+    /// SELECT times out, so the archive (with new mail 2) is left unread.
+    /// Returns the inbox's and the archive's bookmarks after it.
+    static func firstInboxTimeout(_ w: World, start: Date) async throws -> (inbox: String, archive: String)? {
+        let first = try await Self.read(w, archiveSynced: true)
+        let archiveCursor = try #require(first.folders.first { $0.folderId == w.archiveId }?.cursor)
+        let inboxCursor = try #require(try Self.inbox(w, first).cursor)
+        w.server.setFlags(["\\Seen"], in: Self.inboxPath, uid: 1)
+        w.server.setMessages([1, 2].map(Self.message), in: Self.archivePath)
+        w.server.stallNextCommand(containing: "QRESYNC (", seconds: SyncConfig.changeReadRequestTimeoutSeconds + 1)
+        let pass = try await Self.read(
+            w, cursors: [w.inboxId: inboxCursor, w.archiveId: archiveCursor], archiveSynced: true,
+            context: Self.fixedClock(start))
+        let skipped = try Self.status(pass, w.archiveId)
+        guard case .failed = skipped.status, skipped.cursor == nil else {
+            Issue.record("setup: the archive is left unread by the inbox's timeout, got \(skipped.status)"); return nil
+        }
+        return (try #require(try Self.inbox(w, pass).cursor), archiveCursor)
+    }
+
+    @Test("One inbox read that times out keeps the inbox first on the next pass: a passing blip never delays new mail behind the other folders")
+    func oneInboxTimeoutKeepsTheInboxFirst() async throws {
+        try await Self.withWorld(inbox: [1, 2], archive: [1]) { w in
+            let start = Date()
+            guard let cursors = try await Self.firstInboxTimeout(w, start: start) else { return }
+            // Pass 2: the inbox is read first again, and times out again.
+            let set = try await Self.passWithInboxTimingOut(
+                w, inboxCursor: cursors.inbox, archiveCursor: cursors.archive, newest: 2, start: start)
+            let inbox = try Self.inbox(w, set)
+            guard case .failed = inbox.status else { Issue.record("setup: the inbox's read times out, got \(inbox.status)"); return }
+            let archive = try Self.status(set, w.archiveId)
+            guard case .failed = archive.status else { Issue.record("the inbox is read first: the archive waits, got \(archive.status)"); return }
+            #expect(archive.cursor == nil, "the archive was never read in the pass")
+        }
+    }
+
+    @Test("An inbox whose read times out on every pass never keeps the other tracked folders from being read: after two timeouts in a row they are read before it")
+    func inboxTimingOutOnEveryPassLeavesNoFolderUnread() async throws {
+        try await Self.withWorld(inbox: [1, 2], archive: [1]) { w in
+            let start = Date()
+            guard let cursors = try await Self.firstInboxTimeout(w, start: start) else { return }
+            var inboxCursor = cursors.inbox
+            var archiveCursor = cursors.archive
+            // Pass 2: the inbox's second timeout in a row; the archive still waits.
+            let second = try await Self.passWithInboxTimingOut(
+                w, inboxCursor: inboxCursor, archiveCursor: archiveCursor, newest: 2, start: start)
+            let waiting = try Self.status(second, w.archiveId)
+            guard case .failed = waiting.status, waiting.cursor == nil else {
+                Issue.record("setup: one timeout keeps the inbox first, got \(waiting.status)"); return
+            }
+            if let cursor = try Self.inbox(w, second).cursor { inboxCursor = cursor }
+            // Passes 3 and 4: the archive is read before the inbox; its new mail arrives each time.
+            for newest in [3, 4] {
+                let set = try await Self.passWithInboxTimingOut(
+                    w, inboxCursor: inboxCursor, archiveCursor: archiveCursor, newest: newest, start: start)
+                let archive = try Self.status(set, w.archiveId)
+                #expect(Self.isTracked(archive.status), "with message \(newest): the archive is read, got \(archive.status)")
+                #expect(archive.records.contains { $0.messageId == String(newest) }, "its new mail \(newest) arrives")
+                let inbox = try Self.inbox(w, set)
+                guard case .failed = inbox.status else { Issue.record("setup: the inbox's read times out, got \(inbox.status)"); return }
+                if let cursor = archive.cursor { archiveCursor = cursor }
+                if let cursor = inbox.cursor { inboxCursor = cursor }
+            }
+        }
+    }
+
+    @Test("A successful inbox read between two inbox timeouts starts the count again: the inbox stays first")
+    func successfulInboxReadResetsTheTimeoutCount() async throws {
+        try await Self.withWorld(inbox: [1, 2], archive: [1]) { w in
+            let start = Date()
+            guard let cursors = try await Self.firstInboxTimeout(w, start: start) else { return }
+            // Pass 2: everything is read (the archive last, so the inbox is
+            // observed by STATUS on the next pass).
+            let read = try await Self.read(
+                w, cursors: [w.inboxId: cursors.inbox, w.archiveId: cursors.archive], archiveSynced: true,
+                context: Self.fixedClock(start))
+            let readInbox = try Self.inbox(w, read)
+            let readArchive = try Self.status(read, w.archiveId)
+            guard Self.isTracked(readInbox.status), Self.isTracked(readArchive.status),
+                  let inboxCursor = readInbox.cursor, let archiveCursor = readArchive.cursor else {
+                Issue.record("setup: the pass reads both folders, got \(readInbox.status), \(readArchive.status)"); return
+            }
+            // Passes 3 and 4: the inbox times out on both. One timeout since the
+            // successful read: the archive waits on both.
+            var current = (inbox: inboxCursor, archive: archiveCursor)
+            for newest in [3, 4] {
+                let set = try await Self.passWithInboxTimingOut(
+                    w, inboxCursor: current.inbox, archiveCursor: current.archive, newest: newest, start: start)
+                let inbox = try Self.inbox(w, set)
+                guard case .failed = inbox.status else { Issue.record("setup: the inbox's read times out, got \(inbox.status)"); return }
+                let archive = try Self.status(set, w.archiveId)
+                if newest == 3 {
+                    guard case .failed = archive.status, archive.cursor == nil else {
+                        Issue.record("setup: the first timeout keeps the inbox first, got \(archive.status)"); return
+                    }
+                } else {
+                    guard case .failed = archive.status else {
+                        Issue.record("the count started again at the successful read: the inbox stays first, got \(archive.status)"); return
+                    }
+                    #expect(archive.cursor == nil, "the archive was never read in the pass")
+                }
+                if let cursor = inbox.cursor { current.inbox = cursor }
+            }
+        }
+    }
+
+    static let extraPaths = ["Projects", "Receipts", "Travel"]
+
+    /// The inbox, the archive and the three `extraPaths` folders, all synced.
+    static func requestWithExtras(_ w: World, cursors: [String: String?], context: ChangeContext) -> ChangeRequest {
+        let folders = Self.folders(w, cursors: cursors, archiveSynced: true) + extraPaths.map { path in
+            let id = "\(w.accountId):\(path)"
+            return ChangeFolder(id: id, path: path, role: .custom, cursor: cursors[id] ?? nil, isSynced: true,
+                                addressEpoch: Self.epoch, olderMailComplete: true, olderMailCursor: nil)
+        }
+        return ChangeRequest(folders: folders, scope: .all, recheck: [:], context: context, localRows: w.local)
+    }
+
+    static func readWithExtras(_ w: World, _ cursors: [String: String?], context: ChangeContext) async throws -> ChangeSet {
+        try #require(try await w.provider.fetchChanges(since: ChangeCursor(account: nil),
+                                                       request: requestWithExtras(w, cursors: cursors, context: context)))
+    }
+
+    /// Stall the next QRESYNC SELECT of `path` past its timeout (the name is
+    /// sent as an atom or a quoted string; the form not sent stays unused).
+    static func stallSelect(_ w: World, _ path: String) {
+        for fragment in ["SELECT \(path) (QRESYNC", "SELECT \"\(path)\" (QRESYNC"] {
+            w.server.stallNextCommand(containing: fragment, seconds: SyncConfig.changeReadRequestTimeoutSeconds + 1)
+        }
+    }
+
+    /// Four tracked folders besides the inbox, each with new mail 2, read in one
+    /// pass whose third read (`timedOut`) times out: `read` are read before it,
+    /// `leftUnread` is not. `nextRotation` is the order the following pass
+    /// starts from before any reordering. Nil after a setup failure.
+    struct FourFolderTimeout {
+        let read: [ChangeFolder]
+        let timedOut: ChangeFolder
+        let leftUnread: ChangeFolder
+        let nextRotation: [ChangeFolder]
+        var cursors: [String: String?]
+        let start: Date
+    }
+
+    static func fourFolderTimeout(_ w: World) async throws -> FourFolderTimeout? {
+        for path in extraPaths {
+            w.server.setMessages([Self.message(1)], in: path)
+            w.server.setUidValidity(Self.epoch, for: path)
+            w.local.set("\(w.accountId):\(path)", [1])
+        }
+        let baseline = try await readWithExtras(w, [:], context: ChangeContext(onProgress: { _ in }))
+        var cursors: [String: String?] = [:]
+        for folder in baseline.folders {
+            let cursor: String = try #require(folder.cursor)
+            cursors[folder.folderId] = cursor
+        }
+        // Each pass starts the rotation one folder further: the order of this
+        // (unread) peek, one step on, is pass 1's order.
+        let peek = await w.provider.changeReadOrder(
+            requestWithExtras(w, cursors: cursors, context: ChangeContext(onProgress: { _ in })))
+            .filter { $0.role != .inbox }
+        guard peek.count == 4 else { Issue.record("setup: four folders besides the inbox, got \(peek.map(\.id))"); return nil }
+        let order = Array(peek.dropFirst()) + [peek[0]]
+        for folder in order { w.server.setMessages([1, 2].map(Self.message), in: folder.path) }
+        Self.stallSelect(w, order[2].path)
+        let start = Date()
+        let pass = try await readWithExtras(w, cursors, context: Self.fixedClock(start))
+        let statuses = try order.map { try Self.status(pass, $0.id) }
+        guard Self.isTracked(statuses[0].status), Self.isTracked(statuses[1].status),
+              IMAPChangeCursor.decode(statuses[2].cursor)?.failingSince != nil,
+              case .failed = statuses[3].status, statuses[3].cursor == nil else {
+            Issue.record("setup: two folders read, the third times out, the fourth left unread, got \(statuses.map(\.status))"); return nil
+        }
+        for status in statuses { if let cursor = status.cursor { cursors[status.folderId] = cursor } }
+        return FourFolderTimeout(read: Array(order[0...1]), timedOut: order[2], leftUnread: order[3],
+                                 nextRotation: Array(order.dropFirst()) + [order[0]], cursors: cursors, start: start)
+    }
+
+    @Test("A folder a timed-out read left unread is read first on the next pass, before a folder the rotation puts ahead of it whose read times out")
+    func folderLeftUnreadIsReadFirstOnTheNextPass() async throws {
+        try await Self.withWorld(inbox: [1, 2], archive: [1]) { w in
+            guard let setup = try await Self.fourFolderTimeout(w) else { return }
+            // Pass 2: the folder the rotation alone would read first gets new mail,
+            // and its read times out.
+            let ahead = setup.nextRotation[0]
+            #expect(ahead.id == setup.read[1].id, "setup: the rotation puts the second folder read in pass 1 first")
+            w.server.setMessages([1, 2, 3].map(Self.message), in: ahead.path)
+            Self.stallSelect(w, ahead.path)
+            let pass = try await Self.readWithExtras(w, setup.cursors, context: Self.fixedClock(setup.start))
+            let aheadStatus = try Self.status(pass, ahead.id)
+            guard IMAPChangeCursor.decode(aheadStatus.cursor)?.failingSince != nil else {
+                Issue.record("setup: the folder ahead times out, got \(aheadStatus.status)"); return
+            }
+            let unread = try Self.status(pass, setup.leftUnread.id)
+            #expect(Self.isTracked(unread.status), "the folder left unread is read first, got \(unread.status)")
+            #expect(unread.records.contains { $0.messageId == "2" }, "its new mail arrives")
+        }
+    }
+
+    @Test("A folder whose read timed out is read last on the next pass: when it times out again, every other folder has been read")
+    func timedOutFolderIsReadLastOnTheNextPass() async throws {
+        try await Self.withWorld(inbox: [1, 2], archive: [1]) { w in
+            guard let setup = try await Self.fourFolderTimeout(w) else { return }
+            // Pass 2: every folder has new mail 3, and the one that timed out times out again.
+            for folder in setup.nextRotation { w.server.setMessages([1, 2, 3].map(Self.message), in: folder.path) }
+            #expect(setup.nextRotation.last?.id != setup.timedOut.id, "setup: the rotation alone would read a folder after it")
+            Self.stallSelect(w, setup.timedOut.path)
+            let pass = try await Self.readWithExtras(w, setup.cursors, context: Self.fixedClock(setup.start))
+            let again = try Self.status(pass, setup.timedOut.id)
+            guard IMAPChangeCursor.decode(again.cursor)?.failingSince != nil else {
+                Issue.record("setup: the folder times out again, got \(again.status)"); return
+            }
+            for folder in setup.read + [setup.leftUnread] {
+                let status = try Self.status(pass, folder.id)
+                #expect(Self.isTracked(status.status), "\(folder.path) is read before the folder that timed out, got \(status.status)")
+                #expect(status.records.contains { $0.messageId == "3" }, "\(folder.path): its new mail arrives")
+            }
+        }
+    }
+
+    @Test("Read order after a timed-out pass: the folders left unread first, the folder that timed out last; the inbox stays first until its read has timed out on several passes in a row")
+    func readOrderAfterATimeout() {
+        let ids = ["inbox", "a", "b", "c", "d"]
+        let order = ids.map {
+            ChangeFolder(id: $0, path: $0, role: $0 == "inbox" ? .inbox : .custom, cursor: nil, isSynced: true,
+                         addressEpoch: Self.epoch, olderMailComplete: true, olderMailCursor: nil)
+        }
+        let several = SyncConfig.imapChangeInboxTimeoutsBeforeReadLast
+        func ordered(_ first: Set<String>, _ last: String?, _ inboxTimeouts: Int) -> [String] {
+            IMAPProvider.readFirst(order, first: first, last: last, inboxTimeouts: inboxTimeouts).map(\.id)
+        }
+        #expect(ordered(["c", "d"], "a", 0) == ["inbox", "c", "d", "b", "a"])
+        #expect(ordered(["c", "d"], "a", several) == ["c", "d", "inbox", "b", "a"])
+        #expect(ordered([], nil, 0) == ids)
+        #expect(ordered(["b"], "inbox", several - 1) == ["inbox", "b", "a", "c", "d"])
+        #expect(ordered(["b"], "inbox", several) == ["b", "a", "c", "d", "inbox"])
+    }
+
     @Test("A server that drops the connection on every folder's read: at most one session per folder in the pass, and every folder keeps its failure time")
     func everyReadDroppedOpensAtMostOneSessionPerFolder() async throws {
         try await Self.withWorld(inbox: [1, 2], archive: [1]) { w in
@@ -1528,4 +1870,11 @@ struct IMAPChangeReaderTests {
             #expect(Self.uidFetches(w, since: start).isEmpty, "none is fetched: \(Self.uidFetches(w, since: start))")
         }
     }
+}
+
+private final class Locked<Value: Sendable>: Sendable {
+    private let box: Mutex<Value>
+    init(_ value: Value) { box = Mutex(value) }
+    func set(_ value: Value) { box.withLock { $0 = value } }
+    func get() -> Value { box.withLock { $0 } }
 }

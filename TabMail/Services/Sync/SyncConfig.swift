@@ -986,6 +986,11 @@ enum SyncConfig {
     /// listing plus one catch-up check is the cheaper path. Same order of work as
     /// Gmail's `GmailAPI.historyMaxChanges`.
     static let imapChangeArrivalsLimit = 100
+    /// IMAP change reader: passes in a row whose inbox read timed out before the
+    /// next pass reads the other folders first and the inbox last. One timeout
+    /// keeps the inbox first, so a passing blip never delays new mail; a
+    /// successful inbox read starts the count again.
+    static let imapChangeInboxTimeoutsBeforeReadLast = 2
     /// IMAP change reader: longest the `SELECT … (QRESYNC …)` may take. Its answer
     /// lists every change since the bookmark, so it gets more than one ordinary
     /// request (`changeReadRequestTimeoutSeconds`); it is capped by the pass's

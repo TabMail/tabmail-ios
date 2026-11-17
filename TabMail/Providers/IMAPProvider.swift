@@ -828,15 +828,26 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// `ENABLE QRESYNC` was acknowledged on `changeServer`'s session.
     var changeServerQResync = false
     var changeServerLastUsed: Date?
-    /// The LOGOUT of the change session dropped last (`dropChangeServer`). A
-    /// pass opens a new session after a lost one only once it has ended.
-    var changeLogout: Task<Void, Never>?
+    /// The LOGOUT of the change session dropped last (`dropChangeServer`): true
+    /// once the session has ended. A pass opens a new session after a dropped one
+    /// only once it has.
+    var changeLogout: Task<Bool, Never>?
     /// One pass at a time uses the change connection.
     var changeLaneBusy = false
     var changeLaneWaiters: [CheckedContinuation<Void, Never>] = []
     /// Where the next pass starts among the non-inbox folders, so a tight budget
     /// never starves the same folder.
     var changeRotation = 0
+    /// After a pass ended on a read that timed out: the folders it left unread,
+    /// which the next pass reads first, and the folder that timed out, which it
+    /// reads last (`changeReadOrder`). A folder leaves both once a pass starts its
+    /// read, so a folder whose read times out on every pass never keeps the
+    /// others from being read. The inbox stays first until its read has timed out
+    /// on `SyncConfig.imapChangeInboxTimeoutsBeforeReadLast` passes in a row
+    /// (`changeInboxTimeouts`, back to 0 on a successful inbox read).
+    var changeReadFirst: Set<String> = []
+    var changeReadLast: String?
+    var changeInboxTimeouts = 0
     /// The mailbox last selected on the change connection, nil when none or
     /// unknown: STATUS is not sent for it (RFC 3501 §6.3.10).
     var changeSelectedPath: String?
@@ -2772,6 +2783,33 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             try? await server.logout()
         }
         #endif
+    }
+
+    /// `detachedTeardownLogout` that reports whether the session ended: true when
+    /// the LOGOUT was answered or failed on a connection already closed, false
+    /// when it timed out, after which the server may still count the session.
+    func detachedTeardownLogoutEnded(_ server: IMAPServer) -> Task<Bool, Never> {
+        noteLogoutAttempt(server)
+        #if DEBUG
+        let hook = beforeLogoutTestHook
+        let logoutGeneration = generation
+        return Task {
+            if let hook { hook(server, logoutGeneration) }
+            return await Self.logoutEnded(server)
+        }
+        #else
+        return Task { await Self.logoutEnded(server) }
+        #endif
+    }
+
+    nonisolated static func logoutEnded(_ server: IMAPServer) async -> Bool {
+        do {
+            try await server.logout()
+            return true
+        } catch {
+            if let imapError = error as? IMAPError, case .timeout = imapError { return false }
+            return !(error is TimeoutError)
+        }
     }
 
     func markDirty() async {
