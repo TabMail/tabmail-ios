@@ -406,7 +406,8 @@ such an account a retired move takes the exit rule (item 11 of the IMAP amendmen
 their bookmark with one self-heal owed, and its ids go on no list (a source UID names nothing, or another message,
 in the destination, and the optimistic row there can never prove it owns the address); every folder of the account
 when the destination is not recorded or a folder does not resolve. A read/flag or user-label row lists its ids on
-its own folder, unless a retired move drops that folder. A draft delete or an undecodable row drops its folder's
+its own folder, also when a retired move drops that folder (the listing never replaces a held row's user labels;
+the folder's baseline read answers the list). A draft delete or an undecodable row drops its folder's
 bookmark the same way (the IMAP catch-up only checks held rows). `dropChangeBookmark` reads raw columns only.
 Detail: `IOS-ACTION-003` ("Retired actions read again").
 

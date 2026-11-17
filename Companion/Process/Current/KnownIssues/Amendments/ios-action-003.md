@@ -181,8 +181,8 @@ the re-read list for these ids too. *Amended 2026-11-16 (#751, IMAP folders trac
 ids are mailbox-local and that holds a bookmark on any folder takes the exit rule for a retired move
 (source and destination drop their bookmark, one self-heal owed, no ids listed), a draft delete or an
 undecodable row (its folder, or every folder of the account when it does not resolve); its read/flag
-and user-label rows list their ids on their own folder unless a retired move drops it
-(ADR-IOS-111, amendment 2026-11-14, #876).
+and user-label rows list their ids on their own folder, also when a retired move drops it (the
+listing never replaces a held row's user labels; the folder's baseline read answers the list) (ADR-IOS-111, amendment 2026-11-14, #876).
 
 **Not corrected, accepted (2026-11-14): a retired user-label change or replied/forwarded mark in a
 tracked folder.** Neither repair path writes these into a stored row: the change apply's merge

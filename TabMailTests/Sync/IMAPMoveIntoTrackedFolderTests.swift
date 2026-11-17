@@ -1221,6 +1221,58 @@ struct IMAPMoveIntoTrackedFolderTests {
         }
     }
 
+    @Test("Release boundary: an unsent label add in a tracked IMAP folder that an unsent archive also leaves is read again, so the label shows the server's state")
+    @MainActor
+    func retiredLabelInADroppedFolderIsReadAgain() async throws {
+        try await Self.withWorld("boundary-label", capabilities: FakeIMAPServer.defaultCapabilities + Self.qresync,
+                                 archive: [50], local: ["INBOX": [7], "Archive": [50]], tracked: ["INBOX", "Archive"],
+                                 inbox: [7]) { w in
+            let seven = try #require(try await w.pool.read { db in
+                try MessageHeader.filter(Column("accountId") == w.accountId && Column("folderPath") == "INBOX" && Column("messageId") == "7").fetchOne(db)
+            })
+            try ReleaseBoundaryRecheckTests.moveRowOptimistically(w.pool, headerId: try w.seeded().id, to: try w.folder("Archive"))
+            try ReleaseBoundaryRecheckTests.queue(w.pool, .archive, ids: ["88"], accountId: w.accountId, from: "INBOX", to: "Archive")
+            try ReleaseBoundaryRecheckTests.setLabelOptimistically(w.pool, accountId: w.accountId, headerId: seven.id,
+                                                                   providerLabelId: "Receipts", add: true)
+            try ReleaseBoundaryRecheckTests.queue(w.pool, .addUserLabel, ids: ["7"], accountId: w.accountId,
+                                                  from: "INBOX", userLabelId: "Receipts")
+            #expect(try ReleaseBoundaryRecheckTests.storedLabels(w.pool, headerId: seven.id) == ["Receipts"], "setup: the add shows locally")
+            #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: ReleaseBoundaryRecheckTests.nextRelease()))
+            try w.expectListedAgainNotTracked(["INBOX", "Archive"], "boundary")
+            #expect(FolderChangeState(raw: try w.folder("INBOX").changeState).recheck == ["7"], "listed on its own folder, whose bookmark dropped")
+            try await w.normalSync()
+            try await w.changePass()
+            #expect(try ReleaseBoundaryRecheckTests.storedLabels(w.pool, headerId: seven.id).isEmpty,
+                    "the retired label add shows the server's state: no label")
+            #expect(FolderChangeState(raw: try w.folder("INBOX").changeState).recheck.isEmpty, "nothing left to read again")
+            try w.expectHeldOnceWhereTheServerHoldsIt("boundary-label")
+        }
+    }
+
+    @Test("Release boundary on a tracked IMAP folder whose stored role this release cannot read: the boundary still completes and drops its bookmark")
+    @MainActor
+    func retiredRowInAFolderWithAnUnreadableRole() async throws {
+        try await Self.withWorld("boundary-role", capabilities: FakeIMAPServer.defaultCapabilities + Self.qresync,
+                                 archive: [50], local: ["Archive": [50]], tracked: ["INBOX", "Archive"]) { w in
+            let archiveId = "\(w.accountId):Archive"
+            try ReleaseBoundaryRecheckTests.queue(w.pool, .deleteDraft, ids: ["draft-1"], accountId: w.accountId, from: "Archive")
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET role = 'roleFromALaterRelease' WHERE id = ?", arguments: [archiveId])
+            }
+            #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: ReleaseBoundaryRecheckTests.nextRelease()),
+                    "the boundary runs while the database opens and never fails on a row it cannot decode")
+            let (cursor, state) = try await w.pool.read { db -> (String?, String?) in
+                let row = try Row.fetchOne(db, sql: "SELECT changeCursor, changeState FROM folder WHERE id = ?", arguments: [archiveId])
+                return (row?["changeCursor"], row?["changeState"])
+            }
+            #expect(cursor == nil, "its bookmark is dropped")
+            #expect(FolderChangeState(raw: state).selfHealOwed == 1, "one self-heal owed")
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET role = ? WHERE id = ?", arguments: [FolderRole.archive.rawValue, archiveId])
+            }
+        }
+    }
+
     @Test("A tracked IMAP folder whose re-read list is full lists itself again when a pass cuts an arrival, so the arrival lands")
     @MainActor
     func cutArrivalLandsAfterTheListing() async throws {

@@ -32,8 +32,9 @@ import GRDB
 //   re-read can never prove it owns. Every folder of the account when the
 //   destination is not recorded or a folder does not resolve;
 // - a read/flag or user-label change: its ids go on its own folder's re-read
-//   list (the same numbering), unless a retired move drops that folder, whose
-//   listing then writes what the server holds;
+//   list (the same numbering), also when a retired move drops that folder: its
+//   listing never replaces a held row's user labels, and its baseline read
+//   answers the list;
 // - a draft delete, or a row whose kind or ids do not read: its folder drops its
 //   bookmark the same way (every folder of the account when it does not
 //   resolve), since the catch-up there only checks the rows a folder holds;
@@ -216,9 +217,10 @@ extension SyncEngine {
         for accountId in dropAccountIds.sorted() {
             dropFolderIds.formUnion(try rawStrings(db, "SELECT id FROM folder WHERE accountId = ?", [accountId]))
         }
-        // A folder that is listed again needs no re-read list from the boundary:
-        // the listing and its self-heal write what the server holds.
-        for folderId in folderOrder where !dropFolderIds.contains(folderId) {
+        // A folder whose bookmark drops below keeps these ids too: its listing
+        // and self-heal never replace a held row's user labels, and its next
+        // read (the baseline) answers the list.
+        for folderId in folderOrder {
             guard let named = foldersById[folderId] else { continue }
             var state = FolderChangeState(raw: named.changeState)
             let before = state
