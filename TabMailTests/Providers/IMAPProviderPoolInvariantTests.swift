@@ -2270,8 +2270,8 @@ struct IMAPProviderPoolInvariantTests {
             // The refused (pre-claim) launch's session ends with LOGOUT on the
             // wire. The post-claim case is excluded: there the launch's SELECT
             // is in flight when its task is cancelled, and the IMAP library
-            // closes that channel before any LOGOUT can be sent, a library
-            // behaviour tracked separately.
+            // closes that channel before any LOGOUT can be sent: issue #954
+            // owns re-enabling this check for that case.
             #expect(server.abandonedSessionCount() == 0, "the refused launch's connection was dropped without a LOGOUT — commands \(server.recordedCommands()), logout fds \(server.logoutFdLog()), logout attempts \(logoutAttempts.withLock { $0.values.sorted() })")
         }
         provider.setLogoutAttemptTestHookForTesting(nil)
