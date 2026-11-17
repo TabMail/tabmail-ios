@@ -620,4 +620,52 @@ struct NotificationActionRouterTests {
         #expect(ops[0].messageIds == ["4402"])
         #expect(ops[0].observedUidValidity == 90)
     }
+
+    /// The cold ARCHIVE/DELETE arm carries the same notified-epoch veto as
+    /// MARK_READ: a mismatching epoch queues nothing, a matching one queues the
+    /// move stamped with that epoch, and a notification with no epoch keeps the
+    /// previous behaviour.
+    @Test("cold ARCHIVE and DELETE: a moved folder epoch queues nothing; a matching or absent notified epoch queues the move", arguments: ["ARCHIVE", "DELETE"])
+    func coldMoveRefusedWhenTheFolderEpochMoved(actionId: String) async throws {
+        let (pool, _, _, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+        resetStagedGlobal()
+        let accountId = "acc-imap-538-\(actionId)"
+        try await pool.writeWithoutTransaction { db in
+            var acc = Account(emailAddress: "imap@example.com", displayName: "IMAP", provider: .imap)
+            acc.id = accountId
+            try acc.insert(db)
+            var imapInbox = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: accountId)
+            imapInbox.lastKnownUidValidity = 90
+            try imapInbox.insert(db)
+            try Folder(name: "Archive", path: "Archive", role: .archive, accountId: accountId).insert(db)
+            try Folder(name: "Trash", path: "Trash", role: .trash, accountId: accountId).insert(db)
+        }
+        let destination = actionId == "ARCHIVE" ? "Archive" : "Trash"
+
+        await NotificationActionRouter.execute(
+            actionId: actionId, messageId: "4501", accountId: accountId,
+            notifiedObservedUidValidity: 89)
+        var ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.isEmpty, "the UID was observed under an epoch the folder no longer has")
+
+        await NotificationActionRouter.execute(
+            actionId: actionId, messageId: "4502", accountId: accountId,
+            notifiedObservedUidValidity: 90)
+        await NotificationActionRouter.execute(
+            actionId: actionId, messageId: "4503", accountId: accountId)
+        ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+            .sorted { $0.messageIds.first ?? "" < $1.messageIds.first ?? "" }
+        #expect(ops.count == 2)
+        guard ops.count == 2 else { return }
+        for (op, uid) in zip(ops, ["4502", "4503"]) {
+            #expect(op.type == .move)
+            #expect(op.messageIds == [uid])
+            #expect(op.folderPath == "INBOX")
+            #expect(op.destinationPath == destination)
+            #expect(op.observedUidValidity == 90)
+        }
+        let headers = try await pool.read { db in try MessageHeader.fetchCount(db) }
+        #expect(headers == 0, "the cold path writes no local header")
+    }
 }

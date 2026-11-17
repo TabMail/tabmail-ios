@@ -923,7 +923,8 @@ final class NotificationService: UNNotificationServiceExtension {
                         summaryBlurb: summaryBlurb, reminderContent: reminderContent,
                         dueDate: reminderDate, dueTime: reminderTime
                     ),
-                    accountId: accountId, messageId: msg.messageId
+                    accountId: accountId, messageId: msg.messageId,
+                    observedUidValidity: msg.observedUidValidity
                 )
                 break
             }

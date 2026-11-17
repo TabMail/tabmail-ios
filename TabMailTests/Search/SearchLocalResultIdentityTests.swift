@@ -164,13 +164,15 @@ struct SearchLocalResultIdentityTests {
             )
         }
         guard let opened = resolved else { return nil }
+        // Production step 1b: `openResult` turns the resolve into a `TapEffect`
+        // through `tapOutcome`, which builds the `OpenTarget` it navigates to.
+        guard case .open(let target) = SearchView.tapOutcome(for: result, resolvedHeaderId: opened) else {
+            return nil
+        }
         try await reseatBeforeOpening()
         // Production step 2: `.navigationDestination(for: SearchView.OpenTarget.self)`
         // → `MessageDetailView(messageId:expectedRfc822MessageId:)` → this VM. The
         // witness travels WITH the address, exactly as `openResult` appends it.
-        let target = SearchView.OpenTarget(
-            headerId: opened, provenRfc822MessageId: result.capturedRfc822MessageId,
-            provenObservedUidValidity: result.capturedObservedUidValidity)
         let vm = MessageDetailViewModel(
             messageId: target.headerId, dbPool: pool, fetchBodyOverride: { _ in },
             expectedRfc822MessageId: target.provenRfc822MessageId,
@@ -566,10 +568,32 @@ struct SearchLocalResultIdentityTests {
 
     // MARK: - tabmail-ios #538: the address-epoch witness
 
+    /// The local results the PRODUCTION producers mint for `h` — the legacy
+    /// header scan and the FTS resolution — so the epoch handoff under test is
+    /// the app's own, not a copy in this harness.
+    @MainActor
+    private func productionLocalResults(for h: MessageHeader, env: Env) async throws -> [SearchResult] {
+        let legacy = await SearchView.legacyLocalSearch(h.subject, folderIds: [env.inbox.id], pool: env.pool)
+            .filter { $0.headerId == h.id }
+        let fts = try await env.pool.read { db in
+            try SearchView.localFTSResolution(
+                [FTSSearchResult(
+                    contentKey: ContentKey(rawValue: h.id), messageId: h.messageId,
+                    snippet: h.subject, rank: -1,
+                    dateMs: Int64(h.date.timeIntervalSince1970 * 1000))],
+                activeFolderIds: [env.inbox.id], logging: false, db: db
+            ).results
+        }
+        #expect(legacy.count == 1, "the legacy producer must mint the fixture row")
+        #expect(fts.count == 1, "the FTS producer must mint the fixture row")
+        return legacy + fts
+    }
+
     /// A row with no Message-ID is witnessed by the epoch its address was proven
     /// under. A turnover AFTER the tap's proof re-seats a different message at
     /// the same address with a different proven epoch; the detail view must not
-    /// mark that row read (C3).
+    /// mark that row read (C3). Driven through both production producers and
+    /// `tapOutcome`.
     @Test("a witness-less row re-seated under a new UIDVALIDITY after the tap's proof gets no read mutation")
     @MainActor
     func witnessLessReseatUnderANewEpochMarksNothingRead() async throws {
@@ -577,9 +601,13 @@ struct SearchLocalResultIdentityTests {
         defer { finish(env); clearOverlay(); resetStagedGlobal() }
         clearOverlay(); resetStagedGlobal()
 
-        let rendered = header(uid: "51", rfc: nil, subject: "No id", inbox: env.inbox)
+        let rendered = header(uid: "51", rfc: nil, subject: "Epoch reseat fifty one", inbox: env.inbox)
         try await env.pool.write { db in try rendered.insert(db) }
-        let result = mintLocalResult(from: rendered)
+        let results = try await productionLocalResults(for: rendered, env: env)
+        guard results.count == 2 else { return }
+        for result in results {
+            #expect(result.capturedObservedUidValidity == 1000, "the producer must capture the row's epoch")
+        }
         var impostor = header(uid: "51", rfc: nil, subject: "Other mail", inbox: env.inbox)
         impostor.observedUidValidity = 1001
 
@@ -588,20 +616,45 @@ struct SearchLocalResultIdentityTests {
             var it = gateStream.makeAsyncIterator()
             _ = await it.next()
         }
-        let opened = try await tap(result, pool: env.pool) {
-            try await env.pool.write { db in
-                try db.execute(sql: "UPDATE folder SET lastKnownUidValidity = 1001 WHERE id = ?", arguments: [env.inbox.id])
-                try rendered.delete(db)
-                try impostor.insert(db)
+        for (index, result) in results.enumerated() {
+            let opened = try await tap(result, pool: env.pool) {
+                guard index == 0 else { return }
+                try await env.pool.write { db in
+                    try db.execute(sql: "UPDATE folder SET lastKnownUidValidity = 1001 WHERE id = ?", arguments: [env.inbox.id])
+                    try rendered.delete(db)
+                    try impostor.insert(db)
+                }
             }
+            if index == 0 { #expect(opened == rendered.id, "the proof was valid when taken") }
         }
-        #expect(opened == rendered.id, "the proof was valid when taken")
         #expect(fixtureIntentCycleIds().isEmpty, "no read intent may be registered for the re-seated row")
         gate.finish()
         await drainWriteQueue()
         let seated = try await env.pool.read { db in try MessageHeader.fetchOne(db, key: impostor.id) }
         #expect(seated?.subject == "Other mail")
         #expect(seated?.isRead == false, "the impostor stays unread")
+        let ops = try await env.pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.isEmpty, "no read operation for the impostor")
+    }
+
+    /// Non-vacuity for the test above: the same production-minted result with
+    /// its row unchanged is opened and durably marked read.
+    @Test("a witness-less row with its own epoch unchanged is opened and marked read")
+    @MainActor
+    func witnessLessRowWithItsOwnEpochIsMarkedRead() async throws {
+        let env = try makeEnv()
+        defer { finish(env); clearOverlay(); resetStagedGlobal() }
+        clearOverlay(); resetStagedGlobal()
+
+        let rendered = header(uid: "54", rfc: nil, subject: "Epoch kept fifty four", inbox: env.inbox)
+        try await env.pool.write { db in try rendered.insert(db) }
+        let results = try await productionLocalResults(for: rendered, env: env)
+        guard let result = results.first else { return }
+        let opened = try await tap(result, pool: env.pool)
+        #expect(opened == rendered.id)
+        await drainWriteQueue()
+        let after = try await env.pool.read { db in try MessageHeader.fetchOne(db, key: rendered.id) }
+        #expect(after?.isRead == true)
     }
 
     /// The tap-time proof: a witness-less row already re-seated under a new
@@ -613,11 +666,16 @@ struct SearchLocalResultIdentityTests {
         defer { finish(env); clearOverlay(); resetStagedGlobal() }
         clearOverlay(); resetStagedGlobal()
 
-        let rendered = header(uid: "52", rfc: nil, subject: "No id", inbox: env.inbox)
-        let result = mintLocalResult(from: rendered)
+        let rendered = header(uid: "52", rfc: nil, subject: "Epoch reseat fifty two", inbox: env.inbox)
+        try await env.pool.write { db in try rendered.insert(db) }
+        let results = try await productionLocalResults(for: rendered, env: env)
+        guard let result = results.first else { return }
         var impostor = header(uid: "52", rfc: nil, subject: "Other mail", inbox: env.inbox)
         impostor.observedUidValidity = 1001
-        try await env.pool.write { db in try impostor.insert(db) }
+        try await env.pool.write { db in
+            try rendered.delete(db)
+            try impostor.insert(db)
+        }
 
         let opened = try await tap(result, pool: env.pool)
         #expect(opened == nil)
@@ -625,24 +683,32 @@ struct SearchLocalResultIdentityTests {
     }
 
     /// The epoch arm refuses only a PROVEN different epoch: a row whose epoch
-    /// was cleared (address unproven) still opens and is still marked read.
-    @Test("a witness-less row whose current epoch is unproven (nil) still opens and is still marked read")
+    /// was cleared (address unproven) is not vetoed by the witness, so the open
+    /// registers its read intent. (The durable write is then admission's call,
+    /// which refuses an unproven IMAP address on its own; not under test here.)
+    @Test("a witness-less row whose current epoch is unproven (nil) is not vetoed by the witness")
     @MainActor
-    func witnessLessRowWithAnUnprovenEpochStillMarksRead() async throws {
+    func witnessLessRowWithAnUnprovenEpochIsNotVetoed() async throws {
         let env = try makeEnv()
         defer { finish(env); clearOverlay(); resetStagedGlobal() }
         clearOverlay(); resetStagedGlobal()
 
-        let rendered = header(uid: "53", rfc: nil, subject: "No id", inbox: env.inbox)
+        let rendered = header(uid: "53", rfc: nil, subject: "Epoch unproven fifty three", inbox: env.inbox)
         try await env.pool.write { db in try rendered.insert(db) }
-        let result = mintLocalResult(from: rendered)
+        let results = try await productionLocalResults(for: rendered, env: env)
+        guard let result = results.first else { return }
         try await env.pool.write { db in
             try db.execute(sql: "UPDATE messageHeader SET observedUidValidity = NULL WHERE id = ?", arguments: [rendered.id])
         }
+        let (gateStream, gate) = AsyncStream<Void>.makeStream()
+        await AccountManager.shared.enqueueWrite {
+            var it = gateStream.makeAsyncIterator()
+            _ = await it.next()
+        }
         let opened = try await tap(result, pool: env.pool)
         #expect(opened == rendered.id)
+        #expect(fixtureIntentCycleIds() == [rendered.id], "the witness must not veto an unproven epoch")
+        gate.finish()
         await drainWriteQueue()
-        let after = try await env.pool.read { db in try MessageHeader.fetchOne(db, key: rendered.id) }
-        #expect(after?.isRead == true)
     }
 }

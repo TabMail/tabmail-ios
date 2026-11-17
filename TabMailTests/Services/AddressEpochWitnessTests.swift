@@ -85,4 +85,14 @@ struct AddressEpochWitnessTests {
         #expect(bare.userInfo[EmailNotificationBuilder.observedUidValidityUserInfoKey] == nil)
         #expect(EmailNotificationBuilder.observedUidValidity(from: ["observedUidValidity": 0]) == nil)
     }
+
+    @Test("the NSE partial-delivery holder keeps the epoch with the address it publishes")
+    func partialHolderKeepsTheEpoch() throws {
+        let holder = PartialSignalHolder()
+        holder.set(EmailNotificationBuilder.Signal(senderName: "Eve", subject: "Hi"),
+                   accountId: "acc1", messageId: "7", observedUidValidity: 41)
+        let partial = try #require(holder.get())
+        #expect(partial.observedUidValidity == 41)
+        #expect(partial.messageId == "7")
+    }
 }
