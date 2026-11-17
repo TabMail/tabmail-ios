@@ -698,7 +698,7 @@ struct RFC822IdentityMergeGuardTests {
     private func insertDriftedInboxRow(_ pool: DatabasePool, messageId: String, rfc822: String) throws -> String {
         var header = MessageHeader(
             messageId: messageId, subject: "Original subject", from: "Sender", fromAddress: "sender@example.com",
-            to: "user@example.com", date: Date(timeIntervalSince1970: 1_750_000_000), snippet: "snippet",
+            to: "user@example.com", date: Date(), snippet: "snippet",
             folderId: "acc1:INBOX-DRIFT", accountId: "acc1", folderPath: "INBOX-DRIFT", isInInbox: true)
         header.rfc822MessageId = rfc822
         header.headerComplete = true
