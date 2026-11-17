@@ -494,6 +494,31 @@ Tests: `ReleaseBoundaryRecheckTests` (`manyRetiredLabelIdsDrainInACheckedFolder`
 Keywords: changeRecheckLimit, overflow, stored ids never cut, this pass's additions, retired ids
 drain, #903.
 
+### Amendment 2026-11-17: an overflow in a folder holding its own bookmark re-baselines it (#751)
+
+Decision (master-agent ruling): item 2 of the #903 amendment above is amended for a folder that holds
+its own change bookmark (`Folder.changeCursor`). There, when this pass's own additions are cut, the
+folder's bookmark is dropped instead of its catch-up being armed (`cutDropsBookmark` in
+`SyncEngine.applyFolderChanges`): the folder is listed again and its next read starts a new baseline.
+Why: that folder's catch-up need not load a missing message (the IMAP one only checks the rows a folder
+holds), and the bookmark would otherwise move past a cut arrival. A folder with no bookmark keeps the
+#903 behaviour (catch-up armed).
+1. **Bounded per pass, resumed later.** The re-baseline is paged; each pass stops at its deadline and
+   its request allowance (`graphChangeReadRequestsPerSecond` x the read budget) and the next pass resumes
+   page by page. No single pass reads a whole large folder.
+2. **Networks.** The Inbox re-baseline runs on cellular, as the Inbox baseline already does by design;
+   other folders' state baselines wait on an expensive network as before
+   (`catchUpExpensiveNetworkMaxWaitSeconds`).
+3. **Cost on Outlook.** For a folder of N messages: about N/100 delta pages
+   (`graphChangeReadPageSize` = 100), plus header fetches only for messages a non-Inbox folder is
+   missing within the held range.
+4. **Replied and forwarded arrows.** A baseline reads no last verb (#890 amendment). The listing the
+   dropped bookmark makes due expands the last verb, so cut ids inside the listing window get their
+   arrows back. The #903 limitation remains for mail older than the listing window.
+This PR adds no new limitation.
+Keywords: cutDropsBookmark, overflow, own bookmark, re-baseline, listed again, delta pages, cellular
+Inbox, last verb, listing window, #751, #903.
+
 ### Amendment 2026-11-14: Outlook reads the last verb; the merge sets replied and forwarded (#890)
 
 **Context.** Decision 6 of the #882 amendment left replied and forwarded unread: a reply made in Outlook
