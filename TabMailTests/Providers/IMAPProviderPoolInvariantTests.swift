@@ -2206,7 +2206,21 @@ struct IMAPProviderPoolInvariantTests {
             let entries = Mutex(0)
             await provider.setIdleLaunchPlantRaceTestHookForTesting { [provider] in
                 let first = entries.withLock { (n: inout Int) -> Bool in n += 1; return n == 1 }
-                guard first else { return }
+                guard first else {
+                    // Park the restarted launch before ITS claim until the
+                    // cancelled launch has decided (claimed the slot, or been
+                    // refused and handed to logout), so the cancelled launch
+                    // always reaches an EMPTY slot and only the cancellation
+                    // check can refuse it.
+                    let deadline = Date().addingTimeInterval(5)
+                    while Date() < deadline {
+                        let decided = await provider.currentIdleServerForTesting() != nil
+                            || !logoutAttempts.withLock { $0.isEmpty }
+                        if decided { break }
+                        try? await Task.sleep(for: .milliseconds(10))
+                    }
+                    return
+                }
                 // THE EVENT, inside the first launch's pre-claim window.
                 await provider.stopIdle()
                 await provider.startIdle { _, _ in }
