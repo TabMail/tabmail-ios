@@ -1018,7 +1018,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // teardown has closed it, nothing it is waiting for logs in again.
             await server.setReconnectsInsideCommands(false)
             #if DEBUG
-            if let hook = beforeChangeConnectTestHook { await hook(diagSite) }
+            if let hook = beforeChangeConnectTestHook { await hook(diagSite, server) }
             #endif
             // From here to `connect()` there is no suspension: the generation is
             // checked and the session made open to a teardown
@@ -1027,6 +1027,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // finds it open and closes it. This holds for the eviction retry too.
             if openingTornDown(passGeneration) { throw ProviderError.notConnected }
             changeOpening = (server, passGeneration)
+            #if DEBUG
+            // Nil in every run but the test that sets it: no suspension here otherwise.
+            if let hook = changeOpeningPublishedTestHook { await hook(diagSite, server) }
+            #endif
         }
         do {
             try await server.connect()
@@ -3233,10 +3237,16 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     }
     /// Test seam: awaited by every change-session attempt (`createServer` with a
     /// pass generation) after reconnects are turned off and before the attempt
-    /// checks its generation and connects. Gets the attempt's `diagSite`.
-    var beforeChangeConnectTestHook: (@Sendable (String) async -> Void)?
-    func setBeforeChangeConnectTestHookForTesting(_ hook: (@Sendable (String) async -> Void)?) {
+    /// checks its generation and connects. Gets the attempt's `diagSite` and server.
+    var beforeChangeConnectTestHook: (@Sendable (String, IMAPServer) async -> Void)?
+    func setBeforeChangeConnectTestHookForTesting(_ hook: (@Sendable (String, IMAPServer) async -> Void)?) {
         beforeChangeConnectTestHook = hook
+    }
+    /// Test seam: awaited by every change-session attempt right after it is made
+    /// open to a teardown (`changeOpening`) and before it connects.
+    var changeOpeningPublishedTestHook: (@Sendable (String, IMAPServer) async -> Void)?
+    func setChangeOpeningPublishedTestHookForTesting(_ hook: (@Sendable (String, IMAPServer) async -> Void)?) {
+        changeOpeningPublishedTestHook = hook
     }
     /// Whether a change session is open to a teardown (`changeOpening`).
     var hasChangeOpeningForTesting: Bool { changeOpening != nil }

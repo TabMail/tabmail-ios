@@ -1687,7 +1687,7 @@ struct IMAPChangeReaderTests {
                     let loginsBefore = Self.logins(w)
                     // Every connection that reaches the server from the hold on is
                     // counted by `heldGreetingCount`.
-                    await provider.setBeforeChangeConnectTestHookForTesting { site in
+                    await provider.setBeforeChangeConnectTestHookForTesting { site, _ in
                         guard site == attempt else { return }
                         server.holdGreetings()
                         if point == "before" { await provider.markDirty() }
@@ -1720,6 +1720,31 @@ struct IMAPChangeReaderTests {
                     try await Self.withWorld(inbox: [1], body)
                 }
             }
+        }
+    }
+
+    @Test("Every change-session attempt, first and eviction retry, has reconnects off before its last generation check and when it is made open to a teardown, so no wait sits between that check and its connect")
+    func reconnectsAreOffBeforeTheCheckAndAtPublish() async throws {
+        try await Self.withLimitedWorld(maxSessions: 2) { w in
+            // Action and an idle inbox connection fill the limit: the first LOGIN
+            // is refused, the inbox connection evicted, and the retry opens.
+            _ = try await w.provider.fetchMessages(folder: Self.inboxPath, limit: 10, offset: 0)
+            let seen = Locked<[String]>([])
+            let provider = w.provider
+            await provider.setBeforeChangeConnectTestHookForTesting { site, server in
+                seen.set(seen.get() + ["\(site) before-check reconnects=\(await server.reconnectsInsideCommands)"])
+            }
+            await provider.setChangeOpeningPublishedTestHookForTesting { site, server in
+                let open = await provider.hasChangeOpeningForTesting
+                seen.set(seen.get() + ["\(site) published open=\(open) reconnects=\(await server.reconnectsInsideCommands)"])
+            }
+            _ = try await Self.read(w)
+            await provider.setBeforeChangeConnectTestHookForTesting(nil)
+            await provider.setChangeOpeningPublishedTestHookForTesting(nil)
+            #expect(seen.get() == [
+                "change before-check reconnects=false", "change published open=true reconnects=false",
+                "changeRetry before-check reconnects=false", "changeRetry published open=true reconnects=false",
+            ], "attempts seen: \(seen.get())")
         }
     }
 

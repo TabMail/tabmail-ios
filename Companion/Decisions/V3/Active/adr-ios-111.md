@@ -766,7 +766,12 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    after an eviction) turns reconnects off first, then checks the pass's generation and becomes open
    to a teardown in the same actor turn that starts its connect, so a teardown either ends the attempt
    before it connects or finds it open; no connection of a torn-down attempt reaches the server
-   (2026-11-17). A teardown closes the session being opened at once, without a LOGOUT, so
+   (2026-11-17). Known window, accepted: the connect call can still wait for the IMAP library's
+   actor after the attempt became open to a teardown, and a higher-priority teardown's close can
+   run first; the library's `connect()` re-arms the session and undoes that close, so the socket
+   opens and a slow greeting holds it, and the change lane, up to the connect timeout. No LOGIN is
+   ever sent (the check before LOGIN ends the attempt). The cause is in the library and is tracked
+   by tabmail-ios #952; no workaround here. A teardown closes the session being opened at once, without a LOGOUT, so
    whatever it waits for (connect, LOGIN, the CAPABILITY the IMAP library sends after LOGIN, the
    reader's CAPABILITY or ENABLE) ends with an error, and the server stops counting it right away
    instead of when a held answer comes (2026-11-17). A teardown closes only a session opened for its
