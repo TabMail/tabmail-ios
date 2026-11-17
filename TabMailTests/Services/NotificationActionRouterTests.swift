@@ -555,8 +555,11 @@ struct NotificationActionRouterTests {
         defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
         resetStagedGlobal()
 
-        var header = makeDurableHeader(folder: inbox, messageId: "m-reseated-epoch")
-        header.observedUidValidity = 72
+        let header = {
+            var h = makeDurableHeader(folder: inbox, messageId: "m-reseated-epoch")
+            h.observedUidValidity = 72
+            return h
+        }()
         try await pool.writeWithoutTransaction { db in try header.insert(db) }
 
         await NotificationActionRouter.execute(
@@ -575,8 +578,11 @@ struct NotificationActionRouterTests {
         defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
         resetStagedGlobal()
 
-        var header = makeDurableHeader(folder: inbox, messageId: "m-same-epoch")
-        header.observedUidValidity = 72
+        let header = {
+            var h = makeDurableHeader(folder: inbox, messageId: "m-same-epoch")
+            h.observedUidValidity = 72
+            return h
+        }()
         try await pool.writeWithoutTransaction { db in try header.insert(db) }
 
         await NotificationActionRouter.execute(

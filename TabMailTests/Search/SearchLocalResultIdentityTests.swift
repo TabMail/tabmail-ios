@@ -608,8 +608,11 @@ struct SearchLocalResultIdentityTests {
         for result in results {
             #expect(result.capturedObservedUidValidity == 1000, "the producer must capture the row's epoch")
         }
-        var impostor = header(uid: "51", rfc: nil, subject: "Other mail", inbox: env.inbox)
-        impostor.observedUidValidity = 1001
+        let impostor = {
+            var h = header(uid: "51", rfc: nil, subject: "Other mail", inbox: env.inbox)
+            h.observedUidValidity = 1001
+            return h
+        }()
 
         let (gateStream, gate) = AsyncStream<Void>.makeStream()
         await AccountManager.shared.enqueueWrite {
@@ -670,8 +673,11 @@ struct SearchLocalResultIdentityTests {
         try await env.pool.write { db in try rendered.insert(db) }
         let results = try await productionLocalResults(for: rendered, env: env)
         guard let result = results.first else { return }
-        var impostor = header(uid: "52", rfc: nil, subject: "Other mail", inbox: env.inbox)
-        impostor.observedUidValidity = 1001
+        let impostor = {
+            var h = header(uid: "52", rfc: nil, subject: "Other mail", inbox: env.inbox)
+            h.observedUidValidity = 1001
+            return h
+        }()
         try await env.pool.write { db in
             try rendered.delete(db)
             try impostor.insert(db)

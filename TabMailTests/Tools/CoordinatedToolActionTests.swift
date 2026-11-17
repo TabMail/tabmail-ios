@@ -749,8 +749,11 @@ struct CoordinatedToolActionTests {
     private func reseatUnderNewEpoch(
         pool: DatabasePool, folder: Folder, captured: MessageHeader, uid: String, epoch: Int
     ) async throws {
-        var impostor = makeWitnessedIMAPHeader(folder: folder, uid: uid, rfc: nil, observedEpoch: epoch)
-        impostor.subject = "impostor \(uid)"
+        let impostor = {
+            var h = makeWitnessedIMAPHeader(folder: folder, uid: uid, rfc: nil, observedEpoch: epoch)
+            h.subject = "impostor \(uid)"
+            return h
+        }()
         try await pool.writeWithoutTransaction { db in
             try db.execute(
                 sql: "UPDATE folder SET lastKnownUidValidity = ? WHERE id = ?",
