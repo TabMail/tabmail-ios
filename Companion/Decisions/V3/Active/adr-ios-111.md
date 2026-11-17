@@ -629,14 +629,14 @@ empty history pages, #491, #429, #938.
 
 ### Amendment 2026-11-15: the IMAP reader (QRESYNC, per folder) (#751)
 
-Decision (coordinator rulings 2026-11-15): IMAP reads changes through the seam with RFC 7162
+Decision (2026-11-15): IMAP reads changes through the seam with RFC 7162
 QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChanges.swift`).
 1. **Capability gate.** QRESYNC is used only when the server advertises `QRESYNC`, `ENABLE` and
    `UIDPLUS` (`IMAPProvider.qresyncUsable`, capabilities fetched once when the change session opens):
    QRESYNC can only be switched on through ENABLE (RFC 5161), and without UIDPLUS (RFC 4315 COPYUID)
    every move into a tracked folder would land without a proven destination UID (exit rule, item 11). CONDSTORE is never inferred from QRESYNC nor the
    other way. `ENABLE QRESYNC` is sent once per session, on the change connection only. **Connection
-   budget** (coordinator ruling 2026-11-16): the change connection counts
+   budget** (2026-11-16): the change connection counts
    against the server's limit only while it is open, like IDLE (`maxFolderConnections`; the pool's
    reserved count stays 2, action + IDLE). When a slot is needed, the eviction order is: the change
    connection if it is idle between passes (never while a pass holds or opens it,
@@ -652,7 +652,7 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    answered, so a login sent right after a detached logout was refused again (found 2026-11-16 by a
    fake server that counts sessions; IDLE's DONE + LOGOUT lost that race every time). Each caller
    keeps and awaits only its own evictions' logouts; nothing is stored on the provider. An evicted
-   IDLE connection ends its IDLE first (`evictIdleConnection`, coordinator ruling 2026-11-16): DONE
+   IDLE connection ends its IDLE first (`evictIdleConnection`, 2026-11-16): DONE
    completes (its tagged OK, or at most `SyncConfig.imapIdleEvictionDoneWaitSeconds`: a DONE still
    unanswered then is cancelled, and SwiftMail closes the connection on that cancellation, which
    ends the session), then the listener is cancelled and the session logs out. A listener cancelled first ended its stream at once
@@ -660,7 +660,7 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    for an IDLE nobody ended, past the login's wait, so the login was refused (a test flake, made
    deterministic by holding DONE back, `idleEvictionEndsIdleBeforeTheLogout`; the bound:
    `idleEvictionDoneWaitIsBounded`). So a server that allows two connections still runs a
-   pass, a folder fetch and an action (the regression c4 found: the change connection had been a
+   pass, a folder fetch and an action (before this, the change connection had been a
    third, unevictable one). A server without the pair, an ENABLE that is not acknowledged,
    or a mailbox answering `NOMODSEQ` leaves the folder `.untracked(UntrackedObservation)`: no
    ENABLE is sent, no pass fails on it, and its bookmark and coverage are cleared.
@@ -674,7 +674,7 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    listing, a failed listing or a crash in between would otherwise leave the bookmark without it).
 3. **A read.** STATUS first; an unchanged HIGHESTMODSEQ under the bookmark's UIDVALIDITY (both in the
    STATUS answer) is `.tracked` with no SELECT; a MODSEQ means nothing outside its UIDVALIDITY, so a
-   STATUS without UIDVALIDITY never takes this shortcut (Codex c7, 2026-11-16). Otherwise
+   STATUS without UIDVALIDITY never takes this shortcut (2026-11-16). Otherwise
    `SELECT (QRESYNC (uidvalidity modseq))` with its own timeout (`imapChangeSelectTimeoutSeconds`).
    Removals are VANISHED ranges intersected with the folder's held rows (never expanded) and
    `\Deleted` changes on any row the folder holds, at or above the bookmark's UIDNEXT too (a
@@ -694,7 +694,7 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    are unknown, not 0: an untracked folder is then unreadable for the pass. STATUS is never
    sent for the mailbox selected on the change connection; it is selected again instead. A
    folder whose read the apply's binding check rejected is not trackable that pass. **The
-   held range for a changed-not-held UID** (coordinator ruling 2026-11-16) comes from
+   held range for a changed-not-held UID** (2026-11-16) comes from
    the folder's older-mail download progress, carried in `ChangeFolder.olderMailComplete` /
    `olderMailCursor` (`Folder.backfillComplete` / `backfillUidCursor`), never from the rows the folder
    holds now (`IMAPProvider.heldRangeStart`): every UID once the walk completed, above its position
@@ -728,13 +728,19 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    folder loses its counts).
 9. **Failure lapse**. A folder whose read keeps failing keeps its bookmark with
    `failingSince` and is refused (`.failingTooLong`, listed again) after
-   `changeReadFailureLapseSeconds`. This covers a SELECT or FETCH that times out (the session is
-   dropped, but the folder being read is stamped first) and a pass whose change session never opens
-   (connect, CAPABILITY, ENABLE or the pass-start NOOP failing: every work folder is stamped; c4
-   finding 2, a NOOP that always fails had wedged the folders without a failure time). A connection lost mid-pass
-   stamps no folder not yet read.
+   `changeReadFailureLapseSeconds`. This covers a request on the folder being read that times out or
+   loses the connection, whatever the cause (the session is dropped, but that folder is stamped first:
+   a server that always closes the connection on one folder's SELECT or FETCH must not leave it
+   tracked without a failure time), and a pass whose change session never opens (connect, CAPABILITY,
+   ENABLE or the pass-start NOOP failing: every work folder is stamped; a NOOP that always fails had
+   wedged the folders without a failure time). A connection lost on one folder's read fails that
+   folder only: the pass goes on with the folders after it on a new session (at most one per folder,
+   bounded by the read budget), so a server that always drops the connection on the inbox's read
+   still lets the account's other tracked folders be read in the same pass. A session that cannot be
+   opened again mid-pass, or a teardown (`markDirty`, `disconnect`, after which no session is opened
+   in that pass), fails the folders not yet read with no failure time.
 10. **Accepted cost.** A server advertising QRESYNC without CONDSTORE gets no HIGHESTMODSEQ in STATUS,
-   so every tracked folder does a QRESYNC SELECT each pass (no fast path). Work, not loss (r2).
+   so every tracked folder does a QRESYNC SELECT each pass (no fast path). Work, not loss.
 11. **Exit rule: a move that leaves a folder's view possibly wrong** (2026-11-15). ADR-IOS-073
    consequence 3 says an atomic move without safe `COPYUID` "can leave an optimistic row unaddressed
    and recoverable by ordinary sync". For a tracked folder ordinary sync is the change reader, which
@@ -769,7 +775,7 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    only updates or removes rows it holds, so a message such a move left in a folder below the window
    (a move that retired with no effect, its source message older than the window, with backfill
    complete) would stay missing. So a bookmark this rule drops also owes the folder ONE self-heal
-   pass before it is tracked again (coordinator ruling 2026-11-16): `dropChangeBookmark`
+   pass before it is tracked again (2026-11-16): `dropChangeBookmark`
    counts one more retirement in `FolderChangeState.selfHealOwed`, whether or not the folder held a
    bookmark (a folder awaiting its first baseline is tracked after its next listing, which does not
    reach below the window either; without a bookmark only the mark is written, no listing is made

@@ -341,7 +341,7 @@ struct IMAPMoveIntoTrackedFolderTests {
         }
     }
 
-    // MARK: - r5: retirements outside a provider result
+    // MARK: - Retirements outside a provider result
 
     @Test("A move that keeps failing until the retry limit retires it: one copy, where the server holds it, after the normal sync")
     @MainActor
@@ -665,7 +665,7 @@ struct IMAPMoveIntoTrackedFolderTests {
         }
     }
 
-    // MARK: - r5: positive control and the remaining arms
+    // MARK: - Positive control and the remaining arms
 
     @Test("A move WITH proof into a tracked folder keeps its bookmark and tracking, and makes no listing due")
     @MainActor
@@ -743,7 +743,7 @@ struct IMAPMoveIntoTrackedFolderTests {
         }
     }
 
-    // MARK: - r6: the remaining retirement paths
+    // MARK: - The remaining retirement paths
 
     @Test("A move whose source UID the server no longer holds (already moved): one copy, where the server holds it, after the normal sync")
     @MainActor
@@ -1020,7 +1020,7 @@ struct IMAPMoveIntoTrackedFolderTests {
         }
     }
 
-    // MARK: - r7
+    // MARK: - Unproven moves between untracked folders
 
     @Test("An unproven move between UNTRACKED folders makes no listing due, and the message is held once after the normal sync")
     @MainActor

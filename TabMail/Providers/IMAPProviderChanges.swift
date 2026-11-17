@@ -23,7 +23,7 @@ import SwiftMail
 //     `.addressEpochChanged`, and nothing of that SELECT applies;
 //   - `VANISHED (EARLIER)` and live VANISHED become removals, intersected with the
 //     folder's local rows range by range, never expanded (a server may report a
-//     superset, RFC 7162 §3.2.5);
+//     superset, RFC 7162 §3.2.6 and §5.1);
 //   - a changed message marked `\Deleted` becomes a removal of the folder's row
 //     for it wherever its UID sits (IOS-IMAP-001 D3), at or above the bookmark's
 //     UIDNEXT too (a moved-in row re-keyed there); one it does not hold is ignored;
@@ -46,11 +46,13 @@ import SwiftMail
 //   gone (a short FETCH is a real server shape, MIS-IOS-002); that answer is asked
 //   about each missing UID, never expanded.
 // Nothing here writes the database, and nothing here sends a STORE, COPY, MOVE or
-// EXPUNGE. A connection lost or timed out mid-pass fails the folders not yet read
-// (`.failed`, bookmark kept); the folder whose request timed out, and every folder
-// of a pass whose session never opened (its pass-start NOOP included), keeps its
-// failure time and lapses after
-// `SyncConfig.changeReadFailureLapseSeconds`; a budget run out leaves them `.notRun`.
+// EXPUNGE. A folder whose read fails (a refused command, a request that timed out
+// or lost the connection) keeps its failure time and lapses after
+// `SyncConfig.changeReadFailureLapseSeconds`; after a lost connection the pass goes
+// on with the folders after it on a new session. Every folder of a pass whose first
+// session never opened (its pass-start NOOP included) keeps its failure time too; a
+// session that cannot be opened again mid-pass fails the folders not yet read
+// (`.failed`, bookmark kept, no failure time); a budget run out leaves them `.notRun`.
 
 /// IMAP's opaque per-folder change bookmark, stored as JSON in
 /// `Folder.changeCursor`. Three server-assigned integers about the mailbox
@@ -64,11 +66,12 @@ struct IMAPChangeCursor: Codable, Equatable, Sendable {
     let uidValidity: UInt32
     let highestModSeq: UInt64
     let uidNext: UInt32
-    /// When the folder's reads started failing on the server's answers (a
-    /// timeout, a refused command, a change session that cannot be opened), nil
-    /// while they succeed. After `SyncConfig.changeReadFailureLapseSeconds` the
-    /// bookmark is refused (`.failingTooLong`). A connection lost mid-pass never
-    /// sets it for the folders not yet read.
+    /// When the folder's reads started failing (a request on it that timed out
+    /// or lost the connection, a refused command, a change session that cannot
+    /// be opened), nil while they succeed. After
+    /// `SyncConfig.changeReadFailureLapseSeconds` the bookmark is refused
+    /// (`.failingTooLong`). A connection lost mid-pass never sets it for the
+    /// folders not yet read.
     var failingSince: Date?
 
     init(uidValidity: UInt32, highestModSeq: UInt64, uidNext: UInt32, failingSince: Date? = nil) {
@@ -119,54 +122,69 @@ extension IMAPProvider {
         guard context.hasBudget() else { return .uniform(request, account: .keep, status: .notRun) }
 
         var sessionOpened = false
-        do {
-            try await withChangeConnection { server, qresync in
-                // Let the session catch up with other connections' changes before
-                // the STATUS reads (some servers answer STATUS from a cached view).
-                try await withTimeout(seconds: SyncConfig.changeReadRequestTimeoutSeconds) {
-                    _ = try await server.noop()
-                }
-                // Open only once the NOOP has answered: a session whose NOOP keeps
-                // failing is one that cannot be used, under the lapse rule below,
-                // never a connection lost mid-pass that leaves no failure time.
-                sessionOpened = true
-                for (index, folder) in work.enumerated() {
-                    guard context.hasBudget() else { break }
-                    do {
-                        results[folder.id] = try await self.readChangeFolder(
-                            folder, server: server, qresync: qresync, request: request)
-                    } catch {
-                        if Self.changeConnectionLost(after: error) {
-                            // A request given up mid-answer (a SELECT or FETCH that
-                            // timed out) is this folder's read failing: it keeps its
-                            // failure time, so one that always times out lapses to
-                            // the listing (`.failingTooLong`) instead of wedging.
-                            if error is TimeoutError {
-                                results[folder.id] = Self.failedFolder(folder, error: error, now: context.clock())
+        var next = 0
+        var budgetSpent = false
+        // A connection lost on one folder's read fails that folder only: the pass
+        // goes on with the folders after it on a fresh session. Each new session
+        // follows a folder that has been read and failed, so a pass opens at most
+        // one session per folder, and the read budget bounds them all. A teardown
+        // (`markDirty`, `disconnect`) ends the pass instead: it opens no session
+        // after one.
+        let generationAtStart = generation
+        while next < work.count, !budgetSpent {
+            var lostOnFolder = false
+            do {
+                try await withChangeConnection { server, qresync in
+                    // Let the session catch up with other connections' changes before
+                    // the STATUS reads (some servers answer STATUS from a cached view).
+                    try await withTimeout(seconds: SyncConfig.changeReadRequestTimeoutSeconds) {
+                        _ = try await server.noop()
+                    }
+                    // Open only once the NOOP has answered: a session whose NOOP keeps
+                    // failing is one that cannot be used, under the lapse rule below,
+                    // never a connection lost mid-pass that leaves no failure time.
+                    sessionOpened = true
+                    while next < work.count {
+                        guard context.hasBudget() else { budgetSpent = true; return }
+                        let folder = work[next]
+                        do {
+                            results[folder.id] = try await self.readChangeFolder(
+                                folder, server: server, qresync: qresync, request: request)
+                        } catch {
+                            // The folder's read failed, whatever the cause: it keeps its
+                            // failure time, so a folder whose SELECT or FETCH always
+                            // fails or ends the session lapses to the listing
+                            // (`.failingTooLong`) instead of wedging.
+                            results[folder.id] = Self.failedFolder(folder, error: error, now: context.clock())
+                            if Self.changeConnectionLost(after: error) {
+                                // The session is gone (`withChangeConnection` drops it);
+                                // the folders after this one are read on a new one.
+                                next += 1
+                                lostOnFolder = true
+                                throw error
                             }
-                            // The session is gone: every folder not yet read fails,
-                            // bookmark kept; never "no changes" on a new channel.
-                            for rest in work[index...] where results[rest.id] == nil {
-                                results[rest.id] = FolderChanges(folderId: rest.id, status: .failed(error))
-                            }
-                            throw error
                         }
-                        results[folder.id] = Self.failedFolder(folder, error: error, now: context.clock())
+                        next += 1
                     }
                 }
-            }
-        } catch {
-            for folder in work where results[folder.id] == nil {
-                // No session could be opened (connect, CAPABILITY, ENABLE or the
-                // pass-start NOOP failed): every folder's read failed, under the same lapse rule,
-                // so a change connection the server always refuses never freezes
-                // the tracked folders.
-                results[folder.id] = sessionOpened
-                    ? FolderChanges(folderId: folder.id, status: .failed(error))
-                    : Self.failedFolder(folder, error: error, now: context.clock())
-            }
-            if DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[IMAPChanges] pass ended on \(error)")
+            } catch {
+                if DebugModeManager.isLoggingEnabled() {
+                    BackgroundSyncLogger.logDebug("[IMAPChanges] session ended on \(error)")
+                }
+                if lostOnFolder, generation == generationAtStart { continue }
+                for folder in work[next...] where results[folder.id] == nil {
+                    // No session could be opened (connect, CAPABILITY, ENABLE or the
+                    // pass-start NOOP failed). On the pass's first session every
+                    // folder's read failed, under the same lapse rule, so a change
+                    // connection the server always refuses never freezes the tracked
+                    // folders. After a session was opened (one that cannot be opened
+                    // again, or a teardown that ended the pass) the folders not yet
+                    // read fail with no failure time.
+                    results[folder.id] = sessionOpened
+                        ? FolderChanges(folderId: folder.id, status: .failed(error))
+                        : Self.failedFolder(folder, error: error, now: context.clock())
+                }
+                break
             }
         }
         return ChangeSet(

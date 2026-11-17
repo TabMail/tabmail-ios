@@ -49,7 +49,15 @@ struct IMAPChangeReaderTests {
         func firstNumericId(folderId: String, atLeast lower: Int) async throws -> Int? {
             uids(folderId).filter { $0 >= lower }.min()
         }
+        /// Runs once, at the next held-row lookup (mid-read of a folder).
+        private let onHeldLookup = Mutex<(@Sendable () async -> Void)?>(nil)
+        func runOnceAtNextHeldLookup(_ hook: @escaping @Sendable () async -> Void) { onHeldLookup.withLock { $0 = hook } }
         func rows(folderId: String, ids: [String]) async throws -> [CatchUpLocalRow] {
+            let hook = onHeldLookup.withLock { pending -> (@Sendable () async -> Void)? in
+                defer { pending = nil }
+                return pending
+            }
+            if let hook { await hook() }
             let mine = uids(folderId)
             return ids.compactMap(Int.init).filter(mine.contains).map(row)
         }
@@ -657,7 +665,63 @@ struct IMAPChangeReaderTests {
         }
     }
 
-    // MARK: - r2: lapses through the real reader path
+    @Test("Connection lost on the inbox's read: the inbox fails with its failure time, and another tracked folder still gets its new mail in the same pass")
+    func connectionLostOnOneFolderReadsTheRest() async throws {
+        try await Self.withWorld(inbox: [1, 2], archive: [1]) { w in
+            let first = try await Self.read(w, archiveSynced: true)
+            let inboxCursor = try #require(try Self.inbox(w, first).cursor)
+            let archiveCursor = try #require(first.folders.first { $0.folderId == w.archiveId }?.cursor)
+            w.server.setFlags(["\\Seen"], in: Self.inboxPath, uid: 1)
+            w.server.setMessages([1, 2].map(Self.message), in: Self.archivePath)
+            // The inbox is read first: its QRESYNC SELECT is the first one.
+            w.server.killConnectionOnNextCommand(containing: "QRESYNC (")
+            let start = Date()
+            let set = try await Self.read(
+                w, cursors: [w.inboxId: inboxCursor, w.archiveId: archiveCursor], archiveSynced: true,
+                context: Self.fixedClock(start))
+            let inbox = try Self.inbox(w, set)
+            guard case .failed = inbox.status else { Issue.record("inbox: expected failed, got \(inbox.status)"); return }
+            #expect(try #require(IMAPChangeCursor.decode(inbox.cursor)).failingSince == start)
+            let archive = try Self.status(set, w.archiveId)
+            #expect(Self.isTracked(archive.status), "the other folder is read on a fresh session, got \(archive.status)")
+            #expect(archive.records.contains { $0.messageId == "2" }, "its new mail arrives in the same pass")
+        }
+    }
+
+    @Test("A teardown during a pass ends it: no session is opened after it, and the folders not yet read fail with no failure time")
+    func teardownMidPassOpensNoSession() async throws {
+        try await Self.withWorld(inbox: [1, 2], archive: [1]) { w in
+            let first = try await Self.read(w, archiveSynced: true)
+            let inboxCursor = try #require(try Self.inbox(w, first).cursor)
+            let archiveCursor = try #require(first.folders.first { $0.folderId == w.archiveId }?.cursor)
+            // The inbox: a changed flag (a held-row lookup) and an arrival (a
+            // command after it). The archive: an arrival.
+            w.server.setMessages([1, 2, 3].map(Self.message), in: Self.inboxPath)
+            w.server.setFlags(["\\Seen"], in: Self.inboxPath, uid: 1)
+            w.server.setMessages([1, 2].map(Self.message), in: Self.archivePath)
+            let provider = w.provider
+            let server = w.server
+            w.local.runOnceAtNextHeldLookup {
+                await provider.markDirty()
+                // Wait for the torn-down session's LOGOUT: the server then closes it.
+                for _ in 0..<250 where !server.recordedCommands().contains(where: { $0.uppercased().hasPrefix("LOGOUT") }) {
+                    try? await Task.sleep(for: .milliseconds(20))
+                }
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+            let loginsBefore = w.server.recordedCommands().filter { $0.uppercased().hasPrefix("LOGIN") }.count
+            let set = try await Self.read(w, cursors: [w.inboxId: inboxCursor, w.archiveId: archiveCursor], archiveSynced: true)
+            let loginsAfter = w.server.recordedCommands().filter { $0.uppercased().hasPrefix("LOGIN") }.count
+            #expect(w.server.recordedCommands().contains { $0.uppercased().hasPrefix("LOGOUT") }, "setup: the teardown logged out")
+            if case .failed = try Self.inbox(w, set).status {} else { Issue.record("inbox: expected failed, got \(try Self.inbox(w, set).status)") }
+            #expect(loginsAfter == loginsBefore, "no session is opened after the teardown")
+            let archive = try Self.status(set, w.archiveId)
+            guard case .failed = archive.status else { Issue.record("archive: expected failed, got \(archive.status)"); return }
+            #expect(archive.cursor == nil && archive.records.isEmpty, "not yet read: no failure time, nothing applied")
+        }
+    }
+
+    // MARK: - Lapses through the real reader path
 
     /// A context whose clock reads `now` (fixed) with budget always left: the
     /// QRESYNC SELECT's timeout is then one ordinary request's timeout.
@@ -691,6 +755,44 @@ struct IMAPChangeReaderTests {
         }
     }
 
+    /// Two passes whose read of the inbox loses the connection on the request
+    /// named by `fragment`: the folder must lapse to the listing, never stay
+    /// tracked without a failure time while its reads keep failing.
+    static func lostConnectionLapses(on fragment: String, arrivals: Bool) async throws {
+        try await withWorld(inbox: [1, 2]) { w in
+            let cursor = try await baseline(w)
+            if arrivals {
+                w.server.setMessages([1, 2, 3].map(message), in: inboxPath)
+            } else {
+                w.server.setFlags(["\\Seen"], in: inboxPath, uid: 1)
+            }
+            let start = Date()
+            w.server.killConnectionOnNextCommand(containing: fragment)
+            let first = try await inbox(w, read(w, cursors: [w.inboxId: cursor], context: fixedClock(start)))
+            guard case .failed = first.status else { Issue.record("pass 1: expected failed, got \(first.status)"); return }
+            #expect(first.records.isEmpty && first.removals.isEmpty)
+            #expect(try #require(IMAPChangeCursor.decode(first.cursor)).failingSince == start,
+                    "the folder whose read lost the connection keeps the time its reads started failing")
+
+            w.server.killConnectionOnNextCommand(containing: fragment)
+            let later = start.addingTimeInterval(SyncConfig.changeReadFailureLapseSeconds)
+            let second = try await inbox(w, read(w, cursors: [w.inboxId: first.cursor], context: fixedClock(later)))
+            guard case .refused(.failingTooLong) = second.status else {
+                Issue.record("pass 2: expected refused(failingTooLong), got \(second.status)"); return
+            }
+        }
+    }
+
+    @Test("A QRESYNC SELECT that loses the connection on every pass keeps its failure time and lapses to the listing")
+    func repeatedSelectConnectionLossLapses() async throws {
+        try await Self.lostConnectionLapses(on: "QRESYNC (", arrivals: false)
+    }
+
+    @Test("An arrivals FETCH that loses the connection on every pass keeps its failure time and lapses to the listing")
+    func repeatedArrivalsFetchConnectionLossLapses() async throws {
+        try await Self.lostConnectionLapses(on: "UID FETCH", arrivals: true)
+    }
+
     @Test("A change session that never opens fails every tracked folder under the same lapse rule")
     func sessionNeverOpensLapses() async throws {
         try await Self.withWorld(inbox: [1], archive: [1]) { w in
@@ -719,7 +821,7 @@ struct IMAPChangeReaderTests {
         }
     }
 
-    // MARK: - r2: the budget running out after the QRESYNC SELECT
+    // MARK: - The budget running out after the QRESYNC SELECT
 
     @Test("Budget spent after the QRESYNC SELECT: the folder is not run, keeps its old bookmark, and nothing applies")
     func budgetSpentAfterSelect() async throws {
@@ -756,7 +858,7 @@ struct IMAPChangeReaderTests {
         }
     }
 
-    // MARK: - r2: arrivals boundaries
+    // MARK: - Arrivals boundaries
 
     @Test("Arrivals: exactly the limit is read in full; the refusal starts one over it")
     func arrivalsExactlyAtTheLimit() async throws {
@@ -783,7 +885,7 @@ struct IMAPChangeReaderTests {
         }
     }
 
-    // MARK: - r3 coverage
+    // MARK: - Read paths: held range, arrivals walk, re-read confirmation
 
     static func uidFetches(_ w: World, since start: Int) -> [String] {
         w.server.recordedCommands().dropFirst(start).filter { $0.uppercased().contains("UID FETCH") }
@@ -986,7 +1088,7 @@ struct IMAPChangeReaderTests {
         }
     }
 
-    // MARK: - c4 #3: the connection budget
+    // MARK: - The connection budget
 
     /// A provider against a server allowing `maxSessions` logged-in sessions,
     /// under a username of its own (the learned limit is kept per user).

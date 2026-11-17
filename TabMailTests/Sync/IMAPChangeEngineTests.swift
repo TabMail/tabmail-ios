@@ -152,7 +152,7 @@ struct IMAPChangeEngineTests {
         // More than one window: the device holds every UID, the window listing
         // reaches only the newest, so only the catch-up reaches UID 1000.
         let uids = Array(1000..<(1000 + SyncConfig.syncMessageLimit + 10))
-        try await Self.withWorld("eng-r35", capabilities: Self.qresync, serverUIDs: uids, localUIDs: uids) { w in
+        try await Self.withWorld("eng-catchup", capabilities: Self.qresync, serverUIDs: uids, localUIDs: uids) { w in
             let accountId = w.account.id
             func account() throws -> Account { try #require(try w.pool.read { db in try Account.fetchOne(db, key: accountId) }) }
             func oldest() throws -> MessageHeader? {
