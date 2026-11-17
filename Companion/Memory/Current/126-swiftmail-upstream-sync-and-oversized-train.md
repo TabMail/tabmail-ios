@@ -532,3 +532,16 @@ serializer that writes recipients:
   app `IMAPInboxOutsideNamespaceTests` (real `IMAPProvider` + full sync, using `FakeIMAPServer`'s
   `setHierarchy(delimiter:personalNamespacePrefix:)` seam). The `Mail/` cases are red on the old pin.
 - App and NSE pin `cafc29fed52ba01a848268ac1036af5342f0d078` (`project.yml` and the root `Package.resolved`).
+
+## 2026-11-17 — logout never reconnects (#951)
+
+- Upstream took the fork-local `61772f0` as #336, so fork `main` was reset to upstream `5d83469` plus one
+  deviation, "Never connect or log in just to send LOGOUT, and close every connection" (branch
+  `fix/logout-on-closed-connection`, [upstream PR #337](https://github.com/Cocoanetics/SwiftMail/pull/337),
+  head `d286942`). Replay it on every sync until upstream merges it. `61772f0` stays fetchable via the
+  branch `changedsince-timeout`.
+- `logout()` on a closed or ended connection now returns without opening a transport or sending LOGIN
+  (`IMAPCommand.reopensClosedConnection`, false for LOGOUT), and it closes every connection even on error.
+- Collision check: every app `logout()` call is `try?`, so no caller depends on the old reconnect.
+- App and NSE pin `d286942929e361e73215fcc1418d01791f3b2826` (#951, PR #955). The related cancellation
+  behaviour (a cancelled in-flight command closes the channel before any LOGOUT) is tracked in #954.
