@@ -477,6 +477,28 @@ struct IMAPMoveIntoTrackedFolderTests {
         }
     }
 
+    /// The hourly whole-account pass stays plain-IMAP only; only a pass a
+    /// folder is owed runs on every account that can owe one.
+    @Test("The hourly whole-account self-heal runs on a plain IMAP account and not on iCloud",
+          arguments: [AccountProvider.imap, .icloud])
+    @MainActor
+    func hourlySelfHealStaysIMAPOnly(_ accountProvider: AccountProvider) async throws {
+        try await Self.withRetiredBelowTheWindow("hourly-\(accountProvider.rawValue)", accountProvider: accountProvider) { w in
+            let account = try w.account()
+            UserDefaults.standard.removeObject(forKey: "selfHeal_lastRun_\(account.id)")
+            defer { UserDefaults.standard.removeObject(forKey: "selfHeal_lastRun_\(account.id)") }
+            let start = w.server.recordedCommands().count
+            _ = await w.engine.selfHealRecentMessages(account: account)
+            // The pass's check is a UID SEARCH SINCE on each folder it covers.
+            let searched = w.server.recordedCommands().dropFirst(start).contains { $0.uppercased().contains("SINCE") }
+            if accountProvider == .imap {
+                #expect(searched, "imap: the hourly pass runs (it checks the folders it covers)")
+            } else {
+                #expect(!searched, "icloud: the hourly pass does not run")
+            }
+        }
+    }
+
     /// The world of `retiredMoveBelowTheWindowIsHealedBeforeTracking`: INBOX
     /// holds more than one window, the device the newest window and the
     /// target (UID 88, older than every other message), backfill complete; the
