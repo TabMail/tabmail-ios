@@ -809,6 +809,10 @@ struct IMAPChangeReaderTests {
             guard case .failed = changes.status else { Issue.record("expected failed, got \(changes.status)"); return }
             #expect(try #require(IMAPChangeCursor.decode(changes.cursor)).failingSince == start,
                     "no session could be opened in the pass: the folder keeps a failure time")
+            // The next pass does not wait for that LOGOUT again: it opens a session and reads.
+            let next = try await Self.inbox(w, Self.read(w, cursors: [w.inboxId: changes.cursor]))
+            #expect(Self.logins(w) - loginsBefore == 1, "the next pass logs in once, got \(Self.logins(w) - loginsBefore)")
+            #expect(Self.isTracked(next.status), "the next pass reads, got \(next.status)")
         }
     }
 
@@ -1114,6 +1118,44 @@ struct IMAPChangeReaderTests {
         }
     }
 
+    @Test("Read-order hints for folders the account no longer has are dropped on the next pass")
+    func readOrderHintsForRemovedFoldersAreDropped() async throws {
+        try await Self.withWorld(inbox: [1, 2], archive: [1]) { w in
+            guard let setup = try await Self.fourFolderTimeout(w) else { return }
+            #expect(await w.provider.changeReadFirst.contains(setup.leftUnread.id), "setup: the folder left unread is to be read first")
+            #expect(await w.provider.changeReadLast == setup.timedOut.id, "setup: the folder that timed out is to be read last")
+            // Both folders are gone from the account before the next pass.
+            let gone: Set<String> = [setup.leftUnread.id, setup.timedOut.id]
+            let all = Self.requestWithExtras(w, cursors: setup.cursors, context: Self.fixedClock(setup.start))
+            let request = ChangeRequest(folders: all.folders.filter { !gone.contains($0.id) }, scope: .all,
+                                        recheck: [:], context: all.context, localRows: w.local)
+            _ = try await w.provider.fetchChanges(since: ChangeCursor(account: nil), request: request)
+            #expect(await w.provider.changeReadFirst.isEmpty, "the folder removed is still to be read first")
+            #expect(await w.provider.changeReadLast == nil, "the removed folder is still to be read last")
+        }
+    }
+
+    @Test("Once the folders a timed-out pass reordered have been read, the next pass reads in the plain rotation again")
+    func readOrderReturnsToTheRotationAfterRecovery() async throws {
+        try await Self.withWorld(inbox: [1, 2], archive: [1]) { w in
+            guard let setup = try await Self.fourFolderTimeout(w) else { return }
+            // Pass 2: nothing times out; every folder is read.
+            let pass = try await Self.readWithExtras(w, setup.cursors, context: Self.fixedClock(setup.start))
+            for folder in setup.nextRotation {
+                let status = try Self.status(pass, folder.id)
+                guard Self.isTracked(status.status) else { Issue.record("setup: \(folder.path) is read, got \(status.status)"); return }
+            }
+            // The next pass's order: the rotation one step on from pass 2, the inbox
+            // first, with no folder kept ahead or behind by the timed-out pass.
+            let order = await w.provider.changeReadOrder(
+                Self.requestWithExtras(w, cursors: setup.cursors, context: ChangeContext(onProgress: { _ in })))
+            let plain = Array(setup.nextRotation.dropFirst()) + [setup.nextRotation[0]]
+            #expect(order.first?.role == .inbox, "the inbox is first")
+            #expect(order.filter { $0.role != .inbox }.map(\.id) == plain.map(\.id),
+                    "folders read since the timeout are back in the rotation")
+        }
+    }
+
     @Test("Read order after a timed-out pass: the folders left unread first, the folder that timed out last; the inbox stays first until its read has timed out on several passes in a row")
     func readOrderAfterATimeout() {
         let ids = ["inbox", "a", "b", "c", "d"]
@@ -1403,16 +1445,80 @@ struct IMAPChangeReaderTests {
     func teardownWhileOpeningIsNotPlanted() async throws {
         try await Self.withWorld(inbox: [1]) { w in
             w.server.holdGreetings()
+            let loginsBefore = Self.logins(w)
             let pass = Task { try await Self.read(w) }
             #expect(await Self.eventually { w.server.heldGreetingCount() >= 1 }, "setup: the change connection is opening")
             await w.provider.markDirty()
-            let logoutsBefore = Self.logouts(w)
             w.server.releaseGreetings()
             let set = try await pass.value
             let inbox = try Self.inbox(w, set)
             guard case .failed = inbox.status else { Issue.record("expected failed, got \(inbox.status)"); return }
             #expect(await w.provider.changeServer == nil, "a session opened across a teardown is never planted")
-            #expect(await Self.eventually { Self.logouts(w) > logoutsBefore }, "the refused session is logged out")
+            #expect(Self.logins(w) == loginsBefore, "a LOGIN was sent after the teardown: \(Self.logins(w) - loginsBefore)")
+            #expect(inbox.cursor == nil, "a teardown leaves no failure time")
+        }
+    }
+
+    @Test("A teardown while the change session's LOGIN is answered: the session sends none of its own opening commands (CAPABILITY, ENABLE)")
+    func teardownDuringLoginSendsNoOpeningCommand() async throws {
+        try await Self.withWorld(inbox: [1]) { w in
+            let start = w.server.recordedCommands().count
+            w.server.stallNextCommand(containing: "LOGIN", seconds: SyncConfig.changeReadRequestTimeoutSeconds / 2)
+            let loginsBefore = Self.logins(w)
+            let pass = Task { try await Self.read(w) }
+            #expect(await Self.eventually { Self.logins(w) > loginsBefore }, "setup: the change session is logging in")
+            await w.provider.markDirty()
+            let inbox = try Self.inbox(w, try await pass.value)
+            let sent = w.server.recordedCommands().dropFirst(start).map { $0.uppercased() }
+            // The IMAP library asks for the capabilities once after LOGIN (the
+            // answer carries none); the reader's own CAPABILITY is not sent.
+            #expect(sent.filter { $0.hasPrefix("CAPABILITY") }.count == 1, "sent: \(sent)")
+            #expect(!sent.contains { $0.hasPrefix("ENABLE") }, "sent: \(sent)")
+            guard case .failed = inbox.status else { Issue.record("expected failed, got \(inbox.status)"); return }
+            #expect(inbox.cursor == nil, "a teardown leaves no failure time")
+        }
+    }
+
+    @Test("A teardown while the change session's CAPABILITY is answered: ENABLE is never sent")
+    func teardownDuringCapabilitySendsNoEnable() async throws {
+        try await Self.withWorld(inbox: [1]) { w in
+            let start = w.server.recordedCommands().count
+            // Both CAPABILITY commands answer late: the library's after LOGIN and the reader's own.
+            for _ in 0..<2 {
+                w.server.stallNextCommand(containing: "CAPABILITY", seconds: SyncConfig.changeReadRequestTimeoutSeconds / 2)
+            }
+            func capabilities() -> Int {
+                w.server.recordedCommands().dropFirst(start).filter { $0.uppercased().hasPrefix("CAPABILITY") }.count
+            }
+            let pass = Task { try await Self.read(w) }
+            #expect(await Self.eventually(timeout: SyncConfig.changeReadRequestTimeoutSeconds * 2) { capabilities() >= 2 },
+                    "setup: the reader's own CAPABILITY is sent")
+            await w.provider.markDirty()
+            let inbox = try Self.inbox(w, try await pass.value)
+            let sent = w.server.recordedCommands().dropFirst(start).map { $0.uppercased() }
+            #expect(!sent.contains { $0.hasPrefix("ENABLE") }, "sent: \(sent)")
+            guard case .failed = inbox.status else { Issue.record("expected failed, got \(inbox.status)"); return }
+            #expect(inbox.cursor == nil, "a teardown leaves no failure time")
+        }
+    }
+
+    @Test("A teardown while the change connection waits for an evicted session's LOGOUT: the retry never logs in")
+    func teardownDuringEvictionWaitSendsNoLogin() async throws {
+        try await Self.withLimitedWorld(maxSessions: 2) { w in
+            // Action and an idle inbox connection fill the limit; the change
+            // connection's LOGIN is refused, the inbox connection is evicted.
+            _ = try await w.provider.fetchMessages(folder: Self.inboxPath, limit: 10, offset: 0)
+            w.server.stallNextCommand(containing: "LOGOUT", seconds: SyncConfig.imapEvictionLogoutWaitSeconds / 2)
+            let loginsBefore = Self.logins(w)
+            let logoutsBefore = Self.logouts(w)
+            let pass = Task { try await Self.read(w) }
+            #expect(await Self.eventually { Self.logouts(w) > logoutsBefore }, "setup: the evicted connection is logging out")
+            await w.provider.markDirty()
+            let inbox = try Self.inbox(w, try await pass.value)
+            #expect(Self.logins(w) - loginsBefore == 1,
+                    "only the refused first LOGIN: the retry after the teardown never logs in, got \(Self.logins(w) - loginsBefore)")
+            guard case .failed = inbox.status else { Issue.record("expected failed, got \(inbox.status)"); return }
+            #expect(inbox.cursor == nil, "a teardown leaves no failure time")
         }
     }
 

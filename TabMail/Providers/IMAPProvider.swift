@@ -999,7 +999,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     ///
     /// `diagSite` labels the creator for the object-lifecycle oracle above —
     /// no default on purpose: every new call site must identify itself.
-    private func createServer(diagSite: String) async throws -> IMAPServer {
+    /// `passGeneration`: the generation of the change pass the session is opened
+    /// for; the LOGIN is sent only while it holds.
+    private func createServer(diagSite: String, passGeneration: Int? = nil) async throws -> IMAPServer {
         let server = IMAPServer(
             host: host,
             port: port,
@@ -1013,6 +1015,13 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // UI as "The operation couldn't be completed. (NIOSSL.NIOSSLError
             // error 0.)" — permanent, actionable, and named nowhere.
             throw Self.mapTransportSecurityFailure(error, host: host)
+        }
+        // Checked right before the LOGIN is written, after every wait that comes
+        // before it: a teardown (`markDirty`, `disconnect`) during any of them
+        // leaves the pass no session logged in. The socket is closed unused.
+        if let passGeneration, generation != passGeneration {
+            try? await server.disconnect()
+            throw ProviderError.notConnected
         }
         do {
             try await server.login(username: username, password: password)
@@ -3621,9 +3630,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// used idle folder connection (else IDLE), waits for its logout
     /// (`awaitEvictionLogouts`) and tries once more. A second refusal is the
     /// pass's failure (`fetchChanges`' existing handling).
-    func createChangeServer() async throws -> IMAPServer {
+    func createChangeServer(openingIn passGeneration: Int) async throws -> IMAPServer {
         do {
-            return try await createServer(diagSite: "change")
+            return try await createServer(diagSite: "change", passGeneration: passGeneration)
         } catch {
             let isLimitError = "\(error)".contains("max_userip_connections")
             parseAndApplyServerLimit(from: error)
@@ -3632,7 +3641,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAPChanges] Connection limit hit opening the change connection — evicted, retrying") }
             await awaitEvictionLogouts(logouts)
             do {
-                return try await createServer(diagSite: "changeRetry")
+                return try await createServer(diagSite: "changeRetry", passGeneration: passGeneration)
             } catch {
                 parseAndApplyServerLimit(from: error)
                 throw error

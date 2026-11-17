@@ -750,15 +750,17 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    read starts that count again (2026-11-17): one passing timeout never delays new mail behind the
    other folders (with every other folder changed, that delay is about four round trips per folder,
    up to the 20 s read budget), and an inbox that keeps timing out holds the others back for at most
-   two passes. A session dropped while its connection still answers (a
+   two passes. These order hints are dropped for folders the account no longer has. A session dropped while its connection still answers (a
    liveness NOOP answered with an error) logs in again only once its LOGOUT has been answered,
    waited for at most `imapEvictionLogoutWaitSeconds`; a LOGOUT that times out, in that wait or in
-   the IMAP library's own command timeout, has not ended the session and ends the pass; a liveness NOOP that times out reopens the
+   the IMAP library's own command timeout, has not ended the session and ends the pass, and is waited
+   for only once: the next pass opens a session without waiting for it again; a liveness NOOP that times out reopens the
    session once, before any folder is read. A session that cannot be opened again
    mid-pass, a read that timed out, a dropped one whose LOGOUT does not end in time, or a teardown
    (`markDirty`, `disconnect`) fails the folders not yet read with no failure time. A teardown ends
    the pass wherever it lands, while a session is awaited or opened included: no new session logs in
-   for that pass, and since it is the app's own act it leaves no failure time even before the pass's
+   for that pass (the pass's generation is checked right before each command that opens the session,
+   LOGIN, CAPABILITY and ENABLE, after every wait before it, 2026-11-17), and since it is the app's own act it leaves no failure time even before the pass's
    first session has opened (2026-11-17).
 10. **Accepted cost.** A server advertising QRESYNC without CONDSTORE gets no HIGHESTMODSEQ in STATUS,
    so every tracked folder does a QRESYNC SELECT each pass (no fast path). Work, not loss.

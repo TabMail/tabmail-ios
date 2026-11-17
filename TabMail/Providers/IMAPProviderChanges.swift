@@ -222,6 +222,9 @@ extension IMAPProvider {
     /// has timed out on several passes in a row
     /// (`readFirst(_:first:last:inboxTimeouts:)`).
     func changeReadOrder(_ request: ChangeRequest) -> [ChangeFolder] {
+        // Hints for folders the account no longer has are dropped.
+        changeReadFirst.formIntersection(request.folders.map(\.id))
+        if let last = changeReadLast, !request.folders.contains(where: { $0.id == last }) { changeReadLast = nil }
         let candidates = request.folders.filter { folder in
             guard !folder.path.isEmpty else { return false }
             switch request.scope {
@@ -740,16 +743,20 @@ extension IMAPProvider {
         // is reopened. A timed-out folder read never gets here: it ends the pass
         // (`fetchChanges`).
         guard await droppedChangeSessionEnded() else { throw ProviderError.notConnected }
-        // Torn down while the liveness check or the LOGOUT was awaited: no login.
-        guard generation == passGeneration else { throw ProviderError.notConnected }
-        let fresh = try await createChangeServer()
+        // The pass's generation is checked right before each command that opens
+        // the session goes out (LOGIN in `createServer`, then CAPABILITY and
+        // ENABLE), after every wait before it: a teardown at any of them sends
+        // nothing more for this pass.
+        let fresh = try await createChangeServer(openingIn: passGeneration)
         await fresh.setReconnectsInsideCommands(false)
         var qresync = false
         do {
+            guard generation == passGeneration else { throw ProviderError.notConnected }
             let advertised = try await withTimeout(seconds: SyncConfig.changeReadRequestTimeoutSeconds) {
                 try await fresh.fetchCapabilities()
             }
             if Self.qresyncUsable(advertised: advertised.filter { $0.value == nil }.map(\.name)) {
+                guard generation == passGeneration else { throw ProviderError.notConnected }
                 let enabled = try await withTimeout(seconds: SyncConfig.changeReadRequestTimeoutSeconds) {
                     try await fresh.enable([.qresync])
                 }
@@ -809,11 +816,12 @@ extension IMAPProvider {
     /// connection limit.
     private func droppedChangeSessionEnded() async -> Bool {
         guard let logout = changeLogout else { return true }
-        guard let ended = try? await withTimeout(seconds: SyncConfig.imapEvictionLogoutWaitSeconds, operation: {
+        let ended = (try? await withTimeout(seconds: SyncConfig.imapEvictionLogoutWaitSeconds, operation: {
             await logout.value
-        }) else { return false }
-        // Settled either way: a LOGOUT that timed out ends this pass only, and the
-        // next pass opens a session.
+        })) ?? false
+        // A dropped session's LOGOUT is waited for once, up to the bound: one that
+        // has not ended by then ends this pass only, and the next pass opens a
+        // session without waiting for it again.
         if changeLogout == logout { changeLogout = nil }
         return ended
     }
