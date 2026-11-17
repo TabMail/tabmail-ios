@@ -86,6 +86,29 @@ struct AddressEpochWitnessTests {
         #expect(EmailNotificationBuilder.observedUidValidity(from: ["observedUidValidity": 0]) == nil)
     }
 
+    /// Source fence: every production notification producer forwards the epoch
+    /// of the message it notifies about. A producer passing a literal `nil`
+    /// would silently switch the tap-time veto off for that delivery path.
+    @Test("every production notification producer passes the message's own observed epoch")
+    func everyProducerForwardsTheEpoch() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let expected: [(file: String, calls: Int, epoch: String)] = [
+            ("TabMailNotificationService/NotificationService.swift", 6, "observedUidValidity: (msg|partial)\\.observedUidValidity"),
+            ("TabMail/Services/Account/AccountManagerAI.swift", 1, "observedUidValidity: header\\.observedUidValidity"),
+            ("TabMail/Services/AI/ProactiveNotifyService.swift", 1, "observedUidValidity: header\\?\\.observedUidValidity"),
+        ]
+        for site in expected {
+            let source = try String(contentsOf: root.appendingPathComponent(site.file), encoding: .utf8)
+            let calls = source.components(separatedBy: "EmailNotificationBuilder.fill(").count - 1
+                + source.components(separatedBy: "partialHolder.set(").count - 1
+            let forwarded = try NSRegularExpression(pattern: site.epoch)
+                .numberOfMatches(in: source, range: NSRange(source.startIndex..., in: source))
+            #expect(calls == site.calls, "\(site.file): producer census changed (\(calls)); re-check each forwards its epoch")
+            #expect(forwarded == site.calls, "\(site.file): \(forwarded) of \(calls) producers forward the message's epoch")
+        }
+    }
+
     @Test("the NSE partial-delivery holder keeps the epoch with the address it publishes")
     func partialHolderKeepsTheEpoch() throws {
         let holder = PartialSignalHolder()
