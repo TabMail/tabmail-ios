@@ -524,6 +524,9 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// Command fragment (uppercased) → seconds to hold the NEXT matching
         /// command's response, one entry per match. See `stallNextCommand`.
         var stalls: [String: [Double]] = [:]
+        /// Like `stalls`, but the hold ends the session as soon as the client
+        /// closes the connection. See `stallNextCommandWatchingClient`.
+        var watchedStalls: [String: [Double]] = [:]
         /// Seconds to hold the answer to the NEXT IDLE `DONE`, one entry per
         /// DONE. See `delayNextIdleDoneReply`.
         var idleDoneReplyDelays: [Double] = []
@@ -844,6 +847,13 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// `seconds`: a stalled link, for a caller that must bound how long it waits.
     func stallNextCommand(containing fragment: String, seconds: Double) {
         withState { $0.stalls[fragment.uppercased(), default: []].append(seconds) }
+    }
+
+    /// Test seam: like `stallNextCommand`, but while the answer is held the
+    /// server watches the connection, and ends the session the moment the client
+    /// closes it (as a real server does), instead of noticing only after the hold.
+    func stallNextCommandWatchingClient(containing fragment: String, seconds: Double) {
+        withState { $0.watchedStalls[fragment.uppercased(), default: []].append(seconds) }
     }
 
     /// Test seam: hold the tagged answer to the NEXT IDLE `DONE` for `seconds`
@@ -2015,6 +2025,14 @@ final class FakeIMAPServer: @unchecked Sendable {
                     return state.stalls[key]?.removeFirst()
                 }
                 if let stallSeconds { usleep(UInt32(stallSeconds * 1_000_000)) }
+                let watchedSeconds: Double? = withState { state in
+                    let upper = recordedCommand.uppercased()
+                    guard let key = state.watchedStalls.keys.sorted().first(where: {
+                        upper.contains($0) && !(state.watchedStalls[$0] ?? []).isEmpty
+                    }) else { return nil }
+                    return state.watchedStalls[key]?.removeFirst()
+                }
+                if let watchedSeconds, !Self.holdAnswer(fd: fd, seconds: watchedSeconds) { break clientLoop }
                 let response = handleCommand(
                     tag: tag, command: command, args: args, fd: fd,
                     authenticated: &authenticated, selectedMailbox: &selectedMailbox,

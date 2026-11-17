@@ -700,6 +700,12 @@ extension IMAPProvider {
         openingIn passGeneration: Int,
         _ body: (IMAPServer, Bool) async throws -> T
     ) async throws -> T {
+        #if DEBUG
+        if let hook = beforeChangeLaneTestHook {
+            beforeChangeLaneTestHook = nil
+            await hook()
+        }
+        #endif
         while changeLaneBusy {
             await withCheckedContinuation { changeLaneWaiters.append($0) }
         }
@@ -743,12 +749,14 @@ extension IMAPProvider {
         // is reopened. A timed-out folder read never gets here: it ends the pass
         // (`fetchChanges`).
         guard await droppedChangeSessionEnded() else { throw ProviderError.notConnected }
-        // The pass's generation is checked right before each command that opens
-        // the session goes out (LOGIN in `createServer`, then CAPABILITY and
-        // ENABLE), after every wait before it: a teardown at any of them sends
-        // nothing more for this pass.
+        // From its creation until it is kept or discarded here, the session being
+        // opened is open to a teardown, which closes it at once
+        // (`changeOpening`): whatever it waits for ends with an error. Each
+        // command that opens it (LOGIN in `createServer`, then CAPABILITY and
+        // ENABLE) is also sent only while the pass's generation holds, so none
+        // goes out between a teardown and the moment the closing lands.
+        defer { if changeOpening?.generation == passGeneration { changeOpening = nil } }
         let fresh = try await createChangeServer(openingIn: passGeneration)
-        await fresh.setReconnectsInsideCommands(false)
         var qresync = false
         do {
             guard generation == passGeneration else { throw ProviderError.notConnected }

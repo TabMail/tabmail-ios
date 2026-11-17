@@ -816,6 +816,36 @@ struct IMAPChangeReaderTests {
         }
     }
 
+    @Test("A dropped session's LOGOUT is waited for once: when the pass's wait ends before the LOGOUT does, the next pass opens a session without waiting again")
+    func logoutIsWaitedForOnce() async throws {
+        try await Self.withWorld(inbox: [1, 2]) { w in
+            let cursor = try await Self.baseline(w)
+            await w.provider.setChangeServerLastUsedForTesting(.distantPast)
+            w.server.failNextCommand(containing: "NOOP")
+            w.server.stallNextCommand(containing: "LOGOUT", seconds: SyncConfig.imapEvictionLogoutWaitSeconds + 2)
+            // The LOGOUT goes out late, so the pass's wait ends before the IMAP
+            // library's own command timeout does, and the LOGOUT is still running.
+            let provider = w.provider
+            let delayed = Locked(false)
+            await provider.setBeforeLogoutTestHookForTesting { _, _ in
+                guard !delayed.get() else { return }
+                delayed.set(true)
+                usleep(useconds_t(SyncConfig.imapEvictionLogoutWaitSeconds / 5 * 1_000_000))
+            }
+            let first = try await Self.inbox(w, Self.read(w, cursors: [w.inboxId: cursor], context: Self.fixedClock(Date())))
+            guard case .failed = first.status else { Issue.record("setup: the pass ends, got \(first.status)"); return }
+            let loginsBefore = Self.logins(w)
+            let began = Date()
+            let next = try await Self.inbox(w, Self.read(w, cursors: [w.inboxId: first.cursor]))
+            await provider.setBeforeLogoutTestHookForTesting(nil)
+            #expect(delayed.get(), "setup: the dropped session logged out")
+            #expect(Self.logins(w) - loginsBefore == 1, "the next pass logs in once, got \(Self.logins(w) - loginsBefore)")
+            #expect(Self.isTracked(next.status), "the next pass reads, got \(next.status)")
+            #expect(Date().timeIntervalSince(began) < SyncConfig.imapEvictionLogoutWaitSeconds,
+                    "the next pass waited for the old LOGOUT again")
+        }
+    }
+
     @Test("A teardown while a dropped session's LOGOUT is awaited: no session logs in for that pass, and its folders fail with no failure time")
     func teardownDuringLogoutWaitOpensNoSession() async throws {
         try await Self.withWorld(inbox: [1, 2]) { w in
@@ -1132,6 +1162,19 @@ struct IMAPChangeReaderTests {
             _ = try await w.provider.fetchChanges(since: ChangeCursor(account: nil), request: request)
             #expect(await w.provider.changeReadFirst.isEmpty, "the folder removed is still to be read first")
             #expect(await w.provider.changeReadLast == nil, "the removed folder is still to be read last")
+        }
+    }
+
+    @Test("A pass that reads only the inbox keeps the read-order hints of the other folders")
+    func inboxOnlyPassKeepsTheHints() async throws {
+        try await Self.withWorld(inbox: [1, 2], archive: [1]) { w in
+            guard let setup = try await Self.fourFolderTimeout(w) else { return }
+            let all = Self.requestWithExtras(w, cursors: setup.cursors, context: Self.fixedClock(setup.start))
+            let inboxOnly = ChangeRequest(folders: all.folders, scope: .inboxOnly, recheck: [:],
+                                          context: all.context, localRows: w.local)
+            _ = try await w.provider.fetchChanges(since: ChangeCursor(account: nil), request: inboxOnly)
+            #expect(await w.provider.changeReadFirst.contains(setup.leftUnread.id), "the folder left unread is still to be read first")
+            #expect(await w.provider.changeReadLast == setup.timedOut.id, "the folder that timed out is still to be read last")
         }
     }
 
@@ -1459,7 +1502,99 @@ struct IMAPChangeReaderTests {
         }
     }
 
-    @Test("A teardown while the change session's LOGIN is answered: the session sends none of its own opening commands (CAPABILITY, ENABLE)")
+    @Test("A teardown (markDirty, disconnect) while the change session is being opened closes it at once: the server stops counting it before its held answer, and the pass ends")
+    func teardownClosesTheSessionBeingOpened() async throws {
+        for teardown in ["markDirty", "disconnect"] {
+            try await Self.withWorld(inbox: [1]) { w in
+                // Before the pass: the action session. A teardown logs it out too.
+                let sessionsBefore = w.server.liveSessionCount()
+                let start = w.server.recordedCommands().count
+                let held = SyncConfig.changeReadRequestTimeoutSeconds + 1
+                // The CAPABILITY the IMAP library asks for right after LOGIN is held.
+                w.server.stallNextCommandWatchingClient(containing: "CAPABILITY", seconds: held)
+                let began = Date()
+                let pass = Task { try await Self.read(w) }
+                #expect(await Self.eventually {
+                    w.server.recordedCommands().dropFirst(start).contains { $0.uppercased().hasPrefix("CAPABILITY") }
+                }, "\(teardown) setup: the session being opened has logged in and waits for its CAPABILITY")
+                #expect(w.server.liveSessionCount() == sessionsBefore + 1, "\(teardown) setup: the server counts the session being opened")
+                if teardown == "markDirty" { await w.provider.markDirty() } else { try await w.provider.disconnect() }
+                #expect(await Self.eventually(timeout: held / 4) { w.server.liveSessionCount() < sessionsBefore },
+                        "\(teardown): the session being opened is still counted after the teardown: \(w.server.liveSessionCount())")
+                let inbox = try Self.inbox(w, try await pass.value)
+                #expect(Date().timeIntervalSince(began) < held, "\(teardown): the pass waited for the held answer")
+                guard case .failed = inbox.status else { Issue.record("\(teardown): expected failed, got \(inbox.status)"); return }
+                #expect(inbox.cursor == nil, "\(teardown): a teardown leaves no failure time")
+            }
+        }
+    }
+
+    @Test("A teardown closes only a session being opened for an older pass: one opened for the current pass is left alone and kept")
+    func olderTeardownLeavesANewerOpeningAlone() async throws {
+        try await Self.withWorld(inbox: [1]) { w in
+            w.server.holdGreetings()
+            let current = await w.provider.generation
+            let pass = Task { try await Self.read(w) }
+            #expect(await Self.eventually { w.server.heldGreetingCount() >= 1 }, "setup: the change session is being opened")
+            #expect(await w.provider.hasChangeOpeningForTesting, "setup: the session being opened is open to a teardown")
+            // A teardown of the pass before this one: its generation is not newer
+            // than the pass opening now.
+            await w.provider.closeChangeOpening(olderThan: current)
+            w.server.releaseGreetings()
+            let inbox = try Self.inbox(w, try await pass.value)
+            guard case .baselineReady = inbox.status else { Issue.record("expected baselineReady, got \(inbox.status)"); return }
+            #expect(await w.provider.changeServer != nil, "the session opened for the current pass is kept")
+            #expect(!(await w.provider.hasChangeOpeningForTesting), "the kept session is no longer open to a teardown")
+        }
+    }
+
+    @Test("The session being opened stops being open to a teardown on every exit: refused LOGIN, failed ENABLE, kept; a later teardown logs the kept session out instead of closing it")
+    func openingSlotIsClearedOnEveryExit() async throws {
+        try await Self.withWorld(inbox: [1]) { w in
+            for failing in ["LOGIN", "ENABLE"] {
+                w.server.failNextCommand(containing: failing)
+                let inbox = try Self.inbox(w, try await Self.read(w))
+                guard case .failed = inbox.status else { Issue.record("\(failing): expected failed, got \(inbox.status)"); return }
+                #expect(!(await w.provider.hasChangeOpeningForTesting), "\(failing) refused: the failed session is left open to a teardown")
+            }
+            _ = try await Self.baseline(w)
+            #expect(await w.provider.changeServer != nil, "setup: the pass kept its session")
+            #expect(!(await w.provider.hasChangeOpeningForTesting), "the kept session is left open to a teardown")
+            let abandonedBefore = w.server.abandonedSessionCount()
+            let logoutsBefore = Self.logouts(w)
+            await w.provider.markDirty()
+            #expect(await Self.eventually { Self.logouts(w) > logoutsBefore }, "the teardown logged the kept session out")
+            #expect(await Self.eventually { w.server.liveSessionCount() == 0 }, "every session ended")
+            #expect(w.server.abandonedSessionCount() == abandonedBefore,
+                    "a session was closed without its LOGOUT: \(w.server.abandonedSessionCount() - abandonedBefore)")
+        }
+    }
+
+    @Test("A pass that gets the change connection after a teardown never reads on the session a newer pass opened: it fails with no failure time and the newer session stays")
+    func oldPassNeverReadsOnANewerPassSession() async throws {
+        try await Self.withWorld(inbox: [1]) { w in
+            let provider = w.provider
+            let newer = Locked<IMAPServer?>(nil)
+            let commandsAfterNewer = Locked(0)
+            // The pass waits for the change connection; meanwhile a teardown, and a
+            // newer pass that opens a session, reads and keeps it.
+            await provider.setBeforeChangeLaneTestHookForTesting {
+                await provider.markDirty()
+                _ = try? await Self.read(w)
+                newer.set(await provider.changeServer)
+                commandsAfterNewer.set(w.server.recordedCommands().count)
+            }
+            let old = try Self.inbox(w, try await Self.read(w))
+            let planted = try #require(newer.get(), "setup: the newer pass kept its session")
+            guard case .failed = old.status else { Issue.record("expected failed, got \(old.status)"); return }
+            #expect(old.cursor == nil, "a teardown leaves no failure time")
+            #expect(await provider.changeServer === planted, "the newer pass's session stays")
+            let sent = w.server.recordedCommands().dropFirst(commandsAfterNewer.get()).map { $0.uppercased() }
+            #expect(sent.allSatisfy { $0.hasPrefix("LOGOUT") }, "the old pass sent commands after the newer pass: \(sent)")
+        }
+    }
+
+    @Test("A teardown while the change session's LOGIN is answered: nothing more is sent on it (CAPABILITY, ENABLE)")
     func teardownDuringLoginSendsNoOpeningCommand() async throws {
         try await Self.withWorld(inbox: [1]) { w in
             let start = w.server.recordedCommands().count
@@ -1470,9 +1605,9 @@ struct IMAPChangeReaderTests {
             await w.provider.markDirty()
             let inbox = try Self.inbox(w, try await pass.value)
             let sent = w.server.recordedCommands().dropFirst(start).map { $0.uppercased() }
-            // The IMAP library asks for the capabilities once after LOGIN (the
-            // answer carries none); the reader's own CAPABILITY is not sent.
-            #expect(sent.filter { $0.hasPrefix("CAPABILITY") }.count == 1, "sent: \(sent)")
+            // The teardown closed the session while its LOGIN was answered: not
+            // even the CAPABILITY the IMAP library asks for after LOGIN goes out.
+            #expect(!sent.contains { $0.hasPrefix("CAPABILITY") }, "sent: \(sent)")
             #expect(!sent.contains { $0.hasPrefix("ENABLE") }, "sent: \(sent)")
             guard case .failed = inbox.status else { Issue.record("expected failed, got \(inbox.status)"); return }
             #expect(inbox.cursor == nil, "a teardown leaves no failure time")

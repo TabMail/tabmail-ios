@@ -832,6 +832,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// once the session has ended. A pass opens a new session after a dropped one
     /// only once it has.
     var changeLogout: Task<Bool, Never>?
+    /// The change session being opened, from its creation until the pass keeps
+    /// or discards it, with the generation of the pass it is opened for. A
+    /// teardown closes it at once (`closeChangeOpening`), so no session goes on
+    /// logging in or opening for a pass a teardown has ended.
+    var changeOpening: (server: IMAPServer, generation: Int)?
     /// One pass at a time uses the change connection.
     var changeLaneBusy = false
     var changeLaneWaiters: [CheckedContinuation<Void, Never>] = []
@@ -1008,9 +1013,17 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             useTLS: useTLS,
             responseBufferLimit: IMAPFetchMapping.responseBufferLimit
         )
+        if let passGeneration {
+            // Open to a teardown from now on (`closeChangeOpening`). A change
+            // session never reconnects inside a command, so once a teardown has
+            // closed it, nothing it is waiting for logs in again.
+            changeOpening = (server, passGeneration)
+            await server.setReconnectsInsideCommands(false)
+        }
         do {
             try await server.connect()
         } catch {
+            if openingTornDown(passGeneration) { throw ProviderError.notConnected }
             // IOS-TLS-002: a server below the TLS floor otherwise arrives at the
             // UI as "The operation couldn't be completed. (NIOSSL.NIOSSLError
             // error 0.)" — permanent, actionable, and named nowhere.
@@ -1019,12 +1032,16 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         // Checked right before the LOGIN is written, after every wait that comes
         // before it: a teardown (`markDirty`, `disconnect`) during any of them
         // leaves the pass no session logged in. The socket is closed unused.
-        if let passGeneration, generation != passGeneration {
+        if openingTornDown(passGeneration) {
             try? await server.disconnect()
             throw ProviderError.notConnected
         }
         do {
             try await server.login(username: username, password: password)
+        } catch _ where openingTornDown(passGeneration) {
+            // Closed by a teardown while LOGIN (or the CAPABILITY the IMAP
+            // library sends after it) was answered.
+            throw ProviderError.notConnected
         } catch IMAPError.loginFailed(let reason) {
             // The server answered the login and refused it. Decide by the RFC 5530
             // response code, never by the server's prose (`leadingResponseCode`
@@ -2674,6 +2691,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         #if DEBUG
         logMut("disconnect() BUMP")
         #endif
+        closeChangeOpening(olderThan: generation)
 
         let capturedFolderServers = folderServers
         let capturedActionServer = actionServer
@@ -2839,6 +2857,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         #if DEBUG
         logMut("markDirty() BUMP")
         #endif
+        closeChangeOpening(olderThan: generation)
 
         // The change reader's connection: a pass holding it fails its next
         // command (it never reconnects inside one) and drops it.
@@ -3196,6 +3215,17 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     func setBeforeLogoutTestHookForTesting(_ hook: (@Sendable (IMAPServer, Int) -> Void)?) {
         beforeLogoutTestHook = hook
     }
+
+    #if DEBUG
+    /// Test seam: awaited once by the next pass that asks for the change
+    /// connection, before it takes it (`withChangeConnection`).
+    var beforeChangeLaneTestHook: (@Sendable () async -> Void)?
+    func setBeforeChangeLaneTestHookForTesting(_ hook: (@Sendable () async -> Void)?) {
+        beforeChangeLaneTestHook = hook
+    }
+    /// Whether a change session is open to a teardown (`changeOpening`).
+    var hasChangeOpeningForTesting: Bool { changeOpening != nil }
+    #endif
 
     // MARK: T3.7 observability + direct drivers (PORT — `v2final`)
 
@@ -3622,6 +3652,22 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         changeSelectedPath = nil
         logouts.append(detachedTeardownLogout(server))
         return true
+    }
+
+    /// Whether the change pass of `passGeneration` has been torn down since.
+    private func openingTornDown(_ passGeneration: Int?) -> Bool {
+        passGeneration.map { $0 != generation } ?? false
+    }
+
+    /// Teardown: close at once, without a LOGOUT, the change session being
+    /// opened for a pass of a generation older than `current`, never a newer
+    /// pass's. Whatever it is waiting for (connect, LOGIN, CAPABILITY, ENABLE)
+    /// ends with an error, and nothing more is sent on it.
+    func closeChangeOpening(olderThan current: Int) {
+        guard let opening = changeOpening, opening.generation < current else { return }
+        changeOpening = nil
+        let server = opening.server
+        Task { try? await server.disconnect() }
     }
 
     /// Open the change reader's connection (`changeSession`) under the same

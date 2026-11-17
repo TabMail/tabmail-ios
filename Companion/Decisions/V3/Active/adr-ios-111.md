@@ -761,7 +761,14 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    the pass wherever it lands, while a session is awaited or opened included: no new session logs in
    for that pass (the pass's generation is checked right before each command that opens the session,
    LOGIN, CAPABILITY and ENABLE, after every wait before it, 2026-11-17), and since it is the app's own act it leaves no failure time even before the pass's
-   first session has opened (2026-11-17).
+   first session has opened (2026-11-17). The session being opened is open to a teardown from its
+   creation until the pass keeps or discards it: a teardown closes it at once, without a LOGOUT, so
+   whatever it waits for (connect, LOGIN, the CAPABILITY the IMAP library sends after LOGIN, the
+   reader's CAPABILITY or ENABLE) ends with an error, and the server stops counting it right away
+   instead of when a held answer comes (2026-11-17). A teardown closes only a session opened for its
+   own pass or an older one, never a newer pass's, and the session never reconnects inside a command,
+   so nothing it was waiting for logs in again. A pass that gets the change connection only after a
+   teardown never uses the session a newer pass kept.
 10. **Accepted cost.** A server advertising QRESYNC without CONDSTORE gets no HIGHESTMODSEQ in STATUS,
    so every tracked folder does a QRESYNC SELECT each pass (no fast path). Work, not loss.
 11. **Exit rule: a move that leaves a folder's view possibly wrong** (2026-11-15). ADR-IOS-073
