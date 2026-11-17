@@ -115,6 +115,19 @@ extension ChatThreadViewLifecycleTests {
         try await Task.sleep(for: Self.settled)
         #expect(!gate.isFrozen)
         #expect(hold.trackedIdsForTesting.isEmpty)
+
+        // Taken again and let go again before the first let-go has settled: when the first
+        // settle's time is up, the second swipe is still settling and still holds.
+        Self.swipe(.began, on: "overlap")
+        Self.swipe(.ended, on: "overlap")
+        try await Task.sleep(for: ChatViewLayout.swipeSettleHold * 0.9)
+        Self.swipe(.began, on: "overlap")
+        Self.swipe(.ended, on: "overlap")
+        try await Task.sleep(for: ChatViewLayout.swipeSettleHold * 0.6)
+        #expect(gate.isFrozen, "the first let-go's settle never ends the second swipe's")
+        try await Task.sleep(for: Self.settled)
+        #expect(!gate.isFrozen, "the second swipe has settled")
+        #expect(hold.trackedIdsForTesting.isEmpty)
     }
 
     private static let freezeAccount = "acc-chat-swipe-freeze"
