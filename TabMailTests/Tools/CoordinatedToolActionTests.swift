@@ -742,6 +742,128 @@ struct CoordinatedToolActionTests {
         return h
     }
 
+    // MARK: - tabmail-ios #538: the address-epoch witness through the coordinator
+
+    /// Moves the folder to `epoch` and re-seats `uid` with a different
+    /// witness-less message proven under it, as the reset reaction's resync does.
+    private func reseatUnderNewEpoch(
+        pool: DatabasePool, folder: Folder, captured: MessageHeader, uid: String, epoch: Int
+    ) async throws {
+        var impostor = makeWitnessedIMAPHeader(folder: folder, uid: uid, rfc: nil, observedEpoch: epoch)
+        impostor.subject = "impostor \(uid)"
+        try await pool.writeWithoutTransaction { db in
+            try db.execute(
+                sql: "UPDATE folder SET lastKnownUidValidity = ? WHERE id = ?",
+                arguments: [epoch, folder.id])
+            try captured.delete(db)
+            try impostor.insert(db)
+        }
+    }
+
+    @Test("""
+    #538 pass 1: a message with NO Message-ID re-seated under a new UIDVALIDITY while the \
+    confirmation is up is identity-refused — nothing moves, nothing queues, no overlay left
+    """)
+    func witnessLessReseatUnderANewEpochIsRefusedAtPreResolve() async throws {
+        let (pool, _, _, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); clearOverlay() }
+        clearOverlay()
+
+        let (imapInbox, _) = try seedIMAPAccount(pool: pool, accountId: "acc-538-prereso", inboxEpoch: 41)
+        let captured = makeWitnessedIMAPHeader(folder: imapInbox, uid: "7101", rfc: nil, observedEpoch: 41)
+        try await pool.writeWithoutTransaction { db in try captured.insert(db) }
+        let id = captured.id
+        let expected = ExpectedMessageIdentity.map([captured])
+        #expect(expected[id] != nil, "the epoch must be the witness, or the test is vacuous")
+
+        try await reseatUnderNewEpoch(pool: pool, folder: imapInbox, captured: captured, uid: "7101", epoch: 42)
+
+        let admission = await AccountManager.shared.performCoordinatedRoleMove(
+            ids: [id], role: .archive, expectedIdentities: expected)
+
+        #expect(admission.identityRefusedIds == [id])
+        #expect(admission.failedIds == [id])
+        #expect(admission.admittedIds.isEmpty)
+        #expect(admission.pendingIds.isEmpty)
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(final?.folderPath == imapInbox.path, "the impostor must not be archived")
+        #expect(final?.subject == "impostor 7101", "non-vacuity: the impostor is the row at that address")
+        let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.isEmpty)
+        #expect(AccountManager.shared.overlayOpRefCountForTesting()[id] == nil)
+        #expect(AccountManager.shared.snapshotOverlay()[id] == nil)
+    }
+
+    @Test("""
+    #538 pass 2: a message with NO Message-ID re-seated under a new UIDVALIDITY after the \
+    pre-resolve and before the queued write is identity-refused at the write
+    """)
+    func witnessLessReseatUnderANewEpochIsRefusedInsideTheQueuedClosure() async throws {
+        let (pool, _, _, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); clearOverlay() }
+        clearOverlay()
+
+        let (imapInbox, _) = try seedIMAPAccount(pool: pool, accountId: "acc-538-inflight", inboxEpoch: 43)
+        let captured = makeWitnessedIMAPHeader(folder: imapInbox, uid: "7102", rfc: nil, observedEpoch: 43)
+        try await pool.writeWithoutTransaction { db in try captured.insert(db) }
+        let id = captured.id
+        let expected = ExpectedMessageIdentity.map([captured])
+
+        let gate = AsyncStream<Void>.makeStream()
+        await AccountManager.shared.enqueueWrite {
+            for await _ in gate.stream { break }
+        }
+        let call = Task {
+            await AccountManager.shared.performCoordinatedRoleMove(
+                ids: [id], role: .archive, expectedIdentities: expected)
+        }
+        var admittedByPassOne = false
+        for _ in 0..<400 {
+            if AccountManager.shared.snapshotOverlay()[id] != nil { admittedByPassOne = true; break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(admittedByPassOne, "pass 1 must have admitted the id, or this exercises the wrong window")
+
+        try await reseatUnderNewEpoch(pool: pool, folder: imapInbox, captured: captured, uid: "7102", epoch: 44)
+
+        gate.continuation.finish()
+        let admission = await call.value
+        await drainWriteQueue()
+
+        #expect(admission.identityRefusedIds == [id])
+        #expect(admission.admittedIds.isEmpty)
+        #expect(admission.pendingIds.isEmpty)
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(final?.folderPath == imapInbox.path)
+        let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.isEmpty)
+        #expect(AccountManager.shared.overlayOpRefCountForTesting()[id] == nil)
+        #expect(AccountManager.shared.snapshotOverlay()[id] == nil)
+    }
+
+    @Test("#538 non-vacuity: a message with NO Message-ID whose epoch is unchanged still archives")
+    func witnessLessMessageWithItsOwnEpochStillArchives() async throws {
+        let (pool, _, _, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); clearOverlay() }
+        clearOverlay()
+
+        let (imapInbox, imapArchive) = try seedIMAPAccount(pool: pool, accountId: "acc-538-same", inboxEpoch: 45)
+        let captured = makeWitnessedIMAPHeader(folder: imapInbox, uid: "7103", rfc: nil, observedEpoch: 45)
+        try await pool.writeWithoutTransaction { db in try captured.insert(db) }
+        let id = captured.id
+
+        let admission = await AccountManager.shared.performCoordinatedRoleMove(
+            ids: [id], role: .archive, expectedIdentities: ExpectedMessageIdentity.map([captured]))
+        await drainWriteQueue()
+
+        #expect(admission.admittedIds == [id])
+        #expect(admission.identityRefusedIds.isEmpty)
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(final?.folderId == imapArchive.id)
+        let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.count == 1)
+    }
+
     @Test("""
     C3 pass 1 (pre-resolve): a UIDVALIDITY turnover re-seats the captured address onto a \
     DIFFERENT message while the confirmation card is up — the coordinated archive moves \
