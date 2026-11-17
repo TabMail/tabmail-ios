@@ -59,7 +59,31 @@ struct FolderResetGenerationTests {
     /// epoch, and the server's new epoch holds a different email at UID 101.
     /// `shownHasRfc == false` is the shown row without a Message-ID, which the
     /// content witness (`ExpectedMessageIdentity`) cannot check.
-    private func makeEnv(accountId: String, shownHasRfc: Bool = true) throws -> Env {
+    /// Fails the next write transaction once, at BEGIN, as a busy database does:
+    /// another connection holds the write lock with no busy wait, and the first
+    /// write that meets it releases it, so every later write succeeds.
+    final class OneShotWriteFailure: @unchecked Sendable {
+        private let holder = Mutex<DatabaseQueue?>(nil)
+        func arm(path: String) throws {
+            var config = Configuration()
+            config.allowsUnsafeTransactions = true
+            let queue = try DatabaseQueue(path: path, configuration: config)
+            try queue.inDatabase { try $0.execute(sql: "BEGIN IMMEDIATE") }
+            holder.withLock { $0 = queue }
+        }
+        /// Busy callback: refuse this attempt and release the lock.
+        func onBusy() -> Bool {
+            if let queue = holder.withLock({ q -> DatabaseQueue? in defer { q = nil }; return q }) {
+                try? queue.inDatabase { try $0.execute(sql: "ROLLBACK") }
+                try? queue.close()
+            }
+            return false
+        }
+    }
+
+    private func makeEnv(
+        accountId: String, shownHasRfc: Bool = true, writeFailure: OneShotWriteFailure? = nil
+    ) throws -> Env {
         let server = FakeIMAPServer(mailboxes: [
             "INBOX": [FakeIMAPServer.makeMessage(uid: Self.uid, rfc822Text: Self.rfc822(messageId: Self.replacementRfc))],
             "Archive": [],
@@ -68,7 +92,22 @@ struct FolderResetGenerationTests {
         for path in ["INBOX", "Archive", "Trash"] { server.setUidValidity(Self.newEpoch, for: path) }
         try server.start()
 
-        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        let (pool, dir, previous): (DatabasePool, URL, AppDatabase?)
+        if let writeFailure {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            var config = Configuration()
+            config.foreignKeysEnabled = true
+            config.busyMode = .callback { _ in writeFailure.onBusy() }
+            let failingPool = try DatabasePool(path: directory.appendingPathComponent("t.sqlite").path, configuration: config)
+            let appDb = try AppDatabase(dbPool: failingPool)
+            let prior = AppDatabase.shared.withLock { current -> AppDatabase? in
+                let prev = current; current = appDb; return prev
+            }
+            (pool, dir, previous) = (failingPool, directory, prior)
+        } else {
+            (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        }
         _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
         try FolderEpochTestFixture.insertFolder(
             accountId: accountId, path: "INBOX", role: .inbox, pool: pool,
@@ -289,13 +328,17 @@ struct FolderResetGenerationTests {
     @Test("""
     A tag intent stamped before the folder's reset never tags the email re-seated at its id; \
     stamped after it, the replacement is tagged
-    """, arguments: [true, false])
-    func queuedTagAcrossAResetNeverTagsTheReplacement(stampedBeforeReset: Bool) async throws {
-        let env = try makeEnv(accountId: "frg-tag-\(stampedBeforeReset)")
+    The same holds when the tag's own write fails once before it runs: no cache or teaching \
+    work is attributed to the replacement
+    """, arguments: [true, false], [false, true])
+    func queuedTagAcrossAResetNeverTagsTheReplacement(stampedBeforeReset: Bool, tagWriteFails: Bool) async throws {
+        let failure = tagWriteFails ? OneShotWriteFailure() : nil
+        let env = try makeEnv(accountId: "frg-tag-\(stampedBeforeReset)-\(tagWriteFails)", writeFailure: failure)
         clearOverlay()
         let preResetStamp = FolderResetGeneration.current()
         try await runReset(env)
         try await expectReseated(env)
+        if let failure { try failure.arm(path: env.pool.path) }
         let stamp = stampedBeforeReset ? preResetStamp : FolderResetGeneration.current()
         FolderResetGeneration.$gestureStamp.withValue(stamp) {
             AccountManager.shared.registerGestureIntent(id: env.headerId, .actionTag(target: .reply, baseline: nil))
@@ -309,7 +352,8 @@ struct FolderResetGenerationTests {
             }
         }
         for _ in 0..<200 {
-            if try await sideEffects().cache > 0 { break }
+            let effects = try await sideEffects()
+            if effects.cache > 0 && effects.refine > 0 { break }
             try await Task.sleep(for: .milliseconds(10))
         }
         let after = try #require(try await row(env))
@@ -319,8 +363,11 @@ struct FolderResetGenerationTests {
             #expect(effects.cache == 0 && effects.refine == 0,
                     "a tag taken before the reset was cached or taught for the replacement: \(effects)")
         } else {
-            #expect(after.actionTag == .reply, "control: a tag taken after the reset was refused")
-            #expect(effects.cache > 0, "control: the cache step never ran, so the refused arm's zero proves nothing")
+            if !tagWriteFails {
+                #expect(after.actionTag == .reply, "control: a tag taken after the reset was refused")
+            }
+            #expect(effects.cache > 0 && effects.refine > 0,
+                    "control: the cache or teaching step never ran, so the refused arm's zero proves nothing: \(effects)")
         }
         await finish(env)
     }

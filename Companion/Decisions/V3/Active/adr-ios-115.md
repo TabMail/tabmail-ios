@@ -23,7 +23,12 @@ tuple) and draft deletes (minted epoch) already carry their own epoch and are sa
    folder's last reset; `roleMoveRejectDispositions` reports that as `.terminalStale` (a retry under
    a fresh stamp would admit the replacement). No stamp bound = no verdict (refuse-only witness,
    ADR-IOS-068 carve-out). The outbox finalize binds nil (it reads the original at execution time).
-4. A surface whose wait outlives the reset binds the stamp taken when its view was READ. Part 1:
+4. Background work is not a gesture: a deferred Undo is materialized with no stamp (its source
+   address is the one the provider just proved) and only when the destination row still carries the
+   epoch the provider proved; the outbox finalize binds no stamp. A manual tag (local only, no
+   admission) checks the generation inside its own write, and on a failed write before skipping its
+   cache and teaching steps.
+5. A surface whose wait outlives the reset binds the stamp taken when its view was READ. Part 1:
    the AI archive / delete cards (`EmailArchiveTool`, `EmailDeleteTool`) stamp before reading the
    headers the card shows.
 
