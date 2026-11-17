@@ -27,6 +27,10 @@ import GRDB
 //   `rereadLater`). A replied/forwarded mark the record carries is set, never
 //   cleared (a reader that does not know it says false; the phone's own reply
 //   marks its parent before the server shows it; Outlook's last verb, #890);
+// - a folder read under a generation of its ids (`FolderChanges.addressEpoch`)
+//   other than the one it stores applies nothing (the binding epoch check); a
+//   renumbered folder (`ChangeRefusal.addressEpochChanged`) loses its bookmark,
+//   coverage and re-read list and has its turnover reaction armed;
 // - a record from a baseline (`FolderChangeStatus.isBaseline`: the folder's
 //   messages as they are, not changes) inserts only a message dated within the
 //   folder's held range (`Folder.oldestSyncedDate`); with no held range yet it
@@ -43,7 +47,9 @@ import GRDB
 //   (`rereadLater`).
 //   Over `SyncConfig.changeRecheckLimit` ids, a folder the catch-up checks
 //   (`SyncEngine.isSyncable`) keeps every id already stored and only as many of
-//   this pass's additions as fit, and its catch-up is armed for the cut ones; a
+//   this pass's additions as fit, and its catch-up is armed for the cut ones (a
+//   folder holding its own bookmark drops it instead, so it is listed again: its
+//   catch-up need not load a missing message); a
 //   folder the catch-up never checks keeps every id, since nothing else would
 //   repair a dropped one (each pass still reads at most the per-pass budget);
 // - the folder's own bookmark (`Folder.changeCursor`) is written in the same
@@ -58,6 +64,17 @@ struct FolderChangeApplyResult {
     var discoveredParents: [String] = []
     var wroteRows = false
     var armedCatchUp = false
+    /// The folder's path when this transaction armed its turnover reaction
+    /// (`ChangeRefusal.addressEpochChanged`); the engine runs the reaction after
+    /// the transaction commits.
+    var armedTurnoverPath: String?
+    /// Nothing was written, not even the bookmark: the folder is gone, its
+    /// turnover reaction is pending, or the read was under another epoch than
+    /// the folder stores (the binding check). Such a folder is not trackable
+    /// this pass.
+    var rejected = false
+    /// The folder bookmark stored when the transaction ends (nil = none).
+    var storedCursor: String?
 }
 
 extension SyncEngine {
@@ -65,8 +82,24 @@ extension SyncEngine {
     nonisolated static func applyFolderChanges(_ changes: FolderChanges, db: Database) throws -> FolderChangeApplyResult {
         var result = FolderChangeApplyResult()
         guard let folder = try Folder.fetchOne(db, key: changes.folderId),
-              folder.uidValidityResetPendingAt == nil else { return result }
+              folder.uidValidityResetPendingAt == nil else {
+            result.rejected = true
+            return result
+        }
         let accountId = folder.accountId
+
+        // The binding epoch check (compare-and-set, ADR-IOS-104): what was read
+        // under one generation of the folder's ids applies only while the folder
+        // still stores that generation. The turnover reaction runs outside the
+        // per-account semaphore and can stamp a new one between the read and
+        // this transaction; then nothing is written, not even the bookmark.
+        if let epoch = changes.addressEpoch, folder.lastKnownUidValidity != epoch {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Sync] change apply: folder \(folder.name) read under generation \(epoch), stores \(folder.lastKnownUidValidity.map(String.init) ?? "none") — nothing applied")
+            }
+            result.rejected = true
+            return result
+        }
 
         // Shields, read INSIDE this transaction.
         let snapshot = try PendingOperationSnapshot.load(accountId: accountId, db: db)
@@ -127,6 +160,11 @@ extension SyncEngine {
         // already stored (a long list of retired ids drains over passes, #903).
         // Ids are dropped only where the catch-up will find them: arming it does
         // nothing for a folder it never checks, so that folder keeps them all.
+        // A folder holding its own bookmark is listed again instead (as a
+        // refused read is): its catch-up need not load a missing message (the
+        // IMAP one only checks the rows a folder holds), and the bookmark would
+        // move past a cut arrival.
+        var cutDropsBookmark = false
         if recheck.count > SyncConfig.changeRecheckLimit,
            Self.isSyncable(role: folder.role, isFavorite: folder.isFavorite) {
             let stored = Set(before.recheck)
@@ -138,23 +176,56 @@ extension SyncEngine {
                 return added <= room
             }
             if added > room {
-                try markCatchUpLapse(folderId: folder.id, db: db)
+                if folder.changeCursor != nil {
+                    cutDropsBookmark = true
+                } else {
+                    try markCatchUpLapse(folderId: folder.id, db: db)
+                }
                 result.armedCatchUp = true
             }
         }
         state.recheck = recheck
 
         // The folder's own bookmark and coverage.
-        var cursor = changes.cursor ?? folder.changeCursor
+        // A bookmark dropped since the read was issued stays dropped: the read's
+        // new one is not written (its records still apply). Only a drop is
+        // checked (issued with one, none stored now): a reader's own later page
+        // of the same folder moves the bookmark forward, never to none.
+        let bookmarkMoved = changes.readFrom.map { $0.cursor != nil && folder.changeCursor == nil } ?? false
+        var cursor = bookmarkMoved ? folder.changeCursor : (changes.cursor ?? folder.changeCursor)
         switch changes.status {
-        case .refused:
+        case .refused(let reason):
             // This folder only: its bookmark is gone, so it is not covered, its
             // catch-up gets one whole-folder check, and the account's full sync
             // lists it. Its next read starts a new baseline.
+            try dropChangeBookmark(folderId: folder.id, onlyIfHeld: false, db: db)
             cursor = nil
             state.tracking = false
-            try markCatchUpLapse(folderId: folder.id, db: db)
-            try db.execute(sql: "UPDATE account SET lastFullSyncAt = NULL WHERE id = ?", arguments: [accountId])
+            if case .addressEpochChanged(let served) = reason {
+                // The re-read ids name messages of the dead generation.
+                state.recheck = []
+                // Arm the turnover reaction durably, as the STATUS trigger's
+                // reaction does at its step 1; the engine runs it after this
+                // transaction (and the next pass re-drives it after a crash). Only
+                // against a KNOWN stored generation that differs: a folder already
+                // on the served one has nothing to reset.
+                if let stored = folder.lastKnownUidValidity, stored != served {
+                    try db.execute(
+                        sql: "UPDATE folder SET uidValidityResetPendingAt = ? WHERE id = ? AND uidValidityResetPendingAt IS NULL",
+                        arguments: [Date(), folder.id])
+                    result.armedTurnoverPath = folder.path
+                }
+            }
+        case .untracked:
+            // The reader could not track the folder this pass (no change tracking
+            // on this session or this selection): it is not covered, so the engine
+            // lists it when it changed, and the full sync lists it too. The
+            // bookmark it holds is kept: nothing of this read was applied to it,
+            // so it still says exactly what the device has read, and the next
+            // read that can track the folder goes on from it. Dropping it would
+            // start a new baseline past every message that arrived meanwhile,
+            // which only a foreground listing would then fetch.
+            state.tracking = false
         case .baselining:
             state.tracking = false
         case .baselineReady:
@@ -165,13 +236,60 @@ extension SyncEngine {
         case .tracked, .failed, .notRun:
             break
         }
+        if cutDropsBookmark {
+            // Its catch-up gets one whole-folder check and its listing is due.
+            try dropChangeBookmark(folderId: folder.id, onlyIfHeld: false, db: db)
+            cursor = nil
+            state.tracking = false
+        }
         if cursor != folder.changeCursor {
             try db.execute(sql: "UPDATE folder SET changeCursor = ? WHERE id = ?", arguments: [cursor, folder.id])
+            // A bookmark that starts sees nothing older than itself, and once
+            // one is stored the catch-up runs no periodic check. Its one
+            // whole-folder check is armed with it, in this transaction.
+            if changes.armCatchUpWithBookmark, cursor != nil {
+                try markCatchUpLapse(folderId: folder.id, db: db)
+            }
         }
         if state != before {
             try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [state.encoded, folder.id])
         }
+        result.storedCursor = cursor
         return result
+    }
+
+    /// Drop one folder's change bookmark outside a read, as a refused read
+    /// does (`.refused` above): the bookmark is cleared, the folder is no longer
+    /// covered, its catch-up gets one whole-folder check, and the account's full
+    /// sync lists it; its next read starts a new baseline. The re-read list is
+    /// kept. A folder with no bookmark is otherwise left as it is.
+    /// `onlyIfHeld: false` (a refused read) ends the folder's tracking even when
+    /// it holds no bookmark (a refused baseline). `selfHealDue: true` (a move
+    /// retired without proof) also owes the folder one self-heal pass before it
+    /// is tracked again (`FolderChangeState.selfHealOwed`), with or without a
+    /// bookmark: a folder awaiting its first baseline is tracked after its next
+    /// listing, which does not reach below the window either.
+    /// Reads the folder's raw columns only (no model is decoded), so the release
+    /// boundary can call it inside `AppDatabase.init` (#876).
+    nonisolated static func dropChangeBookmark(folderId: String, onlyIfHeld: Bool = true, selfHealDue: Bool = false, db: Database) throws {
+        guard let row = try Row.fetchOne(
+            db, sql: "SELECT accountId, changeCursor, changeState FROM folder WHERE id = ?", arguments: [folderId])
+        else { return }
+        let accountId = String.fromDatabaseValue(row["accountId"] as DatabaseValue)
+        let changeCursor = String.fromDatabaseValue(row["changeCursor"] as DatabaseValue)
+        var state = FolderChangeState(raw: String.fromDatabaseValue(row["changeState"] as DatabaseValue))
+        if selfHealDue { state.selfHealOwed += 1 }
+        guard !onlyIfHeld || changeCursor != nil else {
+            if selfHealDue {
+                try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [state.encoded, folderId])
+            }
+            return
+        }
+        state.tracking = false
+        try db.execute(sql: "UPDATE folder SET changeCursor = NULL, changeState = ? WHERE id = ?",
+                       arguments: [state.encoded, folderId])
+        try markCatchUpLapse(folderId: folderId, db: db)
+        try db.execute(sql: "UPDATE account SET lastFullSyncAt = NULL WHERE id = ?", arguments: [accountId])
     }
 
     /// Arm one folder's catch-up: the same lapse mark `lapseDeltaCursor` sets on
@@ -195,9 +313,28 @@ extension SyncEngine {
         result: inout FolderChangeApplyResult, db: Database
     ) throws -> Bool {
         let rfc822 = record.rfc822MessageId ?? record.header?.rfc822MessageId
-        if var existing = try MessageHeader
+        // The row this record describes must own the address: on IMAP a UID is
+        // mailbox-local, so an optimistically moved row that still carries its
+        // source UID (and no epoch) can sit here under the same number as a
+        // different message. Such a row is not merged or stamped; the record is
+        // read again (`providerAddressOwnershipProven`, the listing's own rule).
+        let canonicalId = MessageIdentity.headerId(
+            accountId: folder.accountId, folderPath: folder.path, messageId: record.messageId)
+        let candidates = try MessageHeader
             .filter(Column("messageId") == record.messageId && Column("folderId") == folder.id)
-            .fetchOne(db) {
+            .fetchAll(db)
+        if var existing = candidates.first(where: { $0.id == canonicalId }) ?? candidates.first {
+            // A nil address epoch means ids that are stable across the account.
+            guard providerAddressOwnershipProven(
+                row: existing, accountId: folder.accountId, folderPath: folder.path,
+                folderId: folder.id, messageId: record.messageId, canonicalId: canonicalId,
+                windowMode: addressEpoch == nil ? .date : .uid, sourceBoundEpoch: addressEpoch)
+            else {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Sync] change apply: \(existing.id) does not own \(folder.path)/\(record.messageId); read again")
+                }
+                return false
+            }
             return try mergeChangeRecord(
                 record, into: &existing, folder: folder, addressEpoch: addressEpoch,
                 snapshot: snapshot, recentlyCompleted: recentlyCompleted, result: &result, db: db)
@@ -220,13 +357,21 @@ extension SyncEngine {
             // A pending destructive op owns this identity.
             return false
         }
+        if snapshot.tag.containsAnyKey(messageId: info.messageId, rfc822MessageId: rfc822)
+            || snapshot.tag.contains(info.messageId) {
+            // The user's pending tag change owns this message's tag: no row is
+            // inserted or taken back (cache restoration and ReplyDetect would
+            // write a tag of their own); it is read again once the op drains.
+            return false
+        }
         if recentlyCompleted[info.messageId] != nil {
             // The queue completed an op on this message within the TTL, so the
             // server state just read may be stale. 🚨 NOT removable: it is what
             // stops a just-completed message from reappearing in its source.
             return false
         }
-        return try insertChangeRecord(info, record: record, folder: folder, snapshot: snapshot, result: &result, db: db)
+        return try insertChangeRecord(
+            info, record: record, folder: folder, addressEpoch: addressEpoch, snapshot: snapshot, result: &result, db: db)
     }
 
     /// The existing-row merge: PRESENT fields only; flags and the server tag
@@ -277,9 +422,15 @@ extension SyncEngine {
         if let rfc822 = record.rfc822MessageId { existing.rfc822MessageId = rfc822 }
         if let references = record.references { existing.referencesJSON = MessageHeader.encodeReferences(references) }
         // Replied/forwarded: set when the server shows it, never cleared.
+        // Not while the user's own tag change is pending: theirs is the one the
+        // server must end up with.
         if record.isReplied && !existing.isReplied {
             existing.isReplied = true
-            try replyDetect(&existing, accountId: folder.accountId, folderPath: folder.path, context: "change merge", db: db)
+            let userTagPending = snapshot.tag.containsAnyKey(messageId: existing.stableId, rfc822MessageId: rfc822)
+                || snapshot.tag.contains(record.messageId)
+            if !userTagPending {
+                try replyDetect(&existing, accountId: folder.accountId, folderPath: folder.path, context: "change merge", db: db)
+            }
         }
         if record.isForwarded { existing.isForwarded = true }
         try existing.update(db)
@@ -293,8 +444,8 @@ extension SyncEngine {
         _ header: inout MessageHeader, accountId: String, folderPath: String, context: String, db: Database
     ) throws {
         guard header.actionTag == .reply else { return }
-        header.actionTag = ActionTag.none
-        header.tagSortOrder = ActionTag.none.sortOrder
+        // Stamped like any tag write.
+        header.setActionTag(ActionTag.none)
         var tagOp = PendingOperation(
             type: .setTag, messageIds: [header.stableId], accountId: accountId,
             folderPath: folderPath, tagValue: ActionTag.none.rawValue)
@@ -334,8 +485,8 @@ extension SyncEngine {
     /// reclaim, Drafts/Sent placeholder dedup (with label and body carry), the
     /// references and user-label rows, and the Sent reply-parent mark.
     private nonisolated static func insertChangeRecord(
-        _ info: MessageHeaderInfo, record: ChangeRecord, folder: Folder, snapshot: PendingOperationSnapshot,
-        result: inout FolderChangeApplyResult, db: Database
+        _ info: MessageHeaderInfo, record: ChangeRecord, folder: Folder, addressEpoch: Int?,
+        snapshot: PendingOperationSnapshot, result: inout FolderChangeApplyResult, db: Database
     ) throws -> Bool {
         let accountId = folder.accountId
         if folder.role == .drafts {
@@ -357,6 +508,9 @@ extension SyncEngine {
             isInInbox: folder.role == .inbox,
             providerDate: info.providerOrderDate
         )
+        // The epoch the read was bound to: the new row's address is actionable
+        // as the listing's would be.
+        header.observedUidValidity = addressEpoch
         header.rfc822MessageId = info.rfc822MessageId
         header.inReplyTo = info.inReplyTo
         header.referencesJSON = MessageHeader.encodeReferences(info.references)
@@ -386,12 +540,28 @@ extension SyncEngine {
             if snapshot.destructive.containsAnyKey(messageId: orphaned.messageId, rfc822MessageId: orphaned.rfc822MessageId) {
                 return false
             }
+            // Taken back only when it owns this address by the listing's own rule
+            // (`providerAddressOwnershipProven`). On IMAP a row in another folder
+            // never does: a row left there by a move that did not happen is
+            // listed again (the exit rule drops both folders' bookmarks), and one
+            // from before a UIDVALIDITY turnover must not be bound to a reused
+            // UID. It is left untouched and the id read again.
+            guard providerAddressOwnershipProven(
+                row: orphaned, accountId: accountId, folderPath: folder.path, folderId: folder.id,
+                messageId: header.messageId, canonicalId: header.id,
+                windowMode: addressEpoch == nil ? .date : .uid, sourceBoundEpoch: addressEpoch)
+            else {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Sync] change apply: \(header.id) in \(orphaned.folderPath) does not own \(folder.path)/\(header.messageId); read again")
+                }
+                return false
+            }
             if DebugModeManager.isLoggingEnabled() {
                 print("[Sync] change apply reclaiming orphaned row \(header.id): folderId \(orphaned.folderId) → \(folder.id)")
             }
             orphaned.folderId = folder.id
             orphaned.folderPath = folder.path
-            orphaned.observedUidValidity = nil
+            orphaned.observedUidValidity = addressEpoch
             orphaned.isInInbox = folder.role == .inbox
             orphaned.messageId = header.messageId
             orphaned.isRead = header.isRead

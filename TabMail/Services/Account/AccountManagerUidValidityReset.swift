@@ -715,6 +715,11 @@ extension AccountManager {
                     folder.lastKnownUidNext = nil
                     folder.lastKnownHighestModSeq = nil
                     folder.catchUpState = nil
+                    // The change bookmark and re-read list name the dead
+                    // generation: a kept bookmark would cost a pass refused on
+                    // the old UIDVALIDITY, and the listed ids name other messages.
+                    folder.changeCursor = nil
+                    folder.changeState = nil
                     folder.backfillComplete = false
                     folder.backfillUidCursor = nil
                     folder.backfillPageToken = nil
@@ -846,7 +851,9 @@ extension AccountManager {
                     .filter(Column("accountId") == accountId && Column("folderPath") == folderPath)
                     .fetchAll(db)
                 for op in ops where Self.opIsProvenInvalidatedByReset(op, fresh: fresh) {
-                    _ = try PendingOperation.deleteOne(db, key: op.id)
+                    // A .move goes through the exit rule (ADR-IOS-111 item 11): its
+                    // optimistic row may sit in a tracked destination.
+                    try AccountOperationExecutor.deleteRetiringOperation(op, db: db)
                     BackgroundSyncLogger.log("[UIDValidity] dropped address-only op \(op.type.rawValue) \(op.id.prefix(8)) on \(folderId) — recorded under UIDVALIDITY \(op.observedUidValidity.map(String.init) ?? "?"), server now \(fresh); its UIDs belong to the epoch the server discarded (exit 4)")
                 }
                 // Before the new epoch becomes admissible: every gesture stamped

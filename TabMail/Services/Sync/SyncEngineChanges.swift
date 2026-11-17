@@ -52,10 +52,33 @@ struct FolderChangeState: Codable, Equatable, Sendable {
     /// pass and in turn, until the change applies. `SyncConfig.changeRecheckLimit`
     /// bounds only a pass's own additions; an id already stored is never cut (#903).
     var recheck: [String] = []
+    /// How many moves retired without proof have left this folder possibly
+    /// wrong since its last complete self-heal pass (`MessageHeaderRekey.finishMove`,
+    /// ADR-IOS-111 exit rule), whether or not it held a bookmark then. While it is
+    /// above zero the folder gets ONE self-heal pass at each full sync
+    /// (`healFoldersAfterAnUnprovenMove`) and is not tracked. The window listing
+    /// reaches only the newest messages, so one the move left in the folder below
+    /// it would otherwise stay missing. A count, not a flag: a pass clears it only
+    /// when no retirement was added while the pass ran.
+    var selfHealOwed: Int = 0
+
+    /// The folder is owed a self-heal pass before it is tracked again.
+    var selfHealDue: Bool { selfHealOwed > 0 }
 
     init(tracking: Bool = false, recheck: [String] = []) {
         self.tracking = tracking
         self.recheck = recheck
+    }
+
+    private enum CodingKeys: String, CodingKey { case v, tracking, recheck, selfHealOwed }
+
+    /// `selfHealOwed` is absent from a state stored before it existed.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        v = try container.decode(Int.self, forKey: .v)
+        tracking = try container.decode(Bool.self, forKey: .tracking)
+        recheck = try container.decode([String].self, forKey: .recheck)
+        selfHealOwed = try container.decodeIfPresent(Int.self, forKey: .selfHealOwed) ?? 0
     }
 
     /// The stored JSON; unreadable or absent = the untracked default.
@@ -68,9 +91,10 @@ struct FolderChangeState: Codable, Equatable, Sendable {
         self = decoded
     }
 
-    /// The JSON to store; nil for the default (untracked, nothing to re-read).
+    /// The JSON to store; nil for the default (untracked, nothing to re-read,
+    /// no self-heal due).
     var encoded: String? {
-        guard tracking || !recheck.isEmpty,
+        guard tracking || !recheck.isEmpty || selfHealDue,
               let data = try? JSONEncoder().encode(self) else { return nil }
         return String(data: data, encoding: .utf8)
     }
@@ -97,6 +121,14 @@ struct ChangePassOutcome: Sendable {
     /// The folders need a listing in this pass (a refusal, a candidate or a
     /// completed baseline).
     var needsListing = false
+    /// The folder bookmark this pass left each folder with: the one its apply
+    /// wrote or kept, or the one its read was issued with when nothing was
+    /// applied. Present only for a folder that had one on either side (a folder
+    /// of an account-wide reader never does); nil = this pass left it none.
+    /// `commitChangeBaseline` tracks such a folder only while it still stores
+    /// exactly this bookmark: one dropped since (an unproven move, ADR-IOS-111
+    /// item 11) or never written is not tracked on the strength of this pass.
+    var folderBookmarkLeft: [String: String?] = [:]
 }
 
 extension SyncEngine {
@@ -135,6 +167,14 @@ extension SyncEngine {
         }
         var outcome = try await applyChangeSet(changeSet, account: account, request: request)
         outcome.needsListing = outcome.needsListing || refused
+        // Folders no bookmark can cover: listed here when they changed.
+        for changes in changeSet.folders {
+            guard case .untracked(let observation) = changes.status else { continue }
+            if try await refreshUntrackedFolder(
+                folderId: changes.folderId, observation: observation, account: account, provider: provider) {
+                outcome.hadChanges = true
+            }
+        }
         outcome.outOfTime = outOfTime
         if outOfTime {
             BackgroundSyncLogger.logDebug("[Sync] Change read for \(account.emailAddress): no read budget left when the turn started — read nothing")
@@ -188,7 +228,9 @@ extension SyncEngine {
             folders: folders.map {
                 ChangeFolder(
                     id: $0.id, path: $0.path, role: $0.role, cursor: $0.changeCursor,
-                    isSynced: synced.contains($0.id), heldSince: $0.oldestSyncedDate)
+                    isSynced: synced.contains($0.id), heldSince: $0.oldestSyncedDate,
+                    addressEpoch: Self.knownUidValidity($0.lastKnownUidValidity),
+                    olderMailComplete: $0.backfillComplete, olderMailCursor: $0.backfillUidCursor)
             },
             scope: scope, recheck: recheck, context: context,
             localRows: SyncEngineCatchUpRowReader(pool: dbPool))
@@ -253,12 +295,16 @@ extension SyncEngine {
         var failures: [any Error] = []
         var readFolders = 0
         var wroteRows = false
-        for changes in changeSet.folders {
+        var armedTurnovers: [String] = []
+        let issuedWith = Dictionary(request.folders.map { ($0.id, $0.cursor) }, uniquingKeysWith: { first, _ in first })
+        for var changes in changeSet.folders {
+            if let cursor = issuedWith[changes.folderId] { changes.readFrom = FolderChanges.ReadFrom(cursor: cursor) }
+            if let issued = issuedWith[changes.folderId], let cursor = issued { outcome.folderBookmarkLeft[changes.folderId] = cursor }
             if changes.status.isTrackable { outcome.trackableFolderIds.insert(changes.folderId) }
             switch changes.status {
             case .failed(let error): failures.append(error)
             case .refused, .baselineReady: outcome.needsListing = true
-            case .tracked, .baselining, .notRun: break
+            case .tracked, .baselining, .notRun, .untracked: break
             }
             if case .notRun = changes.status {} else { readFolders += 1 }
             // A folder with only a message to read later still writes: its re-read
@@ -266,7 +312,16 @@ extension SyncEngine {
             // move. So does a folder whose own bookmark or coverage changed.
             guard !changes.records.isEmpty || !changes.removals.isEmpty || !changes.rereadLater.isEmpty
                 || changes.cursor != nil || changes.status.changesFolderCoverage else { continue }
-            let applied = try await dbPool.write { db in try Self.applyFolderChanges(changes, db: db) }
+            let applying = changes
+            let applied = try await dbPool.write { db in try Self.applyFolderChanges(applying, db: db) }
+            if applied.storedCursor != nil || outcome.folderBookmarkLeft[changes.folderId] != nil {
+                outcome.folderBookmarkLeft[changes.folderId] = applied.storedCursor
+            }
+            if applied.rejected {
+                // Nothing written, not even the bookmark: the folder is not
+                // tracked on the strength of this read, and arms nothing.
+                outcome.trackableFolderIds.remove(changes.folderId)
+            }
             newHeaders += applied.newHeaders
             removedIds += applied.removedIds
             discoveredParents += applied.discoveredParents
@@ -274,6 +329,15 @@ extension SyncEngine {
             if applied.armedCatchUp {
                 BackgroundSyncLogger.logDebug("[Sync] Change apply: re-read list full for folder \(changes.folderId.suffix(12)) — catch-up armed")
             }
+            if let path = applied.armedTurnoverPath { armedTurnovers.append(path) }
+        }
+
+        // A renumbered folder's turnover reaction, armed durably in its folder
+        // transaction above, runs now (single-flight; a crash re-drives it from
+        // the armed flag at the next pass start).
+        for path in armedTurnovers {
+            BackgroundSyncLogger.logDebug("[Sync] Change apply: folder \(path) renumbered — turnover reaction")
+            await AccountManager.shared.runUidValidityResetReaction(accountId: accountId, folderPath: path)
         }
 
         ReplyParentResolver.postParentNotifications(discoveredParents)
@@ -363,10 +427,23 @@ extension SyncEngine {
             }
             for folderId in nowTracked {
                 guard let folder = try Folder.fetchOne(db, key: folderId) else { continue }
+                // A folder with a bookmark of its own is tracked only while it
+                // stores the one this pass left it: a bookmark dropped since (an
+                // unproven move, ADR-IOS-111 item 11), or none at all, leaves it
+                // untracked until a new baseline. The compare is in the UPDATE.
+                let left = outcome.folderBookmarkLeft[folderId]
+                if let left, left == nil || folder.changeCursor != left { continue }
                 var state = FolderChangeState(raw: folder.changeState)
-                guard !state.tracking else { continue }
+                // A folder still owed its self-heal pass after an unproven move
+                // stays untracked: the next full sync lists it and heals it again.
+                guard !state.tracking, !state.selfHealDue else { continue }
                 state.tracking = true
-                try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [state.encoded, folderId])
+                if let left, let bookmark = left {
+                    try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ? AND changeCursor = ?", arguments: [state.encoded, folderId, bookmark])
+                    guard db.changesCount > 0 else { continue }
+                } else {
+                    try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [state.encoded, folderId])
+                }
             }
         }
         if outcome.candidate != nil {
@@ -388,7 +465,7 @@ extension FolderChangeStatus {
     /// flag left on by a reset that raced a pass is cleared here).
     var changesFolderCoverage: Bool {
         switch self {
-        case .refused, .baselining, .baselineReady: return true
+        case .refused, .baselining, .baselineReady, .untracked: return true
         case .tracked, .failed, .notRun: return false
         }
     }

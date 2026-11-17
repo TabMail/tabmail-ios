@@ -399,7 +399,17 @@ overflow rule are decision 3's. A row the release cannot decode arms its folder'
 account's when the folder is unknown). A re-read id is answered as any other (record in the folder,
 removal where the message is not); the Outlook reader now also reads the list of a folder outside the
 synced set (next amendment). *Superseded same day:* "Readers need nothing new". The IMAP reader, when it lands, inherits
-these ids on its folders' lists. Detail: `IOS-ACTION-003` ("Retired actions read again").
+these ids on its folders' lists. *Amended 2026-11-16 (#751):* the IMAP reader keeps its bookmarks per folder, so
+`Account.lastHistoryId` stays NULL and "an account holding a change bookmark" also means an account whose ids are
+mailbox-local (not in `AccountOperationExecutor.accountScopedIdAccountIds`) holding a bookmark on any folder. For
+such an account a retired move takes the exit rule (item 11 of the IMAP amendment): its source and destination drop
+their bookmark with one self-heal owed, and its ids go on no list (a source UID names nothing, or another message,
+in the destination, and the optimistic row there can never prove it owns the address); every folder of the account
+when the destination is not recorded or a folder does not resolve. A read/flag or user-label row lists its ids on
+its own folder, also when a retired move drops that folder (the listing never replaces a held row's user labels;
+the folder's baseline read answers the list). A draft delete or an undecodable row drops its folder's
+bookmark the same way (the IMAP catch-up only checks held rows). `dropChangeBookmark` reads raw columns only.
+Detail: `IOS-ACTION-003` ("Retired actions read again").
 
 Keywords: release boundary, retired actions, recheckRetiredActions, appReleaseStamp, purge, re-read
 list, undecodable row, #876.
@@ -483,6 +493,35 @@ Tests: `ReleaseBoundaryRecheckTests` (`manyRetiredLabelIdsDrainInACheckedFolder`
 `ChangeApplyTests.recheckOverflowArmsCatchUp`.
 Keywords: changeRecheckLimit, overflow, stored ids never cut, this pass's additions, retired ids
 drain, #903.
+
+### Amendment 2026-11-17: an overflow in a folder holding its own bookmark re-baselines it (#751)
+
+Decision (coordinator ruling, 2026-11-17): item 2 of the #903 amendment above is amended for a folder that holds
+its own change bookmark (`Folder.changeCursor`). There, when this pass's own additions are cut, the
+folder's bookmark is also dropped (`cutDropsBookmark` in `SyncEngine.applyFolderChanges`, through
+`dropChangeBookmark`, which arms the catch-up as well): the folder is listed again and its next read
+starts a new baseline.
+Why: that folder's catch-up need not load a missing message (the IMAP one only checks the rows a folder
+holds), and the bookmark would otherwise move past a cut arrival. A folder with no bookmark keeps the
+#903 behaviour (catch-up armed).
+1. **Bounded per pass, resumed later.** The re-baseline is paged; a pass starts no request after its
+   deadline (a request already sent may finish within its own timeout) or past its request allowance
+   (`graphChangeReadRequestsPerSecond` x the read budget). A folder that fits in the allowance can finish
+   in one pass; an unfinished baseline resumes page by page on later passes.
+2. **Networks.** The Inbox re-baseline runs on cellular, as the Inbox baseline already does by design;
+   other folders' state baselines wait on an expensive network as before
+   (`catchUpExpensiveNetworkMaxWaitSeconds`).
+3. **Cost on Outlook.** For a folder of N messages: about N/100 delta pages
+   (`graphChangeReadPageSize` = 100), plus header fetches only for messages a non-Inbox folder is
+   missing within the held range, plus the by-id reads of the folder's re-read list (at most
+   `changeRereadBudgetPerPass` ids a pass).
+4. **Replied and forwarded arrows.** The baseline's delta pages expand no last verb and there is no
+   baseline verb sweep (#890 amendment); only its by-id reads (missing messages, re-read ids) expand it.
+   The listing the dropped bookmark makes due expands the last verb, so cut ids inside the listing
+   window get their arrows back. The #903 limitation remains for mail older than the listing window.
+This PR adds no new limitation.
+Keywords: cutDropsBookmark, overflow, own bookmark, re-baseline, listed again, delta pages, cellular
+Inbox, last verb, listing window, #751, #903.
 
 ### Amendment 2026-11-14: Outlook reads the last verb; the merge sets replied and forwarded (#890)
 
@@ -616,3 +655,214 @@ Keywords: Gmail history resume, per-record resume, readHistory, historyPage, His
 history record id, startHistoryId, cut, stop point, bookmark, time budget, changeReadClock, historyMaxChanges,
 historyMaxPages, too-long history, refusal, re-list, notification extension, page cap with no record,
 empty history pages, #491, #429, #938.
+
+### Amendment 2026-11-15: the IMAP reader (QRESYNC, per folder) (#751)
+
+Decision (2026-11-15): IMAP reads changes through the seam with RFC 7162
+QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChanges.swift`).
+1. **Capability gate.** QRESYNC is used only when the server advertises `QRESYNC`, `ENABLE` and
+   `UIDPLUS` (`IMAPProvider.qresyncUsable`, capabilities fetched once when the change session opens):
+   QRESYNC can only be switched on through ENABLE (RFC 5161), and without UIDPLUS (RFC 4315 COPYUID)
+   every move into a tracked folder would land without a proven destination UID (exit rule, item 11). CONDSTORE is never inferred from QRESYNC nor the
+   other way. `ENABLE QRESYNC` is sent once per session, on the change connection only. **Connection
+   budget** (2026-11-16): the change connection counts
+   against the server's limit only while it is open, like IDLE (`maxFolderConnections`; the pool's
+   reserved count stays 2, action + IDLE). When a slot is needed, the eviction order is: the change
+   connection if it is idle between passes (never while a pass holds or opens it,
+   `evictChangeConnectionIfIdle`), then the least recently used folder connection, then IDLE; this
+   holds for the folder pool's capacity loop and its limit-error retry. Opening the change connection
+   takes the folder connection's refusal handling (`createChangeServer`): a login refused with the
+   server's limit (Dovecot's `max_userip_connections` wording) learns the limit, evicts the LRU folder
+   connection (else IDLE) and retries once; a second refusal fails the pass through the existing
+   failure handling (item 9). No other fallback. Every login made after an eviction (a folder
+   connection after the capacity loop evicted, and both limit retries, folder and change connection)
+   first waits for the LOGOUTs of the connections that same call evicted (`awaitEvictionLogouts`, at
+   most `SyncConfig.imapEvictionLogoutWaitSeconds`): the server counts a session until its LOGOUT is
+   answered, so a login sent right after a detached logout was refused again (found 2026-11-16 by a
+   fake server that counts sessions; IDLE's DONE + LOGOUT lost that race every time). Each caller
+   keeps and awaits only its own evictions' logouts; nothing is stored on the provider. An evicted
+   IDLE connection ends its IDLE first (`evictIdleConnection`, 2026-11-16; order amended 2026-11-17):
+   the listener is cancelled first (a cancelled listener returns without logging out, as on main's
+   `tearDownIdleConnection`), then DONE completes (its tagged OK, or at most
+   `SyncConfig.imapIdleEvictionDoneWaitSeconds`: a DONE still unanswered then is cancelled, and SwiftMail
+   closes the connection on that cancellation, which ends the session), then the session logs out, once.
+   Before, a listener still running took the stream DONE ended as a server-side end and logged the session
+   out a second time; earlier still, a LOGOUT could reach the connection ahead of DONE and wait for an IDLE
+   nobody ended, past the login's wait, so the login was refused (made deterministic by holding DONE back,
+   `idleEvictionEndsIdleBeforeTheLogout`; the bound: `idleEvictionDoneWaitIsBounded`). So a server that allows two connections still runs a
+   pass, a folder fetch and an action (before this, the change connection had been a
+   third, unevictable one). A server without the pair, an ENABLE that is not acknowledged,
+   or a mailbox answering `NOMODSEQ` leaves the folder `.untracked(UntrackedObservation)`: no
+   ENABLE is sent, no pass fails on it, and its coverage is cleared. A bookmark the folder holds is
+   kept (2026-11-16): nothing of that read is applied to it, so the next read that can track the
+   folder goes on from it; dropping it started a new baseline past the messages that arrived
+   meanwhile, which background passes never listed.
+2. **Bookmark.** `Folder.changeCursor` holds `IMAPChangeCursor` JSON (`uidValidity`,
+   `highestModSeq`, `uidNext`, `failingSince`): server metadata, no content (ADR-004). It is never an
+   epoch writer; `Folder.lastKnownUidValidity` stays the epoch authority. A folder holding rows under
+   an unknown UIDVALIDITY starts no bookmark (IOS-EPOCH-001). A first read is a plain SELECT,
+   `.baselineReady` with `FolderChanges.armCatchUpWithBookmark` (the folder's catch-up is armed
+   once, in the same transaction that stores the new bookmark. Once a bookmark is stored the catch-up
+   runs no periodic check, so the arm is never left to the later commit of tracking: a pass with no
+   listing, a failed listing or a crash in between would otherwise leave the bookmark without it).
+3. **A read.** STATUS first; an unchanged HIGHESTMODSEQ under the bookmark's UIDVALIDITY (both in the
+   STATUS answer) is `.tracked` with no SELECT; a MODSEQ means nothing outside its UIDVALIDITY, so a
+   STATUS without UIDVALIDITY never takes this shortcut (2026-11-16). Otherwise
+   `SELECT (QRESYNC (uidvalidity modseq))` with its own timeout (`imapChangeSelectTimeoutSeconds`).
+   Removals are VANISHED ranges intersected with the folder's held rows (never expanded) and
+   `\Deleted` changes on any row the folder holds, at or above the bookmark's UIDNEXT too (a
+   moved-in row re-keyed to its destination UID there; a message the server holds as `\Deleted` is
+   never shown); changed flags on held rows are partial records (read, flag, answered,
+   `$Forwarded`, keywords as user labels); new UIDs and changed-not-held UIDs inside the held range
+   are fetched in full and counted against `imapChangeArrivalsLimit` (100); over it the bookmark is
+   refused (`.tooFarBehind`) and nothing is fetched (the refusal arms the folder's
+   whole-folder catch-up, and the next baseline arms it once more with its bookmark (item 2), so older-mail changes made
+   while the old bookmark lived are caught up). Arrivals do not rely on the SELECT's FETCH stream:
+   RFC 7162 §3.2.5.1 says only "The server sends the client any pending flag changes (using FETCH
+   responses that MUST contain UIDs) and expunges those that have occurred in this mailbox since the
+   provided modification sequence", which does not name new messages; so every UID from the
+   bookmark's UIDNEXT to the served one is asked for with `UID SEARCH UID <range> ALL`. A UID
+   the header FETCH does not return goes on the re-read list (removed only when `UID SEARCH` proves it
+   gone), so the bookmark never moves past a lost arrival. STATUS fields the server leaves out
+   are unknown, not 0: an untracked folder is then unreadable for the pass. STATUS is never
+   sent for the mailbox selected on the change connection; it is selected again instead. A
+   folder whose read the apply's binding check rejected is not trackable that pass. **The
+   held range for a changed-not-held UID** (2026-11-16) comes from
+   the folder's older-mail download progress, carried in `ChangeFolder.olderMailComplete` /
+   `olderMailCursor` (`Folder.backfillComplete` / `backfillUidCursor`), never from the rows the folder
+   holds now (`IMAPProvider.heldRangeStart`): every UID once the walk completed, above its position
+   while it runs, none before it starts (a UID below is the walk's to download). The lowest held row
+   had been used before; when that row was removed through `\Deleted` elsewhere and later un-deleted,
+   the UID fell below the new lowest row and never came back. Before every pass the change session
+   sends a NOOP (some servers answer STATUS from a cached view); the session counts as open only after
+   it answers (item 9). No Message-ID pairing: a moved message is inserted
+   under its own UID and the leftover copy leaves through its own removal (ADR-IOS-068 D4).
+4. **Epoch.** A UIDVALIDITY other than the bookmark's (STATUS or SELECT) is
+   `.refused(.addressEpochChanged(served))`: the apply clears the bookmark and the re-read list and,
+   only against a KNOWN stored epoch that differs, arms `uidValidityResetPendingAt`; the turnover
+   reaction runs after the folder transaction and is re-driven at the next pass start
+   (`redriveArmedTurnovers`). Every read carries `FolderChanges.addressEpoch`; the apply's binding
+   check writes nothing (not even the bookmark) when the folder stores another epoch.
+5. **Untracked folders** report a STATUS observation; the engine compares it with the folder row and
+   re-lists a changed folder through the shared listing path (`refreshUntrackedFolder`, the former
+   `imapDeltaSync` per-folder logic). `imapDeltaSync` and the engine's IMAPProvider cast are deleted;
+   the ADR-IOS-051 count walk goes through `EmailProvider.presentIds(folder:uids:)`.
+6. **Recheck.** Every listed folder's re-read list is read (synced or not), answered whatever the
+   window, without moving the bookmark or tracking; a UID the FETCH does not return is a removal only
+   when `UID SEARCH` on the same selection confirms it gone (its answer is asked about each missing
+   UID, never expanded).
+7. **Merge.** Answered and forwarded are raised, never lowered; an answered message tagged reply
+   becomes none with a queued tag write (ReplyDetect), stamped through `MessageHeader.setActionTag`,
+   and skipped while the user's own `.setTag`/`.removeTag` for the message is pending
+   (`PendingOperationSnapshot.tag`).
+8. **Coverage.** A tracked IMAP folder gets no window listing, no full-sync count walk, no self-heal;
+   its catch-up lists only its first listing, a listing in progress, or a lapse since its last
+   completed listing. STATUS counts are still read for every folder the full sync discovers (no
+   folder loses its counts).
+9. **Failure lapse**. A folder whose read keeps failing keeps its bookmark with
+   `failingSince` and is refused (`.failingTooLong`, listed again) after
+   `changeReadFailureLapseSeconds`. This covers a request on the folder being read that times out or
+   loses the connection, whatever the cause (the session is dropped, but that folder is stamped first:
+   a server that always closes the connection on one folder's SELECT or FETCH must not leave it
+   tracked without a failure time), and a pass whose change session never opens (connect, CAPABILITY,
+   ENABLE or the pass-start NOOP failing: every work folder is stamped; a NOOP that always fails had
+   wedged the folders without a failure time). A connection the server closes during one folder's
+   read fails that folder only: the pass goes on with the folders after it on a new session (at most
+   one per folder, bounded by the read budget), so a server that always drops the connection on the
+   inbox's read still lets the account's other tracked folders be read in the same pass. A read that
+   times out ends the pass instead (2026-11-17): the reader has closed its side, but a server that
+   stopped answering counts that session until it notices, and the client has no signal for when it
+   does, so a new login could hold two sessions against the account's connection limit. The folders
+   not yet read wait for the next pass, which reads them first and the folder that timed out last
+   (2026-11-17), so a folder whose read times out on every pass never keeps the account's other
+   folders from being read. The inbox keeps first place until its read has timed out on
+   `SyncConfig.imapChangeInboxTimeoutsBeforeReadLast` (2) passes in a row, and a successful inbox
+   read starts that count again (2026-11-17): one passing timeout never delays new mail behind the
+   other folders (with every other folder changed, that delay is about four round trips per folder,
+   up to the 20 s read budget), and an inbox that keeps timing out holds the others back for at most
+   two passes. These order hints are dropped for folders the account no longer has. A session dropped while its connection still answers (a
+   liveness NOOP answered with an error) logs in again only once its LOGOUT has been answered,
+   waited for at most `imapEvictionLogoutWaitSeconds`; a LOGOUT that times out, in that wait or in
+   the IMAP library's own command timeout, has not ended the session and ends the pass, and is waited
+   for only once: the next pass opens a session without waiting for it again; a liveness NOOP that times out reopens the
+   session once, before any folder is read. A session that cannot be opened again
+   mid-pass, a read that timed out, a dropped one whose LOGOUT does not end in time, or a teardown
+   (`markDirty`, `disconnect`) fails the folders not yet read with no failure time. A teardown ends
+   the pass wherever it lands, while a session is awaited or opened included: no new session logs in
+   for that pass (the pass's generation is checked right before each command that opens the session,
+   LOGIN, CAPABILITY and ENABLE, after every wait before it, 2026-11-17), and since it is the app's own act it leaves no failure time even before the pass's
+   first session has opened (2026-11-17). The session being opened is open to a teardown from the
+   start of its connect until the pass keeps or discards it. Each attempt (the first, and the retry
+   after an eviction) turns reconnects off first, then checks the pass's generation and becomes open
+   to a teardown in the same actor turn that starts its connect, so a teardown either ends the attempt
+   before it connects or finds it open; no connection of a torn-down attempt reaches the server
+   (2026-11-17). Known window, accepted: the connect call can still wait for the IMAP library's
+   actor after the attempt became open to a teardown, and a higher-priority teardown's close can
+   run first; the library's `connect()` re-arms the session and undoes that close, so the socket
+   opens and a slow greeting holds it, and the change lane, up to the connect timeout. No LOGIN is
+   ever sent (the check before LOGIN ends the attempt). The cause is in the library and is tracked
+   by tabmail-ios #952; no workaround here. A teardown closes the session being opened at once, without a LOGOUT, so
+   whatever it waits for (connect, LOGIN, the CAPABILITY the IMAP library sends after LOGIN, the
+   reader's CAPABILITY or ENABLE) ends with an error, and the server stops counting it right away
+   instead of when a held answer comes (2026-11-17). A teardown closes only a session opened for its
+   own pass or an older one, never a newer pass's, and the session never reconnects inside a command,
+   so nothing it was waiting for logs in again. A pass that gets the change connection only after a
+   teardown never uses the session a newer pass kept.
+10. **Accepted cost.** A server advertising QRESYNC without CONDSTORE gets no HIGHESTMODSEQ in STATUS,
+   so every tracked folder does a QRESYNC SELECT each pass (no fast path). Work, not loss.
+11. **Exit rule: a move that leaves a folder's view possibly wrong** (2026-11-15). ADR-IOS-073
+   consequence 3 says an atomic move without safe `COPYUID` "can leave an optimistic row unaddressed
+   and recoverable by ordinary sync". For a tracked folder ordinary sync is the change reader, which
+   never removes or restores such a row (no window listing, count walk or self-heal, item 8). So
+   whenever `MessageHeaderRekey.finishMove` retires an IMAP move member without re-keying its row, it
+   drops, in the same transaction, the bookmark of every folder whose local view that leaves possibly
+   wrong (`SyncEngine.dropChangeBookmark`: the same effect as a refused read, like the over-100 rule;
+   the folder is listed again by the full sync, which becomes due, and its tracking restarts with the
+   older-mail catch-up armed):
+   - no proven destination UID (COPYUID left out, or declined because it is not one-to-one; also a
+     move the server refused or whose folder is gone, which retire with no destination): the folder
+     the row sits in, and the source folder, which the optimistic move emptied while a refused move
+     left the message there. A refused move does not put the row back in the source; the source's
+     listing does;
+   - the row was moved on before this move retired (a chained move): the folder the row now sits in,
+     which holds it under this move's source UID; with no proof, the source as well;
+   - a proven destination under a UIDVALIDITY the folder does not share: the folder the row sits in
+     (the reader would also refuse that folder; dropped here for uniformity).
+   Both routes are covered, the atomic UID MOVE and the owned COPY sequence on servers without MOVE
+   (both retire through `finishMove`). A move that retires with no provider result to apply (the
+   retry-limit exit, the UIDVALIDITY-changed refusal, the single-message not-found drop, the
+   claim-time retire, and the UIDVALIDITY turnover reaction's exit-4 drop) deletes its row through `AccountOperationExecutor.deleteRetiringOperation`,
+   which runs `finishMove` with no destination in the same transaction, so the same rule applies;
+   which exits exist and when they fire is unchanged. One drop mechanism: a refused read's apply
+   calls `dropChangeBookmark` too. A bookmark dropped between a read and its apply is not written
+   back (`FolderChanges.readFrom`), and `commitChangeBaseline` tracks a folder with a bookmark of
+   its own only while, in the same write, it still stores exactly the bookmark this pass left it
+   (`ChangePassOutcome.folderBookmarkLeft`), whatever the read returned (a first read, a "nothing
+   changed" read). A retirement whose row is no longer at its key drops the source too. Nothing is deleted and no queued operation is touched:
+   removing the placeholder would drop queued user actions that name it, which the never-drop rule
+   forbids. The window listing reaches only the newest messages, and the IMAP older-mail catch-up
+   only updates or removes rows it holds, so a message such a move left in a folder below the window
+   (a move that retired with no effect, its source message older than the window, with backfill
+   complete) would stay missing. So a bookmark this rule drops also owes the folder ONE self-heal
+   pass before it is tracked again (2026-11-16): `dropChangeBookmark`
+   counts one more retirement in `FolderChangeState.selfHealOwed`, whether or not the folder held a
+   bookmark (a folder awaiting its first baseline is tracked after its next listing, which does not
+   reach below the window either; without a bookmark only the mark is written, no listing is made
+   due); the full sync, after its listings and before
+   `commitChangeBaseline`, runs the existing self-heal scoped to that one folder
+   (`healFoldersAfterAnUnprovenMove` → `selfHealRecentMessages(forceSingleFolder:)`, main's 90-day
+   reach, no hourly limit); `commitChangeBaseline` leaves a folder with the mark untracked; the mark
+   is cleared only after a COMPLETE pass (`SelfHealFolderOutcome.complete`: no failed check, no
+   epoch refusal, no search too large, every UID found missing answered by the FETCH and landed),
+   and only while the count is still the one the pass began with (a pass that fails or is short, or
+   a retirement added meanwhile, keeps it for the next full sync). A folder whose pass never
+   completes stays untracked and listed, as on main. Tests: `IMAPMoveIntoTrackedFolderTests` (the message held once, where the server holds
+   it, under its UID, after the normal sync path; `retiredMoveBelowTheWindowIsHealedBeforeTracking`).
+Tests: `IMAPChangeReaderTests`, `ChangeApplyIMAPTests`, `IMAPCatchUpTests.planTrackedFolder`,
+`IMAPChangeFuzzTests`, `ChangeSeamFenceTests`; red-first mutants recorded in the mutation ledger.
+Keywords: QRESYNC, CONDSTORE, ENABLE, VANISHED, HIGHESTMODSEQ, NOMODSEQ, IMAPChangeCursor, change
+connection, untracked, addressEpochChanged, arrivals limit, imapDeltaSync deleted, presentIds, UIDPLUS,
+COPYUID, exit rule, dropChangeBookmark, move without destination proof, connection budget,
+evictChangeConnectionIfIdle, createChangeServer, max_userip_connections, eviction order, heldRangeStart,
+olderMailComplete, olderMailCursor, backfillUidCursor, un-deleted, pass-start NOOP, selfHealDue, selfHealOwed, SelfHealFolderOutcome,
+healFoldersAfterAnUnprovenMove, evictIdleConnection, IDLE DONE before LOGOUT, #751.

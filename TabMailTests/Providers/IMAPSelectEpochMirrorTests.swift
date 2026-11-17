@@ -111,7 +111,7 @@ struct IMAPSelectEpochMirrorTests {
     /// `fetchMessages`, whose SELECT was already tracked. Every later step then
     /// finds the mirror still holding the PREVIOUS step's epoch, because the
     /// bare `server.selectMailbox` observed the new one and threw it away — so
-    /// each of the eleven expectations below fails with the prior step's value.
+    /// each of the ten expectations below fails with the prior step's value.
     /// Swift Testing continues past a failed `#expect`, so the pre-fix run
     /// reports every site individually rather than stopping at the first.
     ///
@@ -144,27 +144,21 @@ struct IMAPSelectEpochMirrorTests {
         #expect(provider.lastObservedUidValidity(folderPath: "INBOX") == Self.e0,
                 "precondition: the sync SELECT was already tracked before T5.3 and must record its epoch")
 
-        // Step 2 — `flushServerState`'s INBOX SELECT.
-        server.setUidValidity(Int(Self.e1), for: "INBOX")
-        try await provider.flushServerState()
-        #expect(provider.lastObservedUidValidity(folderPath: "INBOX") == Self.e1,
-                "the INBOX SELECT that flushes server state observed \(Self.e1) and the mirror must say so, not \(Self.e0)")
-
-        // Step 3 — the date-window backfill SEARCH's SELECT.
+        // Step 2 — the date-window backfill SEARCH's SELECT.
         server.setUidValidity(Int(Self.e2), for: "INBOX")
         let since = Date().addingTimeInterval(-30 * 24 * 60 * 60)
         _ = try await provider.searchBackfillUIDs(folder: "INBOX", since: since, before: Date())
         #expect(provider.lastObservedUidValidity(folderPath: "INBOX") == Self.e2,
-                "the windowed backfill SEARCH's SELECT observed \(Self.e2) and the mirror must say so, not \(Self.e1)")
+                "the windowed backfill SEARCH's SELECT observed \(Self.e2) and the mirror must say so, not \(Self.e0)")
 
-        // Step 4 — the unbounded-start backfill SEARCH's SELECT (a different
+        // Step 3 — the unbounded-start backfill SEARCH's SELECT (a different
         // function from step 3, reached only when `since` is nil).
         server.setUidValidity(Int(Self.e3), for: "INBOX")
         _ = try await provider.searchBackfillUIDs(folder: "INBOX", since: nil, before: Date())
         #expect(provider.lastObservedUidValidity(folderPath: "INBOX") == Self.e3,
                 "the unbounded backfill SEARCH's SELECT observed \(Self.e3) and the mirror must say so, not \(Self.e2)")
 
-        // Step 5 — the deletion-reconcile existence probe's SELECT. This one
+        // Step 4 — the deletion-reconcile existence probe's SELECT. This one
         // also RETURNS its epoch; both must describe the same SELECT.
         server.setUidValidity(Int(Self.e4), for: "INBOX")
         let existence = try await provider.searchExistingUIDs(folder: "INBOX", uids: [1])
@@ -173,40 +167,40 @@ struct IMAPSelectEpochMirrorTests {
         #expect(provider.lastObservedUidValidity(folderPath: "INBOX") == Self.e4,
                 "the existence probe's SELECT observed \(Self.e4) and the mirror must say so, not \(Self.e3)")
 
-        // Step 6 — the rfc822 UID re-resolution probe's SELECT.
+        // Step 5 — the rfc822 UID re-resolution probe's SELECT.
         server.setUidValidity(Int(Self.e5), for: "INBOX")
         _ = try await provider.currentUIDs(rfc822MessageId: Self.rfc, folderPath: "INBOX")
         #expect(provider.lastObservedUidValidity(folderPath: "INBOX") == Self.e5,
                 "the UID re-resolution SELECT observed \(Self.e5) and the mirror must say so, not \(Self.e4)")
 
-        // Step 7 — the user-facing SEARCH's SELECT (action connection).
+        // Step 6 — the user-facing SEARCH's SELECT (action connection).
         server.setUidValidity(Int(Self.e6), for: "INBOX")
         _ = try await provider.search(query: "select mirror", folder: "INBOX")
         #expect(provider.lastObservedUidValidity(folderPath: "INBOX") == Self.e6,
                 "the user SEARCH's SELECT observed \(Self.e6) and the mirror must say so, not \(Self.e5)")
 
-        // Step 8 — the FTS body-batch SELECT. This is the one that genuinely
+        // Step 7 — the FTS body-batch SELECT. This is the one that genuinely
         // races the backfill walk on the SAME folder path.
         server.setUidValidity(Int(Self.e7), for: "INBOX")
         _ = try await provider.fetchTextBodies(ids: ["1"], folder: "INBOX")
         #expect(provider.lastObservedUidValidity(folderPath: "INBOX") == Self.e7,
                 "the FTS body-batch SELECT observed \(Self.e7) and the mirror must say so, not \(Self.e6)")
 
-        // Step 9 — the single-message FETCH's re-SELECT on the action
+        // Step 8 — the single-message FETCH's re-SELECT on the action
         // connection. `try?` — see this test's doc comment.
         server.setUidValidity(Int(Self.e8), for: "INBOX")
         _ = try? await provider.fetchMessage(id: "1", folder: "INBOX")
         #expect(provider.lastObservedUidValidity(folderPath: "INBOX") == Self.e8,
                 "the single-message FETCH's re-SELECT observed \(Self.e8) and the mirror must say so, not \(Self.e7)")
 
-        // Step 10 — the batch full-message FETCH's re-SELECT (body queue hot
+        // Step 9 — the batch full-message FETCH's re-SELECT (body queue hot
         // path, folder-pinned connection). `try?` — see this test's doc comment.
         server.setUidValidity(Int(Self.e9), for: "INBOX")
         _ = try? await provider.fetchMessagesBatch(ids: ["1"], folder: "INBOX")
         #expect(provider.lastObservedUidValidity(folderPath: "INBOX") == Self.e9,
                 "the batch FETCH's re-SELECT observed \(Self.e9) and the mirror must say so, not \(Self.e8)")
 
-        // Step 11 — the attachment fetch's re-SELECT. `e10`, never `e0`: on the
+        // Step 10 — the attachment fetch's re-SELECT. `e10`, never `e0`: on the
         // pre-fix code the mirror sits on `e0` for the whole sweep (step 1 is
         // the only tracked SELECT), so an expectation of `e0` here would pass
         // vacuously against exactly the behaviour this test exists to catch.
@@ -345,8 +339,6 @@ struct IMAPSelectEpochMirrorTests {
         #expect(fetched.count == 1, "the fixture holds exactly one message")
         guard fetched.count == 1 else { return }
         #expect(fetched[0].messageId == "1")
-
-        try await provider.flushServerState()
 
         let backfillUIDs = try await provider.searchBackfillUIDs(
             folder: "INBOX", since: Date().addingTimeInterval(-30 * 24 * 60 * 60), before: Date())

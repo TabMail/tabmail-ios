@@ -387,9 +387,11 @@ extension SyncEngine {
         // row nothing covers a folder, whatever its flag says (a reset that lands
         // while a pass runs can leave a flag behind), so every folder is listed:
         // the pass that does so stores a bookmark and the account never stalls.
-        let trackedFolderIds = holdsChangeBookmark
-            ? Set(syncableFolders.filter { FolderChangeState(raw: $0.changeState).tracking }.map(\.id))
-            : []
+        // A per-folder reader (IMAP, Outlook) keeps the bookmark in the folder row
+        // (`Folder.changeCursor`), which every reset clears with the account's.
+        let trackedFolderIds = Set(syncableFolders.filter {
+            FolderChangeState(raw: $0.changeState).tracking && (holdsChangeBookmark || $0.changeCursor != nil)
+        }.map(\.id))
         if !trackedFolderIds.isEmpty {
             BackgroundSyncLogger.logDebug("[FullSync] \(account.emailAddress) \(trackedFolderIds.count) tracked folder(s): no window listing")
         }
@@ -507,7 +509,7 @@ extension SyncEngine {
         // skips the folder (the cached totalCount already matches the server).
         // `folder.totalCount` here is the fresh STATUS count from fetchFolders
         // above; the local count is read live AFTER the windowed pass.
-        if provider.staleWindowMode == .uid, let imapProvider = provider as? IMAPProvider {
+        if provider.staleWindowMode == .uid {
             for folder in syncableFolders where !folder.path.isEmpty {
                 // T4.S6b — the verified door's SECOND call site, and it is not
                 // redundant with the one in `runSyncMessages`. This loop visits EVERY
@@ -527,6 +529,9 @@ extension SyncEngine {
                 await Self.verifyAndBootstrapPrePopulatedFolderEpoch(
                     folderId: folder.id, folderPath: folder.path, accountId: account.id,
                     provider: provider, dbPool: pool)
+                // A tracked folder's removals arrive exactly through the change
+                // read (VANISHED): no count walk for it (ADR-IOS-111).
+                if trackedFolderIds.contains(folder.id) { continue }
                 do {
                     let folderId = folder.id
                     let localCount = try await pool.read { db in
@@ -542,7 +547,7 @@ extension SyncEngine {
                         }
                         await reconcileExternallyDeletedMessages(
                             folder: folder,
-                            provider: imapProvider,
+                            provider: provider,
                             expectedGhosts: localCount - folder.totalCount
                         )
                     }

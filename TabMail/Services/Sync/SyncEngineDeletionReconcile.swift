@@ -471,7 +471,7 @@ extension SyncEngine {
     /// may never delete more than this plus `SyncConfig
     /// .deletionReconcileCapSlack` (circuit breaker; see
     /// `runDeletionReconcileWalk`).
-    func reconcileExternallyDeletedMessages(folder: Folder, provider: IMAPProvider, expectedGhosts: Int) async {
+    func reconcileExternallyDeletedMessages(folder: Folder, provider: any EmailProvider, expectedGhosts: Int) async {
         guard let workQueue = workQueues[folder.accountId] else { return }
         // Synchronous check-and-insert (no suspension point) — race-free under
         // actor reentrancy; prevents overlapping walks for the same folder.
@@ -520,7 +520,12 @@ extension SyncEngine {
                 // connection is checked out per chunk, so user actions
                 // interleave between chunks.
                 try await workQueue.execute(priority: .headerFetch) {
-                    try await provider.searchExistingUIDs(folder: folderPath, uids: chunk)
+                    // A provider with no presence answer cannot prove an absence:
+                    // the chunk fails, and nothing is deleted.
+                    guard let answer = try await provider.presentIds(folder: folderPath, uids: chunk) else {
+                        throw ProviderError.messageNotFound
+                    }
+                    return answer
                 }
             },
             deleteGhosts: { ghosts in
