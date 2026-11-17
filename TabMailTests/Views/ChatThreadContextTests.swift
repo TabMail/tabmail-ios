@@ -414,5 +414,11 @@ struct ChatThreadContextTests {
         let source = try String(contentsOf: URL(fileURLWithPath: #filePath), encoding: .utf8)
         let unlink = "FileManager.default." + "removeItem("
         #expect(!source.contains(unlink), "a raw directory removal unlinks the database under an open connection")
+        // Each test that opens a database hands it to `TestDatabaseTeardown`.
+        let opens = ["makeAppDB" + "()", "DatabasePool" + "(path"]
+        let tests = source.components(separatedBy: "@Test" + "(").dropFirst()
+        #expect(tests.contains { test in opens.contains { test.contains($0) } }, "control: the tests that open a database are found")
+        let unowned = tests.filter { test in opens.contains { test.contains($0) } && !test.contains("TestDatabaseTeardown" + ".") }
+        #expect(unowned.isEmpty, "a test opens a database it never hands over: \(unowned.map { $0.prefix(90) })")
     }
 }
