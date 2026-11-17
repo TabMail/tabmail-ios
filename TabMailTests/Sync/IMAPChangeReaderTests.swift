@@ -166,6 +166,13 @@ struct IMAPChangeReaderTests {
         if case .tracked = status { return true } else { return false }
     }
 
+    /// A folder whose pass a teardown ended: failed with the provider's
+    /// not-connected error, whatever the opening session was waiting for.
+    static func endedByTeardown(_ status: FolderChangeStatus) -> Bool {
+        guard case .failed(let error) = status, case .notConnected? = error as? ProviderError else { return false }
+        return true
+    }
+
     // MARK: - Baseline and bookmark
 
     @Test("Baseline: a folder with no bookmark gets one from the server's numbers, arms the catch-up, and reports no change")
@@ -1495,7 +1502,7 @@ struct IMAPChangeReaderTests {
             w.server.releaseGreetings()
             let set = try await pass.value
             let inbox = try Self.inbox(w, set)
-            guard case .failed = inbox.status else { Issue.record("expected failed, got \(inbox.status)"); return }
+            #expect(Self.endedByTeardown(inbox.status), "expected the teardown's error, got \(inbox.status)")
             #expect(await w.provider.changeServer == nil, "a session opened across a teardown is never planted")
             #expect(Self.logins(w) == loginsBefore, "a LOGIN was sent after the teardown: \(Self.logins(w) - loginsBefore)")
             #expect(inbox.cursor == nil, "a teardown leaves no failure time")
@@ -1518,13 +1525,16 @@ struct IMAPChangeReaderTests {
                     w.server.recordedCommands().dropFirst(start).contains { $0.uppercased().hasPrefix("CAPABILITY") }
                 }, "\(teardown) setup: the session being opened has logged in and waits for its CAPABILITY")
                 #expect(w.server.liveSessionCount() == sessionsBefore + 1, "\(teardown) setup: the server counts the session being opened")
+                let outcomes = Locked<[SignInOutcome]>([])
+                w.provider.attachSignInOutcomeReporter { outcome in outcomes.set(outcomes.get() + [outcome]) }
                 if teardown == "markDirty" { await w.provider.markDirty() } else { try await w.provider.disconnect() }
                 #expect(await Self.eventually(timeout: held / 4) { w.server.liveSessionCount() < sessionsBefore },
                         "\(teardown): the session being opened is still counted after the teardown: \(w.server.liveSessionCount())")
                 let inbox = try Self.inbox(w, try await pass.value)
                 #expect(Date().timeIntervalSince(began) < held, "\(teardown): the pass waited for the held answer")
-                guard case .failed = inbox.status else { Issue.record("\(teardown): expected failed, got \(inbox.status)"); return }
+                #expect(Self.endedByTeardown(inbox.status), "\(teardown): expected the teardown's error, got \(inbox.status)")
                 #expect(inbox.cursor == nil, "\(teardown): a teardown leaves no failure time")
+                #expect(outcomes.get().isEmpty, "\(teardown): the torn-down opening reported a sign-in outcome: \(outcomes.get())")
             }
         }
     }
@@ -1609,7 +1619,7 @@ struct IMAPChangeReaderTests {
             // even the CAPABILITY the IMAP library asks for after LOGIN goes out.
             #expect(!sent.contains { $0.hasPrefix("CAPABILITY") }, "sent: \(sent)")
             #expect(!sent.contains { $0.hasPrefix("ENABLE") }, "sent: \(sent)")
-            guard case .failed = inbox.status else { Issue.record("expected failed, got \(inbox.status)"); return }
+            #expect(Self.endedByTeardown(inbox.status), "expected the teardown's error, got \(inbox.status)")
             #expect(inbox.cursor == nil, "a teardown leaves no failure time")
         }
     }
@@ -1652,8 +1662,64 @@ struct IMAPChangeReaderTests {
             let inbox = try Self.inbox(w, try await pass.value)
             #expect(Self.logins(w) - loginsBefore == 1,
                     "only the refused first LOGIN: the retry after the teardown never logs in, got \(Self.logins(w) - loginsBefore)")
+            #expect(!(await w.provider.hasChangeOpeningForTesting), "the retry after the teardown left a session open to a teardown")
             guard case .failed = inbox.status else { Issue.record("expected failed, got \(inbox.status)"); return }
             #expect(inbox.cursor == nil, "a teardown leaves no failure time")
+        }
+    }
+
+    @Test("A teardown at any point of opening the change session, on the first attempt or the eviction retry, never lets that attempt's connection reach the server or log in; the pass ends at once with no failure time")
+    func teardownAtAnyOpeningPointConnectsNothing() async throws {
+        // `before`: the teardown lands while the attempt prepares its session,
+        // before it connects (where it used to be open to a teardown already but
+        // not yet connected). `during`: while the server holds its greeting.
+        for attempt in ["change", "changeRetry"] {
+            for point in ["before", "during"] {
+                let label = "\(attempt)/\(point)"
+                let body: (World) async throws -> Void = { w in
+                    if attempt == "changeRetry" {
+                        // Action and an idle inbox connection fill the limit; the
+                        // first LOGIN is refused and the inbox connection evicted.
+                        _ = try await w.provider.fetchMessages(folder: Self.inboxPath, limit: 10, offset: 0)
+                    }
+                    let provider = w.provider
+                    let server = w.server
+                    let loginsBefore = Self.logins(w)
+                    // Every connection that reaches the server from the hold on is
+                    // counted by `heldGreetingCount`.
+                    await provider.setBeforeChangeConnectTestHookForTesting { site in
+                        guard site == attempt else { return }
+                        server.holdGreetings()
+                        if point == "before" { await provider.markDirty() }
+                    }
+                    let pass = Task { try await Self.read(w) }
+                    if point == "during" {
+                        #expect(await Self.eventually { server.heldGreetingCount() >= 1 }, "\(label) setup: the attempt is connecting")
+                        await provider.markDirty()
+                    }
+                    let inbox = try Self.inbox(w, try await pass.value)
+                    let held = server.heldGreetingCount()
+                    let logins = Self.logins(w) - loginsBefore
+                    server.releaseGreetings()
+                    await provider.setBeforeChangeConnectTestHookForTesting(nil)
+                    // Only the first attempt's LOGIN, refused for the limit, on the retry rows.
+                    let expectedLogins = attempt == "changeRetry" ? 1 : 0
+                    #expect(logins == expectedLogins, "\(label): LOGINs after the teardown: \(logins - expectedLogins)")
+                    if point == "before" {
+                        #expect(held == 0, "\(label): the attempt connected after the teardown (\(held) connection(s) reached the server)")
+                    } else {
+                        #expect(held == 1, "\(label): \(held) connection(s) reached the server; only the one torn down was expected")
+                    }
+                    #expect(Self.endedByTeardown(inbox.status), "\(label): expected the teardown's error, got \(inbox.status)")
+                    #expect(inbox.cursor == nil, "\(label): a teardown leaves no failure time")
+                    #expect(!(await provider.hasChangeOpeningForTesting), "\(label): a session is left open to a teardown")
+                }
+                if attempt == "changeRetry" {
+                    try await Self.withLimitedWorld(maxSessions: 2, body)
+                } else {
+                    try await Self.withWorld(inbox: [1], body)
+                }
+            }
         }
     }
 

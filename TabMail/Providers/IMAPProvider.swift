@@ -1014,11 +1014,19 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             responseBufferLimit: IMAPFetchMapping.responseBufferLimit
         )
         if let passGeneration {
-            // Open to a teardown from now on (`closeChangeOpening`). A change
-            // session never reconnects inside a command, so once a teardown has
-            // closed it, nothing it is waiting for logs in again.
-            changeOpening = (server, passGeneration)
+            // A change session never reconnects inside a command, so once a
+            // teardown has closed it, nothing it is waiting for logs in again.
             await server.setReconnectsInsideCommands(false)
+            #if DEBUG
+            if let hook = beforeChangeConnectTestHook { await hook(diagSite) }
+            #endif
+            // From here to `connect()` there is no suspension: the generation is
+            // checked and the session made open to a teardown
+            // (`closeChangeOpening`) in the actor turn that starts the connect,
+            // so a teardown either ends this attempt before it connects or
+            // finds it open and closes it. This holds for the eviction retry too.
+            if openingTornDown(passGeneration) { throw ProviderError.notConnected }
+            changeOpening = (server, passGeneration)
         }
         do {
             try await server.connect()
@@ -3222,6 +3230,13 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     var beforeChangeLaneTestHook: (@Sendable () async -> Void)?
     func setBeforeChangeLaneTestHookForTesting(_ hook: (@Sendable () async -> Void)?) {
         beforeChangeLaneTestHook = hook
+    }
+    /// Test seam: awaited by every change-session attempt (`createServer` with a
+    /// pass generation) after reconnects are turned off and before the attempt
+    /// checks its generation and connects. Gets the attempt's `diagSite`.
+    var beforeChangeConnectTestHook: (@Sendable (String) async -> Void)?
+    func setBeforeChangeConnectTestHookForTesting(_ hook: (@Sendable (String) async -> Void)?) {
+        beforeChangeConnectTestHook = hook
     }
     /// Whether a change session is open to a teardown (`changeOpening`).
     var hasChangeOpeningForTesting: Bool { changeOpening != nil }

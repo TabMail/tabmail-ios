@@ -761,8 +761,12 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    the pass wherever it lands, while a session is awaited or opened included: no new session logs in
    for that pass (the pass's generation is checked right before each command that opens the session,
    LOGIN, CAPABILITY and ENABLE, after every wait before it, 2026-11-17), and since it is the app's own act it leaves no failure time even before the pass's
-   first session has opened (2026-11-17). The session being opened is open to a teardown from its
-   creation until the pass keeps or discards it: a teardown closes it at once, without a LOGOUT, so
+   first session has opened (2026-11-17). The session being opened is open to a teardown from the
+   start of its connect until the pass keeps or discards it. Each attempt (the first, and the retry
+   after an eviction) turns reconnects off first, then checks the pass's generation and becomes open
+   to a teardown in the same actor turn that starts its connect, so a teardown either ends the attempt
+   before it connects or finds it open; no connection of a torn-down attempt reaches the server
+   (2026-11-17). A teardown closes the session being opened at once, without a LOGOUT, so
    whatever it waits for (connect, LOGIN, the CAPABILITY the IMAP library sends after LOGIN, the
    reader's CAPABILITY or ENABLE) ends with an error, and the server stops counting it right away
    instead of when a held answer comes (2026-11-17). A teardown closes only a session opened for its
