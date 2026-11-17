@@ -498,23 +498,27 @@ drain, #903.
 
 Decision (master-agent ruling): item 2 of the #903 amendment above is amended for a folder that holds
 its own change bookmark (`Folder.changeCursor`). There, when this pass's own additions are cut, the
-folder's bookmark is dropped instead of its catch-up being armed (`cutDropsBookmark` in
-`SyncEngine.applyFolderChanges`): the folder is listed again and its next read starts a new baseline.
+folder's bookmark is also dropped (`cutDropsBookmark` in `SyncEngine.applyFolderChanges`, through
+`dropChangeBookmark`, which arms the catch-up as well): the folder is listed again and its next read
+starts a new baseline.
 Why: that folder's catch-up need not load a missing message (the IMAP one only checks the rows a folder
 holds), and the bookmark would otherwise move past a cut arrival. A folder with no bookmark keeps the
 #903 behaviour (catch-up armed).
-1. **Bounded per pass, resumed later.** The re-baseline is paged; each pass stops at its deadline and
-   its request allowance (`graphChangeReadRequestsPerSecond` x the read budget) and the next pass resumes
-   page by page. No single pass reads a whole large folder.
+1. **Bounded per pass, resumed later.** The re-baseline is paged; a pass starts no request after its
+   deadline (a request already sent may finish within its own timeout) or past its request allowance
+   (`graphChangeReadRequestsPerSecond` x the read budget). A folder that fits in the allowance can finish
+   in one pass; an unfinished baseline resumes page by page on later passes.
 2. **Networks.** The Inbox re-baseline runs on cellular, as the Inbox baseline already does by design;
    other folders' state baselines wait on an expensive network as before
    (`catchUpExpensiveNetworkMaxWaitSeconds`).
 3. **Cost on Outlook.** For a folder of N messages: about N/100 delta pages
    (`graphChangeReadPageSize` = 100), plus header fetches only for messages a non-Inbox folder is
-   missing within the held range.
-4. **Replied and forwarded arrows.** A baseline reads no last verb (#890 amendment). The listing the
-   dropped bookmark makes due expands the last verb, so cut ids inside the listing window get their
-   arrows back. The #903 limitation remains for mail older than the listing window.
+   missing within the held range, plus the by-id reads of the folder's re-read list (at most
+   `changeRereadBudgetPerPass` ids a pass).
+4. **Replied and forwarded arrows.** The baseline's delta pages expand no last verb and there is no
+   baseline verb sweep (#890 amendment); only its by-id reads (missing messages, re-read ids) expand it.
+   The listing the dropped bookmark makes due expands the last verb, so cut ids inside the listing
+   window get their arrows back. The #903 limitation remains for mail older than the listing window.
 This PR adds no new limitation.
 Keywords: cutDropsBookmark, overflow, own bookmark, re-baseline, listed again, delta pages, cellular
 Inbox, last verb, listing window, #751, #903.
