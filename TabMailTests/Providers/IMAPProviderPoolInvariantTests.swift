@@ -2027,6 +2027,210 @@ struct IMAPProviderPoolInvariantTests {
         await provider.stopIdle()
     }
 
+    /// **The property.** Ending an ACTIVE IDLE session from outside
+    /// (`markDirty()` or `stopIdle()`) puts DONE on the wire before any
+    /// LOGOUT, and the IDLE connection is logged out exactly once, whatever
+    /// order the cancelled IDLE listener and the teardown run in.
+    ///
+    /// **The interleaving forced here.** The teardown's DONE is held back until
+    /// the cancelled listener task has fully exited. A listener that logs its
+    /// own connection out on the way out (the stream-ended path) then queues
+    /// LOGOUT ahead of DONE; SwiftMail runs that LOGOUT behind its IDLE
+    /// completion wait, and DONE never reaches the wire in time. This is the
+    /// ordering the unforced `markDirtySendsDoneBeforeLogoutForAnActiveIdleSession`
+    /// hit intermittently.
+    ///
+    /// **Red-first evidence.** On the code before the fix (the cancelled
+    /// listener falls through to `onIdleStreamEnded`, which logs out without
+    /// DONE) this test fails: no DONE before LOGOUT and two logout attempts.
+    @Test("An IDLE teardown sends DONE before LOGOUT even when the cancelled listener exits first", arguments: ["markDirty", "stopIdle"])
+    func idleTeardownSendsDoneBeforeLogoutWhenTheListenerExitsFirst(teardown: String) async throws {
+        let server = FakeIMAPServer(
+            username: Self.uniqueUsername(),
+            mailboxes: ["INBOX": [Self.message(uid: 95, id: "idle-teardown-order@example.com")]]
+        )
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(for: server)
+        defer { awaitDisconnect(provider) }
+
+        await provider.startIdle { _, _ in }
+        let idling = await waitUntil { server.recordedCommands().contains { $0.hasPrefix("IDLE") } }
+        #expect(idling, "setup: the IDLE command never reached the wire")
+        guard idling, let idleConnection = await provider.currentIdleServerForTesting() else {
+            await provider.stopIdle()
+            return
+        }
+
+        let listenerExited = Mutex(false)
+        provider.setIdleListenerExitTestHookForTesting { listenerExited.withLock { $0 = true } }
+        await provider.setIdleTeardownBeforeDoneTestHookForTesting {
+            let deadline = Date().addingTimeInterval(5)
+            while !listenerExited.withLock({ $0 }), Date() < deadline {
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+        }
+        let idleLogoutAttempts = Mutex(0)
+        provider.setLogoutAttemptTestHookForTesting { instance in
+            if instance === idleConnection { idleLogoutAttempts.withLock { $0 += 1 } }
+        }
+
+        // THE EVENT.
+        if teardown == "markDirty" {
+            await provider.markDirty()
+        } else {
+            await provider.stopIdle()
+        }
+
+        // THE INVARIANT.
+        let sawDone = await waitUntil { server.recordedCommands().contains("DONE") }
+        #expect(sawDone, "\(teardown)() ended an ACTIVE IDLE session without DONE reaching the wire — observed \(server.recordedCommands())")
+        let sawLogout = await waitUntil { server.recordedCommands().contains { $0.hasPrefix("LOGOUT") } }
+        #expect(sawLogout, "\(teardown)() never logged the IDLE connection out")
+        let commands = server.recordedCommands()
+        if let doneIndex = commands.firstIndex(of: "DONE"),
+           let logoutIndex = commands.firstIndex(where: { $0.hasPrefix("LOGOUT") }) {
+            #expect(doneIndex < logoutIndex, "DONE must precede LOGOUT on the IDLE session — observed \(commands)")
+        }
+        #expect(idleLogoutAttempts.withLock { $0 } == 1, "the IDLE connection must be logged out exactly once")
+
+        provider.setIdleListenerExitTestHookForTesting(nil)
+        await provider.setIdleTeardownBeforeDoneTestHookForTesting(nil)
+        provider.setLogoutAttemptTestHookForTesting(nil)
+        await provider.stopIdle()
+    }
+
+    /// **The property.** When the SERVER ends an IDLE session (BYE, then the
+    /// socket closes) while IDLE is still wanted, the listener disposes of its
+    /// own connection exactly once and IDLE monitoring comes back on its own,
+    /// on a new connection, with no further `startIdle()`. This is the other
+    /// side of the teardown tests above: only a CANCELLED listener leaves the
+    /// logout to its canceller; a listener whose stream simply ended still
+    /// cleans up and relaunches.
+    ///
+    /// **Red evidence.** Remove the listener's `onIdleStreamEnded(owner:)`
+    /// call after its event loop (or return on every loop exit): the dead
+    /// connection stays tracked, no logout is attempted and no successor ever
+    /// enters IDLE.
+    @Test("A server-ended IDLE session is disposed of once and IDLE monitoring resumes on a new connection")
+    func serverEndedIdleSessionIsDisposedOfAndMonitoringResumes() async throws {
+        let server = FakeIMAPServer(
+            username: Self.uniqueUsername(),
+            mailboxes: ["INBOX": [Self.message(uid: 96, id: "idle-server-end@example.com")]]
+        )
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(for: server)
+        defer { awaitDisconnect(provider) }
+
+        await provider.startIdle { _, _ in }
+        let idling = await waitUntil { server.recordedCommands().contains { $0.hasPrefix("IDLE") } }
+        #expect(idling, "setup: the IDLE command never reached the wire")
+        guard idling, let original = await provider.currentIdleServerForTesting() else {
+            await provider.stopIdle()
+            return
+        }
+        let originalLogoutAttempts = Mutex(0)
+        provider.setLogoutAttemptTestHookForTesting { instance in
+            if instance === original { originalLogoutAttempts.withLock { $0 += 1 } }
+        }
+
+        // THE EVENT: the server ends the session; nothing on the client cancels.
+        server.endIdleSessionsFromServer()
+
+        // THE INVARIANT. The relaunch waits out the listener's retry delay.
+        let resumed = await waitUntilAsync(timeoutSeconds: 20) {
+            let current = await provider.currentIdleServerForTesting()
+            return current != nil && current !== original
+                && server.recordedCommands().filter { $0.hasPrefix("IDLE") }.count >= 2
+        }
+        #expect(resumed, "IDLE monitoring never resumed on a new connection after the server ended the session")
+        #expect(originalLogoutAttempts.withLock { $0 } == 1, "the server-ended IDLE connection must be disposed of exactly once")
+
+        provider.setLogoutAttemptTestHookForTesting(nil)
+        await provider.stopIdle()
+    }
+
+    /// **The property.** Evicting the IDLE connection to free a slot for folder
+    /// work ends it like every other IDLE teardown (DONE before LOGOUT, one
+    /// logout) and keeps the wish for IDLE monitoring: a later relaunch brings
+    /// IDLE back on a new connection with no further `startIdle()`.
+    ///
+    /// Driven through the real caller: folder work that needs a slot while the
+    /// only folder slot is checked out (`createFolderConnection`'s capacity
+    /// path).
+    ///
+    /// **Red evidence.** Make `evictIdleConnection()` end IDLE through
+    /// `stopIdle()` (which also turns monitoring off): the relaunch below never
+    /// claims a successor. Drop the DONE from the shared teardown: the order
+    /// check fails.
+    @Test("Evicting IDLE sends DONE before LOGOUT, logs out once, and keeps IDLE monitoring wanted")
+    func evictingIdleEndsItCleanlyAndKeepsMonitoringWanted() async throws {
+        let server = FakeIMAPServer(
+            username: Self.uniqueUsername(),
+            mailboxes: [
+                "INBOX": [Self.message(uid: 97, id: "idle-evict-inbox@example.com")],
+                "Archive": [Self.message(uid: 98, id: "idle-evict-archive@example.com")],
+            ]
+        )
+        try server.start()
+        defer { server.stop() }
+        // A limit of 3 is the smallest that runs IDLE; with IDLE up it leaves
+        // exactly ONE folder slot (`limit - reservedConnections`).
+        // `IMAPProvider.init` seeds its limit from this host+username key.
+        IMAPProvider.persistServerLimit(3, host: "127.0.0.1", username: server.username)
+        let provider = Self.provider(for: server)
+        defer { awaitDisconnect(provider) }
+
+        await provider.startIdle { _, _ in }
+        let idling = await waitUntil { server.recordedCommands().contains { $0.hasPrefix("IDLE") } }
+        #expect(idling, "setup: the IDLE command never reached the wire")
+        guard idling, let evicted = await provider.currentIdleServerForTesting() else {
+            await provider.stopIdle()
+            return
+        }
+        #expect(await provider.poolMaxConnections() == 1, "setup: with IDLE up the pool must have exactly one folder slot")
+
+        // Fill the one folder slot and keep it checked out, so the next
+        // folder's connection can only be made by evicting IDLE.
+        _ = try await provider.fetchMessages(folder: "Archive", limit: 1, offset: 0)
+        await provider.setFolderInUseForTesting(folder: "Archive", inUse: true)
+        let evictedLogoutAttempts = Mutex(0)
+        provider.setLogoutAttemptTestHookForTesting { instance in
+            if instance === evicted { evictedLogoutAttempts.withLock { $0 += 1 } }
+        }
+
+        // THE EVENT: folder work that needs a slot.
+        _ = try await provider.fetchMessages(folder: "INBOX", limit: 1, offset: 0)
+        await provider.setFolderInUseForTesting(folder: "Archive", inUse: false)
+        #expect(await provider.currentIdleServerForTesting() !== evicted, "setup: the folder work did not evict IDLE")
+
+        // THE INVARIANT, part 1: a clean end of the evicted session.
+        let sawDone = await waitUntil { server.recordedCommands().contains("DONE") }
+        #expect(sawDone, "eviction ended an ACTIVE IDLE session without DONE reaching the wire — observed \(server.recordedCommands())")
+        let sawLogout = await waitUntil { server.recordedCommands().contains { $0.hasPrefix("LOGOUT") } }
+        #expect(sawLogout, "eviction never logged the IDLE connection out")
+        let commands = server.recordedCommands()
+        if let doneIndex = commands.firstIndex(of: "DONE"),
+           let logoutIndex = commands.firstIndex(where: { $0.hasPrefix("LOGOUT") }) {
+            #expect(doneIndex < logoutIndex, "DONE must precede LOGOUT on the evicted IDLE session — observed \(commands)")
+        }
+        #expect(evictedLogoutAttempts.withLock { $0 } == 1, "the evicted IDLE connection must be logged out exactly once")
+
+        // THE INVARIANT, part 2: IDLE is still wanted, so a relaunch (the
+        // stand-in for eviction's own delayed relaunch) brings it back.
+        await provider.relaunchIdleConnectionForTesting()
+        let resumed = await waitUntilAsync {
+            let current = await provider.currentIdleServerForTesting()
+            return current != nil && current !== evicted
+                && server.recordedCommands().filter { $0.hasPrefix("IDLE") }.count >= 2
+        }
+        #expect(resumed, "IDLE monitoring did not come back after eviction — eviction turned IDLE off")
+
+        provider.setLogoutAttemptTestHookForTesting(nil)
+        await provider.stopIdle()
+    }
+
     // ════════════════════════════════════════════════════════════════════════
     // MARK: - T3.7 LANDED RECORD (was: DEFERRED TO T3.7)
     // ════════════════════════════════════════════════════════════════════════

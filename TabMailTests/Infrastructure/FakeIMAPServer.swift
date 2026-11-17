@@ -395,6 +395,9 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// branch, and `stop()`'s test-teardown sweep. Consulted+removed in
         /// `closeClientFd`.
         var testInitiatedCloseFds: Set<Int32> = []
+        /// Client fds currently inside an IDLE command (set when IDLE is
+        /// answered, cleared on DONE). `endIdleSessionsFromServer()` ends them.
+        var idlingFds: Set<Int32> = []
         /// R12-F1 (Round 12 finding F1) — the wire-level "abandoned logged-in
         /// session" oracle. `liveSessionCount()` (`loggedInFds.count` above)
         /// cannot distinguish "logged out cleanly" from "abandoned, then the
@@ -593,6 +596,7 @@ final class FakeIMAPServer: @unchecked Sendable {
         // forever — defensive cleanup alongside the LOGOUT command handler.
         withState { state in
             _ = state.loggedInFds.remove(fd)
+            _ = state.idlingFds.remove(fd)
             // R12-F1: the REAL abandoned-logged-in-session oracle. Deliberately
             // keyed off `everLoggedInFds`/`loggedOutFds`, NOT the `loggedInFds`
             // removal just above — `loggedInFds` is ALREADY cleared by the
@@ -775,6 +779,29 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// simulated failure, not a real `IMAPProvider` leak. Use this instead of
     /// `failNextCommand`/`failCommand` whenever a test wants to drive one of
     /// those four "dead connection" branches.
+    /// Server-side end of every active IDLE session, as a server going away
+    /// does it (RFC 3501 §7.1.5): an untagged BYE, then the socket is shut
+    /// down. The client's IDLE stream ends WITHOUT the client having cancelled
+    /// anything. The close is marked test-initiated (see
+    /// `testInitiatedCloseFds`), so it is not counted as an abandoned session.
+    /// `shutdown`, not `close`: the client loop still owns the fd and closes it
+    /// exactly once on its way out.
+    func endIdleSessionsFromServer() {
+        let fds = withState { state -> Set<Int32> in
+            let fds = state.idlingFds
+            state.idlingFds.removeAll()
+            for fd in fds {
+                _ = state.loggedInFds.remove(fd)
+                _ = state.testInitiatedCloseFds.insert(fd)
+            }
+            return fds
+        }
+        for fd in fds {
+            sendLine(fd: fd, "* BYE Server shutting down\r\n")
+            shutdown(fd, SHUT_RDWR)
+        }
+    }
+
     func killConnectionOnNextCommand(containing fragment: String) {
         withState { state in
             state.injectedFailureCountdowns[fragment.uppercased(), default: []]
@@ -1683,7 +1710,10 @@ final class FakeIMAPServer: @unchecked Sendable {
                     // here). Lets a test assert the "teardown sends DONE
                     // for an active IDLE session" invariant (the
                     // markDirty-IDLE fix's pin).
-                    withState { $0.commandLog.append("DONE") }
+                    withState { state in
+                        state.commandLog.append("DONE")
+                        _ = state.idlingFds.remove(fd)
+                    }
                     sendLine(fd: fd, "\(tag) OK IDLE terminated\r\n")
                     idleTag = nil
                     continue
@@ -1744,6 +1774,7 @@ final class FakeIMAPServer: @unchecked Sendable {
                 }
 
                 if command == "IDLE" {
+                    withState { _ = $0.idlingFds.insert(fd) }
                     sendLine(fd: fd, "+ idling\r\n")
                     idleTag = tag
                     continue
