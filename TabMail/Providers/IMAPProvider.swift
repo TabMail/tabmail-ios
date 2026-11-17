@@ -2667,7 +2667,8 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         }
     }
 
-    /// Fire-and-forget teardown logout used by `markDirty()`.
+    /// Fire-and-forget teardown logout used by `markDirty()` and, for the IDLE
+    /// connection, `tearDownIdleConnection()`.
     ///
     /// ⚑ ADAPTED (structure only, no behavioural difference) — the reference
     /// writes `Task { [beforeLogoutTestHook, generation] in … }` inline at each
@@ -2683,8 +2684,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         #if DEBUG
         let hook = beforeLogoutTestHook
         let logoutGeneration = generation
+        let beforeDoneHook = idleTeardownBeforeDoneTestHook
         Task {
             if let hook { hook(server, logoutGeneration) }
+            if sendDoneFirst, let beforeDoneHook { await beforeDoneHook() }
             if sendDoneFirst { try? await server.done() }
             try? await server.logout()
         }
@@ -2742,23 +2745,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         folderCapacityWaiters.removeAll()
 
         // Stop IDLE listener (don't clear idleEnabled — it will resume after reconnect)
-        idleListenerTask?.cancel()
-        idleListenerTask = nil
-        if let server = idleServer {
-            // T3.7 PORT (D-22) — `.done()` BEFORE `.logout()`, mirroring
-            // `stopIdle()`. SwiftMail's `executeCommandBody` calls
-            // `waitForIdleCompletionIfNeeded()` before EVERY command including
-            // LOGOUT; a bare `logout()` against a still-active IDLE session
-            // therefore stalls behind a hard-coded 15s internal timeout
-            // (`waitForIdleHandlerCompletion`'s default) before force-resetting
-            // the connection — blowing this function's own "costs 1-3s"
-            // contract for that connection's socket-level cleanup. Sending DONE
-            // first terminates the IDLE session cleanly so the LOGOUT proceeds
-            // immediately.
-            detachedTeardownLogout(server, sendDoneFirst: true)
+        if tearDownIdleConnection() {
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] markDirty: disconnecting IDLE connection") }
         }
-        idleServer = nil
 
         // Nuke action connection
         if let server = actionServer {
@@ -2973,6 +2962,28 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         idleLaunchPlantRaceTestHook = hook
     }
 
+    /// Fires inside the detached IDLE teardown (`detachedTeardownLogout` with
+    /// `sendDoneFirst`), BEFORE its DONE — lets a test hold the teardown's
+    /// DONE back until the cancelled IDLE listener has fully exited, the
+    /// interleaving in which a listener that logs out on its own way out puts
+    /// LOGOUT on the wire ahead of DONE.
+    var idleTeardownBeforeDoneTestHook: (@Sendable () async -> Void)?
+    func setIdleTeardownBeforeDoneTestHookForTesting(_ hook: (@Sendable () async -> Void)?) {
+        idleTeardownBeforeDoneTestHook = hook
+    }
+
+    /// Fires when an IDLE listener task (`launchIdleConnection`'s Task) exits
+    /// by any path. Mutex-backed and `nonisolated` so the listener reports its
+    /// exit without an actor hop.
+    private nonisolated let idleListenerExitTestHook =
+        Mutex<(@Sendable () -> Void)?>(nil)
+    nonisolated func setIdleListenerExitTestHookForTesting(_ hook: (@Sendable () -> Void)?) {
+        idleListenerExitTestHook.withLock { $0 = hook }
+    }
+    nonisolated fileprivate func noteIdleListenerExit() {
+        idleListenerExitTestHook.withLock { $0 }?()
+    }
+
     // MARK: T3.7 NO-LOGOUT-WHILE-HELD oracle seams (PORT — `v2final`)
     //
     // These five are DELIBERATELY SYNCHRONOUS (no `async`), unlike every hook
@@ -3024,6 +3035,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// generation), at every teardown call site that could plausibly log out a
     /// connection some OTHER task still holds: `disconnect()` and `markDirty()`
     /// — the two EXTERNAL teardowns (cross-field invariant #1's void set).
+    /// It also fires for the IDLE connection's teardown in `stopIdle()` and
+    /// `evictIdleConnection()`, which share `markDirty()`'s IDLE path
+    /// (`tearDownIdleConnection`); the IDLE connection is never checked out,
+    /// so those calls can never look like a held connection being logged out.
     ///
     /// NOT wired into `releaseActionConnection(healthy:false)` /
     /// `releaseFolderConnection(healthy:false)`: those are the exclusive
@@ -3213,13 +3228,29 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     func stopIdle() {
         idleEnabled = false
         idleEventHandler = nil
+        tearDownIdleConnection()
+    }
+
+    /// The ONE way an IDLE session is ended from outside its listener
+    /// (`markDirty()`, `stopIdle()`, `evictIdleConnection()`): cancel the
+    /// listener, clear the slot, then a detached DONE followed by LOGOUT on the
+    /// tracked connection. SwiftMail's `executeCommandBody` calls
+    /// `waitForIdleCompletionIfNeeded()` before EVERY command including LOGOUT,
+    /// so a LOGOUT against a still-active IDLE session stalls behind its 15s
+    /// internal IDLE-completion timeout; DONE first ends the IDLE cleanly
+    /// (SwiftMail bounds DONE by its own timeout). The cancelled listener does
+    /// NOT log out on its way out (see `launchIdleConnection`): this function
+    /// owns the connection's only logout, so nothing can put a LOGOUT on the
+    /// wire ahead of the DONE. Synchronous — callers keep their one-actor-turn
+    /// teardown. Returns whether an IDLE connection was torn down.
+    @discardableResult
+    private func tearDownIdleConnection() -> Bool {
         idleListenerTask?.cancel()
         idleListenerTask = nil
-        if let server = idleServer {
-            noteLogoutAttempt(server)
-            Task { try? await server.done(); try? await server.logout() }
-        }
+        guard let server = idleServer else { return false }
         idleServer = nil
+        detachedTeardownLogout(server, sendDoneFirst: true)
+        return true
     }
 
     /// Minimum server connection limit to enable IDLE.
@@ -3253,6 +3284,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         idleListenerTask?.cancel()
         idleListenerTask = Task { [weak self] in
             guard let self else { return }
+            #if DEBUG
+            defer { self.noteIdleListenerExit() }
+            #endif
             // T3.7 PORT (D-21 / R7-F3): tracks whether THIS launch actually
             // owns the slot, so the failure paths below can tell "my claimed
             // connection died" (tear down by identity) from "I never planted
@@ -3272,11 +3306,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     // connecting) — this connection is surplus. Log it out and
                     // abandon this launch instead of overwriting whatever now
                     // holds the slot.
-                    // `noteLogoutAttempt` is `nonisolated` (Mutex-backed) — no
-                    // actor hop, so the mark cannot perturb the interleaving
-                    // the oracle exists to observe.
-                    self.noteLogoutAttempt(fresh)
-                    try? await fresh.logout()
+                    // The logout runs in its own unstructured task
+                    // (`detachedTeardownLogout`): this listener task may be the
+                    // one that was cancelled, and a logout awaited from a
+                    // cancelled task fails at once without sending LOGOUT.
+                    await self.detachedTeardownLogout(fresh)
                     return
                 }
                 claimed = fresh
@@ -3292,6 +3326,12 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     guard !Task.isCancelled else { break }
                     await self.dispatchIdleEvent(event)
                 }
+                // Cancelled: the stream ends (an `AsyncStream` iterator returns
+                // nil for a cancelled consumer) without the server ending it.
+                // The cancelling teardown (`tearDownIdleConnection`) owns this
+                // connection's DONE-then-LOGOUT; logging out here as well would
+                // race a LOGOUT onto the wire ahead of that DONE.
+                if Task.isCancelled { return }
                 // Stream ended (server broke IDLE or connection dropped)
                 if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP:IDLE] Stream ended — reconnecting in 5s") }
                 await self.onIdleStreamEnded(owner: fresh)
@@ -3327,8 +3367,15 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// SAME instance), IDLE callers do not need each other's result — they only
     /// need to never clobber each other — so this recheck alone fully closes
     /// the hazard.
+    ///
+    /// A CANCELLED launch is refused too (`Task.isCancelled` here reads the
+    /// calling listener task: this is awaited from it). Its canceller
+    /// (`tearDownIdleConnection`) ran while the slot held nothing of this
+    /// launch's, so nobody else will ever dispose of this connection; and a
+    /// cancelled listener does not stay to listen. Refusing sends it down the
+    /// lost-the-race path, which logs it out.
     private func claimIdleServerSlot(_ server: IMAPServer) -> Bool {
-        guard idleEnabled, idleServer == nil else { return false }
+        guard !Task.isCancelled, idleEnabled, idleServer == nil else { return false }
         idleServer = server
         return true
     }
@@ -3388,13 +3435,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// Returns true if an IDLE connection was evicted, false if none was active.
     @discardableResult
     private func evictIdleConnection() -> Bool {
-        guard let server = idleServer else { return false }
+        guard idleServer != nil else { return false }
         if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP:IDLE] Evicting IDLE connection to free server slot") }
-        idleListenerTask?.cancel()
-        idleListenerTask = nil
-        noteLogoutAttempt(server)
-        Task { try? await server.done(); try? await server.logout() }
-        idleServer = nil
+        tearDownIdleConnection()
         // Will relaunch after delay if idleEnabled is still true
         if idleEnabled {
             Task { [weak self] in
