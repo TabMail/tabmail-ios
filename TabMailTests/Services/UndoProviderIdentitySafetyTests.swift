@@ -289,6 +289,45 @@ struct UndoProviderIdentitySafetyTests {
         #expect(AccountManager.shared.overlayOpRefCountForTesting()[original.id] == nil)
     }
 
+    @Test("A deferred Undo materialized from a task carrying an older gesture's reset stamp is still queued")
+    @MainActor
+    func deferredInverseIgnoresAnInheritedResetStamp() async throws {
+        let fixture = try install(provider: .imap)
+        defer { uninstall(fixture) }
+        await AccountManager.shared.clearDeferredMoveSuccessorsForTesting()
+
+        let original = sourceHeader(fixture, providerId: "101", rfc: "move@example.com")
+        try installOptimisticallyMoved(original, pool: fixture.pool)
+        let forward = try await insertInFlightMove(
+            fixture, messageIds: ["101"], from: "INBOX", to: "Archive", epoch: 41)
+        // The task that runs the drain was started by a gesture taken before
+        // Archive's id reset; the Undo and the forward's COPYUID come after it.
+        let unrelatedOldStamp = FolderResetGeneration.current()
+        FolderResetGeneration.recordReset(
+            folderId: MessageIdentity.folderId(accountId: fixture.accountId, folderPath: "Archive"))
+        let restored = await AccountManager.shared.undoMove(
+            accountId: fixture.accountId,
+            forwardDestinationPath: "Archive",
+            members: [UndoMember(header: original)])
+        #expect(restored == [original.id])
+
+        let result = try await finishMove(
+            fixture, operation: forward, sourceId: "101",
+            destinationId: "901", destinationEpoch: 52)
+        await FolderResetGeneration.$gestureStamp.withValue(unrelatedOldStamp) {
+            await AccountManager.shared.materializeDeferredMoveSuccessors(
+                after: forward, result: result)
+        }
+        await AccountManager.shared.awaitWriteQueueDrain()
+
+        let ops = try await fixture.pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.count == 1, "the newer Undo was dropped under an unrelated older stamp")
+        guard ops.count == 1 else { return }
+        #expect(ops[0].messageIds == ["901"])
+        #expect(ops[0].destinationPath == "INBOX")
+        #expect(await AccountManager.shared.deferredMoveSuccessorCountForTesting() == 0)
+    }
+
     /// **THE INVARIANT: a deferred move successor registered against a
     /// predecessor that is retired by a NARROWING pass is materialized, so the
     /// user's follow-up gesture is not stranded.**

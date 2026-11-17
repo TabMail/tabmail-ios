@@ -1152,9 +1152,15 @@ extension AccountManager {
         after predecessor: PendingOperation,
         result: MoveFinishResult
     ) async {
-        await enqueueWriteAfterPriorAdmissions { [self, predecessor, result] in
-            await materializeDeferredMoveSuccessorsInFIFO(
-                after: predecessor, result: result)
+        // No reset-generation stamp: the inverse's source address is the one the
+        // provider just proved (`result`, with its own epoch), not a row someone
+        // was shown, and a stamp inherited from whatever task started the drain
+        // belongs to an unrelated earlier gesture.
+        await FolderResetGeneration.$gestureStamp.withValue(nil) {
+            await enqueueWriteAfterPriorAdmissions { [self, predecessor, result] in
+                await materializeDeferredMoveSuccessorsInFIFO(
+                    after: predecessor, result: result)
+            }
         }
     }
 

@@ -211,6 +211,9 @@ struct FolderResetGenerationTests {
             : ConfirmSink()
         let invocation = ToolInvocation(uiSink: sink, sessionKey: "frg-card-\(action)-\(shownBeforeReset)")
         let arguments: [String: JSONValue] = ["unique_ids": .array([.int(31)])]
+        // The oracle names the email the user saw on the card, for the whole
+        // action interval.
+        env.server.expectMutation(rfc822MessageId: shownBeforeReset ? Self.shownRfc : Self.replacementRfc)
         let output: String
         switch action {
         case .archive:
@@ -220,8 +223,6 @@ struct FolderResetGenerationTests {
         }
         try await expectReseated(env)
 
-        // The oracle names the email the user saw on the card.
-        env.server.expectMutation(rfc822MessageId: shownBeforeReset ? Self.shownRfc : Self.replacementRfc)
         try await drainToWire(env)
 
         let after = try await row(env)
@@ -233,6 +234,10 @@ struct FolderResetGenerationTests {
             #expect(try await ops(env).isEmpty, "\(action): a durable operation was queued for the replacement")
             #expect(!output.contains("\"success\":true") && !output.contains("\"success\": true"),
                     "\(action): the tool reported success for a refused move: \(output)")
+            // Terminal, never pending: a retry under the same id would act on the
+            // replacement, so the agent must not be told the work is outstanding.
+            #expect(output.contains("failed_ids") && !output.contains("pending_ids"),
+                    "\(action): the refusal was not reported as a terminal failure: \(output)")
         } else {
             // Control: the same card on the replacement, shown after the reset,
             // reaches the wire, so an empty violation list above is not a drain
@@ -241,6 +246,96 @@ struct FolderResetGenerationTests {
             #expect(!inboxUids(env).contains(Self.uid),
                     "control: \(action) of the replacement, shown after the reset, never reached the server: \(output)")
         }
+        await finish(env)
+    }
+
+    @Test("""
+    The card's stamp is taken before the headers it shows are read: a reset that completes \
+    after the shown email's read, while the card is still being built, refuses the archive
+    """)
+    func aiCardStampPrecedesTheHeaderRead() async throws {
+        let env = try makeEnv(accountId: "frg-card-read", shownHasRfc: false)
+        UserDefaults.standard.set(false, forKey: AccountManager.markReadOnArchiveDeleteKey)
+        clearOverlay()
+        let translator = MockChatIdTranslator()
+        await translator.seed(env.headerId, as: 31)
+        // The first lookup (id 31) answers and its header is read; the reset runs
+        // at the second lookup (id 32, unknown), before the card is shown.
+        await translator.setOnResolve { [translator] in
+            await translator.setOnResolve { @MainActor in try? await self.runReset(env) }
+        }
+        env.server.expectMutation(rfc822MessageId: Self.shownRfc)
+        let output = try await EmailArchiveTool(context: ToolContext(db: env.pool, translator: translator)).execute(
+            arguments: ["unique_ids": .array([.int(31), .int(32)])],
+            invocation: ToolInvocation(uiSink: ConfirmSink(), sessionKey: "frg-card-read"))
+        try await expectReseated(env)
+        try await drainToWire(env)
+        #expect(env.server.wrongMessageViolations().isEmpty,
+                "a card whose header was read before the reset mutated the replacement: \(output)")
+        #expect(inboxUids(env).contains(Self.uid), "the replacement left INBOX on the server")
+        #expect(try await ops(env).isEmpty, "a durable operation was queued for the replacement")
+        await finish(env)
+    }
+
+    // MARK: - Manual tags
+
+    @Test("""
+    A tag intent stamped before the folder's reset never tags the email re-seated at its id; \
+    stamped after it, the replacement is tagged
+    """, arguments: [true, false])
+    func queuedTagAcrossAResetNeverTagsTheReplacement(stampedBeforeReset: Bool) async throws {
+        let env = try makeEnv(accountId: "frg-tag-\(stampedBeforeReset)")
+        clearOverlay()
+        let preResetStamp = FolderResetGeneration.current()
+        try await runReset(env)
+        try await expectReseated(env)
+        let stamp = stampedBeforeReset ? preResetStamp : FolderResetGeneration.current()
+        FolderResetGeneration.$gestureStamp.withValue(stamp) {
+            AccountManager.shared.registerGestureIntent(id: env.headerId, .actionTag(target: .reply, baseline: nil))
+        }
+        await AccountManager.shared.awaitWriteQueueDrain()
+        let after = try #require(try await row(env))
+        if stampedBeforeReset {
+            #expect(after.actionTag == nil, "a tag taken before the reset was applied to the replacement")
+            let cached = try await env.pool.read { try MessageAICache.fetchCount($0) }
+            #expect(cached == 0, "a tag taken before the reset was cached for the replacement")
+        } else {
+            #expect(after.actionTag == .reply, "control: a tag taken after the reset was refused")
+        }
+        await finish(env)
+    }
+
+    // MARK: - The outbox finalize is not a gesture
+
+    @Test("""
+    A completed reply finalized from a task carrying a pre-reset stamp still flags the original \
+    it was read against after the reset
+    """)
+    func outboxFinalizeIgnoresAnInheritedResetStamp() async throws {
+        let env = try makeEnv(accountId: "frg-outbox")
+        let preResetStamp = FolderResetGeneration.current()
+        try await runReset(env)
+        try await expectReseated(env)
+        var outbox = OutboxMessage(
+            accountId: env.accountId,
+            draft: DraftMessage(
+                to: ["sender@example.com"], subject: "Re: reset generation fixture", body: "reply",
+                inReplyTo: "<\(Self.replacementRfc)>"),
+            originalMessageHeaderId: env.headerId,
+            isForward: false)
+        outbox.status = OutboxStatus.sending.rawValue
+        outbox.sentAt = Date()
+        outbox.appendedToSent = true
+        let sent = outbox
+        try await env.pool.writeWithoutTransaction { db in try sent.insert(db) }
+        _ = try await FolderResetGeneration.$gestureStamp.withValue(preResetStamp) {
+            try await env.pool.write { db in
+                try AccountManager.deleteCompletedSendAtomic(outboxId: sent.id, db: db)
+            }
+        }
+        let replied = try await ops(env).filter { $0.type == .markReplied }
+        #expect(replied.count == 1, "an inherited stamp refused the reply flag of an original read after the reset")
+        #expect(try await row(env)?.isReplied == true)
         await finish(env)
     }
 

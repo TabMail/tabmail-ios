@@ -862,11 +862,21 @@ extension AccountManager {
         // row durable first, mirroring markRead/markUnread/markFlagged/move.
         await ensureDurable([message])
 
-        // Step 1: Update GRDB state immediately (optimistic UI)
-        try? await dbPool.write { db in
-            guard var msg = try MessageHeader.fetchOne(db, key: message.id) else { return }
+        // Step 1: Update GRDB state immediately (optimistic UI). Refused when
+        // this gesture's view of the row predates its folder's id reset: the
+        // row at this id may be a different email, and neither the tag nor the
+        // cache and teaching steps below may be attributed to it.
+        let folderId = MessageIdentity.folderId(accountId: accountId, folderPath: folderPath)
+        let wrote = (try? await dbPool.write { db -> Bool in
+            guard !FolderResetGeneration.refuses(folderId: folderId) else { return false }
+            guard var msg = try MessageHeader.fetchOne(db, key: message.id) else { return true }
             msg.setActionTag(tag)
             try msg.save(db)
+            return true
+        }) ?? true
+        guard wrote else {
+            BackgroundSyncLogger.logDebug("[ManualTag] refused: '\(folderPath)' was reset after the gesture for \(messageId)")
+            return
         }
 
         Task { @MainActor in NotificationCenter.default.post(name: .inboxDataDidChange, object: nil) }
