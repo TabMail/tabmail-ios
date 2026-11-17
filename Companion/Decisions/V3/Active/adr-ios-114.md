@@ -734,7 +734,8 @@ same AI result, kept as long as the email itself is shown.
      v107 on included); its message says the new caller must move the thread chats to their new key.
    - **Tests:** `ThreadChatTests` (a card raised for an earlier email answered after a newer one
      lands, also across accounts; a newer email's question carries the earlier exchange; the email
-     screen on an older email shows the thread's chat, the newest email's card and context; two joined
+     screen on an older email shows the thread's chat with the open email's card and context
+     (`emailScreenUsesTheOpenEmail`), the chat view the newest email's (`chatViewUsesTheNewestEmail`); two joined
      threads; the upgrade; eviction keeps a thread with an Inbox email; inbox chats unchanged; through
      the pill's Send and the production reader, the history of a chat stored under two keys,
      interleaved and over the budget by turns and by characters, is in time order with equal times

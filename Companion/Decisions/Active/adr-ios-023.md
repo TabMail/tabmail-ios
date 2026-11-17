@@ -45,5 +45,9 @@ own session: it shows and continues its thread's chat (every email of the thread
 merged by time, `ThreadChatReader`), and every request names the thread's newest email, also when
 the email screen shows an older one. Old thread chats are cleared by thread, and a thread with any
 Inbox email keeps its chat. Inbox sessions, their swipe pages and compose sessions are unchanged.
+*Amended 2026-11-16 (ADR-IOS-114 decision 14):* only the chat view's requests name the thread's
+newest email. The email screen's Chat pill is about the email that is open: its requests name that
+email, its top card shows it, and its turns are written under that email's thread key, so the
+thread's chat stays one chat.
 
 ---
