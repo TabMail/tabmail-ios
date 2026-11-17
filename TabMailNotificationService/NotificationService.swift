@@ -96,11 +96,11 @@ final class LeaseHolder: @unchecked Sendable {
 /// `EmailNotificationBuilder.fill` without threading extra state through the
 /// watchdog closure.
 final class PartialSignalHolder: @unchecked Sendable {
-    private let slot = Mutex<(signal: EmailNotificationBuilder.Signal, accountId: String, messageId: String)?>(nil)
-    func set(_ signal: EmailNotificationBuilder.Signal, accountId: String, messageId: String) {
-        slot.withLock { $0 = (signal, accountId, messageId) }
+    private let slot = Mutex<(signal: EmailNotificationBuilder.Signal, accountId: String, messageId: String, observedUidValidity: Int?)?>(nil)
+    func set(_ signal: EmailNotificationBuilder.Signal, accountId: String, messageId: String, observedUidValidity: Int?) {
+        slot.withLock { $0 = (signal, accountId, messageId, observedUidValidity) }
     }
-    func get() -> (signal: EmailNotificationBuilder.Signal, accountId: String, messageId: String)? {
+    func get() -> (signal: EmailNotificationBuilder.Signal, accountId: String, messageId: String, observedUidValidity: Int?)? {
         slot.withLock { $0 }
     }
 }
@@ -331,7 +331,7 @@ final class NotificationService: UNNotificationServiceExtension {
     ) {
         if let partial = partialHolder.get() {
             NSELog.step("NSE \(source): delivering PARTIAL (summary=\(partial.signal.summaryBlurb != nil ? "yes" : "no"))")
-            EmailNotificationBuilder.fill(c, signal: partial.signal, accountId: partial.accountId, messageId: partial.messageId)
+            EmailNotificationBuilder.fill(c, signal: partial.signal, accountId: partial.accountId, messageId: partial.messageId, observedUidValidity: partial.observedUidValidity)
             // The action vote is unknown at this point — force passive/no
             // sound regardless of what `fill` decided (it only goes active
             // for actionTag == "reply", which is always nil in a partial
@@ -575,7 +575,8 @@ final class NotificationService: UNNotificationServiceExtension {
         // of the bare "New Email" fallback if they fire before step 6a.
         partialHolder.set(
             EmailNotificationBuilder.Signal(senderName: msg.senderName, senderEmail: msg.senderEmail, subject: msg.subject),
-            accountId: accountId, messageId: msg.messageId
+            accountId: accountId, messageId: msg.messageId,
+            observedUidValidity: msg.observedUidValidity
         )
 
         // ── GRADUAL STAGING stage 1: header ──
@@ -675,7 +676,8 @@ final class NotificationService: UNNotificationServiceExtension {
                     summaryBlurb: peerHit.summaryBlurb,
                     actionTag: peerHit.actionTag
                 ),
-                accountId: accountId, messageId: msg.messageId
+                accountId: accountId, messageId: msg.messageId,
+                observedUidValidity: msg.observedUidValidity
             )
             c.badge = NSNumber(value: NSEBadge.badgeForDelivery(
                 db: db, suite: SharedNSEData.suite.defaults,
@@ -724,7 +726,8 @@ final class NotificationService: UNNotificationServiceExtension {
                     dueDate: cached.reminderDate,
                     dueTime: cached.reminderTime
                 ),
-                accountId: accountId, messageId: msg.messageId
+                accountId: accountId, messageId: msg.messageId,
+                observedUidValidity: msg.observedUidValidity
             )
             // Idempotent: a staging-cache hit means a previous NSE run already
             // counted this message, so this returns the current value unbumped.
@@ -920,7 +923,8 @@ final class NotificationService: UNNotificationServiceExtension {
                         summaryBlurb: summaryBlurb, reminderContent: reminderContent,
                         dueDate: reminderDate, dueTime: reminderTime
                     ),
-                    accountId: accountId, messageId: msg.messageId
+                    accountId: accountId, messageId: msg.messageId,
+                    observedUidValidity: msg.observedUidValidity
                 )
                 break
             }
@@ -1031,7 +1035,8 @@ final class NotificationService: UNNotificationServiceExtension {
             rfc822MessageId: msg.rfc822MessageId)
         EmailNotificationBuilder.fill(
             c, signal: signal,
-            accountId: accountId, messageId: msg.messageId
+            accountId: accountId, messageId: msg.messageId,
+            observedUidValidity: msg.observedUidValidity
         )
         NSELog.step("NSE step8: \(active ? "ACTIVE (reply)" : "PASSIVE"), badge=\(newBadge)")
         c.badge = NSNumber(value: newBadge)

@@ -954,7 +954,8 @@ extension AccountManager {
         let content = UNMutableNotificationContent()
         EmailNotificationBuilder.fill(
             content, signal: signal,
-            accountId: header.accountId, messageId: header.messageId
+            accountId: header.accountId, messageId: header.messageId,
+            observedUidValidity: header.observedUidValidity
         )
 
         try await UNUserNotificationCenter.current().add(

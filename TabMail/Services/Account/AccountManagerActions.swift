@@ -182,20 +182,47 @@ struct RoleMoveAdmission: Sendable, Equatable {
 /// directions (ADR-IOS-061 item E); a `(fromAddress, subject, date)` substitute
 /// was likewise authored (`94fac3e79`) and reverted (`3bd9f0bac`). Do not
 /// reintroduce one. The residual is registered as `IOS-IDENTITY-001`.
+///
+/// ⚑ THE EPOCH ARM (tabmail-ios #538) IS NOT A SUBSTITUTE CONTENT WITNESS. A row
+/// with no usable Message-ID but a PROVEN address epoch
+/// (`MessageHeader.observedUidValidity`) carries that epoch instead. It says
+/// nothing about content, so an ordinary duplicate cannot forge it; it records
+/// which UID numbering the captured address belonged to. A UIDVALIDITY turnover
+/// that re-seats a different message under the same composite id gives the
+/// impostor the FRESH epoch, so a present, different current epoch is proof
+/// that the address no longer names the captured message. It refuses ONLY on
+/// that positive fact: a current row whose epoch is nil (address unproven,
+/// which several sync and optimistic writers set legitimately) is NOT refused,
+/// so the arm never widens refusal beyond a proven re-seat. When a usable
+/// Message-ID exists it alone is the witness, because the same message may be
+/// re-seated at the same UID under a new epoch and the content witness admits
+/// that correctly.
 struct ExpectedMessageIdentity: Sendable, Equatable {
-    /// Always a normalized, non-empty RFC 822 Message-ID — normalized ONCE, here,
-    /// through the tree's single identity-COMPARISON normalizer.
-    let rfc822MessageId: String
+    enum Witness: Sendable, Equatable {
+        /// A normalized, non-empty RFC 822 Message-ID — normalized ONCE, here,
+        /// through the tree's single identity-COMPARISON normalizer.
+        case rfc822(String)
+        /// The positive UIDVALIDITY under which the captured address was proven.
+        /// Used only when the message has no usable Message-ID.
+        case addressEpoch(Int)
+    }
 
-    init?(capturedRfc822MessageId: String?) {
-        guard let normalized = MessageIdentity.comparableRfc822Identity(capturedRfc822MessageId) else {
+    let witness: Witness
+
+    init?(capturedRfc822MessageId: String?, capturedObservedUidValidity: Int? = nil) {
+        if let normalized = MessageIdentity.comparableRfc822Identity(capturedRfc822MessageId) {
+            self.witness = .rfc822(normalized)
+        } else if let epoch = capturedObservedUidValidity, epoch > 0 {
+            self.witness = .addressEpoch(epoch)
+        } else {
             return nil
         }
-        self.rfc822MessageId = normalized
     }
 
     init?(header: MessageHeader) {
-        self.init(capturedRfc822MessageId: header.rfc822MessageId)
+        self.init(
+            capturedRfc822MessageId: header.rfc822MessageId,
+            capturedObservedUidValidity: header.observedUidValidity)
     }
 
     /// True when `header` is the same physical message this identity was captured
@@ -243,8 +270,17 @@ struct ExpectedMessageIdentity: Sendable, Equatable {
     ///   original miss was a `existing.rfc822MessageId =` search that was
     ///   structurally blind to the orphan-reclaim arm's `orphaned.` receiver
     ///   (`MIS-007`).
+    ///
+    /// The epoch arm refuses only a PRESENT, DIFFERENT current epoch — see the
+    /// type doc.
     func matches(_ header: MessageHeader) -> Bool {
-        rfc822MessageId == MessageIdentity.comparableRfc822Identity(header.rfc822MessageId)
+        switch witness {
+        case .rfc822(let rfc822MessageId):
+            return rfc822MessageId == MessageIdentity.comparableRfc822Identity(header.rfc822MessageId)
+        case .addressEpoch(let epoch):
+            guard let current = header.observedUidValidity, current > 0 else { return true }
+            return current == epoch
+        }
     }
 
     /// Zero-DB construction from headers a producer ALREADY holds. Ids with no
@@ -2173,7 +2209,8 @@ extension AccountManager {
                               accountId: accountId, folderPath: forwardDestinationPath)
                     else { return UndoMoveWriteResult() }
                     if let expected = ExpectedMessageIdentity(
-                        capturedRfc822MessageId: member.sourceRfc822MessageId),
+                        capturedRfc822MessageId: member.sourceRfc822MessageId,
+                        capturedObservedUidValidity: member.addressObservedUidValidity),
                        !expected.matches(row) {
                         if DebugModeManager.isLoggingEnabled() {
                             print("[UndoStack] undoMove refused \(member.originalHeaderId): the row at that address is not the message the gesture moved (C3 content witness)")
