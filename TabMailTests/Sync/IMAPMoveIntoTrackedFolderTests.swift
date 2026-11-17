@@ -153,6 +153,7 @@ struct IMAPMoveIntoTrackedFolderTests {
     static func withWorld(
         _ name: String, capabilities: [String], archive: [Int], local: [String: [Int]],
         tracked: Set<String>, folders: [String] = ["INBOX", "Archive"], inbox: [Int] = [],
+        accountProvider: AccountProvider = .imap,
         _ configure: (FakeIMAPServer) -> Void = { _ in },
         _ body: (World) async throws -> Void
     ) async throws {
@@ -168,7 +169,7 @@ struct IMAPMoveIntoTrackedFolderTests {
         let accountId = "tracked-move-\(name)"
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
-        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: accountProvider, pool: pool)
         for path in folders {
             let role: FolderRole = path == "INBOX" ? .inbox : (path == "Archive" ? .archive : .custom)
             let uids = mailboxes[path]?.map(\.uid) ?? []
@@ -457,12 +458,15 @@ struct IMAPMoveIntoTrackedFolderTests {
         }
     }
 
-    @Test("A move retired with no effect, its message below the source's listing window: one self-heal pass brings it back before the source is tracked again")
+    /// Every account whose folders can be owed a pass (a mailbox-local IMAP
+    /// account: plain IMAP or iCloud) runs it, so every mark clears.
+    @Test("A move retired with no effect, its message below the source's listing window: one self-heal pass brings it back before the source is tracked again",
+          arguments: [AccountProvider.imap, .icloud])
     @MainActor
-    func retiredMoveBelowTheWindowIsHealedBeforeTracking() async throws {
+    func retiredMoveBelowTheWindowIsHealedBeforeTracking(_ accountProvider: AccountProvider) async throws {
         // No window listing reaches the target, and its older mail is all
         // loaded (backfill complete), so nothing else walks back to it.
-        try await Self.withRetiredBelowTheWindow("retired-below-window") { w in
+        try await Self.withRetiredBelowTheWindow("retired-below-window-\(accountProvider.rawValue)", accountProvider: accountProvider) { w in
             try w.expectListedAgainNotTracked(["INBOX", "Archive"], "retired below the window")
             for pass in 1...3 {
                 try await w.normalSync()
@@ -480,13 +484,14 @@ struct IMAPMoveIntoTrackedFolderTests {
     /// `tracked`: the folders holding a bookmark before the move.
     @MainActor
     static func withRetiredBelowTheWindow(_ name: String, tracked: Set<String> = ["INBOX", "Archive"],
+                                          accountProvider: AccountProvider = .imap,
                                           _ body: (World) async throws -> Void) async throws {
         var caps = FakeIMAPServer.defaultCapabilities + Self.qresync
         caps.removeAll { $0 == "MOVE" }
         let inbox = Array(1000..<(1000 + SyncConfig.syncMessageLimit + 10))
         try await Self.withWorld(name, capabilities: caps, archive: [50],
                                  local: ["Archive": [50], "INBOX": Array(inbox.suffix(SyncConfig.syncMessageLimit))],
-                                 tracked: tracked, inbox: inbox) { server in
+                                 tracked: tracked, inbox: inbox, accountProvider: accountProvider) { server in
             for _ in 0..<SyncConfig.pendingOperationServerRefusalRetryLimit {
                 server.failNextCommand(containing: "UID COPY", message: "Server busy")
             }

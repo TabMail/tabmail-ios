@@ -29,7 +29,10 @@ extension SyncEngine {
     /// found missing landed (`SelfHealFolderOutcome.complete`).
     @discardableResult
     func selfHealRecentMessages(account: Account, forceSingleFolder: Folder? = nil) async -> Bool {
-        guard account.provider == .imap,
+        // The hourly pass is IMAP-only, as before. A pass a folder is owed
+        // (`forceSingleFolder`, called only for a folder marked owed) runs for
+        // every account that can mark one, so every mark clears (ADR-IOS-111).
+        guard forceSingleFolder != nil || account.provider == .imap,
               let provider = providers[account.id] as? IMAPProvider else { return false }
 
         // Rate limit: once per hour (bypassed for single-folder forced heal)
