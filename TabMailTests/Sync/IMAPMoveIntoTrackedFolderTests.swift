@@ -222,6 +222,79 @@ struct IMAPMoveIntoTrackedFolderTests {
         try? await provider.disconnect()
     }
 
+    // MARK: - A move cancelled before it was ever sent
+
+    @Test("A queued move cancelled before it was sent (Undo, or a move back) while another client deleted or flagged the message in the tracked source: after the next sync no row the server does not hold and no stale flag remain",
+          arguments: ["undo", "moveBack"], ["deleted", "flagged"])
+    @MainActor
+    func cancelledUnsentMoveLeavesNoGhostOrStaleFlags(ending: String, change: String) async throws {
+        let label = "\(ending)/\(change)"
+        // The target (UID 88) sits below INBOX's listing window with backfill
+        // complete, so no listing or older-mail walk reaches it: only the
+        // change pass or an owed self-heal pass can.
+        let inbox = Array(1000..<(1000 + SyncConfig.syncMessageLimit + 10))
+        try await Self.withWorld("cancel-\(ending)-\(change)", capabilities: FakeIMAPServer.defaultCapabilities + Self.qresync,
+                                 archive: [50], local: ["Archive": [50], "INBOX": Array(inbox.suffix(SyncConfig.syncMessageLimit))],
+                                 tracked: ["INBOX", "Archive"], inbox: inbox) { w in
+            let accountId = w.accountId
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET backfillComplete = 1 WHERE accountId = ?", arguments: [accountId])
+            }
+            let original = try w.seeded()
+            #expect(!original.isRead, "\(label) setup: the message is unread on the device")
+            // The gesture: the row is moved optimistically and its move is queued,
+            // never attempted (the drain has not reached it).
+            try await w.pool.write { db in
+                try MessageHeader.filter(Column("id") == original.id).updateAll(
+                    db,
+                    Column("folderId").set(to: "\(accountId):Archive"),
+                    Column("folderPath").set(to: "Archive"),
+                    Column("isInInbox").set(to: false),
+                    Column("observedUidValidity").set(to: nil as Int?))
+                var forward = PendingOperation(
+                    type: .move, messageIds: [original.messageId], accountId: accountId,
+                    folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: Self.epoch)
+                forward.status = PendingStatus.queued.rawValue
+                forward.everAttempted = false
+                _ = try forward.inserted(db)
+            }
+            // Meanwhile another client changes the message where the server holds it.
+            if change == "deleted" {
+                w.server.setMessages(w.server.messages(in: "INBOX").filter { $0.uid != 88 }, in: "INBOX")
+            } else {
+                w.server.setFlags(["\\Seen"], in: "INBOX", uid: 88)
+            }
+            // A change pass reads INBOX while the device holds no row there for it.
+            try await w.changePass()
+            // The user ends the move before it was ever sent.
+            if ending == "undo" {
+                let restored = await AccountManager.shared.undoMove(
+                    accountId: accountId, forwardDestinationPath: "Archive",
+                    members: [UndoMember(header: original)])
+                #expect(restored == [original.id], "\(label) setup: the Undo restored the row")
+            } else {
+                let moved = try #require(try w.heldTarget().first)
+                await AccountManager.shared.move([moved], to: "INBOX")
+            }
+            try await w.drain()
+            let queued = try await w.pool.read { db in try PendingOperation.fetchCount(db) }
+            #expect(queued == 0, "\(label) setup: the cancelled move left nothing queued")
+            #expect(w.server.uids(in: "Archive", rfc822MessageId: Self.target).isEmpty,
+                    "\(label) setup: the cancelled move never reached the server")
+
+            try await w.normalSync()
+            let held = try w.heldTarget()
+            if change == "deleted" {
+                #expect(held.isEmpty,
+                        "\(label): the device still shows a message the server no longer holds: \(held.map { "\($0.folderPath)/\($0.messageId)" })")
+            } else {
+                try w.expectHeldOnceWhereTheServerHoldsIt(label)
+                #expect(held.first?.isRead == true, "\(label): the read state another client set is not shown")
+            }
+            #expect(w.server.wrongMessageViolations().isEmpty)
+        }
+    }
+
     // MARK: - Into a tracked folder
 
     enum Shape: String, CaseIterable {
