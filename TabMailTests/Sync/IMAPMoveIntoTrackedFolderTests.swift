@@ -1100,4 +1100,154 @@ struct IMAPMoveIntoTrackedFolderTests {
             #expect(try pool.read { db in try Account.fetchOne(db, key: accountId)?.lastFullSyncAt } == nil, "its listing is due")
         }
     }
+
+    // MARK: - Release boundary (#876)
+
+    /// The unsent gestures' optimistic local effects: the target archived (its
+    /// row sits in Archive under its INBOX address) and INBOX 7 shown read.
+    @MainActor
+    static func queueUnsentArchiveAndRead(_ w: World, archive: Bool) throws {
+        let pool = w.pool, accountId = w.accountId
+        if archive {
+            try ReleaseBoundaryRecheckTests.moveRowOptimistically(pool, headerId: try w.seeded().id, to: try w.folder("Archive"))
+            try ReleaseBoundaryRecheckTests.queue(pool, .archive, ids: ["88"], accountId: accountId, from: "INBOX", to: "Archive")
+        }
+        try pool.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET isRead = 1 WHERE accountId = ? AND folderPath = 'INBOX' AND messageId = '7'",
+                           arguments: [accountId])
+        }
+        try ReleaseBoundaryRecheckTests.queue(pool, .markRead, ids: ["7"], accountId: accountId, from: "INBOX")
+    }
+
+
+    @Test("Release boundary: an unsent archive and mark-read in tracked IMAP folders show the server's state after the next sync")
+    @MainActor
+    func retiredArchiveAndReadShowTheServerState() async throws {
+        try await Self.withWorld("boundary-archive", capabilities: FakeIMAPServer.defaultCapabilities + Self.qresync,
+                                 archive: [50], local: ["INBOX": [7], "Archive": [50]], tracked: ["INBOX", "Archive"],
+                                 inbox: [7]) { w in
+            try Self.queueUnsentArchiveAndRead(w, archive: true)
+            #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: ReleaseBoundaryRecheckTests.nextRelease()))
+            try w.expectListedAgainNotTracked(["INBOX", "Archive"], "boundary")
+            try await w.normalSync()
+            try await w.changePass()
+            try w.expectHeldOnceWhereTheServerHoldsIt("boundary")
+            let seven = try #require(try await w.pool.read { db in
+                try MessageHeader.filter(Column("accountId") == w.accountId && Column("folderPath") == "INBOX" && Column("messageId") == "7").fetchOne(db)
+            })
+            #expect(!seven.isRead, "the retired mark-read shows the server's state")
+            #expect(FolderChangeState(raw: try w.folder("INBOX").changeState).recheck.isEmpty, "nothing left to read again")
+            // A later pass still shows it the server's way.
+            try await w.changePass()
+            try w.expectHeldOnceWhereTheServerHoldsIt("boundary, next pass")
+        }
+    }
+
+    @Test("Release boundary: an unsent mark-read alone in a tracked IMAP folder is read again on its own list and shows the server's state")
+    @MainActor
+    func retiredReadAloneIsReadAgain() async throws {
+        try await Self.withWorld("boundary-read", capabilities: FakeIMAPServer.defaultCapabilities + Self.qresync,
+                                 archive: [50], local: ["INBOX": [7], "Archive": [50]], tracked: ["INBOX", "Archive"],
+                                 inbox: [7]) { w in
+            try Self.queueUnsentArchiveAndRead(w, archive: false)
+            #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: ReleaseBoundaryRecheckTests.nextRelease()))
+            #expect(FolderChangeState(raw: try w.folder("INBOX").changeState).recheck == ["7"], "listed on its own folder")
+            #expect(FolderChangeState(raw: try w.folder("INBOX").changeState).tracking, "no move: the folder stays tracked")
+            try await w.changePass()
+            let seven = try #require(try await w.pool.read { db in
+                try MessageHeader.filter(Column("accountId") == w.accountId && Column("folderPath") == "INBOX" && Column("messageId") == "7").fetchOne(db)
+            })
+            #expect(!seven.isRead, "the retired mark-read shows the server's state")
+            #expect(FolderChangeState(raw: try w.folder("INBOX").changeState).recheck.isEmpty)
+        }
+    }
+
+    @Test("Release boundary on tracked IMAP folders: a draft delete or an undecodable row drops its folder's bookmark with a self-heal owed; an account with no bookmark is left alone")
+    @MainActor
+    func retiredRowsTheCatchUpCannotRepair() async throws {
+        try await Self.withWorld("boundary-rows", capabilities: FakeIMAPServer.defaultCapabilities + Self.qresync,
+                                 archive: [50], local: ["Archive": [50]], tracked: ["INBOX", "Archive"]) { w in
+            try ReleaseBoundaryRecheckTests.queue(w.pool, .deleteDraft, ids: ["draft-1"], accountId: w.accountId, from: "Archive")
+            try ReleaseBoundaryRecheckTests.makeUndecodable(w.pool, accountId: w.accountId, folderPath: "INBOX")
+            #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: ReleaseBoundaryRecheckTests.nextRelease()))
+            for path in ["INBOX", "Archive"] {
+                let folder = try w.folder(path)
+                #expect(folder.changeCursor == nil, "\(path): its bookmark is dropped")
+                #expect(FolderChangeState(raw: folder.changeState).selfHealOwed == 1, "\(path): one self-heal owed")
+            }
+            #expect(try w.fullSyncDue())
+        }
+        try await Self.withWorld("boundary-untracked", capabilities: FakeIMAPServer.defaultCapabilities + Self.qresync,
+                                 archive: [50], local: ["INBOX": [7], "Archive": [50]], tracked: [], inbox: [7]) { w in
+            try Self.queueUnsentArchiveAndRead(w, archive: true)
+            #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: ReleaseBoundaryRecheckTests.nextRelease()))
+            for path in ["INBOX", "Archive"] {
+                let state = FolderChangeState(raw: try w.folder(path).changeState)
+                #expect(state.recheck.isEmpty && state.selfHealOwed == 0, "\(path): no bookmark anywhere, the full sync lists every folder")
+            }
+            try await w.normalSync()
+            try w.expectHeldOnceWhereTheServerHoldsIt("boundary-untracked")
+        }
+    }
+
+    @Test("Release boundary on tracked IMAP folders: a move with no recorded destination, or a row whose folder is unknown, drops every folder's bookmark")
+    @MainActor
+    func retiredRowsWithNoKnownFolderDropEveryFolder() async throws {
+        // A delete records no destination: its optimistic row may sit in any folder.
+        try await Self.withWorld("boundary-no-destination", capabilities: FakeIMAPServer.defaultCapabilities + Self.qresync,
+                                 archive: [50], local: ["INBOX": [7], "Archive": [50]], tracked: ["INBOX", "Archive"],
+                                 inbox: [7]) { w in
+            try ReleaseBoundaryRecheckTests.queue(w.pool, .delete, ids: ["7"], accountId: w.accountId, from: "INBOX")
+            #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: ReleaseBoundaryRecheckTests.nextRelease()))
+            for path in ["INBOX", "Archive"] {
+                let folder = try w.folder(path)
+                #expect(folder.changeCursor == nil, "\(path): its bookmark is dropped")
+                #expect(FolderChangeState(raw: folder.changeState).selfHealOwed == 1, "\(path): one self-heal owed")
+            }
+            #expect(try w.fullSyncDue())
+        }
+        // A mark-read in a folder the account no longer holds names no folder to read it in.
+        try await Self.withWorld("boundary-unknown-folder", capabilities: FakeIMAPServer.defaultCapabilities + Self.qresync,
+                                 archive: [50], local: ["INBOX": [7], "Archive": [50]], tracked: ["INBOX", "Archive"],
+                                 inbox: [7]) { w in
+            try ReleaseBoundaryRecheckTests.queue(w.pool, .markRead, ids: ["7"], accountId: w.accountId, from: "Gone")
+            #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: ReleaseBoundaryRecheckTests.nextRelease()))
+            for path in ["INBOX", "Archive"] {
+                let folder = try w.folder(path)
+                #expect(folder.changeCursor == nil, "\(path): its bookmark is dropped")
+                #expect(FolderChangeState(raw: folder.changeState).recheck.isEmpty, "\(path): nothing listed")
+            }
+            #expect(try w.fullSyncDue())
+        }
+    }
+
+    @Test("A tracked IMAP folder whose re-read list is full lists itself again when a pass cuts an arrival, so the arrival lands")
+    @MainActor
+    func cutArrivalLandsAfterTheListing() async throws {
+        try await Self.withWorld("cut-arrival", capabilities: FakeIMAPServer.defaultCapabilities + Self.qresync,
+                                 archive: [50], local: ["Archive": [50]], tracked: ["INBOX", "Archive"]) { w in
+            // A full list of ids the server no longer holds, more than one pass reads.
+            let stored = (0..<(SyncConfig.changeRecheckLimit + SyncConfig.changeRereadBudgetPerPass + 10)).map { String(100_000 + $0) }
+            var state = FolderChangeState(raw: try w.folder("INBOX").changeState)
+            state.recheck = stored
+            let encoded = state.encoded, inboxId = "\(w.accountId):INBOX"
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [encoded, inboxId])
+            }
+            // A new arrival the FETCH does not return this pass: it can only go on the list.
+            w.server.setMessages(w.server.messages(in: "INBOX") + [Self.filler(200)], in: "INBOX")
+            w.server.suppressFetchRecord(in: "INBOX", uids: [200])
+            try await w.changePass()
+            let inbox = try w.folder("INBOX")
+            #expect(!FolderChangeState(raw: inbox.changeState).recheck.contains("200"), "setup: the arrival was cut from the full list")
+            #expect(inbox.changeCursor == nil, "the bookmark does not move past the cut arrival")
+            try w.expectListedAgainNotTracked(["INBOX"], "cut")
+            w.server.suppressFetchRecord(in: "INBOX", uids: [])
+            try await w.normalSync()
+            let held = try await w.pool.read { db in
+                try MessageHeader.filter(Column("accountId") == w.accountId && Column("folderPath") == "INBOX" && Column("messageId") == "200").fetchCount(db)
+            }
+            #expect(held == 1, "the cut arrival lands")
+        }
+    }
 }

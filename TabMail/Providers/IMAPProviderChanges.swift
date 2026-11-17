@@ -93,8 +93,6 @@ struct IMAPChangeCursor: Codable, Equatable, Sendable {
     }
 }
 
-/// The server answered a selection without a value the reader needs (UIDVALIDITY
-/// or UIDNEXT): the folder fails closed for this pass.
 /// A folder's counters as one read observed them; nil = not reported.
 struct FolderObservation: Sendable {
     let messageCount: Int?
@@ -103,6 +101,8 @@ struct FolderObservation: Sendable {
     let uidValidity: Int?
 }
 
+/// The server answered a selection without a value the reader needs (UIDVALIDITY
+/// or UIDNEXT): the folder fails closed for this pass.
 struct IMAPChangeReadIncomplete: Error, CustomStringConvertible {
     let folder: String
     let missing: String
@@ -309,7 +309,7 @@ extension IMAPProvider {
         let served = selection.uidValidity.value
         guard served != 0 else { throw IMAPChangeReadIncomplete(folder: folder.path, missing: "UIDVALIDITY") }
         guard served == cursor.uidValidity else {
-            // RFC 7162 §3.2.5.2: the server treated it as a plain SELECT; nothing
+            // RFC 7162 §3.2.5: the server treated it as a plain SELECT; nothing
             // it reported describes the bookmark's numbering.
             return FolderChanges(folderId: folder.id, status: .refused(.addressEpochChanged(Int(served))))
         }

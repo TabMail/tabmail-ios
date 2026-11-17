@@ -3621,8 +3621,8 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     // CONDSTORE HIGHESTMODSEQ (nil unless the server advertises it) — the
                     // full-sync fetch-skip signal (Fix B task 4).
                     highestModSeqVal = status.highestModSequence
-                    // UIDVALIDITY from the SAME STATUS response (nil unless the server
-                    // advertises UIDPLUS — SwiftMail only requests the attribute then).
+                    // UIDVALIDITY from the SAME STATUS response (SwiftMail always asks
+                    // for it; nil when the server leaves it out).
                     // This is what makes the epoch durable for a folder the deletion-
                     // reconcile walk has never visited. Normalised at THIS boundary so
                     // no `0` ("the server did not report a value" — the convention
@@ -6739,28 +6739,6 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
 
     // MARK: - Incremental Sync
 
-    /// Flush pending server-side state before STATUS checks.
-    /// SELECT INBOX + NOOP forces the server to refresh its mailbox state.
-    /// Plain NOOP alone is insufficient on some servers (they only flush the
-    /// currently-SELECTed mailbox). SELECT is the most reliable way to force
-    /// the server to report current state for subsequent STATUS commands.
-    /// Acquires lock because SELECT changes the server's selected mailbox —
-    /// without it, actor reentrancy could corrupt a concurrent operation's
-    /// selected-mailbox state (e.g., fetchMessage SELECTs "Sent", then
-    /// flushServerState SELECTs "INBOX" at an await point, then fetchMessage
-    /// resumes and FETCHes from INBOX instead of Sent).
-    func flushServerState() async throws {
-        try await withFolderConnection(folder: "INBOX") { server in
-            // T5.3 PORT — `v2final:…:IMAPProvider.flushServerState` tracks this
-            // SELECT. It is issued to make the server flush state before the
-            // STATUS poll, but it is still a genuine observation of INBOX's
-            // epoch, and on a non-UIDPLUS server (where STATUS never carries
-            // UIDVALIDITY) it is one of the few that exist.
-            _ = try await selectMailboxTracked(server, folder: "INBOX")
-            _ = try await server.noop()
-        }
-    }
-
     /// Quick STATUS check for delta sync — returns folder stats without SELECT.
     /// Compares against stored values to detect new messages, deletions, or flag changes.
     func folderStatus(path: String) async throws -> IMAPFolderStatus {
@@ -7021,6 +6999,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         }
     }
 
+    /// `EmailProvider.presentIds(folder:uids:)`: `searchExistingUIDs`' answer.
+    func presentIds(folder: String, uids: [UInt32]) async throws -> UIDExistenceResult? {
+        try await searchExistingUIDs(folder: folder, uids: uids)
+    }
+
     /// Check which of an EXPLICIT set of UIDs still exist in a folder via
     /// `UID SEARCH UID <set>` (deletion reconcile, ADR-IOS-051). Unlike the
     /// range variant above, the response can only ever name UIDs from the
@@ -7030,11 +7013,6 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// the caller can abort when the folder's UID numbering was invalidated
     /// (a UIDVALIDITY change makes every local UID meaningless — deleting on
     /// a "not found" result would then be unsafe).
-    /// `EmailProvider.presentIds(folder:uids:)`: this SEARCH's answer.
-    func presentIds(folder: String, uids: [UInt32]) async throws -> UIDExistenceResult? {
-        try await searchExistingUIDs(folder: folder, uids: uids)
-    }
-
     func searchExistingUIDs(folder: String, uids: [UInt32]) async throws -> UIDExistenceResult {
         guard !uids.isEmpty else { return UIDExistenceResult(found: [], uidValidity: 0) }
         try Task.checkCancellation()

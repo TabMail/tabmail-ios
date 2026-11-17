@@ -295,7 +295,7 @@ struct ChangeApplyIMAPTests {
         }
     }
 
-    // MARK: - A bookmark dropped between a read and its apply (r5 #2)
+    // MARK: - A bookmark dropped between a read and its apply
 
     @Test("A bookmark dropped between the read and the apply is not written back, and the folder is not tracked at commit")
     func droppedBetweenReadAndApplyStaysUntracked() async throws {

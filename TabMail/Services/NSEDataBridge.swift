@@ -2509,7 +2509,7 @@ enum NSEDataBridge {
             // STALE-DETECTION RACE FIX: a message that just became durable via this
             // push-merge is NOT registered in pending-ops / recentlyCompleted, so a
             // concurrent/next sync whose server fetch TRANSIENTLY misses it (STATUS/
-            // fetch propagation lag — the thing flushServerState fights) STALE-DELETES
+            // fetch propagation lag) STALE-DELETES
             // it. Symptom: insta-merge shows the new mail, a sync drops it, a later
             // sync brings it back. Register EVERY staged id (not just `writeSet`'s —
             // 5b: a KEPT gradual row this pass SKIPPED still needs its protection

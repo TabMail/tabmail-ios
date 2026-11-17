@@ -314,7 +314,7 @@ struct FolderChanges: Sendable {
     var cursor: String?
     /// The folder's catch-up gets one whole-folder check, armed in the same
     /// transaction that stores this new bookmark (`SyncEngine.applyFolderChanges`):
-    /// a bookmark that starts sees nothing older than itself (ADR-IOS-111 R35),
+    /// a bookmark that starts sees nothing older than itself (ADR-IOS-111),
     /// and once one is stored the catch-up runs no periodic check. Stored with
     /// the bookmark, so a pass with no listing, a failed listing or a crash
     /// before tracking starts never leaves the bookmark without its check.

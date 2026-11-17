@@ -845,7 +845,7 @@ struct IMAPCatchUpTests {
                 == .list(.init(firstStamp: 5, nextUid: 1, lapseCountAtStart: 1)))
     }
 
-    @Test("Over the arrivals limit: the bookmark drops, and the folder's catch-up applies an older flag change and expunge made meanwhile (Q12)")
+    @Test("Over the arrivals limit: the bookmark drops, and the folder's catch-up applies an older flag change and expunge made meanwhile")
     func tooFarBehindArmsTheCatchUp() async throws {
         let caps = FakeIMAPServer.defaultCapabilities + ["ENABLE", "CONDSTORE", "QRESYNC"]
         try await Self.withWorld("q12-acct", serverUIDs: [1, 2, 3, 4, 5], localUIDs: [1, 2, 3, 4, 5], capabilities: caps) { world in

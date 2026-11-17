@@ -716,8 +716,8 @@ extension AccountManager {
                     folder.lastKnownHighestModSeq = nil
                     folder.catchUpState = nil
                     // The change bookmark and re-read list name the dead
-                    // generation: a kept one would refuse again with the old
-                    // UIDVALIDITY and re-arm this reaction (a purge loop).
+                    // generation: a kept bookmark would cost a pass refused on
+                    // the old UIDVALIDITY, and the listed ids name other messages.
                     folder.changeCursor = nil
                     folder.changeState = nil
                     folder.backfillComplete = false

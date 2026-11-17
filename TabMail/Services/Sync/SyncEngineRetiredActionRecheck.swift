@@ -20,9 +20,29 @@ import GRDB
 // does not read is an undecodable row, never a throw, so this can never stop
 // `AppDatabase.init`.
 //
-// Per row, for an account that holds a change bookmark (`Account.lastHistoryId`;
-// an account with none, IMAP today, has every folder listed by the full sync and
-// is left alone):
+// An account whose ids are mailbox-local (a UID names a message only in its
+// folder; not in `AccountOperationExecutor.accountScopedIdAccountIds`) and that
+// holds a change bookmark on any folder takes the rule the drain applies to a
+// move retired without proof (ADR-IOS-111, the exit rule):
+// - a move: its source and destination folders drop their bookmark with one
+//   self-heal owed (`dropChangeBookmark(selfHealDue: true)`), so the full sync
+//   lists them and the self-heal reaches below the window. Its ids go on no
+//   list: a source UID names nothing, or another message, in the destination,
+//   and the optimistic row sits there under the source's address, which a
+//   re-read can never prove it owns. Every folder of the account when the
+//   destination is not recorded or a folder does not resolve;
+// - a read/flag or user-label change: its ids go on its own folder's re-read
+//   list (the same numbering), unless a retired move drops that folder, whose
+//   listing then writes what the server holds;
+// - a draft delete, or a row whose kind or ids do not read: its folder drops its
+//   bookmark the same way (every folder of the account when it does not
+//   resolve), since the catch-up there only checks the rows a folder holds;
+// - anything else: nothing, as below.
+// An account with no bookmark on any folder is left alone: the full sync lists
+// every folder.
+//
+// Per row, for any other account that holds a change bookmark
+// (`Account.lastHistoryId`):
 // - a move (archive, delete, move) or a read/flag change: its ids go on the
 //   re-read list (`FolderChangeState.recheck`) of the folder it was queued on
 //   and, for a move, of its destination, whatever that folder's tracking or
@@ -77,6 +97,8 @@ struct RetiredActionRecheckSummary: Sendable, Equatable {
     var armedFolders = 0
     /// Rows whose kind or ids did not read.
     var undecodableRows = 0
+    /// Folders of mailbox-local accounts whose bookmark was dropped (exit rule).
+    var droppedBookmarks = 0
 }
 
 extension SyncEngine {
@@ -93,8 +115,14 @@ extension SyncEngine {
     /// named, or arm the catch-up where a re-read cannot name them.
     nonisolated static func recheckRetiredActions(db: Database) throws -> RetiredActionRecheckSummary {
         var summary = RetiredActionRecheckSummary()
+        // An account whose ids name one message across folders, with a change
+        // bookmark of its own; and an account whose ids are mailbox-local (a UID
+        // names a message only in its folder) holding a bookmark on any folder.
+        let accountScoped = try AccountOperationExecutor.accountScopedIdAccountIds(db)
         let bookmarked = Set(try rawStrings(db, "SELECT id FROM account WHERE lastHistoryId IS NOT NULL"))
-        guard !bookmarked.isEmpty else { return summary }
+        let mailboxLocal = Set(try rawStrings(
+            db, "SELECT DISTINCT accountId FROM folder WHERE changeCursor IS NOT NULL")).subtracting(accountScoped)
+        guard !bookmarked.isEmpty || !mailboxLocal.isEmpty else { return summary }
 
         // Folder (id, change state) by (account, path), read once per pair.
         var foldersByKey: [String: RetiredActionFolder?] = [:]
@@ -119,13 +147,32 @@ extension SyncEngine {
         var folderOrder: [String] = []
         var armFolderIds = Set<String>()
         var armAccountIds = Set<String>()
+        // Mailbox-local accounts: folders whose local view a retired action may
+        // have left wrong where a re-read cannot fix it (ADR-IOS-111 exit rule).
+        var dropFolderIds = Set<String>()
+        var dropAccountIds = Set<String>()
 
         let rows = try Row.fetchAll(db, sql: """
             SELECT accountId, folderPath, destinationPath, type, messageIdsJSON
             FROM pendingOperation ORDER BY queuePosition
             """)
         for row in rows {
-            guard let accountId = rawString(row, "accountId"), bookmarked.contains(accountId) else { continue }
+            guard let accountId = rawString(row, "accountId") else { continue }
+            let local = mailboxLocal.contains(accountId)
+            guard local || bookmarked.contains(accountId) else { continue }
+            // Where a re-read cannot name the messages: on a mailbox-local
+            // account the folder's bookmark is dropped with a self-heal owed (its
+            // catch-up only checks the rows it holds); otherwise its catch-up is
+            // armed. The account's every folder when the folder does not resolve.
+            func cannotReRead(_ folderPath: String?) throws {
+                if let folderPath, let known = try folder(accountId: accountId, path: folderPath) {
+                    if local { dropFolderIds.insert(known.id) } else { armFolderIds.insert(known.id) }
+                } else if local {
+                    dropAccountIds.insert(accountId)
+                } else {
+                    armAccountIds.insert(accountId)
+                }
+            }
             let folderPath = rawString(row, "folderPath")
             let type = rawString(row, "type").flatMap(OperationType.init(rawValue:))
             let ids = rawString(row, "messageIdsJSON")
@@ -133,30 +180,32 @@ extension SyncEngine {
                 .flatMap { try? JSONDecoder().decode([String].self, from: $0) }
             guard let type, let ids, let folderPath else {
                 summary.undecodableRows += 1
-                if let folderPath, let known = try folder(accountId: accountId, path: folderPath) {
-                    armFolderIds.insert(known.id)
-                } else {
-                    armAccountIds.insert(accountId)
-                }
+                try cannotReRead(folderPath)
                 continue
             }
             if type == .deleteDraft {
-                if let drafts = try folder(accountId: accountId, path: folderPath) {
-                    armFolderIds.insert(drafts.id)
-                } else {
-                    armAccountIds.insert(accountId)
-                }
+                try cannotReRead(folderPath)
                 continue
             }
             guard retiredActionKindsReadAgain.contains(type), !ids.isEmpty else { continue }
             var paths = [folderPath]
-            if PendingOperationSnapshot.destructiveTypes.contains(type),
-               let destination = rawString(row, "destinationPath") {
+            let isMove = PendingOperationSnapshot.destructiveTypes.contains(type)
+            if isMove, let destination = rawString(row, "destinationPath") {
                 paths.append(destination)
+            }
+            if local && isMove {
+                // A UID names a message only in its folder, so a move's source
+                // ids name nothing (or another message) in its destination, and
+                // its optimistic row sits in the destination under the source's
+                // address, which a re-read can never prove it owns. Both folders
+                // take the exit rule a move retired without proof takes.
+                for path in paths { try cannotReRead(path) }
+                if paths.count == 1 { dropAccountIds.insert(accountId) }
+                continue
             }
             for path in paths {
                 guard let named = try folder(accountId: accountId, path: path) else {
-                    armAccountIds.insert(accountId)
+                    try cannotReRead(nil)
                     continue
                 }
                 if idsByFolder[named.id] == nil { folderOrder.append(named.id) }
@@ -164,7 +213,12 @@ extension SyncEngine {
             }
         }
 
-        for folderId in folderOrder {
+        for accountId in dropAccountIds.sorted() {
+            dropFolderIds.formUnion(try rawStrings(db, "SELECT id FROM folder WHERE accountId = ?", [accountId]))
+        }
+        // A folder that is listed again needs no re-read list from the boundary:
+        // the listing and its self-heal write what the server holds.
+        for folderId in folderOrder where !dropFolderIds.contains(folderId) {
             guard let named = foldersById[folderId] else { continue }
             var state = FolderChangeState(raw: named.changeState)
             let before = state
@@ -178,6 +232,10 @@ extension SyncEngine {
                                arguments: [state.encoded, folderId])
             }
         }
+        for folderId in dropFolderIds.sorted() {
+            try dropChangeBookmark(folderId: folderId, selfHealDue: true, db: db)
+        }
+        summary.droppedBookmarks = dropFolderIds.count
 
         for accountId in armAccountIds.sorted() {
             armFolderIds.formUnion(try rawStrings(db, "SELECT id FROM folder WHERE accountId = ?", [accountId]))

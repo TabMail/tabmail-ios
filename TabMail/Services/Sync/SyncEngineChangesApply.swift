@@ -47,7 +47,9 @@ import GRDB
 //   (`rereadLater`).
 //   Over `SyncConfig.changeRecheckLimit` ids, a folder the catch-up checks
 //   (`SyncEngine.isSyncable`) keeps every id already stored and only as many of
-//   this pass's additions as fit, and its catch-up is armed for the cut ones; a
+//   this pass's additions as fit, and its catch-up is armed for the cut ones (a
+//   folder holding its own bookmark drops it instead, so it is listed again: its
+//   catch-up need not load a missing message); a
 //   folder the catch-up never checks keeps every id, since nothing else would
 //   repair a dropped one (each pass still reads at most the per-pass budget);
 // - the folder's own bookmark (`Folder.changeCursor`) is written in the same
@@ -158,6 +160,11 @@ extension SyncEngine {
         // already stored (a long list of retired ids drains over passes, #903).
         // Ids are dropped only where the catch-up will find them: arming it does
         // nothing for a folder it never checks, so that folder keeps them all.
+        // A folder holding its own bookmark is listed again instead (as a
+        // refused read is): its catch-up need not load a missing message (the
+        // IMAP one only checks the rows a folder holds), and the bookmark would
+        // move past a cut arrival.
+        var cutDropsBookmark = false
         if recheck.count > SyncConfig.changeRecheckLimit,
            Self.isSyncable(role: folder.role, isFavorite: folder.isFavorite) {
             let stored = Set(before.recheck)
@@ -169,7 +176,11 @@ extension SyncEngine {
                 return added <= room
             }
             if added > room {
-                try markCatchUpLapse(folderId: folder.id, db: db)
+                if folder.changeCursor != nil {
+                    cutDropsBookmark = true
+                } else {
+                    try markCatchUpLapse(folderId: folder.id, db: db)
+                }
                 result.armedCatchUp = true
             }
         }
@@ -219,9 +230,15 @@ extension SyncEngine {
         case .tracked, .failed, .notRun:
             break
         }
+        if cutDropsBookmark {
+            // Its catch-up gets one whole-folder check and its listing is due.
+            try dropChangeBookmark(folderId: folder.id, onlyIfHeld: false, db: db)
+            cursor = nil
+            state.tracking = false
+        }
         if cursor != folder.changeCursor {
             try db.execute(sql: "UPDATE folder SET changeCursor = ? WHERE id = ?", arguments: [cursor, folder.id])
-            // R35: a bookmark that starts sees nothing older than itself, and once
+            // A bookmark that starts sees nothing older than itself, and once
             // one is stored the catch-up runs no periodic check. Its one
             // whole-folder check is armed with it, in this transaction.
             if changes.armCatchUpWithBookmark, cursor != nil {
@@ -246,11 +263,17 @@ extension SyncEngine {
     /// is tracked again (`FolderChangeState.selfHealOwed`), with or without a
     /// bookmark: a folder awaiting its first baseline is tracked after its next
     /// listing, which does not reach below the window either.
+    /// Reads the folder's raw columns only (no model is decoded), so the release
+    /// boundary can call it inside `AppDatabase.init` (#876).
     nonisolated static func dropChangeBookmark(folderId: String, onlyIfHeld: Bool = true, selfHealDue: Bool = false, db: Database) throws {
-        guard let folder = try Folder.fetchOne(db, key: folderId) else { return }
-        var state = FolderChangeState(raw: folder.changeState)
+        guard let row = try Row.fetchOne(
+            db, sql: "SELECT accountId, changeCursor, changeState FROM folder WHERE id = ?", arguments: [folderId])
+        else { return }
+        let accountId = String.fromDatabaseValue(row["accountId"] as DatabaseValue)
+        let changeCursor = String.fromDatabaseValue(row["changeCursor"] as DatabaseValue)
+        var state = FolderChangeState(raw: String.fromDatabaseValue(row["changeState"] as DatabaseValue))
         if selfHealDue { state.selfHealOwed += 1 }
-        guard !onlyIfHeld || folder.changeCursor != nil else {
+        guard !onlyIfHeld || changeCursor != nil else {
             if selfHealDue {
                 try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [state.encoded, folderId])
             }
@@ -260,7 +283,7 @@ extension SyncEngine {
         try db.execute(sql: "UPDATE folder SET changeCursor = NULL, changeState = ? WHERE id = ?",
                        arguments: [state.encoded, folderId])
         try markCatchUpLapse(folderId: folderId, db: db)
-        try db.execute(sql: "UPDATE account SET lastFullSyncAt = NULL WHERE id = ?", arguments: [folder.accountId])
+        try db.execute(sql: "UPDATE account SET lastFullSyncAt = NULL WHERE id = ?", arguments: [accountId])
     }
 
     /// Arm one folder's catch-up: the same lapse mark `lapseDeltaCursor` sets on

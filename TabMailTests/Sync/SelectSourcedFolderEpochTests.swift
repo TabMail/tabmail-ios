@@ -31,7 +31,7 @@ import GRDB
 /// every durable action on those accounts permanently — a bricked account, not
 /// a transient no-op.
 ///
-/// (Since the SwiftMail pin `9a6189a`, STATUS asks for UIDNEXT and UIDVALIDITY on
+/// (Since the SwiftMail pin `aed5d85`, STATUS asks for UIDNEXT and UIDVALIDITY on
 /// every server, as RFC 3501 §6.3.10 base items, so the UIDPLUS gap above is
 /// closed in the client. The property still holds for a server whose STATUS
 /// leaves UIDVALIDITY out, which is how every case below now models the

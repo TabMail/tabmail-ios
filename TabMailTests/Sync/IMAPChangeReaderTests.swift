@@ -316,7 +316,7 @@ struct IMAPChangeReaderTests {
         }
     }
 
-    @Test("Short FETCH on an arrival: the message is read again later, never lost while the bookmark moves (r1 #1)")
+    @Test("Short FETCH on an arrival: the message is read again later, never lost while the bookmark moves")
     func shortFetchArrivalIsReadLater() async throws {
         try await Self.withWorld(inbox: [1, 2]) { w in
             let cursor = try await Self.baseline(w)
@@ -341,7 +341,7 @@ struct IMAPChangeReaderTests {
         }
     }
 
-    @Test("STATUS without MESSAGES or UIDNEXT: the untracked folder is unreadable this pass, never changed, never 0 (r1 #3)")
+    @Test("STATUS without MESSAGES or UIDNEXT: the untracked folder is unreadable this pass, never changed, never 0")
     func missingStatusFieldIsUnreadable() async throws {
         for omitted in ["MESSAGES", "UIDNEXT"] {
             try await Self.withWorld(capabilities: FakeIMAPServer.defaultCapabilities + ["CONDSTORE"], inbox: [1, 2]) { w in
@@ -351,6 +351,30 @@ struct IMAPChangeReaderTests {
                     Issue.record("\(omitted) left out: expected failed, got \(changes.status)"); return
                 }
             }
+        }
+    }
+
+    @Test("The selected folder, selected again without UIDVALIDITY and nothing else changed: never taken as unchanged; the folder fails with its bookmark kept, and the next complete SELECT tracks it again")
+    func reselectWithoutUidValidityIsNotUnchanged() async throws {
+        try await Self.withWorld(inbox: [1, 2, 3]) { w in
+            // Only INBOX is read, so it stays the change connection's selected mailbox.
+            let cursor = try await Self.baseline(w)
+            let bookmark = try #require(IMAPChangeCursor.decode(cursor))
+            w.server.suppressSelectUidValidity(for: Self.inboxPath)
+            let changes = try await Self.inbox(w, Self.read(w, cursors: [w.inboxId: cursor]))
+            guard case .failed = changes.status else {
+                Issue.record("a selection without UIDVALIDITY proves nothing about the bookmark's numbering: expected failed, got \(changes.status)")
+                return
+            }
+            #expect(changes.removals.isEmpty && changes.records.isEmpty, "nothing of the read applies")
+            let kept = try #require(IMAPChangeCursor.decode(changes.cursor))
+            #expect(kept.uidValidity == bookmark.uidValidity && kept.highestModSeq == bookmark.highestModSeq
+                    && kept.uidNext == bookmark.uidNext, "the bookmark is kept")
+            #expect(kept.failingSince != nil, "the failure time is set")
+            w.server.restoreSelectUidValidity(for: Self.inboxPath)
+            let next = try await Self.inbox(w, Self.read(w, cursors: [w.inboxId: changes.cursor]))
+            #expect(Self.isTracked(next.status), "a complete SELECT tracks it again: \(next.status)")
+            #expect(try #require(IMAPChangeCursor.decode(next.cursor)).failingSince == nil, "the failure time is cleared")
         }
     }
 
@@ -645,7 +669,7 @@ struct IMAPChangeReaderTests {
         try #require(set.folders.first { $0.folderId == folderId })
     }
 
-    @Test("A QRESYNC SELECT that times out on every pass keeps its failure time and lapses to the listing (r2 #1)")
+    @Test("A QRESYNC SELECT that times out on every pass keeps its failure time and lapses to the listing")
     func repeatedSelectTimeoutLapses() async throws {
         try await Self.withWorld(inbox: [1, 2]) { w in
             let cursor = try await Self.baseline(w)
@@ -667,7 +691,7 @@ struct IMAPChangeReaderTests {
         }
     }
 
-    @Test("A change session that never opens fails every tracked folder under the same lapse rule (r2 #2)")
+    @Test("A change session that never opens fails every tracked folder under the same lapse rule")
     func sessionNeverOpensLapses() async throws {
         try await Self.withWorld(inbox: [1], archive: [1]) { w in
             let bookmark = IMAPChangeCursor(uidValidity: UInt32(Self.epoch), highestModSeq: 1, uidNext: 2).encoded

@@ -399,7 +399,16 @@ overflow rule are decision 3's. A row the release cannot decode arms its folder'
 account's when the folder is unknown). A re-read id is answered as any other (record in the folder,
 removal where the message is not); the Outlook reader now also reads the list of a folder outside the
 synced set (next amendment). *Superseded same day:* "Readers need nothing new". The IMAP reader, when it lands, inherits
-these ids on its folders' lists. Detail: `IOS-ACTION-003` ("Retired actions read again").
+these ids on its folders' lists. *Amended 2026-11-16 (#751):* the IMAP reader keeps its bookmarks per folder, so
+`Account.lastHistoryId` stays NULL and "an account holding a change bookmark" also means an account whose ids are
+mailbox-local (not in `AccountOperationExecutor.accountScopedIdAccountIds`) holding a bookmark on any folder. For
+such an account a retired move takes the exit rule (item 11 of the IMAP amendment): its source and destination drop
+their bookmark with one self-heal owed, and its ids go on no list (a source UID names nothing, or another message,
+in the destination, and the optimistic row there can never prove it owns the address); every folder of the account
+when the destination is not recorded or a folder does not resolve. A read/flag or user-label row lists its ids on
+its own folder, unless a retired move drops that folder. A draft delete or an undecodable row drops its folder's
+bookmark the same way (the IMAP catch-up only checks held rows). `dropChangeBookmark` reads raw columns only.
+Detail: `IOS-ACTION-003` ("Retired actions read again").
 
 Keywords: release boundary, retired actions, recheckRetiredActions, appReleaseStamp, purge, re-read
 list, undecodable row, #876.
@@ -626,7 +635,7 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    QRESYNC can only be switched on through ENABLE (RFC 5161), and without UIDPLUS (RFC 4315 COPYUID)
    every move into a tracked folder would land without a proven destination UID (exit rule, item 11). CONDSTORE is never inferred from QRESYNC nor the
    other way. `ENABLE QRESYNC` is sent once per session, on the change connection only. **Connection
-   budget** (coordinator ruling 2026-11-16, option a, c4 finding 3): the change connection counts
+   budget** (coordinator ruling 2026-11-16): the change connection counts
    against the server's limit only while it is open, like IDLE (`maxFolderConnections`; the pool's
    reserved count stays 2, action + IDLE). When a slot is needed, the eviction order is: the change
    connection if it is idle between passes (never while a pass holds or opens it,
@@ -658,7 +667,7 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    `highestModSeq`, `uidNext`, `failingSince`): server metadata, no content (ADR-004). It is never an
    epoch writer; `Folder.lastKnownUidValidity` stays the epoch authority. A folder holding rows under
    an unknown UIDVALIDITY starts no bookmark (IOS-EPOCH-001). A first read is a plain SELECT,
-   `.baselineReady` with `FolderChanges.armCatchUpWithBookmark` (R35: the folder's catch-up is armed
+   `.baselineReady` with `FolderChanges.armCatchUpWithBookmark` (the folder's catch-up is armed
    once, in the same transaction that stores the new bookmark. Once a bookmark is stored the catch-up
    runs no periodic check, so the arm is never left to the later commit of tracking: a pass with no
    listing, a failed listing or a crash in between would otherwise leave the bookmark without it).
@@ -672,19 +681,19 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    never shown); changed flags on held rows are partial records (read, flag, answered,
    `$Forwarded`, keywords as user labels); new UIDs and changed-not-held UIDs inside the held range
    are fetched in full and counted against `imapChangeArrivalsLimit` (100); over it the bookmark is
-   refused (`.tooFarBehind`) and nothing is fetched (Q12 ruling A: the refusal arms the folder's
+   refused (`.tooFarBehind`) and nothing is fetched (the refusal arms the folder's
    whole-folder catch-up, and the next baseline arms it once more with its bookmark (item 2), so older-mail changes made
    while the old bookmark lived are caught up). Arrivals do not rely on the SELECT's FETCH stream:
    RFC 7162 §3.2.5.1 says only "The server sends the client any pending flag changes (using FETCH
    responses that MUST contain UIDs) and expunges those that have occurred in this mailbox since the
    provided modification sequence", which does not name new messages; so every UID from the
-   bookmark's UIDNEXT to the served one is asked for with `UID SEARCH UID <range> ALL` (r1 #5). A UID
+   bookmark's UIDNEXT to the served one is asked for with `UID SEARCH UID <range> ALL`. A UID
    the header FETCH does not return goes on the re-read list (removed only when `UID SEARCH` proves it
-   gone), so the bookmark never moves past a lost arrival (r1 #1). STATUS fields the server leaves out
-   are unknown, not 0: an untracked folder is then unreadable for the pass (r1 #3). STATUS is never
-   sent for the mailbox selected on the change connection; it is selected again instead (r1 #7). A
-   folder whose read the apply's binding check rejected is not trackable that pass (r1 #2). **The
-   held range for a changed-not-held UID** (coordinator ruling 2026-11-16, c4 finding 1) comes from
+   gone), so the bookmark never moves past a lost arrival. STATUS fields the server leaves out
+   are unknown, not 0: an untracked folder is then unreadable for the pass. STATUS is never
+   sent for the mailbox selected on the change connection; it is selected again instead. A
+   folder whose read the apply's binding check rejected is not trackable that pass. **The
+   held range for a changed-not-held UID** (coordinator ruling 2026-11-16) comes from
    the folder's older-mail download progress, carried in `ChangeFolder.olderMailComplete` /
    `olderMailCursor` (`Folder.backfillComplete` / `backfillUidCursor`), never from the rows the folder
    holds now (`IMAPProvider.heldRangeStart`): every UID once the walk completed, above its position
@@ -711,12 +720,12 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
 7. **Merge.** Answered and forwarded are raised, never lowered; an answered message tagged reply
    becomes none with a queued tag write (ReplyDetect), stamped through `MessageHeader.setActionTag`,
    and skipped while the user's own `.setTag`/`.removeTag` for the message is pending
-   (`PendingOperationSnapshot.tag`) (r2 #3).
+   (`PendingOperationSnapshot.tag`).
 8. **Coverage.** A tracked IMAP folder gets no window listing, no full-sync count walk, no self-heal;
    its catch-up lists only its first listing, a listing in progress, or a lapse since its last
    completed listing. STATUS counts are still read for every folder the full sync discovers (no
    folder loses its counts).
-9. **Failure lapse** (r2 #1, #2). A folder whose read keeps failing keeps its bookmark with
+9. **Failure lapse**. A folder whose read keeps failing keeps its bookmark with
    `failingSince` and is refused (`.failingTooLong`, listed again) after
    `changeReadFailureLapseSeconds`. This covers a SELECT or FETCH that times out (the session is
    dropped, but the folder being read is stamped first) and a pass whose change session never opens
@@ -759,7 +768,7 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    only updates or removes rows it holds, so a message such a move left in a folder below the window
    (a move that retired with no effect, its source message older than the window, with backfill
    complete) would stay missing. So a bookmark this rule drops also owes the folder ONE self-heal
-   pass before it is tracked again (coordinator ruling 2026-11-16, option a): `dropChangeBookmark`
+   pass before it is tracked again (coordinator ruling 2026-11-16): `dropChangeBookmark`
    counts one more retirement in `FolderChangeState.selfHealOwed`, whether or not the folder held a
    bookmark (a folder awaiting its first baseline is tracked after its next listing, which does not
    reach below the window either; without a bookmark only the mark is written, no listing is made

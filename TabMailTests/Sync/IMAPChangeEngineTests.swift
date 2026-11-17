@@ -145,7 +145,7 @@ struct IMAPChangeEngineTests {
         }
     }
 
-    // MARK: - A bookmark started with no listing (R35)
+    // MARK: - A bookmark started with no listing
 
     @Test("A bookmark a pass with no listing starts still gets its whole-folder check: an older message read elsewhere before it is read here after the next foreground sync")
     func bookmarkStartedWithoutListingKeepsItsCatchUp() async throws {
