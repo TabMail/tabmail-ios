@@ -441,14 +441,21 @@ struct FolderResetGenerationTests {
         }
         // Hold the gesture's actor hop open too, so the bump below lands
         // between the gesture and the hop that appends it.
+        // Every throwing step comes before the hold is installed, and the
+        // hold is always cleared and released on the way out.
+        let vm = InboxViewModel(folders: [try #require(try await env.pool.read {
+            try Folder.fetchOne($0, key: env.inboxFolderId) })])
         let (hopStream, hopGate) = AsyncStream<Void>.makeStream()
         AccountManager.shared.enqueueHopHoldForTesting.withLock { hold in
             hold = { var iterator = hopStream.makeAsyncIterator(); _ = await iterator.next() }
         }
+        defer {
+            AccountManager.shared.enqueueHopHoldForTesting.withLock { $0 = nil }
+            hopGate.finish()
+            gate.finish()
+        }
         let folderId = env.inboxFolderId
         if !enqueuedBeforeReset { FolderResetGeneration.recordReset(folderId: folderId) }
-        let vm = InboxViewModel(folders: [try #require(try await env.pool.read {
-            try Folder.fetchOne($0, key: env.inboxFolderId) })])
         #expect(vm.archive(env.headerId), "fixture: the inbox did not record the gesture")
         if enqueuedBeforeReset { FolderResetGeneration.recordReset(folderId: folderId) }
         AccountManager.shared.enqueueHopHoldForTesting.withLock { $0 = nil }
