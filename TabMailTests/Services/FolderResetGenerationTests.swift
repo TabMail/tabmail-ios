@@ -439,12 +439,20 @@ struct FolderResetGenerationTests {
             var iterator = gateStream.makeAsyncIterator()
             _ = await iterator.next()
         }
+        // Hold the gesture's actor hop open too, so the bump below lands
+        // between the gesture and the hop that appends it.
+        let (hopStream, hopGate) = AsyncStream<Void>.makeStream()
+        AccountManager.shared.enqueueHopHoldForTesting.withLock { hold in
+            hold = { var iterator = hopStream.makeAsyncIterator(); _ = await iterator.next() }
+        }
         let folderId = env.inboxFolderId
         if !enqueuedBeforeReset { FolderResetGeneration.recordReset(folderId: folderId) }
         let vm = InboxViewModel(folders: [try #require(try await env.pool.read {
             try Folder.fetchOne($0, key: env.inboxFolderId) })])
         #expect(vm.archive(env.headerId), "fixture: the inbox did not record the gesture")
         if enqueuedBeforeReset { FolderResetGeneration.recordReset(folderId: folderId) }
+        AccountManager.shared.enqueueHopHoldForTesting.withLock { $0 = nil }
+        hopGate.finish()
         gate.finish()
         await AccountManager.shared.awaitWriteQueueDrain()
         // The refusal report hops to the main actor.
@@ -502,10 +510,20 @@ struct FolderResetGenerationTests {
 
     // MARK: - Intent cycles keep the oldest stamp
 
-    @Test("A pre-reset intent joining a post-reset cycle cannot ride it past the refusal; two post-reset intents apply",
-          arguments: [true, false])
-    func intentCycleKeepsTheOldestStamp(oldIntentJoins: Bool) async throws {
-        let env = try makeEnv(accountId: "frg-cycle-\(oldIntentJoins)")
+    enum CycleOrder: String, CaseIterable, CustomStringConvertible {
+        /// A post-reset intent opens the cycle and a pre-reset one joins it.
+        case oldJoinsNew
+        /// A pre-reset intent opens the cycle and a post-reset one joins it.
+        case newJoinsOld
+        /// Both intents are post-reset (control).
+        case bothNew
+        var description: String { rawValue }
+    }
+
+    @Test("A cycle holding any pre-reset intent is refused whichever joined first; two post-reset intents apply",
+          arguments: CycleOrder.allCases)
+    func intentCycleKeepsTheOldestStamp(order: CycleOrder) async throws {
+        let env = try makeEnv(accountId: "frg-cycle-\(order)")
         clearOverlay()
         let preResetStamp = FolderResetGeneration.current()
         try await runReset(env)
@@ -516,9 +534,11 @@ struct FolderResetGenerationTests {
             var iterator = gateStream.makeAsyncIterator()
             _ = await iterator.next()
         }
-        AccountManager.shared.registerGestureIntent(id: env.headerId, .isRead(target: true, baseline: false))
-        let joinStamp = oldIntentJoins ? preResetStamp : FolderResetGeneration.current()
-        FolderResetGeneration.$gestureStamp.withValue(joinStamp) {
+        let fresh = FolderResetGeneration.current()
+        FolderResetGeneration.$gestureStamp.withValue(order == .newJoinsOld ? preResetStamp : fresh) {
+            AccountManager.shared.registerGestureIntent(id: env.headerId, .isRead(target: true, baseline: false))
+        }
+        FolderResetGeneration.$gestureStamp.withValue(order == .oldJoinsNew ? preResetStamp : fresh) {
             AccountManager.shared.registerGestureIntent(id: env.headerId, .isFlagged(target: true, baseline: false))
         }
         gate.finish()
@@ -526,7 +546,7 @@ struct FolderResetGenerationTests {
 
         let after = try #require(try await row(env))
         let flagOps = try await ops(env).filter { $0.type == .markRead || $0.type == .markFlagged }
-        if oldIntentJoins {
+        if order != .bothNew {
             #expect(flagOps.isEmpty, "a cycle joined by an intent from before the reset queued \(flagOps.map(\.type))")
             #expect(!after.isFlagged, "a cycle joined by an intent from before the reset flagged the replacement")
         } else {

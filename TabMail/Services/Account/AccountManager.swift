@@ -532,6 +532,10 @@ actor AccountManager {
         _ = writeAdmissions.withLock { $0.notYetEnqueued.remove(token) }
     }
 
+    /// Test seam: awaited by every synchronous enqueue's actor hop before it
+    /// appends, so a test can hold the hop open.
+    nonisolated let enqueueHopHoldForTesting = Mutex<(@Sendable () async -> Void)?>(nil)
+
     /// Test seam: calls of `enqueueWriteAfterPriorAdmissions` currently
     /// waiting for earlier admissions.
     nonisolated func writeAdmissionWaitersForTesting() -> Int {
@@ -568,6 +572,9 @@ actor AccountManager {
             return token
         }
         Task {
+            #if DEBUG
+            if let hold = enqueueHopHoldForTesting.withLock({ $0 }) { await hold() }
+            #endif
             await self.enqueueWrite(work, stamp: stamp)
             _ = writeAdmissions.withLock { admissions in
                 admissions.notYetEnqueued.remove(token)
