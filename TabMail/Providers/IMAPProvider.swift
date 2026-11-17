@@ -3306,11 +3306,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     // connecting) — this connection is surplus. Log it out and
                     // abandon this launch instead of overwriting whatever now
                     // holds the slot.
-                    // `noteLogoutAttempt` is `nonisolated` (Mutex-backed) — no
-                    // actor hop, so the mark cannot perturb the interleaving
-                    // the oracle exists to observe.
-                    self.noteLogoutAttempt(fresh)
-                    try? await fresh.logout()
+                    // The logout runs in its own unstructured task
+                    // (`detachedTeardownLogout`): this listener task may be the
+                    // one that was cancelled, and a logout awaited from a
+                    // cancelled task fails at once without sending LOGOUT.
+                    await self.detachedTeardownLogout(fresh)
                     return
                 }
                 claimed = fresh
@@ -3367,8 +3367,15 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// SAME instance), IDLE callers do not need each other's result — they only
     /// need to never clobber each other — so this recheck alone fully closes
     /// the hazard.
+    ///
+    /// A CANCELLED launch is refused too (`Task.isCancelled` here reads the
+    /// calling listener task: this is awaited from it). Its canceller
+    /// (`tearDownIdleConnection`) ran while the slot held nothing of this
+    /// launch's, so nobody else will ever dispose of this connection; and a
+    /// cancelled listener does not stay to listen. Refusing sends it down the
+    /// lost-the-race path, which logs it out.
     private func claimIdleServerSlot(_ server: IMAPServer) -> Bool {
-        guard idleEnabled, idleServer == nil else { return false }
+        guard !Task.isCancelled, idleEnabled, idleServer == nil else { return false }
         idleServer = server
         return true
     }

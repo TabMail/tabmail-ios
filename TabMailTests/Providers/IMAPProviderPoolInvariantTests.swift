@@ -2151,6 +2151,118 @@ struct IMAPProviderPoolInvariantTests {
         await provider.stopIdle()
     }
 
+    /// **The property, for an IDLE launch cancelled mid-flight.** A quick
+    /// `stopIdle()` + `startIdle()` (the app leaving and re-entering the
+    /// foreground) while an earlier IDLE launch is still connecting must leave
+    /// IDLE monitoring live in the same foreground session: the slot is never
+    /// held by a connection nobody listens to, and every connection is logged
+    /// out at most once (the cancelled launch's connection exactly once).
+    /// "Live" is checked by its consequence: when the server ends the tracked
+    /// IDLE session, monitoring comes back on a new connection by itself, which
+    /// only happens if a listener is running on the tracked connection.
+    ///
+    /// `cancelAfterClaim` picks the window: `false` cancels the launch before
+    /// it claims the slot (inside `setIdleLaunchPlantRaceTestHookForTesting`);
+    /// `true` cancels it right after a successful claim, while its INBOX
+    /// SELECT is held by the server and before its listener runs.
+    ///
+    /// **Red evidence.** Without the claim refusing a cancelled launch, the
+    /// pre-claim case leaves the cancelled launch's connection planted with no
+    /// listener, so monitoring never settles. With the refusal but the surplus
+    /// logout awaited from the cancelled task, the refused session ends with
+    /// no LOGOUT on the wire (`abandonedSessionCount`).
+    @Test("An IDLE launch cancelled by a quick stop and restart leaves IDLE monitoring live", arguments: [false, true])
+    func idleLaunchCancelledMidFlightLeavesMonitoringLive(cancelAfterClaim: Bool) async throws {
+        let server = FakeIMAPServer(
+            username: Self.uniqueUsername(),
+            mailboxes: ["INBOX": [Self.message(uid: 99, id: "idle-cancelled-launch@example.com")]]
+        )
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(for: server)
+        defer { awaitDisconnect(provider) }
+
+        let logoutAttempts = Mutex<[ObjectIdentifier: Int]>([:])
+        provider.setLogoutAttemptTestHookForTesting { instance in
+            logoutAttempts.withLock { $0[ObjectIdentifier(instance), default: 0] += 1 }
+        }
+
+        var cancelled: IMAPServer?
+        if cancelAfterClaim {
+            // Hold the first SELECT (the launch's INBOX SELECT, right after its
+            // claim) long enough to stop and restart IDLE inside the window.
+            server.stallNextCommand(containing: "SELECT", seconds: 2)
+            await provider.startIdle { _, _ in }
+            let claimedAndSelecting = await waitUntilAsync {
+                await provider.currentIdleServerForTesting() != nil
+                    && server.recordedCommands().contains { $0.hasPrefix("SELECT") }
+            }
+            #expect(claimedAndSelecting, "setup: the launch never claimed the slot and reached its SELECT")
+            cancelled = await provider.currentIdleServerForTesting()
+            // THE EVENT.
+            await provider.stopIdle()
+            await provider.startIdle { _, _ in }
+        } else {
+            let entries = Mutex(0)
+            await provider.setIdleLaunchPlantRaceTestHookForTesting { [provider] in
+                let first = entries.withLock { (n: inout Int) -> Bool in n += 1; return n == 1 }
+                guard first else { return }
+                // THE EVENT, inside the first launch's pre-claim window.
+                await provider.stopIdle()
+                await provider.startIdle { _, _ in }
+            }
+            await provider.startIdle { _, _ in }
+        }
+
+        // Let the cancelled launch run to its end, then require one tracked,
+        // listened-to IDLE session.
+        let settled = await waitUntilAsync(timeoutSeconds: 10) {
+            guard let current = await provider.currentIdleServerForTesting() else { return false }
+            return current !== cancelled
+                && server.recordedCommands().filter { $0.hasPrefix("IDLE") }.count >= 1
+        }
+        #expect(settled, "IDLE was not running on a connection after the quick stop and restart")
+        await provider.setIdleLaunchPlantRaceTestHookForTesting(nil)
+        try? await Task.sleep(for: .seconds(cancelAfterClaim ? 3 : 1))
+        guard settled, let tracked = await provider.currentIdleServerForTesting() else {
+            await provider.stopIdle()
+            return
+        }
+
+        // THE INVARIANT: a listener runs on the tracked connection, so a
+        // server-ended session brings monitoring back on a new connection.
+        let idleCountBefore = server.recordedCommands().filter { $0.hasPrefix("IDLE") }.count
+        server.endIdleSessionsFromServer()
+        let resumed = await waitUntilAsync(timeoutSeconds: 20) {
+            let current = await provider.currentIdleServerForTesting()
+            return current != nil && current !== tracked
+                && server.recordedCommands().filter { $0.hasPrefix("IDLE") }.count > idleCountBefore
+        }
+        #expect(resumed, "the tracked IDLE connection had no listener: monitoring never came back in this foreground session (cancelAfterClaim=\(cancelAfterClaim))")
+
+        let counts = logoutAttempts.withLock { $0 }
+        #expect(counts.values.allSatisfy { $0 == 1 }, "a connection was logged out more than once: \(counts.values.sorted())")
+        if let cancelled {
+            #expect(counts[ObjectIdentifier(cancelled)] == 1, "the cancelled launch's connection must be logged out exactly once")
+        }
+        #expect(counts[ObjectIdentifier(tracked)] == 1, "the server-ended IDLE connection must be logged out exactly once")
+
+        // Every connection was disposed of (logged out at least once): after
+        // the final stop, no logged-in session is left and none was abandoned.
+        await provider.stopIdle()
+        let allClosed = await waitUntil { server.liveSessionCount() == 0 }
+        #expect(allClosed, "a connection was never logged out: \(server.liveSessionCount()) session(s) still logged in")
+        if !cancelAfterClaim {
+            // The refused (pre-claim) launch's session ends with LOGOUT on the
+            // wire. The post-claim case is excluded: there the launch's SELECT
+            // is in flight when its task is cancelled, and the IMAP library
+            // closes that channel before any LOGOUT can be sent, a library
+            // behaviour tracked separately.
+            #expect(server.abandonedSessionCount() == 0, "the refused launch's connection was dropped without a LOGOUT — commands \(server.recordedCommands()), logout fds \(server.logoutFdLog()), logout attempts \(logoutAttempts.withLock { $0.values.sorted() })")
+        }
+        provider.setLogoutAttemptTestHookForTesting(nil)
+    }
+
     /// **The property.** Evicting the IDLE connection to free a slot for folder
     /// work ends it like every other IDLE teardown (DONE before LOGOUT, one
     /// logout) and keeps the wish for IDLE monitoring: a later relaunch brings
