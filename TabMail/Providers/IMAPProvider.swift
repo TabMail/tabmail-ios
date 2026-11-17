@@ -3634,16 +3634,18 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// logout to `logouts`.
     /// Returns true if an IDLE connection was evicted, false if none was active.
     ///
-    /// DONE completes (its tagged OK, or `SyncConfig.imapIdleEvictionDoneWaitSeconds`)
-    /// before the listener is cancelled and before the LOGOUT. A listener
-    /// cancelled first ends its stream at once and logs the session out itself
-    /// (`onIdleStreamEnded`); that LOGOUT can reach the connection ahead of
-    /// DONE and then waits for an IDLE nobody ends, so the session stays logged
-    /// in past the eviction's wait and the login that needed its slot is refused.
+    /// The listener is cancelled first, as in `tearDownIdleConnection`: a
+    /// cancelled listener returns without logging out, so this eviction owns
+    /// the session's only DONE-then-LOGOUT. A listener left running would see
+    /// the stream DONE ends and log the same session out again
+    /// (`onIdleStreamEnded`). DONE completes (its tagged OK, or
+    /// `SyncConfig.imapIdleEvictionDoneWaitSeconds`) before the LOGOUT, so the
+    /// LOGOUT never waits behind an IDLE nobody ends and the session is gone
+    /// within the eviction's wait.
     private func evictIdleConnection(_ logouts: inout [Task<Void, Never>]) -> Bool {
         guard let server = idleServer else { return false }
         if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP:IDLE] Evicting IDLE connection to free server slot") }
-        let listener = idleListenerTask
+        idleListenerTask?.cancel()
         idleListenerTask = nil
         noteLogoutAttempt(server)
         #if DEBUG
@@ -3654,7 +3656,6 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             if let beforeDone { await beforeDone() }
             #endif
             _ = try? await withTimeout(seconds: SyncConfig.imapIdleEvictionDoneWaitSeconds) { try await server.done() }
-            listener?.cancel()
             try? await server.logout()
         })
         idleServer = nil
