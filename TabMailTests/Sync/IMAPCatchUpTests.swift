@@ -848,7 +848,7 @@ struct IMAPCatchUpTests {
     @Test("Over the arrivals limit: the bookmark drops, and the folder's catch-up applies an older flag change and expunge made meanwhile")
     func tooFarBehindArmsTheCatchUp() async throws {
         let caps = FakeIMAPServer.defaultCapabilities + ["ENABLE", "CONDSTORE", "QRESYNC"]
-        try await Self.withWorld("q12-acct", serverUIDs: [1, 2, 3, 4, 5], localUIDs: [1, 2, 3, 4, 5], capabilities: caps) { world in
+        try await Self.withWorld("cu-too-far-behind", serverUIDs: [1, 2, 3, 4, 5], localUIDs: [1, 2, 3, 4, 5], capabilities: caps) { world in
             // The folder's catch-up has completed once (its state exists).
             await Self.pass(world)
             #expect(try Self.state(world)?.lastCompletedAt != nil, "precondition: a completed catch-up")
