@@ -1757,6 +1757,27 @@ struct IMAPChangeReaderTests {
         }
     }
 
+    @Test("A teardown whose close runs before the change session's connect starts (the IMAP library re-arms it and connects): the session is never logged in, and the pass ends with no failure time")
+    func teardownUndoneByConnectStillSendsNoLogin() async throws {
+        try await Self.withWorld(inbox: [1]) { w in
+            let provider = w.provider
+            let loginsBefore = Self.logins(w)
+            // The teardown lands after the attempt became open to it and before
+            // its connect starts: its close reaches a server not yet connected,
+            // and connect() re-arms the session and connects anyway.
+            await provider.setChangeOpeningPublishedTestHookForTesting { _, server in
+                await provider.markDirty()
+                try? await server.disconnect()
+            }
+            let inbox = try Self.inbox(w, try await Self.read(w))
+            await provider.setChangeOpeningPublishedTestHookForTesting(nil)
+            #expect(Self.logins(w) == loginsBefore, "a LOGIN was sent after the teardown: \(Self.logins(w) - loginsBefore)")
+            #expect(Self.endedByTeardown(inbox.status), "expected the teardown's error, got \(inbox.status)")
+            #expect(inbox.cursor == nil, "a teardown leaves no failure time")
+            #expect(await provider.changeServer == nil, "a session opened across a teardown is never planted")
+        }
+    }
+
     @Test("Baseline: a plain SELECT serving another UIDVALIDITY than the folder stores refuses, and starts no bookmark")
     func baselineEpochChangeRefuses() async throws {
         try await Self.withWorld(inbox: [1, 2]) { w in
