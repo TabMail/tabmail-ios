@@ -384,6 +384,16 @@ struct FolderResetGenerationTests {
         await finish(env)
     }
 
+    @Test("The sweep reports nil, not 0, when it finds no old row, so Settings keeps its archive prompt")
+    func archiveOldSweepWithNothingToArchiveReportsNil() async throws {
+        let env = try makeEnv(accountId: "frg-sweep-none")
+        let swept = await SettingsView.archiveOldMessages(
+            inboxFolderIds: [env.inboxFolderId], archiveCutoff: Date().addingTimeInterval(-3600))
+        #expect(swept == nil)
+        #expect(try await ops(env).isEmpty)
+        await finish(env)
+    }
+
     // MARK: - Manual tags
 
     @Test("""
