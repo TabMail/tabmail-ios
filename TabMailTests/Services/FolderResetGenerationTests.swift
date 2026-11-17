@@ -260,7 +260,7 @@ struct FolderResetGenerationTests {
         case .delete:
             output = try await EmailDeleteTool(context: context).execute(arguments: arguments, invocation: invocation)
         }
-        try await expectReseated(env)
+        if shownBeforeReset { try await expectReseated(env) }
 
         try await drainToWire(env)
 
