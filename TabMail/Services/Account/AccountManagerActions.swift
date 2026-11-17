@@ -700,6 +700,16 @@ extension AccountManager {
         folderPath: String,
         db: Database
     ) throws -> (messages: [MessageHeader], providerIds: [String], observedUidValidity: Int?)? {
+        // The folder finished an id reset after this gesture's view of the row
+        // was taken: the row at this id may be a different email the resync
+        // re-seated with the new epoch, which the epoch check below would admit.
+        guard !FolderResetGeneration.refuses(
+            folderId: MessageIdentity.folderId(accountId: accountId, folderPath: folderPath)) else {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Queue] refused: '\(folderPath)' was reset after the gesture (account \(accountId.prefix(8)))")
+            }
+            return nil
+        }
         guard let account = try Account.fetchOne(db, key: accountId) else { return nil }
 
         // Demo is stored as IMAP but is backed by DemoProvider: its local ids are
@@ -799,6 +809,14 @@ extension AccountManager {
 
         func all(_ disposition: RoleMoveDisposition) -> [String: RoleMoveDisposition] {
             Dictionary(uniqueKeysWithValues: rejected.map { ($0.id, disposition) })
+        }
+
+        // Refused because the folder finished an id reset after the gesture:
+        // the message the user acted on is gone, and a retry (under a fresh
+        // stamp) would admit its replacement. Terminal, never retained.
+        if FolderResetGeneration.refuses(
+            folderId: MessageIdentity.folderId(accountId: accountId, folderPath: folderPath)) {
+            return all(.terminalStale)
         }
 
         guard let account = try Account.fetchOne(db, key: accountId) else { return all(.retainedForRetry) }

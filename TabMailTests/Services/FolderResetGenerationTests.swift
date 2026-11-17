@@ -1,0 +1,378 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+import Foundation
+import GRDB
+import Synchronization
+import Testing
+@testable import TabMail
+
+/// The invariant: no mutating IMAP command reaches the email re-seated at an id
+/// when the user's view of that id was read before the folder's UIDVALIDITY
+/// reset. A view read after the reset acts normally.
+///
+/// The reset is the REAL reaction (`runUidValidityResetReaction`) against a fake
+/// IMAP server whose new epoch puts a DIFFERENT email at the shown row's UID, so
+/// the resync re-seats it at the same header id with the new epoch, which the
+/// epoch check alone admits. The wire oracle is registered on the email the user
+/// SAW, so any command that touches the replacement is a recorded violation.
+@Suite("Folder reset generation", .serialized, .processGlobalState)
+@MainActor
+struct FolderResetGenerationTests {
+
+    private static let oldEpoch = 810_001
+    private static let newEpoch = 810_002
+    nonisolated private static let uid = 101
+    private static let shownRfc = "shown-101@example.com"
+    private static let replacementRfc = "replacement-101@example.com"
+
+    private struct Env {
+        let pool: DatabasePool
+        let dir: URL
+        let previous: AppDatabase?
+        let server: FakeIMAPServer
+        let accountId: String
+        var headerId: String {
+            MessageIdentity.headerId(
+                accountId: accountId, folderPath: "INBOX",
+                messageId: String(FolderResetGenerationTests.uid))
+        }
+        var inboxFolderId: String { MessageIdentity.folderId(accountId: accountId, folderPath: "INBOX") }
+    }
+
+    private static func rfc822(messageId: String) -> String {
+        """
+        From: Test Sender <sender@example.com>\r
+        To: Recipient <recipient@example.com>\r
+        Subject: reset generation fixture\r
+        Date: Thu, 01 Jan 2026 00:00:00 +0000\r
+        Message-ID: <\(messageId)>\r
+        Content-Type: text/plain; charset=utf-8\r
+        \r
+        reset generation fixture body.\r
+
+        """
+    }
+
+    /// One IMAP account; INBOX holds the shown email at UID 101 under the old
+    /// epoch, and the server's new epoch holds a different email at UID 101.
+    /// `shownHasRfc == false` is the shown row without a Message-ID, which the
+    /// content witness (`ExpectedMessageIdentity`) cannot check.
+    private func makeEnv(accountId: String, shownHasRfc: Bool = true) throws -> Env {
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [FakeIMAPServer.makeMessage(uid: Self.uid, rfc822Text: Self.rfc822(messageId: Self.replacementRfc))],
+            "Archive": [],
+            "Trash": [],
+        ])
+        for path in ["INBOX", "Archive", "Trash"] { server.setUidValidity(Self.newEpoch, for: path) }
+        try server.start()
+
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        try FolderEpochTestFixture.insertFolder(
+            accountId: accountId, path: "INBOX", role: .inbox, pool: pool,
+            totalCount: 1, lastKnownUidNext: Self.uid + 1, lastKnownUidValidity: Self.oldEpoch)
+        try FolderEpochTestFixture.insertFolder(
+            accountId: accountId, path: "Archive", role: .archive, pool: pool, lastKnownUidValidity: Self.newEpoch)
+        try FolderEpochTestFixture.insertFolder(
+            accountId: accountId, path: "Trash", role: .trash, pool: pool, lastKnownUidValidity: Self.newEpoch)
+        try pool.write { db in
+            var header = MessageHeader(
+                messageId: String(Self.uid), subject: "shown", from: "Sender",
+                fromAddress: "sender@example.com", to: "recipient@example.com",
+                date: Date(), snippet: "shown",
+                folderId: "\(accountId):INBOX", accountId: accountId, folderPath: "INBOX",
+                isInInbox: true)
+            header.rfc822MessageId = shownHasRfc ? "<\(Self.shownRfc)>" : nil
+            header.headerComplete = true
+            header.observedUidValidity = Self.oldEpoch
+            try header.insert(db)
+        }
+        return Env(pool: pool, dir: dir, previous: previous, server: server, accountId: accountId)
+    }
+
+    private func finish(_ env: Env) async {
+        await AccountManager.shared.unregisterProviderForTesting(accountId: env.accountId)
+        env.server.stop()
+        InstalledTestDatabaseLifetime.finish(previous: env.previous, pool: env.pool, directory: env.dir)
+        clearOverlay()
+        UndoService.shared.dismissAll()
+        UserDefaults.standard.removeObject(forKey: AccountManager.markReadOnArchiveDeleteKey)
+    }
+
+    private func clearOverlay() {
+        let snapshot = AccountManager.shared.snapshotOverlay()
+        AccountManager.shared.removeOverlayEntries(ids: Array(snapshot.keys))
+    }
+
+    private func connectedProvider(_ env: Env) async throws -> IMAPProvider {
+        let provider = IMAPProvider(
+            host: "127.0.0.1", port: env.server.port,
+            username: env.server.username, password: env.server.password,
+            smtpHost: "127.0.0.1", smtpPort: 587, useTLS: false)
+        try await provider.connect()
+        return provider
+    }
+
+    /// The real reaction, with a connected provider for the account.
+    private func runReset(_ env: Env) async throws {
+        let provider = try await connectedProvider(env)
+        await TestProviderRegistry.withRegisteredProvider(accountId: env.accountId, provider: provider) {
+            await AccountManager.shared.runUidValidityResetReaction(accountId: env.accountId, folderPath: "INBOX")
+        }
+        try? await provider.disconnect()
+    }
+
+    /// Drains the local write queue and then the durable queue to the fake
+    /// server, so an admitted move reaches the wire.
+    private func drainToWire(_ env: Env) async throws {
+        await AccountManager.shared.awaitWriteQueueDrain()
+        let provider = try await connectedProvider(env)
+        await AccountManager.shared.registerProviderForTesting(accountId: env.accountId, provider: provider)
+        await AccountManager.shared.drainPendingQueue()
+        try? await provider.disconnect()
+    }
+
+    private func row(_ env: Env) async throws -> MessageHeader? {
+        try await env.pool.read { try MessageHeader.fetchOne($0, key: env.headerId) }
+    }
+
+    private func ops(_ env: Env) async throws -> [PendingOperation] {
+        try await env.pool.read { try PendingOperation.fetchAll($0) }
+    }
+
+    /// Non-vacuity of every refusal: the reset really re-seated a different
+    /// email at the shown id, under the new epoch the epoch check accepts.
+    private func expectReseated(_ env: Env) async throws {
+        let reseated = try #require(try await row(env), "the resync did not re-seat UID \(Self.uid)")
+        #expect(reseated.rfc822MessageId?.contains(Self.replacementRfc) == true,
+                "fixture: the row at the shown id is not the replacement")
+        let live = try await env.pool.read { try Folder.fetchOne($0, key: env.inboxFolderId)?.lastKnownUidValidity }
+        #expect(live != nil && live != Self.oldEpoch, "fixture: the reset did not stamp a new epoch")
+        #expect(reseated.observedUidValidity == live,
+                "fixture: the replacement does not carry the live epoch, so the epoch check alone would refuse it")
+    }
+
+    private func inboxUids(_ env: Env) -> [Int] {
+        env.server.snapshotMessagesWithFlags(in: "INBOX").map(\.message.uid)
+    }
+
+    // MARK: - The AI confirmation card
+
+    /// A confirmation sink that models the hazard: the card is on screen while
+    /// the folder's UIDVALIDITY reset runs to completion, then the user confirms.
+    @MainActor
+    private final class ResettingConfirmSink: AgentUISink {
+        let reset: @MainActor () async -> Void
+        nonisolated init(reset: @escaping @MainActor () async -> Void) { self.reset = reset }
+        func deliverConfirmation(_ confirmation: AgentToolRouter.ActionConfirmation) {
+            Task { @MainActor in
+                await reset()
+                confirmation.onRespond(true)
+            }
+        }
+    }
+
+    /// Confirms at once.
+    @MainActor
+    private final class ConfirmSink: AgentUISink {
+        nonisolated init() {}
+        func deliverConfirmation(_ confirmation: AgentToolRouter.ActionConfirmation) {
+            confirmation.onRespond(true)
+        }
+    }
+
+    enum CardAction: String, CaseIterable, CustomStringConvertible {
+        case archive, delete
+        var description: String { rawValue }
+    }
+
+    @Test("""
+    An AI archive or delete card shown before a UIDVALIDITY reset and confirmed after it never \
+    moves the email re-seated at the shown id; a card shown after the reset moves it
+    """, arguments: CardAction.allCases, [true, false])
+    func aiCardConfirmedAcrossAResetNeverMutatesTheReplacement(action: CardAction, shownBeforeReset: Bool) async throws {
+        // The shown row has no Message-ID, so the content witness the card already
+        // carries is blind and only the reset itself can tell the rows apart.
+        let env = try makeEnv(accountId: "frg-card-\(action)-\(shownBeforeReset)", shownHasRfc: false)
+        UserDefaults.standard.set(false, forKey: AccountManager.markReadOnArchiveDeleteKey)
+        clearOverlay()
+
+        if !shownBeforeReset {
+            try await runReset(env)
+            try await expectReseated(env)
+        }
+        let translator = MockChatIdTranslator()
+        await translator.seed(31, realId: env.headerId)
+        let context = ToolContext(db: env.pool, translator: translator)
+        let sink: any AgentUISink = shownBeforeReset
+            ? ResettingConfirmSink(reset: { try? await self.runReset(env) })
+            : ConfirmSink()
+        let invocation = ToolInvocation(uiSink: sink, sessionKey: "frg-card-\(action)-\(shownBeforeReset)")
+        let arguments: [String: JSONValue] = ["unique_ids": .array([.int(31)])]
+        let output: String
+        switch action {
+        case .archive:
+            output = try await EmailArchiveTool(context: context).execute(arguments: arguments, invocation: invocation)
+        case .delete:
+            output = try await EmailDeleteTool(context: context).execute(arguments: arguments, invocation: invocation)
+        }
+        try await expectReseated(env)
+
+        // The oracle names the email the user saw on the card.
+        env.server.expectMutation(rfc822MessageId: shownBeforeReset ? Self.shownRfc : Self.replacementRfc)
+        try await drainToWire(env)
+
+        let after = try await row(env)
+        if shownBeforeReset {
+            #expect(env.server.wrongMessageViolations().isEmpty,
+                    "\(action): a card shown before the reset mutated the replacement: \(env.server.wrongMessageViolations())")
+            #expect(inboxUids(env).contains(Self.uid), "\(action): the replacement left INBOX on the server")
+            #expect(after?.folderPath == "INBOX", "\(action): the replacement was moved locally")
+            #expect(try await ops(env).isEmpty, "\(action): a durable operation was queued for the replacement")
+            #expect(!output.contains("\"success\":true") && !output.contains("\"success\": true"),
+                    "\(action): the tool reported success for a refused move: \(output)")
+        } else {
+            // Control: the same card on the replacement, shown after the reset,
+            // reaches the wire, so an empty violation list above is not a drain
+            // that never ran.
+            #expect(env.server.wrongMessageViolations().isEmpty)
+            #expect(!inboxUids(env).contains(Self.uid),
+                    "control: \(action) of the replacement, shown after the reset, never reached the server: \(output)")
+        }
+        await finish(env)
+    }
+
+    // MARK: - The write queue stamps work when it is enqueued
+
+    @Test("""
+    An inbox archive enqueued before the folder's reset is recorded and run after it is refused, \
+    reported as a refused move, and leaves no durable operation; enqueued after it, it is admitted
+    """, arguments: [true, false])
+    func queuedListArchiveStampedBeforeTheResetIsRefused(enqueuedBeforeReset: Bool) async throws {
+        let env = try makeEnv(accountId: "frg-queued-\(enqueuedBeforeReset)")
+        UserDefaults.standard.set(false, forKey: AccountManager.markReadOnArchiveDeleteKey)
+        clearOverlay()
+        try await runReset(env)
+        try await expectReseated(env)
+
+        let refused = Mutex<[String]>([])
+        let observer = NotificationCenter.default.addObserver(
+            forName: .messageMovesRefused, object: nil, queue: nil
+        ) { note in
+            refused.withLock { $0.append(contentsOf: note.object as? [String] ?? []) }
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+
+        // Hold the queue so the gesture's closure runs only after the bump below.
+        let (gateStream, gate) = AsyncStream<Void>.makeStream()
+        await AccountManager.shared.enqueueWrite {
+            var iterator = gateStream.makeAsyncIterator()
+            _ = await iterator.next()
+        }
+        let folderId = env.inboxFolderId
+        if !enqueuedBeforeReset { FolderResetGeneration.recordReset(folderId: folderId) }
+        let vm = InboxViewModel(folders: [try #require(try await env.pool.read {
+            try Folder.fetchOne($0, key: env.inboxFolderId) })])
+        #expect(vm.archive(env.headerId), "fixture: the inbox did not record the gesture")
+        if enqueuedBeforeReset { FolderResetGeneration.recordReset(folderId: folderId) }
+        gate.finish()
+        await AccountManager.shared.awaitWriteQueueDrain()
+        // The refusal report hops to the main actor.
+        for _ in 0..<200 where enqueuedBeforeReset && !refused.withLock({ $0.contains(env.headerId) }) {
+            await Task.yield()
+        }
+
+        let moves = try await ops(env).filter { $0.type == .move }
+        if enqueuedBeforeReset {
+            #expect(moves.isEmpty, "work stamped before the reset queued a move for the replacement")
+            #expect(try await row(env)?.folderPath == "INBOX")
+            #expect(refused.withLock { $0.contains(env.headerId) },
+                    "the refused move was not reported, so its hidden row never returns")
+        } else {
+            #expect(!moves.isEmpty, "control: work stamped after the reset was refused")
+        }
+        await finish(env)
+    }
+
+    // MARK: - Intent cycles keep the oldest stamp
+
+    @Test("A pre-reset intent joining a post-reset cycle cannot ride it past the refusal; two post-reset intents apply",
+          arguments: [true, false])
+    func intentCycleKeepsTheOldestStamp(oldIntentJoins: Bool) async throws {
+        let env = try makeEnv(accountId: "frg-cycle-\(oldIntentJoins)")
+        clearOverlay()
+        let preResetStamp = FolderResetGeneration.current()
+        try await runReset(env)
+        try await expectReseated(env)
+
+        let (gateStream, gate) = AsyncStream<Void>.makeStream()
+        await AccountManager.shared.enqueueWrite {
+            var iterator = gateStream.makeAsyncIterator()
+            _ = await iterator.next()
+        }
+        AccountManager.shared.registerGestureIntent(id: env.headerId, .isRead(target: true, baseline: false))
+        let joinStamp = oldIntentJoins ? preResetStamp : FolderResetGeneration.current()
+        FolderResetGeneration.$gestureStamp.withValue(joinStamp) {
+            AccountManager.shared.registerGestureIntent(id: env.headerId, .isFlagged(target: true, baseline: false))
+        }
+        gate.finish()
+        await AccountManager.shared.awaitWriteQueueDrain()
+
+        let after = try #require(try await row(env))
+        let flagOps = try await ops(env).filter { $0.type == .markRead || $0.type == .markFlagged }
+        if oldIntentJoins {
+            #expect(flagOps.isEmpty, "a cycle joined by an intent from before the reset queued \(flagOps.map(\.type))")
+            #expect(!after.isFlagged, "a cycle joined by an intent from before the reset flagged the replacement")
+        } else {
+            #expect(after.isRead && after.isFlagged, "control: two post-reset intents were refused")
+        }
+        await finish(env)
+    }
+
+    // MARK: - Mechanism pins
+
+    @Test("The stamp is visible inside a GRDB write transaction (the admission reads it there)")
+    func stampIsVisibleInsideTheWriteTransaction() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir) }
+        let seen = try await FolderResetGeneration.$gestureStamp.withValue(424_242) {
+            try await pool.write { _ in FolderResetGeneration.gestureStamp }
+        }
+        #expect(seen == 424_242)
+    }
+
+    @Test("A reset refuses only earlier stamps, only for its own folder, never unstamped work; the real reaction bumps once and a re-drive does not bump again")
+    func generationScopeAndReDrive() async throws {
+        let before = FolderResetGeneration.current()
+        FolderResetGeneration.recordReset(folderId: "frg-scope:INBOX")
+        let after = FolderResetGeneration.current()
+        #expect(after > before)
+        FolderResetGeneration.$gestureStamp.withValue(before) {
+            #expect(FolderResetGeneration.refuses(folderId: "frg-scope:INBOX"))
+            #expect(!FolderResetGeneration.refuses(folderId: "frg-scope:Archive"), "a reset refused another folder")
+        }
+        FolderResetGeneration.$gestureStamp.withValue(after) {
+            #expect(!FolderResetGeneration.refuses(folderId: "frg-scope:INBOX"), "a post-reset gesture was refused")
+        }
+        #expect(!FolderResetGeneration.refuses(folderId: "frg-scope:INBOX"), "unstamped work was refused")
+
+        let env = try makeEnv(accountId: "frg-redrive")
+        let beforeReset = FolderResetGeneration.current()
+        try await runReset(env)
+        let afterReset = FolderResetGeneration.current()
+        #expect(afterReset > beforeReset, "the real reaction did not bump the folder's generation")
+        FolderResetGeneration.$gestureStamp.withValue(beforeReset) {
+            #expect(FolderResetGeneration.refuses(folderId: env.inboxFolderId))
+        }
+        // The idempotent re-drive of step 5 (flag already cleared, epoch already
+        // fresh) must not bump: gestures taken after the real reset stay admissible.
+        let stamped = await AccountManager.shared.uidValidityResetStampFreshEpoch(
+            accountId: env.accountId, folderPath: "INBOX", folderId: env.inboxFolderId,
+            fresh: UInt32(Self.newEpoch))
+        #expect(stamped, "fixture: the re-drive's stamp step did not succeed")
+        #expect(FolderResetGeneration.current() == afterReset, "an idempotent re-drive bumped the generation again")
+        await finish(env)
+    }
+}

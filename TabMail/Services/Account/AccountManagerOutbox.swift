@@ -1178,9 +1178,14 @@ extension AccountManager {
             // only the local lie about what that withholding meant. When the
             // admission returns, the ordinary reply-detect sweep re-establishes the
             // flag from the server's own state.
-            let flagAdmission = try AccountManager.admittedOrdinaryActionTargets(
-                [original], accountId: original.accountId,
-                folderPath: original.folderPath, db: db)
+            // No gesture stamp: the original is read here, at execution time,
+            // not from a row someone was shown, so a stamp inherited from the
+            // task that started this drain must not refuse it.
+            let flagAdmission = try FolderResetGeneration.$gestureStamp.withValue(nil) {
+                try AccountManager.admittedOrdinaryActionTargets(
+                    [original], accountId: original.accountId,
+                    folderPath: original.folderPath, db: db)
+            }
             if outbox.isForward {
                 if let flagAdmission {
                     original.isForwarded = true
