@@ -279,16 +279,16 @@ struct ChatThreadViewLifecycleTests {
 
     @Test("A row is shown once half of it, or half of the screen, is visible: one rule for every height")
     func visibilityRule() {
+        // The rule's numbers, written out: half of the row, or half of the screen.
         let screen: CGFloat = 800
         let short: CGFloat = 100
-        let rowShare = ChatViewLayout.shownShareOfRow
-        let screenShare = ChatViewLayout.shownShareOfViewport
-        #expect(!ChatRowVisibility.isShown(visibleHeight: short * rowShare - 1, rowHeight: short, viewportHeight: screen))
-        #expect(ChatRowVisibility.isShown(visibleHeight: short * rowShare, rowHeight: short, viewportHeight: screen))
+        #expect(!ChatRowVisibility.isShown(visibleHeight: 49, rowHeight: short, viewportHeight: screen))
+        #expect(ChatRowVisibility.isShown(visibleHeight: 50, rowHeight: short, viewportHeight: screen),
+                "a short row counts once half of it shows")
         let tall = 3 * screen
-        #expect(!ChatRowVisibility.isShown(visibleHeight: screen * screenShare - 1, rowHeight: tall, viewportHeight: screen))
-        #expect(ChatRowVisibility.isShown(visibleHeight: screen * screenShare, rowHeight: tall, viewportHeight: screen),
-                "a row taller than the screen counts once it fills half of it")
+        #expect(!ChatRowVisibility.isShown(visibleHeight: 399, rowHeight: tall, viewportHeight: screen))
+        #expect(ChatRowVisibility.isShown(visibleHeight: 400, rowHeight: tall, viewportHeight: screen),
+                "a row more than twice the screen's height counts once it fills half of the screen")
         #expect(ChatRowVisibility.isShown(visibleHeight: screen, rowHeight: tall, viewportHeight: screen))
         #expect(!ChatRowVisibility.isShown(visibleHeight: 0, rowHeight: 0, viewportHeight: screen), "nothing visible is never shown")
     }
