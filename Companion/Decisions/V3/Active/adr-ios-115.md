@@ -31,6 +31,9 @@ tuple) and draft deletes (minted epoch) already carry their own epoch and are sa
 5. A surface whose wait outlives the reset binds the stamp taken when its view was READ. Part 1:
    the AI archive / delete cards (`EmailArchiveTool`, `EmailDeleteTool`) stamp before reading the
    headers the card shows.
+   Settings "Archive old messages" (`SettingsView.archiveOldMessages`, #813) stamps before reading
+   the old rows and binds that stamp around its mark-read and move, which run outside the write
+   queue.
 
 **Why not the alternatives:** a per-message RFC witness (six review rounds each found a producer
 that dropped or rebuilt the Message-ID before admission, and it is blind on RFC-less mail) or a

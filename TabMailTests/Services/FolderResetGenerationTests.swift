@@ -329,6 +329,71 @@ struct FolderResetGenerationTests {
         await finish(env)
     }
 
+    // MARK: - Settings "Archive old messages"
+
+    /// When the folder's reset runs relative to the sweep: before the sweep starts
+    /// (control), after its stamp but before its read, or between its read and its move.
+    enum SweepReset: String, CaseIterable, CustomStringConvertible {
+        case beforeSweep, beforeRead, afterRead
+        var description: String { rawValue }
+    }
+
+    @Test("""
+    Settings "Archive old messages" never marks read or moves the email re-seated at a row's id \
+    when the folder's UIDVALIDITY reset lands after the sweep's stamp; a sweep that starts after \
+    the reset archives it (and marks it read when that setting is on)
+    """, arguments: SweepReset.allCases, [true, false])
+    func archiveOldSweepAcrossAResetNeverMutatesTheReplacement(reset: SweepReset, markReadOnArchive: Bool) async throws {
+        // No Message-ID on the swept row: only the reset itself tells the rows apart.
+        let env = try makeEnv(accountId: "frg-sweep-\(reset)-\(markReadOnArchive)", shownHasRfc: false)
+        UserDefaults.standard.set(markReadOnArchive, forKey: AccountManager.markReadOnArchiveDeleteKey)
+        clearOverlay()
+        if reset == .beforeSweep {
+            try await runReset(env)
+            try await expectReseated(env)
+        }
+        let refused = reset != .beforeSweep
+        env.server.expectMutation(rfc822MessageId: refused ? Self.shownRfc : Self.replacementRfc)
+        let cutoff = Date().addingTimeInterval(3600)
+        let swept = await SettingsView.archiveOldMessages(
+            inboxFolderIds: [env.inboxFolderId], archiveCutoff: cutoff,
+            beforeRead: { if reset == .beforeRead { try? await self.runReset(env) } },
+            afterRead: { if reset == .afterRead { try? await self.runReset(env) } })
+        #expect(swept == 1, "fixture: the sweep did not read the old row")
+        if refused { try await expectReseated(env) }
+
+        try await drainToWire(env)
+
+        if refused {
+            #expect(env.server.wrongMessageViolations().isEmpty,
+                    "the sweep mutated the replacement: \(env.server.wrongMessageViolations())")
+            #expect(inboxUids(env).contains(Self.uid), "the replacement left INBOX on the server")
+            #expect(try await row(env)?.folderPath == "INBOX", "the replacement was moved locally")
+            #expect(try await row(env)?.isRead == false, "the replacement was marked read locally")
+            #expect(try await ops(env).isEmpty, "a durable operation was queued for the replacement")
+        } else {
+            // Control: a sweep that starts after the reset reaches the wire.
+            #expect(env.server.wrongMessageViolations().isEmpty)
+            #expect(!inboxUids(env).contains(Self.uid),
+                    "control: the sweep of the replacement never reached the server")
+            let archived = env.server.snapshotMessagesWithFlags(in: "Archive")
+            #expect(archived.count == 1, "control: the replacement is not in Archive on the server")
+            #expect(archived.allSatisfy { $0.flags.contains("\\Seen") } == markReadOnArchive,
+                    "control: mark-read-on-archive (\(markReadOnArchive)) was not honoured on the server")
+        }
+        await finish(env)
+    }
+
+    @Test("The sweep reports nil, not 0, when it finds no old row, so Settings keeps its archive prompt")
+    func archiveOldSweepWithNothingToArchiveReportsNil() async throws {
+        let env = try makeEnv(accountId: "frg-sweep-none")
+        let swept = await SettingsView.archiveOldMessages(
+            inboxFolderIds: [env.inboxFolderId], archiveCutoff: Date().addingTimeInterval(-3600))
+        #expect(swept == nil)
+        #expect(try await ops(env).isEmpty)
+        await finish(env)
+    }
+
     // MARK: - Manual tags
 
     @Test("""
