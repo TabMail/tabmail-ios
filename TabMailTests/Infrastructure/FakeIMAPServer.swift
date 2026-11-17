@@ -438,6 +438,9 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// below, which is NOT cleared on close — see that field's and
         /// `closeClientFd`'s doc comments.
         var loggedInFds: Set<Int32> = []
+        /// The most sessions logged in at once since the last
+        /// `resetPeakSessionCount()`.
+        var peakLoggedIn = 0
         /// R12-F1: every fd that has EVER completed a successful LOGIN —
         /// unlike `loggedInFds` above (which `closeClientFd` unconditionally
         /// clears on ANY close, logout or not), this one is only consulted
@@ -777,6 +780,18 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// Use `abandonedSessionCount()` for the latter.
     func liveSessionCount() -> Int {
         withState { $0.loggedInFds.count }
+    }
+
+    /// The most sessions logged in at the same time since the last
+    /// `resetPeakSessionCount()` (a server's per-account connection limit counts
+    /// exactly these).
+    func peakSessionCount() -> Int {
+        withState { $0.peakLoggedIn }
+    }
+
+    /// Start the peak count again from the sessions logged in now.
+    func resetPeakSessionCount() {
+        withState { $0.peakLoggedIn = $0.loggedInFds.count }
     }
 
     /// R12-F1: the REAL "abandoned logged-in session" oracle — see
@@ -2071,6 +2086,7 @@ final class FakeIMAPServer: @unchecked Sendable {
                     return "[UNAVAILABLE] Maximum number of connections from user+IP exceeded (mail_max_userip_connections=\(max))"
                 }
                 _ = state.loggedInFds.insert(fd)
+                state.peakLoggedIn = max(state.peakLoggedIn, state.loggedInFds.count)
                 // R12-F1: recorded separately from `loggedInFds` — see that
                 // field's doc comment for why (it gets cleared early by
                 // LOGOUT/kill, so it can't answer "did this fd EVER log in").

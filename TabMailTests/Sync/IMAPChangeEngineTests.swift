@@ -284,6 +284,55 @@ struct IMAPChangeEngineTests {
         }
     }
 
+    // MARK: - No arrival is lost across background passes
+
+    /// Background passes (inbox only, no full sync) on a tracked folder: one pass
+    /// the server cannot track it (`glitch(true)`), then it can again. Every
+    /// message that arrived on the server meanwhile is on the device after the
+    /// later background passes, with no foreground sync in between.
+    static func noArrivalLostAcrossBackgroundPasses(
+        _ name: String, glitch: @escaping (FakeIMAPServer, Bool) -> Void
+    ) async throws {
+        try await withWorld(name, capabilities: qresync, serverUIDs: [1, 2, 3], localUIDs: [1, 2, 3], tracked: true) { w in
+            let accountId = w.account.id
+            func background() async throws {
+                let account = try #require(try await w.pool.read { db in try Account.fetchOne(db, key: accountId) })
+                _ = try await w.engine.performChangePass(account: account, provider: w.provider, inboxOnly: true)
+            }
+            try await background()
+            // The glitch pass: a message arrives while the folder cannot be tracked.
+            await w.provider.markDirty()
+            glitch(w.server, true)
+            w.server.setMessages([1, 2, 3, 4].map(IMAPChangeReaderTests.message), in: path)
+            try await background()
+            // Tracking works again; X arrives before the next pass, Y after it.
+            await w.provider.markDirty()
+            glitch(w.server, false)
+            w.server.setMessages([1, 2, 3, 4, 5].map(IMAPChangeReaderTests.message), in: path)
+            try await background()
+            w.server.setMessages([1, 2, 3, 4, 5, 6].map(IMAPChangeReaderTests.message), in: path)
+            try await background()
+            let held = try w.uids()
+            for uid in 1...6 {
+                #expect(held.contains(String(uid)), "message \(uid) arrived on the server and is missing on the device after the background passes")
+            }
+        }
+    }
+
+    @Test("No arrival is lost across background passes when one session's ENABLE QRESYNC is not acknowledged")
+    func noArrivalLostWhenEnableIsNotAcknowledged() async throws {
+        try await Self.noArrivalLostAcrossBackgroundPasses("eng-enable-ignored") { server, on in
+            server.setIgnoresEnableQResync(on)
+        }
+    }
+
+    @Test("No arrival is lost across background passes when one QRESYNC SELECT leaves out HIGHESTMODSEQ")
+    func noArrivalLostWhenSelectOmitsModSeq() async throws {
+        try await Self.noArrivalLostAcrossBackgroundPasses("eng-nomodseq") { server, on in
+            server.setNoModSeq(on, for: Self.path)
+        }
+    }
+
     @Test("Self-heal skips a tracked folder (no command names it); the same folder untracked is healed")
     func selfHealSkipsTrackedFolder() async throws {
         for tracked in [true, false] {

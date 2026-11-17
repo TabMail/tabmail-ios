@@ -124,15 +124,19 @@ extension IMAPProvider {
         var sessionOpened = false
         var next = 0
         var budgetSpent = false
-        // A connection lost on one folder's read fails that folder only: the pass
-        // goes on with the folders after it on a fresh session. Each new session
-        // follows a folder that has been read and failed, so a pass opens at most
-        // one session per folder, and the read budget bounds them all. A teardown
-        // (`markDirty`, `disconnect`) ends the pass instead: it opens no session
-        // after one.
+        // A connection the server closed during one folder's read fails that
+        // folder only: the pass goes on with the folders after it on a fresh
+        // session. Each new session follows a folder that has been read and
+        // failed, so a pass opens at most one session per folder, and the read
+        // budget bounds them all. A read that timed out ends the pass instead:
+        // the reader has closed its side, but a server that stopped answering
+        // still counts that session until it notices, so a new login could hold
+        // two sessions to the account. The folders not yet read wait for the next
+        // pass. A teardown (`markDirty`, `disconnect`), or a dropped session whose
+        // LOGOUT does not end in time, ends the pass too.
         let generationAtStart = generation
         while next < work.count, !budgetSpent {
-            var lostOnFolder = false
+            var closedByServer = false
             do {
                 try await withChangeConnection { server, qresync in
                     // Let the session catch up with other connections' changes before
@@ -157,10 +161,11 @@ extension IMAPProvider {
                             // (`.failingTooLong`) instead of wedging.
                             results[folder.id] = Self.failedFolder(folder, error: error, now: context.clock())
                             if Self.changeConnectionLost(after: error) {
-                                // The session is gone (`withChangeConnection` drops it);
-                                // the folders after this one are read on a new one.
+                                // The session is gone (`withChangeConnection` drops it).
+                                // Closed by the server: the folders after this one are
+                                // read on a new session. Timed out: the pass ends.
                                 next += 1
-                                lostOnFolder = true
+                                closedByServer = !(error is TimeoutError)
                                 throw error
                             }
                         }
@@ -171,15 +176,16 @@ extension IMAPProvider {
                 if DebugModeManager.isLoggingEnabled() {
                     BackgroundSyncLogger.logDebug("[IMAPChanges] session ended on \(error)")
                 }
-                if lostOnFolder, generation == generationAtStart { continue }
+                if closedByServer, generation == generationAtStart { continue }
                 for folder in work[next...] where results[folder.id] == nil {
                     // No session could be opened (connect, CAPABILITY, ENABLE or the
                     // pass-start NOOP failed). On the pass's first session every
                     // folder's read failed, under the same lapse rule, so a change
                     // connection the server always refuses never freezes the tracked
                     // folders. After a session was opened (one that cannot be opened
-                    // again, or a teardown that ended the pass) the folders not yet
-                    // read fail with no failure time.
+                    // again, a read that timed out, a dropped one that did not end in
+                    // time, or a teardown that ended the pass) the folders not yet
+                    // read fail with no failure time and are read on the next pass.
                     results[folder.id] = sessionOpened
                         ? FolderChanges(folderId: folder.id, status: .failed(error))
                         : Self.failedFolder(folder, error: error, now: context.clock())
@@ -684,6 +690,12 @@ extension IMAPProvider {
                 dropChangeServer(server)
             }
         }
+        // A change session dropped while its connection still answers has its
+        // LOGOUT answered before a new one logs in. One whose connection is already
+        // closed (a timed-out NOOP here aborts it) ends at once, and the session
+        // is reopened. A timed-out folder read never gets here: it ends the pass
+        // (`fetchChanges`).
+        guard await droppedChangeSessionEnded() else { throw ProviderError.notConnected }
         let generationAtStart = generation
         let fresh = try await createChangeServer()
         await fresh.setReconnectsInsideCommands(false)
@@ -717,6 +729,12 @@ extension IMAPProvider {
         return (fresh, qresync)
     }
 
+    #if DEBUG
+    /// Test seam: the change session looks idle since `date`, so the next pass
+    /// checks its liveness first (`changeSession`).
+    func setChangeServerLastUsedForTesting(_ date: Date?) { changeServerLastUsed = date }
+    #endif
+
     /// QRESYNC can be used only when the server advertises QRESYNC, ENABLE and
     /// UIDPLUS. RFC 7162 §3.2.3 switches QRESYNC on only through ENABLE (RFC
     /// 5161). UIDPLUS (RFC 4315 COPYUID) is what lets a move into a tracked
@@ -735,6 +753,19 @@ extension IMAPProvider {
             changeServerQResync = false
             changeSelectedPath = nil
         }
-        detachedTeardownLogout(server)
+        changeLogout = detachedTeardownLogout(server)
+    }
+
+    /// Wait, at most `SyncConfig.imapEvictionLogoutWaitSeconds`, for the LOGOUT
+    /// of the change session dropped last: true once it has ended (answered, or
+    /// failed on a connection already closed). The server counts a session
+    /// until then, against the account's connection limit.
+    private func droppedChangeSessionEnded() async -> Bool {
+        guard let logout = changeLogout else { return true }
+        let ended = (try? await withTimeout(seconds: SyncConfig.imapEvictionLogoutWaitSeconds) {
+            await logout.value
+        }) != nil
+        if ended, changeLogout == logout { changeLogout = nil }
+        return ended
     }
 }

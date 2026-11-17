@@ -214,7 +214,8 @@ enum FolderChangeStatus: Sendable {
     /// The read skipped this folder.
     case notRun
     /// The folder cannot be tracked by a bookmark: the engine lists it when the
-    /// observation says it changed. Its bookmark and coverage are cleared.
+    /// observation says it changed. Its coverage is cleared; a bookmark it holds
+    /// is kept for the next read that can track it.
     case untracked(UntrackedObservation)
 
     var isTrackable: Bool {

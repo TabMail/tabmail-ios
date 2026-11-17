@@ -217,8 +217,14 @@ extension SyncEngine {
                 }
             }
         case .untracked:
-            // No bookmark can cover the folder: the engine lists it when it changed.
-            cursor = nil
+            // The reader could not track the folder this pass (no change tracking
+            // on this session or this selection): it is not covered, so the engine
+            // lists it when it changed, and the full sync lists it too. The
+            // bookmark it holds is kept: nothing of this read was applied to it,
+            // so it still says exactly what the device has read, and the next
+            // read that can track the folder goes on from it. Dropping it would
+            // start a new baseline past every message that arrived meanwhile,
+            // which only a foreground listing would then fetch.
             state.tracking = false
         case .baselining:
             state.tracking = false

@@ -200,8 +200,8 @@ struct ChangeApplyIMAPTests {
 
     // MARK: - Untracked
 
-    @Test("Untracked: the folder's bookmark and coverage are cleared, its rows untouched")
-    func untrackedClearsBookmark() async throws {
+    @Test("Untracked: the folder's tracking is cleared, its bookmark kept for the next read that can track it, its rows untouched")
+    func untrackedKeepsBookmark() async throws {
         try await Base.withWorld { w in
             var state = FolderChangeState(raw: nil)
             state.tracking = true
@@ -211,7 +211,7 @@ struct ChangeApplyIMAPTests {
                 folderId: w.inboxId,
                 status: .untracked(UntrackedObservation(messageCount: 1, uidNext: 5, highestModSeq: nil, uidValidity: Self.storedEpoch))))
             let folder = try Self.folder(w, w.inboxId)
-            #expect(folder.changeCursor == nil)
+            #expect(folder.changeCursor == "c")
             #expect(!FolderChangeState(raw: folder.changeState).tracking)
             #expect(try w.row("4", in: w.inboxId) != nil)
         }

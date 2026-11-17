@@ -828,6 +828,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// `ENABLE QRESYNC` was acknowledged on `changeServer`'s session.
     var changeServerQResync = false
     var changeServerLastUsed: Date?
+    /// The LOGOUT of the change session dropped last (`dropChangeServer`). A
+    /// pass opens a new session after a lost one only once it has ended.
+    var changeLogout: Task<Void, Never>?
     /// One pass at a time uses the change connection.
     var changeLaneBusy = false
     var changeLaneWaiters: [CheckedContinuation<Void, Never>] = []

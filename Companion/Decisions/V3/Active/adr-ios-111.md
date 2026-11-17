@@ -663,7 +663,10 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    pass, a folder fetch and an action (before this, the change connection had been a
    third, unevictable one). A server without the pair, an ENABLE that is not acknowledged,
    or a mailbox answering `NOMODSEQ` leaves the folder `.untracked(UntrackedObservation)`: no
-   ENABLE is sent, no pass fails on it, and its bookmark and coverage are cleared.
+   ENABLE is sent, no pass fails on it, and its coverage is cleared. A bookmark the folder holds is
+   kept (2026-11-16): nothing of that read is applied to it, so the next read that can track the
+   folder goes on from it; dropping it started a new baseline past the messages that arrived
+   meanwhile, which background passes never listed.
 2. **Bookmark.** `Folder.changeCursor` holds `IMAPChangeCursor` JSON (`uidValidity`,
    `highestModSeq`, `uidNext`, `failingSince`): server metadata, no content (ADR-004). It is never an
    epoch writer; `Folder.lastKnownUidValidity` stays the epoch authority. A folder holding rows under
@@ -733,12 +736,20 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    a server that always closes the connection on one folder's SELECT or FETCH must not leave it
    tracked without a failure time), and a pass whose change session never opens (connect, CAPABILITY,
    ENABLE or the pass-start NOOP failing: every work folder is stamped; a NOOP that always fails had
-   wedged the folders without a failure time). A connection lost on one folder's read fails that
-   folder only: the pass goes on with the folders after it on a new session (at most one per folder,
-   bounded by the read budget), so a server that always drops the connection on the inbox's read
-   still lets the account's other tracked folders be read in the same pass. A session that cannot be
-   opened again mid-pass, or a teardown (`markDirty`, `disconnect`, after which no session is opened
-   in that pass), fails the folders not yet read with no failure time.
+   wedged the folders without a failure time). A connection the server closes during one folder's
+   read fails that folder only: the pass goes on with the folders after it on a new session (at most
+   one per folder, bounded by the read budget), so a server that always drops the connection on the
+   inbox's read still lets the account's other tracked folders be read in the same pass. A read that
+   times out ends the pass instead (2026-11-17): the reader has closed its side, but a server that
+   stopped answering counts that session until it notices, and the client has no signal for when it
+   does, so a new login could hold two sessions against the account's connection limit. The folders
+   not yet read wait for the next pass. A session dropped while its connection still answers (a
+   liveness NOOP answered with an error) logs in again only once its LOGOUT has been answered,
+   waited for at most `imapEvictionLogoutWaitSeconds`; a liveness NOOP that times out reopens the
+   session once, before any folder is read. A session that cannot be opened again
+   mid-pass, a read that timed out, a dropped one whose LOGOUT does not end in time, or a teardown
+   (`markDirty`, `disconnect`, after which no session is opened in that pass) fails the folders not
+   yet read with no failure time.
 10. **Accepted cost.** A server advertising QRESYNC without CONDSTORE gets no HIGHESTMODSEQ in STATUS,
    so every tracked folder does a QRESYNC SELECT each pass (no fast path). Work, not loss.
 11. **Exit rule: a move that leaves a folder's view possibly wrong** (2026-11-15). ADR-IOS-073
