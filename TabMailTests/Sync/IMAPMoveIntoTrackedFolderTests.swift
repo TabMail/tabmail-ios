@@ -240,6 +240,10 @@ struct IMAPMoveIntoTrackedFolderTests {
             try await w.pool.write { db in
                 try db.execute(sql: "UPDATE folder SET backfillComplete = 1 WHERE accountId = ?", arguments: [accountId])
             }
+            // Settle the account first (its catch-up's first listing and every
+            // owed listing), so the sync after the cancel owes no listing that
+            // would reach the target and mask a missing recovery.
+            try await w.normalSync()
             let original = try w.seeded()
             #expect(!original.isRead, "\(label) setup: the message is unread on the device")
             // The gesture: the row is moved optimistically and its move is queued,
@@ -264,8 +268,14 @@ struct IMAPMoveIntoTrackedFolderTests {
             } else {
                 w.server.setFlags(["\\Seen"], in: "INBOX", uid: 88)
             }
-            // A change pass reads INBOX while the device holds no row there for it.
+            // A change pass reads INBOX while the device holds no row there for it,
+            // and moves INBOX's bookmark past the change (non-vacuity: the sync
+            // after the cancel will not read this change again by itself).
+            let cursorBefore = try w.folder("INBOX").changeCursor
             try await w.changePass()
+            let cursorAfter = try w.folder("INBOX").changeCursor
+            #expect(cursorBefore != nil && cursorAfter != nil && cursorAfter != cursorBefore,
+                    "\(label) setup: the change pass consumed the other client's change in INBOX")
             // The user ends the move before it was ever sent.
             if ending == "undo" {
                 let restored = await AccountManager.shared.undoMove(

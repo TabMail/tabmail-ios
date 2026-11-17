@@ -1335,10 +1335,12 @@ extension AccountManager {
                         assignments.append(Column("actionTag").set(to: nil as String?))
                         assignments.append(Column("tagSortOrder").set(to: 99))
                     }
+                    // The cancelled move ends through the exit rule every end takes
+                    // (ADR-IOS-111 item 11), while its rows still sit where it put them.
+                    try AccountOperationExecutor.deleteRetiringOperation(predecessor, db: db)
                     try MessageHeader
                         .filter(msgs.map(\.id).contains(Column("id")))
                         .updateAll(db, assignments)
-                    _ = try PendingOperation.deleteOne(db, key: predecessor.id)
 
                     try Self.restoreInboxAICacheAfterOptimisticMove(
                         headerIds: msgs.map(\.id), accountId: accountId,
@@ -2341,7 +2343,9 @@ extension AccountManager {
                               })
                         else { return UndoMoveWriteResult() }
                     }
-                    _ = try PendingOperation.deleteOne(db, key: annihilable[0].id)
+                    // The cancelled move ends through the exit rule every end takes
+                    // (ADR-IOS-111 item 11).
+                    try AccountOperationExecutor.deleteRetiringOperation(annihilable[0], db: db)
                 } else {
                     // A related but non-exact bundle is not evidence the
                     // forward completed. Refuse partial/cross-mailbox/
