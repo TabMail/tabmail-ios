@@ -329,6 +329,49 @@ struct FolderResetGenerationTests {
         await finish(env)
     }
 
+    // MARK: - Settings "Archive old messages"
+
+    @Test("""
+    Settings "Archive old messages" never marks read or moves the email re-seated at a row's id \
+    when the folder's UIDVALIDITY reset lands between the sweep's read and its move; a sweep \
+    that reads after the reset archives it
+    """, arguments: [true, false], [true, false])
+    func archiveOldSweepAcrossAResetNeverMutatesTheReplacement(resetAfterRead: Bool, markReadOnArchive: Bool) async throws {
+        // No Message-ID on the swept row: only the reset itself tells the rows apart.
+        let env = try makeEnv(
+            accountId: "frg-sweep-\(resetAfterRead)-\(markReadOnArchive)", shownHasRfc: false)
+        UserDefaults.standard.set(markReadOnArchive, forKey: AccountManager.markReadOnArchiveDeleteKey)
+        clearOverlay()
+        if !resetAfterRead {
+            try await runReset(env)
+            try await expectReseated(env)
+        }
+        env.server.expectMutation(rfc822MessageId: resetAfterRead ? Self.shownRfc : Self.replacementRfc)
+        let cutoff = Date().addingTimeInterval(3600)
+        let swept = await SettingsView.archiveOldMessages(
+            inboxFolderIds: [env.inboxFolderId], archiveCutoff: cutoff,
+            afterRead: { if resetAfterRead { try? await self.runReset(env) } })
+        #expect(swept == 1, "fixture: the sweep did not read the old row")
+        if resetAfterRead { try await expectReseated(env) }
+
+        try await drainToWire(env)
+
+        if resetAfterRead {
+            #expect(env.server.wrongMessageViolations().isEmpty,
+                    "the sweep mutated the replacement: \(env.server.wrongMessageViolations())")
+            #expect(inboxUids(env).contains(Self.uid), "the replacement left INBOX on the server")
+            #expect(try await row(env)?.folderPath == "INBOX", "the replacement was moved locally")
+            #expect(try await row(env)?.isRead == false, "the replacement was marked read locally")
+            #expect(try await ops(env).isEmpty, "a durable operation was queued for the replacement")
+        } else {
+            // Control: a sweep that read after the reset reaches the wire.
+            #expect(env.server.wrongMessageViolations().isEmpty)
+            #expect(!inboxUids(env).contains(Self.uid),
+                    "control: the sweep of the replacement, read after the reset, never reached the server")
+        }
+        await finish(env)
+    }
+
     // MARK: - Manual tags
 
     @Test("""
