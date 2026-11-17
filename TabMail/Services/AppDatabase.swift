@@ -4459,7 +4459,7 @@ final class AppDatabase: Sendable {
         // text message, and the chat view asks for one when it needs it.
         // Convergence: a fresh install and an upgraded DB both end with the four
         // columns, NULL on every pre-existing row. Numbered after main's newest,
-        // v103_addFolderChangeCursor, whose numbers stay; the next migration is v107.
+        // v104_addReplyAllAndMarkSentAt, whose numbers stay; the next migration is v107.
         migrator.registerTimedMigration(
             "v105_addAITextMessages", foreignKeyChecks: .immediate
         ) { db in
