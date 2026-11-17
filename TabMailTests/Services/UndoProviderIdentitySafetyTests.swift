@@ -292,7 +292,7 @@ struct UndoProviderIdentitySafetyTests {
     @Test("A deferred Undo materialized from a task carrying an older gesture's reset stamp is still queued")
     @MainActor
     func deferredInverseIgnoresAnInheritedResetStamp() async throws {
-        let fixture = try install(provider: .imap)
+        let fixture = try install(provider: .imap, accountId: "undo-reset-stamp")
         defer { uninstall(fixture) }
         await AccountManager.shared.clearDeferredMoveSuccessorsForTesting()
 
@@ -325,6 +325,61 @@ struct UndoProviderIdentitySafetyTests {
         guard ops.count == 1 else { return }
         #expect(ops[0].messageIds == ["901"])
         #expect(ops[0].destinationPath == "INBOX")
+        #expect(await AccountManager.shared.deferredMoveSuccessorCountForTesting() == 0)
+    }
+
+    @Test("A deferred Undo never moves a different email an id reset re-seated at the proven destination")
+    @MainActor
+    func deferredInverseNeverMovesAReseatedDestination() async throws {
+        let fixture = try install(provider: .imap, accountId: "undo-reset-reseat")
+        defer { uninstall(fixture) }
+        await AccountManager.shared.clearDeferredMoveSuccessorsForTesting()
+
+        let original = sourceHeader(fixture, providerId: "101", rfc: "move@example.com")
+        try installOptimisticallyMoved(original, pool: fixture.pool)
+        let forward = try await insertInFlightMove(
+            fixture, messageIds: ["101"], from: "INBOX", to: "Archive", epoch: 41)
+        let restored = await AccountManager.shared.undoMove(
+            accountId: fixture.accountId,
+            forwardDestinationPath: "Archive",
+            members: [UndoMember(header: original)])
+        #expect(restored == [original.id])
+        let result = try await finishMove(
+            fixture, operation: forward, sourceId: "101",
+            destinationId: "901", destinationEpoch: 52)
+
+        // Before materialization, Archive's id reset completes and its resync
+        // seats a different email at UID 901 under the new epoch.
+        let newHeaderId = MessageIdentity.headerId(
+            accountId: fixture.accountId, folderPath: "Archive", messageId: "901")
+        FolderResetGeneration.recordReset(
+            folderId: MessageIdentity.folderId(accountId: fixture.accountId, folderPath: "Archive"))
+        try await fixture.pool.write { db in
+            _ = try MessageHeader.deleteOne(db, key: newHeaderId)
+            var folder = try #require(try Folder.fetchOne(
+                db, key: MessageIdentity.folderId(accountId: fixture.accountId, folderPath: "Archive")))
+            folder.lastKnownUidValidity = 53
+            try folder.update(db)
+            var replacement = MessageHeader(
+                messageId: "901", subject: "replacement", from: "Other",
+                fromAddress: "other@example.com", to: "recipient@example.com",
+                date: Date(), snippet: "replacement",
+                folderId: folder.id, accountId: fixture.accountId, folderPath: "Archive",
+                isInInbox: false)
+            replacement.rfc822MessageId = "<replacement@example.com>"
+            replacement.headerComplete = true
+            replacement.observedUidValidity = 53
+            try replacement.insert(db)
+        }
+
+        await AccountManager.shared.materializeDeferredMoveSuccessors(after: forward, result: result)
+        await AccountManager.shared.awaitWriteQueueDrain()
+
+        let state = try await fixture.pool.read { db in
+            (try MessageHeader.fetchOne(db, key: newHeaderId), try PendingOperation.fetchAll(db))
+        }
+        #expect(state.0?.folderPath == "Archive", "the Undo moved the replacement re-seated at the proven destination")
+        #expect(state.1.isEmpty, "an inverse was queued for the replacement: \(state.1.map(\.messageIds))")
         #expect(await AccountManager.shared.deferredMoveSuccessorCountForTesting() == 0)
     }
 

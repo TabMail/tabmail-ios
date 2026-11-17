@@ -510,8 +510,34 @@ actor AccountManager {
     private struct WriteAdmissions: Sendable {
         var nextToken: UInt64 = 0
         var notYetEnqueued: Set<UInt64> = []
+        #if DEBUG
+        var waitersForTesting = 0
+        #endif
     }
     private let writeAdmissions = Mutex(WriteAdmissions())
+
+    #if DEBUG
+    /// Test seam: publish a synchronous admission that has not reached the
+    /// FIFO yet, as an in-flight `enqueueWriteFromSynchronousContext` hop
+    /// does, until `releaseWriteAdmissionForTesting`.
+    nonisolated func holdWriteAdmissionForTesting() -> UInt64 {
+        writeAdmissions.withLock { admissions -> UInt64 in
+            admissions.nextToken &+= 1
+            admissions.notYetEnqueued.insert(admissions.nextToken)
+            return admissions.nextToken
+        }
+    }
+
+    nonisolated func releaseWriteAdmissionForTesting(_ token: UInt64) {
+        _ = writeAdmissions.withLock { $0.notYetEnqueued.remove(token) }
+    }
+
+    /// Test seam: calls of `enqueueWriteAfterPriorAdmissions` currently
+    /// waiting for earlier admissions.
+    nonisolated func writeAdmissionWaitersForTesting() -> Int {
+        writeAdmissions.withLock { $0.waitersForTesting }
+    }
+    #endif
 
     /// Enqueue a local DB write. Executes FIFO. Never blocks caller.
     func enqueueWrite(_ work: @escaping @Sendable () async -> Void) {
@@ -606,6 +632,10 @@ actor AccountManager {
         // Stamped at entry, before the wait for earlier admissions.
         let stamp = FolderResetGeneration.stampForNewWork()
         let admissionCeiling = writeAdmissions.withLock { $0.nextToken }
+        #if DEBUG
+        writeAdmissions.withLock { $0.waitersForTesting += 1 }
+        defer { writeAdmissions.withLock { $0.waitersForTesting -= 1 } }
+        #endif
         while writeAdmissions.withLock({ admissions in
             admissions.notYetEnqueued.contains { $0 <= admissionCeiling }
         }) {

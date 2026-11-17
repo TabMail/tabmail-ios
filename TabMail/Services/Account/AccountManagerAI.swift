@@ -867,14 +867,21 @@ extension AccountManager {
         // row at this id may be a different email, and neither the tag nor the
         // cache and teaching steps below may be attributed to it.
         let folderId = MessageIdentity.folderId(accountId: accountId, folderPath: folderPath)
-        let wrote = (try? await dbPool.write { db -> Bool in
-            guard !FolderResetGeneration.refuses(folderId: folderId) else { return false }
-            guard var msg = try MessageHeader.fetchOne(db, key: message.id) else { return true }
-            msg.setActionTag(tag)
-            try msg.save(db)
-            return true
-        }) ?? true
-        guard wrote else {
+        let allowed: Bool
+        do {
+            allowed = try await dbPool.write { db -> Bool in
+                guard !FolderResetGeneration.refuses(folderId: folderId) else { return false }
+                guard var msg = try MessageHeader.fetchOne(db, key: message.id) else { return true }
+                msg.setActionTag(tag)
+                try msg.save(db)
+                return true
+            }
+        } catch {
+            // The write never ran its check; a failed write still may not
+            // attribute the tag below to a re-seated row.
+            allowed = !FolderResetGeneration.refuses(folderId: folderId)
+        }
+        guard allowed else {
             BackgroundSyncLogger.logDebug("[ManualTag] refused: '\(folderPath)' was reset after the gesture for \(messageId)")
             return
         }

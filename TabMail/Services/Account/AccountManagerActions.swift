@@ -1190,7 +1190,10 @@ extension AccountManager {
                       let row = try MessageHeader.fetchOne(db, key: record.newHeaderId),
                       row.accountId == predecessor.accountId,
                       row.folderPath == predecessor.destinationPath,
-                      row.messageId == record.newProviderMessageId
+                      row.messageId == record.newProviderMessageId,
+                      // The destination the provider proved, not a different
+                      // email an id reset has since re-seated at that id.
+                      row.observedUidValidity == record.newObservedUidValidity
                 else { continue }
                 rows[successor.oldHeaderId] = row
             }

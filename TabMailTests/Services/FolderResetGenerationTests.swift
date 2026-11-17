@@ -251,10 +251,10 @@ struct FolderResetGenerationTests {
 
     @Test("""
     The card's stamp is taken before the headers it shows are read: a reset that completes \
-    after the shown email's read, while the card is still being built, refuses the archive
-    """)
-    func aiCardStampPrecedesTheHeaderRead() async throws {
-        let env = try makeEnv(accountId: "frg-card-read", shownHasRfc: false)
+    after the shown email's read, while the card is still being built, refuses the move
+    """, arguments: CardAction.allCases)
+    func aiCardStampPrecedesTheHeaderRead(action: CardAction) async throws {
+        let env = try makeEnv(accountId: "frg-card-read-\(action)", shownHasRfc: false)
         UserDefaults.standard.set(false, forKey: AccountManager.markReadOnArchiveDeleteKey)
         clearOverlay()
         let translator = MockChatIdTranslator()
@@ -265,9 +265,16 @@ struct FolderResetGenerationTests {
             await translator.setOnResolve { @MainActor in try? await self.runReset(env) }
         }
         env.server.expectMutation(rfc822MessageId: Self.shownRfc)
-        let output = try await EmailArchiveTool(context: ToolContext(db: env.pool, translator: translator)).execute(
-            arguments: ["unique_ids": .array([.int(31), .int(32)])],
-            invocation: ToolInvocation(uiSink: ConfirmSink(), sessionKey: "frg-card-read"))
+        let context = ToolContext(db: env.pool, translator: translator)
+        let arguments: [String: JSONValue] = ["unique_ids": .array([.int(31), .int(32)])]
+        let invocation = ToolInvocation(uiSink: ConfirmSink(), sessionKey: "frg-card-read-\(action)")
+        let output: String
+        switch action {
+        case .archive:
+            output = try await EmailArchiveTool(context: context).execute(arguments: arguments, invocation: invocation)
+        case .delete:
+            output = try await EmailDeleteTool(context: context).execute(arguments: arguments, invocation: invocation)
+        }
         try await expectReseated(env)
         try await drainToWire(env)
         #expect(env.server.wrongMessageViolations().isEmpty,
@@ -294,13 +301,26 @@ struct FolderResetGenerationTests {
             AccountManager.shared.registerGestureIntent(id: env.headerId, .actionTag(target: .reply, baseline: nil))
         }
         await AccountManager.shared.awaitWriteQueueDrain()
+        // The cache and teaching steps run in their own task; wait for them on
+        // the control arm (bounded), and give the refused arm the same time.
+        func sideEffects() async throws -> (cache: Int, refine: Int) {
+            try await env.pool.read { db in
+                (try MessageAICache.fetchCount(db), try PendingAIRefinement.fetchCount(db))
+            }
+        }
+        for _ in 0..<200 {
+            if try await sideEffects().cache > 0 { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
         let after = try #require(try await row(env))
+        let effects = try await sideEffects()
         if stampedBeforeReset {
             #expect(after.actionTag == nil, "a tag taken before the reset was applied to the replacement")
-            let cached = try await env.pool.read { try MessageAICache.fetchCount($0) }
-            #expect(cached == 0, "a tag taken before the reset was cached for the replacement")
+            #expect(effects.cache == 0 && effects.refine == 0,
+                    "a tag taken before the reset was cached or taught for the replacement: \(effects)")
         } else {
             #expect(after.actionTag == .reply, "control: a tag taken after the reset was refused")
+            #expect(effects.cache > 0, "control: the cache step never ran, so the refused arm's zero proves nothing")
         }
         await finish(env)
     }
@@ -387,6 +407,42 @@ struct FolderResetGenerationTests {
                     "the refused move was not reported, so its hidden row never returns")
         } else {
             #expect(!moves.isEmpty, "control: work stamped after the reset was refused")
+        }
+        await finish(env)
+    }
+
+    @Test("""
+    Work queued behind an earlier admission is stamped when it is requested, not when the wait \
+    ends: a reset during the wait refuses it; requested after the reset, it is admitted
+    """, arguments: [true, false])
+    func workWaitingBehindAnAdmissionKeepsItsRequestStamp(resetDuringWait: Bool) async throws {
+        let env = try makeEnv(accountId: "frg-wait-\(resetDuringWait)")
+        UserDefaults.standard.set(false, forKey: AccountManager.markReadOnArchiveDeleteKey)
+        clearOverlay()
+        try await runReset(env)
+        try await expectReseated(env)
+        if !resetDuringWait { FolderResetGeneration.recordReset(folderId: env.inboxFolderId) }
+
+        let token = AccountManager.shared.holdWriteAdmissionForTesting()
+        let headerId = env.headerId
+        let pool = env.pool
+        let request = Task {
+            await AccountManager.shared.enqueueWriteAfterPriorAdmissions {
+                guard let header = try? await pool.read({ try MessageHeader.fetchOne($0, key: headerId) }) else { return }
+                await AccountManager.shared.move([header], to: "Archive")
+            }
+        }
+        while AccountManager.shared.writeAdmissionWaitersForTesting() == 0 { await Task.yield() }
+        if resetDuringWait { FolderResetGeneration.recordReset(folderId: env.inboxFolderId) }
+        AccountManager.shared.releaseWriteAdmissionForTesting(token)
+        await request.value
+        await AccountManager.shared.awaitWriteQueueDrain()
+
+        let moves = try await ops(env).filter { $0.type == .move }
+        if resetDuringWait {
+            #expect(moves.isEmpty, "work requested before the reset was re-stamped after its wait and admitted")
+        } else {
+            #expect(!moves.isEmpty, "control: work requested after the reset was refused")
         }
         await finish(env)
     }
