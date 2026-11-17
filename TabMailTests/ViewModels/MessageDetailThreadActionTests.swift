@@ -14,6 +14,9 @@ import Testing
 @Suite("Detail view acts on a whole chat as one action", .serialized, .processGlobalState)
 struct MessageDetailThreadActionTests {
     private static let inboxPath = "INBOX"
+    /// One date for every seeded email, taken from today: the emails of a chat tie on date as before,
+    /// and no test depends on a fixed calendar day.
+    private static let seededDate = Date()
     private static let archivePath = "Archive"
     private static let trashPath = "Trash"
     private static let projectsPath = "Projects"
@@ -54,7 +57,7 @@ struct MessageDetailThreadActionTests {
         var header = MessageHeader(
             messageId: messageId, subject: "Test",
             from: "sender@example.com", fromAddress: "sender@example.com",
-            to: "me@example.com", date: Date(timeIntervalSince1970: 1_800_000_000),
+            to: "me@example.com", date: Self.seededDate,
             snippet: "body",
             folderId: "\(accountId):\(folderPath)", accountId: accountId,
             folderPath: folderPath, isInInbox: folderPath == Self.inboxPath
