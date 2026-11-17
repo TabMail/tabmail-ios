@@ -310,9 +310,15 @@ final class MessageDetailViewModel {
         return false
     }
 
-    init(messageId: String, expectedRfc822MessageId: String? = nil) {
+    init(
+        messageId: String,
+        expectedRfc822MessageId: String? = nil,
+        expectedObservedUidValidity: Int? = nil
+    ) {
         self.messageId = messageId
-        self.openIdentity = ExpectedMessageIdentity(capturedRfc822MessageId: expectedRfc822MessageId)
+        self.openIdentity = ExpectedMessageIdentity(
+            capturedRfc822MessageId: expectedRfc822MessageId,
+            capturedObservedUidValidity: expectedObservedUidValidity)
         // ZERO-I/O init (2026-07-03): seed only from the in-memory staged
         // snapshot. This init runs ON THE MAIN ACTOR at tap → view
         // construction, and the previous sync `dbPool.read` here is unbounded
@@ -352,12 +358,15 @@ final class MessageDetailViewModel {
         dbPool: DatabasePool,
         fetchBodyOverride: @escaping (MessageHeader) async throws -> Void,
         observeNotifications: Bool = false,
-        expectedRfc822MessageId: String? = nil
+        expectedRfc822MessageId: String? = nil,
+        expectedObservedUidValidity: Int? = nil
     ) {
         self._dbPoolOverride = PrioritizedDatabase(pool: dbPool)
         self._fetchBodyOverride = fetchBodyOverride
         self.messageId = messageId
-        self.openIdentity = ExpectedMessageIdentity(capturedRfc822MessageId: expectedRfc822MessageId)
+        self.openIdentity = ExpectedMessageIdentity(
+            capturedRfc822MessageId: expectedRfc822MessageId,
+            capturedObservedUidValidity: expectedObservedUidValidity)
         seedAtInit()
         if observeNotifications {
             startAIUpdateListener()

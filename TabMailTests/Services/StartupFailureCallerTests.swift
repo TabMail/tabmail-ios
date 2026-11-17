@@ -50,7 +50,7 @@ struct StartupFailureCallerTests {
             let calls = Mutex<[String]>([])
             let delegate = NotificationDelegate(
                 readiness: { await startup.awaitLaunchReady(background: true) },
-                action: { _, _, _ in Issue.record("Unexpected notification action") },
+                action: { _, _, _, _ in Issue.record("Unexpected notification action") },
                 foregroundMerge: { calls.withLock { $0.append("merge") } },
                 foregroundSync: { calls.withLock { $0.append("sync") } }
             )
@@ -132,7 +132,7 @@ struct StartupFailureCallerTests {
                         calls.withLock { $0.append("readiness") }
                         return await startup.awaitLaunchReady(background: true)
                     },
-                    action: { _, _, _ in calls.withLock { $0.append("action") } }
+                    action: { _, _, _, _ in calls.withLock { $0.append("action") } }
                 )
                 delegate.handleNotificationResponse(
                     actionId: action,
@@ -160,7 +160,7 @@ struct StartupFailureCallerTests {
             let initialWorkCount = DatabaseSuspension.shared.backgroundWorkCountForTesting
             let delegate = NotificationDelegate(
                 readiness: { await startup.awaitLaunchReady(background: true) },
-                action: { receivedAction, message, account in
+                action: { receivedAction, message, account, _ in
                     #expect(receivedAction == action && message == "test-message" && account == "test-account")
                     calls.withLock { $0.append("action") }
                 }
@@ -181,7 +181,7 @@ struct StartupFailureCallerTests {
             let calls = Mutex<[String]>([])
             let delegate = NotificationDelegate(
                 readiness: { calls.withLock { $0.append("readiness") }; return false },
-                action: { _, _, _ in calls.withLock { $0.append("action") } }
+                action: { _, _, _, _ in calls.withLock { $0.append("action") } }
             )
             delegate.handleNotificationResponse(actionId: action, userInfo: [:]) {
                 calls.withLock { $0.append("finish") }

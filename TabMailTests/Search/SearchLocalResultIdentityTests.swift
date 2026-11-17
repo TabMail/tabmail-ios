@@ -128,7 +128,8 @@ struct SearchLocalResultIdentityTests {
             messageId: h.messageId, folderPath: h.folderPath, subject: h.subject,
             from: h.from, fromAddress: h.fromAddress, date: h.date, snippet: h.snippet,
             isRead: h.isRead, isFlagged: h.isFlagged, headerId: h.id,
-            capturedRfc822MessageId: h.rfc822MessageId
+            capturedRfc822MessageId: h.rfc822MessageId,
+            capturedObservedUidValidity: h.observedUidValidity
         )
     }
 
@@ -158,6 +159,7 @@ struct SearchLocalResultIdentityTests {
             try SearchView.resolveLocalResultHeaderId(
                 headerId: headerId,
                 capturedRfc822MessageId: result.capturedRfc822MessageId,
+                capturedObservedUidValidity: result.capturedObservedUidValidity,
                 db: db
             )
         }
@@ -167,10 +169,12 @@ struct SearchLocalResultIdentityTests {
         // → `MessageDetailView(messageId:expectedRfc822MessageId:)` → this VM. The
         // witness travels WITH the address, exactly as `openResult` appends it.
         let target = SearchView.OpenTarget(
-            headerId: opened, provenRfc822MessageId: result.capturedRfc822MessageId)
+            headerId: opened, provenRfc822MessageId: result.capturedRfc822MessageId,
+            provenObservedUidValidity: result.capturedObservedUidValidity)
         let vm = MessageDetailViewModel(
             messageId: target.headerId, dbPool: pool, fetchBodyOverride: { _ in },
-            expectedRfc822MessageId: target.provenRfc822MessageId)
+            expectedRfc822MessageId: target.provenRfc822MessageId,
+            expectedObservedUidValidity: target.provenObservedUidValidity)
         await vm.markReadOnOpenIfNeeded()
         return opened
     }
@@ -558,5 +562,87 @@ struct SearchLocalResultIdentityTests {
         let after = try await env.pool.read { db in try MessageHeader.fetchOne(db, key: row.id) }
         #expect(after?.isRead == true, "opening an unread message must still durably mark it read")
         #expect(after?.isFlagged == true, "non-vacuity: the mid-flight write really did land")
+    }
+
+    // MARK: - tabmail-ios #538: the address-epoch witness
+
+    /// A row with no Message-ID is witnessed by the epoch its address was proven
+    /// under. A turnover AFTER the tap's proof re-seats a different message at
+    /// the same address with a different proven epoch; the detail view must not
+    /// mark that row read (C3).
+    @Test("a witness-less row re-seated under a new UIDVALIDITY after the tap's proof gets no read mutation")
+    @MainActor
+    func witnessLessReseatUnderANewEpochMarksNothingRead() async throws {
+        let env = try makeEnv()
+        defer { finish(env); clearOverlay(); resetStagedGlobal() }
+        clearOverlay(); resetStagedGlobal()
+
+        let rendered = header(uid: "51", rfc: nil, subject: "No id", inbox: env.inbox)
+        try await env.pool.write { db in try rendered.insert(db) }
+        let result = mintLocalResult(from: rendered)
+        var impostor = header(uid: "51", rfc: nil, subject: "Other mail", inbox: env.inbox)
+        impostor.observedUidValidity = 1001
+
+        let (gateStream, gate) = AsyncStream<Void>.makeStream()
+        await AccountManager.shared.enqueueWrite {
+            var it = gateStream.makeAsyncIterator()
+            _ = await it.next()
+        }
+        let opened = try await tap(result, pool: env.pool) {
+            try await env.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET lastKnownUidValidity = 1001 WHERE id = ?", arguments: [env.inbox.id])
+                try rendered.delete(db)
+                try impostor.insert(db)
+            }
+        }
+        #expect(opened == rendered.id, "the proof was valid when taken")
+        #expect(fixtureIntentCycleIds().isEmpty, "no read intent may be registered for the re-seated row")
+        gate.finish()
+        await drainWriteQueue()
+        let seated = try await env.pool.read { db in try MessageHeader.fetchOne(db, key: impostor.id) }
+        #expect(seated?.subject == "Other mail")
+        #expect(seated?.isRead == false, "the impostor stays unread")
+    }
+
+    /// The tap-time proof: a witness-less row already re-seated under a new
+    /// epoch when the result is tapped is not opened.
+    @Test("a witness-less result whose address was re-seated under a new UIDVALIDITY before the tap opens nothing")
+    @MainActor
+    func witnessLessReseatBeforeTheTapOpensNothing() async throws {
+        let env = try makeEnv()
+        defer { finish(env); clearOverlay(); resetStagedGlobal() }
+        clearOverlay(); resetStagedGlobal()
+
+        let rendered = header(uid: "52", rfc: nil, subject: "No id", inbox: env.inbox)
+        let result = mintLocalResult(from: rendered)
+        var impostor = header(uid: "52", rfc: nil, subject: "Other mail", inbox: env.inbox)
+        impostor.observedUidValidity = 1001
+        try await env.pool.write { db in try impostor.insert(db) }
+
+        let opened = try await tap(result, pool: env.pool)
+        #expect(opened == nil)
+        #expect(fixtureIntentCycleIds().isEmpty)
+    }
+
+    /// The epoch arm refuses only a PROVEN different epoch: a row whose epoch
+    /// was cleared (address unproven) still opens and is still marked read.
+    @Test("a witness-less row whose current epoch is unproven (nil) still opens and is still marked read")
+    @MainActor
+    func witnessLessRowWithAnUnprovenEpochStillMarksRead() async throws {
+        let env = try makeEnv()
+        defer { finish(env); clearOverlay(); resetStagedGlobal() }
+        clearOverlay(); resetStagedGlobal()
+
+        let rendered = header(uid: "53", rfc: nil, subject: "No id", inbox: env.inbox)
+        try await env.pool.write { db in try rendered.insert(db) }
+        let result = mintLocalResult(from: rendered)
+        try await env.pool.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET observedUidValidity = NULL WHERE id = ?", arguments: [rendered.id])
+        }
+        let opened = try await tap(result, pool: env.pool)
+        #expect(opened == rendered.id)
+        await drainWriteQueue()
+        let after = try await env.pool.read { db in try MessageHeader.fetchOne(db, key: rendered.id) }
+        #expect(after?.isRead == true)
     }
 }

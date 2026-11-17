@@ -144,12 +144,22 @@ enum EmailNotificationBuilder {
     ///
     /// Returns `true` if the notification was delivered at active level
     /// (caller uses this to decide whether to persist `notified=true`).
+    /// userInfo key carrying the observed UIDVALIDITY of the notified message.
+    static let observedUidValidityUserInfoKey = "observedUidValidity"
+
+    /// Read `observedUidValidityUserInfoKey` back; nil unless a positive Int.
+    static func observedUidValidity(from userInfo: [AnyHashable: Any]) -> Int? {
+        guard let value = userInfo[observedUidValidityUserInfoKey] as? Int, value > 0 else { return nil }
+        return value
+    }
+
     @discardableResult
     static func fill(
         _ c: UNMutableNotificationContent,
         signal s: Signal,
         accountId: String,
-        messageId: String
+        messageId: String,
+        observedUidValidity: Int?
     ) -> Bool {
         c.title = s.senderName.isEmpty ? "New email" : "New email - \(s.senderName)"
         c.subtitle = s.subject
@@ -158,6 +168,15 @@ enum EmailNotificationBuilder {
         var info = c.userInfo
         info["messageId"] = messageId
         info["accountId"] = accountId
+        // The UIDVALIDITY under which `messageId` (an IMAP UID) was observed, so
+        // a tap days later can refuse whatever a turnover re-seated at that UID
+        // (`NotificationActionRouter`, tabmail-ios #538). Absent when unproven
+        // or for a provider with stable ids.
+        if let observedUidValidity, observedUidValidity > 0 {
+            info[observedUidValidityUserInfoKey] = observedUidValidity
+        } else {
+            info.removeValue(forKey: observedUidValidityUserInfoKey)
+        }
         c.userInfo = info
 
         if let rc = s.reminderContent, !rc.isEmpty {
