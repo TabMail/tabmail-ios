@@ -598,6 +598,41 @@ struct MessageDetailThreadActionTests {
         }, "no queued work names the row with no role or the email outside the chat")
     }
 
+    @Test("When the folder roles cannot be read at all, a whole-chat action moves nothing and records no Undo")
+    @MainActor
+    func unreadableRolesMoveNothing() async throws {
+        let (pool, dir, previous) = try makeEnv()
+        defer { teardown(previous: previous, pool: pool, dir: dir) }
+        clearOverlay()
+        UndoService.shared.dismissAll()
+
+        let inbox = try insertHeader(pool, messageId: "unreadable-inbox")
+        let filed = try insertHeader(pool, messageId: "unreadable-filed", folderPath: Self.projectsPath, isRead: true)
+        let chat = [inbox, filed]
+        let ids = chat.map(\.id)
+        let before = try await folders(pool, ids)
+        let vm = openChat(pool, focused: inbox, others: [filed])
+
+        // Every folder read fails, as it does on a database error.
+        try await pool.write { try $0.execute(sql: "ALTER TABLE folder RENAME TO folderUnreadable") }
+        #expect(vm.archiveChat(chat).isEmpty)
+        #expect(vm.deleteChat(chat).isEmpty)
+        #expect(vm.moveChat(chat, toFolderPath: Self.clientsPath).isEmpty)
+        #expect(UndoService.shared.undoStack.isEmpty, "nothing to undo")
+        #expect(AccountManager.shared.snapshotOverlay()[inbox.id] == nil && AccountManager.shared.snapshotOverlay()[filed.id] == nil,
+                "no email is shown moved")
+        try await pool.write { try $0.execute(sql: "ALTER TABLE folderUnreadable RENAME TO folder") }
+        #expect(try await folders(pool, ids) == before, "every email is where it was")
+        #expect(try await opsInDrainOrder(pool).isEmpty, "no work is queued")
+
+        // Control: with the roles readable again, the same Delete takes the chat.
+        #expect(vm.deleteChat(chat) == Set(ids), "control: a readable chat moves")
+        var deleted = before
+        deleted[inbox.id] = Self.trashPath
+        deleted[filed.id] = Self.trashPath
+        try await settle(pool, deleted)
+    }
+
     @Test("A chat of only sent copies and drafts, or already all in Trash, records nothing")
     @MainActor
     func chatWithNothingToMove() async throws {
