@@ -3250,6 +3250,8 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     }
     /// Whether a change session is open to a teardown (`changeOpening`).
     var hasChangeOpeningForTesting: Bool { changeOpening != nil }
+    /// The server in `changeOpening`, nil when none.
+    var changeOpeningServerForTesting: IMAPServer? { changeOpening?.server }
     #endif
 
     // MARK: T3.7 observability + direct drivers (PORT — `v2final`)

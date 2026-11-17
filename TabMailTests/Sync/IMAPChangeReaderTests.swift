@@ -1693,11 +1693,20 @@ struct IMAPChangeReaderTests {
                         if point == "before" { await provider.markDirty() }
                     }
                     let pass = Task { try await Self.read(w) }
+                    var tornDownAt = Date()
                     if point == "during" {
                         #expect(await Self.eventually { server.heldGreetingCount() >= 1 }, "\(label) setup: the attempt is connecting")
+                        tornDownAt = Date()
                         await provider.markDirty()
                     }
                     let inbox = try Self.inbox(w, try await pass.value)
+                    // The IMAP library gives up on a held greeting after its own
+                    // timeout, which equals `imapEvictionLogoutWaitSeconds`: a pass
+                    // that ends well before it ended because the teardown closed
+                    // this attempt, not because the greeting timed out.
+                    let waited = Date().timeIntervalSince(tornDownAt)
+                    #expect(waited < SyncConfig.imapEvictionLogoutWaitSeconds / 2,
+                            "\(label): the pass waited \(waited) s for the held greeting after the teardown")
                     let held = server.heldGreetingCount()
                     let logins = Self.logins(w) - loginsBefore
                     server.releaseGreetings()
@@ -1735,7 +1744,7 @@ struct IMAPChangeReaderTests {
                 seen.set(seen.get() + ["\(site) before-check reconnects=\(await server.reconnectsInsideCommands)"])
             }
             await provider.setChangeOpeningPublishedTestHookForTesting { site, server in
-                let open = await provider.hasChangeOpeningForTesting
+                let open = await provider.changeOpeningServerForTesting === server
                 seen.set(seen.get() + ["\(site) published open=\(open) reconnects=\(await server.reconnectsInsideCommands)"])
             }
             _ = try await Self.read(w)
