@@ -208,6 +208,62 @@ struct SuggestionProducerOrderingTests {
         }
     }
 
+    /// What happens while a card's Recompute waits for its reply.
+    enum DuringRecompute: String, CaseIterable, Sendable {
+        /// Nothing: the recompute stores its reply (the control).
+        case nothing
+        /// An edit of the suggestion is stored.
+        case edit
+        /// The card closes, cancelling the recompute.
+        case close
+    }
+
+    @Test("A card's Recompute, held at the backend, never lands over an edit stored meanwhile, nor after its card closed",
+          arguments: DuringRecompute.allCases)
+    func recomputeHeldAcrossEditAndClose(during: DuringRecompute) async throws {
+        try await withAIEnabled {
+            let fixture = try Fixture()
+            let shown = ReplyResult(body: "Shown reply", textMessage: "Shown text")
+            #expect(await ComposeView.writeCachedReplyToDB(shown, replacing: nil, replyTo: fixture.header, db: fixture.pool) == .written,
+                    "control: the card shows a stored suggestion")
+            let backend = HeldBackend()
+            let changes = ChangeCounter(fixture.header.id)
+            defer { changes.stop(); backend.close(); fixture.close() }
+
+            let header = fixture.header, account = fixture.account, service = backend.service
+            let recompute = Task {
+                await ComposeView.recomputedReply(
+                    for: header, account: account, kbText: "", compositionPrompt: "",
+                    aiService: service, dbPool: AppDatabase.dbPool)
+            }
+            try await waitUntil { backend.replyRequests == 1 }
+            #expect(backend.replyRequests == 1, "control: the recompute is waiting for its reply")
+
+            switch during {
+            case .nothing: break
+            case .edit:
+                #expect(await ComposeView.writeCachedReplyToDB(Self.edit, replacing: shown, replyTo: fixture.header, db: fixture.pool) == .written,
+                        "control: the edit is stored while the recompute waits")
+            case .close:
+                recompute.cancel()
+            }
+            backend.release()
+            let result = await recompute.value
+
+            let produced = ReplyResult(body: Self.producedBody, textMessage: Self.producedText)
+            let expected: ReplyResult = switch during {
+            case .nothing: produced
+            case .edit: Self.edit
+            case .close: shown
+            }
+            #expect(try fixture.row()?.suggestion == expected)
+            #expect(try fixture.cache()?.suggestion == expected)
+            #expect(result == (during == .nothing ? produced : nil), "the card shows the reply only when it was stored")
+            #expect(changes.value == (during == .close ? 0 : 1), "one change: the edit's, or the recompute's own")
+            #expect(backend.replyRequests == 1, "the reply was asked for once")
+        }
+    }
+
     // MARK: - 2. A result from another device carries the stored suggestion whole
 
     @Test("The queue's peer carry keeps the stored suggestion and puts it in the AI cache with its change command")
