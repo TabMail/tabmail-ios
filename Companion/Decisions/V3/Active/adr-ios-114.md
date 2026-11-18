@@ -297,7 +297,11 @@ same AI result, kept as long as the email itself is shown.
      uses `onScrollVisibilityChange` (`onGeometryChange` with `ChatRowVisibility` since 2026-11-16).
    - `defaultScrollAnchor(.bottom)` opens at the newest email. The landing `scrollTo` is issued once
      the thread is loaded, and again on every container or content size change until a scroll of
-     any kind begins (memory 036: a first scroll can be dropped while the screen settles). The first
+     any kind begins (memory 036: a first scroll can be dropped while the screen settles).
+     **Amended 2026-11-18:** "any kind" dropped the pin on the chat's own animated or settling
+     re-pin scroll, so a late height (the AI Suggestion, the reply field's measured height) left the
+     chat short of the bottom. The landing now ends only on the user's scroll (`tracking`,
+     `interacting`; `ChatThreadView.userTookOver`) or a jump-button tap. The first
      scroll records the members' unread state itself (`noteMembers`) before choosing where to land:
      SwiftUI runs the thread-loaded and members changes in either order, and the screen tests caught
      the chat opening at the bottom with the Unread line missing.

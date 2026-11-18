@@ -341,7 +341,12 @@ struct ChatThreadView: View {
                 }
                 .overlay(alignment: .bottomTrailing) {
                     if showsJumpButton {
-                        jumpButton { withAnimation { proxy.scrollTo(Self.bottomId, anchor: .bottom) } }
+                        jumpButton {
+                            // The user's tap ends the landing: its animated scroll is not a hand
+                            // scroll, and a held target would pull the chat back on the next height.
+                            scrollTarget = nil
+                            withAnimation { proxy.scrollTo(Self.bottomId, anchor: .bottom) }
+                        }
                     }
                 }
                 // Swiping left anywhere between the header and the pill slides the whole chat. With
