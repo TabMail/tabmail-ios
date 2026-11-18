@@ -62,6 +62,11 @@ struct FolderChangeState: Codable, Equatable, Sendable {
     /// when no retirement was added while the pass ran.
     var selfHealOwed: Int = 0
 
+    /// The full sync's listing is due for this folder whatever its counters say:
+    /// a count check (phase 2) that did not finish (a failed SEARCH, or a ghost
+    /// a shield protects) set it; a phase 2 that finishes clears it (#755).
+    var listingDue: Bool = false
+
     /// The folder is owed a self-heal pass before it is tracked again.
     var selfHealDue: Bool { selfHealOwed > 0 }
 
@@ -70,7 +75,7 @@ struct FolderChangeState: Codable, Equatable, Sendable {
         self.recheck = recheck
     }
 
-    private enum CodingKeys: String, CodingKey { case v, tracking, recheck, selfHealOwed }
+    private enum CodingKeys: String, CodingKey { case v, tracking, recheck, selfHealOwed, listingDue }
 
     /// `selfHealOwed` is absent from a state stored before it existed.
     init(from decoder: Decoder) throws {
@@ -79,6 +84,7 @@ struct FolderChangeState: Codable, Equatable, Sendable {
         tracking = try container.decode(Bool.self, forKey: .tracking)
         recheck = try container.decode([String].self, forKey: .recheck)
         selfHealOwed = try container.decodeIfPresent(Int.self, forKey: .selfHealOwed) ?? 0
+        listingDue = try container.decodeIfPresent(Bool.self, forKey: .listingDue) ?? false
     }
 
     /// The stored JSON; unreadable or absent = the untracked default.
@@ -94,7 +100,7 @@ struct FolderChangeState: Codable, Equatable, Sendable {
     /// The JSON to store; nil for the default (untracked, nothing to re-read,
     /// no self-heal due).
     var encoded: String? {
-        guard tracking || !recheck.isEmpty || selfHealDue,
+        guard tracking || !recheck.isEmpty || selfHealDue || listingDue,
               let data = try? JSONEncoder().encode(self) else { return nil }
         return String(data: data, encoding: .utf8)
     }
@@ -171,7 +177,8 @@ extension SyncEngine {
         for changes in changeSet.folders {
             guard case .untracked(let observation) = changes.status else { continue }
             if try await refreshUntrackedFolder(
-                folderId: changes.folderId, observation: observation, account: account, provider: provider) {
+                folderId: changes.folderId, observation: observation, account: account, provider: provider,
+                deadline: request.context.deadline) {
                 outcome.hadChanges = true
             }
         }
@@ -386,10 +393,11 @@ extension SyncEngine {
         return outcome
     }
 
-    /// Names and counts of folders already stored, matched by path, column by
-    /// column (`updateChanges`, which bumps no backfill version; ADR-IOS-107). A
-    /// path not stored is ignored: adding and removing folders is the complete
-    /// list's job.
+    /// Names of folders already stored, matched by path, column by column
+    /// (`updateChanges`, which bumps no backfill version; ADR-IOS-107). A path
+    /// not stored is ignored: adding and removing folders is the complete list's
+    /// job. Counts are not written: a folder's counters have one writer, its
+    /// listing.
     nonisolated static func applyFolderUpdates(_ updates: [FolderInfo], accountId: String, db: Database) throws {
         for info in updates {
             guard var folder = try Folder
@@ -397,7 +405,6 @@ extension SyncEngine {
                 .fetchOne(db) else { continue }
             let original = folder
             folder.name = info.name
-            folder.totalCount = info.totalCount
             _ = try folder.updateChanges(db, from: original)
         }
     }
@@ -410,7 +417,8 @@ extension SyncEngine {
     ///   asked to list again (#783). It is stored also when the full sync
     ///   dropped a folder (`FullSyncListing.droppedFolder`: a lost connection
     ///   stops the listing there, so that folder and every later one; a failed
-    ///   retry or SELECT, that folder). Those folders stay untracked and the
+    ///   retry or SELECT, or an empty count the server did not confirm
+    ///   (`ProviderListingUnconfirmed`), that folder). Those folders stay untracked and the
     ///   caller keeps the full sync due, so the next foreground pass lists them;
     ///   their changes after the candidate arrive by the reads from the bookmark
     ///   (an account-wide reader names every folder, and a full record inserts a

@@ -40,19 +40,30 @@ extension SyncEngine {
     /// changed since the folder row's own: a new UID, a different count, or a
     /// different HIGHESTMODSEQ (both known). Pure, for tests.
     nonisolated static func untrackedFolderChanged(
-        observation: UntrackedObservation, lastKnownUidNext: Int?, totalCount: Int, lastKnownHighestModSeq: Int?
+        observation: UntrackedObservation, lastKnownUidNext: Int?, totalCount: Int, lastKnownHighestModSeq: Int?,
+        listingDue: Bool = false
     ) -> Bool {
-        let uidNextChanged = lastKnownUidNext != nil && observation.uidNext != lastKnownUidNext
+        // A count check that did not finish asks for the next listing (#755).
+        if listingDue { return true }
+        // No stored UIDNEXT: no listing has written the folder's counters yet,
+        // so nothing proves it unchanged.
+        let uidNextChanged = lastKnownUidNext == nil || observation.uidNext != lastKnownUidNext
         let countChanged = observation.messageCount != totalCount
+        // A HIGHESTMODSEQ the server reports while the last listing stored none
+        // (a listing on a session without CONDSTORE) proves nothing unchanged:
+        // a flag-only change would otherwise stay unseen (#755).
         let modSeqChanged = modSeqIndicatesChange(server: observation.highestModSeq, cached: lastKnownHighestModSeq)
+            || (observation.highestModSeq != nil && lastKnownHighestModSeq == nil)
         return uidNextChanged || countChanged || modSeqChanged
     }
 
     /// One untracked folder: the turnover trigger, the epoch bootstrap, and for a
-    /// changed folder the window listing, the stored counters and the deletion
-    /// check. Returns whether the folder was listed.
+    /// changed folder the window listing (which writes the folder's counters)
+    /// and the deletion check on that listing's count. Returns whether the
+    /// folder was listed.
     func refreshUntrackedFolder(
-        folderId: String, observation: UntrackedObservation, account: Account, provider: any EmailProvider
+        folderId: String, observation: UntrackedObservation, account: Account, provider: any EmailProvider,
+        deadline: Date? = nil
     ) async throws -> Bool {
         guard let folder = try await dbPool.read({ db in try Folder.fetchOne(db, key: folderId) }),
               !folder.path.isEmpty, folder.uidValidityResetPendingAt == nil else { return false }
@@ -69,7 +80,8 @@ extension SyncEngine {
 
         guard Self.untrackedFolderChanged(
             observation: observation, lastKnownUidNext: folder.lastKnownUidNext,
-            totalCount: folder.totalCount, lastKnownHighestModSeq: folder.lastKnownHighestModSeq) else {
+            totalCount: folder.totalCount, lastKnownHighestModSeq: folder.lastKnownHighestModSeq,
+            listingDue: FolderChangeState(raw: folder.changeState).listingDue) else {
             BackgroundSyncLogger.logDebug("[Sync] Untracked \(folder.name) unchanged (uidNext=\(observation.uidNext), count=\(observation.messageCount), modseq=\(observation.highestModSeq.map(String.init) ?? "-"))")
             // A quiet folder is the one that would otherwise never get an epoch.
             // Bootstrap only (never an overwrite); the binding predicates are
@@ -83,45 +95,33 @@ extension SyncEngine {
         BackgroundSyncLogger.logDebug("[Sync] Untracked \(folder.name) changed (uidNext: \(folder.lastKnownUidNext ?? 0)→\(observation.uidNext), count: \(folder.totalCount)→\(observation.messageCount))")
         let newCount = max(0, observation.messageCount - folder.totalCount)
         if newCount > 0 { publishDownloading(newCount, forAccount: account.id) }
+        // The listing writes the folder's counters from its own selection, with
+        // its rows (`runSyncMessages`); this observation only decided to list.
+        let listed: ListingCounters?
         do {
-            try await syncMessages(for: folder, provider: provider, limit: SyncConfig.syncMessageLimit)
+            listed = try await syncMessages(for: folder, provider: provider, limit: SyncConfig.syncMessageLimit)
         } catch {
             if Self.isSelectFailedError(error) {
                 BackgroundSyncLogger.logDebug("[Sync] Untracked \(folder.name): SELECT failed — skipping")
                 return false
             }
+            // A listing whose empty count the server did not confirm: this folder
+            // only. No counters are written, so the next pass lists it again.
+            if error is ProviderListingUnconfirmed {
+                BackgroundSyncLogger.logDebug("[Sync] Untracked \(folder.name): listing count unconfirmed — skipping: \(error)")
+                return false
+            }
             throw error
         }
 
-        try await dbPool.write { db in
-            var assignments: [ColumnAssignment] = [
-                Column("lastKnownUidNext").set(to: observation.uidNext),
-                Column("totalCount").set(to: observation.messageCount)
-            ]
-            if let modseq = observation.highestModSeq {
-                assignments.append(Column("lastKnownHighestModSeq").set(to: modseq))
-            }
-            _ = try Folder.filter(Column("id") == folder.id).updateAll(db, assignments)
-            // Bootstrap as its own conditional statement (never an overwrite).
-            try Self.bootstrapFolderUidValidity(db, folderId: folder.id, observed: observation.uidValidity)
-        }
-
-        // ADR-IOS-051 phase 2: the live local count against the server's.
-        do {
-            let localCount = try await dbPool.read { db in
-                try MessageHeader.filter(Column("folderId") == folderId).fetchCount(db)
-            }
-            if Self.shouldReconcileDeletions(
-                localCount: localCount, serverCount: observation.messageCount,
-                tolerance: SyncConfig.deletionReconcileCountTolerance) {
-                BackgroundSyncLogger.logDebug("[Sync] Untracked \(folder.name) local=\(localCount) > server=\(observation.messageCount) — reconciling external deletions")
-                await reconcileExternallyDeletedMessages(
-                    folder: folder, provider: provider, expectedGhosts: localCount - observation.messageCount)
-            }
-        } catch {
-            // Best effort: the evidence is durable and re-fires next pass.
-            BackgroundSyncLogger.logDebug("[Sync] Untracked \(folder.name): reconcile trigger check failed: \(error)")
-        }
+        // ADR-IOS-051 phase 2: the live local count against the count of the
+        // listing that just ran, never the observation's. A listing that
+        // proved nothing has no count: no phase 2 this pass, and the folder
+        // was not listed (the next pass lists it again).
+        guard let serverCount = listed?.messageCount else { return false }
+        // Bounded by the pass's deadline: this runs inside the account's turn.
+        await reconcileDeletionsAfterListing(
+            folder: folder, provider: provider, serverCount: serverCount, logPrefix: "[Sync] Untracked", deadline: deadline)
         return true
     }
 }

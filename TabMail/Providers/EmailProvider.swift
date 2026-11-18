@@ -61,11 +61,15 @@ struct FolderInfo: Sendable {
     /// UIDPLUS) and for every non-IMAP provider — nil means UNKNOWN, never
     /// "unchanged", so callers must not synthesise a value from it.
     let uidValidity: Int?
+    /// The server reported the folder's message count (IMAP: STATUS MESSAGES).
+    /// False = `totalCount` is unknown (0 stands in), never a count of 0 (#755).
+    let messageCountReported: Bool
 
     init(
         name: String, path: String, role: FolderRole, unreadCount: Int, totalCount: Int,
-        uidNext: Int? = nil, highestModSeq: Int? = nil, uidValidity: Int? = nil
+        uidNext: Int? = nil, highestModSeq: Int? = nil, uidValidity: Int? = nil, messageCountReported: Bool = true
     ) {
+        self.messageCountReported = messageCountReported
         self.name = name
         self.path = path
         self.role = role
@@ -296,6 +300,15 @@ enum StaleWindowMode: Sendable { case uid, date }
 /// IMAP reads `Mailbox.Selection.messageCount` two lines above its own FETCH, and
 /// the raw `infos.count` is already used by the `[IMAP-FETCH-GAP]` diagnostic;
 /// Gmail and Graph both know how many refs their list call returned.
+/// A folder's counters as one listing's own selection reported them.
+struct ListingCounters: Sendable, Equatable {
+    let messageCount: Int
+    /// Nil when the selection did not report one.
+    let uidNext: Int?
+    /// Nil when the selection did not report one (no CONDSTORE on it).
+    let highestModSeq: Int?
+}
+
 struct FetchCoverage: Sendable, Equatable {
     /// How many records the SERVER named for the window this fetch asked about,
     /// counted before any `compactMap`. `0` on `.unproven` means "no evidence",
@@ -317,10 +330,34 @@ struct FetchCoverage: Sendable, Equatable {
     /// longer lists it.
     var unmaterialisedIds: Set<String>
 
+    /// The folder's counters as the selection that served this listing
+    /// reported them, nil when the listing proved nothing about the folder.
+    /// The one source the engine writes a folder's counters from and runs the
+    /// count-driven deletion check on (ADR-IOS-051 amendment). A provider whose
+    /// listing has no such selection leaves it nil.
+    var counters: ListingCounters? = nil
+
     /// Fail-closed: a provider that cannot report coverage proves nothing.
     /// Never re-derive this from the returned array's count.
     static let unproven = FetchCoverage(
         serverRecordCount: 0, spansEntireFolder: false, unmaterialisedIds: [])
+}
+
+/// Where the backfill progress bar's denominator comes from, held by the
+/// provider (in memory, from requests it makes anyway).
+enum ProgressTotal: Sendable, Equatable {
+    /// No server total: the denominator is the stored row count (Gmail when its
+    /// profile read fails; providers without one).
+    case none
+    /// The provider has a total, but not before this launch's first folder list:
+    /// progress publishes nothing (the bar stays hidden) until it has.
+    case notKnownYet
+    /// The account's message total (Gmail: the profile's; Exchange: the sum of
+    /// `totalItemCount` over its last complete folder list).
+    case messages(Int)
+    /// IMAP: each folder path's STATUS UIDNEXT from the last folder list. The
+    /// numerator is the crawl's UID walk, so the denominator is in UID space.
+    case uidNext([String: Int])
 }
 
 protocol EmailProvider: Sendable {
@@ -330,6 +367,13 @@ protocol EmailProvider: Sendable {
     /// Fetch-ordering dimension for stale-detection windowing. Defaults to `.date`
     /// (HTTP providers); IMAP overrides to `.uid`. See `StaleWindowMode`.
     var staleWindowMode: StaleWindowMode { get }
+
+    /// The backfill progress denominator's source. Progress is display, not a
+    /// sync counter: it never reads the stored folder counters (which only a
+    /// folder's listing writes). See `ProgressTotal`. `crawling` false: the
+    /// header crawl is done and an account total is not needed (a provider
+    /// that must make a request for it answers `.none`).
+    func progressTotal(crawling: Bool) async -> ProgressTotal
 
     /// Which of these ids (numeric, in a provider whose ids are `.uid`-windowed)
     /// the folder still holds, with the generation of the id space the answer
@@ -723,6 +767,9 @@ extension EmailProvider {
     /// IMAP overrides to `.uid`.
     var staleWindowMode: StaleWindowMode { .date }
 
+    /// No server total by default: progress counts stored rows.
+    func progressTotal(crawling: Bool) async -> ProgressTotal { .none }
+
     /// No numeric ids: no presence answer.
     func presentIds(folder: String, uids: [UInt32]) async throws -> UIDExistenceResult? { nil }
 
@@ -1097,6 +1144,34 @@ struct ProviderTemporaryRefusal: Error, CustomStringConvertible, LocalizedError 
 
     var description: String { String(describing: underlying) }
     var errorDescription: String? { underlying.localizedDescription }
+}
+
+/// A folder listing that proved nothing about the folder's contents (#755):
+/// the server said the folder is empty and did not confirm it (on IMAP, the
+/// `UID SEARCH ALL` that must confirm a SELECT's `EXISTS 0` found messages, or
+/// the server refused it with a NO or BAD). The listing removes nothing and
+/// records no counters. It fails this one folder's listing only: every caller
+/// skips the folder and goes on with the others, and the next pass lists it
+/// again (`SyncEngine.fullSync`, `SyncEngine.refreshUntrackedFolder`,
+/// `AccountManager.syncFolders`). A connection lost on the way is not this
+/// error: it stays a connection error.
+struct ProviderListingUnconfirmed: Error, CustomStringConvertible, CustomDebugStringConvertible {
+    let folder: String
+    /// The server's refusal text; nil when the server contradicted the empty count.
+    let refusal: String?
+    /// Content-free: no folder name and no server text, so the always-on logs
+    /// never carry them (`debugDescription` has both, for debug-gated lines).
+    var description: String {
+        refusal != nil
+            ? "Listing: a folder reported empty and the server refused to confirm it"
+            : "Listing: a folder reported empty but the server holds messages"
+    }
+    var debugDescription: String {
+        if let refusal {
+            return "Listing: \(folder) was reported empty and the server refused to confirm it: \(refusal)"
+        }
+        return "Listing: \(folder) was reported empty but the server holds messages"
+    }
 }
 
 /// True when `id` matches a TabMail-internal optimistic-placeholder shape.

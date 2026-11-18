@@ -190,12 +190,17 @@ struct ChangeApplyIMAPTests {
         func obs(_ count: Int, _ next: Int, _ modseq: Int?) -> UntrackedObservation {
             UntrackedObservation(messageCount: count, uidNext: next, highestModSeq: modseq, uidValidity: 1)
         }
-        let f = SyncEngine.untrackedFolderChanged
+        func f(_ o: UntrackedObservation, _ uidNext: Int?, _ count: Int, _ modseq: Int?, _ due: Bool = false) -> Bool {
+            SyncEngine.untrackedFolderChanged(
+                observation: o, lastKnownUidNext: uidNext, totalCount: count, lastKnownHighestModSeq: modseq, listingDue: due)
+        }
         #expect(!f(obs(3, 10, 7), 10, 3, 7))
         #expect(f(obs(3, 11, 7), 10, 3, 7), "a new UID")
         #expect(f(obs(2, 10, 7), 10, 3, 7), "a different count")
         #expect(f(obs(3, 10, 8), 10, 3, 7), "a different HIGHESTMODSEQ")
-        #expect(!f(obs(3, 11, nil), nil, 3, nil), "an unknown stored UIDNEXT is no evidence")
+        #expect(f(obs(3, 11, nil), nil, 3, nil), "no stored UIDNEXT: no listing proved the folder unchanged, so it is listed")
+        #expect(f(obs(3, 10, 7), 10, 3, nil), "a HIGHESTMODSEQ the server reports while the last listing stored none asks for a listing")
+        #expect(f(obs(3, 10, 7), 10, 3, 7, true), "a count check that did not finish asks for a listing")
     }
 
     // MARK: - Untracked

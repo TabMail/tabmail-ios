@@ -90,6 +90,15 @@ actor ExchangeProvider: EmailProvider {
 
     // MARK: - Folders
 
+    /// The sum of `totalItemCount` over this provider's last complete folder
+    /// listing, held in memory only (no request of its own): the backfill
+    /// progress denominator (`progressTotal`). Nil until a listing finished.
+    var lastFolderListMessageTotal: Int?
+
+    func progressTotal(crawling: Bool) async -> ProgressTotal {
+        lastFolderListMessageTotal.map(ProgressTotal.messages) ?? .notKnownYet
+    }
+
     func fetchFolders() async throws -> [FolderInfo] {
         // v1.0 mailFolder resource does NOT include wellKnownName property.
         // Resolve well-known folder IDs by addressing them by name (e.g., GET /mailFolders/inbox).
@@ -128,6 +137,7 @@ actor ExchangeProvider: EmailProvider {
             knownFolderIds: knownFolderIds,
             seen: &seen)
 
+        lastFolderListMessageTotal = folders.reduce(0) { $0 + $1.totalCount }
         if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] fetchFolders returning \(folders.count) folders: \(folders.map { "\($0.name)(\($0.role))" })") }
         return folders
     }

@@ -179,6 +179,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         lastObservedUidValidityBox.withLock { $0[folderPath] }
     }
 
+    /// Per folder: how the folder's pooled connection gets HIGHESTMODSEQ on its
+    /// listings (`negotiateListingCondStore`), decided when that connection's
+    /// session opened and replaced whenever a new one opens for the folder.
+    private var folderListingCondStore: [String: ListingCondStore] = [:]
+
     /// SELECT `folder` and RECORD the epoch that SELECT reported, then hand the
     /// caller the very same `Mailbox.Selection` a bare `server.selectMailbox`
     /// would have returned.
@@ -328,8 +333,12 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// CLEARS on an unreported one), so a race between two writers of the same
     /// path can only manufacture a MISMATCH — refuse, which is safe — and never
     /// agreement. The widening is monotonically safety-increasing for it.
-    private func selectMailboxTracked(_ server: IMAPServer, folder: String) async throws -> Mailbox.Selection {
-        let selection = try await server.selectMailbox(folder)
+    private func selectMailboxTracked(
+        _ server: IMAPServer, folder: String, enablingCondStore: Bool = false
+    ) async throws -> Mailbox.Selection {
+        let selection = enablingCondStore
+            ? try await IMAPChangeCommands().selectCondStore(folder, on: server)
+            : try await server.selectMailbox(folder)
         let observed = selection.uidValidity.value
         // Assignment, not an `if` — a `0` (unreported) must ERASE any earlier
         // entry, never leave it behind as an answer for this SELECT.
@@ -714,7 +723,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     // Background ops (sync, backfill, batch fetch) go through these — zero checkout/SELECT overhead.
 
     /// Folder → pinned IMAP connection (already SELECTed on that folder).
-    private var folderServers: [String: IMAPServer] = [:]
+    private var folderServers: [String: IMAPServer] = [:] {
+        // A folder's listing CONDSTORE decision belongs to its live pool entry:
+        // an evicted or dropped connection takes its decision with it.
+        didSet { folderListingCondStore = folderListingCondStore.filter { folderServers[$0.key] != nil } }
+    }
     /// Folder → last used timestamp (for LRU eviction).
     private var folderLastUsed: [String: Date] = [:]
     /// Folders whose pinned connection is currently in use by an operation.
@@ -815,7 +828,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     // MARK: - Change connection (#751, ADR-IOS-111)
     /// The change reader's own connection (`IMAPProviderChanges.swift`): the only
     /// one that sends `ENABLE QRESYNC` (once per session, when it is opened), so
-    /// no other connection ever gets VANISHED instead of EXPUNGE. It never
+    /// no other connection ever gets VANISHED instead of EXPUNGE. Folder
+    /// connections may enable CONDSTORE for their listings' HIGHESTMODSEQ
+    /// (`negotiateListingCondStore`); their FETCH answers then carry MODSEQ,
+    /// which their parsers ignore. It never
     /// reconnects inside a command (`setReconnectsInsideCommands(false)`): a
     /// session that ends mid-pass fails the rest of the pass instead of carrying
     /// on in a new session without QRESYNC or a selection. Counted in the
@@ -1457,6 +1473,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         do {
             let server = try await createServer(diagSite: "folderCreate")
             createdServer = server
+            // CONDSTORE for the listings, in the authenticated state, before
+            // the session's first SELECT (RFC 5161 §3.1).
+            let condStore = await negotiateListingCondStore(server)
             // T1.2b: the OPEN-the-folder SELECT — the one a folder-pinned
             // connection performs once, before any caller has asked for anything.
             // It is routed through the tracked helper so the mirror describes the
@@ -1466,8 +1485,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // folder before issuing commands (`fetchMessages` directly, the
             // backfill SEARCHes via `searchDateRange`/`searchBeforeOnly`), so the
             // observation it makes is currently indistinguishable from the body's.
-            _ = try await selectMailboxTracked(server, folder: folder)
+            _ = try await selectMailboxTracked(server, folder: folder, enablingCondStore: condStore == .selectParameter)
             folderCreating.remove(folder)
+            folderListingCondStore[folder] = condStore
             #if DEBUG
             assertPoolSlotWasNil(folderServers[folder], "folderServers[\(folder)]")
             #endif
@@ -1534,10 +1554,12 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 do {
                     let server = try await createServer(diagSite: "folderRetry")
                     createdServer = server
+                    let condStore = await negotiateListingCondStore(server)
                     // T1.2b: the same open-the-folder SELECT as the primary create
                     // path above, on the connection-limit retry leg.
-                    _ = try await selectMailboxTracked(server, folder: folder)
+                    _ = try await selectMailboxTracked(server, folder: folder, enablingCondStore: condStore == .selectParameter)
                     folderCreating.remove(folder)
+                    folderListingCondStore[folder] = condStore
                     #if DEBUG
                     assertPoolSlotWasNil(folderServers[folder], "folderServers[\(folder)]")
                     #endif
@@ -3723,7 +3745,26 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         }
     }
 
+    /// Each folder path's STATUS UIDNEXT from the folder lists of this process,
+    /// in memory only: the backfill progress denominator (`progressTotal`). Each
+    /// list is merged in, so a folder whose STATUS failed keeps its earlier value
+    /// (#755). Nil until a folder list finished in this process.
+    private var lastFolderListUidNext: [String: Int]?
+
+    func progressTotal(crawling: Bool) async -> ProgressTotal {
+        lastFolderListUidNext.map(ProgressTotal.uidNext) ?? .notKnownYet
+    }
+
     func fetchFolders() async throws -> [FolderInfo] {
+        let folders = try await listFoldersWithStatus()
+        let listed = Dictionary(
+            folders.compactMap { info in info.uidNext.map { (info.path, $0) } },
+            uniquingKeysWith: { first, _ in first })
+        lastFolderListUidNext = (lastFolderListUidNext ?? [:]).merging(listed) { _, new in new }
+        return folders
+    }
+
+    private func listFoldersWithStatus() async throws -> [FolderInfo] {
         try await withActionConnectionNoSelect { server in
             let mailboxes = try await Self.listMailboxesWithSpecialUse(server)
             let roles = Self.discoveredRoles(
@@ -3737,10 +3778,12 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 var uidNextVal: Int?
                 var highestModSeqVal: Int?
                 var uidValidityVal: Int?
+                var countReported = false
                 do {
                     let status = try await server.mailboxStatus(info.name)
                     unread = status.unseenCount ?? 0
                     total = status.messageCount ?? 0
+                    countReported = status.messageCount != nil
                     uidNextVal = status.uidNext.map { Int($0.value) }
                     // CONDSTORE HIGHESTMODSEQ (nil unless the server advertises it) — the
                     // full-sync fetch-skip signal (Fix B task 4).
@@ -3765,7 +3808,8 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     totalCount: total,
                     uidNext: uidNextVal,
                     highestModSeq: highestModSeqVal,
-                    uidValidity: uidValidityVal
+                    uidValidity: uidValidityVal,
+                    messageCountReported: countReported
                 ))
             }
             return folders
@@ -3874,6 +3918,49 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// Records the client could not map are NOT excluded from either half — they
     /// were covered. They are reported as `unmaterialisedIds` instead, so presence
     /// stays true for them while coverage stays honest.
+    /// How a pooled connection's listings get HIGHESTMODSEQ (RFC 7162 §3.1.2.1:
+    /// only once a CONDSTORE enabling command was sent), decided once per
+    /// session when it opens, in the authenticated state before its first SELECT
+    /// (RFC 5161 §3.1: ENABLE is not valid once a mailbox is selected), as the
+    /// change session decides its mode: with ENABLE, only an acknowledged
+    /// `ENABLE CONDSTORE`; without it, every SELECT on the session carries
+    /// `(CONDSTORE)`. A failure is never the connection's: the session's listings
+    /// report no MODSEQ, and the next session asks again. Either way the
+    /// listing's SELECT carries `(CONDSTORE)` too, so a session reopened inside
+    /// a command keeps MODSEQ without its own ENABLE.
+    enum ListingCondStore: Sendable, Equatable { case enabled, selectParameter, off }
+
+    /// Whether `name` is among the advertised capabilities (case-insensitive).
+    nonisolated static func advertises(_ name: String, in advertised: [String]) -> Bool {
+        advertised.contains { $0.uppercased() == name }
+    }
+
+    func negotiateListingCondStore(_ server: IMAPServer) async -> ListingCondStore {
+        do {
+            let names = try await withTimeout(seconds: SyncConfig.changeReadRequestTimeoutSeconds) {
+                try await server.fetchCapabilities()
+            }.filter { $0.value == nil }.map(\.name)
+            guard Self.advertises("CONDSTORE", in: names) else { return .off }
+            guard Self.advertises("ENABLE", in: names) else { return .selectParameter }
+            let enabled = try await withTimeout(seconds: SyncConfig.changeReadRequestTimeoutSeconds) {
+                try await server.enable([.condStore])
+            }
+            return enabled.contains(.condStore) ? .enabled : .off
+        } catch {
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] listing CONDSTORE check failed — no MODSEQ on this session: \(error)") }
+            return .off
+        }
+    }
+
+    /// The listing's own selection's counters, the one source of the folder's
+    /// stored counters. UIDNEXT 0 is SwiftMail's "not reported".
+    nonisolated static func listingCounters(_ selection: Mailbox.Selection, count: Int) -> ListingCounters {
+        let uidNext = selection.uidNext.value
+        return ListingCounters(
+            messageCount: count, uidNext: uidNext != 0 ? Int(uidNext) : nil,
+            highestModSeq: selection.highestModificationSequenceValue.flatMap { Int(exactly: $0) })
+    }
+
     nonisolated static func coverage(
         rawRecordCount: Int, serverMessageCount: Int, limit: Int, unmaterialisedIds: Set<String>
     ) -> FetchCoverage {
@@ -3941,15 +4028,64 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // see nothing. Not universal: a folder whose CONDSTORE HIGHESTMODSEQ is
             // unchanged is skipped before `runSyncMessages` (`shouldSkipFolderFetch`)
             // and observes nothing from this path on that cycle.
-            let selection = try await selectMailboxTracked(server, folder: folder)
+            // The listing's own HIGHESTMODSEQ needs CONDSTORE on its connection
+            // (RFC 7162 §3.1.2.1), decided when its session opened. The listing
+            // SELECT itself always carries `(CONDSTORE)` when the server accepts
+            // it: a SELECT parameter is an enabling command on every session, so
+            // a session the connection opened again inside a command (after an
+            // acknowledged ENABLE on the earlier one) still gets MODSEQ.
+            let condStore = folderListingCondStore[folder] ?? .off
+            let selection = try await selectMailboxTracked(
+                server, folder: folder, enablingCondStore: condStore != .off)
             let observed = selection.uidValidity.value
             let observedEpoch: UInt32? = observed != 0 ? observed : nil
-            // `EXISTS 0` is the server stating the folder is EMPTY, which IS
-            // complete knowledge — and it must stay so, or an emptied folder's
-            // local rows would never be swept.
+            // An EXISTS no UID or sequence number can carry (above UInt32.max) is
+            // checked before any sequence range is built from it: the listing
+            // proves nothing (#755).
+            if selection.messageCountReported, selection.reportedMessageCount == nil {
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] \(folder): SELECT sent an EXISTS out of range — coverage unproven, nothing removed") }
+                return ([], observedEpoch, .unproven)
+            }
+            // A count of 0 never removes a held row on its own (#755). A 0 with NO
+            // `EXISTS` (a non-compliant server left it out; RFC 3501 requires it)
+            // is no knowledge at all: the coverage is unproven and authorizes no
+            // stale deletion. An explicit `EXISTS 0` empties the folder only once
+            // a `UID SEARCH ALL` on this same selection also finds nothing, so an
+            // emptied folder's rows are still swept. A SEARCH that finds UIDs
+            // contradicts the count: the listing of this folder fails (nothing
+            // removed, nothing listed as done) and is retried next pass, as is one
+            // whose SEARCH is refused (`ProviderListingUnconfirmed`). A SEARCH
+            // lost with its connection stays a connection error.
             guard selection.messageCount > 0 else {
+                guard selection.messageCountReported else {
+                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] \(folder): SELECT sent no EXISTS — coverage unproven, nothing removed") }
+                    return ([], observedEpoch, .unproven)
+                }
+                let found: ExtendedSearchResult<UID>
+                do {
+                    found = try await server.extendedSearch(criteria: [.all])
+                } catch IMAPError.commandFailed(let reason), IMAPError.searchCharsetNotSupported(_, let reason) {
+                    // The server answered the SEARCH with a refusal. SwiftMail has no
+                    // "refused" kind: its search handler reports every NO/BAD as one of
+                    // exactly these two cases (`IMAPError.searchRejected` types a
+                    // [BADCHARSET] code on its own), while a lost connection arrives as
+                    // other errors (`connectionFailed`, `IMAPConnectionAbortedError`,
+                    // `timeout`, cancellation, NIO), which propagate unchanged.
+                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] \(folder): SELECT sent EXISTS 0 and UID SEARCH ALL was refused — listing fails, nothing removed") }
+                    throw ProviderListingUnconfirmed(folder: folder, refusal: reason)
+                }
+                let listedEmpty: Bool
+                do { listedEmpty = try found.listed().isEmpty } catch is ExtendedSearchUnlisted {
+                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] \(folder): SELECT sent EXISTS 0 and UID SEARCH ALL listed no matches — listing fails, nothing removed") }
+                    throw ProviderListingUnconfirmed(folder: folder, refusal: nil)
+                }
+                guard listedEmpty else {
+                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] \(folder): SELECT sent EXISTS 0 but UID SEARCH ALL found messages — listing fails, nothing removed") }
+                    throw ProviderListingUnconfirmed(folder: folder, refusal: nil)
+                }
                 return ([], observedEpoch,
-                        FetchCoverage(serverRecordCount: 0, spansEntireFolder: true, unmaterialisedIds: []))
+                        FetchCoverage(serverRecordCount: 0, spansEntireFolder: true, unmaterialisedIds: [],
+                                      counters: Self.listingCounters(selection, count: 0)))
             }
 
             // No representable range over a non-empty mailbox: we asked nothing,
@@ -3966,11 +4102,14 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 // COVERAGE is measured on `infos` and `selection.messageCount` —
                 // the two things the SERVER said — never on `mapped`. See
                 // `IMAPProvider.coverage(rawRecordCount:serverMessageCount:limit:unmaterialisedIds:)`.
-                return (mapped, observedEpoch, Self.coverage(
+                var coverage = Self.coverage(
                     rawRecordCount: infos.count,
                     serverMessageCount: selection.messageCount,
                     limit: limit,
-                    unmaterialisedIds: Self.unmaterialisedIds(raw: infos, mapped: mapped)))
+                    unmaterialisedIds: Self.unmaterialisedIds(raw: infos, mapped: mapped))
+                // A count the mailbox cannot hold is no count: nothing is written.
+                coverage.counters = selection.reportedMessageCount.map { Self.listingCounters(selection, count: $0) }
+                return (mapped, observedEpoch, coverage)
             } catch {
                 let msg = "\(error)"
                 if msg.contains("Invalid messageset") || msg.contains("invalid messageset") {
@@ -4354,7 +4493,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         let results: UIDSet
         do {
             let extResult: ExtendedSearchResult<UID> = try await server.extendedSearch(criteria: criteria, calendar: Self.utcCalendar)
-            results = extResult.asSet
+            results = try extResult.listed()
         } catch {
             let desc = "\(error)"
             if desc.contains("PayloadTooLargeError") && after == nil {
@@ -7126,7 +7265,12 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 // a connection failure.
                 throw IMAPSearchRefused(reason: reason)
             }
-            return extResult.asSet.toArray().map { UInt32($0.value) }
+            // Membership of each requested UID, never the answer's own set: a
+            // compact ESEARCH answer can name a range far wider than the request.
+            let listed = try extResult.listed()
+            return (from...to).compactMap { uid in
+                UInt32(exactly: uid).flatMap { listed.contains(UID($0)) ? $0 : nil }
+            }
         }
     }
 
@@ -7159,8 +7303,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             let extResult: ExtendedSearchResult<UID> = try await server.extendedSearch(
                 identifierSet: searchSet, criteria: [.all]
             )
+            // Membership of each requested UID (bounded by the request), never
+            // an expansion of the answer.
+            let listed = try extResult.listed()
             return UIDExistenceResult(
-                found: Set(extResult.asSet.toArray().map { UInt32($0.value) }),
+                found: Set(uids.filter { listed.contains(UID($0)) }),
                 uidValidity: selection.uidValidity.value
             )
         }
@@ -7253,7 +7400,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         let results: UIDSet
         do {
             let extResult: ExtendedSearchResult<UID> = try await server.extendedSearch(criteria: [.since(since), .before(before)], calendar: Self.utcCalendar)
-            results = extResult.asSet
+            results = try extResult.listed()
         } catch {
             let desc = "\(error)"
             if desc.contains("PayloadTooLargeError") {
@@ -7308,7 +7455,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         _ = try await selectMailboxTracked(server, folder: folder)
         do {
             let extResult: ExtendedSearchResult<UID> = try await server.extendedSearch(criteria: [.before(before)], calendar: Self.utcCalendar)
-            return extResult.asSet.toArray()
+            return (try extResult.listed()).toArray()
         } catch {
             let desc = "\(error)"
             if desc.contains("PayloadTooLargeError") {
@@ -7534,11 +7681,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         let normalizedId = EmailFilter.normalizeMessageId(messageId)
         if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] searchByMessageId — searching for '\(normalizedId)'") }
         var ext: ExtendedSearchResult<UID> = try await server.extendedSearch(criteria: [.header("Message-ID", "<\(normalizedId)>")])
-        var results: UIDSet = ext.asSet
+        var results: UIDSet = try ext.listed()
         if results.isEmpty {
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] searchByMessageId — bracket search empty, trying bare") }
             ext = try await server.extendedSearch(criteria: [.header("Message-ID", normalizedId)])
-            results = ext.asSet
+            results = try ext.listed()
         }
         if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] searchByMessageId — '\(normalizedId)' → \(results.isEmpty ? "NOT FOUND" : "\(results.count) UIDs")") }
         return results

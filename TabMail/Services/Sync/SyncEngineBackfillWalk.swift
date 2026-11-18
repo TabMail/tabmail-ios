@@ -1550,7 +1550,6 @@ extension SyncEngine {
                                     guard try Self.writeUIDWalkPosition(
                                         db, folderId: folderId, premiseEpoch: writePremise, position: position, [
                                             Column("backfillComplete").set(to: true),
-                                            Column("lastKnownUidNext").set(to: uidNext),
                                         ]
                                     ) else { return false }
                                     _ = try Self.bootstrapCrawledFolderUidValidity(
@@ -1646,7 +1645,6 @@ extension SyncEngine {
                                 guard try Self.writeUIDWalkPosition(
                                     db, folderId: folderId, premiseEpoch: writePremise, position: position, [
                                         Column("backfillUidCursor").set(to: initialCursor),
-                                        Column("lastKnownUidNext").set(to: uidNext),
                                     ]
                                 ) else { return (landed: false, stamped: false) }
                                 let stamped = try Self.bootstrapCrawledFolderUidValidity(

@@ -25,9 +25,6 @@ actor SyncEngine {
     /// `SyncConfig.catchUpSliceIntervalSeconds`. In memory only; a relaunch starts afresh.
     var catchUpSliceWindowEnds: [String: Date] = [:]
 
-    /// Cached server-reported total message count for Gmail/Exchange accounts.
-    /// Used as progress denominator instead of FTS row count (which grows with crawl).
-    var serverMessageTotal: [String: Int] = [:]
 
     /// Generation counter per account — prevents stale task defer from clearing
     /// a replacement task's dictionary entry after resetCrawlState.
@@ -610,7 +607,7 @@ actor SyncEngine {
         let fullSyncDue = timeSinceFullSync >= fullSyncInterval || listingNeeded
         if fullSyncDue {
             BackgroundSyncLogger.logDebug("[Sync] Full sync due for \(account.emailAddress) (last: \(timeSinceFullSync.isFinite ? "\(Int(timeSinceFullSync))s" : "never"), new bookmark: \(listingNeeded))...")
-            let plan = FullSyncPlan(appliedFolderList: changePass?.appliedFolderList)
+            let plan = FullSyncPlan(appliedFolderList: changePass?.appliedFolderList, deadline: deadline)
             let listing: FullSyncListing
             do {
                 listing = try await queue.execute(priority: .headerFetch) {

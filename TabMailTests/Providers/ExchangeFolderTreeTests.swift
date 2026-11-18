@@ -30,7 +30,7 @@ import Testing
 /// - a folder carries only the properties the request's `$select` names (Use
 ///   query parameters), and the nextLink carries the request's options to the
 ///   following pages.
-@Suite("ExchangeProvider — whole folder tree")
+@Suite("ExchangeProvider — whole folder tree", .serialized, .processGlobalState)
 struct ExchangeFolderTreeTests {
     private struct Node {
         let id: String
@@ -190,6 +190,61 @@ struct ExchangeFolderTreeTests {
         #expect(byId["f-inbox"]?.role == .inbox)
         #expect(byId["f-sent"]?.role == .sent)
         #expect(byId["f-acme-contracts"]?.role == .custom)
+    }
+
+    @Test("progressTotal: not known before any folder list, then the sum of every listed folder's totalItemCount (search folders left out), with no request of its own")
+    func progressTotalIsTheLastFolderListsSum() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let requests = Mutex(0)
+        http.register(path: "/v1.0/me/mailFolders") { request in
+            requests.withLock { $0 += 1 }
+            return Self.serve(request)
+        }
+        let provider = ExchangeProvider(
+            userEmail: "folder-tree@example.com",
+            accessToken: { _ in "fake-graph-token" },
+            session: http.session
+        )
+        #expect(await provider.progressTotal(crawling: true) == .notKnownYet, "no folder list yet: not known")
+        #expect(requests.withLock { $0 } == 0, "asking for the total sends no request")
+        _ = try await provider.fetchFolders()
+        let expected = Self.rootChildren.flatMap(\.subtree).filter { !$0.isSearchFolder }
+            .reduce(0) { $0 + Self.counts($1.id).total }
+        let sent = requests.withLock { $0 }
+        #expect(expected > 0)
+        #expect(await provider.progressTotal(crawling: true) == .messages(expected))
+        #expect(requests.withLock { $0 } == sent, "asking for the total sends no request")
+    }
+
+    @Test("Backfill progress on a new Exchange account: nothing is published before the folder list (never 0, never the row count); after it the denominator is the provider total, folders never listed in the database included")
+    func progressWaitsForTheFolderListThenUsesTheProviderTotal() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        http.register(path: "/v1.0/me/mailFolders", handler: Self.serve)
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let account = try FolderEpochTestFixture.makeAccount(id: "exch-progress", provider: .outlook, pool: pool)
+        // One stored folder, still crawling; every other folder is not in the database.
+        try FolderEpochTestFixture.insertFolder(accountId: account.id, path: "f-inbox", role: .inbox, pool: pool)
+        let provider = ExchangeProvider(
+            userEmail: "folder-tree@example.com", accessToken: { _ in "fake-graph-token" }, session: http.session)
+        let engine = SyncEngine()
+        await engine.register(accountId: account.id, provider: provider,
+                              workQueue: ProviderWorkQueue(provider: provider, maxConcurrency: 1))
+        await AccountManager.shared.clearBackfillProgress(accountId: account.id)
+
+        await engine.updateBackfillProgressForAccount(account)
+        #expect(await AccountManager.shared._backfillBacking[account.id] == nil, "nothing is published before the folder list")
+
+        _ = try await provider.fetchFolders()
+        await engine.updateBackfillProgressForAccount(account)
+        let expected = Self.rootChildren.flatMap(\.subtree).filter { !$0.isSearchFolder }
+            .reduce(0) { $0 + Self.counts($1.id).total }
+        let progress = try #require(await AccountManager.shared._backfillBacking[account.id])
+        #expect(progress.totalEmails == expected, "the provider's total, not the stored folders' counts")
+        #expect(progress.totalEmails > 0)
+        await AccountManager.shared.clearBackfillProgress(accountId: account.id)
     }
 }
 

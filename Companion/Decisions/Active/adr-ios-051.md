@@ -51,3 +51,4 @@
 **Relates:** ADR-IOS-042 (UID not date), ADR-IOS-014 (connection pool / per-batch checkout etiquette), ADR-IOS-041/046 (suspension / abandon-on-suspend), PROJECT_MEMORY "IMAP external-deletion blind spot", the Thunderbird add-on's folder-set reconcile (its counterpart).
 
 ---
+- **Phase 2's count (2026-11-18, #755, ADR-IOS-111 amendment "one writer of folder counters"):** the server count phase 2 compares against is only the count reported by the folder's own window listing in the same pass, never a STATUS count. A folder not listed in the pass, or whose listing proved no count, gets no phase 2 that pass; an unfinished phase 2 keeps the folder's listing due.

@@ -49,17 +49,30 @@ struct SyncModSeqTests {
     @Test("shouldSkipFolderFetch: skips ONLY non-inbox CONDSTORE folders with unchanged modseq")
     func fullSyncSkipDecision() {
         // Unchanged HIGHESTMODSEQ on a non-inbox CONDSTORE folder → skip the re-fetch.
-        #expect(SyncEngine.shouldSkipFolderFetch(role: .sent, freshModSeq: 100, cachedModSeq: 100, isDeepSync: false))
-        #expect(SyncEngine.shouldSkipFolderFetch(role: .archive, freshModSeq: 100, cachedModSeq: 100, isDeepSync: false))
+        #expect(SyncEngine.shouldSkipFolderFetch(role: .sent, freshModSeq: 100, cachedModSeq: 100, isDeepSync: false, freshCount: 5, freshUidNext: 9, listedCount: 5, listedUidNext: 9))
+        #expect(SyncEngine.shouldSkipFolderFetch(role: .archive, freshModSeq: 100, cachedModSeq: 100, isDeepSync: false, freshCount: 5, freshUidNext: 9, listedCount: 5, listedUidNext: 9))
         // Changed modseq → NEVER skip (there's a change to fetch).
-        #expect(!SyncEngine.shouldSkipFolderFetch(role: .sent, freshModSeq: 101, cachedModSeq: 100, isDeepSync: false))
+        #expect(!SyncEngine.shouldSkipFolderFetch(role: .sent, freshModSeq: 101, cachedModSeq: 100, isDeepSync: false, freshCount: 5, freshUidNext: 9, listedCount: 5, listedUidNext: 9))
         // Inbox → NEVER skip, even when unchanged (always fully synced).
-        #expect(!SyncEngine.shouldSkipFolderFetch(role: .inbox, freshModSeq: 100, cachedModSeq: 100, isDeepSync: false))
+        #expect(!SyncEngine.shouldSkipFolderFetch(role: .inbox, freshModSeq: 100, cachedModSeq: 100, isDeepSync: false, freshCount: 5, freshUidNext: 9, listedCount: 5, listedUidNext: 9))
         // Deep pass → NEVER skip (the self-healing net).
-        #expect(!SyncEngine.shouldSkipFolderFetch(role: .sent, freshModSeq: 100, cachedModSeq: 100, isDeepSync: true))
+        #expect(!SyncEngine.shouldSkipFolderFetch(role: .sent, freshModSeq: 100, cachedModSeq: 100, isDeepSync: true, freshCount: 5, freshUidNext: 9, listedCount: 5, listedUidNext: 9))
         // Non-CONDSTORE (nil fresh) or no cursor yet (nil cached) → NEVER skip (fetch, today's behavior).
-        #expect(!SyncEngine.shouldSkipFolderFetch(role: .sent, freshModSeq: nil, cachedModSeq: 100, isDeepSync: false))
-        #expect(!SyncEngine.shouldSkipFolderFetch(role: .sent, freshModSeq: 100, cachedModSeq: nil, isDeepSync: false))
+        #expect(!SyncEngine.shouldSkipFolderFetch(role: .sent, freshModSeq: nil, cachedModSeq: 100, isDeepSync: false, freshCount: 5, freshUidNext: 9, listedCount: 5, listedUidNext: 9))
+        #expect(!SyncEngine.shouldSkipFolderFetch(role: .sent, freshModSeq: 100, cachedModSeq: nil, isDeepSync: false, freshCount: 5, freshUidNext: 9, listedCount: 5, listedUidNext: 9))
+    }
+
+    @Test("shouldSkipFolderFetch: a STATUS count or UIDNEXT unlike the last listing's, or a stored none, lists the folder")
+    func fullSyncSkipBlockedByChangedTrigger() {
+        // A server that does not raise HIGHESTMODSEQ on an expunge: the count moved.
+        #expect(!SyncEngine.shouldSkipFolderFetch(role: .sent, freshModSeq: 100, cachedModSeq: 100, isDeepSync: false,
+                                                  freshCount: 4, freshUidNext: 9, listedCount: 5, listedUidNext: 9))
+        #expect(!SyncEngine.shouldSkipFolderFetch(role: .sent, freshModSeq: 100, cachedModSeq: 100, isDeepSync: false,
+                                                  freshCount: 5, freshUidNext: 10, listedCount: 5, listedUidNext: 9))
+        #expect(!SyncEngine.shouldSkipFolderFetch(role: .sent, freshModSeq: 100, cachedModSeq: 100, isDeepSync: false,
+                                                  freshCount: 5, freshUidNext: 9, listedCount: 5, listedUidNext: nil))
+        #expect(!SyncEngine.shouldSkipFolderFetch(role: .sent, freshModSeq: 100, cachedModSeq: 100, isDeepSync: false,
+                                                  freshCount: 5, freshUidNext: nil, listedCount: 5, listedUidNext: 9))
     }
 
     @Test("fullSyncIsDeepPass: forces a deep (never-skip) pass every Nth call")

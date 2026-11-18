@@ -197,7 +197,7 @@ enum NSEIMAPConnection {
             let ext: ExtendedSearchResult<UID> = try await server.extendedSearch(
                 criteria: [.header("Message-ID", "<\(normalized)>")]
             )
-            let bracketed: UIDSet = ext.asSet
+            let bracketed: UIDSet = try ext.listed()
             if !bracketed.isEmpty { return bracketed }
         } catch {
             NSELog.step("NSE IMAP SEARCH (bracketed) failed: \(String(describing: error))")
@@ -207,7 +207,7 @@ enum NSEIMAPConnection {
             let ext: ExtendedSearchResult<UID> = try await server.extendedSearch(
                 criteria: [.header("Message-ID", normalized)]
             )
-            return ext.asSet
+            return try ext.listed()
         } catch {
             NSELog.step("NSE IMAP SEARCH (bare) failed: \(String(describing: error))")
             return nil

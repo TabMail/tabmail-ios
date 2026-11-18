@@ -52,12 +52,19 @@ struct DeletionReconcileOutcome: Sendable, Equatable {
     /// every other abort cause, including "uidValidity unreported" — an unknown is
     /// not a turnover and must not purge a folder.
     var uidValidityMismatch: (expected: UInt32, observed: UInt32)?
+    /// Ghosts the server proved gone that a shield (a pending or recent user
+    /// action) kept back this walk.
+    var shieldedCount = 0
+
+    /// Every chunk searched, nothing stopped the walk, nothing kept back.
+    var finished: Bool { !aborted && failedChunks == 0 && shieldedCount == 0 }
 
     static func == (lhs: DeletionReconcileOutcome, rhs: DeletionReconcileOutcome) -> Bool {
         lhs.deletedCount == rhs.deletedCount &&
         lhs.failedChunks == rhs.failedChunks &&
         lhs.searchedChunks == rhs.searchedChunks &&
         lhs.aborted == rhs.aborted &&
+        lhs.shieldedCount == rhs.shieldedCount &&
         lhs.abortReason == rhs.abortReason &&
         lhs.uidValidityMismatch?.expected == rhs.uidValidityMismatch?.expected &&
         lhs.uidValidityMismatch?.observed == rhs.uidValidityMismatch?.observed
@@ -155,7 +162,8 @@ extension SyncEngine {
         maxDeletions: Int,
         interChunkDelaySeconds: TimeInterval,
         search: @Sendable ([UInt32]) async throws -> UIDExistenceResult,
-        deleteGhosts: @Sendable ([UInt32]) async throws -> Int
+        deleteGhosts: @Sendable ([UInt32]) async throws -> Int,
+        outOfTime: @Sendable () -> Bool = { false }
     ) async -> DeletionReconcileOutcome {
         var outcome = DeletionReconcileOutcome()
         guard let expectedValidity = knownUidValidity(storedUidValidity)
@@ -170,6 +178,13 @@ extension SyncEngine {
             if Task.isCancelled {
                 outcome.aborted = true
                 outcome.abortReason = "cancelled"
+                break
+            }
+            // A walk run by a pass with a deadline stops at it: the folder stays
+            // due for its next listing, and nothing unchecked is deleted.
+            if outOfTime() {
+                outcome.aborted = true
+                outcome.abortReason = "out of time"
                 break
             }
 
@@ -260,7 +275,9 @@ extension SyncEngine {
                     break
                 }
                 do {
-                    outcome.deletedCount += try await deleteGhosts(ghosts)
+                    let deleted = try await deleteGhosts(ghosts)
+                    outcome.deletedCount += deleted
+                    outcome.shieldedCount += max(0, ghosts.count - deleted)
                 } catch {
                     // DB write failure (e.g. suspension) — abandon the walk and
                     // retry on the next trigger (ADR-IOS-046 abandon-on-suspend).
@@ -471,11 +488,70 @@ extension SyncEngine {
     /// may never delete more than this plus `SyncConfig
     /// .deletionReconcileCapSlack` (circuit breaker; see
     /// `runDeletionReconcileWalk`).
-    func reconcileExternallyDeletedMessages(folder: Folder, provider: any EmailProvider, expectedGhosts: Int) async {
-        guard let workQueue = workQueues[folder.accountId] else { return }
+    /// ADR-IOS-051 phase 2 on one folder whose listing just ran: the live local
+    /// count against `serverCount`, that listing's own count, and the walk when
+    /// they disagree. A walk that does not bring the count right (a failed
+    /// SEARCH, an abort, a ghost a shield protects) leaves the folder's listing
+    /// due (`FolderChangeState.listingDue`), so the next pass lists it again and
+    /// gives phase 2 a fresh same-pass count; one that does clears it (#755).
+    /// `deadline`: the pass's own deadline, when it has one. The walk stops there
+    /// and the folder stays due; a pass holding the account's turn is bounded.
+    ///
+    /// The folder is marked due BEFORE the walk and cleared only by a walk that
+    /// finished (every chunk searched, none failed, nothing kept back by a
+    /// shield) and left the counts agreeing: a walk cut short, or a local count
+    /// that agrees only because a user action moved a different row away, never
+    /// clears it.
+    func reconcileDeletionsAfterListing(folder: Folder, provider: any EmailProvider, serverCount: Int, logPrefix: String, deadline: Date? = nil) async {
+        let folderId = folder.id
+        func localCount() async throws -> Int {
+            try await dbPool.read { db in try MessageHeader.filter(Column("folderId") == folderId).fetchCount(db) }
+        }
+        func writeDue(_ due: Bool) async throws {
+            try await dbPool.write { db in
+                guard let raw = try Row.fetchOne(db, sql: "SELECT changeState FROM folder WHERE id = ?", arguments: [folderId]) else { return }
+                var state = FolderChangeState(raw: raw["changeState"])
+                guard state.listingDue != due else { return }
+                state.listingDue = due
+                try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [state.encoded, folderId])
+            }
+        }
+        do {
+            let before = try await localCount()
+            var walkFinished = true
+            if Self.shouldReconcileDeletions(
+                localCount: before, serverCount: serverCount, tolerance: SyncConfig.deletionReconcileCountTolerance) {
+                try await writeDue(true)
+                if let deadline, Date() >= deadline {
+                    walkFinished = false
+                } else {
+                    if DebugModeManager.isLoggingEnabled() {
+                        BackgroundSyncLogger.logDebug("\(logPrefix) \(folder.name): local=\(before) > server=\(serverCount) — reconciling external deletions")
+                    }
+                    walkFinished = await reconcileExternallyDeletedMessages(
+                        folder: folder, provider: provider, expectedGhosts: before - serverCount, deadline: deadline)
+                }
+            }
+            let after = try await localCount()
+            let unresolved = !walkFinished || Self.shouldReconcileDeletions(
+                localCount: after, serverCount: serverCount, tolerance: SyncConfig.deletionReconcileCountTolerance)
+            try await writeDue(unresolved)
+        } catch {
+            // Best effort: the evidence is durable and re-fires next sync.
+            if DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("\(logPrefix) reconcile trigger check failed for \(folder.name): \(error)")
+            }
+        }
+    }
+
+    /// True when the walk finished (`DeletionReconcileOutcome.finished`), or
+    /// there was nothing to walk.
+    @discardableResult
+    func reconcileExternallyDeletedMessages(folder: Folder, provider: any EmailProvider, expectedGhosts: Int, deadline: Date? = nil) async -> Bool {
+        guard let workQueue = workQueues[folder.accountId] else { return false }
         // Synchronous check-and-insert (no suspension point) — race-free under
         // actor reentrancy; prevents overlapping walks for the same folder.
-        guard !deletionReconcileInFlight.contains(folder.id) else { return }
+        guard !deletionReconcileInFlight.contains(folder.id) else { return false }
         deletionReconcileInFlight.insert(folder.id)
         defer { deletionReconcileInFlight.remove(folder.id) }
 
@@ -497,9 +573,9 @@ extension SyncEngine {
             if DebugModeManager.isLoggingEnabled() {
                 BackgroundSyncLogger.logDebug("[Reconcile] \(folder.name): snapshot read failed: \(error)")
             }
-            return
+            return false
         }
-        guard !snapshot.uids.isEmpty else { return }
+        guard !snapshot.uids.isEmpty else { return true }
 
         let maxDeletions = max(expectedGhosts, 0) + SyncConfig.deletionReconcileCapSlack
         if DebugModeManager.isLoggingEnabled() {
@@ -532,7 +608,8 @@ extension SyncEngine {
                 try await self.deleteServerConfirmedDeletions(
                     folder: capturedFolder, ids: ghosts.map(String.init), reason: "reconcile walk"
                 )
-            }
+            },
+            outOfTime: { deadline.map { Date() >= $0 } ?? false }
         )
 
         if DebugModeManager.isLoggingEnabled() {
@@ -554,6 +631,7 @@ extension SyncEngine {
                 storedValue: mismatch.expected, observedValue: mismatch.observed
             )
         }
+        return outcome.finished
     }
 
     // ⚠ `persistFolderUidValidity(folderId:uidValidity:)` USED TO LIVE HERE and is

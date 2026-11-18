@@ -464,6 +464,12 @@ extension AccountManager {
                                 BackgroundSyncLogger.logDebug("[SyncFolders] SELECT failed for \(folder.name) — skipping")
                                 continue
                             }
+                            // A listing whose empty count the server did not confirm
+                            // (#755): this folder only; it is listed again on the next pass.
+                            if error is ProviderListingUnconfirmed {
+                                BackgroundSyncLogger.logDebug("[SyncFolders] listing count unconfirmed for \(folder.name) — skipping")
+                                continue
+                            }
                             // A 404/410 here is a folder the server no longer has (a label or
                             // folder deleted elsewhere); a message that is gone is absorbed
                             // inside the listing (Gmail's per-message read; Outlook lists
