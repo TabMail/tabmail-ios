@@ -323,9 +323,35 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
             return abs(velocity.x) > abs(velocity.y) && shouldBegin(velocity.x)
         }
 
+        /// Runs alongside everything but the navigation pop: a drag that starts on a bubble moves
+        /// only the bubble, never the whole screen back (as in Messages).
         func gestureRecognizer(_ recognizer: UIGestureRecognizer,
                                shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
-            true
+            !Self.isNavigationPop(other, near: recognizer.view)
+        }
+
+        /// The pop from anywhere on the screen waits until the swipe's pan fails, so it takes only
+        /// drags the swipe turned down. The edge back swipe keeps its own start at the screen edge.
+        func gestureRecognizer(_ recognizer: UIGestureRecognizer,
+                               shouldBeRequiredToFailBy other: UIGestureRecognizer) -> Bool {
+            guard let nav = Self.navigationController(of: recognizer.view) else { return false }
+            return other === nav.interactiveContentPopGestureRecognizer
+        }
+
+        /// Whether `other` is a back gesture of the navigation controller showing `view`.
+        static func isNavigationPop(_ other: UIGestureRecognizer, near view: UIView?) -> Bool {
+            guard let nav = navigationController(of: view) else { return false }
+            return other === nav.interactiveContentPopGestureRecognizer || other === nav.interactivePopGestureRecognizer
+        }
+
+        /// The nearest navigation controller up `view`'s responder chain.
+        static func navigationController(of view: UIView?) -> UINavigationController? {
+            var responder: UIResponder? = view
+            while let current = responder {
+                if let nav = current as? UINavigationController { return nav }
+                responder = current.next
+            }
+            return nil
         }
     }
 }
