@@ -247,7 +247,8 @@ struct DictationLongDictationTests {
         polishTimeout: Duration = .seconds(5),
         deadline: Duration = DictationConfig.transcriptionDeadline,
         smartDictation: Bool = true,
-        wordFrequencies: @escaping DictationController.ScreenWordFrequencies = { _ in [:] }
+        wordFrequencies: @escaping DictationController.ScreenWordFrequencies = { _ in [:] },
+        transcribe: DictationController.Transcribe? = nil
     ) -> DictationController {
         DictationController(
             capture: capture,
@@ -261,7 +262,7 @@ struct DictationLongDictationTests {
             emailBody: emailBody,
             corrections: nil,
             useWords: useWords,
-            transcribe: { flac, language, vocabulary, cleanup in try await backend.transcribe(flac, language: language, vocabulary: vocabulary, cleanup: cleanup) },
+            transcribe: transcribe ?? { flac, language, vocabulary, cleanup in try await backend.transcribe(flac, language: language, vocabulary: vocabulary, cleanup: cleanup) },
             warmUp: {},
             polish: { text, cleanup in try await polisher.polish(text, cleanup: cleanup) },
             chunkPolishTimeout: polishTimeout,
@@ -787,6 +788,35 @@ struct DictationLongDictationTests {
         await waitUntil { controller.phase == .idle }
 
         #expect(pasted.texts.withLock { $0 } == ["Part 0. Part 1."])
+    }
+
+    /// Turning AI off (Settings → Opt Out of AI) while a chunk is out stops the dictation's requests:
+    /// the chunk, which then fails on the server's side, is not tried again, and nothing after it is
+    /// sent. The dictation ends as one whose first chunk gave up, with nothing pasted.
+    @Test func noChunkIsSentOnceAIIsTurnedOff() async {
+        let setting = AISettingSwitch()
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        http.register(path: DictationConfig.transcribePath, method: "POST") { _ in
+            setting.turnOff()
+            return .json(raw: "", statusCode: 502)
+        }
+        let capture = SpeakingCapture()
+        let client = BackendClient(llmSession: http.session, isAIOff: { setting.isOff })
+        let controller = controller(capture, ChunkBackend(), transcribe: DictationController.backendTranscription(client))
+        await start(controller, capture)
+
+        var random = Audio.Random(seed: 11)
+        capture.feed(Audio.speech(12, &random) + Audio.room(1.5, &random))
+        await waitUntil { !http.recordedCalls().isEmpty }
+        // Far past the retry delay (1 ms): a retry would be out by now.
+        try? await Task.sleep(for: .milliseconds(300))
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+
+        #expect(controller.phase == .idle)
+        #expect(http.recordedCalls().count == 1)
+        #expect(pasted.texts.withLock { $0 }.isEmpty)
     }
 
     /// At the release, a chunk still failing stops waiting and gets its last tries at once, as one

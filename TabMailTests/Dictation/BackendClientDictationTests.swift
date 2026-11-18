@@ -19,7 +19,7 @@ struct BackendClientDictationTests {
             return .json(raw: #"{"text":"ask jordan about the road map"}"#)
         }
 
-        let transcription = try await BackendClient(llmSession: http.session).transcribeDictation(flac: flac, language: nil, vocabulary: [])
+        let transcription = try await BackendClient(llmSession: http.session, isAIOff: { false }).transcribeDictation(flac: flac, language: nil, vocabulary: [])
 
         // No cleanup asked for, none returned.
         #expect(transcription == DictationTranscription(text: "ask jordan about the road map", cleanedText: nil))
@@ -41,7 +41,7 @@ struct BackendClientDictationTests {
             return .json(raw: #"{"text":"annyeong"}"#)
         }
 
-        _ = try await BackendClient(llmSession: http.session).transcribeDictation(flac: flac, language: "ko", vocabulary: [])
+        _ = try await BackendClient(llmSession: http.session, isAIOff: { false }).transcribeDictation(flac: flac, language: "ko", vocabulary: [])
 
         let request = try #require(seen.withLock { $0 })
         let body = try #require(request.body.flatMap { try JSONSerialization.jsonObject(with: $0) as? [String: String] })
@@ -58,7 +58,7 @@ struct BackendClientDictationTests {
             return .json(raw: #"{"text":"ask Xyvora"}"#)
         }
 
-        _ = try await BackendClient(llmSession: http.session).transcribeDictation(flac: flac, language: nil, vocabulary: ["Xyvora", "Kaelthorne Drake"])
+        _ = try await BackendClient(llmSession: http.session, isAIOff: { false }).transcribeDictation(flac: flac, language: nil, vocabulary: ["Xyvora", "Kaelthorne Drake"])
 
         let request = try #require(seen.withLock { $0 })
         let body = try #require(request.body.flatMap { try JSONSerialization.jsonObject(with: $0) as? [String: Any] })
@@ -77,7 +77,7 @@ struct BackendClientDictationTests {
         }
         let cleanup = DictationCleanup.variables(context: DictationContext(windowTitle: "Chat", screenText: "» ‸"), dictionary: ["Xyvora"])
 
-        let transcription = try await BackendClient(llmSession: http.session).transcribeDictation(flac: flac, language: nil, vocabulary: [], cleanup: cleanup)
+        let transcription = try await BackendClient(llmSession: http.session, isAIOff: { false }).transcribeDictation(flac: flac, language: nil, vocabulary: [], cleanup: cleanup)
 
         #expect(transcription == DictationTranscription(text: "ask jordan", cleanedText: "Ask Jordan."))
         let request = try #require(seen.withLock { $0 })
@@ -96,7 +96,7 @@ struct BackendClientDictationTests {
         http.register(path: "/dictation/transcribe", method: "POST", response: .json(raw: raw))
         let cleanup = DictationCleanup.variables(context: DictationContext(windowTitle: "Chat", screenText: "» ‸"), dictionary: [])
 
-        let transcription = try await BackendClient(llmSession: http.session).transcribeDictation(flac: flac, language: nil, vocabulary: [], cleanup: cleanup)
+        let transcription = try await BackendClient(llmSession: http.session, isAIOff: { false }).transcribeDictation(flac: flac, language: nil, vocabulary: [], cleanup: cleanup)
 
         #expect(transcription == DictationTranscription(text: "ask jordan", cleanedText: cleanedText))
     }
@@ -119,7 +119,7 @@ struct BackendClientDictationTests {
         http.register(path: "/dictation/transcribe", method: "POST", response: .json(raw: body, statusCode: status))
 
         await #expect(throws: expected) {
-            _ = try await BackendClient(llmSession: http.session).transcribeDictation(flac: flac, language: nil, vocabulary: [])
+            _ = try await BackendClient(llmSession: http.session, isAIOff: { false }).transcribeDictation(flac: flac, language: nil, vocabulary: [])
         }
     }
 
@@ -135,7 +135,7 @@ struct BackendClientDictationTests {
             seen.withLock { $0 = request }
             return .bytes(Data(stream.utf8), contentType: "text/event-stream")
         }
-        let polish = await DictationController.backendPolish(BackendClient(llmSession: http.session))
+        let polish = await DictationController.backendPolish(BackendClient(llmSession: http.session, isAIOff: { false }))
 
         let reply = try await polish("Part one. Part two.", ["app_name": "Chat", "dictionary": "Xyvora"])
 

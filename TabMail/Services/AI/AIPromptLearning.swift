@@ -306,6 +306,9 @@ extension AIService {
             }
             return Self.compactResult(outcome, opsCount: opsCount)
 
+        } catch is AIOffError {
+            // AI was turned off before the request was sent: end as the check above does.
+            return .skipped(reason: "AI is disabled")
         } catch {
             if DebugModeManager.isLoggingEnabled() {
                 BackgroundSyncLogger.logDebug("[AIService] compactActionRules: ERROR \(error)")
