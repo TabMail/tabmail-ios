@@ -406,8 +406,10 @@ struct ChatReplyFieldTests {
         #expect(Self.count("composeEnded(.", in: text) == 0 && Self.count("{ _ in composeEnded", in: text) == 0)
         // The AI Suggestion's card is not a send from the field: its outcome leaves the field's
         // words alone (a completion with no field send would empty them).
-        #expect(Self.count("ready.compose.composeView(replyTo: ready.message, onAgentOutcome: { _ in })", in: text) == 1,
-                "the suggestion's compose never completes the field")
+        #expect(Self.count("ready.compose.composeView( replyTo: ready.message, suggestedBody: ready.message.cachedReply, onAgentOutcome: { _ in })", in: text) == 1,
+                "the card holds the tapped row's reply and never completes the field")
+        #expect(Self.count("@State private var example = ChatSuggestionConfig.randomExample()", in: text) == 1,
+                "one example per chat open, kept across redraws")
         #expect(Self.count("composeEnded(", in: text) == 2, "only agent compose cards end through it")
         // Who the reply goes to and whose turn it is decide whether the suggestion shows.
         #expect(Self.count("let usersTurn = (thread.items.last?.isOwn ?? false) || !unsentReplies.isEmpty", in: text) == 1)
@@ -424,6 +426,31 @@ struct ChatReplyFieldTests {
         #expect(Self.count("unsentReplies = ", in: text) == 1, "nothing else writes them")
         #expect(Self.count("ChatUnsentReplyBubble(reply: reply, retry: { reply.retry() }, delete: { reply.delete() })", in: text) == 1,
                 "a failed send's Retry and Delete act on its own row")
+    }
+
+    @Test("The ghost is dashed and captioned in one button; the e.g. line hides while dictating; compose's stored edits refresh the chat")
+    func suggestionLookWiring() throws {
+        let bubble = try Self.source("TabMail/Views/Chat/ChatBubbleView.swift")
+        let ghost = try #require(bubble.range(of: "struct ChatSuggestionBubble: View {")
+            .flatMap { start in bubble[start.lowerBound...].range(of: "struct ChatUnsentReplyBubble").map { String(bubble[start.lowerBound..<$0.lowerBound]) } })
+        #expect(Self.count("lineWidth: ChatViewLayout.suggestionStrokeWidth, dash: ChatViewLayout.suggestionDash))", in: ghost) == 1, "a dashed outline")
+        #expect(Self.count(".background(", in: ghost) == 0 && Self.count(".fill(", in: ghost) == 0, "on a clear bubble")
+        #expect(Self.count("Text(ChatSuggestionConfig.statusLine)", in: ghost) == 1, "the caption shows")
+        // The caption sits inside the button's label, so it takes the tap too.
+        let button = try #require(ghost.range(of: "Button(action: onTap) {"))
+        let caption = try #require(ghost.range(of: "Text(ChatSuggestionConfig.statusLine)"))
+        let style = try #require(ghost.range(of: ".buttonStyle(.plain)"))
+        #expect(button.upperBound <= caption.lowerBound && caption.upperBound <= style.lowerBound)
+        #expect(Self.count("if pulses { TutorialPulseRing(", in: ghost) == 1, "the tutorial rings it")
+        #expect(ChatViewLayout.suggestionDash.count == 2 && ChatViewLayout.suggestionDash.allSatisfy { $0 > 0 }, "the dash is a dash")
+
+        let field = try Self.source("TabMail/Views/Inbox/DynamicIslandChat+ReplyField.swift")
+        #expect(Self.count("hasTabMailSession && inputText.isEmpty && !isDictating", in: field) == 1,
+                "the e.g. line shows only on an empty, signed-in field, never while dictating")
+
+        let compose = try Self.source("TabMail/Views/Compose/ComposeView.swift")
+        #expect(Self.count("if outcome == .written { await postMessageDataDidChange(reply.id) }", in: compose) == 2,
+                "both the edit and the Recompute writer refresh an open chat after a stored write")
     }
 
     // MARK: - 6b. Reply All is recorded exactly when the reply goes to the chat's whole audience

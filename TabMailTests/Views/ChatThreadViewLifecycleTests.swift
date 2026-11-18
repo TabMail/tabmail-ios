@@ -28,7 +28,7 @@ import UIKit
 ///     chat had read.
 ///  6. At the bottom, the AI Suggestion sits where the reply lands once sent: under the newest
 ///     bubble and above the reply field, short or long, and the field never holds it.
-///  7. No AI Suggestion is offered on the user's turn (owner 2026-11-07): while a reply of theirs is
+///  7. No AI Suggestion is offered on the user's turn: while a reply of theirs is
 ///     in the outbox (offline it may stay there for long) and once it is sent, until an email from
 ///     someone else arrives; that email's own AI Suggestion then shows. (The Sending bubble itself:
 ///     `ChatSendingBubbleTests`.)
@@ -618,11 +618,12 @@ struct ChatThreadViewLifecycleTests {
 
     /// Opens the all-read thread, signed in, with `ready` as the newest email's AI Suggestion, and reads
     /// the bottom once the scroll and the field have not moved for a while.
-    private func bottom(ready: String) async throws -> Bottom {
-        try await HostedAccessibility.withAutomation { try await bottomWithAutomation(ready: ready) }
+    /// `typed`: words the user types in the field once it shows, to make it grow.
+    private func bottom(ready: String, typed: String? = nil) async throws -> Bottom {
+        try await HostedAccessibility.withAutomation { try await bottomWithAutomation(ready: ready, typed: typed) }
     }
 
-    private func bottomWithAutomation(ready: String) async throws -> Bottom {
+    private func bottomWithAutomation(ready: String, typed: String?) async throws -> Bottom {
         let saved = ChatSummaryQueueTests.SavedChatViewState()
         let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
         let queue = ActiveAIQueue.shared
@@ -653,8 +654,15 @@ struct ChatThreadViewLifecycleTests {
 
         var last: Bottom?
         var stableFor = 0
+        var typedIn = typed == nil
         for _ in 0..<120 where stableFor < 6 {
             try await Task.sleep(for: .milliseconds(100))
+            if !typedIn, let typed, let field = Self.textViews(controller.view).first(where: \.isEditable) {
+                field.text = typed
+                field.delegate?.textViewDidChange?(field)
+                typedIn = true
+                continue
+            }
             guard let scroll = Self.scrollViews(controller.view).max(by: { $0.contentSize.height < $1.contentSize.height }),
                   let field = Self.textViews(controller.view).first,
                   let ghost = Self.ghosts(in: controller.view).first(where: { $0.text == ready }),
@@ -691,6 +699,20 @@ struct ChatThreadViewLifecycleTests {
         }
         // On the user's side, where their reply lands once sent.
         #expect(short.ghost.midX > 393 / 2, "on the right: \(short.ghost)")
+    }
+
+    @Test("At the bottom, the newest bubble and the AI Suggestion stay above the field however tall a typed draft grows it")
+    func newestBubbleClearsATallField() async throws {
+        let ready = "Sounds good."
+        let short = try await bottom(ready: ready)
+        let draft = (1...6).map { "Line \($0) of what I want to say." }.joined(separator: "\n")
+        let tall = try await bottom(ready: ready, typed: draft)
+        #expect(tall.fieldTexts.contains(draft), "control: the typed draft is in the field: \(tall.fieldTexts)")
+        let fieldRise = short.fieldTop - tall.fieldTop
+        #expect(fieldRise > 40, "control: the draft grows the field, by \(fieldRise)")
+        #expect(abs(tall.belowScreen) < 2, "still at the bottom: \(tall.belowScreen)")
+        #expect(tall.newestBottom <= tall.ghost.minY && tall.ghost.maxY <= tall.fieldTop,
+                "the newest bubble, then the suggestion, both above the grown field: \(tall)")
     }
 
     /// Holds the first context read that reaches the body table, on its reader thread, until

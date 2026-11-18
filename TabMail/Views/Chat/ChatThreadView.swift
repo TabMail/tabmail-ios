@@ -260,10 +260,12 @@ struct ChatThreadView: View {
             .presentationDragIndicator(.visible)
         }
         .fullScreenCover(item: $readyReply) { ready in
-            // Today's Reply All compose, with the AI Suggestion in its box. It leaves the field
-            // alone: the field's words are not what it sends, and a sent reply retires the
+            // Today's Reply All compose, with the AI Suggestion in its box: the full reply of the
+            // row the ghost showed, read with it, so the card holds the reply that was tapped. It
+            // leaves the field alone: the field's words are not what it sends, and a sent reply retires the
             // suggestion through the outbox.
-            ready.compose.composeView(replyTo: ready.message, onAgentOutcome: { _ in })
+            ready.compose.composeView(
+                replyTo: ready.message, suggestedBody: ready.message.cachedReply, onAgentOutcome: { _ in })
         }
         .fullScreenCover(item: $agentCompose) { composeView(for: $0) }
         .fullScreenCover(item: $forwardMessage) { ComposeView(replyTo: $0, isForward: true) }
