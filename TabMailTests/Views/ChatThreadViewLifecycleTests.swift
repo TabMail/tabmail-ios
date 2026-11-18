@@ -26,11 +26,11 @@ import UIKit
 ///  5. An email that joins the open chat is its newest and asks for its summary, first. A draft
 ///     that joins is not the chat's and never asks, from any account, whatever folders the
 ///     chat had read.
-///  6. At the bottom, the newest bubble stays above the reply field however tall the field grows,
-///     a six-line ready AI Reply included.
-///  7. No AI Reply is offered on the user's turn (owner 2026-11-07): while a reply of theirs is in
-///     the outbox (offline it may stay there for long) and once it is sent, until an email from
-///     someone else arrives; that email's own AI Reply then shows. (The Sending bubble itself:
+///  6. At the bottom, the AI Suggestion sits where the reply lands once sent: under the newest
+///     bubble and above the reply field, short or long, and the field never holds it.
+///  7. No AI Suggestion is offered on the user's turn (owner 2026-11-07): while a reply of theirs is
+///     in the outbox (offline it may stay there for long) and once it is sent, until an email from
+///     someone else arrives; that email's own AI Suggestion then shows. (The Sending bubble itself:
 ///     `ChatSendingBubbleTests`.)
 ///
 /// What was asked is read back from the summary queue; which rows are on screen is read from the
@@ -49,7 +49,7 @@ struct ChatThreadViewLifecycleTests {
 
     /// A 40-email chain, e0 (oldest) to e39 (newest), all in the Inbox with their bodies and no
     /// summaries, ten minutes apart (no time stamps between them). `unreadFrom`: emails from this
-    /// index on are unread. `newestReady`: the newest email's ready AI Reply.
+    /// index on are unread. `newestReady`: the newest email's ready AI Suggestion.
     /// `tall`: this email's bubble holds `tallText`, many times the screen's height, with no summary
     /// stored yet, so it still asks for one.
     private static func insertThread(unreadFrom: Int?, newestReady: String? = nil, tall: Int? = nil, pool: DatabasePool) throws -> [MessageHeader] {
@@ -586,7 +586,7 @@ struct ChatThreadViewLifecycleTests {
         Self.expectOpenRequest(opened)
     }
 
-    // MARK: - 6. The field never covers the newest bubble
+    // MARK: - 6. The AI Suggestion sits at the sent position, above the field
 
     private struct Bottom: Equatable {
         /// The chat's scrollable height: the bubbles, then the room kept under the last one.
@@ -595,14 +595,28 @@ struct ChatThreadViewLifecycleTests {
         let fieldTop: CGFloat
         /// The bottom of the newest email's bubble, on screen.
         let newestBottom: CGFloat
+        /// The AI Suggestion's frame, on screen.
+        let ghost: CGRect
         let belowScreen: CGFloat
+        /// The texts of the native editable fields.
+        let fieldTexts: [String]
+    }
+
+    /// The AI Suggestions on screen: their frames and texts, read from their accessibility.
+    private static func ghosts(in view: UIView) -> [(text: String, frame: CGRect)] {
+        HostedAccessibility.elements(under: view).compactMap { element in
+            guard HostedAccessibility.identifier(of: element) == ChatSuggestionBubble.bubbleId,
+                  let label = element.accessibilityLabel,
+                  label.hasPrefix("\(ChatSuggestionConfig.label): ") else { return nil }
+            return (String(label.dropFirst(ChatSuggestionConfig.label.count + 2)), element.accessibilityFrame)
+        }
     }
 
     private static func textViews(_ view: UIView) -> [UITextView] {
         ((view as? UITextView).map { [$0] } ?? []) + view.subviews.flatMap { textViews($0) }
     }
 
-    /// Opens the all-read thread, signed in, with `ready` as the newest email's AI Reply, and reads
+    /// Opens the all-read thread, signed in, with `ready` as the newest email's AI Suggestion, and reads
     /// the bottom once the scroll and the field have not moved for a while.
     private func bottom(ready: String) async throws -> Bottom {
         try await HostedAccessibility.withAutomation { try await bottomWithAutomation(ready: ready) }
@@ -642,7 +656,8 @@ struct ChatThreadViewLifecycleTests {
         for _ in 0..<120 where stableFor < 6 {
             try await Task.sleep(for: .milliseconds(100))
             guard let scroll = Self.scrollViews(controller.view).max(by: { $0.contentSize.height < $1.contentSize.height }),
-                  let field = Self.textViews(controller.view).first(where: { $0.text == ready }),
+                  let field = Self.textViews(controller.view).first,
+                  let ghost = Self.ghosts(in: controller.view).first(where: { $0.text == ready }),
                   let newestBubble = Self.bubbleFrames(in: controller.view).first(where: { $0.index == Self.length - 1 }) else {
                 stableFor = 0
                 continue
@@ -650,29 +665,32 @@ struct ChatThreadViewLifecycleTests {
             let now = Bottom(contentHeight: scroll.contentSize.height,
                              fieldTop: field.convert(field.bounds, to: nil).minY,
                              newestBottom: newestBubble.frame.maxY,
-                             belowScreen: Self.below(scroll))
+                             ghost: ghost.frame,
+                             belowScreen: Self.below(scroll),
+                             fieldTexts: Self.textViews(controller.view).map(\.text))
             stableFor = now == last ? stableFor + 1 : 0
             last = now
         }
         await queue.clearForTesting()
         await queue.setDispatchSuppressedForTesting(false)
-        try #require(stableFor >= 6, "the chat and its field settle, got \(String(describing: last))")
+        try #require(stableFor >= 6, "the chat, its AI Suggestion and its field settle, got \(String(describing: last))")
         return try #require(last)
     }
 
-    @Test("At the bottom, the newest bubble stays above the reply field, a six-line ready AI Reply included")
-    func newestBubbleClearsATallField() async throws {
+    @Test("At the bottom, the AI Suggestion sits under the newest bubble and above the field, short or long")
+    func suggestionSitsAtTheSentPosition() async throws {
         let short = try await bottom(ready: "Sounds good.")
         let long = try await bottom(ready: "Thanks for sending the detailed schedule, I can attend the planning session on Tuesday afternoon and will bring the updated budget numbers, the contractor estimates and the notes from our last discussion. I will also check the two open questions with the team beforehand and send the revised agenda by Monday so everyone has time to review it.")
         #expect(abs(short.belowScreen) < 2 && abs(long.belowScreen) < 2,
                 "both open at the bottom: \(short.belowScreen), \(long.belowScreen)")
-        // What the user sees: the newest bubble ends above the field's text in both chats. The text
-        // rises a little more than the field around it (one line sits centred in the field's
-        // starting height), so the bubble is compared with the text, not with the field's growth.
-        let fieldRise = short.fieldTop - long.fieldTop
-        #expect(fieldRise > 40, "control: the long reply grows the field, by \(fieldRise)")
-        #expect(short.newestBottom <= short.fieldTop && long.newestBottom <= long.fieldTop,
-                "the newest bubble stays above the field: \(short.newestBottom) over \(short.fieldTop), \(long.newestBottom) over \(long.fieldTop)")
+        #expect(long.ghost.height > short.ghost.height + 40, "control: the long suggestion is taller, \(short.ghost) vs \(long.ghost)")
+        for bottom in [short, long] {
+            #expect(bottom.newestBottom <= bottom.ghost.minY, "the suggestion is under the newest email: \(bottom)")
+            #expect(bottom.ghost.maxY <= bottom.fieldTop, "and above the field, never under it: \(bottom)")
+            #expect(bottom.fieldTexts.allSatisfy { $0.isEmpty }, "the field never holds it: \(bottom.fieldTexts)")
+        }
+        // On the user's side, where their reply lands once sent.
+        #expect(short.ghost.midX > 393 / 2, "on the right: \(short.ghost)")
     }
 
     /// Holds the first context read that reaches the body table, on its reader thread, until
@@ -786,7 +804,7 @@ struct ChatThreadViewLifecycleTests {
 
     // MARK: - 7. The user's turn
 
-    @Test("While a reply is in the outbox and once it is sent, no AI Reply shows, until someone else's email arrives")
+    @Test("While a reply is in the outbox and once it is sent, no AI Suggestion shows, until someone else's email arrives")
     func sentReplyTakesTheTurn() async throws {
         try await HostedAccessibility.withAutomation { try await sentReplyTakesTheTurnBody() }
     }
@@ -849,12 +867,12 @@ struct ChatThreadViewLifecycleTests {
             window.isHidden = true
             window.rootViewController = nil
         }
-        func fieldTexts() -> [String] { Self.textViews(controller.view).map(\.text) }
+        func ghostTexts() -> [String] { Self.ghosts(in: controller.view).map(\.text) }
         func waitFor(_ done: () -> Bool) async throws {
             for _ in 0..<60 where !done() { try await Task.sleep(for: .milliseconds(100)) }
         }
-        try await waitFor { fieldTexts().contains(ready) }
-        #expect(fieldTexts().contains(ready), "control: the field offers the AI Reply on the sender's turn: \(fieldTexts())")
+        try await waitFor { ghostTexts().contains(ready) }
+        #expect(ghostTexts().contains(ready), "control: the chat offers the AI Suggestion on the sender's turn: \(ghostTexts())")
 
         // A reply to it is queued, as the compose card queues it.
         let queued = try await AccountManager.persistQueuedSend(
@@ -863,11 +881,11 @@ struct ChatThreadViewLifecycleTests {
             accountId: Self.account, replyToHeaderId: parent.id, isForward: false, serverDraftId: nil,
             draftId: "turn-draft", instanceEpoch: "E1")
         let sentId = try #require(try await pool.read { try OutboxMessage.fetchOne($0, key: queued.outboxId)?.sentMessageId })
-        try await waitFor { !fieldTexts().contains(ready) }
+        try await waitFor { !ghostTexts().contains(ready) }
         // Offline, the email stays in the outbox: the field stays without a suggestion.
         try await Task.sleep(for: .milliseconds(1500))
-        #expect(!fieldTexts().isEmpty, "control: the field is on screen")
-        #expect(!fieldTexts().contains(ready), "no suggestion while the reply is in the outbox: \(fieldTexts())")
+        #expect(!Self.textViews(controller.view).isEmpty, "control: the field is on screen")
+        #expect(!ghostTexts().contains(ready), "no suggestion while the reply is in the outbox: \(ghostTexts())")
 
         // Online, the provider takes it: the send stamps `sentAt`, then writes the Sent copy, in two
         // writes, and nothing tells the chat (no merge signal is posted here).
@@ -891,15 +909,15 @@ struct ChatThreadViewLifecycleTests {
         #expect(said() == 1 && sending() == 0, "the sent email is in the chat and its outbox bubble is gone")
         #expect(neither == 0, "never neither the bubble nor the email on screen")
         try await Task.sleep(for: .milliseconds(500))
-        #expect(!fieldTexts().contains(ready), "no suggestion once the sent email is in the chat: \(fieldTexts())")
+        #expect(!ghostTexts().contains(ready), "no suggestion once the sent email is in the chat: \(ghostTexts())")
 
-        // Someone else answers: their email's own AI Reply shows.
+        // Someone else answers: their email's own AI Suggestion shows.
         let later = "Friday is better for me."
         let other = header("turn-other", from: "friend@example.com", secondsAgo: -5, inReplyTo: own.rfc822MessageId, ready: later)
         try await pool.write { db in try other.insert(db) }
         NotificationCenter.default.post(name: .nseMergeDidCommit, object: nil)
-        try await waitFor { fieldTexts().contains(later) }
-        #expect(fieldTexts().contains(later), "a new email from someone else is their turn: \(fieldTexts())")
+        try await waitFor { ghostTexts().contains(later) }
+        #expect(ghostTexts().contains(later), "a new email from someone else is their turn: \(ghostTexts())")
         await queue.clearForTesting()
         await queue.setDispatchSuppressedForTesting(false)
     }

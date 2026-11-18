@@ -1690,8 +1690,8 @@ struct InboxView: View {
         TutorialCoordinator.shared.discovered(.tagTap)
         switch tag {
         case .reply:
-            // In the chat view the Reply tag opens the chat, its AI Reply ready in the
-            // field; the chat marks emails read as they show.
+            // In the chat view the Reply tag opens the chat, its AI Suggestion ready as a
+            // ghost bubble; the chat marks emails read as they show.
             if ChatViewConfig.opensInChat {
                 selectedMessageId = snapshot.id
                 break

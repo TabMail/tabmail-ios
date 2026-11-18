@@ -175,6 +175,58 @@ struct ChatBubbleView: View {
 /// every email of the user's. A send that failed for good reads "Not sent", with the red mark beside
 /// the bubble as in Messages; touch and hold offers Retry and Delete, which are the Outbox's own
 /// Retry and Discard for the same row (owner 2026-11-07).
+/// The ready AI Suggestion (V1b): a ghost of the user's next message, where it lands once sent
+/// (the newest outgoing place, under the last email). A dashed accent outline on a clear bubble,
+/// accent text, and "AI Suggestion · Tap to use" under it, so it reads plainly as not sent. A tap
+/// opens the compose card with the suggestion written out (L4); nothing is sent from here.
+struct ChatSuggestionBubble: View {
+    /// The suggestion's text version (`MessageHeader.replyTextMessage`).
+    let text: String
+    /// The tutorial's move is this tap: a pulse ring marks it.
+    var pulses = false
+    let onTap: () -> Void
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 4) {
+            Button(action: onTap) {
+                Text(text)
+                    .font(.body)
+                    .foregroundStyle(Theme.accent)
+                    .multilineTextAlignment(.leading)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 9)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: ChatViewLayout.bubbleCornerRadius)
+                            .stroke(Theme.accent, style: StrokeStyle(
+                                lineWidth: ChatViewLayout.suggestionStrokeWidth, dash: ChatViewLayout.suggestionDash))
+                    )
+                    .contentShape(RoundedRectangle(cornerRadius: ChatViewLayout.bubbleCornerRadius))
+                    .overlay {
+                        if pulses {
+                            TutorialPulseRing(shape: RoundedRectangle(cornerRadius: ChatViewLayout.bubbleCornerRadius))
+                        }
+                    }
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("\(ChatSuggestionConfig.label): \(text)")
+            .accessibilityHint("Opens the email, ready to review and send")
+            .accessibilityIdentifier(Self.bubbleId)
+            Text(ChatSuggestionConfig.statusLine)
+                .font(.caption2)
+                .foregroundStyle(Theme.textSecondary)
+                .accessibilityHidden(true)
+        }
+        .containerRelativeFrame(.horizontal, alignment: .trailing) { width, _ in
+            width * ChatViewLayout.bubbleMaxWidthFraction
+        }
+        .frame(maxWidth: .infinity, alignment: .trailing)
+        .padding(.horizontal)
+    }
+
+    /// The ghost, as tests find it.
+    static let bubbleId = "chat.aiSuggestion"
+}
+
 struct ChatUnsentReplyBubble: View {
     let reply: ChatUnsentReply
     let retry: () -> Void

@@ -9,29 +9,26 @@ import Testing
 /// ADR-IOS-114: the chat's reply field.
 ///
 /// THE SYSTEM PROPERTIES pinned here:
-///  1. The field holds the ready AI Reply's text message only for someone else's email that has
-///     a full AI Reply, from an address that takes replies.
-///  2. Send with that text unchanged opens the compose card; any other words go to the agent
-///     on the newest email.
+///  1. The AI Suggestion (the ghost bubble) shows the ready reply's text message only for someone
+///     else's email that has a full reply, from an address that takes replies, while the reply goes
+///     to everyone (`ChatThreadViewSuggestionTests` runs the ghost itself).
+///  2. The field holds only the user's words, and Send sends them to the agent on the newest
+///     email; under the empty field the "e.g." line shows a change from the config set.
 ///  3. Words for the agent name the newest email and say they came from its reply field; for a
 ///     no-reply sender they say not to write a reply.
 ///  4. While the agent writes a reply the line above the field says so.
 ///  5. Only a sent compose card empties the field, and the field never starts dictation by itself
 ///     (the Sending bubble is read from the outbox: `ChatSendingBubbleTests`).
-///  6. With recipients changed (Reply to), Send has the agent write the reply again for the people
-///     chosen, and its message names them; everyone ticked is Reply All.
+///  6. With recipients changed (Reply to), no AI Suggestion shows (it was written for everyone),
+///     and the agent's message names the people chosen; everyone ticked is Reply All.
 ///  6b. A reply opened from the chat records Reply All on the original (`ComposeView.isReplyAll`)
-///     exactly when it goes to the chat's whole audience: the ready AI Reply and a reply asked for
+///     exactly when it goes to the chat's whole audience: the AI Suggestion and a reply asked for
 ///     in the field are Reply All to everyone and a plain reply to the people chosen; a reply the
 ///     agent writes in the open sheet keeps its recipients and is Reply All only when they are the
 ///     whole Reply All audience.
 ///  7. VoiceOver reads who an email went to when it was not everyone.
-///  8. A ready AI Reply shows in the field only while the field holds no words of the user's
-///     (owner 2026-11-07), collapsed or in the open sheet: what the field shows is a function of
-///     the user's words (`ChatFieldFill.shown`), so words typed or said are never replaced, said
-///     words replace a shown reply, no reply shows while a dictation is bringing words, a field
-///     emptied by hand stays empty for that email only, and a completion empties only the words
-///     that were sent.
+///  8. The field shows the user's words and nothing else, collapsed or in the open sheet: words
+///     typed or said are never replaced, and a completion empties only the words that were sent.
 ///  9. The view wires each of these: hosted SwiftUI views cannot be driven from a unit test, so the
 ///     wiring is read from the source.
 @Suite("Chat reply field")
@@ -61,44 +58,52 @@ struct ChatReplyFieldTests {
         return header
     }
 
-    // MARK: - 1. The ready AI Reply
+    // MARK: - 1. The AI Suggestion
 
-    @Test("The field holds the AI Reply's text message only for someone else's email with a full reply")
-    func readyText() {
+    @Test("The AI Suggestion shows the reply's text message only for someone else's email with a full reply, to everyone")
+    func suggestionText() {
         let ready = Self.header("1", reply: "Hi Alex,\n\nTuesday works.", replyText: "Tuesday works")
-        #expect(ChatReplyField.readyText(newest: ready, isOwn: false) == "Tuesday works")
-        #expect(ChatReplyField.readyText(newest: ready, isOwn: true) == nil, "the user's own email")
+        #expect(ChatReplyField.suggestionText(newest: ready, usersTurn: false, onlyTo: nil) == "Tuesday works")
+        #expect(ChatReplyField.suggestionText(newest: ready, usersTurn: true, onlyTo: nil) == nil, "the user's turn")
+        #expect(ChatReplyField.suggestionText(newest: ready, usersTurn: false, onlyTo: [Self.david]) == nil,
+                "written for everyone, so none while the reply goes only to some")
 
         let noReply = Self.header("2", fromAddress: "noreply@example.com", reply: "Hi", replyText: "Hi")
-        #expect(ChatReplyField.readyText(newest: noReply, isOwn: false) == nil, "a no-reply sender")
+        #expect(ChatReplyField.suggestionText(newest: noReply, usersTurn: false, onlyTo: nil) == nil, "a no-reply sender")
 
         let noFullReply = Self.header("3", reply: "", replyText: "Tuesday works")
-        #expect(ChatReplyField.readyText(newest: noFullReply, isOwn: false) == nil, "no full reply stored")
+        #expect(ChatReplyField.suggestionText(newest: noFullReply, usersTurn: false, onlyTo: nil) == nil, "no full reply stored")
         let missingReply = Self.header("4", replyText: "Tuesday works")
-        #expect(ChatReplyField.readyText(newest: missingReply, isOwn: false) == nil)
+        #expect(ChatReplyField.suggestionText(newest: missingReply, usersTurn: false, onlyTo: nil) == nil)
 
         let noText = Self.header("5", reply: "Hi Alex", replyText: "")
-        #expect(ChatReplyField.readyText(newest: noText, isOwn: false) == nil, "no text message")
+        #expect(ChatReplyField.suggestionText(newest: noText, usersTurn: false, onlyTo: nil) == nil, "no text message")
         let missingText = Self.header("6", reply: "Hi Alex")
-        #expect(ChatReplyField.readyText(newest: missingText, isOwn: false) == nil)
+        #expect(ChatReplyField.suggestionText(newest: missingText, usersTurn: false, onlyTo: nil) == nil)
     }
 
     @Test("The placeholder offers a reply only when the sender takes replies")
     func placeholder() {
-        #expect(ChatReplyField(readyText: nil, isNoReply: false, clearCount: 0).placeholder == "Reply or ask anything")
-        #expect(ChatReplyField(readyText: nil, isNoReply: true, clearCount: 0).placeholder == "Ask anything")
+        #expect(ChatReplyField(example: nil, isNoReply: false, clearCount: 0).placeholder == "Reply or ask anything")
+        #expect(ChatReplyField(example: nil, isNoReply: true, clearCount: 0).placeholder == "Ask anything")
     }
 
-    // MARK: - 2. Send
+    // MARK: - 2. The "e.g." line
 
-    @Test("Send with the AI Reply unchanged opens compose; anything else goes to the agent")
-    func route() {
-        #expect(ChatReplyField.route(text: "Tuesday works", readyText: "Tuesday works") == .readyReply)
-        #expect(ChatReplyField.route(text: "  Tuesday works\n", readyText: "Tuesday works ") == .readyReply,
-                "spacing at the ends is not a change")
-        #expect(ChatReplyField.route(text: "Tuesday works, see you", readyText: "Tuesday works") == .agent)
-        #expect(ChatReplyField.route(text: "Tuesday works", readyText: nil) == .agent, "no AI Reply")
-        #expect(ChatReplyField.route(text: "", readyText: "Tuesday works") == .agent)
+    @Test("The e.g. example comes from the config's reply set, content changes only")
+    func exampleFromConfig() {
+        let set = ChatSuggestionConfig.replyExamples
+        #expect(!set.isEmpty)
+        #expect(Set(set).count == set.count, "no example twice")
+        #expect(!set.contains { $0.localizedCaseInsensitiveContains("shorter") }, "no style tweaks")
+        for _ in 0..<50 {
+            #expect(ChatSuggestionConfig.randomExample().map(set.contains) == true)
+        }
+        #expect(Set((0..<200).compactMap { _ in ChatSuggestionConfig.randomExample() }).count > 1, "picked at random")
+        #expect(ChatSuggestionConfig.randomExample(from: []) == nil)
+        #expect(ChatSuggestionConfig.randomExample(from: ["only one"]) == "only one")
+        #expect(ChatSuggestionConfig.exampleLine("politely decline") == "e.g. politely decline")
+        #expect(ChatSuggestionConfig.statusLine == "AI Suggestion · Tap to use")
     }
 
     // MARK: - 3. The agent's message
@@ -147,12 +152,6 @@ struct ChatReplyFieldTests {
     private static let david = ChatThread.Person(address: "david@example.com", name: "David Kim")
     private static let sarah = ChatThread.Person(address: "sarah@example.com", name: "Sarah Chen")
     private static let sam = ChatThread.Person(address: "sam@example.com", name: "Sam Lee")
-
-    @Test("With recipients changed, the unchanged AI Reply goes to the agent to be written again")
-    func changedRecipientsRoute() {
-        #expect(ChatReplyField.route(text: "Tuesday works", readyText: "Tuesday works", recipientsChanged: true) == .agent)
-        #expect(ChatReplyField.route(text: "Tuesday works", readyText: "Tuesday works", recipientsChanged: false) == .readyReply)
-    }
 
     @Test("The agent's message names the people a reply goes only to")
     func agentMessageOnlyTo() {
@@ -251,61 +250,24 @@ struct ChatReplyFieldTests {
         return fill
     }
 
-    /// The user typed `text` into a reply field showing `shown`, on email `email`.
-    private static func typed(_ text: String, over shown: String = "", email: String = "e1") -> ChatFieldFill.Change {
-        .typed(text, shown: shown, email: email, replyField: true)
-    }
+    /// The user typed `text` into the field.
+    private static func typed(_ text: String) -> ChatFieldFill.Change { .typed(text) }
 
-    @Test("With no words of the user's the field shows the ready reply; their words always win")
-    func shownIsTheUsersWordsOrTheReadyReply() {
-        let fresh = ChatFieldFill()
-        #expect(fresh.shown(ready: "A reply", busy: false, email: "e1") == "A reply")
-        #expect(fresh.shown(ready: nil, busy: false, email: "e1") == "", "no ready reply, nothing")
-        // A ready reply that changes is shown as it is now: nothing was ever written.
-        #expect(fresh.shown(ready: "A newer reply", busy: false, email: "e1") == "A newer reply")
-        #expect(fresh.words == "", "the reply is shown, never written into the words")
-
-        let mine = Self.fill(Self.typed("My words", over: "A reply"))
-        #expect(mine.shown(ready: "A reply", busy: false, email: "e1") == "My words")
-        #expect(mine.shown(ready: "A reply", busy: true, email: "e1") == "My words")
-    }
-
-    @Test("While the user spoke last, a dictation running or the agent answering, no reply shows; said words replace a shown one")
-    func busyHidesTheReply() {
-        #expect(ChatFieldFill().shown(ready: "Yes, Tuesday works.", busy: true, email: "e1") == "")
-        // The said words are the user's words: whichever order the words and the end of the
-        // dictation come in, the field shows them.
+    @Test("The field holds only the user's words; said words add to them")
+    func fieldHoldsTheUsersWords() {
+        #expect(ChatFieldFill().words == "", "a new field is empty: no AI text ever enters it")
+        #expect(Self.fill(Self.typed("My words")).words == "My words")
         let said = Self.fill(.said("Can we do Monday"))
-        let words = DictationController.appending("Can we do Monday", to: "")
-        #expect(said.words == words)
-        #expect(said.shown(ready: "Yes, Tuesday works.", busy: true, email: "e1") == words)
-        #expect(said.shown(ready: "Yes, Tuesday works.", busy: false, email: "e1") == words)
+        #expect(said.words == DictationController.appending("Can we do Monday", to: ""))
         // Said words add to the words as they are when they come back, never to an older copy.
         let more = Self.fill(Self.typed("Hi"), .said("there"))
         #expect(more.words == DictationController.appending("there", to: "Hi"))
-    }
-
-    @Test("Edited, the shown reply becomes the user's words; emptied by hand, the field stays empty for that email only")
-    func editsAreTheUsers() {
-        var fill = ChatFieldFill()
-        fill.apply(Self.typed("A reply, and more", over: "A reply"))
-        #expect(fill.words == "A reply, and more", "an edit of the shown reply is the user's")
-        #expect(fill.emptiedOn == nil, "an edit that leaves words is not an emptying")
-
-        fill.apply(Self.typed("", over: "A reply, and more"))
-        #expect(fill.words == "" && fill.emptiedOn == "e1")
-        #expect(fill.shown(ready: "A reply", busy: false, email: "e1") == "", "it stays empty")
-        #expect(fill.shown(ready: "A newer reply to it", busy: false, email: "e1") == "",
-                "even for a newer AI Reply to that email")
-        // A new email is a new turn, also when its AI Reply has the same text as the old one's.
-        #expect(fill.shown(ready: "A reply", busy: false, email: "e2") == "A reply")
-
-        // A set that leaves the shown reply as it was is no edit: the reply stays the app's.
-        let untouched = Self.fill(Self.typed("A reply", over: "A reply"))
-        #expect(untouched.words == "" && untouched.changes == 0)
-        // Emptying a field that showed nothing is not an emptying by hand, nor is the plain chat input's.
-        #expect(Self.fill(Self.typed("", over: "")).emptiedOn == nil)
-        #expect(Self.fill(.typed("", shown: "x", email: "e1", replyField: false)).emptiedOn == nil)
+        // The "e.g." line's change is put in as the user's words, to send or edit.
+        #expect(Self.fill(.put("politely decline")).words == "politely decline")
+        #expect(Self.fill(Self.typed("x"), .put("politely decline")).words == "politely decline")
+        // A set that leaves the words as they are is no change.
+        let same = Self.fill(Self.typed("Hi"), Self.typed("Hi"))
+        #expect(same.changes == 1)
     }
 
     @Test("A completion empties only the words that were sent, or none; newer words stay")
@@ -316,7 +278,7 @@ struct ChatReplyFieldTests {
         // Sent from the collapsed field, then a newer draft typed in the open sheet.
         var fill = Self.fill(Self.typed("First request"), .sentFromField)
         #expect(fill.atSend == "First request" && fill.words == "First request", "the words wait in the field")
-        fill.apply(Self.typed("My newer draft", over: "First request"))
+        fill.apply(Self.typed("My newer draft"))
         fill.apply(.completed)
         #expect(fill.words == "My newer draft", "words written after the send are newer")
         #expect(fill.atSend == nil)
@@ -326,8 +288,6 @@ struct ChatReplyFieldTests {
         // The words sent, still there: the completion empties them.
         #expect(Self.fill(Self.typed("Ask"), .sentFromField, .completed).words == "")
 
-        // The untouched AI Reply sent from the field: no words were the user's, so any typed since stay.
-        #expect(Self.fill(.sentFromField, Self.typed("Typed after the send"), .completed).words == "Typed after the send")
         // From the open sheet the words go at once; a draft typed next stays through the completion.
         let sheet = Self.fill(Self.typed("Ask"), .sentFromSheet)
         #expect(sheet.words == "" && sheet.atSend == "")
@@ -335,16 +295,7 @@ struct ChatReplyFieldTests {
         // A confirmation card empties the words sent, and the send stays open for its completion.
         let card = Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard)
         #expect(card.words == "" && card.atSend == "Ask")
-        #expect(Self.fill(Self.typed("Ask"), .sentFromField, Self.typed("Newer", over: "Ask"), .confirmationCard).words == "Newer")
-    }
-
-    @Test("A send or an answer empties the words, and the ready reply then shows again")
-    func sendThenShowAgain() {
-        var fill = Self.fill(Self.typed("My question"), .sentFromField)
-        #expect(fill.shown(ready: "A reply", busy: false, email: "e1") == "My question",
-                "never while the words wait in the field")
-        fill.apply(.completed)
-        #expect(fill.shown(ready: "A reply", busy: false, email: "e1") == "A reply")
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, Self.typed("Newer"), .confirmationCard).words == "Newer")
     }
 
     @Test("A live transcript adds to the words it started on, and is dropped once anything else changed them")
@@ -358,8 +309,7 @@ struct ChatReplyFieldTests {
 
         // The user changes the words: a transcript that comes after is dropped, and so is every
         // later one of that dictation.
-        let current = fill.words
-        fill.apply(Self.typed("My own words", over: current))
+        fill.apply(Self.typed("My own words"))
         fill.apply(.heard("there friend, late"))
         #expect(fill.words == "My own words")
         fill.apply(.heard("there friend, later"))
@@ -401,19 +351,17 @@ struct ChatReplyFieldTests {
         return String(text[start.upperBound..<end.lowerBound])
     }
 
-    @Test("The input shows ChatFieldFill's text, and every change to its words goes through the one API")
+    @Test("The input shows the user's words, and every change to them goes through the one API")
     func fieldShownWiring() throws {
         let text = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
         #expect(Self.count("TextField(placeholder, text: typedText,", in: text) == 1)
-        #expect(Self.count("Binding(get: { fieldText }, set: { typed in fieldFill.apply(.typed(typed, shown: fieldText, email: fieldEmail, replyField: replyField != nil)) })", in: text) == 1)
-        #expect(Self.count("fieldFill.shown(ready: replyField?.readyText, busy: isDictating || isWorking, email: fieldEmail)", in: text) == 1)
-        #expect(Self.count("message.map(ChatThread.copyKey)", in: text) == 1)
+        #expect(Self.count("Binding(get: { inputText }, set: { fieldFill.apply(.typed($0)) })", in: text) == 1)
         #expect(Self.count("dictation.isActive || speech.isRecording || speech.isStarting", in: text) == 1)
         // ONE API: the view only reads the words; every change is a `fieldFill.apply`.
         #expect(Self.count("var inputText: String { fieldFill.words }", in: text) == 1)
         #expect(Self.count("var inputText", in: text) == 1)
         #expect(Self.count("fieldFill.", in: text)
-                == Self.count("fieldFill.apply(", in: text) + Self.count("fieldFill.shown(", in: text) + Self.count("fieldFill.words", in: text),
+                == Self.count("fieldFill.apply(", in: text) + Self.count("fieldFill.words", in: text),
                 "nothing else touches the field's state")
         // Each change, where it happens: typing (above), both dictations, both sends, the
         // completion, a confirmation card, and an Edit.
@@ -425,20 +373,23 @@ struct ChatReplyFieldTests {
         // It watches the thread's whole chat, so a card raised for an earlier email of the thread counts.
         #expect(Self.count(".onChange(of: shownMessages.last?.actionConfirmation != nil) { _, hasCard in guard hasCard, replyField != nil, !isExpanded else { return } fieldFill.apply(.confirmationCard) fieldSentText = nil withAnimation(expandSpring) { isExpanded = true } }", in: text) == 1)
         #expect(Self.count("dictation.inputSent(inputText) // From the open sheet the input empties as it goes; a newer draft is what is typed next. fieldFill.apply(.sentFromSheet)", in: text) == 1)
-        #expect(Self.count("isTextFieldFocused = false fieldFill.apply(.sentFromField) if ChatReplyField.route", in: text) == 1)
+        #expect(Self.count("isTextFieldFocused = false fieldFill.apply(.sentFromField) dictation.inputSent(inputText)", in: text) == 1)
         #expect(Self.count("fieldFill.apply(.put(text)) isTextFieldFocused = true", in: text) == 1)
-        #expect(Self.count("fieldFill.apply(", in: text) == 9)
+        // The "e.g." line's change goes in as words and is never sent from here.
+        #expect(Self.count("func putExample(_ example: String) { fieldFill.apply(.put(example)) inputSelection = .init(insertionPoint: inputText.endIndex) }", in: text) == 1)
+        #expect(Self.count("fieldFill.apply(", in: text) == 10)
     }
 
-    @Test("The field's Send opens compose for the unchanged AI Reply, else sends the words to the agent")
+    @Test("The field's Send sends the words to the agent; nothing in the field opens compose")
     func fieldSendWiring() throws {
         let text = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
         // Collapsed, the reply field's Send takes the field's route; the open sheet keeps the chat's.
         let message = try Self.body(of: "private func sendMessage() {", in: text)
         // Send refuses only an empty input, and the collapsed field then takes its own route.
-        #expect(message.hasPrefix(" let text = fieldText.trimmingCharacters(in: .whitespaces) guard !text.isEmpty else { return } if let replyField, !isExpanded { sendFromReplyField(text, replyField) return }"))
+        #expect(message.hasPrefix(" let text = inputText.trimmingCharacters(in: .whitespaces) guard !text.isEmpty else { return } if let replyField, !isExpanded { sendFromReplyField(text, replyField) return }"))
         let send = try Self.body(of: "private func sendFromReplyField(_ text: String, _ field: ChatReplyField) {", in: text)
-        #expect(Self.count("if ChatReplyField.route(text: text, readyText: field.readyText, recipientsChanged: field.onlyTo != nil) == .readyReply { onSendReadyReply?() return }", in: send) == 1)
+        #expect(Self.count("return", in: send) == 0, "every send from the field goes to the agent")
+        #expect(Self.count("onSendReadyReply", in: text) == 0 && Self.count("ChatReplyField.route", in: text) == 0)
         #expect(Self.count("onFieldSend?(text)", in: send) == 1)
         #expect(Self.count("sendAgentChat(text, field: send)", in: send) == 1)
         #expect(Self.count("sendFromReplyField(", in: text) == 2, "Send reaches it")
@@ -446,10 +397,10 @@ struct ChatReplyFieldTests {
         #expect(Self.count("enqueueStatus(isReplyField ? ChatReplyField.statusLine(label) : label)", in: text) == 1)
     }
 
-    @Test("The chat opens compose for the AI Reply, empties the field after a send, and shows the outbox's unsent replies")
+    @Test("The chat opens compose for the AI Suggestion, empties the field after a send, and shows the outbox's unsent replies")
     func chatWiring() throws {
         let text = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
-        #expect(Self.count("onSendReadyReply: { readyReply = ChatReadyReply(message: newest, compose: ChatReplyCompose.make( replyTo: newest, target: replyTarget, accounts: context.accounts)) }", in: text) == 1)
+        #expect(Self.count("readyReply = ChatReadyReply(message: newest, compose: ChatReplyCompose.make( replyTo: newest, target: replyTarget, accounts: context.accounts))", in: text) == 1)
         #expect(Self.count("onAgentOutcome: onOutcome)", in: text) == 3, "every agent compose")
         // Every compose card hands its own outcome on: four callbacks, none naming an outcome itself.
         #expect(Self.count("onAgentOutcome:", in: text) == 4)
@@ -488,7 +439,7 @@ struct ChatReplyFieldTests {
         ChatThread.Person(address: "alex@example.com", name: "Alex Doe"), david, sam,
     ]
 
-    /// The compose card the chat opens for the ready AI Reply, as the chat's cover builds it.
+    /// The compose card the chat opens for the AI Suggestion, as the chat's cover builds it.
     private static func card(_ message: MessageHeader?, target: ChatReplyTarget, accounts: [Account] = [me]) -> ComposeView {
         ChatReplyCompose.make(replyTo: message, target: target, accounts: accounts)
             .composeView(replyTo: message, onAgentOutcome: { _ in })
@@ -507,7 +458,7 @@ struct ChatReplyFieldTests {
         case field(onlyTo: [String]?)
     }
 
-    @Test("The ready AI Reply to everyone opens compose as Reply All, to the whole group")
+    @Test("The AI Suggestion to everyone opens compose as Reply All, to the whole group")
     func readyReplyToEveryoneIsReplyAll() {
         let email = Self.groupEmail()
         // Done in Reply to with everyone ticked: Reply All, as before any choice.
@@ -519,7 +470,7 @@ struct ChatReplyFieldTests {
         }
     }
 
-    @Test("The ready AI Reply with people chosen goes only to them, as a plain reply")
+    @Test("The AI Suggestion with people chosen goes only to them, as a plain reply")
     func readyReplyToChosenIsPlainReply() {
         let email = Self.groupEmail()
         let target = ChatReplyTarget.chosen([Self.david], replyPeople: Self.groupPeople)
@@ -681,7 +632,7 @@ struct ChatReplyFieldTests {
                 "the agent's card is read from its request alone (who it goes to is the request's: ChatReplyComposeOriginTests)")
         #expect(Self.count("case .reply: card.reply.composeView(replyTo: req.replyTo, suggestedBody: req.body, onAgentOutcome: onOutcome)", in: chat) == 1,
                 "the agent's reply card opens in the helper's kind")
-        #expect(Self.count("ChatReplyCompose.make(", in: chat) == 2, "the ready AI Reply and the agent's reply")
+        #expect(Self.count("ChatReplyCompose.make(", in: chat) == 2, "the AI Suggestion and the agent's reply")
         #expect(Self.count("isReplyAll", in: chat) == 0 && Self.count("buildReplyAllRecipients", in: chat) == 1,
                 "no card decides the kind or the Reply All recipients itself; the one call left is the header's people")
         // A card from a field request: the agent's closing words open nothing; a field send starts afresh.
@@ -698,7 +649,6 @@ struct ChatReplyFieldTests {
                 "a new newest email resets the choice, even one whose UID matches the last")
 
         let island = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
-        #expect(Self.count("ChatReplyField.route(text: text, readyText: field.readyText, recipientsChanged: field.onlyTo != nil)", in: island) == 1)
         #expect(Self.count("let send = message.map { ChatFieldSend(message: $0, onlyTo: field.onlyTo, isNoReply: field.isNoReply) }", in: island) == 1,
                 "the people chosen are read once, as the field's send starts")
         #expect(Self.count("let fieldReply = field?.fieldReply", in: island) == 1)

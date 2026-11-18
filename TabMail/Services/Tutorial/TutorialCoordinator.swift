@@ -59,8 +59,9 @@ final class TutorialCoordinator {
 
     /// The tutorial's next move in the chat view's reply field, in Priya's chat (part 2).
     enum FieldMove: Equatable {
-        /// Send the AI Reply waiting in the field: the compose card opens.
-        case sendReadyReply
+        /// Tap the AI Suggestion waiting as a ghost in the chat: the compose card opens. The field
+        /// holds nothing.
+        case tapSuggestion
         /// Send the filled-in request to TabMail.
         case ask(ChatPrompt)
     }
@@ -306,7 +307,7 @@ final class TutorialCoordinator {
     nonisolated static func fieldMove(for step: Step?, inPracticeChat: Bool, teachesChat: Bool) -> FieldMove? {
         guard teachesChat, inPracticeChat else { return nil }
         switch step {
-        case .replyToPriya: return .sendReadyReply
+        case .replyToPriya: return .tapSuggestion
         case .makeTemplate: return .ask(.saveReplyAsTemplate)
         default: return nil
         }
@@ -357,7 +358,7 @@ final class TutorialCoordinator {
     }
 
     /// What the practice reply's draft chat holds before its edit ran. In the chat view the
-    /// sent reply's bubble shows the AI Reply ("I'm in"), so the edit keeps its meaning.
+    /// sent reply's bubble shows the AI Suggestion ("I'm in"), so the edit keeps its meaning.
     static let editPrompt = "Say I can’t make it"
     static let chatViewEditPrompt = "Make it shorter"
 

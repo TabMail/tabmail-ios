@@ -100,4 +100,38 @@ enum ChatViewLayout {
     /// The back swipe's zone at the screen's left edge, in points: with nothing open, a rightward
     /// drag that starts here goes back rather than opening a bubble's actions.
     static let backSwipeEdgeWidth: CGFloat = 24
+    /// The AI Suggestion's dashed outline: its line width and its dash and gap lengths.
+    static let suggestionStrokeWidth: CGFloat = 1.5
+    static let suggestionDash: [CGFloat] = [6, 4]
+}
+
+/// The AI Suggestion in the chat: the ghost of the user's next message, and the field's hint.
+enum ChatSuggestionConfig {
+    /// The ghost's name, the one compose's suggestion box uses.
+    static let label = "AI Suggestion"
+    /// The line under the ghost.
+    static let statusLine = "\(label) · Tap to use"
+    /// Changes a reply can ask for, shown one at a time as the field's "e.g." line, picked again
+    /// each time a chat opens. Content changes only: the text version is already short, so no
+    /// style tweaks ("make it shorter").
+    static let replyExamples = [
+        "politely decline",
+        "say I'm happy to",
+        "say yes and suggest Tuesday",
+        "ask them to resend the file",
+        "thank them and say I'll reply by Friday",
+        "say I'm out until Monday",
+        "ask for one more week",
+        "say I'll call them tomorrow",
+        "agree and ask what is next",
+        "ask who else should join",
+    ]
+
+    /// One example from `examples`, at random; nil for an empty set.
+    static func randomExample(from examples: [String] = replyExamples) -> String? {
+        examples.randomElement()
+    }
+
+    /// The field's second line for `example`.
+    static func exampleLine(_ example: String) -> String { "e.g. \(example)" }
 }

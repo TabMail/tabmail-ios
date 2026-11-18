@@ -861,6 +861,35 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    `TutorialChatViewRunTests.chatCardHoldsItsRoom` (no bubble under the coach card in the bar, nor under the subject once it goes) and
    `ChatReplyFieldTests.messagesLayout` (the top bar, never a plain top inset).
 
+16. **The AI Suggestion as a ghost bubble (amendment 2026-11-18; supersedes the parts of decisions
+   10 and 13 that put the ready reply in the field).** The ready reply no longer sits in the reply
+   field. It shows as a ghost of the user's next message, where the reply lands once sent (after the
+   last email and any outbox bubble): `ChatSuggestionBubble`, a dashed accent outline on a clear
+   bubble with accent text (`ChatViewLayout.suggestionStrokeWidth`, `suggestionDash`), with "AI
+   Suggestion · Tap to use" under it. The name is "AI Suggestion", the one compose's suggestion box
+   uses (`ChatSuggestionConfig.label`); "AI Reply" is gone from the chat view's strings. Its text is
+   the reply's text message, read from the email's row (`ChatReplyField.suggestionText`), so a new
+   text message there rewrites the ghost in place, with no second copy. None shows on the user's
+   turn, for a no-reply sender, or while the reply goes only to people chosen in Reply to (the
+   suggestion was written for everyone; the field has the agent write one for them).
+   - **Tap (L4):** opens today's compose card with the full reply in its suggestion box, as Send did
+     (`ChatThreadView.openSuggestion`); Send there sends and the Sent bubble replaces the ghost; Close
+     goes back with the ghost still there. In the tutorial only the step that asks for it
+     (`FieldMove.tapSuggestion`, ringed by `TutorialPulseRing`) opens the card; elsewhere the
+     locked notice shows.
+   - **The field** holds only the user's words (`ChatFieldFill`: `shown`, `emptiedOn` and
+     `ChatReplyField.route` removed): "Reply or ask anything", and under the empty field an "e.g."
+     line with one change from `ChatSuggestionConfig.replyExamples`, picked at random once per chat
+     open (`ChatThreadView.example`). A tap puts the change in the field (`DynamicIslandChat.putExample`)
+     and never sends it. Every Send from the field goes to the agent. When the compose prompt
+     returns its own suggested change with each draft, the line will show that one while a
+     suggestion shows; until then it always shows the config example.
+   Tests: `ChatSuggestionBubbleTests` (the ghost, its tap opening the card, the in-place rewrite,
+   no "AI Reply" string), `ChatThreadViewLifecycleTests.suggestionSitsAtTheSentPosition` and
+   `sentReplyTakesTheTurn`, `ChatReplyFieldRuntimeTests.exampleLinePutsTheChange` and
+   `suggestionNeverEntersTheField`, `ChatReplyFieldTests.suggestionText` and `exampleFromConfig`,
+   `TutorialChatViewTests.fieldText`.
+
 ## The longer index line (routed 2026-11-09)
 
 The DECISIONS.md row grew with each decision of the chat view; it moved here when the index went

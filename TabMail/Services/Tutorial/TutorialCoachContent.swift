@@ -178,7 +178,7 @@ struct TutorialCoachContent: Equatable {
             return card(
                 "Your reply is ready.",
                 "Each email reads like a message, and TabMail already wrote your answer to Priya. "
-                    + "Tap Send to see the full email.", false)
+                    + "Tap the AI Suggestion to see the full email.", false)
         case (.replyToPriya, .compose(showingSuggestion: true)) where !replyEdited:
             return card("TabMail wrote the email.", "Say what to change: tap Edit at the top, then Send.", false)
         case (.makeTemplate, .chat):
