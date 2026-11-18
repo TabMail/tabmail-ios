@@ -21,14 +21,18 @@ import UIKit
 ///  3. The header is in the navigation bar, as in Messages: the names lie inside the bar, under its
 ///     middle (the avatars are above them, level with Back), and the subject line starts below the
 ///     bar, at the default and the largest text size.
+///  4. The header is the chat's top bar: the scroll view's own safe area covers it at every scroll
+///     position, and at rest at the oldest email the first bubble sits below the subject, at the
+///     default and the largest text size.
 @Suite("Chat layout", .serialized, .processGlobalState)
 @MainActor
 struct ChatThreadLayoutTests {
     nonisolated private static let account = "acc-layout"
 
-    private static func makeParent(_ pool: DatabasePool) async throws -> MessageHeader {
+    private static func makeParent(_ pool: DatabasePool, earlier: Int = 0) async throws -> MessageHeader {
         _ = try FolderEpochTestFixture.makeAccount(id: account, provider: .gmail, pool: pool)
         try FolderEpochTestFixture.insertFolder(accountId: account, path: "INBOX", role: .inbox, pool: pool)
+        try await insertEarlier(earlier, pool: pool)
         var header = MessageHeader(
             messageId: "layout-parent", subject: "Lunch plans", from: "sender@example.com",
             fromAddress: "sender@example.com", to: "someone@example.com",
@@ -36,6 +40,7 @@ struct ChatThreadLayoutTests {
             folderId: MessageIdentity.folderId(accountId: account, folderPath: "INBOX"),
             accountId: account, folderPath: "INBOX", isInInbox: true)
         header.rfc822MessageId = "layout-parent@example.com"
+        if earlier > 0 { header.inReplyTo = "<layout-\(earlier - 1)@example.com>" }
         header.headerComplete = true
         header.bodyComplete = true
         header.isRead = true
@@ -44,9 +49,32 @@ struct ChatThreadLayoutTests {
         return parent
     }
 
+    /// `count` earlier emails of the same thread, each a bubble of several lines of text.
+    private static func insertEarlier(_ count: Int, pool: DatabasePool) async throws {
+        guard count > 0 else { return }
+        let now = Date()
+        for index in 0..<count {
+            var header = MessageHeader(
+                messageId: "layout-\(index)", subject: "Lunch plans", from: "Sender \(index % 3)",
+                fromAddress: "sender\(index % 3)@example.com", to: "someone@example.com",
+                date: now.addingTimeInterval(TimeInterval(index - count - 1) * 600), snippet: "Note \(index)",
+                folderId: MessageIdentity.folderId(accountId: account, folderPath: "INBOX"),
+                accountId: account, folderPath: "INBOX", isInInbox: true)
+            header.rfc822MessageId = "<layout-\(index)@example.com>"
+            header.inReplyTo = index == 0 ? nil : "<layout-\(index - 1)@example.com>"
+            header.headerComplete = true
+            header.bodyComplete = true
+            header.isRead = true
+            header.summaryTextMessage = "Note \(index): a few lines of text, long enough to wrap in the bubble and reach behind the header."
+            let row = header
+            try await pool.write { db in try row.insert(db) }
+        }
+    }
+
     /// Hosts the chat on `parent` in a phone-sized window, runs `body`, and tears it down.
     private static func hosted(
         textSize: DynamicTypeSize = .large,
+        earlier: Int = 0,
         _ body: (UIWindow, UIHostingController<AnyView>, MessageHeader) async throws -> Void
     ) async throws {
         let saved = ChatSummaryQueueTests.SavedChatViewState()
@@ -56,7 +84,7 @@ struct ChatThreadLayoutTests {
             InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
         }
         saved.setChatView(on: true)
-        let parent = try await makeParent(pool)
+        let parent = try await makeParent(pool, earlier: earlier)
         let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let window = UIWindow(windowScene: scene)
         let controller = UIHostingController(rootView: AnyView(
@@ -155,6 +183,74 @@ struct ChatThreadLayoutTests {
                 #expect(names.minY >= bar.minY - 0.5 && names.maxY <= bar.maxY + 0.5, "names \(names) in the bar \(bar)")
                 #expect(names.midY > bar.midY, "names under the avatars: \(names) in \(bar)")
                 #expect(subject.minY >= bar.maxY - 0.5, "subject \(subject) under the bar \(bar)")
+            }
+        }
+    }
+
+    /// Earlier emails in the scrolled-chat test: several screens of bubbles.
+    private static let scrolledEarlier = 20
+    /// Scroll positions the scrolled-chat test reads, a bubble's part apart.
+    private static let scrollSteps = 8
+    private static let scrollStep: CGFloat = 37
+
+    private static func scrollViews(_ view: UIView) -> [UIScrollView] {
+        ((view as? UIScrollView).map { [$0] } ?? []) + view.subviews.flatMap { scrollViews($0) }
+    }
+
+    /// Every email bubble, by its accessibility frame.
+    private static func bubbleFrames(in view: UIView) -> [CGRect] {
+        HostedAccessibility.elements(under: view).compactMap { element in
+            element.accessibilityLabel?.contains(" said: ") == true ? element.accessibilityFrame : nil
+        }
+    }
+
+    // The header (names in the navigation bar, the subject line under it) is the chat's top bar:
+    // the scroll view's own safe area must cover it, so the chat scrolls under it; at rest at the
+    // oldest email the first bubble sits below the subject. A plain top inset also adds to the safe
+    // area, so this does not tell a bar from an inset.
+    // Whether the system draws its scroll-edge backdrop behind a bar is not observable from UIKit
+    // (no public property reports it), so it is not asserted here; screenshots show it.
+    @Test("The chat's scroll area clears the header at every scroll position; at rest its first bubble does too",
+          arguments: [DynamicTypeSize.large, .accessibility5])
+    func scrolledContentStaysUnderTheHeader(textSize: DynamicTypeSize) async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
+        try await HostedAccessibility.withAutomation {
+            try await Self.hosted(textSize: textSize, earlier: Self.scrolledEarlier) { window, controller, _ in
+                let isSubject: @MainActor (NSObject) -> Bool = { $0.accessibilityLabel == "Lunch plans" && $0.accessibilityHint == nil }
+                try await Self.waitFor {
+                    HostedAccessibility.elements(under: controller.view).contains(where: isSubject)
+                        && Self.scrollViews(controller.view).contains { $0.contentSize.height > window.bounds.height * 2 }
+                }
+                try await Task.sleep(for: .milliseconds(500))
+                let scroll = try #require(Self.scrollViews(controller.view).max { $0.contentSize.height < $1.contentSize.height })
+                @MainActor func subjectFrame() throws -> CGRect {
+                    try #require(HostedAccessibility.elements(under: controller.view).first(where: isSubject)?.accessibilityFrame)
+                }
+                @MainActor func scrollFrame() -> CGRect { scroll.convert(scroll.bounds, to: nil) }
+                @MainActor func checkInsets(_ at: String) throws {
+                    let subject = try subjectFrame()
+                    let frame = scrollFrame()
+                    #expect(frame.minY + scroll.adjustedContentInset.top >= subject.maxY - 0.5,
+                            "\(at): the scroll area's top \(frame.minY + scroll.adjustedContentInset.top) clears the subject \(subject)")
+                }
+                // Where the chat opens, at the newest email.
+                try checkInsets("at the newest")
+
+                // Scrolled, at several positions.
+                let start = scroll.contentOffset.y
+                for step in 0..<Self.scrollSteps {
+                    scroll.setContentOffset(CGPoint(x: 0, y: max(-scroll.adjustedContentInset.top,
+                        start - window.bounds.height - CGFloat(step) * Self.scrollStep)), animated: false)
+                    try await Task.sleep(for: .milliseconds(200))
+                    try checkInsets("scrolled step \(step)")
+                }
+
+                // At rest at the oldest email.
+                scroll.setContentOffset(CGPoint(x: 0, y: -scroll.adjustedContentInset.top), animated: false)
+                try await Task.sleep(for: .milliseconds(500))
+                try checkInsets("at the oldest")
+                let oldest = try #require(Self.bubbleFrames(in: controller.view).min { $0.minY < $1.minY })
+                #expect(oldest.minY >= (try subjectFrame()).maxY - 0.5, "at the oldest: the first bubble \(oldest) sits below the subject")
             }
         }
     }

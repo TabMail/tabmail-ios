@@ -40,8 +40,8 @@ struct ChatHeaderView: View {
     }
 }
 
-/// The thin line under the navigation bar: the subject and the thread's labels. No band of its own,
-/// so the chat runs up to it.
+/// The thin line under the navigation bar: the subject and the thread's labels. No band of its own:
+/// it sits in the chat's top bar inset, which the navigation bar's scroll edge covers.
 struct ChatSubjectLine: View {
     let subject: String
     let labels: [UserLabel]
@@ -57,6 +57,7 @@ struct ChatSubjectLine: View {
             }
         }
         .padding(.horizontal)
+        .padding(.bottom, ChatViewLayout.subjectLineBottomGap)
         .frame(maxWidth: .infinity)
         .clipped()
         .accessibilityElement(children: .contain)

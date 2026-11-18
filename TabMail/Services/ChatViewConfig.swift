@@ -77,6 +77,8 @@ enum ChatViewLayout {
     static let fieldSideInset: CGFloat = 16
     /// Room between the header's names and the subject line under the navigation bar.
     static let subjectLineSpacing: CGFloat = 2
+    /// Room under the subject line, inside the header's bar, so its letters clear the bar's edge.
+    static let subjectLineBottomGap: CGFloat = 6
     /// The jump-to-bottom button shows once the bottom is this far below the screen.
     static let jumpButtonThreshold: CGFloat = 240
     static let jumpButtonSize: CGFloat = 40

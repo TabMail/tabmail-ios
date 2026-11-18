@@ -339,7 +339,10 @@ struct ChatThreadView: View {
                     }
                 }
             }
-            .safeAreaInset(edge: .top, spacing: 0) {
+            // A bar inset, not a plain one: the navigation bar's scroll edge reaches under the
+            // subject and the tutorial card, so the chat scrolls under the whole header, never
+            // through it (Messages).
+            .safeAreaBar(edge: .top, spacing: 0) {
                 VStack(spacing: 0) {
                     ChatSubjectLine(subject: subject(thread), labels: context.labels)
                     tutorialCard(thread)
