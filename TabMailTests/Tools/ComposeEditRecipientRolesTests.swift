@@ -24,6 +24,7 @@ struct ComposeEditRecipientRolesTests {
 
     private static let primary = "sam@example.com"
     private static let copied = "pat@example.com"
+    private static let blind = "lee@example.com"
 
     private func makeContext() throws -> (ToolContext, DatabaseQueue, MockChatIdTranslator, AgentToolRouter) {
         let db = try TestDatabase.make()
@@ -77,7 +78,14 @@ struct ComposeEditRecipientRolesTests {
         #expect(!ctx.recipients.contains(Self.copied))
     }
 
-    @Test("email_compose: To Sam, Cc Pat reaches the edit request as To Sam, Cc Pat")
+    /// A Bcc recipient never reaches the edit request as To or Cc.
+    private func expectBccNotToOrCc(_ contexts: [ComposeEditContext]) {
+        guard contexts.count == 1 else { return }
+        #expect(!contexts[0].toRecipients.contains(Self.blind))
+        #expect(!contexts[0].ccRecipients.contains(Self.blind))
+    }
+
+    @Test("email_compose: To Sam, Cc Pat, Bcc Lee reaches the edit request as To Sam, Cc Pat")
     func composeKeepsCcAsCc() async throws {
         let (ctx, _, _, router) = try makeContext()
         let tool = EmailComposeTool(context: ctx)
@@ -85,6 +93,7 @@ struct ComposeEditRecipientRolesTests {
             try await tool.execute(arguments: [
                 "to": .array([.string(Self.primary)]),
                 "cc": .array([.string(Self.copied)]),
+                "bcc": .array([.string(Self.blind)]),
                 "request": .string("Ask about moving the offsite to Friday"),
             ])
         }
@@ -92,9 +101,10 @@ struct ComposeEditRecipientRolesTests {
         guard contexts.count == 1 else { return }
         #expect(contexts[0].toRecipients == [Self.primary])
         #expect(contexts[0].mode == "edit_new")
+        expectBccNotToOrCc(contexts)
     }
 
-    @Test("email_forward: To Sam, Cc Pat reaches the edit request as To Sam, Cc Pat")
+    @Test("email_forward: To Sam, Cc Pat, Bcc Lee reaches the edit request as To Sam, Cc Pat")
     func forwardKeepsCcAsCc() async throws {
         let (ctx, db, translator, router) = try makeContext()
         try TestDatabase.insertAccount(db)
@@ -108,6 +118,7 @@ struct ComposeEditRecipientRolesTests {
                 "unique_id": .int(11),
                 "to": .array([.string(Self.primary)]),
                 "cc": .array([.string(Self.copied)]),
+                "bcc": .array([.string(Self.blind)]),
                 "request": .string("Let them know Friday works"),
             ])
         }
@@ -115,6 +126,7 @@ struct ComposeEditRecipientRolesTests {
         guard contexts.count == 1 else { return }
         #expect(contexts[0].toRecipients == [Self.primary])
         #expect(contexts[0].mode == "edit_forward")
+        expectBccNotToOrCc(contexts)
     }
 
     private static let alsoCopied = "lee@example.com"
