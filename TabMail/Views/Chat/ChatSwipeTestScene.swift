@@ -15,8 +15,9 @@ import SwiftUI
 /// opens one from a mailbox: the content column's push of `PushedMessageDestination`, through
 /// `MessageOpenView`. With `--chat-swipe-tutorial-card` the chat is instead the tutorial's practice
 /// chat (Priya's, from the real tutorial seed) in Part 2, so its coach card sits in the header under
-/// the subject; "Move the tutorial on" moves the run to Part 3 a while later, which takes the card
-/// away while the chat stays open.
+/// the subject. "Move the tutorial on" moves the run to Part 3 at once, which takes the card away
+/// while the chat stays open: it sits in a strip under the whole navigation stack, outside the
+/// chat's region, so it is on screen with the chat and no earlier gesture can reach it.
 struct ChatSwipeTestScene: View {
     @State private var ready = false
     @State private var status = "Preparing fixture"
@@ -38,9 +39,6 @@ struct ChatSwipeTestScene: View {
     /// How long after "Remove a bubble" the email leaves: long enough for a test to open the chat
     /// and that bubble's actions first.
     private static let removalDelay: Duration = .seconds(8)
-    /// How long after "Move the tutorial on" the run leaves Part 2: long enough for a test to open
-    /// the chat and try the card's drag and tap first.
-    private static let moveOnDelay: Duration = .seconds(25)
 
     var body: some View {
         Group {
@@ -63,6 +61,16 @@ struct ChatSwipeTestScene: View {
                     } detail: {
                         Text("No message")
                     }
+                } else if tutorialCard {
+                    NavigationStack { list }
+                        .safeAreaInset(edge: .bottom, spacing: 0) {
+                            Button("Move the tutorial on") {
+                                // Part 3 starts in the inbox: Priya's chat holds no card for it,
+                                // and the demo stays.
+                                TutorialCoordinator.shared.nextLesson()
+                            }
+                            .padding()
+                        }
                 } else {
                     NavigationStack { list }
                 }
@@ -78,7 +86,6 @@ struct ChatSwipeTestScene: View {
             Text("Chat swipe fixture")
             if tutorialCard, let practiceId {
                 NavigationLink("Open chat") { ChatThreadView(messageId: practiceId) }
-                Button(armed ? "Move-on armed" : "Move the tutorial on") { armMoveOn() }
             } else if inSplit {
                 Button("Open chat") { pushedId = Self.headerId(Self.count - 1) }
             } else {
@@ -103,15 +110,6 @@ struct ChatSwipeTestScene: View {
             _ = try? await AppDatabase.dbPool.write { db in try MessageHeader.deleteOne(db, key: id) }
             // As a sync's merge announces it: the open chat re-reads its emails.
             NotificationCenter.default.post(name: .nseMergeDidCommit, object: nil)
-        }
-    }
-
-    private func armMoveOn() {
-        armed = true
-        Task {
-            try? await Task.sleep(for: Self.moveOnDelay)
-            // Part 3 starts in the inbox: Priya's chat holds no card for it, and the demo stays.
-            TutorialCoordinator.shared.nextLesson()
         }
     }
 

@@ -365,8 +365,13 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertTrue(isInChat(app))
         XCTAssertTrue(card.exists, "control: the card still shows")
 
-        // The run moves on: the card goes, the chat stays, and where the card sat is the chat's.
-        XCTAssertTrue(card.waitForNonExistence(timeout: 40), "the card goes once the run moves on")
+        // The run moves on (the fixture's strip under the chat): the card goes, the chat stays, and
+        // where the card sat is the chat's.
+        let moveOn = app.buttons["Move the tutorial on"]
+        XCTAssertTrue(moveOn.isHittable, "control: the move-on button shows under the chat")
+        XCTAssertGreaterThan(moveOn.frame.minY, replyField(in: app).frame.maxY, "control: it sits below the chat's region")
+        moveOn.tap()
+        XCTAssertTrue(card.waitForNonExistence(timeout: 5), "the card goes once the run moves on")
         XCTAssertTrue(isInChat(app), "the chat stays")
         XCTAssertGreaterThan(cardY, subject(in: app).frame.maxY, "control: the card's band is below the subject")
         openChatButtons(in: app)
@@ -414,7 +419,6 @@ final class ChatSwipeUITests: XCTestCase {
         }
         XCTAssertTrue(app.staticTexts["Chat swipe fixture"].waitForExistence(timeout: 20))
         if armRemoval { app.buttons["Remove a bubble"].tap() }
-        if host == .tutorialCard { app.buttons["Move the tutorial on"].tap() }
         app.buttons["Open chat"].tap()
         XCTAssertTrue(subject(in: app).waitForExistence(timeout: 10))
         XCTAssertTrue(bubble(host == .tutorialCard ? nil : 3, in: app).waitForExistence(timeout: 10))
