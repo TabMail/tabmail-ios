@@ -457,15 +457,22 @@ extension AccountManager {
                     guard let provider else { return }
                     // Pool creates connections on demand via checkout — no explicit connect needed.
                     for folder in accountFolders where !folder.path.isEmpty {
-                        // Every listing goes through the one classifier: a folder the
-                        // server refused, an unconfirmed empty count, a short FETCH or
-                        // a folder gone on the server is this folder's outcome, never
-                        // an error that ends the refresh; it is listed again next pass
-                        // (#755). Only cancellation leaves here.
+                        // Every listing goes through the one classifier (#755): an
+                        // unproven listing publishes nothing and is listed again next
+                        // pass. What the user sees is unchanged: a listing that ended
+                        // with an error the refresh showed before (a lost connection)
+                        // still ends the refresh with that error; a folder the server
+                        // refused or no longer has, and an unconfirmed count, are
+                        // skipped silently as before so the other folders still sync.
                         let outcome = try await syncEngine.syncFolderMessages(folder: folder, provider: provider)
-                        if case .unproven = outcome {
-                            BackgroundSyncLogger.logDebug("[SyncFolders] listing of \(folder.name) proved nothing — listed again next pass")
+                        guard case .unproven(_, _, let error) = outcome else { continue }
+                        BackgroundSyncLogger.logDebug("[SyncFolders] listing of \(folder.name) proved nothing — listed again next pass")
+                        guard let error else { continue }
+                        if SyncEngine.isSelectFailedError(error) || error is ProviderListingUnconfirmed || isHttpGoneStatus(error) {
+                            BackgroundSyncLogger.logDebug("[SyncFolders] \(folder.name) skipped: \(error)")
+                            continue
                         }
+                        throw error
                     }
                     // AI processing is now event-driven via ActiveBodyQueue → ActiveAIQueue.
                     // New headers from syncFolderMessages are automatically enqueued.

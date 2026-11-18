@@ -96,7 +96,7 @@ struct SyncModSeqTests {
         while !SyncEngine.fullSyncIsDeepPass(folderId: fid, everyN: everyN) {}
         // That deep listing came back short.
         var listing = SyncEngine.FullSyncListing()
-        SyncEngine.record(.unproven(nil, connectionLost: false), folderId: fid, in: &listing)
+        SyncEngine.record(.unproven(nil, connectionLost: false, error: nil), folderId: fid, in: &listing)
         #expect(listing.droppedFolder)
         #expect(SyncEngine.fullSyncIsDeepPass(folderId: fid, everyN: everyN),
                 "the pass after a short deep listing is deep again, so no MODSEQ skip hides the folder")

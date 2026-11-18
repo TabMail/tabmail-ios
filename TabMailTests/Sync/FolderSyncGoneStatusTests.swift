@@ -113,4 +113,27 @@ struct FolderSyncGoneStatusTests {
         #expect(fetched.contains("INBOX"), "the folder was attempted, got \(fetched)")
         #expect(fetched.contains("Archive"), "one folder's unconfirmed listing must not abandon the folders after it, got \(fetched)")
     }
+
+    @Test("A lost connection during a pull-to-refresh ends it with that error and publishes nothing")
+    func aLostConnectionEndsTheRefreshWithItsErrorAndPublishesNothing() async throws {
+        let lost = URLError(.networkConnectionLost)
+        let f = try await Self.makeFixture(accountId: "lost-connection", error: lost)
+        let before = try f.folders.map { try #require(try FolderEpochTestFixture.readFolder(accountId: f.accountId, path: $0.path, pool: f.pool)) }
+        let headersBefore = try await f.pool.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM messageHeader") ?? 0 }
+
+        var surfaced: Error?
+        do {
+            try await AccountManager.shared.syncFolders(f.folders, connecting: [])
+        } catch {
+            surfaced = error
+        }
+        let after = try f.folders.map { try #require(try FolderEpochTestFixture.readFolder(accountId: f.accountId, path: $0.path, pool: f.pool)) }
+        let headersAfter = try await f.pool.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM messageHeader") ?? 0 }
+        await Self.tearDown(f)
+
+        #expect((surfaced as? URLError)?.code == .networkConnectionLost,
+                "a lost connection must reach the user as the same error it did before, got \(String(describing: surfaced))")
+        #expect(after == before, "an unproven listing must publish no folder state")
+        #expect(headersAfter == headersBefore, "an unproven listing must publish no rows")
+    }
 }

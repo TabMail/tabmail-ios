@@ -458,7 +458,7 @@ extension SyncEngine {
                 let ft0 = CFAbsoluteTimeGetCurrent()
                 var outcome = await Self.runListing(for: folder, provider: provider, limit: SyncConfig.syncMessageLimit, dbPool: pool)
                 BackgroundSyncLogger.logDebug("[FullSync] \(account.emailAddress) \(folder.name): \(Int((CFAbsoluteTimeGetCurrent() - ft0) * 1000))ms")
-                if case .unproven(nil, connectionLost: true) = outcome {
+                if case .unproven(nil, connectionLost: true, _) = outcome {
                     // Connection died mid-listing: retry this folder once. The pool
                     // self-heals (a dead connection is discarded on checkin). The
                     // retry's own outcome decides the folder; the failed attempt
@@ -472,7 +472,7 @@ extension SyncEngine {
                     allMigratedIds.append(contentsOf: await processSyncResult(result, folder: folder))
                 }
                 Self.record(outcome, folderId: folder.id, in: &listing)
-                if case .unproven(nil, connectionLost: true) = outcome {
+                if case .unproven(nil, connectionLost: true, _) = outcome {
                     // The retry lost its connection too: the server is unreachable.
                     BackgroundSyncLogger.logDebug("[FullSync] Retry lost its connection for \(folder.name) — skipping remaining folders")
                     break
@@ -2559,7 +2559,9 @@ extension SyncEngine {
     enum ListingOutcome: Sendable {
         case proven(SyncMessagesResult)
         case notListable(SyncMessagesResult?)
-        case unproven(SyncMessagesResult?, connectionLost: Bool)
+        /// `error` is the listing's own error, when it ended with one, so a
+        /// caller that shows errors (pull-to-refresh) can show the same one.
+        case unproven(SyncMessagesResult?, connectionLost: Bool, error: (any Error)?)
 
         /// The merge result, when the listing got as far as its write (returned
         /// records are merged as positive records even when unproven).
@@ -2567,7 +2569,7 @@ extension SyncEngine {
             switch self {
             case .proven(let r): r
             case .notListable(let r): r
-            case .unproven(let r, _): r
+            case .unproven(let r, _, _): r
             }
         }
     }
@@ -2580,14 +2582,14 @@ extension SyncEngine {
         do {
             let result = try await runSyncMessages(for: folder, provider: provider, limit: limit, dbPool: dbPool)
             if result.proven { return .proven(result) }
-            return result.notListable ? .notListable(result) : .unproven(result, connectionLost: false)
+            return result.notListable ? .notListable(result) : .unproven(result, connectionLost: false, error: nil)
         } catch is ProviderFolderNotListable {
             return .notListable(nil)
         } catch {
             if DebugModeManager.isLoggingEnabled() {
                 BackgroundSyncLogger.logDebug("[Listing] \(folder.name) unproven: \(error)")
             }
-            return .unproven(nil, connectionLost: isConnectionError(error))
+            return .unproven(nil, connectionLost: isConnectionError(error), error: error)
         }
     }
 

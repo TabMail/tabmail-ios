@@ -2749,7 +2749,7 @@ struct SyncEngineFullSyncUpsertDiagnosticTests {
             let outcome = await SyncEngine.runListing(
                 for: folder, provider: mock, limit: SyncConfig.syncMessageLimit,
                 dbPool: PrioritizedDatabase(pool: pool))
-            if case .unproven(nil, _) = outcome {} else {
+            if case .unproven(nil, _, _) = outcome {} else {
                 Issue.record("a refused commit must classify as unproven with no result: \(outcome)")
             }
             // Non-vacuity: the sync reached its header insert and the COMMIT of
