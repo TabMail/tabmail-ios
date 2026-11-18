@@ -817,7 +817,7 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    hosted chat's measured field position, the opened pill between the bar and the safe area at the
    largest text size, the header inside the bar and the subject under it, and the scroll area
    clearing the subject and its gap at sampled scroll positions),
-   `TutorialChatViewRunTests.chatCardHoldsItsRoom` (the coach card's room in the bar) and
+   `TutorialChatViewRunTests.chatCardHoldsItsRoom` (no bubble under the coach card in the bar, nor under the subject once it goes) and
    `ChatReplyFieldTests.messagesLayout` (the top bar, never a plain top inset).
 
 ## The longer index line (routed 2026-11-09)
