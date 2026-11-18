@@ -31,7 +31,7 @@ struct ChatReplyRecoveryTests {
 
     /// The chat's email: from Alex to the user and David, Cc Sam. One per case, so no case meets
     /// another's chat.
-    private static func groupEmail(_ tag: String) -> MessageHeader {
+    private static func groupEmail(_ tag: String, suggestion: ReplyResult? = nil) -> MessageHeader {
         var header = MessageHeader(
             messageId: "recovery-\(tag)", subject: "Plans", from: "Alex Doe <alex@example.com>",
             fromAddress: "alex@example.com", to: "\(me), david@example.com",
@@ -42,6 +42,7 @@ struct ChatReplyRecoveryTests {
         header.rfc822MessageId = "<recovery-\(tag)@example.com>"
         header.headerComplete = true
         header.isRead = true
+        if let suggestion { _ = header.replaceSuggestion(with: suggestion, ifStill: nil) }
         return header
     }
 
@@ -63,7 +64,9 @@ struct ChatReplyRecoveryTests {
         }
         private let record = Record()
 
-        init(failure: Failure, asksForReply: Bool = true) {
+        /// `editRequest`: the later request asks `email_reply` to edit the AI Suggestion shown with
+        /// these words, instead of writing a reply.
+        init(failure: Failure, asksForReply: Bool = true, editRequest: String? = nil) {
             http.register(path: "/completions/chat", method: "POST") { [record] request in
                 let body = String(decoding: request.body ?? Data(), as: UTF8.self)
                 let count = record.bodies.withLock { bodies in
@@ -81,7 +84,8 @@ struct ChatReplyRecoveryTests {
                     final = ["assistant": "Done"]
                 } else {
                     let number = Self.emailNumber(in: body) ?? 0
-                    let arguments: [String: Any] = ["unique_id": number, "body": "Friday works"]
+                    let arguments: [String: Any] = editRequest.map { ["unique_id": number, "request": $0] }
+                        ?? ["unique_id": number, "body": "Friday works"]
                     let argumentsText = String(decoding: try! JSONSerialization.data(withJSONObject: arguments), as: UTF8.self)
                     final = [
                         "assistant": "",
@@ -119,7 +123,9 @@ struct ChatReplyRecoveryTests {
     }
 
     /// Opens the chat on `groupEmail(tag)` in a window, its requests going to `backend`, and runs `body`.
-    private func withChat(_ backend: Backend, tag: String, _ body: @MainActor (Chat) async throws -> Void) async throws {
+    private func withChat(_ backend: Backend, tag: String, suggestion: ReplyResult? = nil,
+                          composeEdit: EmailReplyTool.ComposeEdit? = nil,
+                          _ body: @MainActor (Chat) async throws -> Void) async throws {
         let saved = ChatSummaryQueueTests.SavedChatViewState()
         let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
         let queue = ActiveAIQueue.shared
@@ -143,7 +149,7 @@ struct ChatReplyRecoveryTests {
         var account = Account(emailAddress: Self.me, displayName: "Me", provider: .gmail)
         account.id = Self.account
         let accountRow = account
-        let email = Self.groupEmail(tag)
+        let email = Self.groupEmail(tag, suggestion: suggestion)
         let inbox = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: Self.account)
         try await pool.write { db in
             try accountRow.insert(db)
@@ -167,7 +173,7 @@ struct ChatReplyRecoveryTests {
         let registry = ToolRegistry.shared
         await registry.ensureDefaultToolsRegistered()
         let registeredReply = await registry.tool(named: "email_reply")
-        await registry.register(EmailReplyTool(context: ToolContext(db: pool, translator: ChatIdTranslator.shared)))
+        await registry.register(EmailReplyTool(context: ToolContext(db: pool, translator: ChatIdTranslator.shared), composeEdit: composeEdit))
         // The reply's card is left open, so its turn never ends: closing cancels it, and its
         // working mark, which a cancelled turn leaves, is cleared with it.
         func close() async throws {
@@ -388,5 +394,124 @@ struct ChatReplyRecoveryTests {
                         "the earlier request can no longer be recovered: \(HostedAccessibility.identifiers(in: chat.view))")
             }
         }
+    }
+
+    // MARK: - An edit of the AI Suggestion, held, through the field and the cards
+
+    /// Holds the compose edit the field's request runs until `release()`.
+    final class EditGate: Sendable {
+        private let state = Mutex<(entered: Int, released: Bool, waiter: CheckedContinuation<Void, Never>?)>((0, false, nil))
+
+        var entered: Int { state.withLock { $0.entered } }
+
+        func hold() async {
+            await withCheckedContinuation { continuation in
+                let resume = state.withLock { value -> Bool in
+                    value.entered += 1
+                    if value.released { return true }
+                    value.waiter = continuation
+                    return false
+                }
+                if resume { continuation.resume() }
+            }
+        }
+
+        func release() {
+            let waiter = state.withLock { value -> CheckedContinuation<Void, Never>? in
+                value.released = true
+                defer { value.waiter = nil }
+                return value.waiter
+            }
+            waiter?.resume()
+        }
+    }
+
+    private static let shownSuggestion = ReplyResult(
+        body: "Hi Alex,\n\nTuesday works for me.\n\nThanks", textMessage: "Tuesday works for me")
+    private static let editedSuggestion = ReplyResult(
+        body: "Hi Alex,\n\nTuesday works.\n\nThanks", textMessage: "Tuesday works", changeCommand: "make it shorter")
+
+    /// The AI Suggestions on screen, by the text they show.
+    private static func ghosts(in view: UIView) -> [(text: String, element: NSObject)] {
+        HostedAccessibility.elements(under: view).compactMap { element in
+            guard HostedAccessibility.identifier(of: element) == ChatSuggestionBubble.bubbleId,
+                  let label = element.accessibilityLabel,
+                  label.hasPrefix("\(ChatSuggestionConfig.label): ") else { return nil }
+            return (String(label.dropFirst(ChatSuggestionConfig.label.count + 2)), element)
+        }
+    }
+
+    @Test("A field edit of the AI Suggestion, recovered after a failure and held, lands in place; the ghost's card is the exact Reply All",
+          arguments: Failure.allCases)
+    func heldFieldEditThroughTheGhostAndItsCard(failure: Failure) async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted chat")
+        let backend = Backend(failure: failure, editRequest: "make it shorter")
+        let gate = EditGate()
+        let edited = Self.editedSuggestion
+        let composeEdit: EmailReplyTool.ComposeEdit = { _, subject, _, _ in
+            await gate.hold()
+            return try #require(AIService.parseInlineEditResponse(ComposeEditJSON.make(
+                response: "Done.", subject: subject, body: edited.body,
+                textMessage: edited.textMessage ?? "", changeCommand: edited.changeCommand ?? "")))
+        }
+        defer { gate.release() }
+        try await HostedAccessibility.withAutomation {
+            try await withChat(backend, tag: "edit-\(failure.rawValue)", suggestion: Self.shownSuggestion, composeEdit: composeEdit) { chat in
+                let router = AgentToolRouter.shared
+                try await Self.waitUntil { Self.ghosts(in: chat.view).contains { $0.text == Self.shownSuggestion.textMessage } }
+                #expect(Self.ghosts(in: chat.view).map(\.text) == [Self.shownSuggestion.textMessage],
+                        "control: the chat shows the AI Suggestion: \(Self.ghosts(in: chat.view).map(\.text))")
+
+                // The field asks for an edit; the first request fails.
+                #expect(Self.type("Make it shorter", in: chat.view), "control: the field takes words")
+                try await Task.sleep(for: .milliseconds(300))
+                #expect(HostedAccessibility.activate("chatSend", in: chat.view),
+                        "control: the field's Send takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
+                try await Self.waitUntil { backend.bodies.count == 1 && !ActiveAgentTracker.shared.anyWorking }
+                #expect(backend.bodies.count == 1, "control: the request went out once and failed")
+
+                // Retry recovers it; the edit it asks for is held.
+                #expect(Self.type("", in: chat.view), "control: the field is emptied")
+                try await Self.waitUntil { HostedAccessibility.identifiers(in: chat.view).contains("chatRetry") }
+                #expect(HostedAccessibility.activate("chatRetry", in: chat.view),
+                        "control: the field offers Retry: \(HostedAccessibility.identifiers(in: chat.view))")
+                try await Self.waitUntil { gate.entered == 1 }
+                #expect(gate.entered == 1, "control: the recovered turn asked for the edit: \(backend.bodies.count) requests")
+                #expect(Self.ghosts(in: chat.view).map(\.text) == [Self.shownSuggestion.textMessage],
+                        "while the edit is held the ghost keeps the suggestion")
+                let held = try await AppDatabase.dbPool.read { try MessageHeader.fetchOne($0, key: chat.email.id) }
+                #expect(held?.suggestion == Self.shownSuggestion, "nothing is stored while the edit is held")
+
+                // Released: the edit replaces the suggestion in place; no card opens.
+                gate.release()
+                try await Self.waitUntil { Self.ghosts(in: chat.view).contains { $0.text == edited.textMessage } }
+                #expect(Self.ghosts(in: chat.view).map(\.text) == [edited.textMessage],
+                        "the ghost shows the edit: \(Self.ghosts(in: chat.view).map(\.text))")
+                let stored = try await AppDatabase.dbPool.read { try MessageHeader.fetchOne($0, key: chat.email.id) }
+                #expect(stored?.suggestion == edited, "the edit is stored whole, its command included")
+                #expect(router.composeQueueDepth == 0 && router.pendingCompose == nil && chat.controller.presentedViewController == nil,
+                        "an edit in place opens no card")
+
+                // The ghost's card is the exact Reply All, with the edit.
+                let ghost = try #require(Self.ghosts(in: chat.view).first?.element)
+                #expect(ghost.accessibilityActivate(), "control: the ghost takes a tap")
+                var card: [String: String] = [:]
+                try await Self.waitUntil {
+                    card = Self.composeRecipients(chat.controller.presentedViewController?.view)
+                    return card["to"]?.isEmpty == false
+                }
+                #expect(Self.addresses(card["to"]).union(Self.addresses(card["cc"])) == ["alex@example.com", "david@example.com", "sam@example.com"],
+                        "the card goes to everyone on the email: \(card)")
+                #expect(Self.addresses(card["bcc"]).isEmpty, "nobody in Bcc: \(card)")
+                let cardTexts = HostedAccessibility.labels(in: chat.controller.presentedViewController?.view ?? UIView())
+                    + Self.textViews(chat.controller.presentedViewController?.view).map(\.text)
+                #expect(cardTexts.contains { $0.contains("Tuesday works.") }, "the card holds the edit: \(cardTexts.prefix(20))")
+            }
+        }
+    }
+
+    private static func textViews(_ view: UIView?) -> [UITextView] {
+        guard let view else { return [] }
+        return ((view as? UITextView).map { [$0] } ?? []) + view.subviews.flatMap { textViews($0) }
     }
 }
