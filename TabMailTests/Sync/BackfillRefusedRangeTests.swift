@@ -5,7 +5,15 @@
 import Testing
 import Foundation
 import GRDB
+import SQLite3
+import Synchronization
 @testable import TabMail
+
+/// One-shot fault for `storedUIDReadFailureLeavesTheRangePending`: while
+/// `armed`, the first read of `messageHeader.messageId` prepared on a READER
+/// connection is denied (the statement fails to prepare), then the fault
+/// disarms. Writers never get the authorizer, so inserts are unaffected.
+private let storedUIDReadFault = Mutex((armed: false, refused: 0))
 
 /// The IMAP UID walk and a range it cannot load:
 /// - a range whose SEARCH is refused is asked at most once per worker in a
@@ -561,16 +569,37 @@ struct BackfillRefusedRangeTests {
     /// position claims no missing mail, and the next call loads it.
     @Test("A failed stored-UID read leaves its range unfetched and pending; the next call loads it")
     func storedUIDReadFailureLeavesTheRangePending() async throws {
-        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var config = Configuration()
+        config.foreignKeysEnabled = true
+        config.prepareDatabase { db in
+            guard db.configuration.readonly, let conn = db.sqliteConnection else { return }
+            sqlite3_set_authorizer(conn, { _, action, table, column, _, _ in
+                guard action == SQLITE_READ, let table, let column,
+                      String(cString: table) == "messageHeader", String(cString: column) == "messageId"
+                else { return SQLITE_OK }
+                return storedUIDReadFault.withLock { state in
+                    guard state.armed else { return SQLITE_OK }
+                    state.armed = false
+                    state.refused += 1
+                    return SQLITE_DENY
+                }
+            }, nil)
+        }
+        let pool = try DatabasePool(path: dir.appendingPathComponent("t.sqlite").path, configuration: config)
+        let appDb = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let prev = current; current = appDb; return prev
+        }
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        defer { storedUIDReadFault.withLock { $0 = (false, 0) } }
         let world = try await Self.makeWorld(accountId: "stored-read-fails", pool: pool)
         defer { Self.tearDown(world) }
-        defer { _ = SyncEngine.storedUIDReadFailureIdsForTesting.withLock { $0.remove(world.folderId) } }
-        SyncEngine.storedUIDReadFailureIdsForTesting.withLock { _ = $0.insert(world.folderId) }
+        storedUIDReadFault.withLock { $0 = (true, 0) }
 
         #expect(await Self.callEnds(world))
-        #expect(SyncEngine.storedUIDReadFailureIdsForTesting.withLock { !$0.contains(world.folderId) },
-                "precondition: the stored-UID read failed once")
+        #expect(storedUIDReadFault.withLock { $0.refused } == 1, "precondition: the stored-UID read failed once")
         let missing = Set(world.uids).subtracting(try world.local())
         #expect(!missing.isEmpty, "the failed read lost no range: the fixture is vacuous")
         let fetched = Self.fetches(world.server.recordedCommands()[...]).reduce(Set<Int>()) { $0.union($1) }
