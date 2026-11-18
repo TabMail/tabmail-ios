@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import Observation
 import Testing
 @testable import TabMail
 
@@ -43,6 +44,69 @@ struct MessageDetailDisplayOrderTests {
             isOpen = true
             waiter?.resume()
             waiter = nil
+        }
+    }
+
+    @MainActor
+    final class Flag { var on = false }
+
+    /// Every value a screen field took, in order (repeats folded). Shows a
+    /// backslide even when a later refresh puts the newer value back.
+    @MainActor
+    final class Recorder<Value: Equatable> {
+        private(set) var values: [Value]
+        private let read: @MainActor () -> Value
+
+        init(_ read: @escaping @MainActor () -> Value) {
+            self.read = read
+            values = [read()]
+            track()
+        }
+
+        private func track() {
+            withObservationTracking { _ = read() } onChange: { [weak self] in
+                Task { @MainActor in self?.record() }
+            }
+        }
+
+        private func record() {
+            let value = read()
+            if value != values.last { values.append(value) }
+            track()
+        }
+
+        /// True when `older` was shown again after `newer` had been shown.
+        func wentBack(from newer: Value, to older: Value) -> Bool {
+            guard let first = values.firstIndex(of: newer) else { return false }
+            return values[(first + 1)...].contains(older)
+        }
+    }
+
+    /// Scripted server fetches: each call writes its body, and a call can be
+    /// held until the test lets it go.
+    @MainActor
+    final class FetchScript {
+        let pool: DatabasePool
+        let bodies: [String]
+        let holdCall: Int?
+        let gate = Gate()
+        private(set) var calls = 0
+
+        init(pool: DatabasePool, bodies: [String], holdCall: Int? = nil) {
+            self.pool = pool
+            self.bodies = bodies
+            self.holdCall = holdCall
+        }
+
+        func fetch(_ msg: MessageHeader) async throws {
+            calls += 1
+            let call = calls
+            if call == holdCall { await gate.hold() }
+            let html = bodies[min(call, bodies.count) - 1]
+            let key = ContentKey(rawValue: msg.id)
+            try await pool.write { db in
+                try MessageBody(contentKey: key, htmlContent: html).insert(db, onConflict: .replace)
+            }
         }
     }
 
@@ -112,6 +176,22 @@ struct MessageDetailDisplayOrderTests {
         gate.open()
         try await waitUntil { gate.passed }
         try await Task.sleep(for: .milliseconds(100))
+    }
+
+    /// Waits until the newer value is on screen (a reader outside the turns let
+    /// it through) or another reader waits for the held one's turn. Ordered by
+    /// the turn state, not by time.
+    @MainActor
+    private func waitShownOrQueued(_ vm: MessageDetailViewModel, _ shown: () -> Bool) async throws {
+        try await waitUntil { shown() || vm.displayTurnWaitersForTesting > 0 }
+        #expect(shown() || vm.displayTurnWaitersForTesting > 0)
+    }
+
+    /// Waits until no reader runs or waits for a display turn.
+    @MainActor
+    private func waitIdle(_ vm: MessageDetailViewModel) async throws {
+        try await waitUntil { vm.displayTurnIsIdleForTesting }
+        #expect(vm.displayTurnIsIdleForTesting)
     }
 
     private func cleanUp(_ pool: DatabasePool, _ dir: URL, _ previous: AppDatabase?) {
@@ -296,6 +376,9 @@ struct MessageDetailDisplayOrderTests {
             messageId: opened.id, dbPool: pool, fetchBodyOverride: { _ in },
             observeNotifications: true)
         #expect(vm.message == nil)
+        // The mark-read's own write posts a later refresh that would put the new
+        // summary back, so every shown value is recorded, not just the last.
+        let shown = Recorder { vm.message?.summaryBlurb }
         let gate = Gate()
         vm._displayReadHook = { point in
             if point == .markReadResolve, !gate.reached { await gate.hold() }
@@ -305,12 +388,293 @@ struct MessageDetailDisplayOrderTests {
         #expect(gate.reached)
 
         try await save(summary: "new summary", for: opened.id, in: pool)
-        try await release(gate)
+        try await waitShownOrQueued(vm) { vm.message?.summaryBlurb == "new summary" }
+        gate.open()
         await markRead.value
+        try await waitIdle(vm)
 
         try await waitUntil { vm.message?.summaryBlurb == "new summary" }
         #expect(vm.message?.summaryBlurb == "new summary")
         #expect(vm.message?.isRead == true)
+        #expect(!shown.wentBack(from: "new summary", to: "old summary"), "shown: \(shown.values)")
+    }
+
+    // MARK: - Opening and pull-to-refresh, one case per display turn
+
+    @MainActor
+    @Test("the open's first header read never takes the screen back to older data")
+    func openResolveNeverGoesBack() async throws {
+        let (pool, dir, previous) = try makePool()
+        defer { cleanUp(pool, dir, previous) }
+        let opened = header("opened", summary: "old summary")
+        try insert(opened, into: pool)
+        let script = FetchScript(pool: pool, bodies: ["<p>fetched</p>"])
+        let vm = MessageDetailViewModel(
+            messageId: opened.id, dbPool: pool,
+            fetchBodyOverride: { msg in try await script.fetch(msg) },
+            observeNotifications: true)
+        let shown = Recorder { vm.message?.summaryBlurb }
+        let gate = Gate()
+        vm._displayReadHook = { point in
+            if point == .openResolve, !gate.reached { await gate.hold() }
+        }
+        let load = Task { await vm.loadBody() }
+        try await waitUntil { gate.reached }
+        #expect(gate.reached)
+
+        try await save(summary: "new summary", for: opened.id, in: pool)
+        try await waitShownOrQueued(vm) { vm.message?.summaryBlurb == "new summary" }
+        gate.open()
+        await load.value
+        try await waitIdle(vm)
+
+        #expect(vm.message?.id == opened.id)
+        #expect(vm.message?.summaryBlurb == "new summary")
+        #expect(vm.messageBody?.htmlContent == "<p>fetched</p>")
+        #expect(!shown.wentBack(from: "new summary", to: "old summary"), "shown: \(shown.values)")
+    }
+
+    @MainActor
+    @Test("the open's header read after a folder sync never takes the screen back to older data")
+    func openResolveAfterSyncNeverGoesBack() async throws {
+        let (pool, dir, previous) = try makePool()
+        defer { cleanUp(pool, dir, previous) }
+        // Not stored when the open starts: the sync is what lands it.
+        let opened = header("opened", summary: "old summary")
+        let script = FetchScript(pool: pool, bodies: ["<p>fetched</p>"])
+        let vm = MessageDetailViewModel(
+            messageId: opened.id, dbPool: pool,
+            fetchBodyOverride: { msg in try await script.fetch(msg) },
+            observeNotifications: true)
+        let shown = Recorder { vm.message?.summaryBlurb }
+        let gate = Gate()
+        let landed = Flag()
+        vm._displayReadHook = { point in
+            if point == .openResolve, !landed.on {
+                landed.on = true
+                try? await pool.write { db in try opened.insert(db) }
+            }
+            if point == .openResolveAfterSync, !gate.reached { await gate.hold() }
+        }
+        let load = Task { await vm.loadBody() }
+        try await waitUntil { gate.reached }
+        #expect(landed.on)
+        #expect(gate.reached)
+
+        try await save(summary: "new summary", for: opened.id, in: pool)
+        try await waitShownOrQueued(vm) { vm.message?.summaryBlurb == "new summary" }
+        gate.open()
+        await load.value
+        try await waitIdle(vm)
+
+        #expect(vm.message?.id == opened.id)
+        #expect(vm.message?.summaryBlurb == "new summary")
+        #expect(vm.messageBody?.htmlContent == "<p>fetched</p>")
+        #expect(!shown.wentBack(from: "new summary", to: "old summary"), "shown: \(shown.values)")
+    }
+
+    @MainActor
+    @Test("the open's re-read after its server fetch never takes the screen back to older data")
+    func openRereadNeverGoesBack() async throws {
+        let (pool, dir, previous) = try makePool()
+        defer { cleanUp(pool, dir, previous) }
+        let opened = header("opened", summary: "old summary")
+        try insert(opened, into: pool)
+        let script = FetchScript(pool: pool, bodies: ["<p>fetched</p>"])
+        let vm = MessageDetailViewModel(
+            messageId: opened.id, dbPool: pool,
+            fetchBodyOverride: { msg in try await script.fetch(msg) },
+            observeNotifications: true)
+        let shown = Recorder { vm.message?.summaryBlurb }
+        let gate = Gate()
+        vm._displayReadHook = { point in
+            if point == .openReread, !gate.reached { await gate.hold() }
+        }
+        let load = Task { await vm.loadBody() }
+        try await waitUntil { gate.reached }
+        #expect(gate.reached)
+        #expect(script.calls == 1)
+
+        try await save(summary: "new summary", for: opened.id, in: pool)
+        try await waitShownOrQueued(vm) { vm.message?.summaryBlurb == "new summary" }
+        gate.open()
+        await load.value
+        try await waitIdle(vm)
+
+        #expect(vm.message?.id == opened.id)
+        #expect(vm.message?.summaryBlurb == "new summary")
+        #expect(vm.messageBody?.htmlContent == "<p>fetched</p>")
+        #expect(!shown.wentBack(from: "new summary", to: "old summary"), "shown: \(shown.values)")
+    }
+
+    @MainActor
+    @Test("pull-to-refresh's header read never takes the screen back to older data")
+    func refetchResolveNeverGoesBack() async throws {
+        let (pool, dir, previous) = try makePool()
+        defer { cleanUp(pool, dir, previous) }
+        let opened = header("opened", summary: "old summary")
+        try insert(opened, into: pool)
+        let script = FetchScript(pool: pool, bodies: ["<p>refetched</p>"])
+        let vm = MessageDetailViewModel(
+            messageId: opened.id, dbPool: pool,
+            fetchBodyOverride: { msg in try await script.fetch(msg) },
+            observeNotifications: true)
+        vm._testSeedMessage(opened)
+        let shown = Recorder { vm.message?.summaryBlurb }
+        let gate = Gate()
+        vm._displayReadHook = { point in
+            if point == .refetchResolve, !gate.reached { await gate.hold() }
+        }
+        let refetch = Task { await vm.refetchBody() }
+        try await waitUntil { gate.reached }
+        #expect(gate.reached)
+
+        try await save(summary: "new summary", for: opened.id, in: pool)
+        try await waitShownOrQueued(vm) { vm.message?.summaryBlurb == "new summary" }
+        gate.open()
+        await refetch.value
+        try await waitIdle(vm)
+
+        #expect(vm.message?.id == opened.id)
+        #expect(vm.message?.summaryBlurb == "new summary")
+        #expect(vm.messageBody?.htmlContent == "<p>refetched</p>")
+        #expect(!shown.wentBack(from: "new summary", to: "old summary"), "shown: \(shown.values)")
+    }
+
+    @MainActor
+    @Test("pull-to-refresh's body read never puts older bytes back over a newer body another reader showed")
+    func refetchRereadNeverGoesBack() async throws {
+        let (pool, dir, previous) = try makePool()
+        defer { cleanUp(pool, dir, previous) }
+        let opened = header("opened", summary: "summary")
+        try insert(opened, into: pool)
+        // The open's fetch (call 1) is held; pull-to-refresh's fetch (call 2)
+        // stores the older bytes, then the open's fetch stores the newer ones.
+        let script = FetchScript(
+            pool: pool, bodies: ["<p>newer</p>", "<p>older</p>"], holdCall: 1)
+        let vm = MessageDetailViewModel(
+            messageId: opened.id, dbPool: pool,
+            fetchBodyOverride: { msg in try await script.fetch(msg) },
+            observeNotifications: true)
+        let shown = Recorder { vm.messageBody?.htmlContent }
+        let gate = Gate()
+        vm._displayReadHook = { point in
+            if point == .refetchReread, !gate.reached { await gate.hold() }
+        }
+        let load = Task { await vm.loadBody() }
+        try await waitUntil { script.gate.reached }
+        #expect(script.gate.reached)
+
+        let refetch = Task { await vm.refetchBody() }
+        try await waitUntil { gate.reached }
+        #expect(gate.reached)
+        #expect(script.calls == 2)
+
+        // The open's fetch stores the newer body; its re-read follows.
+        script.gate.open()
+        try await waitShownOrQueued(vm) { vm.messageBody?.htmlContent == "<p>newer</p>" }
+        gate.open()
+        await refetch.value
+        await load.value
+        try await waitIdle(vm)
+
+        #expect(vm.message?.id == opened.id)
+        #expect(vm.messageBody?.htmlContent == "<p>newer</p>")
+        #expect(!shown.wentBack(from: "<p>newer</p>", to: "<p>older</p>"), "shown: \(shown.values)")
+    }
+
+    // MARK: - Turn hand-off
+
+    @MainActor
+    @Test("a cancelled open waiting for a turn falls back to its poll, and the reader after it still runs")
+    func cancelledWaitingOpenHandsOn() async throws {
+        let (pool, dir, previous) = try makePool()
+        defer { cleanUp(pool, dir, previous) }
+        let newest = header("newest", summary: "member")
+        let opened = header("opened", summary: "old summary", references: [newest.rfc822MessageId!])
+        try insert(newest, into: pool)
+        try insert(opened, into: pool)
+        let openedId = opened.id
+        try await pool.write { db in
+            try MessageBody(contentKey: ContentKey(rawValue: openedId), htmlContent: "<p>cached</p>").insert(db)
+        }
+        var fetched = false
+        let vm = MessageDetailViewModel(
+            messageId: openedId, dbPool: pool, fetchBodyOverride: { _ in fetched = true },
+            observeNotifications: true)
+        defer { vm.cancelBodyPollForTesting() }
+        vm._testSeedMessage(opened)
+
+        // A thread scan holds the turn.
+        let gate = Gate()
+        vm._displayReadHook = { point in
+            if point == .threadScan, !gate.reached { await gate.hold() }
+        }
+        NotificationCenter.default.post(name: .nseMergeDidCommit, object: Self.testPostSentinel)
+        try await waitUntil { gate.reached }
+        #expect(gate.reached)
+
+        // The open waits for the turn, and its caller is cancelled.
+        let load = Task { await vm.loadBody() }
+        try await waitUntil { vm.displayTurnWaitersForTesting == 1 }
+        #expect(vm.displayTurnWaitersForTesting == 1)
+        load.cancel()
+
+        // A refresh waits behind it.
+        try await save(summary: "new summary", for: openedId, in: pool)
+        try await waitUntil { vm.displayTurnWaitersForTesting == 2 }
+        #expect(vm.displayTurnWaitersForTesting == 2)
+
+        gate.open()
+        await load.value
+        try await waitIdle(vm)
+        try await waitUntil { vm.messageBody != nil }
+
+        #expect(vm.hasStartedBodyPollForTesting)
+        #expect(vm.message?.id == openedId)
+        #expect(vm.message?.summaryBlurb == "new summary")
+        #expect(vm.messageBody?.htmlContent == "<p>cached</p>")
+        #expect(vm.threadMessages.map(\.id) == [newest.id])
+        #expect(!fetched)
+    }
+
+    @MainActor
+    @Test("a turn that publishes nothing hands the turn on to the readers waiting behind it")
+    func nonpublishingTurnHandsOn() async throws {
+        let (pool, dir, previous) = try makePool()
+        defer { cleanUp(pool, dir, previous) }
+        let newest = header("newest", summary: "old summary")
+        let opened = header("opened", summary: "opened", references: [newest.rfc822MessageId!])
+        try insert(newest, into: pool)
+        try insert(opened, into: pool)
+        let vm = MessageDetailViewModel(
+            messageId: opened.id, dbPool: pool, fetchBodyOverride: { _ in },
+            observeNotifications: true)
+        vm._testSeedMessage(opened)
+
+        let gate = Gate()
+        vm._displayReadHook = { point in
+            if point == .threadScan, !gate.reached { await gate.hold() }
+        }
+        NotificationCenter.default.post(name: .nseMergeDidCommit, object: Self.testPostSentinel)
+        try await waitUntil { gate.reached }
+        #expect(gate.reached)
+
+        // Two more scans wait: the first is skipped when its turn comes (a newer
+        // one is queued), so it publishes nothing. A refresh waits behind both.
+        NotificationCenter.default.post(name: .nseMergeDidCommit, object: Self.testPostSentinel)
+        NotificationCenter.default.post(name: .nseMergeDidCommit, object: Self.testPostSentinel)
+        try await waitUntil { vm.displayTurnWaitersForTesting == 2 }
+        #expect(vm.displayTurnWaitersForTesting == 2)
+        try await save(summary: "new summary", for: newest.id, in: pool)
+        try await waitUntil { vm.displayTurnWaitersForTesting == 3 }
+        #expect(vm.displayTurnWaitersForTesting == 3)
+
+        gate.open()
+        try await waitIdle(vm)
+
+        #expect(vm.threadMessages.map(\.id) == [newest.id])
+        #expect(vm.threadMessages.map(\.summaryBlurb) == ["new summary"])
     }
 
     @MainActor
