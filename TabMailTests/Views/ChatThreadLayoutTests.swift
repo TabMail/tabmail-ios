@@ -40,7 +40,12 @@ struct ChatThreadLayoutTests {
             folderId: MessageIdentity.folderId(accountId: account, folderPath: "INBOX"),
             accountId: account, folderPath: "INBOX", isInInbox: true)
         header.rfc822MessageId = "layout-parent@example.com"
-        if earlier > 0 { header.inReplyTo = "<layout-\(earlier - 1)@example.com>" }
+        if earlier > 0 {
+            header.inReplyTo = "<layout-\(earlier - 1)@example.com>"
+            // A finished summary, so a long chat's open queues no summary work beyond the test.
+            header.summaryBlurb = "Lunch?"
+            header.summaryTextMessage = "Lunch?"
+        }
         header.headerComplete = true
         header.bodyComplete = true
         header.isRead = true
@@ -65,6 +70,8 @@ struct ChatThreadLayoutTests {
             header.headerComplete = true
             header.bodyComplete = true
             header.isRead = true
+            // A finished summary (its blurb and text message), so the open queues no summary work.
+            header.summaryBlurb = "Note \(index)"
             header.summaryTextMessage = "Note \(index): a few lines of text, long enough to wrap in the bubble and reach behind the header."
             let row = header
             try await pool.write { db in try row.insert(db) }
@@ -197,13 +204,6 @@ struct ChatThreadLayoutTests {
         ((view as? UIScrollView).map { [$0] } ?? []) + view.subviews.flatMap { scrollViews($0) }
     }
 
-    /// Every email bubble, by its accessibility frame.
-    private static func bubbleFrames(in view: UIView) -> [CGRect] {
-        HostedAccessibility.elements(under: view).compactMap { element in
-            element.accessibilityLabel?.contains(" said: ") == true ? element.accessibilityFrame : nil
-        }
-    }
-
     // The header (names in the navigation bar, the subject line under it) is the chat's top bar:
     // the scroll view's own safe area must cover it, so the chat scrolls under it; at rest at the
     // oldest email the first bubble sits below the subject. A plain top inset also adds to the safe
@@ -223,6 +223,10 @@ struct ChatThreadLayoutTests {
                 }
                 try await Task.sleep(for: .milliseconds(500))
                 let scroll = try #require(Self.scrollViews(controller.view).max { $0.contentSize.height < $1.contentSize.height })
+                let top = -scroll.adjustedContentInset.top
+                try #require(scroll.contentSize.height > window.bounds.height * 2, "control: a chat several screens long, \(scroll.contentSize)")
+                try #require(scroll.contentOffset.y > top + window.bounds.height + CGFloat(Self.scrollSteps) * Self.scrollStep,
+                             "control: it opens at the newest, far enough from the top for every step, \(scroll.contentOffset.y)")
                 @MainActor func subjectFrame() throws -> CGRect {
                     try #require(HostedAccessibility.elements(under: controller.view).first(where: isSubject)?.accessibilityFrame)
                 }
@@ -239,17 +243,20 @@ struct ChatThreadLayoutTests {
                 // Scrolled, at several positions.
                 let start = scroll.contentOffset.y
                 for step in 0..<Self.scrollSteps {
-                    scroll.setContentOffset(CGPoint(x: 0, y: max(-scroll.adjustedContentInset.top,
-                        start - window.bounds.height - CGFloat(step) * Self.scrollStep)), animated: false)
+                    let target = start - window.bounds.height - CGFloat(step) * Self.scrollStep
+                    scroll.setContentOffset(CGPoint(x: 0, y: target), animated: false)
                     try await Task.sleep(for: .milliseconds(200))
+                    #expect(abs(scroll.contentOffset.y - target) < 1, "control: step \(step) is at \(target), got \(scroll.contentOffset.y)")
                     try checkInsets("scrolled step \(step)")
                 }
 
                 // At rest at the oldest email.
-                scroll.setContentOffset(CGPoint(x: 0, y: -scroll.adjustedContentInset.top), animated: false)
+                scroll.setContentOffset(CGPoint(x: 0, y: top), animated: false)
                 try await Task.sleep(for: .milliseconds(500))
                 try checkInsets("at the oldest")
-                let oldest = try #require(Self.bubbleFrames(in: controller.view).min { $0.minY < $1.minY })
+                let oldest = try #require(HostedAccessibility.elements(under: controller.view).first {
+                    $0.accessibilityLabel?.contains(" said: Note 0") == true
+                }?.accessibilityFrame, "the oldest email's bubble shows: \(HostedAccessibility.labels(in: controller.view).prefix(20))")
                 #expect(oldest.minY >= (try subjectFrame()).maxY - 0.5, "at the oldest: the first bubble \(oldest) sits below the subject")
             }
         }
