@@ -109,11 +109,13 @@ final class MessageDetailViewModel {
     /// Where a display reader has read the database and not yet published (#992).
     enum DisplayReadPoint {
         case threadScan, pollReread, markReadResolve
+        #if DEBUG
         /// `loadBody`'s first header resolve, its resolve after `syncOriginalFolder`,
         /// and its post-fetch header re-read.
         case openResolve, openResolveAfterSync, openReread
         /// `refetchBody`'s header resolve and its post-fetch body read.
         case refetchResolve, refetchReread
+        #endif
     }
     /// Test seam: awaited at each `DisplayReadPoint`, so a test can hold a reader
     /// between its read and its publish while a newer write and refresh land.
@@ -208,11 +210,13 @@ final class MessageDetailViewModel {
     /// queueing one (`loadThreadMessagesAsync`) is fine.
     @ObservationIgnored private var displayTurnRunning = false
     @ObservationIgnored private var displayTurnWaiters: [CheckedContinuation<Void, Never>] = []
+    #if DEBUG
 
     /// Test seams: how many readers wait for a display turn, and whether none
     /// runs or waits. Read-only, no input, no network, no production caller.
     var displayTurnWaitersForTesting: Int { displayTurnWaiters.count }
     var displayTurnIsIdleForTesting: Bool { !displayTurnRunning && displayTurnWaiters.isEmpty }
+    #endif
 
     private func inDisplayTurn<T>(_ work: @MainActor () async -> T) async -> T {
         if displayTurnRunning {
@@ -1516,7 +1520,9 @@ final class MessageDetailViewModel {
             if msg == nil {
                 msg = await resolveMessageAsync(compositeId: messageId)
             }
+            #if DEBUG
             await _displayReadHook?(.openResolve)
+            #endif
             if let msg { publishOpened(msg) }
         }
         if cancelledInitialRead {
@@ -1534,7 +1540,9 @@ final class MessageDetailViewModel {
             await syncOriginalFolder()
             await inDisplayTurn {
                 msg = await resolveMessageAsync(compositeId: messageId)
+                #if DEBUG
                 await _displayReadHook?(.openResolveAfterSync)
+                #endif
                 if let msg { publishOpened(msg) }
             }
         }
@@ -1732,7 +1740,9 @@ final class MessageDetailViewModel {
         await inDisplayTurn {
             let postFetchId = resolvedId
             let postFetchHeader = try? await dbPool.pool.read({ db in try MessageHeader.fetchOne(db, key: postFetchId) })
+            #if DEBUG
             await _displayReadHook?(.openReread)
+            #endif
             if var refreshed = postFetchHeader {
                 applyOverlay(to: &refreshed)
                 message = refreshed
@@ -1804,7 +1814,9 @@ final class MessageDetailViewModel {
             if msg == nil {
                 msg = await resolveMessageAsync(compositeId: messageId)
             }
+            #if DEBUG
             await _displayReadHook?(.refetchResolve)
+            #endif
             guard var msg else { return nil }
             applyOverlay(to: &msg)
             message = msg
@@ -1849,7 +1861,9 @@ final class MessageDetailViewModel {
                     let refreshedBody = try? await self.dbPool.read { db in
                         try MessageBody.fetchOne(db, key: postRefetchId)
                     }
+                    #if DEBUG
                     await self._displayReadHook?(.refetchReread)
+                    #endif
                     self.messageBody = refreshedBody ?? previousBody
                     if refreshedBody != nil { self.bodyReloadToken &+= 1 }
                 }
