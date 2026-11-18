@@ -886,12 +886,18 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      applied, which let an older load land after a newer change). Removed with it: an older load that
      succeeded used to apply when the newest one threw; now a failed newest load is an internal read
      failure, the screen keeps its last good state until the next load, and there is no retry layer
-     (`ThreadReloadOrderingTests.failedNewestKeepsTheScreen`). Only a load still out restarts:
-     a change to a row on screen starts a new load; a change to a row not on screen is kept until
-     the running load returns its members, and starts one more load only if that row is one of
-     them. A finished or failed load is not pending, so a summary written for another thread
-     starts no scan. A single-row refresh is newest-only too: per row (the opened header, each
-     thread row) a read that finishes after a newer read of that row started is dropped. The card saves to a draft of its own
+     (`ThreadReloadOrderingTests.failedNewestKeepsTheScreen`). A thread row has ONE reader, the thread load (both
+     readers are local store reads): a change to a row on screen asks for a new load, coalesced
+     to one per main-actor turn, and the load generation drops every older load. A change to a
+     row not on screen is kept while a load is out; if that load returns it as a member, the
+     load publishes nothing and one more load reads it (a failure there keeps the last good
+     screen). A finished or failed load is not pending, so a summary written for another thread
+     starts no scan. The opened header is not in the load's results, so it keeps its own reader,
+     newest-only: a read that finishes after a newer read of it started is dropped. The two
+     readers are disjoint: a load whose opened email changed while it ran publishes nothing and
+     reads again (`ThreadReloadOrderingTests.openedEmailIsNeverAThreadRow`). Invariant
+     (`ThreadReloadOrderingTests.screenNeverGoesBack`, seeded random completion order): what is
+     on screen for a row never goes back to an older version. The card saves to a draft of its own
      (`Draft.separateReplyKey`, the parent in its tail as a reply key's): the chat ignores saved
      drafts, so a reply draft already saved for the email stays as it is in Drafts, never opened,
      saved over or deleted by the card; each card has its own key, so two cards' drafts never

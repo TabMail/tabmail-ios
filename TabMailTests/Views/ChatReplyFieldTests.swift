@@ -11,7 +11,7 @@ import Testing
 /// THE SYSTEM PROPERTIES pinned here:
 ///  1. The AI Suggestion (the ghost bubble) shows the ready reply's text message only for someone
 ///     else's email that has a full reply, from an address that takes replies, while the reply goes
-///     to everyone (`ChatThreadViewSuggestionTests` runs the ghost itself).
+///     to everyone (`ChatSuggestionBubbleTests` runs the ghost itself).
 ///  2. The field holds only the user's words, and Send sends them to the agent on the newest
 ///     email; under the empty field the "e.g." line shows a change from the config set.
 ///  3. Words for the agent name the newest email and say they came from its reply field; for a

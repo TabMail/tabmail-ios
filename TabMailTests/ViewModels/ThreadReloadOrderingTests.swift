@@ -48,28 +48,6 @@ struct ThreadReloadOrderingTests {
         var value: Int { count.withLock { $0 } }
     }
 
-    /// Holds the first single-row read once armed, after its row was read and before its
-    /// transaction ends, so the read returns the row as it was before writes made while held.
-    final class RowReadHold: Sendable {
-        struct State { var armed = false; var readRow = false; var held = false; var timedOut = false }
-        let state = Mutex(State())
-        let release = DispatchSemaphore(value: 0)
-        func arm() { state.withLock { $0.armed = true } }
-        var isHeld: Bool { state.withLock { $0.held } }
-        func statement(_ sql: String) {
-            let first = state.withLock { value -> Bool in
-                guard value.armed, !value.held else { return false }
-                if sql.contains("FROM \"messageHeader\" WHERE \"id\" = ") { value.readRow = true; return false }
-                guard value.readRow, sql.contains("COMMIT") else { return false }
-                value.held = true
-                return true
-            }
-            if first, release.wait(timeout: .now() + 30) == .timedOut {
-                state.withLock { $0.timedOut = true }
-            }
-        }
-    }
-
     private static func header(_ id: String, minutesAgo: Double, inReplyTo: String? = nil) -> MessageHeader {
         var header = MessageHeader(
             messageId: id, subject: "Plans", from: "Sam Lee <sam@example.com>", fromAddress: "sam@example.com",
@@ -278,13 +256,14 @@ struct ThreadReloadOrderingTests {
         #expect(scans.value == 2 * perLoad, "only the held load scanned: \(scans.value) vs \(2 * perLoad)")
     }
 
-    @Test("A failed load is not pending: a later change to a row on screen starts no load")
+    @Test("A failed load is not pending and does not loop: later changes to rows off screen start no load")
     func failedLoadIsNotPending() async throws {
         let fixture = try Self.makeFixture { _ in }
         defer { InstalledTestDatabaseLifetime.finish(previous: fixture.previous, pool: fixture.pool, directory: fixture.directory) }
         let opened = Self.header("idle-1", minutesAgo: 30)
         let newest = Self.header("idle-2", minutesAgo: 10, inReplyTo: "idle-1")
-        try await fixture.pool.write { db in try opened.insert(db); try newest.insert(db) }
+        let other = Self.header("idle-other", minutesAgo: 20)
+        try await fixture.pool.write { db in try opened.insert(db); try newest.insert(db); try other.insert(db) }
 
         let vm = MessageDetailViewModel(
             messageId: opened.id, dbPool: fixture.pool, fetchBodyOverride: { _ in }, observeNotifications: true)
@@ -298,13 +277,13 @@ struct ThreadReloadOrderingTests {
         NotificationCenter.default.post(name: .nseMergeDidCommit, object: MessageDetailStagedFallbackTests.testPostSentinel)
         try await Task.sleep(for: .milliseconds(300))
 
-        // The database recovers and an email joins; row changes on screen start no load.
+        // The database recovers and an email joins; changes to another thread's row start no load.
         let joined = Self.header("idle-3", minutesAgo: 5, inReplyTo: "idle-2")
         try await fixture.pool.write { db in
             try db.execute(sql: "ALTER TABLE folder_hidden RENAME TO folder")
             try joined.insert(db)
         }
-        for _ in 0..<3 { NotificationCenter.default.post(name: .messageDataDidChange, object: newest.id) }
+        for _ in 0..<3 { NotificationCenter.default.post(name: .messageDataDidChange, object: other.id) }
         try await Task.sleep(for: .milliseconds(500))
         #expect(!vm.threadMessages.contains { $0.id == joined.id }, "no load ran after the failure")
 
@@ -314,50 +293,113 @@ struct ThreadReloadOrderingTests {
         #expect(vm.threadMessages.contains { $0.id == joined.id }, "control: a merge still loads")
     }
 
-    @Test("A single-row read that finishes after a newer read of that row started never lands")
-    func lateRowReadNeverLands() async throws {
-        let hold = RowReadHold()
+    @Test("The opened email is never published as a thread row, even when it changes while a load is out")
+    func openedEmailIsNeverAThreadRow() async throws {
+        let hold = ReloadHold()
         let fixture = try Self.makeFixture { hold.statement($0) }
         defer {
             hold.release.signal()
             InstalledTestDatabaseLifetime.finish(previous: fixture.previous, pool: fixture.pool, directory: fixture.directory)
         }
-        let opened = Self.header("late-1", minutesAgo: 30)
-        var newest = Self.header("late-2", minutesAgo: 10, inReplyTo: "late-1")
-        newest.replyTextMessage = "Tuesday works."
-        let seeded = newest
-        try await fixture.pool.write { db in try opened.insert(db); try seeded.insert(db) }
+        let first = Self.header("disj-1", minutesAgo: 30)
+        let second = Self.header("disj-2", minutesAgo: 10, inReplyTo: "disj-1")
+        try await fixture.pool.write { db in try first.insert(db); try second.insert(db) }
+
+        let vm = MessageDetailViewModel(
+            messageId: first.id, dbPool: fixture.pool, fetchBodyOverride: { _ in }, observeNotifications: true)
+        defer { vm.cancelBodyPollForTesting() }
+        vm._testSeedMessage(first)
+        NotificationCenter.default.post(name: .nseMergeDidCommit, object: MessageDetailStagedFallbackTests.testPostSentinel)
+        try await Self.waitUntil { vm.threadMessages.contains { $0.id == second.id } }
+        #expect(!vm.threadMessages.contains { $0.id == first.id }, "control: the opened email is not a thread row")
+
+        // A load for the first email is held; the second email of the thread is opened meanwhile.
+        hold.arm()
+        NotificationCenter.default.post(name: .nseMergeDidCommit, object: MessageDetailStagedFallbackTests.testPostSentinel)
+        try await Self.waitUntil { hold.isHeld }
+        #expect(hold.isHeld, "control: the load is held mid-read")
+        vm._testSeedMessage(second)
+        hold.release.signal()
+
+        // Never a shared row, while settling and after.
+        for _ in 0..<40 {
+            #expect(!vm.threadMessages.contains { $0.id == vm.message?.id }, "the opened email showed as a thread row")
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(!hold.state.withLock { $0.timedOut })
+        try await Self.waitUntil { vm.threadMessages.contains { $0.id == first.id } }
+        #expect(vm.threadMessages.map(\.id) == [first.id], "the thread rows are the other email: \(vm.threadMessages.map(\.id))")
+    }
+
+    /// Delays each traced read by a seeded random amount, so loads and reads finish in a random order.
+    final class Jitter: Sendable {
+        let rng: Mutex<SplitMix64>
+        init(seed: UInt64) { rng = Mutex(SplitMix64(seed: seed)) }
+        func statement(_ sql: String) {
+            guard sql.contains("messageHeader") || sql.contains("messageReference") else { return }
+            let micros = rng.withLock { $0.pick(15_000) }
+            usleep(useconds_t(micros))
+        }
+        func pick(_ bound: Int) -> Int { rng.withLock { $0.pick(bound) } }
+    }
+
+    @Test("What is on screen for a row is never older than a newer accepted read of it, in a random completion order",
+          arguments: [UInt64(0x5EED_0001), 0x5EED_0002, 0x5EED_0003])
+    func screenNeverGoesBack(seed: UInt64) async throws {
+        let jitter = Jitter(seed: seed)
+        let fixture = try Self.makeFixture { jitter.statement($0) }
+        defer { InstalledTestDatabaseLifetime.finish(previous: fixture.previous, pool: fixture.pool, directory: fixture.directory) }
+        let opened = Self.header("rand-1", minutesAgo: 30)
+        let member = Self.header("rand-2", minutesAgo: 10, inReplyTo: "rand-1")
+        try await fixture.pool.write { db in try opened.insert(db); try member.insert(db) }
 
         let vm = MessageDetailViewModel(
             messageId: opened.id, dbPool: fixture.pool, fetchBodyOverride: { _ in }, observeNotifications: true)
         defer { vm.cancelBodyPollForTesting() }
         vm._testSeedMessage(opened)
         NotificationCenter.default.post(name: .nseMergeDidCommit, object: MessageDetailStagedFallbackTests.testPostSentinel)
-        func row() -> MessageHeader? { vm.threadMessages.first { $0.id == seeded.id } }
-        try await Self.waitUntil { row() != nil }
-        try await Task.sleep(for: .milliseconds(200))
+        try await Self.waitUntil { vm.threadMessages.contains { $0.id == member.id } }
 
-        // A first change; its read takes the row and is held.
-        try await fixture.pool.write { db in
-            try db.execute(sql: "UPDATE messageHeader SET replyTextMessage = ? WHERE id = ?", arguments: ["Wednesday then.", seeded.id])
+        // Version written as "v<n>": the shown n may only grow, and ends at the last write.
+        func version(_ text: String?) -> Int { text.flatMap { Int($0.dropFirst()) } ?? 0 }
+        var shownMember = 0
+        var shownOpened = 0
+        func check() {
+            let m = version(vm.threadMessages.first { $0.id == member.id }?.summaryTextMessage)
+            let o = version(vm.message?.summaryTextMessage)
+            #expect(m >= shownMember, "seed \(seed): the member went back from v\(shownMember) to v\(m)")
+            #expect(o >= shownOpened, "seed \(seed): the opened header went back from v\(shownOpened) to v\(o)")
+            #expect(!vm.threadMessages.contains { $0.id == vm.message?.id }, "seed \(seed): the opened email is never a thread row")
+            shownMember = max(shownMember, m)
+            shownOpened = max(shownOpened, o)
         }
-        hold.arm()
-        NotificationCenter.default.post(name: .messageDataDidChange, object: seeded.id)
-        try await Self.waitUntil { hold.isHeld }
-        #expect(hold.isHeld, "control: the first read is held after taking the row")
-
-        // A newer change; its read lands.
-        try await fixture.pool.write { db in
-            try db.execute(sql: "UPDATE messageHeader SET replyTextMessage = ? WHERE id = ?", arguments: ["Sorry, not this week.", seeded.id])
+        let rounds = 20
+        for n in 1...rounds {
+            let target = jitter.pick(2) == 0 ? member.id : opened.id
+            try await fixture.pool.write { db in
+                try db.execute(sql: "UPDATE messageHeader SET summaryTextMessage = ? WHERE id = ?", arguments: ["v\(n)", target])
+            }
+            NotificationCenter.default.post(name: .messageDataDidChange, object: target)
+            if jitter.pick(3) == 0 {
+                NotificationCenter.default.post(name: .nseMergeDidCommit, object: MessageDetailStagedFallbackTests.testPostSentinel)
+            }
+            for _ in 0..<jitter.pick(4) {
+                try await Task.sleep(for: .milliseconds(5))
+                check()
+            }
         }
-        NotificationCenter.default.post(name: .messageDataDidChange, object: seeded.id)
-        try await Self.waitUntil { row()?.replyTextMessage == "Sorry, not this week." }
-        #expect(row()?.replyTextMessage == "Sorry, not this week.", "control: the newer read showed the row")
-
-        // The held read finishes last: its older copy never lands.
-        hold.release.signal()
-        try await Task.sleep(for: .milliseconds(500))
-        #expect(!hold.state.withLock { $0.timedOut })
-        #expect(row()?.replyTextMessage == "Sorry, not this week.", "the newer row stays: \(row()?.replyTextMessage ?? "nil")")
+        let (lastMember, lastOpened) = try await fixture.pool.read { db in
+            (try MessageHeader.fetchOne(db, key: member.id)?.summaryTextMessage,
+             try MessageHeader.fetchOne(db, key: opened.id)?.summaryTextMessage)
+        }
+        try await Self.waitUntil {
+            check()
+            return vm.threadMessages.first { $0.id == member.id }?.summaryTextMessage == lastMember
+                && vm.message?.summaryTextMessage == lastOpened
+        }
+        try await Task.sleep(for: .milliseconds(300))
+        check()
+        #expect(vm.threadMessages.first { $0.id == member.id }?.summaryTextMessage == lastMember, "seed \(seed): the member ends on the last write")
+        #expect(vm.message?.summaryTextMessage == lastOpened, "seed \(seed): the opened header ends on the last write")
     }
 }
