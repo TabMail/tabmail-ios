@@ -232,22 +232,45 @@ enum AppStoreAgeCheck {
     static func acknowledgeSignificantUpdate(userAsked: Bool = false) async -> SignificantUpdate.Outcome {
         guard #available(iOS 26.4, *) else { return .none }
         guard let current = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String else { return .none }
-        let defaults = UserDefaults.standard
-        return await acknowledge(
+        return await acknowledgeSignificantUpdate(
+            userAsked: userAsked, current: current, defaults: .standard,
+            apple: AppleCalls(
+                isRegulated: { try await isInRegulatedRegion() },
+                requiresNotice: { try await requiresSignificantUpdateNotice() },
+                show: { version in
+                    guard let scene = UIApplication.shared.connectedScenes
+                        .first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene else {
+                        throw SignificantUpdate.NoActiveScene()
+                    }
+                    try await AgeRangeService.shared.showSignificantUpdateAcknowledgment(
+                        in: scene, updateDescription: SignificantUpdate.updateDescription(version))
+                }
+            )
+        )
+    }
+
+    /// Apple's three calls for the significant update step. Production passes
+    /// the real ones; tests pass controlled answers, never Apple's real notice.
+    struct AppleCalls {
+        let isRegulated: @MainActor () async throws -> Bool
+        let requiresNotice: @MainActor () async throws -> Bool
+        let show: @MainActor (String) async throws -> Void
+    }
+
+    /// The stored-settings side of the step: reads the handled version and the
+    /// in-progress marker from `defaults` and writes them back there.
+    @MainActor
+    static func acknowledgeSignificantUpdate(
+        userAsked: Bool, current: String, defaults: UserDefaults, apple: AppleCalls
+    ) async -> SignificantUpdate.Outcome {
+        await acknowledge(
             acknowledged: defaults.string(forKey: SignificantUpdate.acknowledgedVersionKey),
             current: current,
             inProgress: defaults.string(forKey: SignificantUpdate.inProgressVersionKey),
             userAsked: userAsked,
-            isRegulated: { try await isInRegulatedRegion() },
-            requiresNotice: { try await requiresSignificantUpdateNotice() },
-            show: { version in
-                guard let scene = UIApplication.shared.connectedScenes
-                    .first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene else {
-                    throw SignificantUpdate.NoActiveScene()
-                }
-                try await AgeRangeService.shared.showSignificantUpdateAcknowledgment(
-                    in: scene, updateDescription: SignificantUpdate.updateDescription(version))
-            },
+            isRegulated: apple.isRegulated,
+            requiresNotice: apple.requiresNotice,
+            show: apple.show,
             record: { version in defaults.set(version, forKey: SignificantUpdate.acknowledgedVersionKey) },
             markInProgress: { version in
                 if let version {

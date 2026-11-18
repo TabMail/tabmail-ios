@@ -449,6 +449,213 @@ struct AppStoreAgeCheckRunnerGuardTests {
     }
 }
 
+/// Codex r2 TC-1: the banner's tap path (`Runner.acknowledgeOnly`) shares the
+/// notice guard with the automatic path, in both directions.
+@Suite("App Store age check: the banner's tap admits one notice at a time")
+@MainActor
+struct AppStoreAgeCheckRunnerTapTests {
+    @MainActor
+    final class Calls {
+        var notices = 0
+        var checks = 0
+        var held: CheckedContinuation<Void, Never>?
+    }
+
+    private func heldNotice(_ calls: Calls) async {
+        calls.notices += 1
+        await withCheckedContinuation { calls.held = $0 }
+    }
+
+    @Test func aTapWhileATappedNoticeIsUpStartsNoSecondAndAgeChecksStillRun() async {
+        let runner = AppStoreAgeCheck.Runner()
+        let calls = Calls()
+        let first = Task { @MainActor in await runner.acknowledgeOnly { await heldNotice(calls) } }
+        while calls.held == nil { await Task.yield() }
+        #expect(calls.notices == 1, "an idle tap opens the notice once")
+        #expect(runner.isAcknowledging)
+
+        await runner.acknowledgeOnly { calls.notices += 1 }
+        #expect(calls.notices == 1, "a second tap starts no second notice")
+
+        await runner.pass(check: { calls.checks += 1; return .allowed }, apply: { _ in }, acknowledge: { calls.notices += 1 })
+        #expect(calls.checks == 1, "the age check still runs")
+        #expect(calls.notices == 1, "and starts no automatic notice beside the tapped one")
+
+        calls.held?.resume()
+        await first.value
+        #expect(!runner.isAcknowledging)
+        await runner.acknowledgeOnly { calls.notices += 1 }
+        #expect(calls.notices == 2, "a tap after it returned is admitted")
+    }
+
+    @Test func aTapWhileAnAutomaticNoticeIsUpStartsNoSecond() async {
+        let runner = AppStoreAgeCheck.Runner()
+        let calls = Calls()
+        let first = Task { @MainActor in
+            await runner.pass(check: { .allowed }, apply: { _ in }, acknowledge: { await heldNotice(calls) })
+        }
+        while calls.held == nil { await Task.yield() }
+
+        await runner.acknowledgeOnly { calls.notices += 1 }
+        #expect(calls.notices == 1, "the tap starts no second notice")
+
+        calls.held?.resume()
+        await first.value
+        await runner.acknowledgeOnly { calls.notices += 1 }
+        #expect(calls.notices == 2)
+        #expect(!runner.isAcknowledging)
+    }
+}
+
+/// Codex r2 TC-2: the UserDefaults side of the step, through the real wrapper
+/// (`acknowledgeSignificantUpdate(userAsked:current:defaults:apple:)`) with
+/// controlled Apple calls. A private defaults suite stands in for `.standard`;
+/// the keys are the production ones.
+@Suite("Significant update: the in-progress marker in stored settings")
+@MainActor
+struct SignificantUpdateMarkerStorageTests {
+    typealias Update = AppStoreAgeCheck.SignificantUpdate
+
+    @MainActor
+    final class Apple {
+        var regulated = true
+        var asked: [String] = []
+        var markerDuringShow: String??
+    }
+
+    private func withDefaults(_ body: (UserDefaults) async throws -> Void) async throws {
+        let name = "SignificantUpdateMarkerStorageTests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
+        try await body(defaults)
+    }
+
+    private func calls(_ apple: Apple, defaults: UserDefaults) -> AppStoreAgeCheck.AppleCalls {
+        AppStoreAgeCheck.AppleCalls(
+            isRegulated: { apple.asked.append("region"); return apple.regulated },
+            requiresNotice: { apple.asked.append("notice"); return true },
+            show: { _ in
+                apple.asked.append("show")
+                apple.markerDuringShow = .some(defaults.string(forKey: Update.inProgressVersionKey))
+            }
+        )
+    }
+
+    @Test func aStoredMarkerForThisVersionOffersTheBannerAndAsksAppleNothing() async throws {
+        try await withDefaults { defaults in
+            defaults.set("1.7", forKey: Update.acknowledgedVersionKey)
+            defaults.set("1.8", forKey: Update.inProgressVersionKey)
+            let apple = Apple()
+            let outcome = await AppStoreAgeCheck.acknowledgeSignificantUpdate(
+                userAsked: false, current: "1.8.3", defaults: defaults, apple: calls(apple, defaults: defaults))
+            #expect(outcome == .offerBanner(version: "1.8"))
+            #expect(apple.asked.isEmpty, "no unasked call")
+            #expect(defaults.string(forKey: Update.acknowledgedVersionKey) == "1.7")
+            #expect(defaults.string(forKey: Update.inProgressVersionKey) == "1.8")
+        }
+    }
+
+    @Test func theMarkerIsStoredWhileTheNoticeIsUpAndRemovedAfter() async throws {
+        try await withDefaults { defaults in
+            defaults.set("1.7", forKey: Update.acknowledgedVersionKey)
+            let apple = Apple()
+            let outcome = await AppStoreAgeCheck.acknowledgeSignificantUpdate(
+                userAsked: false, current: "1.8.0", defaults: defaults, apple: calls(apple, defaults: defaults))
+            #expect(outcome == .none)
+            #expect(apple.markerDuringShow == .some("1.8"), "stored under the real key before Apple is called")
+            #expect(defaults.object(forKey: Update.inProgressVersionKey) == nil, "removed once the notice returns")
+            #expect(defaults.string(forKey: Update.acknowledgedVersionKey) == "1.8")
+        }
+    }
+
+    @Test func aTapWhereTheRulesNoLongerApplyRemovesTheStoredMarker() async throws {
+        try await withDefaults { defaults in
+            defaults.set("1.7", forKey: Update.acknowledgedVersionKey)
+            defaults.set("1.8", forKey: Update.inProgressVersionKey)
+            let apple = Apple()
+            apple.regulated = false
+            let outcome = await AppStoreAgeCheck.acknowledgeSignificantUpdate(
+                userAsked: true, current: "1.8.0", defaults: defaults, apple: calls(apple, defaults: defaults))
+            #expect(outcome == .none)
+            #expect(apple.asked == ["region"])
+            #expect(defaults.object(forKey: Update.inProgressVersionKey) == nil)
+            #expect(defaults.string(forKey: Update.acknowledgedVersionKey) == "1.7")
+        }
+    }
+
+    /// The production entry point reads `.standard`: a seeded marker for the
+    /// running version there yields the banner. Both keys are restored.
+    @Test(.enabled(if: ProcessInfo.processInfo.isOperatingSystemAtLeast(
+        OperatingSystemVersion(majorVersion: 26, minorVersion: 4, patchVersion: 0))))
+    func theProductionEntryReadsTheStandardMarker() async throws {
+        let standard = UserDefaults.standard
+        let keys = [Update.acknowledgedVersionKey, Update.inProgressVersionKey]
+        let saved = keys.map { standard.object(forKey: $0) }
+        defer {
+            for (key, value) in zip(keys, saved) {
+                if let value { standard.set(value, forKey: key) } else { standard.removeObject(forKey: key) }
+            }
+        }
+        let current = try #require(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String)
+        let majorMinor = try #require(Update.majorMinor(current))
+        standard.set("0.0", forKey: Update.acknowledgedVersionKey)
+        standard.set(majorMinor, forKey: Update.inProgressVersionKey)
+        let outcome = await AppStoreAgeCheck.acknowledgeSignificantUpdate()
+        #expect(outcome == .offerBanner(version: majorMinor))
+        #expect(standard.string(forKey: Update.acknowledgedVersionKey) == "0.0")
+    }
+}
+
+/// Codex r2 TC-3: outcome, banner, Review button, request with `userAsked:
+/// true`. RootView cannot be hosted in a unit test with its whole environment,
+/// so this is a scoped source fence over each link.
+@Suite("Significant update banner: RootView wiring")
+struct SignificantUpdateBannerWiringTests {
+    private static func source(_ path: String) throws -> String {
+        let projectRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let raw = try String(contentsOf: projectRoot.appendingPathComponent(path), encoding: .utf8)
+        return raw.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+    }
+
+    private static func body(of signature: String, in text: String) throws -> String {
+        let start = try #require(text.range(of: signature))
+        let end = try #require(text[start.upperBound...].range(of: "private func "))
+        return String(text[start.upperBound..<end.lowerBound])
+    }
+
+    private static func count(_ needle: String, in text: String) -> Int {
+        text.components(separatedBy: needle).count - 1
+    }
+
+    @Test func eachLinkFromOutcomeToRequestIsWired() throws {
+        let root = try Self.source("TabMail/Views/RootView.swift")
+        let apply = try Self.body(of: "private func applySignificantUpdate(", in: root)
+        #expect(apply.contains("case .none: significantUpdateBannerVersion = nil"))
+        #expect(apply.contains("case .offerBanner(let version): significantUpdateBannerVersion = version"))
+        #expect(Self.count("significantUpdateBannerVersion =", in: root) == 2, "only the outcome sets the banner state")
+
+        let automatic = try Self.body(of: "private func checkAppStoreAge() async {", in: root)
+        #expect(automatic.contains("acknowledge: { await applySignificantUpdate(AppStoreAgeCheck.acknowledgeSignificantUpdate()) }"))
+
+        let tap = try Self.body(of: "private func openSignificantUpdateNotice() async {", in: root)
+        #expect(tap.contains("await applySignificantUpdate(AppStoreAgeCheck.acknowledgeSignificantUpdate(userAsked: true))"))
+
+        let placement = "if let version = significantUpdateBannerVersion { SignificantUpdateBanner(version: version) { Task { await openSignificantUpdateNotice() } } }"
+        #expect(Self.count(placement, in: root) == 2, "signed-in and email-only main screens")
+
+        // The banner state is RootView @State and the age check runs from a
+        // .task on the stable ZStack, so a pending banner survives the
+        // onboarding route change.
+        #expect(root.contains("@State private var significantUpdateBannerVersion: String?"))
+        let zstack = try #require(root.range(of: "var body: some View {"))
+        #expect(root[zstack.upperBound...].contains(".task { // App Store age assurance at launch; the foreground pass repeats it. await checkAppStoreAge() }"))
+
+        let banner = try Self.source("TabMail/Views/Shared/SignificantUpdateBanner.swift")
+        #expect(banner.contains("Button(Self.actionTitle, action: onOpen)"), "Review calls the injected action")
+    }
+}
+
 /// Apple's notice can stay up and never return (#1010). The in-progress marker
 /// carries that across a relaunch: the same version is then offered through a
 /// banner, never shown unasked; a new version is shown as usual.
