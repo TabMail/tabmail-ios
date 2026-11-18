@@ -410,7 +410,7 @@ extension SyncEngine {
                 BackgroundSyncLogger.logDebug("[SelfHeal] \(folder.name): insert refused — the folder no longer holds the UIDVALIDITY this pass premised (\(String(describing: storedEpoch))), \(headers.count) headers discarded")
             }
             return SelfHealFolderOutcome(repaired: 0, allLanded: true, complete: false)
-        case .landed(let inserted, let ftsRecords, _, let allLanded):
+        case .landed(let inserted, let ftsRecords, let allLanded):
             if inserted > 0 {
                 BackgroundSyncLogger.logDebug("[SelfHeal] \(folder.name): repaired \(inserted) messages")
                 if !ftsRecords.isEmpty {

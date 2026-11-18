@@ -928,4 +928,59 @@ struct InsertBackfillBatchTests {
             #expect(before[table] == after[table], "a batch of stored rows changed table \(table)")
         }
     }
+
+    /// A Sent batch mixing a new reply with a reply the folder stores and a
+    /// reply the server reports deleted: only the inserted reply marks its
+    /// parent and queues its tag clear.
+    @Test("In a Sent batch only an inserted reply marks its parent replied")
+    func onlyAnInsertedReplyMarksItsParent() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let accountId = "inserted-reply-marks"
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: "Sent", role: .sent, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: "Archive", role: .archive, pool: pool)
+        let sent = try #require(try FolderEpochTestFixture.readFolder(accountId: accountId, path: "Sent", pool: pool))
+        let archive = try #require(try FolderEpochTestFixture.readFolder(accountId: accountId, path: "Archive", pool: pool))
+        let engine = SyncEngine()
+
+        let parents = ["1", "2", "3"].map {
+            Self.info(uid: $0, folder: "archive", cc: "", bcc: "", isRead: true, isFlagged: false,
+                      isReplied: false, inReplyTo: nil, actionTag: .reply, labels: [])
+        }
+        _ = await engine.insertBackfillBatch(parents, folderId: archive.id, accountId: accountId,
+                                             folderPath: archive.path, folderRole: .archive,
+                                             isInInbox: false, observedEpoch: nil)
+        // The stored reply, stored without its In-Reply-To.
+        let storedReply = Self.info(uid: "21", folder: "Sent", cc: "", bcc: "", isRead: true, isFlagged: false,
+                                    isReplied: false, inReplyTo: nil, actionTag: nil, labels: [])
+        _ = await engine.insertBackfillBatch([storedReply], folderId: sent.id, accountId: accountId,
+                                             folderPath: sent.path, folderRole: .sent,
+                                             isInInbox: false, observedEpoch: nil)
+
+        func reply(_ uid: String, to parent: String) -> MessageHeaderInfo {
+            Self.info(uid: uid, folder: "Sent", cc: "", bcc: "", isRead: true, isFlagged: false,
+                      isReplied: false, inReplyTo: "inert-archive-\(parent)@example.com", actionTag: nil, labels: [])
+        }
+        var deleted = reply("22", to: "3")
+        deleted.isDeletedOnServer = true
+        let batch = [reply("20", to: "1"), reply("21", to: "2"), deleted]
+        let result = await engine.insertBackfillBatch(batch, folderId: sent.id, accountId: accountId,
+                                                      folderPath: sent.path, folderRole: .sent,
+                                                      isInInbox: false, observedEpoch: nil)
+        #expect(result.inserted == 1, "precondition: only the new reply was inserted")
+
+        let (rows, ops) = try await pool.read { db in
+            (try MessageHeader.filter(Column("folderId") == archive.id).fetchAll(db),
+             try PendingOperation.filter(Column("type") == OperationType.setTag.rawValue).fetchAll(db))
+        }
+        let byUID = Dictionary(uniqueKeysWithValues: rows.map { ($0.messageId, $0) })
+        #expect(byUID["1"]?.isReplied == true, "the inserted reply did not mark its parent")
+        #expect(byUID["1"]?.actionTag == ActionTag.none)
+        #expect(byUID["2"]?.isReplied == false && byUID["2"]?.actionTag == .reply, "a stored reply's FETCH marked a parent")
+        #expect(byUID["3"]?.isReplied == false && byUID["3"]?.actionTag == .reply, "a reply the server deleted marked a parent")
+        #expect(ops.count == 1 && ops.first?.messageIds == ["inert-archive-1@example.com"],
+                "tag clears queued: \(ops.map(\.messageIds))")
+    }
 }
+

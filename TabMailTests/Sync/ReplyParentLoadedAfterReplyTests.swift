@@ -5,6 +5,7 @@
 import Testing
 import Foundation
 import GRDB
+import Synchronization
 @testable import TabMail
 
 /// A reply the user sent is already stored in Sent (its folder's walk is
@@ -46,7 +47,24 @@ struct ReplyParentLoadedAfterReplyTests {
         }
     }
 
-    private static func expectMarked(accountId: String, parentRfc822: String, pool: DatabasePool) throws {
+    /// Collects the header ids announced with `.messageDataDidChange` while alive.
+    final class Announced: @unchecked Sendable {
+        private final class Box: Sendable { let ids = Mutex<Set<String>>([]) }
+        private let box = Box()
+        private var token: (any NSObjectProtocol)?
+        init() {
+            let box = self.box
+            token = NotificationCenter.default.addObserver(forName: .messageDataDidChange, object: nil, queue: nil) { note in
+                if let id = note.object as? String { _ = box.ids.withLock { $0.insert(id) } }
+            }
+        }
+        deinit { if let token { NotificationCenter.default.removeObserver(token) } }
+        func contains(_ id: String) -> Bool { box.ids.withLock { $0.contains(id) } }
+    }
+
+    private static func expectMarked(
+        accountId: String, parentRfc822: String, pool: DatabasePool, announced: Announced
+    ) throws {
         let (parent, ops) = try pool.read { db in
             (try MessageHeader.filter(Column("accountId") == accountId && Column("rfc822MessageId") == parentRfc822).fetchOne(db),
              try PendingOperation.filter(Column("accountId") == accountId).fetchAll(db))
@@ -54,8 +72,10 @@ struct ReplyParentLoadedAfterReplyTests {
         let row = try #require(parent, "precondition: the parent loaded")
         #expect(row.isReplied, "the parent loaded after its reply does not show as replied")
         #expect(row.actionTag == ActionTag.none, "the parent's Reply suggestion was not cleared (\(String(describing: row.actionTag)))")
-        #expect(ops.contains { $0.type == .setTag && $0.tagValue == ActionTag.none.rawValue && $0.folderPath == row.folderPath },
-                "the cleared tag was not queued for the server")
+        #expect(ops.contains { $0.type == .setTag && $0.tagValue == ActionTag.none.rawValue
+                    && $0.folderPath == row.folderPath && $0.messageIds == [row.stableId] },
+                "the cleared tag was not queued for the server: \(ops.map { ($0.type, $0.folderPath, $0.messageIds) })")
+        #expect(announced.contains(row.id), "the parent's change was not announced")
     }
 
     @Test("IMAP UID walk: a parent loaded after its stored reply is marked replied")
@@ -101,9 +121,10 @@ struct ReplyParentLoadedAfterReplyTests {
             accountId: accountId, provider: imap,
             workQueue: ProviderWorkQueue(provider: imap, maxConcurrency: SyncConfig.imapMaxConnectionCeiling))
 
+        let announced = Announced()
         _ = await engine.runBackfillWalk(account: account, deadline: F.deadline())
 
-        try Self.expectMarked(accountId: accountId, parentRfc822: parentRfc822, pool: pool)
+        try Self.expectMarked(accountId: accountId, parentRfc822: parentRfc822, pool: pool, announced: announced)
     }
 
     @Test("Gmail page walk: a parent loaded after its stored reply is marked replied")
@@ -121,9 +142,70 @@ struct ReplyParentLoadedAfterReplyTests {
                                  parentRfc822: parentRfc822, pool: pool)
         let engine = await F.registeredEngine(accountId: accountId, provider: server.provider())
 
+        let announced = Announced()
         _ = await engine.runBackfill(account: account, deadline: F.deadline())
 
-        try Self.expectMarked(accountId: accountId, parentRfc822: parentRfc822, pool: pool)
+        try Self.expectMarked(accountId: accountId, parentRfc822: parentRfc822, pool: pool, announced: announced)
+    }
+
+    @Test("Full sync: a parent loaded after its stored reply is marked replied")
+    func parentLoadedAfterItsStoredReplyIsMarkedRepliedFullSync() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let accountId = "reply-first-fullsync"
+        let parentRfc822 = "fullsync-parent@example.com"
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: "INBOX", role: .inbox, pool: pool)
+        try Self.seedReplyAndTag(accountId: accountId, sentPath: "Sent", parentPath: "INBOX",
+                                 parentRfc822: parentRfc822, pool: pool)
+        let inbox = try #require(try FolderEpochTestFixture.readFolder(accountId: accountId, path: "INBOX", pool: pool))
+        let mock = MockEmailProvider(staleWindowMode: .uid)
+        await mock.setFetchMessagesResult([Self.parentInfo(uid: "7", rfc822: parentRfc822)])
+
+        let announced = Announced()
+        _ = try await SyncEngine.runSyncMessages(
+            for: inbox, provider: mock, limit: 50, dbPool: PrioritizedDatabase(pool: pool))
+
+        try Self.expectMarked(accountId: accountId, parentRfc822: parentRfc822, pool: pool, announced: announced)
+    }
+
+    @Test("Scroll to older mail: a parent loaded after its stored reply is marked replied")
+    func parentLoadedAfterItsStoredReplyIsMarkedRepliedScroll() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let accountId = "reply-first-scroll"
+        let parentRfc822 = "scrollparent@example.com"
+        let server = StatefulGmailActionServer(messages: [
+            F.gmailSeed("anchor", label: "INBOX", daysAgo: 1),
+            F.gmailSeed("scrollparent", label: "INBOX", daysAgo: 5),
+        ])
+        defer { server.close() }
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .gmail, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: "INBOX", role: .inbox, pool: pool)
+        try F.insertHeader("anchor", accountId: accountId, path: "INBOX", pool: pool)
+        try await pool.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET providerDate = date WHERE messageId = 'anchor'")
+        }
+        try Self.seedReplyAndTag(accountId: accountId, sentPath: "SENT", parentPath: "INBOX",
+                                 parentRfc822: parentRfc822, pool: pool)
+        let inbox = try #require(try FolderEpochTestFixture.readFolder(accountId: accountId, path: "INBOX", pool: pool))
+        let engine = await F.registeredEngine(accountId: accountId, provider: server.provider())
+
+        let announced = Announced()
+        _ = try await engine.fetchOlderMessages(folders: [inbox])
+
+        try Self.expectMarked(accountId: accountId, parentRfc822: parentRfc822, pool: pool, announced: announced)
+    }
+
+    private static func parentInfo(uid: String, rfc822: String) -> MessageHeaderInfo {
+        MessageHeaderInfo(
+            messageId: uid, rfc822MessageId: rfc822, inReplyTo: nil, references: [],
+            threadId: nil, subject: "the parent", from: "Sender",
+            fromAddress: "sender@example.com", to: "me@example.com",
+            cc: "", bcc: "", replyTo: nil,
+            date: Date().addingTimeInterval(-3_600), snippet: "parent",
+            isRead: false, isFlagged: false, hasAttachments: false,
+            isReplied: false, isForwarded: false, actionTag: nil)
     }
 
     private static func rfc2822(_ date: Date) -> String {

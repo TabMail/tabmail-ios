@@ -128,6 +128,19 @@ extension SyncEngine {
         epochBootstrapWriteFailureIdsForTesting.withLock { $0.remove(folderId) != nil }
     }
 
+    /// Test seam: the UID walk's read of the stored UIDs among a range's
+    /// SEARCH answer (before its FETCH) THROWS once for each folder id in here,
+    /// then the id is consumed. Models a transient read failure, which has no
+    /// other seam; a later call must load the range normally.
+    static let storedUIDReadFailureIdsForTesting = Mutex<Set<String>>([])
+
+    /// Marker error for the seam above. DEBUG-only; never reachable in Release.
+    struct StoredUIDReadFailureForTesting: Error {}
+
+    private static func consumeStoredUIDReadFailureForTesting(folderId: String) -> Bool {
+        storedUIDReadFailureIdsForTesting.withLock { $0.remove(folderId) != nil }
+    }
+
     /// Test seam: the FRESH branch's bookkeeping transaction throws for every
     /// folder id in here, and — unlike `epochBootstrapWriteFailureIdsForTesting`
     /// above — the id is **NOT consumed**.
@@ -1845,7 +1858,12 @@ extension SyncEngine {
                                     let uidsToFetch: [UInt32]
                                     do {
                                         let stored = try await AppDatabase.backgroundPool.read { db in
-                                            try MessageHeader.existingMessageIds(
+                                            #if DEBUG
+                                            if Self.consumeStoredUIDReadFailureForTesting(folderId: folderCaptured.id) {
+                                                throw StoredUIDReadFailureForTesting()
+                                            }
+                                            #endif
+                                            return try MessageHeader.existingMessageIds(
                                                 db, folderId: folderCaptured.id, among: existingUIDs.map(String.init))
                                         }
                                         uidsToFetch = existingUIDs.filter { !stored.contains(String($0)) }

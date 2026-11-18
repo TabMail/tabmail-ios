@@ -553,4 +553,36 @@ struct BackfillRefusedRangeTests {
         #expect(fetchedNow == [newUID], "fetched \(fetchedNow.sorted()), expected only the new UID \(newUID)")
         #expect(try world.local() == loaded.union([newUID]))
     }
+
+    // MARK: - The stored-UID read fails
+
+    /// The read of which SEARCHed UIDs the folder stores (before the FETCH)
+    /// fails once: that range is not FETCHed and not confirmed, the walk's
+    /// position claims no missing mail, and the next call loads it.
+    @Test("A failed stored-UID read leaves its range unfetched and pending; the next call loads it")
+    func storedUIDReadFailureLeavesTheRangePending() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let world = try await Self.makeWorld(accountId: "stored-read-fails", pool: pool)
+        defer { Self.tearDown(world) }
+        defer { _ = SyncEngine.storedUIDReadFailureIdsForTesting.withLock { $0.remove(world.folderId) } }
+        SyncEngine.storedUIDReadFailureIdsForTesting.withLock { _ = $0.insert(world.folderId) }
+
+        #expect(await Self.callEnds(world))
+        #expect(SyncEngine.storedUIDReadFailureIdsForTesting.withLock { !$0.contains(world.folderId) },
+                "precondition: the stored-UID read failed once")
+        let missing = Set(world.uids).subtracting(try world.local())
+        #expect(!missing.isEmpty, "the failed read lost no range: the fixture is vacuous")
+        let fetched = Self.fetches(world.server.recordedCommands()[...]).reduce(Set<Int>()) { $0.union($1) }
+        #expect(fetched.isDisjoint(with: missing), "the range whose stored-UID read failed was FETCHed: \(fetched.intersection(missing).sorted())")
+        let row = try world.row()
+        #expect(!row.backfillComplete, "the folder completed over a range that never loaded")
+        let claim = F.uidPositionClaimsMissingMail(row, local: try world.local(), server: world.uids)
+        #expect(claim == nil, "\(claim ?? "")")
+
+        #expect(await Self.callEnds(world))
+        #expect(try world.local() == Set(world.uids), "the next call did not load the range")
+        #expect(try world.row().backfillComplete)
+    }
 }
+
