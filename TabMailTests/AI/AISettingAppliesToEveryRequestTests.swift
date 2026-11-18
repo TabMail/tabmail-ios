@@ -26,6 +26,25 @@ private final class Answered: Sendable {
     func next() -> Int { count.withLock { $0 += 1; return $0 } }
 }
 
+/// A harmless client tool, registered in the shared registry under its own name, that counts its runs.
+private final class CountingTool: AgentTool, Sendable {
+    let name = "test_counting_tool_\(UUID().uuidString.prefix(8))"
+    private let count = Mutex(0)
+
+    var runs: Int { count.withLock { $0 } }
+
+    func execute(arguments: [String: JSONValue]) async throws -> String {
+        count.withLock { $0 += 1 }
+        return "done"
+    }
+
+    /// Registers this tool after the default set, so the tool loop finds it.
+    func register() async {
+        await ToolRegistry.shared.ensureDefaultToolsRegistered()
+        await ToolRegistry.shared.register(self)
+    }
+}
+
 /// Settings → Opt Out of AI applies to every AI request, not only at the start of an operation.
 /// Once it is turned on, the next request an operation would send (a tool round, a rate-limit
 /// retry, a job that waited for its turn, the notification extension's next call) is not sent,
@@ -51,10 +70,12 @@ struct AISettingAppliesToEveryRequestTests {
     private static let answerText = "Here is the answer."
     private static let answer = stream(#"{"assistant":"Here is the answer."}"#)
 
-    /// A round asking for a client tool: the loop runs it and sends its result in the next round.
-    private static let toolRound = stream(
-        #"{"tool_calls":[{"id":"call-1","function":{"name":"not_a_tool","arguments":"{}"}}],"conversation_state":{"harmony_messages":[],"current_round":1}}"#
-    )
+    /// A round asking for the client tool `name`: the loop runs it and sends its result in the next round.
+    private static func toolRound(_ name: String) -> FakeHTTP.CannedResponse {
+        stream(
+            #"{"tool_calls":[{"id":"call-1","function":{"name":""# + name + #"","arguments":"{}"}}],"conversation_state":{"harmony_messages":[],"current_round":1}}"#
+        )
+    }
 
     private static let request = CompletionsRequest(messages: [], client_timezone: "UTC", disable_tools: nil)
 
@@ -153,6 +174,11 @@ struct AISettingAppliesToEveryRequestTests {
     @Test("a chat turn stops at its next tool round once AI is turned off, and its user's message stays as with AI off at the start")
     func aChatTurnStopsAtItsNextToolRound() async throws {
         #expect(await MainActor.run { !DemoModeStore.shared.isActive })
+        try await withTestDatabase { pool in try await chatTurnStopsAtItsNextToolRound(pool) }
+    }
+
+    /// Runs `body` with a fresh database installed as `AppDatabase.shared`, then restores the previous one.
+    private func withTestDatabase<T>(_ body: (DatabasePool) async throws -> T) async throws -> T {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         var config = Configuration()
@@ -169,7 +195,12 @@ struct AISettingAppliesToEveryRequestTests {
             TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
         await MemoryIndex.shared._testReset()
+        return try await body(pool)
+    }
 
+    private func chatTurnStopsAtItsNextToolRound(_ pool: DatabasePool) async throws {
+        let tool = CountingTool()
+        await tool.register()
         let http = FakeHTTP.Scenario()
         defer { http.close() }
         let setting = AISettingSwitch()
@@ -178,7 +209,7 @@ struct AISettingAppliesToEveryRequestTests {
             guard answered.next() == 1 else { return Self.answer }
             // AI is turned off while the first round is out; that round asks for a client tool.
             setting.turnOff()
-            return Self.toolRound
+            return Self.toolRound(tool.name)
         }
         let service = makeService(http, setting)
         let typed = "What is on my calendar tomorrow?"
@@ -195,6 +226,8 @@ struct AISettingAppliesToEveryRequestTests {
             try await chatTurn(service, pool: pool, typed: typed)
         }
         #expect(http.recordedCalls().count == 1)
+        // The tool the first round asked for ran, once; only the round carrying its result was refused.
+        #expect(tool.runs == 1)
         // The same end as the entry check's: no answer and no error, so the pill shows its
         // no-answer line, saves nothing more, and offers no retry or resume of a sent request.
         #expect(midTurn.answer == nil)
@@ -209,6 +242,180 @@ struct AISettingAppliesToEveryRequestTests {
         }
         #expect(next?.text == Self.answerText)
         #expect(http.recordedCalls().count == 2)
+    }
+
+    @Test("a client tool an answer asked for runs once after AI is turned off, and the round carrying its result is not sent")
+    func aRequestedToolRunsAndItsResultIsNotSent() async throws {
+        let tool = CountingTool()
+        await tool.register()
+
+        // Control, AI on throughout: the tool runs and its result goes out in the next round.
+        let enabled = FakeHTTP.Scenario()
+        defer { enabled.close() }
+        let enabledAnswered = Answered()
+        enabled.register(path: "/completions/chat", method: "POST") { _ in
+            enabledAnswered.next() == 1 ? Self.toolRound(tool.name) : Self.answer
+        }
+        let on = AISettingSwitch()
+        let answered = try await BackendClient(llmSession: enabled.session, isAIOff: { on.isOff })
+            .sendCompletionsWithToolsDirect(Self.request)
+        #expect(answered.assistant == Self.answerText)
+        #expect(tool.runs == 1)
+        let enabledCalls = enabled.recordedCalls()
+        #expect(enabledCalls.count == 2)
+        guard enabledCalls.count == 2 else { return }
+        let continuation = String(decoding: enabledCalls[1].body ?? Data(), as: UTF8.self)
+        #expect(continuation.contains(#""tool_call_id":"call-1""#), "the next round carries the tool's result")
+
+        // AI turned off while the first round is out: the tool still runs once; its result is not sent.
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let setting = AISettingSwitch()
+        http.register(path: "/completions/chat", method: "POST") { _ in
+            setting.turnOff()
+            return Self.toolRound(tool.name)
+        }
+        let client = BackendClient(llmSession: http.session, isAIOff: { setting.isOff })
+        await #expect(throws: AIOffError.self) { try await client.sendCompletionsWithToolsDirect(Self.request) }
+        #expect(tool.runs == 2, "the requested tool ran exactly once more")
+        #expect(http.recordedCalls().count == 1, "no continuation request")
+    }
+
+    // MARK: - Chat resume, inline edit: refused after the entry check
+
+    private static let draftSubject = "Quarterly planning"
+    private static let draftBody = "Can we meet on Thursday?"
+
+    private func inlineEdit(_ service: AIService) async throws -> InlineEditResult {
+        let context = ComposeEditContext(
+            recipients: ["recipient@example.com"], toRecipients: ["recipient@example.com"], ccRecipients: [], bccRecipients: [],
+            toDisplayNames: [:], ccDisplayNames: [:], bccDisplayNames: [:], senderName: "Sender", senderEmail: "sender@company.com",
+            mode: "edit_new", compositionPrompt: "", kbText: "", relatedDate: "", relatedSubject: "", relatedFrom: "",
+            relatedTo: "", relatedCc: "", bodyText: "")
+        return try await service.performInlineEdit(
+            currentSubject: Self.draftSubject, currentBody: Self.draftBody, context: context,
+            instruction: "Make it shorter.", chatHistory: [])
+    }
+
+    @Test("a resumed chat turn refused after its check ends with no answer, as with AI off at the start")
+    func aRefusedResumeHasNoAnswer() async throws {
+        #expect(await MainActor.run { !DemoModeStore.shared.isActive })
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        http.register(path: "/completions/chat", method: "POST", response: Self.answer)
+        let setting = AISettingSwitch()
+        let service = makeService(http, setting)
+
+        try await withRealSetting(aiOff: false) {
+            setting.turnOff()
+            let refused = try await service.resumeChatMessage(request: Self.request)
+            #expect(refused == nil)
+            #expect(http.recordedCalls().isEmpty)
+
+            setting.turnOn()
+            let resumed = try await service.resumeChatMessage(request: Self.request)
+            #expect(resumed?.text == Self.answerText)
+            #expect(http.recordedCalls().count == 1)
+        }
+    }
+
+    @Test("an inline edit refused after its check returns the AI-off result and leaves the draft as it was")
+    func aRefusedInlineEditLeavesTheDraft() async throws {
+        #expect(await MainActor.run { !DemoModeStore.shared.isActive })
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        http.register(path: "/completions/chat", method: "POST", response: Self.stream(#"{"assistant":"Response: Shortened.\nSubject: Planning\nBody: Thursday?"}"#))
+        let setting = AISettingSwitch()
+        let service = makeService(http, setting)
+
+        try await withRealSetting(aiOff: false) {
+            setting.turnOff()
+            let refused = try await inlineEdit(service)
+            #expect(refused.response == AIService.inlineEditWithAIOff.response)
+            #expect(refused.response == "AI calls are disabled.")
+            // No new subject, body or recipients: the draft stays as it was.
+            #expect(refused.subject == nil && refused.body == nil)
+            #expect(refused.toDelta == nil && refused.ccDelta == nil && refused.bccDelta == nil)
+            #expect(refused.raw.isEmpty)
+            #expect(http.recordedCalls().isEmpty)
+
+            setting.turnOn()
+            let edited = try await inlineEdit(service)
+            #expect(edited.response == "Shortened.")
+            #expect(edited.subject == "Planning" && edited.body == "Thursday?")
+            #expect(http.recordedCalls().count == 1)
+        }
+    }
+
+    // MARK: - Demo Mode: a refused call uses none of the budget
+
+    enum DemoCall: String, CaseIterable, Sendable {
+        case send, resume, edit
+    }
+
+    /// The Demo Mode calls used, as stored.
+    private static func storedDemoCalls() -> Int {
+        UserDefaults.standard.integer(forKey: "demo.callsConsumed")
+    }
+
+    /// Runs `body` in a running demo with a stored demo token, then ends the demo.
+    private func inDemo(_ body: () async throws -> Void) async throws {
+        let session = DemoTokenManager.DemoSession(
+            accessToken: "test-demo-token", sub: "test",
+            expiresAt: Int(Date().addingTimeInterval(3600).timeIntervalSince1970))
+        try KeychainHelper.save(try JSONEncoder().encode(session), for: "demo_session")
+        await MainActor.run {
+            DemoModeStore.shared._resetForTests()
+            DemoModeStore.shared.isActive = true
+        }
+        func end() async {
+            await MainActor.run { DemoModeStore.shared._resetForTests() }
+            DemoTokenManager.clearSession()
+        }
+        do {
+            try await body()
+        } catch {
+            await end()
+            throw error
+        }
+        await end()
+    }
+
+    /// Makes the call and returns whether it ended as with AI off at the start.
+    private func demoCall(_ call: DemoCall, _ service: AIService) async throws -> Bool {
+        switch call {
+        case .send: return try await service.sendChatMessage(userText: "What is on my calendar tomorrow?", history: []) == nil
+        case .resume: return try await service.resumeChatMessage(request: Self.request) == nil
+        case .edit: return try await inlineEdit(service).response == AIService.inlineEditWithAIOff.response
+        }
+    }
+
+    @Test("a demo call refused after its check uses none of the demo budget; one sent uses exactly one", arguments: DemoCall.allCases)
+    func aRefusedDemoCallUsesNoBudget(call: DemoCall) async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        http.register(path: "/completions/chat", method: "POST", response: Self.answer)
+        let setting = AISettingSwitch()
+        let service = makeService(http, setting)
+
+        try await withTestDatabase { _ in
+            try await withRealSetting(aiOff: false) {
+                try await inDemo {
+                    let before = Self.storedDemoCalls()
+                    setting.turnOff()
+                    let refused = try await demoCall(call, service)
+                    #expect(refused)
+                    #expect(http.recordedCalls().isEmpty)
+                    #expect(Self.storedDemoCalls() == before, "a refused call is not charged")
+
+                    setting.turnOn()
+                    let sentLikeOff = try await demoCall(call, service)
+                    #expect(!sentLikeOff)
+                    #expect(http.recordedCalls().count == 1)
+                    #expect(Self.storedDemoCalls() == before + 1, "a sent call uses exactly one")
+                }
+            }
+        }
     }
 
     // MARK: - Reply: a rate-limit retry
