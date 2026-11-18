@@ -167,7 +167,7 @@ extension SyncEngine {
     /// - Parameter deadline: the caller's own deadline for the whole pass (its
     ///   timeout), or nil when the caller sets none. It is not account sync state.
     func readAndApplyChanges(
-        account: Account, provider: any EmailProvider, scope: ChangeScope, deadline: Date? = nil
+        account: Account, provider: any EmailProvider, scope: ChangeScope, deadline: Date? = nil, pass: UUID? = nil
     ) async throws -> ChangePassOutcome? {
         let accountId = account.id
         let request = try await makeChangeRequest(accountId: accountId, scope: scope, deadline: deadline)
@@ -201,9 +201,9 @@ extension SyncEngine {
             guard case .untracked(let observation) = changes.status else { continue }
             switch try await refreshUntrackedFolder(
                 folderId: changes.folderId, observation: observation, account: account, provider: provider,
-                deadline: deadline) {
+                deadline: deadline, pass: pass) {
             case .listed: outcome.hadChanges = true
-            // Recorded on the account by `listFolder` (`unprovenListingAccounts`),
+            // Recorded for this pass by `listFolder` (`unprovenListingPasses`),
             // so an error in a later folder cannot lose it.
             case .unproven: break
             case .notListed: break

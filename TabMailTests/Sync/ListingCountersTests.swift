@@ -680,6 +680,63 @@ struct ListingCountersTests {
         }
     }
 
+    @Test("A cold folder connection to a server that refuses the (CONDSTORE) SELECT parameter still opens: the pool's open-the-folder SELECT is plain, and the listing's own SELECT falls back to a plain one and lists the folder")
+    func coldConnectionRefusingCondStoreSelectStillLists() async throws {
+        try await E.withWorld("lc-cold-condstore-refused", capabilities: Self.condstoreNoEnableNoReader, serverUIDs: [1], localUIDs: [1]) { w in
+            try Self.addArchive(w, serverUIDs: [1, 2, 3], localUIDs: [1])
+            // The server refuses the first (CONDSTORE) SELECT it sees. With no
+            // ENABLE advertised the session decides `selectParameter`; the first
+            // SELECT on the cold Archive connection must not be that one.
+            w.server.failNextCommand(containing: "(CONDSTORE)")
+            let outcome = await w.engine.listFolder(try Self.archive(w).folder, provider: w.provider, limit: SyncConfig.syncMessageLimit)
+            if case .proven = outcome {} else { Issue.record("the folder opens and lists despite the refused parameter: \(outcome)") }
+            #expect(try Self.archive(w).uids == ["1", "2", "3"])
+        }
+    }
+
+    @Test("A FETCH answer naming two UIDs for one sequence slot proves nothing: the held mail below the window survives and the folder is not published")
+    func conflictingFetchRecordsLeaveHeldMailBelowTheWindow() async throws {
+        try await E.withWorld("lc-conflicting-records", capabilities: Self.condstoreNoReader, serverUIDs: [1], localUIDs: [1]) { w in
+            let server = Array(1...53)
+            try Self.addArchive(w, serverUIDs: server, localUIDs: server)
+            let before = try Self.archive(w).folder
+            // The window is sequences 4...53 (UIDs 4...53). The server also sends
+            // a record at sequence 4 with UID 1, which would lower the sweep floor
+            // to UID 1 and judge 2 and 3, held and on the server, as absent.
+            w.server.setConflictingFetchRecord(templateUID: 4, sequence: 4, uid: 1, in: Self.archivePath)
+            let outcome = await w.engine.listFolder(before, provider: w.provider, limit: SyncConfig.syncMessageLimit)
+            if case .proven = outcome { Issue.record("a conflicting record set is never proof") }
+            let after = try Self.archive(w)
+            #expect(after.uids == Set(server.map(String.init)), "held mail below the window survives")
+            #expect(after.folder.totalCount == before.totalCount && after.folder.lastKnownUidNext == before.lastKnownUidNext,
+                    "nothing is published from a conflicting answer")
+        }
+    }
+
+    @Test("A session lost between the listing's SELECT and its proof makes the listing unproven: no new session logs in to answer the proof, and nothing is published")
+    func sessionLostBetweenSelectAndProofIsUnproven() async throws {
+        try await E.withWorld("lc-proof-session", capabilities: Self.condstoreNoReader, serverUIDs: [1], localUIDs: [1]) { w in
+            try Self.addArchive(w, serverUIDs: [1, 2, 3], localUIDs: [1, 2])
+            let before = try Self.archive(w)
+            // The listing's own SELECT carries (CONDSTORE) on this server; the
+            // pool's open-the-folder SELECT is plain. Answer the listing's SELECT,
+            // then end its session before the confirming FETCH.
+            w.server.closeConnectionAfterAnsweringNextCommand(containing: "(CONDSTORE)")
+            let logBefore = w.server.recordedCommands().count
+            let outcome = await w.engine.listFolder(before.folder, provider: w.provider, limit: SyncConfig.syncMessageLimit)
+            let after = try Self.archive(w)
+            let sent = Array(w.server.recordedCommands().dropFirst(logBefore))
+            let selectIndex = try #require(sent.firstIndex { $0.uppercased().contains("(CONDSTORE)") }, "precondition: the listing's SELECT was sent: \(sent)")
+            let afterSelect = sent[(selectIndex + 1)...]
+            if case .unproven = outcome {} else { Issue.record("a proof that lost its session proves nothing: \(outcome)") }
+            #expect(!afterSelect.contains { $0.uppercased().hasPrefix("LOGIN") || $0.uppercased().hasPrefix("AUTHENTICATE") },
+                    "no new session is opened to answer the proof: \(Array(afterSelect))")
+            #expect(after.uids == before.uids, "nothing is listed or removed")
+            #expect(after.folder.totalCount == before.folder.totalCount && after.folder.lastKnownUidNext == before.folder.lastKnownUidNext,
+                    "nothing is published")
+        }
+    }
+
     // MARK: - Races the owner asked to see end to end
 
     @Test("A CONDSTORE SELECT refused on a live session sends no ENABLE after it (RFC 5161: only before a session selects); after a teardown the next connection starts clean: its own ENABLE before its SELECT, (CONDSTORE) on that SELECT, the server's MODSEQ stored")
@@ -758,17 +815,81 @@ struct ListingCountersTests {
         }
     }
 
-    @Test("Two folders in one pass: the first listing proves nothing, the second proves its window; the account's unproven state survives the later folder, so the stamp stays withheld")
+    static let projectsPath = "Projects"
+
+    static func listingDue(_ w: E.World, path: String) throws -> Bool {
+        let folderId = "\(w.account.id):\(path)"
+        return try w.pool.read { db in
+            FolderChangeState(raw: try String.fetchOne(db, sql: "SELECT changeState FROM folder WHERE id = ?", arguments: [folderId])).listingDue
+        }
+    }
+
+    @Test("An on-demand listing that proves nothing while a scheduled pass runs belongs to no pass: the pass's own proven listings stamp the full sync, and the folder opened on demand is made due so the next pass lists it")
+    func onDemandFailureDuringAPassNeverWithholdsItsStamp() async throws {
+        try await E.withWorld("lc-ondemand-during-pass", capabilities: Self.condstoreNoReader, serverUIDs: [1], localUIDs: [1]) { w in
+            try Self.addArchive(w, serverUIDs: [1, 2, 3], localUIDs: [1, 2])
+            // A custom folder the pass does not list, opened by the user meanwhile.
+            w.server.setMessages([1, 2, 3].map(IMAPChangeReaderTests.message), in: Self.projectsPath)
+            w.server.setUidValidity(E.epoch, for: Self.projectsPath)
+            try FolderEpochTestFixture.insertFolder(
+                accountId: w.account.id, path: Self.projectsPath, role: .custom, pool: w.pool,
+                totalCount: 2, lastKnownUidNext: 3, lastKnownUidValidity: E.epoch)
+            try FolderEpochTestFixture.insertHeaders(accountId: w.account.id, path: Self.projectsPath, uids: [1, 2], pool: w.pool)
+            w.server.suppressFetchRecord(in: Self.projectsPath, uids: [2])
+            #expect(try Self.fullSyncStamp(w) == nil, "precondition: the full sync is due")
+
+            // The pass is held inside its Archive listing; the on-demand listing
+            // fails in the middle of it, after the pass started.
+            w.server.holdNextFetchAfterSnapshot(in: Self.archivePath)
+            defer { w.server.releaseFetchAfterSnapshot(in: Self.archivePath) }
+            let account = try Self.account(w)
+            let pass = Task { try await w.engine.sync(account: account) }
+            let waitUntil = Date().addingTimeInterval(10)
+            while Date() < waitUntil, !w.server.isHoldingFetchAfterSnapshot(in: Self.archivePath) {
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+            #expect(w.server.isHoldingFetchAfterSnapshot(in: Self.archivePath), "precondition: the pass is inside its listing")
+            let projects = try #require(try await w.pool.read { db in try Folder.fetchOne(db, key: "\(w.account.id):\(Self.projectsPath)") })
+            let onDemand = await w.engine.listFolder(projects, provider: w.provider, limit: SyncConfig.syncMessageLimit)
+            guard case .unproven = onDemand else { Issue.record("precondition: the on-demand listing is unproven: \(onDemand)"); return }
+            w.server.releaseFetchAfterSnapshot(in: Self.archivePath)
+            _ = try await pass.value
+
+            #expect(try Self.fullSyncStamp(w) != nil, "the pass's own listings all proved their windows: it stamps")
+            #expect(try Self.listingDue(w, path: Self.projectsPath), "the unproven on-demand listing made its folder due")
+        }
+    }
+
+    @Test("Two folders in one pass: the first listing proves nothing, the second proves its window; the pass's unproven state survives the later folder, so the stamp stays withheld")
     func unprovenStateOnlyGrowsWithinAPass() async throws {
         try await E.withWorld("lc-unproven-acc", capabilities: Self.condstoreNoReader, serverUIDs: [1, 2], localUIDs: [1]) { w in
             try Self.addArchive(w, serverUIDs: [1, 2, 3], localUIDs: [1, 2])
             w.server.suppressFetchRecord(in: Self.archivePath, uids: [2])
-            let first = await w.engine.listFolder(try Self.archive(w).folder, provider: w.provider, limit: SyncConfig.syncMessageLimit)
-            guard case .unproven = first else { Issue.record("precondition: the Archive listing is unproven: \(first)"); return }
-            let second = await w.engine.listFolder(try w.folder(), provider: w.provider, limit: SyncConfig.syncMessageLimit)
-            guard case .proven = second else { Issue.record("precondition: the Inbox listing is proven: \(second)"); return }
-            #expect(await w.engine.unprovenListingAccounts.contains(w.account.id),
-                    "a later folder never clears an earlier folder's unproven listing")
+            _ = try await w.engine.sync(account: try Self.account(w))
+            #expect(try w.uids() == ["1", "2"], "precondition: the Inbox listing proved its window")
+            #expect(try Self.fullSyncStamp(w) == nil, "the Archive's unproven listing withholds the pass's stamp")
+        }
+    }
+
+    @Test("An unproven on-demand listing makes its folder due: the next pass lists it although STATUS shows nothing changed, and nothing was published from the failed listing")
+    func unprovenOnDemandListingMakesTheFolderDue() async throws {
+        try await E.withWorld("lc-ondemand-due", capabilities: Self.condstoreNoReader, serverUIDs: [1], localUIDs: [1]) { w in
+            try Self.addArchive(w, serverUIDs: [1, 2, 3], localUIDs: [1, 2])
+            w.server.suppressFetchRecord(in: Self.archivePath, uids: [2])
+            let before = try Self.archive(w)
+            let outcome = await w.engine.listFolder(before.folder, provider: w.provider, limit: SyncConfig.syncMessageLimit)
+            guard case .unproven = outcome else { Issue.record("precondition: unproven: \(outcome)"); return }
+            let after = try Self.archive(w)
+            #expect(try Self.listingDue(w, path: Self.archivePath), "the folder is due")
+            #expect(after.uids == before.uids && after.folder.totalCount == before.folder.totalCount
+                    && after.folder.lastKnownUidNext == before.folder.lastKnownUidNext, "nothing published")
+            #expect(SyncEngine.untrackedFolderChanged(
+                observation: UntrackedObservation(messageCount: after.folder.totalCount, uidNext: after.folder.lastKnownUidNext ?? 0,
+                                                  highestModSeq: after.folder.lastKnownHighestModSeq, uidValidity: nil),
+                lastKnownUidNext: after.folder.lastKnownUidNext, totalCount: after.folder.totalCount,
+                lastKnownHighestModSeq: after.folder.lastKnownHighestModSeq,
+                listingDue: try Self.listingDue(w, path: Self.archivePath)),
+                    "an unchanged STATUS does not skip a due folder")
         }
     }
 

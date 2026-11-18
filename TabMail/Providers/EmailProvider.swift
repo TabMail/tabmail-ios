@@ -386,6 +386,12 @@ protocol EmailProvider: Sendable {
     /// that must make a request for it answers `.none`).
     func progressTotal(crawling: Bool) async -> ProgressTotal
 
+    /// The full sync took this complete folder list (`fetchFolders`) as the
+    /// account's tree: a provider whose progress total comes from the folder
+    /// list takes it from here, and only from here, so a change read's folder
+    /// discovery never sets it (#755).
+    func adoptFullSyncFolderList(_ folders: [FolderInfo]) async
+
     /// Which of these ids (numeric, in a provider whose ids are `.uid`-windowed)
     /// the folder still holds, with the generation of the id space the answer
     /// was given under (`0` = not reported: nothing may be decided). The
@@ -780,6 +786,9 @@ extension EmailProvider {
 
     /// No server total by default: progress counts stored rows.
     func progressTotal(crawling: Bool) async -> ProgressTotal { .none }
+
+    /// No folder-list total by default.
+    func adoptFullSyncFolderList(_ folders: [FolderInfo]) async {}
 
     /// No numeric ids: no presence answer.
     func presentIds(folder: String, uids: [UInt32]) async throws -> UIDExistenceResult? { nil }

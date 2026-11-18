@@ -58,7 +58,14 @@ struct StaleProtectionTests {
     /// A fetch that returns NOTHING — the server transiently not including the just-arrived
     /// message (STATUS/fetch propagation lag), which is what makes stale detection want to
     /// delete it. `fetchMessagesResult` defaults to `[]`.
-    private func missingFetchMock() -> MockEmailProvider { MockEmailProvider(staleWindowMode: .uid) }
+    /// The listing's SELECT reports an empty INBOX bounded by UIDNEXT 501, so
+    /// UID 500 sits inside what this listing judges; without that bound the
+    /// sweep judges nothing and the protection would not be load-bearing.
+    private func missingFetchMock() -> MockEmailProvider {
+        let mock = MockEmailProvider(staleWindowMode: .uid)
+        mock.setListingCounters(ListingCounters(messageCount: 0, uidNext: 501, highestModSeq: nil), folder: "INBOX")
+        return mock
+    }
 
     @Test("A recentlyCompleted-protected message the fetch missed is NOT marked stale")
     func protectedSurvives() async throws {

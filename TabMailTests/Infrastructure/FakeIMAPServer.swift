@@ -254,6 +254,10 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// A compact `* ESEARCH … UID ALL <set>` answer every UID SEARCH in the
         /// mailbox gets instead of its real one (an overbroad server answer).
         var searchAnswerAllByMailbox: [String: String] = [:]
+        /// A FETCH answer that also carries a conflicting record: after the
+        /// record of `templateUID`, a copy of it at sequence `sequence` with UID
+        /// `uid` (a faulty server naming two UIDs for one slot). Per mailbox.
+        var conflictingFetchRecordByMailbox: [String: (templateUID: Int, sequence: Int, uid: Int)] = [:]
         /// `ENABLE CONDSTORE` is answered with an empty `* ENABLED`.
         var ignoresEnableCondStore = false
         /// Every `ENABLE CONDSTORE` by connection and every `SELECT … (CONDSTORE)`.
@@ -358,6 +362,9 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// state but before its tagged response is sent. This is the exact
         /// ambiguous-success boundary atomic retry is meant to survive.
         var disconnectAfterUIDMoveCommitCount = 0
+        /// Command fragments whose next match is answered in full, then has its
+        /// connection closed (the session ends between two commands).
+        var closeAfterAnsweringFragments: [String] = []
         /// SwiftMail PR #208's post-completion failure contract. The mutation
         /// lands first; only the evidence accompanying tagged NO differs.
         /// Fires on the NEXT UID MOVE only, then clears (#115): a retry is
@@ -1410,6 +1417,12 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// Commit the next UID MOVE, then close its transport before the tagged
     /// response is written. Unlike `killConnectionOnNextCommand`, this fires
     /// after mutation and therefore models an ambiguous success.
+    /// Answer the next command containing `fragment` in full, then close its
+    /// connection: the session ends after that command and before the next one.
+    func closeConnectionAfterAnsweringNextCommand(containing fragment: String) {
+        withState { $0.closeAfterAnsweringFragments.append(fragment.uppercased()) }
+    }
+
     func disconnectAfterNextUIDMoveCommit() {
         withState { $0.disconnectAfterUIDMoveCommitCount += 1 }
     }
@@ -2243,6 +2256,15 @@ final class FakeIMAPServer: @unchecked Sendable {
                 }
                 if disconnectAfterCommit { break clientLoop }
                 sendLine(fd: fd, response)
+                let closeAfterAnswer = withState { state -> Bool in
+                    let upper = recordedCommand.uppercased()
+                    guard let index = state.closeAfterAnsweringFragments.firstIndex(where: { upper.contains($0) }) else { return false }
+                    state.closeAfterAnsweringFragments.remove(at: index)
+                    _ = state.loggedInFds.remove(fd)
+                    _ = state.testInitiatedCloseFds.insert(fd)
+                    return true
+                }
+                if closeAfterAnswer { break clientLoop }
                 if response.uppercased().contains("\(tag.uppercased()) OK") {
                     withState { state in
                         let upper = recordedCommand.uppercased()
@@ -2653,6 +2675,11 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// whatever was asked (a faulty or hostile server; RFC 4731 form). Nil stops it.
     func setSearchAnswersAll(_ set: String?, in mailbox: String) {
         withState { $0.searchAnswerAllByMailbox[mailbox] = set }
+    }
+    /// Every FETCH in `mailbox` that returns `templateUID` also returns a copy of
+    /// its record at `sequence` with UID `uid`. Nil stops it.
+    func setConflictingFetchRecord(templateUID: Int, sequence: Int, uid: Int, in mailbox: String) {
+        withState { $0.conflictingFetchRecordByMailbox[mailbox] = (templateUID, sequence, uid) }
     }
     func setIgnoresEnableCondStore(_ on: Bool) {
         withState { $0.ignoresEnableCondStore = on }
@@ -3447,7 +3474,8 @@ final class FakeIMAPServer: @unchecked Sendable {
                 flags: state.flagsByMailbox[mailbox] ?? [:],
                 uidSuppressed: state.fetchUidSuppressedByMailbox[mailbox] ?? [],
                 internalDateSuppressed: state.fetchInternalDateSuppressedByMailbox[mailbox] ?? [],
-                recordSuppressed: state.fetchRecordSuppressedByMailbox[mailbox] ?? []
+                recordSuppressed: state.fetchRecordSuppressedByMailbox[mailbox] ?? [],
+                conflicting: state.conflictingFetchRecordByMailbox[mailbox]
             )
         }
         passHeldGate(Self.snapshotGateKey(mailbox))
@@ -3533,6 +3561,10 @@ final class FakeIMAPServer: @unchecked Sendable {
             }
 
             response += "* \(seqnum) FETCH (\(fetchItems.joined(separator: " ")))\r\n"
+            if let conflict = snapshot.conflicting, conflict.templateUID == msg.uid {
+                let copied = fetchItems.map { $0 == "UID \(msg.uid)" ? "UID \(conflict.uid)" : $0 }
+                response += "* \(conflict.sequence) FETCH (\(copied.joined(separator: " ")))\r\n"
+            }
         }
 
         response += "\(tag) OK \(uidMode ? "UID " : "")FETCH completed\r\n"

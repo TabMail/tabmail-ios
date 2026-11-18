@@ -23,7 +23,7 @@ actor SyncEngine {
     /// the next pass), so an error after it, in any later folder or route,
     /// never loses it; `lastFullSyncAt` is stamped only when the account is not
     /// in it (#755).
-    var unprovenListingAccounts: Set<String> = []
+    var unprovenListingPasses: Set<UUID> = []
 
     var headerBackfillTasks: [String: Task<Void, Never>] = [:]
 
@@ -549,11 +549,14 @@ actor SyncEngine {
         // makes the full sync due in this pass, and its listings decide which
         // folders become tracked and whether a candidate bookmark is stored.
         var changePass: ChangePassOutcome?
-        // This pass's unproven listings start empty and only grow from here.
-        unprovenListingAccounts.remove(account.id)
+        // This pass's own unproven listings (#755): its change pass's
+        // untracked refreshes record here; an on-demand listing running at the
+        // same time belongs to no pass and never does.
+        let pass = UUID()
+        defer { unprovenListingPasses.remove(pass) }
         do {
             let deltaResult = try await queue.execute(priority: .headerFetch) {
-                try await self.performChangePass(account: account, provider: provider, deadline: deadline)
+                try await self.performChangePass(account: account, provider: provider, deadline: deadline, pass: pass)
             }
             changePass = deltaResult
             if deltaResult.succeeded {
@@ -577,7 +580,7 @@ actor SyncEngine {
                     // retry reads from the account row as it is now.
                     guard let current = try await accountAtTurnStart(account.id) else { throw error }
                     let retryResult = try await queue.execute(priority: .headerFetch) {
-                        try await self.performChangePass(account: current, provider: provider, deadline: deadline)
+                        try await self.performChangePass(account: current, provider: provider, deadline: deadline, pass: pass)
                     }
                     changePass = retryResult
                     if retryResult.succeeded {
@@ -660,8 +663,7 @@ actor SyncEngine {
             // prove its window (#755). A folder the server made not listable
             // (SELECT refused, no usable EXISTS) does not withhold it.
             let now = Date()
-            if listing.droppedFolder { unprovenListingAccounts.insert(account.id) }
-            let fullSyncDone = !unprovenListingAccounts.contains(account.id)
+            let fullSyncDone = !listing.droppedFolder && !unprovenListingPasses.contains(pass)
             try await dbPool.write { db in
                 _ = try Account.filter(Column("id") == account.id)
                     .updateAll(db, Column("lastSyncedAt").set(to: now))

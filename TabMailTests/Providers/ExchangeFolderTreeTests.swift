@@ -192,7 +192,7 @@ struct ExchangeFolderTreeTests {
         #expect(byId["f-acme-contracts"]?.role == .custom)
     }
 
-    @Test("progressTotal: not known before any folder list, then the sum of every listed folder's totalItemCount (search folders left out), with no request of its own")
+    @Test("progressTotal: not known before the full sync adopts a folder list, then the sum of every listed folder's totalItemCount (search folders left out), with no request of its own")
     func progressTotalIsTheLastFolderListsSum() async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
@@ -208,7 +208,10 @@ struct ExchangeFolderTreeTests {
         )
         #expect(await provider.progressTotal(crawling: true) == .notKnownYet, "no folder list yet: not known")
         #expect(requests.withLock { $0 } == 0, "asking for the total sends no request")
-        _ = try await provider.fetchFolders()
+        let listed = try await provider.fetchFolders()
+        #expect(await provider.progressTotal(crawling: true) == .notKnownYet,
+                "a folder list alone (a change read's discovery) never sets the total")
+        await provider.adoptFullSyncFolderList(listed)
         let expected = Self.rootChildren.flatMap(\.subtree).filter { !$0.isSearchFolder }
             .reduce(0) { $0 + Self.counts($1.id).total }
         let sent = requests.withLock { $0 }
@@ -237,7 +240,7 @@ struct ExchangeFolderTreeTests {
         await engine.updateBackfillProgressForAccount(account)
         #expect(await AccountManager.shared._backfillBacking[account.id] == nil, "nothing is published before the folder list")
 
-        _ = try await provider.fetchFolders()
+        await provider.adoptFullSyncFolderList(try await provider.fetchFolders())
         await engine.updateBackfillProgressForAccount(account)
         let expected = Self.rootChildren.flatMap(\.subtree).filter { !$0.isSearchFolder }
             .reduce(0) { $0 + Self.counts($1.id).total }

@@ -164,22 +164,30 @@ struct FolderEqualityTests {
 @Suite("Folder Codable")
 struct FolderCodableTests {
 
-    @Test("Folder encoding carries every field but the listing counters")
-    func encodingOmitsTheListingCounters() throws {
+    @Test("Folder Codable round-trip preserves every field, the listing counters included")
+    func codableRoundTrip() throws {
         var folder = Folder(name: "Work Projects", path: "INBOX/Work", role: .custom, accountId: "acc1")
         folder.unreadCount = 42
         folder.totalCount = 150
         folder.isFavorite = true
         folder.backfillComplete = true
+        folder.oldestSyncedDate = Date(timeIntervalSince1970: 1700000000)
         folder.lastKnownUidNext = 5000
         folder.lastKnownHighestModSeq = 77
         folder.backfillUidCursor = 200
         folder.backfillPageToken = "next-page-xyz"
-        let object = try #require(try JSONSerialization.jsonObject(with: JSONEncoder().encode(folder)) as? [String: Any])
-        #expect(Set(object.keys).isDisjoint(with: Folder.listingCounterColumns), "\(object.keys.sorted())")
-        #expect(object["unreadCount"] as? Int == 42)
-        #expect(object["backfillUidCursor"] as? Int == 200)
-        #expect(object["backfillPageToken"] as? String == "next-page-xyz")
+
+        let decoded = try JSONDecoder().decode(Folder.self, from: JSONEncoder().encode(folder))
+
+        #expect(decoded == folder)
+        #expect(decoded.totalCount == 150 && decoded.lastKnownUidNext == 5000 && decoded.lastKnownHighestModSeq == 77)
+    }
+
+    @Test("Folder Codable round-trip with nil optional fields")
+    func codableRoundTripNils() throws {
+        let folder = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
+        let decoded = try JSONDecoder().decode(Folder.self, from: JSONEncoder().encode(folder))
+        #expect(decoded == folder)
     }
 
     @Test("Fence: a whole-record Folder save encodes every folder column except the listing counters, and never writes them")
@@ -212,7 +220,7 @@ struct FolderCodableTests {
                 "only the listing writer writes the counters")
 
         // Every other column of the table is encoded: a new field cannot be
-        // left out of `Folder.encode(to:)` unnoticed.
+        // left out of the record encoding (`Folder.encode(to: inout PersistenceContainer)`) unnoticed.
         let encoded = Set(try folder.databaseDictionary.keys)
         let tableColumns = Set(try db.read { try $0.columns(in: Folder.databaseTableName).map(\.name) })
         #expect(encoded == tableColumns.subtracting(Folder.listingCounterColumns),

@@ -1774,7 +1774,10 @@ struct RunSyncLargeFolderStaleSafetyTests {
 
         let folder = try await pool.read { try Folder.fetchOne($0, key: "racc:Archive")! }
         // Server now returns only UIDs 1-4 (< limit); UID 5 is genuinely gone.
+        // The listing's own SELECT bounds the sweep: UIDNEXT 6 puts UID 5 inside
+        // what this listing judges (without a bound it would be judged by nobody).
         let mock = MockEmailProvider(staleWindowMode: .uid)
+        mock.setListingCounters(ListingCounters(messageCount: 4, uidNext: 6, highestModSeq: nil), folder: "Archive")
         await mock.setFetchMessagesResult((1...4).map { uid in
             makeHeaderInfo(messageId: "\(uid)", rfc822MessageId: "m-\(uid)@example.com", subject: "Msg \(uid)", date: date)
         })
@@ -1785,6 +1788,57 @@ struct RunSyncLargeFolderStaleSafetyTests {
         // localCount (5) <= threshold → complete-knowledge path preserved → UID 5 is stale.
         #expect(result.staleIds.contains("racc:Archive:5"))
         #expect(!result.staleIds.contains("racc:Archive:1"))
+    }
+
+    /// Both production sweep branches take the listing's own SELECT bound
+    /// (one coverage builder). Listing A selected the Archive at UIDNEXT 4; UID 4
+    /// arrived after that SELECT and was stored live by another listing; A's
+    /// FETCH still returns UID 4, flagged `\Deleted` (so it is not present for
+    /// A). UID 4 is inside A's fetched maximum but above its SELECT: A must not
+    /// remove it, whether the sweep runs windowed (limit = records fetched) or
+    /// whole-folder (limit above them).
+    @Test("A row above the listing's own UIDNEXT survives both sweep branches", arguments: [4, 50])
+    func rowAboveOwnUidNextSurvivesBothSweepBranches(limit: Int) async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let pool = try DatabasePool(path: dir.appendingPathComponent("t.sqlite").path)
+        defer {
+            TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: dir)
+        }
+        try AppDatabase.runMigrations(on: pool)
+
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        try await pool.write { db in
+            var acc = Account(emailAddress: "arch@example.com", displayName: "T", provider: .imap)
+            acc.id = "racc"
+            try acc.insert(db)
+            try Folder(name: "Archive", path: "Archive", role: .archive, accountId: "racc").insert(db)
+            for uid in 1...4 {
+                var h = MessageHeader(
+                    messageId: "\(uid)", subject: "Msg \(uid)", from: "a@x", fromAddress: "a@x",
+                    to: "b@x", date: date, snippet: "s",
+                    folderId: "racc:Archive", accountId: "racc", folderPath: "Archive", isInInbox: false
+                )
+                h.rfc822MessageId = "m-\(uid)@example.com"
+                h.headerComplete = true
+                try h.insert(db)
+            }
+        }
+
+        let folder = try await pool.read { try Folder.fetchOne($0, key: "racc:Archive")! }
+        let mock = MockEmailProvider(staleWindowMode: .uid)
+        mock.setListingCounters(ListingCounters(messageCount: 3, uidNext: 4, highestModSeq: nil), folder: "Archive")
+        await mock.setFetchMessagesResult((1...4).map { uid in
+            var info = makeHeaderInfo(messageId: "\(uid)", rfc822MessageId: "m-\(uid)@example.com", subject: "Msg \(uid)", date: date)
+            info.isDeletedOnServer = uid == 4
+            return info
+        })
+
+        let result = try await SyncEngine.runListing(
+            for: folder, provider: mock, limit: limit, dbPool: PrioritizedDatabase(pool: pool)).requireResult()
+
+        #expect(!result.staleIds.contains("racc:Archive:4"),
+                "a UID allocated after the listing's own SELECT is never evidence for removal (limit \(limit))")
     }
 }
 

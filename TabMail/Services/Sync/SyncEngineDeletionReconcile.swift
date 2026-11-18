@@ -525,8 +525,11 @@ extension SyncEngine {
     /// clears it.
     func reconcileDeletionsAfterListing(folder: Folder, provider: any EmailProvider, serverCount: Int, logPrefix: String, deadline: Date? = nil) async {
         let folderId = folder.id
+        let accountId = folder.accountId
+        // The rows the server can list (a never-uploaded draft's placeholder is
+        // not one): the walk only searches server UIDs.
         func localCount() async throws -> Int {
-            try await dbPool.read { db in try MessageHeader.filter(Column("folderId") == folderId).fetchCount(db) }
+            try await dbPool.read { db in try Self.heldServerRowCount(folderId: folderId, accountId: accountId, db: db) }
         }
         // This check's own mark: it clears the bit only while no newer mark
         // (a later listing, or a later check) has replaced it.

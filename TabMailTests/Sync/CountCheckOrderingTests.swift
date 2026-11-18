@@ -48,6 +48,40 @@ struct CountCheckOrderingTests {
         }
     }
 
+    @Test("A local-only draft (never uploaded) is not a held server row: a folder whose server rows all agree with the server's count is not made due, and the count check sees agreement")
+    func localOnlyDraftNeverMakesAHealthyFolderDue() async throws {
+        try await ChangeApplyTests.withWorld { w in
+            let folderId = w.archiveId
+            for uid in ["1", "2"] { try w.insertRow(uid, in: folderId, path: "Archive") }
+            // A draft that never reached the server, and its placeholder row.
+            let draftId = UUID().uuidString
+            let epoch = "E-\(UUID().uuidString)"
+            let placeholder = PendingOperation.draftPlaceholderMessageId(draftId: draftId, instanceEpoch: epoch)
+            try await w.pool.write { db in
+                var draft = Draft(
+                    id: draftId, accountId: w.accountId,
+                    toJSON: "[\"recipient@example.com\"]", ccJSON: "[]", bccJSON: "[]",
+                    subject: "Local draft", body: "Draft body",
+                    replyToId: nil, isForward: false, editHistoryJSON: nil,
+                    createdAt: Date().timeIntervalSince1970, updatedAt: Date().timeIntervalSince1970,
+                    serverDraftId: nil, serverPushStatus: nil,
+                    rfc822MessageId: nil, attachmentsDirName: nil)
+                draft.instanceEpoch = epoch
+                try draft.insert(db)
+            }
+            try w.insertRow(placeholder, in: folderId, path: "Archive")
+
+            let held = try await w.pool.read { db in try SyncEngine.heldServerRowCount(folderId: folderId, accountId: w.accountId, db: db) }
+            #expect(held == 2, "the placeholder is not a server row")
+            try await w.pool.write { db in try SyncEngine.armListingDueIfHeldExceeds(2, folderId: folderId, db: db) }
+            #expect(try !w.state(folderId).listingDue, "the server's count matches every server row: not due")
+            // Control: one real ghost still makes it due.
+            try w.insertRow("3", in: folderId, path: "Archive")
+            try await w.pool.write { db in try SyncEngine.armListingDueIfHeldExceeds(2, folderId: folderId, db: db) }
+            #expect(try w.state(folderId).listingDue, "a held server row the server does not count makes it due")
+        }
+    }
+
     @Test("A count walk's answer from the old epoch lands after a turnover: nothing is deleted")
     func oldEpochAnswerAfterTurnoverDeletesNothing() async throws {
         try await ChangeApplyTests.withWorld { w in

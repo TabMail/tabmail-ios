@@ -90,13 +90,18 @@ actor ExchangeProvider: EmailProvider {
 
     // MARK: - Folders
 
-    /// The sum of `totalItemCount` over this provider's last complete folder
-    /// listing, held in memory only (no request of its own): the backfill
-    /// progress denominator (`progressTotal`). Nil until a listing finished.
+    /// The sum of `totalItemCount` over the last complete folder list the full
+    /// sync adopted (`adoptFullSyncFolderList`), held in memory only (no
+    /// request of its own): the backfill progress denominator
+    /// (`progressTotal`). Nil until a full sync adopted one.
     var lastFolderListMessageTotal: Int?
 
     func progressTotal(crawling: Bool) async -> ProgressTotal {
         lastFolderListMessageTotal.map(ProgressTotal.messages) ?? .notKnownYet
+    }
+
+    func adoptFullSyncFolderList(_ folders: [FolderInfo]) async {
+        lastFolderListMessageTotal = folders.reduce(0) { $0 + $1.totalCount }
     }
 
     func fetchFolders() async throws -> [FolderInfo] {
@@ -137,7 +142,6 @@ actor ExchangeProvider: EmailProvider {
             knownFolderIds: knownFolderIds,
             seen: &seen)
 
-        lastFolderListMessageTotal = folders.reduce(0) { $0 + $1.totalCount }
         if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] fetchFolders returning \(folders.count) folders: \(folders.map { "\($0.name)(\($0.role))" })") }
         return folders
     }

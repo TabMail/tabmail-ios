@@ -98,4 +98,24 @@ struct ListingRouteFenceTests {
         let body = try #require(engine.range(of: "func syncFolderMessages(").map { String(engine[$0.lowerBound...].prefix(4000)) })
         #expect(body.contains("await listFolder(folder, provider: provider"), "syncFolderMessages lists through listFolder")
     }
+
+    /// Both stale-sweep branches build the coverage they judge with through the
+    /// one builder (`sweepCoverage`), so the listing's own SELECT bound reaches
+    /// whichever branch runs; and the windowed candidate load and the removal
+    /// decision take their UID window from the same helper.
+    @Test("The stale sweep's coverage has one builder, used by both branches")
+    func sweepCoverageHasOneBuilder() throws {
+        let sources = try Self.productionSources()
+        let engine = try #require(sources.first { $0.path == Self.engineFile }?.text)
+        let assignments = engine.components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { $0.hasPrefix("effectiveCoverage = ") }
+        #expect(assignments.count == 3, "the unproven arm and the two sweep branches: \(assignments)")
+        #expect(assignments.allSatisfy { $0 == "effectiveCoverage = .unproven" || $0.hasPrefix("effectiveCoverage = Self.sweepCoverage(") },
+                "every sweep branch builds its coverage through sweepCoverage: \(assignments)")
+        #expect(engine.contains("Self.sweepCoverage(coverage, wholeFolder: true)"))
+        #expect(engine.contains("Self.sweepCoverage(coverage, wholeFolder: false)"))
+        #expect(Self.hits("windowedSweepUIDBounds(", in: sources) == [Self.engineFile: 3],
+                "definition, the windowed candidate load and selectStaleHeaders' windowed arm")
+    }
 }

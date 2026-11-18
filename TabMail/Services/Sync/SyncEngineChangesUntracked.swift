@@ -63,7 +63,7 @@ extension SyncEngine {
     /// did (`UntrackedRefresh`).
     func refreshUntrackedFolder(
         folderId: String, observation: UntrackedObservation, account: Account, provider: any EmailProvider,
-        deadline: Date? = nil
+        deadline: Date? = nil, pass: UUID? = nil
     ) async throws -> UntrackedRefresh {
         guard let folder = try await dbPool.read({ db in try Folder.fetchOne(db, key: folderId) }),
               !folder.path.isEmpty, folder.uidValidityResetPendingAt == nil else { return .notListed }
@@ -98,7 +98,7 @@ extension SyncEngine {
         // The listing writes the folder's counters from its own selection, with
         // its rows (`runSyncMessages`); this observation only decided to list.
         // One classifier (`listFolder` → `runListing`): no error escapes it.
-        let outcome = await listFolder(folder, provider: provider, limit: SyncConfig.syncMessageLimit)
+        let outcome = await listFolder(folder, provider: provider, limit: SyncConfig.syncMessageLimit, pass: pass)
         try Task.checkCancellation()
         // ADR-IOS-051 phase 2: the live local count against the count of the
         // listing that just ran, never the observation's. A listing that

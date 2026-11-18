@@ -317,6 +317,7 @@ extension SyncEngine {
         } else {
             // Sync folder list
             let remoteFolders = try await provider.fetchFolders()
+            await provider.adoptFullSyncFolderList(remoteFolders)
             BackgroundSyncLogger.logDebug("[FullSync] \(account.emailAddress) fetchFolders: \(Int((CFAbsoluteTimeGetCurrent() - fs0) * 1000))ms (\(remoteFolders.count) folders)")
             BootProfiler.mark("fullSync[\(acctTag)]: fetchFolders done in \(Int((CFAbsoluteTimeGetCurrent() - fs0) * 1000))ms (\(remoteFolders.count) folders)")
             skippablePaths = try await pool.write { db in
@@ -647,9 +648,22 @@ extension SyncEngine {
 
     /// One folder listing through the one classifier (`runListing`), with its
     /// merge result published (unread recount, FTS, body queue).
-    func listFolder(_ folder: Folder, provider: any EmailProvider, limit: Int) async -> ListingOutcome {
+    /// An unproven listing makes the folder due (`FolderChangeState.listingDue`)
+    /// and owes it a deep pass, so the next pass lists it whatever its counters
+    /// or STATUS say (#755). It counts against a pass's full-sync stamp only for
+    /// the pass that ran it (`pass`); an on-demand listing (nil) belongs to no
+    /// pass and never withholds a scheduled pass's stamp.
+    func listFolder(_ folder: Folder, provider: any EmailProvider, limit: Int, pass: UUID? = nil) async -> ListingOutcome {
         let outcome = await Self.runListing(for: folder, provider: provider, limit: limit, dbPool: dbPool)
-        if case .unproven = outcome { unprovenListingAccounts.insert(folder.accountId) }
+        if case .unproven = outcome {
+            if let pass { unprovenListingPasses.insert(pass) }
+            Self.oweDeepListing(folderId: folder.id)
+            do {
+                try await dbPool.write { db in try Self.markListingDue(folderId: folder.id, db: db) }
+            } catch {
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Listing] \(folder.name): could not mark the folder due: \(error)") }
+            }
+        }
         if let result = outcome.result { await publishListingResult(result, folder: folder) }
         return outcome
     }
@@ -1050,6 +1064,33 @@ extension SyncEngine {
         }
     }
 
+    /// The one builder of the coverage a listing's stale sweep is told
+    /// (ADR-IOS-111). Both sweep branches (the small whole-folder branch and the
+    /// windowed slice) take it from here, so the listing's own SELECT evidence
+    /// (`counters`, carrying its UIDNEXT bound) reaches the sweep whichever
+    /// branch runs. `wholeFolder` is the branch's own decision: a large folder
+    /// falls to the windowed slice even when the server proved whole-folder
+    /// coverage, and must not then claim complete knowledge.
+    nonisolated static func sweepCoverage(_ coverage: FetchCoverage, wholeFolder: Bool) -> FetchCoverage {
+        var swept = coverage
+        swept.spansEntireFolder = coverage.spansEntireFolder && wholeFolder
+        return swept
+    }
+
+    /// The UID window a windowed IMAP sweep judges: from the lowest UID fetched
+    /// to the highest, and never at or above the listing's own UIDNEXT (a UID
+    /// allocated after its SELECT is never evidence for removal, #755). The one
+    /// source for both the candidate load and the removal decision. Nil when no
+    /// fetched record carried a usable UID: the sweep removes nothing.
+    nonisolated static func windowedSweepUIDBounds(fetched: [MessageHeaderInfo], coverage: FetchCoverage) -> (floor: Int64, ceiling: Int64)? {
+        let fetchedUIDs = fetched.compactMap { Int64($0.messageId) }
+        guard let floorUID = fetchedUIDs.min(), let fetchedMax = fetchedUIDs.max() else { return nil }
+        let ceilingUID = coverage.counters?.uidNext.map { min(fetchedMax, Int64($0) - 1) } ?? fetchedMax
+        guard ceilingUID >= floorUID else { return nil }
+        return (floorUID, ceilingUID)
+    }
+
+
     /// SINGLE SOURCE OF TRUTH for "which local rows may be stale-deleted after a
     /// WINDOWED fetch". Pure + deterministic so production sync and the test harness
     /// share one rule that cannot drift.
@@ -1142,9 +1183,7 @@ extension SyncEngine {
             // UIDNEXT was allocated after that SELECT (its FETCH may still return
             // it, e.g. flagged \Deleted, while another listing stores it live), so
             // it is never evidence for removal (#755).
-            let fetchedUIDs = fetched.compactMap({ Int64($0.messageId) })
-            guard let floorUID = fetchedUIDs.min(), let fetchedMax = fetchedUIDs.max() else { return [] }
-            let ceilingUID = coverage.counters?.uidNext.map { min(fetchedMax, Int64($0) - 1) } ?? fetchedMax
+            guard let (floorUID, ceilingUID) = windowedSweepUIDBounds(fetched: fetched, coverage: coverage) else { return [] }
             return candidates.filter { row in
                 guard let uid = Int64(row.messageId) else { return false } // non-numeric id → never UID-stale
                 return uid >= floorUID && uid <= ceilingUID && !remoteIds.contains(row.messageId)
@@ -1566,7 +1605,7 @@ extension SyncEngine {
                         }
                     }
                 }
-                effectiveCoverage = coverage
+                effectiveCoverage = Self.sweepCoverage(coverage, wholeFolder: true)
                 stale = Self.selectStaleHeaders(
                     candidates: allLocal, fetched: messages, coverage: effectiveCoverage, windowMode: windowMode)
             } else {
@@ -1576,16 +1615,12 @@ extension SyncEngine {
                 // whole folder, per the memory budget) in the fetch-ordering dimension,
                 // then let selectStaleHeaders re-apply the same floor as the single source
                 // of truth.
-                effectiveCoverage = FetchCoverage(
-                    serverRecordCount: coverage.serverRecordCount,
-                    spansEntireFolder: false,
-                    unmaterialisedIds: coverage.unmaterialisedIds)
+                effectiveCoverage = Self.sweepCoverage(coverage, wholeFolder: false)
                 let candidates: [MessageHeader]
                 switch windowMode {
                 case .uid:
                     // messageId is a numeric IMAP UID; CAST avoids a lexicographic compare.
-                    let fetchedUIDs = messages.compactMap({ Int64($0.messageId) })
-                    if let floorUID = fetchedUIDs.min(), let ceilingUID = fetchedUIDs.max() {
+                    if let (floorUID, ceilingUID) = Self.windowedSweepUIDBounds(fetched: messages, coverage: effectiveCoverage) {
                         candidates = try MessageHeader.fetchAll(db, sql:
                             "SELECT * FROM messageHeader WHERE folderId = ? AND CAST(messageId AS INTEGER) BETWEEN ? AND ?",
                             arguments: [folderId, floorUID, ceilingUID])
@@ -2646,9 +2681,27 @@ extension SyncEngine {
     /// it holds more rows than `serverCount` beyond the reconcile tolerance.
     /// Never clears: only a finished walk does (`reconcileDeletionsAfterListing`).
     nonisolated static func armListingDueIfHeldExceeds(_ serverCount: Int, folderId: String, db: Database) throws {
-        let held = try MessageHeader.filter(Column("folderId") == folderId).fetchCount(db)
+        guard let accountId = try String.fetchOne(db, sql: "SELECT accountId FROM folder WHERE id = ?", arguments: [folderId]) else { return }
+        let held = try heldServerRowCount(folderId: folderId, accountId: accountId, db: db)
         guard shouldReconcileDeletions(
             localCount: held, serverCount: serverCount, tolerance: SyncConfig.deletionReconcileCountTolerance) else { return }
+        try markListingDue(folderId: folderId, db: db)
+    }
+
+    /// The rows a folder holds that the server can list: every row but the
+    /// placeholders of local drafts that never reached the server
+    /// (`neverUploadedDraftPlaceholderIds`). The count checks compare this with
+    /// the server's count, as the walk only searches server UIDs: a local-only
+    /// draft never makes a healthy folder look as if it held a ghost (#755).
+    nonisolated static func heldServerRowCount(folderId: String, accountId: String, db: Database) throws -> Int {
+        let held = MessageHeader.filter(Column("folderId") == folderId)
+        let localOnly = try neverUploadedDraftPlaceholderIds(accountId: accountId, db: db)
+        guard !localOnly.isEmpty else { return try held.fetchCount(db) }
+        return try held.filter(!localOnly.contains(Column("messageId"))).fetchCount(db)
+    }
+
+    /// Mark an untracked folder's listing due under a fresh token.
+    nonisolated static func markListingDue(folderId: String, db: Database) throws {
         guard let raw = try Row.fetchOne(db, sql: "SELECT changeState FROM folder WHERE id = ?", arguments: [folderId]) else { return }
         var state = FolderChangeState(raw: raw["changeState"])
         // A tracked folder's removals come from its change reader, which runs

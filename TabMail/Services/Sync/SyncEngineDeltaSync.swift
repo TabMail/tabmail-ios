@@ -29,12 +29,14 @@ extension SyncEngine {
     /// - Parameter deadline: the caller's own deadline for the pass (its
     ///   timeout), or nil when it sets none. A reader's read budget ends early
     ///   enough for what it read to be applied before it (`changeReadEnd`).
+    /// - Parameter pass: the foreground pass this change pass belongs to, whose
+    ///   full-sync stamp its unproven listings withhold; nil for none.
     func performChangePass(
-        account: Account, provider: any EmailProvider, inboxOnly: Bool = false, deadline: Date? = nil
+        account: Account, provider: any EmailProvider, inboxOnly: Bool = false, deadline: Date? = nil, pass: UUID? = nil
     ) async throws -> ChangePassOutcome {
         await redriveArmedTurnovers(accountId: account.id)
         if let outcome = try await readAndApplyChanges(
-            account: account, provider: provider, scope: inboxOnly ? .inboxOnly : .all, deadline: deadline) {
+            account: account, provider: provider, scope: inboxOnly ? .inboxOnly : .all, deadline: deadline, pass: pass) {
             return outcome
         }
         return ChangePassOutcome()

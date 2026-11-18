@@ -59,4 +59,14 @@ struct ListingWindowRecordsTests {
             coverage: coverage, windowMode: .uid)
         #expect(Set(stale.map(\.messageId)) == ["7"], "10 is above the SELECT: never removal evidence; 7, inside and absent, is")
     }
+
+    @Test("A window's records are consistent only with each sequence number once and UIDs rising with it")
+    func windowRecordConsistency() {
+        #expect(IMAPProvider.windowRecordsAreConsistent([info(8, uid: 80), info(9, uid: 90), info(10, uid: 100)]))
+        #expect(!IMAPProvider.windowRecordsAreConsistent([info(8, uid: 80), info(9, uid: 90), info(10, uid: 100), info(8, uid: 2)]),
+                "two UIDs for sequence 8")
+        #expect(!IMAPProvider.windowRecordsAreConsistent([info(8, uid: 80), info(9, uid: 70)]), "UID falls as the sequence rises")
+        #expect(!IMAPProvider.windowRecordsAreConsistent([info(8, uid: nil)]), "a record without a UID")
+        #expect(IMAPProvider.windowRecordsAreConsistent([]))
+    }
 }
