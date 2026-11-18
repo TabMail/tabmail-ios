@@ -4043,8 +4043,8 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // checked before any sequence range is built from it: the listing
             // proves nothing (#755).
             if selection.messageCountReported, selection.reportedMessageCount == nil {
-                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] \(folder): SELECT sent an EXISTS out of range — coverage unproven, nothing removed") }
-                return ([], observedEpoch, .unproven)
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] \(folder): SELECT sent an EXISTS out of range — not listable, nothing removed") }
+                return ([], observedEpoch, .selectionNotListable)
             }
             // A count of 0 never removes a held row on its own (#755). A 0 with NO
             // `EXISTS` (a non-compliant server left it out; RFC 3501 requires it)
@@ -4058,8 +4058,8 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // lost with its connection stays a connection error.
             guard selection.messageCount > 0 else {
                 guard selection.messageCountReported else {
-                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] \(folder): SELECT sent no EXISTS — coverage unproven, nothing removed") }
-                    return ([], observedEpoch, .unproven)
+                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] \(folder): SELECT sent no EXISTS — not listable, nothing removed") }
+                    return ([], observedEpoch, .selectionNotListable)
                 }
                 let found: ExtendedSearchResult<UID>
                 do {

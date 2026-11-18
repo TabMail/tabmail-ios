@@ -337,10 +337,21 @@ struct FetchCoverage: Sendable, Equatable {
     /// listing has no such selection leaves it nil.
     var counters: ListingCounters? = nil
 
+    /// The folder's selection gave no usable count (IMAP: SELECT sent no
+    /// EXISTS, or one no mailbox can hold), so this pass could not list it at
+    /// all. Proves nothing, like `.unproven`, but it is the server's answer,
+    /// not a listing that started and fell short: it does not hold back the
+    /// account's full-sync stamp (#755).
+    var notListable = false
+
     /// Fail-closed: a provider that cannot report coverage proves nothing.
     /// Never re-derive this from the returned array's count.
     static let unproven = FetchCoverage(
         serverRecordCount: 0, spansEntireFolder: false, unmaterialisedIds: [])
+
+    /// The selection gave no usable count: see `notListable`.
+    static let selectionNotListable = FetchCoverage(
+        serverRecordCount: 0, spansEntireFolder: false, unmaterialisedIds: [], notListable: true)
 }
 
 /// Where the backfill progress bar's denominator comes from, held by the

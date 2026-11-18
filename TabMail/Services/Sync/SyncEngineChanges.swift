@@ -417,9 +417,11 @@ extension SyncEngine {
     ///   asked to list again (#783). It is stored also when the full sync
     ///   dropped a folder (`FullSyncListing.droppedFolder`: a lost connection
     ///   stops the listing there, so that folder and every later one; a failed
-    ///   retry or SELECT, or an empty count the server did not confirm
-    ///   (`ProviderListingUnconfirmed`), that folder). Those folders stay untracked and the
-    ///   caller keeps the full sync due, so the next foreground pass lists them;
+    ///   retry, a short FETCH, or an empty count the server did not confirm
+    ///   (`ProviderListingUnconfirmed`), that folder) or found one not listable
+    ///   (`notListableFolderIds`: SELECT refused or no usable EXISTS). Those
+    ///   folders stay untracked; for a dropped one the caller keeps the full
+    ///   sync due, so the next foreground pass lists them;
     ///   their changes after the candidate arrive by the reads from the bookmark
     ///   (an account-wide reader names every folder, and a full record inserts a
     ///   message the folder does not hold yet). A listing that fails any other

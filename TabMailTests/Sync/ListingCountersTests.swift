@@ -287,4 +287,113 @@ struct ListingCountersTests {
             #expect(after.uids.isSuperset(of: ["1", "2", "3", "5", "6"]))
         }
     }
+
+    // MARK: - The full-sync stamp, by this pass's server answer per folder
+
+    static func fullSyncStamp(_ w: E.World) throws -> Date? {
+        let id = w.account.id
+        return try w.pool.read { db in try Account.fetchOne(db, key: id)?.lastFullSyncAt }
+    }
+
+    static func account(_ w: E.World) throws -> Account {
+        let id = w.account.id
+        return try #require(try w.pool.read { db in try Account.fetchOne(db, key: id) })
+    }
+
+    /// A SELECT of the Archive refused with NO, every time.
+    static func refuseArchiveSelect(_ w: E.World) {
+        for fragment in ["SELECT \(archivePath)", "SELECT \"\(archivePath)\""] {
+            w.server.failEveryCommand(containing: fragment, message: "Mailbox unavailable")
+        }
+    }
+
+    @Test("The full-sync stamp after a foreground pass, by the Archive's server answer: proven listing stamps; SELECT refused or SELECT without EXISTS (not listable) stamps; a short FETCH or a contradicted EXISTS 0 (unproven) does not",
+          arguments: ["proven", "selectRefused", "noExists", "shortFetch", "contradictedZero"])
+    func fullSyncStampByListingClass(_ answer: String) async throws {
+        try await E.withWorld("lc-stamp-\(answer)", capabilities: Self.condstoreNoReader, serverUIDs: [1], localUIDs: [1]) { w in
+            try Self.addArchive(w, serverUIDs: [1, 2, 3], localUIDs: [1, 2])
+            switch answer {
+            case "selectRefused": Self.refuseArchiveSelect(w)
+            case "noExists": w.server.suppressSelectExists(true, for: Self.archivePath)
+            case "shortFetch": w.server.suppressFetchRecord(in: Self.archivePath, uids: [2])
+            case "contradictedZero": w.server.setSelectExists(0, for: Self.archivePath)
+            default: break
+            }
+            #expect(try Self.fullSyncStamp(w) == nil, "precondition: the full sync is due")
+            _ = try await w.engine.sync(account: try Self.account(w))
+            let stamped = try Self.fullSyncStamp(w) != nil
+            let held = try Self.archive(w)
+            switch answer {
+            case "proven":
+                #expect(stamped, "a proven listing counts toward the stamp")
+                #expect(held.uids == ["1", "2", "3"])
+            case "selectRefused", "noExists":
+                #expect(stamped, "a folder the server made not listable does not withhold the stamp")
+                #expect(held.uids == ["1", "2"], "nothing listed, nothing removed")
+                #expect(held.folder.totalCount == 2 && held.folder.lastKnownUidNext == 3, "its counters stay unwritten")
+            default:
+                #expect(!stamped, "a started listing that failed to prove its window withholds the stamp: the full sync stays due")
+                #expect(held.uids.isSuperset(of: ["1", "2"]), "nothing removed")
+            }
+        }
+    }
+
+    @Test("A folder whose SELECT is always refused: over three foreground passes the full sync runs once and is not due on every pass")
+    func alwaysRefusedFolderDoesNotKeepTheFullSyncDue() async throws {
+        try await E.withWorld("lc-stamp-always", capabilities: Self.condstoreNoReader, serverUIDs: [1], localUIDs: [1]) { w in
+            try Self.addArchive(w, serverUIDs: [1, 2], localUIDs: [1])
+            Self.refuseArchiveSelect(w)
+            _ = try await w.engine.sync(account: try Self.account(w))
+            let first = try Self.fullSyncStamp(w)
+            #expect(first != nil, "the first pass's full sync is stamped")
+            for pass in 2...3 {
+                _ = try await w.engine.sync(account: try Self.account(w))
+                #expect(try Self.fullSyncStamp(w) == first, "pass \(pass) runs no full sync: the stamp is the first pass's")
+            }
+        }
+    }
+
+    // MARK: - Content-free logs with debug logging off
+
+    @Test("With debug logging off, a listing whose EXISTS 0 the server refused to confirm writes neither the folder name nor the server's words to the app log, and the error's description carries neither")
+    func unconfirmedListingLogsNoContentWithDebugOff() async throws {
+        let previous = DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 }
+        DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = false }
+        defer { DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = previous } }
+        let marker = "Qz7ServerWords"
+        let error = ProviderListingUnconfirmed(folder: "Qz7Folder", refusal: marker)
+        #expect(!"\(error)".contains("Qz7"), "the description is content-free: \(error)")
+        #expect(String(reflecting: error).contains("Qz7Folder"), "the detail stays for the debug-gated lines")
+
+        try await E.withWorld("lc-logs-off", capabilities: Self.condstoreNoReader, serverUIDs: [1], localUIDs: [1]) { w in
+            try Self.addArchive(w, serverUIDs: [1, 2], localUIDs: [1])
+            w.server.setSelectExists(0, for: Self.archivePath)
+            w.server.failEveryCommand(containing: "UID SEARCH", message: marker)
+            let before = AppLogStore.read()
+            _ = try await w.engine.sync(account: try Self.account(w))
+            let written = String(AppLogStore.read().dropFirst(before.count))
+            #expect(!written.contains(marker), "no server words in the app log")
+            #expect(!written.contains(Self.archivePath), "no folder name in the app log")
+        }
+    }
+
+    // MARK: - The connection-limit retry leg
+
+    @Test("A folder connection created on the connection-limit retry leg negotiates CONDSTORE too: the listing on it stores the server's MODSEQ")
+    func connectionLimitRetryLegNegotiatesCondStore() async throws {
+        try await E.withWorld("lc-limit-retry", capabilities: Self.condstoreNoReader, serverUIDs: [1, 2], localUIDs: [1]) { w in
+            // INBOX's folder connection is the one the retry evicts.
+            _ = try await w.engine.syncMessages(for: try w.folder(), provider: w.provider, limit: SyncConfig.syncMessageLimit)
+            try Self.addArchive(w, serverUIDs: [1, 2, 3], localUIDs: [1])
+            w.server.setMaxLoggedInSessions(50)
+            w.server.refuseNextLogins(1)
+            let archive = try Self.archive(w).folder
+            _ = try await w.engine.syncMessages(for: archive, provider: w.provider, limit: SyncConfig.syncMessageLimit)
+            #expect(w.server.refusedLoginCount() == 1, "precondition: the first LOGIN was refused with the limit wording, so the retry leg ran")
+            let after = try Self.archive(w)
+            #expect(after.uids == ["1", "2", "3"])
+            #expect(after.folder.lastKnownHighestModSeq == w.server.qresyncHighestModSeq(for: Self.archivePath),
+                    "the retry leg's connection carries CONDSTORE")
+        }
+    }
 }

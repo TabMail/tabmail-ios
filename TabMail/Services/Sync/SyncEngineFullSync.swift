@@ -117,11 +117,17 @@ extension SyncEngine {
         /// Each listed folder's count as its own listing's selection reported it,
         /// absent when that listing proved none: the one input to phase 2.
         var listedCounts: [String: Int] = [:]
-        /// A folder the full sync meant to list went unlisted after a failure:
-        /// a lost connection (that folder and every later one), a retry that
-        /// failed otherwise, a failed SELECT, or an empty count the server did
-        /// not confirm (`ProviderListingUnconfirmed`).
+        /// A started listing failed to prove its window: a lost connection (that
+        /// folder and every later one), a retry that failed otherwise, a short or
+        /// empty FETCH under a counted selection, or an empty count the server
+        /// did not confirm (`ProviderListingUnconfirmed`). The account's
+        /// full-sync stamp is withheld, so the full sync stays due (#755).
         var droppedFolder = false
+        /// Folders this pass's server answer made not listable: SELECT refused,
+        /// or SELECT with no usable EXISTS. Not listed and not tracked, but they
+        /// do not withhold the stamp: their counters stay unwritten, so the
+        /// change pass's STATUS lists them again (#755).
+        var notListableFolderIds: Set<String> = []
     }
 
     /// Apply the provider's folder list: upsert names and roles, bootstrap epochs,
@@ -455,14 +461,13 @@ extension SyncEngine {
                         listing.listedFolderIds.insert(folder.id)
                         listing.listedCounts[folder.id] = result.listedCounters?.messageCount
                     } else {
-                        // Unproven (a short FETCH): not this pass's listing; the full
-                        // sync stays due and the next pass lists the folder again.
-                        listing.droppedFolder = true
+                        Self.recordUnlisted(result, folderId: folder.id, in: &listing)
                     }
                 } catch {
                     if Self.isSelectFailedError(error) {
                         BackgroundSyncLogger.logDebug("[FullSync] SELECT failed for \(folder.name) (\(folder.path)) — skipping: \(error)")
-                        listing.droppedFolder = true
+                        // Not listable this pass: the server refused the folder.
+                        listing.notListableFolderIds.insert(folder.id)
                         continue
                     }
                     // A listing whose empty count the server did not confirm (#755):
@@ -488,12 +493,14 @@ extension SyncEngine {
                                 listing.listedFolderIds.insert(folder.id)
                                 listing.listedCounts[folder.id] = retryResult.listedCounters?.messageCount
                             } else {
-                                // Unproven (a short FETCH): not this pass's listing; the full
-                                // sync stays due and the next pass lists the folder again.
-                                listing.droppedFolder = true
+                                Self.recordUnlisted(retryResult, folderId: folder.id, in: &listing)
                             }
                         } catch {
-                            listing.droppedFolder = true
+                            if Self.isSelectFailedError(error) {
+                                listing.notListableFolderIds.insert(folder.id)
+                            } else {
+                                listing.droppedFolder = true
+                            }
                             if Self.isConnectionError(error) {
                                 // Retry also hit connection error — server unreachable. Skip remaining folders.
                                 BackgroundSyncLogger.logDebug("[FullSync] Retry failed for \(folder.name): \(error) — skipping remaining folders")
@@ -750,6 +757,9 @@ extension SyncEngine {
         /// coverage. Only such a listing counts as the folder's listing this pass
         /// (`FullSyncListing.listedFolderIds`, the baseline commit, phase 2).
         let proven: Bool
+        /// The folder's selection gave no usable count (`FetchCoverage.notListable`):
+        /// not listed, and not a listing that fell short.
+        let notListable: Bool
     }
 
     /// Canonicalize the local rows for one remote message in one folder.
@@ -2542,8 +2552,22 @@ extension SyncEngine {
             ftsRekeys: syncResult.ftsRekeys,
             headerRekeys: syncResult.headerRekeys,
             listedCounters: syncResult.counters,
-            proven: syncResult.merged && provedWindow
+            proven: syncResult.merged && provedWindow,
+            notListable: coverage.notListable
         )
+    }
+
+    /// A listing that did not count as the folder's listing, classified by this
+    /// pass's server answer alone (#755): a selection with no usable count is
+    /// not listable and does not withhold the full-sync stamp; any other
+    /// (a short or empty FETCH under a counted selection, a refused merge) is a
+    /// started listing that failed to prove its window and withholds it.
+    nonisolated static func recordUnlisted(_ result: SyncMessagesResult, folderId: String, in listing: inout FullSyncListing) {
+        if result.notListable {
+            listing.notListableFolderIds.insert(folderId)
+        } else {
+            listing.droppedFolder = true
+        }
     }
 
     /// Did this listing see every record its selection said its window holds?
@@ -2553,7 +2577,7 @@ extension SyncEngine {
     /// reports no counters proves its window by any coverage other than
     /// `.unproven`.
     nonisolated static func listingProvedItsWindow(_ coverage: FetchCoverage, limit: Int) -> Bool {
-        guard coverage != .unproven else { return false }
+        guard coverage != .unproven, !coverage.notListable else { return false }
         guard let counters = coverage.counters else { return true }
         return coverage.serverRecordCount >= min(counters.messageCount, limit)
     }

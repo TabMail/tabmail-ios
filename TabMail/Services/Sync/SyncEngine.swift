@@ -639,17 +639,18 @@ actor SyncEngine {
                 await self.healFoldersAfterAnUnprovenMove(account: account)
             }
 
-            var listingDone = true
             if let changePass, changePass.fromReader {
                 // The reader's bookmark was read BEFORE these listings; store a
                 // candidate and turn tracking on only now that they are done.
                 try await commitChangeBaseline(
                     account: account, outcome: changePass, listedFolderIds: listing.listedFolderIds)
-                listingDone = !listing.droppedFolder
             }
 
+            // Never stamped after a pass in which a started listing failed to
+            // prove its window (#755). A folder the server made not listable
+            // (SELECT refused, no usable EXISTS) does not withhold it.
             let now = Date()
-            let fullSyncDone = listingDone
+            let fullSyncDone = !listing.droppedFolder
             try await dbPool.write { db in
                 _ = try Account.filter(Column("id") == account.id)
                     .updateAll(db, Column("lastSyncedAt").set(to: now))
