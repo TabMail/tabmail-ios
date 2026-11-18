@@ -52,7 +52,7 @@ extension ChatThreadViewLifecycleTests {
         #expect(!gate.isFrozen, "control: nothing holds the freeze")
         // A closing drag: held from its first motion, through the let-go, until settled.
         let open = ChatSwipeOpen()
-        open.open("unit-bubble", frame: .zero)
+        open.open("unit-bubble", frame: .zero, buttons: .zero)
         let closer = ChatSwipeCloser.Coordinator(open: open)
         let pan = FreezePan()
         pan.event = .began
@@ -66,7 +66,7 @@ extension ChatThreadViewLifecycleTests {
         #expect(!gate.isFrozen, "settled, the data goes through")
 
         // A closing tap: held while the swipe settles shut.
-        open.open("unit-bubble", frame: .zero)
+        open.open("unit-bubble", frame: .zero, buttons: .zero)
         let tap = FreezeTap()
         tap.event = .ended
         closer.handle(tap)

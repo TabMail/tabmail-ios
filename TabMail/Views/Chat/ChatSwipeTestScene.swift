@@ -9,11 +9,14 @@ import SwiftUI
 /// Disposable fixture data for the chat swipe UI tests (`--chat-swipe-ui-test`): one synthetic
 /// account with a four-email chat, opened from a plain list screen so a back swipe has somewhere to
 /// go. `ChatThreadView` owns every swipe; the scene only seeds data and, when armed, takes one email
-/// out of the chat as a sync would.
+/// out of the chat as a sync would. With `--chat-swipe-in-sheet` the list sits in a presented sheet
+/// with its own navigation stack, as search opens chats.
 struct ChatSwipeTestScene: View {
     @State private var ready = false
     @State private var status = "Preparing fixture"
     @State private var armed = false
+    @State private var showsSheet = false
+    private let inSheet = ProcessInfo.processInfo.arguments.contains("--chat-swipe-in-sheet")
     nonisolated private static let accountID = "chat-swipe-fixture"
     nonisolated private static let count = 4
     /// The email "Remove a bubble" takes out of the chat.
@@ -25,19 +28,29 @@ struct ChatSwipeTestScene: View {
     var body: some View {
         Group {
             if ready {
-                NavigationStack {
-                    VStack(spacing: 24) {
-                        Text("Chat swipe fixture")
-                        NavigationLink("Open chat") { ChatThreadView(messageId: Self.headerId(Self.count - 1)) }
-                        Button(armed ? "Removal armed" : "Remove a bubble") { arm() }
+                if inSheet {
+                    NavigationStack {
+                        Button("Show sheet") { showsSheet = true }
+                            .navigationTitle("Fixture root")
                     }
-                    .navigationTitle("Fixture list")
+                    .sheet(isPresented: $showsSheet) { NavigationStack { list } }
+                } else {
+                    NavigationStack { list }
                 }
             } else {
                 Text(status)
             }
         }
         .task { await seed() }
+    }
+
+    private var list: some View {
+        VStack(spacing: 24) {
+            Text("Chat swipe fixture")
+            NavigationLink("Open chat") { ChatThreadView(messageId: Self.headerId(Self.count - 1)) }
+            Button(armed ? "Removal armed" : "Remove a bubble") { arm() }
+        }
+        .navigationTitle("Fixture list")
     }
 
     private static func headerId(_ index: Int) -> String {

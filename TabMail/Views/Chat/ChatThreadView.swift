@@ -71,6 +71,9 @@ struct ChatThreadView: View {
     /// The one open swipe: the chat's, or a bubble's id.
     /// What is open among the chat's swipes (`ChatSwipeOpen`).
     @State private var swipeOpen = ChatSwipeOpen()
+    /// Where the header ends and the reply field starts, in the swipes' space (`ChatSwipeOpen.reach`).
+    @State private var headerBottom = -CGFloat.infinity
+    @State private var pillTop = CGFloat.infinity
     @State private var showsMove = false
     @Environment(\.dismiss) private var dismiss
 
@@ -340,8 +343,6 @@ struct ChatThreadView: View {
                     }
                 }
             }
-            // While a swipe is open, a drag or tap anywhere else on the screen only closes it.
-            .background(ChatSwipeCloser(open: swipeOpen))
             // A bar inset, not a plain one: the navigation bar's scroll edge reaches under the
             // subject and the tutorial card, so the chat scrolls under the whole header, never
             // through it (Messages).
@@ -349,6 +350,11 @@ struct ChatThreadView: View {
                 VStack(spacing: 0) {
                     ChatSubjectLine(subject: subject(thread), labels: context.labels)
                     tutorialCard(thread)
+                }
+                // The open swipe is reachable only below the header.
+                .onGeometryChange(for: CGFloat.self) { $0.frame(in: .named(ChatSwipeOpen.space)).maxY } action: {
+                    headerBottom = $0
+                    swipeOpen.reach(top: $0, bottom: pillTop)
                 }
             }
             .overlay {
@@ -366,8 +372,17 @@ struct ChatThreadView: View {
                     .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
                         if !chatExpanded { pillHeight = height }
                     }
+                    // ...and above the reply field.
+                    .onGeometryChange(for: CGFloat.self) { $0.frame(in: .named(ChatSwipeOpen.space)).minY } action: {
+                        pillTop = $0
+                        swipeOpen.reach(top: headerBottom, bottom: $0)
+                    }
             }
         }
+        // While a swipe is open, a drag or tap anywhere else on the screen only closes it. The
+        // closer's anchor fills the space every swipe frame is measured in.
+        .background(ChatSwipeCloser(open: swipeOpen))
+        .coordinateSpace(.named(ChatSwipeOpen.space))
     }
 
     @ViewBuilder

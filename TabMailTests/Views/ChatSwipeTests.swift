@@ -437,46 +437,77 @@ struct ChatSwipeTests {
         }
     }
 
-    @Test("What is open: one reveal and its frame; it closes, moves with its reveal, and clears when its view leaves")
+    @Test("What is open: one reveal, its frame and buttons; it closes, moves with its reveal, and clears when its view leaves")
     func openState() {
         let open = ChatSwipeOpen()
-        #expect(open.id == nil && !open.owns(.zero))
-        open.open("b", frame: CGRect(x: 0, y: 100, width: 300, height: 50))
-        #expect(open.id == "b" && open.owns(CGPoint(x: 10, y: 120)) && !open.owns(CGPoint(x: 10, y: 200)))
-        open.moved("other", frame: CGRect(x: 0, y: 0, width: 10, height: 10))
-        #expect(open.owns(CGPoint(x: 10, y: 120)), "another reveal's move changes nothing")
-        open.moved("b", frame: CGRect(x: 0, y: 180, width: 300, height: 50))
-        #expect(open.owns(CGPoint(x: 10, y: 200)) && !open.owns(CGPoint(x: 10, y: 120)), "the open one's frame follows it")
+        let row = CGRect(x: 0, y: 100, width: 300, height: 50)
+        let strip = CGRect(x: 0, y: 100, width: 80, height: 50)
+        #expect(open.id == nil && !open.ownsDrag(.zero) && !open.ownsTap(.zero))
+        open.open("b", frame: row, buttons: strip)
+        #expect(open.id == "b" && open.ownsDrag(CGPoint(x: 200, y: 120)) && !open.ownsDrag(CGPoint(x: 10, y: 200)))
+        #expect(open.ownsTap(CGPoint(x: 10, y: 120)), "its buttons stay tappable")
+        #expect(!open.ownsTap(CGPoint(x: 200, y: 120)), "a tap on its own content only closes it")
+        open.moved("other", frame: .zero, buttons: .zero)
+        #expect(open.ownsDrag(CGPoint(x: 200, y: 120)), "another reveal's move changes nothing")
+        open.moved("b", frame: row.offsetBy(dx: 0, dy: 80), buttons: strip.offsetBy(dx: 0, dy: 80))
+        #expect(open.ownsDrag(CGPoint(x: 200, y: 200)) && !open.ownsDrag(CGPoint(x: 200, y: 120)), "the open one's frame follows it")
+        #expect(open.ownsTap(CGPoint(x: 10, y: 200)))
         open.left("other")
         #expect(open.id == "b", "another view leaving changes nothing")
         open.left("b")
-        #expect(open.id == nil && !open.owns(CGPoint(x: 10, y: 200)), "its view left: nothing is open")
-        open.open("b", frame: .zero)
+        #expect(open.id == nil && !open.ownsDrag(CGPoint(x: 200, y: 200)), "its view left: nothing is open")
+        open.open("b", frame: .zero, buttons: .zero)
         open.close()
         #expect(open.id == nil)
+    }
+
+    @Test("Under the header or the reply field nothing is the open reveal's, though its frame runs under them")
+    func openRevealOnlyWhereATouchReachesIt() {
+        let open = ChatSwipeOpen()
+        // The whole chat open: its frame is the scroll view, under the header and the reply field.
+        open.open("chat", frame: CGRect(x: 0, y: 0, width: 400, height: 800),
+                  buttons: CGRect(x: 240, y: 0, width: 160, height: 800))
+        open.reach(top: 120, bottom: 700)
+        for y: CGFloat in [10, 119, 700, 790] {
+            #expect(!open.ownsDrag(CGPoint(x: 100, y: y)), "the header and the reply field are never the chat's")
+            #expect(!open.ownsTap(CGPoint(x: 300, y: y)))
+        }
+        #expect(open.ownsDrag(CGPoint(x: 100, y: 400)))
+        #expect(open.ownsTap(CGPoint(x: 300, y: 400)))
+        #expect(!open.ownsTap(CGPoint(x: 100, y: 400)), "a tap on a bubble while the chat is open only closes")
     }
 
     /// A touch at a set point, as UIKit hands it to `shouldReceive`.
     private final class PlacedTouch: UITouch {
         var point = CGPoint.zero
-        override func location(in view: UIView?) -> CGPoint { point }
+        var readIn: UIView?
+        override func location(in view: UIView?) -> CGPoint { readIn = view; return point }
     }
 
-    @Test("The closer takes a touch only while something is open and only outside it; everything else then waits for it")
-    func closerTakesOnlyTouchesOutsideTheOpenReveal() {
+    @Test("The closer takes a touch only while something is open and only where it is not the open reveal's, read in its anchor")
+    func closerTakesOnlyTouchesOutsideTheOpenReveal() throws {
+        let (nav, window) = try Self.pushedChat()
+        defer { window.isHidden = true }
         let open = ChatSwipeOpen()
         let closer = ChatSwipeCloser.Coordinator(open: open)
+        let anchor = ChatSwipeCloser.Anchor()
+        anchor.coordinator = closer
+        try #require(nav.topViewController).view.addSubview(anchor)
         let touch = PlacedTouch()
-        touch.point = CGPoint(x: 10, y: 400)
+        touch.point = CGPoint(x: 200, y: 400)
         for recognizer in [closer.pan, closer.tap] as [UIGestureRecognizer] {
             #expect(!closer.gestureRecognizer(recognizer, shouldReceive: touch), "nothing open: the chat works as before")
             #expect(!closer.gestureRecognizerShouldBegin(recognizer))
         }
-        open.open("b", frame: CGRect(x: 0, y: 100, width: 300, height: 50))
+        open.open("b", frame: CGRect(x: 0, y: 100, width: 300, height: 50), buttons: CGRect(x: 0, y: 100, width: 80, height: 50))
         #expect(closer.gestureRecognizer(closer.tap, shouldReceive: touch), "a touch elsewhere is the closer's")
+        #expect(touch.readIn === anchor, "read in the space the frames are measured in")
         #expect(closer.gestureRecognizerShouldBegin(closer.tap))
+        touch.point = CGPoint(x: 200, y: 120)
+        #expect(!closer.gestureRecognizer(closer.pan, shouldReceive: touch), "a drag on the open reveal continues it")
+        #expect(closer.gestureRecognizer(closer.tap, shouldReceive: touch), "a tap on its content only closes")
         touch.point = CGPoint(x: 10, y: 120)
-        #expect(!closer.gestureRecognizer(closer.pan, shouldReceive: touch), "the open reveal's drags and buttons stay its own")
+        #expect(!closer.gestureRecognizer(closer.tap, shouldReceive: touch), "its buttons stay tappable")
         let other = UIPanGestureRecognizer()
         #expect(closer.gestureRecognizer(closer.pan, shouldBeRequiredToFailBy: other), "another recognizer waits for the closer")
         #expect(!closer.gestureRecognizer(closer.pan, shouldBeRequiredToFailBy: closer.tap))
@@ -495,11 +526,11 @@ struct ChatSwipeTests {
         try #require(nav.topViewController).view.addSubview(anchor)
         #expect(closer.pan.view === nav.view && closer.tap.view === nav.view, "on the view that holds the bar and the chat")
         #expect(edgePop.isEnabled, "nothing open: the edge back swipe works")
-        open.open("b", frame: .zero)
+        open.open("b", frame: .zero, buttons: .zero)
         #expect(!edgePop.isEnabled, "something open: an edge drag only closes it")
         open.close()
         #expect(edgePop.isEnabled, "closed: the next edge drag goes back")
-        open.open("b", frame: .zero)
+        open.open("b", frame: .zero, buttons: .zero)
         anchor.removeFromSuperview()
         #expect(closer.pan.view == nil && closer.tap.view == nil, "gone with the chat")
         #expect(edgePop.isEnabled, "and the edge back swipe is back on")

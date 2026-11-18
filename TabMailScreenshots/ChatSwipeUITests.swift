@@ -10,6 +10,9 @@ import XCTest
 ///  - While a bubble's actions or the chat's buttons are open, only that reveal takes drags; any
 ///    drag or tap anywhere else (another bubble, the reply field, the header, the screen's edge)
 ///    only closes it, and the next drag goes back.
+///  - Under the header, the reply field and the navigation bar nothing is the open reveal's, and a
+///    tap on a bubble while something is open only closes; the open bubble's own buttons still work,
+///    also in a chat opened inside a presented sheet.
 ///  - A bubble whose actions were open and whose email then leaves the chat leaves nothing open.
 /// "Went back" is read from the screen: the fixture's list shows again and the chat is gone.
 @MainActor
@@ -29,6 +32,26 @@ final class ChatSwipeUITests: XCTestCase {
         openBubble(2, in: app)
         dragRight(on: bubble(2, in: app), in: app)
         XCTAssertTrue(isInChat(app), "the chat stays")
+        XCTAssertTrue(bubbleActionsShow(app), "the open bubble followed the drag and stays open")
+    }
+
+    func testOwnActionsOpenShortDragBackStaysOpen() {
+        let app = launchIntoChat()
+        openBubble(2, in: app)
+        // Less than half the buttons back: only the bubble's own swipe can leave it open (the
+        // closer always closes).
+        let dy = bubble(2, in: app).frame.midY / app.frame.height
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.6, dy: dy))
+            .press(forDuration: 0.05, thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: 0.57, dy: dy)))
+        XCTAssertTrue(isInChat(app))
+        XCTAssertTrue(bubbleActionsShow(app), "the actions stay open")
+    }
+
+    func testOpenActionsOwnButtonStillWorks() {
+        let app = launchIntoChat()
+        openBubble(2, in: app)
+        app.buttons["Move"].tap()
+        XCTAssertTrue(app.navigationBars["Move to"].waitForExistence(timeout: 5), "the open bubble's Move runs")
     }
 
     func testOtherBubbleOpenRightDragOnlyCloses() {
@@ -46,6 +69,14 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertTrue(isInChat(app), "the chat stays")
         XCTAssertTrue(app.buttons["Trash"].waitForNonExistence(timeout: 3), "the chat's buttons closed")
         XCTAssertFalse(app.buttons["Move"].exists, "and no bubble opened")
+    }
+
+    func testChatButtonsOpenTapOnABubbleOnlyCloses() {
+        let app = launchIntoChat()
+        openChatButtons(in: app)
+        tap(atY: bubble(2, in: app).frame.midY, dx: 0.2, in: app)
+        XCTAssertTrue(app.buttons["Trash"].waitForNonExistence(timeout: 3), "the chat's buttons closed")
+        XCTAssertFalse(app.buttons["Sheet Grabber"].waitForExistence(timeout: 2), "the tap opened no card")
     }
 
     // MARK: - The screen's edge
@@ -73,7 +104,7 @@ final class ChatSwipeUITests: XCTestCase {
         let app = launchIntoChat()
         openBubble(2, in: app)
         // The reply field sits just above the home indicator, below the last bubble.
-        let fieldY = app.frame.height - Self.fieldFromBottom
+        let fieldY = replyFieldY(in: app)
         XCTAssertGreaterThan(fieldY, bubble(3, in: app).frame.maxY, "control: below the newest bubble")
         dragRight(atY: fieldY, in: app)
         XCTAssertTrue(isInChat(app), "the chat stays")
@@ -86,6 +117,77 @@ final class ChatSwipeUITests: XCTestCase {
         dragRight(atY: subject(in: app).frame.midY, in: app)
         XCTAssertTrue(isInChat(app), "the chat stays")
         XCTAssertTrue(app.buttons["Move"].waitForNonExistence(timeout: 3), "it only closed the actions")
+    }
+
+    func testChatButtonsOpenRightDragOnTheReplyFieldOnlyClosesNeverGoesBack() {
+        let app = launchIntoChat()
+        openChatButtons(in: app)
+        dragRight(atY: replyFieldY(in: app), in: app)
+        XCTAssertTrue(isInChat(app), "never goes back")
+        XCTAssertTrue(app.buttons["Trash"].waitForNonExistence(timeout: 3), "it only closed the chat's buttons")
+        dragFromEdge(atY: bubble(2, in: app).frame.midY, in: app)
+        XCTAssertTrue(wentBack(app), "the next drag goes back")
+    }
+
+    func testChatButtonsOpenTapOnTheReplyFieldOnlyClosesAndDoesNotFocusIt() {
+        let app = launchIntoChat()
+        openChatButtons(in: app)
+        tap(atY: replyFieldY(in: app), dx: 0.5, in: app)
+        XCTAssertTrue(app.buttons["Trash"].waitForNonExistence(timeout: 3), "it closed the chat's buttons")
+        _ = app.keyboards.firstMatch.waitForExistence(timeout: 2)
+        let focused = app.descendants(matching: .any).matching(NSPredicate(format: "hasKeyboardFocus == true"))
+        XCTAssertEqual(focused.count, 0, "the reply field did not take focus")
+        XCTAssertTrue(isInChat(app))
+    }
+
+    func testChatButtonsOpenRightDragOnTheHeaderOnlyCloses() {
+        let app = launchIntoChat()
+        openChatButtons(in: app)
+        dragRight(atY: subject(in: app).frame.midY, in: app)
+        XCTAssertTrue(isInChat(app), "never goes back")
+        XCTAssertTrue(app.buttons["Trash"].waitForNonExistence(timeout: 3), "it only closed the chat's buttons")
+    }
+
+    func testChatButtonsOpenRightDragOnTheNavigationBarOnlyCloses() {
+        let app = launchIntoChat()
+        openChatButtons(in: app)
+        dragRight(atY: navigationBarY(in: app), in: app)
+        XCTAssertTrue(isInChat(app), "never goes back")
+        XCTAssertTrue(app.buttons["Trash"].waitForNonExistence(timeout: 3), "it only closed the chat's buttons")
+    }
+
+    func testOpenActionsRightDragOnTheNavigationBarOnlyCloses() {
+        let app = launchIntoChat()
+        openBubble(2, in: app)
+        dragRight(atY: navigationBarY(in: app), in: app)
+        XCTAssertTrue(isInChat(app), "never goes back")
+        XCTAssertTrue(app.buttons["Move"].waitForNonExistence(timeout: 3), "it only closed the actions")
+    }
+
+    func testOpenActionsTapOnForwardOnlyCloses() {
+        let app = launchIntoChat()
+        openBubble(2, in: app)
+        app.buttons["Forward"].tap()
+        XCTAssertTrue(app.buttons["Move"].waitForNonExistence(timeout: 3), "it closed the actions")
+        XCTAssertTrue(isInChat(app))
+        XCTAssertTrue(app.buttons["Forward"].isHittable, "forward's compose did not open over the chat")
+    }
+
+    // MARK: - A chat opened inside a presented sheet (as search opens it)
+
+    func testInSheetOpenActionsOwnButtonStillWorks() {
+        let app = launchIntoChat(inSheet: true)
+        openBubble(2, in: app)
+        app.buttons["Move"].tap()
+        XCTAssertTrue(app.navigationBars["Move to"].waitForExistence(timeout: 5), "the open bubble's Move runs")
+    }
+
+    func testInSheetOtherBubbleRightDragOnlyCloses() {
+        let app = launchIntoChat(inSheet: true)
+        openBubble(2, in: app)
+        dragRight(on: bubble(3, in: app), in: app)
+        XCTAssertTrue(isInChat(app), "the chat stays")
+        XCTAssertTrue(app.buttons["Move"].waitForNonExistence(timeout: 3), "the open actions closed, and no other opened")
     }
 
     // MARK: - Left drags and taps while something is open
@@ -148,17 +250,33 @@ final class ChatSwipeUITests: XCTestCase {
     /// area, then about half the collapsed field.
     private static let fieldFromBottom: CGFloat = 60
 
-    private func launchIntoChat(armRemoval: Bool = false) -> XCUIApplication {
+    private func launchIntoChat(armRemoval: Bool = false, inSheet: Bool = false) -> XCUIApplication {
         continueAfterFailure = false
         let app = XCUIApplication()
-        app.launchArguments = ["--screenshot-splash", "--chat-swipe-ui-test"]
+        app.launchArguments = ["--screenshot-splash", "--chat-swipe-ui-test"] + (inSheet ? ["--chat-swipe-in-sheet"] : [])
         app.launch()
+        if inSheet {
+            XCTAssertTrue(app.buttons["Show sheet"].waitForExistence(timeout: 20))
+            app.buttons["Show sheet"].tap()
+        }
         XCTAssertTrue(app.staticTexts["Chat swipe fixture"].waitForExistence(timeout: 20))
         if armRemoval { app.buttons["Remove a bubble"].tap() }
         app.buttons["Open chat"].tap()
         XCTAssertTrue(subject(in: app).waitForExistence(timeout: 10))
         XCTAssertTrue(bubble(3, in: app).waitForExistence(timeout: 10))
         return app
+    }
+
+    private func replyFieldY(in app: XCUIApplication) -> CGFloat {
+        app.frame.height - Self.fieldFromBottom
+    }
+
+    private func navigationBarY(in app: XCUIApplication) -> CGFloat {
+        app.buttons["Forward"].frame.midY
+    }
+
+    private func tap(atY y: CGFloat, dx: CGFloat, in app: XCUIApplication) {
+        app.coordinate(withNormalizedOffset: CGVector(dx: dx, dy: y / app.frame.height)).tap()
     }
 
     private func subject(in app: XCUIApplication) -> XCUIElement {

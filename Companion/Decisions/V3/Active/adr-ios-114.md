@@ -577,16 +577,24 @@ same AI result, kept as long as the email itself is shown.
    swipes wait for the pans. While a reveal is open only it takes drags, either way (further open,
    a full swipe, or shut), and its buttons stay tappable. Any drag or tap anywhere else (another
    bubble, empty space, the reply field, the header, the navigation bar, the screen's edge) only
-   closes it, through `ChatSwipeCloser`: two recognizers on the navigation controller's own view
-   (not a view over the chat, so VoiceOver and every control see the chat as before) that take a
-   touch only while something is open and only outside it; everything else on that touch waits for
-   them, and the screen-edge back swipe is off while something is open. The next drag goes back. A
+   closes it, through one closer, `ChatSwipeCloser`, which owns a pan and a tap on the navigation
+   controller's own view (not a view over the chat, so VoiceOver and every control see the chat as
+   before). It takes a touch only while something is open and only where the touch is not the open
+   reveal's: a drag is the reveal's only inside its frame, a tap only on its buttons (a tap on a
+   bubble while anything is open only closes), and only between the header and the reply field,
+   so the header, the reply field and the navigation bar are never the open reveal's, though the
+   chat's scroll view runs under them. Every frame and the touch are measured in one space by
+   construction: the chat's named coordinate space (`ChatSwipeOpen.space`), which the closer's
+   anchor fills and reads the touch in. Everything else on that touch waits for the closer, and the
+   screen-edge back swipe is off while something is open. The next drag goes back. A
    closing drag or tap holds the interaction freeze like any swipe. A swipe runs alone (no
    simultaneous recognizer), so a swipe never also opens the bubble's card. An open reveal whose
    view leaves the chat (its email moved away by a sync) is no longer open, so the next swipe works
    (ios#1004). Tests: `ChatSwipeUITests` (real drags: the four open states, the edge, close then
-   back, the reply field and the header, left drags, a tap, the email leaving),
-   `nothingOpen`, `onlyTheOpenRevealTakesDrags`, `openState`,
+   back, the reply field, the header and the navigation bar with a bubble or the chat open, a tap
+   on the reply field, on Forward and on a bubble, the open bubble's own Move, the chat inside a
+   presented sheet, left drags, the email leaving), `nothingOpen`, `onlyTheOpenRevealTakesDrags`,
+   `openState`, `openRevealOnlyWhereATouchReachesIt`,
    `closerTakesOnlyTouchesOutsideTheOpenReveal`, `closerCoversTheWholeScreen`,
    `backSwipesWaitForTheRule`, `closingHoldsTheFreeze`.
    Archive, Trash and Move act on every email the

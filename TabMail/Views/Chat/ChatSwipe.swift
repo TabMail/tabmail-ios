@@ -109,34 +109,54 @@ struct ChatSwipeDrag: Equatable {
     }
 }
 
-/// What is open in one chat: the one reveal whose buttons show, and where it sits in the window.
-/// Its owner is the chat screen; every reveal and the chat's closer read it.
+/// What is open in one chat: the one reveal whose buttons show, and where it sits. Its owner is the
+/// chat screen; every reveal and the chat's closer read it. Every frame here is in the chat's own
+/// coordinate space (`space`), which is the closer's anchor view's, so a touch the closer reads in
+/// its anchor and a frame a reveal records are measured in the same space by construction.
 @MainActor
 @Observable
 final class ChatSwipeOpen {
+    /// The chat's coordinate space, named on the view the closer's anchor fills.
+    nonisolated static let space = "chat-swipe"
+
     /// The open reveal's id, or nil.
     private(set) var id: String?
-    /// The open reveal's frame in window coordinates: drags and taps inside it stay its own.
+    /// The open reveal's frame: drags inside it stay its own.
     private(set) var frame: CGRect = .null
+    /// The open reveal's buttons: taps on them stay its own.
+    private(set) var buttons: CGRect = .null
+    /// The band of the chat a touch can reach the reveals in: below the header, above the reply
+    /// field. The header, the reply field and the navigation bar are never the open reveal's.
+    private(set) var reachTop = -CGFloat.infinity
+    private(set) var reachBottom = CGFloat.infinity
     /// Told whenever something opens or nothing is open any more (the chat's closer).
     @ObservationIgnored var openChanged: ((Bool) -> Void)?
 
-    func open(_ id: String, frame: CGRect) {
+    func open(_ id: String, frame: CGRect, buttons: CGRect) {
         self.id = id
         self.frame = frame
+        self.buttons = buttons
         openChanged?(true)
     }
 
-    /// The open reveal moved (a scroll, a layout change).
-    func moved(_ id: String, frame: CGRect) {
+    /// The open reveal moved (a scroll, a layout change, its buttons sliding).
+    func moved(_ id: String, frame: CGRect, buttons: CGRect) {
         guard self.id == id else { return }
         self.frame = frame
+        self.buttons = buttons
+    }
+
+    /// Where the header ends and the reply field starts.
+    func reach(top: CGFloat, bottom: CGFloat) {
+        reachTop = top
+        reachBottom = bottom
     }
 
     func close() {
         let wasOpen = id != nil
         id = nil
         frame = .null
+        buttons = .null
         if wasOpen { openChanged?(false) }
     }
 
@@ -146,9 +166,19 @@ final class ChatSwipeOpen {
         if self.id == id { close() }
     }
 
-    /// Whether a touch at `point` (window coordinates) belongs to the open reveal.
-    func owns(_ point: CGPoint) -> Bool {
-        id != nil && frame.contains(point)
+    /// Whether a drag starting at `point` belongs to the open reveal (it continues it).
+    func ownsDrag(_ point: CGPoint) -> Bool {
+        id != nil && reaches(point) && frame.contains(point)
+    }
+
+    /// Whether a tap at `point` belongs to the open reveal: only its buttons; a tap anywhere else,
+    /// its own content included, only closes it.
+    func ownsTap(_ point: CGPoint) -> Bool {
+        id != nil && reaches(point) && buttons.contains(point)
+    }
+
+    private func reaches(_ point: CGPoint) -> Bool {
+        point.y >= reachTop && point.y < reachBottom
     }
 }
 
@@ -177,6 +207,7 @@ struct ChatSwipeReveal: ViewModifier {
     @State private var drag = ChatSwipeDrag()
     @State private var width: CGFloat = 0
     @State private var frame: CGRect = .null
+    @State private var buttonsFrame: CGRect = .null
 
     private var sign: CGFloat { edge == .trailing ? -1 : 1 }
     private var revealWidth: CGFloat { CGFloat(buttons.count) * ChatViewLayout.swipeButtonWidth }
@@ -195,10 +226,17 @@ struct ChatSwipeReveal: ViewModifier {
                     }
                     .frame(width: abs(drag.offset), alignment: edge == .trailing ? .leading : .trailing)
                     .clipped()
+                    .onGeometryChange(for: CGRect.self) { $0.frame(in: .named(ChatSwipeOpen.space)) } action: {
+                        buttonsFrame = $0
+                        open.moved(id, frame: frame, buttons: $0)
+                    }
                 }
             }
             .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
-            .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { frame = $0; open.moved(id, frame: $0) }
+            .onGeometryChange(for: CGRect.self) { $0.frame(in: .named(ChatSwipeOpen.space)) } action: {
+                frame = $0
+                open.moved(id, frame: $0, buttons: buttonsFrame)
+            }
             // Whether this reveal takes a drag is decided by `ChatSwipe.takesDrag`, from what is open
             // and where the drag starts; the back swipes wait for that decision.
             .gesture(ChatHorizontalPan(
@@ -230,7 +268,7 @@ struct ChatSwipeReveal: ViewModifier {
             close()
             edgeButton?.action()
         case .open:
-            open.open(id, frame: frame)
+            open.open(id, frame: frame, buttons: buttonsFrame)
             withAnimation(Self.spring) { drag.offset = sign * revealWidth }
         case .closed:
             close()
@@ -487,8 +525,8 @@ struct ChatSwipeCloser: UIViewRepresentable {
             }
             var responder: UIResponder? = self
             while let current = responder, !(current is UINavigationController) { responder = current.next }
-            let nav = responder as? UINavigationController
-            coordinator.install(on: nav?.view ?? window, edgePop: nav?.interactivePopGestureRecognizer)
+            guard let nav = responder as? UINavigationController else { return }
+            coordinator.install(on: nav.view, anchor: self, edgePop: nav.interactivePopGestureRecognizer)
         }
     }
 
@@ -498,6 +536,8 @@ struct ChatSwipeCloser: UIViewRepresentable {
         let pan = UIPanGestureRecognizer()
         let tap = UITapGestureRecognizer()
         private weak var host: UIView?
+        /// The view filling the chat's coordinate space (`ChatSwipeOpen.space`): touches are read in it.
+        private(set) weak var anchor: UIView?
         /// The navigation controller's screen-edge back swipe, off while something is open.
         private weak var edgePop: UIGestureRecognizer?
 
@@ -511,8 +551,9 @@ struct ChatSwipeCloser: UIViewRepresentable {
             }
         }
 
-        func install(on view: UIView?, edgePop: UIGestureRecognizer?) {
-            guard let view, host !== view else { return }
+        func install(on view: UIView, anchor: UIView, edgePop: UIGestureRecognizer?) {
+            self.anchor = anchor
+            guard host !== view else { return }
             uninstall()
             view.addGestureRecognizer(pan)
             view.addGestureRecognizer(tap)
@@ -533,10 +574,13 @@ struct ChatSwipeCloser: UIViewRepresentable {
             edgePop = nil
         }
 
-        /// A touch is the closer's only while something is open, and only outside the open reveal
-        /// (whose own drags and buttons stay its own).
+        /// A touch is the closer's only while something is open, and only where it is not the open
+        /// reveal's: a drag on the reveal continues it, a tap on its buttons runs them. Read in the
+        /// anchor, the space every reveal's frame is measured in.
         func gestureRecognizer(_ recognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
-            open.id != nil && !open.owns(touch.location(in: nil))
+            guard open.id != nil else { return false }
+            let point = touch.location(in: anchor)
+            return recognizer === tap ? !open.ownsTap(point) : !open.ownsDrag(point)
         }
 
         func gestureRecognizerShouldBegin(_ recognizer: UIGestureRecognizer) -> Bool {
