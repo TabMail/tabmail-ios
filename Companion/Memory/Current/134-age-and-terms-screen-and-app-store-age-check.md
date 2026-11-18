@@ -96,7 +96,7 @@ ADR-034.
 
 Tests: `AgeAndTermsConsentTests`, `AppStoreAgeCheckSimulationTests` (simulated App Store answers),
 `AgeIneligibleDeletionTokenTests` (refusal handshake through the real token path),
-`SignificantUpdateStorageTests` (first-run record and repeat),
+`SignificantUpdateStorageTests` (first-run record and repeat), `AppStoreAgeCheckRunnerGuardTests` (one age check at a time, notice only after `.allowed`, RootView source fence),
 `SignificantUpdateAcknowledgmentTests` (Apple's answers through `acknowledge`: no notice and no record
 where the rules do not apply, shown then recorded once they do, failures record nothing),
 `AgeAndTermsPushGateTests`, `AgeAndTermsDeviceSyncGateTests`.

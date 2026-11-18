@@ -349,6 +349,106 @@ struct SignificantUpdateAcknowledgmentTests {
     }
 }
 
+/// The runner's other two contracts (Codex r1 TC-1, TC-2): an age check still
+/// running admits no second one, and only an adult answer leads to the notice.
+@Suite("App Store age check: one age check at a time, notice only after an adult answer")
+@MainActor
+struct AppStoreAgeCheckRunnerGuardTests {
+    @MainActor
+    final class Calls {
+        var checks = 0
+        var applied: [AppStoreAgeCheck.Status] = []
+        var notices = 0
+        var heldCheck: CheckedContinuation<AppStoreAgeCheck.Status, Never>?
+    }
+
+    /// TC-1: while an age check is still waiting on the App Store, another
+    /// pass (launch, foreground, Try Again) does nothing at all; once it ends,
+    /// a later pass runs.
+    @Test func aSecondPassWhileTheAgeCheckRunsDoesNothing() async {
+        let runner = AppStoreAgeCheck.Runner()
+        let calls = Calls()
+        let first = Task { @MainActor in
+            await runner.pass(
+                check: {
+                    calls.checks += 1
+                    return await withCheckedContinuation { calls.heldCheck = $0 }
+                },
+                apply: { calls.applied.append($0) },
+                acknowledge: { calls.notices += 1 }
+            )
+        }
+        while calls.heldCheck == nil { await Task.yield() }
+        #expect(runner.isCheckingAge)
+
+        var secondTouched: [String] = []
+        await runner.pass(
+            check: { secondTouched.append("check"); return .minor },
+            apply: { _ in secondTouched.append("apply") },
+            acknowledge: { secondTouched.append("acknowledge") }
+        )
+        #expect(secondTouched.isEmpty, "no check, answer or notice from a pass made while one is running")
+        #expect(calls.checks == 1)
+        #expect(calls.applied.isEmpty, "the first answer is not in yet")
+
+        calls.heldCheck?.resume(returning: .unconfirmed)
+        await first.value
+        #expect(calls.applied == [.unconfirmed])
+        #expect(!runner.isCheckingAge)
+
+        await runner.pass(
+            check: { calls.checks += 1; return .minor },
+            apply: { calls.applied.append($0) },
+            acknowledge: { calls.notices += 1 }
+        )
+        #expect(calls.checks == 2, "a later pass is admitted")
+        #expect(calls.applied == [.unconfirmed, .minor])
+        #expect(calls.notices == 0)
+    }
+
+    /// TC-2: on an idle runner, every answer other than `.allowed` is shown
+    /// and leads to no notice; `.allowed` (the control) does.
+    @Test(arguments: [
+        (AppStoreAgeCheck.Status.minor, false),
+        (AppStoreAgeCheck.Status.unconfirmed, false),
+        (AppStoreAgeCheck.Status.notChecked, false),
+        (AppStoreAgeCheck.Status.allowed, true),
+    ])
+    func onlyAnAdultAnswerLeadsToTheNotice(status: AppStoreAgeCheck.Status, notice: Bool) async {
+        let runner = AppStoreAgeCheck.Runner()
+        let calls = Calls()
+        await runner.pass(
+            check: { calls.checks += 1; return status },
+            apply: { calls.applied.append($0) },
+            acknowledge: { calls.notices += 1 }
+        )
+        #expect(calls.applied == [status], "the answer is applied")
+        #expect(calls.notices == (notice ? 1 : 0))
+        #expect(!runner.isCheckingAge && !runner.isAcknowledging)
+    }
+
+    /// RootView's launch and foreground age check must go through the runner,
+    /// and the banner's tap through its notice guard. A hosted SwiftUI view
+    /// cannot be driven from a unit test, so this reads RootView's source.
+    @Test func rootViewDelegatesToTheRunner() throws {
+        let projectRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let raw = try String(
+            contentsOf: projectRoot.appendingPathComponent("TabMail/Views/RootView.swift"), encoding: .utf8)
+        let text = raw.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        let start = try #require(text.range(of: "private func checkAppStoreAge() async {"))
+        let end = try #require(text[start.upperBound...].range(of: "private func "))
+        let body = String(text[start.upperBound..<end.lowerBound])
+        #expect(body.contains("await appStoreAgeRunner.pass("), "the age check runs through the runner")
+        #expect(body.contains("AppStoreAgeCheck.run(request:"))
+        #expect(body.contains("AppStoreAgeCheck.acknowledgeSignificantUpdate()"))
+        #expect(!text.contains("isCheckingAppStoreAge"), "no second age-check flag beside the runner's")
+        #expect(text.contains("await appStoreAgeRunner.acknowledgeOnly {"), "the banner tap uses the notice guard")
+    }
+}
+
 /// Apple's notice can stay up and never return (#1010). The in-progress marker
 /// carries that across a relaunch: the same version is then offered through a
 /// banner, never shown unasked; a new version is shown as usual.
