@@ -18,6 +18,9 @@ import UIKit
 ///  2. The navigation bar stays while the pill is open, and the opened pill fits between the bar
 ///     and the safe-area line at the largest text size: its top (Close) is below the bar and
 ///     its input bar above the safe-area line.
+///  3. The header is in the navigation bar, as in Messages: the names lie inside the bar, under its
+///     middle (the avatars are above them, level with Back), and the subject line starts below the
+///     bar, at the default and the largest text size.
 @Suite("Chat layout", .serialized, .processGlobalState)
 @MainActor
 struct ChatThreadLayoutTests {
@@ -131,6 +134,27 @@ struct ChatThreadLayoutTests {
                 #expect(close.minY >= bar.maxY - 0.5, "Close top \(close.minY) under the bar's bottom \(bar.maxY)")
                 #expect(bottom.maxY <= safeBottom + 0.5 && bottom.minY > close.maxY,
                         "bottom line \(bottom), Close \(close), safe-area line \(safeBottom)")
+            }
+        }
+    }
+
+    @Test("The people are in the navigation bar and the subject line under it", arguments: [DynamicTypeSize.large, .accessibility5])
+    func headerInTheBar(textSize: DynamicTypeSize) async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
+        try await HostedAccessibility.withAutomation {
+            try await Self.hosted(textSize: textSize) { _, controller, _ in
+                @MainActor func element(_ match: @MainActor (NSObject) -> Bool) -> CGRect? {
+                    HostedAccessibility.elements(under: controller.view).first(where: match)?.accessibilityFrame
+                }
+                let isNames: @MainActor (NSObject) -> Bool = { $0.accessibilityHint == "Changes who gets your reply" }
+                try await Self.waitFor { element(isNames) != nil && Self.navigationBarFrame(in: controller.view) != nil }
+                try await Task.sleep(for: .milliseconds(500))
+                let names = try #require(element(isNames), "labels: \(HostedAccessibility.labels(in: controller.view))")
+                let subject = try #require(element { $0.accessibilityLabel == "Lunch plans" && $0.accessibilityHint == nil })
+                let bar = try #require(Self.navigationBarFrame(in: controller.view))
+                #expect(names.minY >= bar.minY - 0.5 && names.maxY <= bar.maxY + 0.5, "names \(names) in the bar \(bar)")
+                #expect(names.midY > bar.midY, "names under the avatars: \(names) in \(bar)")
+                #expect(subject.minY >= bar.maxY - 0.5, "subject \(subject) under the bar \(bar)")
             }
         }
     }
