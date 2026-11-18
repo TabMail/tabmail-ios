@@ -49,7 +49,8 @@ struct RootView: View {
     /// App Store age assurance (`AppStoreAgeCheck`), asked at launch and on
     /// every foreground. `.minor` / `.unconfirmed` cover the whole app.
     @State private var appStoreAge: AppStoreAgeCheck.Status = .notChecked
-    @State private var isCheckingAppStoreAge = false
+    /// Orders the age check and the significant update notice (`AppStoreAgeCheck.Runner`).
+    @State private var appStoreAgeRunner = AppStoreAgeCheck.Runner()
     @Environment(\.requestAgeRange) private var requestAgeRange
     /// Set while signing out after a failed age check: the person has just
     /// read why, so the generic "Signed Out" alert is not shown on top.
@@ -950,19 +951,20 @@ struct RootView: View {
     // MARK: - Age Checks
 
     /// Ask the App Store for the person's age (`AppStoreAgeCheck`). A failed
-    /// region lookup (`.notChecked`) keeps the previous answer.
+    /// region lookup (`.notChecked`) keeps the previous answer. A notice that
+    /// never returns does not hold up later age checks (`AppStoreAgeCheck.Runner`).
     private func checkAppStoreAge() async {
-        guard !ScreenshotMode.isActive, !isCheckingAppStoreAge else { return }
-        isCheckingAppStoreAge = true
-        defer { isCheckingAppStoreAge = false }
-        let status = await AppStoreAgeCheck.run(request: requestAgeRange)
-        let shown = AppStoreAgeCheck.shown(previous: appStoreAge, checked: status)
-        if shown != appStoreAge {
-            withAnimation { appStoreAge = shown }
-        }
-        if status == .allowed {
-            await AppStoreAgeCheck.acknowledgeSignificantUpdate()
-        }
+        guard !ScreenshotMode.isActive else { return }
+        await appStoreAgeRunner.pass(
+            check: { await AppStoreAgeCheck.run(request: requestAgeRange) },
+            apply: { status in
+                let shown = AppStoreAgeCheck.shown(previous: appStoreAge, checked: status)
+                if shown != appStoreAge {
+                    withAnimation { appStoreAge = shown }
+                }
+            },
+            acknowledge: { await AppStoreAgeCheck.acknowledgeSignificantUpdate() }
+        )
     }
 
     /// OK on the age and terms screen's refusal: the account deletion has

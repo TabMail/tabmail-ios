@@ -356,6 +356,77 @@ struct SignificantUpdateAcknowledgmentTests {
 /// asked; in one, only a confirmed adult gets in, a minor is blocked, a
 /// declined or failed answer blocks with Try Again; a failed region question
 /// changes nothing on screen; a foreground after an adult answer shows nothing.
+@Suite("App Store age check: a notice that never returns")
+@MainActor
+struct AppStoreAgeCheckRunnerTests {
+    @MainActor
+    final class Calls {
+        var checks = 0
+        var notices = 0
+        var applied: [AppStoreAgeCheck.Status] = []
+        /// Held so the stuck notice can be released when the test ends.
+        var stuck: CheckedContinuation<Void, Never>?
+    }
+
+    /// Apple's notice can stay up and never return (issue #972). The next
+    /// launch or foreground pass must still ask the App Store for the age.
+    @Test func aStuckNoticeDoesNotSkipTheNextAgeCheck() async {
+        let runner = AppStoreAgeCheck.Runner()
+        let calls = Calls()
+        let first = Task { @MainActor in
+            await runner.pass(
+                check: { calls.checks += 1; return .allowed },
+                apply: { calls.applied.append($0) },
+                acknowledge: {
+                    calls.notices += 1
+                    await withCheckedContinuation { calls.stuck = $0 }
+                }
+            )
+        }
+        while calls.stuck == nil { await Task.yield() }
+
+        await runner.pass(
+            check: { calls.checks += 1; return .minor },
+            apply: { calls.applied.append($0) },
+            acknowledge: { calls.notices += 1 }
+        )
+
+        #expect(calls.checks == 2, "the second pass asks the App Store again while the notice is stuck")
+        #expect(calls.applied == [.allowed, .minor], "the second answer is shown")
+        #expect(calls.notices == 1, "no second notice while the first is still up")
+
+        calls.stuck?.resume()
+        await first.value
+        #expect(!runner.isCheckingAge && !runner.isAcknowledging)
+    }
+
+    /// While the notice is still up, a pass with an `.allowed` answer does not
+    /// start a second one; once it returns, the next pass may.
+    @Test func noSecondNoticeWhileOneIsUp() async {
+        let runner = AppStoreAgeCheck.Runner()
+        let calls = Calls()
+        let first = Task { @MainActor in
+            await runner.pass(
+                check: { calls.checks += 1; return .allowed },
+                apply: { calls.applied.append($0) },
+                acknowledge: {
+                    calls.notices += 1
+                    await withCheckedContinuation { calls.stuck = $0 }
+                }
+            )
+        }
+        while calls.stuck == nil { await Task.yield() }
+        await runner.pass(check: { calls.checks += 1; return .allowed }, apply: { calls.applied.append($0) }, acknowledge: { calls.notices += 1 })
+        #expect(calls.checks == 2)
+        #expect(calls.notices == 1)
+
+        calls.stuck?.resume()
+        await first.value
+        await runner.pass(check: { calls.checks += 1; return .allowed }, apply: { calls.applied.append($0) }, acknowledge: { calls.notices += 1 })
+        #expect(calls.notices == 2, "a later pass shows the notice again once the first returned")
+    }
+}
+
 @Suite("App Store age check: simulated App Store answers")
 @MainActor
 struct AppStoreAgeCheckSimulationTests {

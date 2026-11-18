@@ -114,6 +114,38 @@ enum AppStoreAgeCheck {
         }
     }
 
+    /// The order of one launch or foreground pass: the age check, then, after
+    /// an `.allowed` answer, the significant update notice. The age check's
+    /// in-progress flag is cleared before the notice is awaited, because
+    /// Apple's notice can stay up and never return (issue #972's extension
+    /// did); holding the flag through it would skip every later age check
+    /// until the app is restarted. The notice keeps its own flag so a second
+    /// notice is not started while one is still up.
+    @MainActor
+    final class Runner {
+        private(set) var isCheckingAge = false
+        private(set) var isAcknowledging = false
+
+        /// `check` asks the App Store (`AppStoreAgeCheck.run`), `apply` shows
+        /// its answer, `acknowledge` is `acknowledgeSignificantUpdate`. A pass
+        /// that finds an age check already running does nothing.
+        func pass(
+            check: () async -> Status,
+            apply: (Status) -> Void,
+            acknowledge: () async -> Void
+        ) async {
+            guard !isCheckingAge else { return }
+            isCheckingAge = true
+            let status = await check()
+            isCheckingAge = false
+            apply(status)
+            guard status == .allowed, !isAcknowledging else { return }
+            isAcknowledging = true
+            await acknowledge()
+            isAcknowledging = false
+        }
+    }
+
     /// What the app shows after a check: a failed region question
     /// (`.notChecked`) keeps the previous answer, anything else replaces it.
     static func shown(previous: Status, checked: Status) -> Status {

@@ -79,6 +79,10 @@ ADR-034.
   `showSignificantUpdateAcknowledgment` before recording; a failure records nothing and asks again on
   the next foreground. `acknowledge(acknowledged:current:isRegulated:requiresNotice:show:record:)` is
   the seam; `acknowledgeSignificantUpdate` passes Apple's calls.
+- Apple's notice can stay up and never return (#972, #1010). `AppStoreAgeCheck.Runner.pass` orders
+  RootView's age check and the notice: the age check's in-progress flag clears BEFORE the notice is
+  awaited, so a stuck notice never skips later age checks; the notice has its own flag, so no second
+  notice starts while one is up (2026-11-18). Test: `AppStoreAgeCheckRunnerTests`.
 
 Tests: `AgeAndTermsConsentTests`, `AppStoreAgeCheckSimulationTests` (simulated App Store answers),
 `AgeIneligibleDeletionTokenTests` (refusal handshake through the real token path),
