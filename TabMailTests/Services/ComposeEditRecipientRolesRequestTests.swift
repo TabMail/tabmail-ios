@@ -115,4 +115,51 @@ struct ComposeEditRecipientRolesRequestTests {
             #expect(!recipientsJSON.contains(Self.copied))
         }
     }
+
+    /// The names the assistant gave reach the backend: the tool's context goes through the
+    /// override seam into a real `AIService` request, and `original_to`/`original_cc` carry
+    /// each recipient as `Name <address>`.
+    @Test("email_compose: tool recipient names reach the backend's original_to and original_cc")
+    @MainActor
+    func toolNamesReachBackend() async throws {
+        try await withAIEnabled {
+            let backend = Backend()
+            let service = AIService(backendClient: BackendClient(llmSession: backend.http.session))
+            let router = AgentToolRouter()
+            let ctx = ToolContext(db: try TestDatabase.make(), translator: MockChatIdTranslator(), router: router)
+            let tool = EmailComposeTool(context: ctx)
+            let override: @Sendable (ComposeEditContext, String) async throws -> InlineEditResult = { context, instruction in
+                try await service.performInlineEdit(
+                    currentSubject: "", currentBody: "", context: context,
+                    instruction: instruction, chatHistory: []
+                )
+            }
+            try await EmailComposeTool.$inlineEditOverride.withValue(override) {
+                let task = Task { @MainActor () -> String in
+                    try await tool.execute(arguments: [
+                        "recipients": .array([.dictionary(["name": .string("Sam Lee"), "email": .string(Self.primary)])]),
+                        "cc": .array([.dictionary(["name": .string("Pat Kim"), "email": .string(Self.copied)])]),
+                        "request": .string("Ask about moving the offsite to Friday"),
+                    ])
+                }
+                let deadline = Date().addingTimeInterval(5)
+                while router.pendingCompose == nil, Date() < deadline { await Task.yield() }
+                guard let req = router.pendingCompose else {
+                    Issue.record("Tool did not open a compose card")
+                    task.cancel()
+                    _ = try? await task.value
+                    return
+                }
+                req.onOutcome(.cancelled)
+                _ = try await task.value
+            }
+
+            let messages = backend.messages
+            #expect(messages.count == 1)
+            guard messages.count == 1 else { return }
+            let vars = messages[0]
+            #expect(vars["original_to"] as? String == "Sam Lee <\(Self.primary)>")
+            #expect(vars["original_cc"] as? String == "Pat Kim <\(Self.copied)>")
+        }
+    }
 }

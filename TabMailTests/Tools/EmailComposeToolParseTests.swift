@@ -34,7 +34,28 @@ struct EmailComposeToolParseTests {
         #expect(entry.leftovers.isEmpty)
         #expect(entry.addresses == ["x@y.com", "a@b.com"])
         #expect(entry.recipients.map(\.name) == ["X Y", nil])
-        #expect(result[1] == "a@b.com")
+        #expect(result.last == "a@b.com")
+    }
+
+    /// Each name the model may send round-trips through the tool's mailbox text: the same
+    /// name, exactly one recipient at the given address, nothing rejected or invented.
+    @Test("A tool recipient's name round-trips, whatever characters it holds",
+          arguments: [
+              "Sam Lee",
+              "Sam \"The Boss\" Lee",
+              "Back\\slash Lee",
+              "ceo@example.org",
+              "Lee, Sam <other@example.org>",
+          ])
+    func nameRoundTrips(_ name: String) throws {
+        let value: JSONValue = .array([
+            .dictionary(["name": .string(name), "email": .string("sam@example.com")]),
+        ])
+        let result = try #require(EmailComposeTool.parseStringArray(value))
+        let entry = RecipientEntry(result)
+        #expect(entry.leftovers.isEmpty)
+        #expect(entry.addresses == ["sam@example.com"])
+        #expect(entry.recipients.map(\.name) == [name])
     }
 
     @Test("A tool recipient's display name reaches the compose draft card")

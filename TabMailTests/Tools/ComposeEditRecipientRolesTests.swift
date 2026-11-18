@@ -49,6 +49,15 @@ struct ComposeEditRecipientRolesTests {
         router: AgentToolRouter,
         run: @escaping @MainActor () async throws -> String
     ) async throws -> [ComposeEditContext] {
+        try await captureEditAndRequest(router: router, run: run).contexts
+    }
+
+    /// The edit contexts the tool built and the To/Cc/Bcc of the compose request it enqueued.
+    private func captureEditAndRequest(
+        router: AgentToolRouter,
+        run: @escaping @MainActor () async throws -> String
+    ) async throws -> (contexts: [ComposeEditContext], to: [String], cc: [String], bcc: [String]) {
+        var enqueued: (to: [String], cc: [String], bcc: [String]) = ([], [], [])
         let box = ContextBox()
         let override: @Sendable (ComposeEditContext, String) async throws -> InlineEditResult = { ctx, _ in
             await box.append(ctx)
@@ -62,10 +71,28 @@ struct ComposeEditRecipientRolesTests {
                 _ = try? await task.value
                 return
             }
+            enqueued = (req.to, req.cc, req.bcc)
             req.onOutcome(.cancelled)
             _ = try await task.value
         }
-        return await box.contexts
+        return (await box.contexts, enqueued.to, enqueued.cc, enqueued.bcc)
+    }
+
+    private static let named: [String: String] = [
+        "sam@example.com": "Sam Lee",
+        "pat@example.com": "Pat Kim",
+        "lee@example.com": "Lee Park",
+        "kim@example.com": "Kim Cho",
+    ]
+
+    private static func namedObject(_ address: String) -> JSONValue {
+        .dictionary(["name": .string(named[address] ?? ""), "email": .string(address)])
+    }
+
+    /// The display names the compose card shows for one enqueued field, filled the way
+    /// ComposeView fills a prefilled field.
+    private static func cardNames(_ texts: [String]) -> [String: String] {
+        ComposeDraftGuards.fieldState(RecipientEntry(texts)).displayNames
     }
 
     private func expectRolesKept(_ contexts: [ComposeEditContext], expectTo: String) {
@@ -225,5 +252,88 @@ struct ComposeEditRecipientRolesTests {
         #expect(contexts[0].toRecipients == [Self.primary])
         #expect(contexts[0].recipients == [Self.primary])
         #expect(contexts[0].ccRecipients == [Self.alsoCopied, Self.newlyCopied])
+    }
+
+    @Test("email_compose: named To, Cc and Bcc reach the compose card with their names")
+    func composeRequestKeepsNames() async throws {
+        let (ctx, _, _, router) = try makeContext()
+        let tool = EmailComposeTool(context: ctx)
+        let captured = try await captureEditAndRequest(router: router) {
+            try await tool.execute(arguments: [
+                "recipients": .array([Self.namedObject(Self.primary)]),
+                "cc": .array([Self.namedObject(Self.copied)]),
+                "bcc": .array([Self.namedObject(Self.blind)]),
+                "request": .string("Ask about moving the offsite to Friday"),
+            ])
+        }
+        #expect(Self.cardNames(captured.to) == [Self.primary: "Sam Lee"])
+        #expect(Self.cardNames(captured.cc) == [Self.copied: "Pat Kim"])
+        #expect(Self.cardNames(captured.bcc) == [Self.blind: "Lee Park"])
+    }
+
+    @Test("email_forward: named To, Cc and Bcc keep their names in the edit request and on the card")
+    func forwardKeepsNames() async throws {
+        let (ctx, db, translator, router) = try makeContext()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        let header = try TestDatabase.insertMessageHeader(db, messageId: "fwd2", subject: "Offsite")
+        await translator.seed(header.id, as: 13)
+
+        let tool = EmailForwardTool(context: ctx)
+        let captured = try await captureEditAndRequest(router: router) {
+            try await tool.execute(arguments: [
+                "unique_id": .int(13),
+                "to": .array([Self.namedObject(Self.primary)]),
+                "cc": .array([Self.namedObject(Self.copied)]),
+                "bcc": .array([Self.namedObject(Self.blind)]),
+                "request": .string("Let them know Friday works"),
+            ])
+        }
+        let contexts = captured.contexts
+        #expect(contexts.count == 1)
+        guard contexts.count == 1 else { return }
+        #expect(contexts[0].mode == "edit_forward")
+        #expect(contexts[0].toRecipients == [Self.primary])
+        #expect(contexts[0].ccRecipients == [Self.copied])
+        #expect(contexts[0].toDisplayNames == [Self.primary: "Sam Lee"])
+        #expect(contexts[0].ccDisplayNames == [Self.copied: "Pat Kim"])
+        #expect(Self.cardNames(captured.to) == [Self.primary: "Sam Lee"])
+        #expect(Self.cardNames(captured.cc) == [Self.copied: "Pat Kim"])
+        #expect(Self.cardNames(captured.bcc) == [Self.blind: "Lee Park"])
+    }
+
+    @Test("email_reply: named additions keep their names in the edit request and on the card")
+    func replyKeepsAddedNames() async throws {
+        let (ctx, db, translator, router) = try makeContext()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        let header = try TestDatabase.insertMessageHeader(
+            db, messageId: "rep2", subject: "Offsite",
+            from: Self.primary, fromAddress: Self.primary,
+            to: "test@example.com"
+        )
+        await translator.seed(header.id, as: 14)
+
+        let tool = EmailReplyTool(context: ctx)
+        let captured = try await captureEditAndRequest(router: router) {
+            try await tool.execute(arguments: [
+                "unique_id": .int(14),
+                "add_recipients": .array([Self.namedObject(Self.newlyCopied)]),
+                "add_cc": .array([Self.namedObject(Self.copied)]),
+                "add_bcc": .array([Self.namedObject(Self.blind)]),
+                "request": .string("Say Friday works"),
+            ])
+        }
+        let contexts = captured.contexts
+        #expect(contexts.count == 1)
+        guard contexts.count == 1 else { return }
+        #expect(contexts[0].mode == "edit_reply")
+        #expect(contexts[0].toRecipients.contains(Self.newlyCopied))
+        #expect(contexts[0].ccRecipients == [Self.copied])
+        #expect(contexts[0].toDisplayNames[Self.newlyCopied] == "Kim Cho")
+        #expect(contexts[0].ccDisplayNames == [Self.copied: "Pat Kim"])
+        #expect(Self.cardNames(captured.to)[Self.newlyCopied] == "Kim Cho")
+        #expect(Self.cardNames(captured.cc) == [Self.copied: "Pat Kim"])
+        #expect(Self.cardNames(captured.bcc) == [Self.blind: "Lee Park"])
     }
 }
