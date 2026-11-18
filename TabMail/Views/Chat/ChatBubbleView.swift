@@ -170,15 +170,10 @@ struct ChatBubbleView: View {
     }
 }
 
-/// A reply in the outbox that has not gone out yet (`ChatUnsentReply`): a blue bubble with the
-/// email's summary once it is made ("Summarizing" until then), and under it "Sending", as under
-/// every email of the user's. A send that failed for good reads "Not sent", with the red mark beside
-/// the bubble as in Messages; touch and hold offers Retry and Delete, which are the Outbox's own
-/// Retry and Discard for the same row (owner 2026-11-07).
-/// The ready AI Suggestion (V1b): a ghost of the user's next message, where it lands once sent
+/// The ready AI Suggestion: a ghost of the user's next message, where it lands once sent
 /// (the newest outgoing place, under the last email). A dashed accent outline on a clear bubble,
 /// accent text, and "AI Suggestion · Tap to use" under it, so it reads plainly as not sent. A tap
-/// opens the compose card with the suggestion written out (L4); nothing is sent from here.
+/// on the bubble or its caption opens the compose card with the suggestion written out; nothing is sent from here.
 struct ChatSuggestionBubble: View {
     /// The suggestion's text version (`MessageHeader.replyTextMessage`).
     let text: String
@@ -187,8 +182,9 @@ struct ChatSuggestionBubble: View {
     let onTap: () -> Void
 
     var body: some View {
-        VStack(alignment: .trailing, spacing: 4) {
-            Button(action: onTap) {
+        // One button, bubble and caption, so the caption's "Tap to use" is a tap target too.
+        Button(action: onTap) {
+            VStack(alignment: .trailing, spacing: 4) {
                 Text(text)
                     .font(.body)
                     .foregroundStyle(Theme.accent)
@@ -200,22 +196,23 @@ struct ChatSuggestionBubble: View {
                             .stroke(Theme.accent, style: StrokeStyle(
                                 lineWidth: ChatViewLayout.suggestionStrokeWidth, dash: ChatViewLayout.suggestionDash))
                     )
-                    .contentShape(RoundedRectangle(cornerRadius: ChatViewLayout.bubbleCornerRadius))
                     .overlay {
                         if pulses {
                             TutorialPulseRing(shape: RoundedRectangle(cornerRadius: ChatViewLayout.bubbleCornerRadius))
                         }
                     }
+                Text(ChatSuggestionConfig.statusLine)
+                    .font(.caption2)
+                    .foregroundStyle(Theme.textSecondary)
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel("\(ChatSuggestionConfig.label): \(text)")
-            .accessibilityHint("Opens the email, ready to review and send")
-            .accessibilityIdentifier(Self.bubbleId)
-            Text(ChatSuggestionConfig.statusLine)
-                .font(.caption2)
-                .foregroundStyle(Theme.textSecondary)
-                .accessibilityHidden(true)
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(ChatSuggestionConfig.label): \(text)")
+        .accessibilityHint("Opens the email, ready to review and send")
+        .accessibilityAddTraits(.isButton)
+        .accessibilityIdentifier(Self.bubbleId)
         .containerRelativeFrame(.horizontal, alignment: .trailing) { width, _ in
             width * ChatViewLayout.bubbleMaxWidthFraction
         }
@@ -227,6 +224,11 @@ struct ChatSuggestionBubble: View {
     static let bubbleId = "chat.aiSuggestion"
 }
 
+/// A reply in the outbox that has not gone out yet (`ChatUnsentReply`): a blue bubble with the
+/// email's summary once it is made ("Summarizing" until then), and under it "Sending", as under
+/// every email of the user's. A send that failed for good reads "Not sent", with the red mark beside
+/// the bubble as in Messages; touch and hold offers Retry and Delete, which are the Outbox's own
+/// Retry and Discard for the same row (owner 2026-11-07).
 struct ChatUnsentReplyBubble: View {
     let reply: ChatUnsentReply
     let retry: () -> Void

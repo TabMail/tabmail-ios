@@ -49,7 +49,7 @@ struct TutorialChatViewContentTests {
         let open = try #require(card(.replyToPriya, .reuseReply, .inbox))
         #expect(open.title.contains("Open Priya"))
         let ready = try #require(card(.replyToPriya, .reuseReply, .chat))
-        #expect(ready.message.contains("Tap Send"))
+        #expect(ready.message.contains("Tap the AI Suggestion") && !ready.message.contains("Tap Send"))
         let ask = try #require(card(.makeTemplate, .reuseReply, .chat))
         #expect(ask.message.contains("tap Send"))
         #expect(card(.makeTemplate, .reuseReply, .inbox) != nil, "back in the inbox the card says where to go")

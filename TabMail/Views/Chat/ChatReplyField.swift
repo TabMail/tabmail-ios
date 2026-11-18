@@ -205,15 +205,11 @@ struct ChatReplyCompose: Equatable {
     let cc: [String]
     let bcc: [String]
 
-    /// The ready AI Suggestion to `message`: a Reply All to the newest email's people exactly when nobody
-    /// is chosen in Reply to (`target.only == nil`); with people chosen, a plain reply to only them,
-    /// with no Cc or Bcc.
-    static func make(replyTo message: MessageHeader?, target: ChatReplyTarget, accounts: [Account]) -> ChatReplyCompose {
-        if let only = target.only {
-            return ChatReplyCompose(isReplyAll: false, to: only.map(\.address), cc: [], bcc: [])
-        }
-        let audience = message.map { buildReplyAllRecipients(for: $0, allAccounts: accounts) }
-        return ChatReplyCompose(isReplyAll: audience != nil, to: audience?.to ?? [], cc: audience?.cc ?? [], bcc: [])
+    /// The AI Suggestion to `message`: a Reply All to its people. The suggestion shows only while
+    /// nobody is chosen in Reply to (`ChatReplyField.suggestionText`).
+    static func make(replyAllTo message: MessageHeader, accounts: [Account]) -> ChatReplyCompose {
+        let audience = buildReplyAllRecipients(for: message, allAccounts: accounts)
+        return ChatReplyCompose(isReplyAll: true, to: audience.to, cc: audience.cc, bcc: [])
     }
 
     /// The agent's reply, read from its request alone, never from the chat showing the card: whether

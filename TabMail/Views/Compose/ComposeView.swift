@@ -2327,15 +2327,22 @@ struct ComposeView: View {
     /// written. The edit stays in the open compose, and the cache is a convenience for reopening, so
     /// a refused write costs that convenience, while the alternative stores it on another email.
     static func writeCachedReplyToDB(_ text: String, replyTo reply: MessageHeader, db: any DatabaseWriter) async {
-        try? await db.write { db in
-            guard let target = try AIWriteTarget.capture(message: reply, db: db) else { return }
-            _ = try AccountManager.aiGuardedHeaderWrite(db, target: target) { _, db in
+        let outcome = (try? await db.write { db -> AIWriteOutcome in
+            guard let target = try AIWriteTarget.capture(message: reply, db: db) else { return .dropped }
+            return try AccountManager.aiGuardedHeaderWrite(db, target: target) { _, db in
                 try db.execute(
                     sql: "UPDATE messageHeader SET cachedReply = ?, replyTextMessage = NULL WHERE id = ?",
                     arguments: [text, reply.id]
                 )
             }
-        }
+        }) ?? .dropped
+        // An open chat shows the row's AI Suggestion: it reloads the row, as after the AI's own writes.
+        if outcome == .written { await postMessageDataDidChange(reply.id) }
+    }
+
+    /// Tells open views the row at `id` changed, on the main actor as the AI queue's writers do.
+    private static func postMessageDataDidChange(_ id: MessageHeader.ID) async {
+        await MainActor.run { NotificationCenter.default.post(name: .messageDataDidChange, object: id) }
     }
 
     /// What `recomputeReply` does, without the view: ask for a new reply to `reply` and store
@@ -2385,6 +2392,7 @@ struct ComposeView: View {
                     }
                 }) ?? .dropped
                 BackgroundSyncLogger.logDebug("[Compose] Recomputed reply for \(reply.messageId), stored: \(outcome == .written)")
+                if outcome == .written { await postMessageDataDidChange(reply.id) }
                 return result.body
             }
             BackgroundSyncLogger.logDebug("[Compose] Recompute returned nil/empty for \(reply.messageId)")

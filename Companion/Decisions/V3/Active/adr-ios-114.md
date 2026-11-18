@@ -872,9 +872,12 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    text message there rewrites the ghost in place, with no second copy. None shows on the user's
    turn, for a no-reply sender, or while the reply goes only to people chosen in Reply to (the
    suggestion was written for everyone; the field has the agent write one for them).
-   - **Tap (L4):** opens today's compose card with the full reply in its suggestion box, as Send did
-     (`ChatThreadView.openSuggestion`); Send there sends and the Sent bubble replaces the ghost; Close
-     goes back with the ghost still there. In the tutorial only the step that asks for it
+   - **Tap** (the bubble or its caption, one button): opens today's Reply All compose card with the
+     full reply in its suggestion box, as Send did (`ChatThreadView.openSuggestion`,
+     `ChatReplyCompose.make(replyAllTo:)`); Send there sends and the Sent bubble replaces the ghost,
+     and the field's words stay (the card is not a send from the field); Close goes back with the
+     ghost still there. An edit or a Recompute in the card that is stored on the row posts
+     `.messageDataDidChange`, so the ghost under the card follows it. In the tutorial only the step that asks for it
      (`FieldMove.tapSuggestion`, ringed by `TutorialPulseRing`) opens the card; elsewhere the
      locked notice shows.
    - **The field** holds only the user's words (`ChatFieldFill`: `shown`, `emptiedOn` and

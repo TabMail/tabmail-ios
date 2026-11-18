@@ -176,7 +176,8 @@ struct ChatReplyFieldRuntimeTests {
     @Test("A send or an answer from the field empties it, and no AI Suggestion fills it")
     func completionEmptiesTheField() async throws {
         try await withMountedField(Self.header("field-C", ready: "A ready reply")) { host, controller in
-            #expect(Self.fieldTexts(controller.view).contains("A ready reply"), "control: the field starts filled")
+            let start = Self.fieldTexts(controller.view)
+            #expect(!start.isEmpty && start.allSatisfy { $0.isEmpty }, "control: the field starts empty, the suggestion is not in it: \(start)")
             #expect(Self.type("My question", in: controller.view), "the mounted pill has a native editable field")
             try await Self.settle()
             #expect(Self.fieldTexts(controller.view).contains("My question"), "control: the edit reached the field")

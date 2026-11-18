@@ -260,10 +260,10 @@ struct ChatThreadView: View {
             .presentationDragIndicator(.visible)
         }
         .fullScreenCover(item: $readyReply) { ready in
-            // Today's reply compose, with the AI Suggestion in its box: Reply All, or a reply
-            // to only the people chosen in Reply to.
-            ready.compose.composeView(
-                replyTo: ready.message, onAgentOutcome: { outcome in composeEnded(outcome, replyTo: ready.message) })
+            // Today's Reply All compose, with the AI Suggestion in its box. It leaves the field
+            // alone: the field's words are not what it sends, and a sent reply retires the
+            // suggestion through the outbox.
+            ready.compose.composeView(replyTo: ready.message, onAgentOutcome: { _ in })
         }
         .fullScreenCover(item: $agentCompose) { composeView(for: $0) }
         .fullScreenCover(item: $forwardMessage) { ComposeView(replyTo: $0, isForward: true) }
@@ -683,15 +683,16 @@ struct ChatThreadView: View {
         TutorialCoordinator.shared.fieldMove(inPracticeChat: holdsTutorialEmail(thread).practice)
     }
 
-    /// A tap on the AI Suggestion (L4): the compose card with it written out, to the people the
-    /// reply goes to now. In the tutorial only the step that asks for it opens the card.
+    /// A tap on the AI Suggestion: the Reply All compose card with it written out (the suggestion
+    /// shows only while the reply goes to everyone). In the tutorial only the step that asks for it
+    /// opens the card.
     private func openSuggestion(on newest: MessageHeader, tutorialMove: TutorialCoordinator.FieldMove?) {
         if TutorialCoordinator.shared.isRunning, tutorialMove != .tapSuggestion {
             _ = TutorialCoordinator.shared.admits(.other)
             return
         }
         readyReply = ChatReadyReply(message: newest, compose: ChatReplyCompose.make(
-            replyTo: newest, target: replyTarget, accounts: context.accounts))
+            replyAllTo: newest, accounts: context.accounts))
     }
 
     private func pill(on newest: MessageHeader) -> some View {

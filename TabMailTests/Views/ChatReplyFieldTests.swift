@@ -400,13 +400,18 @@ struct ChatReplyFieldTests {
     @Test("The chat opens compose for the AI Suggestion, empties the field after a send, and shows the outbox's unsent replies")
     func chatWiring() throws {
         let text = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
-        #expect(Self.count("readyReply = ChatReadyReply(message: newest, compose: ChatReplyCompose.make( replyTo: newest, target: replyTarget, accounts: context.accounts))", in: text) == 1)
+        #expect(Self.count("readyReply = ChatReadyReply(message: newest, compose: ChatReplyCompose.make( replyAllTo: newest, accounts: context.accounts))", in: text) == 1)
         #expect(Self.count("onAgentOutcome: onOutcome)", in: text) == 3, "every agent compose")
-        // Every compose card hands its own outcome on: four callbacks, none naming an outcome itself.
         #expect(Self.count("onAgentOutcome:", in: text) == 4)
         #expect(Self.count("composeEnded(.", in: text) == 0 && Self.count("{ _ in composeEnded", in: text) == 0)
-        #expect(Self.count("ready.compose.composeView( replyTo: ready.message, onAgentOutcome: { outcome in composeEnded(outcome, replyTo: ready.message) })", in: text) == 1,
-                "the field's own compose hands on its outcome")
+        // The AI Suggestion's card is not a send from the field: its outcome leaves the field's
+        // words alone (a completion with no field send would empty them).
+        #expect(Self.count("ready.compose.composeView(replyTo: ready.message, onAgentOutcome: { _ in })", in: text) == 1,
+                "the suggestion's compose never completes the field")
+        #expect(Self.count("composeEnded(", in: text) == 2, "only agent compose cards end through it")
+        // Who the reply goes to and whose turn it is decide whether the suggestion shows.
+        #expect(Self.count("let usersTurn = (thread.items.last?.isOwn ?? false) || !unsentReplies.isEmpty", in: text) == 1)
+        #expect(Self.count("ChatReplyField.suggestionText(newest: newest, usersTurn: usersTurn, onlyTo: replyTarget.only)", in: text) == 1)
         #expect(Self.count("req.onOutcome(outcome) composeEnded(outcome, replyTo: req.mode == .reply ? req.replyTo : nil)", in: text) == 1,
                 "an agent compose hands on its outcome")
         let ended = try Self.body(of: "private func composeEnded(_ outcome: ComposeOutcome, replyTo: MessageHeader?) {", in: text)
@@ -440,8 +445,8 @@ struct ChatReplyFieldTests {
     ]
 
     /// The compose card the chat opens for the AI Suggestion, as the chat's cover builds it.
-    private static func card(_ message: MessageHeader?, target: ChatReplyTarget, accounts: [Account] = [me]) -> ComposeView {
-        ChatReplyCompose.make(replyTo: message, target: target, accounts: accounts)
+    private static func card(_ message: MessageHeader, accounts: [Account] = [me]) -> ComposeView {
+        ChatReplyCompose.make(replyAllTo: message, accounts: accounts)
             .composeView(replyTo: message, onAgentOutcome: { _ in })
     }
 
@@ -458,26 +463,13 @@ struct ChatReplyFieldTests {
         case field(onlyTo: [String]?)
     }
 
-    @Test("The AI Suggestion to everyone opens compose as Reply All, to the whole group")
+    @Test("The AI Suggestion opens compose as Reply All, to the whole group")
     func readyReplyToEveryoneIsReplyAll() {
         let email = Self.groupEmail()
-        // Done in Reply to with everyone ticked: Reply All, as before any choice.
-        for target in [ChatReplyTarget.replyAll, .chosen(Self.groupPeople, replyPeople: Self.groupPeople)] {
-            let compose = Self.card(email, target: target)
-            #expect(compose.isReplyAll, "the send records a Reply All on the original")
-            #expect(compose.prefillTo == ["alex@example.com", "david@example.com"] && compose.prefillCc == ["sam@example.com"])
-            #expect(compose.prefillBcc == nil && compose.replyTo?.id == email.id && !compose.isForward)
-        }
-    }
-
-    @Test("The AI Suggestion with people chosen goes only to them, as a plain reply")
-    func readyReplyToChosenIsPlainReply() {
-        let email = Self.groupEmail()
-        let target = ChatReplyTarget.chosen([Self.david], replyPeople: Self.groupPeople)
-        let compose = Self.card(email, target: target)
-        #expect(!compose.isReplyAll, "a reply to fewer people is never recorded as Reply All")
-        #expect(compose.prefillTo == [Self.david.address], "only David")
-        #expect(compose.prefillCc == nil && compose.prefillBcc == nil, "nobody else, seen or hidden")
+        let compose = Self.card(email)
+        #expect(compose.isReplyAll, "the send records a Reply All on the original")
+        #expect(compose.prefillTo == ["alex@example.com", "david@example.com"] && compose.prefillCc == ["sam@example.com"])
+        #expect(compose.prefillBcc == nil && compose.replyTo?.id == email.id && !compose.isForward)
     }
 
     /// The reply request the AI reply tool opens for `arguments`, on an email from

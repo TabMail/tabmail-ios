@@ -14,7 +14,7 @@ import UIKit
 /// THE SYSTEM PROPERTIES pinned here:
 ///  1. The ready suggestion shows as a ghost of the user's next message, labelled "AI Suggestion",
 ///     with "AI Suggestion · Tap to use" under it; the field stays empty.
-///  2. A tap on it opens the compose card with the suggestion written out (L4), and sends nothing.
+///  2. A tap on it opens the compose card with the suggestion written out, and sends nothing.
 ///  3. One copy: the ghost reads the email's row, so a new text version there rewrites it in place,
 ///     and the old text is gone.
 ///  4. The chat view says "AI Suggestion", never "AI Reply", in any string a user sees or hears.
@@ -66,18 +66,37 @@ struct ChatSuggestionBubbleTests {
             saved.restore()
             InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
         }
+        // Every exit, setup included, gives the queue back as it was.
+        do {
+            try await runChat(pool: pool, saved: saved, body)
+        } catch {
+            await queue.clearForTesting()
+            await queue.setDispatchSuppressedForTesting(false)
+            throw error
+        }
+        await queue.clearForTesting()
+        await queue.setDispatchSuppressedForTesting(false)
+    }
+
+    private func runChat(
+        pool: DatabasePool, saved: ChatSummaryQueueTests.SavedChatViewState,
+        _ body: @MainActor (Chat) async throws -> Void
+    ) async throws {
         saved.setChatView(on: true)
         _ = try FolderEpochTestFixture.makeAccount(id: Self.account, provider: .gmail, pool: pool)
         try FolderEpochTestFixture.insertFolder(accountId: Self.account, path: "INBOX", role: .inbox, pool: pool)
         let email = Self.header()
         try await pool.write { db in try email.insert(db) }
+        // The compose card reads the app's accounts from the navigation store, as in the app.
+        let navigationStore = NavigationStore()
+        navigationStore.accounts = try await pool.read { try Account.fetchAll($0) }
 
         let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let window = UIWindow(windowScene: scene)
         window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
         let controller = UIHostingController(rootView: AnyView(NavigationStack {
             ChatThreadView(messageId: email.id)
-        }.environment(\.hasTabMailSession, true)))
+        }.environment(navigationStore).environment(\.hasTabMailSession, true)))
         window.rootViewController = controller
         window.makeKeyAndVisible()
         defer {
@@ -86,15 +105,7 @@ struct ChatSuggestionBubbleTests {
         }
         let chat = Chat(controller: controller, pool: pool, email: email)
         try await Self.waitUntil { Self.ghost(in: chat.view) != nil }
-        do {
-            try await body(chat)
-        } catch {
-            await queue.clearForTesting()
-            await queue.setDispatchSuppressedForTesting(false)
-            throw error
-        }
-        await queue.clearForTesting()
-        await queue.setDispatchSuppressedForTesting(false)
+        try await body(chat)
     }
 
     private static func waitUntil(_ condition: @MainActor () async throws -> Bool) async throws {
@@ -133,7 +144,7 @@ struct ChatSuggestionBubbleTests {
         }
     }
 
-    // MARK: - 2. L4: a tap opens the compose card
+    // MARK: - 2. A tap opens the compose card
 
     @Test("A tap on the AI Suggestion opens the compose card with it written out, and sends nothing")
     func tapOpensTheComposeCard() async throws {
@@ -167,7 +178,8 @@ struct ChatSuggestionBubbleTests {
                 try db.execute(sql: "UPDATE messageHeader SET cachedReply = ?, replyTextMessage = ? WHERE id = ?",
                                arguments: ["Hello Sam,\n\nI can't make Tuesday.\n\nThanks.", "Sorry, I can't make Tuesday.", id])
             }
-            NotificationCenter.default.post(name: .nseMergeDidCommit, object: nil)
+            // The row-change event the AI's reply writers post after they store a reply.
+            NotificationCenter.default.post(name: .messageDataDidChange, object: id)
             try await Self.waitUntil { Self.ghost(in: chat.view)?.accessibilityLabel == "AI Suggestion: Sorry, I can't make Tuesday." }
             let ghosts = HostedAccessibility.elements(under: chat.view).filter {
                 HostedAccessibility.identifier(of: $0) == ChatSuggestionBubble.bubbleId
@@ -175,6 +187,19 @@ struct ChatSuggestionBubbleTests {
             #expect(ghosts.count == 1, "one ghost")
             #expect(ghosts.first?.accessibilityLabel == "AI Suggestion: Sorry, I can't make Tuesday.")
             #expect(!HostedAccessibility.labels(in: chat.view).contains { $0.contains(Self.ready) }, "the old text is gone")
+        }
+    }
+
+    @Test("An edit of the suggestion stored from compose takes the ghost away: its text no longer matches")
+    func composeEditRetiresTheGhost() async throws {
+        try await withChat { chat in
+            #expect(Self.ghost(in: chat.view) != nil, "control: the ghost shows")
+            // Compose's own writer, as when the user edits the suggestion in the card.
+            await ComposeView.writeCachedReplyToDB("Hello Sam,\n\nMaybe Wednesday?", replyTo: chat.email, db: chat.pool)
+            try await Self.waitUntil { Self.ghost(in: chat.view) == nil }
+            #expect(Self.ghost(in: chat.view) == nil, "the stale suggestion is gone without leaving the chat")
+            let stored = try await chat.pool.read { try MessageHeader.fetchOne($0, key: chat.email.id) }
+            #expect(stored?.cachedReply == "Hello Sam,\n\nMaybe Wednesday?", "control: the edit was stored")
         }
     }
 
