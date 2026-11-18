@@ -21,7 +21,7 @@ import UIKit
 ///  3. The header is in the navigation bar, as in Messages: the names lie inside the bar, under its
 ///     middle (the avatars are above them, level with Back), and the subject line starts below the
 ///     bar, at the default and the largest text size.
-///  4. The header is the chat's top bar: the scroll view's own safe area covers it at every scroll
+///  4. The header is the chat's top bar: the scroll view's own safe area covers it at sampled scroll
 ///     position, and at rest at the oldest email the first bubble sits below the subject, at the
 ///     default and the largest text size.
 @Suite("Chat layout", .serialized, .processGlobalState)
@@ -210,7 +210,7 @@ struct ChatThreadLayoutTests {
     // area, so this does not tell a bar from an inset.
     // Whether the system draws its scroll-edge backdrop behind a bar is not observable from UIKit
     // (no public property reports it), so it is not asserted here; screenshots show it.
-    @Test("The chat's scroll area clears the header at every scroll position; at rest its first bubble does too",
+    @Test("The chat's scroll area clears the header at sampled scroll positions; at rest its first bubble does too",
           arguments: [DynamicTypeSize.large, .accessibility5])
     func scrolledContentStaysUnderTheHeader(textSize: DynamicTypeSize) async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
@@ -234,8 +234,8 @@ struct ChatThreadLayoutTests {
                 @MainActor func checkInsets(_ at: String) throws {
                     let subject = try subjectFrame()
                     let frame = scrollFrame()
-                    #expect(frame.minY + scroll.adjustedContentInset.top >= subject.maxY - 0.5,
-                            "\(at): the scroll area's top \(frame.minY + scroll.adjustedContentInset.top) clears the subject \(subject)")
+                    #expect(frame.minY + scroll.adjustedContentInset.top >= subject.maxY + ChatViewLayout.subjectLineBottomGap - 0.5,
+                            "\(at): the scroll area's top \(frame.minY + scroll.adjustedContentInset.top) clears the subject \(subject) by its gap")
                 }
                 // Where the chat opens, at the newest email.
                 try checkInsets("at the newest")

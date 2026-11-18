@@ -3,6 +3,8 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import SwiftUI
+import UIKit
 import GRDB
 import Testing
 @testable import TabMail
@@ -482,6 +484,61 @@ struct TutorialChatViewRunTests {
             await coordinator.end()
             #expect(!coordinator.teachesChat, "an ended run teaches nothing")
             #expect(!coordinator.highlightsChatViewSwitch)
+        }
+    }
+
+    private static func scrollViews(_ view: UIView) -> [UIScrollView] {
+        ((view as? UIScrollView).map { [$0] } ?? []) + view.subviews.flatMap { scrollViews($0) }
+    }
+
+    // The coach card is part of the chat's top bar: while it shows, the chat's scroll area starts
+    // below it; once the run moves on and it goes, the scroll area comes back up to the subject.
+    @Test("In Priya's chat the coach card holds its room under the subject, and gives it back when it goes")
+    func chatCardHoldsItsRoom() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
+        let fixture = try install()
+        defer { InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1) }
+        try await withSettings(chatView: true) {
+            let coordinator = TutorialCoordinator.shared
+            try await start(.reuseReply)
+            #expect(coordinator.step == .replyToPriya)
+            let priya = try #require(try await fixture.0.read { db in
+                try MessageHeader.filter(Column("accountId") == DemoSeed.demoAccountId
+                    && Column("messageId") == DemoSeed.TutorialFixture.priyaOffsite).fetchOne(db)
+            })
+            try await HostedAccessibility.withAutomation {
+                let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+                let window = UIWindow(windowScene: scene)
+                let controller = UIHostingController(rootView: NavigationStack { ChatThreadView(messageId: priya.id) })
+                window.rootViewController = controller
+                window.makeKeyAndVisible()
+                defer {
+                    window.isHidden = true
+                    window.rootViewController = nil
+                }
+                @MainActor func coach() -> CGRect? {
+                    HostedAccessibility.elements(under: controller.view)
+                        .first { HostedAccessibility.identifier(of: $0) == "tutorial-coach" }?.accessibilityFrame
+                }
+                @MainActor func scrollTop() -> CGFloat? {
+                    guard let scroll = Self.scrollViews(controller.view).max(by: { $0.contentSize.height < $1.contentSize.height })
+                    else { return nil }
+                    return scroll.convert(scroll.bounds, to: nil).minY + scroll.adjustedContentInset.top
+                }
+                for _ in 0..<80 where coach() == nil || scrollTop() == nil { try await Task.sleep(for: .milliseconds(100)) }
+                try await Task.sleep(for: .milliseconds(500))
+                let card = try #require(coach(), "the coach card shows: \(HostedAccessibility.identifiers(in: controller.view))")
+                let withCard = try #require(scrollTop())
+                #expect(card.height > 0)
+                #expect(withCard >= card.maxY - 0.5, "the scroll area's top \(withCard) clears the card \(card)")
+
+                await coordinator.end()
+                for _ in 0..<80 where coach() != nil { try await Task.sleep(for: .milliseconds(100)) }
+                try await Task.sleep(for: .milliseconds(500))
+                #expect(coach() == nil, "the card goes once the run ends")
+                let without = try #require(scrollTop())
+                #expect(without <= card.minY + 0.5, "the scroll area's top \(without) comes back up past where the card stood \(card)")
+            }
         }
     }
 

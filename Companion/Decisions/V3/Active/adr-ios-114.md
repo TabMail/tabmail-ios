@@ -816,7 +816,7 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    the inbox and the email screen keep hiding theirs then. Tests: `ChatThreadLayoutTests` (the
    hosted chat's measured field position, the opened pill between the bar and the safe area at the
    largest text size, the header inside the bar and the subject under it, and the scroll area
-   clearing the subject at every scroll position) and
+   clearing the subject and its gap at sampled scroll positions; `TutorialChatViewRunTests` the coach card's room in the bar) and
    `ChatReplyFieldTests.messagesLayout`.
 
 ## The longer index line (routed 2026-11-09)
