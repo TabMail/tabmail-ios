@@ -313,9 +313,11 @@ struct ChatThreadView: View {
                     }
                     .padding(.top, 8)
                 }
-                // Any scroll (a hand, the jump button, an animated scroll) ends the landing.
+                // Only the user's hand ends the landing. A programmatic scroll that animates (a
+                // late height arriving inside an animated transaction) or its settling is not the
+                // user: the chat stays pinned while the ghost and the field's height arrive.
                 .onScrollPhaseChange { _, phase in
-                    if phase != .idle { scrollTarget = nil }
+                    if Self.userTookOver(phase) { scrollTarget = nil }
                 }
                 .defaultScrollAnchor(.bottom)
                 .scrollDismissesKeyboard(.interactively)
@@ -457,6 +459,11 @@ struct ChatThreadView: View {
     private struct ScrollTarget: Equatable {
         let id: String
         let anchor: UnitPoint
+    }
+
+    /// Whether a scroll phase is the user's own scroll, the only thing that ends the landing's pin.
+    static func userTookOver(_ phase: ScrollPhase) -> Bool {
+        phase == .tracking || phase == .interacting
     }
 
     /// Where the open lands (`scrollOnceLoaded`). Held until a scroll of any kind begins, so the

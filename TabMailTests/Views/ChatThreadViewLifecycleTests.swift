@@ -701,6 +701,17 @@ struct ChatThreadViewLifecycleTests {
         #expect(short.ghost.midX > 393 / 2, "on the right: \(short.ghost)")
     }
 
+    @Test("The open stays pinned at the bottom through programmatic scrolls; only the user's scroll ends it")
+    func onlyTheUsersScrollEndsThePin() {
+        // A late height (the AI Suggestion, the field's measured height) arriving in an animated
+        // transaction makes the re-pin scroll animate. That is not the user, and the pin must hold.
+        #expect(!ChatThreadView.userTookOver(.animating), "an animated re-pin keeps the chat pinned")
+        #expect(!ChatThreadView.userTookOver(.decelerating), "the settling of a programmatic scroll keeps it pinned")
+        #expect(!ChatThreadView.userTookOver(.idle))
+        #expect(ChatThreadView.userTookOver(.tracking), "the user's finger ends the pin")
+        #expect(ChatThreadView.userTookOver(.interacting), "the user's drag ends the pin")
+    }
+
     @Test("At the bottom, the newest bubble and the AI Suggestion stay above the field however tall a typed draft grows it")
     func newestBubbleClearsATallField() async throws {
         let ready = "Sounds good."
