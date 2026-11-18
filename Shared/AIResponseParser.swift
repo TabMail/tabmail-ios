@@ -4,6 +4,21 @@
 
 import Foundation
 
+/// A precomputed reply, the AI Suggestion: the email body, its short text-message version and the
+/// change command that came with it (`MessageHeader.cachedReply` / `replyTextMessage` /
+/// `replyChangeCommand`). The one value its reader (`AIResponseParser.parseReplyResponse`) returns
+/// and every store holds.
+struct ReplyResult: Sendable, Equatable {
+    let body: String
+    let textMessage: String?
+    /// A short command that would change this reply, the reply field's example. Nil when none came
+    /// with it.
+    var changeCommand: String? = nil
+
+    /// The quality filters' sentinel: no reply wanted (an empty body), distinct from nil (error, retried).
+    static let filtered = ReplyResult(body: "", textMessage: nil)
+}
+
 /// Shared AI response parsing between main app and NSE.
 /// Single source of truth — both targets reference this file.
 ///
@@ -47,14 +62,6 @@ enum AIResponseParser {
             reminderContent: reminderContent,
             textMessage: (object["text_message"] as? String).flatMap(nonEmpty)
         )
-    }
-
-    struct ReplyResult {
-        let body: String
-        let textMessage: String?
-        /// A short command that would change this reply (`change_command`), shown as the reply
-        /// field's example while the AI Suggestion shows. Nil when absent.
-        let changeCommand: String?
     }
 
     /// Parse the precache reply JSON: `{"subject": "..", "body": "..", "text_message": "..",

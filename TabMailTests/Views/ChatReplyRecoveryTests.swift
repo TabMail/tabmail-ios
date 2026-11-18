@@ -294,8 +294,8 @@ struct ChatReplyRecoveryTests {
                 let request = try #require(router.firstQueuedRequestForTesting)
                 #expect(request.fieldReply?.email.id == chat.email.id && request.fieldReply?.onlyTo == ["david@example.com"],
                         "the reply carries the choice made when the request was sent: \(String(describing: request.fieldReply))")
-                let reply = ChatReplyCompose.make(agent: request, accounts: chat.accounts)
-                #expect(reply == ChatReplyCompose(isReplyAll: false, to: ["david@example.com"], cc: [], bcc: []),
+                let reply = request.envelope
+                #expect(!reply.isReplyAll && reply.to == ["david@example.com"] && reply.cc.isEmpty && reply.bcc.isEmpty,
                         "a plain reply to only David: \(reply)")
 
                 // The card the chat opens goes only to David.
@@ -343,7 +343,7 @@ struct ChatReplyRecoveryTests {
                 let request = try #require(router.firstQueuedRequestForTesting)
                 #expect(request.fieldReply?.email.id == chat.email.id && request.fieldReply?.onlyTo == nil,
                         "the reply carries the choice made when the request was sent, nobody: \(String(describing: request.fieldReply))")
-                let reply = ChatReplyCompose.make(agent: request, accounts: chat.accounts)
+                let reply = request.envelope
                 #expect(reply.isReplyAll, "a Reply All: \(reply)")
 
                 // The card the chat opens goes to everyone on the email.

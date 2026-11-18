@@ -1050,6 +1050,20 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
       suggestion.
     - **Identity.** The field's edit is bound to the displayed row and its identity, re-checked before the
       body is read. The field's audience applies to copies with the same account and Message-ID.
+    - **One presenter.** The reply tool builds the agent's reply card once, into its request
+      (recipients by role, exactly, an empty field included; the subject; the suggestion's own
+      draft key for an edit of the AI Suggestion). The chat, the inbox and the email's screen open
+      it through one presenter, so leaving the chat while an edit runs opens the same card. Every
+      reply card takes its fields exactly: an empty To is never refilled from the reply's Reply-To.
+    - **Value boundaries.** The ghost, the "e.g." line and the field's edit read one shown value
+      (`ChatReplyField.shown`); the on-device AI cache reads and writes the value whole; the demo
+      and preview seeds go through the same value API. A source fence keeps per-column writes and
+      a second envelope builder out.
+    - **Ordering and identity in the card.** Recompute and an inline edit are admitted through the
+      compose agent fence, one at a time, and an edit stores over the suggestion it started from.
+      A Recompute from another sender than the email's own account stays in its card. A Recompute,
+      and a field request about the row the field showed, check that row's identity before any
+      read or AI call; another email seated at the address refuses the request.
     - **Trade-off.** There is one more indirection at every suggestion write, and envelope comparison
       instead of a cheaper delta check. In exchange, ordering and audience are properties of one writer and
       one builder, rather than of each caller. The rejected alternative was patching each caller with its

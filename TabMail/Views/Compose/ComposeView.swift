@@ -2246,20 +2246,22 @@ struct ComposeView: View {
 
     // MARK: - Recompute reply (debug — direct LLM, skips Device Sync)
 
+    /// Admitted through the compose agent fence, as an inline edit is: one of the two runs at a
+    /// time, so the last gesture admitted lands last and neither replaces the other's newer value.
     private func recomputeReply() {
-        guard let reply = replyTo, let account = resolvedAccount else { return }
+        guard let reply = replyTo, let account = resolvedAccount, agentSendFence.beginAgent() else { return }
         isRecomputing = true
 
-        recomputeTask?.cancel()
+        let fence = agentSendFence
         recomputeTask = Task {
+            defer { fence.finishAgent() }
             if let result = await Self.recomputedReply(
                 for: reply, account: account,
                 kbText: PromptStore.shared.kbText(),
                 compositionPrompt: PromptStore.shared.compositionMarkdown(),
                 aiService: .shared, dbPool: dbPool
             ) {
-                // A newer recompute, or an edit of the suggestion that landed meanwhile, replaced
-                // this one: it owns the suggestion and the spinner.
+                // The card closed meanwhile.
                 guard !Task.isCancelled else { return }
                 shownSuggestion = result
             }
@@ -2339,6 +2341,18 @@ struct ComposeView: View {
         // Recipients are not part of the text fade. They change now, so the
         // agent's autosave, which runs right after this call, stores them.
         setRecipients(recipients.applying(to: toDelta, cc: ccDelta, bcc: bccDelta))
+        // An edit of the suggestion is stored now, while the edit still holds the compose agent
+        // fence (no Recompute runs), over the suggestion it edited: the one shown when it started.
+        // The stored AI Suggestion is the Reply All draft (the chat's ghost). Only an edit of a
+        // reply whose envelope is still that one replaces it; an edit for another audience or
+        // subject stays in this card and its draft. Compose has no source message, and forward
+        // would write to the email being forwarded.
+        let previous = shownSuggestion
+        let edited = newBody.map { ReplyResult(body: $0, textMessage: textMessage, changeCommand: changeCommand) }
+        if showingSuggestion, let edited, let reply = replyTo, !isForward,
+           holdsSuggestionEnvelope(of: reply, subject: newSubject ?? subject) {
+            persistCachedReply(edited, replacing: previous, replyTo: reply)
+        }
         Task { @MainActor in
             // Wait for fade-out to finish
             try? await Task.sleep(for: .milliseconds(280))
@@ -2350,21 +2364,8 @@ struct ComposeView: View {
             if let b = newBody {
                 if showingSuggestion {
                     BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: updating suggestion (len=\(b.count))")
-                    // An edit of the suggestion landed: a recompute still running is older, so it
-                    // neither shows nor stores over it.
-                    recomputeTask?.cancel()
-                    isRecomputing = false
-                    let edited = ReplyResult(body: b, textMessage: textMessage, changeCommand: changeCommand)
-                    let previous = shownSuggestion
-                    shownSuggestion = edited
-                    // The stored AI Suggestion is the Reply All draft (the chat's ghost). Only an
-                    // edit of a reply whose envelope is still that one replaces it, over the
-                    // suggestion this card showed; an edit for another audience or subject stays
-                    // in this card and its draft. Compose has no source message, and forward would
-                    // write to the email being forwarded.
-                    if let reply = replyTo, !isForward, holdsSuggestionEnvelope(of: reply) {
-                        persistCachedReply(edited, replacing: previous, replyTo: reply)
-                    }
+                    // A Recompute admitted after the edit, during the fade, is newer: it keeps its own.
+                    if shownSuggestion == previous { shownSuggestion = edited }
                 } else {
                     BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: updating body (len=\(b.count))")
                     messageBody = b
@@ -2396,7 +2397,7 @@ struct ComposeView: View {
 
     /// Whether this card's draft is still the AI Suggestion's envelope for `reply`
     /// (`ChatReplyCompose.suggestionEnvelope`, the one builder): same sender, subject and audience.
-    private func holdsSuggestionEnvelope(of reply: MessageHeader) -> Bool {
+    private func holdsSuggestionEnvelope(of reply: MessageHeader, subject: String) -> Bool {
         let envelope = ChatReplyCompose.suggestionEnvelope(for: reply, accounts: navigationStore.accounts)
         return envelope.holds(
             recipients: recipients.pendingCommitted, subject: subject,
@@ -2449,15 +2450,25 @@ struct ComposeView: View {
     /// What `recomputeReply` does, without the view: ask for a new reply to `reply` and store
     /// it with its text message and change command. Returns the reply for the suggestion, or nil
     /// when there is none. Internal for testability.
+    ///
+    /// The email's identity is checked with the read, before the AI is asked: a row now holding
+    /// another email is never sent. A recompute from another sender than the email's own account
+    /// (the card's From changed) stays in this card: the stored suggestion is the email's own
+    /// account's Reply All draft.
     nonisolated static func recomputedReply(
         for reply: MessageHeader, account: Account, kbText: String, compositionPrompt: String,
         aiService: AIService, dbPool: PrioritizedDatabase
     ) async -> ReplyResult? {
         // The email's body, and the suggestion this recompute replaces, read together as it starts.
-        let read = try? await dbPool.read { db -> (MessageBody?, ReplyResult?) in
-            (try MessageBody.fetchOne(db, key: reply.id), try MessageHeader.fetchOne(db, key: reply.id)?.suggestion)
+        let read = try? await dbPool.read { db -> (MessageBody?, ReplyResult?)? in
+            guard try AIWriteTarget.stillHolds(reply, db: db) else { return nil }
+            return (try MessageBody.fetchOne(db, key: reply.id), try MessageHeader.fetchOne(db, key: reply.id)?.suggestion)
         }
-        let body = read?.0
+        guard let read = read.flatMap({ $0 }) else {
+            BackgroundSyncLogger.logDebug("[Compose] Recompute skipped: the row is no longer \(reply.messageId)")
+            return nil
+        }
+        let body = read.0
         let bodyText: String
         if let html = body?.htmlContent, !html.isEmpty {
             // Strip embedded .eml sections so the reply context is only the
@@ -2488,11 +2499,12 @@ struct ComposeView: View {
                 // reset reuses the address), so the result is stored only while that row
                 // is still the email being replied to, and only over the suggestion this
                 // recompute started from: a newer one (a later recompute that finished first)
-                // wins. A recompute its card cancelled stores nothing. Only a stored result is
-                // shown, so the card never shows a suggestion the chat does not hold.
-                // Without the start's read there is nothing to store over.
+                // wins. A recompute its card cancelled stores nothing. For the email's own account
+                // only a stored result is shown, so the card never shows a suggestion the chat
+                // does not hold; another sender's stays in this card alone.
+                guard account.id == reply.accountId else { return result }
                 var outcome = AIWriteOutcome.dropped
-                if let read, !Task.isCancelled {
+                if !Task.isCancelled {
                     outcome = await writeCachedReplyToDB(result, replacing: read.1, replyTo: reply, db: dbPool)
                 }
                 BackgroundSyncLogger.logDebug("[Compose] Recomputed reply for \(reply.messageId), stored: \(outcome == .written)")

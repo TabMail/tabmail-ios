@@ -82,13 +82,11 @@ struct ComposeEditMarkerTests {
         }
     }
 
-    @Test("Labelled text from the backend changes no draft field")
+    @Test("Labelled text from the backend is a failed edit, shown as the other AI failures; no draft field changes")
     func labelledTextChangesNothing() async throws {
-        let (result, _) = try await Self.edit("Response: Done.\nSubject: Re: Offsite\nBody: \(Self.body)")
-        #expect(result.body == nil)
-        #expect(result.subject == nil)
-        #expect(result.textMessage == nil)
-        #expect(result.toDelta == nil && result.ccDelta == nil && result.bccDelta == nil)
+        await #expect(throws: InlineEditFailure.self) {
+            _ = try await Self.edit("Response: Done.\nSubject: Re: Offsite\nBody: \(Self.body)")
+        }
     }
 }
 
@@ -204,7 +202,7 @@ struct SuggestionRewriteRouteTests {
                 "To and Cc by role, as the card holds them")
         let row = try await row(fixture.db, fixture.header.id)
         #expect(row.suggestion == ReplyResult(body: Self.editedBody, textMessage: Self.editedText, changeCommand: Self.editedCommand))
-        #expect(ChatReplyField.suggestionText(newest: row, usersTurn: false, onlyTo: nil) == Self.editedText,
+        #expect(ChatReplyField.shown(newest: row, usersTurn: false, onlyTo: nil)?.textMessage == Self.editedText,
                 "the ghost shows the edit's text version")
         #expect(fixture.router.pendingCompose == nil, "no compose card opens")
         #expect(output.contains("in place") && output.contains(Self.editedText) && output.contains("Nothing was sent"))
@@ -252,15 +250,13 @@ struct SuggestionRewriteRouteTests {
             let task = Task { @MainActor in try await tool.run(arguments: request, invocation: invocation, rewritesInPlace: true) }
             let card = try #require(await waitForCard(fixture.router))
             #expect(check(card), "the request carries the edited subject and recipients")
-            // The card shows them exactly: an empty To stays empty, the subject is kept, and the
+            // The card shows them exactly, through the presenter every host uses: an empty To
+            // stays empty, the subject is kept, and it opens on the suggestion's own draft, so the
             // saved reply draft is not loaded over it.
-            let reply = ChatReplyCompose.make(agent: card, accounts: [])
-            let view = reply.composeView(
-                replyTo: card.replyTo, suggestedBody: card.body,
-                draftId: Draft.separateReplyKey(replyTo: "\(fixture.header.accountId):\(fixture.header.stableId)"),
-                onAgentOutcome: { _ in })
+            let view = card.composeView(account: nil, onOutcome: { _ in })
             #expect(view.prefillTo == card.to && view.prefillSubject == card.subject)
-            #expect(view.prefillDraftId != nil)
+            #expect(view.prefillDraftId == Draft.separateReplyKey(
+                replyTo: "\(fixture.header.accountId):\(fixture.header.stableId)"))
             #expect(try await row(fixture.db, fixture.header.id).suggestion == Self.shownReply)
             card.onOutcome(.cancelled)
             #expect(try await task.value.contains("Opened the reply card"), "the outcome says which path ran")
@@ -323,25 +319,66 @@ struct SuggestionRewriteRouteTests {
         _ = try await task.value
     }
 
-    @Test("A swapped occupant of the shown row refuses the field's edit")
-    func swappedRowRefuses() async throws {
+    @Test("Another email seated at the shown row refuses the field's request: no edit, no fresh reply, no card",
+          arguments: [true, false])
+    func swappedRowRefuses(suggestionShows: Bool) async throws {
         let fixture = try await fixture()
         let db = fixture.db
         let id = fixture.header.id
-        // Between the request's resolve and its read, a resync seats another email at the address.
+        // Between the request's resolve and its read, a resync seats another email at the same
+        // address (same row and UID, another Message-ID).
         await fixture.translator.setOnResolve {
             try? await db.write { db in
-                try db.execute(sql: "UPDATE messageHeader SET messageId = 'other', rfc822MessageId = '<other@example.com>' WHERE id = ?",
+                try db.execute(sql: "UPDATE messageHeader SET rfc822MessageId = '<other@example.com>' WHERE id = ?",
                                arguments: [id])
             }
         }
         let calls = Calls()
-        let output = try await tool(fixture, calls: calls, answer: Self.edit()).run(
+        let tool = tool(fixture, calls: calls, answer: Self.edit())
+        let invocation = invocation(fixture.header, suggestion: suggestionShows ? Self.shownReply : nil)
+        let request = request
+        // Bounded: a request that wrongly opens a card is cancelled, never awaited forever.
+        let task = Task { @MainActor in try await tool.run(arguments: request, invocation: invocation, rewritesInPlace: true) }
+        let deadline = Date().addingTimeInterval(2)
+        while fixture.router.pendingCompose == nil, Date() < deadline { await Task.yield() }
+        fixture.router.pendingCompose?.onOutcome(.cancelled)
+        let output = try await task.value
+        #expect(calls.all.isEmpty, "the AI is never asked about another email")
+        #expect(fixture.router.pendingCompose == nil, "no card opens for another email")
+        #expect(try await row(db, id).cachedReply == Self.shown, "nothing is stored")
+        #expect(output.contains("email changed"))
+    }
+
+    @Test("Control: the same request on an unchanged row edits the suggestion")
+    func unchangedRowEdits() async throws {
+        let fixture = try await fixture()
+        let calls = Calls()
+        _ = try await tool(fixture, calls: calls, answer: Self.edit()).run(
             arguments: request, invocation: invocation(fixture.header), rewritesInPlace: true)
-        #expect(calls.all.isEmpty, "the edit is never asked against another email")
-        #expect(try await row(db, id).cachedReply == Self.shown)
-        #expect(fixture.router.pendingCompose == nil)
-        #expect(output.lowercased().contains("unchanged"))
+        #expect(calls.all.count == 1)
+    }
+
+    @Test("A Reply-To that is the user's own address with an outside Cc: the ghost's card opens with To empty, never refilled")
+    func ownReplyToKeepsToEmpty() async throws {
+        let fixture = try await fixture()
+        try await fixture.db.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET replyTo = 'test@example.com', \"to\" = 'test@example.com', cc = 'pat@example.com' WHERE id = ?",
+                           arguments: [fixture.header.id])
+        }
+        let email = try await row(fixture.db, fixture.header.id)
+        let accounts = try await fixture.db.read { try Account.fetchAll($0) }
+        let ready = ChatReadyReply(message: email, suggestion: Self.shownReply, accounts: accounts)
+        let card = ready.compose.composeView(
+            replyTo: email, suggestion: ready.suggestion, draftId: ready.draftId, onAgentOutcome: { _ in })
+        // `nil` would let compose fill To from the reply's Reply-To, the user's own address.
+        #expect(card.prefillTo == [], "To stays empty")
+        #expect(card.prefillCc == ["pat@example.com"], "the outside Cc stays in Cc")
+        // The field's edit of that suggestion starts from the same envelope.
+        let calls = Calls()
+        _ = try await tool(fixture, calls: calls, answer: Self.edit()).run(
+            arguments: request, invocation: invocation(email), rewritesInPlace: true)
+        let call = try #require(calls.all.first)
+        #expect(call.context.toRecipients.isEmpty && call.context.ccRecipients == ["pat@example.com"])
     }
 
     @Test("The field's audience applies to a same-account copy and never to another account's; its suggestion to the shown row only")
@@ -457,9 +494,83 @@ struct SuggestionRewriteRouteTests {
         #expect(!envelope.holds(recipients: envelope.recipients, subject: "Fwd: Offsite", accountId: "acc1", of: fixture.header))
         #expect(!envelope.holds(recipients: envelope.recipients, subject: subject, accountId: "acc2", of: fixture.header))
         // Tapping the ghost again opens the Reply All draft with the stored suggestion.
-        let ghost = ChatReadyReply(message: try await row(fixture.db, fixture.header.id),
-                                   compose: ChatReplyCompose.make(replyAllTo: fixture.header, accounts: []))
-        #expect(ghost.compose.isReplyAll && Set(ghost.compose.to) == Set(envelope.to))
-        #expect(ghost.message.suggestion == Self.shownReply)
+        let stored = try await row(fixture.db, fixture.header.id)
+        let ghost = ChatReadyReply(message: stored, suggestion: try #require(stored.suggestion), accounts: [])
+        #expect(ghost.compose == envelope)
+        #expect(ghost.suggestion == Self.shownReply)
+    }
+}
+
+/// The AI Suggestion has one value, one writer and one envelope builder (ADR-IOS-114 decision 18).
+/// These fences keep a second path from coming back: every production Swift file under the app's
+/// sources is read, so a new file is covered too.
+@Suite("The AI Suggestion keeps one value, one writer and one envelope")
+struct SuggestionSinglePathFenceTests {
+
+    static let root = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+
+    /// Every Swift file of the app and the shared sources, by path relative to the repository.
+    static func sources() throws -> [(path: String, text: String)] {
+        var files: [(String, String)] = []
+        for folder in ["TabMail", "Shared"] {
+            let base = root.appendingPathComponent(folder)
+            guard let walker = FileManager.default.enumerator(at: base, includingPropertiesForKeys: nil) else { continue }
+            for case let url as URL in walker where url.pathExtension == "swift" {
+                let path = String(url.standardizedFileURL.path.dropFirst(root.standardizedFileURL.path.count + 1))
+                files.append((path, try String(contentsOf: url, encoding: .utf8)))
+            }
+        }
+        return files
+    }
+
+    static func lines(matching pattern: String, in files: [(path: String, text: String)]) throws -> [String] {
+        let regex = try NSRegularExpression(pattern: pattern)
+        return files.flatMap { file in
+            file.text.split(separator: "\n", omittingEmptySubsequences: false).enumerated().compactMap { index, line in
+                let text = String(line)
+                let trimmed = text.trimmingCharacters(in: .whitespaces)
+                guard !trimmed.hasPrefix("//"),
+                      regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil else { return nil }
+                return "\(file.path):\(index + 1)"
+            }
+        }
+    }
+
+    @Test("The suggestion's columns are written only by the value's own accessors")
+    func columnsWrittenWhole() throws {
+        let files = try Self.sources()
+        #expect(files.count > 100, "control: the sources were found")
+        let writes = try Self.lines(matching: #"\.(cachedReply|replyTextMessage|replyChangeCommand)\s*=[^=]"#, in: files)
+        #expect(!writes.isEmpty, "control: the accessors themselves write them")
+        let outside = writes.filter {
+            !$0.hasPrefix("TabMail/Models/MessageHeader.swift:") && !$0.hasPrefix("TabMail/Models/MessageAICache.swift:")
+        }
+        #expect(outside.isEmpty, "a write of one column outside the one value: \(outside)")
+        // The cache takes the value whole.
+        let parts = try Self.lines(matching: #"(cachedReply|replyTextMessage|replyChangeCommand):\s"#, in: files.filter {
+            $0.path != "TabMail/Services/Demo/DemoSeed.swift" && $0.path != "TabMail/App/ScreenshotMode.swift"
+        })
+        #expect(parts.isEmpty, "a call passing the suggestion's columns one by one: \(parts)")
+    }
+
+    @Test("One envelope builder: no Reply All re-derivation or re-sorting of a reply card")
+    func oneEnvelopeBuilder() throws {
+        let files = try Self.sources()
+        #expect(try Self.lines(matching: #"make\((replyAllTo|agent):"#, in: files).isEmpty,
+                "the retired second builders")
+        let constructions = try Self.lines(matching: #"ChatReplyCompose\("#, in: files)
+        #expect(constructions.allSatisfy {
+            $0.hasPrefix("TabMail/Views/Chat/ChatReplyField.swift:") || $0.hasPrefix("TabMail/Services/AI/Tools/EmailReplyTool.swift:")
+        }, "an envelope built outside its builder: \(constructions)")
+        #expect(constructions.filter { $0.hasPrefix("TabMail/Services/AI/Tools/EmailReplyTool.swift:") }.count == 1,
+                "the reply tool builds only the fresh reply's edit context itself")
+        // Every host opens the agent's card through the one presenter.
+        let presenters = try Self.lines(matching: #"req\.composeView\(account:"#, in: files)
+        #expect(Set(presenters.map { String($0.prefix { $0 != ":" }) }) == [
+            "TabMail/Views/Chat/ChatThreadView.swift", "TabMail/Views/Inbox/InboxView.swift",
+            "TabMail/Views/Message/MessageDetailView.swift",
+        ])
+        #expect(try Self.lines(matching: #"composeViewForAgentRequest"#, in: files).isEmpty)
     }
 }

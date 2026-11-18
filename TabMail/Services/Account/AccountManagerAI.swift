@@ -100,6 +100,15 @@ enum AIWriteOutcome: Sendable, Equatable { case written, dropped }
 /// same address carries the NEW epoch, so comparing the impostor's live stamp
 /// against the live folder epoch would agree and admit the wrong write — the
 /// captured stamp is what disagrees.
+extension AIWriteTarget {
+    /// Whether the row `message` was read from is still that email: the identity guard every AI
+    /// writer uses, for a read that must not run against another email seated at its address.
+    nonisolated static func stillHolds(_ message: MessageHeader, db: Database) throws -> Bool {
+        guard let target = try capture(message: message, db: db) else { return false }
+        return try target.resolveCurrentHeader(db: db) != nil
+    }
+}
+
 struct AIWriteTarget: Sendable, Equatable {
     let headerId: String
     let accountId: String
@@ -414,8 +423,7 @@ extension AccountManager {
             guard !value.body.isEmpty else { return }
             try MessageAICache.writeThrough(
                 accountId: msg.accountId, folderPath: msg.folderPath, rfc822MessageId: msg.rfc822MessageId,
-                cachedReply: value.body, replyGeneratedAt: generatedAt, replyTextMessage: value.textMessage,
-                replyChangeCommand: value.changeCommand, db: db)
+                reply: value, replyGeneratedAt: generatedAt, db: db)
         }
         return replaced ? outcome : .dropped
     }
@@ -694,9 +702,7 @@ extension AccountManager {
                                     reminderContent: summary.reminderContent,
                                     summaryTextMessage: summary.textMessage,
                                     actionTag: cacheActionTag,
-                                    cachedReply: msg.cachedReply,
-                                    replyTextMessage: msg.replyTextMessage,
-                                    replyChangeCommand: msg.replyChangeCommand,
+                                    reply: msg.suggestion,
                                     db: db
                                 )
                             }

@@ -1324,9 +1324,7 @@ actor ActiveAIQueue {
                             reminderContent: msg.reminderContent,
                             summaryTextMessage: msg.summaryTextMessage,
                             actionTag: msg.actionTag,
-                            cachedReply: msg.cachedReply,
-                            replyTextMessage: msg.replyTextMessage,
-                            replyChangeCommand: msg.replyChangeCommand,
+                            reply: msg.suggestion,
                             db: db
                         )
                     }

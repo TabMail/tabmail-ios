@@ -271,16 +271,13 @@ struct RecipientSplitFirstTests {
 
     @Test("An AI add item that names no address stays visible, and Send refuses it")
     func aiAddKeepsText() throws {
-        let parsed = try #require(AIService.parseInlineEditResponse(ComposeEditJSON.make(
-            addBcc: [["name": "First", "email": "first@example.com"], ["name": "", "email": "unfinished"]])))
-        let bcc = ComposeDraftGuards.applying(try #require(parsed.bccDelta), to: .init())
-        #expect(bcc.tokens == ["first@example.com"])
-        #expect(bcc.rejected == ["unfinished"])
-        guard case .refused = ComposeDraftGuards.sendRecipients(
-            to: Self.to, cc: .init(), bcc: ComposeDraftGuards.pendingCommitted(bcc)) else {
-            Issue.record("The AI add's text was dropped and Send went ahead")
-            return
-        }
+        // An add that names no mailbox refuses the whole edit (shown as an AI failure): nothing
+        // of it reaches the draft, so no address is dropped and nothing goes out unseen.
+        #expect(AIService.parseInlineEditResponse(ComposeEditJSON.make(
+            addBcc: [["name": "First", "email": "first@example.com"], ["name": "", "email": "unfinished"]])) == nil)
+        let control = try #require(AIService.parseInlineEditResponse(ComposeEditJSON.make(
+            addBcc: [["name": "First", "email": "first@example.com"]])), "control: a sendable add is read")
+        #expect(ComposeDraftGuards.applying(try #require(control.bccDelta), to: .init()).tokens == ["first@example.com"])
     }
 
     // MARK: - Contact pick

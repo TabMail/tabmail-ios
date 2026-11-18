@@ -131,11 +131,13 @@ struct ComposeRecipientWiringTests {
         let start = try #require(text.range(of: "private func recomputeReply() {"))
         let end = try #require(text[start.upperBound...].range(of: "// MARK: - "))
         let action = String(text[start.upperBound..<end.lowerBound])
-        #expect(Self.count("if let body = await Self.recomputedReply( for: reply, account: account, kbText: PromptStore.shared.kbText(), compositionPrompt: PromptStore.shared.compositionMarkdown(), aiService: .shared, dbPool: dbPool ) { // A newer recompute replaced this one: it owns the suggestion and the spinner. guard !Task.isCancelled else { return } currentSuggestion = body }", in: action) == 1,
+        #expect(Self.count("guard !Task.isCancelled else { return } shownSuggestion = result }", in: action) == 1,
                 "the new reply replaces the suggestion; no reply keeps it")
-        #expect(Self.count("currentSuggestion", in: action) == 1, "nothing else changes the suggestion")
+        #expect(Self.count("shownSuggestion", in: action) == 1, "nothing else changes the suggestion")
         #expect(Self.count("isRecomputing = true", in: action) == 1)
         #expect(Self.count("isRecomputing = false", in: action) == 1)
-        #expect(Self.count("recomputeTask?.cancel() recomputeTask = Task {", in: action) == 1, "a new recompute cancels the one running")
+        // Recompute and an inline edit are admitted through one fence: one runs at a time.
+        #expect(Self.count("agentSendFence.beginAgent() else { return }", in: action) == 1)
+        #expect(Self.count("defer { fence.finishAgent() }", in: action) == 1)
     }
 }

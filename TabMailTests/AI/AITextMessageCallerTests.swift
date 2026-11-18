@@ -673,7 +673,7 @@ struct AITextMessageCallerTests {
             let row = try #require(try fixture.row())
             #expect(row.cachedReply == "Second recompute", "the newer recompute's reply stays")
             #expect(row.replyTextMessage == "Second text")
-            #expect(ChatReplyField.suggestionText(newest: row, usersTurn: false, onlyTo: nil) == "Second text",
+            #expect(ChatReplyField.shown(newest: row, usersTurn: false, onlyTo: nil)?.textMessage == "Second text",
                     "the ghost shows the second recompute")
         }
     }
@@ -752,7 +752,7 @@ struct AITextMessageCallerTests {
                 for: original, account: fixture.account, kbText: "", compositionPrompt: "",
                 aiService: backend.service, dbPool: AppDatabase.dbPool)
 
-            #expect(suggestion?.body == Self.replyBody, "compose still shows the reply to the email on screen")
+            #expect(suggestion == nil, "the AI is never asked about, or shown a reply for, another email")
             let row = try #require(try fixture.row())
             #expect(row.rfc822MessageId == "different@example.com")
             #expect(row.cachedReply == "The other email's reply")

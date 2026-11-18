@@ -93,8 +93,7 @@ struct AITextMessageStorageTests {
         let db = try TestDatabase.make()
         try db.write {
             try MessageAICache.writeThrough(accountId: "acc1", folderPath: "INBOX", rfc822MessageId: "c@example.com",
-                                            cachedReply: "Body one", replyTextMessage: "Text one",
-                                            replyChangeCommand: "say no", db: $0)
+                                            reply: ReplyResult(body: "Body one", textMessage: "Text one", changeCommand: "say no"), db: $0)
         }
         #expect(try entry(db, "c@example.com")?.replyChangeCommand == "say no")
         try db.write {
@@ -115,7 +114,7 @@ struct AITextMessageStorageTests {
 
         try db.write {
             try MessageAICache.writeThrough(accountId: "acc1", folderPath: "INBOX", rfc822MessageId: "c@example.com",
-                                            cachedReply: "Body two", db: $0)
+                                            reply: ReplyResult(body: "Body two", textMessage: nil), db: $0)
         }
         #expect(try entry(db, "c@example.com")?.replyChangeCommand == nil, "a new reply never keeps an older reply's command")
     }
@@ -125,7 +124,7 @@ struct AITextMessageStorageTests {
         let db = try TestDatabase.make()
         try db.write {
             try MessageAICache.writeThrough(accountId: "acc1", folderPath: "INBOX", rfc822MessageId: "r@example.com",
-                                            cachedReply: "Body one", replyTextMessage: "Text one", db: $0)
+                                            reply: ReplyResult(body: "Body one", textMessage: "Text one"), db: $0)
         }
         #expect(try entry(db, "r@example.com")?.replyTextMessage == "Text one")
 
@@ -137,7 +136,7 @@ struct AITextMessageStorageTests {
 
         try db.write {
             try MessageAICache.writeThrough(accountId: "acc1", folderPath: "INBOX", rfc822MessageId: "r@example.com",
-                                            cachedReply: "Body two", db: $0)
+                                            reply: ReplyResult(body: "Body two", textMessage: nil), db: $0)
         }
         let after = try entry(db, "r@example.com")
         #expect(after?.cachedReply == "Body two")
@@ -150,7 +149,7 @@ struct AITextMessageStorageTests {
         try db.write {
             try MessageAICache.writeThrough(accountId: "acc1", folderPath: "INBOX", rfc822MessageId: "x@example.com",
                                             summaryBlurb: "Summary", summaryTextMessage: "Summary text",
-                                            cachedReply: "Reply", replyTextMessage: "Reply text", db: $0)
+                                            reply: ReplyResult(body: "Reply", textMessage: "Reply text"), db: $0)
         }
         var header = MessageHeader(
             messageId: "7", subject: "S", from: "a@example.com", fromAddress: "a@example.com",
@@ -171,7 +170,7 @@ struct AITextMessageStorageTests {
         try db.write {
             try MessageAICache.writeThrough(accountId: "acc1", folderPath: "INBOX", rfc822MessageId: "y@example.com",
                                             summaryBlurb: "Cached", summaryTextMessage: "Cached text",
-                                            cachedReply: "Cached reply", replyTextMessage: "Cached reply text", db: $0)
+                                            reply: ReplyResult(body: "Cached reply", textMessage: "Cached reply text"), db: $0)
         }
         var header = MessageHeader(
             messageId: "8", subject: "S", from: "a@example.com", fromAddress: "a@example.com",

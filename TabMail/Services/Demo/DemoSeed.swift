@@ -179,6 +179,8 @@ enum DemoSeed {
         var thread: String? = nil
         /// The seeded message this one replies to (`demo-msg-<n>`).
         var inReplyTo: String? = nil
+        /// The seeded AI Suggestion, one value (`MessageHeader.suggestion`).
+        var suggestion: ReplyResult? { cachedReply.map { ReplyResult(body: $0, textMessage: replyTextMessage) } }
         /// Moves the date this many hours back, to order a thread's emails on one day.
         var hoursEarlier: Int = 0
     }
@@ -483,13 +485,14 @@ enum DemoSeed {
             header.tagSortOrder = m.action?.sortOrder ?? 99
             header.summaryBlurb = m.summaryBlurb
             header.summaryTextMessage = m.textMessage
-            header.replyTextMessage = m.replyTextMessage
             // Empty-string sentinel = "reply pipeline ran, no reply needed"
             // (MessageSnapshot.swift:32). Without this, a tagged demo message
             // (e.g. .archive / .delete) with no precomputed reply has
             // `cachedReply == nil` → MessageRowView.showShimmer treats it as
             // "still computing reply" and renders the AI shimmer forever.
-            header.cachedReply = m.cachedReply ?? (m.action != nil ? "" : nil)
+            if let reply = m.suggestion ?? (m.action != nil ? .filtered : nil) {
+                _ = header.replaceSuggestion(with: reply, ifStill: nil)
+            }
             // Email reminders — ReminderBuilder picks these up and renders
             // them as inbox cards. Date is computed as a relative offset so
             // demo always shows fresh-looking due dates.
@@ -519,9 +522,8 @@ enum DemoSeed {
                 var cache = MessageAICache(key: cacheKey, rfc822MessageId: rfc822)
                 cache.summaryBlurb = m.summaryBlurb
                 cache.summaryTextMessage = m.textMessage
-                cache.replyTextMessage = m.replyTextMessage
                 cache.actionTag = m.action
-                cache.cachedReply = m.cachedReply
+                if let reply = m.suggestion { cache.storeSuggestion(reply) }
                 cache.replyGeneratedAt = m.cachedReply != nil ? date : nil
                 cache.updatedAt = date
                 try cache.insert(db)

@@ -66,7 +66,7 @@ struct ChatThreadView: View {
     @State private var readyReply: ChatReadyReply?
     /// The field's "e.g." example, picked once as the chat opens.
     @State private var example = ChatSuggestionConfig.randomExample()
-    @State private var agentCompose: ChatAgentCard?
+    @State private var agentCompose: AgentToolRouter.ComposeRequest?
     /// A compose card opened for the field's last request, so the agent's closing words open
     /// no sheet.
     @State private var fieldComposeOpened = false
@@ -261,7 +261,7 @@ struct ChatThreadView: View {
             // Asked for in a reply field: the agent's closing words open nothing. Who the card goes
             // to travels with the request (`fieldReply`); this chat's own state decides nothing.
             fieldComposeOpened = req.fieldReply != nil
-            agentCompose = ChatAgentCard(request: req, reply: ChatReplyCompose.make(agent: req, accounts: context.accounts))
+            agentCompose = req
             AgentToolRouter.shared.pendingCompose = nil
         }
         .sheet(item: $cardMessage) { msg in
@@ -278,7 +278,7 @@ struct ChatThreadView: View {
             // leaves the field alone: the field's words are not what it sends, and a sent reply retires the
             // suggestion through the outbox.
             ready.compose.composeView(
-                replyTo: ready.message, suggestion: ready.message.suggestion, draftId: ready.draftId,
+                replyTo: ready.message, suggestion: ready.suggestion, draftId: ready.draftId,
                 onAgentOutcome: { _ in })
         }
         .fullScreenCover(item: $agentCompose) { composeView(for: $0) }
@@ -316,10 +316,11 @@ struct ChatThreadView: View {
                             ChatUnsentReplyBubble(reply: reply, retry: { reply.retry() }, delete: { reply.delete() })
                         }
                         // The ready AI Suggestion, where the reply lands once sent.
-                        if let newest = thread.newest, let text = suggestionText(on: newest, thread: thread) {
+                        if let newest = thread.newest, let shown = shownSuggestion(on: newest, thread: thread),
+                           let text = shown.textMessage {
                             let move = tutorialMove(thread)
                             ChatSuggestionBubble(text: text, pulses: move == .tapSuggestion) {
-                                openSuggestion(on: newest, tutorialMove: move)
+                                openSuggestion(shown, on: newest, tutorialMove: move)
                             }
                         }
                         Color.clear.frame(height: pillHeight + ChatViewLayout.pillGap).id(Self.bottomId)
@@ -735,20 +736,20 @@ struct ChatThreadView: View {
     /// The reply field's container, as tests find it.
     static let replyPillId = "chatReplyPill"
 
-    /// The ready AI Suggestion's text on the newest email. None on the user's turn (their email is
+    /// The ready AI Suggestion on the newest email, as one value (`ChatReplyField.shown`). None on the user's turn (their email is
     /// the newest, or a reply of theirs is still in the outbox below it), and none while the reply
     /// goes only to people chosen in Reply to: the suggestion was written for everyone, and the
     /// field has the agent write one for the people chosen. None until the thread and its accounts
     /// have loaded (the newest email and the Reply All audience, without the user's own address,
     /// are known only then), and none while the agent works on a request from the field (it may
     /// open its own compose card).
-    private func suggestionText(on newest: MessageHeader, thread: ChatThread) -> String? {
+    private func shownSuggestion(on newest: MessageHeader, thread: ChatThread) -> ReplyResult? {
         // `isLoaded` is also set when the context read failed: the email's own account, read,
         // is the proof the audience can leave the user out.
         guard viewModel.hasLoadedThread, context.isLoaded, !chatWorking,
               context.accounts.contains(where: { $0.id == newest.accountId }) else { return nil }
         let usersTurn = (thread.items.last?.isOwn ?? false) || !unsentReplies.isEmpty
-        return ChatReplyField.suggestionText(newest: newest, usersTurn: usersTurn, onlyTo: replyTarget.only)
+        return ChatReplyField.shown(newest: newest, usersTurn: usersTurn, onlyTo: replyTarget.only)
     }
 
     /// The tutorial's move in this chat, if it holds the practice email.
@@ -766,7 +767,7 @@ struct ChatThreadView: View {
     /// A tap on the AI Suggestion: the Reply All compose card with it written out (the suggestion
     /// shows only while the reply goes to everyone). In the tutorial only the step that asks for it
     /// opens the card.
-    private func openSuggestion(on newest: MessageHeader, tutorialMove: TutorialCoordinator.FieldMove?) {
+    private func openSuggestion(_ shown: ReplyResult, on newest: MessageHeader, tutorialMove: TutorialCoordinator.FieldMove?) {
         if TutorialCoordinator.shared.isRunning, tutorialMove != .tapSuggestion {
             _ = TutorialCoordinator.shared.admits(.other)
             return
@@ -774,13 +775,13 @@ struct ChatThreadView: View {
         if DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[Chat] openSuggestion message=\(newest.id) alreadyOpen=\(readyReply != nil)")
         }
-        readyReply = ChatReadyReply(message: newest, compose: ChatReplyCompose.make(
-            replyAllTo: newest, accounts: context.accounts))
+        readyReply = ChatReadyReply(message: newest, suggestion: shown, accounts: context.accounts)
     }
 
     private func pill(on newest: MessageHeader) -> some View {
         let isOwn = thread.items.last?.isOwn ?? false
         let isNoReply = !isOwn && EmailFilter.isNoReply(newest.fromAddress)
+        let shown = shownSuggestion(on: newest, thread: thread)
         return VStack(spacing: 8) {
             if let only = replyTarget.only, !chatExpanded {
                 replyingOnlyTo(only)
@@ -799,14 +800,12 @@ struct ChatThreadView: View {
                 isWorking: $chatWorking,
                 onAgentReply: { _ in agentAnswered() },
                 replyField: ChatReplyField(
-                    example: ChatReplyField.example(
-                        suggestionShows: suggestionText(on: newest, thread: thread) != nil,
-                        changeCommand: newest.replyChangeCommand, configured: example),
+                    example: ChatReplyField.example(shown: shown, configured: example),
                     isNoReply: isNoReply,
                     clearCount: fieldClearCount,
                     onlyTo: replyTarget.only,
                     tutorialMove: tutorialMove(thread),
-                    suggestion: suggestionText(on: newest, thread: thread) == nil ? nil : newest.suggestion),
+                    suggestion: shown),
                 onFieldSend: { _ in fieldComposeOpened = false })
             // One container, so its frame is the field's own (ChatThreadLayoutTests).
             .accessibilityElement(children: .contain)
@@ -869,32 +868,10 @@ struct ChatThreadView: View {
         fieldClearCount += 1
     }
 
-    @ViewBuilder
-    private func composeView(for card: ChatAgentCard) -> some View {
-        let req = card.request
-        let onOutcome: @MainActor (ComposeOutcome) -> Void = { outcome in
+    private func composeView(for req: AgentToolRouter.ComposeRequest) -> some View {
+        req.composeView(account: context.accounts.first { $0.id == viewModel.message?.accountId }) { outcome in
             req.onOutcome(outcome)
             composeEnded(outcome, replyTo: req.mode == .reply ? req.replyTo : nil)
-        }
-        switch req.mode {
-        case .compose:
-            ComposeView(
-                suggestedBody: req.body, account: context.accounts.first { $0.id == viewModel.message?.accountId },
-                prefillTo: req.to, prefillCc: req.cc, prefillBcc: req.bcc, prefillSubject: req.subject,
-                onAgentOutcome: onOutcome)
-        case .reply:
-            // A field edit of the AI Suggestion opens on a draft of its own, as the ghost's card does:
-            // the reply draft saved for this email is never loaded over the edited envelope.
-            card.reply.composeView(
-                replyTo: req.replyTo, suggestedBody: req.body,
-                draftId: req.fieldReply?.suggestion == nil ? nil : req.replyTo.map {
-                    Draft.separateReplyKey(replyTo: "\($0.accountId):\($0.stableId)")
-                },
-                onAgentOutcome: onOutcome)
-        case .forward:
-            ComposeView(
-                replyTo: req.replyTo, suggestedBody: req.body, isForward: true,
-                prefillTo: req.to, prefillCc: req.cc, prefillBcc: req.bcc, onAgentOutcome: onOutcome)
         }
     }
 }

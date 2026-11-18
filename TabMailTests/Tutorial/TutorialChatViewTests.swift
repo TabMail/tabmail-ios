@@ -264,7 +264,7 @@ struct TutorialChatViewSeedTests {
         #expect(priya.items.allSatisfy { $0.textMessage != nil })
         let newest = try #require(priya.newest)
         #expect(newest.messageId == DemoSeed.TutorialFixture.priyaOffsite)
-        let ready = try #require(ChatReplyField.suggestionText(newest: newest, usersTurn: false, onlyTo: nil), "the AI Suggestion is ready")
+        let ready = try #require(ChatReplyField.shown(newest: newest, usersTurn: false, onlyTo: nil)?.textMessage, "the AI Suggestion is ready")
         #expect(ready.contains("I'm in"))
 
         let jordan = try chat(DemoSeed.TutorialFixture.jordanFlights, pool: pool)
@@ -607,7 +607,7 @@ extension TutorialChatViewRunTests {
                 })
             }
             func ghost(_ header: MessageHeader) -> String? {
-                ChatReplyField.suggestionText(newest: header, usersTurn: false, onlyTo: nil)
+                ChatReplyField.shown(newest: header, usersTurn: false, onlyTo: nil)?.textMessage
             }
             let opened = try await priya()
             #expect(ghost(opened) != nil, "control: the seeded AI Suggestion shows")
@@ -673,7 +673,7 @@ extension TutorialChatViewContentTests {
             var edited = header
             edited.cachedReply = edit.body
             edited.replyTextMessage = edit.textMessage
-            #expect(ChatReplyField.suggestionText(newest: edited, usersTurn: false, onlyTo: nil) != nil)
+            #expect(ChatReplyField.shown(newest: edited, usersTurn: false, onlyTo: nil)?.textMessage != nil)
         }
     }
 }

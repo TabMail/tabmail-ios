@@ -102,10 +102,8 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
         }
 
         // Restore cached reply if header doesn't have one
-        if let reply = cached.cachedReply, !reply.isEmpty {
-            _ = header.replaceSuggestion(
-                with: ReplyResult(body: reply, textMessage: cached.replyTextMessage, changeCommand: cached.replyChangeCommand),
-                ifStill: nil)
+        if let reply = cached.suggestion, !reply.body.isEmpty {
+            _ = header.replaceSuggestion(with: reply, ifStill: nil)
         }
 
         cached.updatedAt = Date()
@@ -117,8 +115,8 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
     /// Write AI state to the persistent cache (upsert).
     /// Only overwrites non-nil parameters — preserves existing cached fields — except the two
     /// text messages, which belong to their result: a new summary (`summaryBlurb` given) sets
-    /// `summaryTextMessage` to the one passed, nil included, and a new reply (`cachedReply` given)
-    /// sets `replyTextMessage` and `replyChangeCommand` likewise, so a result without one never keeps an older result's.
+    /// `summaryTextMessage` to the one passed, nil included, and a new reply (`reply` given)
+    /// sets the whole suggestion (`reply`, one value), so a result without one never keeps an older result's.
     /// No-op if rfc822MessageId is nil (skip cache for messages without Message-ID). An existing
     /// entry without a Message-ID takes this one; a stored one is never replaced.
     static func writeThrough(
@@ -132,10 +130,8 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
         reminderContent: String? = nil,
         summaryTextMessage: String? = nil,
         actionTag: ActionTag? = nil,
-        cachedReply: String? = nil,
+        reply: ReplyResult? = nil,
         replyGeneratedAt: Date? = nil,
-        replyTextMessage: String? = nil,
-        replyChangeCommand: String? = nil,
         db: Database
     ) throws {
         guard let key = cacheKey(
@@ -162,13 +158,23 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
         if let reminderTime { cache.reminderTime = reminderTime }
         if let reminderContent { cache.reminderContent = reminderContent }
         if let actionTag { cache.actionTag = actionTag }
-        if let cachedReply {
-            cache.cachedReply = cachedReply
-            cache.replyTextMessage = replyTextMessage
-            cache.replyChangeCommand = replyChangeCommand
-        }
+        if let reply { cache.storeSuggestion(reply) }
         if let replyGeneratedAt { cache.replyGeneratedAt = replyGeneratedAt }
         cache.updatedAt = Date()
         try cache.save(db)
+    }
+}
+
+/// The AI Suggestion as the cache keeps it: the same one value as the header's
+/// (`MessageHeader.suggestion`), read and written whole.
+extension MessageAICache {
+    var suggestion: ReplyResult? {
+        cachedReply.map { ReplyResult(body: $0, textMessage: replyTextMessage, changeCommand: replyChangeCommand) }
+    }
+
+    mutating func storeSuggestion(_ value: ReplyResult) {
+        cachedReply = value.body
+        replyTextMessage = value.textMessage
+        replyChangeCommand = value.changeCommand
     }
 }
