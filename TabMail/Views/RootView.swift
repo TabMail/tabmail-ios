@@ -51,6 +51,9 @@ struct RootView: View {
     @State private var appStoreAge: AppStoreAgeCheck.Status = .notChecked
     /// Orders the age check and the significant update notice (`AppStoreAgeCheck.Runner`).
     @State private var appStoreAgeRunner = AppStoreAgeCheck.Runner()
+    /// Set when an earlier significant update notice for this version never
+    /// returned: the banner offers it instead of an unasked call (#1010).
+    @State private var significantUpdateBannerVersion: String?
     @Environment(\.requestAgeRange) private var requestAgeRange
     /// Set while signing out after a failed age check: the person has just
     /// read why, so the generic "Signed Out" alert is not shown on top.
@@ -176,6 +179,11 @@ struct RootView: View {
                                 await cancelDeletion()
                             }
                         }
+                        if let version = significantUpdateBannerVersion {
+                            SignificantUpdateBanner(version: version) {
+                                Task { await openSignificantUpdateNotice() }
+                            }
+                        }
                         MailNavigationView(initialSelection: nil)
                     }
                 }
@@ -265,6 +273,11 @@ struct RootView: View {
                 if let deletionDate = pendingDeletionDate {
                     DeletionBanner(deletionDate: deletionDate) {
                         await cancelDeletion()
+                    }
+                }
+                if let version = significantUpdateBannerVersion {
+                    SignificantUpdateBanner(version: version) {
+                        Task { await openSignificantUpdateNotice() }
                     }
                 }
                 MailNavigationView()
@@ -963,8 +976,22 @@ struct RootView: View {
                     withAnimation { appStoreAge = shown }
                 }
             },
-            acknowledge: { await AppStoreAgeCheck.acknowledgeSignificantUpdate() }
+            acknowledge: { await applySignificantUpdate(AppStoreAgeCheck.acknowledgeSignificantUpdate()) }
         )
+    }
+
+    /// The banner's tap: the person opens Apple's notice themselves.
+    private func openSignificantUpdateNotice() async {
+        await appStoreAgeRunner.acknowledgeOnly {
+            await applySignificantUpdate(AppStoreAgeCheck.acknowledgeSignificantUpdate(userAsked: true))
+        }
+    }
+
+    private func applySignificantUpdate(_ outcome: AppStoreAgeCheck.SignificantUpdate.Outcome) {
+        switch outcome {
+        case .none: significantUpdateBannerVersion = nil
+        case .offerBanner(let version): significantUpdateBannerVersion = version
+        }
     }
 
     /// OK on the age and terms screen's refusal: the account deletion has

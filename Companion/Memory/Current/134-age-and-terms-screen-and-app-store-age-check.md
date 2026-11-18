@@ -83,6 +83,14 @@ ADR-034.
   RootView's age check and the notice: the age check's in-progress flag clears BEFORE the notice is
   awaited, so a stuck notice never skips later age checks; the notice has its own flag, so no second
   notice starts while one is up (2026-11-18). Test: `AppStoreAgeCheckRunnerTests`.
+- Stuck notice across launches (owner 2026-11-18, #1010, option chosen with the fallback approved; no
+  timer): `SignificantUpdate.inProgressVersionKey` holds the major.minor handed to Apple, set just
+  before `show` and cleared when it returns or throws. A launch that finds it set for the CURRENT
+  major.minor makes no unasked call and returns `.offerBanner`; RootView shows
+  `SignificantUpdateBanner` (SignInAgainBanner shape, above `MailNavigationView` beside
+  `DeletionBanner`), whose tap calls Apple through the same marker path (`userAsked: true`). A marker
+  for another version is ignored. Killing the app mid-notice also yields the banner (accepted). The
+  marker is app state, not user data. Tests: `SignificantUpdateStuckNoticeTests`.
 
 Tests: `AgeAndTermsConsentTests`, `AppStoreAgeCheckSimulationTests` (simulated App Store answers),
 `AgeIneligibleDeletionTokenTests` (refusal handshake through the real token path),

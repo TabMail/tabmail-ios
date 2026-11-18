@@ -349,6 +349,96 @@ struct SignificantUpdateAcknowledgmentTests {
     }
 }
 
+/// Apple's notice can stay up and never return (#1010). The in-progress marker
+/// carries that across a relaunch: the same version is then offered through a
+/// banner, never shown unasked; a new version is shown as usual.
+@Suite("Significant update: a notice that never returned")
+@MainActor
+struct SignificantUpdateStuckNoticeTests {
+    /// The UserDefaults the real step uses, held in memory.
+    @MainActor
+    final class Store {
+        var acknowledged: String?
+        var inProgress: String?
+        var shown: [String] = []
+        var stuck: CheckedContinuation<Void, Never>?
+    }
+
+    private func launch(
+        _ store: Store, current: String, userAsked: Bool = false,
+        show: @escaping (String) async throws -> Void
+    ) async -> AppStoreAgeCheck.SignificantUpdate.Outcome {
+        await AppStoreAgeCheck.acknowledge(
+            acknowledged: store.acknowledged, current: current,
+            inProgress: store.inProgress, userAsked: userAsked,
+            isRegulated: { true }, requiresNotice: { true },
+            show: show,
+            record: { store.acknowledged = $0 },
+            markInProgress: { store.inProgress = $0 }
+        )
+    }
+
+    /// Runs a launch whose notice never returns, until the notice is up.
+    private func stuckLaunch(_ store: Store, current: String) async -> Task<Void, Never> {
+        let task = Task { @MainActor in
+            _ = await launch(store, current: current) { version in
+                store.shown.append(version)
+                await withCheckedContinuation { store.stuck = $0 }
+            }
+        }
+        while store.stuck == nil { await Task.yield() }
+        return task
+    }
+
+    @Test func aRelaunchAfterAStuckNoticeShowsTheBannerAndNoUnaskedNotice() async {
+        let store = Store()
+        store.acknowledged = "1.7"
+        let first = await stuckLaunch(store, current: "1.8.0")
+        #expect(store.inProgress == "1.8", "the marker is set while the notice is up")
+
+        // The next launch reads the same stored values.
+        let outcome = await launch(store, current: "1.8.1") { store.shown.append($0) }
+        #expect(outcome == .offerBanner(version: "1.8"))
+        #expect(store.shown == ["1.8"], "no second unasked notice")
+        #expect(store.acknowledged == "1.7", "not recorded as handled")
+
+        // Tapping the banner opens Apple's notice; on return it is recorded.
+        let tapped = await launch(store, current: "1.8.1", userAsked: true) { store.shown.append($0) }
+        #expect(tapped == .none)
+        #expect(store.shown == ["1.8", "1.8"])
+        #expect(store.acknowledged == "1.8")
+        #expect(store.inProgress == nil, "the marker clears once the notice returns")
+
+        store.stuck?.resume()
+        await first.value
+    }
+
+    @Test func aNewVersionAfterAStuckNoticeIsShownUnaskedAgain() async {
+        let store = Store()
+        store.acknowledged = "1.7"
+        let first = await stuckLaunch(store, current: "1.8.0")
+
+        let outcome = await launch(store, current: "1.9.0") { store.shown.append($0) }
+        #expect(outcome == .none)
+        #expect(store.shown == ["1.8", "1.9"], "the older version's marker is ignored")
+        #expect(store.acknowledged == "1.9")
+        #expect(store.inProgress == nil)
+
+        store.stuck?.resume()
+        await first.value
+    }
+
+    @Test func aFailedNoticeClearsTheMarker() async {
+        struct Failure: Error {}
+        let store = Store()
+        store.acknowledged = "1.7"
+        let outcome = await launch(store, current: "1.8.0") { _ in throw Failure() }
+        #expect(outcome == .none)
+        #expect(store.inProgress == nil, "a notice that returned with an error is asked again unasked")
+        #expect(store.acknowledged == "1.7")
+    }
+}
+
 /// Apple's age sheet does not run in the Simulator (Apple DTS), so these give
 /// `AppStoreAgeCheck.decide` the answers iOS would give and check what the app
 /// then shows (owner 2026-10-09: simulated answers stand in for a device test).

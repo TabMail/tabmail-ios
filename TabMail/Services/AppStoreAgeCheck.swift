@@ -144,6 +144,14 @@ enum AppStoreAgeCheck {
             await acknowledge()
             isAcknowledging = false
         }
+
+        /// The banner's tap: shows the notice unless one is already up.
+        func acknowledgeOnly(_ acknowledge: () async -> Void) async {
+            guard !isAcknowledging else { return }
+            isAcknowledging = true
+            await acknowledge()
+            isAcknowledging = false
+        }
     }
 
     /// What the app shows after a check: a failed region question
@@ -166,6 +174,21 @@ enum AppStoreAgeCheck {
     /// Only the last acknowledged version is stored.
     enum SignificantUpdate {
         static let acknowledgedVersionKey = "AppStoreAgeCheck.significantUpdateVersion"
+        /// The major.minor whose notice was handed to Apple and has not come
+        /// back yet. Still set at launch means the notice never returned (or
+        /// the app was closed while it was up): that version's notice is then
+        /// offered through a banner instead of shown unasked (owner 2026-11-18,
+        /// issue #1010). App state, not user data.
+        static let inProgressVersionKey = "AppStoreAgeCheck.significantUpdateInProgress"
+
+        /// What the step leaves for the screen.
+        enum Outcome: Equatable {
+            /// Nothing to offer.
+            case none
+            /// A previous notice for this major.minor never returned: offer it
+            /// through the banner, where the person opens it themselves.
+            case offerBanner(version: String)
+        }
 
         enum Decision: Equatable {
             /// This version was already handled.
@@ -203,14 +226,18 @@ enum AppStoreAgeCheck {
     /// after an `.allowed` age check, which also covers regions where the rules
     /// do not apply, so the region is asked again here. A failure is logged
     /// and asked again on the next foreground.
+    /// `userAsked` is true when the person tapped the banner.
     @MainActor
-    static func acknowledgeSignificantUpdate() async {
-        guard #available(iOS 26.4, *) else { return }
-        guard let current = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String else { return }
+    @discardableResult
+    static func acknowledgeSignificantUpdate(userAsked: Bool = false) async -> SignificantUpdate.Outcome {
+        guard #available(iOS 26.4, *) else { return .none }
+        guard let current = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String else { return .none }
         let defaults = UserDefaults.standard
-        await acknowledge(
+        return await acknowledge(
             acknowledged: defaults.string(forKey: SignificantUpdate.acknowledgedVersionKey),
             current: current,
+            inProgress: defaults.string(forKey: SignificantUpdate.inProgressVersionKey),
+            userAsked: userAsked,
             isRegulated: { try await isInRegulatedRegion() },
             requiresNotice: { try await requiresSignificantUpdateNotice() },
             show: { version in
@@ -221,7 +248,14 @@ enum AppStoreAgeCheck {
                 try await AgeRangeService.shared.showSignificantUpdateAcknowledgment(
                     in: scene, updateDescription: SignificantUpdate.updateDescription(version))
             },
-            record: { version in defaults.set(version, forKey: SignificantUpdate.acknowledgedVersionKey) }
+            record: { version in defaults.set(version, forKey: SignificantUpdate.acknowledgedVersionKey) },
+            markInProgress: { version in
+                if let version {
+                    defaults.set(version, forKey: SignificantUpdate.inProgressVersionKey)
+                } else {
+                    defaults.removeObject(forKey: SignificantUpdate.inProgressVersionKey)
+                }
+            }
         )
     }
 
@@ -232,22 +266,39 @@ enum AppStoreAgeCheck {
     /// calls; tests pass the answers iOS would give. `record` stores the
     /// handled major.minor; nothing is recorded when a call fails, so the next
     /// foreground asks again.
+    ///
+    /// Apple's notice can stay up and never return (#972, #1010). `inProgress`
+    /// is the stored in-progress marker: `markInProgress(version)` is called
+    /// just before `show` and `markInProgress(nil)` once it returns or throws.
+    /// A marker still set for THIS major.minor means an earlier notice never
+    /// came back, so unless `userAsked` (the banner was tapped) Apple is not
+    /// called and `.offerBanner` is returned. A marker for another version is
+    /// ignored. No time limit is involved.
     @MainActor
+    @discardableResult
     static func acknowledge(
         acknowledged: String?,
         current: String,
+        inProgress: String? = nil,
+        userAsked: Bool = false,
         isRegulated: () async throws -> Bool,
         requiresNotice: () async throws -> Bool,
         show: (String) async throws -> Void,
-        record: (String) -> Void
-    ) async {
-        guard let version = SignificantUpdate.majorMinor(current) else { return }
+        record: (String) -> Void,
+        markInProgress: (String?) -> Void = { _ in }
+    ) async -> SignificantUpdate.Outcome {
+        guard let version = SignificantUpdate.majorMinor(current) else { return .none }
         switch SignificantUpdate.decide(acknowledged: acknowledged, current: current) {
         case .nothing:
-            return
+            return .none
         case .record:
             record(version)
+            return .none
         case .askApple:
+            if inProgress == version, !userAsked {
+                BackgroundSyncLogger.logDebug("[AppStoreAgeCheck] Notice for \(version) never returned; offering the banner")
+                return .offerBanner(version: version)
+            }
             do {
                 // Only where Apple says the age rules apply. Elsewhere, such as
                 // on a device with no Apple Account, Apple's acknowledgment can
@@ -256,12 +307,15 @@ enum AppStoreAgeCheck {
                 // later is still shown this version's notice.
                 guard try await isRegulated() else { return }
                 if try await requiresNotice() {
+                    markInProgress(version)
+                    defer { markInProgress(nil) }
                     try await show(version)
                 }
                 record(version)
             } catch {
                 BackgroundSyncLogger.logDebug("[AppStoreAgeCheck] Significant update acknowledgment failed, asking again on next foreground: \(error)")
             }
+            return .none
         }
     }
 
