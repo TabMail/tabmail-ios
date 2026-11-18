@@ -3,7 +3,9 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import GRDB
 import Observation
+import Synchronization
 import SwiftUI
 import Testing
 import UIKit
@@ -17,6 +19,14 @@ import UIKit
 ///  2. A thread's words never show in another thread's field.
 ///  3. The words are there again in a new app run (a new store on the same database), and an
 ///     emptied field leaves nothing to bring back.
+///  4. Two pills on one chat (the chat view's field and the email card's pill over it) show and
+///     change ONE draft: what is typed, emptied or sent in one is what the other shows.
+///  5. The user's saved words survive a read of them that fails or is left (Back while it runs):
+///     they are there on the next open.
+///  6. What the user does before a chat's saved words are read is what the chat keeps, and a pill
+///     moving to another email of another chat keeps each chat's words on its own.
+///  7. The email screen's pill (no reply field) keeps its chat's words too; the inbox's chat keeps
+///     none. A demo's words stay in the demo and go with it.
 @Suite("Chat field words kept on Back", .serialized, .processGlobalState)
 @MainActor
 struct ChatFieldWordsRuntimeTests {
@@ -29,6 +39,57 @@ struct ChatFieldWordsRuntimeTests {
         header.rfc822MessageId = "<\(uid)@example.com>"
         header.computedThreadId = thread
         return header
+    }
+
+    /// A pill whose email and openness the test changes.
+    @Observable final class Host {
+        var message: MessageHeader?
+        var expanded: Bool
+        init(_ message: MessageHeader?, expanded: Bool = false) {
+            self.message = message
+            self.expanded = expanded
+        }
+    }
+
+    /// The chat view's pill (`replyField`), else the email screen's (or, with no email, the inbox's).
+    struct PillView: View {
+        @Bindable var host: Host
+        let replyField: Bool
+        var body: some View {
+            DynamicIslandChat(
+                message: host.message, isExpanded: $host.expanded,
+                replyField: replyField ? ChatReplyField(example: nil, isNoReply: false, clearCount: 0) : nil)
+            .environment(\.hasTabMailSession, true)
+        }
+    }
+
+    /// A mounted pill: its view, and `close` for Back.
+    final class Mounted {
+        private var window: UIWindow?
+        let view: UIView
+        init(window: UIWindow, view: UIView) {
+            self.window = window
+            self.view = view
+        }
+
+        func close() {
+            window?.isHidden = true
+            window?.rootViewController = nil
+            window = nil
+        }
+    }
+
+    /// Mounts `root` in its own window; several can be mounted at once, one over the other.
+    static func mount<V: View>(_ root: V) async throws -> Mounted {
+        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        let controller = UIHostingController(rootView: root)
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        // An open pill takes its spring to show its field.
+        try await Task.sleep(for: .milliseconds(600))
+        return Mounted(window: window, view: controller.view)
     }
 
     struct HostView: View {
@@ -83,20 +144,54 @@ struct ChatFieldWordsRuntimeTests {
     }
 
     /// One installed database for the whole test, as one app run has.
-    static func withDatabase(_ body: @MainActor () async throws -> Void) async throws {
+    static func withDatabase(_ body: @MainActor (DatabasePool) async throws -> Void) async throws {
         let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
         ChatPillState.shared.removeAllSessions()
         // A new app run's store: nothing in memory from an earlier test.
         ChatFieldWords.shared = ChatFieldWords()
-        defer { ChatPillState.shared.removeAllSessions() }
-        try await body()
+        defer {
+            ChatPillState.shared.removeAllSessions()
+            ChatFieldWords.shared = ChatFieldWords()
+        }
+        try await body(pool)
+        await ChatFieldWords.shared.written()
+    }
+
+    /// The kept words, by chat key.
+    static func stored(_ pool: DatabasePool) throws -> [String: String] {
+        let rows = try pool.read { try ChatFieldWordsRecord.fetchAll($0) }
+        return Dictionary(uniqueKeysWithValues: rows.map { ($0.sessionId, $0.words) })
+    }
+
+    /// A second pool on the test database with a single reader, so a test can hold the store's
+    /// reads (`DatabaseReaderGate`) while the pill is open.
+    static func singleReaderPool(_ pool: DatabasePool) throws -> DatabasePool {
+        var config = Configuration()
+        config.maximumReaderCount = 1
+        config.busyMode = .timeout(5)
+        return try DatabasePool(path: pool.path, configuration: config)
+    }
+
+    /// A new app run whose store reads and writes through `database`.
+    static func newRun(_ database: @escaping @Sendable () -> PrioritizedDatabase) async {
+        await ChatFieldWords.shared.written()
+        ChatFieldWords.shared = ChatFieldWords(database: database)
+        ChatPillState.shared.removeAllSessions()
+    }
+
+    /// Saves `words` in the field of `message`'s chat, as an earlier app run did.
+    static func save(_ words: String, on message: MessageHeader) async throws {
+        try await open(message) { view in
+            #expect(type(words, in: view), "the mounted pill has a native editable field")
+            try await settle()
+        }
         await ChatFieldWords.shared.written()
     }
 
     @Test("Words typed in a chat's field are there again after Back, also on the thread's newer email")
     func wordsSurviveBack() async throws {
-        try await Self.withDatabase {
+        try await Self.withDatabase { _ in
             let words = "Sounds good, see you Tuesday"
             try await Self.open(Self.header("back-1", thread: "back-thread")) { view in
                 #expect(Self.fieldTexts(view).allSatisfy { $0.isEmpty }, "control: the field starts empty")
@@ -116,7 +211,7 @@ struct ChatFieldWordsRuntimeTests {
 
     @Test("A thread's words never show in another thread's field")
     func wordsStayInTheirThread() async throws {
-        try await Self.withDatabase {
+        try await Self.withDatabase { _ in
             let words = "Only for the first thread"
             try await Self.open(Self.header("key-1", thread: "key-thread-A")) { view in
                 #expect(Self.type(words, in: view), "the mounted pill has a native editable field")
@@ -138,7 +233,7 @@ struct ChatFieldWordsRuntimeTests {
 
     @Test("Words typed in a chat's field are there again after the app was closed and opened")
     func wordsSurviveARestart() async throws {
-        try await Self.withDatabase {
+        try await Self.withDatabase { _ in
             let words = "Kept across a restart"
             try await Self.open(Self.header("restart-1", thread: "restart-thread")) { view in
                 #expect(Self.type(words, in: view), "the mounted pill has a native editable field")
@@ -156,7 +251,7 @@ struct ChatFieldWordsRuntimeTests {
 
     @Test("A field the user emptied is empty when the chat is reopened, in this run and the next")
     func emptiedFieldStaysEmpty() async throws {
-        try await Self.withDatabase {
+        try await Self.withDatabase { _ in
             let header = Self.header("empty-1", thread: "empty-thread")
             try await Self.open(header) { view in
                 #expect(Self.type("Words to take back", in: view))
@@ -171,6 +266,268 @@ struct ChatFieldWordsRuntimeTests {
             ChatFieldWords.shared = ChatFieldWords()
             try await Self.open(header) { view in
                 #expect(Self.fieldTexts(view).allSatisfy { $0.isEmpty }, "the next run: \(Self.fieldTexts(view))")
+            }
+        }
+    }
+
+    // MARK: - 4. Two pills on one chat
+
+    @Test("The chat view's field and the email card's pill over it show and change one draft")
+    func twoPillsShareOneDraft() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted Send")
+        try await HostedAccessibility.withAutomation {
+            try await Self.withDatabase { pool in
+                _ = try FolderEpochTestFixture.makeAccount(id: "words", provider: .imap, pool: pool)
+                try FolderEpochTestFixture.insertFolder(accountId: "words", path: "INBOX", role: .inbox, pool: pool)
+                let email = Self.header("two-1", thread: "two-thread")
+                try await pool.write { try email.insert($0) }
+                let key = ChatFieldWords.key(for: email)
+                let backend = ThreadChatTests.Backend()
+                try await ThreadChatTests.withBackend(backend, chatView: true) {
+                    let field = try await Self.mount(PillView(host: Host(email), replyField: true))
+                    defer { field.close() }
+                    let card = try await Self.mount(PillView(host: Host(email, expanded: true), replyField: false))
+
+                    #expect(Self.type("Typed in the field", in: field.view))
+                    try await Self.settle()
+                    #expect(Self.fieldTexts(card.view).contains("Typed in the field"), "the card shows the field's words: \(Self.fieldTexts(card.view))")
+
+                    #expect(Self.type("Changed on the card", in: card.view))
+                    try await Self.settle()
+                    #expect(Self.fieldTexts(field.view).contains("Changed on the card"), "the field shows the card's: \(Self.fieldTexts(field.view))")
+
+                    #expect(Self.type("", in: card.view))
+                    try await Self.settle()
+                    #expect(Self.fieldTexts(field.view).allSatisfy(\.isEmpty), "emptied on the card, empty in the field: \(Self.fieldTexts(field.view))")
+
+                    // A send from the card: its words went, from both pills and from storage.
+                    #expect(Self.type("Ask about the date", in: card.view))
+                    try await Self.settle()
+                    #expect(HostedAccessibility.activate("chatSend", in: card.view),
+                            "the card's Send takes a tap: \(HostedAccessibility.identifiers(in: card.view))")
+                    try await ThreadChatTests.wait { backend.bodies.count == 1 }
+                    #expect(backend.bodies.count == 1, "control: the question went to the backend")
+                    try await ThreadChatTests.wait { !ActiveAgentTracker.shared.anyWorking }
+                    try await Self.settle()
+                    #expect(Self.fieldTexts(field.view).allSatisfy { !$0.contains("Ask about the date") },
+                            "the sent words are not in the field: \(Self.fieldTexts(field.view))")
+                    await ChatFieldWords.shared.written()
+                    let stored1 = try Self.stored(pool)
+                    #expect(stored1[key] == nil, "nor kept")
+
+                    // The card closes with words typed on it: the field shows them.
+                    #expect(Self.type("Typed last, on the card", in: card.view))
+                    try await Self.settle()
+                    card.close()
+                    try await Self.settle()
+                    #expect(Self.fieldTexts(field.view).contains("Typed last, on the card"), "\(Self.fieldTexts(field.view))")
+                    await ChatFieldWords.shared.written()
+                    let stored2 = try Self.stored(pool)
+                    #expect(stored2 == [key: "Typed last, on the card"])
+                }
+            }
+        }
+    }
+
+    // MARK: - 5. A failed or left read keeps the saved words
+
+    @Test("Saved words survive a read of them that fails: they are there on the next open")
+    func failedReadKeepsSavedWords() async throws {
+        try await Self.withDatabase { pool in
+            let email = Self.header("fail-1", thread: "fail-thread")
+            try await Self.save("Words worth keeping", on: email)
+
+            // A new run whose first reads fail: the database they read has no such table.
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("chat-words-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let broken = try DatabasePool(path: directory.appendingPathComponent("broken.sqlite").path)
+            let failing = Failing()
+            await Self.newRun { failing.isOn ? PrioritizedDatabase(pool: broken) : PrioritizedDatabase(pool: pool) }
+            try await Self.open(email) { _ in }
+            failing.turnOff()
+
+            try await Self.open(email) { view in
+                #expect(Self.fieldTexts(view).contains("Words worth keeping"), "the next open shows them: \(Self.fieldTexts(view))")
+            }
+            await Self.newRun { PrioritizedDatabase(pool: pool) }
+            try await Self.open(email) { view in
+                #expect(Self.fieldTexts(view).contains("Words worth keeping"), "and the next run's: \(Self.fieldTexts(view))")
+            }
+        }
+    }
+
+    /// Whether the store's reads still fail.
+    final class Failing: Sendable {
+        private let on = Mutex(true)
+        var isOn: Bool { on.withLock { $0 } }
+        func turnOff() { on.withLock { $0 = false } }
+    }
+
+    @Test("Saved words survive Back while their read runs: they are there on the next open")
+    func leftReadKeepsSavedWords() async throws {
+        try await Self.withDatabase { pool in
+            let email = Self.header("left-1", thread: "left-thread")
+            try await Self.save("Words worth keeping", on: email)
+
+            let single = try Self.singleReaderPool(pool)
+            await Self.newRun { PrioritizedDatabase(pool: single) }
+            let gate = DatabaseReaderGate(single)
+            #expect(await gate.waitUntilHeld(), "control: the reads are held")
+            // Back while the chat's read waits.
+            try await Self.open(email) { _ in }
+            await gate.release()
+            try await Self.settle()
+
+            try await Self.open(email) { view in
+                #expect(Self.fieldTexts(view).contains("Words worth keeping"), "the next open shows them: \(Self.fieldTexts(view))")
+            }
+            await ChatFieldWords.shared.written()
+            let stored3 = try Self.stored(pool)
+            #expect(stored3 == [ChatFieldWords.key(for: email): "Words worth keeping"])
+        }
+    }
+
+    // MARK: - 6. Newer intention, and a pill moving between chats
+
+    @Test("A field emptied before the chat's saved words were read stays empty")
+    func emptiedBeforeTheReadStaysEmpty() async throws {
+        try await Self.withDatabase { pool in
+            let email = Self.header("hold-1", thread: "hold-thread")
+            try await Self.save("Older words", on: email)
+
+            let single = try Self.singleReaderPool(pool)
+            await Self.newRun { PrioritizedDatabase(pool: single) }
+            let gate = DatabaseReaderGate(single)
+            #expect(await gate.waitUntilHeld(), "control: the reads are held")
+            try await Self.open(email) { view in
+                #expect(Self.type("x", in: view))
+                try await Self.settle()
+                #expect(Self.type("", in: view))
+                try await Self.settle()
+                await gate.release()
+                try await Self.settle()
+                #expect(Self.fieldTexts(view).allSatisfy(\.isEmpty), "the user's emptying stays: \(Self.fieldTexts(view))")
+            }
+            try await Self.open(email) { view in
+                #expect(Self.fieldTexts(view).allSatisfy(\.isEmpty), "and is what is kept: \(Self.fieldTexts(view))")
+            }
+            await ChatFieldWords.shared.written()
+            let stored4 = try Self.stored(pool)
+            #expect(stored4.isEmpty)
+        }
+    }
+
+    @Test("A pill moving to another chat's email while a read runs: each chat keeps only its own words",
+          arguments: [false, true])
+    func switchingChatsKeepsEachChatsWords(bothReadsHeld: Bool) async throws {
+        try await Self.withDatabase { pool in
+            let first = Self.header("sw-1", thread: "switch-A")
+            let second = Self.header("sw-2", thread: "switch-B")
+            try await Self.save("Words for A", on: first)
+
+            let single = try Self.singleReaderPool(pool)
+            await Self.newRun { PrioritizedDatabase(pool: single) }
+            let host = Host(first)
+            var gate: DatabaseReaderGate?
+            if bothReadsHeld {
+                gate = DatabaseReaderGate(single)
+            }
+            let pill = try await Self.mount(PillView(host: host, replyField: true))
+            defer { pill.close() }
+            if !bothReadsHeld {
+                #expect(Self.fieldTexts(pill.view).contains("Words for A"), "control: A's words read: \(Self.fieldTexts(pill.view))")
+                gate = DatabaseReaderGate(single)
+            }
+            let held = try #require(gate)
+            #expect(await held.waitUntilHeld(), "control: the reads are held")
+
+            host.message = second
+            try await Self.settle()
+            #expect(Self.type("Words for B", in: pill.view))
+            try await Self.settle()
+            await held.release()
+            try await Self.settle()
+            #expect(Self.fieldTexts(pill.view).contains("Words for B") && !Self.fieldTexts(pill.view).contains("Words for A"),
+                    "B keeps the words typed on it: \(Self.fieldTexts(pill.view))")
+
+            host.message = first
+            try await Self.settle()
+            #expect(Self.fieldTexts(pill.view).contains("Words for A") && !Self.fieldTexts(pill.view).contains("Words for B"),
+                    "A keeps its own: \(Self.fieldTexts(pill.view))")
+            await ChatFieldWords.shared.written()
+            let stored5 = try Self.stored(pool)
+            #expect(stored5 == [ChatFieldWords.key(for: first): "Words for A", ChatFieldWords.key(for: second): "Words for B"])
+        }
+    }
+
+    // MARK: - 7. The email screen's pill, the inbox's chat, a demo
+
+    @Test("The email screen's pill keeps its chat's words over Back; the inbox's chat keeps none")
+    func emailScreenPillKeepsWords() async throws {
+        try await Self.withDatabase { pool in
+            let email = Self.header("screen-1", thread: "screen-thread")
+            let screen = try await Self.mount(PillView(host: Host(email, expanded: true), replyField: false))
+            #expect(Self.type("From the email screen", in: screen.view), "the open pill has a native editable field")
+            try await Self.settle()
+            screen.close()
+            try await Self.settle()
+            let again = try await Self.mount(PillView(host: Host(email, expanded: true), replyField: false))
+            #expect(Self.fieldTexts(again.view).contains("From the email screen"), "\(Self.fieldTexts(again.view))")
+            again.close()
+
+            // Control: the inbox's chat has no thread, and keeps nothing.
+            let inbox = try await Self.mount(PillView(host: Host(nil, expanded: true), replyField: false))
+            #expect(Self.type("An inbox question", in: inbox.view), "control: the inbox's chat has a field")
+            try await Self.settle()
+            inbox.close()
+            try await Self.settle()
+            let inboxAgain = try await Self.mount(PillView(host: Host(nil, expanded: true), replyField: false))
+            #expect(Self.fieldTexts(inboxAgain.view).allSatisfy { !$0.contains("An inbox question") }, "\(Self.fieldTexts(inboxAgain.view))")
+            inboxAgain.close()
+            await ChatFieldWords.shared.written()
+            let stored6 = try Self.stored(pool)
+            #expect(stored6 == [ChatFieldWords.key(for: email): "From the email screen"])
+        }
+    }
+
+    @Test("A demo's words stay in the demo and go with it; the real chat keeps its own")
+    func demoWordsStayInTheDemo() async throws {
+        try await Self.withDatabase { pool in
+            UserDefaults.standard.set(false, forKey: "device_sync_auto_enabled")
+            DeviceSyncService.shared.disconnect()
+            DemoModeStore.shared._resetForTests()
+            defer { DemoModeStore.shared._resetForTests() }
+            let email = Self.header("demo-1", thread: "demo-thread")
+            let realKey = ChatFieldWords.key(for: email)
+            try await Self.save("Real words", on: email)
+
+            try await DemoModeService.shared.start(mintToken: false)
+            #expect(DemoModeStore.isDemoActive, "control: the demo runs")
+            try await Self.open(email) { view in
+                #expect(Self.fieldTexts(view).allSatisfy { !$0.contains("Real words") }, "the demo never shows the real chat's words")
+                #expect(Self.type("Demo words", in: view))
+                try await Self.settle()
+            }
+            try await Self.open(email) { view in
+                #expect(Self.fieldTexts(view).contains("Demo words"), "control: kept in the demo: \(Self.fieldTexts(view))")
+            }
+            await ChatFieldWords.shared.written()
+            let inDemo = try Self.stored(pool)
+            #expect(inDemo.count == 2 && inDemo[realKey] == "Real words", "the demo's are kept apart: \(inDemo)")
+
+            await DemoModeService.shared.exit()
+            #expect(!DemoModeStore.isDemoActive, "control: the demo ended")
+            let stored7 = try Self.stored(pool)
+            #expect(stored7 == [realKey: "Real words"], "the demo's words went with it")
+
+            try await DemoModeService.shared.start(mintToken: false)
+            try await Self.open(email) { view in
+                #expect(Self.fieldTexts(view).allSatisfy { !$0.contains("Demo words") }, "the next demo starts with none: \(Self.fieldTexts(view))")
+            }
+            await DemoModeService.shared.exit()
+            try await Self.open(email) { view in
+                #expect(Self.fieldTexts(view).contains("Real words"), "the real chat keeps its words: \(Self.fieldTexts(view))")
             }
         }
     }

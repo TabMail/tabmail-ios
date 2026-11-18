@@ -4,34 +4,83 @@
 
 import Foundation
 import GRDB
+import Observation
+import SwiftUI
 
 /// The unsent words of a chat's field, kept on this iPhone like Messages keeps them (ADR-IOS-117):
 /// they are in the field again when the user comes back to the chat, also after the app was closed.
 ///
-/// ONE store for every pill about an email (the chat view's reply field, the email screen's pill),
-/// keyed by the thread's chat key, the one the chat history uses (`key(for:)`), so a newer email in
-/// the thread keeps the words and another thread never shows them. Never synced, never sent, never
-/// indexed, never logged.
+/// ONE owner of a chat's words for every pill about an email (the chat view's reply field, the
+/// email screen's pill), keyed by the thread's chat key, the one the chat history uses
+/// (`key(for:)`), so a newer email in the thread keeps the words and another thread never shows
+/// them. Every pill on a chat reads and changes the same fill (`apply`), so two pills on one chat
+/// never hold two drafts. Never synced, never sent, never indexed, never logged.
 ///
-/// Within the app run, `known` is what the field reads: a key's words are read from the database
-/// once, and every change lands in memory at once and is written behind it, in order, the newest
-/// words of a key winning. So Back and an immediate reopen never race the write.
+/// A chat's stored words are read into its fill once in this run (`load`), and only while nothing
+/// changed it: a change made first is the user's newer intention (typed, emptied, sent, dictating),
+/// and is what is kept. A read that fails changes nothing, so the stored words stay for the next
+/// read. Every change lands in memory at once and is written behind it, in order, the newest words
+/// of a key winning, so Back and an immediate reopen never race the write.
 @MainActor
+@Observable
 final class ChatFieldWords {
     /// The app's store. A test installs a new one to start as a new app run would.
     static var shared = ChatFieldWords()
 
-    /// The database the words are written to, read when used (tests install their own).
-    private let database: @Sendable () -> PrioritizedDatabase
-    /// The words of every key this run has read or changed; "" is none.
-    private var known: [String: String] = [:]
-    /// Keys whose words changed since they were last written, with the words to write.
-    private var unwritten: [String: String] = [:]
-    /// The write in progress, if any; it writes until `unwritten` is empty.
-    private var writer: Task<Void, Never>?
+    /// Where the words are read from and written to.
+    struct Storage: Sendable {
+        /// The words stored for a key; nil when none.
+        let read: @Sendable (String) async throws -> String?
+        /// Writes each key's words; "" deletes the key's row.
+        let write: @Sendable ([String: String]) async throws -> Void
 
-    init(database: @escaping @Sendable () -> PrioritizedDatabase = { AppDatabase.dbPool }) {
-        self.database = database
+        /// The app's database (tests install their own).
+        static func database(_ database: @escaping @Sendable () -> PrioritizedDatabase) -> Storage {
+            Storage(
+                read: { key in
+                    // The raw pool: the words never come from the extension's staging, so the
+                    // read needs no staging merge first.
+                    try await database().pool.read { db in
+                        try String.fetchOne(
+                            db, sql: "SELECT words FROM \(ChatFieldWordsRecord.databaseTableName) WHERE sessionId = ?",
+                            arguments: [key])
+                    }
+                },
+                write: { batch in
+                    let now = Date()
+                    try await database().write { db in
+                        for (key, words) in batch {
+                            if words.isEmpty {
+                                try ChatFieldWordsRecord.filter(key: key).deleteAll(db)
+                            } else {
+                                try ChatFieldWordsRecord(sessionId: key, words: words, updatedAt: now).save(db)
+                            }
+                        }
+                    }
+                })
+        }
+    }
+
+    private let storage: Storage
+    /// The fill of every chat this run has read or changed: what each pill on the chat shows.
+    private var fills: [String: ChatFieldFill] = [:]
+    /// Chats changed in this run: their fill is newer than anything stored, and no read replaces it.
+    @ObservationIgnored private var changed: Set<String> = []
+    /// Chats whose stored words this run has read.
+    @ObservationIgnored private var read: Set<String> = []
+    /// The read in progress of each chat. Its id tells the chat's current read from an obsolete one.
+    @ObservationIgnored private var reading: [String: (id: UUID, task: Task<String?, Error>)] = [:]
+    /// Chats whose words changed since they were last written, with the words to write.
+    @ObservationIgnored private var unwritten: [String: String] = [:]
+    /// The write in progress, if any; it writes until `unwritten` is empty.
+    @ObservationIgnored private var writer: Task<Void, Never>?
+
+    init(storage: Storage = .database { AppDatabase.dbPool }) {
+        self.storage = storage
+    }
+
+    convenience init(database: @escaping @Sendable () -> PrioritizedDatabase) {
+        self.init(storage: .database(database))
     }
 
     /// The key a pill about `message` keeps its words under: its thread's chat key
@@ -40,37 +89,60 @@ final class ChatFieldWords {
         DemoModeStore.scopedSessionId(ChatThreadKey.key(for: message))
     }
 
-    /// The words kept for `key`; "" when none.
-    func words(for key: String) async -> String {
-        if let words = known[key] { return words }
-        // The raw pool: the words never come from the extension's staging, so the read needs
-        // no staging merge first.
-        let pool = database().pool
+    /// The chat `key`'s fill: its words and its field's state, as every pill on it shows them.
+    func fill(for key: String) -> ChatFieldFill {
+        fills[key] ?? ChatFieldFill()
+    }
+
+    /// The only way a chat's words change (`ChatFieldFill.apply`), from any pill on it. What is
+    /// not sent (`ChatFieldFill.unsent`) is kept whenever it changes; "" keeps nothing.
+    func apply(_ change: ChatFieldFill.Change, to key: String) {
+        let before = fill(for: key)
+        var after = before
+        after.apply(change)
+        guard after != before else { return }
+        fills[key] = after
+        changed.insert(key)
+        guard after.unsent != before.unsent else { return }
+        unwritten[key] = after.unsent
+        guard writer == nil else { return }
+        writer = Task { await writeUnwritten() }
+    }
+
+    /// Reads the chat `key`'s stored words into its fill, once in this run, unless the chat changed
+    /// first or meanwhile. A failed read changes nothing: the stored words stay, and the next pill
+    /// to show the chat reads them again. The read runs on its own, so a pill that goes away while
+    /// it runs does not end it for another pill on the chat.
+    func load(_ key: String) async {
+        guard !changed.contains(key), !read.contains(key) else { return }
+        let current: (id: UUID, task: Task<String?, Error>)
+        if let inFlight = reading[key] {
+            current = inFlight
+        } else {
+            let storage = storage
+            current = (UUID(), Task { try await storage.read(key) })
+            reading[key] = current
+        }
         let stored: String?
         do {
-            stored = try await pool.read { db in
-                try String.fetchOne(db, sql: "SELECT words FROM \(ChatFieldWordsRecord.databaseTableName) WHERE sessionId = ?",
-                                    arguments: [key])
-            }
+            stored = try await current.task.value
         } catch {
+            if reading[key]?.id == current.id { reading[key] = nil }
             if DebugModeManager.isLoggingEnabled() {
                 BackgroundSyncLogger.logDebug("[ChatFieldWords] read failed: \(type(of: error))")
             }
-            return ""
+            return
         }
-        // A change made while reading is newer than what was stored.
-        if let words = known[key] { return words }
-        known[key] = stored ?? ""
-        return stored ?? ""
-    }
-
-    /// Keep `words` for `key`; "" removes them.
-    func set(_ words: String, for key: String) {
-        guard known[key] != words else { return }
-        known[key] = words
-        unwritten[key] = words
-        guard writer == nil else { return }
-        writer = Task { await writeUnwritten() }
+        // Only the chat's current read lands (a demo's exit makes its reads obsolete), and only
+        // on a chat nothing changed.
+        guard reading[key]?.id == current.id else { return }
+        reading[key] = nil
+        guard !changed.contains(key) else { return }
+        read.insert(key)
+        guard let stored, !stored.isEmpty else { return }
+        var fill = ChatFieldFill()
+        fill.apply(.put(stored))
+        fills[key] = fill
     }
 
     /// Returns once every change made so far is written.
@@ -81,8 +153,12 @@ final class ChatFieldWords {
     /// Forget a demo's words in this run: a demo's exit deletes its rows (`DemoSeed.wipe`), and the
     /// next demo's chats have the same keys.
     func forgetDemo() {
-        known = known.filter { !$0.key.hasPrefix(Self.demoPrefix) }
-        unwritten = unwritten.filter { !$0.key.hasPrefix(Self.demoPrefix) }
+        let isDemo = { (key: String) in key.hasPrefix(Self.demoPrefix) }
+        fills = fills.filter { !isDemo($0.key) }
+        changed = changed.filter { !isDemo($0) }
+        read = read.filter { !isDemo($0) }
+        reading = reading.filter { !isDemo($0.key) }
+        unwritten = unwritten.filter { !isDemo($0.key) }
     }
 
     private nonisolated static let demoPrefix = "demo:"
@@ -91,17 +167,8 @@ final class ChatFieldWords {
         while !unwritten.isEmpty {
             let batch = unwritten
             unwritten = [:]
-            let now = Date()
             do {
-                try await database().write { db in
-                    for (key, words) in batch {
-                        if words.isEmpty {
-                            try ChatFieldWordsRecord.filter(key: key).deleteAll(db)
-                        } else {
-                            try ChatFieldWordsRecord(sessionId: key, words: words, updatedAt: now).save(db)
-                        }
-                    }
-                }
+                try await storage.write(batch)
             } catch {
                 // Kept in memory for this run; the next change writes them again.
                 for (key, words) in batch where unwritten[key] == nil { unwritten[key] = words }
@@ -112,6 +179,24 @@ final class ChatFieldWords {
             }
         }
         writer = nil
+    }
+
+    /// A pill's handle on its words: its chat's fill here when it is about an email (`key`), else
+    /// its own (`own`: the inbox's chat and a compose's pill keep none).
+    @MainActor
+    struct Field {
+        let key: String?
+        let own: Binding<ChatFieldFill>
+
+        var words: String {
+            guard let key else { return own.wrappedValue.words }
+            return ChatFieldWords.shared.fill(for: key).words
+        }
+
+        func apply(_ change: ChatFieldFill.Change) {
+            guard let key else { own.wrappedValue.apply(change); return }
+            ChatFieldWords.shared.apply(change, to: key)
+        }
     }
 
     // MARK: - Lifetime
