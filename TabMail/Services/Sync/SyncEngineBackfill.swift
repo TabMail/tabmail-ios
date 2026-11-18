@@ -230,8 +230,6 @@ extension SyncEngine {
                 WHERE bodyEmptyConfirmed = 1 OR bodyMetadataOversized = 1
                 """)
         }
-        // Reset cc/bcc backfill flag so existing messages get cc/bcc populated
-        UserDefaults.standard.set(false, forKey: "ccBccBackfillDone")
         BackgroundSyncLogger.logDebug("[SmartReindex] Crawl state reset — backfill will re-walk from top")
     }
 
@@ -331,12 +329,6 @@ extension SyncEngine {
                                 : 30
                             try? await Task.sleep(for: .seconds(sleepDelay))
                             continue
-                        }
-
-                        // Mark cc/bcc backfill done after first full crawl cycle completes
-                        if !UserDefaults.standard.bool(forKey: "ccBccBackfillDone") {
-                            UserDefaults.standard.set(true, forKey: "ccBccBackfillDone")
-                            BackgroundSyncLogger.logDebug("[Backfill] cc/bcc backfill marked complete for account \(accountId)")
                         }
 
                         // All folders walked — body fetch handled by BackfillBodyQueue

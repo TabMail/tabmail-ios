@@ -129,6 +129,40 @@ enum ReplyParentResolver {
         return updated
     }
 
+    /// Within an open write transaction, after a batch of rows was inserted in
+    /// any folder: mark the inserted rows that a reply already stored in a Sent
+    /// folder of the same account answers. This is the parent-side direction of
+    /// `markParentsReplied` (which runs when the reply is inserted): a parent
+    /// that loads after its reply shows as replied too, as on Gmail. The marking
+    /// itself (`isReplied`, the `.reply` tag clear, the queued `setTag`) is
+    /// `markParentsReplied`'s, fed the replies' `inReplyTo` values. No query runs
+    /// when nothing was inserted. Index-backed by `messageHeader_inReplyTo`.
+    ///
+    /// Returns the parent header IDs updated, for `postParentNotifications`.
+    static func markInsertedParentsOfStoredReplies(
+        insertedRfc822Ids: [String],
+        accountId: String,
+        db: Database
+    ) throws -> [String] {
+        let normalized = Set(insertedRfc822Ids.map(EmailFilter.normalizeMessageId).filter { !$0.isEmpty })
+        guard !normalized.isEmpty else { return [] }
+        let chunkSize = SyncConfig.backfillInsertChunkSize
+        let ids = Array(normalized)
+        var repliedTo: [String?] = []
+        for start in stride(from: 0, to: ids.count, by: chunkSize) {
+            let slice = Array(ids[start..<min(start + chunkSize, ids.count)])
+            let placeholders = Array(repeating: "?", count: slice.count).joined(separator: ",")
+            var args: [any DatabaseValueConvertible] = [accountId, FolderRole.sent.rawValue]
+            for value in slice { args.append(value) }
+            repliedTo += try String.fetchAll(db, sql: """
+                SELECT DISTINCT r.inReplyTo
+                FROM messageHeader r JOIN folder f ON f.id = r.folderId
+                WHERE r.accountId = ? AND f.role = ? AND r.inReplyTo IN (\(placeholders))
+                """, arguments: StatementArguments(args)).map { Optional($0) }
+        }
+        return try markParentsReplied(inReplyTos: repliedTo, folderRole: .sent, accountId: accountId, db: db)
+    }
+
     /// The set lookup executed by `markParentsReplied`, named so plan coverage
     /// cannot drift from production's predicates or projection.
     static func parentLookupSQL(count: Int) -> String {

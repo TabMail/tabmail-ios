@@ -11,7 +11,7 @@ import GRDB
 
 /// Tests for SyncEngine.insertBackfillBatch() — the core backfill insert method.
 /// This method handles: dedup against existing messages, pending-op skip,
-/// ReplyDetect override, FTS record building, AI cache restore, and cc/bcc backfill.
+/// ReplyDetect override, FTS record building and AI cache restore.
 ///
 /// We can't call SyncEngine.insertBackfillBatch directly (it's on the actor),
 /// so we replicate the algorithm using the same GRDB operations.
@@ -27,14 +27,12 @@ struct InsertBackfillBatchDedupTests {
         accountId: String,
         folderPath: String,
         isInInbox: Bool,
-        db: DatabaseQueue,
-        needsCcBccBackfill: Bool = false
-    ) throws -> (inserted: Int, ftsRecords: [FTSHeaderRecord], ccBccUpdates: [(headerId: String, cc: String, bcc: String)]) {
-        guard !headers.isEmpty else { return (0, [], []) }
+        db: DatabaseQueue
+    ) throws -> (inserted: Int, ftsRecords: [FTSHeaderRecord]) {
+        guard !headers.isEmpty else { return (0, []) }
 
         var ftsRecords: [FTSHeaderRecord] = []
         var count = 0
-        var ccBccUpdates: [(headerId: String, cc: String, bcc: String)] = []
 
         try db.write { db in
             // Load pending destructive IDs
@@ -65,18 +63,7 @@ struct InsertBackfillBatchDedupTests {
                 // PendingOp skip
                 if pendingDestructiveIds.contains(info.messageId) ||
                    (info.rfc822MessageId.map { pendingDestructiveIds.contains($0) } ?? false) { continue }
-                if existingIds.contains(info.messageId) {
-                    // cc/bcc backfill for existing
-                    if needsCcBccBackfill && (!info.cc.isEmpty || !info.bcc.isEmpty) {
-                        let headerId = "\(accountId):\(folderPath):\(info.messageId)"
-                        try db.execute(
-                            sql: "UPDATE messageHeader SET cc = ?, bcc = ? WHERE id = ?",
-                            arguments: [info.cc, info.bcc, headerId]
-                        )
-                        ccBccUpdates.append((headerId: headerId, cc: info.cc, bcc: info.bcc))
-                    }
-                    continue
-                }
+                if existingIds.contains(info.messageId) { continue }
 
                 var header = MessageHeader(
                     messageId: info.messageId,
@@ -142,7 +129,7 @@ struct InsertBackfillBatchDedupTests {
                 ))
             }
         }
-        return (count, ftsRecords, ccBccUpdates)
+        return (count, ftsRecords)
     }
 
     private func makeHeaderInfo(
@@ -193,7 +180,7 @@ struct InsertBackfillBatchDedupTests {
             makeHeaderInfo(messageId: "102", subject: "Test"),
         ]
 
-        let (inserted, ftsRecords, _) = try simulateInsertBackfillBatch(
+        let (inserted, ftsRecords) = try simulateInsertBackfillBatch(
             infos, folderId: "acc1:INBOX", accountId: "acc1",
             folderPath: "INBOX", isInInbox: true, db: db
         )
@@ -217,7 +204,7 @@ struct InsertBackfillBatchDedupTests {
             makeHeaderInfo(messageId: "101"), // new
         ]
 
-        let (inserted, ftsRecords, _) = try simulateInsertBackfillBatch(
+        let (inserted, ftsRecords) = try simulateInsertBackfillBatch(
             infos, folderId: "acc1:INBOX", accountId: "acc1",
             folderPath: "INBOX", isInInbox: true, db: db
         )
@@ -249,7 +236,7 @@ struct InsertBackfillBatchDedupTests {
             makeHeaderInfo(messageId: "101"), // no pending op
         ]
 
-        let (inserted, _, _) = try simulateInsertBackfillBatch(
+        let (inserted, _) = try simulateInsertBackfillBatch(
             infos, folderId: "acc1:INBOX", accountId: "acc1",
             folderPath: "INBOX", isInInbox: true, db: db
         )
@@ -278,7 +265,7 @@ struct InsertBackfillBatchDedupTests {
             makeHeaderInfo(messageId: "100", rfc822MessageId: "<msg100@example.com>"),
         ]
 
-        let (inserted, _, _) = try simulateInsertBackfillBatch(
+        let (inserted, _) = try simulateInsertBackfillBatch(
             infos, folderId: "acc1:INBOX", accountId: "acc1",
             folderPath: "INBOX", isInInbox: true, db: db
         )
@@ -306,7 +293,7 @@ struct InsertBackfillBatchDedupTests {
 
         let infos = [makeHeaderInfo(messageId: "100")]
 
-        let (inserted, _, _) = try simulateInsertBackfillBatch(
+        let (inserted, _) = try simulateInsertBackfillBatch(
             infos, folderId: "acc1:INBOX", accountId: "acc1",
             folderPath: "INBOX", isInInbox: true, db: db
         )
@@ -317,13 +304,12 @@ struct InsertBackfillBatchDedupTests {
     @Test("Empty input returns zero counts")
     func emptyInput() throws {
         let db = try TestDatabase.make()
-        let (inserted, ftsRecords, ccBccUpdates) = try simulateInsertBackfillBatch(
+        let (inserted, ftsRecords) = try simulateInsertBackfillBatch(
             [], folderId: "acc1:INBOX", accountId: "acc1",
             folderPath: "INBOX", isInInbox: true, db: db
         )
         #expect(inserted == 0)
         #expect(ftsRecords.isEmpty)
-        #expect(ccBccUpdates.isEmpty)
     }
 
     @Test("Cross-folder dedup — same messageId in different folder is NOT a duplicate")
@@ -338,7 +324,7 @@ struct InsertBackfillBatchDedupTests {
 
         // Insert same messageId into Sent folder
         let infos = [makeHeaderInfo(messageId: "100")]
-        let (inserted, _, _) = try simulateInsertBackfillBatch(
+        let (inserted, _) = try simulateInsertBackfillBatch(
             infos, folderId: "acc1:Sent", accountId: "acc1",
             folderPath: "Sent", isInInbox: false, db: db
         )
@@ -751,66 +737,6 @@ struct InsertBackfillBatchAICacheTests {
     }
 }
 
-@Suite("InsertBackfillBatch — CC/BCC Backfill")
-struct InsertBackfillBatchCcBccTests {
-
-    @Test("CC/BCC backfill updates existing messages when flag is set")
-    func ccBccBackfillUpdatesExisting() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, id: "acc1")
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-        try TestDatabase.insertMessageHeader(db, messageId: "100", folderId: "acc1:INBOX", accountId: "acc1", folderPath: "INBOX")
-
-        let info = MessageHeaderInfo(
-            messageId: "100",
-            rfc822MessageId: nil,
-            inReplyTo: nil,
-            references: [],
-            threadId: nil,
-            subject: "Test",
-            from: "sender@example.com",
-            fromAddress: "sender@example.com",
-            to: "recipient@example.com",
-            cc: "cc@example.com",
-            bcc: "bcc@example.com",
-            replyTo: nil,
-            date: Date(),
-            snippet: "",
-            isRead: false,
-            isFlagged: false,
-            hasAttachments: false,
-            isReplied: false,
-            isForwarded: false,
-            actionTag: nil
-        )
-
-        // Simulate with needsCcBccBackfill = true
-        var ccBccUpdates: [(headerId: String, cc: String, bcc: String)] = []
-        try db.write { db in
-            let existingIds = try String.fetchSet(db,
-                MessageHeader
-                    .select(Column("messageId"))
-                    .filter(Column("folderId") == "acc1:INBOX" && ["100"].contains(Column("messageId")))
-            )
-            if existingIds.contains(info.messageId) && (!info.cc.isEmpty || !info.bcc.isEmpty) {
-                let headerId = "acc1:INBOX:\(info.messageId)"
-                try db.execute(
-                    sql: "UPDATE messageHeader SET cc = ?, bcc = ? WHERE id = ?",
-                    arguments: [info.cc, info.bcc, headerId]
-                )
-                ccBccUpdates.append((headerId: headerId, cc: info.cc, bcc: info.bcc))
-            }
-        }
-
-        #expect(ccBccUpdates.count == 1)
-        #expect(ccBccUpdates[0].cc == "cc@example.com")
-
-        let header = try db.read { try MessageHeader.fetchOne($0, key: "acc1:INBOX:100") }
-        #expect(header?.cc == "cc@example.com")
-        #expect(header?.bcc == "bcc@example.com")
-    }
-}
-
 @Suite("InsertBackfillBatch — Header Field Mapping")
 struct InsertBackfillBatchFieldMappingTests {
 
@@ -904,5 +830,102 @@ struct InsertBackfillBatchFieldMappingTests {
 
         let decoded = EmailFilter.decodeHTMLEntities("Hello &amp; world &lt;test&gt;")
         #expect(decoded == "Hello & world <test>")
+    }
+}
+
+// MARK: - A batch of stored rows changes nothing
+
+/// The insert never reads the FETCH of a row the folder already stores. The
+/// IMAP UID walk drops stored UIDs before its FETCH, and this suite is what
+/// keeps the two in step: any new code that makes a stored row's FETCH
+/// matter (a write, a queued op, a search-index update) breaks it.
+///
+/// Calls the real `SyncEngine.insertBackfillBatch` on a real database.
+/// `.serialized, .processGlobalState`: replaces `AppDatabase.shared` and
+/// writes the process-wide `ccBccBackfillDone` key, which older builds read and
+/// leave behind; both values must give the same result.
+@Suite("InsertBackfillBatch — stored rows are inert", .serialized, .processGlobalState)
+struct InsertBackfillBatchTests {
+    private static let ccBccKey = "ccBccBackfillDone"
+
+    private static func info(
+        uid: String, folder: String, cc: String, bcc: String, isRead: Bool, isFlagged: Bool,
+        isReplied: Bool, inReplyTo: String?, actionTag: ActionTag?, labels: [String]
+    ) -> MessageHeaderInfo {
+        var info = MessageHeaderInfo(
+            messageId: uid, rfc822MessageId: "inert-\(folder)-\(uid)@example.com", inReplyTo: inReplyTo,
+            references: inReplyTo.map { [$0] } ?? [], threadId: nil, subject: "inert \(uid)",
+            from: "Sender", fromAddress: "sender@example.com", to: "recipient@example.com",
+            cc: cc, bcc: bcc, replyTo: nil,
+            date: Date().addingTimeInterval(-Double(Int(uid) ?? 0) * 60), snippet: "inert",
+            isRead: isRead, isFlagged: isFlagged, hasAttachments: false,
+            isReplied: isReplied, isForwarded: false, actionTag: actionTag)
+        info.userLabelIds = labels
+        return info
+    }
+
+    /// Every table a stored row's FETCH could reach, as raw rows.
+    private static func snapshot(_ pool: DatabasePool) throws -> [String: [Row]] {
+        try pool.read { db in
+            var out: [String: [Row]] = [:]
+            for table in ["messageHeader", "messageReference", "pendingOperation", "messageUserLabel", "userLabel"] {
+                out[table] = try Row.fetchAll(db, sql: "SELECT * FROM \(table) ORDER BY 1, 2")
+            }
+            return out
+        }
+    }
+
+    @Test("A batch made only of stored rows changes no header, reference, pending op or search-index row",
+          arguments: [FolderRole.inbox, FolderRole.sent], [true, false])
+    func existingRowsAreInert(_ role: FolderRole, _ ccBccFlag: Bool) async throws {
+        let saved = UserDefaults.standard.object(forKey: Self.ccBccKey)
+        defer { UserDefaults.standard.set(saved, forKey: Self.ccBccKey) }
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let accountId = "inert-\(role.rawValue)-\(ccBccFlag)"
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        let path = role == .sent ? "Sent" : "INBOX"
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: path, role: role, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: "Archive", role: .archive, pool: pool)
+        let folder = try #require(try FolderEpochTestFixture.readFolder(accountId: accountId, path: path, pool: pool))
+        let archive = try #require(try FolderEpochTestFixture.readFolder(accountId: accountId, path: "Archive", pool: pool))
+        let engine = SyncEngine()
+
+        // A parent no reply has marked yet: the second batch names it.
+        let parent = Self.info(uid: "1", folder: "archive", cc: "", bcc: "", isRead: true, isFlagged: false,
+                               isReplied: false, inReplyTo: nil, actionTag: .reply, labels: [])
+        _ = await engine.insertBackfillBatch([parent], folderId: archive.id, accountId: accountId,
+                                             folderPath: archive.path, folderRole: .archive,
+                                             isInInbox: false, observedEpoch: nil)
+
+        let uids = ["11", "12", "13"]
+        let stored = uids.map {
+            Self.info(uid: $0, folder: path, cc: "old-cc@example.com", bcc: "", isRead: false, isFlagged: false,
+                      isReplied: false, inReplyTo: nil, actionTag: nil, labels: [])
+        }
+        let first = await engine.insertBackfillBatch(stored, folderId: folder.id, accountId: accountId,
+                                                     folderPath: folder.path, folderRole: role,
+                                                     isInInbox: role == .inbox, observedEpoch: nil)
+        #expect(first.inserted == uids.count, "precondition: the rows were stored")
+
+        // The same UIDs, every field the FETCH carries different.
+        let fetchedAgain = uids.map {
+            Self.info(uid: $0, folder: path, cc: "new-cc-\($0)@example.com", bcc: "new-bcc@example.com",
+                      isRead: true, isFlagged: true, isReplied: true,
+                      inReplyTo: "inert-archive-1@example.com", actionTag: .reply, labels: ["$Label\($0)"])
+        }
+        UserDefaults.standard.set(ccBccFlag, forKey: Self.ccBccKey)
+        let before = try Self.snapshot(pool)
+        let second = await engine.insertBackfillBatch(fetchedAgain, folderId: folder.id, accountId: accountId,
+                                                      folderPath: folder.path, folderRole: role,
+                                                      isInInbox: role == .inbox, observedEpoch: nil)
+        let after = try Self.snapshot(pool)
+
+        #expect(second.inserted == 0)
+        #expect(second.ftsRecords.isEmpty, "the insert built search-index rows for stored messages")
+        #expect(!second.failed)
+        for table in before.keys.sorted() {
+            #expect(before[table] == after[table], "a batch of stored rows changed table \(table)")
+        }
     }
 }
