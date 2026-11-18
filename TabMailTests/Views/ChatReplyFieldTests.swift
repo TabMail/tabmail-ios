@@ -642,6 +642,24 @@ struct ChatReplyFieldTests {
         #expect(fewer.prefillTo == ["sender@example.com"])
     }
 
+    @Test("The chat sits like Messages: header in the navigation bar, field just above the safe area")
+    func messagesLayout() throws {
+        let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
+        // The safe area already clears the home indicator: the field adds only its small gap,
+        // collapsed or opened, and a side inset from the layout config.
+        #expect(Self.count(".padding(.bottom, ChatViewLayout.fieldBottomGap)", in: chat) == 1)
+        #expect(Self.count(".padding(.horizontal, chatExpanded ? 0 : ChatViewLayout.fieldSideInset)", in: chat) == 1)
+        #expect(Self.count(": 34", in: chat) == 0 && Self.count("? 8 :", in: chat) == 0, "no literal insets")
+        #expect(ChatViewLayout.fieldBottomGap == 8 && ChatViewLayout.fieldSideInset == 16)
+        // The people are in the bar's principal slot, level with Back; under the bar only the
+        // subject line, with no band of its own.
+        #expect(Self.count("ToolbarItem(placement: .principal) {", in: chat) == 1)
+        #expect(Self.count("ChatSubjectLine(subject: subject(thread), labels: context.labels)", in: chat) == 1)
+        let header = try Self.source("TabMail/Views/Chat/ChatHeaderView.swift")
+        #expect(Self.count(".background(.bar)", in: header) == 0)
+        #expect(Self.count("Text(subject)", in: header) == 1, "the subject only in the thin line")
+    }
+
     @Test("Reply to, Forward and the chosen people reach the field and the compose card")
     func recipientsWiring() throws {
         let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
@@ -662,7 +680,7 @@ struct ChatReplyFieldTests {
         #expect(Self.count("fieldComposeOpened = true", in: chat) == 0)
         #expect(Self.count("if replyTo != nil { replyTarget = .replyAll }", in: chat) == 1, "a sent reply clears it")
         #expect(Self.count("ownAddresses: context.ownAddresses) { replyTarget = $0 }", in: chat) == 1, "Done sets it")
-        #expect(Self.count("ChatHeaderView(thread: thread, subject: subject(thread), labels: context.labels) { guard TutorialCoordinator.shared.admits(.other) else { return } showsReplyTo = true }", in: chat) == 1)
+        #expect(Self.count("ChatHeaderView(thread: thread) { guard TutorialCoordinator.shared.admits(.other) else { return } showsReplyTo = true }", in: chat) == 1)
         #expect(Self.count("Button { guard TutorialCoordinator.shared.admits(.other) else { return } forwardMessage = thread.newest }", in: chat) == 1)
         #expect(Self.count(".fullScreenCover(item: $forwardMessage) { ComposeView(replyTo: $0, isForward: true) }", in: chat) == 1)
         #expect(Self.count(".onChange(of: thread.newest.map(ChatThread.copyKey)) { _, _ in replyTarget = .replyAll }", in: chat) == 1,

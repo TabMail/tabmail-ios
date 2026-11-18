@@ -4,16 +4,14 @@
 
 import SwiftUI
 
-/// The chat's header: who the reply goes to, the subject, the thread's labels.
+/// The chat's header, in the navigation bar's principal slot as in Messages: the avatars level with
+/// Back, the names under them. Tapping the names changes who gets the reply.
 struct ChatHeaderView: View {
     let thread: ChatThread
-    let subject: String
-    let labels: [UserLabel]
-    /// Tapping the names changes who gets the reply.
     var onTapNames: (() -> Void)? = nil
 
     var body: some View {
-        VStack(spacing: 4) {
+        VStack(spacing: ChatViewLayout.subjectLineSpacing) {
             HStack(spacing: -8) {
                 ForEach(Array(thread.replyPeople.prefix(ChatViewLayout.headerNameCount + 1).enumerated()), id: \.offset) { _, person in
                     ChatAvatar(person: person, size: ChatViewLayout.headerAvatarSize)
@@ -24,7 +22,7 @@ struct ChatHeaderView: View {
                 Button { onTapNames?() } label: {
                     HStack(spacing: 2) {
                         Text(ChatThread.headerTitle(thread.replyPeople))
-                            .font(.subheadline)
+                            .font(.caption)
                             .fontWeight(.semibold)
                             .foregroundStyle(Theme.textPrimary)
                             .lineLimit(1)
@@ -37,24 +35,30 @@ struct ChatHeaderView: View {
                 .disabled(onTapNames == nil)
                 .accessibilityHint("Changes who gets your reply")
             }
+        }
+        .accessibilityElement(children: .contain)
+    }
+}
+
+/// The thin line under the navigation bar: the subject and the thread's labels. No band of its own,
+/// so the chat runs up to it.
+struct ChatSubjectLine: View {
+    let subject: String
+    let labels: [UserLabel]
+
+    var body: some View {
+        HStack(spacing: 4) {
             Text(subject)
                 .font(.caption)
                 .foregroundStyle(Theme.textSecondary)
                 .lineLimit(1)
-            if !labels.isEmpty {
-                HStack(spacing: 4) {
-                    ForEach(UserLabelDisplaySegment.expand(labels)) { segment in
-                        UserLabelChip(name: segment.displayName)
-                    }
-                }
-                .frame(maxWidth: .infinity)
-                .clipped()
+            ForEach(UserLabelDisplaySegment.expand(labels)) { segment in
+                UserLabelChip(name: segment.displayName)
             }
         }
         .padding(.horizontal)
-        .padding(.bottom, 8)
         .frame(maxWidth: .infinity)
-        .background(.bar)
+        .clipped()
         .accessibilityElement(children: .contain)
     }
 }

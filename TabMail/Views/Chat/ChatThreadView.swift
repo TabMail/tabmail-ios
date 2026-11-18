@@ -184,6 +184,16 @@ struct ChatThreadView: View {
         // A new newest email has its own people: the next reply is a Reply All to them.
         .onChange(of: thread.newest.map(ChatThread.copyKey)) { _, _ in replyTarget = .replyAll }
         .toolbar {
+            // Who the reply goes to, in the navigation bar as in Messages: the avatars level with
+            // Back, the names under them.
+            ToolbarItem(placement: .principal) {
+                if viewModel.message != nil {
+                    ChatHeaderView(thread: thread) {
+                        guard TutorialCoordinator.shared.admits(.other) else { return }
+                        showsReplyTo = true
+                    }
+                }
+            }
             ToolbarItem(placement: .topBarTrailing) {
                 // Forward the newest email, in today's forward compose. The tutorial's mail
                 // actions are off (owner 2026-10-21).
@@ -330,10 +340,7 @@ struct ChatThreadView: View {
             }
             .safeAreaInset(edge: .top, spacing: 0) {
                 VStack(spacing: 0) {
-                    ChatHeaderView(thread: thread, subject: subject(thread), labels: context.labels) {
-                        guard TutorialCoordinator.shared.admits(.other) else { return }
-                        showsReplyTo = true
-                    }
+                    ChatSubjectLine(subject: subject(thread), labels: context.labels)
                     tutorialCard(thread)
                 }
             }
@@ -664,8 +671,8 @@ struct ChatThreadView: View {
                 },
                 onFieldSend: { _ in fieldComposeOpened = false })
         }
-        .padding(.horizontal, chatExpanded ? 0 : 12)
-        .padding(.bottom, chatExpanded ? 8 : 34)
+        .padding(.horizontal, chatExpanded ? 0 : ChatViewLayout.fieldSideInset)
+        .padding(.bottom, ChatViewLayout.fieldBottomGap)
         .animation(Self.pillSpring, value: chatExpanded)
     }
 
