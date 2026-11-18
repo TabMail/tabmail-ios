@@ -89,8 +89,6 @@ struct ChatFieldFill {
 
     /// Every change to the words.
     enum Change {
-        /// The user edited the input to the new text, which is now their words.
-        case typed(String)
         /// A dictation's text came back: it is added to the words as they are now.
         case said(String)
         /// An on-device dictation starts: its live transcript adds to the words as they are now.
@@ -98,8 +96,8 @@ struct ChatFieldFill {
         /// The live transcript so far. Dropped if anything else changed the words since the
         /// transcript's last write (the change counter).
         case heard(String)
-        /// The app puts words in for the user (an Edit of an earlier message, or the "e.g." line's
-        /// change).
+        /// The words become this text: the user's edit of the input, or words the app puts in for
+        /// them (an Edit of an earlier message, or the "e.g." line's change).
         case put(String)
         /// Send from the open sheet: the words go, and nothing is left to complete.
         case sentFromSheet
@@ -116,8 +114,6 @@ struct ChatFieldFill {
     mutating func apply(_ change: Change) {
         let before = words
         switch change {
-        case let .typed(typed):
-            words = typed
         case let .said(text):
             words = DictationController.appending(text, to: words)
         case .startHearing:

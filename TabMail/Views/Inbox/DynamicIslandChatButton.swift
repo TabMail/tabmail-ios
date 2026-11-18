@@ -853,7 +853,7 @@ struct DynamicIslandChat: View {
     /// The input as the user sees and edits it: what the user types becomes their words. The
     /// app's own changes to the words do not pass through here.
     private var typedText: Binding<String> {
-        Binding(get: { inputText }, set: { fieldFill.apply(.typed($0)) })
+        Binding(get: { inputText }, set: { fieldFill.apply(.put($0)) })
     }
 
     /// The "e.g." line's change, put in the field for the user to send or edit; never sent here.

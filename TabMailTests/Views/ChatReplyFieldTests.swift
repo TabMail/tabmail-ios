@@ -251,7 +251,7 @@ struct ChatReplyFieldTests {
     }
 
     /// The user typed `text` into the field.
-    private static func typed(_ text: String) -> ChatFieldFill.Change { .typed(text) }
+    private static func typed(_ text: String) -> ChatFieldFill.Change { .put(text) }
 
     @Test("The field holds only the user's words; said words add to them")
     func fieldHoldsTheUsersWords() {
@@ -355,7 +355,7 @@ struct ChatReplyFieldTests {
     func fieldShownWiring() throws {
         let text = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
         #expect(Self.count("TextField(placeholder, text: typedText,", in: text) == 1)
-        #expect(Self.count("Binding(get: { inputText }, set: { fieldFill.apply(.typed($0)) })", in: text) == 1)
+        #expect(Self.count("Binding(get: { inputText }, set: { fieldFill.apply(.put($0)) })", in: text) == 1)
         #expect(Self.count("dictation.isActive || speech.isRecording || speech.isStarting", in: text) == 1)
         // ONE API: the view only reads the words; every change is a `fieldFill.apply`.
         #expect(Self.count("var inputText: String { fieldFill.words }", in: text) == 1)

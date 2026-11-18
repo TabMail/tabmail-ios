@@ -887,13 +887,19 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      succeeded used to apply when the newest one threw; now a failed newest load is an internal read
      failure, the screen keeps its last good state until the next load, and there is no retry layer
      (`ThreadReloadOrderingTests.failedNewestKeepsTheScreen`). A thread row has ONE reader, the thread load (both
-     readers are local store reads): a change to a row on screen asks for a new load, coalesced
-     to one per main-actor turn, and the load generation drops every older load. A change to a
+     readers are local store reads): a change to a row on screen asks for a new load at once,
+     which fences the running scan in the same main-actor turn (it publishes nothing). At most one
+     scan runs (`MessageDetailViewModel.loadThreadMessagesAsync`): a load asked for while one runs
+     waits, and one waiting load covers a whole burst, starting when the running scan returns or
+     throws. A change to a
      row not on screen is kept while a load is out; if that load returns it as a member, the
      load publishes nothing and one more load reads it (a failure there keeps the last good
      screen). A finished or failed load is not pending, so a summary written for another thread
      starts no scan. The opened header is not in the load's results, so it keeps its own reader,
-     newest-only: a read that finishes after a newer read of it started is dropped. The two
+     newest-only: a read that finishes after a newer read of it started does not replace it. Every
+     read that publishes it on open, refresh and refetch (`applyRefresh`, `loadBody`, `refetchBody`)
+     takes a ticket in that one order (`openedRefreshGeneration`); the body load goes on with its
+     own read either way. The two
      readers are disjoint: a load whose opened email changed while it ran publishes nothing and
      reads again (`ThreadReloadOrderingTests.openedEmailIsNeverAThreadRow`). Invariant
      (`ThreadReloadOrderingTests.screenNeverGoesBack`, seeded random completion order): what is
