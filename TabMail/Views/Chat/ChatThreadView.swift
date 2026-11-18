@@ -146,7 +146,8 @@ struct ChatThreadView: View {
         .dismissKeyboardOnTap()
         .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbarVisibility(chatExpanded && chatInputFocused ? .hidden : .automatic, for: .navigationBar)
+        // The bar stays while the opened pill has focus, unlike the inbox and the email screen: it
+        // holds who the chat is with, and Messages never hides it.
         .task {
             noteMembers()
             await viewModel.loadBody()
@@ -636,6 +637,9 @@ struct ChatThreadView: View {
 
     // MARK: - Reply field
 
+    /// The reply field's container, as tests find it.
+    static let replyPillId = "chatReplyPill"
+
     private func pill(on newest: MessageHeader) -> some View {
         let isOwn = thread.items.last?.isOwn ?? false
         // The user's turn: their email is the newest, or a reply of theirs is still in the outbox
@@ -670,6 +674,9 @@ struct ChatThreadView: View {
                         replyTo: newest, target: replyTarget, accounts: context.accounts))
                 },
                 onFieldSend: { _ in fieldComposeOpened = false })
+            // One container, so its frame is the field's own (ChatThreadLayoutTests).
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier(Self.replyPillId)
         }
         .padding(.horizontal, chatExpanded ? 0 : ChatViewLayout.fieldSideInset)
         .padding(.bottom, ChatViewLayout.fieldBottomGap)
