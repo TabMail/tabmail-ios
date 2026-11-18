@@ -712,6 +712,201 @@ struct ChatThreadViewLifecycleTests {
         #expect(ChatThreadView.userTookOver(.interacting), "the user's drag ends the pin")
     }
 
+    // MARK: - The landing's pin, through the live view
+
+    /// The open chat, for the pin tests: its window, its scroll view and the newest email's row.
+    @MainActor
+    struct Pinned {
+        let controller: UIViewController
+        let window: UIWindow
+        let pool: DatabasePool
+        let newest: MessageHeader
+
+        var scroll: UIScrollView? {
+            ChatThreadViewLifecycleTests.scrollViews(controller.view).max { $0.contentSize.height < $1.contentSize.height }
+        }
+        var belowScreen: CGFloat { scroll.map(ChatThreadViewLifecycleTests.below) ?? .infinity }
+        var field: UITextView? { ChatThreadViewLifecycleTests.textViews(controller.view).first(where: \.isEditable) }
+        var fieldTop: CGFloat? { field.map { $0.convert($0.bounds, to: nil).minY } }
+        var ghostShows: Bool { !ChatThreadViewLifecycleTests.ghosts(in: controller.view).isEmpty }
+        /// The screen top of email `index`'s bubble.
+        func top(of index: Int) -> CGFloat? { ChatThreadViewLifecycleTests.bubbleFrame(index, in: controller.view)?.minY }
+        /// Whether any part of email `index`'s bubble is in the scroll view's visible area.
+        func shows(_ index: Int) -> Bool {
+            guard let scroll, let frame = ChatThreadViewLifecycleTests.bubbleFrame(index, in: controller.view) else { return false }
+            return frame.intersects(scroll.convert(scroll.bounds, to: nil).inset(by: scroll.adjustedContentInset))
+        }
+
+        /// Delivers scroll phases to the chat, as its scroll view reports them.
+        func phases(_ phases: ScrollPhase...) {
+            for phase in phases { NotificationCenter.default.post(name: .chatScrollPhaseForTesting, object: phase) }
+        }
+
+        /// Late height 1: the newest email's AI Suggestion arrives, as the AI writes its row.
+        func ghostArrives(_ text: String) async throws {
+            var row = newest
+            row.cachedReply = "Hello,\n\n\(text)\n\nThanks."
+            row.replyTextMessage = text
+            let written = row
+            try await pool.write { db in try written.update(db) }
+            // As the AI's reply write announces it.
+            NotificationCenter.default.post(name: .messageDataDidChange, object: written.id)
+        }
+
+        /// Late height 2: the reply field grows with typed lines, which changes `pillHeight`.
+        func fieldGrows() throws {
+            let field = try #require(field, "the reply field")
+            field.text = (1...6).map { "Line \($0) of a draft." }.joined(separator: "\n")
+            field.delegate?.textViewDidChange?(field)
+        }
+
+        /// Late height 3: the screen gets shorter (a container resize).
+        func screenShrinks(by points: CGFloat) {
+            window.frame.size.height -= points
+        }
+    }
+
+    /// The pin tests' bound on a layout wait: three seconds of frames.
+    private static let layoutWaitFrames = 180
+
+    /// Waits, frame by frame, until `condition` holds; false at the bound. A wait on layout, not a
+    /// fixed delay: it returns at the first frame the condition is true.
+    private static func until(_ condition: @MainActor () -> Bool) async throws -> Bool {
+        for _ in 0..<Self.layoutWaitFrames {
+            if condition() { return true }
+            try await Task.sleep(for: .milliseconds(16))
+        }
+        return condition()
+    }
+
+    /// Opens the 40-email thread in a window and runs `body` with it; tears everything down after.
+    private func withPinned(unreadFrom: Int?, _ body: @MainActor (Pinned) async throws -> Void) async throws {
+        try await HostedAccessibility.withAutomation {
+            let saved = ChatSummaryQueueTests.SavedChatViewState()
+            let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+            let queue = ActiveAIQueue.shared
+            await queue.setDispatchSuppressedForTesting(true)
+            await queue.clearForTesting()
+            defer {
+                saved.restore()
+                InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
+            }
+            saved.setChatView(on: true)
+            ChatPillState.shared.removeAllSessions()
+            let headers = try Self.insertThread(unreadFrom: unreadFrom, pool: pool)
+            let newest = try #require(headers.last)
+            let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+            let window = UIWindow(windowScene: scene)
+            window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+            let controller = UIHostingController(rootView: NavigationStack {
+                ChatThreadView(messageId: newest.id)
+            }.environment(\.hasTabMailSession, true))
+            window.rootViewController = controller
+            window.makeKeyAndVisible()
+            defer {
+                window.isHidden = true
+                window.rootViewController = nil
+                ChatPillState.shared.removeAllSessions()
+            }
+            try await body(Pinned(controller: controller, window: window, pool: pool, newest: newest))
+            await queue.clearForTesting()
+            await queue.setDispatchSuppressedForTesting(false)
+        }
+    }
+
+    @Test("Opened at the bottom, the chat ends at the bottom through programmatic scroll phases and every late height")
+    func bottomLandingFollowsLateHeights() async throws {
+        try await withPinned(unreadFrom: nil) { chat in
+            #expect(try await Self.until { chat.field != nil && chat.belowScreen < 2 }, "control: the open lands at the bottom")
+            // The chat's own re-pin scroll animates and settles: not the user.
+            chat.phases(.animating, .decelerating, .idle)
+            try await chat.ghostArrives("Sounds good, see you Tuesday.")
+            #expect(try await Self.until { chat.ghostShows && chat.belowScreen < 2 },
+                    "the AI Suggestion arrives and the chat ends at the bottom: \(chat.belowScreen)")
+            chat.phases(.animating, .idle)
+            let fieldTop = try #require(chat.fieldTop)
+            try chat.fieldGrows()
+            #expect(try await Self.until { (chat.fieldTop ?? fieldTop) < fieldTop - 40 && chat.belowScreen < 2 },
+                    "the field grows and the chat ends at the bottom: \(chat.belowScreen)")
+            chat.phases(.animating, .idle)
+            chat.screenShrinks(by: 120)
+            #expect(try await Self.until { chat.belowScreen < 2 && (chat.scroll?.bounds.height ?? 0) < 852 - 100 },
+                    "the screen shrinks and the chat ends at the bottom: \(chat.belowScreen)")
+        }
+    }
+
+    @Test("Opened at the Unread line, the line stays where it landed through programmatic phases and late heights")
+    func unreadLandingKeepsItsAnchor() async throws {
+        let firstUnread = 20
+        try await withPinned(unreadFrom: firstUnread) { chat in
+            #expect(try await Self.until { chat.field != nil && chat.shows(firstUnread) && !chat.shows(firstUnread - 1) && chat.belowScreen > 2 },
+                    "control: the open lands at the Unread line")
+            let landed = try #require(chat.top(of: firstUnread))
+            chat.phases(.animating, .decelerating, .idle)
+            // Both changes move the bottom anchor's idea of the screen: only the held landing
+            // keeps the Unread line where it is.
+            chat.screenShrinks(by: 120)
+            #expect(try await Self.until { (chat.scroll?.bounds.height ?? 0) < 852 - 100 && abs((chat.top(of: firstUnread) ?? 0) - landed) < 2 },
+                    "the screen shrinks and the Unread line stays: \(String(describing: chat.top(of: firstUnread))) vs \(landed)")
+            chat.phases(.animating, .idle)
+            let fieldTop = try #require(chat.fieldTop)
+            try chat.fieldGrows()
+            #expect(try await Self.until { (chat.fieldTop ?? fieldTop) < fieldTop - 40 && abs((chat.top(of: firstUnread) ?? 0) - landed) < 2 },
+                    "the field grows and the Unread line stays: \(String(describing: chat.top(of: firstUnread))) vs \(landed)")
+        }
+    }
+
+    @Test("A tap on the jump button ends the Unread landing: a later height never brings the line back")
+    func jumpButtonEndsTheLanding() async throws {
+        let firstUnread = 20
+        try await withPinned(unreadFrom: firstUnread) { chat in
+            #expect(try await Self.until { chat.field != nil && chat.shows(firstUnread) && chat.belowScreen > 2 },
+                    "control: the open lands at the Unread line")
+            let jump = try #require(try await Self.jumpButton(in: chat), "the jump button shows away from the bottom")
+            #expect(jump.accessibilityActivate(), "control: the jump button takes the tap")
+            // Its animated scroll reports as SwiftUI reports it: a programmatic phase.
+            chat.phases(.animating)
+            #expect(try await Self.until { chat.belowScreen < 2 }, "control: the jump reaches the bottom")
+            chat.phases(.idle)
+            let fieldTop = try #require(chat.fieldTop)
+            try chat.fieldGrows()
+            #expect(try await Self.until { (chat.fieldTop ?? fieldTop) < fieldTop - 40 }, "control: the field grows")
+            chat.screenShrinks(by: 120)
+            #expect(try await Self.until { (chat.scroll?.bounds.height ?? 0) < 852 - 100 }, "control: the screen shrinks")
+            #expect(!chat.shows(firstUnread), "the Unread line never comes back after the jump")
+            #expect(chat.belowScreen < 2, "the chat stays where the jump took it: \(chat.belowScreen)")
+        }
+    }
+
+    @Test("After the user's own scroll, late heights below never bring the landing back")
+    func usersScrollEndsTheLanding() async throws {
+        try await withPinned(unreadFrom: nil) { chat in
+            #expect(try await Self.until { chat.field != nil && chat.belowScreen < 2 }, "control: the open lands at the bottom")
+            let scroll = try #require(chat.scroll)
+            // A hand drag up: the scroll view reports tracking, then interacting, and moves.
+            chat.phases(.tracking, .interacting)
+            Self.scroll(scroll, by: -1500)
+            chat.phases(.idle)
+            let away = chat.belowScreen
+            #expect(away > 1000, "control: the drag moved the chat up: \(away)")
+            try await chat.ghostArrives("Sounds good, see you Tuesday.")
+            let fieldTop = try #require(chat.fieldTop)
+            try chat.fieldGrows()
+            #expect(try await Self.until { chat.ghostShows && (chat.fieldTop ?? fieldTop) < fieldTop - 40 },
+                    "control: the AI Suggestion arrives and the field grows")
+            #expect(chat.belowScreen > 1000, "the reading position stays the user's: \(chat.belowScreen)")
+        }
+    }
+
+    /// The jump button, once it shows.
+    private static func jumpButton(in chat: Pinned) async throws -> NSObject? {
+        func find() -> NSObject? {
+            HostedAccessibility.elements(under: chat.controller.view).first { $0.accessibilityLabel == "Jump to the newest email" }
+        }
+        _ = try await until { find() != nil }
+        return find()
+    }
+
     @Test("At the bottom, the newest bubble and the AI Suggestion stay above the field however tall a typed draft grows it")
     func newestBubbleClearsATallField() async throws {
         let ready = "Sounds good."

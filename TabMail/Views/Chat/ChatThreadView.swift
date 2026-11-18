@@ -5,6 +5,13 @@
 import GRDB
 import SwiftUI
 
+#if DEBUG
+extension Notification.Name {
+    /// Test seam only: a scroll phase delivered to the open chat as if its scroll view reported it.
+    static let chatScrollPhaseForTesting = Notification.Name("chatScrollPhaseForTesting")
+}
+#endif
+
 extension ChatViewConfig {
     /// Whether an open goes to the chat now. Demo mode with AI declined counts as AI off. A
     /// tutorial run follows what it teaches, decided when it started (`teachesChat`).
@@ -316,9 +323,14 @@ struct ChatThreadView: View {
                 // Only the user's hand ends the landing. A programmatic scroll that animates (a
                 // late height arriving inside an animated transaction) or its settling is not the
                 // user: the chat stays pinned while the ghost and the field's height arrive.
-                .onScrollPhaseChange { _, phase in
-                    if Self.userTookOver(phase) { scrollTarget = nil }
+                .onScrollPhaseChange { _, phase in endLanding(on: phase) }
+                #if DEBUG
+                // Test seam: tests cannot make a hand scroll or a programmatic animation phase on
+                // demand, so they post one here. Production never posts it.
+                .onReceive(NotificationCenter.default.publisher(for: .chatScrollPhaseForTesting)) { note in
+                    if let phase = note.object as? ScrollPhase { endLanding(on: phase) }
                 }
+                #endif
                 .defaultScrollAnchor(.bottom)
                 .scrollDismissesKeyboard(.interactively)
                 .onScrollGeometryChange(for: Bool.self) { geo in
@@ -469,6 +481,11 @@ struct ChatThreadView: View {
     /// Whether a scroll phase is the user's own scroll, the only thing that ends the landing's pin.
     static func userTookOver(_ phase: ScrollPhase) -> Bool {
         phase == .tracking || phase == .interacting
+    }
+
+    /// A scroll phase began: the user's own scroll ends the landing.
+    private func endLanding(on phase: ScrollPhase) {
+        if Self.userTookOver(phase) { scrollTarget = nil }
     }
 
     /// Where the open lands (`scrollOnceLoaded`). Held until a scroll of any kind begins, so the
